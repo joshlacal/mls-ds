@@ -502,6 +502,258 @@ mod tests {
                     "{name}: {}",
                     result.err().map(|e| e.to_string()).unwrap_or_default()
                 );
+                // A freshly valid outer signature does not make substituted
+                // coordinates or artifact bindings authoritative. Keep this
+                // distinct from rejection of a stale/invalid outer signature.
+                if leaves == 2 {
+                    let alternate_uuid = json!("11111111-2222-4333-8444-555555555555");
+                    let alternate_hash = json!(STANDARD.encode([0xA6; 32]));
+                    let mut substitutions: Vec<(String, Value)> = vec![
+                        (
+                            "/actorDid".into(),
+                            json!("did:plc:cccccccccccccccccccccccc"),
+                        ),
+                        ("/actorDeviceId".into(), alternate_uuid.clone()),
+                        (
+                            "/keyId".into(),
+                            json!(
+                                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xA7; 32])
+                            ),
+                        ),
+                        ("/authGeneration".into(), json!(2)),
+                        (
+                            "/recipientDid".into(),
+                            json!("did:plc:dddddddddddddddddddddddd"),
+                        ),
+                        ("/requestId".into(), alternate_uuid.clone()),
+                        ("/firstMessageId".into(), alternate_uuid.clone()),
+                        ("/conversationId".into(), alternate_uuid.clone()),
+                        ("/contextHash".into(), alternate_hash.clone()),
+                    ];
+                    for (prefix, fields) in [
+                        (
+                            "/next",
+                            vec![
+                                "conversationId",
+                                "generation",
+                                "stateVersion",
+                                "groupId",
+                                "epoch",
+                                "groupContextHash",
+                                "confirmationTag",
+                            ],
+                        ),
+                        (
+                            "/artifacts/metadataSnapshot/coordinate",
+                            vec![
+                                "conversationId",
+                                "generation",
+                                "groupId",
+                                "epoch",
+                                "groupContextHash",
+                                "confirmationTag",
+                            ],
+                        ),
+                        (
+                            "/artifacts/welcome/deliveries/0/provenance",
+                            vec![
+                                "requestId",
+                                "preparationDigest",
+                                "contextHash",
+                                "grantId",
+                                "grantRevision",
+                                "keyPackageRef",
+                            ],
+                        ),
+                        (
+                            "/artifacts/metadataSnapshot/authorProof",
+                            vec![
+                                "authorDid",
+                                "authorDeviceId",
+                                "authorKeyId",
+                                "signaturePublicKey",
+                                "authGenerationAtOrigin",
+                                "originTransitionId",
+                            ],
+                        ),
+                    ] {
+                        for field in fields {
+                            let pointer = format!("{prefix}/{field}");
+                            let old = body.pointer(&pointer).unwrap();
+                            let changed = if let Some(number) = old.as_u64() {
+                                json!(number + 1)
+                            } else if field.ends_with("Did") {
+                                json!("did:plc:cccccccccccccccccccccccc")
+                            } else if field == "authorKeyId" {
+                                json!(base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                    .encode([0xA7; 32]))
+                            } else if field.ends_with("Id")
+                                && field != "groupId"
+                                && !(prefix.ends_with("coordinate") && field == "conversationId")
+                            {
+                                alternate_uuid.clone()
+                            } else if field == "conversationId" {
+                                json!(STANDARD.encode([0xA6; 16]))
+                            } else {
+                                alternate_hash.clone()
+                            };
+                            substitutions.push((pointer, changed));
+                        }
+                    }
+                    substitutions.extend([
+                        (
+                            "/artifacts/welcome/deliveries/0/recipientDid".into(),
+                            json!("did:plc:cccccccccccccccccccccccc"),
+                        ),
+                        (
+                            "/artifacts/welcome/deliveries/0/recipientDeviceId".into(),
+                            alternate_uuid.clone(),
+                        ),
+                        (
+                            "/artifacts/metadataSnapshot/originTransitionId".into(),
+                            alternate_uuid.clone(),
+                        ),
+                        (
+                            "/artifacts/metadataSnapshot/metadataVersion".into(),
+                            json!(2),
+                        ),
+                        (
+                            "/artifacts/metadataSnapshot/ciphertextSha256".into(),
+                            alternate_hash.clone(),
+                        ),
+                        (
+                            "/artifacts/metadataSnapshot/ciphertextSize".into(),
+                            json!(metadata.len() + 1),
+                        ),
+                    ]);
+                    for (pointer, value) in &substitutions {
+                        let mut changed = body.clone();
+                        assert_ne!(
+                            changed.pointer(pointer).unwrap(),
+                            value,
+                            "{name}:{pointer} mutation must change its value"
+                        );
+                        *changed.pointer_mut(pointer).unwrap() = value.clone();
+                        eprintln!("{name}: signed semantic binding {pointer}");
+                        if pointer == "/keyId" {
+                            let message = transcript::direct_request_signing_bytes(
+                                DirectRequestKind::Publish,
+                                &serde_json::to_vec(&changed).unwrap(),
+                            )
+                            .unwrap();
+                            let wrapper = json!({"body":changed,"signature":STANDARD.encode(signing.sign(&message).to_bytes())});
+                            assert!(
+                                transcript::verify_signed_request(
+                                    DirectRequestKind::Publish,
+                                    &serde_json::to_vec(&wrapper).unwrap(),
+                                    &actor_key
+                                )
+                                .is_err(),
+                                "{name}: signed key ID substitution accepted"
+                            );
+                            continue;
+                        }
+                        assert!(
+                            verify_bootstrap(
+                                &verify(&changed),
+                                &actor_key,
+                                &selected,
+                                prior.as_ref(),
+                                now
+                            )
+                            .is_err(),
+                            "{name}: freshly signed semantic mutation accepted at {pointer}"
+                        );
+                    }
+                    // Mutate the actual MLS authenticated-data bytes while
+                    // preserving framing and refreshing the outer artifact hash.
+                    for (field, bytes_field, aad) in [
+                        (
+                            "addCommit",
+                            "bytes",
+                            transcript::direct_request_commit_aad(&context_hash).unwrap(),
+                        ),
+                        (
+                            "initialCiphertext",
+                            "",
+                            transcript::direct_request_application_aad(
+                                &context_hash,
+                                &serde_json::to_vec(&body["next"]).unwrap(),
+                                body["firstMessageId"].as_str().unwrap(),
+                            )
+                            .unwrap(),
+                        ),
+                    ] {
+                        let mut changed = body.clone();
+                        let value = if bytes_field.is_empty() {
+                            &body["artifacts"][field]
+                        } else {
+                            &body["artifacts"][field][bytes_field]
+                        };
+                        let mut raw = bytes(value).unwrap();
+                        let offsets = raw
+                            .windows(aad.len())
+                            .enumerate()
+                            .filter_map(|(i, b)| (b == aad).then_some(i))
+                            .collect::<Vec<_>>();
+                        assert_eq!(offsets.len(), 1, "{name}: unique {field} AAD");
+                        raw[offsets[0] + aad.len() - 1] ^= 1;
+                        if bytes_field.is_empty() {
+                            changed["artifacts"][field] = json!(STANDARD.encode(raw));
+                        } else {
+                            changed["artifacts"][field][bytes_field] = json!(STANDARD.encode(&raw));
+                            changed["artifacts"][field]["sha256"] =
+                                json!(STANDARD.encode(Sha256::digest(raw)));
+                        }
+                        assert!(
+                            verify_bootstrap(
+                                &verify(&changed),
+                                &actor_key,
+                                &selected,
+                                prior.as_ref(),
+                                now
+                            )
+                            .is_err(),
+                            "{name}: freshly signed wrong {field} AAD accepted"
+                        );
+                    }
+                    if prior.is_some() {
+                        for field in [
+                            "conversationId",
+                            "generation",
+                            "stateVersion",
+                            "groupId",
+                            "epoch",
+                            "groupContextHash",
+                            "confirmationTag",
+                        ] {
+                            let mut changed = body.clone();
+                            let old = &changed["origin"]["exactPrior"][field];
+                            changed["origin"]["exactPrior"][field] =
+                                if let Some(number) = old.as_u64() {
+                                    json!(number + 1)
+                                } else if field == "conversationId" {
+                                    alternate_uuid.clone()
+                                } else {
+                                    alternate_hash.clone()
+                                };
+                            let mut changed_context = ctx.clone();
+                            changed_context["origin"] = changed["origin"].clone();
+                            changed["contextHash"] = json!(STANDARD.encode(
+                                transcript::direct_request_context_hash(
+                                    &serde_json::to_vec(&changed_context).unwrap()
+                                )
+                                .unwrap()
+                            ));
+                            assert!(matches!(verify_bootstrap(&verify(&changed), &actor_key, &selected, prior.as_ref(), now), Err(BootstrapError::LegacyIneligible)), "{name}: freshly signed changed prior {field} did not fail exact retained prior");
+                        }
+                    }
+                    eprintln!(
+                        "{name}: {} signed semantic, 2 MLS AAD, {} exact prior negative assertions",
+                        substitutions.len(),
+                        if prior.is_some() { 7 } else { 0 }
+                    );
+                }
                 let mut fractional_deadline = body.clone();
                 fractional_deadline["importUntil"] =
                     json!(format_time(until).replace(".000Z", ".123Z"));
