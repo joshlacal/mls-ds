@@ -43,6 +43,10 @@ pub const REQUEST_AUTH_FIXTURE_ENV: &str = "REQUEST_AUTH_FIXTURE";
 pub const REQUEST_SERVER_FIXTURE_BINARY_ENV: &str = "REQUEST_SERVER_FIXTURE_BINARY";
 pub const ALICE_DID_HOST: &str = "alice.request-fixture.catbird.blue";
 pub const BOB_DID_HOST: &str = "bob.request-fixture.catbird.blue";
+const AUTH_JTI_MIGRATION: &str =
+    include_str!("../../../server/migrations/20260214000002_auth_jti_nonce.sql");
+const AUTH_JTI_MIGRATION_SHA384: &str =
+    "a653190a473ce3535c946769e8e269173fcf22c1cc6196063eb9461e4766bc084a57c61d2b3a4ffee4b5a1b4da06856b";
 
 static DATABASE_SETUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -232,6 +236,7 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
     );
 
     install_or_validate_reviewed_baseline()?;
+    install_auth_replay_prerequisite()?;
     let ledger: Vec<InstalledMigration> = serde_json::from_str(&psql_query(
         "SELECT coalesce(json_agg(json_build_object('version',version,'description',description,'success',success,'checksum',encode(checksum,'hex')) ORDER BY version),'[]'::json)::text FROM public._sqlx_migrations",
     )?)
@@ -279,6 +284,19 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
         baseline_migrations: 14,
         additive_migrations: ledger.len() - 14,
     })
+}
+
+fn install_auth_replay_prerequisite() -> Result<()> {
+    anyhow::ensure!(
+        hex::encode(Sha384::digest(AUTH_JTI_MIGRATION.as_bytes())) == AUTH_JTI_MIGRATION_SHA384,
+        "canonical auth JTI migration checksum drift"
+    );
+    psql_exec(AUTH_JTI_MIGRATION)?;
+    anyhow::ensure!(
+        psql_query("SELECT to_regclass('public.auth_jti_nonce')::text")?.trim() == "auth_jti_nonce",
+        "canonical auth JTI replay store is unavailable"
+    );
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -845,19 +863,63 @@ impl ShippingServerFixture {
         let service = SigningKey::from_bytes((&[42_u8; 32]).into())?;
         let receipt_point = receipt.verifying_key().to_encoded_point(true);
         let receipt_key_id = protocol::direct_request_receipt_key_id(receipt_point.as_bytes())?;
-        let mut multikey = vec![0x80, 0x24];
-        multikey.extend_from_slice(receipt_point.as_bytes());
-        let receipt_document = serde_json::to_vec(&json!({
-            "id":"did:web:chat.catbird.blue",
-            "verificationMethod":[{
+        let retained_keys: Value = serde_json::from_str(&psql_query(
+            "SELECT coalesce(json_agg(json_build_object('keyId',key_id,'publicKey',encode(public_key,'base64')) ORDER BY key_id),'[]'::json)::text FROM chat.direct_request_receipt_keys",
+        )?)?;
+        let mut methods = retained_keys
+            .as_array()
+            .context("request receipt key registry projection")?
+            .iter()
+            .map(|retained| -> Result<Value> {
+                let key = STANDARD.decode(
+                    retained["publicKey"]
+                        .as_str()
+                        .context("retained receipt public key")?,
+                )?;
+                anyhow::ensure!(
+                    protocol::direct_request_receipt_key_id(&key)? == retained["keyId"],
+                    "retained receipt key ID mismatch"
+                );
+                let mut multikey = vec![0x80, 0x24];
+                multikey.extend_from_slice(&key);
+                Ok(json!({
+                    "id":retained["keyId"],
+                    "controller":"did:web:chat.catbird.blue",
+                    "type":"Multikey",
+                    "publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !methods.iter().any(|method| method["id"] == receipt_key_id) {
+            let mut multikey = vec![0x80, 0x24];
+            multikey.extend_from_slice(receipt_point.as_bytes());
+            methods.push(json!({
                 "id":receipt_key_id,
                 "controller":"did:web:chat.catbird.blue",
                 "type":"Multikey",
                 "publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)
-            }]
+            }));
+        }
+        let receipt_document = serde_json::to_vec(&json!({
+            "id":"did:web:chat.catbird.blue",
+            "verificationMethod":methods
         }))?;
-        let cursor_key_id =
-            psql_query("SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE")?;
+        let cursor_key_id = URL_SAFE_NO_PAD.encode([0xC1_u8; 32]);
+        psql_exec(&format!(
+            "BEGIN; \
+             INSERT INTO chat.protocol_instances(singleton,protocol_version,protocol_instance_id,cursor_key_id) \
+             VALUES(TRUE,'1','00000000-0000-4000-8000-000000000001','{cursor_key_id}') \
+             ON CONFLICT(singleton) DO NOTHING; \
+             INSERT INTO chat.event_retention(protocol_instance_id,retained_floor,updated_at) \
+             SELECT protocol_instance_id,0,clock_timestamp() FROM chat.protocol_instances WHERE singleton=TRUE \
+             ON CONFLICT(protocol_instance_id) DO NOTHING; COMMIT;",
+        ))?;
+        anyhow::ensure!(
+            psql_query("SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE")?
+                .trim()
+                == cursor_key_id,
+            "guarded database cursor fence differs from fixture key"
+        );
         let mut child = Command::new(binary)
             .env("TEST_DATABASE_URL", REQUEST_TEST_DATABASE_URL)
             .env(
@@ -872,7 +934,7 @@ impl ShippingServerFixture {
             )
             .env("CHAT_CUTOVER_ENABLED", "1")
             .env("CHAT_DIRECT_REQUESTS_ENABLED", "1")
-            .env("CHAT_CURSOR_KEY_ID", cursor_key_id.trim())
+            .env("CHAT_CURSOR_KEY_ID", &cursor_key_id)
             .env(
                 "CHAT_CURSOR_SEALING_SECRET",
                 URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),

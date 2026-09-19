@@ -249,7 +249,11 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
         String::from_utf8_lossy(&prepare_response)
     );
     let response: Value = serde_json::from_slice(&prepare_response)?;
-    let preparation = response["outcome"]["preparation"].clone();
+    let preparation = response
+        .pointer("/outcome/preparation")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .with_context(|| format!("prepare returned no live preparation: {response}"))?;
     let preparation_bytes = serde_json::to_vec(&preparation)?;
     protocol::verify_direct_request_preparation(&preparation_bytes, &server.receipt_public_key)?;
     let verified_prepare = protocol::verify_signed_request(
