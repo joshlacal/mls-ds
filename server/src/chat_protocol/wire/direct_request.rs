@@ -110,7 +110,7 @@ pub fn verify_final_group_info(
             1 => match u8::tls_deserialize(&mut remaining)
                 .map_err(|_| WireValidationError::Malformed)?
             {
-                1 if index % 2 == 0 => {
+                1 if index.is_multiple_of(2) => {
                     let leaf = WireLeafNode::tls_deserialize(&mut remaining)
                         .map_err(|_| WireValidationError::Malformed)?;
                     validate_clean_leaf_shape(&leaf)?;

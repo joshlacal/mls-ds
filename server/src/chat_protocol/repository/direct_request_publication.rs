@@ -55,7 +55,6 @@ impl PreparedPublication {
         if actual != self.transaction_id {
             return Err(PublicationError::Invariant);
         }
-        self.candidate.validate_preparation(tx).await?;
         Ok(())
     }
 }
@@ -326,6 +325,27 @@ fn encode(value: &Value) -> Result<Vec<u8>, PublicationError> {
     serde_json::to_vec(value).map_err(|_| PublicationError::Invariant)
 }
 
+async fn reject_prepared(
+    tx: &mut Transaction<'_, Postgres>,
+    candidate: LockedDirectRequestPublication,
+    signer: &DirectRequestReceiptSigner,
+    code: &str,
+) -> Result<Vec<u8>, PublicationError> {
+    match terminal(
+        tx,
+        candidate,
+        signer,
+        PublicationDisposition::Rejected,
+        "directRequestRejectedReceipt",
+        json!({"code":code}),
+    )
+    .await?
+    {
+        PublicationPreparation::Terminal(bytes) => Ok(bytes),
+        PublicationPreparation::Ready(_) => Err(PublicationError::Invariant),
+    }
+}
+
 /// Apply the complete prepared publication in the caller-owned transaction.
 /// Every error requires rollback; no sub-operation commits, creates a separate
 /// group or sends the initial message independently.
@@ -336,8 +356,23 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     policy: &RelationshipAuthority<T>,
 ) -> Result<Vec<u8>, PublicationError> {
     prepared.require_transaction(tx).await?;
-    prepared.candidate.validate_policy(tx, policy).await?;
+    if let Err(error) = prepared.candidate.validate_policy(tx, policy).await {
+        if let DirectRequestStoreError::Database(error) = error {
+            return Err(error.into());
+        }
+        prepared.candidate.refresh_instant(tx).await?;
+        return reject_prepared(tx, prepared.candidate, signer, "RequestPolicyDenied").await;
+    }
     prepared.candidate.refresh_instant(tx).await?;
+    if let Err(error) = prepared.candidate.validate_preparation(tx).await {
+        let code = match error {
+            DirectRequestStoreError::Expired => "PreparationExpired",
+            DirectRequestStoreError::IncludedAuthorityChanged => "PreparationRevoked",
+            DirectRequestStoreError::Database(error) => return Err(error.into()),
+            _ => "PreparationConflict",
+        };
+        return reject_prepared(tx, prepared.candidate, signer, code).await;
+    }
     let now = prepared.candidate.trusted_instant();
     // Round upward: the SQL deadline includes fractional acceptance seconds.
     // Revalidate after every lock/policy wait, before constructing persisted time.
@@ -356,19 +391,7 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
                 direct_request::BootstrapError::LegacyIneligible => "StaleLegacyPrior",
                 _ => "InvalidBootstrap",
             };
-            return match terminal(
-                tx,
-                prepared.candidate,
-                signer,
-                PublicationDisposition::Rejected,
-                "directRequestRejectedReceipt",
-                json!({"code":code}),
-            )
-            .await?
-            {
-                PublicationPreparation::Terminal(bytes) => Ok(bytes),
-                PublicationPreparation::Ready(_) => Err(PublicationError::Invariant),
-            };
+            return reject_prepared(tx, prepared.candidate, signer, code).await;
         }
     };
     let b = prepared.candidate.signed().body().clone();
