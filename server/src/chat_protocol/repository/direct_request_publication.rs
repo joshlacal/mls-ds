@@ -6,6 +6,7 @@ use super::direct_request_preparation::{
     LockedDirectRequestPublication, PublicationDisposition,
 };
 use super::direct_request_receipts::DirectRequestReceiptSigner;
+use super::direct_request_retention;
 use crate::chat_protocol::{
     relationship_policy::{PublicTransport, RelationshipAuthority},
     snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle},
@@ -467,13 +468,22 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
         Ok(())
     };
     for blob in [
-        server_fields.as_slice(), genesis_info.as_slice(), final_state.snapshot(),
-        tree.bytes(), metadata_ciphertext.as_slice(), final_info.as_slice(),
-        welcome.as_slice(), initial.as_slice(), metadata_bytes.as_slice(), event.as_slice(),
+        server_fields.as_slice(),
+        genesis_info.as_slice(),
+        final_state.snapshot(),
+        tree.bytes(),
+        metadata_ciphertext.as_slice(),
+        final_info.as_slice(),
+        welcome.as_slice(),
+        initial.as_slice(),
+        metadata_bytes.as_slice(),
+        event.as_slice(),
     ] {
         add_blob(blob.len())?;
     }
-    let deliveries = a["welcome"]["deliveries"].as_array().ok_or(PublicationError::Invariant)?;
+    let deliveries = a["welcome"]["deliveries"]
+        .as_array()
+        .ok_or(PublicationError::Invariant)?;
     for delivery in deliveries {
         add_blob(encode(&delivery["provenance"])?.len())?;
     }
@@ -492,14 +502,57 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     } else {
         0
     };
-    let retained_artifact_bytes = retained_charge::charge(existing_charge, receipt.bytes().len(), &retained_charge::PublicationArtifactLengths {
-        signed_wrapper: signed_bytes.len(), accepted_entry: entry_bytes.len(),
-        unsigned_body: unsigned_body.len(), transcript: transcript.len(), signature: signature.len(),
-        remaining_blobs,
-        final_leaves: final_state.binding().tree_summary().leaves().len() as u64,
-        deliveries: deliveries.len() as u64, predecessor_intervals,
-        legacy_successor: prepared.prior.is_some(),
-    }).ok_or(PublicationError::Invariant)?;
+    // A legacy successor may have devices in older, already-closed schedules.
+    // A later close notifies that entire history, so only counting the current
+    // predecessor's open intervals would under-reserve retained audience rows.
+    let mut final_dids = Vec::new();
+    let mut final_devices = Vec::new();
+    for leaf in final_state.binding().tree_summary().leaves() {
+        let identity = std::str::from_utf8(leaf.basic_credential())
+            .map_err(|_| PublicationError::Invariant)?;
+        let (did, device) = identity
+            .rsplit_once('#')
+            .ok_or(PublicationError::Invariant)?;
+        final_dids.push(did.to_owned());
+        final_devices.push(Uuid::parse_str(device).map_err(|_| PublicationError::Invariant)?);
+    }
+    let historical_audience: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT recipient_did,recipient_device_id FROM chat.application_intervals WHERE conversation_id=$1 UNION SELECT * FROM unnest($2::text[],$3::uuid[])) audience",
+    ).bind(convo).bind(&final_dids).bind(&final_devices).fetch_one(&mut **tx).await?;
+    let historical_audience =
+        u64::try_from(historical_audience).map_err(|_| PublicationError::Invariant)?;
+    let snapshot_tree_bytes = (final_state.snapshot().len() as u64)
+        .checked_add(tree.bytes().len() as u64)
+        .ok_or(PublicationError::Invariant)?;
+    let decision_reserve = direct_request_retention::decision_reservation_bytes(
+        snapshot_tree_bytes,
+        historical_audience,
+    )
+    .ok_or(PublicationError::Invariant)?;
+    let lifecycle_reserve = direct_request_retention::lifecycle_reservation_bytes(
+        snapshot_tree_bytes,
+        historical_audience,
+        deliveries.len() as u64,
+    )
+    .ok_or(PublicationError::Invariant)?;
+    let retained_artifact_bytes = retained_charge::charge(
+        existing_charge,
+        receipt.bytes().len(),
+        &retained_charge::PublicationArtifactLengths {
+            signed_wrapper: signed_bytes.len(),
+            accepted_entry: entry_bytes.len(),
+            unsigned_body: unsigned_body.len(),
+            transcript: transcript.len(),
+            signature: signature.len(),
+            remaining_blobs,
+            final_leaves: final_state.binding().tree_summary().leaves().len() as u64,
+            deliveries: deliveries.len() as u64,
+            predecessor_intervals,
+            legacy_successor: prepared.prior.is_some(),
+        },
+    )
+    .and_then(|bytes| bytes.checked_add(lifecycle_reserve))
+    .ok_or(PublicationError::Invariant)?;
     let response = match preparation::complete_published_publication(
         tx,
         prepared.candidate,
@@ -568,6 +621,19 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     }
     sqlx::query("INSERT INTO chat.direct_request_publications(request_id,conversation_id,generation,state_version,first_message_id,actor_did,actor_device_id,actor_key_id,recipient_did,context_hash,preparation_digest,publication_digest,signed_publication,request_entry,request_entry_sha256,final_group_info,final_group_info_sha256,full_welcome,full_welcome_sha256,initial_ciphertext,initial_ciphertext_sha256,metadata_snapshot,metadata_snapshot_sha256,import_until,created_at,actor_auth_generation) VALUES($1,$2,$3,1,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)")
         .bind(request).bind(convo).bind(generation).bind(id(&b["firstMessageId"])?).bind(actor).bind(actor_device).bind(actor_key).bind(recipient).bind(binary(&b["contextHash"])?).bind(binary(&b["preparationDigest"])?).bind(digest).bind(&signed_bytes).bind(&entry_bytes).bind(Sha256::digest(&entry_bytes).as_slice()).bind(&final_info).bind(Sha256::digest(&final_info).as_slice()).bind(&welcome).bind(Sha256::digest(&welcome).as_slice()).bind(&initial).bind(Sha256::digest(&initial).as_slice()).bind(&metadata_bytes).bind(Sha256::digest(&metadata_bytes).as_slice()).bind(import_until).bind(now).bind(auth).execute(&mut **tx).await?;
+    direct_request_retention::install_lifecycle_reserve(
+        tx,
+        request,
+        decision_reserve,
+        deliveries.len() as u64,
+    )
+    .await
+    .map_err(|error| match error {
+        direct_request_retention::RetentionError::Database(error) => {
+            PublicationError::Database(error)
+        }
+        _ => PublicationError::Invariant,
+    })?;
     for leaf in final_state.binding().tree_summary().leaves() {
         let identity = std::str::from_utf8(leaf.basic_credential())
             .map_err(|_| PublicationError::Invariant)?;

@@ -414,6 +414,7 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         NotAuthorized,
         DeviceBindingMismatch,
+        CapacityUnavailable,
     ]),
     AcknowledgeWelcome => ("blue.catbird.chat.acknowledgeWelcome", [
         AccountSessionExpired,
@@ -430,6 +431,7 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         NotAuthorized,
         DeviceBindingMismatch,
+        CapacityUnavailable,
     ]),
     ActivateReset => ("blue.catbird.chat.activateReset", [
         AccountSessionExpired,
@@ -503,6 +505,7 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         NotAuthorized,
         DeviceBindingMismatch,
+        CapacityUnavailable,
     ]),
     CreateConversation => ("blue.catbird.chat.createConversation", [
         AccountSessionExpired,
@@ -743,6 +746,7 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         NotAuthorized,
         DeviceBindingMismatch,
+        CapacityUnavailable,
     ]),
     ReplenishKeyPackages => ("blue.catbird.chat.replenishKeyPackages", [
         AccountSessionExpired,

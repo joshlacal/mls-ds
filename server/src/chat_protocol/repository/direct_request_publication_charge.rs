@@ -6,36 +6,6 @@
 
 const ROW_ALLOWANCE: u64 = 16 * 1024;
 
-/// Retention reserved at publication for the request's bounded remaining
-/// lifecycle. Later writers must compare their actual persisted copies against
-/// these slots before committing; the reservation is not a blob-size waiver.
-pub(super) struct LifecycleReserve {
-    pub decision: u64,
-    pub per_delivery: u64,
-    pub total: u64,
-}
-
-pub(super) fn lifecycle_reserve(
-    snapshot_bytes: usize,
-    tree_bytes: usize,
-    historical_audience: u64,
-    deliveries: u64,
-) -> Option<LifecycleReserve> {
-    if deliveries > 39 {
-        return None;
-    }
-    // The first decision is acceptance OR a close before acceptance. The
-    // snapshot/tree copy is separately charged because it can exceed the
-    // 64 KiB limit imposed on later signed lifecycle blobs.
-    let decision = (4u64 * 1024 * 1024)
-        .checked_add(u64::try_from(snapshot_bytes).ok()?)?
-        .checked_add(u64::try_from(tree_bytes).ok()?)?
-        .checked_add(historical_audience.checked_mul(3)?.checked_mul(ROW_ALLOWANCE)?)?;
-    let per_delivery: u64 = 512 * 1024;
-    let total = decision.checked_add(deliveries.checked_mul(per_delivery)?)?;
-    Some(LifecycleReserve { decision, per_delivery, total })
-}
-
 pub(super) struct PublicationArtifactLengths {
     pub signed_wrapper: usize,
     pub accepted_entry: usize,
@@ -121,17 +91,5 @@ mod tests {
         let mut parts = fixture();
         parts.predecessor_intervals = u64::MAX;
         assert!(charge(0, 0, &parts).is_none());
-    }
-
-    #[test]
-    fn lifecycle_reserve_counts_historical_audience_and_all_selected_deliveries() {
-        let current = lifecycle_reserve(2_000_000, 500_000, 40, 39).unwrap();
-        assert_eq!(current.decision, 4 * 1024 * 1024 + 2_500_000 + 40 * 3 * ROW_ALLOWANCE);
-        assert_eq!(current.per_delivery, 512 * 1024);
-        assert_eq!(current.total, current.decision + 39 * current.per_delivery);
-        let historical = lifecycle_reserve(2_000_000, 500_000, 140, 39).unwrap();
-        assert_eq!(historical.total - current.total, 100 * 3 * ROW_ALLOWANCE);
-        assert!(lifecycle_reserve(0, 0, u64::MAX, 1).is_none());
-        assert!(lifecycle_reserve(0, 0, 40, 40).is_none());
     }
 }

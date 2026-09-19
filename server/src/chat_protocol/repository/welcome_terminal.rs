@@ -515,6 +515,10 @@ pub(crate) enum WelcomeTerminalTransactionOutcome {
 
 #[derive(Debug, Error)]
 pub(crate) enum WelcomeTerminalFacadeError {
+    #[error("request Welcome is already terminal for another operation")]
+    FreshTerminal,
+    #[error(transparent)]
+    Retention(#[from] super::direct_request_retention::RetentionError),
     #[error("Welcome request body is out of domain")]
     InvalidRequest,
     #[error("completed Welcome operation disagrees with the locked terminal state")]
@@ -596,6 +600,29 @@ async fn prepare_first_welcome_terminal(
     .await?
     {
         let response = canonical_welcome_response(parsed.endpoint, &material)?;
+        let raw = mutation
+            .accepted_wrapper_bytes()
+            .ok_or(WelcomeTerminalFacadeError::InvalidRequest)?;
+        let charged = super::direct_request_retention::logical_charge(
+            &[
+                raw,
+                raw,
+                mutation.transcript_bytes(),
+                response.as_bytes(),
+                mutation.signature().as_slice(),
+            ],
+            0,
+            6,
+        )?;
+        super::direct_request_retention::consume_welcome(
+            transaction,
+            parsed.welcome_id,
+            mutation.actor_did().as_str(),
+            Uuid::from_bytes(*mutation.actor_device_id().as_bytes()),
+            parsed.operation_id,
+            charged,
+        )
+        .await?;
         let (scope_authority, completion) = prelude.into_execution_parts();
         return Ok(WelcomeTerminalTransactionOutcome::Classified {
             completion: WelcomeCompletion::new(authority, scope_authority, completion, &response),
@@ -1624,10 +1651,38 @@ async fn direct_request_welcome_terminal(
 > {
     use serde_json::Value;
     use sqlx::Row;
-    let row=sqlx::query("SELECT d.import_until,p.signed_publication,p.request_entry,p.publication_digest,p.generation,c.current_generation,c.lifecycle,c.closed_at,c.close_transition_id,o.status,o.terminal_at,o.signed_request_bytes,o.request_digest FROM chat.direct_request_device_deliveries d JOIN chat.direct_request_publications p USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id LEFT JOIN chat.direct_request_welcome_outcomes o ON o.request_id=d.request_id AND o.recipient_did=d.owner_did AND o.recipient_device_id=d.owner_device_id WHERE d.request_id=$1 AND d.owner_did=$2 AND d.owner_device_id=$3 AND p.conversation_id=$4 FOR UPDATE OF c,d")
+    let row=sqlx::query("SELECT d.import_until,p.signed_publication,p.request_entry,p.publication_digest,p.generation,c.current_generation,c.lifecycle,c.closed_at,c.close_transition_id,o.status,o.terminal_at,o.signed_request_bytes,o.request_digest,slot.operation_id AS retained_operation_id FROM chat.direct_request_device_deliveries d JOIN chat.direct_request_publications p USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id LEFT JOIN chat.direct_request_welcome_outcomes o ON o.request_id=d.request_id AND o.recipient_did=d.owner_did AND o.recipient_device_id=d.owner_device_id LEFT JOIN chat.direct_request_welcome_slots slot ON slot.request_id=d.request_id AND slot.recipient_did=d.owner_did AND slot.recipient_device_id=d.owner_device_id WHERE d.request_id=$1 AND d.owner_did=$2 AND d.owner_device_id=$3 AND p.conversation_id=$4 FOR UPDATE OF c,d")
         .bind(parsed.welcome_id).bind(mutation.actor_did().as_str()).bind(Uuid::from_bytes(*mutation.actor_device_id().as_bytes())).bind(parsed.conversation_id)
         .fetch_optional(&mut **tx).await?;
     let Some(row) = row else { return Ok(None) };
+    let original: Option<Uuid> = row.try_get("retained_operation_id")?;
+    if first
+        && (row.try_get::<Option<String>, _>("status")?.is_some()
+            || row.try_get::<String, _>("lifecycle")? != "active"
+            || row.try_get::<i64, _>("current_generation")?
+                != row.try_get::<i64, _>("generation")?
+            || original.is_some())
+    {
+        // The caller returns an error and rolls back the freshly claimed
+        // generic operation. Only the original completed ID can replay.
+        return Err(WelcomeTerminalFacadeError::FreshTerminal);
+    }
+    if !first && original != Some(parsed.operation_id) {
+        return Err(WelcomeTerminalFacadeError::ReplayPostState);
+    }
+    if first {
+        super::direct_request_retention::logical_charge(
+            &[
+                mutation
+                    .accepted_wrapper_bytes()
+                    .ok_or(WelcomeTerminalFacadeError::InvalidRequest)?,
+                mutation.transcript_bytes(),
+            ],
+            0,
+            0,
+        )?;
+    }
+
     // Lock waits cannot extend the immutable Welcome import horizon.
     let now = if first {
         sqlx::query_scalar("SELECT date_trunc('milliseconds',clock_timestamp())")

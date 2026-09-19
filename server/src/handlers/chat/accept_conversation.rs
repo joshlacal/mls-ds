@@ -80,6 +80,8 @@ async fn handle_inner(
             use acceptance::DirectAcceptanceError as E;
             use ChatProtocolErrorCode as C;
             match error {
+                E::Retention(crate::chat_protocol::repository::direct_request_retention::RetentionError::Database(_)) => ChatFailure::storage(endpoint),
+                E::Retention(_) => ChatFailure::protocol_with_retry(endpoint,C::CapacityUnavailable,Some(30)),
                 E::Database(_) => ChatFailure::storage(endpoint),
                 E::InvalidSignature => ChatFailure::protocol(endpoint, C::InvalidSignature),
                 E::InvalidRequest => ChatFailure::protocol(endpoint, C::InvalidRequest),

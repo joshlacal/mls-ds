@@ -961,6 +961,7 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     if let Some(response) = actor.recorded_response() {
         return Ok(response.to_vec());
     }
+    super::direct_request_retention::logical_charge(&[raw], 0, 0)?;
     let signed = actor.signed();
     let body = signed.body();
     let text = |v: &Value| {
@@ -977,7 +978,7 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
         return Err(DirectAcceptanceError::Invariant);
     }
     let actor_device_id = uuid(&body["actorDeviceId"])?;
-    let head = sqlx::query("SELECT c.current_generation,c.current_state_version,c.next_entry_seq,c.lifecycle,c.protocol_version,s.group_id,s.epoch,s.group_context_hash,s.confirmation_tag,p.recipient_did,p.generation AS publication_generation FROM chat.conversations c JOIN chat.generation_states s ON s.conversation_id=c.conversation_id AND s.generation=c.current_generation AND s.state_version=c.current_state_version JOIN chat.direct_request_publications p ON p.conversation_id=c.conversation_id AND p.request_id=$2 WHERE c.conversation_id=$1 FOR UPDATE OF c")
+    let head = sqlx::query("SELECT c.current_generation,c.current_state_version,c.next_entry_seq,c.lifecycle,c.protocol_version,s.group_id,s.epoch,s.group_context_hash,s.confirmation_tag,(octet_length(s.public_snapshot_bytes)::bigint+octet_length(s.tree_summary_bytes)::bigint) AS snapshot_tree_bytes,p.recipient_did,p.generation AS publication_generation FROM chat.conversations c JOIN chat.generation_states s ON s.conversation_id=c.conversation_id AND s.generation=c.current_generation AND s.state_version=c.current_state_version JOIN chat.direct_request_publications p ON p.conversation_id=c.conversation_id AND p.request_id=$2 WHERE c.conversation_id=$1 FOR UPDATE OF c")
         .bind(conversation_id).bind(request_id).fetch_optional(&mut **tx).await?.ok_or(DirectAcceptanceError::NotPending)?;
     if head.try_get::<String, _>("recipient_did")? != principal.did()
         || head.try_get::<String, _>("protocol_version")? != "2"
@@ -1059,6 +1060,40 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     tagged_entry["$type"] = json!("blue.catbird.chat.defs#directRequestAcceptanceEntry");
     let tagged_bytes =
         serde_json::to_vec(&tagged_entry).map_err(|_| DirectAcceptanceError::Invariant)?;
+    let devices: Vec<(String,Uuid)> = sqlx::query_as("SELECT d.user_did,d.device_id FROM chat.devices d JOIN chat.participants p ON p.user_did=d.user_did WHERE p.conversation_id=$1 AND p.current_membership AND d.status='active' ORDER BY convert_to(d.user_did,'UTF8'),uuid_send(d.device_id)")
+        .bind(conversation_id).fetch_all(&mut **tx).await?;
+    let response = serde_json::to_vec(&json!({"coordinates":next,"acceptanceProof":proof}))
+        .map_err(|_| DirectAcceptanceError::Invariant)?;
+    let event_payload = serde_json::to_vec(&json!({"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":conversation_id}))
+        .map_err(|_| DirectAcceptanceError::Invariant)?;
+    let signed_raw = signed.accepted_wrapper_bytes();
+    let charged = super::direct_request_retention::logical_charge(
+        &[
+            signed_raw,
+            signed_raw,
+            signed_raw,
+            signed.transcript_bytes(),
+            signed.transcript_bytes(),
+            signed.signature().as_slice(),
+            signed.signature().as_slice(),
+            signed.signature().as_slice(),
+            &tagged_bytes,
+            &server_fields,
+            &proof_bytes,
+            &response,
+            &event_payload,
+        ],
+        head.try_get::<i64, _>("snapshot_tree_bytes")? as u64,
+        12 + 2 * devices.len() as u64,
+    )?;
+    super::direct_request_retention::consume_decision(
+        tx,
+        request_id,
+        actor.operation_id(),
+        "accept",
+        charged,
+    )
+    .await?;
     let allocated = delivery::append_entry(
         tx,
         &delivery::AppendEntry {
@@ -1109,8 +1144,6 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
         .bind(request_id).bind(now).execute(&mut **tx).await?;
     // The same account audience gets a policy refresh. No peer read receipt is
     // emitted when the recipient merely previews/imports the initial message.
-    let devices: Vec<(String,Uuid)> = sqlx::query_as("SELECT d.user_did,d.device_id FROM chat.devices d JOIN chat.participants p ON p.user_did=d.user_did WHERE p.conversation_id=$1 AND p.current_membership AND d.status='active' ORDER BY convert_to(d.user_did,'UTF8'),uuid_send(d.device_id)")
-        .bind(conversation_id).fetch_all(&mut **tx).await?;
     let recipients: Vec<_> = devices
         .iter()
         .map(|(did, id)| delivery::EntryRecipient {
@@ -1127,7 +1160,13 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     )
     .fetch_one(&mut **tx)
     .await?;
-    let event = delivery::NewEvent {event_id:Uuid::new_v4(),event_kind:delivery::EventKind::ConversationChanged,payload_bytes:serde_json::to_vec(&json!({"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":conversation_id})).map_err(|_|DirectAcceptanceError::Invariant)?,created_at:now,protocol_instance_id:protocol_id};
+    let event = delivery::NewEvent {
+        event_id: Uuid::new_v4(),
+        event_kind: delivery::EventKind::ConversationChanged,
+        payload_bytes: event_payload,
+        created_at: now,
+        protocol_instance_id: protocol_id,
+    };
     let position = delivery::append_event(tx, &event)
         .await
         .map_err(|_| DirectAcceptanceError::Invariant)?;
@@ -1153,8 +1192,7 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     )
     .await
     .map_err(|_| DirectAcceptanceError::Invariant)?;
-    let response = serde_json::to_vec(&json!({"coordinates":next,"acceptanceProof":proof}))
-        .map_err(|_| DirectAcceptanceError::Invariant)?;
+
     sqlx::query("INSERT INTO chat.direct_request_acceptance_claims(operation_id,request_id,principal_did,request_digest,accepted_request,signature,response_bytes,response_sha256,recorded_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)")
         .bind(actor.operation_id()).bind(request_id).bind(principal.did()).bind(signed.request_digest().as_slice())
         .bind(signed.accepted_wrapper_bytes()).bind(signed.signature().as_slice()).bind(&response)
@@ -1164,6 +1202,7 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
 
 #[derive(Debug)]
 pub(crate) enum DirectAcceptanceError {
+    Retention(super::direct_request_retention::RetentionError),
     Database(sqlx::Error),
     InvalidSignature,
     InvalidRequest,
@@ -1176,5 +1215,11 @@ pub(crate) enum DirectAcceptanceError {
 impl From<sqlx::Error> for DirectAcceptanceError {
     fn from(value: sqlx::Error) -> Self {
         Self::Database(value)
+    }
+}
+
+impl From<super::direct_request_retention::RetentionError> for DirectAcceptanceError {
+    fn from(error: super::direct_request_retention::RetentionError) -> Self {
+        Self::Retention(error)
     }
 }
