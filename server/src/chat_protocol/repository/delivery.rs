@@ -2166,6 +2166,12 @@ pub(crate) async fn get_entries_with_terminal_control_interval(
               FROM chat.entries AS entry
              WHERE entry.conversation_id = $1
                AND entry.seq > $2
+               AND (NOT EXISTS (
+                    SELECT 1 FROM chat.direct_request_publications p
+                    LEFT JOIN chat.direct_request_lifecycle l USING(request_id)
+                    WHERE p.conversation_id=entry.conversation_id AND COALESCE(l.consent,'pending')='pending'
+               ) OR entry.entry_kind='blue.catbird.chat.defs#directRequestEntry')
+
                AND ($7::bigint IS NULL OR (
                    entry.entry_kind <> $5 AND entry.seq >= $7 AND entry.seq <= $8
                ))

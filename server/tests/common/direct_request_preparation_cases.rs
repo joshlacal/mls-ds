@@ -103,6 +103,10 @@ async fn ordinary_recovery_packages_and_missing_grants_cannot_prepare() {
         select_devices(&mut tx, &lock, Utc::now()).await,
         Err(DirectRequestStoreError::RecipientKeysUnavailable)
     ));
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     tx.rollback().await.unwrap();
 }
 #[tokio::test]
@@ -150,7 +154,7 @@ async fn complete_snapshot_reserves_all_deliverable_devices_and_never_recovery_p
         .any(|d| d.owner_device_id == recipient.owner_device_id));
     reserve_preparation(
         &mut tx,
-        lock,
+        &lock,
         &selected,
         b"signed-snapshot-test",
         &[9; 32],
@@ -185,6 +189,10 @@ async fn complete_snapshot_reserves_all_deliverable_devices_and_never_recovery_p
                 .unwrap();
         assert_eq!(state, "reserved");
     }
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     tx.rollback().await.unwrap();
 }
 #[tokio::test]
@@ -209,7 +217,7 @@ async fn unrelated_enrollment_and_replenishment_preserve_snapshot_but_disable_in
     let lock = locked(&mut tx, i.clone()).await;
     let now = Utc::now();
     let selected = select_devices(&mut tx, &lock, now).await.unwrap();
-    reserve_preparation(&mut tx, lock, &selected, b"snapshot", &[9; 32], now)
+    reserve_preparation(&mut tx, &lock, &selected, b"snapshot", &[9; 32], now)
         .await
         .unwrap();
     seed_request_device(
@@ -229,5 +237,67 @@ async fn unrelated_enrollment_and_replenishment_preserve_snapshot_but_disable_in
         validate_selected_authority(&mut tx, &lock, now).await,
         Err(DirectRequestStoreError::IncludedAuthorityChanged)
     ));
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn live_device_pair_and_global_budgets_reject_without_consuming_more_packages() {
+    let pool = crate::common::direct_request_database::setup().await;
+    let mut tx = pool.begin().await.unwrap();
+    let actor = seed_request_device(
+        &mut tx,
+        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+        "recovery",
+        false,
+    )
+    .await;
+    seed_request_device(
+        &mut tx,
+        "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+        "direct-request",
+        true,
+    )
+    .await;
+    let i = seed_identity(&actor);
+    let lock = locked(&mut tx, i.clone()).await;
+    let now = Utc::now();
+    let devices = select_devices(&mut tx, &lock, now).await.unwrap();
+    reserve_preparation(&mut tx, &lock, &devices, b"snapshot", &[9; 32], now)
+        .await
+        .unwrap();
+    let mut next = i.clone();
+    next.request_id = Uuid::new_v4();
+    assert!(matches!(
+        check_preparation_budget(&mut tx, &next, now).await,
+        Err(DirectRequestStoreError::QuotaExceeded)
+    ));
+    let lock = locked(&mut tx, i).await;
+    finish_terminal(
+        &mut tx,
+        lock,
+        TerminalOutcome::Cancelled,
+        b"cancel",
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+    check_preparation_budget(&mut tx, &next, now).await.unwrap();
+    sqlx::query("UPDATE chat.direct_request_budget SET retained_bytes=8589934592 WHERE singleton")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert!(matches!(
+        check_preparation_budget(&mut tx, &next, now).await,
+        Err(DirectRequestStoreError::QuotaExceeded)
+    ));
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     tx.rollback().await.unwrap();
 }

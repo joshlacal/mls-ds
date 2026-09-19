@@ -2431,7 +2431,8 @@ fn relationship_operation_matches_scope(
     matches!(
         (operation, scope),
         (
-            ProjectionOperationScope::Creation
+            ProjectionOperationScope::DirectRequestPreparation
+                | ProjectionOperationScope::Creation
                 | ProjectionOperationScope::PendingAdd
                 | ProjectionOperationScope::Acceptance,
             ProjectionScope::Admission(_)
@@ -2449,4 +2450,23 @@ fn canonical_transaction_id(value: &str) -> bool {
         && value.as_bytes()[0] != b'0'
         && value.bytes().all(|byte| byte.is_ascii_digit())
         && value.parse::<u64>().is_ok_and(|value| value > 0)
+}
+
+/// Private request-attempt witness comes only from the signed request
+/// compositor after its canonical operation and identity prefix are locked.
+pub(super) async fn verify_direct_request_policy<T: PublicTransport>(
+    transaction: &mut Transaction<'_, Postgres>,
+    witness: &super::direct_request_preparation::DirectRequestPolicyWitness,
+    authority: &RelationshipAuthority<T>,
+    quota_exceeded: bool,
+) -> Result<(), RelationshipRepositoryError> {
+    let (transaction_id, request, actor_digest, read_set_digest) = witness.parts();
+    let scope=ProjectionScope::Admission(request.clone());
+    let make_scope=||LockedRelationshipFallbackScope::from_locked_read_set(
+        transaction_id.to_owned(),ProjectionOperationScope::DirectRequestPreparation,
+        scope.clone(),actor_digest,read_set_digest);
+    let (projection,decision)=load_fallback_relationship_projection(transaction,make_scope()?,authority)
+        .await?.ok_or(RelationshipRepositoryError::InvalidProjection)?;
+    consume_resealed_relationship_projection(&projection,&decision,make_scope()?,&scope,authority,quota_exceeded)
+        .map_err(|_|RelationshipRepositoryError::InvalidProjection)
 }

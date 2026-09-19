@@ -91,12 +91,20 @@ async fn issue(
     let sealer = runtime
         .cursor_sealer()
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
-    let (ticket, expires_at) = mint_subscription_ticket_for_admission(
+    let supported_versions = input.supported_protocol_versions.as_ref().map(|values| {
+        let mut values: Vec<String> = values.iter().map(|v| v.as_str().to_owned()).collect();
+        values.sort(); values
+    });
+    if supported_versions.as_ref().is_some_and(|v| v.is_empty() || v.len() > 2 || v.iter().any(|v| v != "1" && v != "2") || v.windows(2).any(|p| p[0] == p[1])) {
+        return Err(ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest));
+    }
+    let (ticket, expires_at, inventory_scope) = mint_subscription_ticket_for_admission(
         pool,
         admission,
         input.inventory_session_id.as_ref(),
         input.event_cursor.as_ref(),
         sealer,
+        supported_versions,
     )
     .await
     .map_err(map_ticket_error)?;
@@ -107,7 +115,7 @@ async fn issue(
     let endpoint = jacquard_common::types::string::UriValue::<DefaultStr>::new_owned(endpoint)
         .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let output = GetSubscriptionTicketOutput {
-        inventory_scope: None,
+        inventory_scope: inventory_scope.map(serde_json::from_value).transpose().map_err(|_| ChatFailure::invariant(ENDPOINT))?,
         endpoint,
         expires_at: chrono_to_datetime(expires_at),
         ticket: ticket.into(),

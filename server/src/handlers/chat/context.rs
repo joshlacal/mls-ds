@@ -343,6 +343,7 @@ pub(crate) fn operation_prelude_failure(
     use PreludeError as E;
 
     match error {
+        E::DirectRequestConsentRequired => ChatFailure::protocol(endpoint, C::NotParticipant),
         E::Database(_) => ChatFailure::storage(endpoint),
         E::Authorization(error) => auth_repository_failure(endpoint, error),
         E::MissingDevice | E::MissingDeviceKey => {

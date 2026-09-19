@@ -1324,6 +1324,26 @@ pub(crate) struct CheckedParticipantView {
 }
 
 impl CheckedParticipantView {
+    pub(crate) fn for_direct_request(
+        user_did: &str, role: &str, status: &str, leaf_count: i64,
+        invitation: Option<CheckedInvitationProvenance>,
+        publication: &crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest,
+    ) -> Result<Self, ProjectionError> {
+        use crate::chat_protocol::direct_request_transcript::DirectRequestKind;
+        if status != PARTICIPANT_STATUS_PENDING || leaf_count == 0 {
+            return Self::new(user_did, role, status, leaf_count, invitation);
+        }
+        let body = publication.body();
+        let included = body["artifacts"]["welcome"]["deliveries"].as_array().map(|rows| rows.iter().filter(|row|row["recipientDid"].as_str()==Some(user_did)).count()).unwrap_or(0);
+        if publication.kind() != DirectRequestKind::Publish || body["recipientDid"].as_str() != Some(user_did)
+            || included as i64 != leaf_count || role != MEMBER_ROLE_ADMIN {
+            return Err(source_inconsistency("participant.leafCount", "pending request leaves require exact signed publication coverage"));
+        }
+        let mut view = Self::new(user_did, role, status, 0, invitation)?;
+        view.leaf_count = leaf_count;
+        Ok(view)
+    }
+
     pub(crate) fn new(
         user_did: &str,
         role: &str,
@@ -1696,6 +1716,7 @@ pub(crate) enum ConversationProjectionSource {
 }
 
 pub(crate) struct CheckedConversationState {
+    direct_request: Option<chat_dto::DirectRequestState<DefaultStr>>,
     cipher_suite: SmolStr,
     conversation_kind: SmolStr,
     coordinates: CheckedConversationCoordinates,
@@ -1725,6 +1746,13 @@ pub(crate) struct CheckedConversationClose {
 }
 
 impl ConversationProjectionSource {
+    pub(crate) fn with_direct_request(mut self, request: chat_dto::DirectRequestState<DefaultStr>) -> Result<Self, ProjectionError> {
+        let Self::State(state) = &mut self else { return Err(source_inconsistency("directRequest", "request state requires conversation state")); };
+        if state.conversation_kind != CONVERSATION_KIND_DIRECT { return Err(source_inconsistency("directRequest", "request state requires direct conversation")); }
+        state.direct_request = Some(request);
+        Ok(self)
+    }
+
     pub(crate) fn state(
         cipher_suite: &str,
         conversation_kind: &str,
@@ -1762,6 +1790,7 @@ impl ConversationProjectionSource {
             }
         }
         Ok(Self::State(CheckedConversationState {
+            direct_request: None,
             cipher_suite: SmolStr::from(cipher_suite),
             conversation_kind: SmolStr::from(conversation_kind),
             coordinates,
@@ -2223,7 +2252,7 @@ pub(crate) fn conversation_state_view(
         ));
     };
     Ok(chat_dto::ConversationState {
-        direct_request: None,
+        direct_request: state.direct_request.clone(),
         sequencer_did: None,
         sequencer_term: None,
         cipher_suite: state.cipher_suite.clone(),
@@ -2341,9 +2370,9 @@ pub(crate) fn conversation_inventory_item(
         ConversationProjectionSource::State(state) => Ok(
             chat_dto::ConversationInventoryItem::ConversationInventoryState(Box::new(
                 chat_dto::ConversationInventoryState {
-                    direct_request: None,
+                    direct_request: state.direct_request.clone(),
                     state: chat_dto::ConversationState {
-                        direct_request: None,
+                        direct_request: state.direct_request.clone(),
                         sequencer_did: None,
                         sequencer_term: None,
                         cipher_suite: state.cipher_suite.clone(),

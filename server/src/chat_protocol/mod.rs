@@ -95,7 +95,7 @@ pub(crate) mod repository;
 pub mod snapshot;
 pub(crate) mod state_machine;
 pub(crate) mod transcript;
-pub(crate) mod direct_request_transcript;
+pub mod direct_request_transcript;
 pub(crate) mod validation;
 pub mod wire;
 

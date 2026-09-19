@@ -29,6 +29,8 @@ use super::{
 
 #[derive(Debug, Error)]
 pub(crate) enum PreludeError {
+    #[error("direct request account consent is required")]
+    DirectRequestConsentRequired,
     #[error("operation authority belongs to a different transaction")]
     ForeignTransaction,
     #[error("operation authority class is not supported by this prelude")]
@@ -3200,6 +3202,7 @@ pub(crate) async fn prepare_identity_scope_prelude(
         &device_pairs,
     )
     .await?;
+    super::direct_request_lifecycle::enforce_ordinary_mutation(transaction, authority).await?;
     let operation = claim_operation(transaction, reservation).await?;
     Ok(PreparedBusinessPrelude {
         authority: ScopeBoundBusinessAuthority { locked: business },

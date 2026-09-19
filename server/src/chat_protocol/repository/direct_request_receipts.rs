@@ -263,3 +263,19 @@ impl DirectRequestReceiptSigner {
         Ok(SignedDirectRequestReceipt { body, bytes })
     }
 }
+
+impl DirectRequestReceiptSigner {
+    pub(crate) fn sign_acceptance(&self, body: &[u8]) -> Result<[u8; 64], String> {
+        let value: Value =
+            serde_json::from_slice(body).map_err(|_| "invalid acceptance receipt JSON")?;
+        if value["authorityDid"].as_str() != Some(REQUEST_RECEIPT_AUTHORITY)
+            || value["keyId"].as_str() != Some(self.key_id())
+        {
+            return Err("acceptance receipt authority mismatch".into());
+        }
+        Ok(self.sign(
+            &direct_request_signing_bytes(DirectRequestKind::AcceptanceCommit, body)
+                .map_err(|e| e.to_string())?,
+        ))
+    }
+}

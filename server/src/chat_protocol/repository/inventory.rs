@@ -42,6 +42,8 @@ pub(crate) const MAX_INVENTORY_PAGE_ITEMS: u64 = 100;
 pub(crate) enum InventoryRepositoryError {
     #[error("inventory session was not found")]
     SessionNotFound,
+    #[error("inventory contains a protocol version outside the negotiated scope")]
+    ProtocolUpgradeRequired,
     #[error("inventory session durable row is invalid")]
     DurableRowInvalid,
     #[error("inventory session no longer has current device/key authority")]
@@ -1564,6 +1566,7 @@ pub(crate) struct CreateInventorySessionRequest {
     pub(crate) inventory_session_id: Uuid,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) supported_protocol_versions: Option<Vec<String>>,
 }
 
 /// Create one retained inventory session under one captured event fence and
@@ -1760,10 +1763,17 @@ pub(crate) async fn create_inventory_session(
         .await?
         .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
     let fence = verify_locked_inventory_fence(transaction, device, &locked_row).await?;
-    let authorities =
+    let mut authorities =
         super::super::read_authority::inventory_authorities(transaction, fence)
             .await
-            .map_err(InventoryRepositoryError::ReadAuthority)?;
+            .map_err(InventoryRepositoryError::ReadAuthority)?.into_vec();
+    if let Some(versions) = &request.supported_protocol_versions {
+        let ids: Vec<Uuid> = authorities.iter().map(|a| a.conversation_id()).collect();
+        let supported: Vec<Uuid> = sqlx::query_scalar("SELECT conversation_id FROM chat.conversations WHERE conversation_id = ANY($1) AND protocol_version = ANY($2)")
+            .bind(&ids).bind(versions).fetch_all(&mut **transaction).await?;
+        let supported: std::collections::HashSet<Uuid> = supported.into_iter().collect();
+        authorities.retain(|a| supported.contains(&a.conversation_id()));
+    }
     // 5. Optimistic fence re-validation (ratified 2026-07-24 locking ruling),
     //    extended to run ONCE after the authorities derivation and immediately
     //    before the materialization inserts. If the head moved, a
@@ -1788,6 +1798,21 @@ pub(crate) async fn create_inventory_session(
     };
     if revalidated_head != snapshot_event_position {
         return Err(InventoryRepositoryError::SnapshotConflict);
+    }
+
+    // Scope is captured from the complete audience before any domain is paged.
+    if let Some(versions) = &request.supported_protocol_versions {
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-DIRECT-REQUEST-INVENTORY-SCOPE\0");
+        digest.update(request.inventory_session_id.as_bytes());
+        digest.update(snapshot_event_position.to_be_bytes());
+        for version in versions { digest.update(version.as_bytes()); }
+        for authority in &authorities { digest.update(authority.conversation_id().as_bytes()); }
+        let hash: [u8; 32] = digest.finalize().into();
+        use base64::Engine as _;
+        let scope = serde_json::json!({"scopeDigest": base64::engine::general_purpose::STANDARD.encode(hash), "supportedProtocolVersions": versions});
+        sqlx::query("UPDATE chat.inventory_sessions SET inventory_scope=$2, supported_protocol_versions=$3, scoped_conversation_ids=$4 WHERE inventory_session_id=$1")
+            .bind(request.inventory_session_id).bind(scope).bind(versions).bind(authorities.iter().map(|a|a.conversation_id()).collect::<Vec<_>>()).execute(&mut **transaction).await?;
     }
 
     // 6. Materialize each domain from the C1 typed loaders -> projections ->
@@ -1866,7 +1891,7 @@ pub(crate) async fn create_inventory_session(
     // 6b. Welcome domain — the exact device's `status='pending'` deliveries,
     //     payload server-derived from `welcome_bundles.wrapper_bytes`. Ordinals
     //     ascend by `welcome_id`.
-    let welcome_sources = retained_welcome_sources(transaction, &user_did, device_id).await?;
+    let welcome_sources = retained_welcome_sources(transaction, &user_did, device_id, request.supported_protocol_versions.as_deref()).await?;
     let mut welcome_items = Vec::with_capacity(welcome_sources.len());
     for (ordinal, (welcome_id, source)) in welcome_sources.iter().enumerate() {
         let ordinal =
@@ -1884,18 +1909,28 @@ pub(crate) async fn create_inventory_session(
             *welcome_id,
             canonical.bytes().to_vec(),
             payload_sha256,
+            None::<Uuid>,
         ));
+    }
+    if request.supported_protocol_versions.as_ref().is_some_and(|v|v.iter().any(|v|v=="2")) {
+        let request_items = super::direct_request_lifecycle::pending_request_welcomes(transaction, &user_did, device_id).await?;
+        for (id, bytes) in request_items {
+            let hash: [u8;32] = Sha256::digest(&bytes).into();
+            welcome_items.push((0,id,bytes,hash,Some(id)));
+        }
+        welcome_items.sort_by_key(|item|item.1);
+        for (ordinal,item) in welcome_items.iter_mut().enumerate() { item.0=ordinal as i64; }
     }
     for chunk in welcome_items.chunks(INVENTORY_INSERT_CHUNK_ROWS) {
         let mut query = QueryBuilder::<Postgres>::new(
             r#"
             INSERT INTO chat.inventory_welcome_items(
                 inventory_session_id, ordinal, welcome_id, recipient_did,
-                recipient_device_id, item_key_bytes, payload_bytes, payload_sha256
+                recipient_device_id, item_key_bytes, payload_bytes, payload_sha256, direct_request_id
             )
             "#,
         );
-        query.push_values(chunk, |mut values, (ordinal, welcome_id, payload_bytes, payload_sha256)| {
+        query.push_values(chunk, |mut values, (ordinal, welcome_id, payload_bytes, payload_sha256, request_id)| {
             values
                 .push_bind(request.inventory_session_id)
                 .push_bind(*ordinal)
@@ -1904,7 +1939,8 @@ pub(crate) async fn create_inventory_session(
                 .push_bind(device_id)
                 .push_bind(welcome_id.as_bytes().as_slice())
                 .push_bind(payload_bytes.as_slice())
-                .push_bind(payload_sha256.as_slice());
+                .push_bind(payload_sha256.as_slice())
+                .push_bind(*request_id);
         });
         query.build().execute(&mut **transaction).await?;
     }
@@ -1913,7 +1949,7 @@ pub(crate) async fn create_inventory_session(
     //     statuses) then every retained recovery-work item (all three statuses),
     //     one canonical ordinal sequence with 0x00/0x01-prefixed item keys.
     let recovery_entries =
-        retained_recovery_inbox_entries(transaction, &user_did, device_id).await?;
+        retained_recovery_inbox_entries(transaction, &user_did, device_id, request.supported_protocol_versions.as_deref()).await?;
     let mut recovery_items = Vec::with_capacity(recovery_entries.len());
     let mut recovery_ordinal: i64 = 0;
     for entry in recovery_entries {
@@ -3206,6 +3242,7 @@ pub(crate) struct InventoryPublicRequestBinding {
     domain: InventoryDomain,
     limit: u16,
     canonical_filter_sha256: [u8; 32],
+    supported_protocol_versions: Option<Vec<String>>,
 }
 
 /// Purpose-staged: the validating constructor is exercised by the G/H handler
@@ -3235,7 +3272,22 @@ impl InventoryPublicRequestBinding {
             domain,
             limit,
             canonical_filter_sha256,
+            supported_protocol_versions: None,
         })
+    }
+
+    pub(crate) fn with_protocol_versions(mut self, versions: Option<Vec<String>>) -> Result<Self, InventoryRepositoryError> {
+        if let Some(values) = &versions {
+            if values.is_empty() || values.len() > 2 || values.iter().any(|v| v != "1" && v != "2") || values.windows(2).any(|p| p[0] >= p[1]) {
+                return Err(InventoryRepositoryError::InvalidMaterialization);
+            }
+            let mut digest = Sha256::new();
+            digest.update(b"CATBIRD-CHAT-INVENTORY-NEGOTIATION\0");
+            for version in values { digest.update(version.as_bytes()); }
+            self.canonical_filter_sha256 = digest.finalize().into();
+        }
+        self.supported_protocol_versions = versions;
+        Ok(self)
     }
 
     pub(crate) fn endpoint_nsid(&self) -> &'static str {
@@ -3460,6 +3512,8 @@ const INVENTORY_KEY_PACKAGE_CONTENT_TYPE: &str = "keyPackage";
 /// row; no plaintext capability column exists (only the seal + lookup hash).
 #[derive(Debug, FromRow)]
 struct InventorySessionFenceLockRow {
+    inventory_scope: Option<serde_json::Value>,
+    supported_protocol_versions: Option<Vec<String>>,
     inventory_session_id: Uuid,
     user_did: String,
     device_id: Uuid,
@@ -3486,7 +3540,7 @@ async fn lock_inventory_session_row(
 ) -> Result<Option<InventorySessionFenceLockRow>, InventoryRepositoryError> {
     Ok(sqlx::query_as(
         r#"
-        SELECT inventory_session_id, user_did, device_id, jkt, auth_generation,
+        SELECT inventory_scope, supported_protocol_versions, inventory_session_id, user_did, device_id, jkt, auth_generation,
                snapshot_event_position, snapshot_event_cursor_sha256,
                created_at, expires_at, protocol_instance_id, cursor_key_id,
                cursor_format_version, snapshot_retained_floor,
@@ -3748,12 +3802,17 @@ fn assemble_inventory_page_response(
     items: &[Vec<u8>],
     next_page_cursor: Option<&str>,
     expires_at: DateTime<Utc>,
+    inventory_scope: Option<&serde_json::Value>,
 ) -> Result<Vec<u8>, InventoryRepositoryError> {
     let mut out = Vec::with_capacity(
         256 + items.iter().map(Vec::len).sum::<usize>() + 2 * capability_text.len(),
     );
     out.extend_from_slice(b"{\"hasMore\":");
     out.extend_from_slice(if has_more { b"true" } else { b"false" });
+    if let Some(scope) = inventory_scope {
+        out.extend_from_slice(b",\"inventoryScope\":");
+        out.extend_from_slice(&serde_json::to_vec(scope).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?);
+    }
     out.extend_from_slice(b",\"inventorySessionId\":\"");
     append_json_string(&mut out, capability_text);
     out.extend_from_slice(b"\",\"items\":[");
@@ -4340,6 +4399,13 @@ async fn serve_page_receipt(
     sealer: &CursorSealer,
     random: &mut (dyn SecureRandom + Send),
 ) -> Result<ServedPageOutcome, InventoryRepositoryError> {
+    if row.supported_protocol_versions != request.supported_protocol_versions {
+        return Err(InventoryRepositoryError::SessionPresentationMismatch);
+    }
+    // A legacy session predating a v2 publication may not replay a successful
+    // partial snapshot after a conversation upgrades.
+    reject_unsupported_inventory(transaction, &row.user_did, row.device_id, row.supported_protocol_versions.as_deref()).await?;
+
     let page = read_retained_page(transaction, row, request, after_ordinal.unwrap_or(-1)).await?;
     // The receipt's OWN created/expires instants: the whole-second serve
     // instant (>= the predecessor's served_at for the continuation arm) and
@@ -4398,6 +4464,7 @@ async fn serve_page_receipt(
                 &page.items,
                 successor.as_ref().map(|successor| successor.text.as_str()),
                 row.expires_at,
+                row.inventory_scope.as_ref(),
             )?;
             let response_sha256: [u8; 32] = Sha256::digest(&response_bytes).into();
             serve_page_receipt_row(
@@ -4563,6 +4630,7 @@ async fn replay_served_receipt(
         &items,
         successor_text.as_deref(),
         row.expires_at,
+        row.inventory_scope.as_ref(),
     )?;
     let response_sha256: [u8; 32] = Sha256::digest(&response_bytes).into();
     if response_sha256 != canonical_response_sha256 {
@@ -4627,12 +4695,23 @@ async fn create_inventory_snapshot_attempt(
     // deterministically select the same current-version session and its
     // initial receipts. A wire-version bump intentionally avoids reusing an
     // older session whose retained payload bytes are already receipt-bound.
-    let inventory_session_id = derive_inventory_session_uuid(
+    let legacy_session_id = derive_inventory_session_uuid(
         device.user_did(),
         device.device_id(),
         device.jkt(),
         device.auth_generation(),
     );
+    let inventory_session_id = if request.supported_protocol_versions.is_some() {
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-SCOPED-INVENTORY-SESSION\0");
+        digest.update(legacy_session_id.as_bytes());
+        digest.update(request.canonical_filter_sha256);
+        let bytes: [u8; 32] = digest.finalize().into();
+        let mut id: [u8; 16] = bytes[..16].try_into().expect("fixed digest prefix");
+        id[6] = (id[6] & 0x0f) | 0x40; id[8] = (id[8] & 0x3f) | 0x80;
+        Uuid::from_bytes(id)
+    } else { legacy_session_id };
+    reject_unsupported_inventory(transaction, device.user_did(), device.device_id(), request.supported_protocol_versions.as_deref()).await?;
     // Create-or-lock. On first sight the session row is created and fully
     // materialized; a concurrent winner's committed row (unique violation on
     // the session identity) and every later call take the replay path over the
@@ -4712,6 +4791,7 @@ async fn create_inventory_snapshot_attempt(
                 inventory_session_id,
                 created_at,
                 expires_at,
+                supported_protocol_versions: request.supported_protocol_versions.clone(),
             },
             sealer,
             random,
@@ -5121,7 +5201,7 @@ async fn conversation_projection_source(
     let conversation_id = authority.conversation_id();
     match authority.arm() {
         super::super::read_authority::ConversationInventoryArm::State { .. } => {
-            load_conversation_state_source(transaction, conversation_id).await
+            load_conversation_state_source(transaction, conversation_id, user_did).await
         }
         super::super::read_authority::ConversationInventoryArm::Removal {
             membership_interval_id,
@@ -5270,12 +5350,14 @@ async fn conversation_arm_columns(
 pub(crate) async fn load_conversation_state_source(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
+    requester_did: &str,
 ) -> Result<crate::chat_protocol::read_projection::ConversationProjectionSource, InventoryRepositoryError> {
     use crate::chat_protocol::read_projection::{
         CheckedConversationCoordinates, CheckedDeviceLeafView, CheckedInvitationProvenance,
         CheckedMetadataAuthorProof, CheckedMetadataAvatarBinding, CheckedMetadataCryptoContext,
         CheckedMetadataSnapshot, CheckedParticipantView, ConversationProjectionSource,
     };
+    let request = super::direct_request_lifecycle::load_request_projection(transaction, conversation_id, requester_did).await?;
     let state: ConversationStateSourceRow = sqlx::query_as(
         r#"
         SELECT conversation.kind, conversation.lifecycle,
@@ -5341,16 +5423,10 @@ pub(crate) async fn load_conversation_state_source(
             ),
             None => None,
         };
-        participants.push(
-            CheckedParticipantView::new(
-                &row.user_did,
-                &row.role,
-                &row.status,
-                row.leaf_count,
-                invitation_provenance,
-            )
-            .map_err(InventoryRepositoryError::Projection)?,
-        );
+        participants.push(match &request {
+            Some((publication,_)) => CheckedParticipantView::for_direct_request(&row.user_did,&row.role,&row.status,row.leaf_count,invitation_provenance,publication),
+            None => CheckedParticipantView::new(&row.user_did,&row.role,&row.status,row.leaf_count,invitation_provenance),
+        }.map_err(InventoryRepositoryError::Projection)?);
     }
 
     let leaf_rows: Vec<ConversationLeafRow> = sqlx::query_as(
@@ -5451,7 +5527,7 @@ pub(crate) async fn load_conversation_state_source(
     )
     .map_err(InventoryRepositoryError::Projection)?;
 
-    ConversationProjectionSource::state(
+    let source = ConversationProjectionSource::state(
         INVENTORY_CIPHER_SUITE_V1,
         &state.kind,
         coordinates,
@@ -5459,8 +5535,11 @@ pub(crate) async fn load_conversation_state_source(
         metadata_snapshot,
         participants,
         state.snapshot_seq,
-    )
-    .map_err(InventoryRepositoryError::Projection)
+    ).map_err(InventoryRepositoryError::Projection)?;
+    match request {
+        Some((_,request)) => source.with_direct_request(request).map_err(InventoryRepositoryError::Projection),
+        None => Ok(source),
+    }
 }
 
 
@@ -5612,6 +5691,7 @@ async fn retained_welcome_sources(
     transaction: &mut Transaction<'_, Postgres>,
     user_did: &str,
     device_id: Uuid,
+    supported_versions: Option<&[String]>,
 ) -> Result<
     Vec<(
         Uuid,
@@ -5636,12 +5716,14 @@ async fn retained_welcome_sources(
             ON conversation.conversation_id = wb.conversation_id
          WHERE wd.recipient_did = $1
            AND wd.recipient_device_id = $2
+           AND ($3::TEXT[] IS NULL OR conversation.protocol_version = ANY($3))
            AND wd.status = 'pending'
          ORDER BY wd.welcome_id
         "#,
     )
     .bind(user_did)
     .bind(device_id)
+    .bind(supported_versions)
     .fetch_all(&mut **transaction)
     .await?;
     let mut sources = Vec::with_capacity(rows.len());
@@ -5720,6 +5802,7 @@ async fn retained_recovery_inbox_entries(
     transaction: &mut Transaction<'_, Postgres>,
     user_did: &str,
     device_id: Uuid,
+    supported_versions: Option<&[String]>,
 ) -> Result<Vec<RetainedRecoveryInboxEntry>, InventoryRepositoryError> {
     use super::super::read_projection::{
         CheckedConversationCoordinates, CheckedKeyPackageArtifact, CheckedLeafRecoveryReservation,
@@ -5766,11 +5849,13 @@ async fn retained_recovery_inbox_entries(
             ON conversation.conversation_id = request.conversation_id
          WHERE request.requester_did = $1
            AND request.requester_device_id = $2
+           AND ($3::TEXT[] IS NULL OR conversation.protocol_version = ANY($3))
          ORDER BY request.recovery_request_id
         "#,
     )
     .bind(user_did)
     .bind(device_id)
+    .bind(supported_versions)
     .fetch_all(&mut **transaction)
     .await?;
     for row in request_rows {
@@ -5874,11 +5959,13 @@ async fn retained_recovery_inbox_entries(
            AND state.state_version = work.state_version
          WHERE work.recipient_did = $1
            AND work.recipient_device_id = $2
+           AND ($3::TEXT[] IS NULL OR conversation.protocol_version = ANY($3))
          ORDER BY work.recovery_work_id
         "#,
     )
     .bind(user_did)
     .bind(device_id)
+    .bind(supported_versions)
     .fetch_all(&mut **transaction)
     .await?;
     for row in work_rows {
@@ -6151,4 +6238,23 @@ struct G7MaterializationDigestRow {
     maximum_ordinal: Option<i64>,
     payload_bytes: i64,
     items_sha256: Vec<u8>,
+}
+
+/// Fail the whole session before returning a successful partial history. The
+/// account participant and exact historical-device interval audiences both
+/// matter: an upgrade must not erase a previously visible conversation.
+pub(crate) async fn reject_unsupported_inventory(
+    tx: &mut Transaction<'_, Postgres>, user_did: &str, device_id: Uuid,
+    supported: Option<&[String]>,
+) -> Result<(), InventoryRepositoryError> {
+    // Capable readers explicitly scope omissions. Only old destructive readers
+    // require the full-session failure. Their successful partial pages could
+    // otherwise delete unsupported local histories.
+    if supported.is_some() { return Ok(()); }
+    let versions = vec!["1".to_owned()];
+    let unsupported: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM chat.conversations c WHERE NOT (c.protocol_version = ANY($3)) AND (EXISTS (SELECT 1 FROM chat.participants p WHERE p.conversation_id=c.conversation_id AND p.user_did=$1) OR EXISTS (SELECT 1 FROM chat.application_intervals i WHERE i.conversation_id=c.conversation_id AND i.recipient_did=$1 AND i.recipient_device_id=$2)))")
+        .bind(user_did).bind(device_id).bind(&versions).fetch_one(&mut **tx).await?;
+    if unsupported { return Err(InventoryRepositoryError::ProtocolUpgradeRequired); }
+    Ok(())
 }

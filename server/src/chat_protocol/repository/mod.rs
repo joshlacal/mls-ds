@@ -14,6 +14,8 @@ pub(crate) mod device_directory;
 #[allow(dead_code)]
 pub(crate) mod direct_request_preparation;
 #[allow(dead_code)]
+pub(crate) mod direct_request_publication;
+#[allow(dead_code)]
 pub(crate) mod direct_request_receipts;
 pub(crate) mod entry_read;
 #[allow(dead_code)]
@@ -43,3 +45,5 @@ pub(crate) mod transition;
 pub(crate) mod welcome;
 #[allow(dead_code)]
 pub(crate) mod welcome_terminal;
+
+pub(crate) mod direct_request_lifecycle;

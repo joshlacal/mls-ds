@@ -189,6 +189,13 @@ async fn run_chat_expiry_sweeper_inner(
     loop {
         timer.tick().await;
         let counts = run_sweep_cycle(&pool, config, blob_store.as_ref()).await;
+        if let Some(signer) = runtime.request_receipt_signer() {
+            match crate::chat_protocol::repository::direct_request_preparation::expire_due_preparations(&pool,signer,config.batch).await {
+                Ok(expired) if expired>0=>tracing::info!(expired,"expired direct request preparations"),
+                Ok(_)=>{},
+                Err(_)=>tracing::warn!("direct request preparation expiry failed"),
+            }
+        }
         if counts.had_errors() {
             tracing::warn!(
                 recovery_due = counts.recovery_due,

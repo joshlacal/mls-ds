@@ -85,11 +85,12 @@ async fn read_conversation_state_in_transaction(
         .map_err(map_authority_error)?;
     // This call holds the locked conversation head and the exact requester
     // proof through all source and pending-request reads below.
+    let requester_did = device.user_did().to_owned();
     let authority = authorize_conversation_state(transaction, device, conversation_id)
         .await
         .map_err(map_authority_error)?;
 
-    let source = super::inventory::load_conversation_state_source(transaction, conversation_id)
+    let source = super::inventory::load_conversation_state_source(transaction, conversation_id, &requester_did)
         .await
         .map_err(map_inventory_error)?;
     let state =

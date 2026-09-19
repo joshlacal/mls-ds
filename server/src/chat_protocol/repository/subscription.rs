@@ -75,11 +75,17 @@ pub(crate) async fn visible_events(
                   event.payload_sha256, event.created_at
              FROM chat.event_recipients recipient
              JOIN chat.events event USING (event_position)
+             JOIN chat.inventory_sessions session ON session.inventory_session_id = $7
             WHERE recipient.user_did = $1
               AND recipient.device_id = $2
               AND event.protocol_instance_id = $3
               AND event.event_position > $4
               AND event.event_position <= $5
+              AND (session.supported_protocol_versions IS NULL
+                   OR NOT (convert_from(event.payload_bytes, 'UTF8')::jsonb ? 'conversationId')
+                   OR EXISTS (SELECT 1 FROM chat.conversations c
+                       WHERE c.conversation_id::text = convert_from(event.payload_bytes, 'UTF8')::jsonb->>'conversationId'
+                         AND c.protocol_version = ANY(session.supported_protocol_versions)))
             ORDER BY event.event_position
             LIMIT $6"#,
     )
@@ -89,6 +95,7 @@ pub(crate) async fn visible_events(
     .bind(after_position)
     .bind(through_position)
     .bind(limit)
+    .bind(ticket.inventory_session_id)
     .fetch_all(&mut **transaction)
     .await?;
 

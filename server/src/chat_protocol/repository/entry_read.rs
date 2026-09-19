@@ -133,6 +133,9 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
     );
     object.insert("seq".into(), Value::Number(row.seq.into()));
     object.insert("signedRequest".into(), signed_request);
+    if matches!(row.entry_kind.as_str(), "blue.catbird.chat.defs#directRequestEntry" | "blue.catbird.chat.defs#directRequestAcceptanceEntry") {
+        return Ok(Value::Object(object));
+    }
     if row.entry_kind != delivery::APPLICATION_ENTRY_KIND {
         return crate::chat_protocol::transcript::persisted_control_entry_response_json(
             &row.entry_kind,

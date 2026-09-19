@@ -12,7 +12,7 @@ mod signed_admission {
     pub(super) struct LockedRequestActor {
         transaction_id: String,
         pub(super) signed: VerifiedDirectRequest,
-        signing_key: Vec<u8>,
+        pub(super) signing_key: Vec<u8>,
         now: DateTime<Utc>,
     }
 
@@ -65,6 +65,7 @@ mod signed_admission {
             DirectRequestKind::Prepare => "blue.catbird.chat.prepareDirectRequest",
             DirectRequestKind::Cancel => "blue.catbird.chat.cancelDirectRequestPreparation",
             DirectRequestKind::Publish => "blue.catbird.chat.publishDirectRequest",
+            DirectRequestKind::Accept => "blue.catbird.chat.acceptConversation",
             _ => return invalid(),
         };
         if principal.endpoint_nsid() != endpoint || principal.exp() <= now.timestamp() {
@@ -87,7 +88,7 @@ mod signed_admission {
         .await?;
         let public_key = public_key.ok_or(DirectRequestStoreError::IdentityConflict)?;
         let signed = direct_request_transcript::verify_signed_request(kind, raw, &public_key)
-            .map_err(|_| DirectRequestStoreError::IdentityConflict)?;
+            .map_err(|_| DirectRequestStoreError::InvalidSignature)?;
         let operation_id = uuid_field(
             signed.body(),
             if kind == DirectRequestKind::Keys {
@@ -98,12 +99,26 @@ mod signed_admission {
         )?;
         let operation =
             super::super::prelude::lock_direct_request_operation(tx, operation_id).await?;
+        let collision: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.operation_claims WHERE operation_id=$1) OR EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1 AND $2) OR EXISTS(SELECT 1 FROM chat.direct_request_key_publications WHERE operation_id=$1 AND NOT $2)")
+            .bind(operation_id).bind(kind == DirectRequestKind::Keys).fetch_one(&mut **tx).await?;
+        if collision {
+            return Err(DirectRequestStoreError::IdentityConflict);
+        }
         let mut dids = vec![principal.did().to_owned()];
         if let Some(recipient) = signed.body()["recipientDid"].as_str() {
             if recipient == principal.did() {
                 return invalid();
             }
             dids.push(recipient.to_owned());
+        }
+        if kind == DirectRequestKind::Accept {
+            let accounts: Option<(String,String)> = sqlx::query_as("SELECT actor_did,recipient_did FROM chat.direct_request_attempts WHERE request_id=$1")
+                .bind(operation_id).fetch_optional(&mut **tx).await?;
+            let (sender, recipient) = accounts.ok_or(DirectRequestStoreError::IdentityConflict)?;
+            if principal.did() != recipient {
+                return invalid();
+            }
+            dids.extend([sender, recipient]);
         }
         let devices = super::super::prelude::lock_direct_request_identity_scope(tx, &dids).await?;
         let actor = devices
@@ -139,7 +154,7 @@ mod signed_admission {
         Ok(())
     }
 
-    async fn publish_request_keys(
+    pub(super) async fn publish_request_keys(
         tx: &mut Transaction<'_, Postgres>,
         actor: LockedRequestActor,
     ) -> Result<Vec<u8>, DirectRequestStoreError> {
@@ -179,6 +194,14 @@ mod signed_admission {
         if !enabled && !keys.is_empty() {
             return invalid();
         }
+        sqlx::query("UPDATE chat.key_packages SET status='expired',terminal_at=not_after WHERE owner_did=$1 AND owner_device_id=$2 AND usage_scope='direct-request' AND status IN('available','reserved') AND not_after<=$3")
+            .bind(did).bind(device).bind(actor.now).execute(&mut **tx).await?;
+        // Retire unusable request-only material under the one-time rule. These
+        // packages never become available again, including after disable/enable.
+        sqlx::query("INSERT INTO chat.direct_request_retired_packages(key_package_ref,retired_at,reason) SELECT p.key_package_ref,$5,'unusable' FROM chat.key_packages p WHERE owner_did=$1 AND owner_device_id=$2 AND usage_scope='direct-request' AND status='available' AND (owner_auth_generation<>$3 OR not_after<$4 OR NOT EXISTS(SELECT 1 FROM chat.direct_request_grants g WHERE g.key_package_ref=p.key_package_ref AND g.revoked_at IS NULL AND g.expires_at>=$4)) ON CONFLICT DO NOTHING")
+            .bind(did).bind(device).bind(generation).bind(actor.now+Duration::seconds(MIN_PACKAGE_HORIZON_SECONDS)).bind(actor.now).execute(&mut **tx).await?;
+        sqlx::query("UPDATE chat.key_packages p SET status='reserved' WHERE owner_did=$1 AND owner_device_id=$2 AND usage_scope='direct-request' AND status='available' AND (owner_auth_generation<>$3 OR not_after<$4 OR NOT EXISTS(SELECT 1 FROM chat.direct_request_grants g WHERE g.key_package_ref=p.key_package_ref AND g.revoked_at IS NULL AND g.expires_at>=$4))")
+            .bind(did).bind(device).bind(generation).bind(actor.now+Duration::seconds(MIN_PACKAGE_HORIZON_SECONDS)).execute(&mut **tx).await?;
         let (available,live):(i64,i64)=sqlx::query_as("SELECT count(*) FILTER(WHERE usage_scope='direct-request' AND status='available'),count(*) FROM chat.key_packages WHERE owner_did=$1 AND owner_device_id=$2 AND status IN('available','reserved')")
         .bind(did).bind(device).fetch_one(&mut **tx).await?;
         if available + keys.len() as i64 > 128 || live + keys.len() as i64 > 1000 {
@@ -244,6 +267,10 @@ mod signed_admission {
         // Disable explicitly revokes all grants. Revision only changes the device
         // publication CAS; immutable grants remain package-bound.
         if !enabled {
+            sqlx::query("INSERT INTO chat.direct_request_retired_packages(key_package_ref,retired_at,reason) SELECT key_package_ref,$3,'disabled' FROM chat.key_packages WHERE owner_did=$1 AND owner_device_id=$2 AND usage_scope='direct-request' AND status='available' ON CONFLICT DO NOTHING")
+                .bind(did).bind(device).bind(actor.now).execute(&mut **tx).await?;
+            sqlx::query("UPDATE chat.key_packages SET status='reserved' WHERE owner_did=$1 AND owner_device_id=$2 AND usage_scope='direct-request' AND status='available'")
+                .bind(did).bind(device).execute(&mut **tx).await?;
             sqlx::query("UPDATE chat.direct_request_grants SET revoked_at=$3 WHERE owner_did=$1 AND owner_device_id=$2 AND revoked_at IS NULL")
             .bind(did).bind(device).bind(actor.now).execute(&mut **tx).await?;
         }
@@ -434,8 +461,10 @@ pub(super) async fn complete_publication(
         || body["actorDid"].as_str() != Some(candidate.lock.identity.actor_did.as_str())
         || body["actorDeviceId"].as_str()
             != Some(candidate.lock.identity.actor_device_id.to_string().as_str())
+        || body["actorKeyId"].as_str() != Some(candidate.lock.identity.actor_key_id.as_str())
         || body["authGeneration"].as_i64() != Some(candidate.lock.identity.actor_auth_generation)
         || bytes("preparationRequestDigest") != candidate.lock.identity.prepare_digest
+        || body["recordedAt"].as_str() != Some(time_string(candidate.now).as_str())
         || body["requestKind"].as_str() != Some("publish")
         || bytes("requestDigest") != candidate.signed.request_digest()
     {
@@ -469,4 +498,591 @@ pub(super) async fn complete_publication(
         candidate.now,
     )
     .await
+}
+
+/// Repository-minted relationship witness. No external constructor, no claimed
+/// payload identity is accepted as locked authority.
+pub(super) struct DirectRequestPolicyWitness {
+    transaction_id: String,
+    request: crate::chat_protocol::relationship_policy::AdmissionRequest,
+    actor_digest: [u8; 32],
+    read_set_digest: [u8; 32],
+}
+impl DirectRequestPolicyWitness {
+    pub(super) fn parts(
+        &self,
+    ) -> (
+        &str,
+        &crate::chat_protocol::relationship_policy::AdmissionRequest,
+        [u8; 32],
+        [u8; 32],
+    ) {
+        (
+            &self.transaction_id,
+            &self.request,
+            self.actor_digest,
+            self.read_set_digest,
+        )
+    }
+}
+
+pub(crate) enum DirectRequestResult {
+    Prepared(Vec<u8>),
+    Terminal(Vec<u8>),
+    Unknown(Uuid),
+    Keys(Vec<u8>),
+}
+
+fn signed_identity(
+    signed: &crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest,
+) -> Result<AttemptIdentity, DirectRequestStoreError> {
+    use crate::chat_protocol::direct_request_transcript::DirectRequestKind;
+    use base64::Engine as _;
+    let body = signed.body();
+    let string = |key: &str| {
+        body[key]
+            .as_str()
+            .ok_or(DirectRequestStoreError::IdentityConflict)
+    };
+    Ok(AttemptIdentity {
+        request_id: Uuid::parse_str(string("requestId")?)
+            .map_err(|_| DirectRequestStoreError::IdentityConflict)?,
+        actor_did: string("actorDid")?.to_owned(),
+        actor_device_id: Uuid::parse_str(string("actorDeviceId")?)
+            .map_err(|_| DirectRequestStoreError::IdentityConflict)?,
+        actor_key_id: signed.key_id().to_owned(),
+        actor_auth_generation: signed
+            .auth_generation()
+            .ok_or(DirectRequestStoreError::IdentityConflict)?
+            as i64,
+        recipient_did: string("recipientDid")?.to_owned(),
+        prepare_digest: if signed.kind() == DirectRequestKind::Prepare {
+            signed.request_digest().to_vec()
+        } else {
+            base64::engine::general_purpose::STANDARD
+                .decode(string("preparationRequestDigest")?)
+                .map_err(|_| DirectRequestStoreError::IdentityConflict)?
+        },
+    })
+}
+fn time_string(now: DateTime<Utc>) -> String {
+    now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+fn terminal_receipt(
+    signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
+    i: &AttemptIdentity,
+    kind: &str,
+    request_kind: &str,
+    request_digest: &[u8],
+    now: DateTime<Utc>,
+    extra: serde_json::Value,
+) -> Result<super::direct_request_receipts::SignedDirectRequestReceipt, DirectRequestStoreError> {
+    use base64::Engine as _;
+    let mut receipt = serde_json::json!({"$type":format!("blue.catbird.chat.defs#{kind}"),"requestId":i.request_id.to_string(),"requestDigest":base64::engine::general_purpose::STANDARD.encode(request_digest),"preparationRequestDigest":base64::engine::general_purpose::STANDARD.encode(&i.prepare_digest),"actorDid":i.actor_did,"actorDeviceId":i.actor_device_id.to_string(),"actorKeyId":i.actor_key_id,"authGeneration":i.actor_auth_generation,"requestKind":request_kind,"recordedAt":time_string(now)});
+    if let Some(fields) = extra.as_object() {
+        for (k, v) in fields {
+            receipt[k] = v.clone();
+        }
+    }
+    signer.seal_outcome(serde_json::json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":signer.key_id(),"receipt":receipt})).map_err(|_|DirectRequestStoreError::InvalidReceipt)
+}
+
+pub(crate) async fn cancel_direct_request(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: &crate::auth::VerifiedServicePrincipal,
+    raw: &[u8],
+    signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
+    now: DateTime<Utc>,
+) -> Result<DirectRequestResult, DirectRequestStoreError> {
+    use crate::chat_protocol::direct_request_transcript::DirectRequestKind;
+    let (actor, operation) =
+        signed_admission::admit_request(tx, principal, DirectRequestKind::Cancel, raw, now).await?;
+    let identity = signed_identity(&actor.signed)?;
+    let lock = load_locked_attempt(tx, identity, &operation).await?;
+    if let Some(row) = &lock.row {
+        if let Some(receipt) = row.terminal_bytes()? {
+            return Ok(DirectRequestResult::Terminal(receipt.to_vec()));
+        }
+    }
+    signed_admission::require_fresh(&actor)?;
+    let receipt = terminal_receipt(
+        signer,
+        &lock.identity,
+        "directRequestCancelledReceipt",
+        "cancel",
+        actor.signed.request_digest(),
+        now,
+        serde_json::json!({}),
+    )?;
+    Ok(DirectRequestResult::Terminal(
+        finish_terminal(
+            tx,
+            lock,
+            TerminalOutcome::Cancelled,
+            receipt.bytes(),
+            None,
+            now,
+        )
+        .await?,
+    ))
+}
+
+pub(crate) async fn publish_direct_request_keys(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: &crate::auth::VerifiedServicePrincipal,
+    raw: &[u8],
+    now: DateTime<Utc>,
+) -> Result<DirectRequestResult, DirectRequestStoreError> {
+    let (actor, _) = signed_admission::admit_request(
+        tx,
+        principal,
+        crate::chat_protocol::direct_request_transcript::DirectRequestKind::Keys,
+        raw,
+        now,
+    )
+    .await?;
+    Ok(DirectRequestResult::Keys(
+        signed_admission::publish_request_keys(tx, actor).await?,
+    ))
+}
+
+pub(crate) async fn prepare_direct_request<
+    T: crate::chat_protocol::relationship_policy::PublicTransport,
+>(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: &crate::auth::VerifiedServicePrincipal,
+    raw: &[u8],
+    signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
+    policy: &crate::chat_protocol::relationship_policy::RelationshipAuthority<T>,
+    now: DateTime<Utc>,
+) -> Result<DirectRequestResult, DirectRequestStoreError> {
+    use crate::chat_protocol::{
+        direct_request_transcript::DirectRequestKind,
+        relationship_policy::{AdmissionOperation, AdmissionRequest},
+    };
+    use base64::Engine as _;
+    let (actor, operation) =
+        signed_admission::admit_request(tx, principal, DirectRequestKind::Prepare, raw, now)
+            .await?;
+    let identity = signed_identity(&actor.signed)?;
+    let lock = load_locked_attempt(tx, identity, &operation).await?;
+    if let Some(row) = &lock.row {
+        if let Some(receipt) = row.terminal_bytes()? {
+            return Ok(DirectRequestResult::Terminal(receipt.to_vec()));
+        }
+        if row.lease_expires_at.is_some_and(|expiry| expiry > now) {
+            return Ok(DirectRequestResult::Prepared(
+                row.prepare_response
+                    .clone()
+                    .ok_or(DirectRequestStoreError::InvalidReceipt)?,
+            ));
+        }
+        let receipt = terminal_receipt(
+            signer,
+            &lock.identity,
+            "directRequestExpiredReceipt",
+            "expiry",
+            &lock.identity.prepare_digest,
+            now,
+            serde_json::json!({}),
+        )?;
+        return Ok(DirectRequestResult::Terminal(
+            finish_terminal(
+                tx,
+                lock,
+                TerminalOutcome::Expired,
+                receipt.bytes(),
+                None,
+                now,
+            )
+            .await?,
+        ));
+    }
+    if signed_admission::require_fresh(&actor).is_err() {
+        let receipt = terminal_receipt(
+            signer,
+            &lock.identity,
+            "directRequestExpiredReceipt",
+            "expiry",
+            &lock.identity.prepare_digest,
+            now,
+            serde_json::json!({}),
+        )?;
+        return Ok(DirectRequestResult::Terminal(
+            finish_terminal(
+                tx,
+                lock,
+                TerminalOutcome::Expired,
+                receipt.bytes(),
+                None,
+                now,
+            )
+            .await?,
+        ));
+    }
+    sqlx::query("SAVEPOINT direct_request_prepare_body")
+        .execute(&mut **tx)
+        .await?;
+    let prepared = async {
+    let b = actor.signed.body();
+    let i = &lock.identity;
+    check_preparation_budget(tx,i,now).await?;
+    let (recent,pair_pending,recipient_pending):(i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM chat.participants WHERE created_by_did=$1 AND invitation_transition_id IS NOT NULL AND created_at >= $3-INTERVAL '24 hours'),(SELECT count(*) FROM chat.participants WHERE created_by_did=$1 AND user_did=$2 AND current_membership AND status='pending'),(SELECT count(*) FROM chat.participants WHERE user_did=$2 AND current_membership AND status='pending')")
+        .bind(&i.actor_did).bind(&i.recipient_did).bind(now).fetch_one(&mut **tx).await?;
+    let quota_exceeded = recent >= 100 || pair_pending >= 5 || recipient_pending >= 100;
+    let mut roster = vec![i.actor_did.clone(), i.recipient_did.clone()];
+    roster.sort();
+    let witness = DirectRequestPolicyWitness {
+        transaction_id: transaction_id(tx).await?,
+        request: AdmissionRequest {
+            inviter: i.actor_did.clone(),
+            roster,
+            pending_recipients: vec![i.recipient_did.clone()],
+            operation: AdmissionOperation::Direct,
+        },
+        actor_digest: Sha256::digest(
+            [
+                actor.signed.transcript_bytes(),
+                actor.signing_key.as_slice(),
+            ]
+            .concat(),
+        )
+        .into(),
+        read_set_digest: Sha256::digest(
+            [
+                i.request_id.as_bytes().as_slice(),
+                i.prepare_digest.as_slice(),
+                &recent.to_be_bytes(),
+                &pair_pending.to_be_bytes(),
+                &recipient_pending.to_be_bytes(),
+            ]
+            .concat(),
+        )
+        .into(),
+    };
+    super::relationship::verify_direct_request_policy(tx, &witness, policy, quota_exceeded)
+        .await
+        .map_err(|_| DirectRequestStoreError::PolicyDenied)?;
+    let selected = select_devices(tx, &lock, now).await?;
+    let minimum_import_until = now + Duration::seconds(604_800 + 300);
+    let devices=selected.iter().map(|d|Ok(serde_json::json!({"actorDid":d.owner_did,"actorDeviceId":d.owner_device_id.to_string(),"keyId":d.owner_key_id,"authGeneration":d.auth_generation,"keyPackage":{"framing":"mlsMessage","contentType":"keyPackage","bytes":base64::engine::general_purpose::STANDARD.encode(&d.wrapper_bytes),"sha256":base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&d.wrapper_bytes)),"keyPackageRef":base64::engine::general_purpose::STANDARD.encode(&d.key_package_ref)},"grant":serde_json::from_slice::<serde_json::Value>(&d.signed_grant).map_err(|_|DirectRequestStoreError::InvalidReceipt)?}))).collect::<Result<Vec<_>,DirectRequestStoreError>>()?;
+    let mut snapshot = serde_json::json!({"protocolVersion":"2","requestId":b["requestId"],"firstMessageId":b["firstMessageId"],"conversationId":b["conversationId"],"recipientDid":b["recipientDid"],"origin":b["origin"],"profile":b["profile"],"creator":{"actorDid":i.actor_did,"actorDeviceId":i.actor_device_id.to_string(),"keyId":i.actor_key_id,"authGeneration":i.actor_auth_generation},"selectedDevices":devices,"preparedAt":time_string(now),"leaseExpiresAt":time_string(now+Duration::seconds(300)),"minimumImportUntil":time_string(minimum_import_until),"preparationRequestDigest":base64::engine::general_purpose::STANDARD.encode(&i.prepare_digest),"authorityDid":"did:web:chat.catbird.blue","receiptKeyId":signer.key_id()});
+    let (snapshot_digest, signature) = signer
+        .sign_preparation(
+            &serde_json::to_vec(&snapshot).map_err(|_| DirectRequestStoreError::InvalidReceipt)?,
+        )
+        .map_err(|_| DirectRequestStoreError::InvalidReceipt)?;
+    snapshot["preparationDigest"] =
+        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(snapshot_digest));
+    snapshot["preparationSignature"] =
+        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(signature));
+    let response =
+        serde_json::to_vec(&snapshot).map_err(|_| DirectRequestStoreError::InvalidReceipt)?;
+    if response.len() > 8_388_608 {
+        return Err(DirectRequestStoreError::QuotaExceeded);
+    }
+    Ok(DirectRequestResult::Prepared(
+        reserve_preparation(tx, &lock, &selected, &response, &snapshot_digest, now).await?,
+    ))
+    }.await;
+    match prepared {
+        Ok(value) => {
+            sqlx::query("RELEASE SAVEPOINT direct_request_prepare_body")
+                .execute(&mut **tx)
+                .await?;
+            Ok(value)
+        }
+        Err(error) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT direct_request_prepare_body")
+                .execute(&mut **tx)
+                .await?;
+            let code = match error {
+                DirectRequestStoreError::PolicyDenied => "RequestPolicyDenied",
+                DirectRequestStoreError::QuotaExceeded => "CapacityUnavailable",
+                DirectRequestStoreError::RecipientKeysUnavailable => "RecipientKeysUnavailable",
+                DirectRequestStoreError::IncludedAuthorityChanged => "PreparationRevoked",
+                DirectRequestStoreError::Expired => "PreparationExpired",
+                DirectRequestStoreError::IdentityConflict => "PreparationConflict",
+                other => return Err(other),
+            };
+            let receipt = terminal_receipt(
+                signer,
+                &lock.identity,
+                "directRequestRejectedReceipt",
+                "prepare",
+                actor.signed.request_digest(),
+                now,
+                serde_json::json!({"code":code}),
+            )?;
+            Ok(DirectRequestResult::Terminal(
+                finish_terminal(
+                    tx,
+                    lock,
+                    TerminalOutcome::Rejected,
+                    receipt.bytes(),
+                    None,
+                    now,
+                )
+                .await?,
+            ))
+        }
+    }
+}
+
+pub(super) struct LockedDirectRequestAcceptance {
+    transaction_id: String,
+    signed: crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest,
+    now: DateTime<Utc>,
+}
+impl LockedDirectRequestAcceptance {
+    pub(super) fn signed(
+        &self,
+    ) -> &crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest {
+        &self.signed
+    }
+    pub(super) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.now
+    }
+    pub(super) async fn require_transaction(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), DirectRequestStoreError> {
+        if transaction_id(tx).await? != self.transaction_id {
+            return Err(DirectRequestStoreError::ForeignTransaction);
+        }
+        Ok(())
+    }
+}
+pub(super) async fn admit_acceptance(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: &crate::auth::VerifiedServicePrincipal,
+    raw: &[u8],
+    now: DateTime<Utc>,
+) -> Result<LockedDirectRequestAcceptance, DirectRequestStoreError> {
+    let (actor, _) = signed_admission::admit_request(
+        tx,
+        principal,
+        crate::chat_protocol::direct_request_transcript::DirectRequestKind::Accept,
+        raw,
+        now,
+    )
+    .await?;
+    // The consent owner must arbitrate exact completed replay before applying
+    // first-execution age; this helper does not grant that bypass to effects.
+    Ok(LockedDirectRequestAcceptance {
+        transaction_id: transaction_id(tx).await?,
+        signed: actor.signed,
+        now,
+    })
+}
+
+impl LockedDirectRequestPublication {
+    pub(super) async fn validate_policy<
+        T: crate::chat_protocol::relationship_policy::PublicTransport,
+    >(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        policy: &crate::chat_protocol::relationship_policy::RelationshipAuthority<T>,
+    ) -> Result<(), DirectRequestStoreError> {
+        use crate::chat_protocol::relationship_policy::{AdmissionOperation, AdmissionRequest};
+        require_transaction(tx, &self.lock).await?;
+        let i = &self.lock.identity;
+        let (mut recent,mut pair_pending,mut recipient_pending):(i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM chat.participants WHERE created_by_did=$1 AND invitation_transition_id IS NOT NULL AND created_at >= $3-INTERVAL '24 hours'),(SELECT count(*) FROM chat.participants WHERE created_by_did=$1 AND user_did=$2 AND current_membership AND status='pending'),(SELECT count(*) FROM chat.participants WHERE user_did=$2 AND current_membership AND status='pending')")
+            .bind(&i.actor_did).bind(&i.recipient_did).bind(self.now).fetch_one(&mut **tx).await?;
+        if self.signed.body()["origin"]["$type"].as_str()
+            == Some("blue.catbird.chat.defs#legacyPendingDirectOrigin")
+        {
+            let prior_conversation = Uuid::parse_str(
+                self.signed.body()["conversationId"]
+                    .as_str()
+                    .ok_or(DirectRequestStoreError::IdentityConflict)?,
+            )
+            .map_err(|_| DirectRequestStoreError::IdentityConflict)?;
+            let existing:Option<DateTime<Utc>>=sqlx::query_scalar("SELECT created_at FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND created_by_did=$3 AND current_membership AND status='pending' AND invitation_transition_id IS NOT NULL")
+                .bind(prior_conversation).bind(&i.recipient_did).bind(&i.actor_did).fetch_optional(&mut **tx).await?;
+            if let Some(created) = existing {
+                pair_pending = pair_pending.saturating_sub(1);
+                recipient_pending = recipient_pending.saturating_sub(1);
+                if created >= self.now - Duration::hours(24) {
+                    recent = recent.saturating_sub(1);
+                }
+            }
+        }
+        let mut roster = vec![i.actor_did.clone(), i.recipient_did.clone()];
+        roster.sort();
+        let witness = DirectRequestPolicyWitness {
+            transaction_id: transaction_id(tx).await?,
+            request: AdmissionRequest {
+                inviter: i.actor_did.clone(),
+                roster,
+                pending_recipients: vec![i.recipient_did.clone()],
+                operation: AdmissionOperation::Direct,
+            },
+            actor_digest: Sha256::digest(self.signed.transcript_bytes()).into(),
+            read_set_digest: Sha256::digest(
+                [
+                    i.request_id.as_bytes().as_slice(),
+                    i.prepare_digest.as_slice(),
+                    &recent.to_be_bytes(),
+                    &pair_pending.to_be_bytes(),
+                    &recipient_pending.to_be_bytes(),
+                ]
+                .concat(),
+            )
+            .into(),
+        };
+        super::relationship::verify_direct_request_policy(
+            tx,
+            &witness,
+            policy,
+            recent >= 100 || pair_pending >= 5 || recipient_pending >= 100,
+        )
+        .await
+        .map_err(|_| DirectRequestStoreError::PolicyDenied)
+    }
+}
+
+pub(crate) async fn get_direct_request_outcome(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: &crate::auth::VerifiedServicePrincipal,
+    actor_device_id: Uuid,
+    request_id: Uuid,
+    signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
+    now: DateTime<Utc>,
+) -> Result<DirectRequestResult, DirectRequestStoreError> {
+    if principal.endpoint_nsid() != "blue.catbird.chat.getDirectRequestOutcome"
+        || principal.exp() <= now.timestamp()
+    {
+        return Err(DirectRequestStoreError::IdentityConflict);
+    }
+    let operation = super::prelude::lock_direct_request_operation(tx, request_id).await?;
+    let devices =
+        super::prelude::lock_direct_request_identity_scope(tx, &[principal.did().to_owned()])
+            .await?;
+    if !devices.iter().any(|d| {
+        d.user_did == principal.did()
+            && d.device_id == actor_device_id
+            && d.status == "active"
+            && d.revoked_at.is_none()
+    }) {
+        return Err(DirectRequestStoreError::IdentityConflict);
+    }
+    let row:Option<(String,Uuid,String,i64,String,Vec<u8>,String)>=sqlx::query_as("SELECT actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status FROM chat.direct_request_attempts WHERE request_id=$1")
+        .bind(request_id).fetch_optional(&mut **tx).await?;
+    let Some((actor_did, device, key, generation, recipient, prepare_digest, status)) = row else {
+        return Ok(DirectRequestResult::Unknown(request_id));
+    };
+    if !((actor_did == principal.did() && device == actor_device_id)
+        || (status == "published"
+            && (actor_did == principal.did() || recipient == principal.did())))
+    {
+        return Err(DirectRequestStoreError::IdentityConflict);
+    }
+    let i = AttemptIdentity {
+        request_id,
+        actor_did,
+        actor_device_id: device,
+        actor_key_id: key,
+        actor_auth_generation: generation,
+        recipient_did: recipient,
+        prepare_digest,
+    };
+    let lock = load_locked_attempt(tx, i, &operation).await?;
+    let row = lock
+        .row
+        .as_ref()
+        .ok_or(DirectRequestStoreError::InvalidReceipt)?;
+    if let Some(receipt) = row.terminal_bytes()? {
+        return Ok(DirectRequestResult::Terminal(receipt.to_vec()));
+    }
+    if row.lease_expires_at.is_some_and(|expiry| expiry > now) {
+        return Ok(DirectRequestResult::Prepared(
+            row.prepare_response
+                .clone()
+                .ok_or(DirectRequestStoreError::InvalidReceipt)?,
+        ));
+    }
+    let receipt = terminal_receipt(
+        signer,
+        &lock.identity,
+        "directRequestExpiredReceipt",
+        "expiry",
+        &lock.identity.prepare_digest,
+        now,
+        serde_json::json!({}),
+    )?;
+    Ok(DirectRequestResult::Terminal(
+        finish_terminal(
+            tx,
+            lock,
+            TerminalOutcome::Expired,
+            receipt.bytes(),
+            None,
+            now,
+        )
+        .await?,
+    ))
+}
+
+/// Background expiry uses the same request lock as prepare/publish/cancel.
+/// Enumeration grants no authority; each target is reread under that lock and
+/// the complete canonical account/device/key prefix before the receipt is made.
+pub(crate) async fn expire_due_preparations(
+    pool: &sqlx::PgPool,
+    signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
+    limit: i64,
+) -> Result<usize, DirectRequestStoreError> {
+    let ids:Vec<Uuid>=sqlx::query_scalar("SELECT request_id FROM chat.direct_request_attempts WHERE status='prepared' AND lease_expires_at<=clock_timestamp() ORDER BY lease_expires_at,request_id LIMIT $1")
+        .bind(limit.clamp(1,100)).fetch_all(pool).await?;
+    let mut count = 0;
+    for id in ids {
+        let mut tx = pool.begin().await?;
+        let operation = super::prelude::lock_direct_request_operation(&mut tx, id).await?;
+        let row:Option<(String,Uuid,String,i64,String,Vec<u8>)>=sqlx::query_as("SELECT actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest FROM chat.direct_request_attempts WHERE request_id=$1 AND status='prepared' AND lease_expires_at<=clock_timestamp()")
+            .bind(id).fetch_optional(&mut *tx).await?;
+        let Some((actor_did, device, key, generation, recipient, prepare_digest)) = row else {
+            tx.rollback().await?;
+            continue;
+        };
+        super::prelude::lock_direct_request_identity_scope(
+            &mut tx,
+            &[actor_did.clone(), recipient.clone()],
+        )
+        .await?;
+        let i = AttemptIdentity {
+            request_id: id,
+            actor_did,
+            actor_device_id: device,
+            actor_key_id: key,
+            actor_auth_generation: generation,
+            recipient_did: recipient,
+            prepare_digest,
+        };
+        let lock = load_locked_attempt(&mut tx, i, &operation).await?;
+        let now: DateTime<Utc> =
+            sqlx::query_scalar("SELECT date_trunc('milliseconds',clock_timestamp())")
+                .fetch_one(&mut *tx)
+                .await?;
+        let receipt = terminal_receipt(
+            signer,
+            &lock.identity,
+            "directRequestExpiredReceipt",
+            "expiry",
+            &lock.identity.prepare_digest,
+            now,
+            serde_json::json!({}),
+        )?;
+        finish_terminal(
+            &mut tx,
+            lock,
+            TerminalOutcome::Expired,
+            receipt.bytes(),
+            None,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+        count += 1;
+    }
+    Ok(count)
 }

@@ -18,12 +18,16 @@ const MIN_PACKAGE_HORIZON_SECONDS: i64 = 604_800 + 300 + PREPARATION_TTL_SECONDS
 pub(crate) enum DirectRequestStoreError {
     #[error("request authority does not match its immutable attempt")]
     IdentityConflict,
+    #[error("invalid direct request signature")]
+    InvalidSignature,
     #[error("request authority belongs to another transaction")]
     ForeignTransaction,
     #[error("request preparation has expired")]
     Expired,
     #[error("request resources are exhausted")]
     QuotaExceeded,
+    #[error("direct request policy denied")]
+    PolicyDenied,
     #[error("recipient request keys unavailable")]
     RecipientKeysUnavailable,
     #[error("included device authority changed")]
@@ -127,6 +131,11 @@ async fn load_locked_attempt(
     if operation.transaction_id() != txid || operation.request_id() != identity.request_id {
         return Err(DirectRequestStoreError::ForeignTransaction);
     }
+    let collision: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.operation_claims WHERE operation_id=$1) OR EXISTS(SELECT 1 FROM chat.direct_request_key_publications WHERE operation_id=$1)")
+        .bind(identity.request_id).fetch_one(&mut **tx).await?;
+    if collision {
+        return Err(DirectRequestStoreError::IdentityConflict);
+    }
     let row: Option<AttemptRow> = sqlx::query_as(
         "SELECT request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,prepare_response,selected_digest,lease_expires_at,terminal_response,terminal_response_sha256,publication_digest,reserved_bytes FROM chat.direct_request_attempts WHERE request_id=$1 FOR UPDATE")
         .bind(identity.request_id).fetch_optional(&mut **tx).await?;
@@ -203,12 +212,12 @@ async fn finish_terminal(
             .bind(if outcome == TerminalOutcome::Published { 0 } else { row.reserved_bytes }).bind(if outcome == TerminalOutcome::Published { 0 } else { row.reserved_bytes })
             .execute(&mut **tx).await?;
     } else {
-        if outcome != TerminalOutcome::Cancelled {
+        if outcome == TerminalOutcome::Published {
             return Err(DirectRequestStoreError::InvalidReceipt);
         }
         let i = &lock.identity;
-        sqlx::query("INSERT INTO chat.direct_request_attempts(request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,terminal_at,terminal_response,terminal_response_sha256,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,'cancelled',$8,$9,$10,$8)")
-            .bind(i.request_id).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.actor_key_id).bind(i.actor_auth_generation).bind(&i.recipient_did).bind(&i.prepare_digest).bind(now).bind(receipt).bind(digest).execute(&mut **tx).await?;
+        sqlx::query("INSERT INTO chat.direct_request_attempts(request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,terminal_at,terminal_response,terminal_response_sha256,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$11,$8,$9,$10,$8)")
+            .bind(i.request_id).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.actor_key_id).bind(i.actor_auth_generation).bind(&i.recipient_did).bind(&i.prepare_digest).bind(now).bind(receipt).bind(digest).bind(outcome.as_str()).execute(&mut **tx).await?;
     }
     Ok(receipt.to_vec())
 }
@@ -272,7 +281,7 @@ async fn select_devices(
 
 async fn reserve_preparation(
     tx: &mut Transaction<'_, Postgres>,
-    lock: LockedAttempt,
+    lock: &LockedAttempt,
     selected: &[SelectedDevice],
     signed_response: &[u8],
     selection_digest: &[u8],
@@ -299,23 +308,8 @@ async fn reserve_preparation(
         return Err(DirectRequestStoreError::InvalidReceipt);
     }
     let i = &lock.identity;
-    let (sender_live,pair_live,recipient_live,hourly,account_bytes): (i64,i64,i64,i64,i64) = sqlx::query_as(r#"
-        SELECT count(*) FILTER(WHERE status='prepared' AND actor_did=$1),
-               count(*) FILTER(WHERE status='prepared' AND actor_did=$1 AND actor_device_id=$2 AND recipient_did=$3),
-               count(*) FILTER(WHERE status='prepared' AND recipient_did=$3),
-               count(*) FILTER(WHERE prepared_at IS NOT NULL AND actor_did=$1 AND prepared_at>$4-INTERVAL '1 hour'),
-               GREATEST(COALESCE(sum(reserved_bytes) FILTER(WHERE status IN('prepared','published') AND (actor_did=$1 OR recipient_did=$1)),0),COALESCE(sum(reserved_bytes) FILTER(WHERE status IN('prepared','published') AND (actor_did=$3 OR recipient_did=$3)),0))::bigint
-          FROM chat.direct_request_attempts
-    "#).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.recipient_did).bind(now).fetch_one(&mut **tx).await?;
-    if sender_live >= 2
-        || pair_live >= 1
-        || recipient_live >= 4
-        || hourly >= 20
-        || account_bytes + MAX_BUNDLE_BYTES > MAX_PENDING_ACCOUNT_BYTES
-    {
-        return Err(DirectRequestStoreError::QuotaExceeded);
-    }
-    let updated=sqlx::query("UPDATE chat.direct_request_budget SET pending_bytes=pending_bytes+$1,retained_bytes=retained_bytes+$1 WHERE singleton AND pending_bytes+$1 <= $2 AND retained_bytes+$1 <= $3")
+    check_preparation_budget(tx, &lock.identity, now).await?;
+    let updated=sqlx::query("UPDATE chat.direct_request_budget SET pending_bytes=pending_bytes+$1,retained_bytes=retained_bytes+$1 WHERE singleton AND (SELECT pending_bytes FROM chat.direct_request_effective_budget)+$1 <= $2 AND retained_bytes+$1 <= $3")
         .bind(MAX_BUNDLE_BYTES).bind(MAX_PENDING_GLOBAL_BYTES).bind(MAX_RETAINED_GLOBAL_BYTES).execute(&mut **tx).await?;
     if updated.rows_affected() != 1 {
         return Err(DirectRequestStoreError::QuotaExceeded);
@@ -366,6 +360,40 @@ async fn validate_selected_authority(
     "#).bind(lock.identity.request_id).bind(now+Duration::seconds(604_800+300)).fetch_one(&mut **tx).await?;
     if invalid {
         return Err(DirectRequestStoreError::IncludedAuthorityChanged);
+    }
+    Ok(())
+}
+
+async fn check_preparation_budget(
+    tx: &mut Transaction<'_, Postgres>,
+    i: &AttemptIdentity,
+    now: DateTime<Utc>,
+) -> Result<(), DirectRequestStoreError> {
+    let (sender_live,pair_live,recipient_live,hourly,account_bytes): (i64,i64,i64,i64,i64) = sqlx::query_as(r#"
+        SELECT count(*) FILTER(WHERE status='prepared' AND actor_did=$1),
+               count(*) FILTER(WHERE status='prepared' AND actor_did=$1 AND actor_device_id=$2 AND recipient_did=$3),
+               count(*) FILTER(WHERE status='prepared' AND recipient_did=$3),
+               count(*) FILTER(WHERE prepared_at IS NOT NULL AND actor_did=$1 AND prepared_at>$4-INTERVAL '1 hour'),
+               GREATEST(COALESCE(sum(reserved_bytes) FILTER(WHERE status IN('prepared','published') AND NOT EXISTS(SELECT 1 FROM chat.direct_request_pending_releases r WHERE r.request_id=a.request_id) AND (actor_did=$1 OR recipient_did=$1)),0),COALESCE(sum(reserved_bytes) FILTER(WHERE status IN('prepared','published') AND NOT EXISTS(SELECT 1 FROM chat.direct_request_pending_releases r WHERE r.request_id=a.request_id) AND (actor_did=$3 OR recipient_did=$3)),0))::bigint
+          FROM chat.direct_request_attempts a
+    "#).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.recipient_did).bind(now).fetch_one(&mut **tx).await?;
+    if sender_live >= 2
+        || pair_live >= 1
+        || recipient_live >= 4
+        || hourly >= 20
+        || account_bytes + MAX_BUNDLE_BYTES > MAX_PENDING_ACCOUNT_BYTES
+    {
+        return Err(DirectRequestStoreError::QuotaExceeded);
+    }
+    let (pending, retained): (i64, i64) = sqlx::query_as(
+        "SELECT pending_bytes,retained_bytes FROM chat.direct_request_effective_budget WHERE singleton",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if pending + MAX_BUNDLE_BYTES > MAX_PENDING_GLOBAL_BYTES
+        || retained + MAX_BUNDLE_BYTES > MAX_RETAINED_GLOBAL_BYTES
+    {
+        return Err(DirectRequestStoreError::QuotaExceeded);
     }
     Ok(())
 }

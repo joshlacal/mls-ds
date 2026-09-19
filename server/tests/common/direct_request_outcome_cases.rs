@@ -38,7 +38,7 @@ async fn cancellation_of_unknown_fences_delayed_preparation_and_publication() {
     let lock = test_lock(&mut tx, i.clone()).await;
     let replay = reserve_preparation(
         &mut tx,
-        lock,
+        &lock,
         &[],
         b"must-not-prepare",
         &[0; 32],
@@ -171,4 +171,43 @@ async fn published_receipt_replays_after_lease_expiry_and_cancel_cannot_overwrit
     .unwrap();
     assert_eq!(replay, b"published-exact");
     tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn delayed_prepare_waits_for_committed_cancellation_fence() {
+    let pool = crate::common::direct_request_database::setup().await;
+    let i = test_identity();
+    let mut tx = pool.begin().await.unwrap();
+    let lock = test_lock(&mut tx, i.clone()).await;
+    finish_terminal(
+        &mut tx,
+        lock,
+        TerminalOutcome::Cancelled,
+        b"committed-cancel",
+        None,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let pool2 = pool.clone();
+    let mut delayed = tokio::spawn(async move {
+        let mut late = pool2.begin().await.unwrap();
+        let lock = test_lock(&mut late, i).await;
+        let replay =
+            reserve_preparation(&mut late, &lock, &[], b"late-prepare", &[4; 32], Utc::now())
+                .await
+                .unwrap();
+        late.commit().await.unwrap();
+        replay
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut delayed)
+            .await
+            .is_err(),
+        "operation lock must serialize delayed preparation"
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(delayed.await.unwrap(), b"committed-cancel");
+    // The committed tombstone is intentionally retained in this dedicated
+    // database; tests do not bypass the no-delete history invariant.
 }

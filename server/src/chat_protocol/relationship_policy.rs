@@ -1466,6 +1466,7 @@ impl EvidenceKind {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ProjectionOperationScope {
+    DirectRequestPreparation,
     Creation,
     PendingAdd,
     Acceptance,
@@ -1477,6 +1478,7 @@ pub(crate) enum ProjectionOperationScope {
 impl ProjectionOperationScope {
     pub(crate) const fn as_persisted_str(self) -> &'static str {
         match self {
+            Self::DirectRequestPreparation => "directRequestPreparation",
             Self::Creation => "creation",
             Self::PendingAdd => "pendingAdd",
             Self::Acceptance => "acceptance",
@@ -1488,6 +1490,7 @@ impl ProjectionOperationScope {
 
     pub(crate) fn from_persisted_str(value: &str) -> Result<Self, ProjectionPersistenceError> {
         match value {
+            "directRequestPreparation" => Ok(Self::DirectRequestPreparation),
             "creation" => Ok(Self::Creation),
             "pendingAdd" => Ok(Self::PendingAdd),
             "acceptance" => Ok(Self::Acceptance),
@@ -3628,7 +3631,8 @@ fn relationship_operation_scope_matches(
     matches!(
         (operation_scope, scope),
         (
-            ProjectionOperationScope::Creation
+            ProjectionOperationScope::DirectRequestPreparation
+                | ProjectionOperationScope::Creation
                 | ProjectionOperationScope::PendingAdd
                 | ProjectionOperationScope::Acceptance,
             ProjectionScope::Admission(_)
@@ -3969,6 +3973,7 @@ fn projection_operation_scope_tag(scope: ProjectionOperationScope) -> u8 {
         ProjectionOperationScope::RecoveryReservation => 3,
         ProjectionOperationScope::RecoveryFulfillment => 4,
         ProjectionOperationScope::Traffic => 5,
+        ProjectionOperationScope::DirectRequestPreparation => 6,
     }
 }
 

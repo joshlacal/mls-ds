@@ -5,6 +5,8 @@
 // full-coordinate CAS and apply the returned state/effects atomically. No
 // function in this module writes storage or calls a legacy MLS handler.
 
+pub(crate) mod direct_request;
+
 use std::{cmp::Ordering, collections::BTreeSet};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};

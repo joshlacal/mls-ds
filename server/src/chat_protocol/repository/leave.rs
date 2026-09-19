@@ -250,6 +250,12 @@ async fn execute_first(
     )
     .await?;
     let applied = apply_prepared_leave_lifecycle_execution(execution).await?;
+    if parsed.kind == SignedMutationKind::ConversationClose {
+        sqlx::query("INSERT INTO chat.direct_request_lifecycle(request_id,conversation_id,consent,closed_at) SELECT request_id,conversation_id,'closed',$2 FROM chat.direct_request_publications WHERE conversation_id=$1 ON CONFLICT(request_id) DO UPDATE SET consent='closed',closed_at=EXCLUDED.closed_at")
+            .bind(parsed.conversation_id).bind(authority.trusted_instant().datetime()).execute(&mut **transaction).await?;
+        sqlx::query("INSERT INTO chat.direct_request_pending_releases(request_id,released_bytes,released_at,reason) SELECT a.request_id,a.reserved_bytes,$2,'closed' FROM chat.direct_request_attempts a JOIN chat.direct_request_publications p USING(request_id) WHERE p.conversation_id=$1 ON CONFLICT(request_id) DO NOTHING")
+            .bind(parsed.conversation_id).bind(authority.trusted_instant().datetime()).execute(&mut **transaction).await?;
+    }
     let event_position = applied.event_positions.first().copied();
     if event_position.is_none() {
         return Err(LeaveFacadeError::InvalidCanonicalMaterial);

@@ -924,3 +924,122 @@ fn recovery_package_terminal_state_is_consistent(
         _ => false,
     }
 }
+
+/// Protocol two acceptance commits recipient consent only. It never consumes a
+/// recovery package, alters MLS leaves, or terminalizes bootstrap Welcomes.
+pub(crate) async fn accept_direct_request(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: &crate::auth::VerifiedServicePrincipal,
+    raw: &[u8],
+    signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<u8>, DirectAcceptanceError> {
+    use super::delivery;
+    use crate::chat_protocol::direct_request_transcript::{direct_request_acceptance_entry_hash, DirectRequestKind};
+    use serde_json::{json, Value};
+    use base64::engine::general_purpose::STANDARD;
+    let actor = super::direct_request_preparation::admit_acceptance(tx, principal, raw, now)
+        .await.map_err(|_| DirectAcceptanceError::InvalidSignature)?;
+    actor.require_transaction(tx).await.map_err(|_| DirectAcceptanceError::Invariant)?;
+    let signed = actor.signed();
+    let body = signed.body();
+    let text = |v: &Value| v.as_str().map(str::to_owned).ok_or(DirectAcceptanceError::InvalidRequest);
+    let uuid = |v: &Value| Uuid::parse_str(&text(v)?).map_err(|_| DirectAcceptanceError::InvalidRequest);
+    let conversation_id = uuid(&body["prior"]["conversationId"])?;
+    let request_id = uuid(&body["requestId"])?;
+    let transition_id = uuid(&body["transitionId"])?;
+    let actor_device_id = uuid(&body["actorDeviceId"])?;
+    let head = sqlx::query("SELECT c.current_generation,c.current_state_version,c.next_entry_seq,c.lifecycle,c.protocol_version,s.group_id,s.epoch,s.group_context_hash,s.confirmation_tag,p.recipient_did FROM chat.conversations c JOIN chat.generation_states s ON s.conversation_id=c.conversation_id AND s.generation=c.current_generation AND s.state_version=c.current_state_version JOIN chat.direct_request_publications p ON p.conversation_id=c.conversation_id AND p.generation=c.current_generation AND p.request_id=$2 WHERE c.conversation_id=$1 FOR UPDATE OF c")
+        .bind(conversation_id).bind(request_id).fetch_optional(&mut **tx).await?.ok_or(DirectAcceptanceError::NotPending)?;
+    if head.try_get::<String,_>("recipient_did")? != principal.did() || head.try_get::<String,_>("protocol_version")? != "2" {
+        return Err(DirectAcceptanceError::NotPending);
+    }
+    let existing: Option<(String,Option<Vec<u8>>,Option<Vec<u8>>)> = sqlx::query_as("SELECT consent,acceptance_digest,acceptance_proof FROM chat.direct_request_lifecycle WHERE request_id=$1")
+        .bind(request_id).fetch_optional(&mut **tx).await?;
+    if let Some((consent,digest,proof)) = existing {
+        if consent == "accepted" && digest.as_deref() == Some(signed.request_digest().as_slice()) {
+            let proof: Value = serde_json::from_slice(&proof.ok_or(DirectAcceptanceError::Invariant)?).map_err(|_|DirectAcceptanceError::Invariant)?;
+            return serde_json::to_vec(&json!({"coordinates":proof["receipt"]["body"]["next"],"acceptanceProof":proof})).map_err(|_|DirectAcceptanceError::Invariant);
+        }
+        return Err(DirectAcceptanceError::NotPending);
+    }
+    if head.try_get::<String,_>("lifecycle")? != "active" { return Err(DirectAcceptanceError::NotPending); }
+    let signed_at = chrono::DateTime::parse_from_rfc3339(&text(&body["signedAt"])?).map_err(|_|DirectAcceptanceError::InvalidRequest)?.with_timezone(&chrono::Utc);
+    if signed_at > now + chrono::Duration::seconds(30) || signed_at < now - chrono::Duration::seconds(300) {
+        return Err(DirectAcceptanceError::Expired);
+    }
+    let generation: i64 = head.try_get("current_generation")?;
+    let version: i64 = head.try_get("current_state_version")?;
+    let seq: i64 = head.try_get("next_entry_seq")?;
+    let prior = json!({"conversationId":conversation_id,"generation":generation,"stateVersion":version,"groupId":STANDARD.encode(head.try_get::<Vec<u8>,_>("group_id")?),"epoch":head.try_get::<i64,_>("epoch")?,"groupContextHash":STANDARD.encode(head.try_get::<Vec<u8>,_>("group_context_hash")?),"confirmationTag":STANDARD.encode(head.try_get::<Vec<u8>,_>("confirmation_tag")?),"lifecycle":"active"});
+    let mut next = prior.clone();
+    next["stateVersion"] = json!(version.checked_add(1).ok_or(DirectAcceptanceError::Invariant)?);
+    if body["prior"] != prior || body["next"] != next { return Err(DirectAcceptanceError::StaleCoordinates); }
+    let invitation = sqlx::query("SELECT invitation_transition_id,created_by_did,created_by_device_id FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership AND status='pending' FOR UPDATE")
+        .bind(conversation_id).bind(principal.did()).fetch_optional(&mut **tx).await?.ok_or(DirectAcceptanceError::NotPending)?;
+    let provenance = json!({"invitationTransitionId":invitation.try_get::<Uuid,_>("invitation_transition_id")?,"invitedByDid":invitation.try_get::<String,_>("created_by_did")?,"invitedByDeviceId":invitation.try_get::<Uuid,_>("created_by_device_id")?});
+    if body["invitationProvenance"] != provenance { return Err(DirectAcceptanceError::InvalidRequest); }
+    let received_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
+    let wrapper: Value = serde_json::from_slice(signed.accepted_wrapper_bytes()).map_err(|_|DirectAcceptanceError::Invariant)?;
+    let entry = json!({"entryId":transition_id,"conversationId":conversation_id,"seq":seq,"signedRequest":wrapper,"receivedAt":received_at});
+    let entry_bytes = serde_json::to_vec(&entry).map_err(|_|DirectAcceptanceError::Invariant)?;
+    let entry_hash = direct_request_acceptance_entry_hash(&entry_bytes).map_err(|_|DirectAcceptanceError::Invariant)?;
+    let receipt_body = json!({"$type":"blue.catbird.chat.defs#directRequestAcceptanceCommitReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPTANCE-COMMIT\0","protocolVersion":"2","authorityDid":super::direct_request_receipts::REQUEST_RECEIPT_AUTHORITY,"keyId":signer.key_id(),"requestId":request_id,"acceptanceDigest":STANDARD.encode(signed.request_digest()),"entryHash":STANDARD.encode(entry_hash),"prior":prior,"next":next,"recordedAt":received_at});
+    let receipt_signature = signer.sign_acceptance(&serde_json::to_vec(&receipt_body).map_err(|_|DirectAcceptanceError::Invariant)?).map_err(|_|DirectAcceptanceError::Invariant)?;
+    let receipt = json!({"body":receipt_body,"signature":STANDARD.encode(receipt_signature)});
+    let proof = json!({"entry":entry,"receipt":receipt});
+    let proof_bytes = serde_json::to_vec(&proof).map_err(|_|DirectAcceptanceError::Invariant)?;
+    let server_fields = serde_json::to_vec(&receipt).map_err(|_|DirectAcceptanceError::Invariant)?;
+    let mut tagged_entry = entry;
+    tagged_entry["$type"] = json!("blue.catbird.chat.defs#directRequestAcceptanceEntry");
+    let tagged_bytes = serde_json::to_vec(&tagged_entry).map_err(|_|DirectAcceptanceError::Invariant)?;
+    let allocated = delivery::append_entry(tx, &delivery::AppendEntry {
+        conversation_id,entry_id:transition_id,entry_kind:"blue.catbird.chat.defs#directRequestAcceptanceEntry".into(),
+        accepted_payload_sha256:Sha256::digest(&tagged_bytes).to_vec(),accepted_payload_bytes:tagged_bytes,
+        signed_request_bytes:signed.accepted_wrapper_bytes().to_vec(),request_digest:signed.request_digest().to_vec(),signature:signed.signature().to_vec(),server_fields_bytes:server_fields,
+        outer_entry_fingerprint:entry_hash.to_vec(),actor_did:principal.did().into(),actor_device_id,
+        actor_key_id:signed.key_id().into(),actor_auth_generation:signed.auth_generation().ok_or(DirectAcceptanceError::Invariant)? as i64,
+        generation:Some(generation),state_version:Some(version+1),transition_id:Some(transition_id),message_id:None,received_at:now,
+    }).await.map_err(|_|DirectAcceptanceError::Invariant)?;
+    if allocated != seq as u64 { return Err(DirectAcceptanceError::Invariant); }
+    sqlx::query("INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,prior_generation,prior_state_version,next_generation,next_state_version,entry_seq,accepted_at) VALUES($1,$2,'directRequestAcceptance',$3,$4,$5,$6,'admin','active',$7,$8,$9,$10,$11,$12,$13,$12,$14,$15,$16)")
+        .bind(transition_id).bind(conversation_id).bind(principal.did()).bind(actor_device_id).bind(signed.key_id()).bind(signed.auth_generation().unwrap() as i64)
+        .bind(signed.accepted_wrapper_bytes()).bind(&signed.transcript_bytes()[DirectRequestKind::Accept.domain().len()..]).bind(signed.transcript_bytes()).bind(signed.request_digest().as_slice()).bind(signed.signature().as_slice())
+        .bind(generation).bind(version).bind(version+1).bind(seq).bind(now).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO chat.generation_states(conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,lifecycle,state_kind,producing_transition_id,public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,leaf_count,created_at) SELECT conversation_id,generation,$4,group_id,epoch,group_context_hash,confirmation_tag,lifecycle,'directRequestAcceptance',$5,public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,leaf_count,$6 FROM chat.generation_states WHERE conversation_id=$1 AND generation=$2 AND state_version=$3")
+        .bind(conversation_id).bind(generation).bind(version).bind(version+1).bind(transition_id).bind(now).execute(&mut **tx).await?;
+    sqlx::query("UPDATE chat.participants SET status='active',accepted_at=$3,acceptance_transition_id=$4,acceptance_entry_id=$4 WHERE conversation_id=$1 AND user_did=$2 AND current_membership AND status='pending'")
+        .bind(conversation_id).bind(principal.did()).bind(now).bind(transition_id).execute(&mut **tx).await?;
+    sqlx::query("UPDATE chat.conversations SET current_state_version=$2 WHERE conversation_id=$1")
+        .bind(conversation_id).bind(version+1).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO chat.direct_request_lifecycle(request_id,conversation_id,consent,acceptance_proof,acceptance_digest,accepted_at) VALUES($1,$2,'accepted',$3,$4,$5)")
+        .bind(request_id).bind(conversation_id).bind(proof_bytes).bind(signed.request_digest().as_slice()).bind(now).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO chat.direct_request_pending_releases(request_id,released_bytes,released_at,reason) SELECT request_id,reserved_bytes,$2,'accepted' FROM chat.direct_request_attempts WHERE request_id=$1 ON CONFLICT(request_id) DO NOTHING")
+        .bind(request_id).bind(now).execute(&mut **tx).await?;
+    // The same account audience gets a policy refresh. No peer read receipt is
+    // emitted when the recipient merely previews/imports the initial message.
+    let devices: Vec<(String,Uuid)> = sqlx::query_as("SELECT d.user_did,d.device_id FROM chat.devices d JOIN chat.participants p ON p.user_did=d.user_did WHERE p.conversation_id=$1 AND p.current_membership AND d.status='active' ORDER BY convert_to(d.user_did,'UTF8'),uuid_send(d.device_id)")
+        .bind(conversation_id).fetch_all(&mut **tx).await?;
+    let recipients: Vec<_> = devices.iter().map(|(did,id)|delivery::EntryRecipient{user_did:did.clone(),device_id:*id,entitlement_kind:delivery::EntryEntitlementKind::Control}).collect();
+    delivery::insert_entry_recipients(tx,conversation_id,allocated,&recipients).await.map_err(|_|DirectAcceptanceError::Invariant)?;
+    let protocol_id: Uuid = sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances WHERE singleton FOR SHARE").fetch_one(&mut **tx).await?;
+    let event = delivery::NewEvent {event_id:Uuid::new_v4(),event_kind:delivery::EventKind::ConversationChanged,payload_bytes:serde_json::to_vec(&json!({"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":conversation_id})).map_err(|_|DirectAcceptanceError::Invariant)?,created_at:now,protocol_instance_id:protocol_id};
+    let position=delivery::append_event(tx,&event).await.map_err(|_|DirectAcceptanceError::Invariant)?;
+    let mut event_recipients=Vec::new();
+    for (did,id) in devices {
+        let predecessor: Option<i64> = sqlx::query_scalar("SELECT max(event_position) FROM chat.event_recipients WHERE user_did=$1 AND device_id=$2").bind(&did).bind(id).fetch_one(&mut **tx).await?;
+        event_recipients.push(delivery::EventRecipient{user_did:did,device_id:id,entitlement_kind:delivery::EventEntitlementKind::Participant,audience_predecessor_position:predecessor});
+    }
+    delivery::insert_event_recipients(tx,position,&event_recipients).await.map_err(|_|DirectAcceptanceError::Invariant)?;
+    delivery::enqueue_outbox(tx,Uuid::new_v4(),position,delivery::OutboxWorkKind::Stream,now).await.map_err(|_|DirectAcceptanceError::Invariant)?;
+    serde_json::to_vec(&json!({"coordinates":next,"acceptanceProof":proof})).map_err(|_|DirectAcceptanceError::Invariant)
+}
+
+#[derive(Debug)]
+pub(crate) enum DirectAcceptanceError {
+    Database(sqlx::Error), InvalidSignature, InvalidRequest, NotPending,
+    StaleCoordinates, Expired, Invariant,
+}
+impl From<sqlx::Error> for DirectAcceptanceError {
+    fn from(value: sqlx::Error) -> Self { Self::Database(value) }
+}

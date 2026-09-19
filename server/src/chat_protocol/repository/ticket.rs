@@ -322,6 +322,10 @@ pub(crate) async fn revalidate_consumed_ticket(
     if cursor_position < retained_floor {
         return Err(TicketRepositoryError::CursorExpired);
     }
+    let versions: Option<Vec<String>> = sqlx::query_scalar("SELECT supported_protocol_versions FROM chat.inventory_sessions WHERE inventory_session_id=$1")
+        .bind(ticket.inventory_session_id).fetch_one(&mut **transaction).await?;
+    inventory::reject_unsupported_inventory(transaction, &ticket.user_did, ticket.device_id, versions.as_deref())
+        .await.map_err(|_| TicketRepositoryError::SessionBindingMismatch)?;
     Ok(())
 }
 
@@ -639,7 +643,8 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
     inventory_session_capability: &str,
     event_cursor: &str,
     sealer: &crate::chat_protocol::CursorSealer,
-) -> Result<(String, DateTime<Utc>), TicketRepositoryError> {
+    supported_versions: Option<Vec<String>>,
+) -> Result<(String, DateTime<Utc>, Option<serde_json::Value>), TicketRepositoryError> {
     let attempt = admission
         .into_single_read_attempt("blue.catbird.chat.getSubscriptionTicket", "POST")
         .map_err(|_| TicketRepositoryError::SessionBindingMismatch)?;
@@ -647,12 +652,14 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
     let device = read_authority::lock_read_device_authority_once(&mut transaction, attempt)
         .await
         .map_err(|_| TicketRepositoryError::DeviceBindingMismatch)?;
-    let inventory_session_id = inventory::derive_inventory_session_uuid(
-        device.user_did(),
-        device.device_id(),
-        device.jkt(),
-        device.auth_generation(),
-    );
+    let lookup = capability_hash(inventory_session_capability)?;
+    let session: Option<(Uuid, Option<Vec<String>>, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT inventory_session_id, supported_protocol_versions, inventory_scope FROM chat.inventory_sessions WHERE token_hash=$1 FOR UPDATE")
+        .bind(lookup.as_slice()).fetch_optional(&mut *transaction).await?;
+    let (inventory_session_id, retained_versions, inventory_scope) = session.ok_or(TicketRepositoryError::SessionMissing)?;
+    if retained_versions != supported_versions { return Err(TicketRepositoryError::SessionBindingMismatch); }
+    inventory::reject_unsupported_inventory(&mut transaction, device.user_did(), device.device_id(), retained_versions.as_deref())
+        .await.map_err(|_| TicketRepositoryError::SessionBindingMismatch)?;
     let (capability, session_expires_at) = inventory::snapshot_capability_for_ticket(
         &mut transaction,
         &device,
@@ -701,7 +708,7 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
     };
     mint_subscription_ticket(&mut transaction, &request).await?;
     transaction.commit().await?;
-    Ok((URL_SAFE_NO_PAD.encode(opaque), expires_at))
+    Ok((URL_SAFE_NO_PAD.encode(opaque), expires_at, inventory_scope))
 }
 
 /// Hash a canonical 32-byte random capability. This helper is intentionally

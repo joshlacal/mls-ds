@@ -27,6 +27,8 @@ mod context;
 mod conversation_state;
 mod create_conversation;
 mod device_views;
+mod direct_requests;
+mod publish_direct_request;
 mod enroll_device;
 mod errors;
 mod expiry_worker;
@@ -91,7 +93,12 @@ where
 fn is_implemented(endpoint: ChatEndpoint) -> bool {
     matches!(
         endpoint,
-        ChatEndpoint::EnrollDevice
+        ChatEndpoint::PublishDirectRequestKeys
+            | ChatEndpoint::PublishDirectRequest
+            | ChatEndpoint::PrepareDirectRequest
+            | ChatEndpoint::GetDirectRequestOutcome
+            | ChatEndpoint::CancelDirectRequestPreparation
+            | ChatEndpoint::EnrollDevice
             | ChatEndpoint::ReplenishKeyPackages
             | ChatEndpoint::GetDevices
             | ChatEndpoint::GetOwnDevices
@@ -135,6 +142,11 @@ where
     BlobStore: FromRef<S>,
 {
     let router = Router::new()
+        .route(&xrpc_path(ChatEndpoint::PublishDirectRequestKeys),post(direct_requests::publish_keys).layer(DefaultBodyLimit::max(16_777_216)))
+        .route(&xrpc_path(ChatEndpoint::PublishDirectRequest),post(publish_direct_request::handle).layer(DefaultBodyLimit::max(16_777_216)))
+        .route(&xrpc_path(ChatEndpoint::PrepareDirectRequest),post(direct_requests::prepare).layer(DefaultBodyLimit::max(65_536)))
+        .route(&xrpc_path(ChatEndpoint::CancelDirectRequestPreparation),post(direct_requests::cancel).layer(DefaultBodyLimit::max(65_536)))
+        .route(&xrpc_path(ChatEndpoint::GetDirectRequestOutcome),get(direct_requests::outcome))
         .route(
             &xrpc_path(ChatEndpoint::EnrollDevice),
             post(enroll_device::handle),

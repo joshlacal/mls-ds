@@ -34,11 +34,42 @@ pub async fn setup() -> PgPool {
             "../../migrations/20260919000001_direct_request_preparation.sql"
         )),
     ));
+    migrations.push(Migration::new(
+        20260919000002,
+        Cow::Borrowed("direct request publication"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000002_direct_request_publication.sql"
+        )),
+    ));
+    migrations.push(Migration::new(
+        20260919000003,
+        Cow::Borrowed("direct request lifecycle"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000003_direct_request_lifecycle.sql"
+        )),
+    ));
+    migrations.push(Migration::new(
+        20260919000004,
+        Cow::Borrowed("direct request welcome delivery"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000004_direct_request_welcome_delivery.sql"
+        )),
+    ));
+    migrations.push(Migration::new(
+        20260919000005,
+        Cow::Borrowed("direct request budget release"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000005_direct_request_budget_release.sql"
+        )),
+    ));
     let migrator = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,
         locking: true,
-        no_tx: false,
     };
     let mut connection = pool.acquire().await.unwrap();
     sqlx::query("SET chat.operation_claim_activation_approved='handlers-and-legacy-apis-sealed'")

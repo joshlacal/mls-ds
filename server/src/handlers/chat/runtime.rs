@@ -19,6 +19,10 @@ use crate::realtime::{SseState, StreamEvent};
 /// every chat handler as `State<Arc<ChatRuntime>>`.
 pub struct ChatRuntime {
     cutover_enabled: bool,
+    request_receipt_signer: Option<
+        Arc<crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner>,
+    >,
+    requests_ready: std::sync::atomic::AtomicBool,
     relationship_authority: Arc<ProductionRelationshipAuthority>,
     sse_state: Arc<SseState>,
     cursor_sealer: Option<CursorSealer>,
@@ -75,8 +79,24 @@ impl ChatRuntime {
                     .to_owned(),
             );
         }
+        let request_receipt_signer = if env_flag("CHAT_DIRECT_REQUESTS_ENABLED") {
+            if !cutover_enabled {
+                return Err("direct requests require chat cutover".into());
+            }
+            let receipt_pem = std::env::var("CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM")
+                .map_err(|_| "missing dedicated request receipt key")?;
+            let service_pem = std::env::var("SIGNING_KEY_PEM")
+                .map_err(|_| "missing service signing key for separation check")?;
+            let document = std::env::var("CHAT_REQUEST_RECEIPT_DID_DOCUMENT_JSON")
+                .map_err(|_| "missing request receipt authority document")?;
+            Some(Arc::new(crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner::configured(&receipt_pem,&service_pem,&document)?))
+        } else {
+            None
+        };
         Ok(Self {
             cutover_enabled,
+            request_receipt_signer,
+            requests_ready: std::sync::atomic::AtomicBool::new(false),
             relationship_authority,
             sse_state,
             cursor_sealer,
@@ -150,7 +170,23 @@ impl ChatRuntime {
                 protocol.0
             ));
         }
+        if let Some(signer) = &self.request_receipt_signer {
+            signer.validate_and_retain_keys(pool).await?;
+            self.requests_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         Ok(())
+    }
+
+    pub(crate) fn request_receipt_signer(
+        &self,
+    ) -> Option<
+        &crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner,
+    > {
+        self.requests_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then_some(self.request_receipt_signer.as_deref())
+            .flatten()
     }
 
     pub(crate) async fn subscribe_typing(

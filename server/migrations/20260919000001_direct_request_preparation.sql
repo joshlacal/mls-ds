@@ -181,3 +181,96 @@ BEGIN
 END $$;
 CREATE CONSTRAINT TRIGGER direct_request_pool_limit AFTER INSERT OR UPDATE ON chat.key_packages
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION chat.enforce_direct_request_pool_limit();
+
+ALTER TABLE chat.relationship_projection_snapshots DROP CONSTRAINT relationship_projection_snapshots_scope_check;
+ALTER TABLE chat.relationship_projection_snapshots ADD CONSTRAINT relationship_projection_snapshots_scope_check
+    CHECK(operation_scope IN ('creation','pendingAdd','acceptance','recoveryReservation','recoveryFulfillment','traffic','directRequestPreparation'));
+
+-- Retiring an unused request grant burns its package rather than making it
+-- eligible for recovery or later request reuse. Retention lasts until native
+-- package expiry and remains auditable independently of attempt rows.
+CREATE TABLE chat.direct_request_retired_packages (
+    key_package_ref BYTEA PRIMARY KEY REFERENCES chat.key_packages(key_package_ref),
+    retired_at TIMESTAMPTZ NOT NULL,
+    reason TEXT NOT NULL CHECK(reason IN ('unusable','disabled'))
+);
+CREATE TRIGGER direct_request_retired_packages_immutable BEFORE UPDATE OR DELETE ON chat.direct_request_retired_packages
+    FOR EACH ROW EXECUTE FUNCTION chat.enforce_immutable_identity();
+
+CREATE OR REPLACE FUNCTION chat.assert_key_package_reservation_mapping(target_package BYTEA)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    package_row chat.key_packages%ROWTYPE;
+    active_count BIGINT;
+    consumed_count BIGINT;
+    selected_count BIGINT;
+    retired_count BIGINT;
+BEGIN
+    SELECT * INTO package_row FROM chat.key_packages WHERE key_package_ref=target_package;
+    IF NOT FOUND THEN RETURN; END IF;
+    PERFORM 1 FROM chat.principals WHERE user_did=package_row.owner_did FOR UPDATE;
+    IF package_row.usage_scope='direct-request' THEN
+        IF EXISTS(SELECT 1 FROM chat.key_package_reservations WHERE key_package_ref=target_package) THEN
+            RAISE EXCEPTION 'request package cannot have recovery reservation' USING ERRCODE='23514';
+        END IF;
+        SELECT count(*) INTO selected_count FROM chat.direct_request_selected_devices
+         WHERE key_package_ref=target_package;
+        SELECT count(*) INTO retired_count FROM chat.direct_request_retired_packages
+         WHERE key_package_ref=target_package;
+        IF (package_row.status='available' AND (selected_count<>0 OR retired_count<>0))
+           OR (package_row.status='reserved' AND selected_count+retired_count<>1)
+           OR (package_row.status='consumed' AND (selected_count<>1 OR retired_count<>0 OR NOT EXISTS(
+               SELECT 1 FROM chat.direct_request_selected_devices s JOIN chat.direct_request_attempts a USING(request_id)
+                WHERE s.key_package_ref=target_package AND s.request_id=package_row.terminal_transition_id
+                  AND a.status='published' AND a.terminal_at=package_row.terminal_at
+                  AND s.owner_did=package_row.owner_did AND s.owner_device_id=package_row.owner_device_id
+                  AND s.owner_key_id=package_row.owner_key_id AND s.auth_generation=package_row.owner_auth_generation
+           ))) THEN
+            RAISE EXCEPTION 'request key package reservation mapping mismatch' USING ERRCODE='23514';
+        END IF;
+        RETURN;
+    END IF;
+    -- The original recovery package mapping is unchanged.
+    SELECT count(*) FILTER(WHERE status='active'),
+           count(*) FILTER(WHERE status='consumed' AND consumed_transition_id=package_row.terminal_transition_id)
+      INTO active_count,consumed_count FROM chat.key_package_reservations WHERE key_package_ref=target_package;
+    IF package_row.status='reserved' AND active_count<>1 THEN
+        RAISE EXCEPTION 'key package reservation mapping mismatch' USING ERRCODE='23514';
+    ELSIF package_row.status='consumed' AND consumed_count<>1 THEN
+        RAISE EXCEPTION 'key package reservation mapping mismatch' USING ERRCODE='23514';
+    ELSIF package_row.status NOT IN ('reserved','consumed') AND active_count<>0 THEN
+        RAISE EXCEPTION 'key package reservation mapping mismatch' USING ERRCODE='23514';
+    END IF;
+END $$;
+
+-- All mutation families share one UUID namespace and operation lock. This
+-- prevents sequential or concurrent v1/v2 reuse without fabricating v1 claims.
+CREATE FUNCTION chat.guard_direct_request_operation_namespace() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE operation UUID;
+BEGIN
+    IF TG_TABLE_NAME='direct_request_attempts' THEN operation:=NEW.request_id;
+    ELSE operation:=NEW.operation_id; END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended('chat-operation-id:'||operation::text,0));
+    IF (TG_TABLE_NAME<>'operation_claims' AND EXISTS(SELECT 1 FROM chat.operation_claims WHERE operation_id=operation))
+       OR (TG_TABLE_NAME<>'direct_request_attempts' AND EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=operation))
+       OR (TG_TABLE_NAME<>'direct_request_key_publications' AND EXISTS(SELECT 1 FROM chat.direct_request_key_publications WHERE operation_id=operation)) THEN
+        RAISE EXCEPTION 'operation ID already belongs to another protocol mutation' USING ERRCODE='23505';
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER direct_request_attempt_operation_namespace BEFORE INSERT ON chat.direct_request_attempts
+ FOR EACH ROW EXECUTE FUNCTION chat.guard_direct_request_operation_namespace();
+CREATE TRIGGER direct_request_keys_operation_namespace BEFORE INSERT ON chat.direct_request_key_publications
+ FOR EACH ROW EXECUTE FUNCTION chat.guard_direct_request_operation_namespace();
+CREATE TRIGGER legacy_direct_request_operation_namespace BEFORE INSERT ON chat.operation_claims
+ FOR EACH ROW EXECUTE FUNCTION chat.guard_direct_request_operation_namespace();
+
+CREATE FUNCTION chat.check_direct_request_package_mapping() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM chat.assert_key_package_reservation_mapping(NEW.key_package_ref);
+    RETURN NULL;
+END $$;
+CREATE CONSTRAINT TRIGGER direct_request_selection_package_mapping AFTER INSERT ON chat.direct_request_selected_devices
+ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION chat.check_direct_request_package_mapping();
+CREATE CONSTRAINT TRIGGER direct_request_retired_package_mapping AFTER INSERT ON chat.direct_request_retired_packages
+ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION chat.check_direct_request_package_mapping();
