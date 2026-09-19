@@ -134,6 +134,43 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
     let server = ShippingServerFixture::start(&https)?;
     let client = reqwest::Client::builder().build()?;
     let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
+    let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
+    let (device_key_status, device_key_response) = alice
+        .get_device_key(
+            &client,
+            &server.base_url,
+            &bob.did,
+            bob.device_id,
+            &bob_key_id,
+        )
+        .await?;
+    anyhow::ensure!(
+        device_key_status == reqwest::StatusCode::OK,
+        "get device key failed {device_key_status}: {}",
+        String::from_utf8_lossy(&device_key_response)
+    );
+    let device_key: Value = serde_json::from_slice(&device_key_response)?;
+    anyhow::ensure!(
+        device_key["ownerDid"] == bob.did
+            && device_key["deviceId"] == bob.device_id.to_string()
+            && device_key["keyId"] == bob_key_id
+            && device_key["signaturePublicKey"] == STANDARD.encode(&bob_public),
+        "get device key response did not match the exact target tuple"
+    );
+    for (owner_did, device_id, key_id) in [
+        (alice.did.as_str(), bob.device_id, bob_key_id.as_str()),
+        (bob.did.as_str(), alice.device_id, bob_key_id.as_str()),
+        (bob.did.as_str(), bob.device_id, alice_key_id.as_str()),
+    ] {
+        let (status, body) = alice
+            .get_device_key(&client, &server.base_url, owner_did, device_id, key_id)
+            .await?;
+        let error: Value = serde_json::from_slice(&body)?;
+        anyhow::ensure!(
+            status == reqwest::StatusCode::BAD_REQUEST && error["error"] == "DeviceKeyNotFound",
+            "mismatched device-key tuple did not fail closed"
+        );
+    }
     let grant_id = Uuid::new_v4();
     let grant = json!({
         "$type":"blue.catbird.chat.defs#directRequestGrantBody",
@@ -212,7 +249,6 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
     let request_id = Uuid::new_v4();
     let first_message_id = Uuid::new_v4();
     let conversation_id = Uuid::new_v4();
-    let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
     let prepare = signed_mls_request(
         &alice_engine,
         &alice_identity,

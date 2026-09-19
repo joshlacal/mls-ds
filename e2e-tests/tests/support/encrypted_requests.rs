@@ -801,6 +801,32 @@ impl ServiceIdentity {
         let bytes = response.bytes().await?.to_vec();
         Ok((status, bytes))
     }
+
+    pub async fn get_device_key(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        owner_did: &str,
+        device_id: Uuid,
+        key_id: &str,
+    ) -> Result<(StatusCode, Vec<u8>)> {
+        const NSID: &str = "blue.catbird.chat.getDeviceKey";
+        let response = client
+            .get(format!("{base_url}/xrpc/{NSID}"))
+            .bearer_auth(self.jwt(NSID, true))
+            .query(&[
+                ("actorDeviceId", self.device_id.to_string()),
+                ("ownerDid", owner_did.to_owned()),
+                ("deviceId", device_id.to_string()),
+                ("keyId", key_id.to_owned()),
+            ])
+            .send()
+            .await
+            .context("shipping router device-key request")?;
+        let status = response.status();
+        let bytes = response.bytes().await?.to_vec();
+        Ok((status, bytes))
+    }
 }
 
 pub fn seed_service_device(identity: &ServiceIdentity, mls_public_key: &[u8]) -> Result<()> {
