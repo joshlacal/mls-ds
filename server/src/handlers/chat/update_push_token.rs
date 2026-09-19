@@ -30,7 +30,9 @@ struct UpdatePushTokenBody {
     registration: Option<catbird_atproto::blue_catbird::chat::SignedPushRegistration>,
 }
 
-fn present_registration<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<catbird_atproto::blue_catbird::chat::SignedPushRegistration>, D::Error> {
+fn present_registration<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<catbird_atproto::blue_catbird::chat::SignedPushRegistration>, D::Error> {
     catbird_atproto::blue_catbird::chat::SignedPushRegistration::deserialize(deserializer).map(Some)
 }
 
@@ -170,10 +172,17 @@ mod tests {
 
     #[test]
     fn present_null_or_malformed_registration_never_uses_legacy_clear() {
-        for payload in [r#"{"registration":null}"#, r#"{"registration":{}}"#, r#"{"registration":false}"#] {
+        for payload in [
+            r#"{"registration":null}"#,
+            r#"{"registration":{}}"#,
+            r#"{"registration":false}"#,
+        ] {
             assert!(serde_json::from_str::<UpdatePushTokenBody>(payload).is_err());
         }
-        assert!(serde_json::from_str::<UpdatePushTokenBody>("{}").unwrap().registration.is_none());
+        assert!(serde_json::from_str::<UpdatePushTokenBody>("{}")
+            .unwrap()
+            .registration
+            .is_none());
     }
 
     #[test]
