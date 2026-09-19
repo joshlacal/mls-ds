@@ -430,6 +430,43 @@
       "digestHex": "e9c7094ac1061a0451f5a889e3367e126a140393c2b65d9ce070bff9ef914626"
     }
   ],
+  "legacyAcceptanceBody": {
+    "$type": "blue.catbird.chat.defs#participantAcceptanceBody",
+    "signatureDomain": "CATBIRD-CHAT-ACCEPT\u0000",
+    "transitionId": "12345678-1234-4234-8234-123456789abc",
+    "recoveryRequestId": "12345678-1234-4234-8234-123456789abc",
+    "actorDid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+    "actorDeviceId": "12345678-1234-4234-8234-123456789abc",
+    "keyId": "Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU",
+    "authGeneration": 1,
+    "prior": {
+      "conversationId": "12345678-1234-4234-8234-123456789abc",
+      "generation": 0,
+      "stateVersion": 0,
+      "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "epoch": 0,
+      "groupContextHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "confirmationTag": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "lifecycle": "active"
+    },
+    "next": {
+      "conversationId": "12345678-1234-4234-8234-123456789abc",
+      "generation": 0,
+      "stateVersion": 0,
+      "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "epoch": 0,
+      "groupContextHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "confirmationTag": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "lifecycle": "active"
+    },
+    "invitationProvenance": {
+      "invitationTransitionId": "12345678-1234-4234-8234-123456789abc",
+      "invitedByDid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+      "invitedByDeviceId": "12345678-1234-4234-8234-123456789abc"
+    },
+    "idempotencyKey": "12345678-1234-4234-8234-123456789abc",
+    "signedAt": "2026-09-19T12:00:00.000Z"
+  },
   "limits": {
     "bootstrapBytes": 8388608,
     "bootstrapPlusOne": 8388609,

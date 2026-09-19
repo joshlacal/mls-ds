@@ -9,19 +9,18 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": [
-            "signedRequest"
-          ],
+          "required": [],
           "properties": {
             "signedRequest": {
-              "type": "union",
-              "refs": [
-                "blue.catbird.chat.defs#signedParticipantAcceptance",
-                "blue.catbird.chat.defs#signedDirectRequestAcceptance"
-              ],
-              "closed": true
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedParticipantAcceptance"
+            },
+            "directRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedDirectRequestAcceptance"
             }
-          }
+          },
+          "description": "Exactly one field is required at runtime; missing, both and unknown fields are rejected before effects. Existing v1 signedRequest bytes remain unchanged."
         }
       },
       "output": {
@@ -29,8 +28,7 @@
         "schema": {
           "type": "object",
           "required": [
-            "coordinates",
-            "entry"
+            "coordinates"
           ],
           "properties": {
             "coordinates": {
@@ -38,12 +36,8 @@
               "ref": "blue.catbird.chat.defs#conversationCoordinates"
             },
             "entry": {
-              "type": "union",
-              "refs": [
-                "blue.catbird.chat.defs#participantAcceptanceEntry",
-                "blue.catbird.chat.defs#directRequestAcceptanceEntry"
-              ],
-              "closed": true
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#participantAcceptanceEntry"
             },
             "recovery": {
               "type": "ref",

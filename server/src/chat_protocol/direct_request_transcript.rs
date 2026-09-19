@@ -109,12 +109,16 @@ pub fn direct_request_signing_bytes(
     if kind == DirectRequestKind::Publish {
         let body: Value = serde_json::from_slice(raw_body_json).map_err(error)?;
         let artifacts = &body["artifacts"];
+        if artifacts["metadataSnapshot"].get("avatarBinding").is_some() {
+            return Err(error("request bootstrap forbids blob bindings"));
+        }
         let paths = [
             &artifacts["genesisGroupInfo"]["bytes"],
             &artifacts["addCommit"]["bytes"],
             &artifacts["finalGroupInfo"]["bytes"],
             &artifacts["welcome"]["opaqueWelcome"],
             &artifacts["metadataSnapshot"]["ciphertext"],
+            &artifacts["metadataSnapshot"]["nonce"],
             &artifacts["initialCiphertext"],
         ];
         let mut lengths = Vec::new();
@@ -195,7 +199,10 @@ pub fn verify_signed_request(
     public_key: &[u8],
 ) -> Result<VerifiedDirectRequest> {
     // Project the ORIGINAL bytes first, preserving duplicate-field rejection.
-    project(raw_wrapper, kind.wrapper_name(), false)?;
+    strict_document(raw_wrapper)?;
+    let presentation: Value = serde_json::from_slice(raw_wrapper).map_err(error)?;
+    let tagged = kind == DirectRequestKind::Outcome && presentation.get("$type").is_some();
+    project(raw_wrapper, kind.wrapper_name(), tagged)?;
     let wrapper: Value = serde_json::from_slice(raw_wrapper).map_err(error)?;
     let body = wrapper["body"].clone();
     let transcript =
@@ -448,6 +455,22 @@ mod tests {
                 key.verifying_key().to_encoded_point(true).as_bytes(),
             )
             .unwrap();
+            wrapper["$type"] = json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
+            verify_signed_request(
+                DirectRequestKind::Outcome,
+                &serde_json::to_vec(&wrapper).unwrap(),
+                key.verifying_key().to_encoded_point(true).as_bytes(),
+            )
+            .unwrap();
+            wrapper["$type"] =
+                json!("blue.catbird.chat.defs#signedDirectRequestAcceptanceCommitReceipt");
+            assert!(verify_signed_request(
+                DirectRequestKind::Outcome,
+                &serde_json::to_vec(&wrapper).unwrap(),
+                key.verifying_key().to_encoded_point(true).as_bytes()
+            )
+            .is_err());
+            wrapper.as_object_mut().unwrap().remove("$type");
             wrapper["body"]["receipt"]["requestDigest"] = json!(STANDARD.encode([1; 32]));
             assert!(verify_signed_request(
                 DirectRequestKind::Outcome,
@@ -676,4 +699,180 @@ pub fn validate_direct_request_introduction(raw_json: &[u8]) -> Result<Value> {
         return Err(error("introduction UTF-8 byte cap"));
     }
     Ok(value)
+}
+
+/// Hash of exact retained server entry fields and recipient signed consent.
+pub fn direct_request_acceptance_entry_hash(raw_entry: &[u8]) -> Result<[u8; 32]> {
+    let mut bytes = b"CATBIRD-DIRECT-REQUEST-ACCEPTANCE-ENTRY\0".to_vec();
+    bytes.extend(project(raw_entry, "directRequestAcceptanceEntry", false)?);
+    Ok(Sha256::digest(bytes).into())
+}
+#[cfg(test)]
+mod field_bound_tests {
+    use super::*;
+    #[test]
+    fn unicode_text_and_application_ciphertext_exact_bounds() {
+        let text = "é".repeat(MAX_REQUEST_TEXT_UTF8_BYTES / 2);
+        assert!(validate_direct_request_introduction(
+            &serde_json::to_vec(&json!({"text":text})).unwrap()
+        )
+        .is_ok());
+        assert!(validate_direct_request_introduction(
+            &serde_json::to_vec(&json!({"text":format!("{text}a")})).unwrap()
+        )
+        .is_err());
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/direct_request_vectors.json"
+        ))
+        .unwrap();
+        let mut publish = fixture["signed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "Publish")
+            .unwrap()["body"]
+            .clone();
+        publish["artifacts"]["initialCiphertext"] =
+            json!(STANDARD.encode(vec![0; MAX_INITIAL_APPLICATION_CIPHERTEXT_BYTES]));
+        assert!(direct_request_signing_bytes(
+            DirectRequestKind::Publish,
+            &serde_json::to_vec(&publish).unwrap()
+        )
+        .is_ok());
+        publish["artifacts"]["initialCiphertext"] =
+            json!(STANDARD.encode(vec![0; MAX_INITIAL_APPLICATION_CIPHERTEXT_BYTES + 1]));
+        assert!(direct_request_signing_bytes(
+            DirectRequestKind::Publish,
+            &serde_json::to_vec(&publish).unwrap()
+        )
+        .is_err());
+    }
+}
+
+/// Strict endpoint presence check preserving the byte-identical legacy form.
+/// Returns true for directRequest (v2), false for signedRequest (v1).
+pub fn direct_request_acceptance_endpoint_is_v2(raw_endpoint: &[u8]) -> Result<bool> {
+    strict_document(raw_endpoint)?;
+    let value: Value = serde_json::from_slice(raw_endpoint).map_err(error)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| error("acceptance endpoint object"))?;
+    if object.len() != 1 {
+        return Err(error("acceptance requires exactly one versioned request"));
+    }
+    if object.contains_key("signedRequest") {
+        project(
+            &serde_json::to_vec(&object["signedRequest"]).map_err(error)?,
+            "signedParticipantAcceptance",
+            false,
+        )?;
+        Ok(false)
+    } else if object.contains_key("directRequest") {
+        project(
+            &serde_json::to_vec(&object["directRequest"]).map_err(error)?,
+            "signedDirectRequestAcceptance",
+            false,
+        )?;
+        Ok(true)
+    } else {
+        Err(error("unknown acceptance endpoint field"))
+    }
+}
+
+#[cfg(test)]
+mod acceptance_presence_tests {
+    use super::*;
+    #[test]
+    fn exact_legacy_or_direct_form_is_required() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/direct_request_vectors.json"
+        ))
+        .unwrap();
+        let old =
+            json!({"body":fixture["legacyAcceptanceBody"],"signature":STANDARD.encode([0;64])});
+        let new_body = fixture["signed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "Accept")
+            .unwrap()["body"]
+            .clone();
+        let new = json!({"body":new_body,"signature":STANDARD.encode([0;64])});
+        let legacy = json!({"signedRequest":old});
+        let direct = json!({"directRequest":new});
+        assert!(
+            !direct_request_acceptance_endpoint_is_v2(&serde_json::to_vec(&legacy).unwrap())
+                .unwrap()
+        );
+        assert!(
+            direct_request_acceptance_endpoint_is_v2(&serde_json::to_vec(&direct).unwrap())
+                .unwrap()
+        );
+        assert!(direct_request_acceptance_endpoint_is_v2(b"{}").is_err());
+        assert!(direct_request_acceptance_endpoint_is_v2(
+            &serde_json::to_vec(&json!({"signedRequest":old,"directRequest":new})).unwrap()
+        )
+        .is_err());
+    }
+}
+
+/// Canonical immutable request entry fingerprint. This hash is an identity,
+/// not a substitute for publication receipt or authenticated read authority.
+pub fn direct_request_entry_hash(raw_entry: &[u8]) -> Result<[u8; 32]> {
+    let mut bytes = b"CATBIRD-DIRECT-REQUEST-ENTRY\0".to_vec();
+    bytes.extend(project(raw_entry, "directRequestEntry", false)?);
+    Ok(Sha256::digest(bytes).into())
+}
+
+/// Host JSON is validated before encryption. Plaintext is canonical DAG-CBOR;
+/// unlike signing projections, UUIDs/DIDs in this application object stay text.
+pub fn encode_direct_request_introduction(raw_host_json: &[u8]) -> Result<Vec<u8>> {
+    let value = validate_direct_request_introduction(raw_host_json)?;
+    serde_ipld_dagcbor::to_vec(&value).map_err(error)
+}
+/// Exact canonical bytes are required before any preview or invitation projection.
+pub fn decode_direct_request_introduction(raw_cbor: &[u8]) -> Result<Value> {
+    if raw_cbor.len() > MAX_INITIAL_APPLICATION_CIPHERTEXT_BYTES {
+        return Err(error("introduction plaintext byte cap"));
+    }
+    let value: Value = serde_ipld_dagcbor::from_slice(raw_cbor).map_err(error)?;
+    let canonical = serde_ipld_dagcbor::to_vec(&value).map_err(error)?;
+    if canonical != raw_cbor {
+        return Err(error("noncanonical introduction CBOR"));
+    }
+    validate_direct_request_introduction(&serde_json::to_vec(&value).map_err(error)?)
+}
+#[cfg(test)]
+mod introduction_cbor_tests {
+    use super::*;
+    #[test]
+    fn worst_case_json_escape_text_and_invitation_fit_unchanged_ciphertext_budget() {
+        let text = "\0".repeat(MAX_REQUEST_TEXT_UTF8_BYTES);
+        let value = json!({"text":text,"invitation":{"authorityDid":"did:web:chat.catbird.blue","conversationId":"12345678-1234-4234-8234-123456789abc","invitationTransitionId":"22345678-1234-4234-8234-123456789abc","invitedByDid":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","invitedByDeviceId":"32345678-1234-4234-8234-123456789abc","recipientDid":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"}});
+        let host = serde_json::to_vec(&value).unwrap();
+        assert!(host.len() > MAX_INITIAL_APPLICATION_CIPHERTEXT_BYTES);
+        let encrypted_plaintext = encode_direct_request_introduction(&host).unwrap();
+        assert!(encrypted_plaintext.len() < MAX_REQUEST_TEXT_UTF8_BYTES + 1024);
+        assert_eq!(
+            decode_direct_request_introduction(&encrypted_plaintext).unwrap(),
+            value
+        );
+    }
+    #[test]
+    fn duplicates_unknowns_and_noncanonical_encodings_fail_closed() {
+        // Two text keys in a map, even if a generic decoder would choose one.
+        assert!(decode_direct_request_introduction(b"\xa2\x64text\x61a\x64text\x61b").is_err());
+        assert!(decode_direct_request_introduction(b"\xbf\x64text\x61a\xff").is_err());
+        let unknown =
+            serde_ipld_dagcbor::to_vec(&json!({"text":"hello","attachment":"forbidden"})).unwrap();
+        assert!(decode_direct_request_introduction(&unknown).is_err());
+        let mut invalid = json!({"text":"hello","invitation":{"authorityDid":"did:web:chat.catbird.blue","conversationId":"NOT-A-UUID","invitationTransitionId":"22345678-1234-4234-8234-123456789abc","invitedByDid":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","invitedByDeviceId":"32345678-1234-4234-8234-123456789abc","recipientDid":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"}});
+        assert!(
+            encode_direct_request_introduction(&serde_json::to_vec(&invalid).unwrap()).is_err()
+        );
+        invalid["invitation"] = Value::Null;
+        assert!(
+            encode_direct_request_introduction(&serde_json::to_vec(&invalid).unwrap()).is_err()
+        );
+    }
 }
