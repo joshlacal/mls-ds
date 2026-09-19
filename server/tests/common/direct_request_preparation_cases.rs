@@ -30,11 +30,11 @@ async fn seed_request_device(
     sqlx::query("INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at,usage_scope) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10,$11)")
         .bind(&package_ref).bind(&wrapper).bind(Sha256::digest(&wrapper).to_vec()).bind(Uuid::new_v4().as_bytes().as_slice()).bind(did).bind(device).bind(&key_id).bind(now-Duration::seconds(1)).bind(expiry).bind(now).bind(scope).execute(&mut **tx).await.unwrap();
     sqlx::query("INSERT INTO chat.direct_request_capabilities(owner_did,owner_device_id,owner_key_id,auth_generation,revision,enabled,protocol_version,signed_publication,publication_digest,updated_at) VALUES($1,$2,$3,1,1,TRUE,'2','test',$4,$5)")
-        .bind(did).bind(device).bind(&key_id).bind(vec![1;32]).bind(now).execute(&mut **tx).await.unwrap();
+        .bind(did).bind(device).bind(&key_id).bind(vec![1_u8;32]).bind(now).execute(&mut **tx).await.unwrap();
     let grant_id = Uuid::new_v4();
     if grant {
         sqlx::query("INSERT INTO chat.direct_request_grants(grant_id,revision,owner_did,owner_device_id,owner_key_id,auth_generation,capability_revision,key_package_ref,purpose,protocol_version,profile,signed_grant,grant_digest,expires_at,created_at) VALUES($1,1,$2,$3,$4,1,1,$5,'direct-request-bootstrap','2','encryptedIntroduction1','test',$6,$7,$8)")
-            .bind(grant_id).bind(did).bind(device).bind(&key_id).bind(&package_ref).bind(vec![1;32]).bind(expiry).bind(now).execute(&mut **tx).await.unwrap();
+            .bind(grant_id).bind(did).bind(device).bind(&key_id).bind(&package_ref).bind(vec![1_u8;32]).bind(expiry).bind(now).execute(&mut **tx).await.unwrap();
     }
     SelectedDevice {
         owner_did: did.to_owned(),
@@ -299,5 +299,47 @@ async fn live_device_pair_and_global_budgets_reject_without_consuming_more_packa
         .execute(&mut *tx)
         .await
         .unwrap();
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn request_operation_namespace_conflicts_with_keys_and_legacy_claims() {
+    use sqlx::Acquire as _;
+    let pool = crate::common::direct_request_database::setup().await;
+    let mut tx = pool.begin().await.unwrap();
+    let actor = seed_request_device(
+        &mut tx,
+        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+        "recovery",
+        false,
+    )
+    .await;
+    let i = seed_identity(&actor);
+    let lock = locked(&mut tx, i.clone()).await;
+    finish_terminal(
+        &mut tx,
+        lock,
+        TerminalOutcome::Cancelled,
+        b"cancel",
+        None,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let mut sp = tx.begin().await.unwrap();
+    let error=sqlx::query("INSERT INTO chat.operation_claims(operation_id,principal_did,endpoint_nsid,mutation_kind,request_digest,accepted_request_sha256,signature,claimed_at) VALUES($1,$2,'blue.catbird.chat.createConversation','creation',$3,$3,$4,clock_timestamp())")
+        .bind(i.request_id).bind(&actor.owner_did).bind(vec![1_u8;32]).bind(vec![1_u8;64]).execute(&mut *sp).await.unwrap_err();
+    assert!(error.to_string().contains("operation ID already belongs"));
+    sp.rollback().await.unwrap();
+    let next = seed_identity(&actor);
+    sqlx::query("INSERT INTO chat.direct_request_key_publications(operation_id,owner_did,owner_device_id,owner_key_id,auth_generation,revision,request_digest,accepted_request,response_bytes,response_sha256,created_at) VALUES($1,$2,$3,$4,1,1,$5,'request','response',digest('response','sha256'),clock_timestamp())")
+        .bind(next.request_id).bind(&actor.owner_did).bind(actor.owner_device_id).bind(&actor.owner_key_id).bind(vec![1_u8;32]).execute(&mut *tx).await.unwrap();
+    let op = super::prelude::lock_direct_request_operation(&mut tx, next.request_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        load_locked_attempt(&mut tx, next, &op).await,
+        Err(DirectRequestStoreError::IdentityConflict)
+    ));
     tx.rollback().await.unwrap();
 }

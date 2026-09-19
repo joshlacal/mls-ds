@@ -13,7 +13,7 @@ mod signed_admission {
         transaction_id: String,
         pub(super) signed: VerifiedDirectRequest,
         pub(super) signing_key: Vec<u8>,
-        now: DateTime<Utc>,
+        pub(super) now: DateTime<Utc>,
     }
 
     fn invalid<T>() -> Result<T, DirectRequestStoreError> {
@@ -133,6 +133,10 @@ mod signed_admission {
         {
             return invalid();
         }
+        let now = request_database_instant(tx).await?;
+        if principal.exp() <= now.timestamp() {
+            return invalid();
+        }
         Ok((
             LockedRequestActor {
                 transaction_id: transaction_id(tx).await?,
@@ -145,10 +149,14 @@ mod signed_admission {
     }
 
     pub(super) fn require_fresh(actor: &LockedRequestActor) -> Result<(), DirectRequestStoreError> {
+        require_fresh_at(actor, actor.now)
+    }
+    pub(super) fn require_fresh_at(
+        actor: &LockedRequestActor,
+        now: DateTime<Utc>,
+    ) -> Result<(), DirectRequestStoreError> {
         let signed_at = datetime_field(actor.signed.body(), "signedAt")?;
-        if signed_at < actor.now - Duration::seconds(300)
-            || signed_at > actor.now + Duration::seconds(60)
-        {
+        if signed_at < now - Duration::seconds(300) || signed_at > now + Duration::seconds(60) {
             return Err(DirectRequestStoreError::Expired);
         }
         Ok(())
@@ -263,6 +271,7 @@ mod signed_admission {
             sqlx::query("INSERT INTO chat.direct_request_grants(grant_id,revision,owner_did,owner_device_id,owner_key_id,auth_generation,capability_revision,key_package_ref,purpose,protocol_version,profile,signed_grant,grant_digest,expires_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'direct-request-bootstrap','2','encryptedIntroduction1',$9,$10,$11,$12)")
             .bind(uuid_field(grant.body(),"grantId")?).bind(integer_field(grant.body(),"grantRevision")?).bind(did).bind(device).bind(actor.signed.key_id()).bind(generation).bind(revision).bind(package_ref).bind(raw_grant).bind(grant.request_digest().as_slice()).bind(expires).bind(actor.now).execute(&mut **tx).await?;
         }
+        require_fresh_at(&actor, request_database_instant(tx).await?)?;
         // Replenishment preserves the authority of previously selected grants.
         // Disable explicitly revokes all grants. Revision only changes the device
         // publication CAS; immutable grants remain package-bound.
@@ -316,6 +325,14 @@ impl LockedDirectRequestPublication {
     pub(super) fn trusted_instant(&self) -> DateTime<Utc> {
         self.now
     }
+    pub(super) async fn refresh_instant(
+        &mut self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), DirectRequestStoreError> {
+        require_transaction(tx, &self.lock).await?;
+        self.now = request_database_instant(tx).await?;
+        Ok(())
+    }
     /// Required immediately before any publication effect. This is additional
     /// to T04's final-tree, artifact, pair and relationship validations.
     pub(super) async fn validate_preparation(
@@ -328,7 +345,8 @@ impl LockedDirectRequestPublication {
             .row
             .as_ref()
             .ok_or(DirectRequestStoreError::InvalidReceipt)?;
-        if row.status != "prepared" || row.lease_expires_at.is_none_or(|e| e <= self.now) {
+        let now = request_database_instant(tx).await?;
+        if row.status != "prepared" || row.lease_expires_at.is_none_or(|e| e <= now) {
             return Err(DirectRequestStoreError::Expired);
         }
         use base64::Engine as _;
@@ -360,7 +378,7 @@ impl LockedDirectRequestPublication {
                 return Err(DirectRequestStoreError::IdentityConflict);
             }
         }
-        validate_selected_authority(tx, &self.lock, self.now).await
+        validate_selected_authority(tx, &self.lock, now).await
     }
 }
 pub(super) async fn admit_publication(
@@ -428,6 +446,7 @@ pub(super) async fn admit_publication(
         }
     }
     signed_admission::require_fresh(&actor)?;
+    let now = actor.now;
     Ok(DirectRequestPublicationAdmission::Candidate(
         LockedDirectRequestPublication {
             lock,
@@ -565,6 +584,15 @@ fn signed_identity(
         },
     })
 }
+async fn request_database_instant(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<DateTime<Utc>, DirectRequestStoreError> {
+    Ok(
+        sqlx::query_scalar("SELECT date_trunc('milliseconds',clock_timestamp())")
+            .fetch_one(&mut **tx)
+            .await?,
+    )
+}
 fn time_string(now: DateTime<Utc>) -> String {
     now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -597,6 +625,7 @@ pub(crate) async fn cancel_direct_request(
     use crate::chat_protocol::direct_request_transcript::DirectRequestKind;
     let (actor, operation) =
         signed_admission::admit_request(tx, principal, DirectRequestKind::Cancel, raw, now).await?;
+    let now = actor.now;
     let identity = signed_identity(&actor.signed)?;
     let lock = load_locked_attempt(tx, identity, &operation).await?;
     if let Some(row) = &lock.row {
@@ -664,6 +693,7 @@ pub(crate) async fn prepare_direct_request<
     let (actor, operation) =
         signed_admission::admit_request(tx, principal, DirectRequestKind::Prepare, raw, now)
             .await?;
+    let now = actor.now;
     let identity = signed_identity(&actor.signed)?;
     let lock = load_locked_attempt(tx, identity, &operation).await?;
     if let Some(row) = &lock.row {
@@ -763,6 +793,8 @@ pub(crate) async fn prepare_direct_request<
     super::relationship::verify_direct_request_policy(tx, &witness, policy, quota_exceeded)
         .await
         .map_err(|_| DirectRequestStoreError::PolicyDenied)?;
+    let now = request_database_instant(tx).await?;
+    signed_admission::require_fresh_at(&actor, now)?;
     let selected = select_devices(tx, &lock, now).await?;
     let minimum_import_until = now + Duration::seconds(604_800 + 300);
     let devices=selected.iter().map(|d|Ok(serde_json::json!({"actorDid":d.owner_did,"actorDeviceId":d.owner_device_id.to_string(),"keyId":d.owner_key_id,"authGeneration":d.auth_generation,"keyPackage":{"framing":"mlsMessage","contentType":"keyPackage","bytes":base64::engine::general_purpose::STANDARD.encode(&d.wrapper_bytes),"sha256":base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&d.wrapper_bytes)),"keyPackageRef":base64::engine::general_purpose::STANDARD.encode(&d.key_package_ref)},"grant":serde_json::from_slice::<serde_json::Value>(&d.signed_grant).map_err(|_|DirectRequestStoreError::InvalidReceipt)?}))).collect::<Result<Vec<_>,DirectRequestStoreError>>()?;
@@ -871,8 +903,8 @@ pub(super) async fn admit_acceptance(
     // first-execution age; this helper does not grant that bypass to effects.
     Ok(LockedDirectRequestAcceptance {
         transaction_id: transaction_id(tx).await?,
+        now: actor.now,
         signed: actor.signed,
-        now,
     })
 }
 
@@ -967,6 +999,7 @@ pub(crate) async fn get_direct_request_outcome(
     }) {
         return Err(DirectRequestStoreError::IdentityConflict);
     }
+    let now = request_database_instant(tx).await?;
     let row:Option<(String,Uuid,String,i64,String,Vec<u8>,String)>=sqlx::query_as("SELECT actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status FROM chat.direct_request_attempts WHERE request_id=$1")
         .bind(request_id).fetch_optional(&mut **tx).await?;
     let Some((actor_did, device, key, generation, recipient, prepare_digest, status)) = row else {

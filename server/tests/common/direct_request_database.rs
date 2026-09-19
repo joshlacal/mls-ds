@@ -66,6 +66,30 @@ pub async fn setup() -> PgPool {
             "../../migrations/20260919000005_direct_request_budget_release.sql"
         )),
     ));
+    migrations.push(Migration::new(
+        20260919000006,
+        Cow::Borrowed("direct request attempt null fences"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000006_direct_request_attempt_null_fences.sql"
+        )),
+    ));
+    migrations.push(Migration::new(
+        20260919000007,
+        Cow::Borrowed("direct request publication integrity"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000007_direct_request_publication_integrity.sql"
+        )),
+    ));
+    migrations.push(Migration::new(
+        20260919000008,
+        Cow::Borrowed("direct request lifecycle fences"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000008_direct_request_lifecycle_fences.sql"
+        )),
+    ));
     let migrator = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,

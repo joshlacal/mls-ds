@@ -19,6 +19,7 @@ use crate::realtime::{SseState, StreamEvent};
 /// every chat handler as `State<Arc<ChatRuntime>>`.
 pub struct ChatRuntime {
     cutover_enabled: bool,
+    request_producers_enabled: bool,
     request_receipt_signer: Option<
         Arc<crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner>,
     >,
@@ -79,7 +80,10 @@ impl ChatRuntime {
                     .to_owned(),
             );
         }
-        let request_receipt_signer = if env_flag("CHAT_DIRECT_REQUESTS_ENABLED") {
+        let request_producers_enabled = env_flag("CHAT_DIRECT_REQUESTS_ENABLED");
+        let request_receipt_signer = if request_producers_enabled
+            || std::env::var_os("CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM").is_some()
+        {
             if !cutover_enabled {
                 return Err("direct requests require chat cutover".into());
             }
@@ -95,6 +99,7 @@ impl ChatRuntime {
         };
         Ok(Self {
             cutover_enabled,
+            request_producers_enabled,
             request_receipt_signer,
             requests_ready: std::sync::atomic::AtomicBool::new(false),
             relationship_authority,
@@ -170,12 +175,37 @@ impl ChatRuntime {
                 protocol.0
             ));
         }
+        if self.request_receipt_signer.is_none() {
+            let schema_present: bool = sqlx::query_scalar(
+                "SELECT to_regclass('chat.direct_request_attempts') IS NOT NULL",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|_| "request rollback schema check")?;
+            if schema_present {
+                let durable: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts)")
+                        .fetch_one(pool)
+                        .await
+                        .map_err(|_| "request rollback authority check")?;
+                if durable {
+                    return Err("durable requests require receipt authority for cancellation, outcome, and consent even when producers are disabled".into());
+                }
+            }
+        }
         if let Some(signer) = &self.request_receipt_signer {
             signer.validate_and_retain_keys(pool).await?;
             self.requests_ready
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         Ok(())
+    }
+
+    pub(crate) fn request_producers_enabled(&self) -> bool {
+        self.request_producers_enabled
+            && self
+                .requests_ready
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn request_receipt_signer(

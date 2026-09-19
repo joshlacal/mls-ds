@@ -146,7 +146,7 @@ async fn published_receipt_replays_after_lease_expiry_and_cancel_cannot_overwrit
     let now = Utc::now();
     let _lock = test_lock(&mut tx, i.clone()).await;
     sqlx::query("INSERT INTO chat.direct_request_attempts(request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,prepare_response,selected_digest,prepared_at,lease_expires_at,created_at) VALUES($1,$2,$3,$4,1,$5,$6,'prepared','prepared',$7,$8,$9,$8)")
-        .bind(i.request_id).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.actor_key_id).bind(&i.recipient_did).bind(&i.prepare_digest).bind(vec![4;32]).bind(now).bind(now+Duration::seconds(300)).execute(&mut *tx).await.unwrap();
+        .bind(i.request_id).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.actor_key_id).bind(&i.recipient_did).bind(&i.prepare_digest).bind(vec![4_u8;32]).bind(now).bind(now+Duration::seconds(300)).execute(&mut *tx).await.unwrap();
     let lock = test_lock(&mut tx, i.clone()).await;
     finish_terminal(
         &mut tx,
@@ -210,4 +210,20 @@ async fn delayed_prepare_waits_for_committed_cancellation_fence() {
     assert_eq!(delayed.await.unwrap(), b"committed-cancel");
     // The committed tombstone is intentionally retained in this dedicated
     // database; tests do not bypass the no-delete history invariant.
+}
+
+#[tokio::test]
+async fn nullable_receipt_and_snapshot_fields_cannot_bypass_database_checks() {
+    let pool = crate::common::direct_request_database::setup().await;
+    for status in ["cancelled", "prepared"] {
+        let mut tx = pool.begin().await.unwrap();
+        let i = test_identity();
+        let error=sqlx::query("INSERT INTO chat.direct_request_attempts(request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,prepared_at,selected_digest,lease_expires_at,terminal_at,created_at) VALUES($1,$2,$3,$4,1,$5,$6,$7,CASE WHEN $7='prepared' THEN clock_timestamp() END,CASE WHEN $7='prepared' THEN $6 END,CASE WHEN $7='prepared' THEN clock_timestamp()+INTERVAL '5 seconds' END,CASE WHEN $7='cancelled' THEN clock_timestamp() END,clock_timestamp())")
+            .bind(i.request_id).bind(i.actor_did).bind(i.actor_device_id).bind(i.actor_key_id).bind(i.recipient_did).bind(i.prepare_digest).bind(status).execute(&mut *tx).await.expect_err("null receipt or snapshot cannot authenticate state");
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("23514")
+        );
+        tx.rollback().await.unwrap();
+    }
 }

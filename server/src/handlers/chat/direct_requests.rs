@@ -75,6 +75,17 @@ async fn mutate(
     let signer = runtime
         .request_receipt_signer()
         .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::CutoverRequired))?;
+    if !runtime.request_producers_enabled()
+        && matches!(
+            endpoint,
+            ChatEndpoint::PrepareDirectRequest | ChatEndpoint::PublishDirectRequestKeys
+        )
+    {
+        return Err(ChatFailure::protocol(
+            endpoint,
+            ChatProtocolErrorCode::CutoverRequired,
+        ));
+    }
     let principal = context::verify_service_principal(pool, endpoint, headers).await?;
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
