@@ -14,7 +14,7 @@ use uuid::Uuid;
 mod permissions;
 use permissions::allowed_while_pending;
 
-fn conversation_id(body: ClosedObjectRef<'_>) -> Option<Uuid> {
+fn conversation_id(body: &ClosedObjectRef<'_>) -> Option<Uuid> {
     if let Some(CanonicalValueRef::Uuid(id)) = body.get("conversationId") {
         return Some(Uuid::from_bytes(*id.as_bytes()));
     }
@@ -26,7 +26,7 @@ fn conversation_id(body: ClosedObjectRef<'_>) -> Option<Uuid> {
         "context",
     ] {
         if let Some(CanonicalValueRef::Object(nested)) = body.get(key) {
-            if let Some(id) = conversation_id(nested) {
+            if let Some(id) = conversation_id(&nested) {
                 return Some(id);
             }
         }
@@ -72,7 +72,7 @@ pub(crate) async fn enforce_ordinary_mutation(
         WelcomeAcknowledgement(p) => p.body(),
         WelcomeRejection(p) => p.body(),
     };
-    let id = match conversation_id(body) {
+    let id = match conversation_id(&body) {
         Some(id) => Some(id),
         None if mutation.kind() == SignedMutationKind::BlobDeletion => match body.get("blobId") {
             Some(CanonicalValueRef::Uuid(id)) => {
