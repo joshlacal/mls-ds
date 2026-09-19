@@ -157,12 +157,29 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
         String::from_utf8_lossy(&device_key_response)
     );
     let device_key: Value = serde_json::from_slice(&device_key_response)?;
+    let mut device_key_mismatches = Vec::new();
+    for (field, matches) in [
+        ("ownerDid", device_key["ownerDid"] == bob.did),
+        (
+            "deviceId",
+            device_key["deviceId"] == bob.device_id.to_string(),
+        ),
+        ("keyId", device_key["keyId"] == bob_key_id),
+        (
+            "signaturePublicKey",
+            device_key["signaturePublicKey"]["$bytes"] == STANDARD.encode(&bob_public)
+                && device_key["signaturePublicKey"]
+                    .as_object()
+                    .is_some_and(|bytes| bytes.len() == 1),
+        ),
+    ] {
+        if !matches {
+            device_key_mismatches.push(field);
+        }
+    }
     anyhow::ensure!(
-        device_key["ownerDid"] == bob.did
-            && device_key["deviceId"] == bob.device_id.to_string()
-            && device_key["keyId"] == bob_key_id
-            && device_key["signaturePublicKey"] == STANDARD.encode(&bob_public),
-        "get device key response did not match the exact target tuple"
+        device_key_mismatches.is_empty(),
+        "get device key response differed in fields: {device_key_mismatches:?}"
     );
     for (owner_did, device_id, key_id) in [
         (alice.did.as_str(), bob.device_id, bob_key_id.as_str()),
