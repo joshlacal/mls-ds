@@ -786,6 +786,10 @@ impl HttpsDidFixture {
                     "1",
                     "-subj",
                     "/CN=Catbird Request Fixture CA",
+                    "-addext",
+                    "basicConstraints=critical,CA:TRUE",
+                    "-addext",
+                    "keyUsage=critical,keyCertSign,cRLSign",
                     "-keyout",
                 ])
                 .arg(&ca_key)

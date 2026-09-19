@@ -97,6 +97,16 @@ impl Drop for ChildGuard {
         let _ = self.0.wait();
     }
 }
+fn profile(actor: &Actor) -> Value {
+    let label = actor
+        .identity
+        .did
+        .trim_start_matches("did:web:")
+        .split('-')
+        .next()
+        .unwrap_or("Synthetic");
+    json!({"did":actor.identity.did,"handle":actor.identity.did.trim_start_matches("did:web:"),"displayName":format!("{label} request fixture"),"description":"Synthetic local request qualification account"})
+}
 fn response(status: StatusCode, value: Value) -> Response {
     (status, axum::Json(value)).into_response()
 }
@@ -168,6 +178,7 @@ fn set_declaration(
 ) -> Result<Value> {
     ensure!(
         Uuid::parse_str(device)?.get_version_num() == 4
+            && Uuid::parse_str(device)?.get_variant() == uuid::Variant::RFC4122
             && Uuid::parse_str(device)?.to_string() == device,
         "canonical v4 device required"
     );
@@ -264,9 +275,17 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
             proxy.documents.lock().unwrap()[&host].clone(),
         );
     }
-    let q = match params(&query) {
-        Ok(q) => q,
-        Err(_) => return error(StatusCode::BAD_REQUEST, "InvalidQuery"),
+    // Canonical XRPC arrays deliberately repeat keys (for example protocol
+    // versions). Forward those exact query bytes to the shipping parser.
+    let q = if path.starts_with("/xrpc/blue.catbird.chat.")
+        || path == "/xrpc/app.bsky.actor.getProfiles"
+    {
+        BTreeMap::new()
+    } else {
+        match params(&query) {
+            Ok(q) => q,
+            Err(_) => return error(StatusCode::BAD_REQUEST, "InvalidQuery"),
+        }
     };
     let public_actor = proxy.actors.iter().find(|a| {
         host == a.identity.did.trim_start_matches("did:web:")
@@ -327,6 +346,42 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
             json!({"did":actor.identity.did,"handle":actor.identity.did.trim_start_matches("did:web:")}),
         );
     }
+    if path == "/xrpc/app.bsky.actor.getProfiles" && method == Method::GET {
+        let values = url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect::<Vec<_>>();
+        if values.is_empty()
+            || values.len() > 25
+            || values
+                .iter()
+                .any(|(k, v)| k != "actors" || !proxy.actors.iter().any(|a| &a.identity.did == v))
+        {
+            return error(StatusCode::BAD_REQUEST, "InvalidFixtureProfiles");
+        }
+        return response(
+            StatusCode::OK,
+            json!({"profiles":values.iter().map(|(_,did)|profile(proxy.actors.iter().find(|a|&a.identity.did==did).unwrap())).collect::<Vec<_>>()}),
+        );
+    }
+    if matches!(
+        path.as_str(),
+        "/xrpc/app.bsky.actor.searchActors" | "/xrpc/app.bsky.actor.searchActorsTypeahead"
+    ) && method == Method::GET
+    {
+        if q.keys().any(|k| !["q", "limit"].contains(&k.as_str()))
+            || q.get("q").is_none_or(|v| v.len() > 256)
+            || q.get("limit")
+                .is_some_and(|v| v.parse::<usize>().map_or(true, |n| !(1..=100).contains(&n)))
+        {
+            return error(StatusCode::BAD_REQUEST, "InvalidFixtureSearch");
+        }
+        let term = q["q"].to_ascii_lowercase();
+        let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(25);
+        return response(
+            StatusCode::OK,
+            json!({"actors":proxy.actors.iter().filter(|a|a.identity.did.contains(&term)).take(limit).map(|a|profile(a)).collect::<Vec<_>>()}),
+        );
+    }
     if path == "/xrpc/app.bsky.actor.getProfile" && method == Method::GET {
         let Some(a) = proxy
             .actors
@@ -335,10 +390,7 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
         else {
             return error(StatusCode::NOT_FOUND, "UnknownActor");
         };
-        return response(
-            StatusCode::OK,
-            json!({"did":a.identity.did,"handle":a.identity.did.trim_start_matches("did:web:"),"displayName":"Synthetic request fixture"}),
-        );
+        return response(StatusCode::OK, profile(a));
     }
     if path == "/xrpc/app.bsky.graph.getBlocks" && method == Method::GET {
         return response(StatusCode::OK, json!({"blocks":[]}));
@@ -601,6 +653,7 @@ async fn main() -> Result<()> {
     );
     let hosts_path = config.output_dir.join("tls-hosts.json");
     protected_write(&hosts_path, &serde_json::to_vec(&https.hosts)?)?;
+    let ws_config = config.output_dir.join("websocket-target.json");
     let mut tls = Command::new("python3")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("support/client_runtime_tls.py"))
         .arg(https.root.join("server.pem"))
@@ -608,6 +661,7 @@ async fn main() -> Result<()> {
         .arg(tls_port.to_string())
         .arg(upstream.to_string())
         .arg(&hosts_path)
+        .arg(&ws_config)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
@@ -619,7 +673,21 @@ async fn main() -> Result<()> {
     );
     let _tls = ChildGuard(tls);
     https.port = tls_port;
-    let server = ShippingServerFixture::start(&https)?;
+    let server = ShippingServerFixture::start_with_client_runtime(
+        &https,
+        "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents",
+    )?;
+    let service_url = url::Url::parse(&server.base_url)?;
+    ensure!(
+        service_url.scheme() == "http" && service_url.host_str() == Some("127.0.0.1"),
+        "shipping WebSocket target must be exact loopback"
+    );
+    protected_write(
+        &ws_config,
+        &serde_json::to_vec(
+            &json!({"port":service_url.port().context("shipping port")?,"origin":config.cors_origin}),
+        )?,
+    )?;
     proxy.documents.lock().unwrap().insert(
         "chat.catbird.blue".into(),
         serde_json::from_slice(&server.receipt_document)?,
@@ -865,8 +933,13 @@ mod tests {
             .body(Body::from("{}"))
             .unwrap();
         assert_eq!(
-            serve(State(proxy), wrong).await.status(),
+            serve(State(proxy.clone()), wrong).await.status(),
             StatusCode::FORBIDDEN
+        );
+        let arrays=Request::builder().uri("/xrpc/blue.catbird.chat.getConversations?supportedProtocolVersions=1&supportedProtocolVersions=2").header("host",&host).header("authorization","Bearer opaque").body(Body::empty()).unwrap();
+        assert_eq!(
+            serve(State(proxy), arrays).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
         assert!(actor.records.lock().unwrap().is_empty());
     }
