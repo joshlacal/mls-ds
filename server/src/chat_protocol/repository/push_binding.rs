@@ -201,13 +201,7 @@ mod tests {
     async fn guarded_device_binding_rotation_retry_disable_and_authority_fences() {
         let pool = super::direct_request_database::setup().await;
         let mut tx = pool.begin().await.unwrap();
-        // Draft DDL is exercised transactionally, never installed by test discovery.
-        sqlx::raw_sql(include_str!(
-            "../../../tests/fixtures/push_binding_migration_draft.sql"
-        ))
-        .execute(&mut *tx)
-        .await
-        .unwrap();
+        // The guarded, explicit migration manifest installs the reviewed schema.
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../../catbird-atproto/tests/fixtures/push-registration.json"
         ))
