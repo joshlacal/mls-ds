@@ -311,6 +311,58 @@ mod tests {
             .is_err());
     }
 
+    /// F2: the eligibility decision instant comes from PostgreSQL. A database
+    /// clock ten minutes away from this process must still seal (it used to be
+    /// judged against `Utc::now()` and fail as an internal 500), while a window
+    /// that is wrong relative to that same instant is still refused.
+    #[test]
+    fn eligibility_envelope_is_judged_on_its_database_decision_instant() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use chrono::{Duration, SecondsFormat, Utc};
+        use uuid::Uuid;
+
+        let receipt = key(41);
+        let service = key(42);
+        let pem = receipt.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let service_pem = service.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let signer = DirectRequestReceiptSigner::configured(
+            pem.as_str(),
+            service_pem.as_str(),
+            &document(&[&receipt]),
+        )
+        .unwrap();
+        let body = |checked: chrono::DateTime<Utc>, lifetime: Duration| RequestPushEligibilityBody {
+            protocol_version: 1,
+            authority_did: REQUEST_RECEIPT_AUTHORITY.into(),
+            key_id: signer.key_id().into(),
+            event_id: Uuid::new_v4().to_string(),
+            request_id: Uuid::new_v4().to_string(),
+            recipient_did: "did:web:bob.example.org".into(),
+            device_id: Uuid::new_v4().to_string(),
+            provider: "apns".into(),
+            registration_id: Uuid::new_v4().to_string(),
+            token_generation: 1,
+            binding_digest: URL_SAFE_NO_PAD.encode([3_u8; 32]),
+            target_key_id: URL_SAFE_NO_PAD.encode([7_u8; 32]),
+            device_auth_generation: 1,
+            conversation_id: Uuid::new_v4().to_string(),
+            first_message_id: Uuid::new_v4().to_string(),
+            sender_did: "did:web:alice.example.org".into(),
+            eligible: true,
+            checked_at: checked.to_rfc3339_opts(SecondsFormat::Millis, true),
+            expires_at: (checked + lifetime).to_rfc3339_opts(SecondsFormat::Millis, true),
+        };
+        for skew in [Duration::minutes(10), Duration::minutes(-10)] {
+            let database_now = Utc::now() + skew;
+            signer
+                .seal_request_push_eligibility(body(database_now, Duration::seconds(5)), database_now)
+                .expect("eligibility at the database decision instant seals despite host skew");
+            assert!(signer
+                .seal_request_push_eligibility(body(database_now, Duration::seconds(6)), database_now)
+                .is_err());
+        }
+    }
+
     #[test]
     fn deterministic_request_push_interoperability_vector() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -457,6 +509,11 @@ impl DirectRequestReceiptSigner {
         ))
     }
 
+    /// The event envelope is a wall-clock bearer between two services: the
+    /// worker stamps `issuedAt` from this host's clock and Nest judges it
+    /// against its own clock (like a JWT `iat`). No database time is involved,
+    /// so validating against the same host clock here is the intended
+    /// semantics.
     pub(crate) fn seal_request_push_event(
         &self,
         body: RequestPushEventBody,
@@ -466,12 +523,15 @@ impl DirectRequestReceiptSigner {
         self.seal_internal_push_body(body, REQUEST_PUSH_EVENT_DOMAIN)
     }
 
+    /// `checked_at` is the eligibility decision's database clock sample, so the
+    /// envelope window is judged at that same instant; a process wall clock
+    /// skewed from PostgreSQL would reject a correct positive or negative.
     pub(crate) fn seal_request_push_eligibility(
         &self,
         body: RequestPushEligibilityBody,
+        checked_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<SignedInternalEnvelope, String> {
-        body.validate(chrono::Utc::now())
-            .map_err(|e| e.to_string())?;
+        body.validate(checked_at).map_err(|e| e.to_string())?;
         self.seal_internal_push_body(body, REQUEST_PUSH_ELIGIBILITY_DOMAIN)
     }
 
