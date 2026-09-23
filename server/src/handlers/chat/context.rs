@@ -336,7 +336,16 @@ pub(crate) fn operation_prelude_failure(
     use PreludeError as E;
 
     match error {
-        E::DirectRequestConsentRequired => ChatFailure::protocol(endpoint, C::NotParticipant),
+        // Pending request consent: the endpoint's own declared refusal.
+        // Endpoints declaring neither code still downgrade (lexicon gap).
+        E::DirectRequestConsentRequired => ChatFailure::protocol(
+            endpoint,
+            if endpoint.declares(C::ConversationNotAccepted) {
+                C::ConversationNotAccepted
+            } else {
+                C::NotParticipant
+            },
+        ),
         E::Database(_) => ChatFailure::storage(endpoint),
         E::Authorization(error) => auth_repository_failure(endpoint, error),
         E::MissingDevice | E::MissingDeviceKey => {
