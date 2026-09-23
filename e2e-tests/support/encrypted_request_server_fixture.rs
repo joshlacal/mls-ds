@@ -14,6 +14,42 @@ use sqlx::postgres::PgPoolOptions;
 const EXACT_DATABASE_URL: &str =
     "postgresql://127.0.0.1:5432/catbird_direct_requests_test_20260919";
 
+/// Same predicate as the e2e harness `dedicated_request_database_name`: a
+/// faketime cluster (127.0.0.1, never port 5432) or a fault clone
+/// (127.0.0.1:5432, `_fault_<16 lowercase hex>`) are the only other targets.
+fn is_dedicated_database_url(url: &str) -> bool {
+    let Some((port, name)) = url
+        .strip_prefix("postgresql://127.0.0.1:")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    let Some(port) = port
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| port.parse::<u16>().ok())
+        .flatten()
+    else {
+        return false;
+    };
+    if let Some(suffix) = name.strip_prefix("catbird_direct_requests_faketime_") {
+        port != 0
+            && port != 5432
+            && (1..=40).contains(&suffix.len())
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    } else if let Some(suffix) = name.strip_prefix("catbird_direct_requests_fault_") {
+        url == format!("postgresql://127.0.0.1:5432/{name}")
+            && suffix.len() == 16
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    } else {
+        false
+    }
+}
+
 #[derive(Clone)]
 struct FixtureState {
     pool: DbPool,
@@ -49,8 +85,8 @@ async fn main() -> Result<()> {
     let database_url =
         std::env::var("TEST_DATABASE_URL").context("TEST_DATABASE_URL is required")?;
     anyhow::ensure!(
-        database_url == EXACT_DATABASE_URL,
-        "server fixture refuses every database except {EXACT_DATABASE_URL}"
+        database_url == EXACT_DATABASE_URL || is_dedicated_database_url(&database_url),
+        "server fixture refuses every database except {EXACT_DATABASE_URL} and dedicated faketime/fault request databases"
     );
     let resolver_hosts = std::env::var("REQUEST_FIXTURE_DID_HOSTS")
         .context("REQUEST_FIXTURE_DID_HOSTS is required")?

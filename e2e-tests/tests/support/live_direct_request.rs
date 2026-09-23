@@ -619,7 +619,7 @@ fn graph(conversation: Uuid) -> anyhow::Result<Value> {
     let sql = format!("SELECT json_build_object('generation',c.current_generation,'stateVersion',c.current_state_version,'generationStateVersion',(SELECT g.current_state_version FROM chat.generations g WHERE g.conversation_id=c.conversation_id AND g.generation=c.current_generation),'acceptanceClaims',(SELECT count(*) FROM chat.direct_request_acceptance_claims a JOIN chat.direct_request_publications p ON p.request_id=a.request_id WHERE p.conversation_id=c.conversation_id),'epoch',s.epoch,'nextSeq',c.next_entry_seq,'transitions',(SELECT count(*) FROM chat.transitions t WHERE t.conversation_id=c.conversation_id),'introductions',(SELECT count(*) FROM chat.entries e WHERE e.conversation_id=c.conversation_id AND e.entry_kind='blue.catbird.chat.defs#directRequestEntry'),'applications',(SELECT count(*) FROM chat.entries e WHERE e.conversation_id=c.conversation_id AND e.entry_kind='blue.catbird.chat.defs#applicationEntry'))::text FROM chat.conversations c JOIN chat.generation_states s ON s.conversation_id=c.conversation_id AND s.generation=c.current_generation AND s.state_version=c.current_state_version WHERE c.conversation_id='{conversation}'");
     let result = std::process::Command::new("psql")
         .args([
-            REQUEST_TEST_DATABASE_URL,
+            crate::encrypted_requests::request_database_url(),
             "-X",
             "-A",
             "-t",

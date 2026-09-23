@@ -50,6 +50,51 @@ fn database_url_gate_accepts_only_the_exact_local_target() {
 }
 
 #[test]
+fn database_url_gate_admits_only_dedicated_faketime_and_fault_databases() {
+    assert_eq!(
+        validate_request_test_database_url(Some(
+            "postgresql://127.0.0.1:55432/catbird_direct_requests_faketime_c22"
+        ))
+        .unwrap(),
+        "catbird_direct_requests_faketime_c22"
+    );
+    assert_eq!(
+        validate_request_test_database_url(Some(
+            "postgresql://127.0.0.1:5432/catbird_direct_requests_fault_0123456789abcdef"
+        ))
+        .unwrap(),
+        "catbird_direct_requests_fault_0123456789abcdef"
+    );
+    for rejected in [
+        // The shared cluster port stays reserved for the shared database.
+        "postgresql://127.0.0.1:5432/catbird_direct_requests_faketime_c22",
+        "postgresql://127.0.0.1:05432/catbird_direct_requests_faketime_c22",
+        "postgresql://localhost:55432/catbird_direct_requests_faketime_c22",
+        "postgresql://10.0.0.5:55432/catbird_direct_requests_faketime_c22",
+        "postgresql://127.0.0.1:55432/catbird_direct_requests_test_20260919",
+        "postgresql://127.0.0.1:55432/postgres",
+        "postgresql://127.0.0.1:55432/catbird_direct_requests_faketime_",
+        "postgresql://127.0.0.1:55432/catbird_direct_requests_faketime_C22",
+        "postgresql://127.0.0.1:55432/catbird_direct_requests_faketime_c22;drop",
+        "postgresql://127.0.0.1:+55432/catbird_direct_requests_faketime_c22",
+        "postgresql://127.0.0.1:55432/catbird_direct_requests_faketime_c22?host=10.0.0.5",
+        "postgresql://127.0.0.1:55432/catbird_direct_requests_faketime_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        // Fault clones live only on the shared loopback cluster port.
+        "postgresql://127.0.0.1:55432/catbird_direct_requests_fault_0123456789abcdef",
+        "postgresql://localhost:5432/catbird_direct_requests_fault_0123456789abcdef",
+        "postgresql://127.0.0.1:5432/catbird_direct_requests_fault_0123456789ABCDEF",
+        "postgresql://127.0.0.1:5432/catbird_direct_requests_fault_0123456789abcde",
+        "postgresql://127.0.0.1:5432/catbird_direct_requests_fault_0123456789abcdef0",
+        "postgresql://127.0.0.1:5432/catbird_direct_requests_fault_0123456789abcdeg",
+    ] {
+        assert!(
+            validate_request_test_database_url(Some(rejected)).is_err(),
+            "{rejected} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn reviewed_baseline_has_exactly_fourteen_ordered_entries() {
     let baseline = reviewed_baseline();
     assert_eq!(baseline.len(), 14);

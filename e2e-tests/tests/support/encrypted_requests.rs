@@ -174,14 +174,78 @@ pub fn reviewed_request_migrations() -> [BaselineMigration; 17] {
     ]
 }
 
-pub fn validate_request_test_database_url(value: Option<&str>) -> Result<&'static str> {
+/// The only alternatives to the shared guarded database, each dedicated to
+/// one test and loopback-only. Returns the database name when `url` is:
+/// - `127.0.0.1:<port != 5432>/catbird_direct_requests_faketime_<[a-z0-9_]{1,40}>`,
+///   a private cluster from `e2e-tests/support/faketime_postgres.py` whose
+///   clock the test advances; or
+/// - `127.0.0.1:5432/catbird_direct_requests_fault_<16 lowercase hex>`, a
+///   dedicated fault-injection clone on the shared cluster.
+pub fn dedicated_request_database_name(url: &str) -> Option<&str> {
+    let (port, name) = url
+        .strip_prefix("postgresql://127.0.0.1:")?
+        .split_once('/')?;
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let port = port.parse::<u16>().ok()?;
+    let valid = if let Some(suffix) = name.strip_prefix("catbird_direct_requests_faketime_") {
+        port != 0
+            && port != 5432
+            && (1..=40).contains(&suffix.len())
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    } else if let Some(suffix) = name.strip_prefix("catbird_direct_requests_fault_") {
+        url == format!("postgresql://127.0.0.1:5432/{name}")
+            && suffix.len() == 16
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    } else {
+        false
+    };
+    valid.then_some(name)
+}
+
+pub fn validate_request_test_database_url(value: Option<&str>) -> Result<String> {
     match value {
-        Some(REQUEST_TEST_DATABASE_URL) => Ok(REQUEST_TEST_DATABASE_NAME),
-        Some(_) => {
-            bail!("{REQUEST_TEST_DATABASE_ENV} must exactly equal {REQUEST_TEST_DATABASE_URL}")
-        }
+        Some(REQUEST_TEST_DATABASE_URL) => Ok(REQUEST_TEST_DATABASE_NAME.to_owned()),
+        Some(url) => match dedicated_request_database_name(url) {
+            Some(name) => Ok(name.to_owned()),
+            None => bail!(
+                "{REQUEST_TEST_DATABASE_ENV} must equal {REQUEST_TEST_DATABASE_URL} or name a dedicated faketime/fault request database"
+            ),
+        },
         None => bail!("{REQUEST_TEST_DATABASE_ENV} is required"),
     }
+}
+
+static ROUTED_DATABASE_URL: OnceLock<String> = OnceLock::new();
+
+/// Target of every harness psql, fixture, and guarded-connection call. Fixed
+/// once per process: an explicit `route_to_dedicated_database`, else a
+/// dedicated `REQUEST_TEST_DATABASE_URL`, else the shared guarded database.
+pub fn request_database_url() -> &'static str {
+    ROUTED_DATABASE_URL.get_or_init(|| match std::env::var(REQUEST_TEST_DATABASE_ENV) {
+        Ok(url) if dedicated_request_database_name(&url).is_some() => url,
+        _ => REQUEST_TEST_DATABASE_URL.to_owned(),
+    })
+}
+
+/// Route this whole test process to one dedicated database. Must precede the
+/// first harness database use; rerouting to a different target fails.
+pub fn route_to_dedicated_database(url: &str) -> Result<()> {
+    anyhow::ensure!(
+        dedicated_request_database_name(url).is_some(),
+        "{url} is not a dedicated faketime/fault request database"
+    );
+    let routed = ROUTED_DATABASE_URL.get_or_init(|| url.to_owned());
+    anyhow::ensure!(
+        routed == url,
+        "request harness already routed to {routed}; cannot reroute to {url}"
+    );
+    Ok(())
 }
 
 fn reviewed_send_message_prerequisite() -> BaselineMigration {
@@ -263,6 +327,7 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
     );
     let raw = std::env::var(REQUEST_TEST_DATABASE_ENV).ok();
     validate_request_test_database_url(raw.as_deref())?;
+    let expected_database = validate_request_test_database_url(Some(request_database_url()))?;
     let _setup = DATABASE_SETUP_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -280,7 +345,7 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
     let owner = fields[2].to_owned();
     let server_address = fields[3].to_owned();
     anyhow::ensure!(
-        database == REQUEST_TEST_DATABASE_NAME,
+        database == expected_database,
         "unexpected request database {database}"
     );
     anyhow::ensure!(
@@ -570,7 +635,7 @@ fn psql_query(sql: &str) -> Result<String> {
             "-F",
             "\t",
             "-d",
-            REQUEST_TEST_DATABASE_URL,
+            request_database_url(),
             "-c",
             sql,
         ])
@@ -592,7 +657,7 @@ fn psql_exec(sql: &str) -> Result<()> {
             "ON_ERROR_STOP=1",
             "-q",
             "-d",
-            REQUEST_TEST_DATABASE_URL,
+            request_database_url(),
             "-c",
             sql,
         ])
@@ -1333,7 +1398,7 @@ impl ShippingServerFixture {
         );
         let mut command = Command::new(binary);
         command
-            .env("TEST_DATABASE_URL", REQUEST_TEST_DATABASE_URL)
+            .env("TEST_DATABASE_URL", request_database_url())
             .env("REQUEST_FIXTURE_DID_HOSTS", https.hosts.join(","))
             .env("REQUEST_FIXTURE_DID_PORT", https.port.to_string())
             .env("REQUEST_FIXTURE_DID_CA_PEM", &https.ca_pem)
