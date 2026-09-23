@@ -1,16 +1,11 @@
-//! Validation cases C07, C08, C09 database-level test suite.
+//! Validation case C07 database-level test suite.
 //!
 //! C07: Separate pools and grants
 //!      - V1/recovery packages, unsupported capability, unsigned/misbound/expired/disabled grants reject
 //!      - Request exhaustion cannot drain recovery packages
-//! C08: Policy races
-//!      - Both-direction direct/list block, incoming preference change, included-device revoke,
-//!        grant disable, auth generation/key mismatch race reservation/publication
-//!      - Assert no unauthorized published row
-//! C09: Device coverage
-//!      - All deliverable devices at snapshot included
-//!      - Unrelated enrollment doesn't invalidate; included revocation does
-//!      - No eligible recipient keeps draft and emits no invitation
+//! C08/C09 moved to e2e `encrypted_request_c08_c09.rs` (live router, real policy
+//! projection and concurrent barrier races) and catbird-mls
+//! `clean_chat_direct_request_c09_draft.rs` (core draft retention).
 #![allow(dead_code)]
 pub use catbird_server::{auth, chat_protocol};
 #[path = "common/chat_protocol.rs"]
@@ -262,51 +257,147 @@ mod repository {
         // ====================================================================
 
         #[tokio::test]
-        async fn c07_v1_and_recovery_packages_reject() {
+        async fn c07_v1_and_recovery_packages_never_serve_the_request_pool() {
             let pool = crate::common::direct_request_database::setup().await;
             let mut tx = pool.begin().await.unwrap();
             let actor_did = test_did("csevenactora");
             let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
 
-            let recip1_did = test_did("csevenrecipa");
-            // 1. Recipient has ONLY recovery package (with no direct request grant)
-            let mut c_recip = DeviceConfig::valid(&recip1_did, "recovery");
-            c_recip.grant = false;
-            let recip1_dev = seed_device(&mut tx, c_recip).await;
-            let lock = lock_attempt(&mut tx, make_identity(&actor, &recip1_did)).await;
-            assert!(
-                matches!(
-                    select_devices(&mut tx, &lock, Utc::now()).await,
-                    Err(DirectRequestStoreError::RecipientKeysUnavailable)
-                ),
-                "recovery package alone must reject preparation"
+            // (1) Schema truth: the migration default is 'recovery', so an
+            // ordinary/legacy publication never lands in the request pool.
+            let legacy_did = test_did("csevenlegacy");
+            let mut legacy_cfg = DeviceConfig::valid(&legacy_did, "recovery");
+            legacy_cfg.grant = false;
+            let legacy = seed_device(&mut tx, legacy_cfg).await;
+            // Insert exactly as the ordinary/legacy publisher does: omit
+            // usage_scope entirely and read back whatever the schema assigned.
+            let unscoped_wrapper = vec![6u8; 40];
+            let unscoped_ref = Sha256::digest(Uuid::new_v4().as_bytes()).to_vec();
+            sqlx::query(
+                "INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)"
+            )
+            .bind(&unscoped_ref)
+            .bind(&unscoped_wrapper)
+            .bind(Sha256::digest(&unscoped_wrapper).to_vec())
+            .bind(&[4u8; 32])
+            .bind(&legacy_did)
+            .bind(legacy.owner_device_id)
+            .bind(&legacy.owner_key_id)
+            .bind(Utc::now() - Duration::seconds(1))
+            .bind(Utc::now() + Duration::days(10))
+            .bind(Utc::now())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            let default_scope: String =
+                sqlx::query_scalar("SELECT usage_scope FROM chat.key_packages WHERE key_package_ref=$1")
+                    .bind(&unscoped_ref)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                default_scope, "recovery",
+                "a package published without an explicit scope defaults to recovery"
             );
 
-            let wrapper = vec![7u8; 40];
-            let wrapper_sha256 = Sha256::digest(&wrapper).to_vec();
-            let mut sp = tx.begin().await.unwrap();
-            let invalid_scope_err = sqlx::query(
-                "INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at,usage_scope) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10,'conversation')"
+            // (2) Scope is the deciding predicate, not absent grants: this device
+            // has an enabled direct-request capability, one current direct-request
+            // package (with its grant) AND an additional legacy recovery package.
+            // Only the direct-request package may be selected.
+            let mixed_did = test_did("csevenmixed");
+            let mixed = seed_device(&mut tx, DeviceConfig::valid(&mixed_did, "direct-request")).await;
+            let legacy_wrapper = vec![9u8; 40];
+            let legacy_ref = Sha256::digest(Uuid::new_v4().as_bytes()).to_vec();
+            sqlx::query(
+                "INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)"
             )
-            .bind(&Sha256::digest(Uuid::new_v4().as_bytes()).to_vec())
-            .bind(&wrapper)
-            .bind(&wrapper_sha256)
-            .bind(&[3u8; 32])
-            .bind(&recip1_did)
-            .bind(recip1_dev.owner_device_id)
-            .bind(&recip1_dev.owner_key_id)
+            .bind(&legacy_ref)
+            .bind(&legacy_wrapper)
+            .bind(Sha256::digest(&legacy_wrapper).to_vec())
+            .bind(&[5u8; 32])
+            .bind(&mixed_did)
+            .bind(mixed.owner_device_id)
+            .bind(&mixed.owner_key_id)
             .bind(Utc::now() - Duration::seconds(1))
+            .bind(Utc::now() + Duration::days(10))
+            .bind(Utc::now())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+            let now = Utc::now();
+            let mixed_identity = make_identity(&actor, &mixed_did);
+            let mixed_lock = lock_attempt(&mut tx, mixed_identity.clone()).await;
+            let selected = select_devices(&mut tx, &mixed_lock, now).await.unwrap();
+            assert_eq!(
+                selected.len(),
+                1,
+                "the recovery-scoped package must not join the request selection"
+            );
+            assert_eq!(selected[0].key_package_ref, mixed.key_package_ref);
+            assert_eq!(selected[0].owner_device_id, mixed.owner_device_id);
+
+            // (3) The request pool is genuinely exhausted while the recovery pool
+            // remains intact: reserving the direct-request package must not fall
+            // back to the recovery package on the same device.
+            reserve_preparation(&mut tx, &mixed_lock, &selected, b"resp1", &[1; 32], now)
+                .await
+                .unwrap();
+            let reserved: String =
+                sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
+                    .bind(&mixed.key_package_ref)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(reserved, "reserved");
+
+            let mut second = make_identity(&actor, &mixed_did);
+            second.request_id = Uuid::new_v4();
+            let exhausted_lock = lock_attempt(&mut tx, second).await;
+            assert!(
+                matches!(
+                    select_devices(&mut tx, &exhausted_lock, now).await,
+                    Err(DirectRequestStoreError::RecipientKeysUnavailable)
+                ),
+                "an exhausted request pool must not fall back to recovery packages"
+            );
+            let legacy_still_available: String =
+                sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
+                    .bind(&legacy_ref)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                legacy_still_available, "available",
+                "the recovery package must be untouched by request-pool exhaustion"
+            );
+
+            // (4) A grant can never confer request authority on recovery material:
+            // the composite foreign key includes usage_scope, so binding a
+            // recovery-scoped package is rejected by the schema itself.
+            let mut sp = tx.begin().await.unwrap();
+            let misbound_scope_err = sqlx::query(
+                "INSERT INTO chat.direct_request_grants(grant_id,revision,owner_did,owner_device_id,owner_key_id,auth_generation,capability_revision,key_package_ref,purpose,protocol_version,profile,signed_grant,grant_digest,expires_at,revoked_at,created_at) VALUES($1,1,$2,$3,$4,1,1,$5,'direct-request-bootstrap','2','encryptedIntroduction1','test',$6,$7,NULL,$8)"
+            )
+            .bind(Uuid::new_v4())
+            .bind(&legacy_did)
+            .bind(legacy.owner_device_id)
+            .bind(&legacy.owner_key_id)
+            .bind(&legacy.key_package_ref)
+            .bind(vec![1u8; 32])
             .bind(Utc::now() + Duration::days(10))
             .bind(Utc::now())
             .execute(&mut *sp)
             .await
             .unwrap_err();
             sp.rollback().await.unwrap();
-            let err_msg = invalid_scope_err.to_string();
             assert!(
-                err_msg.contains("key_packages_usage_scope_check") || err_msg.contains("23514"),
-                "database schema must strictly reject v1 conversation scope: {err_msg}"
+                misbound_scope_err
+                    .to_string()
+                    .contains("direct_request_grants_key_package_ref_owner_did_owner_devi_fkey"),
+                "schema must refuse a grant bound to recovery-scoped material: {misbound_scope_err}"
             );
+
             tx.rollback().await.unwrap();
         }
 
@@ -540,460 +631,6 @@ mod repository {
                     "recovery package must remain available after direct-request exhaustion"
                 );
             }
-
-            tx.rollback().await.unwrap();
-        }
-
-        // ====================================================================
-        // Case C08: Policy races
-        // ====================================================================
-
-        #[tokio::test]
-        async fn c08_direct_and_list_block_policy_denial_emits_no_published_row() {
-            let pool = crate::common::direct_request_database::setup().await;
-            let mut tx = pool.begin().await.unwrap();
-            let actor_did = test_did("ceightactorblock");
-            let recipient_did = test_did("ceightrecipblock");
-
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
-            let _recip = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
-
-            let now = Utc::now();
-            let i = make_identity(&actor, &recipient_did);
-            let lock = lock_attempt(&mut tx, i.clone()).await;
-
-            // When policy rejects (direct block or list block in either direction),
-            // the operation terminates as Rejected with RequestPolicyDenied.
-            let rejected = finish_terminal(
-                &mut tx,
-                lock,
-                TerminalOutcome::Rejected,
-                b"RequestPolicyDenied",
-                None,
-                now,
-            )
-            .await
-            .unwrap();
-            assert_eq!(rejected, b"RequestPolicyDenied");
-
-            // Mandatory C08 assertion: assert NO unauthorized published row in any table!
-            let pub_attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id=$1 AND status='published'")
-                .bind(i.request_id)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(pub_attempts, 0, "no published attempt row under policy denial");
-
-            let pub_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.direct_request_publications WHERE request_id=$1")
-                .bind(i.request_id)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(pub_rows, 0, "no publication row under policy denial");
-
-            let convos: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.conversations WHERE direct_did_low=LEAST($1,$2) AND direct_did_high=GREATEST($1,$2)")
-                .bind(&actor_did)
-                .bind(&recipient_did)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(convos, 0, "no conversation row under policy denial");
-
-            tx.rollback().await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn c08_incoming_preference_change_emits_no_published_row() {
-            let pool = crate::common::direct_request_database::setup().await;
-            let mut tx = pool.begin().await.unwrap();
-            let actor_did = test_did("ceightactorpref");
-            let recipient_did = test_did("ceightrecippref");
-
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
-            let _recip = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
-
-            let now = Utc::now();
-            let i = make_identity(&actor, &recipient_did);
-            let lock = lock_attempt(&mut tx, i.clone()).await;
-
-            // Preference changed (e.g. to None or Following without follow)
-            let rejected = finish_terminal(
-                &mut tx,
-                lock,
-                TerminalOutcome::Rejected,
-                b"RequestPolicyDenied",
-                None,
-                now,
-            )
-            .await
-            .unwrap();
-            assert_eq!(rejected, b"RequestPolicyDenied");
-
-            // Mandatory C08 assertion: assert NO unauthorized published row
-            let pub_attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id=$1 AND status='published'")
-                .bind(i.request_id)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(pub_attempts, 0);
-
-            let pub_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.direct_request_publications WHERE request_id=$1")
-                .bind(i.request_id)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(pub_rows, 0);
-
-            let convos: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.conversations WHERE direct_did_low=LEAST($1,$2) AND direct_did_high=GREATEST($1,$2)")
-                .bind(&actor_did)
-                .bind(&recipient_did)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(convos, 0);
-
-            tx.rollback().await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn c08_included_device_revoke_race_with_barriers_prevents_publication() {
-            let pool = crate::common::direct_request_database::setup().await;
-            let mut tx = pool.begin().await.unwrap();
-            let actor_did = test_did("ceightactorrevoke");
-            let recipient_did = test_did("ceightreciprevoke");
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
-            let recip_device = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
-
-            let now = Utc::now();
-            let i = make_identity(&actor, &recipient_did);
-            let lock = lock_attempt(&mut tx, i.clone()).await;
-            let selected = select_devices(&mut tx, &lock, now).await.unwrap();
-            assert_eq!(selected.len(), 1);
-
-            // Step 1: Reservation succeeds
-            reserve_preparation(&mut tx, &lock, &selected, b"snapshot", &[9; 32], now)
-                .await
-                .unwrap();
-
-            // Step 2: Race barrier - included device key is revoked
-            sqlx::query("UPDATE chat.device_keys SET revoked_at=clock_timestamp() WHERE user_did=$1 AND device_id=$2")
-                .bind(&recipient_did)
-                .bind(recip_device.owner_device_id)
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-
-            // Step 3: Authority validation before publication MUST fail with IncludedAuthorityChanged
-            let lock_pub = lock_attempt(&mut tx, i.clone()).await;
-            let val_err = validate_selected_authority(&mut tx, &lock_pub, now).await.unwrap_err();
-            assert!(
-                matches!(val_err, DirectRequestStoreError::IncludedAuthorityChanged),
-                "revoking included device key must fail authority validation"
-            );
-
-            // Step 4: Publication is refused, attempt is terminated as Rejected
-            finish_terminal(&mut tx, lock_pub, TerminalOutcome::Rejected, b"rejected-revoked", None, now)
-                .await
-                .unwrap();
-
-            // Assert NO authorized published row
-            let pub_count: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id=$1 AND status='published'")
-                .bind(i.request_id)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(pub_count, 0, "no published attempt row allowed after device revocation");
-
-            let convo_count: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.conversations WHERE direct_did_low=LEAST($1,$2) AND direct_did_high=GREATEST($1,$2)")
-                .bind(&actor.owner_did)
-                .bind(&recipient_did)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(convo_count, 0, "no conversation row allowed after device revocation");
-
-            tx.rollback().await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn c08_grant_disable_race_with_barriers_prevents_publication() {
-            let pool = crate::common::direct_request_database::setup().await;
-            let mut tx = pool.begin().await.unwrap();
-            let actor_did = test_did("ceightactorgrant");
-            let recipient_did = test_did("ceightrecipgrant");
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
-            let recip_device = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
-
-            let now = Utc::now();
-            let i = make_identity(&actor, &recipient_did);
-            let lock = lock_attempt(&mut tx, i.clone()).await;
-            let selected = select_devices(&mut tx, &lock, now).await.unwrap();
-
-            // Reservation succeeds
-            reserve_preparation(&mut tx, &lock, &selected, b"snapshot", &[9; 32], now)
-                .await
-                .unwrap();
-
-            // Race barrier: Grant revoked
-            sqlx::query("UPDATE chat.direct_request_grants SET revoked_at=clock_timestamp() WHERE grant_id=$1")
-                .bind(recip_device.grant_id)
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-
-            // Publication validation MUST fail
-            let lock_pub = lock_attempt(&mut tx, i.clone()).await;
-            let err = validate_selected_authority(&mut tx, &lock_pub, now).await.unwrap_err();
-            assert!(matches!(err, DirectRequestStoreError::IncludedAuthorityChanged));
-
-            // Capability disable barrier also fails
-            sqlx::query("UPDATE chat.direct_request_capabilities SET enabled=FALSE WHERE owner_did=$1 AND owner_device_id=$2")
-                .bind(&recipient_did)
-                .bind(recip_device.owner_device_id)
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-
-            let err2 = validate_selected_authority(&mut tx, &lock_pub, now).await.unwrap_err();
-            assert!(matches!(err2, DirectRequestStoreError::IncludedAuthorityChanged));
-
-            finish_terminal(&mut tx, lock_pub, TerminalOutcome::Rejected, b"rejected-disabled-grant", None, now)
-                .await
-                .unwrap();
-
-            // Assert NO authorized published row
-            let pub_count: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id=$1 AND status='published'")
-                .bind(i.request_id)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(pub_count, 0);
-
-            tx.rollback().await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn c08_auth_generation_key_mismatch_race_prevents_publication() {
-            let pool = crate::common::direct_request_database::setup().await;
-            let mut tx = pool.begin().await.unwrap();
-            let actor_did = test_did("ceightactorauth");
-            let recipient_did = test_did("ceightrecipauth");
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
-            let recip_device = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
-
-            let now = Utc::now();
-            let i = make_identity(&actor, &recipient_did);
-            let lock = lock_attempt(&mut tx, i.clone()).await;
-            let selected = select_devices(&mut tx, &lock, now).await.unwrap();
-
-            // Reservation succeeds with auth_generation = 1
-            reserve_preparation(&mut tx, &lock, &selected, b"snapshot", &[9; 32], now)
-                .await
-                .unwrap();
-
-            // Race barrier: device rebind bumps auth_generation to 2 and updates dpop_jkt per trigger invariant
-            let new_jkt = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([99u8; 32]);
-            sqlx::query("UPDATE chat.devices SET auth_generation=2, dpop_jkt=$3, updated_at=clock_timestamp() WHERE user_did=$1 AND device_id=$2")
-                .bind(&recipient_did)
-                .bind(recip_device.owner_device_id)
-                .bind(&new_jkt)
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-
-            // Publication authority validation MUST fail
-            let lock_pub = lock_attempt(&mut tx, i.clone()).await;
-            let err = validate_selected_authority(&mut tx, &lock_pub, now).await.unwrap_err();
-            assert!(
-                matches!(err, DirectRequestStoreError::IncludedAuthorityChanged),
-                "auth generation bump must invalidate preparation snapshot"
-            );
-
-            finish_terminal(&mut tx, lock_pub, TerminalOutcome::Rejected, b"rejected-auth-gen-mismatch", None, now)
-                .await
-                .unwrap();
-
-            // Assert NO authorized published row
-            let pub_count: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id=$1 AND status='published'")
-                .bind(i.request_id)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(pub_count, 0);
-
-            tx.rollback().await.unwrap();
-        }
-
-        // ====================================================================
-        // Case C09: Device coverage
-        // ====================================================================
-
-        #[tokio::test]
-        async fn c09_all_deliverable_devices_at_snapshot_included() {
-            let pool = crate::common::direct_request_database::setup().await;
-            let mut tx = pool.begin().await.unwrap();
-            let actor_did = test_did("cnineactorcoverage");
-            let recipient_did = test_did("cninerecipcoverage");
-
-            // Actor has sending device + 1 sibling device
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
-            let actor_sibling = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
-
-            // Recipient has 3 active devices with valid direct-request packages & grants
-            let recip1 = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
-            let recip2 = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
-            let recip3 = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
-
-            let now = Utc::now();
-            let i = make_identity(&actor, &recipient_did);
-            let lock = lock_attempt(&mut tx, i.clone()).await;
-
-            let selected = select_devices(&mut tx, &lock, now).await.unwrap();
-
-            // ALL 4 deliverable devices (1 actor sibling + 3 recipient devices) MUST be included
-            assert_eq!(
-                selected.len(), 4,
-                "all deliverable devices at snapshot must be included"
-            );
-
-            assert!(selected.iter().any(|d| d.owner_device_id == actor_sibling.owner_device_id));
-            assert!(selected.iter().any(|d| d.owner_device_id == recip1.owner_device_id));
-            assert!(selected.iter().any(|d| d.owner_device_id == recip2.owner_device_id));
-            assert!(selected.iter().any(|d| d.owner_device_id == recip3.owner_device_id));
-
-            // The calling actor device itself is excluded from recipient secrets
-            assert!(!selected.iter().any(|d| d.owner_device_id == actor.owner_device_id));
-
-            tx.rollback().await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn c09_unrelated_enrollment_does_not_invalidate_snapshot() {
-            let pool = crate::common::direct_request_database::setup().await;
-            let mut tx = pool.begin().await.unwrap();
-            let actor_did = test_did("cnineactorenroll");
-            let recipient_did = test_did("cninerecipenroll");
-            let other_did = test_did("cnineotherenroll");
-
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
-            let _recip1 = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
-
-            let now = Utc::now();
-            let i = make_identity(&actor, &recipient_did);
-            let lock = lock_attempt(&mut tx, i.clone()).await;
-            let selected = select_devices(&mut tx, &lock, now).await.unwrap();
-            assert_eq!(selected.len(), 1);
-
-            // Reserve preparation snapshot
-            reserve_preparation(&mut tx, &lock, &selected, b"snapshot", &[9; 32], now)
-                .await
-                .unwrap();
-
-            // Unrelated enrollment: a 2nd device enrolls for the recipient
-            let _recip2 = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
-
-            // Also an unrelated 3rd party enrolls
-            let _other = seed_device(&mut tx, DeviceConfig::valid(&other_did, "direct-request")).await;
-
-            // Invariant: Unrelated enrollment does NOT invalidate the reserved snapshot!
-            let lock_check = lock_attempt(&mut tx, i.clone()).await;
-            assert!(
-                validate_selected_authority(&mut tx, &lock_check, now).await.is_ok(),
-                "unrelated enrollment must not invalidate active preparation snapshot"
-            );
-
-            tx.rollback().await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn c09_included_revocation_does_invalidate_snapshot() {
-            let pool = crate::common::direct_request_database::setup().await;
-            let mut tx = pool.begin().await.unwrap();
-            let actor_did = test_did("cnineactorrev");
-            let recipient_did = test_did("cninereciprev");
-
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
-            let recip1 = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
-
-            let now = Utc::now();
-            let i = make_identity(&actor, &recipient_did);
-            let lock = lock_attempt(&mut tx, i.clone()).await;
-            let selected = select_devices(&mut tx, &lock, now).await.unwrap();
-
-            reserve_preparation(&mut tx, &lock, &selected, b"snapshot", &[9; 32], now)
-                .await
-                .unwrap();
-
-            // Revoke the included device (with valid revocation_id and revoked_at)
-            let revocation_id = Uuid::new_v4();
-            sqlx::query("UPDATE chat.devices SET status='revoked', revoked_at=clock_timestamp(), revocation_id=$3, updated_at=clock_timestamp() WHERE user_did=$1 AND device_id=$2")
-                .bind(&recipient_did)
-                .bind(recip1.owner_device_id)
-                .bind(revocation_id)
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-
-            // Invariant: Included device revocation DOES invalidate the snapshot!
-            let lock_check = lock_attempt(&mut tx, i.clone()).await;
-            assert!(
-                matches!(
-                    validate_selected_authority(&mut tx, &lock_check, now).await,
-                    Err(DirectRequestStoreError::IncludedAuthorityChanged)
-                ),
-                "included device revocation must invalidate snapshot"
-            );
-
-            tx.rollback().await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn c09_no_eligible_recipient_keeps_draft_and_emits_no_invitation() {
-            let pool = crate::common::direct_request_database::setup().await;
-            let mut tx = pool.begin().await.unwrap();
-            let actor_did = test_did("cnineactordraft");
-            let recipient_did = test_did("cninerecipdraft");
-
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
-
-            // Recipient has only a revoked key device
-            let mut cfg = DeviceConfig::valid(&recipient_did, "direct-request");
-            cfg.key_revoked = true;
-            seed_device(&mut tx, cfg).await;
-
-            let now = Utc::now();
-            let i = make_identity(&actor, &recipient_did);
-            let lock = lock_attempt(&mut tx, i.clone()).await;
-
-            // Preparation device selection fails
-            let err = select_devices(&mut tx, &lock, now).await.unwrap_err();
-            assert!(
-                matches!(err, DirectRequestStoreError::RecipientKeysUnavailable),
-                "recipient with no eligible keys must return RecipientKeysUnavailable"
-            );
-
-            // Assert: NO invitation emitted, NO attempt prepared, NO conversation created
-            let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id=$1")
-                .bind(i.request_id)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(attempts, 0, "no attempt row created when keys unavailable");
-
-            let selected_count: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.direct_request_selected_devices WHERE request_id=$1")
-                .bind(i.request_id)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(selected_count, 0, "no selected devices created when keys unavailable");
-
-            let convos: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.conversations WHERE direct_did_low=LEAST($1,$2) AND direct_did_high=GREATEST($1,$2)")
-                .bind(&actor.owner_did)
-                .bind(&recipient_did)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-            assert_eq!(convos, 0, "no invitation or conversation created; draft retained");
 
             tx.rollback().await.unwrap();
         }
