@@ -1672,8 +1672,12 @@ pub(in crate::chat_protocol) async fn verify_inventory_fence(
     }
 
     // Temporal bounds: the fence was captured now or in the recent past, and
-    // never in the future or beyond the schema's session expiry horizon.
-    let now = Utc::now();
+    // never in the future or beyond the schema's session expiry horizon. Judged
+    // on the same database clock that stamped `captured_at`.
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| ReadAuthorityError::Storage)?;
     if row.captured_at > now + chrono::Duration::seconds(5)
         || now.signed_duration_since(row.captured_at) > chrono::Duration::minutes(15)
     {

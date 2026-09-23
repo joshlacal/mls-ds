@@ -4827,7 +4827,10 @@ async fn create_inventory_snapshot_attempt(
     // verification; the replay path consumes it in the serve verification.
     let mut existing = lock_inventory_session_row(transaction, inventory_session_id).await?;
     if let Some(existing_row) = &existing {
-        let now = chrono::Utc::now();
+        // Same database clock that stamps session created_at/served_at; a
+        // process wall clock here could reuse a session the database already
+        // considers expired.
+        let now = current_whole_second(transaction).await?;
         let current_max_event: Option<i64> = sqlx::query_scalar(
             "SELECT coalesce(max(event_position), 0)::bigint FROM chat.events WHERE protocol_instance_id = $1",
         )
