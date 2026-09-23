@@ -7,6 +7,8 @@ horizon are reachable only by moving the database clock. This launches a
 private cluster under libfaketime; production code and the shared guarded
 database are untouched.
 
+  lib                               (print the libfaketime every faked process
+                                     must preload; builds it on first use)
   start   --dir D --port P --db catbird_direct_requests_faketime_<suffix>
           [--clock-file F]          (share an existing FAKETIME_TIMESTAMP_FILE,
                                      e.g. the test runner's, so every faked
@@ -17,9 +19,16 @@ database are untouched.
 Schema = the shared guarded database's exact `_sqlx_migrations` ledger,
 replayed in order from `mls-ds/server/migrations`; each file's SHA-384 must
 equal the shared ledger checksum before it is applied.
+
+Why not the Homebrew libfaketime: with FAKETIME_NO_CACHE=1 every
+clock_gettime re-parses the timestamp file into process-global state without
+a lock, so in a multi-threaded process (the tokio test runner, the server
+fixture) concurrent readers see the un-offset real clock and backwards
+Instants (~5% of reads under a +29d offset). That made C22 fail ~1 in 10
+with sqlx PoolTimedOut or TokenExpired. The same pinned release built with
+PTHREAD_SINGLETHREADED_TIME serializes that path and shows no wrong reads.
 """
 import argparse
-import glob
 import hashlib
 import json
 import os
@@ -52,11 +61,38 @@ def psql(url, *args, env=None):
     return out.stdout
 
 
+LIBFAKETIME_VERSION = "0.9.13"
+LIBFAKETIME_SHA256 = "8e56deeb805682b025107e095f1d94a6ea677472f05824cd475f5c5e6e1a5ddf"
+LIBFAKETIME_CACHE = (Path.home() / ".cache" / "catbird-e2e"
+                     / f"libfaketime-{LIBFAKETIME_VERSION}-serialized")
+
+
 def faketime_lib():
-    libs = sorted(glob.glob("/opt/homebrew/opt/libfaketime/lib/faketime/libfaketime.1.dylib"))
-    if not libs:
-        sys.exit("libfaketime missing: brew install libfaketime")
-    return libs[0]
+    """Pinned libfaketime with the clock path serialized across threads."""
+    lib = LIBFAKETIME_CACHE / "libfaketime.1.dylib"
+    if lib.is_file():
+        return str(lib)
+    build = Path(subprocess.run(["mktemp", "-d"], capture_output=True, text=True,
+                                check=True).stdout.strip())
+    try:
+        tarball = build / "libfaketime.tar.gz"
+        subprocess.run(["curl", "-sSfL", "-o", str(tarball),
+                        "https://github.com/wolfcw/libfaketime/archive/refs/tags/"
+                        f"v{LIBFAKETIME_VERSION}.tar.gz"], check=True)
+        if hashlib.sha256(tarball.read_bytes()).hexdigest() != LIBFAKETIME_SHA256:
+            sys.exit("libfaketime source tarball digest mismatch")
+        subprocess.run(["tar", "xzf", str(tarball), "-C", str(build)], check=True)
+        src = build / f"libfaketime-{LIBFAKETIME_VERSION}" / "src"
+        subprocess.run(["make", "-f", "Makefile.OSX",
+                        "FAKETIME_COMPILE_CFLAGS=-DPTHREAD_SINGLETHREADED_TIME",
+                        "libfaketime.1.dylib"], cwd=src, check=True, capture_output=True)
+        LIBFAKETIME_CACHE.mkdir(parents=True, exist_ok=True)
+        staged = LIBFAKETIME_CACHE / f".libfaketime.{os.getpid()}"
+        subprocess.run(["cp", str(src / "libfaketime.1.dylib"), str(staged)], check=True)
+        os.replace(staged, lib)
+    finally:
+        subprocess.run(["rm", "-rf", str(build)], check=False)
+    return str(lib)
 
 
 def start(a):
@@ -175,7 +211,11 @@ def main():
     sub.add_parser("advance").add_argument("--dir", required=True)
     sub.choices["advance"].add_argument("--offset", required=True)
     sub.add_parser("stop").add_argument("--dir", required=True)
+    sub.add_parser("lib")
     a = p.parse_args()
+    if a.cmd == "lib":
+        print(faketime_lib())
+        return
     {"start": start, "advance": advance, "stop": stop}[a.cmd](a)
 
 

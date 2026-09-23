@@ -11,9 +11,14 @@
 //! Run (built with `--no-run`, then the test binary directly, because
 //! `cargo` is not faked):
 //!   printf '+0\n' > $CLOCK
-//!   DYLD_INSERT_LIBRARIES=/opt/homebrew/opt/libfaketime/lib/faketime/libfaketime.1.dylib \
+//!   DYLD_INSERT_LIBRARIES=$(python3 e2e-tests/support/faketime_postgres.py lib) \
 //!   DYLD_FORCE_FLAT_NAMESPACE=1 FAKETIME_TIMESTAMP_FILE=$CLOCK FAKETIME_NO_CACHE=1 \
 //!   FAKETIME_DONT_FAKE_MONOTONIC=1 <test-binary> --nocapture --test-threads=1
+//!
+//! The preloaded library must be the launcher's thread-serialized build: the
+//! stock libfaketime re-parses the clock file into unlocked globals on every
+//! read, so this multi-threaded process and the server fixture intermittently
+//! read the real clock after the advance (see `faketime_postgres.py`).
 //!
 //! The client projection is read through the public facade
 //! `MLSOrchestrator::refresh_request_preview` (see `support/live_orchestrator.rs`;
@@ -74,6 +79,13 @@ fn launcher() -> PathBuf {
 
 impl FaketimeCluster {
     fn start(clock_file: &str) -> anyhow::Result<Self> {
+        let lib = Command::new("python3").arg(launcher()).arg("lib").output()?;
+        anyhow::ensure!(lib.status.success(), "serialized libfaketime unavailable");
+        let lib = String::from_utf8(lib.stdout)?.trim().to_owned();
+        anyhow::ensure!(
+            std::env::var("DYLD_INSERT_LIBRARIES").as_deref() == Ok(lib.as_str()),
+            "C22 must preload the serialized libfaketime {lib}; the stock build races across threads"
+        );
         let run = &Uuid::new_v4().simple().to_string()[..12];
         let dir = std::env::temp_dir().join(format!("c22-faketime-{run}"));
         let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
