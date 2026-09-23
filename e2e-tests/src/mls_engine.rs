@@ -97,6 +97,12 @@ impl MlsEngine {
         })
     }
 
+    /// The device's live native context, for driving a real orchestrator over
+    /// this exact store.
+    pub fn context(&self) -> Arc<MLSContext> {
+        self.ctx.clone()
+    }
+
     /// Flush and drop the actual native context while retaining its exact store.
     pub fn close_for_offline(mut self) -> Result<ClosedMlsEngine> {
         self.ctx

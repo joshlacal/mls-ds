@@ -31,6 +31,12 @@ multibase = "0.9"
 axum = { version = "0.8", optional = true }
 url = { version = "2", optional = true }
 
+# Only for tests that include catbird-mls/tests/mock_{storage,credentials}.rs
+# (app-metadata storage beside a real orchestrator); pinned exactly as catbird-mls.
+[dev-dependencies]
+openmls_traits = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
+openmls_basic_credential = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["draft-ietf-mls-pq-ciphersuites"] }
+
 [[example]]
 name = "client_runtime_gateway"
 required-features = ["local-runtime-fixture"]

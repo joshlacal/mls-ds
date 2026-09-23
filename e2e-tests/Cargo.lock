@@ -2787,6 +2787,8 @@ dependencies = [
  "hex",
  "jsonwebtoken",
  "multibase",
+ "openmls_basic_credential",
+ "openmls_traits",
  "p256",
  "rand 0.8.5",
  "reqwest",

@@ -859,7 +859,9 @@ impl HttpsDidFixture {
                     "rsa:2048",
                     "-nodes",
                     "-days",
-                    "1",
+                    // Covers faketime runs that advance every clock past the
+                    // seven-day request import horizon.
+                    "90",
                     "-subj",
                     "/CN=Catbird Request Fixture CA",
                     "-addext",
@@ -895,7 +897,9 @@ impl HttpsDidFixture {
                     "x509",
                     "-req",
                     "-days",
-                    "1",
+                    // Covers faketime runs that advance every clock past the
+                    // seven-day request import horizon.
+                    "90",
                     "-sha256",
                     "-CAcreateserial",
                     "-in",
