@@ -13,6 +13,7 @@ use crate::{
     chat_protocol::{
         error::{ChatEndpoint, ChatProtocolErrorCode},
         repository::{
+            core::LockedG6PreludeError,
             prelude,
             revocation::{self, DeviceRevocationFacadeError, DeviceRevocationTransactionOutcome},
         },
@@ -92,6 +93,12 @@ fn revocation_failure(error: DeviceRevocationFacadeError) -> ChatFailure {
         E::TargetRevoked => ChatFailure::protocol(ENDPOINT, C::DeviceRevoked),
         E::AuthenticationGenerationConflict => {
             ChatFailure::protocol(ENDPOINT, C::AuthenticationGenerationConflict)
+        }
+        // No declared revokeDevice code describes a transient scope race; the
+        // facade already retried, so exhaustion stays an invariant but is named.
+        E::G6Prelude(LockedG6PreludeError::DiscoveryDrift) => {
+            tracing::warn!("revokeDevice G6 scope kept drifting; retry attempts exhausted");
+            ChatFailure::invariant(ENDPOINT)
         }
         E::G6Prelude(_)
         | E::Conversation(_)

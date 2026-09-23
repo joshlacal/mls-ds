@@ -2176,6 +2176,36 @@ impl PreparedBusinessPrelude {
         &self.authority
     }
 
+    /// Recover the operation reservation for another identity-scope attempt.
+    /// The caller MUST already have rolled back to a savepoint taken before
+    /// `prepare_identity_scope_prelude`, discarding this prelude's identity
+    /// locks and its uncommitted claim row (a skipped rollback fails the next
+    /// claim as a duplicate). The operation advisory lock predates that
+    /// savepoint and is still held; re-entering it re-proves the reservation
+    /// for this same transaction without re-admitting the request.
+    pub(crate) async fn into_rewound_reservation(
+        self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<OperationReservationGuard, PreludeError> {
+        let OperationClaimGuard {
+            transaction_id,
+            binding,
+        } = self.operation;
+        let operation_lock = auth::reserve_canonical_operation_id(
+            transaction,
+            binding.operation_id,
+            Some(binding.operation_id),
+        )
+        .await?;
+        if operation_lock.transaction_id() != transaction_id {
+            return Err(PreludeError::ForeignTransaction);
+        }
+        Ok(OperationReservationGuard {
+            operation_lock,
+            binding,
+        })
+    }
+
     /// Consume and return the prelude only when its private operation claim is
     /// the exact Recovery operation represented by `mutation`.
     pub(crate) fn verify_recovery_operation(

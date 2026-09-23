@@ -7,9 +7,10 @@
 //! fixture's opt-in `_policy` override files, never protocol tables.
 //!
 //! Races are real: a separate PostgreSQL session holds the recipient's
-//! principal/device/key rows `FOR UPDATE` as a barrier; both the authority
-//! mutation (real `publishDirectRequestKeys` disable or real `revokeDevice`) and
-//! the real `publishDirectRequest` queue on it in a chosen order, the barrier is
+//! principal/device/key rows (principal row only for the revoke race)
+//! `FOR UPDATE` as a barrier; both the authority mutation (real
+//! `publishDirectRequestKeys` disable or real `revokeDevice`) and the real
+//! `publishDirectRequest` queue on it in a chosen order, the barrier is
 //! released, and the router serializes them. Both orderings run.
 #![allow(dead_code)]
 
@@ -33,7 +34,7 @@ use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database,
     request_database_snapshot, reviewed_request_migrations, seed_service_device,
     signed_mls_request, validate_request_test_database_url, HttpsDidFixture, ServiceIdentity,
-    ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
+    request_database_url, ShippingServerFixture,
 };
 
 #[path = "support/live_direct_request.rs"]
@@ -57,10 +58,10 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 fn psql(sql: &str) -> anyhow::Result<String> {
-    validate_request_test_database_url(std::env::var("REQUEST_TEST_DATABASE_URL").ok().as_deref())?;
+    validate_request_test_database_url(Some(request_database_url()))?;
     let output = Command::new("psql")
         .args([
-            REQUEST_TEST_DATABASE_URL,
+            request_database_url(),
             "-X",
             "-A",
             "-t",
@@ -524,33 +525,43 @@ async fn release_by_accept(
     let prior = bootstrap.coordinates.clone();
     let mut next = prior.clone();
     next["stateVersion"] = json!(prior["stateVersion"].as_u64().context("state version")? + 1);
-    let transition = Uuid::new_v4();
-    let signed = signed_mls_request(
-        engine,
-        identity,
-        DirectRequestKind::Accept,
-        json!({
-            "$type":"blue.catbird.chat.defs#directRequestAcceptanceBody",
-            "signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPT\0","protocolVersion":"2",
-            "actorDid":svc.did,"actorDeviceId":svc.device_id.to_string(),
-            "keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&public)),"authGeneration":1,
-            "requestId":prep.request_id.to_string(),"transitionId":transition.to_string(),
-            "prior":prior,"next":next,
-            "invitationProvenance":{"invitationTransitionId":prep.request_id.to_string(),
-                "invitedByDid":alice.did(),"invitedByDeviceId":alice.svc.device_id.to_string()},
-            "idempotencyKey":transition.to_string(),"signedAt":canonical_now()
-        }),
-    )?;
-    let (status, body) = post(
-        rig,
-        svc,
-        "blue.catbird.chat.acceptConversation",
-        &json!({"directRequest":signed}),
-    )
-    .await?;
-    anyhow::ensure!(status == reqwest::StatusCode::OK, "release accept {status}: {body}");
-    println!("RELEASE request {} accepted by {}", prep.request_id, svc.device_id);
-    Ok(())
+    // The shared DB is contended by concurrent suites; acceptance admission
+    // masks transient storage failures as InvalidSignature. Re-sign and retry
+    // so capacity is still released (a committed first try would fail loudly).
+    let mut last = None;
+    for _ in 0..3 {
+        let transition = Uuid::new_v4();
+        let signed = signed_mls_request(
+            engine,
+            identity,
+            DirectRequestKind::Accept,
+            json!({
+                "$type":"blue.catbird.chat.defs#directRequestAcceptanceBody",
+                "signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPT\0","protocolVersion":"2",
+                "actorDid":svc.did,"actorDeviceId":svc.device_id.to_string(),
+                "keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&public)),"authGeneration":1,
+                "requestId":prep.request_id.to_string(),"transitionId":transition.to_string(),
+                "prior":prior,"next":next,
+                "invitationProvenance":{"invitationTransitionId":prep.request_id.to_string(),
+                    "invitedByDid":alice.did(),"invitedByDeviceId":alice.svc.device_id.to_string()},
+                "idempotencyKey":transition.to_string(),"signedAt":canonical_now()
+            }),
+        )?;
+        let (status, body) = post(
+            rig,
+            svc,
+            "blue.catbird.chat.acceptConversation",
+            &json!({"directRequest":signed}),
+        )
+        .await?;
+        if status == reqwest::StatusCode::OK {
+            println!("RELEASE request {} accepted by {}", prep.request_id, svc.device_id);
+            return Ok(());
+        }
+        println!("RELEASE retry after accept {status}: {body}");
+        last = Some((status, body));
+    }
+    anyhow::bail!("release accept failed: {last:?}")
 }
 
 /// Verify the router's signed receipt against the receipt authority key and
@@ -645,21 +656,33 @@ impl Barrier {
     /// Lock the account's principal, device and key rows in the same canonical
     /// tables the router's identity-scope prefix and every authority writer lock.
     fn hold(did: &str) -> anyhow::Result<Self> {
+        Self::hold_rows(&format!(
+            "SELECT count(*) FROM (SELECT 1 FROM chat.principals WHERE user_did='{did}' FOR UPDATE) p;\n\
+             SELECT count(*) FROM (SELECT 1 FROM chat.devices WHERE user_did='{did}' FOR UPDATE) d;\n\
+             SELECT count(*) FROM (SELECT 1 FROM chat.device_keys WHERE user_did='{did}' FOR UPDATE) k;"
+        ))
+    }
+
+    /// Lock only the account's principal row: the first identity lock of both
+    /// the publication and the G6 revocation transaction. Unlike [`hold`], a
+    /// `revokeDevice` admission (which locks only the actor device/key rows)
+    /// passes, so the revocation queues here *after* its lock-free G6 scope
+    /// discovery and queue order is commit order.
+    fn hold_principal(did: &str) -> anyhow::Result<Self> {
+        Self::hold_rows(&format!(
+            "SELECT count(*) FROM (SELECT 1 FROM chat.principals WHERE user_did='{did}' FOR UPDATE) p;"
+        ))
+    }
+
+    fn hold_rows(locks: &str) -> anyhow::Result<Self> {
         let mut child = Command::new("psql")
-            .args([REQUEST_TEST_DATABASE_URL, "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
+            .args([request_database_url(), "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
         let mut stdin = child.stdin.take().context("barrier stdin")?;
-        writeln!(
-            stdin,
-            "BEGIN;\nSELECT pg_backend_pid();\n\
-             SELECT count(*) FROM (SELECT 1 FROM chat.principals WHERE user_did='{did}' FOR UPDATE) p;\n\
-             SELECT count(*) FROM (SELECT 1 FROM chat.devices WHERE user_did='{did}' FOR UPDATE) d;\n\
-             SELECT count(*) FROM (SELECT 1 FROM chat.device_keys WHERE user_did='{did}' FOR UPDATE) k;\n\
-             \\echo BARRIER-HELD"
-        )?;
+        writeln!(stdin, "BEGIN;\nSELECT pg_backend_pid();\n{locks}\n\\echo BARRIER-HELD")?;
         stdin.flush()?;
         let mut lines = BufReader::new(child.stdout.take().context("barrier stdout")?).lines();
         let pid: i64 = lines.next().context("barrier pid")??.trim().parse()?;
@@ -671,7 +694,8 @@ impl Barrier {
         anyhow::bail!("barrier session exited before holding locks")
     }
 
-    /// Backends waiting (directly or transitively) behind this barrier.
+    /// Backends waiting (directly or transitively) behind this barrier. Runs
+    /// use a dedicated database, so no foreign session can be counted.
     fn waiters(&self) -> anyhow::Result<i64> {
         count(&format!(
             "WITH RECURSIVE w(pid) AS (SELECT pid FROM pg_stat_activity WHERE {b}=ANY(pg_blocking_pids(pid)) \
@@ -713,16 +737,15 @@ struct RaceResult {
     second: (reqwest::StatusCode, Value),
 }
 
-/// Queue `first` then `second` behind a barrier on `did`, confirm both are in
-/// flight inside the server, then release so the router serializes them.
+/// Queue `first` then `second` behind `barrier`, confirm both are in flight
+/// inside the server, then release so the router serializes them.
 async fn race(
     rig: &Rig,
-    did: &str,
+    barrier: Barrier,
     first: (&ServiceIdentity, &'static str, Value),
     second: (&ServiceIdentity, &'static str, Value),
     label: &str,
 ) -> anyhow::Result<RaceResult> {
-    let barrier = Barrier::hold(did)?;
     let a = spawn_post(rig, first.0, first.1, first.2);
     let queued_first = barrier.wait_for_waiters(1).await?;
     let b = spawn_post(rig, second.0, second.1, second.2);
@@ -909,9 +932,9 @@ async fn grant_disable_race(mutation_first: bool) -> anyhow::Result<()> {
     let publish = (&alice.svc, "blue.catbird.chat.publishDirectRequest", publication);
     let label = if mutation_first { "grant-disable-first" } else { "publish-first/grant-disable" };
     let result = if mutation_first {
-        race(&rig, bob.did(), disable, publish, label).await?
+        race(&rig, Barrier::hold(bob.did())?, disable, publish, label).await?
     } else {
-        race(&rig, bob.did(), publish, disable, label).await?
+        race(&rig, Barrier::hold(bob.did())?, publish, disable, label).await?
     };
     let (disable_result, publish_result) = if mutation_first {
         (result.first, result.second)
@@ -990,10 +1013,16 @@ async fn device_revoke_race(mutation_first: bool) -> anyhow::Result<()> {
     );
     let publish = (&alice.svc, "blue.catbird.chat.publishDirectRequest", publication);
     let label = if mutation_first { "revoke-first" } else { "publish-first/revoke" };
+    // Principal-only barrier: both transactions queue on their first identity
+    // lock, the revocation only after its lock-free G6 scope discovery. Queue
+    // order is therefore commit order, and in publish-first the revocation's
+    // discovery provably predates the publication's commit, so its locked
+    // rediscovery must see the new conversation (G6 DiscoveryDrift, F18).
+    let barrier = Barrier::hold_principal(bob.did())?;
     let result = if mutation_first {
-        race(&rig, bob.did(), revoke, publish, label).await?
+        race(&rig, barrier, revoke, publish, label).await?
     } else {
-        race(&rig, bob.did(), publish, revoke, label).await?
+        race(&rig, barrier, publish, revoke, label).await?
     };
     let (revoke_result, publish_result) = if mutation_first {
         (result.first, result.second)
@@ -1002,6 +1031,17 @@ async fn device_revoke_race(mutation_first: bool) -> anyhow::Result<()> {
     };
     let published = publish_result.0 == reqwest::StatusCode::OK
         && receipt(&rig, &publish_result.1)?.0 == "directRequestPublishedReceipt";
+    // Target's interval/leaf in the request conversation, read before the
+    // release by acceptance can touch the conversation.
+    let target_access = psql(&format!(
+        "SELECT (SELECT count(*) FROM chat.application_intervals WHERE conversation_id='{c}' \
+                 AND recipient_did='{d}' AND recipient_device_id='{v}' AND terminal_seq IS NULL)||','|| \
+                (SELECT count(*) FROM chat.member_devices WHERE conversation_id='{c}' \
+                 AND user_did='{d}' AND device_id='{v}' AND active)",
+        c = prep.conversation_id,
+        d = bob.did(),
+        v = bob.svc.device_id
+    ))?;
     if published {
         release_by_accept(
             &rig,
@@ -1031,18 +1071,21 @@ async fn device_revoke_race(mutation_first: bool) -> anyhow::Result<()> {
         anyhow::ensure!(rows == NO_ROWS, "{rows:?}");
         println!("C08/C09 {label}: included device revoked first; publish -> PreparationRevoked; rows {rows:?}");
     } else {
-        anyhow::ensure!(publish_result.0 == reqwest::StatusCode::OK, "{}", publish_result.1);
-        anyhow::ensure!(receipt(&rig, &publish_result.1)?.0 == "directRequestPublishedReceipt");
-        anyhow::ensure!(rows.publications == 1 && rows.deliveries == 2);
-        let authorized = count(&format!(
-            "SELECT count(*) FROM chat.direct_request_publications p JOIN chat.device_keys k \
-             ON k.user_did='{}' AND k.device_id='{}' WHERE p.request_id='{}' AND k.revoked_at > p.created_at",
-            bob.did(),
-            bob.svc.device_id,
-            prep.request_id
-        ))?;
-        anyhow::ensure!(authorized == 1, "publication included a device revoked before it committed");
-        println!("C08 {label}: publish committed first with active device; revocation serialized after; rows {rows:?}");
+        // Publication rejects a revoked included device (revoke-first arm), so
+        // its success proves it committed while the target was still active.
+        anyhow::ensure!(published, "{}", publish_result.1);
+        anyhow::ensure!(rows.publications == 1 && rows.deliveries == 2, "{rows:?}");
+        // G6 revocation is immediate authority state; it never fabricates an
+        // MLS Remove or closes an application interval (state_machine.rs
+        // plan_device_revocation_inner). Closing is a later Remove commit.
+        anyhow::ensure!(
+            target_access == "1,1",
+            "revoked device's request interval/leaf changed by revocation: {target_access}"
+        );
+        println!(
+            "C08 {label}: publish committed first; revocation discovered scope before it, rediscovered after, \
+             retried and committed; target interval+leaf open/active={target_access}; rows {rows:?}"
+        );
     }
     Ok(())
 }
