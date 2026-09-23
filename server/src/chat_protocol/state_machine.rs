@@ -3915,8 +3915,12 @@ impl HydrationAuthority {
             conversations.push(plan.into_revocation_batch_member_plan()?);
         }
 
+        // Conversation-bound Reserved packages must be attached to exactly one
+        // locked conversation plan; conversation-less ones (request-scope held
+        // or retired packages) are revoked by the device-global batch prefix.
         if revoked_packages.iter().any(|binding| {
             binding.expected_status == PackageStatus::Reserved
+                && binding.conversation_id.is_some()
                 && !attached_reserved_package_refs.contains(&binding.key_package_ref)
         }) {
             return Err(StateMachineError::InvalidHydrationAuthority);

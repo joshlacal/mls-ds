@@ -1069,7 +1069,10 @@ async fn device_revoke_race(mutation_first: bool) -> anyhow::Result<()> {
     if mutation_first {
         expect_rejected(&rig, publish_result.0, &publish_result.1, "PreparationRevoked")?;
         anyhow::ensure!(rows == NO_ROWS, "{rows:?}");
-        println!("C08/C09 {label}: included device revoked first; publish -> PreparationRevoked; rows {rows:?}");
+        // The preparation-held (Reserved, no recovery reservation) request
+        // package is retired by the revocation itself (F25).
+        let packages = request_packages_revoked(bob.did(), bob.svc.device_id)?;
+        println!("C08/C09 {label}: included device revoked first; publish -> PreparationRevoked; rows {rows:?}; request packages total,revoked-by-revocation={packages}");
     } else {
         // Publication rejects a revoked included device (revoke-first arm), so
         // its success proves it committed while the target was still active.
@@ -1098,6 +1101,60 @@ async fn c08_live_included_device_revoke_race_revoke_first() -> anyhow::Result<(
 #[tokio::test(flavor = "multi_thread")]
 async fn c08_live_included_device_revoke_race_publish_first() -> anyhow::Result<()> {
     device_revoke_race(false).await
+}
+
+/// `total,revoked-by-this-revocation` for the device's request-scope packages;
+/// fails unless every one is Revoked bound to the device's revocation row.
+fn request_packages_revoked(did: &str, device: Uuid) -> anyhow::Result<String> {
+    let packages = psql(&format!(
+        "SELECT count(*)||','||count(*) FILTER (WHERE p.status='revoked' AND p.terminal_revocation_id=r.revocation_id \
+                AND p.terminal_at=r.accepted_at) \
+           FROM chat.key_packages p JOIN chat.device_revocations r \
+             ON r.target_did=p.owner_did AND r.target_device_id=p.owner_device_id \
+          WHERE p.owner_did='{did}' AND p.owner_device_id='{device}' AND p.usage_scope='direct-request'"
+    ))?;
+    let (total, revoked) = packages.split_once(',').context("package projection")?;
+    anyhow::ensure!(total != "0" && total == revoked, "request packages not all revoked: {packages}");
+    Ok(packages)
+}
+
+/// F25 wider case: a device that disabled its request keys (packages retired
+/// to Reserved without any preparation) can still be revoked, and the
+/// revocation retires those packages.
+#[tokio::test(flavor = "multi_thread")]
+async fn c08_live_revoke_device_with_retired_request_packages() -> anyhow::Result<()> {
+    let run = Uuid::new_v4().simple().to_string();
+    let bob_id = identity("c08-rv-retired", &run);
+    let rig = rig(&[&bob_id]).await?;
+    let bob = Account::new(bob_id, "c08-rv-retired")?;
+    publish_keys(&rig, &bob).await?;
+    let sibling = siblings::enroll(&bob.svc, &rig.client, &rig.server.base_url).await?;
+    let (status, body) = post(
+        &rig,
+        &bob.svc,
+        "blue.catbird.chat.publishDirectRequestKeys",
+        &keys_envelope(&bob, 2, false)?,
+    )
+    .await?;
+    anyhow::ensure!(status == reqwest::StatusCode::OK && body["enabled"] == false, "disable {status}: {body}");
+    let retired = count(&format!(
+        "SELECT count(*) FROM chat.key_packages WHERE owner_did='{}' AND owner_device_id='{}' \
+         AND usage_scope='direct-request' AND status='reserved'",
+        bob.did(),
+        bob.svc.device_id
+    ))?;
+    anyhow::ensure!(retired > 0, "disable left no retired request packages");
+    let (status, body) = post(
+        &rig,
+        &sibling.service,
+        "blue.catbird.chat.revokeDevice",
+        &revoke_envelope(&sibling, bob.svc.device_id)?,
+    )
+    .await?;
+    anyhow::ensure!(status == reqwest::StatusCode::OK, "revokeDevice {status}: {body}");
+    let packages = request_packages_revoked(bob.did(), bob.svc.device_id)?;
+    println!("C08 retired-packages revoke: {retired} retired request packages; revoke 200; total,revoked-by-revocation={packages}");
+    Ok(())
 }
 
 // ===========================================================================

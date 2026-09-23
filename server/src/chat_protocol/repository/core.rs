@@ -865,7 +865,8 @@ impl LockedRevocationConversationManifest {
 
 /// Exact live KeyPackage row locked target-first for a global revocation.
 /// Available rows have no reservation provenance; Reserved rows bind the
-/// owning conversation/request. Both become terminal Revoked with immutable
+/// owning conversation/request, except request-scope held/retired packages,
+/// which bind neither. All become terminal Revoked with immutable
 /// revocation provenance in the batch persistence plan.
 #[derive(Debug)]
 pub(crate) struct LockedRevocationPackageGuard {
@@ -905,10 +906,15 @@ impl LockedRevocationPackageGuard {
             LockedRecoveryPackageStatus::Available => {
                 conversation_id.is_none() && request_id.is_none()
             }
-            LockedRecoveryPackageStatus::Reserved => {
-                conversation_id.is_some_and(uuid_is_canonical_v4)
-                    && request_id.is_some_and(uuid_is_canonical_v4)
-            }
+            // Recovery reservations bind conversation+request; request-scope
+            // held packages bind neither (hydration checks their scope).
+            LockedRecoveryPackageStatus::Reserved => match (conversation_id, request_id) {
+                (Some(conversation_id), Some(request_id)) => {
+                    uuid_is_canonical_v4(conversation_id) && uuid_is_canonical_v4(request_id)
+                }
+                (None, None) => true,
+                _ => false,
+            },
             _ => false,
         };
         if !canonical_transaction_id(&transaction_id)
@@ -1158,6 +1164,7 @@ impl LockedRevocationFanoutGuard {
                         (package.status, package.conversation_id, package.request_id),
                         (LockedRecoveryPackageStatus::Available, None, None)
                             | (LockedRecoveryPackageStatus::Reserved, Some(_), Some(_))
+                            | (LockedRecoveryPackageStatus::Reserved, None, None)
                     )
             })
             || conversations
@@ -2339,6 +2346,7 @@ struct RevocationPackageRow {
     owner_auth_generation: i64,
     not_after: DateTime<Utc>,
     status: String,
+    usage_scope: String,
     conversation_id: Option<Uuid>,
     request_id: Option<Uuid>,
 }
@@ -2361,6 +2369,7 @@ async fn hydrate_locked_revocation_packages(
                kp.owner_auth_generation,
                kp.not_after,
                kp.status,
+               kp.usage_scope,
                r.conversation_id,
                r.recovery_request_id AS request_id
           FROM chat.key_packages kp
@@ -2393,13 +2402,18 @@ async fn hydrate_locked_revocation_packages(
             .wrapper_sha256
             .try_into()
             .map_err(|_| RevocationScopeHydrationError::OutOfDomain)?;
-        let status = match row.status.as_str() {
-            "available" if row.conversation_id.is_none() && row.request_id.is_none() => {
-                LockedRecoveryPackageStatus::Available
-            }
-            "reserved" if row.conversation_id.is_some() && row.request_id.is_some() => {
-                LockedRecoveryPackageStatus::Reserved
-            }
+        let status = match (
+            row.status.as_str(),
+            row.usage_scope.as_str(),
+            row.conversation_id,
+            row.request_id,
+        ) {
+            ("available", _, None, None) => LockedRecoveryPackageStatus::Available,
+            ("reserved", _, Some(_), Some(_)) => LockedRecoveryPackageStatus::Reserved,
+            // Request-scope packages held by a direct-request preparation or
+            // retired by a keys disable/unusable sweep have no recovery
+            // reservation; revocation still retires them (Reserved -> Revoked).
+            ("reserved", "direct-request", None, None) => LockedRecoveryPackageStatus::Reserved,
             _ => return Err(RevocationScopeHydrationError::FanoutMismatch),
         };
         let digest = revocation_package_guard_digest(
