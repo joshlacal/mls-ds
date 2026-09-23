@@ -54,8 +54,73 @@ fn normalize_lexicon_dirs(
     if normalized > 0 {
         println!("  Normalized {normalized} raw-byte XRPC body schema(s) for Jacquard");
     }
+    let inlined = inline_bytes_alias_refs(tempdir.path())?;
+    if inlined > 0 {
+        println!("  Inlined {inlined} ref(s) to top-level bytes definitions for Jacquard");
+    }
 
     Ok(tempdir)
+}
+
+/// Jacquard attaches its DAG-JSON `{"$bytes":…}` serde helper only to
+/// properties whose own schema is `bytes`; a ref to a top-level `bytes` def
+/// becomes a bare `bytes::Bytes` alias field that neither accepts nor emits
+/// the lexicon JSON byte form. Inline each such ref (keeping the referring
+/// description) so every byte field gets the helper; the alias type itself is
+/// still generated and names the identical Rust type.
+fn inline_bytes_alias_refs(lexicon_dir: &Path) -> Result<usize, Box<dyn std::error::Error>> {
+    let documents = load_preflight_documents(lexicon_dir)?;
+    let aliases: BTreeMap<String, Value> = documents
+        .values()
+        .flat_map(|document| {
+            document.defs.iter().filter_map(|(name, schema)| {
+                (schema.get("type").and_then(Value::as_str) == Some("bytes"))
+                    .then(|| (format!("{}#{name}", document.id), schema.clone()))
+            })
+        })
+        .collect();
+    let mut inlined = 0usize;
+    for document in documents.values() {
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&document.source_path)?)?;
+        let count = inline_bytes_refs(&mut value["defs"], &document.id, &aliases)?;
+        if count > 0 {
+            fs::write(&document.source_path, serde_json::to_string_pretty(&value)?)?;
+            inlined += count;
+        }
+    }
+    Ok(inlined)
+}
+
+fn inline_bytes_refs(
+    value: &mut Value,
+    nsid: &str,
+    aliases: &BTreeMap<String, Value>,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    match value {
+        Value::Object(map) if map.get("type").and_then(Value::as_str) == Some("ref") => {
+            let reference = map.get("ref").and_then(Value::as_str).unwrap_or_default();
+            let target = canonicalize_ref(nsid, reference)
+                .map_err(|error| invalid_union_contract(format!("{nsid} ref {reference}: {error}")))?;
+            let Some(schema) = aliases.get(&target) else {
+                return Ok(0);
+            };
+            let mut inlined = schema.clone();
+            if let Some(description) = map.get("description") {
+                inlined["description"] = description.clone();
+            }
+            *value = inlined;
+            Ok(1)
+        }
+        Value::Object(map) => map
+            .values_mut()
+            .map(|child| inline_bytes_refs(child, nsid, aliases))
+            .sum(),
+        Value::Array(items) => items
+            .iter_mut()
+            .map(|child| inline_bytes_refs(child, nsid, aliases))
+            .sum(),
+        _ => Ok(0),
+    }
 }
 
 fn validate_strict_union_contracts(lexicon_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -1009,5 +1074,37 @@ mod tests {
         assert!(generated.contains(&format!("rename = \"{FIXTURE_ID}#first\"")));
         assert!(generated.contains(&format!("rename = \"{FIXTURE_ID}#second\"")));
         assert!(!generated.contains("open_union"));
+    }
+
+    #[test]
+    fn bytes_alias_refs_get_the_dag_json_bytes_helper() {
+        let lexicon = fixture_with_defs(json!({
+            "digest": { "type": "bytes", "minLength": 32, "maxLength": 32 },
+            "main": {
+                "type": "object",
+                "required": ["local"],
+                "properties": {
+                    "local": { "type": "ref", "ref": "#digest", "description": "kept" },
+                    "absolute": { "type": "ref", "ref": format!("{FIXTURE_ID}#digest") }
+                }
+            }
+        }));
+        let fixture = write_fixture(&lexicon);
+        let normalized =
+            normalize_lexicon_dirs(&[fixture.path().to_path_buf()]).expect("normalize fixture");
+        let corpus = LexiconCorpus::load_from_dir(normalized.path()).expect("load fixture corpus");
+        let output = tempfile::tempdir().expect("generated output tempdir");
+        CodeGenerator::new(&corpus, "crate::generated")
+            .write_to_disk(output.path())
+            .expect("generate fixture corpus");
+        let generated =
+            fs::read_to_string(output.path().join("blue_catbird/chat/union_fixture.rs"))
+                .expect("read generated fixture module");
+        let compact: String = generated.split_whitespace().collect();
+        assert!(compact.contains(
+            "#[serde(default,with=\"jacquard_common::opt_serde_bytes_helper\")]pubabsolute:"
+        ));
+        assert!(compact.contains("#[serde(with=\"jacquard_common::serde_bytes_helper\")]publocal:"));
+        assert!(generated.contains("kept"));
     }
 }
