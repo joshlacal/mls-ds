@@ -3562,6 +3562,7 @@ async fn hydrate_locked_available_recovery_package_at_coordinate(
           AND kp.owner_key_id = $3
           AND kp.owner_auth_generation = $4
           AND kp.status = 'available'
+          AND kp.usage_scope = 'recovery'
           AND kp.not_before < $5
           AND kp.created_at <= $5
           AND $5 < kp.not_after
