@@ -260,6 +260,32 @@ fn reviewed_pending_inventory_prerequisite() -> BaselineMigration {
     baseline!(20260907000001, "chat direct pending inventory", "20260907000001_chat_direct_pending_inventory.sql", "82708d24b2deb72452ebdaf28749aa86ed95075f7ed920c4cc5526962e2ae9f9d8561a5029fc853ba654564d76ef63f1")
 }
 
+fn reviewed_service_auth_prerequisite() -> BaselineMigration {
+    baseline!(20260820000001, "chat service auth admissions", "20260820000001_chat_service_auth_admissions.sql", "2e8cb6bf47498402e56ba5c2fc753114c1d46e0767c98aa243c47993eb4f51a84de89469a8ae9af6bfac751ddadd18ac")
+}
+
+fn reviewed_legacy_dpop_prerequisite() -> BaselineMigration {
+    baseline!(20260820000002, "chat nullable legacy dpop jkt", "20260820000002_chat_nullable_legacy_dpop_jkt.sql", "d1914c731e0fbf81f5b0a9bf9cd77c12f2943fd940c36b9a351b1156b5ca09b55f2b4b44c6810012b4377f6ac283955d")
+}
+
+fn reviewed_performance_indices_prerequisite() -> BaselineMigration {
+    baseline!(20260824000001, "chat performance indices", "20260824000001_chat_performance_indices.sql", "e5f3f169724d2afc84043d80057bf9e494fbc9ad617ced0feaebb469d1be68788e7c19e19a67fb36296b85ee803139e0")
+}
+
+/// Every reviewed prerequisite between the immutable baseline and the request
+/// migrations, in production version order. The guarded ledger prefix must
+/// match this exact sequence.
+fn reviewed_prerequisites() -> [BaselineMigration; 6] {
+    [
+        reviewed_send_message_prerequisite(),
+        reviewed_service_auth_prerequisite(),
+        reviewed_legacy_dpop_prerequisite(),
+        reviewed_inventory_gc_prerequisite(),
+        reviewed_performance_indices_prerequisite(),
+        reviewed_pending_inventory_prerequisite(),
+    ]
+}
+
 fn validate_reviewed_baseline_source() -> Result<()> {
     let baseline = reviewed_baseline();
     anyhow::ensure!(
@@ -387,51 +413,26 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
             "reviewed baseline checksum drift"
         );
     }
+    let prerequisites = reviewed_prerequisites();
     anyhow::ensure!(
-        ledger.len() >= baseline.len() + 4,
+        ledger.len() >= baseline.len() + prerequisites.len(),
         "migration ledger lost reviewed prerequisite rows"
     );
-    let send_expected = reviewed_send_message_prerequisite();
-    let send_actual = &ledger[baseline.len()];
-    anyhow::ensure!(
-        send_actual.version == send_expected.version
-            && send_actual.description == send_expected.description
-            && send_actual.success
-            && send_actual.checksum == send_expected.reviewed_sha384,
-        "send-message prerequisite ledger drift"
-    );
-    let service_auth = &ledger[baseline.len() + 1];
-    anyhow::ensure!(
-        service_auth.version == SERVICE_AUTH_MIGRATION_VERSION
-            && service_auth.description == SERVICE_AUTH_MIGRATION_DESCRIPTION
-            && service_auth.success
-            && service_auth.checksum == SERVICE_AUTH_MIGRATION_SHA384,
-        "service-auth migration ledger drift"
-    );
-    let inventory_gc_expected = reviewed_inventory_gc_prerequisite();
-    let inventory_gc_actual = ledger
-        .get(baseline.len() + 2)
-        .context("inventory-GC prerequisite missing")?;
-    anyhow::ensure!(
-        inventory_gc_actual.version == inventory_gc_expected.version
-            && inventory_gc_actual.description == inventory_gc_expected.description
-            && inventory_gc_actual.success
-            && inventory_gc_actual.checksum == inventory_gc_expected.reviewed_sha384,
-        "inventory-GC prerequisite ledger drift"
-    );
-    let pending_expected = reviewed_pending_inventory_prerequisite();
-    let pending_actual = ledger
-        .get(baseline.len() + 3)
-        .context("pending-inventory prerequisite missing")?;
-    anyhow::ensure!(
-        pending_actual.version == pending_expected.version
-            && pending_actual.description == pending_expected.description
-            && pending_actual.success
-            && pending_actual.checksum == pending_expected.reviewed_sha384,
-        "pending-inventory prerequisite ledger drift"
-    );
+    for (actual, expected) in ledger[baseline.len()..]
+        .iter()
+        .zip(prerequisites.iter())
+    {
+        anyhow::ensure!(
+            actual.version == expected.version
+                && actual.description == expected.description
+                && actual.success
+                && actual.checksum == expected.reviewed_sha384,
+            "reviewed prerequisite ledger drift at {}",
+            expected.version
+        );
+    }
     let expected_request = reviewed_request_migrations();
-    let actual_request = &ledger[baseline.len() + 4..];
+    let actual_request = &ledger[baseline.len() + prerequisites.len()..];
     anyhow::ensure!(
         actual_request.len() == expected_request.len(),
         "request migration ledger count drift: expected {}, found {}",
@@ -597,6 +598,23 @@ fn install_or_validate_reviewed_baseline() -> Result<()> {
         inventory_gc_contract.trim() == "true\ttrue",
         "inventory-GC immutable-row allowlist contract is unavailable"
     );
+    let legacy_dpop = reviewed_legacy_dpop_prerequisite();
+    anyhow::ensure!(
+        hex::encode(Sha384::digest(legacy_dpop.sql.as_bytes())) == legacy_dpop.reviewed_sha384,
+        "legacy-DPoP prerequisite source checksum mismatch"
+    );
+    if !installed_versions.contains(&legacy_dpop.version) {
+        apply_migration(&legacy_dpop)?;
+    }
+    let performance_indices = reviewed_performance_indices_prerequisite();
+    anyhow::ensure!(
+        hex::encode(Sha384::digest(performance_indices.sql.as_bytes()))
+            == performance_indices.reviewed_sha384,
+        "performance-indices prerequisite source checksum mismatch"
+    );
+    if !installed_versions.contains(&performance_indices.version) {
+        apply_migration(&performance_indices)?;
+    }
     let pending_inventory = reviewed_pending_inventory_prerequisite();
     anyhow::ensure!(
         hex::encode(Sha384::digest(pending_inventory.sql.as_bytes()))
