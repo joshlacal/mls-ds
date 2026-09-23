@@ -8,6 +8,9 @@ private cluster under libfaketime; production code and the shared guarded
 database are untouched.
 
   start   --dir D --port P --db catbird_direct_requests_faketime_<suffix>
+          [--clock-file F]          (share an existing FAKETIME_TIMESTAMP_FILE,
+                                     e.g. the test runner's, so every faked
+                                     process moves together)
   advance --dir D --offset +8d      (takes effect on the next query)
   stop    --dir D                   (stops the recorded pid, deletes D)
 
@@ -68,8 +71,14 @@ def start(a):
     user = os.environ["USER"]
     subprocess.run([PG_BIN / "initdb", "-D", root / "data", "-A", "trust", "-U", user,
                     "--no-sync", "--locale=C", "-E", "UTF8"], check=True, capture_output=True)
-    clock = root / "faketime"
-    clock.write_text("+0\n")
+    if a.clock_file:
+        clock = Path(a.clock_file).resolve()
+        if not clock.is_file():
+            sys.exit(f"--clock-file {clock} does not exist")
+    else:
+        clock = root / "faketime"
+        clock.write_text("+0\n")
+    (root / "clock_path").write_text(str(clock))
     # Launch postgres directly: pg_ctl goes through /bin/sh, which SIP strips
     # of DYLD_*. LC_ALL avoids libfaketime making the postmaster multithreaded.
     env = {
@@ -127,7 +136,7 @@ def start(a):
 def advance(a):
     if not re.fullmatch(r"[+-]\d+[smhdy]?", a.offset):
         sys.exit("--offset must look like +8d")
-    (Path(a.dir) / "faketime").write_text(a.offset + "\n")
+    Path((Path(a.dir) / "clock_path").read_text()).write_text(a.offset + "\n")
     print(json.dumps({"offset": a.offset}))
 
 
@@ -153,6 +162,7 @@ def main():
     s.add_argument("--dir", required=True)
     s.add_argument("--port", type=int, required=True)
     s.add_argument("--db", required=True)
+    s.add_argument("--clock-file")
     sub.add_parser("advance").add_argument("--dir", required=True)
     sub.choices["advance"].add_argument("--offset", required=True)
     sub.add_parser("stop").add_argument("--dir", required=True)
