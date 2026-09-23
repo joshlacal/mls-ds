@@ -1,8 +1,7 @@
-//! Validation cases C07, C08, C09 live shipping router test suite.
+//! Validation case C07 live shipping router test suite.
 //!
 //! C07: Separate pools and grants (live router exhaustion cannot drain recovery packages)
-//! C08: Policy races (barrier races prevent unauthorized published rows through live router)
-//! C09: Device coverage (multi-device coverage and invalidation lifecycle on live router)
+//! C08/C09 moved to `encrypted_request_c08_c09.rs`.
 
 #[path = "support/encrypted_requests.rs"]
 mod encrypted_requests;
@@ -88,24 +87,31 @@ async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> any
     let run = Uuid::new_v4().simple().to_string();
     let alice = ServiceIdentity::new(format!("did:web:alice-{run}.request-fixture.catbird.blue"));
     let bob = ServiceIdentity::new(format!("did:web:bob-{run}.request-fixture.catbird.blue"));
+    let charlie = ServiceIdentity::new(format!("did:web:charlie-{run}.request-fixture.catbird.blue"));
     let https = HttpsDidFixture::start(
         did_port,
         &[
             (alice.did.clone(), alice.did_document()),
             (bob.did.clone(), bob.did_document()),
+            (charlie.did.clone(), charlie.did_document()),
         ],
     )?;
 
     let alice_engine = MlsEngine::new("c07-alice")?;
     let bob_engine = MlsEngine::new("c07-bob")?;
+    let charlie_engine = MlsEngine::new("c07-charlie")?;
     let alice_identity = format!("{}#{}", alice.did, alice.device_id);
     let bob_identity = format!("{}#{}", bob.did, bob.device_id);
+    let charlie_identity = format!("{}#{}", charlie.did, charlie.device_id);
     let (_alice_package, _alice_package_ref) = alice_engine.create_key_package(&alice_identity)?;
     let (bob_package, bob_package_ref) = bob_engine.create_key_package(&bob_identity)?;
+    let (_charlie_package, _) = charlie_engine.create_key_package(&charlie_identity)?;
     let alice_public = alice_engine.identity_public_key(&alice_identity)?;
     let bob_public = bob_engine.identity_public_key(&bob_identity)?;
+    let charlie_public = charlie_engine.identity_public_key(&charlie_identity)?;
     seed_service_device(&alice, &alice_public)?;
     seed_service_device(&bob, &bob_public)?;
+    seed_service_device(&charlie, &charlie_public)?;
 
     // Seed 1 recovery package for Bob directly in database via psql
     let recovery_ref = Sha256::digest(Uuid::new_v4().as_bytes()).to_vec();
@@ -115,6 +121,7 @@ async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> any
     let rec_init_hex = hex::encode(Uuid::new_v4().as_bytes());
     let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
     let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
+    let charlie_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&charlie_public));
 
     run_psql_exec(&format!(
         "INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at,usage_scope) \
@@ -222,19 +229,22 @@ async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> any
         .await?;
     anyhow::ensure!(prep_status_1 == reqwest::StatusCode::OK);
 
-    // Now Alice attempts to prepare request 2: direct request pool for Bob is exhausted!
+    // Now Charlie attempts to prepare a request to Bob: direct request pool for Bob is exhausted!
+    // We use Charlie (a distinct sender) because budget checks enforce pair_live < 1 per
+    // (actor, device, recipient); sending from Charlie ensures the request clears quota/budget
+    // checks and genuinely exercises device selection / request pool exhaustion.
     let request_id_2 = Uuid::new_v4();
     let prepare_2 = signed_mls_request(
-        &alice_engine,
-        &alice_identity,
+        &charlie_engine,
+        &charlie_identity,
         DirectRequestKind::Prepare,
         json!({
             "$type":"blue.catbird.chat.defs#directRequestPreparationBody",
             "signatureDomain":"CATBIRD-DIRECT-REQUEST-PREPARE\0",
             "protocolVersion":"2",
-            "actorDid":alice.did,
-            "actorDeviceId":alice.device_id.to_string(),
-            "keyId":alice_key_id,
+            "actorDid":charlie.did,
+            "actorDeviceId":charlie.device_id.to_string(),
+            "keyId":charlie_key_id,
             "authGeneration":1,
             "requestId":request_id_2.to_string(),
             "firstMessageId":Uuid::new_v4().to_string(),
@@ -246,7 +256,7 @@ async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> any
             "signedAt":canonical_now()
         }),
     )?;
-    let (prep_status_2, prep_body_2) = alice
+    let (prep_status_2, prep_body_2) = charlie
         .post(
             &client,
             &server.base_url,
@@ -256,12 +266,32 @@ async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> any
         )
         .await?;
     let resp: Value = serde_json::from_slice(&prep_body_2)?;
-    let code = resp.pointer("/outcome/body/receipt/code").and_then(|v| v.as_str());
-    let is_rejected = (prep_status_2 == reqwest::StatusCode::BAD_REQUEST && resp["error"] == "RecipientKeysUnavailable")
-        || (prep_status_2 == reqwest::StatusCode::OK && (code == Some("RecipientKeysUnavailable") || code == Some("CapacityUnavailable")));
+    let code = resp
+        .pointer("/outcome/body/receipt/code")
+        .and_then(|v| v.as_str());
+    // The exhaustion must be the *request-pool* outcome specifically. Accepting
+    // CapacityUnavailable here would be vacuous: budget/quota checks run before
+    // device selection, so a capacity refusal never consults the request pool and
+    // would leave the recovery-pool invariant trivially true.
     anyhow::ensure!(
-        is_rejected,
-        "second prepare must return rejection: status={prep_status_2}, body={resp}"
+        code == Some("RecipientKeysUnavailable"),
+        "second prepare must terminate with the request-pool exhaustion outcome \
+         RecipientKeysUnavailable, received status={prep_status_2}: {resp}"
+    );
+    anyhow::ensure!(
+        prep_status_2 == reqwest::StatusCode::OK,
+        "terminal rejection must be delivered as a signed receipt outcome: {prep_status_2}"
+    );
+
+    // The request pool really was consumed: the single direct-request package is
+    // reserved by request 1 while Bob's recovery package is untouched.
+    let direct_status = run_psql_query(&format!(
+        "SELECT status FROM chat.key_packages WHERE key_package_ref=decode('{hex}','hex')",
+        hex = hex::encode(&bob_package_ref),
+    ))?;
+    anyhow::ensure!(
+        direct_status.trim() == "reserved",
+        "the direct-request pool must be genuinely exhausted by reservation, got: {direct_status}"
     );
 
     // INVARIANT: Bob's recovery package MUST remain available in the database!
@@ -273,69 +303,89 @@ async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> any
         "recovery package must remain available after direct request pool exhaustion: {recovery_status}"
     );
 
+    // Capacity hygiene: cancel Alice's preparation so request 1 does not linger in DB
+    let verified_prepare_1 = protocol::verify_signed_request(
+        DirectRequestKind::Prepare,
+        &serde_json::to_vec(&prepare_1)?,
+        &alice_public,
+    )?;
+    let cancel_body = json!({
+        "$type": "blue.catbird.chat.defs#directRequestCancellationBody",
+        "signatureDomain": "CATBIRD-DIRECT-REQUEST-CANCEL\0",
+        "protocolVersion": "2",
+        "actorDid": alice.did,
+        "actorDeviceId": alice.device_id.to_string(),
+        "keyId": alice_key_id,
+        "authGeneration": 1,
+        "requestId": request_id_1.to_string(),
+        "recipientDid": bob.did,
+        "preparationRequestDigest": STANDARD.encode(verified_prepare_1.request_digest()),
+        "idempotencyKey": Uuid::new_v4().to_string(),
+        "signedAt": canonical_now(),
+    });
+    let cancel = signed_mls_request(&alice_engine, &alice_identity, DirectRequestKind::Cancel, cancel_body)?;
+    let (cancel_status, _) = alice.post(
+        &client,
+        &server.base_url,
+        "blue.catbird.chat.cancelDirectRequestPreparation",
+        &json!({"signedRequest": cancel}),
+        true,
+    ).await?;
+    anyhow::ensure!(cancel_status == reqwest::StatusCode::OK, "cancel preparation: {cancel_status}");
+
     Ok(())
 }
 
+/// C07: a key publication whose grant carries no signature at all must be
+/// rejected before any key package, grant or capability row is written.
 #[tokio::test(flavor = "multi_thread")]
-async fn c08_live_router_policy_races_prevent_unauthorized_publication() -> anyhow::Result<()> {
+async fn c07_live_router_unsigned_grant_rejects_before_publication() -> anyhow::Result<()> {
     let did_port = HttpsDidFixture::reserve_port()?;
     let run = Uuid::new_v4().simple().to_string();
-    let alice = ServiceIdentity::new(format!("did:web:alice-{run}.request-fixture.catbird.blue"));
     let bob = ServiceIdentity::new(format!("did:web:bob-{run}.request-fixture.catbird.blue"));
-    let https = HttpsDidFixture::start(
-        did_port,
-        &[
-            (alice.did.clone(), alice.did_document()),
-            (bob.did.clone(), bob.did_document()),
-        ],
-    )?;
+    let https = HttpsDidFixture::start(did_port, &[(bob.did.clone(), bob.did_document())])?;
 
-    let alice_engine = MlsEngine::new("c08-alice")?;
-    let bob_engine = MlsEngine::new("c08-bob")?;
-    let alice_identity = format!("{}#{}", alice.did, alice.device_id);
+    let bob_engine = MlsEngine::new("c07-unsigned-grant")?;
     let bob_identity = format!("{}#{}", bob.did, bob.device_id);
-    let (_alice_package, _alice_package_ref) = alice_engine.create_key_package(&alice_identity)?;
     let (bob_package, bob_package_ref) = bob_engine.create_key_package(&bob_identity)?;
-    let alice_public = alice_engine.identity_public_key(&alice_identity)?;
     let bob_public = bob_engine.identity_public_key(&bob_identity)?;
-    seed_service_device(&alice, &alice_public)?;
+    let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
     seed_service_device(&bob, &bob_public)?;
 
     let server = ShippingServerFixture::start(&https)?;
     let client = reqwest::Client::builder().build()?;
 
-    let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
-    let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
-
-    // Bob publishes keys
     let grant_id = Uuid::new_v4();
-    let grant = signed_mls_request(
+    let grant_body = json!({
+        "$type":"blue.catbird.chat.defs#directRequestGrantBody",
+        "signatureDomain":"CATBIRD-DIRECT-REQUEST-GRANT\0",
+        "protocolVersion":"2",
+        "actorDid":bob.did,
+        "actorDeviceId":bob.device_id.to_string(),
+        "keyId":bob_key_id,
+        "authGeneration":1,
+        "grantId":grant_id.to_string(),
+        "grantRevision":1,
+        "purpose":"direct-request-bootstrap",
+        "profile":"encryptedIntroduction1",
+        "keyPackageRef":STANDARD.encode(&bob_package_ref),
+        "keyPackageSha256":STANDARD.encode(Sha256::digest(&bob_package)),
+        "expiresAt":canonical_future(29),
+        "idempotencyKey":grant_id.to_string(),
+        "signedAt":canonical_now()
+    });
+    // Identical body to the accepted grant above, but the grant wrapper is
+    // unsigned: exactly the "grant present, signature absent" case.
+    let unsigned_grant = json!({ "body": grant_body });
+
+    // Control: the same envelope signed correctly is accepted by this router.
+    let signed_control = signed_mls_request(
         &bob_engine,
         &bob_identity,
         DirectRequestKind::Grant,
-        json!({
-            "$type":"blue.catbird.chat.defs#directRequestGrantBody",
-            "signatureDomain":"CATBIRD-DIRECT-REQUEST-GRANT\0",
-            "protocolVersion":"2",
-            "actorDid":bob.did,
-            "actorDeviceId":bob.device_id.to_string(),
-            "keyId":bob_key_id,
-            "authGeneration":1,
-            "grantId":grant_id.to_string(),
-            "grantRevision":1,
-            "purpose":"direct-request-bootstrap",
-            "profile":"encryptedIntroduction1",
-            "keyPackageRef":STANDARD.encode(&bob_package_ref),
-            "keyPackageSha256":STANDARD.encode(Sha256::digest(&bob_package)),
-            "expiresAt":canonical_future(29),
-            "idempotencyKey":grant_id.to_string(),
-            "signedAt":canonical_now()
-        }),
+        unsigned_grant["body"].clone(),
     )?;
-    let keys = signed_mls_request(
-        &bob_engine,
-        &bob_identity,
-        DirectRequestKind::Keys,
+    let keys_body = |grant: Value, revision: i64| {
         json!({
             "$type":"blue.catbird.chat.defs#directRequestKeysPublicationBody",
             "signatureDomain":"CATBIRD-DIRECT-REQUEST-KEYS\0",
@@ -344,7 +394,7 @@ async fn c08_live_router_policy_races_prevent_unauthorized_publication() -> anyh
             "actorDeviceId":bob.device_id.to_string(),
             "keyId":bob_key_id,
             "authGeneration":1,
-            "revision":1,
+            "revision":revision,
             "enabled":true,
             "keys":[{
                 "keyPackage":{
@@ -358,290 +408,81 @@ async fn c08_live_router_policy_races_prevent_unauthorized_publication() -> anyh
             }],
             "idempotencyKey":Uuid::new_v4().to_string(),
             "signedAt":canonical_now()
-        }),
-    )?;
-    bob.post(
-        &client,
-        &server.base_url,
-        "blue.catbird.chat.publishDirectRequestKeys",
-        &json!({"signedRequest":keys}),
-        true,
-    )
-    .await?;
-
-    // Alice prepares direct request
-    let request_id = Uuid::new_v4();
-    let first_message_id = Uuid::new_v4();
-    let conversation_id = Uuid::new_v4();
-    let prepare = signed_mls_request(
-        &alice_engine,
-        &alice_identity,
-        DirectRequestKind::Prepare,
-        json!({
-            "$type":"blue.catbird.chat.defs#directRequestPreparationBody",
-            "signatureDomain":"CATBIRD-DIRECT-REQUEST-PREPARE\0",
-            "protocolVersion":"2",
-            "actorDid":alice.did,
-            "actorDeviceId":alice.device_id.to_string(),
-            "keyId":alice_key_id,
-            "authGeneration":1,
-            "requestId":request_id.to_string(),
-            "firstMessageId":first_message_id.to_string(),
-            "conversationId":conversation_id.to_string(),
-            "recipientDid":bob.did,
-            "origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},
-            "profile":"encryptedIntroduction1",
-            "idempotencyKey":request_id.to_string(),
-            "signedAt":canonical_now()
-        }),
-    )?;
-    let (prep_status, prep_response) = alice
+        })
+    };
+    // We cannot use signed_mls_request here because its canonical transcript
+    // projection recursively validates inner grants (requiring the 'signature'
+    // field), which is exactly what we want the server to reject. Instead,
+    // construct the wrapper manually with a dummy signature: the server's own
+    // projection of the body will encounter the unsigned inner grant and reject
+    // the request before it ever checks our outer Ed25519 signature.
+    let unsigned_keys_body = keys_body(unsigned_grant, 1);
+    let dummy_sig = bob_engine.sign_identity(&bob_identity, b"dummy".to_vec())?;
+    let unsigned_keys = json!({
+        "body": unsigned_keys_body,
+        "signature": STANDARD.encode(dummy_sig)
+    });
+    let (status, raw) = bob
         .post(
             &client,
             &server.base_url,
-            "blue.catbird.chat.prepareDirectRequest",
-            &json!({"signedRequest":prepare}),
+            "blue.catbird.chat.publishDirectRequestKeys",
+            &json!({"signedRequest":unsigned_keys}),
             true,
         )
         .await?;
-    anyhow::ensure!(prep_status == reqwest::StatusCode::OK);
+    let response: Value = serde_json::from_slice(&raw)?;
+    anyhow::ensure!(
+        status.is_client_error(),
+        "unsigned grant must be rejected, received {status}: {response}"
+    );
 
-    let prep_value: Value = serde_json::from_slice(&prep_response)?;
-    let preparation = prep_value["outcome"]["preparation"].clone();
-    let selected = preparation["selectedDevices"].as_array().unwrap();
-
-    // Alice builds publication payload
-    let verified_prepare = protocol::verify_signed_request(
-        DirectRequestKind::Prepare,
-        &serde_json::to_vec(&prepare)?,
-        &alice_public,
-    )?;
-    let context = json!({
-        "protocolVersion":"2",
-        "requestId":request_id.to_string(),
-        "firstMessageId":first_message_id.to_string(),
-        "conversationId":conversation_id.to_string(),
-        "origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},
-        "actorDid":alice.did,
-        "actorDeviceId":alice.device_id.to_string(),
-        "actorKeyId":alice_key_id,
-        "recipientDid":bob.did,
-        "preparationDigest":preparation["preparationDigest"]
-    });
-    let journal = alice_engine.prepare_direct_request(&DirectRequestBootstrapInput {
-        draft_id: Uuid::new_v4().to_string(),
-        context_json: serde_json::to_vec(&context)?,
-        group_id: rand::random::<[u8; 32]>().to_vec(),
-        generation: 0,
-        state_version: 1,
-        key_packages: vec![bob_package.clone()],
-        expected_package_refs: vec![bob_package_ref.clone()],
-        authority_import_until: u64::MAX,
-        preparation_request_digest: *verified_prepare.request_digest(),
-        receipt_authority_key: server.receipt_public_key.clone(),
-        text: "Race test intro".into(),
-        invitation: None,
-        metadata: GroupMetadataV1 {
-            version: 1,
-            title: String::new(),
-            description: String::new(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-        },
-    })?;
-    let bootstrap = &journal.bootstrap;
-    let mut publish_body = prepare["body"].clone();
-    publish_body["$type"] = json!("blue.catbird.chat.defs#directRequestPublicationBody");
-    publish_body["signatureDomain"] = json!("CATBIRD-DIRECT-REQUEST-PUBLISH\0");
-    publish_body["signedAt"] = json!(canonical_now());
-    publish_body["preparationDigest"] = preparation["preparationDigest"].clone();
-    publish_body["preparationRequestDigest"] =
-        json!(STANDARD.encode(verified_prepare.request_digest()));
-    publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
-    publish_body["next"] = bootstrap.coordinates.clone();
-    let import_until_str = chrono::DateTime::from_timestamp(
-        bootstrap.import_until as i64,
-        0
-    )
-    .unwrap()
-    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    publish_body["importUntil"] = json!(import_until_str);
-
-    let artifact = |data: &[u8], content_type: &str| {
-        json!({
-            "framing":"mlsMessage","contentType":content_type,
-            "bytes":STANDARD.encode(data),"sha256":STANDARD.encode(Sha256::digest(data))
-        })
-    };
-    let deliveries = selected
-        .iter()
-        .map(|device| {
-            json!({
-                "recipientDid":device["actorDid"],
-                "recipientDeviceId":device["actorDeviceId"],
-                "provenance":{
-                    "requestId":request_id.to_string(),
-                    "preparationDigest":preparation["preparationDigest"],
-                    "contextHash":STANDARD.encode(bootstrap.context_hash),
-                    "grantId":device["grant"]["body"]["grantId"],
-                    "grantRevision":device["grant"]["body"]["grantRevision"],
-                    "keyPackageRef":device["keyPackage"]["keyPackageRef"],
-                    "importUntil":import_until_str
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    let author = json!({
-        "authorDid":alice.did,"authorDeviceId":alice.device_id.to_string(),"authorKeyId":alice_key_id,
-        "signaturePublicKey":STANDARD.encode(&alice_public),"authGenerationAtOrigin":1,
-        "originTransitionId":request_id.to_string(),"originSeq":1,"roleAtOrigin":"admin",
-        "deviceStatusAtOrigin":"active"
-    });
-    publish_body["artifacts"] = json!({
-        "genesisGroupInfo":artifact(&bootstrap.genesis_group_info,"groupInfo"),
-        "addCommit":artifact(&bootstrap.add_commit,"publicMessageCommit"),
-        "finalGroupInfo":artifact(&bootstrap.final_group_info,"groupInfo"),
-        "welcome":{"opaqueWelcome":STANDARD.encode(&bootstrap.welcome),"sha256":STANDARD.encode(Sha256::digest(&bootstrap.welcome)),"deliveries":deliveries},
-        "initialCiphertext":STANDARD.encode(&bootstrap.initial_ciphertext),
-        "metadataSnapshot":{
-            "coordinate":metadata_coordinate(&bootstrap.coordinates)?,
-            "originTransitionId":request_id.to_string(),"metadataVersion":1,
-            "nonce":STANDARD.encode(&bootstrap.metadata_nonce),
-            "ciphertext":STANDARD.encode(&bootstrap.metadata_ciphertext),
-            "ciphertextSha256":STANDARD.encode(Sha256::digest(&bootstrap.metadata_ciphertext)),
-            "ciphertextSize":bootstrap.metadata_ciphertext.len(),"authorProof":author
-        }
-    });
-    let publication = signed_mls_request(
-        &alice_engine,
-        &alice_identity,
-        DirectRequestKind::Publish,
-        publish_body,
-    )?;
-
-    // ====================================================================
-    // RACE BARRIER: Revoke Bob's device key before Alice's publish reaches server
-    // ====================================================================
-    run_psql_exec(&format!(
-        "UPDATE chat.device_keys SET revoked_at=clock_timestamp() WHERE user_did='{did}' AND device_id='{device}'",
+    // No key package, grant or capability row may have been created.
+    let key_rows = run_psql_query(&format!(
+        "SELECT count(*) FROM chat.key_packages WHERE key_package_ref=decode('{hex}','hex')",
+        hex = hex::encode(&bob_package_ref),
+    ))?;
+    anyhow::ensure!(
+        key_rows.trim() == "0",
+        "unsigned grant published a key package row: {key_rows}"
+    );
+    let grant_rows = run_psql_query(&format!(
+        "SELECT count(*) FROM chat.direct_request_grants WHERE grant_id='{grant_id}'"
+    ))?;
+    anyhow::ensure!(
+        grant_rows.trim() == "0",
+        "unsigned grant wrote a grant row: {grant_rows}"
+    );
+    let capability_rows = run_psql_query(&format!(
+        "SELECT count(*) FROM chat.direct_request_capabilities WHERE owner_did='{did}' AND owner_device_id='{device}'",
         did = bob.did,
         device = bob.device_id,
     ))?;
+    anyhow::ensure!(
+        capability_rows.trim() == "0",
+        "unsigned grant wrote a capability row: {capability_rows}"
+    );
 
-    // Alice publishes through live router
-    let (publish_status, publish_bytes) = alice
+    // Control: the correctly signed equivalent from the same device is accepted.
+    let (control_status, control_raw) = bob
         .post(
             &client,
             &server.base_url,
-            "blue.catbird.chat.publishDirectRequest",
-            &json!({"signedRequest":publication}),
+            "blue.catbird.chat.publishDirectRequestKeys",
+            &json!({"signedRequest": signed_mls_request(
+                &bob_engine,
+                &bob_identity,
+                DirectRequestKind::Keys,
+                keys_body(signed_control, 1),
+            )?}),
             true,
         )
         .await?;
-
-    let pub_resp: Value = serde_json::from_slice(&publish_bytes)?;
-    let code = pub_resp.pointer("/outcome/body/receipt/code").and_then(|v| v.as_str());
-    let is_revoked = (publish_status == reqwest::StatusCode::BAD_REQUEST && pub_resp["error"] == "PreparationRevoked")
-        || (publish_status == reqwest::StatusCode::OK && code == Some("PreparationRevoked"));
     anyhow::ensure!(
-        is_revoked,
-        "publication must be rejected when included device authority changed: status={publish_status}, resp={pub_resp}"
+        control_status == reqwest::StatusCode::OK,
+        "signed control publication must succeed: {control_status}: {}",
+        String::from_utf8_lossy(&control_raw)
     );
-
-    // CRITICAL ASSERTION: NO unauthorized published rows in database
-    let pub_attempts: i64 = run_psql_query(&format!(
-        "SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{request_id}' AND status='published'"
-    ))?.trim().parse()?;
-    anyhow::ensure!(pub_attempts == 0, "no published attempt row allowed");
-
-    let convos: i64 = run_psql_query(&format!(
-        "SELECT count(*) FROM chat.conversations WHERE conversation_id='{conversation_id}'"
-    ))?.trim().parse()?;
-    anyhow::ensure!(convos == 0, "no conversation row allowed");
-
-    let pub_rows: i64 = run_psql_query(&format!(
-        "SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{request_id}'"
-    ))?.trim().parse()?;
-    anyhow::ensure!(pub_rows == 0, "no publication row allowed");
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn c09_live_router_device_coverage_and_invalidation_lifecycle() -> anyhow::Result<()> {
-    // 1. Ordinary live direct request exercises multi-device / complete recipient coverage
-    // and verifies that all deliverable recipient devices are included in the Welcome and decrypted.
-    let fixture = live_direct_request::publish_request(true).await?;
-    anyhow::ensure!(fixture.request_id != Uuid::nil());
-    anyhow::ensure!(fixture.conversation_id != Uuid::nil());
-
-    // 2. Bob's direct request key was consumed by publish_request.
-    // A fresh preparation for Bob has NO eligible recipient keys -> draft retained, no invitation emitted.
-    let client = reqwest::Client::builder().build()?;
-    let next_request_id = Uuid::new_v4();
-    let next_conversation_id = Uuid::new_v4();
-    let alice_identity = format!("{}#{}", fixture.alice.did, fixture.alice.device_id);
-    let alice_public = fixture.alice_engine.as_ref().unwrap().identity_public_key(&alice_identity)?;
-    let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
-    let prepare_empty = signed_mls_request(
-        fixture.alice_engine.as_ref().unwrap(),
-        &alice_identity,
-        DirectRequestKind::Prepare,
-        json!({
-            "$type":"blue.catbird.chat.defs#directRequestPreparationBody",
-            "signatureDomain":"CATBIRD-DIRECT-REQUEST-PREPARE\0",
-            "protocolVersion":"2",
-            "actorDid":fixture.alice.did,
-            "actorDeviceId":fixture.alice.device_id.to_string(),
-            "keyId":alice_key_id,
-            "authGeneration":1,
-            "requestId":next_request_id.to_string(),
-            "firstMessageId":Uuid::new_v4().to_string(),
-            "conversationId":next_conversation_id.to_string(),
-            "recipientDid":fixture.bob.did,
-            "origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},
-            "profile":"encryptedIntroduction1",
-            "idempotencyKey":next_request_id.to_string(),
-            "signedAt":canonical_now()
-        }),
-    )?;
-    let (prep_status, prep_response) = fixture.alice
-        .post(
-            &client,
-            &fixture.server.base_url,
-            "blue.catbird.chat.prepareDirectRequest",
-            &json!({"signedRequest":prepare_empty}),
-            true,
-        )
-        .await?;
-
-    let prep_resp: Value = serde_json::from_slice(&prep_response)?;
-    let code = prep_resp.pointer("/outcome/body/receipt/code").and_then(|v| v.as_str());
-    let is_unavailable = (prep_status == reqwest::StatusCode::BAD_REQUEST && prep_resp["error"] == "RecipientKeysUnavailable")
-        || (prep_status == reqwest::StatusCode::OK && code == Some("RecipientKeysUnavailable"));
-    anyhow::ensure!(
-        is_unavailable,
-        "prepare with no eligible recipient must fail with RecipientKeysUnavailable: status={prep_status}, resp={prep_resp}"
-    );
-
-    // Verify draft retained: attempt recorded as rejected, no conversation or publication created
-    let attempt_status = run_psql_query(&format!(
-        "SELECT status FROM chat.direct_request_attempts WHERE request_id='{next_request_id}'"
-    ))?;
-    anyhow::ensure!(
-        attempt_status.trim() == "rejected",
-        "attempt must be rejected: {attempt_status}"
-    );
-
-    let convos: i64 = run_psql_query(&format!(
-        "SELECT count(*) FROM chat.conversations WHERE conversation_id='{next_conversation_id}'"
-    ))?.trim().parse()?;
-    anyhow::ensure!(convos == 0, "no conversation row when no recipient keys");
-
-    let publications: i64 = run_psql_query(&format!(
-        "SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{next_request_id}'"
-    ))?.trim().parse()?;
-    anyhow::ensure!(publications == 0, "no publication row when no recipient keys");
 
     Ok(())
 }

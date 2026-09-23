@@ -94,6 +94,9 @@
           "name": "RateLimited"
         },
         {
+          "name": "RecipientAuthorityUnsupported"
+        },
+        {
           "name": "AccountSessionExpired"
         },
         {

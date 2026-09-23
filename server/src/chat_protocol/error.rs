@@ -157,6 +157,7 @@ define_error_codes!(
     UnavailableIntroduction,
     StaleAuthGeneration,
     RegistrationConflict,
+    RecipientAuthorityUnsupported,
 );
 
 impl ChatProtocolErrorCode {
@@ -278,7 +279,8 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         RequestNotAccepted,
         UnavailableIntroduction,
-        RateLimited
+        RateLimited,
+        RecipientAuthorityUnsupported
     ]),
     PrepareDirectRequest => ("blue.catbird.chat.prepareDirectRequest", [
         AccountSessionExpired,
@@ -306,7 +308,8 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         RequestNotAccepted,
         UnavailableIntroduction,
-        RateLimited
+        RateLimited,
+        RecipientAuthorityUnsupported
     ]),
     GetDirectRequestOutcome => ("blue.catbird.chat.getDirectRequestOutcome", [
         AccountSessionExpired,
@@ -334,7 +337,8 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         RequestNotAccepted,
         UnavailableIntroduction,
-        RateLimited
+        RateLimited,
+        RecipientAuthorityUnsupported
     ]),
     CancelDirectRequestPreparation => ("blue.catbird.chat.cancelDirectRequestPreparation", [
         AccountSessionExpired,
@@ -362,7 +366,8 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         RequestNotAccepted,
         UnavailableIntroduction,
-        RateLimited
+        RateLimited,
+        RecipientAuthorityUnsupported
     ]),
     PublishDirectRequest => ("blue.catbird.chat.publishDirectRequest", [
         AccountSessionExpired,
@@ -390,7 +395,8 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         RequestNotAccepted,
         UnavailableIntroduction,
-        RateLimited
+        RateLimited,
+        RecipientAuthorityUnsupported
     ]),
     AcceptConversation => ("blue.catbird.chat.acceptConversation", [
         AccountSessionExpired,

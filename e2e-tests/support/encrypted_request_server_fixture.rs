@@ -151,6 +151,18 @@ async fn main() -> Result<()> {
         .validate_protocol_fence(&pool)
         .await
         .map_err(anyhow::Error::msg)?;
+    // The production sweeper expires every due row in its database, so it may
+    // only run against a dedicated (faketime/fault) request database.
+    if std::env::var("REQUEST_FIXTURE_EXPIRY_SWEEP").as_deref() == Ok("1") {
+        anyhow::ensure!(
+            is_dedicated_database_url(&database_url),
+            "REQUEST_FIXTURE_EXPIRY_SWEEP requires a dedicated request database"
+        );
+        tokio::spawn(catbird_server::handlers::chat::run_chat_expiry_sweeper(
+            pool.clone(),
+            runtime.clone(),
+        ));
+    }
     if let Some((event_id, trigger, result)) = push_event {
         let push_pool = pool.clone();
         let push_runtime = runtime.clone();

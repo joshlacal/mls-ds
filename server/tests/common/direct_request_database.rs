@@ -226,6 +226,14 @@ pub async fn setup() -> PgPool {
             "../../migrations/20260919000017_direct_request_push_outbox.sql"
         )),
     ));
+    migrations.push(Migration::new(
+        20260919000018,
+        Cow::Borrowed("fix direct request lifecycle close fence"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000018_fix_direct_request_lifecycle_close_fence.sql"
+        )),
+    ));
     let migrator = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,

@@ -71,6 +71,31 @@ fn durable_graph_for_req(actor_did: &str, req_id: Uuid, convo_id: Uuid) -> anyho
     Ok(result.stdout)
 }
 
+fn keys_snapshot_for_did(did: &str) -> anyhow::Result<Vec<u8>> {
+    validate_request_test_database_url(std::env::var("REQUEST_TEST_DATABASE_URL").ok().as_deref())?;
+    let d = did.replace('\'', "''");
+    let sql = format!(
+        r#"SELECT jsonb_build_object(
+      'key_packages',(SELECT jsonb_agg(to_jsonb(k) ORDER BY k.key_package_ref) FROM chat.key_packages k WHERE owner_did='{d}'),
+      'grants',(SELECT jsonb_agg(to_jsonb(g) ORDER BY g.grant_id) FROM chat.direct_request_grants g WHERE owner_did='{d}'),
+      'capabilities',(SELECT jsonb_agg(to_jsonb(c) ORDER BY c.owner_device_id) FROM chat.direct_request_capabilities c WHERE owner_did='{d}'),
+      'publications',(SELECT jsonb_agg(to_jsonb(p) ORDER BY p.revision) FROM chat.direct_request_key_publications p WHERE owner_did='{d}')
+    )::text"#
+    );
+    let result = std::process::Command::new("psql")
+        .args([
+            REQUEST_TEST_DATABASE_URL,
+            "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", &sql,
+        ])
+        .output()?;
+    anyhow::ensure!(
+        result.status.success(),
+        "keys snapshot failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(result.stdout)
+}
+
 fn changed_leaf(value: &Value, path: &str) -> anyhow::Result<Value> {
     if let Some(n) = value.as_u64() {
         return Ok(json!(n + 1));
@@ -574,6 +599,8 @@ async fn grant_field_mutations_fail_before_keys_publication() -> anyhow::Result<
         "/signedAt",
     ];
 
+    let snapshot_before = keys_snapshot_for_did(&bob.did)?;
+
     for path in paths {
         let mut altered_grant = signed_grant.clone();
         let leaf = altered_grant["body"]
@@ -625,42 +652,129 @@ async fn grant_field_mutations_fail_before_keys_publication() -> anyhow::Result<
             status.is_client_error(),
             "grant mutation {path} unexpectedly returned {status}: {response}"
         );
-        println!("C03 Grant field binding rejected before publication: {path}");
+
+        let snapshot_after = keys_snapshot_for_did(&bob.did)?;
+        anyhow::ensure!(
+            snapshot_before == snapshot_after,
+            "grant mutation {path} leaked DB changes: before != after"
+        );
+        println!("C03 Grant field binding rejected before publication, DB unchanged: {path}");
     }
+
+    // Positive control: the unmutated signed grant at revision 1 publishes
+    let control_op = Uuid::new_v4();
+    let control_keys_body = json!({
+        "$type":"blue.catbird.chat.defs#directRequestKeysPublicationBody",
+        "signatureDomain":"CATBIRD-DIRECT-REQUEST-KEYS\0",
+        "protocolVersion":"2",
+        "actorDid":bob.did,
+        "actorDeviceId":bob.device_id.to_string(),
+        "keyId":bob_key_id,
+        "authGeneration":1,
+        "revision":1,
+        "enabled":true,
+        "keys":[{
+            "keyPackage":{
+                "framing":"mlsMessage",
+                "contentType":"keyPackage",
+                "bytes":STANDARD.encode(&bob_package),
+                "sha256":STANDARD.encode(Sha256::digest(&bob_package)),
+                "keyPackageRef":STANDARD.encode(&bob_package_ref)
+            },
+            "grant":signed_grant
+        }],
+        "idempotencyKey":control_op.to_string(),
+        "signedAt":canonical_now()
+    });
+    let control_signed = signed_mls_request(&bob_engine, &bob_identity, DirectRequestKind::Keys, control_keys_body)?;
+    let (control_status, _): (reqwest::StatusCode, Vec<u8>) = bob.post(
+        &client,
+        &server.base_url,
+        "blue.catbird.chat.publishDirectRequestKeys",
+        &json!({"signedRequest":control_signed}),
+        true,
+    ).await?;
+    anyhow::ensure!(
+        control_status.is_success(),
+        "positive control: unmutated grant at revision 1 must succeed, got {control_status}"
+    );
+    let snapshot_after_control = keys_snapshot_for_did(&bob.did)?;
+    anyhow::ensure!(
+        snapshot_before != snapshot_after_control,
+        "positive control published but DB rows are unchanged — test is vacuous"
+    );
+    println!("C03 Grant positive control: unmutated grant published, DB rows appeared");
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ciphertext_and_aad_mutations_fail_at_recipient_before_acceptance() -> anyhow::Result<()> {
-    let f = live_direct_request::publish_request(false).await?;
-    let initial_graph = durable_graph_for_req(&f.alice.did, f.request_id, f.conversation_id)?;
+    // --- Part 1: tampered ciphertext reaches the real AEAD via the tamper hook ---
+    // The server accepted this publication because the tampered byte is inside the
+    // AEAD-protected body (only the ciphertext content is flipped, outer framing
+    // and digests are re-computed by the signing step). The recipient's real
+    // process_message / AEAD unwrap must reject it.
+    let tampered = live_direct_request::publish_request_with_unverifiable_introduction().await?;
+    let initial_graph = durable_graph_for_req(
+        &tampered.alice.did, tampered.request_id, tampered.conversation_id,
+    )?;
 
-    // First import the authentic Welcome so native store is ready
-    f.bob_engine.process_direct_request(&f.welcome_input)?;
+    // Import the Welcome so native MLS store is ready (Welcome itself is authentic)
+    tampered.bob_engine.process_direct_request(&tampered.welcome_input)?;
 
-    // 1. Corrupted ciphertext: flip byte in initial_ciphertext
-    let mut corrupt_welcome = f.welcome_input.clone();
-    let mut ct_bytes = corrupt_welcome.bootstrap.initial_ciphertext.clone();
-    ct_bytes[0] ^= 1;
-    corrupt_welcome.bootstrap.initial_ciphertext = ct_bytes;
-
-    let res = f.bob_engine.decrypt_direct_request(&corrupt_welcome);
-    anyhow::ensure!(res.is_err(), "corrupted ciphertext input digest must fail welcome provenance check");
-    println!("C03 Recipient rejected corrupted ciphertext input digest");
-
-    // 2. Mismatched AAD: flip byte in context_hash
-    let mut wrong_aad_welcome = f.welcome_input.clone();
-    wrong_aad_welcome.bootstrap.context_hash[0] ^= 1;
-    let res = f.bob_engine.decrypt_direct_request(&wrong_aad_welcome);
-    anyhow::ensure!(res.is_err(), "wrong AAD context hash must fail introduction context check");
-    println!("C03 Recipient rejected mutated AAD context hash");
-
-    // Graph unchanged
-    anyhow::ensure!(
-        durable_graph_for_req(&f.alice.did, f.request_id, f.conversation_id)? == initial_graph,
-        "recipient decryption failure leaked graph changes"
+    // Decrypt must reach the AEAD and return Unavailable{InvalidIntroduction}
+    let tampered_result = tampered.bob_engine.decrypt_direct_request(&tampered.welcome_input)?;
+    assert_eq!(
+        tampered_result,
+        DirectRequestIntroductionResult::Unavailable { code: "InvalidIntroduction".into() },
+        "tampered ciphertext must be rejected by the real AEAD, not a pre-check"
     );
+    println!("C03 Tampered ciphertext reached AEAD and was rejected: InvalidIntroduction");
+
+    // Graph unchanged after AEAD rejection
+    anyhow::ensure!(
+        durable_graph_for_req(&tampered.alice.did, tampered.request_id, tampered.conversation_id)? == initial_graph,
+        "AEAD rejection leaked graph changes"
+    );
+
+    // --- Part 2: context_hash mismatch is caught before AEAD ---
+    let authentic = live_direct_request::publish_request(false).await?;
+    authentic.bob_engine.process_direct_request(&authentic.welcome_input)?;
+    let auth_graph = durable_graph_for_req(
+        &authentic.alice.did, authentic.request_id, authentic.conversation_id,
+    )?;
+
+    let mut wrong_ctx = authentic.welcome_input.clone();
+    wrong_ctx.bootstrap.context_hash[0] ^= 1;
+    let ctx_err = authentic.bob_engine.decrypt_direct_request(&wrong_ctx);
+    let err_msg = format!("{:?}", ctx_err);
+    anyhow::ensure!(
+        err_msg.contains("context mismatch"),
+        "expected context mismatch error, got: {err_msg}"
+    );
+    println!("C03 Recipient rejected mutated context_hash: {err_msg}");
+
+    anyhow::ensure!(
+        durable_graph_for_req(&authentic.alice.did, authentic.request_id, authentic.conversation_id)? == auth_graph,
+        "context_hash rejection leaked graph changes"
+    );
+
+    // --- Part 3: positive control — authentic introduction decrypts successfully ---
+    let control = live_direct_request::publish_request(false).await?;
+    control.bob_engine.process_direct_request(&control.welcome_input)?;
+    let control_result = control.bob_engine.decrypt_direct_request(&control.welcome_input)?;
+    match &control_result {
+        DirectRequestIntroductionResult::Ready { plaintext } => {
+            let text = String::from_utf8_lossy(plaintext);
+            anyhow::ensure!(
+                text.contains("Real encrypted first contact"),
+                "positive control plaintext unexpected: {text}"
+            );
+        }
+        other => anyhow::bail!("positive control must decrypt Ready, got: {other:?}"),
+    }
+    println!("C03 Positive control: authentic introduction decrypted successfully");
 
     Ok(())
 }

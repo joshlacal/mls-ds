@@ -2081,7 +2081,7 @@ mod tests {
             authority,
             &AuthorizeBlobReadRequest {
                 blob_id,
-                caller_did,
+                caller_did: caller_did.clone(),
                 caller_device_id,
                 auth_generation,
             },

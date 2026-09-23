@@ -1,5 +1,6 @@
 //! Reusable real first-contact fixture; all original C01 assertions remain active.
 use super::*;
+use catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestBootstrap;
 
 pub struct PublishedRequestFixture {
     pub alice: ServiceIdentity,
@@ -32,6 +33,39 @@ pub async fn publish_request(import_recipient: bool) -> anyhow::Result<Published
 pub async fn publish_request_variant(
     import_recipient: bool,
     include_sibling: bool,
+) -> anyhow::Result<(PublishedRequestFixture, Option<siblings::RecipientSibling>)> {
+    publish_request_variant_configured(import_recipient, include_sibling, false).await
+}
+
+/// C03 only: a malicious-but-authentic sender who holds the real MLS group and
+/// signing key and therefore publishes a *consistently re-signed* publication
+/// whose introduction the recipient cannot authenticate. Nothing else changes:
+/// the same real prepare/publish router path, the same real Welcome.
+pub async fn publish_request_with_unverifiable_introduction(
+) -> anyhow::Result<PublishedRequestFixture> {
+    Ok(
+        publish_request_variant_configured(false, false, true)
+            .await?
+            .0,
+    )
+}
+
+/// Flip the final byte of the AEAD-protected application ciphertext body. Every
+/// outer framing byte, the canonical wire encoding, the message AAD, the group
+/// id/epoch and every server-side digest stay valid, and the publication is
+/// re-signed after this, so only the recipient's real OpenMLS AEAD can reject it.
+fn tamper_introduction_ciphertext(bootstrap: &mut DirectRequestBootstrap) -> anyhow::Result<()> {
+    let raw = &mut bootstrap.initial_ciphertext;
+    anyhow::ensure!(!raw.is_empty(), "prepared introduction ciphertext is empty");
+    let last = raw.len() - 1;
+    raw[last] ^= 1;
+    Ok(())
+}
+
+async fn publish_request_variant_configured(
+    import_recipient: bool,
+    include_sibling: bool,
+    tamper_introduction: bool,
 ) -> anyhow::Result<(PublishedRequestFixture, Option<siblings::RecipientSibling>)> {
     let authority = connect_guarded_request_database(5).await?;
     assert_eq!(
@@ -350,7 +384,7 @@ pub async fn publish_request_variant(
         "recipientDid":bob.did,
         "preparationDigest":preparation["preparationDigest"]
     });
-    let journal = alice_engine.prepare_direct_request(&DirectRequestBootstrapInput {
+    let mut journal = alice_engine.prepare_direct_request(&DirectRequestBootstrapInput {
         draft_id: Uuid::new_v4().to_string(),
         context_json: serde_json::to_vec(&context)?,
         group_id: rand::random::<[u8; 32]>().to_vec(),
@@ -389,6 +423,9 @@ pub async fn publish_request_variant(
             avatar_content_type: None,
         },
     })?;
+    if tamper_introduction {
+        tamper_introduction_ciphertext(&mut journal.bootstrap)?;
+    }
     let bootstrap = &journal.bootstrap;
     let mut publish_body = prepare["body"].clone();
     publish_body["$type"] = json!("blue.catbird.chat.defs#directRequestPublicationBody");
@@ -456,10 +493,16 @@ pub async fn publish_request_variant(
         DirectRequestKind::Publish,
         publish_body,
     )?;
-    alice_engine.persist_request_publication(
-        &request_id.to_string(),
-        &serde_json::to_vec(&json!({"signedRequest":publication}))?,
-    )?;
+    // persist_request_publication verifies the publication artifacts against the
+    // bootstrap stored in the local journal. A tampered introduction would fail
+    // that local check before the POST, so we skip it: the test proves the
+    // server accepts the framing and the recipient's real AEAD rejects it.
+    if !tamper_introduction {
+        alice_engine.persist_request_publication(
+            &request_id.to_string(),
+            &serde_json::to_vec(&json!({"signedRequest":publication}))?,
+        )?;
+    }
     let (publish_status, publish_response) = alice
         .post(
             &client,

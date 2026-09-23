@@ -32,6 +32,9 @@ fn failure(endpoint: ChatEndpoint, error: DirectRequestStoreError) -> ChatFailur
         DirectRequestStoreError::RecipientKeysUnavailable => {
             ChatProtocolErrorCode::RecipientKeysUnavailable
         }
+        DirectRequestStoreError::RecipientAuthorityUnsupported => {
+            ChatProtocolErrorCode::RecipientAuthorityUnsupported
+        }
         DirectRequestStoreError::IncludedAuthorityChanged => {
             ChatProtocolErrorCode::PreparationRevoked
         }
