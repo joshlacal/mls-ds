@@ -14,6 +14,14 @@
 //!   receipt signed by the DS receipt authority.
 //! - Max-plus-one device: a 21st active device, the only way to reach a 41st
 //!   leaf, is refused by the production active-device trigger.
+//! - Max-plus-one bundle at DS: the real bootstrap with a 40th delivery (41st
+//!   leaf) is refused by the shared core transcript at signing and, presented
+//!   under the original signature, by DS with typed InvalidSignature and no
+//!   row change; the exact bundle still publishes afterwards. A validly
+//!   re-signed publication (separate real request to a third account) whose
+//!   delivery is outside the DS selection gets a DS-signed InvalidBootstrap
+//!   rejected receipt, writes no conversation/entry/publication/delivery,
+//!   consumes no package, replays identically, and fences the attempt.
 //! - Nest body tiers in the real process: exactly 16 MiB on publishDirectRequest
 //!   and exactly 10 MiB on prepareDirectRequest are forwarded; one byte more is
 //!   413 without any forwarding attempt, so the 16 MiB publication tier does not
@@ -103,6 +111,31 @@ async fn wait_json(path: &Path, timeout: Duration) -> Result<Value> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     anyhow::bail!("timed out waiting for JSON artifact at {}", path.display());
+}
+
+/// Read-only view of every row a publication could touch, so a refusal can be
+/// shown to have written nothing.
+fn publication_rows(request_id: Uuid, conversation_id: Uuid, dids: [&str; 2]) -> Result<Value> {
+    let sql = format!(
+        "SELECT json_build_object(\
+          'attempts',(SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{request_id}'),\
+          'publications',(SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{request_id}'),\
+          'deliveries',(SELECT count(*) FROM chat.direct_request_device_deliveries WHERE request_id='{request_id}'),\
+          'conversations',(SELECT count(*) FROM chat.conversations WHERE conversation_id='{conversation_id}'),\
+          'entries',(SELECT count(*) FROM chat.entries WHERE conversation_id='{conversation_id}'),\
+          'packages',(SELECT json_object_agg(s,n) FROM (SELECT usage_scope||':'||status AS s,count(*) AS n FROM chat.key_packages WHERE owner_did IN ('{}','{}') GROUP BY 1) p),\
+          'idempotency',(SELECT count(*) FROM chat.idempotency_records WHERE principal_did='{}' AND endpoint_nsid='{PUBLISH}'))",
+        dids[0], dids[1], dids[0]
+    );
+    let output = Command::new("psql")
+        .args([request_database_url(), "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", &sql])
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "publication row read failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 /// Mirrors `live_direct_request_siblings::enroll`: identity rows via the shared
@@ -219,76 +252,35 @@ impl PairedNest {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
-    let started = Instant::now();
-    let name = format!(
-        "catbird_direct_requests_fault_{}",
-        &Uuid::new_v4().simple().to_string()[..16]
-    );
-    maintenance(&format!("CREATE DATABASE {name}"))?;
-    let _dedicated = DedicatedDatabase(name.clone());
-    route_to_dedicated_database(&format!("postgresql://127.0.0.1:5432/{name}"))?;
-    anyhow::ensure!(request_database_url().ends_with(&name));
-    println!("C26 dedicated database {name}");
-    let authority = connect_guarded_request_database(5).await?;
-    assert_eq!(
-        authority.additive_migrations,
-        reviewed_request_migrations().len()
-    );
+/// A real prepared, bootstrapped and Alice-signed publication for one request.
+struct BuiltPublication {
+    request_id: Uuid,
+    conversation_id: Uuid,
+    preparation: Value,
+    publication: Value,
+    coordinates: Value,
+    welcome_len: usize,
+}
 
-    let did_port = HttpsDidFixture::reserve_port()?;
-    let run = Uuid::new_v4().simple().to_string();
-    let alice = ServiceIdentity::new(format!("did:web:alice-{run}.c26-fixture.catbird.blue"));
-    let bob = ServiceIdentity::new(format!("did:web:bob-{run}.c26-fixture.catbird.blue"));
-    let https = HttpsDidFixture::start(
-        did_port,
-        &[
-            (alice.did.clone(), alice.did_document()),
-            (bob.did.clone(), bob.did_document()),
-        ],
-    )?;
-    let ds_server = ShippingServerFixture::start(&https)?;
-    let client = reqwest::Client::builder().build()?;
-    println!("C26 run {run}: DS at {}", ds_server.base_url);
-
-    // 1. Creator plus 39 other devices; both accounts end at the 20-device ceiling.
-    let alice_engine = MlsEngine::new("c26-alice")?;
-    let alice_identity = format!("{}#{}", alice.did, alice.device_id);
-    alice_engine.create_key_package(&alice_identity)?;
-    let alice_public = alice_engine.identity_public_key(&alice_identity)?;
+/// Real `prepareDirectRequest`, production bootstrap from the DS-selected
+/// packages, and Alice's signed publication (not yet sent).
+async fn prepare_and_build(
+    alice_engine: &MlsEngine,
+    alice_identity: &str,
+    alice: &ServiceIdentity,
+    recipient_did: &str,
+    ds: &ShippingServerFixture,
+    client: &reqwest::Client,
+    text: &str,
+) -> Result<BuiltPublication> {
+    let alice_public = alice_engine.identity_public_key(alice_identity)?;
     let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
-    seed_service_device(&alice, &alice_public)?;
-    for _ in 0..19 {
-        enroll_device(&alice, &client, &ds_server.base_url).await?;
-    }
-    for _ in 0..20 {
-        enroll_device(&bob, &client, &ds_server.base_url).await?;
-    }
-    println!(
-        "Enrolled 39 devices through publishDirectRequestKeys in {:?}",
-        started.elapsed()
-    );
-
-    // 2. Max-plus-one device: a 41st leaf needs a 21st active device on one
-    //    account. The production deferred trigger refuses it at commit, so the
-    //    fixture insert rolls back and leaves no row.
-    let extra = ServiceIdentity::new(bob.did.clone());
-    let refused = seed_service_device(&extra, &[7_u8; 32])
-        .expect_err("21st active device must be refused by the active-device ceiling");
-    anyhow::ensure!(
-        refused.to_string().contains("active device limit exceeded"),
-        "expected the production active-device ceiling, got: {refused}"
-    );
-    println!("Assertion: 21st active device (41st leaf) refused: active device limit exceeded.");
-
-    // 3. Real preparation selects exactly the 39 non-creator devices.
     let request_id = Uuid::new_v4();
     let first_message_id = Uuid::new_v4();
     let conversation_id = Uuid::new_v4();
     let prepare = signed_mls_request(
-        &alice_engine,
-        &alice_identity,
+        alice_engine,
+        alice_identity,
         DirectRequestKind::Prepare,
         json!({
             "$type":"blue.catbird.chat.defs#directRequestPreparationBody",
@@ -301,7 +293,7 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
             "requestId":request_id.to_string(),
             "firstMessageId":first_message_id.to_string(),
             "conversationId":conversation_id.to_string(),
-            "recipientDid":bob.did,
+            "recipientDid":recipient_did,
             "origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},
             "profile":"encryptedIntroduction1",
             "idempotencyKey":request_id.to_string(),
@@ -310,8 +302,8 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
     )?;
     let (prepare_status, prepare_response) = alice
         .post(
-            &client,
-            &ds_server.base_url,
+            client,
+            &ds.base_url,
             PREPARE,
             &json!({"signedRequest":prepare}),
             true,
@@ -328,25 +320,16 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
         .with_context(|| format!("prepare returned no preparation: {prepare_json}"))?;
     protocol::verify_direct_request_preparation(
         &serde_json::to_vec(preparation)?,
-        &ds_server.receipt_public_key,
+        &ds.receipt_public_key,
     )?;
     let selected = preparation["selectedDevices"]
         .as_array()
         .context("selectedDevices array")?;
-    let per_account = |did: &str| selected.iter().filter(|d| d["actorDid"] == did).count();
-    anyhow::ensure!(
-        selected.len() == 39 && per_account(&alice.did) == 19 && per_account(&bob.did) == 20,
-        "expected 19 creator siblings + 20 recipient devices, got {} ({} / {})",
-        selected.len(),
-        per_account(&alice.did),
-        per_account(&bob.did)
-    );
     let verified_prepare = protocol::verify_signed_request(
         DirectRequestKind::Prepare,
         &serde_json::to_vec(&prepare)?,
         &alice_public,
     )?;
-    println!("Assertion: signed preparation selected 39 devices (19 + 20) for a 40-leaf group.");
 
     // 4. Production 40-leaf bootstrap from the DS-selected packages.
     let context = json!({
@@ -358,7 +341,7 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
         "actorDid":alice.did,
         "actorDeviceId":alice.device_id.to_string(),
         "actorKeyId":alice_key_id,
-        "recipientDid":bob.did,
+        "recipientDid":recipient_did,
         "preparationDigest":preparation["preparationDigest"]
     });
     let decode = |device: &Value, field: &str| -> Result<Vec<u8>> {
@@ -384,8 +367,8 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
             .collect::<Result<_>>()?,
         authority_import_until: u64::MAX,
         preparation_request_digest: *verified_prepare.request_digest(),
-        receipt_authority_key: ds_server.receipt_public_key.clone(),
-        text: "Real 40-leaf encrypted introduction".into(),
+        receipt_authority_key: ds.receipt_public_key.clone(),
+        text: text.into(),
         invitation: None,
         metadata: GroupMetadataV1 {
             version: 1,
@@ -458,17 +441,166 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
         }
     });
     let publication = signed_mls_request(
-        &alice_engine,
-        &alice_identity,
+        alice_engine,
+        alice_identity,
         DirectRequestKind::Publish,
         publish_body,
     )?;
+    Ok(BuiltPublication {
+        request_id,
+        conversation_id,
+        preparation: preparation.clone(),
+        publication,
+        coordinates: bootstrap.coordinates.clone(),
+        welcome_len: bootstrap.welcome.len(),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
+    let started = Instant::now();
+    let name = format!(
+        "catbird_direct_requests_fault_{}",
+        &Uuid::new_v4().simple().to_string()[..16]
+    );
+    maintenance(&format!("CREATE DATABASE {name}"))?;
+    let _dedicated = DedicatedDatabase(name.clone());
+    route_to_dedicated_database(&format!("postgresql://127.0.0.1:5432/{name}"))?;
+    anyhow::ensure!(request_database_url().ends_with(&name));
+    println!("C26 dedicated database {name}");
+    let authority = connect_guarded_request_database(5).await?;
+    assert_eq!(
+        authority.additive_migrations,
+        reviewed_request_migrations().len()
+    );
+
+    let did_port = HttpsDidFixture::reserve_port()?;
+    let run = Uuid::new_v4().simple().to_string();
+    let alice = ServiceIdentity::new(format!("did:web:alice-{run}.c26-fixture.catbird.blue"));
+    let bob = ServiceIdentity::new(format!("did:web:bob-{run}.c26-fixture.catbird.blue"));
+    let carol = ServiceIdentity::new(format!("did:web:carol-{run}.c26-fixture.catbird.blue"));
+    let https = HttpsDidFixture::start(
+        did_port,
+        &[
+            (alice.did.clone(), alice.did_document()),
+            (bob.did.clone(), bob.did_document()),
+            (carol.did.clone(), carol.did_document()),
+        ],
+    )?;
+    let ds_server = ShippingServerFixture::start(&https)?;
+    let client = reqwest::Client::builder().build()?;
+    println!("C26 run {run}: DS at {}", ds_server.base_url);
+
+    // 1. Creator plus 39 other devices; both accounts end at the 20-device ceiling.
+    let alice_engine = MlsEngine::new("c26-alice")?;
+    let alice_identity = format!("{}#{}", alice.did, alice.device_id);
+    alice_engine.create_key_package(&alice_identity)?;
+    let alice_public = alice_engine.identity_public_key(&alice_identity)?;
+    seed_service_device(&alice, &alice_public)?;
+    for _ in 0..19 {
+        enroll_device(&alice, &client, &ds_server.base_url).await?;
+    }
+    for _ in 0..20 {
+        enroll_device(&bob, &client, &ds_server.base_url).await?;
+    }
+    println!(
+        "Enrolled 39 devices through publishDirectRequestKeys in {:?}",
+        started.elapsed()
+    );
+
+    // 2. Max-plus-one device: a 41st leaf needs a 21st active device on one
+    //    account. The production deferred trigger refuses it at commit, so the
+    //    fixture insert rolls back and leaves no row.
+    let extra = ServiceIdentity::new(bob.did.clone());
+    let refused = seed_service_device(&extra, &[7_u8; 32])
+        .expect_err("21st active device must be refused by the active-device ceiling");
+    anyhow::ensure!(
+        refused.to_string().contains("active device limit exceeded"),
+        "expected the production active-device ceiling, got: {refused}"
+    );
+    println!("Assertion: 21st active device (41st leaf) refused: active device limit exceeded.");
+
+    // 3. Real preparation selects exactly the 39 non-creator devices, and
+    // 4. the production 40-leaf bootstrap is built from the DS-selected packages.
+    let built = prepare_and_build(
+        &alice_engine,
+        &alice_identity,
+        &alice,
+        &bob.did,
+        &ds_server,
+        &client,
+        "Real 40-leaf encrypted introduction",
+    )
+    .await?;
+    let (request_id, conversation_id) = (built.request_id, built.conversation_id);
+    let selected = built.preparation["selectedDevices"]
+        .as_array()
+        .context("selectedDevices array")?;
+    let per_account = |did: &str| selected.iter().filter(|d| d["actorDid"] == did).count();
+    anyhow::ensure!(
+        selected.len() == 39 && per_account(&alice.did) == 19 && per_account(&bob.did) == 20,
+        "expected 19 creator siblings + 20 recipient devices, got {} ({} / {})",
+        selected.len(),
+        per_account(&alice.did),
+        per_account(&bob.did)
+    );
+    println!("Assertion: signed preparation selected 39 devices (19 + 20) for a 40-leaf group.");
+    let publication = built.publication.clone();
     let publication_bytes = serde_json::to_vec(&json!({"signedRequest":publication}))?;
     println!(
         "Built 40-leaf publication: {} wire bytes, welcome {} bytes",
         publication_bytes.len(),
-        bootstrap.welcome.len()
+        built.welcome_len
     );
+
+    // 4b. Max-plus-one bundle straight to DS: the real 40-leaf bootstrap (39
+    //     deliveries + creator) plus a 40th delivery (41st leaf) for a device
+    //     outside the selection. The shared core transcript refuses to sign it
+    //     at its 39-delivery schema bound, so it can only be presented under
+    //     the original signature; DS must refuse it before admission with the
+    //     typed InvalidSignature and write nothing (the refusal is not
+    //     attributable to the bound alone; step 9 covers DS's own selection
+    //     check). The exact bundle must still publish afterwards.
+    let rows_before = publication_rows(request_id, conversation_id, [&alice.did, &bob.did])?;
+    let mut body = publication["body"].clone();
+    let deliveries = body["artifacts"]["welcome"]["deliveries"]
+        .as_array_mut()
+        .context("deliveries array")?;
+    let mut outside = deliveries.last().context("last delivery")?.clone();
+    outside["recipientDid"] = json!(bob.did);
+    outside["recipientDeviceId"] = json!(Uuid::new_v4().to_string());
+    deliveries.push(outside);
+    anyhow::ensure!(deliveries.len() == 40, "max-plus-one must carry 40 deliveries");
+    let refusal =
+        signed_mls_request(&alice_engine, &alice_identity, DirectRequestKind::Publish, body.clone())
+            .expect_err("core transcript must refuse a 41-leaf publication");
+    anyhow::ensure!(
+        refusal.to_string().contains("array length bound"),
+        "expected the core 39-delivery bound, got: {refusal}"
+    );
+    println!("Assertion: core transcript refuses to sign 40 deliveries (41 leaves): {refusal}");
+    let (status, response) = alice
+        .post(
+            &client,
+            &ds_server.base_url,
+            PUBLISH,
+            &json!({"signedRequest":{"body":body,"signature":publication["signature"]}}),
+            true,
+        )
+        .await?;
+    let error: Value = serde_json::from_slice(&response)
+        .with_context(|| format!("untyped refusal {status}: {}", String::from_utf8_lossy(&response)))?;
+    println!("41st leaf (40 deliveries) direct to DS -> {status} {error}");
+    anyhow::ensure!(
+        status == reqwest::StatusCode::UNAUTHORIZED && error["error"] == "InvalidSignature",
+        "DS must refuse the unsignable 41-leaf bundle with typed InvalidSignature, got {status}: {error}"
+    );
+    let rows_after = publication_rows(request_id, conversation_id, [&alice.did, &bob.did])?;
+    anyhow::ensure!(
+        rows_after == rows_before,
+        "refused 41-leaf publication changed rows: {rows_before} -> {rows_after}"
+    );
+    println!("Assertion: 41-leaf publication refused by DS (401 InvalidSignature); rows unchanged {rows_before}.");
 
     // 5. Separate real Nest process in front of the real DS.
     let paired_dir = std::env::temp_dir().join(format!("c26-paired-nest-{run}"));
@@ -565,7 +697,7 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
             && proof["requestId"] == request_id.to_string()
             && proof["conversationId"] == conversation_id.to_string()
             && proof["requestDigest"] == STANDARD.encode(verified_publication.request_digest())
-            && proof["coordinates"] == bootstrap.coordinates,
+            && proof["coordinates"] == built.coordinates,
         "published receipt does not bind this 40-leaf publication: {proof}"
     );
     println!("Assertion: exact 40-leaf bundle accepted through Nest into DS with a DS-signed published receipt.");
@@ -620,6 +752,116 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
         "Assertion: paired Nest process exited cleanly ({} forwarding attempts); total {:?}.",
         result["serviceAuthCalls"],
         started.elapsed()
+    );
+
+    // 9. DS's own selection check on a validly signed publication. A separate
+    //    real request to a third account (the 40-leaf preparation above is
+    //    already published): Alice re-signs the real bootstrap with its only
+    //    delivery swapped for a device outside the DS selection. By design DS
+    //    answers with a DS-signed terminal rejected receipt for that attempt
+    //    and writes no conversation, entry, publication or Welcome delivery;
+    //    replaying the refused bytes returns the same receipt, and the
+    //    original valid bytes can no longer publish.
+    enroll_device(&carol, &client, &ds_server.base_url).await?;
+    let probe = prepare_and_build(
+        &alice_engine,
+        &alice_identity,
+        &alice,
+        &carol.did,
+        &ds_server,
+        &client,
+        "Outside-selection probe",
+    )
+    .await?;
+    let probe_selected = probe.preparation["selectedDevices"]
+        .as_array()
+        .context("probe selectedDevices")?;
+    anyhow::ensure!(
+        probe_selected.iter().any(|d| d["actorDid"] == carol.did),
+        "probe preparation must select Carol's device: {probe_selected:?}"
+    );
+    let probe_rows = |label: &str| -> Result<Value> {
+        let rows = publication_rows(probe.request_id, probe.conversation_id, [&alice.did, &carol.did])?;
+        println!("{label} probe rows {rows}");
+        Ok(rows)
+    };
+    let before = probe_rows("before")?;
+    let mut body = probe.publication["body"].clone();
+    let carol_delivery = body["artifacts"]["welcome"]["deliveries"]
+        .as_array_mut()
+        .context("probe deliveries")?
+        .iter_mut()
+        .find(|d| d["recipientDid"] == carol.did)
+        .context("Carol delivery")?;
+    carol_delivery["recipientDeviceId"] = json!(Uuid::new_v4().to_string());
+    let outside =
+        signed_mls_request(&alice_engine, &alice_identity, DirectRequestKind::Publish, body)?;
+    let outside_envelope = json!({"signedRequest":outside});
+    let (status, response) = alice
+        .post(&client, &ds_server.base_url, PUBLISH, &outside_envelope, true)
+        .await?;
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "outside-selection publication must get a receipt, got {status}: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let outcome: Value = serde_json::from_slice(&response)?;
+    let mut receipt = outcome["outcome"].clone();
+    receipt
+        .as_object_mut()
+        .context("probe outcome object")?
+        .remove("$type");
+    let verified = protocol::verify_signed_request(
+        DirectRequestKind::Outcome,
+        &serde_json::to_vec(&receipt)?,
+        &ds_server.receipt_public_key,
+    )?;
+    let rejected = &verified.body()["receipt"];
+    println!("delivery outside selection direct to DS -> {status} {rejected}");
+    anyhow::ensure!(
+        rejected["$type"] == "blue.catbird.chat.defs#directRequestRejectedReceipt"
+            && rejected["code"] == "InvalidBootstrap"
+            && rejected["requestId"] == probe.request_id.to_string(),
+        "expected a DS-signed InvalidBootstrap rejection for this request: {rejected}"
+    );
+    let after = probe_rows("after")?;
+    for field in ["publications", "deliveries", "conversations", "entries"] {
+        anyhow::ensure!(
+            after[field] == 0 && after[field] == before[field],
+            "refused publication wrote {field}: {before} -> {after}"
+        );
+    }
+    anyhow::ensure!(
+        after["packages"]["direct-request:consumed"] == before["packages"]["direct-request:consumed"],
+        "refused publication consumed a request package: {before} -> {after}"
+    );
+    let (replay_status, replay) = alice
+        .post(&client, &ds_server.base_url, PUBLISH, &outside_envelope, true)
+        .await?;
+    anyhow::ensure!(
+        replay_status == reqwest::StatusCode::OK && replay == response,
+        "refused bytes must replay the identical terminal receipt"
+    );
+    let (valid_status, valid) = alice
+        .post(
+            &client,
+            &ds_server.base_url,
+            PUBLISH,
+            &json!({"signedRequest":probe.publication}),
+            true,
+        )
+        .await?;
+    println!(
+        "original valid probe bytes after refusal -> {valid_status} {}",
+        String::from_utf8_lossy(&valid)
+    );
+    let fenced = probe_rows("fenced")?;
+    anyhow::ensure!(
+        fenced["publications"] == 0 && fenced["conversations"] == 0 && fenced["deliveries"] == 0,
+        "valid bytes published after a terminal refusal: {fenced}"
+    );
+    println!(
+        "Assertion: outside-selection publication refused by DS with a signed InvalidBootstrap receipt; no conversation/entry/publication/delivery rows, package state unchanged, replay identical, attempt fenced."
     );
     Ok(())
 }
