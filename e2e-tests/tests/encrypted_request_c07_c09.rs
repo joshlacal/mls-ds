@@ -12,7 +12,11 @@ use base64::{
     Engine as _,
 };
 use catbird_mls::{
-    chat_v2::transcript::direct_request::{self as protocol, DirectRequestKind},
+    chat_v2::transcript::{
+        decode_strict_json,
+        direct_request::{self as protocol, DirectRequestKind},
+        project_signed_body, SignedMutationKind, SigningTranscript,
+    },
     metadata::GroupMetadataV1,
     orchestrator::direct_request_bootstrap::{
         metadata_coordinate, DirectRequestBootstrapInput, DirectRequestIntroductionResult,
@@ -60,25 +64,17 @@ fn run_psql_query(sql: &str) -> anyhow::Result<String> {
     String::from_utf8(output.stdout).context("psql returned non-UTF8 output")
 }
 
-fn run_psql_exec(sql: &str) -> anyhow::Result<()> {
-    let output = Command::new("psql")
-        .args([
-            "-X",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-d",
-            REQUEST_TEST_DATABASE_URL,
-            "-c",
-            sql,
-        ])
-        .output()
-        .context("launch psql mutation for live encrypted-request test")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "psql mutation failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
+/// Ordinary signed chat mutation (same transcript builder the client uses).
+fn sign_mutation(
+    engine: &MlsEngine,
+    identity: &str,
+    kind: SignedMutationKind,
+    body: Value,
+) -> anyhow::Result<Value> {
+    let strict = decode_strict_json(&serde_json::to_vec(&body)?)?;
+    let transcript = SigningTranscript::build_for(kind, &project_signed_body(kind, &strict)?)?;
+    let signature = engine.sign_identity(identity, transcript.bytes().to_vec())?;
+    Ok(json!({"body": body, "signature": STANDARD.encode(signature)}))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -113,26 +109,61 @@ async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> any
     seed_service_device(&bob, &bob_public)?;
     seed_service_device(&charlie, &charlie_public)?;
 
-    // Seed 1 recovery package for Bob directly in database via psql
-    let recovery_ref = Sha256::digest(Uuid::new_v4().as_bytes()).to_vec();
-    let rec_ref_hex = hex::encode(&recovery_ref);
-    let rec_wrapper_hex = hex::encode(vec![9u8; 40]);
-    let rec_sha_hex = hex::encode(Sha256::digest(vec![9u8; 40]));
-    let rec_init_hex = hex::encode(Uuid::new_v4().as_bytes());
     let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
     let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
     let charlie_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&charlie_public));
 
-    run_psql_exec(&format!(
-        "INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at,usage_scope) \
-         VALUES(decode('{rec_ref_hex}','hex'),decode('{rec_wrapper_hex}','hex'),decode('{rec_sha_hex}','hex'),decode('{rec_init_hex}','hex'),'{did}','{device}','{key}',1,clock_timestamp()-INTERVAL '1 second',clock_timestamp()+INTERVAL '30 days','available',clock_timestamp(),'recovery')",
-        did = bob.did,
-        device = bob.device_id,
-        key = bob_key_id,
-    ))?;
-
     let server = ShippingServerFixture::start(&https)?;
     let client = reqwest::Client::builder().build()?;
+
+    // Bob's recovery pool is filled through the real ordinary-signed
+    // replenishKeyPackages RPC (generic key-package writer, recovery scope).
+    let (recovery_package, recovery_ref) = bob_engine.create_key_package(&bob_identity)?;
+    let rec_ref_hex = hex::encode(&recovery_ref);
+    let replenish = sign_mutation(
+        &bob_engine,
+        &bob_identity,
+        SignedMutationKind::KeyPackageReplenishment,
+        json!({
+            "$type":"blue.catbird.chat.defs#keyPackageReplenishmentBody",
+            "signatureDomain":"CATBIRD-CHAT-DEVICE-REPLENISH\0",
+            "actorDid":bob.did,
+            "actorDeviceId":bob.device_id.to_string(),
+            "keyId":bob_key_id,
+            "authGeneration":1,
+            "signaturePublicKey":STANDARD.encode(&bob_public),
+            "keyPackages":[{
+                "framing":"mlsMessage",
+                "contentType":"keyPackage",
+                "bytes":STANDARD.encode(&recovery_package),
+                "sha256":STANDARD.encode(Sha256::digest(&recovery_package)),
+                "keyPackageRef":STANDARD.encode(&recovery_ref)
+            }],
+            "idempotencyKey":Uuid::new_v4().to_string(),
+            "signedAt":canonical_now()
+        }),
+    )?;
+    let (replenish_status, replenish_raw) = bob
+        .post(
+            &client,
+            &server.base_url,
+            "blue.catbird.chat.replenishKeyPackages",
+            &json!({"signedRequest":replenish}),
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        replenish_status == reqwest::StatusCode::OK,
+        "recovery replenishment failed {replenish_status}: {}",
+        String::from_utf8_lossy(&replenish_raw)
+    );
+    let recovery_row = run_psql_query(&format!(
+        "SELECT usage_scope||' '||status FROM chat.key_packages WHERE key_package_ref=decode('{rec_ref_hex}','hex')"
+    ))?;
+    anyhow::ensure!(
+        recovery_row.trim() == "recovery available",
+        "real replenishment must publish a recovery-scoped available package: {recovery_row}"
+    );
 
     // Bob publishes exactly 1 direct-request key package
     let grant_id = Uuid::new_v4();
@@ -410,18 +441,32 @@ async fn c07_live_router_unsigned_grant_rejects_before_publication() -> anyhow::
             "signedAt":canonical_now()
         })
     };
-    // We cannot use signed_mls_request here because its canonical transcript
-    // projection recursively validates inner grants (requiring the 'signature'
-    // field), which is exactly what we want the server to reject. Instead,
-    // construct the wrapper manually with a dummy signature: the server's own
-    // projection of the body will encounter the unsigned inner grant and reject
-    // the request before it ever checks our outer Ed25519 signature.
-    let unsigned_keys_body = keys_body(unsigned_grant, 1);
-    let dummy_sig = bob_engine.sign_identity(&bob_identity, b"dummy".to_vec())?;
-    let unsigned_keys = json!({
-        "body": unsigned_keys_body,
-        "signature": STANDARD.encode(dummy_sig)
-    });
+    // Sign the outer Keys envelope for real over the canonical transcript of
+    // the publication body, then remove ONLY the inner grant signature. The
+    // outer signature stays byte-identical and valid for everything the signer
+    // bound; the single difference from the accepted control envelope below is
+    // the unsigned inner grant, so the inner predicate decides. (The closed
+    // contract types `grant` as signedDirectRequestGrant, so no canonical
+    // transcript can itself contain an unsigned grant.)
+    let control_keys = signed_mls_request(
+        &bob_engine,
+        &bob_identity,
+        DirectRequestKind::Keys,
+        keys_body(signed_control, 1),
+    )?;
+    let mut unsigned_keys = control_keys.clone();
+    unsigned_keys["body"]["keys"][0]["grant"] = unsigned_grant;
+    assert_eq!(unsigned_keys["signature"], control_keys["signature"]);
+    let local = protocol::verify_signed_request(
+        DirectRequestKind::Keys,
+        &serde_json::to_vec(&unsigned_keys)?,
+        &bob_public,
+    )
+    .expect_err("unsigned inner grant must not verify");
+    anyhow::ensure!(
+        local.to_string() == "missing required field signature",
+        "rejection must come from the unsigned inner grant predicate, got: {local}"
+    );
     let (status, raw) = bob
         .post(
             &client,
@@ -433,8 +478,8 @@ async fn c07_live_router_unsigned_grant_rejects_before_publication() -> anyhow::
         .await?;
     let response: Value = serde_json::from_slice(&raw)?;
     anyhow::ensure!(
-        status.is_client_error(),
-        "unsigned grant must be rejected, received {status}: {response}"
+        status == reqwest::StatusCode::UNAUTHORIZED && response["error"] == "InvalidSignature",
+        "unsigned grant must be rejected with typed InvalidSignature, received {status}: {response}"
     );
 
     // No key package, grant or capability row may have been created.
@@ -463,18 +508,14 @@ async fn c07_live_router_unsigned_grant_rejects_before_publication() -> anyhow::
         "unsigned grant wrote a capability row: {capability_rows}"
     );
 
-    // Control: the correctly signed equivalent from the same device is accepted.
+    // Control: the identical envelope with the inner grant signature intact
+    // (same outer signature, same idempotency key) is accepted.
     let (control_status, control_raw) = bob
         .post(
             &client,
             &server.base_url,
             "blue.catbird.chat.publishDirectRequestKeys",
-            &json!({"signedRequest": signed_mls_request(
-                &bob_engine,
-                &bob_identity,
-                DirectRequestKind::Keys,
-                keys_body(signed_control, 1),
-            )?}),
+            &json!({"signedRequest":control_keys}),
             true,
         )
         .await?;

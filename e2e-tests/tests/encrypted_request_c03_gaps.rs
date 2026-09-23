@@ -776,5 +776,12 @@ async fn ciphertext_and_aad_mutations_fail_at_recipient_before_acceptance() -> a
     }
     println!("C03 Positive control: authentic introduction decrypted successfully");
 
+    // Capacity hygiene: every published request is released through real
+    // signed acceptance so the shared pending budget is not leaked.
+    for fixture in [&tampered, &authentic, &control] {
+        live_direct_request::accept_existing_fixture(fixture).await?;
+    }
+    println!("C03 capacity hygiene: 3 published requests released via signed acceptance");
+
     Ok(())
 }

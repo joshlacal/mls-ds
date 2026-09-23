@@ -15,9 +15,12 @@ mod encrypted_requests;
 mod staged;
 
 use anyhow::Context as _;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use catbird_mls::{
-    chat_v2::transcript::direct_request as protocol,
+    chat_v2::transcript::direct_request::{self as protocol, DirectRequestKind},
     orchestrator::{
         direct_request_bootstrap::DirectRequestIntroductionResult,
         direct_request_journal::{DirectRequestJournal, DirectRequestJournalPhase},
@@ -25,7 +28,8 @@ use catbird_mls::{
     },
 };
 use encrypted_requests::{
-    request_database_snapshot, request_database_url, DeterministicFaultTransport, FaultBoundary,
+    canonical_now, request_database_snapshot, request_database_url, signed_mls_request,
+    DeterministicFaultTransport, FaultBoundary,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -368,5 +372,51 @@ async fn c11_committed_publication_lost_response_resolves_after_process_restart(
         resolved["pid"],
         hex::encode(Sha256::digest(&durable.bootstrap.initial_ciphertext))
     );
+
+    // 7. Capacity hygiene: release the committed request through the real
+    //    signed acceptance RPC (the shared pending budget never frees by time).
+    let prior = welcome.bootstrap.coordinates.clone();
+    let bob_public = f.bob_engine.identity_public_key(&f.bob_identity)?;
+    let transition = Uuid::new_v4();
+    let mut next = prior.clone();
+    next["stateVersion"] = json!(prior["stateVersion"].as_u64().context("state version")? + 1);
+    let accept = signed_mls_request(
+        &f.bob_engine,
+        &f.bob_identity,
+        DirectRequestKind::Accept,
+        json!({
+            "$type":"blue.catbird.chat.defs#directRequestAcceptanceBody",
+            "signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPT\0", "protocolVersion":"2",
+            "actorDid":f.bob.did, "actorDeviceId":f.bob.device_id.to_string(),
+            "keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)), "authGeneration":1,
+            "requestId":request.to_string(), "transitionId":transition.to_string(),
+            "prior":prior, "next":next,
+            "invitationProvenance":{"invitationTransitionId":request.to_string(),
+                "invitedByDid":f.alice.did,"invitedByDeviceId":f.alice.device_id.to_string()},
+            "idempotencyKey":transition.to_string(),"signedAt":canonical_now()
+        }),
+    )?;
+    let (status, body) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.acceptConversation",
+            &json!({"directRequest":accept}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "release acceptance failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        count(&format!("SELECT count(*) FROM chat.direct_request_acceptance_claims WHERE request_id='{request}'"))?,
+        1,
+        "request released by exactly one acceptance claim"
+    );
+    println!("C11 capacity hygiene: request {request} released via signed acceptance");
     Ok(())
 }
