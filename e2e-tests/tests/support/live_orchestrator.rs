@@ -144,6 +144,18 @@ pub async fn live_orchestrator(
 ) -> anyhow::Result<LiveOrchestrator> {
     let credentials = MockCredentials::new();
     credentials.set_request_authority_document(receipt_authority_document);
+    live_orchestrator_with_credentials(context, service, client, base_url, credentials).await
+}
+
+/// Same as `live_orchestrator`, over caller-populated credentials (for example
+/// authorized device keys read from the live `getDeviceKey` RPC).
+pub async fn live_orchestrator_with_credentials(
+    context: Arc<MLSContext>,
+    service: &crate::encrypted_requests::ServiceIdentity,
+    client: &reqwest::Client,
+    base_url: &str,
+    credentials: MockCredentials,
+) -> anyhow::Result<LiveOrchestrator> {
     credentials
         .store_device_uuid(&service.did, &service.device_id.to_string())
         .await?;
