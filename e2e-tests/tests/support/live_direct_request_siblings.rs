@@ -1,14 +1,14 @@
 //! Actual C06: account consent precedes both independent recipient imports.
 use super::*;
 
-pub(super) struct RecipientSibling {
+pub struct RecipientSibling {
     pub service: ServiceIdentity,
     pub engine: MlsEngine,
     pub identity: String,
     pub package_ref: Vec<u8>,
 }
 
-pub(super) async fn enroll(
+pub async fn enroll(
     account: &ServiceIdentity,
     client: &reqwest::Client,
     server: &str,

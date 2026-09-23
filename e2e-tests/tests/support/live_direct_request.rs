@@ -22,14 +22,14 @@ pub struct PublishedRequestFixture {
 }
 
 #[path = "live_direct_request_siblings.rs"]
-mod siblings;
+pub mod siblings;
 pub use siblings::accept_before_both_recipient_imports;
 
 pub async fn publish_request(import_recipient: bool) -> anyhow::Result<PublishedRequestFixture> {
     Ok(publish_request_variant(import_recipient, false).await?.0)
 }
 
-async fn publish_request_variant(
+pub async fn publish_request_variant(
     import_recipient: bool,
     include_sibling: bool,
 ) -> anyhow::Result<(PublishedRequestFixture, Option<siblings::RecipientSibling>)> {
