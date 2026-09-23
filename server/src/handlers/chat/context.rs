@@ -60,7 +60,10 @@ pub(crate) fn require_cutover(
 }
 
 fn capture_instant(endpoint: ChatEndpoint) -> Result<TrustedRequestInstant, ChatFailure> {
-    TrustedRequestInstant::capture().map_err(|_| ChatFailure::invariant(endpoint))
+    TrustedRequestInstant::capture().map_err(|error| {
+        tracing::error!(endpoint = endpoint.nsid(), ?error, "clean-chat trusted instant capture failed");
+        ChatFailure::invariant(endpoint)
+    })
 }
 
 pub(crate) async fn verify_service_principal(
@@ -151,7 +154,10 @@ pub(crate) async fn admit_unsigned_read(
     let authority = auth::authorize_unsigned_request(pool, pre_replay)
         .await
         .map_err(|error| auth_repository_failure(endpoint, error))?;
-    dpop::seal_read_admission(authority).map_err(|_| ChatFailure::invariant(endpoint))
+    dpop::seal_read_admission(authority).map_err(|error| {
+        tracing::error!(endpoint = endpoint.nsid(), ?error, "clean-chat read admission seal failed");
+        ChatFailure::invariant(endpoint)
+    })
 }
 /// Byte-opaque operation-only admission for an ordinary signed procedure.
 /// Global operation arbitration in the caller-owned transaction decides
@@ -329,9 +335,19 @@ pub(crate) fn auth_repository_failure(
     use AuthRepositoryError as E;
     use ChatProtocolErrorCode as C;
     let code = match error {
-        E::Database(_) => return ChatFailure::storage(endpoint),
-        E::CorruptIdempotencyRecord | E::InvalidCompletion => {
-            return ChatFailure::invariant(endpoint)
+        E::Database(_) | E::CorruptIdempotencyRecord | E::InvalidCompletion => {
+            // Redacted on the wire; the server log keeps the cause so an
+            // internal 500 is never silent.
+            tracing::error!(
+                endpoint = endpoint.nsid(),
+                error = ?error,
+                "clean-chat authorization repository failure"
+            );
+            return if matches!(error, E::Database(_)) {
+                ChatFailure::storage(endpoint)
+            } else {
+                ChatFailure::invariant(endpoint)
+            };
         }
         E::ReplayDetected => C::NotAuthorized,
         E::DpopBindingMismatch => C::DeviceBindingMismatch,
