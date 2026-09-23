@@ -6,7 +6,7 @@
 
 const ROW_ALLOWANCE: u64 = 16 * 1024;
 
-pub(super) struct PublicationArtifactLengths {
+pub(crate) struct PublicationArtifactLengths {
     pub signed_wrapper: usize,
     pub accepted_entry: usize,
     pub unsigned_body: usize,
@@ -19,7 +19,7 @@ pub(super) struct PublicationArtifactLengths {
     pub legacy_successor: bool,
 }
 
-pub(super) fn charge(
+pub(crate) fn charge(
     existing_attempt: u64,
     receipt: usize,
     parts: &PublicationArtifactLengths,

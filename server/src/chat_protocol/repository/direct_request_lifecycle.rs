@@ -174,7 +174,10 @@ pub(crate) async fn load_request_projection(
     }
     let row = sqlx::query("SELECT p.signed_publication,p.request_id,p.recipient_did,k.signing_public_key,l.consent,l.acceptance_proof FROM chat.direct_request_publications p JOIN chat.device_keys k ON k.user_did=p.actor_did AND k.device_id=p.actor_device_id AND k.key_id=p.actor_key_id LEFT JOIN chat.direct_request_lifecycle l USING(request_id) WHERE p.conversation_id=$1 ORDER BY p.generation DESC LIMIT 1")
         .bind(conversation_id).fetch_optional(&mut **tx).await?.ok_or(E::InvalidMaterialization)?;
-    let signed: Vec<u8> = row.try_get("signed_publication")?;
+    let signed: Option<Vec<u8>> = row.try_get("signed_publication")?;
+    let Some(signed) = signed else {
+        return Ok(None);
+    };
     let key: Vec<u8> = row.try_get("signing_public_key")?;
     let publication = verify_signed_request(DirectRequestKind::Publish, &signed, &key)
         .map_err(|_| E::InvalidMaterialization)?;
@@ -223,6 +226,11 @@ pub(crate) async fn load_request_projection(
         None => "outgoingPending",
         Some("accepted") if acceptance_proof.is_some() => "accepted",
         Some("closed") => "closed",
+        // Server-driven 30-day expiry is terminal like close. The wire
+        // directRequestState.consent knownValues have no "expired" arm, so it
+        // projects as "closed"; the signed publishedExpiry receipt (outcome
+        // query) carries the distinction.
+        Some("expired") => "closed",
         _ => return Err(E::InvalidMaterialization),
     };
     let mut value = json!({"requestId":body["requestId"],"senderDid":body["actorDid"],"recipientDid":body["recipientDid"],"firstMessageId":body["firstMessageId"],"contextHash":body["contextHash"],"preparationDigest":body["preparationDigest"],"importUntil":body["importUntil"],"consent":consent});

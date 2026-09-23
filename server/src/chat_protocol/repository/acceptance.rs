@@ -1149,8 +1149,6 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     }
     sqlx::query("INSERT INTO chat.direct_request_lifecycle(request_id,conversation_id,consent,acceptance_proof,acceptance_digest,accepted_at) VALUES($1,$2,'accepted',$3,$4,$5)")
         .bind(request_id).bind(conversation_id).bind(proof_bytes).bind(signed.request_digest().as_slice()).bind(now).execute(&mut **tx).await?;
-    sqlx::query("INSERT INTO chat.direct_request_pending_releases(request_id,released_bytes,released_at,reason) SELECT request_id,reserved_bytes,$2,'accepted' FROM chat.direct_request_attempts WHERE request_id=$1 ON CONFLICT(request_id) DO NOTHING")
-        .bind(request_id).bind(now).execute(&mut **tx).await?;
     // The same account audience gets a policy refresh. No peer read receipt is
     // emitted when the recipient merely previews/imports the initial message.
     let recipients: Vec<_> = devices
