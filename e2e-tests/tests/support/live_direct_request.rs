@@ -1,6 +1,6 @@
 //! Reusable real first-contact fixture; all original C01 assertions remain active.
 use super::*;
-use catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestBootstrap;
+use mls_e2e_tests::tamper_introduction_ciphertext;
 
 pub struct PublishedRequestFixture {
     pub alice: ServiceIdentity,
@@ -50,17 +50,6 @@ pub async fn publish_request_with_unverifiable_introduction(
     )
 }
 
-/// Flip the final byte of the AEAD-protected application ciphertext body. Every
-/// outer framing byte, the canonical wire encoding, the message AAD, the group
-/// id/epoch and every server-side digest stay valid, and the publication is
-/// re-signed after this, so only the recipient's real OpenMLS AEAD can reject it.
-fn tamper_introduction_ciphertext(bootstrap: &mut DirectRequestBootstrap) -> anyhow::Result<()> {
-    let raw = &mut bootstrap.initial_ciphertext;
-    anyhow::ensure!(!raw.is_empty(), "prepared introduction ciphertext is empty");
-    let last = raw.len() - 1;
-    raw[last] ^= 1;
-    Ok(())
-}
 
 async fn publish_request_variant_configured(
     import_recipient: bool,

@@ -13,6 +13,26 @@ pub mod mls_engine;
 #[path = "../tests/support/encrypted_requests.rs"]
 pub mod local_runtime_fixture;
 
+/// Malicious-but-authentic sender aimed at an externally owned runtime client
+/// behind the local client runtime gateway (reuses the C03 tamper routine).
+#[cfg(feature = "local-runtime-fixture")]
+#[path = "../tests/support/gateway_tampered_request.rs"]
+pub mod gateway_tampered_request;
+
+/// Flip the final byte of the AEAD-protected application ciphertext body. Every
+/// outer framing byte, the canonical wire encoding, the message AAD, the group
+/// id/epoch and every server-side digest stay valid, and the publication is
+/// re-signed after this, so only the recipient's real OpenMLS AEAD can reject it.
+pub fn tamper_introduction_ciphertext(
+    bootstrap: &mut catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestBootstrap,
+) -> anyhow::Result<()> {
+    let raw = &mut bootstrap.initial_ciphertext;
+    anyhow::ensure!(!raw.is_empty(), "prepared introduction ciphertext is empty");
+    let last = raw.len() - 1;
+    raw[last] ^= 1;
+    Ok(())
+}
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use rand::RngCore;
