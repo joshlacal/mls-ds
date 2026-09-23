@@ -249,32 +249,49 @@ async fn world() -> anyhow::Result<World> {
     let (status, body) = post(&w, &w.owner.svc, "blue.catbird.chat.publishDirectRequestKeys", &json!({"signedRequest":signed})).await?;
     anyhow::ensure!(status == StatusCode::OK, "owner keys {status}: {body}");
     for i in 0..SENDERS {
-        let p = publish(&w, i).await?;
-        w.published.push(p);
+        match publish(&w, i).await {
+            Ok(p) => w.published.push(p),
+            Err(error) => {
+                // Capacity hygiene: never leave earlier publications open.
+                let released = accept_all(&w).await;
+                return Err(error.context(format!(
+                    "publication {i} failed; released {} earlier publication(s): {released:?}", w.published.len())));
+            }
+        }
     }
     Ok(w)
 }
 
-/// Release every published request (capacity hygiene) through real acceptance.
+/// Release every published request (capacity hygiene) through real signed
+/// acceptance. Attempts all of them, then reports every refusal.
 async fn accept_all(w: &World) -> anyhow::Result<()> {
+    let mut refused = Vec::new();
     for p in &w.published {
-        let s = &w.senders[p.sender];
-        let transition = Uuid::new_v4();
-        let mut next = p.coordinates.clone();
-        next["stateVersion"] = json!(p.coordinates["stateVersion"].as_u64().context("state version")? + 1);
-        let signed = signed_mls_request(&w.owner.engine, &w.owner.identity, DirectRequestKind::Accept, json!({
-            "$type":"blue.catbird.chat.defs#directRequestAcceptanceBody",
-            "signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPT\0","protocolVersion":"2",
-            "actorDid":w.owner.svc.did,"actorDeviceId":w.owner.svc.device_id.to_string(),"keyId":w.owner.key_id,
-            "authGeneration":1,"requestId":p.request_id.to_string(),"transitionId":transition.to_string(),
-            "prior":p.coordinates,"next":next,
-            "invitationProvenance":{"invitationTransitionId":p.request_id.to_string(),
-                "invitedByDid":s.svc.did,"invitedByDeviceId":s.svc.device_id.to_string()},
-            "idempotencyKey":transition.to_string(),"signedAt":canonical_now()
-        }))?;
-        let (status, body) = post(w, &w.owner.svc, "blue.catbird.chat.acceptConversation", &json!({"directRequest":signed})).await?;
-        anyhow::ensure!(status == StatusCode::OK, "release accept {status}: {body}");
+        if let Err(error) = accept_one(w, p).await {
+            refused.push(format!("{}: {error:#}", p.request_id));
+        }
     }
+    anyhow::ensure!(refused.is_empty(), "release refused: {}", refused.join("; "));
+    Ok(())
+}
+
+async fn accept_one(w: &World, p: &Published) -> anyhow::Result<()> {
+    let s = &w.senders[p.sender];
+    let transition = Uuid::new_v4();
+    let mut next = p.coordinates.clone();
+    next["stateVersion"] = json!(p.coordinates["stateVersion"].as_u64().context("state version")? + 1);
+    let signed = signed_mls_request(&w.owner.engine, &w.owner.identity, DirectRequestKind::Accept, json!({
+        "$type":"blue.catbird.chat.defs#directRequestAcceptanceBody",
+        "signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPT\0","protocolVersion":"2",
+        "actorDid":w.owner.svc.did,"actorDeviceId":w.owner.svc.device_id.to_string(),"keyId":w.owner.key_id,
+        "authGeneration":1,"requestId":p.request_id.to_string(),"transitionId":transition.to_string(),
+        "prior":p.coordinates,"next":next,
+        "invitationProvenance":{"invitationTransitionId":p.request_id.to_string(),
+            "invitedByDid":s.svc.did,"invitedByDeviceId":s.svc.device_id.to_string()},
+        "idempotencyKey":transition.to_string(),"signedAt":canonical_now()
+    }))?;
+    let (status, body) = post(w, &w.owner.svc, "blue.catbird.chat.acceptConversation", &json!({"directRequest":signed})).await?;
+    anyhow::ensure!(status == StatusCode::OK, "release accept {status}: {body}");
     Ok(())
 }
 
@@ -295,19 +312,19 @@ fn typed(status: StatusCode, body: &Value, code: &str, what: &str) {
     assert_eq!(body["error"], code, "{what}: typed error code: {body}");
     println!("C25 rejected [{what}] -> {status} {}", body["error"]);
 }
-/// Like `typed`, but tolerates the OQ-11 server defect where continuation-path
-/// scope mismatches return 500 InternalServerError instead of the intended 400
-/// InventorySessionMismatch (the endpoint's declared error table omits the code).
-fn rejected(status: StatusCode, body: &Value, code: &str, what: &str) {
-    assert!(
-        (status == StatusCode::BAD_REQUEST && body["error"] == code)
-            || (status == StatusCode::INTERNAL_SERVER_ERROR && body["error"] == "InternalServerError"),
-        "{what}: expected 400 {code} or 500 OQ-11 fallback, got {status} {body}"
-    );
-    if status == StatusCode::INTERNAL_SERVER_ERROR {
-        println!("C25 rejected [{what}] -> {status} (OQ-11: {code} downgraded to InternalServerError)");
-    } else {
+/// Strict rejection check: must be 400 with the typed code. Until OQ-11 is
+/// fixed (InventorySessionMismatch undeclared on getConversations so the
+/// handler downgrades it to a 500), this records the failure and carries on
+/// so every later clause still runs; the test then fails on the summary.
+fn rejected(status: StatusCode, body: &Value, code: &str, what: &str, failures: &mut Vec<String>) {
+    if status == StatusCode::BAD_REQUEST && body["error"] == code {
         println!("C25 rejected [{what}] -> {status} {}", body["error"]);
+    } else {
+        let detail = format!("{what}: expected 400 {code}, got {status} {} {body}", body["error"]);
+        if status == StatusCode::INTERNAL_SERVER_ERROR && body["error"] == "InternalServerError" {
+            println!("C25 FAILURE [OQ-11] [{what}] -> {status} (InventorySessionMismatch undeclared on getConversations; downgraded to InternalServerError)");
+        }
+        failures.push(detail);
     }
 }
 
@@ -419,15 +436,66 @@ fn snapshot(w: &World, s: &Session) -> anyhow::Result<AuthenticatedInventorySnap
     })
 }
 
+type Fenced = catbird_mls::orchestrator::Result<catbird_mls::orchestrator::authenticated_inventory::AppliedInventoryFence>;
+
+/// Main's contract: an unknown inventory item fails the snapshot closed with
+/// the typed `InvalidInput` naming the unknown union variant.
+fn poison_must_fail_closed(result: Fenced, when: &str) {
+    match result {
+        Err(catbird_mls::orchestrator::OrchestratorError::InvalidInput(message)) => {
+            assert!(message.contains("unknown read union variant"), "{when}: typed cause: {message}");
+            println!("C25 core sync [{when}]: unknown item -> InvalidInput({message})");
+        }
+        other => panic!("{when}: expected typed InvalidInput, got {:?}", other.map(|f| f.inventory_session_id().to_owned())),
+    }
+}
+
+/// Byte view of all local sync state: orchestrator caches (sorted, serde)
+/// plus the full persisted mock storage (Debug of its maps).
+async fn local_state(o: &live_orchestrator::LiveOrchestrator) -> String {
+    let conversations: std::collections::BTreeMap<String, Value> = o.conversations().lock().await.iter()
+        .map(|(k, v)| (k.clone(), serde_json::to_value(v).expect("conversation view"))).collect();
+    let groups: std::collections::BTreeMap<String, Value> = o.group_states().lock().await.iter()
+        .map(|(k, v)| (format!("{k:?}"), serde_json::to_value(v).expect("group state"))).collect();
+    format!("{}\n{}\n{:?}", serde_json::to_string(&conversations).expect("json"),
+        serde_json::to_string(&groups).expect("json"), o.storage())
+}
+
+async fn conversation_ids(o: &live_orchestrator::LiveOrchestrator) -> std::collections::BTreeSet<String> {
+    o.conversations().lock().await.keys().cloned().collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn c25_inventory_and_event_scope_on_live_router() -> anyhow::Result<()> {
-    let w = world().await?;
+    let w = std::sync::Arc::new(world().await?);
+    // The scenario runs in its own task so that a failed assertion (panic) or
+    // error still reaches the release below; the failure is re-raised after.
+    let outcome = tokio::spawn(scenario(w.clone())).await;
+    accept_all(&w).await?;
+    println!("C25 released {} published requests through acceptance", w.published.len());
+    let failures = match outcome {
+        Ok(result) => result?,
+        Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+        Err(join) => return Err(join.into()),
+    };
+    // Surface every failed rejection check (currently the OQ-11 500s) as one
+    // summarizing test failure after all clauses have run.
+    anyhow::ensure!(failures.is_empty(),
+        "C25 typed-rejection failures (OQ-11: InventorySessionMismatch undeclared on getConversations):\n{}",
+        failures.join("\n"));
+    Ok(())
+}
+
+/// Every C25 clause; returns the recorded typed-rejection failures.
+async fn scenario(w: std::sync::Arc<World>) -> anyhow::Result<Vec<String>> {
+    let w = &*w;
+    let mut failures: Vec<String> = Vec::new();
     let expected: std::collections::BTreeSet<String> =
         w.published.iter().map(|p| p.conversation_id.to_string()).collect();
     println!("C25 owner {} device {}; conversations {expected:?}", w.owner.svc.did, w.owner.svc.device_id);
 
     // 1. Scope bound to every page of all three domains (limit=1 forces paging).
-    let s12 = scoped_session(&w, 1, &["1", "2"]).await?;
+    let s12 = scoped_session(w, 1, &["1", "2"]).await?;
     let scope = &s12.conversations.fence["scope"];
     assert_eq!(scope["supportedProtocolVersions"], json!(["1", "2"]), "inventoryScope versions");
     assert!(scope["scopeDigest"].as_str().or_else(|| scope["scopeDigest"]["$bytes"].as_str()).is_some(), "scopeDigest");
@@ -444,53 +512,53 @@ async fn c25_inventory_and_event_scope_on_live_router() -> anyhow::Result<()> {
 
     // 2. Continuations with a changed scope/limit/domain are refused; the
     //    compatible continuation still succeeds afterwards.
-    let (status, first, _) = read(&w, CONVERSATIONS, 1, &["1", "2"], None, None).await?;
+    let (status, first, _) = read(w, CONVERSATIONS, 1, &["1", "2"], None, None).await?;
     assert_eq!(status, StatusCode::OK);
     let next = first["nextPageCursor"].as_str().context("page 1 continuation")?.to_owned();
     let session = first["inventorySessionId"].as_str().context("session")?.to_owned();
-    let (st, b, _) = read(&w, CONVERSATIONS, 1, &["1"], None, Some(&next)).await?;
-    rejected(st, &b, "InventorySessionMismatch", "conversations continuation under scope [1]");
-    let (st, b, _) = read(&w, CONVERSATIONS, 1, &["2"], None, Some(&next)).await?;
-    rejected(st, &b, "InventorySessionMismatch", "conversations continuation under scope [2]");
-    let (st, b, _) = read(&w, CONVERSATIONS, 1, &[], None, Some(&next)).await?;
-    rejected(st, &b, "InventorySessionMismatch", "conversations continuation without scope");
-    let (st, b, _) = read(&w, CONVERSATIONS, 2, &["1", "2"], None, Some(&next)).await?;
-    rejected(st, &b, "InventorySessionMismatch", "conversations continuation with changed limit");
-    let (st, b, _) = read(&w, WELCOMES, 1, &["1", "2"], Some(&session), Some(&next)).await?;
-    rejected(st, &b, "InventorySessionMismatch", "conversations cursor replayed on welcomes domain");
-    let (st, b, _) = read(&w, WELCOMES, 1, &["1"], Some(&session), None).await?;
+    let (st, b1, _) = read(w, CONVERSATIONS, 1, &["1"], None, Some(&next)).await?;
+    rejected(st, &b1, "InventorySessionMismatch", "conversations continuation under scope [1]", &mut failures);
+    let (st, b2, _) = read(w, CONVERSATIONS, 1, &["2"], None, Some(&next)).await?;
+    rejected(st, &b2, "InventorySessionMismatch", "conversations continuation under scope [2]", &mut failures);
+    let (st, b3, _) = read(w, CONVERSATIONS, 1, &[], None, Some(&next)).await?;
+    rejected(st, &b3, "InventorySessionMismatch", "conversations continuation without scope", &mut failures);
+    let (st, b4, _) = read(w, CONVERSATIONS, 2, &["1", "2"], None, Some(&next)).await?;
+    rejected(st, &b4, "InventorySessionMismatch", "conversations continuation with changed limit", &mut failures);
+    let (st, b5, _) = read(w, WELCOMES, 1, &["1", "2"], Some(&session), Some(&next)).await?;
+    rejected(st, &b5, "InventorySessionMismatch", "conversations cursor replayed on welcomes domain", &mut failures);
+    let (st, b, _) = read(w, WELCOMES, 1, &["1"], Some(&session), None).await?;
     typed(st, &b, "InventorySessionMismatch", "welcomes with the [1,2] session under scope [1]");
-    let (st, b, _) = read(&w, RECOVERY, 1, &["1"], Some(&session), None).await?;
+    let (st, b, _) = read(w, RECOVERY, 1, &["1"], Some(&session), None).await?;
     typed(st, &b, "InventorySessionMismatch", "recovery with the [1,2] session under scope [1]");
-    let (st, page2, _) = read(&w, CONVERSATIONS, 1, &["1", "2"], None, Some(&next)).await?;
+    let (st, page2, _) = read(w, CONVERSATIONS, 1, &["1", "2"], None, Some(&next)).await?;
     assert_eq!(st, StatusCode::OK, "compatible continuation after refusals: {page2}");
     assert_eq!(fence(&page2), fence(&first), "compatible continuation keeps the fence");
 
     // 3. Event cursor + subscription ticket scope binding.
-    let s1 = scoped_session(&w, 100, &["1"]).await?;
+    let s1 = scoped_session(w, 100, &["1"]).await?;
     assert_ne!(s1.id, s12.id, "scope [1] is a distinct session capability");
     assert_eq!(s1.conversations.fence["scope"]["supportedProtocolVersions"], json!(["1"]));
     assert!(s1.conversations.items.is_empty(), "v2 conversations are outside scope [1]");
     let (st, b) = w.owner.svc.get(&w.client, &w.server.base_url, TICKET, &[]).await
         .map(|(s, raw)| (s, serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null)))?;
     assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED, "control: GET is not the ticket method ({b})");
-    let (st, b) = mint(&w, &s12.id, &s12.id, Some(&["1"])).await?;
+    let (st, b) = mint(w, &s12.id, &s12.id, Some(&["1"])).await?;
     typed(st, &b, "InventorySessionMismatch", "[1,2] cursor reused under scope [1]");
-    let (st, b) = mint(&w, &s12.id, &s12.id, None).await?;
+    let (st, b) = mint(w, &s12.id, &s12.id, None).await?;
     typed(st, &b, "InventorySessionMismatch", "[1,2] cursor reused without scope");
-    let (st, b) = mint(&w, &s12.id, &s1.id, Some(&["1", "2"])).await?;
+    let (st, b) = mint(w, &s12.id, &s1.id, Some(&["1", "2"])).await?;
     typed(st, &b, "InventorySessionMismatch", "[1] session cursor reused against the [1,2] session");
-    let (st, b) = mint(&w, &s1.id, &s12.id, Some(&["1"])).await?;
+    let (st, b) = mint(w, &s1.id, &s12.id, Some(&["1"])).await?;
     typed(st, &b, "InventorySessionMismatch", "[1,2] cursor reused against the [1] session");
-    let (st, t12) = mint(&w, &s12.id, &s12.id, Some(&["1", "2"])).await?;
+    let (st, t12) = mint(w, &s12.id, &s12.id, Some(&["1", "2"])).await?;
     assert_eq!(st, StatusCode::OK, "compatible [1,2] ticket: {t12}");
     // The ticket endpoint may serialize scopeDigest as a $bytes array; compare versions only.
     assert_eq!(t12["inventoryScope"]["supportedProtocolVersions"],
         s12.conversations.fence["scope"]["supportedProtocolVersions"], "ticket versions match session scope");
-    let (st, t12b) = mint(&w, &s12.id, &s12.id, Some(&["1", "2"])).await?;
+    let (st, t12b) = mint(w, &s12.id, &s12.id, Some(&["1", "2"])).await?;
     assert_eq!(st, StatusCode::OK, "compatible reuse mints again: {t12b}");
     assert_ne!(t12["ticket"], t12b["ticket"], "each mint is a distinct one-use ticket");
-    let (st, t1) = mint(&w, &s1.id, &s1.id, Some(&["1"])).await?;
+    let (st, t1) = mint(w, &s1.id, &s1.id, Some(&["1"])).await?;
     assert_eq!(st, StatusCode::OK, "compatible [1] ticket: {t1}");
     let (t12, t12b, t1) = (
         t12["ticket"].as_str().context("ticket")?.to_owned(),
@@ -500,26 +568,28 @@ async fn c25_inventory_and_event_scope_on_live_router() -> anyhow::Result<()> {
 
     // 4. subscribeEvents: tickets are bound to their scope's cursor.
     let bogus = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-    let (code, b) = subscribe(&w, &s12.id, &bogus).await?;
+    let (code, b) = subscribe(w, &s12.id, &bogus).await?;
     assert_eq!((code, b["error"].as_str()), (400, Some("InvalidTicket")), "control: handshake reaches the ticket gate");
-    let (code, b) = subscribe(&w, &s1.id, &t12).await?;
+    let (code, b) = subscribe(w, &s1.id, &t12).await?;
     assert_eq!((code, b["error"].as_str()), (400, Some("InvalidTicket")), "[1,2] ticket with the [1] cursor: {b}");
-    let (code, b) = subscribe(&w, &s12.id, &t1).await?;
+    let (code, b) = subscribe(w, &s12.id, &t1).await?;
     assert_eq!((code, b["error"].as_str()), (400, Some("InvalidTicket")), "[1] ticket with the [1,2] cursor: {b}");
-    let (code, _) = subscribe(&w, &s12.id, &t12).await?;
+    let (code, _) = subscribe(w, &s12.id, &t12).await?;
     assert_eq!(code, 101, "[1,2] ticket upgrades with its own cursor after the refused attempt");
-    let (code, b) = subscribe(&w, &s12.id, &t12).await?;
+    let (code, b) = subscribe(w, &s12.id, &t12).await?;
     assert_eq!((code, b["error"].as_str()), (400, Some("InvalidTicket")), "consumed ticket is one-use: {b}");
-    let (code, _) = subscribe(&w, &s1.id, &t1).await?;
+    let (code, _) = subscribe(w, &s1.id, &t1).await?;
     assert_eq!(code, 101, "[1] ticket upgrades with its own cursor");
-    let (code, _) = subscribe(&w, &s12.id, &t12b).await?;
+    let (code, _) = subscribe(w, &s12.id, &t12b).await?;
     assert_eq!(code, 101, "second compatible [1,2] ticket upgrades");
     println!("C25 subscribeEvents: foreign-scope cursors refused, own cursors upgraded (101), replay refused");
 
     // 5. Real core sync over the exact server pages (single page per domain).
-    let exact = scoped_session(&w, 100, &["1", "2"]).await?;
-    let receipt_document = w.server.receipt_document.clone();
-    let clean = snapshot(&w, &exact)?;
+    //    Contract (Main decision): an unknown item fails the whole snapshot
+    //    closed with typed InvalidInput, applies nothing, leaves existing local
+    //    state byte-unchanged, and the next clean snapshot applies everything.
+    let exact = scoped_session(w, 100, &["1", "2"]).await?;
+    let clean = snapshot(w, &exact)?;
     let mut poisoned = clean.clone();
     let mut page: Value = serde_json::from_slice(&poisoned.conversation_pages[0])?;
     let unknown = Uuid::new_v4().to_string();
@@ -527,36 +597,30 @@ async fn c25_inventory_and_event_scope_on_live_router() -> anyhow::Result<()> {
         "$type":"blue.catbird.chat.defs#conversationInventoryFutureVariant","conversationId":unknown
     }));
     poisoned.conversation_pages[0] = serde_json::to_vec(&page)?;
-    let fresh = live_orchestrator::live_orchestrator(
-        w.owner.engine.context(), &w.owner.svc, &w.client, &w.server.base_url, receipt_document.clone(),
+    let orch = live_orchestrator::live_orchestrator(
+        w.owner.engine.context(), &w.owner.svc, &w.client, &w.server.base_url, w.server.receipt_document.clone(),
     ).await?;
-    let poisoned_result = fresh.ingest_authenticated_inventory_snapshot(&poisoned).await;
-    let after_poison: std::collections::BTreeSet<String> = fresh.conversations().lock().await.keys().cloned().collect();
-    println!("C25 core sync, page = {} valid items + 1 unknown: result={:?}; conversations synced={after_poison:?}",
-        SENDERS, poisoned_result.as_ref().map(|f| f.inventory_session_id().to_owned()));
-    let clean_result = fresh.ingest_authenticated_inventory_snapshot(&clean).await;
-    let after_clean: std::collections::BTreeSet<String> = fresh.conversations().lock().await.keys().cloned().collect();
-    println!("C25 core sync, clean page: result={:?}; conversations synced={after_clean:?}",
-        clean_result.as_ref().map(|f| f.inventory_session_id().to_owned()));
-    fresh.shutdown().await;
-    let clean_fence = clean_result.context("clean exact snapshot must ingest")?;
-    assert!(clean_fence.matches_snapshot(&clean), "fence binds the clean snapshot");
-    assert!(expected.is_subset(&after_clean), "all capable conversations sync from the clean page");
-    assert!(!after_clean.contains(&unknown), "unknown item never materializes");
-    // The C25 isolation clause requires the valid items to sync next to an
-    // unknown one. Record the actual core behaviour for the evidence.
-    match &poisoned_result {
-        Ok(_) => {
-            assert!(expected.is_subset(&after_poison), "isolation: capable conversations synced next to the unknown item");
-            assert!(!after_poison.contains(&unknown), "isolation: unknown item quarantined");
-            println!("C25 ISOLATION: PASS (unknown item quarantined, capable conversations synced)");
-        }
-        Err(error) => {
-            assert!(after_poison.is_empty(), "failed ingest must not partially apply: {after_poison:?}");
-            println!("C25 ISOLATION: WHOLE-PAGE FAILURE (no partial application): {error}");
-        }
-    }
-    accept_all(&w).await?;
-    println!("C25 released {} published requests through acceptance", w.published.len());
-    Ok(())
+    // (a) Empty device: nothing is applied.
+    let before = local_state(&orch).await;
+    poison_must_fail_closed(orch.ingest_authenticated_inventory_snapshot(&poisoned).await, "empty device");
+    assert_eq!(local_state(&orch).await, before, "failed ingest leaves empty local state byte-unchanged");
+    assert!(conversation_ids(&orch).await.is_empty(), "zero conversations applied");
+    // (b) Clean snapshot applies all capable conversations.
+    let fence = orch.ingest_authenticated_inventory_snapshot(&clean).await.context("clean exact snapshot must ingest")?;
+    assert!(fence.matches_snapshot(&clean), "fence binds the clean snapshot");
+    let synced = conversation_ids(&orch).await;
+    assert!(expected.is_subset(&synced) && !synced.contains(&unknown), "clean snapshot applies all capable conversations: {synced:?}");
+    println!("C25 core sync [clean]: applied {synced:?}");
+    // (c) Populated device: the poisoned snapshot changes nothing.
+    let populated = local_state(&orch).await;
+    poison_must_fail_closed(orch.ingest_authenticated_inventory_snapshot(&poisoned).await, "populated device");
+    assert_eq!(local_state(&orch).await, populated, "existing local state byte-unchanged after fail-closed ingest");
+    // (d) The next clean snapshot applies all again.
+    let fence = orch.ingest_authenticated_inventory_snapshot(&clean).await.context("next clean snapshot must ingest")?;
+    assert!(fence.matches_snapshot(&clean), "next clean fence binds the snapshot");
+    let resynced = conversation_ids(&orch).await;
+    assert!(expected.is_subset(&resynced), "next clean snapshot applies all: {resynced:?}");
+    orch.shutdown().await;
+    println!("C25 ISOLATION: fail-closed whole snapshot (typed InvalidInput, zero applied, local state byte-unchanged, next clean applies all)");
+    Ok(failures)
 }
