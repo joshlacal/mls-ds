@@ -434,7 +434,16 @@ pub async fn expire_due_published_requests(
     Ok(count)
 }
 
-/// Prune heavy cryptographic artifacts for requests terminal (closed or expired) for >14 days.
+/// Prune heavy artifacts of requests terminal (closed or expired) for >14 days
+/// and release their retained charge. The retained charge is additive over
+/// independently stored blobs plus the precharged lifecycle reserve, so the
+/// released amount is exactly (a) the bytes of the pruned publication and
+/// delivery-provenance columns, each of which the charge counted once, plus
+/// (b) the unconsumed lifecycle reserve: a terminal request can record no
+/// further decision, and every Welcome import window closed before this
+/// horizon (import_until <= publication + 7 days < terminal + 14 days).
+/// Transition/entry copies, rows, the attempt tombstone and consumed
+/// decision/Welcome slots stay charged.
 pub async fn prune_terminal_request_artifacts(
     pool: &PgPool,
     limit: i64,
@@ -457,61 +466,48 @@ pub async fn prune_terminal_request_artifacts(
     .await?;
 
     let mut count = 0;
-    for (id, consent) in candidates {
+    for (id, _consent) in candidates {
         let mut tx = pool.begin().await?;
         let _operation = super::prelude::lock_direct_request_operation(&mut tx, id).await?;
 
-        let row: Option<(String, i64, i64, i64, i64)> = sqlx::query_as(
+        let row: Option<(String, i64, i64, i64)> = sqlx::query_as(
             r#"
             SELECT l.consent,
                    c.charged_bytes,
-                   COALESCE(octet_length(a.terminal_response), 0)::bigint AS receipt_len,
-                   COALESCE(a.reserved_bytes, 0)::bigint AS existing_attempt,
-                   (SELECT count(*) FROM chat.direct_request_device_deliveries d WHERE d.request_id = $1)::bigint AS deliveries
+                   (COALESCE(octet_length(p.signed_publication), 0)
+                    + COALESCE(octet_length(p.request_entry), 0)
+                    + COALESCE(octet_length(p.final_group_info), 0)
+                    + COALESCE(octet_length(p.full_welcome), 0)
+                    + COALESCE(octet_length(p.initial_ciphertext), 0)
+                    + COALESCE(octet_length(p.metadata_snapshot), 0)
+                    + COALESCE((SELECT sum(octet_length(d.provenance)) FROM chat.direct_request_device_deliveries d WHERE d.request_id = $1), 0))::bigint AS pruned_bytes,
+                   GREATEST(0, r.decision_bytes + r.welcome_bytes_per_delivery * r.delivery_count
+                    - COALESCE((SELECT sum(s.charged_bytes) FROM chat.direct_request_decision_slots s WHERE s.request_id = $1), 0)
+                    - COALESCE((SELECT sum(w.charged_bytes) FROM chat.direct_request_welcome_slots w WHERE w.request_id = $1), 0))::bigint AS unused_reserve
               FROM chat.direct_request_lifecycle l
               JOIN chat.direct_request_publications p USING(request_id)
               JOIN chat.direct_request_retained_charges c USING(request_id)
-              LEFT JOIN chat.direct_request_attempts a USING(request_id)
+              JOIN chat.direct_request_lifecycle_reserves r USING(request_id)
              WHERE l.request_id = $1
                AND l.consent IN ('closed', 'expired')
                AND COALESCE(l.closed_at, l.expired_at) <= clock_timestamp() - INTERVAL '14 days'
                AND p.pruned_at IS NULL
-               AND NOT EXISTS (SELECT 1 FROM chat.direct_request_retained_releases r WHERE r.request_id = l.request_id)
+               AND NOT EXISTS (SELECT 1 FROM chat.direct_request_retained_releases x WHERE x.request_id = l.request_id)
             "#
         )
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
 
-        let Some((actual_consent, charged_bytes, receipt_len, existing_attempt, deliveries)) = row else {
+        let Some((actual_consent, charged_bytes, pruned_bytes, unused_reserve)) = row else {
             tx.rollback().await?;
             continue;
         };
-
-        use super::direct_request_publication::retained_charge::{self, PublicationArtifactLengths};
-        let final_leaves = (deliveries as u64).checked_add(1).unwrap_or(1);
-        let lengths_zeroed = PublicationArtifactLengths {
-            signed_wrapper: 0,
-            accepted_entry: 0,
-            unsigned_body: 0,
-            transcript: 0,
-            signature: 0,
-            remaining_blobs: 0,
-            final_leaves,
-            deliveries: deliveries as u64,
-            predecessor_intervals: 0,
-            legacy_successor: false,
-        };
-        let surviving = retained_charge::charge(
-            existing_attempt.max(0) as u64,
-            receipt_len.max(0) as usize,
-            &lengths_zeroed,
-        )
-        .unwrap_or(0);
-
-        let released_bytes = (charged_bytes as u64)
-            .saturating_sub(surviving)
-            .clamp(1, 8_589_934_592) as i64;
+        let released_bytes = (pruned_bytes + unused_reserve).min(charged_bytes);
+        if released_bytes < 1 {
+            tx.rollback().await?;
+            continue;
+        }
         let reason = if actual_consent == "closed" {
             "closed_pruned"
         } else {

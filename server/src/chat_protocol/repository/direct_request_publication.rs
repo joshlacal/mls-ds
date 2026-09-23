@@ -21,7 +21,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 #[path = "direct_request_publication_charge.rs"]
-pub(crate) mod retained_charge;
+mod retained_charge;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PublicationError {
