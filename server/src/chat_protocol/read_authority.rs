@@ -625,8 +625,10 @@ fn classify_current_relationship(
     }
 }
 
-/// `AccessInterval` exposes its opening transition id as bytes; the schema
-/// CHECK constrains `membership_interval_id = opening_transition_id`.
+/// `AccessInterval` exposes its opening transition id as bytes. For
+/// non-direct-request intervals, `membership_interval_id = opening_transition_id`;
+/// for direct-request intervals they differ, and queries must key by opening
+/// identity `(conversation_id, recipient_did, recipient_device_id, opening_transition_id)`.
 fn interval_id(interval: &AccessInterval) -> Uuid {
     Uuid::from_slice(interval.opening_transition_id())
         .expect("interval opening transition id is a canonical UUID")
@@ -822,6 +824,25 @@ pub(crate) async fn authorize_conversation_state(
                     return Err(e);
                 }
             };
+            let open_membership_interval_id = sqlx::query_scalar::<_, Uuid>(
+                r#"
+                SELECT membership_interval_id
+                  FROM chat.application_intervals
+                 WHERE conversation_id = $1
+                   AND recipient_did = $2
+                   AND recipient_device_id = $3
+                   AND opening_transition_id = $4
+                   AND terminal_seq IS NULL
+                "#,
+            )
+            .bind(conversation_id)
+            .bind(device.user_did())
+            .bind(device.device_id())
+            .bind(open_membership_interval_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| ReadAuthorityError::Storage)?
+            .unwrap_or(open_membership_interval_id);
             CurrentConversationRelationshipWitness::CurrentOpenLeaf {
                 participant_period_id,
                 leaf_period_id,
@@ -1710,7 +1731,7 @@ enum InventoryArmDecision {
         closing_outer_entry_fingerprint: Vec<u8>,
     },
     Removal {
-        membership_interval_id: Uuid,
+        opening_transition_id: Uuid,
         terminal_seq: u64,
         closing_transition_id: Uuid,
         closing_outer_entry_fingerprint: Vec<u8>,
@@ -1764,7 +1785,7 @@ fn classify_inventory_arm(
     if let Some(finite) = facts.latest_finite {
         let end = finite.end().ok_or(ReadAuthorityError::Invariant)?;
         return Ok(InventoryArmDecision::Removal {
-            membership_interval_id: interval_id(finite),
+            opening_transition_id: interval_id(finite),
             terminal_seq: end.seq(),
             closing_transition_id: interval_end_transition(end),
             closing_outer_entry_fingerprint: interval_end_fingerprint(end).to_vec(),
@@ -1788,21 +1809,34 @@ fn classify_inventory_arm(
     Ok(InventoryArmDecision::None)
 }
 
-/// The durable `removed_at` of the exact-device interval that closed the
-/// removal, loaded under the locked head. An absent row after a hydrated
-/// closed interval is an invariant.
+/// The durable `removed_at` and `membership_interval_id` of the exact-device
+/// interval that closed the removal, loaded under the locked head by opening identity.
+/// An absent row after a hydrated closed interval is an invariant.
 async fn interval_removed_at(
     tx: &mut Transaction<'_, Postgres>,
-    membership_interval_id: Uuid,
-) -> Result<DateTime<Utc>, ReadAuthorityError> {
-    let removed_at: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT removed_at FROM chat.application_intervals WHERE membership_interval_id=$1",
+    conversation_id: Uuid,
+    recipient_did: &str,
+    recipient_device_id: Uuid,
+    opening_transition_id: Uuid,
+) -> Result<(Uuid, DateTime<Utc>), ReadAuthorityError> {
+    let row: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+        r#"
+        SELECT membership_interval_id, removed_at
+          FROM chat.application_intervals
+         WHERE conversation_id = $1
+           AND recipient_did = $2
+           AND recipient_device_id = $3
+           AND opening_transition_id = $4
+        "#,
     )
-    .bind(membership_interval_id)
+    .bind(conversation_id)
+    .bind(recipient_did)
+    .bind(recipient_device_id)
+    .bind(opening_transition_id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|_| ReadAuthorityError::Storage)?;
-    removed_at.ok_or(ReadAuthorityError::Invariant)
+    row.ok_or(ReadAuthorityError::Invariant)
 }
 
 /// Lock-free candidate discovery: every conversation the requesting device
@@ -1949,12 +1983,19 @@ pub(crate) async fn inventory_authorities(
                 closing_outer_entry_fingerprint,
             },
             InventoryArmDecision::Removal {
-                membership_interval_id,
+                opening_transition_id,
                 terminal_seq,
                 closing_transition_id,
                 closing_outer_entry_fingerprint,
             } => {
-                let removed_at = interval_removed_at(tx, membership_interval_id).await?;
+                let (membership_interval_id, removed_at) = interval_removed_at(
+                    tx,
+                    conversation_id,
+                    &fence.user_did,
+                    fence.device_id,
+                    opening_transition_id,
+                )
+                .await?;
                 ConversationInventoryArm::Removal {
                     membership_interval_id,
                     terminal_seq,

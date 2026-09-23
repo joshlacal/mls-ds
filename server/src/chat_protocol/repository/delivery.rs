@@ -983,7 +983,10 @@ pub(crate) async fn insert_application_interval(
 /// `terminal_seq > start_seq` and a 32-byte `closing_outer_entry_fingerprint`.
 #[derive(Clone, Debug)]
 pub(crate) struct ApplicationIntervalClose {
-    pub(crate) membership_interval_id: Uuid,
+    pub(crate) conversation_id: Uuid,
+    pub(crate) recipient_did: String,
+    pub(crate) recipient_device_id: Uuid,
+    pub(crate) opening_transition_id: Uuid,
     pub(crate) terminal_seq: i64,
     pub(crate) closing_state_version: i64,
     pub(crate) closing_transition_id: Uuid,
@@ -995,8 +998,10 @@ pub(crate) struct ApplicationIntervalClose {
 
 /// Compare-and-set an open application interval to finite, writing all seven
 /// closing columns at once. Matches only a still-open interval (`terminal_seq IS
-/// NULL`); a second close, a wrong id, or a drifted (already-closed) row matches
-/// nothing and is a typed conflict. A closed interval is terminal — the
+/// NULL`) identified by its unique opening identity `(conversation_id,
+/// recipient_did, recipient_device_id, opening_transition_id)`; a second
+/// close, a wrong id, or a drifted (already-closed) row matches nothing and is
+/// a typed conflict. A closed interval is terminal — the
 /// `application_intervals_lifecycle_monotonic` trigger also rejects any rewrite of
 /// a finite row, and the `application_intervals_identity_immutable` trigger allows
 /// only these seven closing columns to change.
@@ -1007,18 +1012,24 @@ pub(crate) async fn close_application_interval(
     let result = sqlx::query(
         r#"
         UPDATE chat.application_intervals
-           SET terminal_seq = $2,
-               closing_state_version = $3,
-               closing_transition_id = $4,
-               closing_outer_entry_fingerprint = $5,
-               closing_kind = $6,
-               closing_leaf_period_id = $7,
-               removed_at = $8
-         WHERE membership_interval_id = $1
+           SET terminal_seq = $5,
+               closing_state_version = $6,
+               closing_transition_id = $7,
+               closing_outer_entry_fingerprint = $8,
+               closing_kind = $9,
+               closing_leaf_period_id = $10,
+               removed_at = $11
+         WHERE conversation_id = $1
+           AND recipient_did = $2
+           AND recipient_device_id = $3
+           AND opening_transition_id = $4
            AND terminal_seq IS NULL
         "#,
     )
-    .bind(close.membership_interval_id)
+    .bind(close.conversation_id)
+    .bind(&close.recipient_did)
+    .bind(close.recipient_device_id)
+    .bind(close.opening_transition_id)
     .bind(close.terminal_seq)
     .bind(close.closing_state_version)
     .bind(close.closing_transition_id)

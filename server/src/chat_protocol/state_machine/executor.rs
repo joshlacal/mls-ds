@@ -6516,7 +6516,10 @@ async fn apply_leaf_recovery_fulfillment(
                 delivery::close_application_interval(
                     transaction,
                     &ApplicationIntervalClose {
-                        membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                        conversation_id,
+                        recipient_did: device_did(after.recipient())?,
+                        recipient_device_id: device_uuid(after.recipient()),
+                        opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
                         terminal_seq: checked_i64(end.seq())?,
                         closing_state_version: state_version,
                         closing_transition_id: Uuid::from_bytes(*end.transition_id()),
@@ -7038,7 +7041,10 @@ async fn apply_generic_commit(
         delivery::close_application_interval(
             transaction,
             &ApplicationIntervalClose {
-                membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                conversation_id,
+                recipient_did: device_did(after.recipient())?,
+                recipient_device_id: device_uuid(after.recipient()),
+                opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
                 terminal_seq: checked_i64(end.seq())?,
                 closing_state_version: state_version,
                 closing_transition_id: Uuid::from_bytes(*end.transition_id()),
@@ -7487,7 +7493,10 @@ async fn apply_leave_fulfillment(
                 delivery::close_application_interval(
                     transaction,
                     &ApplicationIntervalClose {
-                        membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                        conversation_id,
+                        recipient_did: device_did(after.recipient())?,
+                        recipient_device_id: device_uuid(after.recipient()),
+                        opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
                         terminal_seq: checked_i64(end.seq())?,
                         closing_state_version: state_version,
                         closing_transition_id: Uuid::from_bytes(*end.transition_id()),
@@ -8839,7 +8848,10 @@ async fn apply_close(
         delivery::close_application_interval(
             transaction,
             &ApplicationIntervalClose {
-                membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                conversation_id,
+                recipient_did: device_did(after.recipient())?,
+                recipient_device_id: device_uuid(after.recipient()),
+                opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
                 terminal_seq: checked_i64(end.seq())?,
                 closing_state_version: state_version,
                 closing_transition_id: Uuid::from_bytes(*end.transition_id()),
@@ -9743,7 +9755,10 @@ async fn apply_reset_activation(
                 delivery::close_application_interval(
                     transaction,
                     &ApplicationIntervalClose {
-                        membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                        conversation_id,
+                        recipient_did: device_did(after.recipient())?,
+                        recipient_device_id: device_uuid(after.recipient()),
+                        opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
                         terminal_seq: checked_i64(end.seq())?,
                         closing_state_version: retired_state_version,
                         closing_transition_id: Uuid::from_bytes(*end.transition_id()),

@@ -2102,7 +2102,13 @@ mod tests {
         close_application_interval(
             &mut transaction,
             &ApplicationIntervalClose {
-                membership_interval_id: std::env::var("TEST_BLOB_CLOSE_INTERVAL_ID")
+                conversation_id: std::env::var("TEST_BLOB_CONVERSATION_ID")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(blob_id),
+                recipient_did: caller_did.clone(),
+                recipient_device_id: caller_device_id,
+                opening_transition_id: std::env::var("TEST_BLOB_CLOSE_INTERVAL_ID")
                     .unwrap()
                     .parse()
                     .expect("TEST_BLOB_CLOSE_INTERVAL_ID must be a UUID"),
