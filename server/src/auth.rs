@@ -304,6 +304,18 @@ impl VerifiedServicePrincipal {
     pub fn token_bytes(&self) -> &[u8] {
         self.token.as_bytes()
     }
+
+    pub fn for_federated_s2s(did: &str, endpoint_nsid: &str) -> Self {
+        let now = chrono::Utc::now().timestamp();
+        Self {
+            did: did.to_string(),
+            endpoint_nsid: endpoint_nsid.to_string(),
+            jti: uuid::Uuid::new_v4().to_string(),
+            iat: now,
+            exp: now + 300,
+            token: "federated-s2s-token".to_string(),
+        }
+    }
 }
 
 /// Opaque exact bearer artifact produced only after `AuthMiddleware` accepts

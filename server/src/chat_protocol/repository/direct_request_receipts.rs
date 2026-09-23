@@ -1,7 +1,7 @@
 // Dedicated protocol-two receipt authority. Never signs with service-auth or
 // cursor keys, never trusts a public key supplied by a receipt.
 use super::super::direct_request_transcript::{
-    direct_request_preparation_signing_bytes, direct_request_receipt_key_id,
+    direct_request_preparation_signing_bytes, direct_request_receipt_key_id_for_authority,
     direct_request_signing_bytes, DirectRequestKind,
 };
 use p256::{
@@ -20,6 +20,7 @@ use super::super::request_push::{
 pub const REQUEST_RECEIPT_AUTHORITY: &str = "did:web:chat.catbird.blue";
 
 pub struct DirectRequestReceiptSigner {
+    authority_did: String,
     signing_key: SigningKey,
     key_id: String,
     published_keys: BTreeMap<String, Vec<u8>>,
@@ -48,22 +49,28 @@ impl DirectRequestReceiptSigner {
             return Err("request receipt key must differ from service-auth key".into());
         }
         let public = signing_key.verifying_key().to_encoded_point(true);
-        let key_id = direct_request_receipt_key_id(public.as_bytes()).map_err(|e| e.to_string())?;
         let document: Value =
             serde_json::from_str(document).map_err(|_| "invalid receipt DID document")?;
-        if document["id"].as_str() != Some(REQUEST_RECEIPT_AUTHORITY) {
-            return Err("receipt authority DID mismatch".into());
+        let doc_id = document["id"]
+            .as_str()
+            .ok_or("missing receipt authority DID in document")?;
+        if !crate::chat_protocol::is_bare_did(doc_id) {
+            return Err("invalid receipt authority DID in document".into());
         }
+        let authority_did = doc_id.to_owned();
+        let key_id = direct_request_receipt_key_id_for_authority(&authority_did, public.as_bytes())
+            .map_err(|e| e.to_string())?;
         let methods = document["verificationMethod"]
             .as_array()
             .ok_or("missing receipt verification methods")?;
+        let expected_prefix = format!("{}#chat-request-receipt-", authority_did);
         let mut published_keys = BTreeMap::new();
         for method in methods {
             let id = method["id"].as_str().ok_or("method missing ID")?;
-            if !id.starts_with("did:web:chat.catbird.blue#chat-request-receipt-") {
+            if !id.starts_with(&expected_prefix) {
                 continue;
             }
-            if method["controller"].as_str() != Some(REQUEST_RECEIPT_AUTHORITY)
+            if method["controller"].as_str() != Some(&authority_did)
                 || method["type"].as_str() != Some("Multikey")
             {
                 return Err("invalid request receipt method controller/type".into());
@@ -83,7 +90,10 @@ impl DirectRequestReceiptSigner {
             if &verified == service_key.verifying_key() {
                 return Err("historical receipt key reuses service-auth key".into());
             }
-            if direct_request_receipt_key_id(&key).map_err(|e| e.to_string())? != id {
+            if direct_request_receipt_key_id_for_authority(&authority_did, &key)
+                .map_err(|e| e.to_string())?
+                != id
+            {
                 return Err("request receipt method fingerprint mismatch".into());
             }
             if published_keys.insert(id.to_owned(), key).is_some() {
@@ -94,10 +104,14 @@ impl DirectRequestReceiptSigner {
             return Err("active receipt method is not published".into());
         }
         Ok(Self {
+            authority_did,
             signing_key,
             key_id,
             published_keys,
         })
+    }
+    pub(crate) fn authority_did(&self) -> &str {
+        &self.authority_did
     }
     pub(crate) fn key_id(&self) -> &str {
         &self.key_id
@@ -114,7 +128,7 @@ impl DirectRequestReceiptSigner {
         use sha2::{Digest, Sha256};
         let value: Value =
             serde_json::from_slice(snapshot).map_err(|_| "invalid preparation JSON")?;
-        if value["authorityDid"].as_str() != Some(REQUEST_RECEIPT_AUTHORITY)
+        if value["authorityDid"].as_str() != Some(self.authority_did())
             || value["receiptKeyId"].as_str() != Some(self.key_id())
         {
             return Err("preparation receipt authority mismatch".into());
@@ -125,7 +139,7 @@ impl DirectRequestReceiptSigner {
     }
     pub(crate) fn sign_outcome(&self, body: &[u8]) -> Result<[u8; 64], String> {
         let value: Value = serde_json::from_slice(body).map_err(|_| "invalid outcome JSON")?;
-        if value["authorityDid"].as_str() != Some(REQUEST_RECEIPT_AUTHORITY)
+        if value["authorityDid"].as_str() != Some(self.authority_did())
             || value["keyId"].as_str() != Some(self.key_id())
         {
             return Err("outcome receipt authority mismatch".into());
@@ -157,7 +171,7 @@ impl DirectRequestReceiptSigner {
             }
         }
         sqlx::query("INSERT INTO chat.direct_request_receipt_keys(key_id,authority_did,public_key,created_at) VALUES($1,$2,$3,clock_timestamp()) ON CONFLICT(key_id) DO NOTHING")
-            .bind(&self.key_id).bind(REQUEST_RECEIPT_AUTHORITY).bind(self.signing_key.verifying_key().to_encoded_point(true).as_bytes()).execute(&mut *tx).await.map_err(|_|"receipt registry insert")?;
+            .bind(&self.key_id).bind(self.authority_did()).bind(self.signing_key.verifying_key().to_encoded_point(true).as_bytes()).execute(&mut *tx).await.map_err(|_|"receipt registry insert")?;
         tx.commit()
             .await
             .map_err(|_| "receipt registry commit".to_owned())
@@ -468,6 +482,77 @@ mod tests {
             serde_json::to_string(&vector).unwrap()
         );
     }
+    #[test]
+    fn variable_configured_authority_signer_signs_and_verifies_own_authority() {
+        use super::super::super::direct_request_transcript::verify_signed_request;
+        let receipt = key(21);
+        let service = key(22);
+        let pem = receipt.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let service_pem = service.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let authority = "did:web:federated-node.example.org";
+
+        let public = receipt.verifying_key().to_encoded_point(true);
+        let mut multikey = vec![0x80, 0x24];
+        multikey.extend_from_slice(public.as_bytes());
+        let key_id = direct_request_receipt_key_id_for_authority(authority, public.as_bytes()).unwrap();
+        let methods = vec![serde_json::json!({
+            "id": key_id,
+            "controller": authority,
+            "type": "Multikey",
+            "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, multikey)
+        })];
+        let doc = serde_json::json!({
+            "id": authority,
+            "verificationMethod": methods
+        })
+        .to_string();
+
+        let signer = DirectRequestReceiptSigner::configured(
+            pem.as_str(),
+            service_pem.as_str(),
+            &doc,
+        )
+        .unwrap();
+
+        assert_eq!(signer.authority_did(), authority);
+        assert_eq!(signer.key_id(), key_id);
+
+        // Outcome receipt signed with configured authority
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#directRequestReceiptBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-OUTCOME\0",
+            "protocolVersion": "2",
+            "authorityDid": authority,
+            "keyId": signer.key_id(),
+            "receipt": {
+                "$type": "blue.catbird.chat.defs#directRequestCancelledReceipt",
+                "requestId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+                "actorDid": "did:plc:sender11111111111111111",
+                "actorDeviceId": "018f3f6a-7b2c-4d91-8a5e-0f123456789b",
+                "cancelledAt": "2026-09-19T00:00:00Z"
+            }
+        });
+        let sealed = signer.seal_outcome(body.clone()).unwrap();
+
+        // Verify passes with matching public key
+        let verified = verify_signed_request(
+            DirectRequestKind::Outcome,
+            sealed.bytes(),
+            public.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(verified.body()["authorityDid"], authority);
+
+        // Mismatched authority in body is rejected during signing
+        let mut bad_body = body.clone();
+        bad_body["authorityDid"] = serde_json::json!("did:web:chat.catbird.blue");
+        assert!(signer.seal_outcome(bad_body).is_err());
+
+        // Mismatched key_id is rejected during signing
+        let mut bad_key_id = body.clone();
+        bad_key_id["keyId"] = serde_json::json!("did:web:other#key-1");
+        assert!(signer.seal_outcome(bad_key_id).is_err());
+    }
 }
 
 /// Opaque receipt produced by the configured dedicated authority, not by a
@@ -498,7 +583,7 @@ impl DirectRequestReceiptSigner {
     pub(crate) fn sign_acceptance(&self, body: &[u8]) -> Result<[u8; 64], String> {
         let value: Value =
             serde_json::from_slice(body).map_err(|_| "invalid acceptance receipt JSON")?;
-        if value["authorityDid"].as_str() != Some(REQUEST_RECEIPT_AUTHORITY)
+        if value["authorityDid"].as_str() != Some(self.authority_did())
             || value["keyId"].as_str() != Some(self.key_id())
         {
             return Err("acceptance receipt authority mismatch".into());
@@ -545,7 +630,7 @@ impl DirectRequestReceiptSigner {
         let body = serde_json::to_vec(&body).map_err(|_| "invalid request push body")?;
         let value: Value =
             serde_json::from_slice(&body).map_err(|_| "invalid request push JSON")?;
-        if value["authorityDid"].as_str() != Some(REQUEST_RECEIPT_AUTHORITY)
+        if value["authorityDid"].as_str() != Some(self.authority_did())
             || value["keyId"].as_str() != Some(self.key_id())
         {
             return Err("request push receipt authority mismatch".into());

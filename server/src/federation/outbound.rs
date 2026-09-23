@@ -152,6 +152,52 @@ impl OutboundClient {
         }
     }
 
+    /// Make an authenticated XRPC procedure call returning raw JSON.
+    pub async fn call_procedure_json(
+        &self,
+        endpoint: &str,
+        method: &str,
+        auth_token: &str,
+        body: &impl Serialize,
+    ) -> Result<serde_json::Value, OutboundError> {
+        let url = format!("{}/xrpc/{}", endpoint.trim_end_matches('/'), method);
+        debug!(method, "Outbound DS procedure (raw json)");
+        let deadline = self.deadline(method)?;
+
+        let send = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {auth_token}"))
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send();
+        let resp = tokio::time::timeout_at(deadline, send)
+            .await
+            .map_err(|_| timeout_error(method))?
+            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            decode_json_bounded(
+                resp,
+                ResponseBodyBudget::new(ORDINARY_DS_CONTROL_MAX_BYTES, deadline),
+            )
+            .await
+            .map_err(|error| map_ordinary_body_error(error, method))
+        } else {
+            let error_body = summarize_error_body(resp, deadline)
+                .await
+                .map(|summary| summary.to_string())
+                .unwrap_or_else(|error| format!("error response metadata unavailable: {error}"));
+            Err(OutboundError::RemoteError {
+                status: status.as_u16(),
+                body: error_body,
+                endpoint: endpoint.to_string(),
+                method: method.to_string(),
+            })
+        }
+    }
+
     /// Check if a remote DS is reachable.
     pub async fn health_check(
         &self,

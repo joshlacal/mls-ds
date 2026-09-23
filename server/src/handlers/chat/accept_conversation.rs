@@ -63,6 +63,47 @@ async fn handle_inner(
         let now = crate::chat_protocol::validation::TrustedRequestInstant::capture()
             .map_err(|_| ChatFailure::invariant(endpoint))?
             .datetime();
+
+        let parsed_req: serde_json::Value = serde_json::from_str(envelope.request.get())
+            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+        let convo_id_str = parsed_req["body"]["prior"]["conversationId"].as_str().unwrap_or_default();
+        let conversation_id = uuid::Uuid::parse_str(convo_id_str).unwrap_or_default();
+
+        let creator_did: Option<String> = sqlx::query_scalar("SELECT created_by_did FROM chat.participants WHERE conversation_id = $1 AND current_membership AND status = 'pending'")
+            .bind(conversation_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some(creator) = &creator_did {
+            if let Ok(coord) = crate::federation::canonical_relay::resolve_pair_coordinator(pool, creator, principal.did()).await {
+                if !coord.is_coordinator {
+                    let payload = crate::federation::canonical_relay::DeliverAcceptanceInput {
+                        conversation_id,
+                        direct_request: parsed_req,
+                    };
+                    let output = crate::federation::canonical_relay::relay_acceptance_to_coordinator(
+                        &coord.coordinator_endpoint(),
+                        &coord.coordinator_did,
+                        payload,
+                    ).await.map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::RelationshipPolicyUnavailable))?;
+
+                    let _ = crate::federation::canonical_relay::ingest_remote_acceptance_entry(
+                        pool,
+                        Some(runtime.sse_state()),
+                        conversation_id,
+                        &output.entry,
+                        &output.acceptance_proof,
+                    ).await;
+
+                    use base64::Engine as _;
+                    let outcome_bytes = base64::engine::general_purpose::STANDARD.decode(&output.outcome_bytes)
+                        .map_err(|_| ChatFailure::invariant(endpoint))?;
+                    return Ok(context::json_ok(outcome_bytes));
+                }
+            }
+        }
         let mut tx = pool
             .begin()
             .await
@@ -102,6 +143,33 @@ async fn handle_inner(
             log_direct_acceptance_storage_error("commit", &error);
             ChatFailure::storage(endpoint)
         })?;
+        if let Some(creator) = &creator_did {
+            if let Ok(coord) = crate::federation::canonical_relay::resolve_pair_coordinator(pool, creator, principal.did()).await {
+                if coord.is_coordinator && !coord.is_sender_home {
+                    let entry_row: Option<Vec<u8>> = sqlx::query_scalar("SELECT accepted_payload_bytes FROM chat.entries WHERE conversation_id = $1 AND seq = 2")
+                        .bind(conversation_id)
+                        .fetch_optional(pool)
+                        .await
+                        .ok()
+                        .flatten();
+                    let entry_val = entry_row.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::json!({}));
+                    let proof_val: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}));
+                    let deliver_input = crate::federation::canonical_relay::DeliverAcceptanceEntryInput {
+                        conversation_id,
+                        entry: entry_val,
+                        acceptance_proof: proof_val.get("acceptanceProof").cloned().unwrap_or(serde_json::Value::Null),
+                    };
+                    if let Err(e) = crate::federation::canonical_relay::deliver_acceptance_entry_to_peer(
+                        &coord.sender_home.endpoint,
+                        &coord.sender_home.did,
+                        deliver_input,
+                    ).await {
+                        tracing::warn!("Failed to deliver acceptance entry to peer (sync/outbox will retry): {e}");
+                    }
+                }
+            }
+        }
+
         return Ok(context::json_ok(
             crate::chat_protocol::direct_request_transcript::present_endpoint_output(
                 endpoint.nsid(),

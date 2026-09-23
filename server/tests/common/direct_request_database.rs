@@ -234,6 +234,14 @@ pub async fn setup() -> PgPool {
             "../../migrations/20260919000018_fix_direct_request_lifecycle_close_fence.sql"
         )),
     ));
+    migrations.push(Migration::new(
+        20260919000019,
+        Cow::Borrowed("variable receipt authority keys"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000019_variable_receipt_authority_keys.sql"
+        )),
+    ));
     // QuotaFix added this on mainline after the pinned baseline above stopped at
     // 000018. `ignore_missing: false` turns its absence into a hard
     // `VersionMissing(20260919000021)` for every direct-request target, so pin it

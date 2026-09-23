@@ -4978,7 +4978,7 @@ async fn historical_request_receipt_key(
     tx: &mut Transaction<'_, Postgres>,
     key_id: &str,
 ) -> Result<Vec<u8>, ControlEvidenceLoadError> {
-    sqlx::query_scalar("SELECT public_key FROM chat.direct_request_receipt_keys WHERE key_id=$1 AND authority_did='did:web:chat.catbird.blue'")
+    sqlx::query_scalar("SELECT public_key FROM chat.direct_request_receipt_keys WHERE key_id=$1")
         .bind(key_id).fetch_optional(&mut **tx).await?.ok_or(ControlEvidenceLoadError::InvalidEvidence)
 }
 

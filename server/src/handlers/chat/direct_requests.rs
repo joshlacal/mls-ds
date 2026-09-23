@@ -109,6 +109,52 @@ async fn mutate(
     let now = crate::chat_protocol::validation::TrustedRequestInstant::capture()
         .map_err(|_| ChatFailure::invariant(endpoint))?
         .datetime();
+
+    if endpoint == ChatEndpoint::PrepareDirectRequest {
+        if let Ok(parsed_req) = serde_json::from_str::<serde_json::Value>(envelope.signed_request.get()) {
+            if let Some(recipient_did) = parsed_req["body"]["recipientDid"].as_str() {
+                let actor_did = principal.did();
+                if let Ok(coord) = crate::federation::canonical_relay::resolve_pair_coordinator(pool, actor_did, recipient_did).await {
+                    if !coord.is_coordinator {
+                        let outcome = crate::federation::canonical_relay::relay_prepare_direct_request(
+                            &coord.coordinator_endpoint(),
+                            &coord.coordinator_did,
+                            &parsed_req,
+                        ).await.map_err(|_| failure(endpoint, DirectRequestStoreError::PolicyDenied))?;
+                        let bytes = serde_json::to_vec(&outcome)
+                            .map_err(|_| ChatFailure::invariant(endpoint))?;
+                        return Ok(context::json_ok(bytes));
+                    } else if !coord.is_recipient_home {
+                        let request_id = uuid::Uuid::parse_str(parsed_req["body"]["requestId"].as_str().unwrap_or_default())
+                            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+                        let remote_devices = crate::federation::canonical_relay::reserve_remote_recipient_bootstrap(
+                            &coord.recipient_home.endpoint,
+                            &coord.recipient_home.did,
+                            request_id,
+                            actor_did,
+                            recipient_did,
+                        ).await.map_err(|_| failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable))?;
+
+                        let mut tx = pool.begin().await.map_err(|_| ChatFailure::storage(endpoint))?;
+                        crate::federation::canonical_relay::stage_remote_recipient_devices(&mut tx, &remote_devices, now).await
+                            .map_err(|_| failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable))?;
+                        let result = requests::prepare_direct_request(
+                            &mut tx,
+                            &principal,
+                            envelope.signed_request.get().as_bytes(),
+                            signer,
+                            runtime.relationship_authority().as_ref(),
+                            now,
+                        ).await.map_err(|e| failure(endpoint, e))?;
+                        let bytes = output(result, endpoint)?;
+                        tx.commit().await.map_err(|_| ChatFailure::storage(endpoint))?;
+                        return Ok(context::json_ok(bytes));
+                    }
+                }
+            }
+        }
+    }
+
     let mut tx = pool
         .begin()
         .await
@@ -233,6 +279,24 @@ pub(super) async fn outcome(
             requests::get_direct_request_outcome(&mut tx, &principal, device, request, signer, now)
                 .await
                 .map_err(|e| failure(endpoint, e))?;
+        if matches!(result, requests::DirectRequestResult::Unknown(_)) {
+            let default_ds = std::env::var("DEFAULT_DS_ENDPOINT").ok();
+            let self_endpoint = crate::identity::self_endpoint();
+            if let Some(ref peer_ds) = default_ds {
+                if peer_ds != &self_endpoint {
+                    let peer_did = std::env::var("DEFAULT_DS_DID").unwrap_or_else(|_| "did:web:ds1.test".into());
+                    if let Ok(relayed) = crate::federation::canonical_relay::relay_get_outcome(
+                        peer_ds,
+                        &peer_did,
+                        request,
+                        device,
+                    ).await {
+                        let bytes = serde_json::to_vec(&relayed).map_err(|_| ChatFailure::invariant(endpoint))?;
+                        return Ok(context::json_ok(bytes));
+                    }
+                }
+            }
+        }
         let bytes = output(result, endpoint)?;
         tx.commit()
             .await

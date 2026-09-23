@@ -277,6 +277,10 @@ impl ChatRuntime {
             .flatten()
     }
 
+    pub fn sse_state(&self) -> &Arc<SseState> {
+        &self.sse_state
+    }
+
     pub(crate) async fn subscribe_typing(
         &self,
         conversation_id: &str,

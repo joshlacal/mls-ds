@@ -222,7 +222,10 @@ pub fn verify_signed_request(
     ) {
         use p256::ecdsa::signature::Verifier;
         let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key).map_err(error)?;
-        if body["keyId"].as_str() != Some(direct_request_receipt_key_id(public_key)?.as_str()) {
+        let authority_did = body["authorityDid"].as_str().unwrap_or("did:web:chat.catbird.blue");
+        if body["keyId"].as_str()
+            != Some(direct_request_receipt_key_id_for_authority(authority_did, public_key)?.as_str())
+        {
             return Err(error("receipt method fingerprint mismatch"));
         }
         let sig = p256::ecdsa::Signature::from_slice(&signature).map_err(error)?;
@@ -484,13 +487,25 @@ mod tests {
 
 /// Identifier only, not trust establishment. The caller must resolve this exact
 /// retained method from the authenticated configured authority DID document.
-pub fn direct_request_receipt_key_id(public_key: &[u8]) -> Result<String> {
+pub fn direct_request_receipt_key_id_for_authority(
+    authority_did: &str,
+    public_key: &[u8],
+) -> Result<String> {
+    if !crate::chat_protocol::is_bare_did(authority_did) {
+        return Err(error("invalid authority DID"));
+    }
     let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key).map_err(error)?;
     let hash = Sha256::digest(key.to_encoded_point(true).as_bytes());
     Ok(format!(
-        "did:web:chat.catbird.blue#chat-request-receipt-{}",
+        "{}#chat-request-receipt-{}",
+        authority_did,
         hex::encode(hash)
     ))
+}
+
+/// Default legacy helper keyed to did:web:chat.catbird.blue.
+pub fn direct_request_receipt_key_id(public_key: &[u8]) -> Result<String> {
+    direct_request_receipt_key_id_for_authority("did:web:chat.catbird.blue", public_key)
 }
 /// Verify the complete immutable snapshot with an independently trusted method.
 pub fn verify_direct_request_preparation(
@@ -503,9 +518,12 @@ pub fn verify_direct_request_preparation(
     }
     project(raw_view, "directRequestPreparationView", false)?;
     let view: Value = serde_json::from_slice(raw_view).map_err(error)?;
-    if view["receiptKeyId"].as_str()
-        != Some(direct_request_receipt_key_id(trusted_public_key)?.as_str())
-    {
+    let expected_key_id = if let Some(authority_did) = view["authorityDid"].as_str() {
+        direct_request_receipt_key_id_for_authority(authority_did, trusted_public_key)?
+    } else {
+        direct_request_receipt_key_id(trusted_public_key)?
+    };
+    if view["receiptKeyId"].as_str() != Some(expected_key_id.as_str()) {
         return Err(error("preparation receipt method mismatch"));
     }
     let mut snapshot = view.clone();
@@ -543,13 +561,19 @@ pub fn resolve_direct_request_receipt_key(
     authenticated_document: &[u8],
     method_id: &str,
 ) -> Result<Vec<u8>> {
-    const AUTHORITY: &str = "did:web:chat.catbird.blue";
     if authenticated_document.len() > 1024 * 1024 {
         return Err(error("DID document byte cap"));
     }
     strict_document(authenticated_document)?;
     let doc: Value = serde_json::from_slice(authenticated_document).map_err(error)?;
-    if doc["id"].as_str() != Some(AUTHORITY) {
+    let doc_id = doc["id"].as_str().ok_or_else(|| error("missing document id"))?;
+    if !crate::chat_protocol::is_bare_did(doc_id) {
+        return Err(error("invalid document owner DID"));
+    }
+    let (expected_authority, _) = method_id
+        .split_once('#')
+        .ok_or_else(|| error("receipt method missing fragment"))?;
+    if doc_id != expected_authority {
         return Err(error("receipt document owner mismatch"));
     }
     let methods = doc["verificationMethod"]
@@ -563,7 +587,7 @@ pub fn resolve_direct_request_receipt_key(
         return Err(error("receipt method missing or ambiguous"));
     }
     let method = found[0];
-    if method["controller"].as_str() != Some(AUTHORITY)
+    if method["controller"].as_str() != Some(doc_id)
         || method["type"].as_str() != Some("Multikey")
     {
         return Err(error("receipt controller or key type mismatch"));
@@ -578,7 +602,7 @@ pub fn resolve_direct_request_receipt_key(
         return Err(error("receipt key must be compressed P256 multikey"));
     }
     let key = &bytes[2..];
-    if direct_request_receipt_key_id(key)? != method_id {
+    if direct_request_receipt_key_id_for_authority(doc_id, key)? != method_id {
         return Err(error("receipt immutable method fingerprint mismatch"));
     }
     Ok(key.to_vec())
@@ -591,11 +615,14 @@ fn strict_document(raw: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod receipt_rotation_tests {
     use super::*;
-    fn method(key: &p256::ecdsa::SigningKey) -> Value {
+    fn method_for_authority(authority: &str, key: &p256::ecdsa::SigningKey) -> Value {
         let point = key.verifying_key().to_encoded_point(true);
         let mut multikey = vec![0x80, 0x24];
         multikey.extend_from_slice(point.as_bytes());
-        json!({"id":direct_request_receipt_key_id(point.as_bytes()).unwrap(),"controller":"did:web:chat.catbird.blue","type":"Multikey","publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)})
+        json!({"id":direct_request_receipt_key_id_for_authority(authority, point.as_bytes()).unwrap(),"controller":authority,"type":"Multikey","publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)})
+    }
+    fn method(key: &p256::ecdsa::SigningKey) -> Value {
+        method_for_authority("did:web:chat.catbird.blue", key)
     }
     #[test]
     fn rotation_retains_old_method_and_rejects_untrusted_shapes() {
@@ -631,6 +658,55 @@ mod receipt_rotation_tests {
         assert!(
             resolve_direct_request_receipt_key(&serde_json::to_vec(&doc).unwrap(), id).is_err()
         );
+    }
+    #[test]
+    fn variable_authority_passes_and_mismatches_are_rejected() {
+        let key = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let auth_a = "did:web:node-a.chat.catbird.blue";
+        let auth_b = "did:web:node-b.chat.catbird.blue";
+        let method_a = method_for_authority(auth_a, &key);
+        let id_a = method_a["id"].as_str().unwrap();
+        let doc_a = json!({"id": auth_a, "verificationMethod": [method_a]});
+
+        // Variable authority passes
+        let resolved =
+            resolve_direct_request_receipt_key(&serde_json::to_vec(&doc_a).unwrap(), id_a).unwrap();
+        assert_eq!(
+            resolved,
+            key.verifying_key().to_encoded_point(true).as_bytes()
+        );
+
+        // Mismatched document owner vs method id authority rejected
+        let mut mismatched_doc = doc_a.clone();
+        mismatched_doc["id"] = json!(auth_b);
+        assert!(resolve_direct_request_receipt_key(
+            &serde_json::to_vec(&mismatched_doc).unwrap(),
+            id_a
+        )
+        .is_err());
+
+        // Mismatched controller rejected
+        let mut mismatched_controller = doc_a.clone();
+        mismatched_controller["verificationMethod"][0]["controller"] = json!(auth_b);
+        assert!(resolve_direct_request_receipt_key(
+            &serde_json::to_vec(&mismatched_controller).unwrap(),
+            id_a
+        )
+        .is_err());
+
+        // Tampered public key fingerprint mismatch rejected
+        let other_key = p256::ecdsa::SigningKey::from_slice(&[6; 32]).unwrap();
+        let mut tampered_key = doc_a.clone();
+        let other_point = other_key.verifying_key().to_encoded_point(true);
+        let mut other_multikey = vec![0x80, 0x24];
+        other_multikey.extend_from_slice(other_point.as_bytes());
+        tampered_key["verificationMethod"][0]["publicKeyMultibase"] =
+            json!(multibase::encode(multibase::Base::Base58Btc, other_multikey));
+        assert!(resolve_direct_request_receipt_key(
+            &serde_json::to_vec(&tampered_key).unwrap(),
+            id_a
+        )
+        .is_err());
     }
 }
 

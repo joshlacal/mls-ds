@@ -353,7 +353,11 @@ fn request_body_limit(path: &str) -> usize {
         }
         "/xrpc/blue.catbird.mlsDS.deliverMessage"
         | "/xrpc/blue.catbird.mlsDS.deliverWelcome"
-        | "/xrpc/blue.catbird.mlsDS.submitCommit" => SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
+        | "/xrpc/blue.catbird.mlsDS.submitCommit"
+        | "/xrpc/blue.catbird.mlsDS.publishDirectRequest"
+        | "/xrpc/blue.catbird.mlsDS.deliverDirectRequest"
+        | "/xrpc/blue.catbird.mlsDS.relaySendMessage"
+        | "/xrpc/blue.catbird.mlsDS.deliverMessageEntry" => SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
         _ => DEFAULT_REQUEST_BODY_LIMIT_BYTES,
     }
 }

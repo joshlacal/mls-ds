@@ -1045,7 +1045,7 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     let entry_bytes = serde_json::to_vec(&entry).map_err(|_| DirectAcceptanceError::Invariant)?;
     let entry_hash = direct_request_acceptance_entry_hash(&entry_bytes)
         .map_err(|_| DirectAcceptanceError::Invariant)?;
-    let receipt_body = json!({"$type":"blue.catbird.chat.defs#directRequestAcceptanceCommitReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPTANCE-COMMIT\0","protocolVersion":"2","authorityDid":super::direct_request_receipts::REQUEST_RECEIPT_AUTHORITY,"keyId":signer.key_id(),"requestId":request_id,"acceptanceDigest":STANDARD.encode(signed.request_digest()),"entryHash":STANDARD.encode(entry_hash),"prior":prior,"next":next,"recordedAt":received_at});
+    let receipt_body = json!({"$type":"blue.catbird.chat.defs#directRequestAcceptanceCommitReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPTANCE-COMMIT\0","protocolVersion":"2","authorityDid":signer.authority_did(),"keyId":signer.key_id(),"requestId":request_id,"acceptanceDigest":STANDARD.encode(signed.request_digest()),"entryHash":STANDARD.encode(entry_hash),"prior":prior,"next":next,"recordedAt":received_at});
     let receipt_signature = signer
         .sign_acceptance(
             &serde_json::to_vec(&receipt_body).map_err(|_| DirectAcceptanceError::Invariant)?,

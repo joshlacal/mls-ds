@@ -50,6 +50,26 @@ async fn inner(
     let now = TrustedRequestInstant::capture()
         .map_err(|_| ChatFailure::invariant(endpoint))?
         .datetime();
+    let parsed_req: serde_json::Value = serde_json::from_str(envelope.signed_request.get())
+        .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    let recipient_did = parsed_req["body"]["recipientDid"].as_str().ok_or_else(|| {
+        ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+    })?;
+    let actor_did = principal.did();
+
+    if let Ok(coord) = crate::federation::canonical_relay::resolve_pair_coordinator(pool, actor_did, recipient_did).await {
+        if !coord.is_coordinator {
+            let relayed = crate::federation::canonical_relay::relay_publish_direct_request(
+                &coord.coordinator_endpoint(),
+                &coord.coordinator_did,
+                &parsed_req,
+            ).await.map_err(|_| failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::PolicyDenied)))?;
+            let bytes = serde_json::to_vec(&relayed)
+                .map_err(|_| ChatFailure::invariant(endpoint))?;
+            return Ok(context::json_ok(bytes));
+        }
+    }
+
     let mut tx = pool.begin().await.map_err(|error| {
         tracing::error!(%error, "publish_direct_request pool.begin failed");
         ChatFailure::storage(endpoint)
@@ -90,6 +110,49 @@ async fn inner(
         trace_database_failure("commit", &error);
         ChatFailure::storage(endpoint)
     })?;
+
+    if let Ok(coord) = crate::federation::canonical_relay::resolve_pair_coordinator(pool, actor_did, recipient_did).await {
+        if coord.is_coordinator && !coord.is_recipient_home {
+            let request_id = uuid::Uuid::parse_str(parsed_req["body"]["requestId"].as_str().unwrap_or_default())
+                .unwrap_or_default();
+            let conversation_id = uuid::Uuid::parse_str(parsed_req["body"]["conversationId"].as_str().unwrap_or_default())
+                .unwrap_or_default();
+            let first_message_id = uuid::Uuid::parse_str(parsed_req["body"]["firstMessageId"].as_str().unwrap_or_default())
+                .unwrap_or_default();
+
+            let entry_row: Option<Vec<u8>> = sqlx::query_scalar("SELECT accepted_payload_bytes FROM chat.entries WHERE transition_id = $1")
+                .bind(request_id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+
+            let entry_val: serde_json::Value = entry_row
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or(serde_json::json!({}));
+
+            let deliveries = parsed_req["artifacts"]["welcome"]["deliveries"].as_array().cloned().unwrap_or_default();
+
+            let deliver_input = crate::federation::canonical_relay::DeliverDirectRequestInput {
+                request_id,
+                conversation_id,
+                first_message_id,
+                entry: entry_val,
+                deliveries,
+                publication_receipt: receipt.clone(),
+                coordinator_did: coord.coordinator_did.clone(),
+            };
+
+            if let Err(e) = crate::federation::canonical_relay::deliver_direct_request_to_peer(
+                &coord.recipient_home.endpoint,
+                &coord.recipient_home.did,
+                deliver_input,
+            ).await {
+                tracing::warn!("Failed to deliver direct request to recipient peer: {e}");
+            }
+        }
+    }
+
     Ok(context::json_ok(response))
 }
 fn failure(error: PublicationError) -> ChatFailure {

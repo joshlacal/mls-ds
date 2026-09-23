@@ -714,7 +714,7 @@ fn terminal_receipt(
             receipt[k] = v.clone();
         }
     }
-    signer.seal_outcome(serde_json::json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":signer.key_id(),"receipt":receipt})).map_err(|_|DirectRequestStoreError::InvalidReceipt)
+    signer.seal_outcome(serde_json::json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":signer.authority_did(),"keyId":signer.key_id(),"receipt":receipt})).map_err(|_|DirectRequestStoreError::InvalidReceipt)
 }
 
 pub(crate) async fn cancel_direct_request(
@@ -921,7 +921,7 @@ pub(crate) async fn prepare_direct_request<
     )
     .ok_or(DirectRequestStoreError::InvalidReceipt)?;
     let devices=selected.iter().map(|d|Ok(serde_json::json!({"actorDid":d.owner_did,"actorDeviceId":d.owner_device_id.to_string(),"keyId":d.owner_key_id,"authGeneration":d.auth_generation,"keyPackage":{"framing":"mlsMessage","contentType":"keyPackage","bytes":base64::engine::general_purpose::STANDARD.encode(&d.wrapper_bytes),"sha256":base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&d.wrapper_bytes)),"keyPackageRef":base64::engine::general_purpose::STANDARD.encode(&d.key_package_ref)},"grant":serde_json::from_slice::<serde_json::Value>(&d.signed_grant).map_err(|_|DirectRequestStoreError::InvalidReceipt)?}))).collect::<Result<Vec<_>,DirectRequestStoreError>>()?;
-    let mut snapshot = serde_json::json!({"protocolVersion":"2","requestId":b["requestId"],"firstMessageId":b["firstMessageId"],"conversationId":b["conversationId"],"recipientDid":b["recipientDid"],"origin":b["origin"],"profile":b["profile"],"creator":{"actorDid":i.actor_did,"actorDeviceId":i.actor_device_id.to_string(),"keyId":i.actor_key_id,"authGeneration":i.actor_auth_generation},"selectedDevices":devices,"preparedAt":time_string(now),"leaseExpiresAt":time_string(now+Duration::seconds(300)),"minimumImportUntil":time_string(minimum_import_until),"preparationRequestDigest":base64::engine::general_purpose::STANDARD.encode(&i.prepare_digest),"authorityDid":"did:web:chat.catbird.blue","receiptKeyId":signer.key_id()});
+    let mut snapshot = serde_json::json!({"protocolVersion":"2","requestId":b["requestId"],"firstMessageId":b["firstMessageId"],"conversationId":b["conversationId"],"recipientDid":b["recipientDid"],"origin":b["origin"],"profile":b["profile"],"creator":{"actorDid":i.actor_did,"actorDeviceId":i.actor_device_id.to_string(),"keyId":i.actor_key_id,"authGeneration":i.actor_auth_generation},"selectedDevices":devices,"preparedAt":time_string(now),"leaseExpiresAt":time_string(now+Duration::seconds(300)),"minimumImportUntil":time_string(minimum_import_until),"preparationRequestDigest":base64::engine::general_purpose::STANDARD.encode(&i.prepare_digest),"authorityDid":signer.authority_did(),"receiptKeyId":signer.key_id()});
     let (snapshot_digest, signature) = signer
         .sign_preparation(
             &serde_json::to_vec(&snapshot).map_err(|_| DirectRequestStoreError::InvalidReceipt)?,

@@ -206,9 +206,9 @@ pub(crate) async fn load_request_projection(
                 .ok_or(E::InvalidMaterialization)?;
             let recipient_key: Vec<u8> = sqlx::query_scalar("SELECT signing_public_key FROM chat.device_keys WHERE user_did=$1 AND device_id=$2 AND key_id=$3")
                 .bind(&recipient).bind(device).bind(key_id).fetch_one(&mut **tx).await?;
-            let authority_key: Vec<u8> = sqlx::query_scalar("SELECT public_key FROM chat.direct_request_receipt_keys WHERE key_id=$1 AND authority_did=$2")
+            let authority_key: Vec<u8> = sqlx::query_scalar("SELECT public_key FROM chat.direct_request_receipt_keys WHERE key_id=$1")
                 .bind(proof["receipt"]["body"]["keyId"].as_str().ok_or(E::InvalidMaterialization)?)
-                .bind(super::direct_request_receipts::REQUEST_RECEIPT_AUTHORITY).fetch_one(&mut **tx).await?;
+                .fetch_one(&mut **tx).await?;
             let verified =
                 verify_direct_request_acceptance_proof(&bytes, &authority_key, &recipient_key)
                     .map_err(|_| E::InvalidMaterialization)?;

@@ -106,7 +106,7 @@ async fn terminal(
     for (k, v) in extra.as_object().ok_or(PublicationError::Invariant)? {
         receipt[k] = v.clone();
     }
-    let receipt=signer.seal_outcome(json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":signer.key_id(),"receipt":receipt})).map_err(|_|PublicationError::Invariant)?;
+    let receipt=signer.seal_outcome(json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":signer.authority_did(),"keyId":signer.key_id(),"receipt":receipt})).map_err(|_|PublicationError::Invariant)?;
     Ok(PublicationPreparation::Terminal(
         preparation::complete_publication(tx, candidate, disposition, &receipt).await?,
     ))
@@ -459,7 +459,7 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     // Seal the receipt while package reservations are still present. Every
     // subsequent write is in this same transaction, so a failed effect also
     // rolls this receipt back.
-    let receipt=signer.seal_outcome(json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":signer.key_id(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":b["requestId"],"requestDigest":STANDARD.encode(prepared.bootstrap.publication_digest()),"preparationRequestDigest":b["preparationRequestDigest"],"actorDid":actor,"actorDeviceId":actor_device.to_string(),"actorKeyId":actor_key,"authGeneration":auth,"requestKind":"publish","recordedAt":time(now),"conversationId":convo.to_string(),"firstMessageId":b["firstMessageId"],"coordinates":b["next"]}})).map_err(|_|PublicationError::Invariant)?;
+    let receipt=signer.seal_outcome(json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":signer.authority_did(),"keyId":signer.key_id(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":b["requestId"],"requestDigest":STANDARD.encode(prepared.bootstrap.publication_digest()),"preparationRequestDigest":b["preparationRequestDigest"],"actorDid":actor,"actorDeviceId":actor_device.to_string(),"actorKeyId":actor_key,"authGeneration":auth,"requestKind":"publish","recordedAt":time(now),"conversationId":convo.to_string(),"firstMessageId":b["firstMessageId"],"coordinates":b["next"]}})).map_err(|_|PublicationError::Invariant)?;
     let existing_charge = prepared.candidate.existing_artifact_bytes(tx).await?;
     let mut remaining_blobs = 0u64;
     let mut add_blob = |length: usize| -> Result<(), PublicationError> {

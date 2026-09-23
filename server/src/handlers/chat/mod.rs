@@ -304,7 +304,51 @@ where
         .route(
             &xrpc_path(ChatEndpoint::GetBlob),
             get(blob_routes::get_blob),
-        );
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.reserveRecipientBootstrap",
+            post(crate::handlers::ds::direct_requests::reserve_recipient_bootstrap)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.prepareDirectRequest",
+            post(crate::handlers::ds::direct_requests::prepare_direct_request)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.publishDirectRequest",
+            post(crate::handlers::ds::direct_requests::publish_direct_request)
+                .layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.deliverDirectRequest",
+            post(crate::handlers::ds::direct_requests::deliver_direct_request)
+                .layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.deliverAcceptance",
+            post(crate::handlers::ds::direct_requests::deliver_acceptance)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.deliverAcceptanceEntry",
+            post(crate::handlers::ds::direct_requests::deliver_acceptance_entry)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.relaySendMessage",
+            post(crate::handlers::ds::direct_requests::relay_send_message)
+                .layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.deliverMessageEntry",
+            post(crate::handlers::ds::direct_requests::deliver_message_entry)
+                .layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getDirectRequestOutcome",
+            get(crate::handlers::ds::direct_requests::get_direct_request_outcome),
+        )
     router
 }
 fn xrpc_path(endpoint: ChatEndpoint) -> String {

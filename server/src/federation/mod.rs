@@ -1,4 +1,5 @@
 pub mod ack;
+pub mod canonical_relay;
 pub mod declaration_client;
 pub mod errors;
 pub mod mailbox;
@@ -14,6 +15,7 @@ pub mod transfer;
 pub mod upstream;
 
 pub use ack::*;
+pub use canonical_relay::*;
 pub use declaration_client::{DeviceRecord, DeviceRecordClient, DeviceRecordValue, MLSChatPolicy};
 pub use errors::FederationError;
 pub use mailbox::FederatedBackend;
