@@ -43,6 +43,9 @@
           "name": "BlobQuotaExceeded"
         },
         {
+          "name": "ConversationNotAccepted"
+        },
+        {
           "name": "ConversationNotFound"
         },
         {

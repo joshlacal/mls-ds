@@ -48,6 +48,9 @@
           "name": "BlobNotFound"
         },
         {
+          "name": "ConversationNotAccepted"
+        },
+        {
           "name": "CutoverRequired"
         },
         {

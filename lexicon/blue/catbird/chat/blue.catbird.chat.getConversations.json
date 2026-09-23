@@ -113,6 +113,9 @@
           "name": "AccountSessionExpired"
         },
         {
+          "name": "InventorySessionMismatch"
+        },
+        {
           "name": "NotAuthorized"
         },
         {
