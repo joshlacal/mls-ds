@@ -27,9 +27,10 @@ use catbird_mls::{
 };
 use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
-    reviewed_baseline, reviewed_request_migrations, seed_service_device, signed_mls_request,
-    validate_request_test_database_url, DeterministicFaultTransport, FaultBoundary,
-    HttpsDidFixture, RequestRig, ServiceIdentity, ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
+    request_database_url, reviewed_baseline, reviewed_request_migrations, seed_service_device,
+    signed_mls_request, validate_request_test_database_url, DeterministicFaultTransport,
+    FaultBoundary, HttpsDidFixture, RequestRig, ServiceIdentity, ShippingServerFixture,
+    dedicated_request_database_name,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -49,7 +50,7 @@ mod live_direct_request;
 fn psql_cmd(sql: &str) -> anyhow::Result<String> {
     let output = std::process::Command::new("psql")
         .args([
-            REQUEST_TEST_DATABASE_URL,
+            request_database_url(),
             "-X",
             "-A",
             "-t",
@@ -234,6 +235,17 @@ async fn release_by_close_from(
     Ok(())
 }
 
+/// Every event row addressed to the sender (the source of her subscribeEvents
+/// stream) plus her direct-request push fan-out rows.
+fn alice_event_audience(f: &live_direct_request::PublishedRequestFixture) -> anyhow::Result<String> {
+    let a = &f.alice.did;
+    psql_cmd(&format!(r#"SELECT jsonb_build_object(
+      'events',(SELECT jsonb_agg(jsonb_build_object('position',er.event_position,'kind',e.event_kind,'device',er.device_id,'entitlement',er.entitlement_kind) ORDER BY er.event_position,er.device_id)
+                FROM chat.event_recipients er JOIN chat.events e USING(event_position) WHERE er.user_did='{a}'),
+      'push',(SELECT count(*) FROM chat.direct_request_push_event_recipients WHERE recipient_did='{a}')
+    )::text"#))
+}
+
 fn durable_comprehensive(f: &live_direct_request::PublishedRequestFixture) -> anyhow::Result<String> {
     let (r, c, a, b) = (f.request_id, f.conversation_id, &f.alice.did, &f.bob.did);
     psql_cmd(&format!(r#"SELECT jsonb_build_object(
@@ -260,10 +272,20 @@ struct Barrier {
 }
 
 impl Barrier {
+    /// Holds the global direct-request budget singleton, then the principal,
+    /// device and key rows of `dids` — the same order the server takes them
+    /// (direct_request_lock.rs) — so racing operations queue behind this session.
+    /// Only valid on a dedicated per-test database, where every other session
+    /// belongs to this test's own fixture server.
     fn hold(dids: &[&str]) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            dedicated_request_database_name(request_database_url()).is_some(),
+            "barrier races must run on a dedicated catbird_direct_requests_fault_<hex> database"
+        );
         let dids = dids.iter().map(|d| format!("'{d}'")).collect::<Vec<_>>().join(",");
+        let budget = "SELECT singleton FROM chat.direct_request_budget WHERE singleton FOR UPDATE;\n";
         let mut child = Command::new("psql")
-            .args([REQUEST_TEST_DATABASE_URL, "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
+            .args([request_database_url(), "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -271,7 +293,7 @@ impl Barrier {
         let mut stdin = child.stdin.take().context("barrier stdin")?;
         writeln!(
             stdin,
-            "BEGIN;\nSELECT pg_backend_pid();\n\
+            "BEGIN;\nSELECT pg_backend_pid();\n{budget}\
              SELECT count(*) FROM (SELECT 1 FROM chat.principals WHERE user_did IN ({dids}) FOR UPDATE) p;\n\
              SELECT count(*) FROM (SELECT 1 FROM chat.devices WHERE user_did IN ({dids}) FOR UPDATE) d;\n\
              SELECT count(*) FROM (SELECT 1 FROM chat.device_keys WHERE user_did IN ({dids}) FOR UPDATE) k;\n\
@@ -290,6 +312,8 @@ impl Barrier {
         anyhow::bail!("barrier session exited before holding locks")
     }
 
+    /// Sessions of this dedicated database blocked, directly or transitively,
+    /// by the barrier session.
     fn waiters(&self) -> anyhow::Result<i64> {
         let sql = format!(
             "WITH RECURSIVE w(pid) AS (SELECT pid FROM pg_stat_activity WHERE {b}=ANY(pg_blocking_pids(pid)) \
@@ -297,18 +321,17 @@ impl Barrier {
              SELECT count(*) FROM w",
             b = self.pid
         );
-        let out = psql_cmd(&sql)?;
-        Ok(out.trim().parse()?)
+        Ok(psql_cmd(&sql)?.trim().parse()?)
     }
 
     async fn wait_for_waiters(&self, at_least: i64) -> anyhow::Result<i64> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let n = self.waiters()?;
             if n >= at_least {
                 return Ok(n);
             }
-            anyhow::ensure!(Instant::now() < deadline, "only {n} waiters behind barrier");
+            anyhow::ensure!(Instant::now() < deadline, "only {n}/{at_least} sessions queued behind barrier");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -362,6 +385,231 @@ fn expect_rejected_receipt(
     Ok(())
 }
 
+/// Publish one fresh direct-request key package + grant for `who` via the real
+/// signed publishDirectRequestKeys RPC.
+async fn publish_direct_keys(
+    f: &live_direct_request::PublishedRequestFixture,
+    who: &ServiceIdentity,
+    engine: &MlsEngine,
+    revision: u64,
+) -> anyhow::Result<()> {
+    let identity = format!("{}#{}", who.did, who.device_id);
+    let (package, package_ref) = engine.create_key_package(&identity)?;
+    let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&engine.identity_public_key(&identity)?));
+    let grant_id = Uuid::new_v4();
+    let signed_grant = signed_mls_request(engine, &identity, DirectRequestKind::Grant, json!({
+        "$type": "blue.catbird.chat.defs#directRequestGrantBody",
+        "signatureDomain": "CATBIRD-DIRECT-REQUEST-GRANT\0",
+        "protocolVersion": "2",
+        "actorDid": who.did,
+        "actorDeviceId": who.device_id.to_string(),
+        "keyId": key_id,
+        "authGeneration": 1,
+        "grantId": grant_id.to_string(),
+        "grantRevision": 1,
+        "purpose": "direct-request-bootstrap",
+        "profile": "encryptedIntroduction1",
+        "keyPackageRef": STANDARD.encode(&package_ref),
+        "keyPackageSha256": STANDARD.encode(Sha256::digest(&package)),
+        "expiresAt": canonical_future(29),
+        "idempotencyKey": grant_id.to_string(),
+        "signedAt": canonical_now()
+    }))?;
+    let keys_op = Uuid::new_v4();
+    let keys = signed_mls_request(engine, &identity, DirectRequestKind::Keys, json!({
+        "$type": "blue.catbird.chat.defs#directRequestKeysPublicationBody",
+        "signatureDomain": "CATBIRD-DIRECT-REQUEST-KEYS\0",
+        "protocolVersion": "2",
+        "actorDid": who.did,
+        "actorDeviceId": who.device_id.to_string(),
+        "keyId": key_id,
+        "authGeneration": 1,
+        "revision": revision,
+        "enabled": true,
+        "keys": [{
+            "keyPackage": {
+                "framing": "mlsMessage",
+                "contentType": "keyPackage",
+                "bytes": STANDARD.encode(&package),
+                "sha256": STANDARD.encode(Sha256::digest(&package)),
+                "keyPackageRef": STANDARD.encode(&package_ref)
+            },
+            "grant": signed_grant
+        }],
+        "idempotencyKey": keys_op.to_string(),
+        "signedAt": canonical_now()
+    }))?;
+    let (status, body) = who
+        .post(&f.client, &f.server.base_url, "blue.catbird.chat.publishDirectRequestKeys", &json!({"signedRequest": keys}), true)
+        .await?;
+    anyhow::ensure!(status == reqwest::StatusCode::OK, "{} keys publication failed {status}: {}", who.did, String::from_utf8_lossy(&body));
+    Ok(())
+}
+
+/// Real signed prepareDirectRequest from `sender` to `recipient_did`, then the
+/// sender's native engine builds the bootstrap and the signed publication.
+/// Returns (signed publication, request id, candidate conversation id).
+async fn prepare_direct_publication(
+    f: &live_direct_request::PublishedRequestFixture,
+    sender: &ServiceIdentity,
+    engine: &MlsEngine,
+    recipient_did: &str,
+    text: &str,
+) -> anyhow::Result<(Value, Uuid, Uuid)> {
+    let identity = format!("{}#{}", sender.did, sender.device_id);
+    let public = engine.identity_public_key(&identity)?;
+    let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&public));
+    let request_id = Uuid::new_v4();
+    let first_msg_id = Uuid::new_v4();
+    let candidate = Uuid::new_v4();
+    let prepare = signed_mls_request(engine, &identity, DirectRequestKind::Prepare, json!({
+        "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
+        "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\0",
+        "protocolVersion": "2",
+        "actorDid": sender.did,
+        "actorDeviceId": sender.device_id.to_string(),
+        "keyId": key_id,
+        "authGeneration": 1,
+        "requestId": request_id.to_string(),
+        "firstMessageId": first_msg_id.to_string(),
+        "conversationId": candidate.to_string(),
+        "recipientDid": recipient_did,
+        "origin": {"$type": "blue.catbird.chat.defs#freshDirectOrigin"},
+        "profile": "encryptedIntroduction1",
+        "idempotencyKey": request_id.to_string(),
+        "signedAt": canonical_now()
+    }))?;
+    let (prepare_status, prepare_body) = sender
+        .post(&f.client, &f.server.base_url, "blue.catbird.chat.prepareDirectRequest", &json!({"signedRequest": prepare}), true)
+        .await?;
+    anyhow::ensure!(prepare_status == reqwest::StatusCode::OK, "{} prepare failed {prepare_status}: {}", sender.did, String::from_utf8_lossy(&prepare_body));
+    let prep_resp: Value = serde_json::from_slice(&prepare_body)?;
+    let prep_snapshot = prep_resp.pointer("/outcome/preparation").context("preparation snapshot")?;
+
+    let context = json!({
+        "protocolVersion": "2",
+        "requestId": request_id.to_string(),
+        "firstMessageId": first_msg_id.to_string(),
+        "conversationId": candidate.to_string(),
+        "origin": {"$type": "blue.catbird.chat.defs#freshDirectOrigin"},
+        "actorDid": sender.did,
+        "actorDeviceId": sender.device_id.to_string(),
+        "actorKeyId": key_id,
+        "recipientDid": recipient_did,
+        "preparationDigest": prep_snapshot["preparationDigest"]
+    });
+    let selected = prep_snapshot["selectedDevices"].as_array().context("selectedDevices")?;
+    // Same derivation as the shared fixture: the import authority is the earliest
+    // selected grant expiry, which must cover the server's preparation floor.
+    let minimum_import_until = chrono::DateTime::parse_from_rfc3339(
+        prep_snapshot["minimumImportUntil"].as_str().context("minimumImportUntil")?,
+    )?
+    .timestamp();
+    let authority_import_until = selected
+        .iter()
+        .map(|dev| {
+            Ok(chrono::DateTime::parse_from_rfc3339(dev["grant"]["body"]["expiresAt"].as_str().context("grant expiresAt")?)?
+                .timestamp())
+        })
+        .collect::<anyhow::Result<Vec<i64>>>()?
+        .into_iter()
+        .min()
+        .context("no selected devices")?;
+    anyhow::ensure!(authority_import_until >= minimum_import_until, "selected grant expires before preparation import floor");
+    let authority_import_until = u64::try_from(authority_import_until)?;
+    let verified_prepare = protocol::verify_signed_request(DirectRequestKind::Prepare, &serde_json::to_vec(&prepare)?, &public)?;
+    let journal = engine.prepare_direct_request(&DirectRequestBootstrapInput {
+        draft_id: Uuid::new_v4().to_string(),
+        context_json: serde_json::to_vec(&context)?,
+        group_id: rand::random::<[u8; 32]>().to_vec(),
+        generation: 0,
+        state_version: 1,
+        key_packages: selected
+            .iter()
+            .map(|dev| Ok(STANDARD.decode(dev["keyPackage"]["bytes"].as_str().context("pkg bytes")?)?))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        expected_package_refs: selected
+            .iter()
+            .map(|dev| Ok(STANDARD.decode(dev["keyPackage"]["keyPackageRef"].as_str().context("pkg ref")?)?))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        authority_import_until,
+        preparation_request_digest: *verified_prepare.request_digest(),
+        receipt_authority_key: f.server.receipt_public_key.clone(),
+        text: text.into(),
+        invitation: None,
+        metadata: GroupMetadataV1 {
+            version: 1,
+            title: String::new(),
+            description: String::new(),
+            avatar_blob_locator: None,
+            avatar_content_type: None,
+        },
+    })?;
+    let bootstrap = &journal.bootstrap;
+    let mut body = prepare["body"].clone();
+    body["$type"] = json!("blue.catbird.chat.defs#directRequestPublicationBody");
+    body["signatureDomain"] = json!("CATBIRD-DIRECT-REQUEST-PUBLISH\0");
+    body["signedAt"] = json!(canonical_now());
+    body["preparationDigest"] = prep_snapshot["preparationDigest"].clone();
+    body["preparationRequestDigest"] = json!(STANDARD.encode(verified_prepare.request_digest()));
+    body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
+    body["next"] = bootstrap.coordinates.clone();
+    body["importUntil"] = json!(chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
+        .context("import timestamp")?
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let artifact = |data: &[u8], content_type: &str| {
+        json!({
+            "framing": "mlsMessage", "contentType": content_type,
+            "bytes": STANDARD.encode(data), "sha256": STANDARD.encode(Sha256::digest(data))
+        })
+    };
+    let deliveries = selected
+        .iter()
+        .map(|device| {
+            json!({
+                "recipientDid": device["actorDid"],
+                "recipientDeviceId": device["actorDeviceId"],
+                "provenance": {
+                    "requestId": request_id.to_string(),
+                    "preparationDigest": prep_snapshot["preparationDigest"],
+                    "contextHash": STANDARD.encode(bootstrap.context_hash),
+                    "grantId": device["grant"]["body"]["grantId"],
+                    "grantRevision": device["grant"]["body"]["grantRevision"],
+                    "keyPackageRef": device["keyPackage"]["keyPackageRef"],
+                    "importUntil": body["importUntil"]
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let author = json!({
+        "authorDid": sender.did, "authorDeviceId": sender.device_id.to_string(), "authorKeyId": key_id,
+        "signaturePublicKey": STANDARD.encode(&public), "authGenerationAtOrigin": 1,
+        "originTransitionId": request_id.to_string(), "originSeq": 1, "roleAtOrigin": "admin",
+        "deviceStatusAtOrigin": "active"
+    });
+    body["artifacts"] = json!({
+        "genesisGroupInfo": artifact(&bootstrap.genesis_group_info, "groupInfo"),
+        "addCommit": artifact(&bootstrap.add_commit, "publicMessageCommit"),
+        "finalGroupInfo": artifact(&bootstrap.final_group_info, "groupInfo"),
+        "welcome": {
+            "opaqueWelcome": STANDARD.encode(&bootstrap.welcome),
+            "sha256": STANDARD.encode(Sha256::digest(&bootstrap.welcome)),
+            "deliveries": deliveries
+        },
+        "initialCiphertext": STANDARD.encode(&bootstrap.initial_ciphertext),
+        "metadataSnapshot": {
+            "coordinate": metadata_coordinate(&bootstrap.coordinates)?,
+            "originTransitionId": request_id.to_string(), "metadataVersion": 1,
+            "nonce": STANDARD.encode(&bootstrap.metadata_nonce),
+            "ciphertext": STANDARD.encode(&bootstrap.metadata_ciphertext),
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(&bootstrap.metadata_ciphertext)),
+            "ciphertextSize": bootstrap.metadata_ciphertext.len(), "authorProof": author
+        }
+    });
+    let publication = signed_mls_request(engine, &identity, DirectRequestKind::Publish, body)?;
+    Ok((publication, request_id, candidate))
+}
+
 // ============================================================================
 // Case C14: Crossed starts
 // Concurrent A->B / B->A yields one direct; loser retains authored draft,
@@ -386,243 +634,12 @@ async fn c14_crossed_starts_yield_single_direct_and_existing_direct_receipt() ->
     .parse()?;
     assert_eq!(count_before, 1, "Expected exactly one active direct conversation after Alice's publication");
 
-    // Alice publishes direct request keys so Bob can address Alice for B -> A
-    let alice_identity = format!("{}#{}", f.alice.did, f.alice.device_id);
+    // Alice publishes direct request keys so Bob can address Alice for B -> A,
+    // then Bob prepares and publishes the crossed B -> A request.
     let alice_engine = f.alice_engine.as_ref().context("Alice engine")?;
-    let (alice_package, alice_package_ref) = alice_engine.create_key_package(&alice_identity)?;
-    let alice_public = alice_engine.identity_public_key(&alice_identity)?;
-    let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
-
-    let grant_id = Uuid::new_v4();
-    let grant = json!({
-        "$type": "blue.catbird.chat.defs#directRequestGrantBody",
-        "signatureDomain": "CATBIRD-DIRECT-REQUEST-GRANT\0",
-        "protocolVersion": "2",
-        "actorDid": f.alice.did,
-        "actorDeviceId": f.alice.device_id.to_string(),
-        "keyId": alice_key_id,
-        "authGeneration": 1,
-        "grantId": grant_id.to_string(),
-        "grantRevision": 1,
-        "purpose": "direct-request-bootstrap",
-        "profile": "encryptedIntroduction1",
-        "keyPackageRef": STANDARD.encode(&alice_package_ref),
-        "keyPackageSha256": STANDARD.encode(Sha256::digest(&alice_package)),
-        "expiresAt": canonical_future(29),
-        "idempotencyKey": grant_id.to_string(),
-        "signedAt": canonical_now()
-    });
-    let signed_grant = signed_mls_request(alice_engine, &alice_identity, DirectRequestKind::Grant, grant)?;
-
-    let keys_op = Uuid::new_v4();
-    let keys = signed_mls_request(
-        alice_engine,
-        &alice_identity,
-        DirectRequestKind::Keys,
-        json!({
-            "$type": "blue.catbird.chat.defs#directRequestKeysPublicationBody",
-            "signatureDomain": "CATBIRD-DIRECT-REQUEST-KEYS\0",
-            "protocolVersion": "2",
-            "actorDid": f.alice.did,
-            "actorDeviceId": f.alice.device_id.to_string(),
-            "keyId": alice_key_id,
-            "authGeneration": 1,
-            "revision": 1,
-            "enabled": true,
-            "keys": [{
-                "keyPackage": {
-                    "framing": "mlsMessage",
-                    "contentType": "keyPackage",
-                    "bytes": STANDARD.encode(&alice_package),
-                    "sha256": STANDARD.encode(Sha256::digest(&alice_package)),
-                    "keyPackageRef": STANDARD.encode(&alice_package_ref)
-                },
-                "grant": signed_grant
-            }],
-            "idempotencyKey": keys_op.to_string(),
-            "signedAt": canonical_now()
-        }),
-    )?;
-    let (keys_status, keys_body) = f
-        .alice
-        .post(
-            &f.client,
-            &f.server.base_url,
-            "blue.catbird.chat.publishDirectRequestKeys",
-            &json!({"signedRequest": keys}),
-            true,
-        )
-        .await?;
-    anyhow::ensure!(keys_status == reqwest::StatusCode::OK, "Alice keys publication failed: {}", String::from_utf8_lossy(&keys_body));
-
-    // Bob now prepares a direct request to Alice (B -> A)
-    let bob_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
-    let bob_public = f.bob_engine.identity_public_key(&bob_identity)?;
-    let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
-    let bob_request_id = Uuid::new_v4();
-    let bob_first_msg_id = Uuid::new_v4();
-    let bob_candidate_convo_id = Uuid::new_v4();
-
-    let bob_prepare = signed_mls_request(
-        &f.bob_engine,
-        &bob_identity,
-        DirectRequestKind::Prepare,
-        json!({
-            "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
-            "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\0",
-            "protocolVersion": "2",
-            "actorDid": f.bob.did,
-            "actorDeviceId": f.bob.device_id.to_string(),
-            "keyId": bob_key_id,
-            "authGeneration": 1,
-            "requestId": bob_request_id.to_string(),
-            "firstMessageId": bob_first_msg_id.to_string(),
-            "conversationId": bob_candidate_convo_id.to_string(),
-            "recipientDid": f.alice.did,
-            "origin": {"$type": "blue.catbird.chat.defs#freshDirectOrigin"},
-            "profile": "encryptedIntroduction1",
-            "idempotencyKey": bob_request_id.to_string(),
-            "signedAt": canonical_now()
-        }),
-    )?;
-
-    let (prepare_status, prepare_body) = f
-        .bob
-        .post(
-            &f.client,
-            &f.server.base_url,
-            "blue.catbird.chat.prepareDirectRequest",
-            &json!({"signedRequest": bob_prepare}),
-            true,
-        )
-        .await?;
-    anyhow::ensure!(prepare_status == reqwest::StatusCode::OK, "Bob prepare failed {prepare_status}: {}", String::from_utf8_lossy(&prepare_body));
-
-    let prep_resp: Value = serde_json::from_slice(&prepare_body)?;
-    let prep_snapshot = prep_resp.pointer("/outcome/preparation").context("Bob preparation snapshot")?;
-
-    // Bob generates candidate bootstrap and publication envelope
-    let bob_context = json!({
-        "protocolVersion": "2",
-        "requestId": bob_request_id.to_string(),
-        "firstMessageId": bob_first_msg_id.to_string(),
-        "conversationId": bob_candidate_convo_id.to_string(),
-        "origin": {"$type": "blue.catbird.chat.defs#freshDirectOrigin"},
-        "actorDid": f.bob.did,
-        "actorDeviceId": f.bob.device_id.to_string(),
-        "actorKeyId": bob_key_id,
-        "recipientDid": f.alice.did,
-        "preparationDigest": prep_snapshot["preparationDigest"]
-    });
-    let bob_selected = prep_snapshot["selectedDevices"].as_array().context("selectedDevices")?;
-    let bob_authority_import_until = u64::try_from(
-        chrono::DateTime::parse_from_rfc3339(
-            prep_snapshot["minimumImportUntil"]
-                .as_str()
-                .context("minimumImportUntil")?,
-        )?
-        .timestamp(),
-    )?;
-    let bob_verified_prepare = protocol::verify_signed_request(
-        DirectRequestKind::Prepare,
-        &serde_json::to_vec(&bob_prepare)?,
-        &bob_public,
-    )?;
-    let bob_journal = f.bob_engine.prepare_direct_request(&DirectRequestBootstrapInput {
-        draft_id: Uuid::new_v4().to_string(),
-        context_json: serde_json::to_vec(&bob_context)?,
-        group_id: rand::random::<[u8; 32]>().to_vec(),
-        generation: 0,
-        state_version: 1,
-        key_packages: bob_selected
-            .iter()
-            .map(|dev| Ok(STANDARD.decode(dev["keyPackage"]["bytes"].as_str().context("pkg bytes")?)?))
-            .collect::<anyhow::Result<Vec<_>>>()?,
-        expected_package_refs: bob_selected
-            .iter()
-            .map(|dev| Ok(STANDARD.decode(dev["keyPackage"]["keyPackageRef"].as_str().context("pkg ref")?)?))
-            .collect::<anyhow::Result<Vec<_>>>()?,
-        authority_import_until: bob_authority_import_until,
-        preparation_request_digest: *bob_verified_prepare.request_digest(),
-        receipt_authority_key: f.server.receipt_public_key.clone(),
-        text: "Bob's candidate introduction".into(),
-        invitation: None,
-        metadata: GroupMetadataV1 {
-            version: 1,
-            title: String::new(),
-            description: String::new(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-        },
-    })?;
-    let bob_bootstrap = &bob_journal.bootstrap;
-    let mut bob_publish_body = bob_prepare["body"].clone();
-    bob_publish_body["$type"] = json!("blue.catbird.chat.defs#directRequestPublicationBody");
-    bob_publish_body["signatureDomain"] = json!("CATBIRD-DIRECT-REQUEST-PUBLISH\0");
-    bob_publish_body["signedAt"] = json!(canonical_now());
-    bob_publish_body["preparationDigest"] = prep_snapshot["preparationDigest"].clone();
-    bob_publish_body["preparationRequestDigest"] = json!(STANDARD.encode(bob_verified_prepare.request_digest()));
-    bob_publish_body["contextHash"] = json!(STANDARD.encode(bob_bootstrap.context_hash));
-    bob_publish_body["next"] = bob_bootstrap.coordinates.clone();
-    bob_publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
-        bob_bootstrap.import_until as i64,
-        0
-    )
-    .context("import timestamp")?
-    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
-
-    let artifact = |data: &[u8], content_type: &str| {
-        json!({
-            "framing": "mlsMessage", "contentType": content_type,
-            "bytes": STANDARD.encode(data), "sha256": STANDARD.encode(Sha256::digest(data))
-        })
-    };
-    let bob_deliveries = bob_selected
-        .iter()
-        .map(|device| {
-            json!({
-                "recipientDid": device["actorDid"],
-                "recipientDeviceId": device["actorDeviceId"],
-                "provenance": {
-                    "requestId": bob_request_id.to_string(),
-                    "preparationDigest": prep_snapshot["preparationDigest"],
-                    "contextHash": STANDARD.encode(bob_bootstrap.context_hash),
-                    "grantId": device["grant"]["body"]["grantId"],
-                    "grantRevision": device["grant"]["body"]["grantRevision"],
-                    "keyPackageRef": device["keyPackage"]["keyPackageRef"],
-                    "importUntil": bob_publish_body["importUntil"]
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    let bob_author = json!({
-        "authorDid": f.bob.did, "authorDeviceId": f.bob.device_id.to_string(), "authorKeyId": bob_key_id,
-        "signaturePublicKey": STANDARD.encode(&bob_public), "authGenerationAtOrigin": 1,
-        "originTransitionId": bob_request_id.to_string(), "originSeq": 1, "roleAtOrigin": "admin",
-        "deviceStatusAtOrigin": "active"
-    });
-    bob_publish_body["artifacts"] = json!({
-        "genesisGroupInfo": artifact(&bob_bootstrap.genesis_group_info, "groupInfo"),
-        "addCommit": artifact(&bob_bootstrap.add_commit, "publicMessageCommit"),
-        "finalGroupInfo": artifact(&bob_bootstrap.final_group_info, "groupInfo"),
-        "welcome": {
-            "opaqueWelcome": STANDARD.encode(&bob_bootstrap.welcome),
-            "sha256": STANDARD.encode(Sha256::digest(&bob_bootstrap.welcome)),
-            "deliveries": bob_deliveries
-        },
-        "initialCiphertext": STANDARD.encode(&bob_bootstrap.initial_ciphertext),
-        "metadataSnapshot": {
-            "coordinate": metadata_coordinate(&bob_bootstrap.coordinates)?,
-            "originTransitionId": bob_request_id.to_string(), "metadataVersion": 1,
-            "nonce": STANDARD.encode(&bob_bootstrap.metadata_nonce),
-            "ciphertext": STANDARD.encode(&bob_bootstrap.metadata_ciphertext),
-            "ciphertextSha256": STANDARD.encode(Sha256::digest(&bob_bootstrap.metadata_ciphertext)),
-            "ciphertextSize": bob_bootstrap.metadata_ciphertext.len(), "authorProof": bob_author
-        }
-    });
-    let bob_publish = signed_mls_request(&f.bob_engine, &bob_identity, DirectRequestKind::Publish, bob_publish_body)?;
-
-    // Bob publishes B -> A direct request
+    publish_direct_keys(&f, &f.alice, alice_engine, 1).await?;
+    let (bob_publish, _bob_request_id, bob_candidate_convo_id) =
+        prepare_direct_publication(&f, &f.bob, &f.bob_engine, &f.alice.did, "Bob's candidate introduction").await?;
     let (publish_status, publish_response) = f
         .bob
         .post(
@@ -633,7 +650,6 @@ async fn c14_crossed_starts_yield_single_direct_and_existing_direct_receipt() ->
             true,
         )
         .await?;
-
     anyhow::ensure!(
         publish_status == reqwest::StatusCode::OK,
         "Bob publish request failed {publish_status}: {}",
@@ -675,6 +691,75 @@ async fn c14_crossed_starts_yield_single_direct_and_existing_direct_receipt() ->
     assert!(!candidate_exists, "Losing candidate conversation ID must not exist in database");
     release_by_close(&f).await?;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c14_concurrent_crossed_publications_barrier_one_direct() -> anyhow::Result<()> {
+    // Registered pair; close the fixture's direct so neither side has one.
+    let f = live_direct_request::publish_request(false).await?;
+    release_by_close(&f).await?;
+    let alice_engine = f.alice_engine.as_ref().context("Alice engine")?;
+    publish_direct_keys(&f, &f.alice, alice_engine, 1).await?;
+    publish_direct_keys(&f, &f.bob, &f.bob_engine, 2).await?;
+
+    // Both sides prepare real candidates (A -> B and B -> A) before either publishes.
+    let (a_pub, a_req, a_convo) = prepare_direct_publication(&f, &f.alice, alice_engine, &f.bob.did, "Alice crossed start").await?;
+    let (b_pub, b_req, b_convo) = prepare_direct_publication(&f, &f.bob, &f.bob_engine, &f.alice.did, "Bob crossed start").await?;
+
+    // Both publications queue behind a barrier holding the request budget and
+    // both principals' locks, then are released together.
+    let barrier = Barrier::hold(&[&f.alice.did, &f.bob.did])?;
+    let a_future = {
+        let (who, client, base, env) = (f.alice.clone(), f.client.clone(), f.server.base_url.clone(), json!({"signedRequest": a_pub.clone()}));
+        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.publishDirectRequest", &env, true).await })
+    };
+    let b_future = {
+        let (who, client, base, env) = (f.bob.clone(), f.client.clone(), f.server.base_url.clone(), json!({"signedRequest": b_pub.clone()}));
+        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.publishDirectRequest", &env, true).await })
+    };
+    let queued = barrier.wait_for_waiters(2).await?;
+    barrier.release()?;
+    let (a_status, a_bytes) = a_future.await??;
+    let (b_status, b_bytes) = b_future.await??;
+    anyhow::ensure!(a_status == reqwest::StatusCode::OK, "Alice publish {a_status}: {}", String::from_utf8_lossy(&a_bytes));
+    anyhow::ensure!(b_status == reqwest::StatusCode::OK, "Bob publish {b_status}: {}", String::from_utf8_lossy(&b_bytes));
+    let a_receipt = serde_json::from_slice::<Value>(&a_bytes)?["outcome"]["body"]["receipt"].clone();
+    let b_receipt = serde_json::from_slice::<Value>(&b_bytes)?["outcome"]["body"]["receipt"].clone();
+    const PUBLISHED: &str = "blue.catbird.chat.defs#directRequestPublishedReceipt";
+    const EXISTING: &str = "blue.catbird.chat.defs#directRequestExistingDirectReceipt";
+    let alice_won = a_receipt["$type"] == PUBLISHED;
+    let (winner_convo, loser_convo, loser_req, loser_receipt, winner_pub) = if alice_won {
+        assert_eq!(b_receipt["$type"], EXISTING, "loser must get existing-direct receipt: {b_receipt}");
+        (a_convo, b_convo, b_req, &b_receipt, &a_pub)
+    } else {
+        assert_eq!(b_receipt["$type"], PUBLISHED, "exactly one publication must win: {a_receipt} / {b_receipt}");
+        assert_eq!(a_receipt["$type"], EXISTING, "loser must get existing-direct receipt: {a_receipt}");
+        (b_convo, a_convo, a_req, &a_receipt, &b_pub)
+    };
+    eprintln!("C14 concurrent crossed start: queued={queued} winner={}", if alice_won { "alice" } else { "bob" });
+    assert_eq!(loser_receipt["conversationId"], winner_convo.to_string(), "loser receipt names the winner");
+    assert_eq!(loser_receipt["requiresAcceptance"], true, "loser is pending recipient; nothing silently accepted");
+
+    let (did_low, did_high) = if f.alice.did < f.bob.did { (&f.alice.did, &f.bob.did) } else { (&f.bob.did, &f.alice.did) };
+    assert_eq!(
+        psql_cmd(&format!("SELECT count(*) FROM chat.conversations WHERE kind='direct' AND lifecycle='active' AND direct_did_low='{did_low}' AND direct_did_high='{did_high}'"))?,
+        "1",
+        "exactly one active direct for the pair"
+    );
+    assert_eq!(psql_cmd(&format!("SELECT count(*) FROM chat.conversations WHERE conversation_id='{loser_convo}'"))?, "0", "loser candidate not created");
+    assert_eq!(psql_cmd(&format!("SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{loser_req}'"))?, "0", "loser ciphertext not transplanted");
+    assert_eq!(
+        psql_cmd(&format!("SELECT count(*) FROM chat.transitions WHERE conversation_id='{winner_convo}' AND kind='directRequestAcceptance'"))?,
+        "0",
+        "no acceptance recorded for the winner"
+    );
+
+    // Release capacity: close the winner through the real signed RPC.
+    let (close_env, _) = close_envelope(&f, alice_won, Some(winner_pub["body"]["next"].clone()))?;
+    let who = if alice_won { &f.alice } else { &f.bob };
+    let (close_status, close_bytes) = who.post(&f.client, &f.server.base_url, "blue.catbird.chat.closeConversation", &close_env, true).await?;
+    anyhow::ensure!(close_status == reqwest::StatusCode::OK, "winner close {close_status}: {}", String::from_utf8_lossy(&close_bytes));
     Ok(())
 }
 
@@ -1268,6 +1353,9 @@ async fn c19_preview_fetch_import_ack_produce_no_peer_visible_signals() -> anyho
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
     let entries_before: Value = serde_json::from_slice(&entries_before_bytes)?;
+    // Alice's subscribeEvents stream and push fan-out are served from these
+    // durable audience rows; snapshot them to prove no peer-visible event.
+    let events_before = alice_event_audience(&f)?;
 
     // 2. Bob fetches inventory session and pending welcomes via getPendingWelcomes (preview fetch)
     let (status, convos_bytes) = f
@@ -1309,6 +1397,9 @@ async fn c19_preview_fetch_import_ack_produce_no_peer_visible_signals() -> anyho
     );
 
     // 3. Bob imports the Welcome and executes internal durability ACK via acknowledgeWelcome
+    f.bob_engine.process_direct_request(&f.welcome_input)?;
+    let intro = f.bob_engine.decrypt_direct_request(&f.welcome_input)?;
+    assert!(matches!(intro, DirectRequestIntroductionResult::Ready { .. }), "Bob natively imports and decrypts the preview");
     let ack_id = Uuid::new_v4();
     let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&f.bob_engine.identity_public_key(&bob_identity)?));
     let ack_body = json!({
@@ -1410,6 +1501,11 @@ async fn c19_preview_fetch_import_ack_produce_no_peer_visible_signals() -> anyho
     assert_eq!(
         entries_before, entries_after,
         "getEntries projection must not reveal recipient preview/ACK activity"
+    );
+    assert_eq!(
+        alice_event_audience(&f)?,
+        events_before,
+        "no event (read, delivery, presence, typing or other) reaches Alice's stream or push fan-out"
     );
     release_by_close(&f).await?;
 
@@ -1669,7 +1765,7 @@ async fn c20_close_racing_accept_barrier_one_winner() -> anyhow::Result<()> {
     };
 
     let queued = barrier.wait_for_waiters(2).await?;
-    eprintln!("C20 close-vs-accept race: {queued} transactions queued behind barrier");
+    eprintln!("C20 close-vs-accept race: queued={queued}");
     barrier.release()?;
 
     let (close_status, _close_bytes) = close_future.await??;
@@ -1743,7 +1839,7 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
         "idempotencyKey": ack_id.to_string(),
         "signedAt": canonical_now()
     }))?;
-    let (close_env, _close_tx_id) = close_envelope(&f, true, None)?;
+    let (close_env, close_tx_id) = close_envelope(&f, true, None)?;
 
     let barrier = Barrier::hold(&[&f.alice.did, &f.bob.did])?;
     let close_future = {
@@ -1763,6 +1859,11 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
     // Close is always permitted while pending, so it is the authoritative outcome
     // regardless of order; the ack is durable iff it committed before the close.
     anyhow::ensure!(close_status == reqwest::StatusCode::OK, "close must win: {close_status}: {}", String::from_utf8_lossy(&close_bytes));
+    assert_eq!(
+        psql_cmd(&format!("SELECT count(*) FROM chat.transitions WHERE conversation_id='{}' AND kind='closeConversation' AND transition_id='{close_tx_id}'", f.conversation_id))?,
+        "1",
+        "the signed close is the single durable close transition"
+    );
     let acknowledged = psql_cmd(&format!(
         "SELECT count(*) FROM chat.direct_request_welcome_outcomes WHERE request_id='{}' AND status='acknowledged'",
         f.request_id
