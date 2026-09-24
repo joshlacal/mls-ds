@@ -51,6 +51,81 @@ pub(crate) async fn lock_direct_request_operation_set(
     })
 }
 
+/// Try to lock the request operation non-blockingly. Returns None if any advisory
+/// lock is held or if the budget row is locked.
+pub(crate) async fn try_lock_direct_request_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    request_id: Uuid,
+) -> Result<Option<DirectRequestOperationLock>, sqlx::Error> {
+    try_lock_direct_request_operation_set(transaction, request_id, &[]).await
+}
+
+pub(crate) async fn try_lock_direct_request_operation_set(
+    transaction: &mut Transaction<'_, Postgres>,
+    request_id: Uuid,
+    additional_ids: &[Uuid],
+) -> Result<Option<DirectRequestOperationLock>, sqlx::Error> {
+    let mut ids = additional_ids.to_vec();
+    ids.push(request_id);
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        let acquired: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))")
+                .bind(format!("chat-operation-id:{id}"))
+                .fetch_one(&mut **transaction)
+                .await?;
+        if !acquired {
+            return Ok(None);
+        }
+    }
+    let budget = sqlx::query(
+        "SELECT singleton FROM chat.direct_request_budget WHERE singleton FOR UPDATE NOWAIT",
+    )
+    .fetch_optional(&mut **transaction)
+    .await;
+    match &budget {
+        Ok(Some(_)) => {}
+        Ok(None) => return Ok(None),
+        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("55P03") => {
+            return Ok(None);
+        }
+        Err(_) => {
+            budget?;
+        }
+    }
+    let transaction_id = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    Ok(Some(DirectRequestOperationLock {
+        transaction_id,
+        request_id,
+    }))
+}
+
+/// Try to acquire the request operation advisory lock only, without touching the
+/// budget singleton row. Used for background sweeps that do not mutate budget bytes.
+pub(crate) async fn try_lock_direct_request_operation_only(
+    transaction: &mut Transaction<'_, Postgres>,
+    request_id: Uuid,
+) -> Result<Option<DirectRequestOperationLock>, sqlx::Error> {
+    let acquired: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(format!("chat-operation-id:{request_id}"))
+            .fetch_one(&mut **transaction)
+            .await?;
+    if !acquired {
+        return Ok(None);
+    }
+    let transaction_id = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    Ok(Some(DirectRequestOperationLock {
+        transaction_id,
+        request_id,
+    }))
+}
+
 #[derive(sqlx::FromRow)]
 pub(crate) struct DirectRequestLockedDevice {
     pub(crate) user_did: String,

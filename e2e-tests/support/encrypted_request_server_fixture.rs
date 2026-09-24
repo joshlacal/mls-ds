@@ -113,7 +113,11 @@ async fn main() -> Result<()> {
         .map_err(anyhow::Error::msg)?;
 
     let pool = PgPoolOptions::new()
-        .max_connections(4)
+        .max_connections(32)
+        .test_before_acquire(false)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .acquire_timeout(std::time::Duration::from_secs(60))
         .connect(&database_url)
         .await
         .context("connect guarded request database")?;

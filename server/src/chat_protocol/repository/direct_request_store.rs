@@ -53,20 +53,20 @@ async fn validate_terminal_charge(
     tx: &mut Transaction<'_, Postgres>,
     lock: &LockedAttempt,
     charge: i64,
-    published: bool,
+    _published: bool,
 ) -> Result<(i64, i64), DirectRequestStoreError> {
     if charge <= 0 || charge > MAX_RETAINED_GLOBAL_BYTES {
         return Err(DirectRequestStoreError::QuotaExceeded);
     }
     let old = lock.row.as_ref().map_or(0, |r| r.reserved_bytes);
     let retained_delta = charge - old;
-    let pending_delta = if published { charge - old } else { -old };
+    let pending_delta = if lock.row.is_some() { -old } else { 0 };
     let (pending,retained):(i64,i64) = sqlx::query_as("SELECT pending_bytes,retained_bytes FROM chat.direct_request_effective_budget WHERE singleton")
         .fetch_one(&mut **tx).await?;
     let (account_pending,account_retained):(i64,i64)=sqlx::query_as(r#"
         SELECT max(pending)::bigint,max(retained)::bigint FROM (
           SELECT who.did,
-            COALESCE(sum(a.reserved_bytes) FILTER(WHERE a.status IN('prepared','published') AND NOT EXISTS(SELECT 1 FROM chat.direct_request_pending_releases r WHERE r.request_id=a.request_id)),0) AS pending,
+            COALESCE(sum(a.reserved_bytes) FILTER(WHERE a.status = 'prepared'),0) AS pending,
             COALESCE(sum(COALESCE(c.charged_bytes,a.reserved_bytes)),0) AS retained
           FROM (VALUES($1::text),($2::text)) who(did)
           LEFT JOIN chat.direct_request_attempts a ON a.actor_did=who.did OR a.recipient_did=who.did
@@ -85,6 +85,9 @@ async fn validate_terminal_charge(
     }
     Ok((pending_delta, retained_delta))
 }
+pub(crate) const MAX_UNANSWERED_OUTBOUND_REQUESTS: i64 = 10;
+pub(crate) const MAX_UNANSWERED_INBOUND_REQUESTS: i64 = 32;
+
 const MIN_PACKAGE_HORIZON_SECONDS: i64 = 604_800 + 300 + PREPARATION_TTL_SECONDS;
 
 #[derive(Debug, Error)]
@@ -477,19 +480,29 @@ async fn check_preparation_budget(
     now: DateTime<Utc>,
     charge: i64,
 ) -> Result<(), DirectRequestStoreError> {
-    let (sender_live,pair_live,recipient_live,hourly,account_bytes): (i64,i64,i64,i64,i64) = sqlx::query_as(r#"
+    let (sender_live, pair_live, recipient_live, hourly, sender_pending_bytes, outbound_unanswered, inbound_unanswered): (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(r#"
         SELECT count(*) FILTER(WHERE status='prepared' AND actor_did=$1),
                count(*) FILTER(WHERE status='prepared' AND actor_did=$1 AND actor_device_id=$2 AND recipient_did=$3),
                count(*) FILTER(WHERE status='prepared' AND recipient_did=$3),
                count(*) FILTER(WHERE prepared_at IS NOT NULL AND actor_did=$1 AND prepared_at>$4-INTERVAL '1 hour'),
-               GREATEST(COALESCE(sum(reserved_bytes) FILTER(WHERE status IN('prepared','published') AND NOT EXISTS(SELECT 1 FROM chat.direct_request_pending_releases r WHERE r.request_id=a.request_id) AND (actor_did=$1 OR recipient_did=$1)),0),COALESCE(sum(reserved_bytes) FILTER(WHERE status IN('prepared','published') AND NOT EXISTS(SELECT 1 FROM chat.direct_request_pending_releases r WHERE r.request_id=a.request_id) AND (actor_did=$3 OR recipient_did=$3)),0))::bigint
+               COALESCE(sum(reserved_bytes) FILTER(WHERE status='prepared' AND actor_did=$1),0)::bigint,
+               (SELECT count(*) FROM chat.direct_request_attempts a
+                  LEFT JOIN chat.direct_request_lifecycle l USING(request_id)
+                 WHERE a.actor_did=$1 AND a.status='published' AND l.request_id IS NULL),
+               (SELECT count(*) FROM chat.direct_request_attempts a
+                  LEFT JOIN chat.direct_request_lifecycle l USING(request_id)
+                 WHERE a.recipient_did=$3 AND a.status='published' AND l.request_id IS NULL)
           FROM chat.direct_request_attempts a
     "#).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.recipient_did).bind(now).fetch_one(&mut **tx).await?;
+    if inbound_unanswered >= MAX_UNANSWERED_INBOUND_REQUESTS {
+        return Err(DirectRequestStoreError::RecipientKeysUnavailable);
+    }
     if sender_live >= 2
         || pair_live >= 1
         || recipient_live >= 4
         || hourly >= 20
-        || account_bytes + charge > MAX_PENDING_ACCOUNT_BYTES
+        || sender_pending_bytes + charge > MAX_PENDING_ACCOUNT_BYTES
+        || outbound_unanswered >= MAX_UNANSWERED_OUTBOUND_REQUESTS
     {
         return Err(DirectRequestStoreError::QuotaExceeded);
     }

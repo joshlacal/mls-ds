@@ -50,10 +50,10 @@ async fn inner(
     let now = TrustedRequestInstant::capture()
         .map_err(|_| ChatFailure::invariant(endpoint))?
         .datetime();
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|_| ChatFailure::storage(endpoint))?;
+    let mut tx = pool.begin().await.map_err(|error| {
+        tracing::error!(%error, "publish_direct_request pool.begin failed");
+        ChatFailure::storage(endpoint)
+    })?;
     let prepared = direct_request_publication::prepare_publication(
         &mut tx,
         &principal,
@@ -88,6 +88,7 @@ async fn inner(
     Ok(context::json_ok(response))
 }
 fn failure(error: PublicationError) -> ChatFailure {
+    tracing::warn!(?error, "publish_direct_request failure");
     use crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError as E;
     let endpoint = ChatEndpoint::PublishDirectRequest;
     match error {
