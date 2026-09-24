@@ -1,104 +1,24 @@
 //! G7 Checkpoint P: direct production-hydration proof for the corpus-bound
 //! genuine signed Creation fixture.
-//!
-//! This integration crate path-includes the production `chat_protocol` module
-//! tree (so `repository::core`'s `super::super::…` paths resolve) and drives
-//! the REAL `hydrate_locked_conversation_state` aggregate over a private RAII
-//! per-run executor database seeded through the frozen
-//! `executor_seed::seed_hydratable_genuine_creation_graph` fixture. No-DB
-//! source guards pin the frozen seed helper and the production hydrator path
-//! against drift.
 
-// DELIBERATELY NO CRATE-LEVEL `#![allow(dead_code)]`.
-//
-// This suite's entire value is that its negatives RUN. A blanket dead-code
-// allow at crate root is precisely the mechanism that let two security helpers
-// (`get_devices_attempt_verifies` and `proof_rejects_foreign_transaction`) sit
-// in this file with zero callers while every drift negative silently never
-// executed. The allow is therefore narrowed to the path-included production
-// modules and the shared fixture helpers below, where "not every consuming
-// test uses every helper" is genuinely true. Anything this file DEFINES for
-// itself — bridge functions, fixtures, guards — is now covered by the
-// `dead_code` lint, so an unwired negative is a compiler warning again.
+use crate::common::{self, executor_seed};
+use crate::chat_protocol::*;
+use crate::chat_protocol::cursor::*;
+use crate::chat_protocol::dpop::*;
+use crate::chat_protocol::model::*;
+use crate::chat_protocol::read_authority::*;
+use crate::chat_protocol::read_projection::*;
+use crate::chat_protocol::relationship_policy::*;
+use crate::chat_protocol::repository::*;
+use crate::chat_protocol::snapshot::*;
+use crate::chat_protocol::state_machine::*;
+use crate::chat_protocol::transcript::*;
+use crate::chat_protocol::validation::*;
+use crate::chat_protocol::wire::*;
 
-#[allow(dead_code)]
-mod common;
-
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-#[allow(unused_imports)]
-mod repository {
-    pub use crate::chat_protocol::repository::{auth, blobs, inventory, key_packages, prelude};
-}
-#[allow(dead_code)]
-mod snapshot {
-    pub use catbird_server::chat_protocol::snapshot::*;
-}
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/read_projection.rs"]
-mod read_projection;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-#[path = "../src/chat_protocol"]
 mod chat_protocol {
-    pub mod direct_request_transcript {
-        pub use catbird_server::chat_protocol::direct_request_transcript::*;
-    }
-    pub(crate) use cursor::{CursorSealer, OsSecureRandom, SecureRandom};
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-    pub mod model {
-        pub use crate::model::*;
-    }
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod error {
-        pub use catbird_server::chat_protocol::error::*;
-    }
-    pub mod read_projection {
-        pub use crate::read_projection::*;
-    }
-    /// Test-crate visibility bridge for the B-auth read authority.
-    ///
-    /// The budgets, attempts, locked row, and row proof are
-    /// `pub(in crate::chat_protocol)`. A `#[test] fn` must live at the crate
-    /// root for the sealed `--exact` gate commands to name it, and the crate
-    /// root is outside that visibility. This module sits INSIDE
-    /// `crate::chat_protocol`, so it can reach them and hand the crate root
-    /// only plain counts, booleans, and the `pub(crate)` error type.
-    ///
-    /// It adds **no constructor**. Every function here calls the production
-    /// constructor and cannot fabricate a `VerifiedReadAdmission`: that still
-    /// requires `seal_read_admission` over a real committed
-    /// `VerifiedChatDeviceRequest`. It widens no production visibility — it
-    /// exists only in this test crate.
+    pub(super) use crate::chat_protocol::*;
+
     pub mod b_auth_bridge {
         use super::dpop::{
             LockedReadDatabaseRow, ReadAdmissionAttempt, ReadAdmissionBindingError,
@@ -293,7 +213,7 @@ mod chat_protocol {
                 row_did.into_boxed_str(),
                 row_device,
                 status.into_boxed_str(),
-                jkt.into_boxed_str(),
+                Some(jkt.into_boxed_str()),
                 generation,
                 key_id.into_boxed_str(),
                 signing_sha,
@@ -328,7 +248,7 @@ mod chat_protocol {
                 did.to_owned().into_boxed_str(),
                 device_id,
                 device_status.to_owned().into_boxed_str(),
-                textual_jkt.to_owned().into_boxed_str(),
+                Some(textual_jkt.to_owned().into_boxed_str()),
                 auth_generation,
                 key_id.to_owned().into_boxed_str(),
                 signing_public_key_sha256,
@@ -606,18 +526,6 @@ mod chat_protocol {
             })
         }
     }
-    /// Test-crate visibility bridge for the B-read authority module.
-    ///
-    /// The B-read budgets, conversions, lock entry point, and fence types are
-    /// `pub(in crate::chat_protocol)`. A `#[test] fn` must live at the crate
-    /// root for the sealed `--exact` gate commands to name it, and the crate
-    /// root is outside that visibility. This module sits INSIDE
-    /// `crate::chat_protocol`, so it can reach them and hand the crate root
-    /// only plain values and `pub(crate)` view DTOs.
-    ///
-    /// It adds **no constructor**: every function here calls a production
-    /// constructor or accessor and cannot fabricate a budget, attempt,
-    /// authority, or fence.
     pub mod read_authority_bridge {
         use super::dpop::{ReadAdmissionAttempt, VerifiedReadAdmission};
         use super::read_authority::{
@@ -1319,29 +1227,10 @@ mod chat_protocol {
             }
         }
     }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    pub mod read_authority {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/read_authority.rs"
-        ));
-
-        /// Pure coverage for the interval-witness validator's boundary rules. These run
-        /// wherever a harness `include!`s this file as a module of the test crate, so
-        /// they need no database and no fixture corpus.
         #[cfg(test)]
         mod interval_witness_boundary_tests {
-            use super::*;
+            use super::read_authority::*;
+            use uuid::Uuid;
 
             const OPENING_FINGERPRINT: [u8; 32] = [7u8; 32];
             const UNRELATED_FINGERPRINT: [u8; 32] = [9u8; 32];
@@ -1401,7 +1290,7 @@ mod chat_protocol {
                 let witnesses = build_ordered_interval_witnesses(rows, 12)
                     .expect("a mandated reset->reset touch is not an overlap");
                 assert_eq!(witnesses.len(), 2);
-                assert_eq!(witnesses[1].start_seq, 6);
+                assert_eq!(witnesses[1].start_seq(), 6);
             }
 
             #[test]
@@ -1564,106 +1453,8 @@ mod chat_protocol {
                 ));
             }
         }
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    #[path = "repository"]
-    pub mod repository {
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod blobs {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-        pub mod key_packages {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-        pub mod prelude {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-        pub mod ticket {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/ticket.rs"
-            ));
-        }
-        #[allow(dead_code)]
-        pub mod recovery;
-        pub mod core {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-        pub mod execution_context {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        pub mod welcome_terminal {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/welcome_terminal.rs"
-            ));
-        }
-        pub mod relationship {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-    }
-    #[allow(dead_code)]
-    pub mod state_machine;
-}
 
-#[allow(dead_code)]
-#[path = "common/executor_seed.rs"]
-mod executor_seed;
+}
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -1847,7 +1638,7 @@ const SEALED_REPOSITORY_CORE_SHA256: &str =
 #[test]
 fn frozen_executor_seed_helper_is_byte_identical_to_the_sealed_baseline() {
     assert_eq!(
-        hex::encode(Sha256::digest(include_bytes!("common/executor_seed.rs"))),
+        hex::encode(Sha256::digest(include_bytes!("../../../tests/common/executor_seed.rs"))),
         FROZEN_EXECUTOR_SEED_SHA256,
         "tests/common/executor_seed.rs must stay byte-identical to the frozen P helper"
     );
@@ -1856,9 +1647,7 @@ fn frozen_executor_seed_helper_is_byte_identical_to_the_sealed_baseline() {
 #[test]
 fn production_repository_core_is_byte_identical_to_the_sealed_baseline() {
     assert_eq!(
-        hex::encode(Sha256::digest(include_bytes!(
-            "../src/chat_protocol/repository/core.rs"
-        ))),
+        hex::encode(Sha256::digest(include_bytes!("core.rs"))),
         SEALED_REPOSITORY_CORE_SHA256,
         "src/chat_protocol/repository/core.rs must stay byte-identical to the sealed baseline"
     );
@@ -1916,7 +1705,7 @@ fn require_ordered_anchors(source: &str, start: usize, anchors: &[&str]) {
 
 #[test]
 fn production_hydrator_retains_the_direct_locked_aggregate_path() {
-    let core = include_str!("../src/chat_protocol/repository/core.rs");
+    let core = include_str!("core.rs");
     assert_eq!(
         core.matches("fn hydrate_locked_conversation_state").count(),
         1,
@@ -1934,10 +1723,10 @@ fn production_hydrator_retains_the_direct_locked_aggregate_path() {
 
 #[test]
 fn locked_aggregate_has_no_unchecked_or_shipping_test_hydration_constructor() {
-    let core = include_str!("../src/chat_protocol/repository/core.rs");
-    let state_machine = include_str!("../src/chat_protocol/state_machine.rs");
-    let public_state = include_str!("../src/chat_protocol/public_state.rs");
-    let module_root = include_str!("../src/chat_protocol/mod.rs");
+    let core = include_str!("core.rs");
+    let state_machine = include_str!("../state_machine.rs");
+    let public_state = include_str!("../public_state.rs");
+    let module_root = include_str!("../mod.rs");
     for (name, source) in [
         ("repository/core.rs", core),
         ("state_machine.rs", state_machine),
@@ -2413,20 +2202,20 @@ fn signed_blob_deletion_bytes(operation_id: Uuid, blob_id: Uuid) -> Vec<u8> {
 // candidate bytes, not a re-read of something that could have drifted.
 // ---------------------------------------------------------------------------
 
-const B_AUTH_DPOP_SOURCE: &str = include_str!("../src/chat_protocol/dpop.rs");
-const B_AUTH_AUTH_SOURCE: &str = include_str!("../src/chat_protocol/repository/auth.rs");
-const B_AUTH_PRELUDE_SOURCE: &str = include_str!("../src/chat_protocol/repository/prelude.rs");
-const B_AUTH_CONTEXT_SOURCE: &str = include_str!("../src/handlers/chat/context.rs");
-const B_AUTH_INVENTORY_SOURCE: &str = include_str!("../src/chat_protocol/repository/inventory.rs");
-const B_AUTH_GET_DEVICES_SOURCE: &str = include_str!("../src/handlers/chat/get_devices.rs");
-const B_AUTH_GET_OWN_DEVICES_SOURCE: &str = include_str!("../src/handlers/chat/get_own_devices.rs");
+const B_AUTH_DPOP_SOURCE: &str = include_str!("../dpop.rs");
+const B_AUTH_AUTH_SOURCE: &str = include_str!("auth.rs");
+const B_AUTH_PRELUDE_SOURCE: &str = include_str!("prelude.rs");
+const B_AUTH_CONTEXT_SOURCE: &str = include_str!("../../handlers/chat/context.rs");
+const B_AUTH_INVENTORY_SOURCE: &str = include_str!("inventory.rs");
+const B_AUTH_GET_DEVICES_SOURCE: &str = include_str!("../../handlers/chat/get_devices.rs");
+const B_AUTH_GET_OWN_DEVICES_SOURCE: &str = include_str!("../../handlers/chat/get_own_devices.rs");
 const B_AUTH_DEVICE_DIRECTORY_SOURCE: &str =
-    include_str!("../src/chat_protocol/repository/device_directory.rs");
-const B_AUTH_DEVICE_VIEWS_SOURCE: &str = include_str!("../src/handlers/chat/device_views.rs");
+    include_str!("device_directory.rs");
+const B_AUTH_DEVICE_VIEWS_SOURCE: &str = include_str!("../../handlers/chat/device_views.rs");
 /// Read-only. The live schema floor that makes the nonpositive-generation
 /// shapes unreachable from a real row.
 const B_AUTH_CORE_MIGRATION_SOURCE: &str =
-    include_str!("../migrations/20260722000001_chat_protocol_core.sql");
+    include_str!("../../../migrations/20260722000001_chat_protocol_core.sql");
 
 /// Every source file that could hold a `locked_auth_generation()` call.
 ///
@@ -3347,7 +3136,7 @@ fn b_auth_get_own_devices_budget_mints_fixed_three_attempts() {
 
 /// This test file's own bytes, so a compile-time proof can also be shown to
 /// exist in source rather than only asserted in prose.
-const B_AUTH_G7_SELF_SOURCE: &str = include_str!("chat_protocol_g7_entitlement.rs");
+const B_AUTH_G7_SELF_SOURCE: &str = include_str!("g7_entitlement_tests.rs");
 
 // ---------------------------------------------------------------------------
 // 8. Nonignored source/compile: privacy, call graph, and the exact thirteen.
@@ -4222,7 +4011,7 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     // Source guards per amendment §4: the two seam methods are the ONLY
     // `ReadAdmissionAttempt` mints for B-read endpoints, the budgets have no
     // other constructor, and no test-only constructor exists.
-    let read_authority_source: &str = include_str!("../src/chat_protocol/read_authority.rs");
+    let read_authority_source: &str = include_str!("../read_authority.rs");
     // The needle is `ReadAdmissionAttempt {` as a STRUCT-LITERAL position: a
     // function signature (`-> ReadAdmissionAttempt {`) also contains the text,
     // so the count is taken over the comment-stripped code with the exact
@@ -4358,7 +4147,7 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
         "device_views.rs is read-only through Stage B"
     );
     assert_eq!(
-        hex::encode(Sha256::digest(include_bytes!("common/executor_seed.rs"))),
+        hex::encode(Sha256::digest(include_bytes!("../../../tests/common/executor_seed.rs"))),
         FROZEN_EXECUTOR_SEED_SHA256,
         "the frozen executor seed helper is unchanged by Stage B"
     );
@@ -5442,7 +5231,7 @@ async fn fixture_cursor_key(pool: &PgPool, protocol_instance_id: Uuid) -> String
 }
 
 /// Source input for the B-read source guards.
-const B_READ_READ_AUTHORITY_SOURCE: &str = include_str!("../src/chat_protocol/read_authority.rs");
+const B_READ_READ_AUTHORITY_SOURCE: &str = include_str!("../read_authority.rs");
 
 #[test]
 fn read_admission_seal_consumes_repository_locked_generation() {
@@ -7797,7 +7586,7 @@ async fn inventory_fence_rejects_key_floor_head_and_expiry_drift() {
 // ============================================================================
 
 const CANONICAL_JSON_FIXTURE: &str =
-    include_str!("fixtures/chat_protocol_g7_canonical_json_v1.json");
+    include_str!("../../../tests/fixtures/chat_protocol_g7_canonical_json_v1.json");
 
 use catbird_atproto::generated::blue_catbird::chat as chat_dto;
 use jacquard_common::DefaultStr;
@@ -9358,8 +9147,8 @@ fn c1_2_projected_dtos_encode_canonically_without_extra_data() {
 // C1-2 source guards (brief Step 5, corrected text).
 // ----------------------------------------------------------------------------
 
-const C1_2_READ_PROJECTION_SOURCE: &str = include_str!("../src/chat_protocol/read_projection.rs");
-const C1_2_ENTITLEMENT_SOURCE: &str = include_str!("chat_protocol_g7_entitlement.rs");
+const C1_2_READ_PROJECTION_SOURCE: &str = include_str!("../read_projection.rs");
+const C1_2_ENTITLEMENT_SOURCE: &str = include_str!("g7_entitlement_tests.rs");
 
 fn c1_2_assert_no_forbidden_derive(source: &str, declaration: &str) {
     let start = source

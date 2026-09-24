@@ -1066,24 +1066,25 @@ impl EntryReadAuthority {
 
 /// The exact-device interval rows, in the deterministic
 /// `(start_seq, membership_interval_id)` order the frozen interface requires.
+#[cfg_attr(test, derive(Clone))]
 #[derive(FromRow)]
-struct ExactDeviceIntervalRow {
-    membership_interval_id: Uuid,
-    conversation_id: Uuid,
-    generation: i64,
-    recipient_did: String,
-    recipient_device_id: Uuid,
-    start_seq: i64,
-    opening_transition_id: Uuid,
-    opening_outer_entry_fingerprint: Vec<u8>,
+pub(in crate::chat_protocol) struct ExactDeviceIntervalRow {
+    pub(in crate::chat_protocol) membership_interval_id: Uuid,
+    pub(in crate::chat_protocol) conversation_id: Uuid,
+    pub(in crate::chat_protocol) generation: i64,
+    pub(in crate::chat_protocol) recipient_did: String,
+    pub(in crate::chat_protocol) recipient_device_id: Uuid,
+    pub(in crate::chat_protocol) start_seq: i64,
+    pub(in crate::chat_protocol) opening_transition_id: Uuid,
+    pub(in crate::chat_protocol) opening_outer_entry_fingerprint: Vec<u8>,
     // Read only to mirror the schedule trigger's touching-boundary rule below.
     // Deliberately absent from `interval_row_binding_digest`: the frozen witness
     // bytes must not change, and `generation` already separates a reset touch.
-    opening_kind: String,
-    terminal_seq: Option<i64>,
-    closing_transition_id: Option<Uuid>,
-    closing_outer_entry_fingerprint: Option<Vec<u8>>,
-    closing_kind: Option<String>,
+    pub(in crate::chat_protocol) opening_kind: String,
+    pub(in crate::chat_protocol) terminal_seq: Option<i64>,
+    pub(in crate::chat_protocol) closing_transition_id: Option<Uuid>,
+    pub(in crate::chat_protocol) closing_outer_entry_fingerprint: Option<Vec<u8>>,
+    pub(in crate::chat_protocol) closing_kind: Option<String>,
 }
 
 async fn load_exact_device_interval_rows(
@@ -1188,7 +1189,7 @@ fn interval_row_binding_digest(
 /// replace->add and reset->reset. It is accepted only with the same boundary
 /// evidence the trigger requires, so the reader is exactly as strict as the
 /// writer.
-fn build_ordered_interval_witnesses(
+pub(in crate::chat_protocol) fn build_ordered_interval_witnesses(
     rows: Vec<ExactDeviceIntervalRow>,
     observed_head_seq: u64,
 ) -> Result<Box<[EntryIntervalWitness]>, ReadAuthorityError> {
