@@ -449,7 +449,9 @@ fn trusted_origin_and_endpoint_make_htu_without_request_authority_input() {
 #[test]
 fn every_dpop_endpoint_owns_its_exact_http_method_profile() {
     for endpoint in [
+        "blue.catbird.chat.getDeviceKey",
         "blue.catbird.chat.getDevices",
+        "blue.catbird.chat.getDirectRequestOutcome",
         "blue.catbird.chat.getOwnDevices",
         "blue.catbird.chat.getConversations",
         "blue.catbird.chat.getConversationState",
