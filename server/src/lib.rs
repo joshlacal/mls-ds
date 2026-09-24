@@ -55,6 +55,10 @@ compile_error!(
 );
 
 extern crate self as catbird_server;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+pub mod common;
+
 
 pub mod actors;
 pub mod atproto_bytes;
