@@ -20445,5 +20445,93 @@ mod direct_request_history_tests {
 }
 
 #[cfg(test)]
-#[path = "state_machine/tests.rs"]
-mod tests;
+impl DeviceIdentity {
+    pub(crate) fn from_did_for_test(did: &str) -> Self {
+        Self {
+            principal: PrincipalId::new(did.as_bytes().to_vec()).unwrap(),
+            device_id: [0; 16],
+        }
+    }
+}
+
+#[cfg(test)]
+impl ParticipantRecord {
+    pub(crate) fn for_relationship_scope_test(
+        did: &str,
+        status: ParticipantStatus,
+        inviter: Option<DeviceIdentity>,
+    ) -> Self {
+        Self {
+            principal: PrincipalId::new(did.as_bytes().to_vec()).unwrap(),
+            status,
+            role: ParticipantRole::Member,
+            role_producer: None,
+            invitation: inviter.map(|inviter| InvitationProvenance {
+                transition: TransitionEvidence::new(1, *uuid::Uuid::from_u128(0x01234567_89ab_4cde_8f01_23456789abcd).as_bytes(), [0; 32]).unwrap(),
+                inviter,
+            }),
+            acceptance: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ConversationState {
+    pub(crate) fn for_relationship_scope_test(
+        kind: ConversationKind,
+        conversation_id: [u8; 16],
+        participants: Vec<ParticipantRecord>,
+    ) -> Self {
+        let coordinate = crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
+            conversation_id,
+            1,
+            1,
+            [0; 32],
+            0,
+            [0; 32],
+            [0; 32],
+            crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Active,
+        );
+        Self {
+            kind,
+            coordinate,
+            producer: TransitionEvidence::new(1, *uuid::Uuid::from_u128(0x01234567_89ab_4cde_8f01_23456789abcd).as_bytes(), [0; 32]).unwrap(),
+            public_state: None,
+            metadata: None,
+            metadata_producer: None,
+            participants,
+            leaves: Vec::new(),
+            intervals: Vec::new(),
+            terminal_proofs: Vec::new(),
+            recovery_requests: Vec::new(),
+            recovery_reservations: Vec::new(),
+            reset_requests: Vec::new(),
+            leave_requests: Vec::new(),
+            welcomes: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl LockedRegistrationProjection {
+    pub(crate) fn for_scope_test(
+        transaction_id: &str,
+        conversation_id: [u8; 16],
+        actor_did: &str,
+        status: PersistedRegistrationStatus,
+        durable_row_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            transaction_id: transaction_id.to_owned(),
+            conversation_id,
+            actor: DeviceIdentity::from_did_for_test(actor_did),
+            key_id: [0; 32],
+            registered_mls_signature_key: [0; 32],
+            auth_generation: 1,
+            status,
+            trusted_read_at: ServerTimestamp::from_unix_millis_for_test(0).unwrap(),
+            durable_row_digest,
+            authority_scope_digest: [1; 32],
+        }
+    }
+}

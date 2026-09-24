@@ -1,435 +1,24 @@
-//! Focused authority-boundary tests for the clean-chat Reset repository.
-//!
-//! Run live cases against the dedicated clean-chat database:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_reset_repository -- --test-threads=1
-
-#![allow(dead_code)]
-
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-mod repository {
-    pub(crate) use crate::chat_protocol::repository::*;
-}
-
-mod chat_protocol {
-    pub mod direct_request_transcript {
-        pub use catbird_server::chat_protocol::direct_request_transcript::*;
-    }
-    pub mod model {
-        pub use crate::model::*;
-    }
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    // `mint_signed_repository_authority` is `pub(super)` in `dpop.rs`, so after the
-    // relocation it is visible here but not at this test crate's root, and a `use`
-    // re-export cannot widen it (E0364). Forward it from the level where it is
-    // already in scope rather than relocating its caller.
-    pub(crate) fn mint_signed_repository_authority(
-        pre_replay: dpop::PreReplayCryptographicVerification,
-        canonical: transcript::CanonicalSignedMutation,
-        stored_public_key: &[u8],
-        repository_receipt: repository::auth::RepositoryAuthorityReceipt,
-    ) -> Result<dpop::VerifiedChatDeviceRequest, model::AuthPrimitiveError> {
-        dpop::mint_signed_repository_authority(
-            pre_replay,
-            canonical,
-            stored_public_key,
-            repository_receipt,
-        )
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    pub mod repository {
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod prelude {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        pub mod relationship {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-        pub mod core {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        #[allow(dead_code)]
-        pub mod reset {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/reset.rs"
-            ));
-
-            #[derive(Clone, Copy, Debug)]
-            pub(crate) enum PendingResetCasExpectationMutation {
-                ResetRequestId,
-                ConversationId,
-                RequesterDid,
-                RequesterDeviceId,
-                RequesterKeyId,
-                RequesterAuthGeneration,
-                PriorGeneration,
-                PriorStateVersion,
-                PriorGroupId,
-                PriorEpoch,
-                PriorGroupContextHash,
-                PriorConfirmationTag,
-                Reason,
-                SignedRequestBytes,
-                SigningTranscriptBytes,
-                RequestDigest,
-                Signature,
-                ReceivedAt,
-                ExpiresAt,
-            }
-
-            pub(crate) const ALL_PENDING_RESET_CAS_EXPECTATION_MUTATIONS:
-                [PendingResetCasExpectationMutation; 19] = [
-                PendingResetCasExpectationMutation::ResetRequestId,
-                PendingResetCasExpectationMutation::ConversationId,
-                PendingResetCasExpectationMutation::RequesterDid,
-                PendingResetCasExpectationMutation::RequesterDeviceId,
-                PendingResetCasExpectationMutation::RequesterKeyId,
-                PendingResetCasExpectationMutation::RequesterAuthGeneration,
-                PendingResetCasExpectationMutation::PriorGeneration,
-                PendingResetCasExpectationMutation::PriorStateVersion,
-                PendingResetCasExpectationMutation::PriorGroupId,
-                PendingResetCasExpectationMutation::PriorEpoch,
-                PendingResetCasExpectationMutation::PriorGroupContextHash,
-                PendingResetCasExpectationMutation::PriorConfirmationTag,
-                PendingResetCasExpectationMutation::Reason,
-                PendingResetCasExpectationMutation::SignedRequestBytes,
-                PendingResetCasExpectationMutation::SigningTranscriptBytes,
-                PendingResetCasExpectationMutation::RequestDigest,
-                PendingResetCasExpectationMutation::Signature,
-                PendingResetCasExpectationMutation::ReceivedAt,
-                PendingResetCasExpectationMutation::ExpiresAt,
-            ];
-
-            pub(crate) fn scope_rows_for_test(
-                prelude: &PreparedBusinessPrelude,
-            ) -> Vec<(String, Uuid, Option<String>)> {
-                let scope = prelude.scope_authority();
-                let mut rows = scope
-                    .keys()
-                    .iter()
-                    .map(|key| {
-                        (
-                            key.user_did().to_owned(),
-                            key.device_id(),
-                            Some(key.key_id().to_owned()),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                for device in scope.devices() {
-                    if !rows
-                        .iter()
-                        .any(|row| row.0 == device.user_did() && row.1 == device.device_id())
-                    {
-                        rows.push((device.user_did().to_owned(), device.device_id(), None));
-                    }
-                }
-                rows.sort();
-                rows
-            }
-
-            pub(crate) fn activation_request_for_test(
-                authority: LockedResetActivationAuthority,
-            ) -> LockedPendingResetRequestGuard {
-                authority.request
-            }
-
-            pub(crate) fn authority_prior_for_test(
-                authority: &LockedResetRequestAuthority,
-            ) -> Option<PublicGroupSnapshotCoordinate> {
-                authority.aggregate.head().prior_coordinate().cloned()
-            }
-
-            pub(crate) fn corrupt_guard_trusted_instant_for_test(
-                mut guard: LockedPendingResetRequestGuard,
-            ) -> LockedPendingResetRequestGuard {
-                guard.trusted_instant += Duration::milliseconds(1);
-                guard
-            }
-
-            pub(crate) fn mutate_pending_reset_cas_expectation_for_test(
-                mut guard: LockedPendingResetRequestGuard,
-                mutation: PendingResetCasExpectationMutation,
-            ) -> LockedPendingResetRequestGuard {
-                match mutation {
-                    PendingResetCasExpectationMutation::ResetRequestId => {
-                        guard.reset_request_id = Uuid::new_v4()
-                    }
-                    PendingResetCasExpectationMutation::ConversationId => {
-                        guard.conversation_id = Uuid::new_v4()
-                    }
-                    PendingResetCasExpectationMutation::RequesterDid => {
-                        guard.requester_did = "did:plc:casdriftfixtureaaaaaaaa"
-                            .to_owned()
-                            .into_boxed_str()
-                    }
-                    PendingResetCasExpectationMutation::RequesterDeviceId => {
-                        guard.requester_device_id = Uuid::new_v4()
-                    }
-                    PendingResetCasExpectationMutation::RequesterKeyId => {
-                        guard.requester_key_id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                            .to_owned()
-                            .into_boxed_str()
-                    }
-                    PendingResetCasExpectationMutation::RequesterAuthGeneration => {
-                        guard.requester_auth_generation += 1
-                    }
-                    PendingResetCasExpectationMutation::PriorGeneration => {
-                        guard.prior = PublicGroupSnapshotCoordinate::new(
-                            *guard.prior.conversation_id(),
-                            guard.prior.generation() + 1,
-                            guard.prior.state_version(),
-                            *guard.prior.group_id(),
-                            guard.prior.epoch(),
-                            *guard.prior.group_context_hash(),
-                            *guard.prior.confirmation_tag(),
-                            guard.prior.lifecycle(),
-                        )
-                    }
-                    PendingResetCasExpectationMutation::PriorStateVersion => {
-                        guard.prior = PublicGroupSnapshotCoordinate::new(
-                            *guard.prior.conversation_id(),
-                            guard.prior.generation(),
-                            guard.prior.state_version() + 1,
-                            *guard.prior.group_id(),
-                            guard.prior.epoch(),
-                            *guard.prior.group_context_hash(),
-                            *guard.prior.confirmation_tag(),
-                            guard.prior.lifecycle(),
-                        )
-                    }
-                    PendingResetCasExpectationMutation::PriorGroupId => {
-                        let mut value = *guard.prior.group_id();
-                        value[0] ^= 1;
-                        guard.prior = PublicGroupSnapshotCoordinate::new(
-                            *guard.prior.conversation_id(),
-                            guard.prior.generation(),
-                            guard.prior.state_version(),
-                            value,
-                            guard.prior.epoch(),
-                            *guard.prior.group_context_hash(),
-                            *guard.prior.confirmation_tag(),
-                            guard.prior.lifecycle(),
-                        )
-                    }
-                    PendingResetCasExpectationMutation::PriorEpoch => {
-                        guard.prior = PublicGroupSnapshotCoordinate::new(
-                            *guard.prior.conversation_id(),
-                            guard.prior.generation(),
-                            guard.prior.state_version(),
-                            *guard.prior.group_id(),
-                            guard.prior.epoch() + 1,
-                            *guard.prior.group_context_hash(),
-                            *guard.prior.confirmation_tag(),
-                            guard.prior.lifecycle(),
-                        )
-                    }
-                    PendingResetCasExpectationMutation::PriorGroupContextHash => {
-                        let mut value = *guard.prior.group_context_hash();
-                        value[0] ^= 1;
-                        guard.prior = PublicGroupSnapshotCoordinate::new(
-                            *guard.prior.conversation_id(),
-                            guard.prior.generation(),
-                            guard.prior.state_version(),
-                            *guard.prior.group_id(),
-                            guard.prior.epoch(),
-                            value,
-                            *guard.prior.confirmation_tag(),
-                            guard.prior.lifecycle(),
-                        )
-                    }
-                    PendingResetCasExpectationMutation::PriorConfirmationTag => {
-                        let mut value = *guard.prior.confirmation_tag();
-                        value[0] ^= 1;
-                        guard.prior = PublicGroupSnapshotCoordinate::new(
-                            *guard.prior.conversation_id(),
-                            guard.prior.generation(),
-                            guard.prior.state_version(),
-                            *guard.prior.group_id(),
-                            guard.prior.epoch(),
-                            *guard.prior.group_context_hash(),
-                            value,
-                            guard.prior.lifecycle(),
-                        )
-                    }
-                    PendingResetCasExpectationMutation::Reason => {
-                        guard.reason = "poisonedState".to_owned().into_boxed_str()
-                    }
-                    PendingResetCasExpectationMutation::SignedRequestBytes => {
-                        guard.signed_request_bytes[0] ^= 1
-                    }
-                    PendingResetCasExpectationMutation::SigningTranscriptBytes => {
-                        guard.signing_transcript_bytes[0] ^= 1
-                    }
-                    PendingResetCasExpectationMutation::RequestDigest => {
-                        guard.request_digest[0] ^= 1
-                    }
-                    PendingResetCasExpectationMutation::Signature => guard.signature[0] ^= 1,
-                    PendingResetCasExpectationMutation::ReceivedAt => {
-                        guard.received_at += Duration::milliseconds(1)
-                    }
-                    PendingResetCasExpectationMutation::ExpiresAt => {
-                        guard.expires_at += Duration::milliseconds(1)
-                    }
-                }
-
-                let row = PendingResetRow {
-                    reset_request_id: guard.reset_request_id,
-                    conversation_id: guard.conversation_id,
-                    requester_did: guard.requester_did.to_string(),
-                    requester_device_id: guard.requester_device_id,
-                    requester_key_id: guard.requester_key_id.to_string(),
-                    requester_auth_generation: guard.requester_auth_generation,
-                    prior_generation: i64::try_from(guard.prior.generation()).unwrap(),
-                    prior_state_version: i64::try_from(guard.prior.state_version()).unwrap(),
-                    prior_group_id: guard.prior.group_id().to_vec(),
-                    prior_epoch: i64::try_from(guard.prior.epoch()).unwrap(),
-                    prior_group_context_hash: guard.prior.group_context_hash().to_vec(),
-                    prior_confirmation_tag: guard.prior.confirmation_tag().to_vec(),
-                    reason: guard.reason.to_string(),
-                    status: "pending".to_owned(),
-                    signed_request_bytes: guard.signed_request_bytes.to_vec(),
-                    signing_transcript_bytes: guard.signing_transcript_bytes.to_vec(),
-                    request_digest: guard.request_digest.to_vec(),
-                    signature: guard.signature.to_vec(),
-                    received_at: guard.received_at,
-                    expires_at: guard.expires_at,
-                    terminal_transition_id: None,
-                    terminal_at: None,
-                };
-                guard.immutable_row_digest = reset_immutable_row_digest(&row, &guard.prior);
-                guard.guard_digest = locked_pending_reset_digest(
-                    &guard.transaction_id,
-                    guard.trusted_instant,
-                    &guard.scope_digest,
-                    &guard.head_digest,
-                    &guard.immutable_row_digest,
-                    &guard.requester_device_digest,
-                    &guard.requester_key_digest,
-                    guard.authorized_terminal,
-                );
-                guard
-            }
-        }
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod recovery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-        pub mod execution_context {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        pub mod blobs {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-        pub mod key_packages {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-    }
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
-}
-
-mod common;
-
 use std::sync::{Arc, OnceLock};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use chat_protocol::{
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use ed25519_dalek::{Signer, SigningKey};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use sqlx::{postgres::PgPoolOptions, Acquire, PgPool, Postgres, Transaction};
+use tokio::sync::{Mutex, Notify};
+use uuid::Uuid;
+
+use crate::common;
+use crate::chat_protocol::{
+    dpop,
+    model,
+    public_state,
+    relationship_policy,
     repository::{
+        self,
         auth::{
-            recheck_existing_business_authority_for_test, AuthRepositoryError,
+            self, recheck_existing_business_authority_for_test, AuthRepositoryError,
             RepositoryAuthorityClass,
         },
         core::hydrate_locked_conversation_state,
@@ -455,13 +44,7 @@ use chat_protocol::{
         ValidatedChatNsid,
     },
 };
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use ed25519_dalek::{Signer, SigningKey};
-use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use sqlx::{postgres::PgPoolOptions, Acquire, PgPool, Postgres, Transaction};
-use tokio::sync::{Mutex, Notify};
-use uuid::Uuid;
+
 
 const ALICE_DID: &str = "did:plc:alicefixtureaaaaaaaaaaaa";
 const ALICE_DEVICE: &str = "2f93a82d-b061-4c75-8f61-57f23146b910";
@@ -533,7 +116,7 @@ fn pure_reset_fixture() -> ResetFixture {
 async fn pool() -> PgPool {
     let url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must explicitly name the dedicated clean-chat database");
-    common::chat_protocol::validate_chat_protocol_database_url(Some(&url))
+    crate::common::chat_protocol::validate_chat_protocol_database_url(Some(&url))
         .expect("unsafe clean-chat Reset repository test database");
     PgPoolOptions::new()
         .max_connections(8)
@@ -615,13 +198,13 @@ fn verified_request(
     fixture: &ResetFixture,
     at: DateTime<Utc>,
     mutation: &VerifiedSignedMutation,
-) -> chat_protocol::dpop::VerifiedChatDeviceRequest {
+) -> crate::chat_protocol::dpop::VerifiedChatDeviceRequest {
     let endpoint = match mutation.projection() {
         VerifiedMutationProjection::ResetRequest(_) => "blue.catbird.chat.requestReset",
         VerifiedMutationProjection::ResetActivation(_) => "blue.catbird.chat.activateReset",
         _ => panic!("reset test helper requires a Reset mutation"),
     };
-    let pre_replay = chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
+    let pre_replay = crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
         Uuid::new_v4(),
         *Uuid::new_v4().as_bytes().first_chunk::<12>().unwrap(),
         endpoint,
@@ -632,14 +215,14 @@ fn verified_request(
     );
     let canonical =
         decode_canonical_signed_mutation(mutation.accepted_wrapper_bytes().unwrap()).unwrap();
-    let receipt = chat_protocol::repository::auth::reset_existing_device_receipt_for_test(
+    let receipt = crate::chat_protocol::repository::auth::reset_existing_device_receipt_for_test(
         mutation,
         &fixture.actor_dpop_jkt,
         &fixture.signing_public_key,
     )
     .unwrap();
     assert_eq!(receipt.class(), RepositoryAuthorityClass::ExistingDevice);
-    chat_protocol::mint_signed_repository_authority(
+    crate::chat_protocol::dpop::mint_signed_repository_authority(
         pre_replay,
         canonical,
         &fixture.signing_public_key,
@@ -1141,7 +724,7 @@ fn rust_lock_helper_identifiers(source: &str) -> std::collections::BTreeSet<Stri
 
 #[test]
 fn reset_source_has_no_raw_business_guard_or_duplicate_identity_lock_path() {
-    let source = include_str!("../src/chat_protocol/repository/reset.rs");
+    let source = include_str!("../reset.rs");
     for forbidden in [
         "BusinessAuthorityGuard",
         "LockedResetScope",
@@ -1161,7 +744,7 @@ fn reset_source_has_no_raw_business_guard_or_duplicate_identity_lock_path() {
 
 #[test]
 fn reset_identity_discovery_is_read_only_and_locked_preparation_does_not_relock_identity_rows() {
-    let source = include_str!("../src/chat_protocol/repository/reset.rs");
+    let source = include_str!("../reset.rs");
     let discovery = source
         .split_once("pub(crate) async fn discover_reset_identity_scope(")
         .unwrap()
@@ -1260,7 +843,7 @@ fn reset_lock_helper_scanner_ignores_comments_and_rust_string_literals() {
 
 #[test]
 fn reset_scope_drift_is_not_an_inner_savepoint_retry() {
-    let source = include_str!("../src/chat_protocol/repository/reset.rs");
+    let source = include_str!("../reset.rs");
     let preparation = source
         .split_once("async fn prepare_reset_read_set_inner(")
         .unwrap()
@@ -1274,7 +857,7 @@ fn reset_scope_drift_is_not_an_inner_savepoint_retry() {
 
 #[test]
 fn reset_request_fixture_authority_remains_test_only() {
-    let source = include_str!("../src/chat_protocol/dpop.rs");
+    let source = include_str!("../../dpop.rs");
     assert!(source.contains("#[cfg(test)]\npub(crate) mod repository_test_evidence"));
     let fixture_module = source
         .split_once("pub(crate) mod repository_test_evidence")
@@ -1285,7 +868,7 @@ fn reset_request_fixture_authority_remains_test_only() {
 
 #[test]
 fn reset_receipt_fixture_is_test_only_reset_specific_and_not_forged_by_harness() {
-    let auth_source = include_str!("../src/chat_protocol/repository/auth.rs");
+    let auth_source = include_str!("../auth.rs");
     let fixture = auth_source
         .split_once("pub(crate) fn reset_existing_device_receipt_for_test(")
         .unwrap();
@@ -1300,7 +883,7 @@ fn reset_receipt_fixture_is_test_only_reset_specific_and_not_forged_by_harness()
     assert!(fixture_body.contains("UnsupportedAuthorizationShape"));
     assert!(fixture_body.contains("ed25519_key_id(signing_public_key)"));
 
-    let harness = include_str!("chat_protocol_reset_repository.rs");
+    let harness = include_str!("tests.rs");
     let receipt_struct_literal = ["RepositoryAuthority", "Receipt {"].concat();
     let replay_struct_literal = ["ReplayAudit", "Ids {"].concat();
     assert!(!harness.contains(&receipt_struct_literal));
@@ -1309,7 +892,7 @@ fn reset_receipt_fixture_is_test_only_reset_specific_and_not_forged_by_harness()
 
 #[test]
 fn reset_operation_claim_verification_binds_every_exact_authority_dimension() {
-    let prelude_source = include_str!("../src/chat_protocol/repository/prelude.rs");
+    let prelude_source = include_str!("../prelude.rs");
     let reset_verifier = prelude_source
         .split_once("pub(crate) fn verify_reset_operation(")
         .unwrap()
@@ -1361,7 +944,7 @@ fn reset_operation_claim_verification_binds_every_exact_authority_dimension() {
         );
     }
 
-    let reset_source = include_str!("../src/chat_protocol/repository/reset.rs");
+    let reset_source = include_str!("../reset.rs");
     assert!(reset_source.contains("ResetOperationEndpoint::RequestReset"));
     assert!(reset_source.contains("ResetOperationEndpoint::ActivateReset"));
     assert_eq!(reset_source.matches(".verify_reset_operation(").count(), 3);
@@ -1413,7 +996,7 @@ fn reset_operation_claim_runtime_rejects_every_mismatched_dimension() {
         ResetOperationClaimMutationForTest::MutationKind,
     ] {
         assert!(
-            chat_protocol::repository::prelude::reset_operation_claim_mutation_rejected_for_test(
+            crate::chat_protocol::repository::prelude::reset_operation_claim_mutation_rejected_for_test(
                 &original,
                 &alternate,
                 &fixture.actor_dpop_jkt,
@@ -1427,7 +1010,7 @@ fn reset_operation_claim_runtime_rejects_every_mismatched_dimension() {
 
 #[test]
 fn reset_operation_claim_runtime_fixture_seams_are_test_only_and_reset_specific() {
-    let auth_source = include_str!("../src/chat_protocol/repository/auth.rs");
+    let auth_source = include_str!("../auth.rs");
     let auth_fixture = auth_source
         .split_once("pub(super) fn reset_locked_scope_for_claim_test(")
         .unwrap();
@@ -1440,7 +1023,7 @@ fn reset_operation_claim_runtime_fixture_seams_are_test_only_and_reset_specific(
     assert!(auth_body.contains("SignedMutationKind::ResetRequest"));
     assert!(auth_body.contains("SignedMutationKind::ResetActivation"));
 
-    let prelude_source = include_str!("../src/chat_protocol/repository/prelude.rs");
+    let prelude_source = include_str!("../prelude.rs");
     let prelude_fixture = prelude_source
         .split_once("pub(crate) fn reset_operation_claim_mutation_rejected_for_test(")
         .unwrap();

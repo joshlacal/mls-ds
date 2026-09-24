@@ -1,207 +1,7 @@
-//! Live-PostgreSQL tests for the clean-chat inventory session, receipt, and
-//! capability surfaces (lane D, ordinal 35).
-//!
-//! The D-2 create path (`create_inventory_session` and the
-//! `create_inventory_snapshot_and_first_page` facade) is `#[cfg(not(test))]`
-//! (it consumes `dpop`/`read_projection` surfaces the partial include trees
-//! cannot mount), so session rows are seeded with the exact statement shapes
-//! the create path issues (quoted from `inventory.rs`). The PAGING bodies —
-//! `serve_initial_inventory_page`, `issue_next_inventory_page_cursor`,
-//! `complete_inventory_page`, and the serve/replay machinery they compose —
-//! are compiled UNCONDITIONALLY since the final-review fix round and are
-//! driven DIRECTLY as production code by
-//! `production_paging_entrypoints_serve_and_replay_the_full_receipt_chain`;
-//! the older receipt tests additionally prove the schema's receipt,
-//! consumption, materialization, immutability, and expiry semantics at the
-//! SQL boundary with the real D-1 `CursorSealer`/`SecureRandom` machinery.
-//!
-//! The B-read admission seam (`dpop`/`read_authority`) IS test-visible and is
-//! driven for real in the C-1 expiry tests: the initial-page request's
-//! fail-closed gate (`verify_inventory_fence`) is exercised through the real
-//! admission -> lock -> loader -> fence chain.
-//!
-//! Run with:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_inventory -- --test-threads=1
-
-#![allow(dead_code)]
-
-mod common;
-pub use catbird_server::{auth, identity, util};
-
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-
-// Full production-module prelude (mirrors `chat_protocol_g7_entitlement.rs`)
-// so the shared `common::executor_seed` fulfillment-graph builders compile
-// here and can seed a coherent conversation + membership graph for the
-// populated materialization tests, and so the B-read admission seam
-// (`dpop`/`read_authority`/`repository::auth`) is drivable for real.
-mod chat_protocol {
-    pub mod direct_request_transcript {
-        pub use catbird_server::chat_protocol::direct_request_transcript::*;
-    }
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-    pub mod model {
-        pub use crate::model::*;
-    }
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod error {
-        pub use catbird_server::chat_protocol::error::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    pub mod read_authority {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/read_authority.rs"
-        ));
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    pub mod repository {
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod blobs {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-        pub mod core {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-        pub mod execution_context {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-        pub mod key_packages {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-        pub mod prelude {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        pub mod recovery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
-        pub mod relationship {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-        pub mod ticket {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/ticket.rs"
-            ));
-        }
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-    }
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
-
-    /// Test-crate visibility bridge for the B-read inventory admission.
-    ///
-    /// `VerifiedReadAdmission`, `ReadAdmissionAttempt`, `LockedReadDeviceAuthority`,
-    /// and the fence constructors are `pub(in crate::chat_protocol)`. A
-    /// `#[test] fn` lives at the crate root, which is outside that visibility,
-    /// so this module — INSIDE `crate::chat_protocol` — drives the real
-    /// admission -> lock -> loader -> fence chain and hands the crate root
-    /// only a closed outcome enum. It adds **no constructor** and widens no
-    /// production visibility.
-    pub mod inventory_bridge {
-        use super::dpop::{seal_read_admission, ReadAdmissionAttempt};
-        use super::read_authority::{
+use crate::common;
+mod inventory_bridge {
+        use crate::chat_protocol::dpop::{seal_read_admission, ReadAdmissionAttempt};
+        use crate::chat_protocol::read_authority::{
             from_locked_inventory_fence_record, lock_read_device_authority_once,
             LockedInventoryFenceRecord, LockedReadDeviceAuthority, VerifiedInventoryFence,
         };
@@ -233,9 +33,9 @@ mod chat_protocol {
             pool: &sqlx::PgPool,
             inventory_session_id: Uuid,
         ) -> FenceOutcome {
-            let authority = match crate::repository::auth::authorize_unsigned_request(
+            let authority = match crate::chat_protocol::repository::auth::authorize_unsigned_request(
                 pool,
-                super::dpop::repository_test_evidence::ordinary_registered_device(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12]
                         .try_into()
@@ -340,37 +140,34 @@ mod chat_protocol {
             )
             .map_err(|_| ())?;
             let durable_row = from_locked_inventory_fence_record(record);
-            super::read_authority::verify_inventory_fence(transaction, device, durable_row)
+            crate::chat_protocol::read_authority::verify_inventory_fence(transaction, device, durable_row)
                 .await
                 .map_err(|_| ())
         }
     }
-}
 
-#[path = "common/executor_seed.rs"]
-mod executor_seed;
+
+use crate::common::executor_seed;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chat_protocol::cursor::{
+use crate::chat_protocol::cursor::{
     decode_capability_token, mint_capability_token, CapabilityToken, CursorSealer,
     SealedCapability, SealerBinding, SecureRandom, SecureRandomError,
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use repository::inventory::{
+use crate::chat_protocol::repository::inventory::{
     create_device_inventory_session, get_devices, CreateDeviceInventorySessionRequest,
     DeviceInventorySubject, EventTerminalHint, IntervalSummaryTerminalHint, InventoryDomain,
     InventoryPublicRequestBinding, InventoryRepositoryError, InventorySummaryTerminalHint,
     TombstoneTerminalHint, INVENTORY_CONVERSATIONS_NSID, MAX_GET_DEVICES_DIDS,
 };
-use repository::ticket::{ticket_hash, SUBSCRIBE_EVENTS_PATH};
+use crate::chat_protocol::repository::ticket::{ticket_hash, SUBSCRIBE_EVENTS_PATH};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-mod repository {
-    pub use crate::chat_protocol::repository::*;
-}
+use crate::chat_protocol::repository;
 
 fn random_plc_did() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -595,7 +392,7 @@ async fn seed_revoked_device(pool: &PgPool, did: &str, created_at: DateTime<Utc>
 
 #[tokio::test]
 async fn get_devices_rejects_zero_or_too_many_dids() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(2).await;
 
     let mut tx = pool.begin().await.expect("begin");
     let empty = get_devices(&mut tx, &[]).await;
@@ -617,7 +414,7 @@ async fn get_devices_rejects_zero_or_too_many_dids() {
 
 #[tokio::test]
 async fn get_devices_returns_active_devices_scoped_to_requested_dids() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(2).await;
     let now = clock_now(&pool).await;
 
     let did_a = random_plc_did();
@@ -662,7 +459,7 @@ async fn get_devices_returns_active_devices_scoped_to_requested_dids() {
 
 #[tokio::test]
 async fn get_devices_excludes_revoked_devices() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(2).await;
     let now = clock_now(&pool).await;
 
     let did = random_plc_did();
@@ -906,7 +703,7 @@ async fn seed_fixed_admission_device(pool: &PgPool) {
     let fixed_at = Utc.timestamp_opt(1_753_190_400, 0).unwrap(); // 2026-07-22T12:00:00Z
     seed_principal(
         pool,
-        chat_protocol::inventory_bridge::FIXED_TEST_DID,
+        inventory_bridge::FIXED_TEST_DID,
         fixed_at,
     )
     .await;
@@ -920,9 +717,9 @@ async fn seed_fixed_admission_device(pool: &PgPool) {
         "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
          VALUES($1,$2,'dev-b-read','active',$3,1,chat.protocol_capabilities(),$4,$4) ON CONFLICT DO NOTHING",
     )
-    .bind(chat_protocol::inventory_bridge::FIXED_TEST_DID)
-    .bind(Uuid::parse_str(chat_protocol::inventory_bridge::FIXED_TEST_DEVICE).unwrap())
-    .bind(chat_protocol::inventory_bridge::FIXED_TEST_JKT)
+    .bind(inventory_bridge::FIXED_TEST_DID)
+    .bind(Uuid::parse_str(inventory_bridge::FIXED_TEST_DEVICE).unwrap())
+    .bind(inventory_bridge::FIXED_TEST_JKT)
     .bind(fixed_at)
     .execute(pool)
     .await
@@ -931,8 +728,8 @@ async fn seed_fixed_admission_device(pool: &PgPool) {
         "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
          VALUES($1,$2,$3,$4,1,$5) ON CONFLICT DO NOTHING",
     )
-    .bind(chat_protocol::inventory_bridge::FIXED_TEST_DID)
-    .bind(Uuid::parse_str(chat_protocol::inventory_bridge::FIXED_TEST_DEVICE).unwrap())
+    .bind(inventory_bridge::FIXED_TEST_DID)
+    .bind(Uuid::parse_str(inventory_bridge::FIXED_TEST_DEVICE).unwrap())
     .bind(&key_id)
     .bind(&public_key)
     .bind(fixed_at)
@@ -1646,10 +1443,10 @@ async fn serve_page_receipt_seed(
 const DOMAIN_ENDPOINTS: [(&str, &str); 3] = [
     (
         "conversations",
-        repository::inventory::INVENTORY_CONVERSATIONS_NSID,
+        crate::chat_protocol::repository::inventory::INVENTORY_CONVERSATIONS_NSID,
     ),
-    ("welcomes", repository::inventory::INVENTORY_WELCOMES_NSID),
-    ("recovery", repository::inventory::INVENTORY_RECOVERY_NSID),
+    ("welcomes", crate::chat_protocol::repository::inventory::INVENTORY_WELCOMES_NSID),
+    ("recovery", crate::chat_protocol::repository::inventory::INVENTORY_RECOVERY_NSID),
 ];
 
 /// The reassembled canonical response for one served receipt, proven to match
@@ -1681,15 +1478,15 @@ async fn reassemble_served_receipt(
     let items: Vec<Vec<u8>> = {
         let domain = request.domain().page_domain();
         let sql = match domain {
-            chat_protocol::cursor::InventoryPageDomain::Conversations => {
+            crate::chat_protocol::cursor::InventoryPageDomain::Conversations => {
                 "SELECT payload_bytes FROM chat.inventory_conversation_items \
                  WHERE inventory_session_id = $1 AND ordinal > $2 ORDER BY ordinal LIMIT $3"
             }
-            chat_protocol::cursor::InventoryPageDomain::PendingWelcomes => {
+            crate::chat_protocol::cursor::InventoryPageDomain::PendingWelcomes => {
                 "SELECT payload_bytes FROM chat.inventory_welcome_items \
                  WHERE inventory_session_id = $1 AND ordinal > $2 ORDER BY ordinal LIMIT $3"
             }
-            chat_protocol::cursor::InventoryPageDomain::LeafRecovery => {
+            crate::chat_protocol::cursor::InventoryPageDomain::LeafRecovery => {
                 "SELECT payload_bytes FROM chat.inventory_recovery_items \
                  WHERE inventory_session_id = $1 AND ordinal > $2 ORDER BY ordinal LIMIT $3"
             }
@@ -1872,7 +1669,7 @@ fn empty_sha256() -> Vec<u8> {
 /// SHA-256 lookup hash and the sealed nonce/ciphertext pair live at rest.
 #[tokio::test]
 async fn session_creation_shape_proves_all_three_complete_and_false_consumed() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(3).await;
     let fence = ensure_fence(&pool).await;
     let now = whole_second(clock_now(&pool).await);
     let device = seed_device_with_key(&pool, now - Duration::seconds(120)).await;
@@ -2015,7 +1812,7 @@ async fn session_creation_shape_proves_all_three_complete_and_false_consumed() {
 /// deferred trigger.
 #[tokio::test]
 async fn g7_ticket_binding_accepts_a_fully_consumed_session_and_rejects_drift() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(3).await;
     let fence = ensure_fence(&pool).await;
     let now = whole_second(clock_now(&pool).await);
     let device = seed_device_with_key(&pool, now - Duration::seconds(120)).await;
@@ -2158,7 +1955,7 @@ async fn g7_ticket_binding_accepts_a_fully_consumed_session_and_rejects_drift() 
 /// without the exact served final receipt.
 #[tokio::test]
 async fn retained_session_rows_are_immutable_outside_the_gc() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(3).await;
     let fence = ensure_fence(&pool).await;
     let now = whole_second(clock_now(&pool).await);
     let device = seed_device_with_key(&pool, now - Duration::seconds(120)).await;
@@ -2735,7 +2532,7 @@ async fn sibling_device_sessions_cannot_share_item_rows() {
 /// session tables.
 #[tokio::test]
 async fn get_own_devices_uses_separate_device_fence() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(3).await;
     let now = whole_second(clock_now(&pool).await);
     // The requester device (with its key) plus a sibling device of the SAME
     // principal — both are subjects of the own-device snapshot.
@@ -2815,7 +2612,7 @@ async fn get_own_devices_uses_separate_device_fence() {
 
 #[tokio::test]
 async fn get_own_devices_polling_beyond_cap_succeeds_and_stays_bounded() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(3).await;
     let now = whole_second(clock_now(&pool).await);
     let requester = seed_device_with_key(&pool, now - Duration::seconds(120)).await;
 
@@ -2892,7 +2689,7 @@ fn terminal_seq_hints_carry_no_fingerprint() {
     // No hint DTO carries an outer-entry fingerprint (a hint must never duplicate
     // one, nor authorize a close/schedule-terminalize). Assert structurally over
     // the hint DTO block in the production source.
-    let source = include_str!("../src/chat_protocol/repository/inventory.rs");
+    let source = include_str!("inventory.rs");
     let hint_block = source
         .split_once("terminalSeq wake/navigation hint DTOs")
         .expect("hint DTO section exists")
@@ -2954,7 +2751,7 @@ fn shared_session(session: SeededSession) -> SharedSession {
 /// served receipt byte-for-byte.
 #[tokio::test]
 async fn initial_creator_barrier_one_receipt_winner_and_byte_identical_replay() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fence = ensure_fence(&pool).await;
     let now = whole_second(clock_now(&pool).await);
     let device = seed_device_with_key(&pool, now - Duration::seconds(120)).await;
@@ -3906,16 +3703,16 @@ async fn seed_pending_invited_conversation(pool: &PgPool, invitee: &SessionDevic
 }
 
 /// The paging device authority for the PRODUCTION entrypoints under the
-/// include harness (`repository::inventory::PagingDeviceAuthority`, the
+/// include harness (`crate::chat_protocol::repository::inventory::PagingDeviceAuthority`, the
 /// `cfg(test)` identity arm of the production alias). Built fresh per call —
 /// the entrypoints consume it.
-fn paging_device(device: &SessionDevice) -> repository::inventory::PagingDeviceAuthority {
-    repository::inventory::PagingDeviceAuthority {
-        user_did: device.did.clone(),
-        device_id: device.device_id,
-        jkt: Some(device.jkt.clone()),
-        auth_generation: 1,
-    }
+fn paging_device(device: &SessionDevice) -> crate::chat_protocol::repository::inventory::PagingDeviceAuthority {
+    crate::chat_protocol::repository::inventory::PagingDeviceAuthority::for_test(
+        device.did.clone(),
+        device.device_id,
+        Some(device.jkt.clone()),
+        1,
+    )
 }
 
 /// Extract the `nextPageCursor` capability text from a canonical response.
@@ -4062,7 +3859,7 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
     // Initial page: PRODUCTION serve over the retained item rows.
     let mut random = DeterministicRandom::new(0xC1F2);
     let mut tx = pool.begin().await.expect("begin the initial serve");
-    let r0 = repository::inventory::serve_initial_inventory_page(
+    let r0 = crate::chat_protocol::repository::inventory::serve_initial_inventory_page(
         &mut tx,
         Some(paging_device(&device)),
         session_id,
@@ -4093,7 +3890,7 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
     // successor hash; the sealed boundary trigger validates the forwarded
     // after_ordinal on the INSERT).
     let mut tx = pool.begin().await.expect("begin the continuation");
-    let r1 = repository::inventory::issue_next_inventory_page_cursor(
+    let r1 = crate::chat_protocol::repository::inventory::issue_next_inventory_page_cursor(
         &mut tx,
         paging_device(&device),
         &c1,
@@ -4109,7 +3906,7 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
 
     // Final page: PRODUCTION serve + the one-way `*_consumed` CAS.
     let mut tx = pool.begin().await.expect("begin the final page");
-    let r2 = repository::inventory::complete_inventory_page(
+    let r2 = crate::chat_protocol::repository::inventory::complete_inventory_page(
         &mut tx,
         paging_device(&device),
         &c2,
@@ -4137,7 +3934,7 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
     // identical decrypted successor embedded in the bytes; the CAS never
     // repeats.
     let mut tx = pool.begin().await.expect("begin the initial replay");
-    let r0_replay = repository::inventory::serve_initial_inventory_page(
+    let r0_replay = crate::chat_protocol::repository::inventory::serve_initial_inventory_page(
         &mut tx,
         Some(paging_device(&device)),
         session_id,
@@ -4155,7 +3952,7 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
     );
 
     let mut tx = pool.begin().await.expect("begin the continuation replay");
-    let r1_replay = repository::inventory::issue_next_inventory_page_cursor(
+    let r1_replay = crate::chat_protocol::repository::inventory::issue_next_inventory_page_cursor(
         &mut tx,
         paging_device(&device),
         &c1,
@@ -4173,7 +3970,7 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
     );
 
     let mut tx = pool.begin().await.expect("begin the final replay");
-    let r2_replay = repository::inventory::complete_inventory_page(
+    let r2_replay = crate::chat_protocol::repository::inventory::complete_inventory_page(
         &mut tx,
         paging_device(&device),
         &c2,
@@ -4198,7 +3995,7 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
     // A fabricated capability locates no predecessor and fails closed.
     let fabricated = mint_capability_token(&mut random).expect("mint an unrelated capability");
     let mut tx = pool.begin().await.expect("begin the fabricated attempt");
-    let denied = repository::inventory::issue_next_inventory_page_cursor(
+    let denied = crate::chat_protocol::repository::inventory::issue_next_inventory_page_cursor(
         &mut tx,
         paging_device(&device),
         &fabricated.encode(),
@@ -4219,14 +4016,14 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
     );
 
     // A foreign device identity fails the paging fence before any serve.
-    let foreign = repository::inventory::PagingDeviceAuthority {
-        user_did: device.did.clone(),
-        device_id: Uuid::new_v4(),
-        jkt: Some(device.jkt.clone()),
-        auth_generation: 1,
-    };
+    let foreign = crate::chat_protocol::repository::inventory::PagingDeviceAuthority::for_test(
+        device.did.clone(),
+        Uuid::new_v4(),
+        Some(device.jkt.clone()),
+        1,
+    );
     let mut tx = pool.begin().await.expect("begin the foreign attempt");
-    let denied = repository::inventory::issue_next_inventory_page_cursor(
+    let denied = crate::chat_protocol::repository::inventory::issue_next_inventory_page_cursor(
         &mut tx,
         foreign,
         &c1,
@@ -4257,9 +4054,9 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
 /// `ordinary_registered_device`).
 fn fixed_admission_device() -> SessionDevice {
     SessionDevice {
-        did: chat_protocol::inventory_bridge::FIXED_TEST_DID.to_owned(),
-        device_id: Uuid::parse_str(chat_protocol::inventory_bridge::FIXED_TEST_DEVICE).unwrap(),
-        jkt: chat_protocol::inventory_bridge::FIXED_TEST_JKT.to_owned(),
+        did: inventory_bridge::FIXED_TEST_DID.to_owned(),
+        device_id: Uuid::parse_str(inventory_bridge::FIXED_TEST_DEVICE).unwrap(),
+        jkt: inventory_bridge::FIXED_TEST_JKT.to_owned(),
     }
 }
 
@@ -4303,8 +4100,8 @@ async fn expired_session_initial_page_request_fails_closed_while_the_row_exists(
     // (the loader seam's captured_at is older than the 15-minute temporal
     // bound of `verify_inventory_fence`).
     assert_eq!(
-        chat_protocol::inventory_bridge::verify_session_fence_for_test(&pool, session_id).await,
-        chat_protocol::inventory_bridge::FenceOutcome::Rejected,
+        inventory_bridge::verify_session_fence_for_test(&pool, session_id).await,
+        inventory_bridge::FenceOutcome::Rejected,
         "the expired session's initial-page request fails closed"
     );
 
@@ -4456,8 +4253,8 @@ async fn gc_reclaim_of_the_expired_session_permits_a_new_session_under_the_same_
     // refused at the real B-read fence while the expired row exists (the
     // bridge authorizes and locks the fixed device the identity is bound to).
     assert_eq!(
-        chat_protocol::inventory_bridge::verify_session_fence_for_test(&pool, session_id).await,
-        chat_protocol::inventory_bridge::FenceOutcome::Rejected,
+        inventory_bridge::verify_session_fence_for_test(&pool, session_id).await,
+        inventory_bridge::FenceOutcome::Rejected,
         "the expired session's initial-page request fails closed before the GC"
     );
 
@@ -4518,8 +4315,8 @@ async fn gc_reclaim_of_the_expired_session_permits_a_new_session_under_the_same_
     )
     .await;
     assert_eq!(
-        chat_protocol::inventory_bridge::verify_session_fence_for_test(&pool, session_id).await,
-        chat_protocol::inventory_bridge::FenceOutcome::Accepted,
+        inventory_bridge::verify_session_fence_for_test(&pool, session_id).await,
+        inventory_bridge::FenceOutcome::Accepted,
         "the new session under the same identity is live and servable"
     );
     let request = conversations_request(100);
@@ -4592,11 +4389,8 @@ fn whitespace_collapsed(text: &str) -> String {
 
 #[test]
 fn d2_receipt_sql_and_response_shapes_are_source_pinned() {
-    let production = include_str!("../src/chat_protocol/repository/inventory.rs");
-    let test_source = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/chat_protocol_inventory.rs"
-    ));
+    let production = include_str!("inventory.rs");
+    let test_source = include_str!("inventory_tests.rs");
     let production_flat = whitespace_collapsed(production);
 
     // (1) The seeded-session INSERT is the production create INSERT, statement
@@ -4722,7 +4516,7 @@ fn d2_receipt_sql_and_response_shapes_are_source_pinned() {
 use common::http_acceptance as http;
 #[tokio::test]
 async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_drift() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     http::ensure_fence(&pool).await;
     let device = http::seed_device(&pool).await;
     let router = http::router_for_authenticated_acceptance(pool.clone()).await;
@@ -4788,7 +4582,7 @@ async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_dr
 
 #[tokio::test]
 async fn http_inventory_rejects_exact_device_when_session_auth_generation_is_stale() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fence = ensure_fence(&pool).await;
     let device = http::seed_device(&pool).await;
     let session_device = SessionDevice {
@@ -4879,7 +4673,7 @@ async fn http_inventory_rejects_exact_device_when_session_auth_generation_is_sta
 
 #[tokio::test]
 async fn http_inventory_bootstrap_round_trip_emitter_to_all_consumers_end_to_end() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fence = ensure_fence(&pool).await;
     let device = http::seed_device(&pool).await;
     let session_device = SessionDevice {

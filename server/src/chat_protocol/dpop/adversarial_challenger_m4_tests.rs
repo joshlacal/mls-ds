@@ -6,66 +6,7 @@
 //! 3. Rebind Ed25519 signature checks vs new DPoP JKTs
 //! 4. 32 `blue.catbird.chat.*` endpoints cutover rejection (`CHAT_CUTOVER_ENABLED=false`)
 
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-mod repository {
-    pub(crate) use crate::chat_protocol::repository::inventory;
-}
-
-mod chat_protocol {
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-
-    pub mod model {
-        pub use crate::model::*;
-    }
-
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-
-    pub mod repository {
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-    }
-
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-}
+#![allow(dead_code)]
 
 use std::{
     collections::BTreeSet,
@@ -82,29 +23,34 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
-use catbird_server::{
-    blob_store::BlobStore,
-    chat_protocol::error::ChatEndpoint,
-    handlers::chat::{chat_router, ChatRuntime},
-    realtime::SseState,
-    storage::DbPool,
-};
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use p256::ecdsa::{signature::Signer, Signature as P256Signature, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower_util::ServiceExt;
 
-use chat_protocol::dpop::{
-    verify_enrollment_request_auth, verify_ordinary_request_auth, verify_rebind_request_auth,
-    TrustedNestVerifier,
-};
-use transcript::{
-    decode_and_verify_enrollment_body, decode_canonical_signed_mutation, decode_rebind_bootstrap,
-};
-use validation::{
-    ed25519_key_id, enrollment_grant_expiry, CanonicalHttpMethod, CanonicalTimestamp,
-    CanonicalUuidV4, NumericDate, TrustedExternalBase, TrustedRequestInstant, ValidatedChatNsid,
+use crate::{
+    blob_store::BlobStore,
+    chat_protocol::{
+        dpop::{
+            verify_enrollment_request_auth, verify_ordinary_request_auth,
+            verify_rebind_request_auth, TrustedNestVerifier,
+        },
+        error::ChatEndpoint,
+        transcript::{
+            decode_and_verify_enrollment_body, decode_canonical_signed_mutation,
+            decode_rebind_bootstrap,
+        },
+        validation::{
+            self,
+            ed25519_key_id, enrollment_grant_expiry, CanonicalHttpMethod, CanonicalTimestamp,
+            CanonicalUuidV4, NumericDate, TrustedExternalBase, TrustedRequestInstant,
+            ValidatedChatNsid,
+        },
+    },
+    handlers::chat::{chat_router, ChatRuntime},
+    realtime::SseState,
+    storage::DbPool,
 };
 
 const DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
@@ -1338,7 +1284,9 @@ fn is_get_endpoint(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::GetBlobUsage
             | ChatEndpoint::GetConversationState
             | ChatEndpoint::GetConversations
+            | ChatEndpoint::GetDeviceKey
             | ChatEndpoint::GetDevices
+            | ChatEndpoint::GetDirectRequestOutcome
             | ChatEndpoint::GetEntries
             | ChatEndpoint::GetLeafRecoveryInbox
             | ChatEndpoint::GetOwnDevices
@@ -1351,8 +1299,8 @@ fn is_get_endpoint(endpoint: ChatEndpoint) -> bool {
 async fn challenge_4_all_32_endpoints_cutover_disabled_rejection() {
     assert_eq!(
         ChatEndpoint::ALL.len(),
-        32,
-        "Must contain exactly 32 endpoints"
+        38,
+        "Must contain exactly 38 endpoints"
     );
 
     for endpoint in ChatEndpoint::ALL {
@@ -1396,7 +1344,11 @@ async fn challenge_4_all_32_endpoints_cutover_disabled_rejection() {
         let body: Value = serde_json::from_slice(&bytes)
             .unwrap_or_else(|err| panic!("Non-JSON body from {}: {err}", endpoint.nsid()));
 
-        let expected_error = if *endpoint == ChatEndpoint::UploadBlob {
+        // AcceptConversation classifies the v1-vs-v2 acceptance envelope before
+        // the cutover gate; an empty body is rejected as InvalidRequest without
+        // any database work. Every other endpoint (UploadBlob included) is
+        // cutover-gated first.
+        let expected_error = if *endpoint == ChatEndpoint::AcceptConversation {
             "InvalidRequest"
         } else {
             "CutoverRequired"

@@ -1,198 +1,10 @@
-//! Live-PostgreSQL repository tests for the clean-chat transition state-family
-//! row writers (`chat_protocol::repository::transition`).
-//!
-//! These prove the per-family appliers persist every migration-1 column
-//! faithfully, that each compare-and-set advances/terminalizes exactly the row
-//! in the expected pre-state and conflicts on drift, that metadata nonce reuse
-//! maps to its typed variant, and that the DDL's own partial-unique / status
-//! constraints back-stop the appliers.
-//!
-//! Isolation boundary: these test a *dumb, exact SQL layer*. Each row writer is
-//! exercised inside one transaction with same-transaction read-back and then
-//! ROLLED BACK. This deliberately verifies every IMMEDIATE constraint (primary
-//! keys, partial-unique indexes, immediate foreign keys, CHECKs), column
-//! fidelity, and CAS `rows_affected` semantics — while the migration's DEFERRED
-//! cross-table coherence triggers (`assert_participant_provenance`,
-//! `assert_reset_request_mapping`, `assert_recovery_fulfillment_mapping`,
-//! `assert_entry_transition_mapping`, and the deferred provenance FKs into
-//! `chat.entries`/`chat.transitions`) fire only at COMMIT and enforce a fully
-//! coherent transition+entry+state graph. Building that graph is the composing
-//! executor's job (task E2b) and is verified there, not by these unit writers.
-//!
-//! The repository `delivery` module consumes sealed `WelcomeCasBinding` authority
-//! from `state_machine`, so this harness mirrors the production-shaped nested
-//! `chat_protocol` module graph used by the executor integration tests. That graph
-//! gives the directly included repository sources their real protocol context.
-//!
-//! Run against the dedicated clean-chat database:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_transition_repository -- --test-threads=1
-
-#![allow(dead_code)]
-
-mod common;
-
-// `delivery` now consumes the sealed `WelcomeCasBinding` from the state machine.
-// Mirror the executor harness's real nested module graph instead of compiling a
-// second, context-free copy of the repository source.
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-#[allow(dead_code)]
-mod snapshot {
-    pub use catbird_server::chat_protocol::snapshot::*;
-}
-mod repository {
-    pub(crate) use crate::chat_protocol::repository::*;
-}
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-mod chat_protocol {
-    pub mod direct_request_transcript {
-        pub use catbird_server::chat_protocol::direct_request_transcript::*;
-    }
-    pub mod model {
-        pub use crate::model::*;
-    }
-
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-    pub mod repository {
-        pub mod execution_context {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        pub mod blobs {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod prelude {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        pub mod key_packages {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-        pub mod recovery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
-        pub mod relationship {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-        pub mod core {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-    }
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
-}
-
 use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use repository::transition::{
+use crate::common;
+use crate::chat_protocol::repository::transition::{
     cas_key_package_status, cas_participant_active_role, cas_participant_pending_to_active,
     cas_registration_revoke, close_leaf_period, insert_device_revocation,
     insert_generation_state_row, insert_leaf_period, insert_leaf_recovery_request,
@@ -210,7 +22,7 @@ use repository::transition::{
     TransitionActorRole, TransitionCoordinates, TransitionKind, TransitionRepositoryError,
 };
 
-use repository::delivery::{
+use crate::chat_protocol::repository::delivery::{
     close_application_interval, insert_application_interval, insert_recovery_work_item,
     insert_schedule_terminal_proof, insert_welcome_bundle, insert_welcome_delivery,
     terminalize_recovery_work_item, terminalize_welcome_delivery_for_supersession,
@@ -635,7 +447,7 @@ fn delivery_conflict(result: Result<(), DeliveryRepositoryError>) {
 async fn existing_chat_protocol_db() -> PgPool {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must name the existing clean-chat test database");
-    common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+    crate::common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
         .expect("unsafe TEST_DATABASE_URL for transition repository test");
     PgPool::connect(&database_url)
         .await
@@ -648,7 +460,7 @@ async fn existing_chat_protocol_db() -> PgPool {
 
 #[tokio::test]
 async fn participant_insert_accept_terminalize_are_faithful_and_cas_guarded() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
 
     let invited_did = random_plc_did();
@@ -903,7 +715,7 @@ async fn participant_active_role_cas_is_exact_and_preserves_every_other_column()
 
 #[tokio::test]
 async fn leaf_insert_and_close_are_faithful_and_cas_guarded() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
 
     // A second genesis-origin device for the same actor/participant.
@@ -1004,7 +816,7 @@ async fn leaf_insert_and_close_are_faithful_and_cas_guarded() {
 
 #[tokio::test]
 async fn metadata_snapshot_inserts_faithfully_and_nonce_reuse_is_typed() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
 
     // Nonce reuse maps to the typed variant: duplicate the (committed) creation
@@ -1121,7 +933,7 @@ async fn metadata_snapshot_inserts_faithfully_and_nonce_reuse_is_typed() {
 
 #[tokio::test]
 async fn transition_and_generation_state_spine_rows_persist_faithfully() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
 
     let transition_id = Uuid::new_v4();
@@ -1222,7 +1034,7 @@ async fn transition_and_generation_state_spine_rows_persist_faithfully() {
 
 #[tokio::test]
 async fn reset_request_insert_and_terminalize_are_cas_guarded() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
 
     let reset_request_id = Uuid::new_v4();
@@ -1338,7 +1150,7 @@ async fn reset_request_insert_and_terminalize_are_cas_guarded() {
 
 #[tokio::test]
 async fn leave_request_insert_and_terminalize_are_cas_guarded() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
 
     let leave_request_id = Uuid::new_v4();
@@ -1453,7 +1265,7 @@ async fn leave_request_insert_and_terminalize_are_cas_guarded() {
 
 #[tokio::test]
 async fn key_package_status_cas_is_guarded_and_faithful() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
 
     let now = clock_now(&pool).await;
@@ -1535,7 +1347,7 @@ async fn key_package_status_cas_is_guarded_and_faithful() {
 
 #[tokio::test]
 async fn recovery_request_and_reservation_insert_shapes_are_faithful() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
 
     let recovery_request_id = Uuid::new_v4();
@@ -1746,7 +1558,7 @@ async fn recovery_request_and_reservation_insert_shapes_are_faithful() {
 /// conflict.
 #[tokio::test]
 async fn recovery_terminalizers_conflict_on_missing_row() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let missing = Uuid::new_v4();
     let now = clock_now(&pool).await;
 
@@ -1787,7 +1599,7 @@ async fn recovery_terminalizers_conflict_on_missing_row() {
 
 #[tokio::test]
 async fn application_interval_insert_and_close_are_faithful_and_cas_guarded() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
     let now = clock_now(&pool).await;
 
@@ -1862,7 +1674,10 @@ async fn application_interval_insert_and_close_are_faithful_and_cas_guarded() {
     // FKs are DEFERRED, so only the CAS/column shape is verified here.
     let closing_fingerprint = vec![0x25_u8; 32];
     let close = ApplicationIntervalClose {
-        membership_interval_id: interval_id,
+        conversation_id: interval.conversation_id,
+        recipient_did: interval.recipient_did.clone(),
+        recipient_device_id: interval.recipient_device_id,
+        opening_transition_id: interval.opening_transition_id,
         terminal_seq: 5,
         closing_state_version: 2,
         closing_transition_id: fixture.creation_transition_id,
@@ -1900,7 +1715,7 @@ async fn application_interval_insert_and_close_are_faithful_and_cas_guarded() {
 
     // CAS-drift: closing an interval id that matches no open row -> conflict.
     let drift = ApplicationIntervalClose {
-        membership_interval_id: Uuid::new_v4(),
+        opening_transition_id: Uuid::new_v4(),
         ..close.clone()
     };
     delivery_conflict(close_application_interval(&mut tx, &drift).await);
@@ -1989,7 +1804,7 @@ async fn application_interval_insert_and_close_are_faithful_and_cas_guarded() {
 
 #[tokio::test]
 async fn schedule_terminal_proof_insert_is_faithful_and_pk_guarded() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
     let now = clock_now(&pool).await;
 
@@ -2044,7 +1859,7 @@ async fn schedule_terminal_proof_insert_is_faithful_and_pk_guarded() {
 
 #[tokio::test]
 async fn welcome_bundle_insert_is_faithful_and_transition_unique() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
     let now = clock_now(&pool).await;
 
@@ -2207,7 +2022,7 @@ async fn seed_welcome_delivery_prereqs(
 
 #[tokio::test]
 async fn welcome_delivery_insert_and_primary_key_constraint_are_faithful() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
     let now = clock_now(&pool).await;
 
@@ -2273,7 +2088,7 @@ async fn welcome_delivery_insert_and_primary_key_constraint_are_faithful() {
 
 #[tokio::test]
 async fn welcome_supersession_disposition_persists_exact_exclusive_source_id() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
     let now = clock_now(&pool).await;
     // `welcome_dispositions_event_position_uq` is UNIQUE over the whole table,
@@ -2369,7 +2184,7 @@ async fn welcome_supersession_disposition_persists_exact_exclusive_source_id() {
 
 #[tokio::test]
 async fn recovery_work_item_insert_and_terminalize_are_cas_guarded() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
     let now = clock_now(&pool).await;
 
@@ -2655,7 +2470,7 @@ fn registration_revoke(p: &RevocationPrereqs) -> RegistrationRevoke {
 #[tokio::test]
 #[ignore = "fixture rot: operation-claim completeness (migrations 20260728000001-04) requires a chat.operation_claims row this seed never creates; test not realigned"]
 async fn device_revocation_insert_and_registration_revoke_commit_past_the_mapping_trigger() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
 
     // Fire the DEFERRED `enforce_device_revocation_mapping` trigger via
     // `SET CONSTRAINTS ALL IMMEDIATE` inside a rolled-back tx — the full footprint

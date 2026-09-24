@@ -10961,3 +10961,92 @@ mod retained_recovery_package_tests {
         }
     }
 }
+
+
+#[cfg(test)]
+impl LockedConversationHeadGuard {
+    pub(crate) fn for_scope_test(
+        transaction_id: &str,
+        conversation_id: [u8; 16],
+        prior_exists: bool,
+        next_entry_seq: u64,
+        durable_row_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            transaction_id: transaction_id.to_owned(),
+            conversation_id: Uuid::from_bytes(conversation_id),
+            prior_coordinate: prior_exists.then(|| {
+                PublicGroupSnapshotCoordinate::new(
+                    conversation_id,
+                    1,
+                    1,
+                    [0; 32],
+                    0,
+                    [0; 32],
+                    [0; 32],
+                    PublicGroupSnapshotLifecycle::Active,
+                )
+            }),
+            next_entry_seq,
+            locked_at: Utc::now(),
+            durable_row_digest,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LockedInvitationQuotaGuard {
+    pub(crate) fn for_scope_test(
+        transaction_id: &str,
+        inviter_did: String,
+        mut new_recipient_dids: Vec<String>,
+        durable_row_digest: [u8; 32],
+    ) -> Self {
+        new_recipient_dids.sort();
+        Self {
+            transaction_id: transaction_id.to_owned(),
+            inviter_did,
+            new_recipient_dids,
+            inviter_recent_24h: 0,
+            recipient_facts: Vec::new(),
+            locked_at: Utc::now(),
+            durable_row_digest,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LockedDirectConversationLookupGuard {
+    pub(crate) fn for_scope_test(
+        transaction_id: &str,
+        did_low: String,
+        did_high: String,
+        outcome: LockedDirectLookupOutcome,
+        durable_row_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            transaction_id: transaction_id.to_owned(),
+            did_low,
+            did_high,
+            locked_at: Utc::now(),
+            outcome,
+            durable_row_digest,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LockedConversationStateGuard {
+    pub(crate) fn for_scope_test(
+        state: ConversationState,
+        head: LockedConversationHeadGuard,
+        locked_graph_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            state,
+            head,
+            locked_graph_digest,
+            locked_snapshot_digest: None,
+        }
+    }
+}

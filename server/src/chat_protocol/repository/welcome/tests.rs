@@ -1,4 +1,4 @@
-use super::*;
+use super::welcome::*;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;

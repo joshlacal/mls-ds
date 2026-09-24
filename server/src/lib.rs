@@ -56,7 +56,7 @@ compile_error!(
 
 extern crate self as catbird_server;
 #[cfg(test)]
-#[path = "../tests/common/mod.rs"]
+#[path = "common_tests.rs"]
 pub mod common;
 
 

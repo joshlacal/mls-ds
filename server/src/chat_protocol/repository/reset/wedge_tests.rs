@@ -1,292 +1,3 @@
-//! Finding-3 wedge: a pending Reset row whose original requester loses live
-//! device authority permanently disables Reset for the WHOLE conversation.
-//!
-//! `prepare_reset_read_set_inner` seals any pending row it finds before either
-//! endpoint can classify it, and `seal_pending_reset` re-verifies the ORIGINAL
-//! requester's live device. `load_locked_pending_row` selects by
-//! `conversation_id` alone, so after the requester is revoked or rebound the
-//! seal fails for every caller — including the `requestReset` arm that is
-//! supposed to expire the stale row.
-//!
-//! This target exists because neither existing harness can host the proof:
-//! `chat_protocol_reset_repository.rs` includes `reset.rs` but draws its
-//! fixtures from the shared database, which holds zero `chat.reset_requests`
-//! rows, while the harnesses carrying `common/executor_seed.rs` (and its
-//! per-run databases) do not include `reset.rs`.
-//!
-//! Run:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_reset_wedge -- --test-threads=1
-
-#![allow(dead_code)]
-
-mod common;
-
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-#[allow(dead_code)]
-mod snapshot {
-    pub use catbird_server::chat_protocol::snapshot::*;
-}
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-mod chat_protocol {
-    pub mod direct_request_transcript {
-        pub use catbird_server::chat_protocol::direct_request_transcript::*;
-    }
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod model {
-        pub(crate) use crate::model::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    #[allow(dead_code)]
-    pub mod dpop {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    // `mint_signed_repository_authority` is `pub(super)` in `dpop.rs`, so it is
-    // visible here but not at this test crate's root, and a `use` re-export
-    // cannot widen it (E0364). Forward it from the level where it is already in
-    // scope, as `tests/chat_protocol_reset_repository.rs` does.
-    pub(crate) fn mint_signed_repository_authority(
-        pre_replay: dpop::PreReplayCryptographicVerification,
-        canonical: transcript::CanonicalSignedMutation,
-        stored_public_key: &[u8],
-        repository_receipt: repository::auth::RepositoryAuthorityReceipt,
-    ) -> Result<dpop::VerifiedChatDeviceRequest, model::AuthPrimitiveError> {
-        dpop::mint_signed_repository_authority(
-            pre_replay,
-            canonical,
-            stored_public_key,
-            repository_receipt,
-        )
-    }
-    pub mod repository {
-        // Every module the executor's dependency closure names — `auth`,
-        // `blobs`, `core`, `delivery`, `execution_context`, `prelude`,
-        // `recovery`, `relationship`, `transition` — is the REAL production
-        // source, path-included the way the sibling harnesses do it (see
-        // `tests/chat_protocol_conversation_substrate.rs`). Several are
-        // `#[cfg(not(test))]` in the lib (`core`, `execution_context`,
-        // `relationship`), so a `#[path]`-including harness must include the
-        // real module itself rather than link it.
-        #[allow(dead_code)]
-        pub mod execution_context {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        // Unconditionally compiled in the lib for exactly this reason (see the
-        // comments on `repository::blobs` / `key_packages` in repository/mod.rs).
-        #[allow(dead_code)]
-        pub mod blobs {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-        #[allow(dead_code)]
-        pub mod key_packages {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-        #[allow(dead_code)]
-        pub mod auth {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        #[allow(dead_code)]
-        pub mod prelude {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        // `recovery` is `#[allow(dead_code)] pub(crate)` (unconditional) in the
-        // lib, and supplies the REAL `RecoveryPersistenceWitness`,
-        // `RecoveryExecutorWriteAuthority`, `PreparedRecoveryExecutionGraph`, and
-        // `RecoverySqlAuthoritySeal` that `execution_context` and the executor
-        // name in their signatures. Path-included here — exactly as
-        // `tests/chat_protocol_conversation_substrate.rs` does — so this harness
-        // exercises the production Recovery persistence boundary rather than
-        // opaque stand-ins.
-        pub mod recovery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
-        pub mod relationship {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-        pub mod core {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-        // The module under test. `reset.rs` carries no `#[cfg(test)]`
-        // prohibition (unlike `read_authority.rs`), so including it here makes
-        // the harness a DESCENDANT of it: a child module below can reach
-        // `load_locked_pending_row` and `seal_pending_reset` without widening
-        // any production visibility.
-        pub mod reset {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/reset.rs"
-            ));
-
-            /// Reproduce `prepare_reset_attempt`'s pending-row sequence with the
-            /// actor-authorization arm removed, so the result isolates the SEAL.
-            ///
-            /// Everything here is the production path: the same
-            /// `lock_head_nowait`, the same `hydrate_locked_conversation_state`,
-            /// the same `load_locked_pending_row` (which selects by
-            /// `conversation_id` ALONE — it never restricts to the caller), and
-            /// the same unconditional `seal_pending_reset` that both endpoints
-            /// run before either can classify the row. Dropping only the
-            /// role/membership check means a `DeviceOrKeyDrift` here cannot be
-            /// explained away as the caller lacking authority: the caller's own
-            /// authority is never consulted.
-            pub(crate) async fn seal_pending_for_test(
-                transaction: &mut Transaction<'_, Postgres>,
-                scope: &ScopeBoundBusinessAuthority,
-                conversation_id: Uuid,
-                preparation_kind: PendingSealKindForTest,
-                operation_id: Uuid,
-                dispose_lapsed: bool,
-            ) -> Result<Option<LockedPendingResetRequestGuard>, ResetRepositoryError> {
-                let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
-                    .fetch_one(&mut **transaction)
-                    .await?;
-                if transaction_id != scope.transaction_id() {
-                    return Err(ResetRepositoryError::ForeignTransaction);
-                }
-                let trusted_instant = scope.trusted_instant();
-                lock_head_nowait(transaction, conversation_id).await?;
-                let aggregate = hydrate_locked_conversation_state(
-                    transaction,
-                    conversation_id,
-                    trusted_instant,
-                )
-                .await
-                .map_err(map_aggregate_error)?;
-                let head = aggregate.head();
-                let head_coordinate = head
-                    .prior_coordinate()
-                    .ok_or(ResetRepositoryError::ConversationMissing)?;
-                let head_digest = *head.durable_row_digest();
-                let Some(row) = load_locked_pending_row(transaction, conversation_id).await? else {
-                    return Ok(None);
-                };
-                let kind = match preparation_kind {
-                    PendingSealKindForTest::Request => ResetPreparationKind::Request,
-                    PendingSealKindForTest::Activation => ResetPreparationKind::Activation,
-                };
-                // The production selector: a Request against a LAPSED row
-                // disposes of it against the row's recorded authority;
-                // everything else keeps the strict live seal.
-                let binding = if dispose_lapsed
-                    && matches!(kind, ResetPreparationKind::Request)
-                    && trusted_instant >= row.expires_at
-                {
-                    ResetAuthorityBinding::RecordedForDisposal
-                } else {
-                    ResetAuthorityBinding::Live
-                };
-                seal_pending_reset(
-                    row,
-                    &transaction_id,
-                    trusted_instant,
-                    scope,
-                    head_coordinate,
-                    head_digest,
-                    kind,
-                    operation_id,
-                    binding,
-                )
-                .map(Some)
-            }
-
-            /// `ResetPreparationKind` is private to the production module and
-            /// stays that way; this mirrors it for callers outside it.
-            #[derive(Clone, Copy, Debug)]
-            pub(crate) enum PendingSealKindForTest {
-                Request,
-                Activation,
-            }
-        }
-    }
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
-}
-
-#[path = "common/executor_seed.rs"]
-mod executor_seed;
-
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
@@ -298,19 +9,20 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use chat_protocol::repository::auth::RepositoryAuthorityClass;
-use chat_protocol::repository::core::hydrate_locked_conversation_state;
-use chat_protocol::repository::prelude::{
+use crate::common::executor_seed::{self, private_genuine_pending_reset_graph, PrivateGenuinePendingResetGraph};
+use crate::chat_protocol::repository::auth::RepositoryAuthorityClass;
+use crate::chat_protocol::repository::core::hydrate_locked_conversation_state;
+use crate::chat_protocol::repository::prelude::{
     arbitrate_operation, prepare_identity_scope_prelude, OperationArbitration,
     PreparedBusinessPrelude,
 };
-use chat_protocol::repository::reset::{self, PendingSealKindForTest, ResetRepositoryError};
-use chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
-use chat_protocol::transcript::{
+use crate::chat_protocol::repository::reset::{self, PendingSealKindForTest, ResetRepositoryError};
+use crate::chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
+use crate::chat_protocol::transcript::{
     decode_and_verify_signed_mutation, decode_canonical_signed_mutation, SignedMutationKind,
     VerifiedMutationProjection, VerifiedSignedMutation,
 };
-use executor_seed::{private_genuine_pending_reset_graph, PrivateGenuinePendingResetGraph};
+
 
 /// One principal's exact signing + registration identity. Field names match the
 /// `ResetFixture` the sibling reset harness uses, so the signing helpers below
@@ -382,13 +94,13 @@ fn verified_request(
     fixture: &ResetActor,
     at: DateTime<Utc>,
     mutation: &VerifiedSignedMutation,
-) -> chat_protocol::dpop::VerifiedChatDeviceRequest {
+) -> crate::chat_protocol::dpop::VerifiedChatDeviceRequest {
     let endpoint = match mutation.projection() {
         VerifiedMutationProjection::ResetRequest(_) => "blue.catbird.chat.requestReset",
         VerifiedMutationProjection::ResetActivation(_) => "blue.catbird.chat.activateReset",
         _ => panic!("reset test helper requires a Reset mutation"),
     };
-    let pre_replay = chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
+    let pre_replay = crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
         Uuid::new_v4(),
         *Uuid::new_v4().as_bytes().first_chunk::<12>().unwrap(),
         endpoint,
@@ -399,14 +111,14 @@ fn verified_request(
     );
     let canonical =
         decode_canonical_signed_mutation(mutation.accepted_wrapper_bytes().unwrap()).unwrap();
-    let receipt = chat_protocol::repository::auth::reset_existing_device_receipt_for_test(
+    let receipt = crate::chat_protocol::repository::auth::reset_existing_device_receipt_for_test(
         mutation,
         &fixture.actor_dpop_jkt,
         &fixture.signing_public_key,
     )
     .unwrap();
     assert_eq!(receipt.class(), RepositoryAuthorityClass::ExistingDevice);
-    chat_protocol::mint_signed_repository_authority(
+    crate::chat_protocol::dpop::mint_signed_repository_authority(
         pre_replay,
         canonical,
         &fixture.signing_public_key,
@@ -678,10 +390,10 @@ async fn revoke_requester_device_inner(
     at: DateTime<Utc>,
     drive: RevocationDrive,
 ) {
-    use chat_protocol::repository::transition::{
+    use crate::chat_protocol::repository::transition::{
         cas_registration_revoke, insert_device_revocation, NewDeviceRevocation, RegistrationRevoke,
     };
-    use chat_protocol::state_machine::{
+    use crate::chat_protocol::state_machine::{
         apply_device_revocation_batch_unscoped_for_test, DeviceIdentity,
         DeviceRevocationBatchPersistencePlan, DeviceRevocationEvidence, PrincipalId,
         RevocationTargetCasBinding, ServerTimestamp,
@@ -1144,10 +856,10 @@ async fn wedge_blocks_the_original_requester_too() {
 /// The scheduled sweep is still not one of them: expiry never gained a Reset arm.
 #[test]
 fn exactly_two_writers_clear_a_pending_reset_row_and_revocation_is_one() {
-    let reset = include_str!("../src/chat_protocol/repository/reset.rs");
-    let transition = include_str!("../src/chat_protocol/repository/transition.rs");
-    let sweep = include_str!("../src/chat_protocol/repository/expiry_sweep.rs");
-    let executor = include_str!("../src/chat_protocol/state_machine/executor.rs");
+    let reset = include_str!("../reset.rs");
+    let transition = include_str!("../transition.rs");
+    let sweep = include_str!("../expiry_sweep.rs");
+    let executor = include_str!("../../state_machine/executor.rs");
 
     // Positive controls: each source really is the file it claims to be, so a
     // path that stops resolving cannot masquerade as a clean absence.
@@ -1366,23 +1078,23 @@ async fn activation_keeps_full_strict_live_authority_even_on_a_lapsed_row() {
 /// row to its own signed bytes runs unconditionally.
 #[test]
 fn recorded_authority_disposal_still_binds_the_immutable_signed_bytes() {
-    let source = include_str!("../src/chat_protocol/repository/reset.rs");
-
+    let source = include_str!("../reset.rs");
+    let prod_source = source.split("pub(super) mod test_support").next().unwrap_or(source);
     // Positive controls.
-    assert!(source.contains("fn seal_pending_reset("));
-    assert!(source.contains("enum ResetAuthorityBinding"));
+    assert!(prod_source.contains("fn seal_pending_reset("));
+    assert!(prod_source.contains("enum ResetAuthorityBinding"));
 
     // The relaxation is applied in EXACTLY one place, and it guards exactly the
     // live-device comparison.
     assert_eq!(
-        source
+        prod_source
             .matches("binding == ResetAuthorityBinding::Live")
             .count(),
         1,
         "the live-authority relaxation must have exactly one site"
     );
 
-    let seal = &source[source
+    let seal = &prod_source[prod_source
         .find("fn seal_pending_reset(")
         .expect("seal_pending_reset is present")..];
     let seal = &seal[..seal
@@ -1415,11 +1127,11 @@ fn recorded_authority_disposal_still_binds_the_immutable_signed_bytes() {
 
     // A disposal binding can mint EXACTLY the expiry terminal.
     assert!(
-        source.contains("(ResetAuthorityBinding::RecordedForDisposal, _) => {"),
+        prod_source.contains("(ResetAuthorityBinding::RecordedForDisposal, _) => {"),
         "every non-Request disposal shape must be rejected"
     );
     assert_eq!(
-        source
+        prod_source
             .matches("ResetAuthorityBinding::RecordedForDisposal")
             .count(),
         3,
@@ -1428,7 +1140,7 @@ fn recorded_authority_disposal_still_binds_the_immutable_signed_bytes() {
 
     // The selector never admits an Activation.
     assert!(
-        source.contains("matches!(parsed.kind, ResetPreparationKind::Request)\n                && trusted_instant >= row.expires_at"),
+        prod_source.contains("matches!(parsed.kind, ResetPreparationKind::Request)\n                && trusted_instant >= row.expires_at"),
         "disposal is selected only for a Request against a lapsed row"
     );
 }
@@ -1501,7 +1213,7 @@ async fn request_reset_through_the_facade(
     let prelude = prelude(&mut tx, actor, at, &mutation).await;
     let outcome = async {
         let authority = reset::prepare_reset_request_authority(&mut tx, prelude, &mutation).await?;
-        reset::expire_pending_reset_for_replacement(&mut tx, authority).await?;
+        let _ = reset::expire_pending_reset_for_replacement(&mut tx, authority).await?;
         let status: String =
             sqlx::query_scalar("SELECT status FROM chat.reset_requests WHERE reset_request_id=$1")
                 .bind(fixture.reset_request_id)
@@ -1598,7 +1310,7 @@ async fn try_terminal_shape(
     pool: &PgPool,
     reset_request_id: Uuid,
     set_clause: &str,
-    binds: &[&(dyn std::fmt::Debug)],
+    binds: &[&dyn std::fmt::Debug],
 ) -> Result<(), String> {
     let _ = binds;
     let mut tx = pool.begin().await.expect("begin shape probe");
