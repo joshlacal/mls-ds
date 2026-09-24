@@ -611,6 +611,7 @@ impl ValidatedChatNsid {
             "blue.catbird.chat.getDeviceKey"
             | "blue.catbird.chat.getDevices"
             | "blue.catbird.chat.getOwnDevices"
+            | "blue.catbird.chat.getDirectRequestOutcome"
             | "blue.catbird.chat.getConversations"
             | "blue.catbird.chat.getConversationState"
             | "blue.catbird.chat.getEntries"
