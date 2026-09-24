@@ -79,3 +79,6 @@ mod reset_wedge_tests;
 #[cfg(test)]
 #[path = "relationship/tests.rs"]
 mod relationship_repository_tests;
+#[cfg(test)]
+#[path = "transition/tests.rs"]
+mod transition_repository_tests;
