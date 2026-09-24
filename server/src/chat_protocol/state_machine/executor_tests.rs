@@ -1,178 +1,6 @@
 //! Live-PostgreSQL end-to-end verification of the E2b-2/E2b-3 transition
 //! executor `apply_conversation_persistence_plan_unscoped_for_test` and the spine/seq-seam writers
 //! it composes.
-//!
-//! Two kinds of coverage:
-//!  * The NEW dumb-SQL writers (conversation-head insert/CAS/close, generation
-//!    insert/state-version-CAS/supersede, `append_entry_at`) — column fidelity +
-//!    CAS advance/conflict, inside one transaction with read-back + ROLLBACK.
-//!  * The executor driven end-to-end: a REAL creation plan built through the
-//!    production `plan_creation` path (with the E2b-3 `#[cfg(test)]`
-//!    metadata-bearing evidence + head-CAS synthesis), applied and COMMITTED,
-//!    then the full committed graph SELECT-verified past every DEFERRED trigger;
-//!    plus re-apply -> conflict with zero residue, and mid-transaction failure
-//!    injection -> whole-graph rollback.
-//!
-//! Run:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_executor -- --test-threads=1
-
-#![allow(dead_code)]
-
-mod common;
-
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-#[allow(dead_code)]
-mod snapshot {
-    pub use catbird_server::chat_protocol::snapshot::*;
-}
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-mod chat_protocol {
-    pub mod direct_request_transcript {
-        pub use catbird_server::chat_protocol::direct_request_transcript::*;
-    }
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod model {
-        pub(crate) use crate::model::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    #[allow(dead_code)]
-    pub mod dpop {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    pub mod repository {
-        // Every module the executor's dependency closure names — `auth`,
-        // `blobs`, `core`, `delivery`, `execution_context`, `prelude`,
-        // `recovery`, `relationship`, `transition` — is the REAL production
-        // source, path-included the way the sibling harnesses do it (see
-        // `tests/chat_protocol_conversation_substrate.rs`). Several are
-        // `#[cfg(not(test))]` in the lib (`core`, `execution_context`,
-        // `relationship`), so a `#[path]`-including harness must include the
-        // real module itself rather than link it.
-        #[allow(dead_code)]
-        pub mod execution_context {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        // Unconditionally compiled in the lib for exactly this reason (see the
-        // comments on `repository::blobs` / `key_packages` in repository/mod.rs).
-        #[allow(dead_code)]
-        pub mod blobs {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-        #[allow(dead_code)]
-        pub mod key_packages {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-        #[allow(dead_code)]
-        pub mod auth {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        #[allow(dead_code)]
-        pub mod prelude {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        // `recovery` is `#[allow(dead_code)] pub(crate)` (unconditional) in the
-        // lib, and supplies the REAL `RecoveryPersistenceWitness`,
-        // `RecoveryExecutorWriteAuthority`, `PreparedRecoveryExecutionGraph`, and
-        // `RecoverySqlAuthoritySeal` that `execution_context` and the executor
-        // name in their signatures. Path-included here — exactly as
-        // `tests/chat_protocol_conversation_substrate.rs` does — so this harness
-        // exercises the production Recovery persistence boundary rather than
-        // opaque stand-ins.
-        pub mod recovery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
-        pub mod relationship {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-        pub mod core {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-    }
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
-}
 
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -186,21 +14,22 @@ use sqlx::PgPool;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use chat_protocol::public_state::ActivePublicState;
-use chat_protocol::repository::delivery::WelcomeRejectionReason;
-use chat_protocol::repository::delivery::{
+use crate::chat_protocol;
+use crate::chat_protocol::public_state::ActivePublicState;
+use crate::chat_protocol::repository::delivery::WelcomeRejectionReason;
+use crate::chat_protocol::repository::delivery::{
     append_entry_at, canonical_welcome_disposition_event_payload, AppendEntry,
     DeliveryRepositoryError, EntryEntitlementKind, EventEntitlementKind, EventKind, EventRecipient,
     NewEvent, NewRecoveryWorkItem, OutboxWorkKind, RecoveryWorkSourceKind,
 };
-use chat_protocol::repository::transition::ResetReason;
-use chat_protocol::repository::transition::{
+use crate::chat_protocol::repository::transition::ResetReason;
+use crate::chat_protocol::repository::transition::{
     cas_conversation_head, cas_generation_state_version, lock_active_leaf_period_bindings,
     supersede_generation, ActiveLeafPeriodBinding, ConversationHeadCas, ConversationHeadClose,
     GenerationStateVersionCas, GenerationSupersede, TransitionActorRole, TransitionRepositoryError,
 };
-use chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
-use chat_protocol::state_machine::{
+use crate::chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
+use crate::chat_protocol::state_machine::{
     apply_conversation_persistence_plan_unscoped_for_test,
     apply_device_revocation_batch_unscoped_for_test, device_revocation_plan_for_test,
     persistence_plan_for_test, plan_accept_conversation, plan_close, plan_commit, plan_creation,
@@ -221,20 +50,15 @@ use chat_protocol::state_machine::{
     TransitionEvidence, WelcomeDispositionInput, WelcomeExpiryAuthority, WelcomeExpiryContext,
     WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus, ZeroLeafLeave,
 };
-use chat_protocol::transcript::{
+use crate::chat_protocol::transcript::{
     decode_and_verify_control_entry, decode_canonical_signed_mutation,
     rebind_persisted_control_entry, VerifiedMutationProjection,
 };
-use chat_protocol::validation::ed25519_key_id;
-use chat_protocol::wire::{validate_public_commit, MAX_PUBLIC_MESSAGE_WIRE_BYTES};
+use crate::chat_protocol::validation::ed25519_key_id;
+use crate::chat_protocol::wire::{validate_public_commit, MAX_PUBLIC_MESSAGE_WIRE_BYTES};
+use crate::common;
+use crate::common::executor_seed::*;
 
-// ---------------------------------------------------------------------------
-// Harness + corpus fixtures (adapted from tests/chat_protocol_state_machine.rs).
-// ---------------------------------------------------------------------------
-
-#[path = "common/executor_seed.rs"]
-mod executor_seed;
-use executor_seed::*;
 /// A FRESH invitee each run. Only the creator (alice) must match the corpus
 /// genesis leaf; the pending invitee is an arbitrary principal, so a random DID
 /// keeps the direct-pair unique index (and bob's global event chain) collision-

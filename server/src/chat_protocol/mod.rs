@@ -103,6 +103,9 @@ pub mod wire;
 #[path = "state_machine/tests.rs"]
 mod state_machine_tests;
 #[cfg(test)]
+#[path = "state_machine/executor_tests.rs"]
+mod state_machine_executor_tests;
+#[cfg(test)]
 #[path = "transcript/application_entry_tests.rs"]
 mod application_entry_tests;
 #[cfg(test)]
