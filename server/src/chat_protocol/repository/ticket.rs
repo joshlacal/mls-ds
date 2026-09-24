@@ -675,28 +675,32 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
     )
     .await
     .map_err(|_| TicketRepositoryError::SessionBindingMismatch)?;
-    let (capability, session_expires_at) = inventory::snapshot_capability_for_ticket(
-        &mut transaction,
-        &device,
-        inventory_session_id,
-        sealer,
-    )
-    .await
-    .map_err(|error| match error {
-        inventory::InventoryRepositoryError::SessionNotFound => {
-            TicketRepositoryError::SessionMissing
-        }
-        inventory::InventoryRepositoryError::DeviceAuthorityMismatch => {
-            TicketRepositoryError::DeviceBindingMismatch
-        }
-        _ => TicketRepositoryError::SessionBindingMismatch,
-    })?;
+    let (capability, session_created_at, session_expires_at) =
+        inventory::snapshot_capability_for_ticket(
+            &mut transaction,
+            &device,
+            inventory_session_id,
+            sealer,
+        )
+        .await
+        .map_err(|error| match error {
+            inventory::InventoryRepositoryError::SessionNotFound => {
+                TicketRepositoryError::SessionMissing
+            }
+            inventory::InventoryRepositoryError::DeviceAuthorityMismatch => {
+                TicketRepositoryError::DeviceBindingMismatch
+            }
+            _ => TicketRepositoryError::SessionBindingMismatch,
+        })?;
     if event_cursor != capability || inventory_session_capability != capability {
         return Err(TicketRepositoryError::CursorMismatch);
     }
     let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
         .fetch_one(&mut *transaction)
         .await?;
+    // The session instant is the next whole second after its transaction, so
+    // it can still lie ahead of `now`; a ticket never predates its session.
+    let now = now.max(session_created_at);
     let expires_at = (now + chrono::Duration::seconds(30)).min(session_expires_at);
     if now >= expires_at {
         return Err(TicketRepositoryError::TicketExpired);
