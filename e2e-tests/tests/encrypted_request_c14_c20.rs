@@ -1784,7 +1784,7 @@ async fn c20_close_racing_accept_barrier_one_winner() -> anyhow::Result<()> {
     eprintln!("C20 close-vs-accept race: queued={queued}");
     barrier.release()?;
 
-    let (close_status, _close_bytes) = close_future.await??;
+    let (close_status, close_bytes) = close_future.await??;
     let (accept_status, accept_bytes) = accept_future.await??;
 
     // Exactly one operation wins the race!
@@ -1799,17 +1799,15 @@ async fn c20_close_racing_accept_barrier_one_winner() -> anyhow::Result<()> {
     eprintln!("C20 close-vs-accept race: durable winner={winners} close={close_status} accept={accept_status}");
 
     if close_won {
-        assert!(accept_status.is_client_error(), "When close wins, accept must fail with client error: {accept_status}");
+        assert_eq!(accept_status, reqwest::StatusCode::BAD_REQUEST, "When close wins, accept must fail with client error: {accept_status}");
         let accept_err: Value = serde_json::from_slice(&accept_bytes)?;
         assert_eq!(accept_err["error"], "InvitationNotPending", "Loser accept gets InvitationNotPending");
         assert_eq!(winners, "closeConversation", "only the close transition is durable");
     } else {
         assert!(accept_won, "If close did not win, accept must have won");
-        // KNOWN DEFECT (recorded in evidence/c20 as a failed clause, not a pass):
-        // the losing stale-prior close returns 500 "internal failure (no protocol
-        // code exposed)" instead of the typed StaleCoordinates. Refusal + a single
-        // durable winner are asserted; the typed-error clause is not satisfied.
-        assert!(!close_status.is_success(), "When accept wins, close with stale prior must fail: {close_status}");
+        assert_eq!(close_status, reqwest::StatusCode::BAD_REQUEST, "When accept wins, close with stale prior must fail 400 StaleCoordinates: {close_status}");
+        let close_err: Value = serde_json::from_slice(&close_bytes)?;
+        assert_eq!(close_err["error"], "StaleCoordinates", "Stale prior close must return typed StaleCoordinates error");
         assert_eq!(winners, "directRequestAcceptance", "only the acceptance transition is durable");
         // Release capacity: close from the accepted head.
         release_by_close_from(&f, Some(accepted_head)).await?;

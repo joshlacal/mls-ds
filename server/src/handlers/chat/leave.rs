@@ -120,7 +120,8 @@ fn map_failure(endpoint: ChatEndpoint, error: LeaveFacadeError) -> ChatFailure {
         | E::Executor(crate::chat_protocol::state_machine::ExecutorError::Transition(crate::chat_protocol::repository::transition::TransitionRepositoryError::Database(_))) => ChatFailure::storage(endpoint),
         E::Transition(crate::chat_protocol::repository::transition::TransitionRepositoryError::CompareAndSetConflict)
         | E::Executor(crate::chat_protocol::state_machine::ExecutorError::Transition(crate::chat_protocol::repository::transition::TransitionRepositoryError::CompareAndSetConflict))
-        | E::StateMachine(S::StaleCoordinates) => ChatFailure::protocol(endpoint, C::StaleCoordinates),
+        | E::StateMachine(S::StaleCoordinates)
+        | E::StateMachine(S::ConversationClosed) => ChatFailure::protocol(endpoint, C::StaleCoordinates),
         E::StateMachine(S::CoordinateOverflow) => ChatFailure::protocol(endpoint, C::CoordinateOverflow),
         E::StateMachine(S::DirectParticipantMutationForbidden) => ChatFailure::protocol(endpoint, C::DirectParticipantMutationForbidden),
         E::StateMachine(S::LastAdminRequired) => ChatFailure::protocol(endpoint, C::LastAdminRequired),
