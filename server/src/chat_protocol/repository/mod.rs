@@ -54,3 +54,5 @@ pub(crate) mod push_binding;
 
 #[cfg(test)]
 mod rollback_tests;
+#[cfg(test)]
+mod inventory_repository_tests;
