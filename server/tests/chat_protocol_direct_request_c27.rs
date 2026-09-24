@@ -405,24 +405,34 @@ mod repository {
             let iso = isolated().await;
             let pool = iso.pool.clone();
 
-            // Account pending: a published settlement holds pending capacity;
-            // further reservation that would exceed 64 MiB is refused, and an
-            // over-cap settlement is refused with no partial effect.
+            // Account pending: live PREPARED (unpublished) reservations
+            // accumulate pending bytes until a further reservation that would
+            // exceed 64 MiB is refused without rewriting history.
             let mut tx = pool.begin().await.unwrap();
             let alice = device(&mut tx, &did(), "recovery", false).await;
             let bob_did = did();
             device(&mut tx, &bob_did, "direct-request", true).await;
-            let published = identity(&alice, &bob_did);
-            prepare(&mut tx, &published).await.unwrap();
-            let l = lock(&mut tx, &published).await.unwrap();
-            finish_terminal_charged(&mut tx, l, TerminalOutcome::Published, b"c27-published-receipt", Some(&[9; 32]), Utc::now(), Some(60 * 1_048_576)).await.unwrap();
+            let first = identity(&alice, &bob_did);
+            let snap_36mb = vec![0x36_u8; 36 * 1_048_576];
+            prepare_sized(&mut tx, &first, &snap_36mb).await.unwrap();
             let carol_did = did();
             device(&mut tx, &carol_did, "direct-request", true).await;
+            let second = identity(&alice, &carol_did);
+            let snap_30mb = vec![0x30_u8; 30 * 1_048_576];
             let before = history(&mut tx, &alice.owner_did).await;
-            assert!(matches!(prepare(&mut tx, &identity(&alice, &carol_did)).await, Err(DirectRequestStoreError::QuotaExceeded)));
-            assert_eq!(history(&mut tx, &alice.owner_did).await, before);
+            assert!(matches!(
+                prepare_sized(&mut tx, &second, &snap_30mb).await,
+                Err(DirectRequestStoreError::QuotaExceeded)
+            ), "36 MiB + 30 MiB exceeds 64 MiB account pending cap while sender_live=1 (< 2)");
+            assert_eq!(history(&mut tx, &alice.owner_did).await, before, "refused preparation leaves history intact without eviction");
+            // Cancelling the first live reservation retires its pending charge
+            cancel(&mut tx, &first).await.unwrap();
+            assert!(prepare_sized(&mut tx, &second, &snap_30mb).await.is_ok(), "reservation succeeds after retiring pending bytes");
             tx.rollback().await.unwrap();
 
+            // Account retained: a published request's charge is retained against
+            // the 256 MiB account limit. An over-cap settlement exceeding 256 MiB
+            // is refused with no partial effect.
             let mut tx = pool.begin().await.unwrap();
             let alice = device(&mut tx, &did(), "recovery", false).await;
             let bob_did = did();
@@ -432,11 +442,21 @@ mod repository {
             let before = history(&mut tx, &alice.owner_did).await;
             let l = lock(&mut tx, &over).await.unwrap();
             assert!(matches!(
-                finish_terminal_charged(&mut tx, l, TerminalOutcome::Published, b"c27-published-receipt", Some(&[9; 32]), Utc::now(), Some(65 * 1_048_576)).await,
+                finish_terminal_charged(&mut tx, l, TerminalOutcome::Published, b"c27-published-receipt", Some(&[9; 32]), Utc::now(), Some(270 * 1_048_576)).await,
                 Err(DirectRequestStoreError::QuotaExceeded)));
             assert_eq!(history(&mut tx, &alice.owner_did).await, before, "refused settlement leaves the prepared attempt intact");
-            tx.rollback().await.unwrap();
 
+            // Separately prove retained bytes of published requests still refuse
+            // new capacity without eviction (the retained budget clause).
+            let l2 = lock(&mut tx, &over).await.unwrap();
+            finish_terminal_charged(&mut tx, l2, TerminalOutcome::Published, b"c27-published-receipt", Some(&[9; 32]), Utc::now(), Some(250 * 1_048_576)).await.unwrap();
+            let carol_did = did();
+            device(&mut tx, &carol_did, "direct-request", true).await;
+            let before_carol = history(&mut tx, &alice.owner_did).await;
+            assert!(matches!(prepare(&mut tx, &identity(&alice, &carol_did)).await, Err(DirectRequestStoreError::QuotaExceeded)),
+                "new prepare refused when published retained charge (250 MiB) + next prep exceeds 256 MiB account retained limit");
+            assert_eq!(history(&mut tx, &alice.owner_did).await, before_carol, "retained refusal does not evict published request history");
+            tx.rollback().await.unwrap();
             // Account retained: distinct senders each prepare (maximum 8 MB
             // snapshot, under the 8 MiB prepare-response cap) and cancel to
             // one recipient; retained artifacts accumulate with no pending
