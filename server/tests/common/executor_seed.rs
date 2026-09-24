@@ -1840,6 +1840,53 @@ pub fn maintenance_url_from_env() -> String {
     parsed.into()
 }
 
+/// Attempts allowed for a fresh-database migration that loses the shared-catalog
+/// write race described on [`FRESH_DB_MIGRATION_LOCK_KEY`].
+///
+/// The advisory lock below serializes every migrator in *this* process, but the
+/// `GRANT ALL PRIVILEGES ON DATABASE catbird` write is to a tuple that belongs
+/// to the whole cluster, so a concurrently running sibling test binary — a
+/// different process, with its own lock space — can still update it first. The
+/// loser's migration is fully rolled back (PostgreSQL DDL here is transactional,
+/// and sqlx writes the `_sqlx_migrations` row inside that same transaction), so
+/// re-running the migrator simply re-applies from the last committed version.
+/// Bounded, because a persistent XX000 is a real defect and must surface.
+const FRESH_DB_MIGRATION_ATTEMPTS: usize = 30;
+
+/// True for the transient cluster-catalog write conflict this harness retries:
+/// SQLSTATE `XX000` (`internal_error`), which is what
+/// `simple_heap_update` raises as "tuple concurrently updated".
+fn is_transient_catalog_conflict(error: &sqlx::migrate::MigrateError) -> bool {
+    matches!(
+        error,
+        sqlx::migrate::MigrateError::Execute(sqlx::Error::Database(database))
+            if database.code().as_deref() == Some("XX000")
+    )
+}
+
+/// Advisory-lock key serializing fresh-database migrations *within one
+/// database*.
+///
+/// sqlx's own migrator lock is keyed on the current database name
+/// (`sqlx-postgres/src/migrate.rs::generate_lock_id`), so two freshly created,
+/// differently named databases get two different keys and do not exclude each
+/// other. PostgreSQL advisory locks would not help either: they are scoped to
+/// the database you take them in (verified on this cluster — a lock held in one
+/// database does not block the same key in another). Two fresh databases
+/// therefore migrate genuinely concurrently, and they collide, because
+/// migration `20250101000000_greenfield_schema` runs
+/// `GRANT ALL PRIVILEGES ON DATABASE catbird TO catbird`, which rewrites the
+/// *shared* `pg_database` tuple for `catbird` on this cluster. The loser fails
+/// with `SQLSTATE XX000 "tuple concurrently updated"`, which made the outcome
+/// depend only on whether the two migrations happened to overlap — exactly how
+/// `welcome::tests`' two Part-4 cases failed in parallel and passed alone.
+///
+/// This key is still taken, because within a single fresh database it is the
+/// only thing that serializes the migrator for the *other* tests that share that
+/// pool, and it is the same key `common::fresh_db` uses. The cross-database race
+/// itself is handled by the bounded retry in `fresh_executor_db`.
+pub const FRESH_DB_MIGRATION_LOCK_KEY: i64 = 0x6361_7462_6972_6473;
+
 pub async fn fresh_executor_db() -> (PgPool, FreshDbGuard) {
     let maintenance_url = maintenance_url_from_env();
     let admin = PgPoolOptions::new()
@@ -1872,9 +1919,37 @@ pub async fn fresh_executor_db() -> (PgPool, FreshDbGuard) {
     .execute(&mut *migration_connection)
     .await
     .expect("authorize operation-claim activation on the exact migration connection");
-    let migration_result = sqlx::migrate!("./migrations")
-        .run(&mut *migration_connection)
-        .await;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(FRESH_DB_MIGRATION_LOCK_KEY)
+        .execute(&mut *migration_connection)
+        .await
+        .expect("acquire the cluster-wide fresh-DB migration lock");
+    let migration_result = {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let result = sqlx::migrate!("./migrations")
+                .run(&mut *migration_connection)
+                .await;
+            match result {
+                Err(error)
+                    if is_transient_catalog_conflict(&error)
+                        && attempt < FRESH_DB_MIGRATION_ATTEMPTS =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        20 * attempt as u64,
+                    ))
+                    .await;
+                }
+                other => break other,
+            }
+        }
+    };
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(FRESH_DB_MIGRATION_LOCK_KEY)
+        .execute(&mut *migration_connection)
+        .await
+        .expect("release the cluster-wide fresh-DB migration lock");
     sqlx::query("RESET chat.operation_claim_activation_approved")
         .execute(&mut *migration_connection)
         .await
