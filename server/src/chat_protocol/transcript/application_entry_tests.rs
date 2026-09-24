@@ -1,12 +1,8 @@
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+use super::*;
+use crate::chat_protocol::model;
+use crate::chat_protocol::validation::{
+    ed25519_key_id, CanonicalTimestamp, CanonicalUuidV4, TrustedRequestInstant,
+};
 
 use std::{collections::BTreeMap, fmt};
 
@@ -19,13 +15,6 @@ use serde::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-
-use transcript::{
-    build_verified_application_entry, decode_and_verify_application_entry,
-    decode_and_verify_signed_mutation, decode_canonical_signed_mutation,
-    rebind_persisted_application_entry, VerifiedApplicationEntry,
-};
-use validation::{ed25519_key_id, CanonicalTimestamp, CanonicalUuidV4, TrustedRequestInstant};
 
 const CONVERSATION_ID: &str = "11111111-1111-4111-9111-111111111111";
 const ENTRY_ID: &str = "8eee908a-1f55-4b55-8271-7690f6de14fc";
@@ -191,7 +180,7 @@ fn hex_array<const N: usize>(value: &Value) -> [u8; N] {
 
 fn golden() -> Golden {
     let manifest: Value = serde_json::from_str(include_str!(
-        "../../../docs/generated-artifacts/chat-application-v1/manifest.json"
+        "../../../../../docs/generated-artifacts/chat-application-v1/manifest.json"
     ))
     .unwrap();
     let vector = &manifest["vectors"][0];
@@ -688,7 +677,7 @@ fn application_authority_has_no_public_raw_constructor_and_is_non_clone() {
     impl<T: ?Sized + Clone> AmbiguousIfClone<u8> for T {}
     let _ = <VerifiedApplicationEntry as AmbiguousIfClone<_>>::marker;
 
-    let source = include_str!("../src/chat_protocol/transcript.rs");
+    let source = include_str!("../transcript.rs");
     assert!(source.contains("pub(crate) struct VerifiedApplicationEntry"));
     assert!(!source.contains("pub struct VerifiedApplicationEntry"));
     assert!(!source.contains("pub fn build_verified_application_entry"));
