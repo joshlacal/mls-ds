@@ -70,3 +70,6 @@ mod recovery_tests;
 #[cfg(test)]
 #[path = "ticket/tests.rs"]
 mod ticket_tests;
+#[cfg(test)]
+#[path = "reset/tests.rs"]
+mod reset_repository_tests;
