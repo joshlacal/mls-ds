@@ -51,3 +51,6 @@ pub(crate) mod welcome_terminal;
 pub(crate) mod direct_request_lifecycle;
 
 pub(crate) mod push_binding;
+
+#[cfg(test)]
+mod rollback_tests;
