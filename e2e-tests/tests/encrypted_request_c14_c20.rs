@@ -354,7 +354,7 @@ fn receipt_info(response: &Value, key: &[u8]) -> anyhow::Result<(String, Option<
         .as_object_mut()
         .context("receipt object")?
         .remove("$type");
-    let verified = protocol::verify_signed_request(
+    let verified = protocol::verify_received_signed_request(
         DirectRequestKind::Outcome,
         &serde_json::to_vec(&signed)?,
         key,
@@ -484,7 +484,10 @@ async fn prepare_direct_publication(
         .await?;
     anyhow::ensure!(prepare_status == reqwest::StatusCode::OK, "{} prepare failed {prepare_status}: {}", sender.did, String::from_utf8_lossy(&prepare_body));
     let prep_resp: Value = serde_json::from_slice(&prepare_body)?;
-    let prep_snapshot = prep_resp.pointer("/outcome/preparation").context("preparation snapshot")?;
+    let prep_snapshot = protocol::verify_direct_request_preparation(
+        &serde_json::to_vec(prep_resp.pointer("/outcome/preparation").context("preparation snapshot")?)?,
+        &f.server.receipt_public_key,
+    )?;
 
     let context = json!({
         "protocolVersion": "2",

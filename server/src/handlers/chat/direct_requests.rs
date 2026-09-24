@@ -44,7 +44,7 @@ fn failure(endpoint: ChatEndpoint, error: DirectRequestStoreError) -> ChatFailur
     ChatFailure::protocol(endpoint, code)
 }
 fn output(result: DirectRequestResult, endpoint: ChatEndpoint) -> Result<Vec<u8>, ChatFailure> {
-    let payload = match result {
+    let mut payload = match result {
         DirectRequestResult::Keys(bytes) => return Ok(bytes),
         DirectRequestResult::Unknown(id) => {
             serde_json::json!({"$type":"blue.catbird.chat.defs#directRequestUnknownOutcome","requestId":id.to_string()})
@@ -59,6 +59,13 @@ fn output(result: DirectRequestResult, endpoint: ChatEndpoint) -> Result<Vec<u8>
             value
         }
     };
+    // Outcomes and mutation receipts echo retained bare-base64 signed bytes;
+    // present them as lexicon `{"$bytes":…}` at response time only.
+    crate::chat_protocol::direct_request_transcript::present_read_presentation(
+        "directRequestOutcome",
+        &mut payload,
+    )
+    .map_err(|_| ChatFailure::invariant(endpoint))?;
     let bytes = serde_json::to_vec(&serde_json::json!({"outcome":payload}))
         .map_err(|_| ChatFailure::invariant(endpoint))?;
     if bytes.len() > 8_388_608 {

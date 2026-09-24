@@ -79,6 +79,11 @@ async fn inner(
     let mut receipt: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| ChatFailure::invariant(endpoint))?;
     receipt["$type"] = serde_json::json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
+    crate::chat_protocol::direct_request_transcript::present_read_presentation(
+        "directRequestOutcome",
+        &mut receipt,
+    )
+    .map_err(|_| ChatFailure::invariant(endpoint))?;
     let response = serde_json::to_vec(&serde_json::json!({"outcome":receipt}))
         .map_err(|_| ChatFailure::invariant(endpoint))?;
     tx.commit().await.map_err(|error| {

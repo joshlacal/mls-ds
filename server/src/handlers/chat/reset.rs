@@ -76,7 +76,7 @@ async fn handle(
         .map_err(|error| reset_failure(endpoint, error))?;
 
     let response = match outcome {
-        ResetTransactionOutcome::Replay(completed) => context::replay_response(&completed),
+        ResetTransactionOutcome::Replay(completed) => context::replay_response(endpoint, &completed)?,
         ResetTransactionOutcome::First(applied) => {
             let event_position = applied.event_position();
             let (_, completion, response) = applied.into_parts();

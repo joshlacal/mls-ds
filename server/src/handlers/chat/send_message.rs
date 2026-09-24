@@ -51,7 +51,7 @@ async fn send(
         .map_err(|e| context::operation_prelude_failure(ENDPOINT, e))?;
     match prepared {
         PreparedChatAdmission::Replay(replay) => {
-            let response = context::replay_response(&replay);
+            let response = context::replay_response(ENDPOINT, &replay)?;
             tx.commit()
                 .await
                 .map_err(|_| ChatFailure::storage(ENDPOINT))?;

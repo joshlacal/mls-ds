@@ -2895,21 +2895,6 @@ fn dag_value_generated_json(
                 "operationId" | "deviceId" => {
                     Ok(dag_value_json(value, ControlJsonBytes::BareStandardBase64))
                 }
-                // These generated aliases are bare `bytes::Bytes`, rather than
-                // fields carrying Jacquard's DAG-JSON serde helper. Feed their
-                // generated DTO deserializer the byte-array representation it
-                // derives while retaining DAG-JSON for the actual response.
-                "artifactHash" | "identifierBytes" => match value {
-                    DagValue::Bytes(value) => Ok(SchemaValue::Array(
-                        value
-                            .iter()
-                            .map(|byte| SchemaValue::Number((*byte).into()))
-                            .collect(),
-                    )),
-                    _ => Err(AuthPrimitiveError::invalid(
-                        "generated control entry byte alias",
-                    )),
-                },
                 _ => dag_value_generated_json(definition(name)?, value),
             }
         }
@@ -3003,25 +2988,6 @@ fn normalize_generated_response_json(
                         return Err(AuthPrimitiveError::invalid("generated response identifier"));
                     }
                     Ok(value.clone())
-                }
-                "artifactHash" | "identifierBytes" => {
-                    let values = value.as_array().ok_or_else(|| {
-                        AuthPrimitiveError::invalid("generated response byte alias")
-                    })?;
-                    let bytes = values
-                        .iter()
-                        .map(|value| {
-                            value
-                                .as_u64()
-                                .and_then(|value| u8::try_from(value).ok())
-                                .ok_or_else(|| {
-                                    AuthPrimitiveError::invalid(
-                                        "generated response byte alias value",
-                                    )
-                                })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok(SchemaValue::String(STANDARD.encode(bytes)))
                 }
                 _ => normalize_generated_response_json(definition(name)?, value),
             }

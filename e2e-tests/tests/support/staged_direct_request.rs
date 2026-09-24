@@ -273,7 +273,7 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
         .filter(|value| !value.is_null())
         .cloned()
         .with_context(|| format!("prepare returned no live preparation: {response}"))?;
-    protocol::verify_direct_request_preparation(
+    let preparation = protocol::verify_direct_request_preparation(
         &serde_json::to_vec(&preparation)?,
         &server.receipt_public_key,
     )?;
@@ -461,7 +461,7 @@ impl StagedRequest {
             .as_object_mut()
             .context("outcome object")?
             .remove("$type");
-        let verified = protocol::verify_signed_request(
+        let verified = protocol::verify_received_signed_request(
             DirectRequestKind::Outcome,
             &serde_json::to_vec(&receipt)?,
             &self.server.receipt_public_key,

@@ -397,7 +397,7 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         .await?;
     assert_eq!(acc1_status, reqwest::StatusCode::OK);
     let acc1_val: Value = serde_json::from_slice(&acc1_bytes)?;
-    let acc1_proof = protocol::verify_direct_request_acceptance_proof(
+    let acc1_proof = protocol::verify_received_direct_request_acceptance_proof(
         &serde_json::to_vec(&acc1_val["acceptanceProof"])?,
         &fixture1.server.receipt_public_key,
         &bob_public1,
@@ -600,10 +600,12 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         r2_state_val["state"]["directRequest"]["consent"],
         "incomingPending"
     );
-    assert_eq!(
-        r2_state_val["state"]["directRequest"]["contextHash"],
-        STANDARD.encode(req2_context_hash)
-    );
+    let r2_request = protocol::normalize_read_presentation(
+        &serde_json::to_vec(&r2_state_val["state"]["directRequest"])?,
+        "directRequestState",
+        false,
+    )?;
+    assert_eq!(r2_request["contextHash"], STANDARD.encode(req2_context_hash));
 
     // Read preview/pending conversation state for Request 2 (outgoingPending for Alice)
     let (r2_alice_status, r2_alice_bytes) = fixture2

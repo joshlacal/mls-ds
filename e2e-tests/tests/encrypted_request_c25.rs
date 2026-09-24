@@ -137,7 +137,7 @@ async fn publish(w: &World, sender: usize) -> anyhow::Result<Published> {
     anyhow::ensure!(status == StatusCode::OK, "prepare {status}: {response}");
     let snapshot = response.pointer("/outcome/preparation").filter(|v| !v.is_null()).cloned()
         .with_context(|| format!("no live preparation: {response}"))?;
-    protocol::verify_direct_request_preparation(&serde_json::to_vec(&snapshot)?, &w.server.receipt_public_key)?;
+    let snapshot = protocol::verify_direct_request_preparation(&serde_json::to_vec(&snapshot)?, &w.server.receipt_public_key)?;
     let verified = protocol::verify_signed_request(DirectRequestKind::Prepare, &serde_json::to_vec(&prepare)?, &s.public)?;
     let selected = snapshot["selectedDevices"].as_array().context("selectedDevices")?;
     anyhow::ensure!(selected.len() == 1 && selected[0]["actorDeviceId"] == owner.device_id.to_string(),
