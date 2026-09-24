@@ -102,7 +102,13 @@ async fn handle_inner(
             log_direct_acceptance_storage_error("commit", &error);
             ChatFailure::storage(endpoint)
         })?;
-        return Ok(context::json_ok(bytes));
+        return Ok(context::json_ok(
+            crate::chat_protocol::direct_request_transcript::present_endpoint_output(
+                endpoint.nsid(),
+                bytes,
+            )
+            .map_err(|_| ChatFailure::invariant(endpoint))?,
+        ));
     }
     let admission =
         context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;

@@ -57,7 +57,7 @@ async fn revoke(
 
     let response = match outcome {
         DeviceRevocationTransactionOutcome::Replay(replay) => {
-            context::replay_response(replay.response())
+            context::replay_response(ENDPOINT, replay.response())?
         }
         DeviceRevocationTransactionOutcome::First(mut first) => {
             let application = first

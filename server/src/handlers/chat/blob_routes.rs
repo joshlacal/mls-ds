@@ -166,7 +166,7 @@ async fn prepare_blob_upload_inner(
             .commit()
             .await
             .map_err(|_| ChatFailure::storage(PREPARE))?;
-        return Ok(context::replay_response(&response));
+        return context::replay_response(PREPARE, &response);
     };
     let authority = prepared.authority();
     let mutation = authority
@@ -426,7 +426,7 @@ async fn delete_blob_inner(
             .commit()
             .await
             .map_err(|_| ChatFailure::storage(DELETE))?;
-        return Ok(context::replay_response(&response));
+        return context::replay_response(DELETE, &response);
     };
     let authority = prepared.authority();
     let mutation = authority

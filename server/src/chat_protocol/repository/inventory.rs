@@ -3900,9 +3900,16 @@ fn assemble_inventory_page_response(
     out.extend_from_slice(b"{\"hasMore\":");
     out.extend_from_slice(if has_more { b"true" } else { b"false" });
     if let Some(scope) = inventory_scope {
+        // Retained scope keeps bare base64; the read presents lexicon bytes.
+        let mut scope = scope.clone();
+        crate::chat_protocol::direct_request_transcript::present_read_presentation(
+            "directRequestInventoryScope",
+            &mut scope,
+        )
+        .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
         out.extend_from_slice(b",\"inventoryScope\":");
         out.extend_from_slice(
-            &serde_json::to_vec(scope)
+            &serde_json::to_vec(&scope)
                 .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
         );
     }

@@ -133,15 +133,13 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
     );
     object.insert("seq".into(), Value::Number(row.seq.into()));
     object.insert("signedRequest".into(), signed_request);
-    if matches!(
-        row.entry_kind.as_str(),
-        "blue.catbird.chat.defs#directRequestEntry"
-            | "blue.catbird.chat.defs#directRequestAcceptanceEntry"
-    ) {
-        return Ok(Value::Object(object));
-    }
-    if row.entry_kind != delivery::APPLICATION_ENTRY_KIND {
-        return crate::chat_protocol::transcript::persisted_control_entry_response_json(
+    let mut entry = if row.entry_kind != delivery::APPLICATION_ENTRY_KIND
+        && !matches!(
+            row.entry_kind.as_str(),
+            "blue.catbird.chat.defs#directRequestEntry"
+                | "blue.catbird.chat.defs#directRequestAcceptanceEntry"
+        ) {
+        crate::chat_protocol::transcript::persisted_control_entry_response_json(
             &row.entry_kind,
             &row.entry_id.hyphenated().to_string(),
             &row.conversation_id.hyphenated().to_string(),
@@ -151,9 +149,18 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
             &row.server_fields_bytes,
         )
         .map(|bytes| serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant))
-        .map_err(|_| EntryReadFacadeError::Invariant)?;
-    }
-    Ok(Value::Object(object))
+        .map_err(|_| EntryReadFacadeError::Invariant)??
+    } else {
+        Value::Object(object)
+    };
+    // Every entry kind echoes its retained signed wrapper; present its declared
+    // bytes as lexicon `{"$bytes"}` at read time only.
+    crate::chat_protocol::direct_request_transcript::present_read_presentation(
+        "conversationEntry",
+        &mut entry,
+    )
+    .map_err(|_| EntryReadFacadeError::Invariant)?;
+    Ok(entry)
 }
 fn map_authority_error(error: ReadAuthorityError) -> EntryReadFacadeError {
     tracing::error!("get_entries map_authority_error: {:?}", error);

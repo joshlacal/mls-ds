@@ -37,11 +37,10 @@
 //!   definition, re-encodes with this encoder, and requires byte-for-byte
 //!   equality.
 //!
-//! The generated chat DTO surface accepts byte fields in two input shapes
-//! (`{"$bytes": <padded base64>}` for `serde_bytes_helper` fields and plain
-//! byte arrays for the bare `bytes::Bytes` aliases such as `ArtifactHash` and
-//! `IdentifierBytes`). The normalizer also accepts bare base64 strings when
-//! validating compatibility input trees, but a v2 server must not be mixed with
+//! The generated chat DTO surface serializes every byte field, including the
+//! `ArtifactHash` and `IdentifierBytes` aliases, as `{"$bytes": <padded
+//! base64>}`. The normalizer also accepts byte arrays and bare base64 strings
+//! when validating compatibility input trees, but a v2 server must not be mixed with
 //! pre-v2 retained sessions: replay serves retained bytes verbatim. Stop old
 //! instances, wait the full 15-minute session TTL, and only then resume v2
 //! protocol availability. All accepted forms normalize to the one lexicon wire shape
@@ -440,6 +439,9 @@ fn normalize_def(
                 "directRequestAcceptanceBody"
                     | "directRequestAcceptanceCommitReceiptBody"
                     | "directRequestGrantBody"
+                    | "directRequestPublicationBody"
+                    | "directRequestCancellationBody"
+                    | "directRequestKeysPublicationBody"
             );
             if signed_request_body {
                 if let CanonValue::Object(entries) = value {

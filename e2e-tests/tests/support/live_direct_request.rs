@@ -309,7 +309,7 @@ async fn publish_request_variant_configured(
         .cloned()
         .with_context(|| format!("prepare returned no live preparation: {response}"))?;
     let preparation_bytes = serde_json::to_vec(&preparation)?;
-    protocol::verify_direct_request_preparation(&preparation_bytes, &server.receipt_public_key)?;
+    let preparation = protocol::verify_direct_request_preparation(&preparation_bytes, &server.receipt_public_key)?;
     let verified_prepare = protocol::verify_signed_request(
         DirectRequestKind::Prepare,
         &serde_json::to_vec(&prepare)?,
@@ -517,7 +517,7 @@ async fn publish_request_variant_configured(
         &serde_json::to_vec(&publication)?,
         &alice_public,
     )?;
-    let verified_receipt = protocol::verify_signed_request(
+    let verified_receipt = protocol::verify_received_signed_request(
         DirectRequestKind::Outcome,
         &serde_json::to_vec(&receipt)?,
         &server.receipt_public_key,
@@ -697,8 +697,15 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
         pending["state"]["directRequest"]["consent"],
         "incomingPending"
     );
+    // Reads present lexicon bytes as `{"$bytes":…}`; normalize through the
+    // shared client helper before comparing with the signed publication.
+    let pending_request = protocol::normalize_read_presentation(
+        &serde_json::to_vec(&pending["state"]["directRequest"])?,
+        "directRequestState",
+        false,
+    )?;
     assert_eq!(
-        pending["state"]["directRequest"]["contextHash"],
+        pending_request["contextHash"],
         f.publication["body"]["contextHash"]
     );
     let (inventory_status, inventory_bytes) = f
@@ -869,7 +876,7 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
     )
     .await?;
     let accepted: Value = serde_json::from_slice(&accepted_bytes)?;
-    let proof = protocol::verify_direct_request_acceptance_proof(
+    let proof = protocol::verify_received_direct_request_acceptance_proof(
         &serde_json::to_vec(&accepted["acceptanceProof"])?,
         &f.server.receipt_public_key,
         &bob_public,
@@ -973,7 +980,7 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
         String::from_utf8_lossy(&state_bytes)
     );
     let state: Value = serde_json::from_slice(&state_bytes)?;
-    let sender_proof = protocol::verify_direct_request_acceptance_proof(
+    let sender_proof = protocol::verify_received_direct_request_acceptance_proof(
         &serde_json::to_vec(&state["state"]["directRequest"]["acceptanceProof"])?,
         &f.server.receipt_public_key,
         &bob_public,
@@ -1025,11 +1032,21 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
         .iter()
         .find(|e| e["$type"] == "blue.catbird.chat.defs#directRequestEntry")
         .context("introduction entry")?;
+    let introduction_entry = protocol::normalize_read_presentation(
+        &serde_json::to_vec(introduction_entry)?,
+        "directRequestEntry",
+        true,
+    )?;
     assert_eq!(introduction_entry["signedRequest"], f.publication);
     assert_eq!(
         introduction_entry["signedRequest"]["body"]["firstMessageId"],
         f.first_message_id.to_string()
     );
+    use catbird_mls::atproto::generated::blue_catbird::chat::send_message::SendMessageOutput;
+    let typed_sent: SendMessageOutput = serde_json::from_slice(&sent_bytes)
+        .context("sendMessage output does not decode into generated types")?;
+    assert_eq!(typed_sent.entry.seq, 3);
+
     let response_entry = entries
         .iter()
         .find(|e| e["$type"] == "blue.catbird.chat.defs#applicationEntry")
@@ -1037,11 +1054,21 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
     let mut row = response_entry.clone();
     row.as_object_mut().context("entry object")?.remove("$type");
     assert_eq!(row, sent["entry"]);
+    let normalized_response = protocol::normalize_read_presentation(
+        &serde_json::to_vec(response_entry)?,
+        "applicationEntry",
+        true,
+    )?;
+    let mut normalized_row = normalized_response.clone();
+    normalized_row
+        .as_object_mut()
+        .context("entry object")?
+        .remove("$type");
     let verified_entry = VerifiedApplicationEntry::verify(
-        &decode_strict_json(&serde_json::to_vec(&row)?)?,
+        &decode_strict_json(&serde_json::to_vec(&normalized_row)?)?,
         &bob_public,
     )?;
-    assert_eq!(row["signedRequest"], application);
+    assert_eq!(normalized_row["signedRequest"], application);
     let authenticated = sender.decrypt_authenticated(&group, &ciphertext)?;
     verified_entry.bind_sender(&authenticated.sender_credential.identity)?;
     assert_eq!(authenticated.epoch, epoch);
@@ -1051,6 +1078,147 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
     );
     assert_eq!(sender.epoch(&group)?, epoch);
     assert_eq!(request_database_snapshot(f.request_id)?.message_rows, 1);
+    assert_generated_accepted_reads(&f, &state_bytes, &bytes).await
+}
+
+/// Every read of an accepted request decodes into the generated
+/// catbird-atproto response types, with byte fields (including the
+/// `ArtifactHash` alias) carrying their exact decoded bytes.
+async fn assert_generated_accepted_reads(
+    f: &PublishedRequestFixture,
+    state_bytes: &[u8],
+    entries_bytes: &[u8],
+) -> anyhow::Result<()> {
+    use catbird_mls::atproto::generated::blue_catbird::chat::{
+        get_conversation_state::GetConversationStateOutput, get_conversations::GetConversationsOutput,
+        get_direct_request_outcome::GetDirectRequestOutcomeOutput,
+        ConversationEntry, ConversationInventoryItem, DirectRequestOutcome, DirectRequestStateConsent,
+    };
+    let context_hash = STANDARD.decode(
+        f.publication["body"]["contextHash"]
+            .as_str()
+            .context("signed context hash")?,
+    )?;
+    let state: GetConversationStateOutput = serde_json::from_slice(state_bytes)
+        .context("getConversationState does not decode into generated types")?;
+    let request = state.state.direct_request.context("typed request state")?;
+    assert_eq!(request.consent, DirectRequestStateConsent::Accepted);
+    assert!(request.acceptance_proof.is_some(), "typed acceptance proof");
+    assert_eq!(request.context_hash.as_ref(), context_hash.as_slice());
+
+    use catbird_mls::atproto::generated::blue_catbird::chat::get_entries::GetEntriesOutput;
+    let page: GetEntriesOutput = serde_json::from_slice(entries_bytes)
+        .context("getEntries whole page does not decode into generated types")?;
+    assert_eq!(page.entries.len(), 3);
+    assert_eq!(page.has_more, false);
+    assert_eq!(page.next_after_seq, 3);
+    let typed_introduction = page
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            ConversationEntry::DirectRequestEntry(entry) => Some(entry),
+            _ => None,
+        })
+        .context("typed introduction entry")?;
+    assert_eq!(
+        typed_introduction.signed_request.signature.as_ref(),
+        STANDARD
+            .decode(f.publication["signature"].as_str().context("publication signature")?)?
+            .as_slice()
+    );
+    assert!(page
+        .entries
+        .iter()
+        .any(|entry| matches!(entry, ConversationEntry::DirectRequestAcceptanceEntry(_))));
+    let typed_app = page
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            ConversationEntry::ApplicationEntry(entry) => Some(entry),
+            _ => None,
+        })
+        .context("typed application entry")?;
+    assert_eq!(typed_app.seq, 3);
+
+    use catbird_mls::atproto::generated::blue_catbird::chat::SubscriptionMessage;
+    // A subscribeEvents frame for this conversation decodes into the generated SubscriptionMessage type.
+    let frame_val = serde_json::json!({
+        "$type": "blue.catbird.chat.defs#eventEnvelope",
+        "previousCursor": "cursor-0",
+        "cursor": "cursor-1",
+        "payload": {
+            "$type": "blue.catbird.chat.defs#messageAvailableEvent",
+            "conversationId": f.conversation_id.to_string(),
+            "seq": 3,
+        },
+        "createdAt": "2026-09-24T12:00:00.000Z",
+    });
+    let typed_frame: SubscriptionMessage = serde_json::from_value(frame_val)
+        .context("subscribeEvents frame does not decode into generated types")?;
+    assert!(matches!(typed_frame, SubscriptionMessage::EventEnvelope(_)));
+
+    let (status, inventory_bytes) = f
+        .alice
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getConversations",
+            &[
+                ("limit".into(), "100".into()),
+                ("supportedProtocolVersions".into(), "1".into()),
+                ("supportedProtocolVersions".into(), "2".into()),
+            ],
+        )
+        .await?;
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "accepted inventory failed {status}: {}",
+        String::from_utf8_lossy(&inventory_bytes)
+    );
+    let inventory: GetConversationsOutput = serde_json::from_slice(&inventory_bytes)
+        .context("getConversations does not decode into generated types")?;
+    let inventory_request = inventory
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ConversationInventoryItem::ConversationInventoryState(item) => item
+                .state
+                .direct_request
+                .as_ref()
+                .filter(|request| request.request_id.as_str() == f.request_id.to_string()),
+            _ => None,
+        })
+        .context("typed inventory request")?;
+    assert_eq!(inventory_request.consent, DirectRequestStateConsent::Accepted);
+    assert_eq!(inventory_request.context_hash.as_ref(), context_hash.as_slice());
+
+    let (status, outcome_bytes) = f
+        .alice
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getDirectRequestOutcome",
+            &[("requestId".into(), f.request_id.to_string())],
+        )
+        .await?;
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "accepted outcome failed {status}: {}",
+        String::from_utf8_lossy(&outcome_bytes)
+    );
+    let outcome: GetDirectRequestOutcomeOutput = serde_json::from_slice(&outcome_bytes)
+        .context("getDirectRequestOutcome does not decode into generated types")?;
+    let DirectRequestOutcome::SignedDirectRequestReceipt(receipt) = outcome.outcome else {
+        anyhow::bail!("accepted request outcome is not its signed receipt");
+    };
+    let receipt_sig = f.receipt["signature"]
+        .as_str()
+        .or_else(|| f.receipt["signature"]["$bytes"].as_str())
+        .context("receipt signature")?;
+    assert_eq!(
+        receipt.signature.as_ref(),
+        STANDARD.decode(receipt_sig)?.as_slice()
+    );
     Ok(())
 }
 
@@ -1083,7 +1251,7 @@ pub async fn accept_existing_fixture(f: &PublishedRequestFixture) -> anyhow::Res
     let envelope = json!({"directRequest":signed});
     let bytes = checked_post(f, &f.bob, "blue.catbird.chat.acceptConversation", &envelope).await?;
     let accepted: Value = serde_json::from_slice(&bytes)?;
-    let proof = protocol::verify_direct_request_acceptance_proof(
+    let proof = protocol::verify_received_direct_request_acceptance_proof(
         &serde_json::to_vec(&accepted["acceptanceProof"])?,
         &f.server.receipt_public_key,
         &public_key,

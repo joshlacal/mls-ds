@@ -88,7 +88,7 @@ async fn handle(
 
     let response = match outcome {
         WelcomeTerminalTransactionOutcome::Replay { response, .. } => {
-            context::replay_response(&response)
+            context::replay_response(endpoint, &response)?
         }
         WelcomeTerminalTransactionOutcome::Prepared(first) => {
             let applied = first

@@ -391,10 +391,11 @@ fn build_publication(
     prep: &Prep,
 ) -> anyhow::Result<(Value, catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestBootstrap)> {
     let preparation = prep.preparation()?;
-    protocol::verify_direct_request_preparation(
+    let preparation = protocol::verify_direct_request_preparation(
         &serde_json::to_vec(preparation)?,
         &rig.server.receipt_public_key,
     )?;
+    let preparation = &preparation;
     let selected = preparation["selectedDevices"]
         .as_array()
         .context("selectedDevices")?;
@@ -576,7 +577,7 @@ fn receipt(rig: &Rig, response: &Value) -> anyhow::Result<(String, Option<String
         .as_object_mut()
         .context("receipt object")?
         .remove("$type");
-    let verified = protocol::verify_signed_request(
+    let verified = protocol::verify_received_signed_request(
         DirectRequestKind::Outcome,
         &serde_json::to_vec(&signed)?,
         &rig.server.receipt_public_key,

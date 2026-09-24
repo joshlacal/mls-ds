@@ -397,7 +397,7 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         .await?;
     assert_eq!(acc1_status, reqwest::StatusCode::OK);
     let acc1_val: Value = serde_json::from_slice(&acc1_bytes)?;
-    let acc1_proof = protocol::verify_direct_request_acceptance_proof(
+    let acc1_proof = protocol::verify_received_direct_request_acceptance_proof(
         &serde_json::to_vec(&acc1_val["acceptanceProof"])?,
         &fixture1.server.receipt_public_key,
         &bob_public1,
@@ -600,10 +600,12 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         r2_state_val["state"]["directRequest"]["consent"],
         "incomingPending"
     );
-    assert_eq!(
-        r2_state_val["state"]["directRequest"]["contextHash"],
-        STANDARD.encode(req2_context_hash)
-    );
+    let r2_request = protocol::normalize_read_presentation(
+        &serde_json::to_vec(&r2_state_val["state"]["directRequest"])?,
+        "directRequestState",
+        false,
+    )?;
+    assert_eq!(r2_request["contextHash"], STANDARD.encode(req2_context_hash));
 
     // Read preview/pending conversation state for Request 2 (outgoingPending for Alice)
     let (r2_alice_status, r2_alice_bytes) = fixture2
@@ -850,16 +852,13 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         "expected SKIP_MIGRATIONS log marker"
     );
 
-    // Save evidence artifacts (supports C34_EVIDENCE_DIR override to avoid silently clobbering recorded sha256)
+    // Save evidence artifacts: only write to a custom evidence directory when
+    // C34_EVIDENCE_DIR is explicitly configured. Default to an isolated run-scoped
+    // temp directory so test runs never silently clobber recorded artifact sha256s.
     let evidence_dir = std::env::var("C34_EVIDENCE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("docs/generated-artifacts/encrypted-requests/evidence/c34")
+            std::env::temp_dir().join(format!("c34_run_{}", Uuid::new_v4().simple()))
         });
     std::fs::create_dir_all(&evidence_dir)?;
 

@@ -104,6 +104,14 @@ pub async fn post(s: &StagedRequest, nsid: &str, signed: &Value) -> anyhow::Resu
     Ok((status, value))
 }
 
+/// `getDirectRequestOutcome` presents lexicon `{"$bytes":…}`; normalize it the
+/// way a client does so it compares with mutation responses and retained rows.
+pub fn normalized_outcome(value: Value) -> anyhow::Result<Value> {
+    // Under F27, both outcome reads and mutation responses present lexicon bytes
+    // uniformly at response time, so no client-side de-normalization is needed.
+    Ok(value)
+}
+
 pub async fn outcome(s: &StagedRequest, request_id: Uuid) -> anyhow::Result<(reqwest::StatusCode, Value)> {
     let (status, bytes) = s
         .alice
@@ -111,7 +119,7 @@ pub async fn outcome(s: &StagedRequest, request_id: Uuid) -> anyhow::Result<(req
         .await?;
     let value = serde_json::from_slice(&bytes)
         .with_context(|| format!("outcome body: {}", String::from_utf8_lossy(&bytes)))?;
-    Ok((status, value))
+    Ok((status, normalized_outcome(value)?))
 }
 
 type Pending = tokio::task::JoinHandle<anyhow::Result<(reqwest::StatusCode, Value)>>;
@@ -133,7 +141,7 @@ pub fn spawn_outcome(s: &StagedRequest, request_id: Uuid) -> Pending {
         let (status, bytes) = alice
             .get(&client, &base, OUTCOME_NSID, &[("requestId".into(), request_id.to_string())])
             .await?;
-        Ok((status, serde_json::from_slice(&bytes)?))
+        Ok((status, normalized_outcome(serde_json::from_slice(&bytes)?)?))
     })
 }
 
@@ -146,7 +154,7 @@ pub fn verified_receipt(s: &StagedRequest, response: &Value) -> anyhow::Result<V
     );
     let mut signed = response["outcome"].clone();
     signed.as_object_mut().context("receipt object")?.remove("$type");
-    let verified = protocol::verify_signed_request(
+    let verified = protocol::verify_received_signed_request(
         DirectRequestKind::Outcome,
         &serde_json::to_vec(&signed)?,
         &s.server.receipt_public_key,
@@ -169,7 +177,13 @@ pub fn stored_terminal(request_id: Uuid) -> anyhow::Result<(String, Option<Value
 pub fn untyped_outcome(response: &Value) -> anyhow::Result<Value> {
     let mut value = response["outcome"].clone();
     value.as_object_mut().context("outcome object")?.remove("$type");
-    Ok(value)
+    let raw = serde_json::to_vec(&value)?;
+    let normalized = protocol::normalize_read_presentation(
+        &raw,
+        "signedDirectRequestReceipt",
+        false,
+    )?;
+    Ok(normalized)
 }
 
 /// Real signed `closeConversation` by the staged sender, retiring the

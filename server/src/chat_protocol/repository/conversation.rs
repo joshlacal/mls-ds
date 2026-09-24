@@ -127,7 +127,11 @@ async fn read_conversation_state_in_transaction(
             .map_err(|_| ConversationStateReadError::Invariant)?;
     }
     Ok(CanonicalConversationStateResponse {
-        bytes: serde_json::to_vec(&wire).map_err(|_| ConversationStateReadError::Invariant)?,
+        bytes: crate::chat_protocol::direct_request_transcript::present_endpoint_output(
+            "blue.catbird.chat.getConversationState",
+            serde_json::to_vec(&wire).map_err(|_| ConversationStateReadError::Invariant)?,
+        )
+        .map_err(|_| ConversationStateReadError::Invariant)?,
     })
 }
 

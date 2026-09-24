@@ -167,7 +167,7 @@ async fn retained_welcome(
     let state: Value = serde_json::from_slice(&raw)?;
     assert_eq!(state["state"]["directRequest"]["consent"], "accepted");
     let accepting_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
-    let proof = protocol::verify_direct_request_acceptance_proof(
+    let proof = protocol::verify_received_direct_request_acceptance_proof(
         &serde_json::to_vec(&state["state"]["directRequest"]["acceptanceProof"])?,
         &f.server.receipt_public_key,
         &f.bob_engine.identity_public_key(&accepting_identity)?,

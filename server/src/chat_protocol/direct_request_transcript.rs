@@ -1075,7 +1075,7 @@ fn read_definition(name: &str) -> Result<&'static Value> {
 /// not mutation admission: the strict signing and ingress APIs remain unchanged.
 /// Duplicate raw fields are rejected before JSON values can discard evidence.
 /// The returned value still passes the complete closed contract projection.
-pub fn normalize_direct_request_read_presentation(
+pub fn normalize_read_presentation(
     raw: &[u8],
     name: &str,
     tagged: bool,
@@ -1159,6 +1159,135 @@ fn normalize_read_schema(schema: &Value, value: &mut Value, depth: usize) -> Res
     }
     Ok(())
 }
+/// Convert schema-declared bytes fields of a `blue.catbird.chat.defs`
+/// definition to `{"$bytes": <canonical-base64>}` objects, as required by the
+/// lexicon and generated DTOs. Read-time only: retained signed bytes are never
+/// rewritten. Existing `$bytes` objects are kept, so this is idempotent.
+pub fn present_read_presentation(name: &str, value: &mut Value) -> Result<()> {
+    present_read_schema(read_definition(name)?, value, 0)
+}
+
+macro_rules! endpoint_lexicons {
+    ($($name:literal),+ $(,)?) => {
+        [$((
+            concat!("blue.catbird.chat.", $name),
+            include_str!(concat!("../../../lexicon/blue/catbird/chat/blue.catbird.chat.", $name, ".json")),
+        )),+]
+    };
+}
+
+/// Every chat endpoint whose output (or subscription message) schema reaches a
+/// bytes field.
+fn endpoint_output_schema(nsid: &str) -> Option<&'static Value> {
+    static SCHEMAS: std::sync::OnceLock<std::collections::HashMap<&'static str, Value>> =
+        std::sync::OnceLock::new();
+    SCHEMAS
+        .get_or_init(|| {
+            endpoint_lexicons![
+                "acceptConversation", "activateReset", "cancelDirectRequestPreparation",
+                "cancelLeafRecovery", "cancelLeave", "closeConversation", "createConversation",
+                "enrollDevice", "getConversationState", "getConversations", "getDeviceKey",
+                "getDirectRequestOutcome", "getEntries", "getLeafRecoveryInbox", "getOwnDevices",
+                "getPendingWelcomes", "getSubscriptionTicket", "prepareBlobUpload",
+                "prepareDirectRequest", "publishDirectRequest", "replenishKeyPackages",
+                "requestLeafRecovery", "requestLeave", "requestReset", "revokeDevice",
+                "sendMessage", "submitTransition", "updatePushToken", "uploadBlob",
+            ]
+            .into_iter()
+            .map(|(nsid, raw)| {
+                let mut doc: Value = serde_json::from_str(raw).expect("embedded chat lexicon");
+                let main = doc["defs"]["main"].take();
+                let schema = match main["output"]["schema"].is_null() {
+                    true => main["message"]["schema"].clone(),
+                    false => main["output"]["schema"].clone(),
+                };
+                (nsid, schema)
+            })
+            .collect()
+        })
+        .get(nsid)
+}
+
+/// Present a successful endpoint output with lexicon `{"$bytes"}` byte fields.
+/// Endpoints without bytes in their output are returned unchanged.
+pub fn present_endpoint_output(nsid: &str, raw: Vec<u8>) -> Result<Vec<u8>> {
+    let Some(schema) = endpoint_output_schema(nsid) else {
+        return Ok(raw);
+    };
+    let mut value: Value = serde_json::from_slice(&raw).map_err(error)?;
+    present_read_schema(schema, &mut value, 0)?;
+    serde_json::to_vec(&value).map_err(error)
+}
+
+/// Endpoint lexicons reference `blue.catbird.chat.defs#x`; defs use `#x`.
+fn read_ref_name(reference: &str) -> Option<&str> {
+    reference
+        .strip_prefix("blue.catbird.chat.defs")
+        .unwrap_or(reference)
+        .strip_prefix('#')
+}
+
+fn present_read_schema(schema: &Value, value: &mut Value, depth: usize) -> Result<()> {
+    if depth > 128 {
+        return Err(error("read presentation nesting cap"));
+    }
+    match schema["type"].as_str() {
+        Some("ref") => {
+            let name = schema["ref"]
+                .as_str()
+                .and_then(read_ref_name)
+                .ok_or_else(|| error("unsupported read schema reference"))?;
+            present_read_schema(read_definition(name)?, value, depth + 1)?;
+        }
+        Some("bytes") => {
+            if let Some(encoded) = value.as_str() {
+                let bytes = STANDARD.decode(encoded).map_err(error)?;
+                if STANDARD.encode(&bytes) != encoded {
+                    return Err(error("noncanonical bytes presentation"));
+                }
+                *value = serde_json::json!({ "$bytes": encoded });
+            }
+        }
+        Some("object") => {
+            if let Some(object) = value.as_object_mut() {
+                let properties = schema["properties"]
+                    .as_object()
+                    .ok_or_else(|| error("invalid object schema"))?;
+                for (field, value) in object {
+                    if let Some(property) = properties.get(field) {
+                        present_read_schema(property, value, depth + 1)?;
+                    }
+                }
+            }
+        }
+        Some("array") => {
+            if let Some(values) = value.as_array_mut() {
+                for value in values {
+                    present_read_schema(&schema["items"], value, depth + 1)?;
+                }
+            }
+        }
+        Some("union") => {
+            if let Some(type_str) = value.get("$type").and_then(Value::as_str) {
+                let name = type_str
+                    .strip_prefix("blue.catbird.chat.defs#")
+                    .ok_or_else(|| error("invalid read union tag"))?;
+                let allowed = schema["refs"]
+                    .as_array()
+                    .ok_or_else(|| error("invalid union schema"))?
+                    .iter()
+                    .any(|r| r.as_str().and_then(read_ref_name) == Some(name));
+                if !allowed {
+                    return Err(error("unknown read union tag"));
+                }
+                present_read_schema(read_definition(name)?, value, depth + 1)?;
+            }
+        }
+        Some("string" | "integer" | "boolean") => {}
+        _ => return Err(error("unsupported read schema type")),
+    }
+    Ok(())
+}
 
 /// Verify a received read representation through the unchanged strict verifier.
 /// Body values use bare canonical base64 for downstream identity comparisons;
@@ -1172,7 +1301,7 @@ pub fn verify_received_signed_request(
     let wrapper: Value = serde_json::from_slice(raw_wrapper).map_err(error)?;
     let tagged = kind == DirectRequestKind::Outcome && wrapper.get("$type").is_some();
     let normalized =
-        normalize_direct_request_read_presentation(raw_wrapper, kind.wrapper_name(), tagged)?;
+        normalize_read_presentation(raw_wrapper, kind.wrapper_name(), tagged)?;
     let mut verified = verify_signed_request(
         kind,
         &serde_json::to_vec(&normalized).map_err(error)?,
@@ -1189,7 +1318,7 @@ pub fn verify_received_direct_request_acceptance_proof(
     trusted_authority_key: &[u8],
     recipient_device_key: &[u8],
 ) -> Result<Value> {
-    let proof = normalize_direct_request_read_presentation(
+    let proof = normalize_read_presentation(
         raw_proof,
         "directRequestAcceptanceProof",
         false,
@@ -1294,7 +1423,7 @@ mod read_presentation_tests {
                 .unwrap();
             let mut read_body = row["body"].clone();
             present(read_definition(kind.body_name()).unwrap(), &mut read_body);
-            let normalized = normalize_direct_request_read_presentation(
+            let normalized = normalize_read_presentation(
                 &serde_json::to_vec(&read_body).unwrap(),
                 kind.body_name(),
                 true,
@@ -1374,7 +1503,7 @@ mod read_presentation_tests {
         );
         let text = json!({"text":"YWJjZA=="});
         assert_eq!(
-            normalize_direct_request_read_presentation(
+            normalize_read_presentation(
                 &serde_json::to_vec(&text).unwrap(),
                 "directRequestIntroduction",
                 false
@@ -1382,7 +1511,7 @@ mod read_presentation_tests {
             .unwrap(),
             text
         );
-        assert!(normalize_direct_request_read_presentation(
+        assert!(normalize_read_presentation(
             br#"{"text":{"$bytes":"YWJjZA=="}}"#,
             "directRequestIntroduction",
             false

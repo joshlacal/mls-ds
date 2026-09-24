@@ -252,7 +252,9 @@ pub(crate) fn json_ok(response_bytes: Vec<u8>) -> Response {
 
 /// Render facade-owned canonical JSON bytes at their exact validated status.
 /// Endpoint facades use this for deterministic success and terminal-error
-/// material; handlers must not deserialize and reserialize those bytes.
+/// material; handlers must not deserialize and reserialize those bytes. The one
+/// exception is the read-time lexicon `{"$bytes"}` presentation of a success
+/// output, which never alters the retained bytes.
 pub(crate) fn canonical_json_response(
     endpoint: ChatEndpoint,
     status: i32,
@@ -265,6 +267,7 @@ pub(crate) fn canonical_json_response(
     if response_bytes.is_empty() {
         return Err(ChatFailure::invariant(endpoint));
     }
+    let response_bytes = present_success(endpoint, status, response_bytes)?;
     let mut response = Response::new(axum::body::Body::from(response_bytes));
     *response.status_mut() = status;
     response
@@ -273,19 +276,39 @@ pub(crate) fn canonical_json_response(
     Ok(response)
 }
 
-/// Render a completed idempotency record verbatim (OQ-3): the stored status and
-/// exact stored response bytes, with the endpoint content-type.
-pub(crate) fn replay_response(completed: &CompletedIdempotentResponse) -> Response {
+fn present_success(
+    endpoint: ChatEndpoint,
+    status: StatusCode,
+    response_bytes: Vec<u8>,
+) -> Result<Vec<u8>, ChatFailure> {
+    if status != StatusCode::OK {
+        return Ok(response_bytes);
+    }
+    crate::chat_protocol::direct_request_transcript::present_endpoint_output(
+        endpoint.nsid(),
+        response_bytes,
+    )
+    .map_err(|_| ChatFailure::invariant(endpoint))
+}
+
+/// Render a completed idempotency record (OQ-3): the stored status and stored
+/// response bytes, with the same read-time `{"$bytes"}` presentation as the
+/// first response, so a replay is byte-identical to it.
+pub(crate) fn replay_response(
+    endpoint: ChatEndpoint,
+    completed: &CompletedIdempotentResponse,
+) -> Result<Response, ChatFailure> {
     let status = u16::try_from(completed.status())
         .ok()
         .and_then(|value| StatusCode::from_u16(value).ok())
         .unwrap_or(StatusCode::OK);
-    let mut response = Response::new(axum::body::Body::from(completed.response_bytes().to_vec()));
+    let bytes = present_success(endpoint, status, completed.response_bytes().to_vec())?;
+    let mut response = Response::new(axum::body::Body::from(bytes));
     *response.status_mut() = status;
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    response
+    Ok(response)
 }
 
 /// Map a repository authorization failure to the endpoint's declared wire code

@@ -337,7 +337,7 @@ fn receipt(response: &Value, key: &[u8]) -> anyhow::Result<(String, Option<Strin
     let mut signed = response["outcome"].clone();
     signed.as_object_mut().context("receipt object")?.remove("$type");
     let verified =
-        protocol::verify_signed_request(DirectRequestKind::Outcome, &serde_json::to_vec(&signed)?, key)?;
+        protocol::verify_received_signed_request(DirectRequestKind::Outcome, &serde_json::to_vec(&signed)?, key)?;
     let proof = verified.body()["receipt"].clone();
     Ok((
         proof["$type"]

@@ -123,11 +123,20 @@ async fn issue(
         .to_owned();
     let endpoint = jacquard_common::types::string::UriValue::<DefaultStr>::new_owned(endpoint)
         .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+    // Retained scope keeps bare base64; the read presents lexicon bytes (as getConversations does).
+    let inventory_scope = match inventory_scope {
+        Some(mut scope) => {
+            crate::chat_protocol::direct_request_transcript::present_read_presentation(
+                "directRequestInventoryScope",
+                &mut scope,
+            )
+            .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+            Some(serde_json::from_value(scope).map_err(|_| ChatFailure::invariant(ENDPOINT))?)
+        }
+        None => None,
+    };
     let output = GetSubscriptionTicketOutput {
-        inventory_scope: inventory_scope
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|_| ChatFailure::invariant(ENDPOINT))?,
+        inventory_scope,
         endpoint,
         expires_at: chrono_to_datetime(expires_at),
         ticket: ticket.into(),

@@ -153,7 +153,10 @@ async fn alice_publishes_with_note(f: &PublishedRequestFixture, p: &Prepared, no
     let identity = format!("{}#{}", f.alice.did, f.alice.device_id);
     let public = engine.identity_public_key(&identity)?;
     let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&public));
-    let snapshot = p.response.1.pointer("/outcome/preparation").context("preparation snapshot")?;
+    let snapshot = protocol::verify_direct_request_preparation(
+        &serde_json::to_vec(p.response.1.pointer("/outcome/preparation").context("preparation snapshot")?)?,
+        &f.server.receipt_public_key,
+    )?;
     let selected = snapshot["selectedDevices"].as_array().context("selectedDevices")?;
     let verified = protocol::verify_signed_request(DirectRequestKind::Prepare, &serde_json::to_vec(&p.signed)?, &public)?;
     let context = json!({
