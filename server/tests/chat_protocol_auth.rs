@@ -1,3 +1,61 @@
+
+
+pub use catbird_server::auth;
+
+mod repository {
+    pub mod auth {
+        use uuid::Uuid;
+        #[derive(Debug, Clone, Eq, PartialEq)]
+        pub struct ReplayAuditIds;
+        #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+        pub enum RepositoryAuthorityClass {
+            ExistingDevice,
+            EnrollmentBootstrap,
+        }
+        #[derive(Debug, Clone)]
+        pub struct LockedExistingDeviceReadCoordinates<'a> {
+            pub did: &'a str,
+            pub device_id: Uuid,
+            pub textual_jkt: Option<&'a str>,
+            pub auth_generation: i64,
+            pub key_id: &'a str,
+            pub signing_key_sha256: &'a [u8; 32],
+        }
+        #[derive(Debug, Clone)]
+        pub struct RepositoryAuthorityReceipt;
+        impl RepositoryAuthorityReceipt {
+            pub fn class(&self) -> RepositoryAuthorityClass {
+                RepositoryAuthorityClass::ExistingDevice
+            }
+            pub fn operation_id(&self) -> Option<Uuid> {
+                None
+            }
+            pub fn locked_existing_device_read_coordinates(&self) -> Option<LockedExistingDeviceReadCoordinates<'static>> {
+                static DUMMY_HASH: [u8; 32] = [0; 32];
+                Some(LockedExistingDeviceReadCoordinates {
+                    did: "",
+                    device_id: Uuid::nil(),
+                    textual_jkt: None,
+                    auth_generation: 1,
+                    key_id: "",
+                    signing_key_sha256: &DUMMY_HASH,
+                })
+            }
+            pub fn replay_ids(&self) -> ReplayAuditIds {
+                ReplayAuditIds
+            }
+        }
+    }
+    pub mod inventory {
+        use crate::cursor::{EventCursor, InventoryPageDomain, InventorySessionBinding, InventorySessionToken};
+        pub struct LockedInventoryCursorEvidence;
+        impl LockedInventoryCursorEvidence {
+            pub fn into_cursor_parts(self) -> (InventorySessionBinding, InventorySessionToken, EventCursor, InventoryPageDomain, Vec<u8>, u64, u64, u64) {
+                panic!("test stub")
+            }
+        }
+    }
+}
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/cursor.rs"]
 mod cursor;
@@ -11,11 +69,25 @@ mod transcript;
 #[path = "../src/chat_protocol/validation.rs"]
 mod validation;
 
-mod repository {
-    pub(crate) use crate::chat_protocol::repository::inventory;
-}
 
 mod chat_protocol {
+
+    pub mod read_projection {
+        pub struct DummyCanonical;
+        impl DummyCanonical {
+            pub fn bytes(&self) -> &[u8] { &[] }
+        }
+        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
+            _value: &T,
+            _schema: &str,
+        ) -> Result<DummyCanonical, String> {
+            Ok(DummyCanonical)
+        }
+    }
+    pub mod repository {
+        pub use crate::repository::*;
+    }
+
     pub mod cursor {
         pub use crate::cursor::*;
     }
@@ -32,23 +104,6 @@ mod chat_protocol {
         pub use crate::validation::*;
     }
 
-    pub mod repository {
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-    }
 
     pub mod dpop {
         #![allow(dead_code)]
@@ -1295,11 +1350,11 @@ fn ordinary_nest_token_and_dpop_proof_verify_as_one_bound_request() {
 
     assert_eq!(verified.subject().as_str(), DID);
     assert_eq!(verified.device_id().as_str(), DEVICE_ID);
-    assert_eq!(verified.dpop_jkt().as_str(), proof_jkt);
-    assert_eq!(verified.token_replay().issuer(), ISSUER);
-    assert_eq!(verified.token_replay().jti().as_str(), TOKEN_JTI);
-    assert_eq!(verified.proof_replay().jkt().as_str(), proof_jkt);
-    assert_eq!(verified.proof_replay().jti_bytes(), &[1; 12]);
+    assert_eq!(verified.dpop_jkt().unwrap().as_str(), proof_jkt);
+    assert_eq!(verified.token_replay().unwrap().issuer(), ISSUER);
+    assert_eq!(verified.token_replay().unwrap().jti().as_str(), TOKEN_JTI);
+    assert_eq!(verified.proof_replay().unwrap().jkt().as_str(), proof_jkt);
+    assert_eq!(verified.proof_replay().unwrap().jti_bytes(), &[1; 12]);
     assert!(verified.auth_transaction_replay().is_none());
     assert_eq!(
         verified.token_sha256(),
@@ -1312,7 +1367,7 @@ fn ordinary_nest_token_and_dpop_proof_verify_as_one_bound_request() {
     assert_eq!(verified.endpoint().as_str(), "blue.catbird.chat.getEntries");
     assert_eq!(verified.method().as_str(), "GET");
     assert_eq!(verified.htu(), htu);
-    assert_eq!(verified.chat_instance().as_str(), CHAT_INSTANCE);
+    assert_eq!(verified.chat_instance().unwrap().as_str(), CHAT_INSTANCE);
     assert_eq!(verified.token_iat().get(), 1_700_000_000);
     assert_eq!(verified.token_exp().get(), 1_700_000_120);
     assert_eq!(verified.proof_iat().get(), 1_700_000_060);
@@ -1328,10 +1383,10 @@ fn ordinary_nest_token_and_dpop_proof_verify_as_one_bound_request() {
         &now,
     )
     .unwrap();
-    assert_eq!(repeated.token_replay().jti(), verified.token_replay().jti());
+    assert_eq!(repeated.token_replay().unwrap().jti(), verified.token_replay().unwrap().jti());
     assert_eq!(
-        repeated.proof_replay().jti_bytes(),
-        verified.proof_replay().jti_bytes()
+        repeated.proof_replay().unwrap().jti_bytes(),
+        verified.proof_replay().unwrap().jti_bytes()
     );
     assert!(repeated.requires_atomic_replay_consumption());
 
@@ -1810,7 +1865,7 @@ fn enrollment_grant_has_exact_claims_formula_bindings_and_third_replay_identity(
     )
     .unwrap();
     assert_eq!(
-        stale_exact_pre_replay.token_replay().jti().as_str(),
+        stale_exact_pre_replay.token_replay().unwrap().jti().as_str(),
         RETRY_TOKEN_JTI
     );
     assert_eq!(
@@ -1822,12 +1877,12 @@ fn enrollment_grant_has_exact_claims_formula_bindings_and_third_replay_identity(
         RETRY_AUTH_TXN
     );
     assert_ne!(
-        stale_exact_pre_replay.token_replay().jti(),
-        verified.token_replay().jti()
+        stale_exact_pre_replay.token_replay().unwrap().jti(),
+        verified.token_replay().unwrap().jti()
     );
     assert_ne!(
-        stale_exact_pre_replay.proof_replay().jti_bytes(),
-        verified.proof_replay().jti_bytes()
+        stale_exact_pre_replay.proof_replay().unwrap().jti_bytes(),
+        verified.proof_replay().unwrap().jti_bytes()
     );
     assert!(stale_exact_pre_replay
         .validate_enrollment_first_execution_signed_at()
@@ -1929,7 +1984,7 @@ fn rebind_bootstrap_uses_signed_new_jkt_but_remains_pre_repository_authority() {
     let pre_replay =
         verify_rebind_request_auth(&trust, &format!("DPoP {token}"), &proof, bootstrap, &now)
             .unwrap();
-    assert_eq!(pre_replay.dpop_jkt().as_str(), new_jkt);
+    assert_eq!(pre_replay.dpop_jkt().unwrap().as_str(), new_jkt);
     assert!(pre_replay.requires_atomic_replay_consumption());
     assert_eq!(pre_replay.trusted_instant().as_str(), now.as_str());
     let carried_bootstrap = pre_replay.rebind_bootstrap().unwrap();

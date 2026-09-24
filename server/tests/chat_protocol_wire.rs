@@ -37,13 +37,6 @@ fn xwing_kem_output_is_valid(_bytes: &[u8]) -> bool {
     false
 }
 
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/snapshot.rs"]
-mod snapshot;
-
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/wire.rs"]
-mod source_wire;
 
 const TEST_ALICE_CREDENTIAL: &[u8] = b"did:web:a.co#00000000-0000-4000-8000-000000000001";
 const TEST_BOB_CREDENTIAL: &[u8] = b"did:web:b.co#00000000-0000-4000-8000-000000000002";
@@ -2726,12 +2719,12 @@ fn group_info_uses_repository_signed_time_floor_instead_of_os_time() {
     const REPOSITORY_SIGNED_TIME_MILLIS: i64 = 150_999;
 
     assert_eq!(
-        source_wire::trusted_unix_millis_to_seconds(-1),
+        catbird_server::chat_protocol::wire::trusted_unix_millis_to_seconds(-1),
         None,
         "pre-epoch sealed instants are outside the protocol time domain"
     );
     assert_eq!(
-        source_wire::trusted_unix_millis_to_seconds(999),
+        catbird_server::chat_protocol::wire::trusted_unix_millis_to_seconds(999),
         Some(0),
         "the production seam is total and floors nonnegative subseconds"
     );
@@ -2773,7 +2766,7 @@ fn group_info_uses_repository_signed_time_floor_instead_of_os_time() {
     );
 
     let repository_time_seconds =
-        source_wire::trusted_unix_millis_to_seconds(REPOSITORY_SIGNED_TIME_MILLIS)
+        catbird_server::chat_protocol::wire::trusted_unix_millis_to_seconds(REPOSITORY_SIGNED_TIME_MILLIS)
             .expect("sealed repository time is nonnegative");
     assert_eq!(
         repository_time_seconds, 150,

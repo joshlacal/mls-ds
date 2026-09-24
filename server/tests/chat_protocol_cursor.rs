@@ -1,3 +1,5 @@
+
+
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
@@ -8,10 +10,13 @@ mod validation;
 #[allow(dead_code)]
 mod repository {
     pub(crate) mod inventory {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/inventory.rs"
-        ));
+        use crate::cursor::{EventCursor, InventoryPageDomain, InventorySessionBinding, InventorySessionToken};
+        pub struct LockedInventoryCursorEvidence;
+        impl LockedInventoryCursorEvidence {
+            pub fn into_cursor_parts(self) -> (InventorySessionBinding, InventorySessionToken, EventCursor, InventoryPageDomain, Vec<u8>, u64, u64, u64) {
+                panic!("stub")
+            }
+        }
     }
 }
 
