@@ -585,4 +585,5 @@ pub(crate) async fn read_leaf_recovery_inbox(
 }
 
 #[cfg(test)]
+#[path = "welcome/tests.rs"]
 mod tests;

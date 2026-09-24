@@ -5055,4 +5055,5 @@ mod projection_integrity_tests {
 }
 
 #[cfg(test)]
+#[path = "relationship_policy/tests.rs"]
 mod tests;

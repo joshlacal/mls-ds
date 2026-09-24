@@ -1,7 +1,7 @@
 use super::*;
 use super as relationship_policy;
-use crate::chat_protocol::model;
-use crate::chat_protocol::validation::{self, CanonicalTimestamp, TrustedRequestInstant};
+use super::super::model;
+use super::super::validation::{self, CanonicalTimestamp, TrustedRequestInstant};
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeDelta, TimeZone, Utc};

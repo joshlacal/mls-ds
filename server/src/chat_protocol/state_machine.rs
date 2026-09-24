@@ -20445,4 +20445,5 @@ mod direct_request_history_tests {
 }
 
 #[cfg(test)]
+#[path = "state_machine/tests.rs"]
 mod tests;
