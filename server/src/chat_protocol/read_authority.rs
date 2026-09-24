@@ -2102,3 +2102,23 @@ pub(crate) async fn inventory_authorities(
     revalidate_fence_after_heads(tx, &fence).await?;
     Ok(authorities.into_boxed_slice())
 }
+
+#[cfg(test)]
+impl LockedReadDeviceAuthority {
+    pub(in crate::chat_protocol) fn for_test(
+        user_did: String,
+        device_id: uuid::Uuid,
+        jkt: Option<String>,
+        auth_generation: u64,
+    ) -> Self {
+        Self {
+            txid: 0,
+            user_did,
+            device_id,
+            jkt,
+            auth_generation,
+            active_key_id: String::new(),
+            device_row_sha256: [0; 32],
+        }
+    }
+}

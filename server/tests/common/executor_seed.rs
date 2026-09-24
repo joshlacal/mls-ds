@@ -3409,7 +3409,16 @@ pub(crate) mod genuine_terminal_fixture {
         let server_fields = verified
             .server_fields_dag_cbor()
             .expect("policy server fields");
-        let authority = HydrationAuthority::new(entry.cid).expect("policy authority");
+        let head = crate::chat_protocol::repository::core::LockedConversationHeadGuard::for_test(
+            "1".to_string(),
+            Uuid::from_bytes(entry.cid),
+            Some(*prior),
+            seq,
+            instant(at),
+            [1; 32],
+        );
+        let authority = HydrationAuthority::from_locked_existing_head(&head)
+            .expect("policy hydration authority");
         let transition = authority
             .control_transition(verified)
             .expect("policy transition authority");

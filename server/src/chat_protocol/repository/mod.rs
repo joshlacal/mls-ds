@@ -85,3 +85,5 @@ mod transition_repository_tests;
 #[cfg(test)]
 #[path = "auth/tests.rs"]
 mod auth_repository_tests;
+#[cfg(test)]
+mod inventory_tests;
