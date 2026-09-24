@@ -1,4 +1,5 @@
 use super::*;
+use super::ticket::*;
 use crate::chat_protocol::cursor::{CursorSealer, SealerBinding, SecureRandom, SecureRandomError};
 use zeroize::Zeroizing;
 
@@ -146,7 +147,7 @@ use tokio::time::{sleep, Duration as TokioDuration};
 use tower_util::ServiceExt;
 use uuid::Uuid;
 
-use super::{
+use super::ticket::{
     consume_subscription_ticket, insert_event_cursor_receipt, mint_subscription_ticket,
     revalidate_consumed_ticket, ticket_hash, MintSubscriptionTicket, NewEventCursorReceipt,
     TicketRepositoryError, SUBSCRIBE_EVENTS_PATH,

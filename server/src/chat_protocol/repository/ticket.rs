@@ -573,7 +573,7 @@ pub(crate) struct NewEventCursorReceipt {
 }
 
 impl NewEventCursorReceipt {
-    fn validate(&self) -> Result<(), TicketRepositoryError> {
+    pub(super) fn validate(&self) -> Result<(), TicketRepositoryError> {
         if self.cursor_hash == [0; HASH_BYTES]
             || self
                 .predecessor_cursor_hash
@@ -733,7 +733,7 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
 /// Hash a canonical 32-byte random capability. This helper is intentionally
 /// private to the repository boundary so callers cannot accidentally persist
 /// decoded capability bytes.
-fn capability_hash(encoded: &str) -> Result<[u8; HASH_BYTES], TicketRepositoryError> {
+pub(super) fn capability_hash(encoded: &str) -> Result<[u8; HASH_BYTES], TicketRepositoryError> {
     if encoded.len() != CAPABILITY_ASCII_BYTES {
         return Err(TicketRepositoryError::InvalidCapability);
     }
@@ -757,7 +757,3 @@ fn fixed_hash(value: Vec<u8>) -> Result<[u8; HASH_BYTES], TicketRepositoryError>
         .try_into()
         .map_err(|_| TicketRepositoryError::InvalidReceipt)
 }
-
-#[cfg(test)]
-#[path = "ticket/tests.rs"]
-mod tests;

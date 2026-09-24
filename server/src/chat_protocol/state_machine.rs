@@ -20443,7 +20443,3 @@ mod direct_request_history_tests {
             .is_err());
     }
 }
-
-#[cfg(test)]
-#[path = "state_machine/tests.rs"]
-mod tests;

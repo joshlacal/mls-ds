@@ -58,3 +58,15 @@ mod concurrency_tests;
 mod rollback_tests;
 #[cfg(test)]
 mod inventory_repository_tests;
+#[cfg(test)]
+#[path = "delivery/read_tests.rs"]
+mod delivery_read_tests;
+#[cfg(test)]
+#[path = "welcome/tests.rs"]
+mod welcome_tests;
+#[cfg(test)]
+#[path = "recovery/tests.rs"]
+mod recovery_tests;
+#[cfg(test)]
+#[path = "ticket/tests.rs"]
+mod ticket_tests;

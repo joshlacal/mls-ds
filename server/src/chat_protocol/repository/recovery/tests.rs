@@ -1,8 +1,9 @@
 use super::*;
-use super::super::delivery::{
+use super::delivery::{
     canonical_leaf_recovery_event_payload, canonical_welcome_available_event_payload,
     LeafRecoveryEventStatus,
 };
+use super::recovery::*;
 use crate::chat_protocol::dpop;
 use crate::chat_protocol::model;
 use crate::chat_protocol::public_state;

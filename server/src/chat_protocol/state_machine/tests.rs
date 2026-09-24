@@ -1,5 +1,5 @@
-use super::*;
-use super::hydrate_conversation_state as hydrate_graph;
+use super::state_machine::*;
+use super::state_machine::hydrate_conversation_state as hydrate_graph;
 use crate::chat_protocol;
 use crate::chat_protocol::{
     public_state::{

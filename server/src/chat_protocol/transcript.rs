@@ -3865,7 +3865,3 @@ mod request_presentation_tests {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "transcript/application_entry_tests.rs"]
-mod application_entry_tests;
