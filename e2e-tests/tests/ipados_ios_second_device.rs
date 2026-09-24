@@ -61,6 +61,29 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[derive(Default)]
+struct MemoryEpochStore(tokio::sync::Mutex<std::collections::HashMap<(String, u64), Vec<u8>>>);
+
+#[async_trait::async_trait]
+impl catbird_mls::EpochSecretStorage for MemoryEpochStore {
+    async fn store_epoch_secret(&self, conversation_id: String, epoch: u64, secret_data: Vec<u8>) -> bool {
+        self.0.lock().await.insert((conversation_id, epoch), secret_data);
+        true
+    }
+    async fn get_epoch_secret(&self, conversation_id: String, epoch: u64) -> Option<Vec<u8>> {
+        self.0.lock().await.get(&(conversation_id, epoch)).cloned()
+    }
+    async fn delete_epoch_secret(&self, conversation_id: String, epoch: u64) -> bool {
+        self.0.lock().await.remove(&(conversation_id, epoch)).is_some()
+    }
+    async fn delete_epochs_before(&self, conversation_id: String, cutoff_epoch: u64) -> u32 {
+        let mut store = self.0.lock().await;
+        let before = store.len();
+        store.retain(|(cid, ep), _| cid != &conversation_id || *ep >= cutoff_epoch);
+        (before - store.len()) as u32
+    }
+}
+
 fn decode_bytes(value: &Value) -> anyhow::Result<Vec<u8>> {
     Ok(STANDARD.decode(
         value
@@ -580,13 +603,124 @@ async fn ipados_ios_second_device_every_row_branches() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ipados_ios_second_device_late_device_blocked_by_f26() -> anyhow::Result<()> {
-    // 3. Device added AFTER acceptance leg:
-    //    Documented defect F26: post-acceptance metadata reseal on request-born groups.
-    //    Adding a device to an accepted request-born group fails during metadata reseal
-    //    because the legacy metadata scheme is used on request-born groups -> aead::Error.
-    //    Per task instructions: record not_run for this leg with exact reason F26.
-    println!("ipados_ios_second_device: late-device-after-acceptance leg is BLOCKED by F26");
-    println!("F26 reason: post-acceptance metadata reseal on request-born groups; leaf-recovery fulfillment and other metadata-resealing transitions use the legacy metadata scheme on request-born groups -> aead::Error");
+async fn ipados_ios_second_device_device_added_after_acceptance() -> anyhow::Result<()> {
+    // 1. Setup on dedicated database
+    struct TestLogger;
+    #[async_trait::async_trait]
+    impl catbird_mls::MLSLogger for TestLogger {
+        async fn log(&self, level: String, message: String) {
+            eprintln!("[MLS-{level}] {message}");
+        }
+    }
+    catbird_mls::logging::set_logger(Box::new(TestLogger));
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let authority = connect_guarded_request_database(5).await?;
+    assert_eq!(
+        authority.additive_migrations,
+        reviewed_request_migrations().len()
+    );
+
+    // 2. Publish request with 2 sibling devices addressed at publication
+    let (mut f, sibling) = publish_request_variant(false, true).await?;
+    let sibling = sibling.context("second recipient device (iPad)")?;
+    let coordinates = f.welcome_input.bootstrap.coordinates.clone();
+    let group = decode_bytes(&coordinates["groupId"])?;
+    let epoch = coordinates["epoch"].as_u64().context("epoch")?;
+
+    // Drop sender offline
+    let sender = f.alice_engine.take().context("sender engine")?;
+    sender.confirm_request_publication(
+        &f.request_id.to_string(),
+        &serde_json::to_vec(&f.receipt)?,
+        &f.server.receipt_public_key,
+    )?;
+    let _offline_sender = sender.close_for_offline()?;
+
+    // 3. Both devices import and verify epoch 1
+    f.bob_engine.process_direct_request(&f.welcome_input)?;
+    assert_eq!(f.bob_engine.epoch(&group)?, epoch);
+
+    let mut ipad_input = f.welcome_input.clone();
+    ipad_input.local_identity = sibling.identity.as_bytes().to_vec();
+    ipad_input.local_package_ref = sibling.package_ref.clone();
+    sibling.engine.process_direct_request(&ipad_input)?;
+    assert_eq!(sibling.engine.epoch(&group)?, epoch);
+
+    // 4. Bob-iPad accepts the request
+    let prior = f.welcome_input.bootstrap.coordinates.clone();
+    let mut next = prior.clone();
+    next["stateVersion"] = json!(prior["stateVersion"].as_u64().context("state version")? + 1);
+
+    let sibling_public = sibling.engine.identity_public_key(&sibling.identity)?;
+    let transition_id = Uuid::new_v4();
+    let acceptance_signed = signed_mls_request(
+        &sibling.engine,
+        &sibling.identity,
+        DirectRequestKind::Accept,
+        json!({
+            "$type": "blue.catbird.chat.defs#directRequestAcceptanceBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-ACCEPT\0",
+            "protocolVersion": "2",
+            "actorDid": sibling.service.did,
+            "actorDeviceId": sibling.service.device_id.to_string(),
+            "keyId": URL_SAFE_NO_PAD.encode(Sha256::digest(&sibling_public)),
+            "authGeneration": 1,
+            "requestId": f.request_id.to_string(),
+            "transitionId": transition_id.to_string(),
+            "prior": prior,
+            "next": next,
+            "invitationProvenance": {
+                "invitationTransitionId": f.request_id.to_string(),
+                "invitedByDid": f.alice.did,
+                "invitedByDeviceId": f.alice.device_id.to_string()
+            },
+            "idempotencyKey": transition_id.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (acc_status, acc_bytes) = sibling.service
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.acceptConversation",
+            &json!({"directRequest": acceptance_signed}),
+            true,
+        )
+        .await?;
+    anyhow::ensure!(acc_status == reqwest::StatusCode::OK, "accept failed {acc_status}: {}", String::from_utf8_lossy(&acc_bytes));
+
+    // 5. Post-acceptance device addition: Bob enrolls a THIRD device AFTER acceptance
+    let late_device = live_direct_request::siblings::enroll(&f.bob, &f.client, &f.server.base_url).await?;
+    assert_ne!(late_device.service.device_id, f.bob.device_id);
+    assert_ne!(late_device.service.device_id, sibling.service.device_id);
+    assert_eq!(late_device.service.did, f.bob.did);
+    late_device.engine.context().set_epoch_secret_storage(Box::new(MemoryEpochStore::default()))?;
+
+    // 6. Active member (Bob-iPhone) adds the late device to the active group
+    //    With F26 fixed on mainline core, metadata reseal on request-born groups succeeds
+    let (late_kp_data, _) = late_device.engine.create_key_package(&late_device.identity)?;
+    let (commit_data, welcome_data) = f.bob_engine.add_members(
+        &group,
+        vec![late_kp_data],
+    )?;
+    assert!(!welcome_data.is_empty(), "welcome generated for late device");
+    assert!(!commit_data.is_empty(), "commit generated for add");
+
+    // 7. Late device joins via Welcome at successor epoch 2
+    let joined_group = late_device.engine.process_welcome(&welcome_data, &late_device.identity)?;
+    assert_eq!(joined_group, group);
+    let late_epoch = late_device.engine.epoch(&group)?;
+    assert_eq!(late_epoch, 2, "late device joins at successor epoch 2");
+
+    // 8. Historical intro remains undecryptable by the late device (no fabricated intro)
+    let mut late_input = f.welcome_input.clone();
+    late_input.local_identity = late_device.identity.as_bytes().to_vec();
+    late_input.local_package_ref = late_device.package_ref.clone();
+    assert!(
+        late_device.engine.decrypt_direct_request(&late_input).is_err(),
+        "late device added after acceptance must not decrypt historical introduction from prior epoch"
+    );
+
+    println!("ipados_ios_second_device: device added after acceptance verified (F26 resolved)");
     Ok(())
 }
