@@ -781,19 +781,68 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
     println!("C34: Captured exact baseline server refusal: {expected_refusal_phrase}");
 
     // 4b. Forced SKIP_MIGRATIONS=1 run: verify baseline has no direct request routes
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let skip_port = listener.local_addr()?.port();
+    drop(listener);
+
     let mut skip_child = Command::new(baseline_binary)
         .env("DATABASE_URL", &dedicated_url)
         .env("SKIP_MIGRATIONS", "1")
+        .env("SERVICE_DID", "did:web:chat.catbird.blue")
+        .env("SELF_ENDPOINT", "https://chat.catbird.blue")
+        .env("SERVER_HOST", "127.0.0.1")
+        .env("SERVER_PORT", skip_port.to_string())
+        .env("PORT", skip_port.to_string())
+        .env("S3_ACCESS_KEY", "test")
+        .env("S3_SECRET_KEY", "test")
+        .env("S3_BUCKET", "test")
+        .env("S3_ENDPOINT", "http://127.0.0.1:9000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("spawn baseline with SKIP_MIGRATIONS")?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Wait for baseline server readiness (replaces flaky sleep)
+    let stdout = skip_child.stdout.take().context("skip_child stdout")?;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        let mut signaled = false;
+        let mut ready_sender = Some(ready_tx);
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if line.contains("Server listening on") && !signaled {
+                signaled = true;
+                if let Some(tx) = ready_sender.take() {
+                    let _ = tx.send(());
+                }
+            }
+            lines.push(std::mem::take(&mut line));
+        }
+        lines.join("")
+    });
+
+    let _ = tokio::time::timeout(Duration::from_secs(15), ready_rx).await;
+
+    // Probe direct-request route on running baseline: must be 404 / route absence
+    let probe_client = reqwest::Client::builder().build()?;
+    let probe_url = format!("http://127.0.0.1:{skip_port}/xrpc/blue.catbird.chat.prepareDirectRequest");
+    let probe_resp = probe_client.post(&probe_url).send().await
+        .context("probe baseline server route")?;
+    assert_eq!(
+        probe_resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "baseline server must return 404 for direct request routes"
+    );
+    println!("C34: Confirmed baseline server returns 404 for direct-request route");
+
     let _ = skip_child.kill();
     let skip_out = skip_child.wait_with_output()?;
+    let skip_stdout = stdout_reader.join().unwrap_or_default();
     let skip_combined = format!(
         "{}\n{}",
-        String::from_utf8_lossy(&skip_out.stdout),
+        skip_stdout,
         String::from_utf8_lossy(&skip_out.stderr)
     );
     assert!(
@@ -801,13 +850,17 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         "expected SKIP_MIGRATIONS log marker"
     );
 
-    // Save evidence artifacts
-    let evidence_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .context("mls-ds parent")?
-        .parent()
-        .context("isolated root")?
-        .join("docs/generated-artifacts/encrypted-requests/evidence/c34");
+    // Save evidence artifacts (supports C34_EVIDENCE_DIR override to avoid silently clobbering recorded sha256)
+    let evidence_dir = std::env::var("C34_EVIDENCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("docs/generated-artifacts/encrypted-requests/evidence/c34")
+        });
     std::fs::create_dir_all(&evidence_dir)?;
 
     let refusal_log_path = evidence_dir.join("c34-baseline-refusal.log");
@@ -815,7 +868,6 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
 
     let skip_log_path = evidence_dir.join("c34-baseline-skip-migrations.log");
     std::fs::write(&skip_log_path, skip_combined.as_bytes())?;
-
     println!(
         "C34: Saved baseline refusal logs to {}",
         evidence_dir.display()

@@ -180,9 +180,12 @@ async fn execute_first(
     .await?;
     if aggregate.head().transaction_id() != scope_authority.transaction_id()
         || aggregate.head().prior_coordinate() != Some(aggregate.state().coordinate())
-        || parsed
-            .prior
-            .is_some_and(|prior| aggregate.state().coordinate() != &prior)
+    {
+        return Err(LeaveFacadeError::InvalidCanonicalMaterial);
+    }
+    if parsed
+        .prior
+        .is_some_and(|prior| aggregate.state().coordinate() != &prior)
     {
         return Err(LeaveFacadeError::StateMachine(crate::chat_protocol::state_machine::StateMachineError::StaleCoordinates));
     }

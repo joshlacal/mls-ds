@@ -312,6 +312,40 @@ impl Barrier {
         anyhow::bail!("barrier session exited before holding locks")
     }
 
+    /// Holds chat.conversations FOR UPDATE for this conversation_id.
+    /// Used for close-vs-accept races where both execution transactions
+    /// lock chat.conversations FOR UPDATE OF c before transition planning.
+    fn hold_conversation(conversation_id: Uuid) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            dedicated_request_database_name(request_database_url()).is_some(),
+            "barrier races must run on a dedicated catbird_direct_requests_fault_<hex> database"
+        );
+        let mut child = Command::new("psql")
+            .args([request_database_url(), "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let mut stdin = child.stdin.take().context("barrier stdin")?;
+        writeln!(
+            stdin,
+            "BEGIN;\nSELECT pg_backend_pid();\n\
+             SELECT 1 FROM chat.conversations WHERE conversation_id = '{conversation_id}' FOR UPDATE;\n\
+             \\echo BARRIER-HELD"
+        )?;
+        stdin.flush()?;
+        let stdout = child.stdout.take().context("barrier stdout")?;
+        let mut lines = BufReader::new(stdout).lines();
+        let pid_line = lines.next().context("barrier pid")??;
+        let pid: i64 = pid_line.trim().parse()?;
+        for line in lines.by_ref() {
+            if line?.trim() == "BARRIER-HELD" {
+                return Ok(Self { child, stdin, pid });
+            }
+        }
+        anyhow::bail!("barrier session exited before holding conversation lock")
+    }
+
     /// Sessions of this dedicated database blocked, directly or transitively,
     /// by the barrier session.
     fn waiters(&self) -> anyhow::Result<i64> {
@@ -1256,10 +1290,10 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
     assert_eq!(durable_comprehensive(&f)?, before, "Recipient arbitrary Add must leave graph unchanged");
 
     // ========================================================================
-    // PART C: Close / decline remain available
-    // ========================================================================
+// PART C: Close / per-device Welcome rejection remain available
+// ========================================================================
 
-    // 1. Decline: Bob calls rejectWelcome with real signed welcomeRejectionBody -> succeeds!
+// 1. Per-device Welcome rejection: Bob calls rejectWelcome with real signed welcomeRejectionBody -> succeeds!
     let bob_reject_id = Uuid::new_v4();
     let bob_reject_body = json!({
         "$type": "blue.catbird.chat.defs#welcomeRejectionBody",
@@ -1283,9 +1317,14 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         String::from_utf8_lossy(&reject_bytes)
     );
     let reject_resp: Value = serde_json::from_slice(&reject_bytes)?;
-    assert_eq!(reject_resp["status"], "rejected", "Decline outcome must be recorded as rejected");
+    assert_eq!(reject_resp["status"], "rejected", "rejectWelcome outcome must be recorded as rejected");
+    assert_eq!(
+        psql_cmd(&format!("SELECT count(*) FROM chat.direct_request_welcome_outcomes WHERE request_id='{}' AND recipient_did='{}' AND status='rejected'", f.request_id, f.bob.did))?,
+        "1",
+        "rejectWelcome must be recorded durably in direct_request_welcome_outcomes"
+    );
 
-    // 2. Close: Alice calls closeConversation with real signed conversationCloseBody -> succeeds!
+    // 2. Terminal close (account decline / creator close): Alice calls closeConversation with real signed conversationCloseBody -> succeeds!
     let (close_env, close_tx_id) = close_envelope(&f, true, None)?;
     let (close_status, close_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.closeConversation", &close_env, true).await?;
     anyhow::ensure!(
@@ -1306,10 +1345,6 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "Production code must record closeConversation transition row"
     );
 
-    // prepareBlobUpload maps every prelude error to an opaque 500 and also
-    // returned 500 for the same body shape after a real acceptance (probe
-    // recorded in evidence/c18), so its pending refusal is NOT attributed to the
-    // consent gate; attachment binds are covered by sendMessage blobBindings.
     release_by_close(&third).await?;
     Ok(())
 }
@@ -1656,8 +1691,10 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
         "signedAt": canonical_now()
     });
     let signed_ack = sign_mutation(&f.bob_engine, &bob_identity, SignedMutationKind::WelcomeAcknowledgement, ack_body)?;
-    let (ack_status, _) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.acknowledgeWelcome", &json!({"signedRequest": signed_ack}), true).await?;
-    assert!(!ack_status.is_success(), "Late welcome acknowledgement on closed conversation must fail");
+    let (ack_status, ack_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.acknowledgeWelcome", &json!({"signedRequest": signed_ack}), true).await?;
+    assert_eq!(ack_status, reqwest::StatusCode::BAD_REQUEST, "Late welcome acknowledgement on closed conversation must fail 400: {ack_status}");
+    let ack_err: Value = serde_json::from_slice(&ack_bytes)?;
+    assert_eq!(ack_err["error"], "WelcomeSuperseded", "Late ack on closed conversation returns typed WelcomeSuperseded error");
     assert_eq!(durable_comprehensive(&f)?, durable_after_close, "Late ack must leave graph unchanged");
 
     // Attempt C: Late sendMessage by Alice -> REJECTED
@@ -1716,17 +1753,95 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
 
     Ok(())
 }
-
 #[tokio::test(flavor = "multi_thread")]
-async fn c20_close_racing_accept_barrier_one_winner() -> anyhow::Result<()> {
-    // Publish a fresh direct request fixture
+async fn c20_close_racing_accept_close_wins() -> anyhow::Result<()> {
     let f = live_direct_request::publish_request(false).await?;
     f.alice_engine.as_ref().context("Alice engine")?.confirm_request_publication(
         &f.request_id.to_string(),
         &serde_json::to_vec(&f.receipt)?,
         &f.server.receipt_public_key,
     )?;
+    let (close_env, _close_tx_id) = close_envelope(&f, true, None)?;
 
+    let bob_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
+    let bob_public = f.bob_engine.identity_public_key(&bob_identity)?;
+    let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
+    let transition_id = Uuid::new_v4();
+    let accept_body = json!({
+        "$type": "blue.catbird.chat.defs#directRequestAcceptanceBody",
+        "signatureDomain": "CATBIRD-DIRECT-REQUEST-ACCEPT\0",
+        "protocolVersion": "2",
+        "actorDid": f.bob.did,
+        "actorDeviceId": f.bob.device_id.to_string(),
+        "keyId": bob_key_id,
+        "authGeneration": 1,
+        "transitionId": transition_id.to_string(),
+        "requestId": f.request_id.to_string(),
+        "prior": f.publication["body"]["next"],
+        "next": {
+            "conversationId": f.conversation_id.to_string(),
+            "generation": 0,
+            "stateVersion": 2,
+            "groupId": f.publication["body"]["next"]["groupId"],
+            "epoch": 1,
+            "lifecycle": "active",
+            "groupContextHash": f.publication["body"]["next"]["groupContextHash"],
+            "confirmationTag": f.publication["body"]["next"]["confirmationTag"]
+        },
+        "invitationProvenance": {
+            "invitationTransitionId": f.request_id.to_string(),
+            "invitedByDid": f.alice.did,
+            "invitedByDeviceId": f.alice.device_id.to_string()
+        },
+        "idempotencyKey": transition_id.to_string(),
+        "signedAt": canonical_now()
+    });
+    let signed_accept = signed_mls_request(&f.bob_engine, &bob_identity, DirectRequestKind::Accept, accept_body)?;
+    let accept_env = json!({"directRequest": signed_accept});
+
+    // Queue close first on chat.conversations FOR UPDATE (which both take in execution):
+    let barrier = Barrier::hold_conversation(f.conversation_id)?;
+    let close_future = {
+        let (who, client, base, env) = (f.alice.clone(), f.client.clone(), f.server.base_url.clone(), close_env.clone());
+        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.closeConversation", &env, true).await })
+    };
+    let queued_first = barrier.wait_for_waiters(1).await?;
+
+    // Then queue accept: Bob's accept blocks behind close.
+    let accept_future = {
+        let (who, client, base, env) = (f.bob.clone(), f.client.clone(), f.server.base_url.clone(), accept_env.clone());
+        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.acceptConversation", &env, true).await })
+    };
+    let queued_both = barrier.wait_for_waiters(2).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    barrier.release()?;
+
+    let (close_status, close_bytes) = close_future.await??;
+    let (accept_status, accept_bytes) = accept_future.await??;
+    eprintln!("C20 close-vs-accept close-wins arm: queued first={queued_first} both={queued_both} close={close_status} accept={accept_status}");
+
+    assert_eq!(close_status, reqwest::StatusCode::OK, "Close must win when queued first: {close_status}: {}", String::from_utf8_lossy(&close_bytes));
+    assert_eq!(accept_status, reqwest::StatusCode::BAD_REQUEST, "Accept must fail 400 InvitationNotPending when close wins: {accept_status}");
+    let accept_err: Value = serde_json::from_slice(&accept_bytes)?;
+    assert_eq!(accept_err["error"], "InvitationNotPending", "Loser accept gets InvitationNotPending");
+
+    let winners: String = psql_cmd(&format!(
+        "SELECT string_agg(kind, ',' ORDER BY kind) FROM chat.transitions WHERE conversation_id='{}' AND kind IN ('closeConversation','directRequestAcceptance')",
+        f.conversation_id
+    ))?;
+    assert_eq!(winners, "closeConversation", "only close transition is durable");
+    release_by_close(&f).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c20_close_racing_accept_accept_wins() -> anyhow::Result<()> {
+    let f = live_direct_request::publish_request(false).await?;
+    f.alice_engine.as_ref().context("Alice engine")?.confirm_request_publication(
+        &f.request_id.to_string(),
+        &serde_json::to_vec(&f.receipt)?,
+        &f.server.receipt_public_key,
+    )?;
     let (close_env, _close_tx_id) = close_envelope(&f, true, None)?;
 
     let bob_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
@@ -1766,57 +1881,38 @@ async fn c20_close_racing_accept_barrier_one_winner() -> anyhow::Result<()> {
     let signed_accept = signed_mls_request(&f.bob_engine, &bob_identity, DirectRequestKind::Accept, accept_body)?;
     let accept_env = json!({"directRequest": signed_accept});
 
-    // Race close (by Alice) vs accept (by Bob): both transactions queue behind a
-    // row-lock barrier on both principals, then are released together.
-    let barrier = Barrier::hold(&[&f.alice.did, &f.bob.did])?;
-    let close_future = {
-        let (who, client, base, env) = (f.alice.clone(), f.client.clone(), f.server.base_url.clone(), close_env.clone());
-        tokio::spawn(async move {
-            who.post(&client, &base, "blue.catbird.chat.closeConversation", &env, true).await
-        })
-    };
+    // Queue accept first on chat.conversations FOR UPDATE (which both take in execution):
+    let barrier = Barrier::hold_conversation(f.conversation_id)?;
     let accept_future = {
         let (who, client, base, env) = (f.bob.clone(), f.client.clone(), f.server.base_url.clone(), accept_env.clone());
-        tokio::spawn(async move {
-            who.post(&client, &base, "blue.catbird.chat.acceptConversation", &env, true).await
-        })
+        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.acceptConversation", &env, true).await })
     };
+    let queued_first = barrier.wait_for_waiters(1).await?;
 
-    let queued = barrier.wait_for_waiters(2).await?;
-    eprintln!("C20 close-vs-accept race: queued={queued}");
+    // Then queue close: Alice's close blocks behind accept.
+    let close_future = {
+        let (who, client, base, env) = (f.alice.clone(), f.client.clone(), f.server.base_url.clone(), close_env.clone());
+        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.closeConversation", &env, true).await })
+    };
+    let queued_both = barrier.wait_for_waiters(2).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     barrier.release()?;
 
     let (close_status, close_bytes) = close_future.await??;
     let (accept_status, accept_bytes) = accept_future.await??;
+    eprintln!("C20 close-vs-accept accept-wins arm: queued first={queued_first} both={queued_both} close={close_status} accept={accept_status}");
 
-    // Exactly one operation wins the race!
-    let close_won = close_status == reqwest::StatusCode::OK;
-    let accept_won = accept_status == reqwest::StatusCode::OK;
+    assert_eq!(accept_status, reqwest::StatusCode::OK, "Accept must win when queued first: {accept_status}: {}", String::from_utf8_lossy(&accept_bytes));
+    assert_eq!(close_status, reqwest::StatusCode::BAD_REQUEST, "Close with stale prior must fail 400 StaleCoordinates: {close_status}");
+    let close_err: Value = serde_json::from_slice(&close_bytes)?;
+    assert_eq!(close_err["error"], "StaleCoordinates", "Stale prior close must return typed StaleCoordinates error");
 
-    // Durable proof of exactly one authoritative outcome.
     let winners: String = psql_cmd(&format!(
         "SELECT string_agg(kind, ',' ORDER BY kind) FROM chat.transitions WHERE conversation_id='{}' AND kind IN ('closeConversation','directRequestAcceptance')",
         f.conversation_id
     ))?;
-    eprintln!("C20 close-vs-accept race: durable winner={winners} close={close_status} accept={accept_status}");
-
-    if close_won {
-        assert_eq!(accept_status, reqwest::StatusCode::BAD_REQUEST, "When close wins, accept must fail with client error: {accept_status}");
-        let accept_err: Value = serde_json::from_slice(&accept_bytes)?;
-        assert_eq!(accept_err["error"], "InvitationNotPending", "Loser accept gets InvitationNotPending");
-        assert_eq!(winners, "closeConversation", "only the close transition is durable");
-    } else {
-        assert!(accept_won, "If close did not win, accept must have won");
-        assert_eq!(close_status, reqwest::StatusCode::BAD_REQUEST, "When accept wins, close with stale prior must fail 400 StaleCoordinates: {close_status}");
-        let close_err: Value = serde_json::from_slice(&close_bytes)?;
-        assert_eq!(close_err["error"], "StaleCoordinates", "Stale prior close must return typed StaleCoordinates error");
-        assert_eq!(winners, "directRequestAcceptance", "only the acceptance transition is durable");
-        // Release capacity: close from the accepted head.
-        release_by_close_from(&f, Some(accepted_head)).await?;
-        return Ok(());
-    }
-
-    release_by_close(&f).await?;
+    assert_eq!(winners, "directRequestAcceptance", "only accept transition is durable");
+    release_by_close_from(&f, Some(accepted_head)).await?;
     Ok(())
 }
 
@@ -1869,7 +1965,7 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
     let queued = barrier.wait_for_waiters(2).await?;
     barrier.release()?;
     let (close_status, close_bytes) = close_future.await??;
-    let (ack_status, _) = ack_future.await??;
+    let (ack_status, ack_bytes) = ack_future.await??;
     eprintln!("C20 close-vs-import race: queued={queued} close={close_status} ack={ack_status}");
 
     // Close is always permitted while pending, so it is the authoritative outcome
@@ -1884,6 +1980,11 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
         "SELECT count(*) FROM chat.direct_request_welcome_outcomes WHERE request_id='{}' AND status='acknowledged'",
         f.request_id
     ))?;
+    if !ack_status.is_success() {
+        assert_eq!(ack_status, reqwest::StatusCode::BAD_REQUEST, "Late ack must fail 400: {ack_status}");
+        let ack_err: Value = serde_json::from_slice(&ack_bytes)?;
+        assert_eq!(ack_err["error"], "WelcomeSuperseded", "Late ack must return typed WelcomeSuperseded error");
+    }
     assert_eq!(acknowledged, if ack_status.is_success() { "1" } else { "0" }, "ack durability must match its response");
 
     // Authoritative outcome is that the conversation is superseded
