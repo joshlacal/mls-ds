@@ -1017,8 +1017,10 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "idempotencyKey": Uuid::new_v4().to_string(),
         "signedAt": canonical_now()
     }))?;
-    let (bp_status, _) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.prepareBlobUpload", &json!({"signedRequest": alice_blob_prep}), true).await?;
-    assert!(!bp_status.is_success(), "Creator blob upload preparation while pending must fail: {bp_status}");
+    let (bp_status, bp_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.prepareBlobUpload", &json!({"signedRequest": alice_blob_prep}), true).await?;
+    assert_eq!(bp_status, reqwest::StatusCode::BAD_REQUEST, "Creator blob upload preparation must fail 400");
+    let err: Value = serde_json::from_slice(&bp_bytes)?;
+    assert_eq!(err["error"], "ConversationNotAccepted");
     assert_eq!(durable_comprehensive(&f)?, before, "Creator blob upload preparation must leave graph unchanged");
 
     // 6. Metadata/admin change: submitTransition with metadataTransitionBody
@@ -1039,8 +1041,10 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "idempotencyKey": tid_alice_meta,
         "signedAt": canonical_now()
     }))?;
-    let (meta_status, _) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": alice_metadata_trans}), true).await?;
-    assert!(!meta_status.is_success(), "Creator metadata transition while pending must fail: {meta_status}");
+    let (meta_status, meta_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": alice_metadata_trans}), true).await?;
+    assert_eq!(meta_status, reqwest::StatusCode::BAD_REQUEST, "Creator metadata transition must fail 400");
+    let err: Value = serde_json::from_slice(&meta_bytes)?;
+    assert_eq!(err["error"], "ConversationNotAccepted");
     assert_eq!(durable_comprehensive(&f)?, before, "Creator metadata transition must leave graph unchanged");
 
     // 7. Arbitrary Add / admin: submitTransition with policyTransitionBody addParticipant
@@ -1073,8 +1077,10 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "idempotencyKey": tid_alice_policy,
         "signedAt": canonical_now()
     }))?;
-    let (pol_status, _) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": alice_policy}), true).await?;
-    assert!(!pol_status.is_success(), "Creator policy transition (arbitrary Add) while pending must fail: {pol_status}");
+    let (pol_status, pol_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": alice_policy}), true).await?;
+    assert_eq!(pol_status, reqwest::StatusCode::BAD_REQUEST, "Creator arbitrary Add must fail 400");
+    let err: Value = serde_json::from_slice(&pol_bytes)?;
+    assert_eq!(err["error"], "ConversationNotAccepted");
     assert_eq!(durable_comprehensive(&f)?, before, "Arbitrary Add transition must leave graph unchanged");
 
     // 8. Reset: requestReset by Alice
@@ -1092,8 +1098,10 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "idempotencyKey": reset_id.to_string(),
         "signedAt": canonical_now()
     }))?;
-    let (rst_status, _) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.requestReset", &json!({"signedRequest": alice_reset}), true).await?;
-    assert!(!rst_status.is_success(), "Creator requestReset while pending must fail: {rst_status}");
+    let (rst_status, rst_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.requestReset", &json!({"signedRequest": alice_reset}), true).await?;
+    assert_eq!(rst_status, reqwest::StatusCode::BAD_REQUEST, "Creator requestReset must fail 400");
+    let err: Value = serde_json::from_slice(&rst_bytes)?;
+    assert_eq!(err["error"], "ConversationNotAccepted");
     assert_eq!(durable_comprehensive(&f)?, before, "Reset request must leave graph unchanged");
 
     // ========================================================================
@@ -1167,8 +1175,10 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "idempotencyKey": Uuid::new_v4().to_string(),
         "signedAt": canonical_now()
     }))?;
-    let (b_bp_status, _) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.prepareBlobUpload", &json!({"signedRequest": bob_blob_prep}), true).await?;
-    assert!(!b_bp_status.is_success(), "Recipient blob upload preparation while pending must fail: {b_bp_status}");
+    let (b_bp_status, b_bp_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.prepareBlobUpload", &json!({"signedRequest": bob_blob_prep}), true).await?;
+    assert_eq!(b_bp_status, reqwest::StatusCode::BAD_REQUEST, "Recipient blob upload preparation must fail 400");
+    let err: Value = serde_json::from_slice(&b_bp_bytes)?;
+    assert_eq!(err["error"], "ConversationNotAccepted");
     assert_eq!(durable_comprehensive(&f)?, before, "Recipient blob upload preparation must leave graph unchanged");
 
     // 5. Reset by Bob
@@ -1186,8 +1196,10 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "idempotencyKey": b_reset_id.to_string(),
         "signedAt": canonical_now()
     }))?;
-    let (b_rst_status, _) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.requestReset", &json!({"signedRequest": bob_reset}), true).await?;
-    assert!(!b_rst_status.is_success(), "Recipient requestReset while pending must fail: {b_rst_status}");
+    let (b_rst_status, b_rst_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.requestReset", &json!({"signedRequest": bob_reset}), true).await?;
+    assert_eq!(b_rst_status, reqwest::StatusCode::BAD_REQUEST, "Recipient requestReset must fail 400");
+    let err: Value = serde_json::from_slice(&b_rst_bytes)?;
+    assert_eq!(err["error"], "ConversationNotAccepted");
     assert_eq!(durable_comprehensive(&f)?, before, "Recipient reset must leave graph unchanged");
 
     // 6. Metadata/admin change and arbitrary Add by Bob via submitTransition
@@ -1206,8 +1218,10 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "idempotencyKey": tid_bob_meta,
         "signedAt": canonical_now()
     }))?;
-    let (b_meta_status, _) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": bob_metadata_trans}), true).await?;
-    assert!(!b_meta_status.is_success(), "Recipient metadata transition while pending must fail: {b_meta_status}");
+    let (b_meta_status, b_meta_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": bob_metadata_trans}), true).await?;
+    assert_eq!(b_meta_status, reqwest::StatusCode::BAD_REQUEST, "Recipient metadata transition must fail 400");
+    let err: Value = serde_json::from_slice(&b_meta_bytes)?;
+    assert_eq!(err["error"], "ConversationNotAccepted");
     assert_eq!(durable_comprehensive(&f)?, before, "Recipient metadata transition must leave graph unchanged");
 
     let tid_bob_policy = Uuid::new_v4().to_string();
@@ -1235,8 +1249,10 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "idempotencyKey": tid_bob_policy,
         "signedAt": canonical_now()
     }))?;
-    let (b_pol_status, _) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": bob_policy}), true).await?;
-    assert!(!b_pol_status.is_success(), "Recipient arbitrary Add while pending must fail: {b_pol_status}");
+    let (b_pol_status, b_pol_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": bob_policy}), true).await?;
+    assert_eq!(b_pol_status, reqwest::StatusCode::BAD_REQUEST, "Recipient arbitrary Add must fail 400");
+    let err: Value = serde_json::from_slice(&b_pol_bytes)?;
+    assert_eq!(err["error"], "ConversationNotAccepted");
     assert_eq!(durable_comprehensive(&f)?, before, "Recipient arbitrary Add must leave graph unchanged");
 
     // ========================================================================
