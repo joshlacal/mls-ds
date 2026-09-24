@@ -555,17 +555,6 @@ async fn c23_real_client_upgrades_legacy_pending_direct() -> anyhow::Result<()> 
 // Explicit signed RPC legs: the server gate and concurrent races.
 // ---------------------------------------------------------------------------
 
-/// Reads present coordinate bytes as `{"$bytes":…}` or bare base64; signed
-/// bodies take bare standard base64.
-fn bare(value: &Value) -> Value {
-    match value {
-        Value::Object(map) if map.len() == 1 && map.contains_key("$bytes") => map["$bytes"].clone(),
-        Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), bare(v))).collect()),
-        Value::Array(items) => Value::Array(items.iter().map(bare).collect()),
-        other => other.clone(),
-    }
-}
-
 /// Authoritative current state as the actor reads it through the live server.
 async fn read_state(f: &Fixture, who: &Party, cid: Uuid) -> anyhow::Result<Value> {
     let (status, body) = who
@@ -582,8 +571,14 @@ async fn read_state(f: &Fixture, who: &Party, cid: Uuid) -> anyhow::Result<Value
         "getConversationState {status}: {}",
         String::from_utf8_lossy(&body)
     );
-    let state: Value = serde_json::from_slice(&body)?;
-    Ok(bare(&state["state"]))
+    let response: Value = serde_json::from_slice(&body)?;
+    // Reads present lexicon bytes as `{"$bytes":…}`; the shared client
+    // normalizer yields the bare form signed bodies require.
+    Ok(protocol::normalize_read_presentation(
+        &serde_json::to_vec(&response["state"])?,
+        "conversationState",
+        false,
+    )?)
 }
 
 fn legacy_origin_for(f: &Fixture, state: &Value) -> anyhow::Result<Value> {
@@ -672,7 +667,7 @@ async fn prepare_upgrade(
         .filter(|v| !v.is_null())
         .cloned()
         .with_context(|| format!("prepare returned no live preparation: {response}"))?;
-    protocol::verify_direct_request_preparation(
+    let preparation = protocol::verify_direct_request_preparation(
         &serde_json::to_vec(&preparation)?,
         &f.server.receipt_public_key,
     )?;
@@ -801,7 +796,7 @@ fn publication_receipt(f: &Fixture, status: reqwest::StatusCode, bytes: &[u8]) -
     let response: Value = serde_json::from_slice(bytes)?;
     let mut outcome = response["outcome"].clone();
     outcome.as_object_mut().context("outcome object")?.remove("$type");
-    let verified = protocol::verify_signed_request(
+    let verified = protocol::verify_received_signed_request(
         DirectRequestKind::Outcome,
         &serde_json::to_vec(&outcome)?,
         &f.server.receipt_public_key,
@@ -1156,6 +1151,21 @@ async fn race(leg: RaceLeg, label: &str) -> anyhow::Result<&'static str> {
     if !upgrade_won {
         assert_eq!(receipt_kind(&upgrade_receipt), (REJECTED, "StaleLegacyPrior"), "[{label}]");
     }
+    // A losing competitor must be refused with a typed, declared protocol
+    // code for its endpoint — never an untyped 500.
+    if upgrade_won {
+        let allowed: &[&str] = match leg {
+            RaceLeg::Accept => &["StaleCoordinates", "NotParticipant", "InvitationNotPending", "ConversationNotAccepted"],
+            RaceLeg::Close => &["StaleCoordinates", "NotParticipant", "ConversationNotAccepted"],
+            RaceLeg::Reset => &["StaleCoordinates", "NotMember", "ConversationNotAccepted"],
+            RaceLeg::SecondUpgrade => unreachable!("handled above"),
+        };
+        let body: Value = serde_json::from_slice(&c_bytes).unwrap_or(Value::Null);
+        let code = body["error"].as_str().unwrap_or_default().to_owned();
+        println!("[{label}] loser {nsid} typed code {c_status} {code}");
+        assert_eq!(c_status, reqwest::StatusCode::BAD_REQUEST, "[{label}] loser must be a typed 400, got {c_status} {code}");
+        assert!(allowed.contains(&code.as_str()), "[{label}] loser code {code} not a declared stale/non-pending code {allowed:?}");
+    }
     let winner = match (leg, upgrade_won) {
         (_, true) => {
             assert_eq!(after["protocolVersion"], "2", "[{label}]");
@@ -1194,7 +1204,7 @@ async fn race(leg: RaceLeg, label: &str) -> anyhow::Result<&'static str> {
 async fn race_rounds(leg: RaceLeg, label: &str) -> anyhow::Result<()> {
     let _db = dedicated_database().await?;
     let mut winners = Vec::new();
-    for round in 0..3 {
+    for round in 0..5 {
         winners.push(race(leg, &format!("{label}#{round}")).await?);
     }
     println!("[{label}] winners {winners:?}");
