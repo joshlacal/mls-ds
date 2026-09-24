@@ -1,55 +1,32 @@
 //! Live-PostgreSQL concurrency race suite over the clean-chat protocol's
-//! production serialization points (`chat_protocol::repository::{transition,delivery}`).
+//! production serialization points (`chat_protocol::repository::delivery`).
+//!
+//! Ported in-crate from `server/tests/chat_protocol_concurrency.rs`: the module
+//! and the functions it asserts on are `pub(crate)`, so an integration crate
+//! could only reach them by `include!`-ing `delivery.rs` into a synthetic
+//! `repository` module, which then failed to compile because that synthetic
+//! module has none of `delivery.rs`'s real siblings. Running inside the library
+//! crate keeps the real module graph.
 //!
 //! Every scenario runs TWO real transactions against the same committed prior
-//! state CONCURRENTLY (two pool connections synchronized by a `tokio::sync::Barrier`,
-//! the pattern from the E1 outbox no-double-claim and head-CAS conflict tests) and
-//! asserts the result is equivalent to exactly ONE legal lock-ordered
+//! state CONCURRENTLY (two pool connections synchronized by a `tokio::sync::Barrier`)
+//! and asserts the result is equivalent to exactly ONE legal lock-ordered
 //! serialization: for a compare-and-set race exactly one writer commits and the
-//! loser leaves ZERO business residue (its conditional write matched no row and its
-//! transaction rolled back); for the append-log allocator concurrent writers get
-//! UNIQUE, CONTIGUOUS seqs; for the outbox two workers never double-claim. There is
-//! no impossible interleaving and no unproven terminal state.
+//! loser leaves ZERO business residue; for the append-log allocator concurrent
+//! writers get UNIQUE, CONTIGUOUS seqs; for the outbox two workers never
+//! double-claim.
 //!
-//! Because each write is a conditional operation keyed on the exact prior state (a
-//! CAS `WHERE status = expected`, the head `SELECT ... FOR UPDATE` seq allocator,
-//! or `FOR UPDATE SKIP LOCKED`), the outcome is timing-independent: even when the
-//! writes do not physically overlap, the second writer re-evaluates against the
-//! winner's committed row.
-//!
-//! Scope note: the coordinate-advancing executor edges (creation / policy / commit
-//! / close / reset) compose a full successor generation-state + entry graph guarded
-//! by deferred cross-table triggers; racing those faithfully requires the executor
-//! plan harness (`tests/chat_protocol_executor.rs`) and is tracked as remainder in
-//! the E3 report. This suite proves the same one-legal-serialization property at
-//! the underlying single-row serialization authorities the executor composes.
-//!
-//! The production repository modules are gated `#[cfg(not(test))]`, so — mirroring
-//! the sibling repository harnesses — this test `include!`s them directly. Live
-//! cases run under the standard whole-suite gate: they hard-fail (panic in
-//! `setup_chat_protocol_db`) without `TEST_DATABASE_URL` rather than skipping:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_concurrency -- --test-threads=1
+//! Live cases run under the standard whole-suite gate: they hard-fail (panic in
+//! `setup_chat_protocol_db`) without `TEST_DATABASE_URL` rather than skipping.
 
 #![allow(dead_code)]
 
-mod common;
-
-mod repository {
-    pub(crate) mod transition {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/transition.rs"
-        ));
-    }
-    pub(crate) mod delivery {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/delivery.rs"
-        ));
-    }
-}
+use super::delivery::{
+    append_event, claim_outbox_batch, enqueue_outbox, mark_outbox_delivered,
+    resolve_application_send, AppendEntry, ApplicationSend, ApplicationSendDisposition,
+    ApplicationSendOutcome, DeliveryRepositoryError, EventKind, NewEvent, OutboxWorkKind,
+    APPLICATION_ENTRY_KIND,
+};
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -60,16 +37,26 @@ use sqlx::PgPool;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use repository::delivery::{
-    append_event, claim_outbox_batch, enqueue_outbox, mark_outbox_delivered,
-    resolve_application_send, AppendEntry, ApplicationSend, ApplicationSendDisposition,
-    ApplicationSendOutcome, DeliveryRepositoryError, EventKind, NewEvent, OutboxWorkKind,
-    APPLICATION_ENTRY_KIND,
-};
+/// Reserved per-run database prefix owned by this module.
+const CONCURRENCY_DB_PREFIX: &str = "chat_concurrency_";
+
+/// Mint a private, fully migrated clean-protocol database for one test case.
+///
+/// The fixed shared target (`setup_chat_protocol_db`) is validation-only and
+/// refuses to run against the polluted shared installation, so each case owns a
+/// disposable clone of the *same* reviewed 14-migration schema. The returned
+/// guard must stay bound for the whole test — it reaps the database on the
+/// normal path and during panic unwind.
+async fn concurrency_db(
+    max_connections: u32,
+) -> (PgPool, crate::common::fresh_db::DisposableDatabase) {
+    crate::common::fresh_db::fresh_clean_protocol_db(CONCURRENCY_DB_PREFIX, max_connections).await
+}
 
 // ---------------------------------------------------------------------------
 // Harness (adapted from tests/chat_protocol_delivery.rs + the executor seeders).
 // ---------------------------------------------------------------------------
+
 
 struct BaseConversation {
     conversation_id: Uuid,
@@ -458,7 +445,7 @@ fn coherent_application_send(base: &BaseConversation, salt: u8) -> ApplicationSe
 /// `tests/chat_protocol_executor.rs`, not claimed here.
 #[tokio::test]
 async fn two_terminal_authorities_on_one_work_row_serialize_to_one_winner() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (pool, _database) = concurrency_db(4).await;
     let protocol_instance_id = seed_protocol_instance(&pool).await;
     let now = clock_now(&pool).await;
 
@@ -536,7 +523,7 @@ async fn two_terminal_authorities_on_one_work_row_serialize_to_one_winner() {
 /// allocator serializes them. `next_entry_seq` ends at 4.
 #[tokio::test]
 async fn concurrent_application_appends_get_unique_contiguous_seqs() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (pool, _database) = concurrency_db(4).await;
     let base = seed_base(&pool).await;
 
     let barrier = Arc::new(Barrier::new(2));
@@ -590,7 +577,7 @@ async fn concurrent_application_appends_get_unique_contiguous_seqs() {
 /// row another already locked instead of blocking on it.
 #[tokio::test]
 async fn two_outbox_workers_never_double_claim() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (pool, _database) = concurrency_db(4).await;
     let protocol_instance_id = seed_protocol_instance(&pool).await;
     let now = clock_now(&pool).await;
 

@@ -7762,4 +7762,5 @@ fn digest_optional_time(digest: &mut Sha256, value: Option<DateTime<Utc>>) {
 }
 
 #[cfg(test)]
+#[path = "recovery/tests.rs"]
 mod tests;

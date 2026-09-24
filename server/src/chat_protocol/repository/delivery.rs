@@ -2489,4 +2489,5 @@ pub(crate) async fn fetch_control_entry_for_device(
 }
 
 #[cfg(test)]
+#[path = "delivery/read_tests.rs"]
 mod read_tests;

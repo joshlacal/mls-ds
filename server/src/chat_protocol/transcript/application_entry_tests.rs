@@ -1,6 +1,6 @@
 use super::*;
-use crate::chat_protocol::model;
-use crate::chat_protocol::validation::{
+use super::super::model;
+use super::super::validation::{
     ed25519_key_id, CanonicalTimestamp, CanonicalUuidV4, TrustedRequestInstant,
 };
 

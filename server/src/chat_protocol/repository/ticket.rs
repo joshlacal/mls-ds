@@ -759,4 +759,5 @@ fn fixed_hash(value: Vec<u8>) -> Result<[u8; HASH_BYTES], TicketRepositoryError>
 }
 
 #[cfg(test)]
+#[path = "ticket/tests.rs"]
 mod tests;

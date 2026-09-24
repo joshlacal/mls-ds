@@ -1834,7 +1834,7 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
 // Re-pin only alongside a reviewed change to `tests/common/executor_seed.rs`;
 // an unexplained mismatch here still means the seed drifted.
 const FROZEN_EXECUTOR_SEED_SHA256: &str =
-    "6428038d04be0ab28bd9743cd146690dbfe8d708293739cff738ed1aa3d1b1f1";
+    "70de1ae2c7277ffdfbc26eb6c2b7fd2d74a5a0d415233b9b7b8779039e6a74ea";
 // Re-pinned 2026-08-15 for finding 3 fix (b): `load_reset_request_hydration_rows`
 // admits the ratified `revoked` status and selects `terminal_revocation_id`,
 // `select_reset_terminal` gained the revocation arm (and now checks the

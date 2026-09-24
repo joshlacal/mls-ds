@@ -234,6 +234,23 @@ pub async fn setup() -> PgPool {
             "../../migrations/20260919000018_fix_direct_request_lifecycle_close_fence.sql"
         )),
     ));
+    // QuotaFix added this on mainline after the pinned baseline above stopped at
+    // 000018. `ignore_missing: false` turns its absence into a hard
+    // `VersionMissing(20260919000021)` for every direct-request target, so pin it
+    // exactly the way `e2e-tests/tests/support/encrypted_requests.rs` does, with
+    // the reviewed sha384 of the migration bytes.
+    let capacity_abuse_fix =
+        include_str!("../../migrations/20260919000021_direct_request_capacity_abuse_fix.sql");
+    assert_eq!(
+        format!("{:x}", sha2::Sha384::digest(capacity_abuse_fix.as_bytes())),
+        "5b6d18e3f9a43bccf357ee37f0df7b322d956369fb55cd036fbbbdb4e63f5c291730ac10885b6de511a697cb365939ca"
+    );
+    migrations.push(Migration::new(
+        20260919000021,
+        Cow::Borrowed("direct request capacity abuse fix"),
+        MigrationType::Simple,
+        Cow::Borrowed(capacity_abuse_fix),
+    ));
     let migrator = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,
