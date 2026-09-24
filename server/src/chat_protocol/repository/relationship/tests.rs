@@ -1,416 +1,16 @@
-//! Repository-boundary tests for clean-chat relationship projections.
-//!
-//! Database cases stay ignored until the root task authorizes a freshly
-//! migrated, dedicated `catbird_chat_protocol_test_20260722` database. They
-//! stay `#[ignore]`d (not de-ignored into the standard whole-suite gate)
-//! because they hydrate durable relationship-projection state that must be read
-//! back "after restart" against a pristine schema; a shared, never-truncated
-//! database would carry residue between runs. Run them explicitly against a
-//! freshly-migrated dedicated database:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_relationship_repository -- --ignored --test-threads=1
-
-#![allow(dead_code)]
-
-use catbird_server::{identity, util};
-
-mod common;
-
-#[path = "../src/identity.rs"]
-mod identity;
-#[path = "../src/util/mod.rs"]
-mod util;
-
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-// Minimal locked-state types for compiling and exercising the real production
-// relationship scope sealers in this path-included repository harness.
-mod state_machine {
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) enum ConversationKind {
-        Direct,
-        Group,
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) enum ParticipantStatus {
-        Pending,
-        Active,
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) enum PersistedRegistrationStatus {
-        Active,
-        Revoked,
-    }
-
-    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-    pub(crate) struct PrincipalId(Vec<u8>);
-
-    impl PrincipalId {
-        pub(crate) fn from_did(value: &str) -> Self {
-            Self(value.as_bytes().to_vec())
-        }
-
-        pub(crate) fn as_bytes(&self) -> &[u8] {
-            &self.0
-        }
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub(crate) struct DeviceIdentity {
-        principal: PrincipalId,
-    }
-
-    impl DeviceIdentity {
-        pub(crate) fn from_did(value: &str) -> Self {
-            Self {
-                principal: PrincipalId::from_did(value),
-            }
-        }
-
-        pub(crate) fn principal(&self) -> &PrincipalId {
-            &self.principal
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub(crate) struct ParticipantRecord {
-        principal: PrincipalId,
-        status: ParticipantStatus,
-        invitation_inviter: Option<DeviceIdentity>,
-    }
-
-    impl ParticipantRecord {
-        pub(crate) fn new(
-            did: &str,
-            status: ParticipantStatus,
-            invitation_inviter: Option<DeviceIdentity>,
-        ) -> Self {
-            Self {
-                principal: PrincipalId::from_did(did),
-                status,
-                invitation_inviter,
-            }
-        }
-
-        pub(crate) fn principal(&self) -> &PrincipalId {
-            &self.principal
-        }
-
-        pub(crate) fn status(&self) -> ParticipantStatus {
-            self.status
-        }
-
-        pub(crate) fn invitation_inviter(&self) -> Option<&DeviceIdentity> {
-            self.invitation_inviter.as_ref()
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub(crate) struct ConversationCoordinate([u8; 16]);
-
-    impl ConversationCoordinate {
-        pub(crate) fn conversation_id(&self) -> &[u8; 16] {
-            &self.0
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub(crate) struct ConversationState {
-        kind: ConversationKind,
-        coordinate: ConversationCoordinate,
-        participants: Vec<ParticipantRecord>,
-    }
-
-    impl ConversationState {
-        pub(crate) fn new(
-            kind: ConversationKind,
-            conversation_id: [u8; 16],
-            mut participants: Vec<ParticipantRecord>,
-        ) -> Self {
-            participants.sort_by(|left, right| left.principal.cmp(&right.principal));
-            Self {
-                kind,
-                coordinate: ConversationCoordinate(conversation_id),
-                participants,
-            }
-        }
-
-        pub(crate) fn kind(&self) -> ConversationKind {
-            self.kind
-        }
-
-        pub(crate) fn coordinate(&self) -> &ConversationCoordinate {
-            &self.coordinate
-        }
-
-        pub(crate) fn participants(&self) -> &[ParticipantRecord] {
-            &self.participants
-        }
-
-        pub(crate) fn participant(&self, principal: &PrincipalId) -> Option<&ParticipantRecord> {
-            self.participants
-                .iter()
-                .find(|participant| participant.principal() == principal)
-        }
-    }
-
-    #[derive(Debug)]
-    pub(crate) struct LockedRegistrationProjection {
-        transaction_id: String,
-        conversation_id: [u8; 16],
-        actor: DeviceIdentity,
-        status: PersistedRegistrationStatus,
-        durable_row_digest: [u8; 32],
-    }
-
-    impl LockedRegistrationProjection {
-        pub(crate) fn for_scope_test(
-            transaction_id: &str,
-            conversation_id: [u8; 16],
-            actor_did: &str,
-            status: PersistedRegistrationStatus,
-            durable_row_digest: [u8; 32],
-        ) -> Self {
-            Self {
-                transaction_id: transaction_id.to_owned(),
-                conversation_id,
-                actor: DeviceIdentity::from_did(actor_did),
-                status,
-                durable_row_digest,
-            }
-        }
-
-        pub(crate) fn transaction_id(&self) -> &str {
-            &self.transaction_id
-        }
-
-        pub(crate) fn conversation_id(&self) -> &[u8; 16] {
-            &self.conversation_id
-        }
-
-        pub(crate) fn actor(&self) -> &DeviceIdentity {
-            &self.actor
-        }
-
-        pub(crate) fn status(&self) -> PersistedRegistrationStatus {
-            self.status
-        }
-
-        pub(crate) fn durable_row_digest(&self) -> &[u8; 32] {
-            &self.durable_row_digest
-        }
-    }
-}
-
-// Compile the real repository implementation under the same module shape it
-// has in production. The policy's path-included tests own their lightweight
-// revision witness, so this adapter supplies only the production core factory
-// surface; the production library still compiles against repository/core.rs.
-mod repository {
-    pub(crate) mod core {
-        pub use catbird_server::chat_protocol::repository::core::*;
-
-        #[derive(Debug)]
-        pub(crate) struct LockedConversationHeadGuard {
-            transaction_id: String,
-            conversation_id: uuid::Uuid,
-            prior_coordinate: Option<()>,
-            next_entry_seq: u64,
-            durable_row_digest: [u8; 32],
-        }
-
-        impl LockedConversationHeadGuard {
-            pub(crate) fn for_scope_test(
-                transaction_id: &str,
-                conversation_id: [u8; 16],
-                prior_exists: bool,
-                next_entry_seq: u64,
-                durable_row_digest: [u8; 32],
-            ) -> Self {
-                Self {
-                    transaction_id: transaction_id.to_owned(),
-                    conversation_id: uuid::Uuid::from_bytes(conversation_id),
-                    prior_coordinate: prior_exists.then_some(()),
-                    next_entry_seq,
-                    durable_row_digest,
-                }
-            }
-
-            pub(crate) fn transaction_id(&self) -> &str {
-                &self.transaction_id
-            }
-
-            pub(crate) fn conversation_id(&self) -> uuid::Uuid {
-                self.conversation_id
-            }
-
-            pub(crate) fn prior_coordinate(&self) -> Option<&()> {
-                self.prior_coordinate.as_ref()
-            }
-
-            pub(crate) fn next_entry_seq(&self) -> u64 {
-                self.next_entry_seq
-            }
-
-            pub(crate) fn durable_row_digest(&self) -> &[u8; 32] {
-                &self.durable_row_digest
-            }
-        }
-
-        #[derive(Debug)]
-        pub(crate) struct LockedInvitationQuotaGuard {
-            transaction_id: String,
-            inviter_did: String,
-            new_recipient_dids: Vec<String>,
-            durable_row_digest: [u8; 32],
-        }
-
-        impl LockedInvitationQuotaGuard {
-            pub(crate) fn for_scope_test(
-                transaction_id: &str,
-                inviter_did: String,
-                mut new_recipient_dids: Vec<String>,
-                durable_row_digest: [u8; 32],
-            ) -> Self {
-                new_recipient_dids.sort();
-                Self {
-                    transaction_id: transaction_id.to_owned(),
-                    inviter_did,
-                    new_recipient_dids,
-                    durable_row_digest,
-                }
-            }
-
-            pub(crate) fn transaction_id(&self) -> &str {
-                &self.transaction_id
-            }
-
-            pub(crate) fn inviter_did(&self) -> &str {
-                &self.inviter_did
-            }
-
-            pub(crate) fn new_recipient_dids(&self) -> &[String] {
-                &self.new_recipient_dids
-            }
-
-            pub(crate) fn durable_row_digest(&self) -> &[u8; 32] {
-                &self.durable_row_digest
-            }
-        }
-
-        #[derive(Clone, Debug, Eq, PartialEq)]
-        pub(crate) enum LockedDirectLookupOutcome {
-            Absent,
-            Existing,
-        }
-
-        #[derive(Debug)]
-        pub(crate) struct LockedDirectConversationLookupGuard {
-            transaction_id: String,
-            did_low: String,
-            did_high: String,
-            outcome: LockedDirectLookupOutcome,
-            durable_row_digest: [u8; 32],
-        }
-
-        impl LockedDirectConversationLookupGuard {
-            pub(crate) fn for_scope_test(
-                transaction_id: &str,
-                did_low: String,
-                did_high: String,
-                outcome: LockedDirectLookupOutcome,
-                durable_row_digest: [u8; 32],
-            ) -> Self {
-                Self {
-                    transaction_id: transaction_id.to_owned(),
-                    did_low,
-                    did_high,
-                    outcome,
-                    durable_row_digest,
-                }
-            }
-
-            pub(crate) fn transaction_id(&self) -> &str {
-                &self.transaction_id
-            }
-
-            pub(crate) fn did_low(&self) -> &str {
-                &self.did_low
-            }
-
-            pub(crate) fn did_high(&self) -> &str {
-                &self.did_high
-            }
-
-            pub(crate) fn outcome(&self) -> &LockedDirectLookupOutcome {
-                &self.outcome
-            }
-
-            pub(crate) fn durable_row_digest(&self) -> &[u8; 32] {
-                &self.durable_row_digest
-            }
-        }
-
-        #[derive(Debug)]
-        pub(crate) struct LockedConversationStateGuard {
-            state: crate::state_machine::ConversationState,
-            head: LockedConversationHeadGuard,
-            locked_graph_digest: [u8; 32],
-        }
-
-        impl LockedConversationStateGuard {
-            pub(crate) fn for_scope_test(
-                state: crate::state_machine::ConversationState,
-                head: LockedConversationHeadGuard,
-                locked_graph_digest: [u8; 32],
-            ) -> Self {
-                Self {
-                    state,
-                    head,
-                    locked_graph_digest,
-                }
-            }
-
-            pub(crate) fn state(&self) -> &crate::state_machine::ConversationState {
-                &self.state
-            }
-
-            pub(crate) fn head(&self) -> &LockedConversationHeadGuard {
-                &self.head
-            }
-
-            pub(crate) fn locked_graph_digest(&self) -> &[u8; 32] {
-                &self.locked_graph_digest
-            }
-        }
-    }
-
-    pub(crate) mod relationship {
-        pub(crate) fn observe_relationship_persistence(
-        ) -> crate::relationship_policy::TrustedRelationshipPersistenceInstant {
-            crate::relationship_policy::TrustedRelationshipPersistenceInstant::for_test(
-                chrono::Utc::now(),
-            )
-        }
-
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/relationship.rs"
-        ));
-    }
-}
-
+use crate::chat_protocol::relationship_policy;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
-use relationship_policy::{
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use uuid::Uuid;
+
+use crate::common;
+use crate::chat_protocol::relationship_policy::{
     AdmissionOperation, AdmissionRequest, AllocatedProjectionRevisionGuard, HttpRelationshipSource,
     PolicyDenial, ProjectionClock, ProjectionOperationScope, ProjectionScope, PublicGet,
     PublicResponse, PublicTransport, RelationshipPolicyConfig, RelationshipPolicyConfigInput,
@@ -418,7 +18,7 @@ use relationship_policy::{
     HARD_MAX_REQUEST_BURST, HARD_MAX_REQUEST_RATE, MAX_ADMISSION_GRAPH_CALLS,
     MAX_ADMISSION_SOURCE_CALLS, MAX_DECLARATION_HTTP_CALLS, MAX_TRAFFIC_GRAPH_CALLS,
 };
-use repository::relationship::{
+use crate::chat_protocol::repository::relationship::{
     allocate_projection_revision, load_fallback_relationship_projection,
     load_fallback_traffic_projection, persist_relationship_projection, persist_traffic_projection,
     seal_acceptance_fallback_scope, seal_direct_creation_fallback_scope,
@@ -426,27 +26,25 @@ use repository::relationship::{
     seal_recovery_fallback_scope, seal_traffic_fallback_scope, LockedRelationshipFallbackScope,
     LockedTrafficFallbackScope,
 };
-use serde_json::json;
-use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use validation::{CanonicalTimestamp, TrustedRequestInstant};
-
-use repository::core::{
+use crate::chat_protocol::validation::{CanonicalTimestamp, TrustedRequestInstant};
+use crate::chat_protocol::repository::core::{
     LockedConversationHeadGuard, LockedConversationStateGuard, LockedDirectConversationLookupGuard,
     LockedDirectLookupOutcome, LockedInvitationQuotaGuard,
 };
-use state_machine::{
+use crate::chat_protocol::state_machine::{
     ConversationKind, ConversationState, DeviceIdentity, LockedRegistrationProjection,
     ParticipantRecord, ParticipantStatus, PersistedRegistrationStatus,
 };
 
+fn observe_relationship_persistence() -> TrustedRelationshipPersistenceInstant {
+    TrustedRelationshipPersistenceInstant::for_test(chrono::Utc::now())
+}
+
+
 #[test]
 fn repository_source_seals_projection_and_scope_authority() {
-    let source = include_str!("../src/chat_protocol/repository/relationship.rs");
-    let policy_source = include_str!("../src/chat_protocol/relationship_policy.rs");
+    let source = include_str!("../relationship.rs");
+    let policy_source = include_str!("../../relationship_policy.rs");
 
     for constraint in [
         "chat.relationship_projection_snapshots_complete_deferred",
@@ -561,7 +159,7 @@ fn locked_scope_state(
     graph_digest: [u8; 32],
 ) -> LockedConversationStateGuard {
     LockedConversationStateGuard::for_scope_test(
-        ConversationState::new(kind, conversation_id, participants),
+        ConversationState::for_relationship_scope_test(kind, conversation_id, participants),
         LockedConversationHeadGuard::for_scope_test(
             transaction_id,
             conversation_id,
@@ -699,7 +297,7 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         transaction_id,
         alice.clone(),
         bob.clone(),
-        LockedDirectLookupOutcome::Existing,
+        LockedDirectLookupOutcome::Existing { conversation_id: Uuid::from_bytes([0x12; 16]), coordinate: crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new([0x12; 16], 1, 1, [0; 32], 0, [0; 32], [0; 32], crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Active), locked_head_digest: [1; 32] },
         [0x14; 32],
     );
     assert!(seal_direct_creation_fallback_scope(
@@ -710,14 +308,14 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
     )
     .is_err());
 
-    let inviter = DeviceIdentity::from_did(&alice);
+    let inviter = DeviceIdentity::from_did_for_test(&alice);
     let pending_locked = locked_scope_state(
         transaction_id,
         conversation_id,
         ConversationKind::Group,
         vec![
-            ParticipantRecord::new(&alice, ParticipantStatus::Active, None),
-            ParticipantRecord::new(&bob, ParticipantStatus::Pending, Some(inviter.clone())),
+            ParticipantRecord::for_relationship_scope_test(&alice, ParticipantStatus::Active, None),
+            ParticipantRecord::for_relationship_scope_test(&bob, ParticipantStatus::Pending, Some(inviter.clone())),
         ],
         [0x21; 32],
         [0x22; 32],
@@ -825,8 +423,8 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         conversation_id,
         ConversationKind::Group,
         vec![
-            ParticipantRecord::new(&alice, ParticipantStatus::Active, None),
-            ParticipantRecord::new(&bob, ParticipantStatus::Active, None),
+            ParticipantRecord::for_relationship_scope_test(&alice, ParticipantStatus::Active, None),
+            ParticipantRecord::for_relationship_scope_test(&bob, ParticipantStatus::Active, None),
         ],
         [0x31; 32],
         [0x32; 32],
@@ -1205,7 +803,7 @@ async fn traffic_fallback(
 #[tokio::test]
 #[ignore = "root fresh-database authorization required"]
 async fn relationship_snapshot_is_atomic_and_hydrates_after_pool_restart() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let (authority, request, _trusted_now, mut persisted) = relationship_fallback(&pool).await;
     let projection_id = uuid::Uuid::parse_str(&persisted.projection_id).unwrap();
     let expected_revision = persisted.projection_revision;
@@ -1255,7 +853,7 @@ async fn relationship_snapshot_is_atomic_and_hydrates_after_pool_restart() {
     let wrong_roster = (100..103).map(did).collect::<Vec<_>>();
     persist_principal_read_set(&pool, &wrong_roster).await;
     pool.close().await;
-    let restarted = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let restarted = crate::common::chat_protocol::setup_chat_protocol_db(2).await;
 
     let mut stale_transaction = restarted.begin().await.unwrap();
     let (stale_witness, stale_request) =
@@ -1312,7 +910,7 @@ async fn relationship_snapshot_is_atomic_and_hydrates_after_pool_restart() {
 #[tokio::test]
 #[ignore = "root fresh-database authorization required"]
 async fn failed_child_insert_leaves_no_partial_projection() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(2).await;
     let (_authority, _request, _trusted_now, mut persisted) = relationship_fallback(&pool).await;
     let projection_id = uuid::Uuid::parse_str(&persisted.projection_id).unwrap();
     persisted.declarations[0].recipient = "not-a-did".into();
@@ -1341,7 +939,7 @@ async fn failed_child_insert_leaves_no_partial_projection() {
 #[tokio::test]
 #[ignore = "root fresh-database authorization required"]
 async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
     let (authority, scope, _trusted_now, mut persisted) = traffic_fallback(&pool).await;
     let projection_id = uuid::Uuid::parse_str(&persisted.projection_id).unwrap();
     let expected_revision = persisted.projection_revision;
@@ -1416,7 +1014,7 @@ async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
 
     pool.close().await;
 
-    let restarted = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let restarted = crate::common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut stale_transaction = restarted.begin().await.unwrap();
     let (stale_witness, stale_scope) =
         lock_traffic_scope(&mut stale_transaction, &scope.members).await;
@@ -1504,7 +1102,7 @@ async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
 #[tokio::test]
 #[ignore = "root fresh-database authorization required"]
 async fn missing_traffic_fallback_recollection_preserves_block_denial() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(2).await;
     let members = roster(2);
     persist_principal_read_set(&pool, &members).await;
     let authority = blocked_authority();
@@ -1526,7 +1124,7 @@ async fn missing_traffic_fallback_recollection_preserves_block_denial() {
 #[tokio::test]
 #[ignore = "root fresh-database authorization required"]
 async fn zero_call_traffic_fallback_hydrates_after_restart() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(2).await;
     let authority = authority();
     let actor = did(0);
     let live = relationship_policy::collect_traffic_projection(
@@ -1556,7 +1154,7 @@ async fn zero_call_traffic_fallback_hydrates_after_restart() {
     persist_principal_read_set(&pool, std::slice::from_ref(&actor)).await;
     pool.close().await;
 
-    let restarted = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let restarted = crate::common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut load_transaction = restarted.begin().await.unwrap();
     let (witness, scope) =
         lock_traffic_scope(&mut load_transaction, std::slice::from_ref(&actor)).await;
@@ -1573,7 +1171,7 @@ async fn zero_call_traffic_fallback_hydrates_after_restart() {
 #[tokio::test]
 #[ignore = "root fresh-database authorization required"]
 async fn sequence_is_unique_across_concurrency_restarts_and_rollback_gaps() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(8).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(8).await;
     let authority = Arc::new(authority());
     let mut tasks = Vec::new();
     for _ in 0..16 {
@@ -1628,7 +1226,7 @@ async fn sequence_is_unique_across_concurrency_restarts_and_rollback_gaps() {
 
     let mut previous = u64::try_from(before_gap).unwrap();
     for _ in 0..3 {
-        let restarted = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let restarted = crate::common::chat_protocol::setup_chat_protocol_db(2).await;
         let guard = allocated_revision(&restarted).await;
         let actor = did(0);
         let live = relationship_policy::collect_traffic_projection(
@@ -1653,7 +1251,7 @@ async fn sequence_is_unique_across_concurrency_restarts_and_rollback_gaps() {
 #[tokio::test]
 #[ignore = "root fresh-database authorization required"]
 async fn burned_unused_revision_below_high_water_cannot_be_persisted() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool = crate::common::chat_protocol::setup_chat_protocol_db(2).await;
 
     let mut burned_tx = pool.begin().await.unwrap();
     let (burned_allocation_id, burned_revision): (uuid::Uuid, i64) = sqlx::query_as(
