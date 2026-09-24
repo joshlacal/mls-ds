@@ -310,16 +310,21 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
     }
     if path == "/xrpc/com.atproto.repo.getRecord" && method == Method::GET {
         if public_actor.is_none()
-            || q.get("collection").map(String::as_str) != Some("chat.bsky.actor.declaration")
             || q.get("rkey").map(String::as_str) != Some("self")
             || q.len() != 3
         {
             return error(StatusCode::BAD_REQUEST, "InvalidQuery");
         }
-        return response(
-            StatusCode::OK,
-            json!({"uri":format!("at://{}/chat.bsky.actor.declaration/self",q["repo"]),"value":{"$type":"chat.bsky.actor.declaration","allowIncoming":"all"}}),
-        );
+        if q.get("collection").map(String::as_str) == Some("chat.bsky.actor.declaration") {
+            return response(
+                StatusCode::OK,
+                json!({"uri":format!("at://{}/chat.bsky.actor.declaration/self",q["repo"]),"value":{"$type":"chat.bsky.actor.declaration","allowIncoming":"all"}}),
+            );
+        }
+        if q.get("collection").map(String::as_str) == Some("blue.catbird.chat.declaration") {
+            return error(StatusCode::NOT_FOUND, "RecordNotFound");
+        }
+        return error(StatusCode::BAD_REQUEST, "InvalidQuery");
     }
     if path == "/xrpc/app.bsky.graph.getRelationships" && method == Method::GET {
         if !q
