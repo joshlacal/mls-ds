@@ -1253,7 +1253,15 @@ pub(crate) async fn expire_due_preparations(
         sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *tx).await?;
         let operation = match super::prelude::try_lock_direct_request_operation(&mut tx, id).await {
             Ok(Some(op)) => op,
-            Ok(None) | Err(_) => {
+            Ok(None) => {
+                tx.rollback().await?;
+                continue;
+            }
+            Err(error) => {
+                let is_timeout = matches!(&error, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"));
+                if !is_timeout {
+                    tracing::warn!(%error, request_id = %id, "expire_due_preparations operation lock failed, sweep skipped");
+                }
                 tx.rollback().await?;
                 continue;
             }
@@ -1264,13 +1272,16 @@ pub(crate) async fn expire_due_preparations(
             tx.rollback().await?;
             continue;
         };
-        if super::prelude::lock_direct_request_identity_scope(
+        if let Err(error) = super::prelude::lock_direct_request_identity_scope(
             &mut tx,
             &[actor_did.clone(), recipient.clone()],
         )
         .await
-        .is_err()
         {
+            let is_timeout = matches!(&error, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"));
+            if !is_timeout {
+                tracing::warn!(%error, request_id = %id, "expire_due_preparations identity scope lock failed, sweep skipped");
+            }
             tx.rollback().await?;
             continue;
         }
@@ -1285,7 +1296,11 @@ pub(crate) async fn expire_due_preparations(
         };
         let lock = match load_locked_attempt(&mut tx, i, &operation).await {
             Ok(l) => l,
-            Err(_) => {
+            Err(error) => {
+                let is_timeout = matches!(&error, DirectRequestStoreError::Database(sqlx::Error::Database(d)) if d.code().as_deref() == Some("55P03"));
+                if !is_timeout {
+                    tracing::warn!(%error, request_id = %id, "expire_due_preparations load_locked_attempt failed, sweep skipped");
+                }
                 tx.rollback().await?;
                 continue;
             }
