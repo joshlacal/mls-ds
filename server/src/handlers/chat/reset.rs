@@ -152,13 +152,18 @@ fn reset_failure(endpoint: ChatEndpoint, error: ResetFacadeError) -> ChatFailure
         {
             ChatFailure::protocol(endpoint, C::ResetRequestStale)
         }
-        E::MissingMutation
+        error @ (E::MissingMutation
         | E::UnsupportedMutation
         | E::InvalidCanonicalMaterial
         | E::Repository(_)
         | E::StateMachine(_)
         | E::ExecutionContext(_)
-        | E::Executor(_) => ChatFailure::invariant(endpoint),
+        | E::Executor(_)) => {
+            // Never exposed to the caller; the concrete variant is the only
+            // evidence an operator has for an unmapped (endpoint, cause) pair.
+            tracing::error!(endpoint = endpoint.nsid(), variant = ?error, "reset handler invariant failure");
+            ChatFailure::invariant(endpoint)
+        }
     }
 }
 

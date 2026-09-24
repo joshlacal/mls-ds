@@ -495,31 +495,13 @@ fn canonical_datetime(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// Response DTOs decode coordinate bytes only in lexicon `{"$bytes"}` form; use
+/// the shared canonical builder like every sibling facade.
 fn coordinate_json(
     coordinate: &PublicGroupSnapshotCoordinate,
 ) -> Result<JsonValue, ResetFacadeError> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-
-    let generation = i64::try_from(coordinate.generation())
-        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
-    let state_version = i64::try_from(coordinate.state_version())
-        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
-    let epoch = i64::try_from(coordinate.epoch())
-        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
-    let lifecycle = match coordinate.lifecycle() {
-        PublicGroupSnapshotLifecycle::Active => "active",
-        PublicGroupSnapshotLifecycle::Superseded => "superseded",
-    };
-    Ok(json!({
-        "conversationId": Uuid::from_bytes(*coordinate.conversation_id()).hyphenated().to_string(),
-        "generation": generation,
-        "stateVersion": state_version,
-        "groupId": STANDARD.encode(coordinate.group_id()),
-        "epoch": epoch,
-        "groupContextHash": STANDARD.encode(coordinate.group_context_hash()),
-        "confirmationTag": STANDARD.encode(coordinate.confirmation_tag()),
-        "lifecycle": lifecycle,
-    }))
+    super::coordinate::canonical_coordinate_json(coordinate)
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)
 }
 
 #[derive(Debug, FromRow)]
