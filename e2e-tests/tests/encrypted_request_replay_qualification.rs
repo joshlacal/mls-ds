@@ -21,7 +21,7 @@ use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
     reviewed_baseline, reviewed_request_migrations, seed_service_device, signed_mls_request,
     validate_request_test_database_url, DeterministicFaultTransport, FaultBoundary,
-    HttpsDidFixture, RequestRig, ServiceIdentity, ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
+    HttpsDidFixture, RequestRig, ServiceIdentity, ShippingServerFixture, request_database_url,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -50,7 +50,7 @@ fn durable_graph(f: &live_direct_request::PublishedRequestFixture) -> anyhow::Re
     );
     let result = std::process::Command::new("psql")
         .args([
-            REQUEST_TEST_DATABASE_URL,
+            request_database_url(),
             "-X",
             "-A",
             "-t",

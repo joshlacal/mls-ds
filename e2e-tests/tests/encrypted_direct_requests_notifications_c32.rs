@@ -25,7 +25,7 @@ use encrypted_requests::{
     request_database_snapshot, reviewed_baseline, reviewed_request_migrations, seed_service_device,
     signed_mls_request, validate_request_test_database_url, DeterministicFaultTransport,
     FaultBoundary, HttpsDidFixture, PushFixtureConfig, RequestRig, ServiceIdentity,
-    ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
+    ShippingServerFixture, request_database_url,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -79,7 +79,7 @@ fn execute_psql(sql: &str) -> anyhow::Result<()> {
             "ON_ERROR_STOP=1",
             "-q",
             "-d",
-            REQUEST_TEST_DATABASE_URL,
+            request_database_url(),
             "-c",
             sql,
         ])

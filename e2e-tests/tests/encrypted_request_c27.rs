@@ -40,7 +40,7 @@ use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
     reviewed_request_migrations, seed_service_device, signed_mls_request,
     validate_request_test_database_url, HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
-    REQUEST_TEST_DATABASE_URL,
+    request_database_url,
 };
 use live_direct_request::PublishedRequestFixture;
 use mls_e2e_tests::mls_engine::MlsEngine;
@@ -51,7 +51,7 @@ use uuid::Uuid;
 /// Read-only projection of the guarded database.
 fn psql(sql: &str) -> anyhow::Result<String> {
     let out = std::process::Command::new("psql")
-        .args([REQUEST_TEST_DATABASE_URL, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([request_database_url(), "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql])
         .output()?;
     anyhow::ensure!(out.status.success(), "psql: {}", String::from_utf8_lossy(&out.stderr));
     Ok(String::from_utf8(out.stdout)?.trim().to_owned())

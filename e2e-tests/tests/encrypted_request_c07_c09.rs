@@ -27,7 +27,7 @@ use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database,
     request_database_snapshot, reviewed_request_migrations, seed_service_device,
     signed_mls_request, validate_request_test_database_url, HttpsDidFixture,
-    ServiceIdentity, ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
+    ServiceIdentity, ShippingServerFixture, request_database_url,
 };
 
 #[path = "support/live_direct_request.rs"]
@@ -50,7 +50,7 @@ fn run_psql_query(sql: &str) -> anyhow::Result<String> {
             "-t",
             "-A",
             "-d",
-            REQUEST_TEST_DATABASE_URL,
+            request_database_url(),
             "-c",
             sql,
         ])
@@ -79,6 +79,9 @@ fn sign_mutation(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> anyhow::Result<()> {
+    // Install/verify the reviewed ledger on the routed database before seeding.
+    let authority = connect_guarded_request_database(5).await?;
+    anyhow::ensure!(authority.additive_migrations == reviewed_request_migrations().len());
     let did_port = HttpsDidFixture::reserve_port()?;
     let run = Uuid::new_v4().simple().to_string();
     let alice = ServiceIdentity::new(format!("did:web:alice-{run}.request-fixture.catbird.blue"));
@@ -371,6 +374,8 @@ async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> any
 /// rejected before any key package, grant or capability row is written.
 #[tokio::test(flavor = "multi_thread")]
 async fn c07_live_router_unsigned_grant_rejects_before_publication() -> anyhow::Result<()> {
+    let authority = connect_guarded_request_database(5).await?;
+    anyhow::ensure!(authority.additive_migrations == reviewed_request_migrations().len());
     let did_port = HttpsDidFixture::reserve_port()?;
     let run = Uuid::new_v4().simple().to_string();
     let bob = ServiceIdentity::new(format!("did:web:bob-{run}.request-fixture.catbird.blue"));
