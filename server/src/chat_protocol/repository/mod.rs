@@ -89,3 +89,5 @@ mod auth_repository_tests;
 mod inventory_tests;
 #[cfg(test)]
 mod g7_entitlement_tests;
+#[cfg(test)]
+mod conversation_substrate_tests;

@@ -1,201 +1,13 @@
 //! Live-PostgreSQL verification of the T4-H2-pre conversation-substrate
 //! production hydrators (`chat_protocol::repository::core`).
-//!
-//! These exercise the REAL, production `#[cfg(not(test))]` guard-hydration path,
-//! which no other suite compiles: the lib build gates `repository::core` behind
-//! `#[cfg(not(test))]`, and the state-machine/executor harnesses use the
-//! `for_test` guard constructors instead. So — like the executor harness — this
-//! test `include!`s the whole `chat_protocol` module tree (so `core.rs`'s
-//! `super::super::{snapshot,state_machine,validation}` paths resolve) and adds
-//! `repository::core` on top.
-//!
-//! Live cases are `#[ignore]`d and run explicitly against the dedicated,
-//! freshly-migrated gate database:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_conversation_substrate -- --ignored --test-threads=1
 
 #![allow(dead_code)]
 
-mod common;
-#[path = "common/executor_seed.rs"]
-mod executor_seed;
-#[path = "common/frozen_public_state.rs"]
-mod frozen_public_state;
-
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-// `cursor.rs` remains path-included at this integration crate root. The actual
-// production `dpop.rs` is included only at `crate::chat_protocol::dpop`; this
-// root non-DPoP shim re-exports physically nested repository modules without
-// moving their private visibility boundary out of `crate::chat_protocol::repository`.
-mod repository {
-    pub use crate::chat_protocol::repository::{auth, blobs, inventory, key_packages, prelude};
-}
-#[allow(dead_code)]
-mod snapshot {
-    pub use catbird_server::chat_protocol::snapshot::*;
-}
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
+use crate::common;
+use crate::common::executor_seed;
+use crate::common::frozen_public_state;
 mod chat_protocol {
-    pub mod direct_request_transcript {
-        pub use catbird_server::chat_protocol::direct_request_transcript::*;
-    }
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-    pub mod model {
-        pub use crate::model::*;
-    }
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    pub mod repository {
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod blobs {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-        pub mod key_packages {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-        pub mod prelude {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-        pub mod recovery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
-        pub mod core {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-        pub mod execution_context {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        pub mod welcome {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/welcome.rs"
-            ));
-        }
-        pub mod welcome_terminal {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/welcome_terminal.rs"
-            ));
-        }
-        pub mod expiry_sweep {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/expiry_sweep.rs"
-            ));
-        }
-        pub mod relationship {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-    }
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
+    pub(super) use crate::chat_protocol::*;
 }
 
 mod welcome_terminal_facade_contract {
@@ -444,7 +256,7 @@ mod welcome_terminal_facade_contract {
             panic!("unterminated Welcome source item: {marker}");
         }
 
-        let source = include_str!("../src/chat_protocol/repository/welcome_terminal.rs");
+        let source = include_str!("welcome_terminal.rs");
         let prepare = source_code(source_item(
             source,
             "async fn prepare_first_welcome_terminal(",
@@ -2336,9 +2148,9 @@ mod historical_control_path {
     };
     use crate::chat_protocol::validation::ed25519_key_id;
 
-    const CONTRACT_VECTORS: &str = include_str!("fixtures/mls_chat_contract_vectors.json");
+    const CONTRACT_VECTORS: &str = include_str!("../../../tests/fixtures/mls_chat_contract_vectors.json");
     const LEXICON: &str =
-        include_str!("../../lexicon/blue/catbird/chat/blue.catbird.chat.defs.json");
+        include_str!("../../../../lexicon/blue/catbird/chat/blue.catbird.chat.defs.json");
 
     fn uuid_v4_bytes(byte: u8) -> [u8; 16] {
         let mut value = [byte; 16];
@@ -2796,7 +2608,7 @@ mod historical_control_path {
     // The reusable implementation now lives in `common::executor_seed`, so
     // G7 read fixtures and this historical loader bind to exactly the same
     // independently signed origin bytes.
-    pub(super) use crate::executor_seed::{
+    pub(super) use crate::common::executor_seed::{
         build_real_close_entry, build_real_corpus_creation_entry, build_real_creation_entry,
         RealCreationEntry,
     };
@@ -3005,7 +2817,7 @@ mod historical_control_path {
             assert_eq!(from_bytes, from_row, "kind {}", case.entry_kind);
         }
 
-        let template = crate::frozen_public_state::restore_genesis();
+        let template = crate::common::frozen_public_state::restore_genesis();
         let entry = build_real_corpus_creation_entry(*template.coordinate().conversation_id());
         let historical =
             HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
@@ -3227,7 +3039,7 @@ mod historical_control_loader {
     };
     use crate::chat_protocol::repository::delivery::{EntryEntitlementKind, EventKind};
     use crate::chat_protocol::repository::execution_context::{
-        hydrate_execution_context_unscoped_for_test, ExecutionContextArtifacts,
+        hydrate_execution_context_unscoped_for_test, prepare_execution_context_for_test, ExecutionContextArtifacts,
         ExecutionContextHydrationError,
     };
     use crate::chat_protocol::snapshot::{
@@ -3551,9 +3363,9 @@ mod historical_control_loader {
     #[tokio::test]
     #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
     async fn corpus_bound_creation_fixture_hydrates_through_the_production_aggregate() {
-        let (pool, _database) = crate::executor_seed::setup().await;
+        let (pool, _database) = crate::common::executor_seed::setup().await;
         let cid = Uuid::new_v4();
-        let graph = crate::executor_seed::seed_hydratable_genuine_creation_graph(&pool, cid).await;
+        let graph = crate::common::executor_seed::seed_hydratable_genuine_creation_graph(&pool, cid).await;
 
         let locked_at: DateTime<Utc> =
             sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
@@ -3622,7 +3434,7 @@ mod historical_control_loader {
             .expect("active corpus public state");
         assert_eq!(
             active.snapshot(),
-            crate::executor_seed::corpus_file("genesis-public-state.bin"),
+            crate::common::executor_seed::corpus_file("genesis-public-state.bin"),
             "production reload retains the pinned canonical genesis snapshot"
         );
         assert_eq!(
@@ -3669,7 +3481,7 @@ mod historical_control_loader {
     #[tokio::test]
     #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
     async fn shared_genuine_group_pending_fixture_hydrates_the_signed_invitation_relationship() {
-        let fixture = crate::executor_seed::private_genuine_group_pending_graph().await;
+        let fixture = crate::common::executor_seed::private_genuine_group_pending_graph().await;
         let locked_at: DateTime<Utc> =
             sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
                 .fetch_one(&fixture.pool)
@@ -3724,7 +3536,7 @@ mod historical_control_loader {
     #[tokio::test]
     #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
     async fn shared_genuine_direct_pending_fixture_hydrates_exact_two_admin_roster() {
-        let fixture = crate::executor_seed::private_genuine_direct_pending_graph().await;
+        let fixture = crate::common::executor_seed::private_genuine_direct_pending_graph().await;
         let locked_at: DateTime<Utc> =
             sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
                 .fetch_one(&fixture.pool)
@@ -3764,7 +3576,7 @@ mod historical_control_loader {
     #[tokio::test]
     #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
     async fn shared_genuine_removal_fixture_hydrates_finite_terminal_interval() {
-        let fixture = crate::executor_seed::private_genuine_removal_graph().await;
+        let fixture = crate::common::executor_seed::private_genuine_removal_graph().await;
         let locked_at: DateTime<Utc> =
             sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
                 .fetch_one(&fixture.pool)
@@ -3837,7 +3649,7 @@ mod historical_control_loader {
     #[tokio::test]
     #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
     async fn shared_genuine_reset_fixture_retires_old_leaf_and_hydrates_successor() {
-        let fixture = crate::executor_seed::private_genuine_reset_graph().await;
+        let fixture = crate::common::executor_seed::private_genuine_reset_graph().await;
         let locked_at: DateTime<Utc> =
             sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
                 .fetch_one(&fixture.pool)
@@ -3928,7 +3740,7 @@ mod historical_control_loader {
     #[tokio::test]
     #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
     async fn shared_genuine_terminal_close_fixture_hydrates_exact_schedule_proof() {
-        let fixture = crate::executor_seed::private_genuine_terminal_close_graph().await;
+        let fixture = crate::common::executor_seed::private_genuine_terminal_close_graph().await;
         let locked_at: DateTime<Utc> =
             sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
                 .fetch_one(&fixture.pool)
@@ -3976,7 +3788,7 @@ mod historical_control_loader {
     }
 
     async fn seed_real_creation_graph(pool: &PgPool, entry: &RealCreationEntry) -> Uuid {
-        crate::executor_seed::seed_genuine_creation_graph(pool, entry, None, None)
+        crate::common::executor_seed::seed_genuine_creation_graph(pool, entry, None, None)
             .await
             .creation_transition_id
     }
@@ -3986,7 +3798,7 @@ mod historical_control_loader {
         entry: &RealCreationEntry,
         public_state: &ActivePublicState,
     ) -> Uuid {
-        crate::executor_seed::seed_genuine_creation_graph(pool, entry, Some(public_state), None)
+        crate::common::executor_seed::seed_genuine_creation_graph(pool, entry, Some(public_state), None)
             .await
             .creation_transition_id
     }
@@ -3997,7 +3809,7 @@ mod historical_control_loader {
         public_state: &ActivePublicState,
         group_info: &[u8],
     ) -> Uuid {
-        crate::executor_seed::seed_genuine_creation_graph(
+        crate::common::executor_seed::seed_genuine_creation_graph(
             pool,
             entry,
             Some(public_state),
@@ -4338,7 +4150,7 @@ mod historical_control_loader {
 
     async fn commit_genuine_terminal_conversation(pool: &PgPool) -> Uuid {
         let cid = Uuid::new_v4();
-        let template = crate::frozen_public_state::restore_genesis();
+        let template = crate::common::frozen_public_state::restore_genesis();
         let coordinate = crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
             *cid.as_bytes(),
             template.coordinate().generation(),
@@ -4592,7 +4404,7 @@ mod historical_control_loader {
                 terminal_state,
             );
         let active_cid = Uuid::new_v4();
-        let active_template = crate::frozen_public_state::restore_genesis();
+        let active_template = crate::common::frozen_public_state::restore_genesis();
         let active_coordinate = crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
             *active_cid.as_bytes(),
             active_template.coordinate().generation(),
@@ -4643,7 +4455,7 @@ mod historical_control_loader {
             .await
             .expect("connect to existing gate database");
         let cid = Uuid::new_v4();
-        let template = crate::frozen_public_state::restore_genesis();
+        let template = crate::common::frozen_public_state::restore_genesis();
         let coordinate = crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
             *cid.as_bytes(),
             template.coordinate().generation(),
@@ -4768,7 +4580,7 @@ mod historical_control_loader {
             .await
             .expect("connect to existing gate database");
         let cid = Uuid::new_v4();
-        let template = crate::frozen_public_state::restore_genesis();
+        let template = crate::common::frozen_public_state::restore_genesis();
         let coordinate = crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
             *cid.as_bytes(),
             template.coordinate().generation(),
@@ -4829,7 +4641,7 @@ mod historical_control_loader {
             .await
             .expect("connect to existing gate database");
         let cid = Uuid::new_v4();
-        let template = crate::frozen_public_state::restore_genesis();
+        let template = crate::common::frozen_public_state::restore_genesis();
         let coordinate = crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
             *cid.as_bytes(),
             template.coordinate().generation(),
@@ -6149,9 +5961,9 @@ mod historical_control_loader {
             XWING_CIPHERSUITE,
         };
         use crate::common;
-        use crate::executor_seed::bind_creation_entry_to_group_info;
-        pub(super) use crate::executor_seed::device_event_predecessor;
-        use crate::executor_seed::genuine_terminal_fixture::{
+        use crate::common::executor_seed::bind_creation_entry_to_group_info;
+        pub(super) use crate::common::executor_seed::device_event_predecessor;
+        use crate::common::executor_seed::genuine_terminal_fixture::{
             build_genuine_add_fulfillment_entry_with_bytes,
             build_genuine_commit_control_with_bytes,
             build_genuine_leave_request as build_genuine_leave_request_shared,
@@ -6164,10 +5976,10 @@ mod historical_control_loader {
             GenuinePolicyChange, GenuinePolicyControl, RealAcceptanceEntry,
             RealLeafRecoveryFulfillmentEntry,
         };
-        pub(super) use crate::executor_seed::genuine_terminal_fixture::{
+        pub(super) use crate::common::executor_seed::genuine_terminal_fixture::{
             coordinate_json, AcceptanceInvitee,
         };
-        use crate::random_plc_did;
+        use super::super::random_plc_did;
 
         fn g6_raw_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
             let mut cursor = start;
@@ -6385,9 +6197,9 @@ mod historical_control_loader {
 
         #[test]
         fn g6_production_authority_path_has_no_raw_business_guard() {
-            let core = include_str!("../src/chat_protocol/repository/core.rs");
-            let state_machine = include_str!("../src/chat_protocol/state_machine.rs");
-            let execution = include_str!("../src/chat_protocol/repository/execution_context.rs");
+            let core = include_str!("core.rs");
+            let state_machine = include_str!("../state_machine.rs");
+            let execution = include_str!("execution_context.rs");
 
             let scope_seal = g6_source_item(core, "pub(crate) async fn seal_g6_scope_authority(");
             let scope_seal = g6_source_code(scope_seal);
@@ -6511,10 +6323,10 @@ mod historical_control_loader {
             // state_machine's executor module moved to its own file post-C2-seal;
             // the guard scans the same source text, now split across two files.
             let state_machine = concat!(
-                include_str!("../src/chat_protocol/state_machine.rs"),
-                include_str!("../src/chat_protocol/state_machine/executor.rs"),
+                include_str!("../state_machine.rs"),
+                include_str!("../state_machine/executor.rs"),
             );
-            let execution = include_str!("../src/chat_protocol/repository/execution_context.rs");
+            let execution = include_str!("execution_context.rs");
             let member_digest_item = g6_source_item(
                 state_machine,
                 "fn prepared_device_revocation_members_binding_digest(",
@@ -6572,7 +6384,7 @@ mod historical_control_loader {
 
         #[test]
         fn g6_discovery_and_prehead_typestate_enforce_lock_order() {
-            let core = include_str!("../src/chat_protocol/repository/core.rs");
+            let core = include_str!("core.rs");
             let discovery =
                 g6_source_item(core, "pub(crate) async fn discover_g6_revocation_scope(");
             let discovery_code = g6_source_code(discovery);
@@ -6641,8 +6453,8 @@ mod historical_control_loader {
 
         #[test]
         fn g6_post_head_path_has_no_identity_lock_or_identity_query() {
-            let core = include_str!("../src/chat_protocol/repository/core.rs");
-            let execution = include_str!("../src/chat_protocol/repository/execution_context.rs");
+            let core = include_str!("core.rs");
+            let execution = include_str!("execution_context.rs");
 
             let post_head = g6_source_item(core, "pub(crate) async fn hydrate_locked_g6_prelude(");
             let post_head_code = g6_source_code(post_head);
@@ -8868,10 +8680,17 @@ mod historical_control_loader {
                 assert_eq!(before.event_recipient_count, 0);
                 assert_eq!(before.outbox_count, 0);
 
-                let prepared = hydrate_execution_context(
+                let context = hydrate_execution_context_unscoped_for_test(
                     &mut transaction,
                     &plan,
                     g6_welcome_expiry_artifacts(),
+                )
+                .await
+                .expect("normal production hydration mints context");
+                let prepared = crate::chat_protocol::repository::execution_context::prepare_execution_context_for_test(
+                    &mut transaction,
+                    &plan,
+                    context,
                 )
                 .await
                 .expect("normal production hydration mints the prepared expiry capsule");
@@ -10184,7 +10003,7 @@ mod historical_control_loader {
                     .unwrap_or_else(|error| panic!("{name} processes: {error:?}"))
             };
 
-            let genesis = crate::frozen_public_state::restore_genesis();
+            let genesis = crate::common::frozen_public_state::restore_genesis();
             let invited = rebind_active_snapshot(
                 &genesis,
                 PublicGroupSnapshotCoordinate::new(
@@ -10235,7 +10054,7 @@ mod historical_control_loader {
             );
             let sender_leaf_index = add_senders[0].leaf_index();
             assert_eq!(sender_leaf_index, 0, "frozen Add sender is Alice leaf zero");
-            let add = crate::frozen_public_state::restore_add_commit(&add_prior, sender_leaf_index);
+            let add = crate::common::frozen_public_state::restore_add_commit(&add_prior, sender_leaf_index);
             assert_eq!(add.adds().len(), 1);
             assert_eq!(
                 add.adds()[0].key_package_ref(),
@@ -10325,7 +10144,7 @@ mod historical_control_loader {
                 ),
             )
             .expect("reacceptance coordinate-only edge");
-            let rejoin = crate::frozen_public_state::restore_rejoin_commit(&rejoin_prior)
+            let rejoin = crate::common::frozen_public_state::restore_rejoin_commit(&rejoin_prior)
                 .expect("restore strict manifest-bound frozen rejoin Add");
             assert_eq!(rejoin.adds().len(), 1);
             assert_eq!(
@@ -12438,7 +12257,7 @@ mod historical_control_loader {
                 pending_recipients: vec![invitee.did.clone()],
                 operation: AdmissionOperation::Group,
             };
-            let live = crate::relationship_policy_source::collect_admission_projection(
+            let live = crate::chat_protocol::relationship_policy::collect_admission_projection(
                 &authority,
                 &FixedProjectionClock(trusted_at),
                 PolicyProjectionRevisionGuard::for_test(1),
@@ -14047,7 +13866,7 @@ mod historical_control_loader {
                 pending_recipients: creation_pending,
                 operation: AdmissionOperation::Group,
             };
-            let live_creation = crate::relationship_policy_source::collect_admission_projection(
+            let live_creation = crate::chat_protocol::relationship_policy::collect_admission_projection(
                 &relationship_authority,
                 &FixedProjectionClock(trusted_at),
                 PolicyProjectionRevisionGuard::for_test(1),
@@ -14092,7 +13911,7 @@ mod historical_control_loader {
                 pending_recipients: vec![invitee.did.clone()],
                 operation: AdmissionOperation::Group,
             };
-            let live_acceptance = crate::relationship_policy_source::collect_admission_projection(
+            let live_acceptance = crate::chat_protocol::relationship_policy::collect_admission_projection(
                 &acceptance_relationship_authority,
                 &FixedProjectionClock(trusted_at),
                 PolicyProjectionRevisionGuard::for_test(1),
@@ -14131,7 +13950,7 @@ mod historical_control_loader {
             );
             let mut fulfillment_roster = vec![entry.actor_did.clone(), invitee.did.clone()];
             fulfillment_roster.sort();
-            let live_fulfillment = crate::relationship_policy_source::collect_block_projection(
+            let live_fulfillment = crate::chat_protocol::relationship_policy::collect_block_projection(
                 &fulfillment_relationship_authority,
                 &FixedProjectionClock(trusted_at),
                 PolicyProjectionRevisionGuard::for_test(1),
@@ -14171,7 +13990,7 @@ mod historical_control_loader {
             let mut recovery_request_roster = vec![entry.actor_did.clone(), invitee.did.clone()];
             recovery_request_roster.sort();
             let live_recovery_request =
-                crate::relationship_policy_source::collect_block_projection(
+                crate::chat_protocol::relationship_policy::collect_block_projection(
                     &recovery_request_relationship_authority,
                     &FixedProjectionClock(prior_bound_recovery_at),
                     PolicyProjectionRevisionGuard::for_test(1),
@@ -22268,7 +22087,7 @@ mod historical_control_loader {
             let (mut entry, invitee) =
                 creation_with_pending_invitee(build_real_corpus_creation_entry(*cid.as_bytes()));
             entry.head_next_entry_seq = 3;
-            let template = crate::frozen_public_state::restore_genesis();
+            let template = crate::common::frozen_public_state::restore_genesis();
             let coordinate = PublicGroupSnapshotCoordinate::new(
                 *cid.as_bytes(),
                 template.coordinate().generation(),
@@ -33299,7 +33118,7 @@ mod historical_control_loader {
         #[tokio::test]
         #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
         async fn a_not_yet_due_welcome_delivery_is_not_swept() {
-            let (pool, _database) = crate::executor_seed::setup().await;
+            let (pool, _database) = crate::common::executor_seed::setup().await;
             let graph = commit_genuine_policy_acceptance_fulfillment(&pool).await;
             let cid = Uuid::from_bytes(graph.entry.cid);
             let welcome_id = graph.fulfillment.welcome_id;
@@ -33339,7 +33158,7 @@ mod historical_control_loader {
         #[tokio::test]
         #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
         async fn a_due_welcome_delivery_is_swept_exactly_once() {
-            let (pool, _database) = crate::executor_seed::setup().await;
+            let (pool, _database) = crate::common::executor_seed::setup().await;
             let graph = commit_genuine_policy_acceptance_fulfillment(&pool).await;
             let cid = Uuid::from_bytes(graph.entry.cid);
             let welcome_id = graph.fulfillment.welcome_id;
@@ -34228,8 +34047,8 @@ mod chat_expiry_sweep_enumeration {
     #[tokio::test]
     #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
     async fn due_leaf_recovery_enumeration_never_returns_a_terminal_request() {
-        let (pool, _database) = crate::executor_seed::setup().await;
-        let scenario = crate::executor_seed::run_fulfillment_scenario(&pool).await;
+        let (pool, _database) = crate::common::executor_seed::setup().await;
+        let scenario = crate::common::executor_seed::run_fulfillment_scenario(&pool).await;
 
         let status: String = sqlx::query_scalar(
             "SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id = $1",

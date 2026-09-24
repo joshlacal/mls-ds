@@ -14,8 +14,6 @@ use sqlx::PgPool;
 pub mod chat_protocol;
 pub mod fresh_db;
 pub mod http_acceptance;
-#[allow(dead_code)]
-pub mod executor_seed;
 
 /// Mint a private, freshly migrated database for one test case.
 ///
