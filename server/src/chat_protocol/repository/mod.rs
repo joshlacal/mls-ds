@@ -73,3 +73,6 @@ mod ticket_tests;
 #[cfg(test)]
 #[path = "reset/tests.rs"]
 mod reset_repository_tests;
+#[cfg(test)]
+#[path = "reset/wedge_tests.rs"]
+mod reset_wedge_tests;
