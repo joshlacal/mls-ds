@@ -133,7 +133,10 @@ impl GatewaySender<'_> {
             &document,
             preparation["receiptKeyId"].as_str().context("receiptKeyId")?,
         )?;
-        protocol::verify_direct_request_preparation(&serde_json::to_vec(&preparation)?, &receipt_key)?;
+        // Continue with the verified value: reads present `{"$bytes"}`, and only
+        // the verifier's normalized projection may feed the strict signer.
+        let preparation =
+            protocol::verify_direct_request_preparation(&serde_json::to_vec(&preparation)?, &receipt_key)?;
         let verified_prepare = protocol::verify_signed_request(
             DirectRequestKind::Prepare,
             &serde_json::to_vec(&prepare)?,
@@ -266,8 +269,11 @@ impl GatewaySender<'_> {
         let published: Value = serde_json::from_slice(&body)?;
         let mut receipt = published["outcome"].clone();
         receipt.as_object_mut().context("published outcome object")?.remove("$type");
-        let verified_receipt =
-            protocol::verify_signed_request(DirectRequestKind::Outcome, &serde_json::to_vec(&receipt)?, &receipt_key)?;
+        let verified_receipt = protocol::verify_received_signed_request(
+            DirectRequestKind::Outcome,
+            &serde_json::to_vec(&receipt)?,
+            &receipt_key,
+        )?;
         let proof = &verified_receipt.body()["receipt"];
         ensure!(
             proof["requestId"] == request_id.to_string()
