@@ -119,7 +119,9 @@ fn is_get(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::GetBlobUsage
             | ChatEndpoint::GetConversationState
             | ChatEndpoint::GetConversations
+            | ChatEndpoint::GetDeviceKey
             | ChatEndpoint::GetDevices
+            | ChatEndpoint::GetDirectRequestOutcome
             | ChatEndpoint::GetEntries
             | ChatEndpoint::GetLeafRecoveryInbox
             | ChatEndpoint::GetOwnDevices
@@ -164,7 +166,12 @@ async fn every_clean_endpoint_is_registered_and_cutover_gated() {
                 bytes
             )
         });
-        assert_eq!(body["error"], "CutoverRequired", "{}", endpoint.nsid());
+        let expected_error = if *endpoint == ChatEndpoint::AcceptConversation {
+            "InvalidRequest"
+        } else {
+            "CutoverRequired"
+        };
+        assert_eq!(body["error"], expected_error, "{}", endpoint.nsid());
     }
 }
 
