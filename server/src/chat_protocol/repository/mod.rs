@@ -82,3 +82,6 @@ mod relationship_repository_tests;
 #[cfg(test)]
 #[path = "transition/tests.rs"]
 mod transition_repository_tests;
+#[cfg(test)]
+#[path = "auth/tests.rs"]
+mod auth_repository_tests;

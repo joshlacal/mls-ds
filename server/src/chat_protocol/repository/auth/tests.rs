@@ -1,203 +1,37 @@
-//! Repository-boundary tests for clean chat authentication.
-//!
-//! Database cases remain ignored until the schema owner clears the dedicated
-//! `catbird_chat_protocol_test_20260722` database gate. They stay `#[ignore]`d
-//! (not de-ignored into the standard whole-suite gate) because each seeds
-//! replay/idempotency rows that collide on a shared, never-truncated database;
-//! they need a pristine schema per run, which the standard harness does not
-//! provide. Run them explicitly against a freshly-migrated dedicated database:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_auth_repository -- --ignored --test-threads=1
-
-mod common;
-
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-#[allow(dead_code)]
-mod snapshot {
-    pub use catbird_server::chat_protocol::snapshot::*;
-}
-mod repository {
-    pub(crate) use crate::chat_protocol::repository::*;
-}
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-// The production repository module now includes Welcome CAS writers that
-// consume the nested `crate::chat_protocol` authority types. Mirror the
-// production-shaped module graph used by the transition harness so this
-// repository-boundary target compiles without weakening production paths.
-#[allow(dead_code)]
-mod chat_protocol {
-    pub mod direct_request_transcript {
-        pub use catbird_server::chat_protocol::direct_request_transcript::*;
-    }
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-
-    pub mod model {
-        pub use crate::model::*;
-    }
-
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    pub mod repository {
-        pub mod blobs {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-        pub mod execution_context {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod prelude {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        pub mod key_packages {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-        pub mod recovery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
-        pub mod core {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        pub mod relationship {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-    }
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
-
-    #[test]
-    fn final_authority_constructor_requires_the_concrete_repository_receipt() {
-        let constructor: fn(
-            dpop::PreReplayCryptographicVerification,
-            repository::auth::RepositoryAuthorityReceipt,
-        ) -> dpop::VerifiedChatDeviceRequest = dpop::mint_unsigned_repository_authority;
-        let _ = constructor;
-    }
-}
-
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
 use ed25519_dalek::{Signer, SigningKey};
-use repository::auth::{
-    authorize_enrollment_operation_only, authorize_rebind_operation_only,
+use serde_json::json;
+use sha2::{Digest, Sha256};
+
+use crate::chat_protocol::validation;
+use crate::chat_protocol::repository;
+use crate::common;
+use crate::chat_protocol::dpop;
+use crate::chat_protocol::repository::auth::{
+    self, authorize_enrollment_operation_only, authorize_rebind_operation_only,
     authorize_replenishment_operation_only, authorize_signed_request, authorize_unsigned_request,
     test_arbitrate_business_idempotency, test_recheck_business_authority,
     test_record_completed_idempotency, AuthRepositoryError, AuthorizationOutcome,
     EnrollmentOperationAdmission, RebindOperationAdmission, SignedOperationAdmission,
     TestBusinessIdempotencyOutcome,
 };
-use repository::key_packages::NewKeyPackage;
-use repository::prelude::{self, PreludeError};
-use serde_json::json;
-use sha2::{Digest, Sha256};
-use transcript::{
-    decode_and_verify_enrollment_body, decode_canonical_signed_mutation, decode_rebind_bootstrap,
+use crate::chat_protocol::repository::key_packages::NewKeyPackage;
+use crate::chat_protocol::repository::prelude::{self, PreludeError};
+use crate::chat_protocol::transcript::{
+    self, decode_and_verify_enrollment_body, decode_canonical_signed_mutation, decode_rebind_bootstrap,
 };
+
+#[test]
+fn final_authority_constructor_requires_the_concrete_repository_receipt() {
+    let constructor: fn(
+        dpop::PreReplayCryptographicVerification,
+        auth::RepositoryAuthorityReceipt,
+    ) -> dpop::VerifiedChatDeviceRequest = dpop::mint_unsigned_repository_authority;
+    let _ = constructor;
+}
 
 const REGISTERED_DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
 const REGISTERED_DEVICE: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
@@ -324,7 +158,7 @@ async fn replenishment_admission(
 ) -> SignedOperationAdmission {
     authorize_replenishment_operation_only(
         pool,
-        chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
             uuid::Uuid::new_v4(),
             random_proof_jti(),
             "blue.catbird.chat.replenishKeyPackages",
@@ -380,8 +214,8 @@ fn ordinary_evidence(
     endpoint: &str,
     trusted_at: &str,
     dpop_jkt: &str,
-) -> chat_protocol::dpop::PreReplayCryptographicVerification {
-    chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
+) -> crate::chat_protocol::dpop::PreReplayCryptographicVerification {
+    crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
         uuid::Uuid::new_v4(),
         random_proof_jti(),
         endpoint,
@@ -702,8 +536,8 @@ fn enrollment_evidence(
     proof_jti: [u8; 12],
     auth_txn: uuid::Uuid,
     trusted_at: &str,
-) -> chat_protocol::dpop::PreReplayCryptographicVerification {
-    chat_protocol::dpop::repository_test_evidence::enrollment_with_replay(
+) -> crate::chat_protocol::dpop::PreReplayCryptographicVerification {
+    crate::chat_protocol::dpop::repository_test_evidence::enrollment_with_replay(
         decode_and_verify_enrollment_body(raw).unwrap(),
         token_jti,
         proof_jti,
@@ -740,8 +574,8 @@ fn rebind_evidence(
     token_jti: uuid::Uuid,
     proof_jti: [u8; 12],
     trusted_at: &str,
-) -> chat_protocol::dpop::PreReplayCryptographicVerification {
-    chat_protocol::dpop::repository_test_evidence::rebind_with_replay(
+) -> crate::chat_protocol::dpop::PreReplayCryptographicVerification {
+    crate::chat_protocol::dpop::repository_test_evidence::rebind_with_replay(
         decode_rebind_bootstrap(raw).unwrap(),
         token_jti,
         proof_jti,
@@ -751,7 +585,7 @@ fn rebind_evidence(
 
 fn first_authority(
     outcome: AuthorizationOutcome,
-) -> chat_protocol::dpop::VerifiedChatDeviceRequest {
+) -> crate::chat_protocol::dpop::VerifiedChatDeviceRequest {
     match outcome {
         AuthorizationOutcome::FirstExecution(authority) => authority,
         AuthorizationOutcome::CompletedReplay(_) => panic!("fresh request replayed"),
@@ -912,7 +746,7 @@ async fn valid_replay_evidence_is_burned_even_when_device_lookup_fails() {
     let token_jti = uuid::Uuid::new_v4();
     let proof_jti = random_proof_jti();
     let evidence =
-        chat_protocol::dpop::repository_test_evidence::ordinary_missing_device_with_replay(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_missing_device_with_replay(
             token_jti, proof_jti,
         );
 
@@ -940,7 +774,7 @@ async fn valid_replay_evidence_is_burned_even_when_device_lookup_fails() {
 
     let conflicting_proof_jti = random_proof_jti();
     let conflicting_set =
-        chat_protocol::dpop::repository_test_evidence::ordinary_missing_device_with_replay(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_missing_device_with_replay(
             token_jti,
             conflicting_proof_jti,
         );
@@ -971,7 +805,7 @@ async fn replay_audit_commits_independently_of_business_rollback() {
     let operation_id = uuid::Uuid::new_v4();
     let raw = signed_blob_deletion(operation_id, uuid::Uuid::new_v4(), FIRST_T);
     let canonical = decode_canonical_signed_mutation(&raw).unwrap();
-    let evidence = chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+    let evidence = crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
         token_jti,
         proof_jti,
         "blue.catbird.chat.deleteBlob",
@@ -1043,7 +877,7 @@ async fn identical_business_racers_converge_and_exact_replay_bypasses_only_age()
 
     let first = authorize_signed_request(
         &pool,
-        chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
             uuid::Uuid::new_v4(),
             random_proof_jti(),
             "blue.catbird.chat.deleteBlob",
@@ -1055,7 +889,7 @@ async fn identical_business_racers_converge_and_exact_replay_bypasses_only_age()
     .unwrap();
     let second = authorize_signed_request(
         &pool,
-        chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
             uuid::Uuid::new_v4(),
             random_proof_jti(),
             "blue.catbird.chat.deleteBlob",
@@ -1130,7 +964,7 @@ async fn identical_business_racers_converge_and_exact_replay_bypasses_only_age()
     let late_t = "2026-07-23T14:05:09.123Z";
     let exact_late = authorize_signed_request(
         &pool,
-        chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
             uuid::Uuid::new_v4(),
             random_proof_jti(),
             "blue.catbird.chat.deleteBlob",
@@ -1148,7 +982,7 @@ async fn identical_business_racers_converge_and_exact_replay_bypasses_only_age()
     let whitespace_raw = [b" \n".as_slice(), raw.as_slice(), b" \n".as_slice()].concat();
     let whitespace_error = authorize_signed_request(
         &pool,
-        chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
             uuid::Uuid::new_v4(),
             random_proof_jti(),
             "blue.catbird.chat.deleteBlob",
@@ -1168,7 +1002,7 @@ async fn identical_business_racers_converge_and_exact_replay_bypasses_only_age()
     let changed_signature_raw = serde_json::to_vec(&changed_signature).unwrap();
     let signature_error = authorize_signed_request(
         &pool,
-        chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
             uuid::Uuid::new_v4(),
             random_proof_jti(),
             "blue.catbird.chat.deleteBlob",
@@ -1188,7 +1022,7 @@ async fn identical_business_racers_converge_and_exact_replay_bypasses_only_age()
     let changed_body_raw = serde_json::to_vec(&changed_body).unwrap();
     let digest_error = authorize_signed_request(
         &pool,
-        chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
             uuid::Uuid::new_v4(),
             random_proof_jti(),
             "blue.catbird.chat.deleteBlob",
@@ -1668,7 +1502,7 @@ async fn replenishment_exact_replay_survives_next_day_but_stale_first_creates_no
     let raw = signed_replenishment(operation_id, FIRST_T);
     let first = authorize_replenishment_operation_only(
         &pool,
-        chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
             uuid::Uuid::new_v4(),
             random_proof_jti(),
             "blue.catbird.chat.replenishKeyPackages",
@@ -1713,7 +1547,7 @@ async fn replenishment_exact_replay_survives_next_day_but_stale_first_creates_no
 
     let replay = authorize_replenishment_operation_only(
         &pool,
-        chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
             uuid::Uuid::new_v4(),
             random_proof_jti(),
             "blue.catbird.chat.replenishKeyPackages",
@@ -1738,7 +1572,7 @@ async fn replenishment_exact_replay_survives_next_day_but_stale_first_creates_no
     let stale_raw = signed_replenishment(stale_operation_id, FIRST_T);
     let stale = authorize_replenishment_operation_only(
         &pool,
-        chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
             uuid::Uuid::new_v4(),
             random_proof_jti(),
             "blue.catbird.chat.replenishKeyPackages",
