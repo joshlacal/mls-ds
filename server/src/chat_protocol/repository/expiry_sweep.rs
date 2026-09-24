@@ -322,7 +322,14 @@ pub async fn expire_due_published_requests(
     let mut count = 0;
     for id in ids {
         let mut tx = pool.begin().await?;
-        let _operation = super::prelude::lock_direct_request_operation(&mut tx, id).await?;
+        sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *tx).await?;
+        let _operation = match super::prelude::try_lock_direct_request_operation_only(&mut tx, id).await {
+            Ok(Some(op)) => op,
+            Ok(None) | Err(_) => {
+                tx.rollback().await?;
+                continue;
+            }
+        };
         let row: Option<(Uuid, String, Uuid, String, i64, String, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
             r#"
             SELECT p.conversation_id, a.actor_did, a.actor_device_id, a.actor_key_id,
@@ -347,11 +354,16 @@ pub async fn expire_due_published_requests(
             continue;
         };
 
-        super::prelude::lock_direct_request_identity_scope(
+        if super::prelude::lock_direct_request_identity_scope(
             &mut tx,
             &[actor_did.clone(), recipient_did.clone()],
         )
-        .await?;
+        .await
+        .is_err()
+        {
+            tx.rollback().await?;
+            continue;
+        }
 
         let now: DateTime<Utc> = sqlx::query_scalar(
             "SELECT date_trunc('milliseconds', clock_timestamp())"
@@ -468,7 +480,14 @@ pub async fn prune_terminal_request_artifacts(
     let mut count = 0;
     for (id, _consent) in candidates {
         let mut tx = pool.begin().await?;
-        let _operation = super::prelude::lock_direct_request_operation(&mut tx, id).await?;
+        sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *tx).await?;
+        let _operation = match super::prelude::try_lock_direct_request_operation_only(&mut tx, id).await {
+            Ok(Some(op)) => op,
+            Ok(None) | Err(_) => {
+                tx.rollback().await?;
+                continue;
+            }
+        };
 
         let row: Option<(String, i64, i64, i64)> = sqlx::query_as(
             r#"

@@ -3827,5 +3827,6 @@ mod event_scope_tests;
 mod direct_request_lock;
 pub(super) use direct_request_lock::{
     lock_direct_request_identity_scope, lock_direct_request_operation,
-    lock_direct_request_operation_set, DirectRequestOperationLock,
+    lock_direct_request_operation_set, try_lock_direct_request_operation,
+    try_lock_direct_request_operation_only, DirectRequestOperationLock,
 };

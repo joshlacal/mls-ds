@@ -1250,18 +1250,30 @@ pub(crate) async fn expire_due_preparations(
     let mut count = 0;
     for id in ids {
         let mut tx = pool.begin().await?;
-        let operation = super::prelude::lock_direct_request_operation(&mut tx, id).await?;
+        sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *tx).await?;
+        let operation = match super::prelude::try_lock_direct_request_operation(&mut tx, id).await {
+            Ok(Some(op)) => op,
+            Ok(None) | Err(_) => {
+                tx.rollback().await?;
+                continue;
+            }
+        };
         let row:Option<(String,Uuid,String,i64,String,Vec<u8>)>=sqlx::query_as("SELECT actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest FROM chat.direct_request_attempts WHERE request_id=$1 AND status='prepared' AND lease_expires_at<=clock_timestamp()")
             .bind(id).fetch_optional(&mut *tx).await?;
         let Some((actor_did, device, key, generation, recipient, prepare_digest)) = row else {
             tx.rollback().await?;
             continue;
         };
-        super::prelude::lock_direct_request_identity_scope(
+        if super::prelude::lock_direct_request_identity_scope(
             &mut tx,
             &[actor_did.clone(), recipient.clone()],
         )
-        .await?;
+        .await
+        .is_err()
+        {
+            tx.rollback().await?;
+            continue;
+        }
         let i = AttemptIdentity {
             request_id: id,
             actor_did,
@@ -1271,7 +1283,13 @@ pub(crate) async fn expire_due_preparations(
             recipient_did: recipient,
             prepare_digest,
         };
-        let lock = load_locked_attempt(&mut tx, i, &operation).await?;
+        let lock = match load_locked_attempt(&mut tx, i, &operation).await {
+            Ok(l) => l,
+            Err(_) => {
+                tx.rollback().await?;
+                continue;
+            }
+        };
         let now: DateTime<Utc> =
             sqlx::query_scalar("SELECT date_trunc('milliseconds',clock_timestamp())")
                 .fetch_one(&mut *tx)
