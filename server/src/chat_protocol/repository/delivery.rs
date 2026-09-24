@@ -2487,3 +2487,6 @@ pub(crate) async fn fetch_control_entry_for_device(
     .await?;
     Ok(row)
 }
+
+#[cfg(test)]
+mod read_tests;
