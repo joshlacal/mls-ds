@@ -1035,7 +1035,7 @@ impl ServiceIdentity {
     }
 
     fn jwt_with_jti(&self, nsid: &str, valid_signature: bool, jti: Uuid) -> String {
-        let now = chrono::Utc::now().timestamp();
+        let now = monotonic_utc_now().timestamp();
         let header = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(
                 &json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto",self.did)}),
@@ -1234,12 +1234,28 @@ pub fn signed_mls_request(
     Ok(wrapper)
 }
 
+static LAST_OBSERVED_UTC_NOW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn monotonic_utc_now() -> chrono::DateTime<chrono::Utc> {
+    for _ in 0..10 {
+        let now = chrono::Utc::now();
+        let ts = now.timestamp();
+        let last = LAST_OBSERVED_UTC_NOW.load(std::sync::atomic::Ordering::Relaxed);
+        if last == 0 || ts + 5 >= last {
+            LAST_OBSERVED_UTC_NOW.fetch_max(ts, std::sync::atomic::Ordering::Relaxed);
+            return now;
+        }
+        std::thread::yield_now();
+    }
+    chrono::Utc::now()
+}
+
 pub fn canonical_now() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    monotonic_utc_now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 pub fn canonical_future(days: i64) -> String {
-    (chrono::Utc::now() + chrono::Duration::days(days))
+    (monotonic_utc_now() + chrono::Duration::days(days))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 

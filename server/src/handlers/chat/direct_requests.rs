@@ -20,6 +20,7 @@ use axum::{
 use std::sync::Arc;
 
 fn failure(endpoint: ChatEndpoint, error: DirectRequestStoreError) -> ChatFailure {
+    tracing::warn!(%error, endpoint = endpoint.nsid(), "direct request repository failure");
     let code = match error {
         DirectRequestStoreError::Database(_) => return ChatFailure::storage(endpoint),
         DirectRequestStoreError::ForeignTransaction | DirectRequestStoreError::InvalidReceipt => {
@@ -217,7 +218,10 @@ pub(super) async fn outcome(
         let mut tx = pool
             .begin()
             .await
-            .map_err(|_| ChatFailure::storage(endpoint))?;
+            .map_err(|error| {
+                tracing::error!(%error, "get_direct_request_outcome pool.begin failed");
+                ChatFailure::storage(endpoint)
+            })?;
         let result =
             requests::get_direct_request_outcome(&mut tx, &principal, device, request, signer, now)
                 .await

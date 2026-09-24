@@ -183,13 +183,17 @@ impl ChatRuntime {
             "clean-chat protocol fence cannot be validated without a cursor sealer".to_owned()
         })?;
         let expected_key_id = URL_SAFE_NO_PAD.encode(sealer.key_id());
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|error| format!("failed to acquire connection for clean-chat protocol fence: {error}"))?;
 
         let protocol = sqlx::query_as::<_, (uuid::Uuid, String)>(
             "SELECT p.protocol_instance_id, p.cursor_key_id \
              FROM chat.protocol_instances AS p \
              WHERE p.singleton = TRUE",
         )
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|error| format!("failed to load clean-chat protocol instance fence: {error}"))?
         .ok_or_else(|| "clean-chat protocol instance singleton is missing".to_owned())?;
@@ -207,7 +211,7 @@ impl ChatRuntime {
              WHERE protocol_instance_id = $1)",
         )
         .bind(protocol.0)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|error| format!("failed to load clean-chat event-retention fence: {error}"))?;
         if !retention_exists {
