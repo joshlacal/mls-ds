@@ -3810,13 +3810,14 @@ fn verify_successor_capability(
 /// ticket compositor. The UUID session handle is not a bearer: this helper
 /// locks the exact session, verifies the exact device identity and live fence,
 /// then decrypts the sealed capability under the session's binding. The raw
-/// capability is returned only to the caller's transaction frame.
+/// capability is returned only to the caller's transaction frame, with the
+/// session's `(created_at, expires_at)` window.
 pub(crate) async fn snapshot_capability_for_ticket(
     transaction: &mut Transaction<'_, Postgres>,
     device: &super::super::read_authority::LockedReadDeviceAuthority,
     inventory_session_id: Uuid,
     sealer: &CursorSealer,
-) -> Result<(String, DateTime<Utc>), InventoryRepositoryError> {
+) -> Result<(String, DateTime<Utc>, DateTime<Utc>), InventoryRepositoryError> {
     let row = lock_inventory_session_row(transaction, inventory_session_id)
         .await?
         .ok_or(InventoryRepositoryError::SessionNotFound)?;
@@ -3841,7 +3842,7 @@ pub(crate) async fn snapshot_capability_for_ticket(
     if now >= row.expires_at {
         return Err(InventoryRepositoryError::DurableRowInvalid);
     }
-    Ok((capability, row.expires_at))
+    Ok((capability, row.created_at, row.expires_at))
 }
 
 /// The `SealerBinding` for one served page receipt, derived from the receipt

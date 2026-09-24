@@ -958,15 +958,15 @@ fn canonical_new_pending_welcomes(
                 .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?,
             "coordinates": coordinate_json(successor)?,
             "status": "pending",
-            "opaqueWelcome": STANDARD.encode(welcome.opaque_welcome()),
-            "sha256": STANDARD.encode(welcome.sha256()),
+            "opaqueWelcome": {"$bytes": STANDARD.encode(welcome.opaque_welcome())},
+            "sha256": {"$bytes": STANDARD.encode(welcome.sha256())},
             "recipientDid": did,
             "recipientDeviceId":
                 Uuid::from_bytes(*welcome.recipient().device_id()).hyphenated().to_string(),
             "provenance": {
                 "recoveryRequestId":
                     Uuid::from_bytes(*welcome.recovery_request_id()).hyphenated().to_string(),
-                "keyPackageRef": STANDARD.encode(welcome.key_package_ref()),
+                "keyPackageRef": {"$bytes": STANDARD.encode(welcome.key_package_ref())},
             },
             "expiresAt": canonical_datetime(expires_at),
         }));
@@ -1458,13 +1458,13 @@ fn replay_welcome_json(
             "transitionSeq": row.entry_seq,
             "coordinates": coordinate_json(successor)?,
             "status": "pending",
-            "opaqueWelcome": STANDARD.encode(&row.wrapper_bytes),
-            "sha256": STANDARD.encode(&row.wrapper_sha256),
+            "opaqueWelcome": {"$bytes": STANDARD.encode(&row.wrapper_bytes)},
+            "sha256": {"$bytes": STANDARD.encode(&row.wrapper_sha256)},
             "recipientDid": row.recipient_did,
             "recipientDeviceId": row.recipient_device_id.hyphenated().to_string(),
             "provenance": {
                 "recoveryRequestId": row.recovery_request_id.hyphenated().to_string(),
-                "keyPackageRef": STANDARD.encode(&row.key_package_ref),
+                "keyPackageRef": {"$bytes": STANDARD.encode(&row.key_package_ref)},
             },
             "expiresAt": canonical_datetime(row.expires_at),
         }));
