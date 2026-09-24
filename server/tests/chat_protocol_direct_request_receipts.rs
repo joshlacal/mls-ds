@@ -100,3 +100,12 @@ async fn restart_and_rotation_retain_historical_receipt_trust() {
     .unwrap();
     assert!(missing.validate_and_retain_keys(&pool).await.is_err());
 }
+
+#[path = "../src/chat_protocol/request_push.rs"]
+pub mod request_push;
+
+#[path = "../src/chat_protocol/validation.rs"]
+pub mod validation;
+
+#[path = "../src/chat_protocol/model.rs"]
+pub mod model;

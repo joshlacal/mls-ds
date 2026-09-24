@@ -168,23 +168,35 @@ pub async fn run_federation_fixture() -> Result<(), String> {
         .await
         .map_err(|e| format!("database initialization failed: {e}"))?;
 
-    let fed_config = catbird_server::federation::FederationConfig::from_env()
-        .map_err(|e| format!("failed to load federation config: {e}"))?;
+    let fed_config = catbird_server::federation::FederationConfig::from_env();
 
-    let resolver = Arc::new(catbird_server::federation::DsResolver::new(
-        fed_config.allow_insecure_http,
-        fed_config.allowed_domains.clone(),
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(
+            fed_config.outbound_connect_timeout_secs,
+        ))
+        .timeout(std::time::Duration::from_secs(
+            fed_config.outbound_timeout_secs,
+        ))
+        .user_agent("catbird-mls-ds/1.0")
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+    let _resolver = Arc::new(catbird_server::federation::DsResolver::new(
+        pool.clone(),
+        http_client,
+        fed_config.self_did.clone(),
+        fed_config.self_endpoint.clone(),
         fed_config.default_ds_endpoint.clone(),
         fed_config.endpoint_cache_ttl_secs,
     ));
 
     let _outbound = Arc::new(catbird_server::federation::outbound::OutboundClient::new(
-        resolver.clone(),
-        fed_config.clone(),
+        fed_config.outbound_connect_timeout_secs,
+        fed_config.outbound_timeout_secs,
     ));
 
     let _service_auth = if let Some(pem) = &fed_config.signing_key_pem {
-        match catbird_server::auth::ServiceAuth::new(
+        match catbird_server::federation::ServiceAuthClient::from_es256_pem(
             fed_config.self_did.clone(),
             pem.as_bytes(),
             None,
