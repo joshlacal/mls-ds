@@ -54,6 +54,8 @@ compile_error!(
     "`subscription-production-proof` is a non-shipping test surface and cannot coexist with `server-bin`"
 );
 
+extern crate self as catbird_server;
+
 pub mod actors;
 pub mod atproto_bytes;
 pub mod auth;
