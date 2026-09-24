@@ -1196,6 +1196,15 @@ pub(crate) async fn get_direct_request_outcome(
         .row
         .as_ref()
         .ok_or(DirectRequestStoreError::InvalidReceipt)?;
+    let expiry_receipt: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT signed_receipt FROM chat.direct_request_expiry_receipts WHERE request_id = $1",
+    )
+    .bind(request_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(receipt) = expiry_receipt {
+        return Ok(DirectRequestResult::Terminal(receipt));
+    }
     if let Some(receipt) = row.terminal_bytes()? {
         return Ok(DirectRequestResult::Terminal(receipt.to_vec()));
     }

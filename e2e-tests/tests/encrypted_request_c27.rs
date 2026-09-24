@@ -311,14 +311,18 @@ async fn c27_live_no_second_introduction_and_capacity_refusal_preserve_history()
     };
     assert_eq!(protocol::decode_direct_request_introduction(&plaintext)?["text"], "Real encrypted first contact");
 
-    // Pending capacity of a published request is released only by a consent
-    // transition; acceptance writes a release equal to its published charge.
+    // F1 (migration 20260919000021): publication retires the pending charge, so a
+    // published request holds only its retained charge and acceptance writes no
+    // pending release; the retained charge still equals the published reservation.
     let r1 = f.request_id;
-    assert_eq!(psql(&format!("SELECT count(*) FROM chat.direct_request_pending_releases WHERE request_id='{r1}'"))?, "0");
+    let no_pending_release = format!("SELECT count(*) FROM chat.direct_request_pending_releases WHERE request_id='{r1}'");
+    assert_eq!(psql(&format!("SELECT status FROM chat.direct_request_attempts WHERE request_id='{r1}'"))?, "published");
+    assert_eq!(psql(&no_pending_release)?, "0");
     live_direct_request::accept_existing_fixture(&f).await?;
+    assert_eq!(psql(&no_pending_release)?, "0", "acceptance writes no pending release after F1");
     assert_eq!(
-        psql(&format!("SELECT r.reason||':'||(r.released_bytes=a.reserved_bytes AND a.reserved_bytes=c.charged_bytes)::text FROM chat.direct_request_pending_releases r JOIN chat.direct_request_attempts a USING(request_id) JOIN chat.direct_request_retained_charges c USING(request_id) WHERE request_id='{r1}'"))?,
-        "accepted:true"
+        psql(&format!("SELECT (a.reserved_bytes=c.charged_bytes)::text FROM chat.direct_request_attempts a JOIN chat.direct_request_retained_charges c USING(request_id) WHERE request_id='{r1}'"))?,
+        "true"
     );
     Ok(())
 }

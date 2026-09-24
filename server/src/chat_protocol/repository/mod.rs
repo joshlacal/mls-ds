@@ -17,13 +17,13 @@ pub(crate) mod direct_request_preparation;
 pub(crate) mod direct_request_publication;
 pub(crate) mod direct_request_push;
 #[allow(dead_code)]
-pub(crate) mod direct_request_receipts;
+pub mod direct_request_receipts;
 pub(crate) mod direct_request_retention;
 pub(crate) mod entry_read;
 #[allow(dead_code)]
 pub(crate) mod execution_context;
 #[allow(dead_code)]
-pub(crate) mod expiry_sweep;
+pub mod expiry_sweep;
 pub(crate) mod inventory;
 #[allow(dead_code)]
 pub(crate) mod key_packages;
