@@ -152,7 +152,7 @@ pub fn reviewed_baseline() -> [BaselineMigration; 14] {
     ]
 }
 
-pub fn reviewed_request_migrations() -> [BaselineMigration; 18] {
+pub fn reviewed_request_migrations() -> [BaselineMigration; 19] {
     [
         baseline!(20260919000001, "direct request preparation", "20260919000001_direct_request_preparation.sql", "d4d3527aa77b8fe91d8d754f72290b682571cc6731866d72c059f10d4b2f7cf8ef629069737addeedaabd6f6eee682ca"),
         baseline!(20260919000002, "direct request publication", "20260919000002_direct_request_publication.sql", "7fda0b09fcdef20e4da2e1701f6a56c12f636f7881b46e2f6e249cb0d5fc2aa63c734dc07cbb543169398253e29cec9e"),
@@ -172,6 +172,7 @@ pub fn reviewed_request_migrations() -> [BaselineMigration; 18] {
         baseline!(20260919000016, "direct request push bindings", "20260919000016_direct_request_push_bindings.sql", "483aee1650f60a488d2a6498c11e4ce229906889ca1a655c37f080fefccf610bc4f552b06a63719ff471f95c060360f8"),
         baseline!(20260919000017, "direct request push outbox", "20260919000017_direct_request_push_outbox.sql", "813c165f4e1739fb81d1cd26b2e1cea505745b1df77d22d6ca4882ba44bf2a9446a0929be20320e04a22c93e2bdc380b"),
         baseline!(20260919000018, "fix direct request lifecycle close fence", "20260919000018_fix_direct_request_lifecycle_close_fence.sql", "db45c270c4f162078319724213518f3d3186ab5883ff75729e253663874738a001fa61af41791065eeca2f8c76bc1974"),
+        baseline!(20260919000021, "direct request capacity abuse fix", "20260919000021_direct_request_capacity_abuse_fix.sql", "5b6d18e3f9a43bccf357ee37f0df7b322d956369fb55cd036fbbbdb4e63f5c291730ac10885b6de511a697cb365939ca"),
     ]
 }
 
@@ -1034,7 +1035,7 @@ impl ServiceIdentity {
     }
 
     fn jwt_with_jti(&self, nsid: &str, valid_signature: bool, jti: Uuid) -> String {
-        let now = chrono::Utc::now().timestamp();
+        let now = monotonic_utc_now().timestamp();
         let header = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(
                 &json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto",self.did)}),
@@ -1233,12 +1234,28 @@ pub fn signed_mls_request(
     Ok(wrapper)
 }
 
+static LAST_OBSERVED_UTC_NOW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn monotonic_utc_now() -> chrono::DateTime<chrono::Utc> {
+    for _ in 0..10 {
+        let now = chrono::Utc::now();
+        let ts = now.timestamp();
+        let last = LAST_OBSERVED_UTC_NOW.load(std::sync::atomic::Ordering::Relaxed);
+        if last == 0 || ts + 5 >= last {
+            LAST_OBSERVED_UTC_NOW.fetch_max(ts, std::sync::atomic::Ordering::Relaxed);
+            return now;
+        }
+        std::thread::yield_now();
+    }
+    chrono::Utc::now()
+}
+
 pub fn canonical_now() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    monotonic_utc_now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 pub fn canonical_future(days: i64) -> String {
-    (chrono::Utc::now() + chrono::Duration::days(days))
+    (monotonic_utc_now() + chrono::Duration::days(days))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 

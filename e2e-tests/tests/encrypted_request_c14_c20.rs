@@ -1588,11 +1588,13 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
     ))?;
     assert_eq!(consent_state, "closed", "direct_request_lifecycle consent must be closed");
 
+    // F1 (migration 20260919000021): publication already retired the pending
+    // charge, so the signed close writes no pending release.
     let pending_releases: i64 = psql_cmd(&format!(
-        "SELECT count(*) FROM chat.direct_request_pending_releases WHERE request_id='{}' AND reason='closed'",
+        "SELECT count(*) FROM chat.direct_request_pending_releases WHERE request_id='{}'",
         f.request_id
     ))?.parse()?;
-    assert_eq!(pending_releases, 1, "Pending budget must be released with reason 'closed'");
+    assert_eq!(pending_releases, 0, "close must not write a pending release after F1");
 
     let durable_after_close = durable_comprehensive(&f)?;
 

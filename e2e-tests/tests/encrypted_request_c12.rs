@@ -173,11 +173,12 @@ async fn c12_barrier_publish_first_cancel_returns_committed_identity_and_withdra
                 (SELECT kind FROM chat.transitions WHERE transition_id='{transition_id}' AND conversation_id='{c}')||'|'||\
                 (SELECT consent FROM chat.direct_request_lifecycle WHERE request_id='{r}')||'|'||\
                 (SELECT (closed_at IS NOT NULL)::text FROM chat.direct_request_lifecycle WHERE request_id='{r}')||'|'||\
-                (SELECT reason FROM chat.direct_request_pending_releases WHERE request_id='{r}')||'|'||\
+                COALESCE((SELECT reason FROM chat.direct_request_pending_releases WHERE request_id='{r}'),'none')||'|'||\
                 (SELECT status FROM chat.direct_request_attempts WHERE request_id='{r}')"
     ))?;
     println!("C12 after signed close lifecycle|transition|consent|closed|release|attempt = {after}");
-    assert_eq!(after, "superseded|closeConversation|closed|true|closed|published");
+    // F1 (migration 20260919000021): publication retired pending, so close writes no pending release.
+    assert_eq!(after, "superseded|closeConversation|closed|true|none|published");
 
     // Cancel after the withdrawal still only reports the committed publication.
     let (status, late_cancel) =

@@ -136,7 +136,10 @@ def start(a):
 def advance(a):
     if not re.fullmatch(r"[+-]\d+[smhdy]?", a.offset):
         sys.exit("--offset must look like +8d")
-    Path((Path(a.dir) / "clock_path").read_text()).write_text(a.offset + "\n")
+    target = Path((Path(a.dir) / "clock_path").read_text().strip())
+    temp = target.with_name(f"{target.name}.tmp.{os.getpid()}")
+    temp.write_text(a.offset + "\n")
+    temp.replace(target)
     print(json.dumps({"offset": a.offset}))
 
 
@@ -151,6 +154,12 @@ def stop(a):
             time.sleep(0.25)
     except ProcessLookupError:
         pass
+    log_file = root / "postgres.log"
+    if log_file.is_file():
+        lines = log_file.read_text().splitlines()
+        print(f"--- POSTGRES LOG TAIL ({len(lines)} lines total) ---", file=sys.stderr)
+        for l in lines[-30:]:
+            print(f"  {l}", file=sys.stderr)
     subprocess.run(["rm", "-rf", str(root)], check=True)
     print(json.dumps({"stopped": pid}))
 

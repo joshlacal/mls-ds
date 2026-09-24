@@ -17,9 +17,9 @@ use super::super::request_push::{
     SignedInternalEnvelope, REQUEST_PUSH_ELIGIBILITY_DOMAIN, REQUEST_PUSH_EVENT_DOMAIN,
 };
 
-pub(crate) const REQUEST_RECEIPT_AUTHORITY: &str = "did:web:chat.catbird.blue";
+pub const REQUEST_RECEIPT_AUTHORITY: &str = "did:web:chat.catbird.blue";
 
-pub(crate) struct DirectRequestReceiptSigner {
+pub struct DirectRequestReceiptSigner {
     signing_key: SigningKey,
     key_id: String,
     published_keys: BTreeMap<String, Vec<u8>>,
@@ -35,7 +35,7 @@ impl DirectRequestReceiptSigner {
     /// The caller supplies an operations-managed authority DID document, exactly
     /// as the existing sequencer receipt configuration does. Its trust source is
     /// configuration, never a candidate receipt or request field.
-    pub(crate) fn configured(
+    pub fn configured(
         receipt_pem: &str,
         service_pem: &str,
         document: &str,
@@ -137,7 +137,7 @@ impl DirectRequestReceiptSigner {
     }
     /// Run before route activation. Existing keys must remain published with
     /// identical bytes through rotation; the new active key is retained first.
-    pub(crate) async fn validate_and_retain_keys(&self, pool: &PgPool) -> Result<(), String> {
+    pub async fn validate_and_retain_keys(&self, pool: &PgPool) -> Result<(), String> {
         let mut tx = pool
             .begin()
             .await

@@ -63,7 +63,7 @@ use crate::chat_protocol::state_machine::{ExecutorError, HydrationAuthority, Sta
 /// retry/logging policy can distinguish "the database said no" from "this exact
 /// row is not sweepable", and none is translated into an XRPC code here.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ExpirySweepError {
+pub enum ExpirySweepError {
     #[error("clean-chat expiry sweep database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("clean-chat expiry sweep identity lock failed: {0}")]
@@ -80,6 +80,8 @@ pub(crate) enum ExpirySweepError {
     ExecutionHydration(#[from] ExecutionContextHydrationError),
     #[error("clean-chat expiry sweep execution failed: {0:?}")]
     Execution(ExecutorError),
+    #[error("clean-chat expiry sweep direct request error: {0}")]
+    DirectRequest(String),
 }
 
 impl From<ExecutorError> for ExpirySweepError {
@@ -294,4 +296,305 @@ pub(crate) async fn sweep_one_welcome(
         transaction.rollback().await?;
     }
     Ok(outcome)
+}
+
+/// Expire published unanswered direct requests older than 30 days.
+pub async fn expire_due_published_requests(
+    pool: &PgPool,
+    signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
+    limit: i64,
+) -> Result<usize, ExpirySweepError> {
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT p.request_id
+          FROM chat.direct_request_publications p
+          LEFT JOIN chat.direct_request_lifecycle l USING(request_id)
+         WHERE l.request_id IS NULL
+           AND p.created_at <= clock_timestamp() - INTERVAL '30 days'
+         ORDER BY p.created_at, p.request_id
+         LIMIT $1
+        "#
+    )
+    .bind(limit.clamp(1, 100))
+    .fetch_all(pool)
+    .await?;
+
+    let mut count = 0;
+    for id in ids {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *tx).await?;
+        let _operation = match super::prelude::try_lock_direct_request_operation_only(&mut tx, id).await {
+            Ok(Some(op)) => op,
+            Ok(None) => {
+                tx.rollback().await?;
+                continue;
+            }
+            Err(error) => {
+                let is_timeout = matches!(&error, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"));
+                if !is_timeout {
+                    tracing::warn!(%error, request_id = %id, "expire_due_published_requests operation lock failed, sweep skipped");
+                }
+                tx.rollback().await?;
+                continue;
+            }
+        };
+        let row: Option<(Uuid, String, Uuid, String, i64, String, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            r#"
+            SELECT p.conversation_id, a.actor_did, a.actor_device_id, a.actor_key_id,
+                   a.actor_auth_generation, a.recipient_did, a.prepare_digest,
+                   a.publication_digest, r.decision_bytes
+              FROM chat.direct_request_publications p
+              JOIN chat.direct_request_attempts a USING(request_id)
+              JOIN chat.direct_request_lifecycle_reserves r USING(request_id)
+              LEFT JOIN chat.direct_request_lifecycle l USING(request_id)
+             WHERE p.request_id = $1
+               AND a.status = 'published'
+               AND l.request_id IS NULL
+               AND p.created_at <= clock_timestamp() - INTERVAL '30 days'
+            "#
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((conversation_id, actor_did, actor_device_id, actor_key_id, actor_auth_generation, recipient_did, prepare_digest, publication_digest, decision_bytes)) = row else {
+            tx.rollback().await?;
+            continue;
+        };
+
+        if let Err(error) = super::prelude::lock_direct_request_identity_scope(
+            &mut tx,
+            &[actor_did.clone(), recipient_did.clone()],
+        )
+        .await
+        {
+            let is_timeout = matches!(&error, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"));
+            if !is_timeout {
+                tracing::warn!(%error, request_id = %id, "expire_due_published_requests identity scope lock failed, sweep skipped");
+            }
+            tx.rollback().await?;
+            continue;
+        }
+
+        let now: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT date_trunc('milliseconds', clock_timestamp())"
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        // Lexicon: directRequestExpiredReceipt.requestKind is const "expiry"
+        // and has no expiredAt. A published-request expiry binds requestDigest
+        // to the publication digest; a preparation-lease expiry binds it to the
+        // preparation digest. recordedAt is the expiry instant.
+        let receipt_body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#directRequestReceiptBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-OUTCOME\0",
+            "protocolVersion": "2",
+            "authorityDid": super::direct_request_receipts::REQUEST_RECEIPT_AUTHORITY,
+            "keyId": signer.key_id(),
+            "receipt": {
+                "$type": "blue.catbird.chat.defs#directRequestExpiredReceipt",
+                "requestId": id.to_string(),
+                "requestDigest": b64(&publication_digest),
+                "preparationRequestDigest": b64(&prepare_digest),
+                "actorDid": actor_did,
+                "actorDeviceId": actor_device_id.to_string(),
+                "actorKeyId": actor_key_id,
+                "authGeneration": actor_auth_generation,
+                "requestKind": "expiry",
+                "recordedAt": now_str,
+            }
+        });
+
+        let signed_receipt = signer
+            .seal_outcome(receipt_body)
+            .map_err(|e| ExpirySweepError::DirectRequest(format!("seal expired receipt: {e}")))?;
+        let signed_bytes = signed_receipt.bytes();
+        let receipt_sha256 = sha2::Sha256::digest(signed_bytes).to_vec();
+        let operation_id = Uuid::new_v4();
+        let charged_bytes = signed_bytes.len() as i64;
+        if charged_bytes > decision_bytes {
+            tx.rollback().await?;
+            continue;
+        }
+
+        sqlx::query(
+            "INSERT INTO chat.direct_request_lifecycle(request_id, conversation_id, consent, expired_at) VALUES ($1, $2, 'expired', $3)"
+        )
+        .bind(id)
+        .bind(conversation_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO chat.direct_request_expiry_receipts(request_id, operation_id, signed_receipt, receipt_sha256, expired_at) VALUES ($1, $2, $3, $4, $5)"
+        )
+        .bind(id)
+        .bind(operation_id)
+        .bind(signed_bytes)
+        .bind(&receipt_sha256)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO chat.direct_request_decision_slots(request_id, operation_id, decision_kind, charged_bytes) VALUES ($1, $2, 'expire', $3)"
+        )
+        .bind(id)
+        .bind(operation_id)
+        .bind(charged_bytes)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Prune heavy artifacts of requests terminal (closed or expired) for >14 days
+/// and release their retained charge. The retained charge is additive over
+/// independently stored blobs plus the precharged lifecycle reserve, so the
+/// released amount is exactly (a) the bytes of the pruned publication and
+/// delivery-provenance columns, each of which the charge counted once, plus
+/// (b) the unconsumed lifecycle reserve: a terminal request can record no
+/// further decision, and every Welcome import window closed before this
+/// horizon (import_until <= publication + 7 days < terminal + 14 days).
+/// Transition/entry copies, rows, the attempt tombstone and consumed
+/// decision/Welcome slots stay charged.
+pub async fn prune_terminal_request_artifacts(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<usize, ExpirySweepError> {
+    let candidates: Vec<(Uuid, String)> = sqlx::query_as(
+        r#"
+        SELECT l.request_id, l.consent
+          FROM chat.direct_request_lifecycle l
+          JOIN chat.direct_request_publications p USING(request_id)
+         WHERE l.consent IN ('closed', 'expired')
+           AND COALESCE(l.closed_at, l.expired_at) <= clock_timestamp() - INTERVAL '14 days'
+           AND p.pruned_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM chat.direct_request_retained_releases r WHERE r.request_id = l.request_id)
+         ORDER BY COALESCE(l.closed_at, l.expired_at), l.request_id
+         LIMIT $1
+        "#
+    )
+    .bind(limit.clamp(1, 100))
+    .fetch_all(pool)
+    .await?;
+
+    let mut count = 0;
+    for (id, _consent) in candidates {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *tx).await?;
+        let _operation = match super::prelude::try_lock_direct_request_operation_only(&mut tx, id).await {
+            Ok(Some(op)) => op,
+            Ok(None) => {
+                tx.rollback().await?;
+                continue;
+            }
+            Err(error) => {
+                let is_timeout = matches!(&error, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"));
+                if !is_timeout {
+                    tracing::warn!(%error, request_id = %id, "prune_terminal_request_artifacts operation lock failed, sweep skipped");
+                }
+                tx.rollback().await?;
+                continue;
+            }
+        };
+
+        let row: Option<(String, i64, i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT l.consent,
+                   c.charged_bytes,
+                   (COALESCE(octet_length(p.signed_publication), 0)
+                    + COALESCE(octet_length(p.request_entry), 0)
+                    + COALESCE(octet_length(p.final_group_info), 0)
+                    + COALESCE(octet_length(p.full_welcome), 0)
+                    + COALESCE(octet_length(p.initial_ciphertext), 0)
+                    + COALESCE(octet_length(p.metadata_snapshot), 0)
+                    + COALESCE((SELECT sum(octet_length(d.provenance)) FROM chat.direct_request_device_deliveries d WHERE d.request_id = $1), 0))::bigint AS pruned_bytes,
+                   GREATEST(0, r.decision_bytes + r.welcome_bytes_per_delivery * r.delivery_count
+                    - COALESCE((SELECT sum(s.charged_bytes) FROM chat.direct_request_decision_slots s WHERE s.request_id = $1), 0)
+                    - COALESCE((SELECT sum(w.charged_bytes) FROM chat.direct_request_welcome_slots w WHERE w.request_id = $1), 0))::bigint AS unused_reserve
+              FROM chat.direct_request_lifecycle l
+              JOIN chat.direct_request_publications p USING(request_id)
+              JOIN chat.direct_request_retained_charges c USING(request_id)
+              JOIN chat.direct_request_lifecycle_reserves r USING(request_id)
+             WHERE l.request_id = $1
+               AND l.consent IN ('closed', 'expired')
+               AND COALESCE(l.closed_at, l.expired_at) <= clock_timestamp() - INTERVAL '14 days'
+               AND p.pruned_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM chat.direct_request_retained_releases x WHERE x.request_id = l.request_id)
+            "#
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((actual_consent, charged_bytes, pruned_bytes, unused_reserve)) = row else {
+            tx.rollback().await?;
+            continue;
+        };
+        let released_bytes = (pruned_bytes + unused_reserve).min(charged_bytes);
+        if released_bytes < 1 {
+            tx.rollback().await?;
+            continue;
+        }
+        let reason = if actual_consent == "closed" {
+            "closed_pruned"
+        } else {
+            "expired_pruned"
+        };
+
+        let now: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT date_trunc('milliseconds', clock_timestamp())"
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO chat.direct_request_retained_releases(request_id, released_bytes, released_at, reason) VALUES ($1, $2, $3, $4)"
+        )
+        .bind(id)
+        .bind(released_bytes)
+        .bind(now)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE chat.direct_request_publications
+                SET signed_publication = NULL,
+                    request_entry = NULL,
+                    final_group_info = NULL,
+                    full_welcome = NULL,
+                    initial_ciphertext = NULL,
+                    metadata_snapshot = NULL,
+                    pruned_at = $2
+              WHERE request_id = $1
+            "#
+        )
+        .bind(id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE chat.direct_request_device_deliveries SET provenance = NULL WHERE request_id = $1"
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        count += 1;
+    }
+    Ok(count)
 }
