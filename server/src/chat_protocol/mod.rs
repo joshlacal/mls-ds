@@ -108,6 +108,9 @@ mod application_entry_tests;
 #[cfg(test)]
 #[path = "relationship_policy/tests.rs"]
 mod relationship_policy_tests;
+#[cfg(test)]
+#[path = "dpop/adversarial_challenger_m4_tests.rs"]
+mod adversarial_challenger_m4_tests;
 
 /// Non-shipping executable proof runners. Only zero-authority scenario
 /// functions are exported; opaque protocol authorities and prepared graphs
