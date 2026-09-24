@@ -31,6 +31,7 @@
 // with a reason; anything else must fail to be silent.
 
 mod common;
+pub use catbird_server::auth;
 
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/cursor.rs"]
@@ -46,6 +47,18 @@ mod transcript;
 mod validation;
 
 mod chat_protocol {
+    pub mod read_projection {
+        pub struct DummyCanonical;
+        impl DummyCanonical {
+            pub fn bytes(&self) -> &[u8] { &[] }
+        }
+        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
+            _value: &T,
+            _schema: &str,
+        ) -> Result<DummyCanonical, String> {
+            Ok(DummyCanonical)
+        }
+    }
     pub mod model {
         pub use crate::model::*;
     }
@@ -62,10 +75,6 @@ mod chat_protocol {
         pub use crate::cursor::*;
     }
 
-    // Enumerated per-module rather than including `repository/mod.rs` wholesale:
-    // that file opens with an inner `//!` doc comment, which is not accepted in
-    // `include!` position, and it would additionally declare every sibling module
-    // whose own `super::super::*` references this shim does not carry.
     pub mod repository {
         pub mod device_directory {
             #![allow(dead_code)]
@@ -74,19 +83,56 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/device_directory.rs"
             ));
         }
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
         pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
+            use crate::cursor::{EventCursor, InventoryPageDomain, InventorySessionBinding, InventorySessionToken};
+            pub struct LockedInventoryCursorEvidence;
+            impl LockedInventoryCursorEvidence {
+                pub fn into_cursor_parts(self) -> (InventorySessionBinding, InventorySessionToken, EventCursor, InventoryPageDomain, Vec<u8>, u64, u64, u64) {
+                    panic!("stub")
+                }
+            }
+        }
+        pub mod auth {
+            use uuid::Uuid;
+            #[derive(Debug, Clone, Eq, PartialEq)]
+            pub struct ReplayAuditIds;
+            #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+            pub enum RepositoryAuthorityClass {
+                ExistingDevice,
+                EnrollmentBootstrap,
+            }
+            pub struct LockedExistingDeviceReadCoordinates<'a> {
+                pub did: &'a str,
+                pub device_id: Uuid,
+                pub textual_jkt: Option<&'a str>,
+                pub auth_generation: i64,
+                pub key_id: &'a str,
+                pub signing_key_sha256: &'a [u8; 32],
+            }
+            #[derive(Debug, Clone)]
+            pub struct RepositoryAuthorityReceipt;
+            static DUMMY_HASH: [u8; 32] = [0; 32];
+            impl RepositoryAuthorityReceipt {
+                pub fn class(&self) -> RepositoryAuthorityClass {
+                    RepositoryAuthorityClass::ExistingDevice
+                }
+                pub fn operation_id(&self) -> Option<Uuid> {
+                    None
+                }
+                pub fn locked_existing_device_read_coordinates(&self) -> Option<LockedExistingDeviceReadCoordinates<'static>> {
+                    Some(LockedExistingDeviceReadCoordinates {
+                        did: "",
+                        device_id: Uuid::nil(),
+                        textual_jkt: None,
+                        auth_generation: 1,
+                        key_id: "",
+                        signing_key_sha256: &DUMMY_HASH,
+                    })
+                }
+                pub fn replay_ids(&self) -> ReplayAuditIds {
+                    ReplayAuditIds
+                }
+            }
         }
     }
 
@@ -869,7 +915,7 @@ async fn enroll_device_happy_path_publishes_batch_and_conforms_to_read_back() {
     // device (Option A builds this view by hand, so this pins every hand-set field
     // to the certified projection).
     assert_eq!(view.key_id, device["keyId"].as_str().unwrap());
-    assert_eq!(view.dpop_jkt, device["dpopJkt"].as_str().unwrap());
+    assert_eq!(view.dpop_jkt.as_deref(), device["dpopJkt"].as_str());
     assert_eq!(view.status, device["status"].as_str().unwrap());
     assert_eq!(
         view.auth_generation,

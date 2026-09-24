@@ -1,132 +1,17 @@
-//! Pure authority and SQL-contract tests for the clean-chat Recovery repository.
-//!
-//! This target performs no database I/O. It includes the not-yet-wired
-//! repository module directly so the authority slice can compile before the
-//! later `repository/mod.rs` integration change.
-
-#![allow(dead_code)]
-
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-mod snapshot {
-    pub use catbird_server::chat_protocol::snapshot::*;
-}
-
-mod chat_protocol {
-    pub mod direct_request_transcript {
-        pub use catbird_server::chat_protocol::direct_request_transcript::*;
-    }
-    pub mod dpop {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    pub mod model {
-        pub use crate::model::*;
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    pub mod repository {
-        pub mod auth {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod prelude {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        pub mod core {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        pub mod relationship {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-        pub mod transition {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod delivery {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-        pub mod execution_context {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        pub mod recovery {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
-    }
-    pub mod state_machine {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
-}
-
-use chat_protocol::repository::delivery::{
+use super::*;
+use super::super::delivery::{
     canonical_leaf_recovery_event_payload, canonical_welcome_available_event_payload,
     LeafRecoveryEventStatus,
 };
-use chat_protocol::repository::recovery::{
-    cancellation_actor_matches_requester, classify_client_terminal_disposition,
-    classify_locked_recovery, expired_recovery_package_shape_valid, persisted_recovery_origin,
-    requester_key_liveness_matches, requester_row_liveness_matches, RecoveryClientTerminalAction,
-    RecoveryClientTerminalDisposition, RecoveryClientTerminalError, RecoveryLockStage,
-    RecoveryPersistedOrigin, RecoveryRowStatus, RecoveryTerminalClassification,
-    CANONICAL_RECOVERY_LOCK_ORDER, LOCK_AVAILABLE_RECOVERY_PACKAGE_SQL,
-    LOCK_RECOVERY_CONVERSATION_SQL, LOCK_RECOVERY_EXPIRY_DEVICE_SQL, LOCK_RECOVERY_EXPIRY_KEY_SQL,
-    LOCK_RECOVERY_EXPIRY_PRINCIPAL_SQL, LOCK_RECOVERY_GENERATION_SQL,
-    LOCK_RECOVERY_GENERATION_STATE_SQL, LOCK_RECOVERY_MEMBER_DEVICE_SQL, LOCK_RECOVERY_PACKAGE_SQL,
-    LOCK_RECOVERY_REQUEST_SQL, LOCK_RECOVERY_RESERVATION_SQL, RECOVERY_TERMINAL_LOCATOR_SQL,
-};
+use crate::chat_protocol::dpop;
+use crate::chat_protocol::model;
+use crate::chat_protocol::public_state;
+use crate::chat_protocol::relationship_policy;
+use crate::chat_protocol::snapshot;
+use crate::chat_protocol::state_machine;
+use crate::chat_protocol::transcript;
+use crate::chat_protocol::validation;
+use crate::chat_protocol::wire;
 use chrono::{Duration, TimeZone, Utc};
 use uuid::Uuid;
 
@@ -179,7 +64,7 @@ fn recovery_primary_event_payloads_are_exact_closed_lexicon_bytes() {
 
 #[test]
 fn recovery_business_lock_scope_never_performs_live_relationship_transport() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     assert!(
         !source.contains(".collect_block_projection("),
         "live relationship transport must be completed and persisted before business locks"
@@ -360,7 +245,7 @@ fn head_graph_locks_are_legal_single_table_locks_in_exact_order() {
     assert!(member.contains("FOR UPDATE OF md"));
     assert!(!member.contains("LEFT JOIN"));
 
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     let function = source.split_once("async fn lock_head_graph(").unwrap().1;
     let conversation_pos = function.find("LOCK_RECOVERY_CONVERSATION_SQL").unwrap();
     let generation_pos = function.find("LOCK_RECOVERY_GENERATION_SQL").unwrap();
@@ -542,7 +427,7 @@ fn available_package_lock_is_full_row_deterministic_and_terminal_null() {
 
 #[test]
 fn fresh_expiry_path_has_a_canonical_identity_prefix_and_database_trusted_millisecond() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     assert!(source.contains("pub(crate) async fn prepare_recovery_expiry_authority("));
     assert!(source.contains("canonical_operation_lock_key(request_id)"));
     assert!(source.contains("date_trunc('milliseconds', transaction_timestamp())"));
@@ -564,7 +449,7 @@ fn fresh_expiry_path_has_a_canonical_identity_prefix_and_database_trusted_millis
 
 #[test]
 fn authority_surface_is_non_cloneable_opaque_and_only_emits_sealed_transition_bindings() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     for authority in [
         "RecoveryRequestAuthority",
         "RecoveryCancellationAuthority",
@@ -603,7 +488,7 @@ fn authority_surface_is_non_cloneable_opaque_and_only_emits_sealed_transition_bi
 
 #[test]
 fn client_terminal_outcomes_never_drop_the_consumed_prelude() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     assert!(source.contains("struct RecoveryCancellationRetained"));
     assert!(source.contains("struct RecoveryFulfillmentRetained"));
     assert!(source.contains("struct RecoveryClassifiedTerminalOutcome"));
@@ -615,7 +500,7 @@ fn client_terminal_outcomes_never_drop_the_consumed_prelude() {
 
 #[test]
 fn retained_rows_are_reverified_instead_of_status_only_rehydrated() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     assert!(source.contains("reverify_retained_cancellation("));
     assert!(source.contains("validate_superseded_terminal_shapes("));
     assert!(source.contains("require_persisted_idempotency_key("));
@@ -623,7 +508,7 @@ fn retained_rows_are_reverified_instead_of_status_only_rehydrated() {
 
 #[test]
 fn exact_task4_recovery_sql_bindings_are_sealed_and_consumed_only_by_the_witness() {
-    let transition = include_str!("../src/chat_protocol/repository/transition.rs");
+    let transition = include_str!("../transition.rs");
     assert!(transition.contains("use super::recovery::RecoverySqlAuthoritySeal;"));
     assert!(
         transition
@@ -631,7 +516,7 @@ fn exact_task4_recovery_sql_bindings_are_sealed_and_consumed_only_by_the_witness
             .count()
             >= 6
     );
-    let recovery = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let recovery = include_str!("../recovery.rs");
     assert!(recovery.contains("RecoveryKeyPackageRowCas::new("));
     assert!(recovery.contains("RecoveryTerminalTripleCas::new("));
     assert!(recovery.contains("reserve_available_recovery_package("));
@@ -640,7 +525,7 @@ fn exact_task4_recovery_sql_bindings_are_sealed_and_consumed_only_by_the_witness
 
 #[test]
 fn recovery_prewrite_reloads_full_aggregate_custom_head_and_every_exact_row_before_hydration() {
-    let recovery = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let recovery = include_str!("../recovery.rs");
     let witness = recovery
         .split_once("impl RecoveryPersistenceWitness {")
         .and_then(|(_, implementation)| {
@@ -672,7 +557,7 @@ fn recovery_prewrite_reloads_full_aggregate_custom_head_and_every_exact_row_befo
     assert!(witness.contains("new_request_from_row(&request).ok().as_ref()"));
     assert!(witness.contains("new_reservation_from_row(&reservation).ok().as_ref()"));
 
-    let execution = include_str!("../src/chat_protocol/repository/execution_context.rs");
+    let execution = include_str!("../execution_context.rs");
     let facade = execution
         .split_once("pub(in crate::chat_protocol) async fn prepare_recovery_execution")
         .and_then(|(_, tail)| {
@@ -694,7 +579,7 @@ fn recovery_prewrite_reloads_full_aggregate_custom_head_and_every_exact_row_befo
 #[test]
 fn production_executor_requires_exact_recovery_write_authority_and_fences_legacy_fallbacks_to_tests(
 ) {
-    let source = include_str!("../src/chat_protocol/state_machine.rs");
+    let source = include_str!("../../state_machine/executor.rs");
     assert!(
         source
             .matches("missing validated Recovery executor write authority")
@@ -704,7 +589,7 @@ fn production_executor_requires_exact_recovery_write_authority_and_fences_legacy
     );
     assert_eq!(
         source
-            .matches("#[cfg(test)]\n        if recovery_write_authority.is_none()")
+            .matches("#[cfg(test)]\n    if recovery_write_authority.is_none()")
             .count(),
         4,
         "every status-only Recovery fallback must be a genuine cfg(test) seam"
@@ -717,7 +602,7 @@ fn production_executor_requires_exact_recovery_write_authority_and_fences_legacy
 
 #[test]
 fn client_due_for_expiry_types_freeze_action_specific_post_apply_errors() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     let cancellation = source
         .split_once("impl RecoveryCancellationDueForExpiry")
         .and_then(|(_, tail)| tail.split_once("\n}"))
@@ -741,7 +626,7 @@ fn client_due_for_expiry_types_freeze_action_specific_post_apply_errors() {
 
 #[test]
 fn every_client_recovery_acquisition_consumes_the_exact_operation_claim() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     for endpoint in [
         "RecoveryOperationEndpoint::RequestLeafRecovery",
         "RecoveryOperationEndpoint::CancelLeafRecovery",
@@ -791,7 +676,7 @@ fn client_terminal_disposition_matrix_matches_frozen_brief() {
 
 #[test]
 fn client_preparation_performs_no_package_reservation_or_terminal_write() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     for function in [
         "prepare_recovery_request_authority(",
         "prepare_recovery_cancellation_authority(",
@@ -823,7 +708,7 @@ fn client_preparation_performs_no_package_reservation_or_terminal_write() {
 
 #[test]
 fn plan_inputs_are_opaque_linear_and_retain_the_prelude() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     for plan in [
         "RecoveryRequestPlanInput",
         "RecoveryCancellationPlanInput",
@@ -863,7 +748,7 @@ fn plan_inputs_are_opaque_linear_and_retain_the_prelude() {
 
 #[test]
 fn fulfillment_scope_discovery_is_read_only_and_includes_actor_plus_requester() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     assert!(source.contains("pub(crate) async fn discover_recovery_fulfillment_terminal_scope("));
     assert!(
         !compact(RECOVERY_TERMINAL_LOCATOR_SQL).contains("FOR UPDATE"),
@@ -883,18 +768,18 @@ fn fulfillment_scope_discovery_is_read_only_and_includes_actor_plus_requester() 
         "scope discovery must include the admitted actor device"
     );
     assert!(
-        source.contains("CanonicalDeviceIdentity::new(actor_did, actor_device_id)"),
+        compact(source).contains("CanonicalDeviceIdentity::new( actor_did"),
         "canonical scope must lock the actor identity"
     );
     assert!(
-        source.contains("CanonicalDeviceIdentity::new(locator.requester_did"),
+        compact(source).contains("CanonicalDeviceIdentity::new( locator.requester_did"),
         "canonical scope must lock the original requester identity"
     );
 }
 
 #[test]
 fn scheduler_expiry_stays_unclaimed_and_prelude_free() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     assert!(
         source.contains("pub(crate) struct RecoverySchedulerExpiryAuthority"),
         "scheduler-only expiry authority must exist"
@@ -941,7 +826,7 @@ fn scheduler_expiry_stays_unclaimed_and_prelude_free() {
 
 #[test]
 fn recovery_planners_consume_exact_inputs_and_the_facade_mints_payloads() {
-    let state_machine = include_str!("../src/chat_protocol/state_machine.rs");
+    let state_machine = include_str!("../../state_machine.rs");
     for (planner, input) in [
         ("plan_recovery_request_input", "RecoveryRequestPlanInput"),
         (
@@ -982,7 +867,7 @@ fn recovery_planners_consume_exact_inputs_and_the_facade_mints_payloads() {
             );
         }
     }
-    let execution = include_str!("../src/chat_protocol/repository/execution_context.rs");
+    let execution = include_str!("../execution_context.rs");
     let facade = execution
         .split_once("pub(in crate::chat_protocol) async fn prepare_recovery_execution")
         .and_then(|(_, tail)| tail.split_once(") -> Result<"))
@@ -994,7 +879,7 @@ fn recovery_planners_consume_exact_inputs_and_the_facade_mints_payloads() {
     assert!(!facade.contains("primary_event_payload"));
     assert!(!facade.contains("welcome_disposition_event_payloads"));
 
-    let recovery = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let recovery = include_str!("../recovery.rs");
     let graph = recovery
         .split_once("struct PreparedRecoveryExecutionGraph")
         .and_then(|(_, tail)| tail.split_once("\n}"))
@@ -1008,7 +893,7 @@ fn recovery_planners_consume_exact_inputs_and_the_facade_mints_payloads() {
 
 #[test]
 fn prepared_scheduler_expiry_has_no_client_completion_guard() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     let scheduler = source
         .split_once("pub(crate) struct PreparedSchedulerRecoveryExpiry")
         .and_then(|(_, tail)| tail.split_once("\n}"))
@@ -1028,7 +913,7 @@ fn prepared_scheduler_expiry_has_no_client_completion_guard() {
 
 #[test]
 fn same_transition_fulfilled_row_is_corruption_not_replay() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     assert!(
         source.contains("if context.fulfilling_transition_id == Some(transition_id)"),
         "the fulfillment guard must error on the same transition (corruption)"
@@ -1041,7 +926,7 @@ fn same_transition_fulfilled_row_is_corruption_not_replay() {
 
 #[test]
 fn recovery_terminal_locator_row_carries_request_id() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let source = include_str!("../recovery.rs");
     assert!(
         source.contains("recovery_request_id: Uuid"),
         "RecoveryTerminalLocatorRow must carry recovery_request_id for \

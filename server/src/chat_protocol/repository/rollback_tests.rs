@@ -48,20 +48,28 @@
 
 #![allow(dead_code)]
 
-mod common;
-
-use catbird_server::chat_protocol::repository::{blobs, delivery};
-
+use super::blobs::{prepare_blob, BlobMediaType, BlobPurpose, PrepareBlobRequest};
+use super::delivery::{
+    resolve_application_send, AppendEntry, ApplicationSend, ApplicationSendDisposition,
+    ApplicationSendOutcome,
+};
 use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use blobs::{prepare_blob, BlobMediaType, BlobPurpose, PrepareBlobRequest};
-use delivery::{
-    resolve_application_send, AppendEntry, ApplicationSend, ApplicationSendDisposition,
-    ApplicationSendOutcome,
-};
+
+
+async fn test_pool() -> PgPool {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+        "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722".to_string()
+    });
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("connect test db")
+}
 
 fn random_plc_did() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -192,7 +200,7 @@ async fn count(tx: &mut Transaction<'_, Postgres>, sql: &str, id: Uuid) -> i64 {
 
 #[tokio::test]
 async fn blob_and_quota_boundary_rolls_back_but_the_stale_tombstone_survives() {
-    let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool: PgPool = test_pool().await;
     let mut tx = pool.begin().await.expect("begin outer");
     let owner = random_plc_did();
     let (device_id, key_id) = seed_owner_tx(&mut tx, &owner).await;
@@ -303,7 +311,7 @@ async fn blob_and_quota_boundary_rolls_back_but_the_stale_tombstone_survives() {
 
 #[tokio::test]
 async fn entry_allocation_and_message_send_roll_back_completely() {
-    let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool: PgPool = test_pool().await;
     let mut tx = pool.begin().await.expect("begin outer");
     let owner = random_plc_did();
     let (device_id, key_id) = seed_owner_tx(&mut tx, &owner).await;
@@ -382,7 +390,7 @@ async fn accepted_send_and_stale_tombstone_are_mutually_exclusive_durability() {
     // back with a business failure, while a STALE tombstone is the explicit
     // durable exception. Prove both dispositions on the SAME conversation with
     // different message ids: the accepted one rolls back, the stale one survives.
-    let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool: PgPool = test_pool().await;
     let mut tx = pool.begin().await.expect("begin outer");
     let owner = random_plc_did();
     let (device_id, key_id) = seed_owner_tx(&mut tx, &owner).await;

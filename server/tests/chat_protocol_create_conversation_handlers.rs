@@ -11,9 +11,6 @@ mod common;
 pub use catbird_server::{auth, crypto};
 
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[allow(dead_code)]
@@ -23,57 +20,18 @@ mod transcript;
 #[path = "../src/chat_protocol/validation.rs"]
 mod validation;
 
-mod repository {
-    pub(crate) use crate::chat_protocol::repository::inventory;
-}
-
 mod chat_protocol {
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-
-    pub mod model {
-        pub use crate::model::*;
-    }
-
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-
-    pub mod repository {
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
+    pub mod read_projection {
+        pub struct DummyCanonical;
+        impl DummyCanonical {
+            pub fn bytes(&self) -> &[u8] { &[] }
         }
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
+        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
+            _value: &T,
+            _schema: &str,
+        ) -> Result<DummyCanonical, String> {
+            Ok(DummyCanonical)
         }
-        pub mod device_directory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/device_directory.rs"
-            ));
-        }
-    }
-
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
     }
 }
 

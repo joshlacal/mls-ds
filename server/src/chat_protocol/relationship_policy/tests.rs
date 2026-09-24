@@ -1,15 +1,10 @@
-#![allow(dead_code)]
-
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+use super::*;
+use super as relationship_policy;
+use crate::chat_protocol::model;
+use crate::chat_protocol::validation::{self, CanonicalTimestamp, TrustedRequestInstant};
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeDelta, TimeZone, Utc};
-use relationship_policy::*;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -21,7 +16,6 @@ use std::sync::{
 use std::time::Duration;
 use tokio::time::Instant;
 use url::Url;
-use validation::TrustedRequestInstant;
 
 fn did(index: usize) -> String {
     const DIGITS: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";

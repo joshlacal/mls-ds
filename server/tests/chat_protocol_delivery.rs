@@ -20,6 +20,81 @@
 
 mod common;
 
+
+mod chat_protocol {
+    pub mod snapshot {
+        pub use catbird_server::chat_protocol::snapshot::*;
+    }
+    pub mod state_machine {
+        use catbird_server::chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
+        pub struct Principal;
+        static PRINCIPAL: Principal = Principal;
+        impl Principal {
+            pub fn as_bytes(&self) -> &'static [u8] { b"did:plc:test" }
+        }
+        pub struct DeviceIdentity;
+        static DEVICE_IDENTITY: DeviceIdentity = DeviceIdentity;
+        impl DeviceIdentity {
+            pub fn principal(&self) -> &'static Principal { &PRINCIPAL }
+            pub fn device_id(&self) -> &'static [u8; 16] { &[0; 16] }
+        }
+        #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+        pub enum WelcomeStatus {
+            Pending,
+            Acknowledged,
+            Rejected,
+            Expired,
+        }
+        #[derive(Debug, Clone, Copy)]
+        pub struct ServerTimestamp(u64);
+        impl ServerTimestamp {
+            pub fn unix_millis(&self) -> i64 { 0 }
+        }
+        pub struct FakeCoordinate;
+        static FAKE_COORD: FakeCoordinate = FakeCoordinate;
+        impl FakeCoordinate {
+            pub fn lifecycle(&self) -> PublicGroupSnapshotLifecycle { PublicGroupSnapshotLifecycle::Active }
+            pub fn generation(&self) -> u64 { 0 }
+            pub fn state_version(&self) -> u64 { 0 }
+            pub fn epoch(&self) -> u64 { 0 }
+            pub fn group_id(&self) -> &[u8] { &[] }
+            pub fn group_context_hash(&self) -> &[u8] { &[] }
+            pub fn confirmation_tag(&self) -> &[u8] { &[] }
+            pub fn conversation_id(&self) -> &[u8; 16] { &[0; 16] }
+        }
+        pub struct WelcomeCasBinding;
+        static DUMMY_HASH: [u8; 32] = [0; 32];
+        impl WelcomeCasBinding {
+            pub fn transaction_id(&self) -> &str { "" }
+            pub fn conversation_id(&self) -> &[u8; 16] { &[0; 16] }
+            pub fn welcome_id(&self) -> &[u8; 16] { &[0; 16] }
+            pub fn recipient(&self) -> &DeviceIdentity { &DEVICE_IDENTITY }
+            pub fn transition_seq(&self) -> u64 { 0 }
+            pub fn coordinate(&self) -> &FakeCoordinate { &FAKE_COORD }
+            pub fn recovery_request_id(&self) -> &[u8; 16] { &[0; 16] }
+            pub fn key_package_ref(&self) -> &[u8; 32] { &DUMMY_HASH }
+            pub fn opaque_welcome_sha256(&self) -> &[u8; 32] { &DUMMY_HASH }
+            pub fn expires_at(&self) -> ServerTimestamp { ServerTimestamp(0) }
+            pub fn expected_status(&self) -> WelcomeStatus { WelcomeStatus::Pending }
+            pub fn successor_status(&self) -> WelcomeStatus { WelcomeStatus::Acknowledged }
+            pub fn locked_at(&self) -> ServerTimestamp { ServerTimestamp(0) }
+            pub fn verify_seal(&self) -> bool { true }
+        }
+        pub struct WelcomeWork;
+        impl WelcomeWork {
+            pub fn welcome_id(&self) -> &[u8; 16] { &[0; 16] }
+            pub fn recipient(&self) -> &DeviceIdentity { &DEVICE_IDENTITY }
+            pub fn transition_seq(&self) -> u64 { 0 }
+            pub fn status(&self) -> WelcomeStatus { WelcomeStatus::Expired }
+            pub fn coordinate(&self) -> &FakeCoordinate { &FAKE_COORD }
+            pub fn expires_at(&self) -> ServerTimestamp { ServerTimestamp(0) }
+            pub fn recovery_request_id(&self) -> &[u8; 16] { &[0; 16] }
+            pub fn key_package_ref(&self) -> &[u8; 32] { &DUMMY_HASH }
+            pub fn sha256(&self) -> &[u8; 32] { &DUMMY_HASH }
+        }
+    }
+}
+
 mod repository {
     pub(crate) mod delivery {
         include!(concat!(

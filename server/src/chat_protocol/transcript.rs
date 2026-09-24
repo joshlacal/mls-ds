@@ -3865,3 +3865,6 @@ mod request_presentation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod application_entry_tests;

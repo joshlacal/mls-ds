@@ -1,69 +1,105 @@
-//! Subscription-ticket mint + one-use consume tests (Task 2, Slice 4c).
-//!
-//! Unlike the Welcome chain, an inventory session and its ticket bind only to a
-//! device — no roster/Welcome coherence — so the full mint/consume path is
-//! exercised against the live schema here. A session is seeded COMPLETE in all
-//! three shared domains with zero materialized items: the materialization
-//! trigger accepts a complete-with-zero domain when `count = 0` and the domain
-//! hash equals `SHA256("")`, so no item rows are needed.
-//!
-//! Run with:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_ticket -- --include-ignored --test-threads=1
-
-#![allow(dead_code)]
-
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-use cursor::{CursorSealer, SealerBinding, SecureRandom, SecureRandomError};
+use super::*;
+use crate::chat_protocol::cursor::{CursorSealer, SealerBinding, SecureRandom, SecureRandomError};
 use zeroize::Zeroizing;
 
-mod repository {
-    pub(crate) mod inventory {
-        use crate::cursor::{
-            EventCursor, InventoryPageDomain, InventorySessionBinding, InventorySessionToken,
-        };
+#[path = "../../../../tests/common/http_acceptance.rs"]
+mod http_acceptance;
+use http_acceptance as http;
 
-        #[allow(dead_code)]
-        pub(crate) struct LockedInventoryCursorEvidence;
+async fn test_pool(max_connections: u32) -> PgPool {
+    let url = std::env::var("REQUEST_TEST_DATABASE_URL")
+        .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+        .unwrap_or_else(|_| {
+            "postgresql://127.0.0.1:5432/catbird_direct_requests_test_20260919".to_string()
+        });
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect(&url)
+        .await
+        .expect("connect test db")
+}
 
-        impl LockedInventoryCursorEvidence {
-            #[allow(dead_code)]
-            #[allow(clippy::type_complexity)]
-            pub(crate) fn into_cursor_parts(
-                self,
-            ) -> (
-                InventorySessionBinding,
-                InventorySessionToken,
-                EventCursor,
-                InventoryPageDomain,
-                Vec<u8>,
-                u64,
-                u64,
-                u64,
-            ) {
-                unreachable!("ticket acceptance does not exercise inventory page cursors")
-            }
-        }
+#[test]
+    fn capability_hash_requires_the_canonical_43_character_encoding() {
+        let capability = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert_eq!(
+            capability_hash(capability).unwrap(),
+            <[u8; 32]>::from(Sha256::digest([0u8; 32]))
+        );
+        assert!(capability_hash("not-a-capability").is_err());
+        assert!(capability_hash("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").is_err());
     }
-    pub(crate) mod ticket {
-        include!(concat!(
+
+    #[test]
+    fn source_contains_no_plaintext_cursor_columns() {
+        let source = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/chat_protocol/repository/ticket.rs"
         ));
+        assert!(!source.contains(concat!("snapshot_event_cursor_", "bytes")));
+        assert!(!source.contains(concat!("event_cursor_", "bytes")));
     }
-}
-mod common;
+
+    #[test]
+    fn mint_request_debug_redacts_bearer_material() {
+        let request = MintSubscriptionTicket {
+            ticket_hash: vec![0xA5; 32],
+            user_did: "did:plc:example".to_owned(),
+            device_id: Uuid::nil(),
+            jkt: Some("secret-jkt".to_owned()),
+            auth_generation: 7,
+            inventory_session_id: "session-capability-secret".to_owned(),
+            event_cursor: "event-capability-secret".to_owned(),
+            subscription_path: SUBSCRIBE_EVENTS_PATH.to_owned(),
+            created_at: Utc::now(),
+            expires_at: Utc::now(),
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("A5"));
+        assert!(!debug.contains("secret-jkt"));
+        assert!(!debug.contains("session-capability-secret"));
+        assert!(!debug.contains("event-capability-secret"));
+        assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn sealed_receipt_boundary_rejects_nonce_reuse_shapes() {
+        let now = Utc::now();
+        let mut receipt = NewEventCursorReceipt {
+            cursor_hash: [1; 32],
+            inventory_session_id: Uuid::new_v4(),
+            user_did: "did:plc:example".to_owned(),
+            device_id: Uuid::new_v4(),
+            jkt: Some("jkt".to_owned()),
+            auth_generation: 1,
+            protocol_instance_id: Uuid::new_v4(),
+            cursor_key_id: "key".to_owned(),
+            event_position: 1,
+            predecessor_cursor_hash: None,
+            retained_floor_at_issue: 0,
+            cursor_nonce: [1; 12],
+            cursor_ciphertext: vec![2; 17],
+            canonical_envelope_sha256: None,
+            created_at: now,
+            expires_at: now + chrono::Duration::minutes(1),
+        };
+        assert!(receipt.validate().is_ok());
+        receipt.cursor_nonce = [0; 12];
+        assert!(matches!(
+            receipt.validate(),
+            Err(TicketRepositoryError::InvalidReceipt)
+        ));
+        receipt.cursor_nonce = [1; 12];
+        receipt.cursor_ciphertext = vec![2; 16];
+        assert!(matches!(
+            receipt.validate(),
+            Err(TicketRepositoryError::InvalidReceipt)
+        ));
+    }
 
 #[test]
 fn ticket_repository_uses_only_g7_hash_and_sealed_columns() {
-    let source = include_str!("../src/chat_protocol/repository/ticket.rs");
+    let source = include_str!("../ticket.rs");
     assert!(!source.contains(concat!("snapshot_event_cursor_", "bytes")));
     assert!(!source.contains(concat!("event_cursor_", "bytes")));
     for required in [
@@ -110,7 +146,7 @@ use tokio::time::{sleep, Duration as TokioDuration};
 use tower_util::ServiceExt;
 use uuid::Uuid;
 
-use repository::ticket::{
+use super::{
     consume_subscription_ticket, insert_event_cursor_receipt, mint_subscription_ticket,
     revalidate_consumed_ticket, ticket_hash, MintSubscriptionTicket, NewEventCursorReceipt,
     TicketRepositoryError, SUBSCRIBE_EVENTS_PATH,
@@ -446,7 +482,7 @@ fn mint_request(
 
 #[tokio::test]
 async fn mint_binds_the_session_fence_and_ticket_is_consumable_once() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let pool = test_pool(3).await;
     let now = clock_now(&pool).await;
     let device = seed_device(&pool, now - Duration::seconds(200)).await;
     let session = seed_session(
@@ -515,7 +551,7 @@ async fn mint_binds_the_session_fence_and_ticket_is_consumable_once() {
 
 #[tokio::test]
 async fn retention_floor_cannot_advance_beneath_a_live_ticket_session() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let pool = test_pool(3).await;
     let now = clock_now(&pool).await;
     let device = seed_device(&pool, now - Duration::seconds(200)).await;
     let session = seed_session(
@@ -558,7 +594,7 @@ async fn retention_floor_cannot_advance_beneath_a_live_ticket_session() {
 
 #[tokio::test]
 async fn snapshot_cursor_receipt_is_persisted_with_exact_session_authority() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool = test_pool(2).await;
     let now = clock_now(&pool).await;
     let device = seed_device(&pool, now - Duration::seconds(200)).await;
     let session = seed_session(
@@ -620,7 +656,7 @@ async fn snapshot_cursor_receipt_is_persisted_with_exact_session_authority() {
 
 #[tokio::test]
 async fn idle_subscription_revalidation_stops_after_exact_device_revocation() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let pool = test_pool(3).await;
     let now = clock_now(&pool).await;
     let device = seed_device(&pool, now - Duration::seconds(200)).await;
     let session = seed_session(
@@ -684,7 +720,7 @@ async fn idle_subscription_revalidation_stops_after_exact_device_revocation() {
 
 #[tokio::test]
 async fn mint_rejects_incomplete_session() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool = test_pool(2).await;
     let now = clock_now(&pool).await;
     let device = seed_device(&pool, now - Duration::seconds(200)).await;
     let session = seed_session(
@@ -716,7 +752,7 @@ async fn mint_rejects_incomplete_session() {
 
 #[tokio::test]
 async fn mint_rejects_cursor_that_does_not_match_the_session() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool = test_pool(2).await;
     let now = clock_now(&pool).await;
     let device = seed_device(&pool, now - Duration::seconds(200)).await;
     let session = seed_session(
@@ -748,7 +784,7 @@ async fn mint_rejects_cursor_that_does_not_match_the_session() {
 
 #[tokio::test]
 async fn consume_rejects_an_expired_ticket() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let pool = test_pool(2).await;
     let now = clock_now(&pool).await;
     let device = seed_device(&pool, now - Duration::seconds(400)).await;
     // A session window entirely in the past so the ticket can be minted expired.
@@ -794,7 +830,7 @@ async fn consume_rejects_an_expired_ticket() {
 
 #[tokio::test]
 async fn concurrent_consumes_never_double_claim() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = test_pool(4).await;
     let now = clock_now(&pool).await;
     let device = seed_device(&pool, now - Duration::seconds(200)).await;
     let session = seed_session(
@@ -866,7 +902,7 @@ async fn concurrent_consumes_never_double_claim() {
 
 #[tokio::test]
 async fn consume_serializes_with_exact_device_revocation() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let pool = test_pool(3).await;
     let now = clock_now(&pool).await;
     let device = seed_device(&pool, now - Duration::seconds(200)).await;
     let session = seed_session(
@@ -944,11 +980,10 @@ async fn consume_serializes_with_exact_device_revocation() {
     ));
 }
 
-use common::http_acceptance as http;
 
 #[tokio::test]
 async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_device() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = test_pool(4).await;
     http::ensure_fence(&pool).await;
     let owner = http::seed_device(&pool).await;
     let foreign = http::seed_device(&pool).await;
@@ -990,7 +1025,7 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
         ),
     )
     .await;
-    assert_eq!(owner_status, axum::http::StatusCode::OK);
+    assert_eq!(owner_status, axum::http::StatusCode::OK, "owner_response: {owner_response:?}");
     assert_eq!(
         owner_response["endpoint"],
         "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents"

@@ -1764,7 +1764,7 @@ pub enum ProjectionScope {
 }
 
 #[derive(Debug)]
-#[cfg_attr(test, derive(Clone))]
+#[cfg_attr(test, derive(Clone, PartialEq))]
 pub struct RelationshipProjection {
     projection_id: Uuid,
     operation_scope: ProjectionOperationScope,
@@ -1785,7 +1785,7 @@ pub struct RelationshipProjection {
 }
 
 #[derive(Debug)]
-#[cfg_attr(test, derive(Clone))]
+#[cfg_attr(test, derive(Clone, PartialEq))]
 pub struct TrafficProjection {
     projection_id: Uuid,
     operation_scope: ProjectionOperationScope,
@@ -1839,6 +1839,18 @@ impl Clone for ProjectionPersistenceAuthority {
             panic!("AllocatedProjectionRevisionGuard is linear and cannot be cloned");
         }
         Self(Mutex::new(None))
+    }
+}
+#[cfg(test)]
+impl PartialEq for ProjectionPersistenceAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        let a = self.0.lock().expect("test authority lock");
+        let b = other.0.lock().expect("test authority lock");
+        match (&*a, &*b) {
+            (None, None) => true,
+            (Some(ga), Some(gb)) => ga.projection_revision() == gb.projection_revision(),
+            _ => false,
+        }
     }
 }
 
@@ -5041,3 +5053,6 @@ mod projection_integrity_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

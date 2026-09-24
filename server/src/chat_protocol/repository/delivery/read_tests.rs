@@ -1,41 +1,4 @@
-//! Live-PostgreSQL verification of the clean-chat delivery READ path
-//! (`chat_protocol::repository::delivery::{get_entries, conversation_snapshot_seq,
-//! fetch_device_application_intervals, fetch_schedule_terminal_proof,
-//! fetch_control_entry_for_device}` and the closed `#applicationEntry` /
-//! `#conversationEntry` projections).
-//!
-//! The write authority (the transition executor + the E1/E2b-1 writers) is
-//! certified elsewhere; this file proves the READ side returns EXACTLY what those
-//! writers froze, on the exact entitlement seams, with gap-safe paging.
-//!
-//! Every case writes coherent rows and reads them back inside ONE transaction
-//! that is ROLLED BACK — so the migration's DEFERRED cross-table triggers (which
-//! fire only at COMMIT) never run, and each case only has to satisfy the
-//! IMMEDIATE FK/CHECK graph against the committed `seed_fixture` base. This is
-//! the same read-back+rollback discipline the executor primitive tests use.
-//!
-//! The production repository module is gated `#[cfg(not(test))]` (see
-//! `src/chat_protocol/repository/mod.rs`), so — mirroring the sibling repository
-//! harnesses — this test `include!`s it directly. Live cases run under the
-//! standard whole-suite gate: they hard-fail (panic in `setup_chat_protocol_db`)
-//! without `TEST_DATABASE_URL` rather than skipping:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_delivery_read -- --test-threads=1
-
-#![allow(dead_code)]
-
-mod common;
-
-mod repository {
-    pub(crate) mod delivery {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/delivery.rs"
-        ));
-    }
-}
-
+use super::*;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
@@ -46,14 +9,18 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use repository::delivery::{
-    append_entry, close_application_interval, conversation_snapshot_seq,
-    fetch_control_entry_for_device, fetch_device_application_intervals,
-    fetch_schedule_terminal_proof, get_entries, insert_entry_recipients,
-    insert_schedule_terminal_proof, AppendEntry, ApplicationIntervalClose, DeliveryRepositoryError,
-    EntryEntitlementKind, EntryRecipient, IntervalCloseKind, NewScheduleTerminalProof,
-    APPLICATION_ENTRY_KIND,
-};
+async fn test_pool(max_connections: u32) -> PgPool {
+    let url = std::env::var("REQUEST_TEST_DATABASE_URL")
+        .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+        .unwrap_or_else(|_| {
+            "postgresql://127.0.0.1:5432/catbird_direct_requests_test_20260919".to_string()
+        });
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect(&url)
+        .await
+        .expect("connect test db")
+}
 
 const COMMIT_ENTRY_KIND: &str = "blue.catbird.chat.defs#commitEntry";
 // Kinds whose `entries_reference_shape_check` arm requires BOTH transition_id and
@@ -525,7 +492,7 @@ fn parse_ts(text: &str) -> DateTime<Utc> {
 }
 
 fn load_contract_vectors() -> Value {
-    serde_json::from_str(include_str!("fixtures/mls_chat_contract_vectors.json"))
+    serde_json::from_str(include_str!("../../../../tests/fixtures/mls_chat_contract_vectors.json"))
         .expect("contract vectors fixture")
 }
 
@@ -541,7 +508,7 @@ fn load_contract_vectors() -> Value {
 /// scalars. The control projection is rejected on an application row.
 #[tokio::test]
 async fn application_projection_returns_exactly_the_five_golden_fields() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = test_pool(4).await;
     let fixture = seed_fixture(&pool).await;
     let vectors = load_contract_vectors();
     let golden = &vectors["applicationEntryFingerprint"];
@@ -623,7 +590,7 @@ async fn application_projection_returns_exactly_the_five_golden_fields() {
 /// control row.
 #[tokio::test]
 async fn thirteen_control_projections_preserve_serverfields_and_golden_fingerprint() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = test_pool(4).await;
     let fixture = seed_fixture(&pool).await;
     let vectors = load_contract_vectors();
     let cases = vectors["controlEntryFingerprints"]["cases"]
@@ -727,7 +694,7 @@ async fn thirteen_control_projections_preserve_serverfields_and_golden_fingerpri
 /// distinction.)
 #[tokio::test]
 async fn control_projection_is_one_field_sensitive_through_delivery() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = test_pool(4).await;
     let fixture = seed_fixture(&pool).await;
     let received_at = clock_now(&pool).await;
 
@@ -837,7 +804,7 @@ async fn control_projection_is_one_field_sensitive_through_delivery() {
 /// creation control at seq 1 is unentitled to the caller and never surfaces.
 #[tokio::test]
 async fn get_entries_is_gap_safe_and_hides_unentitled_rows() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = test_pool(4).await;
     let fixture = seed_fixture(&pool).await;
     let now = clock_now(&pool).await;
 
@@ -989,7 +956,7 @@ async fn get_entries_is_gap_safe_and_hides_unentitled_rows() {
 /// application entry.
 #[tokio::test]
 async fn application_visibility_binds_one_device_sibling_sees_control_only() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = test_pool(4).await;
     let fixture = seed_fixture(&pool).await;
     let sibling_device = seed_sibling_device(&pool, &fixture.actor_did).await;
     let now = clock_now(&pool).await;
@@ -1078,7 +1045,7 @@ async fn application_visibility_binds_one_device_sibling_sees_control_only() {
 /// gets nothing.
 #[tokio::test]
 async fn interval_read_opening_binding_all_or_none_close_and_former_device_row() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = test_pool(4).await;
     let fixture = seed_fixture(&pool).await;
     let sibling_device = seed_sibling_device(&pool, &fixture.actor_did).await;
     let leaf_period_id = leaf_period_of(&pool, fixture.conversation_id).await;
@@ -1148,7 +1115,10 @@ async fn interval_read_opening_binding_all_or_none_close_and_former_device_row()
     close_application_interval(
         &mut tx,
         &ApplicationIntervalClose {
-            membership_interval_id: interval.membership_interval_id,
+            conversation_id: interval.conversation_id,
+            recipient_did: interval.recipient_did.clone(),
+            recipient_device_id: interval.recipient_device_id,
+            opening_transition_id: interval.opening_transition_id,
             terminal_seq: terminal_seq as i64,
             closing_state_version: 1,
             closing_transition_id,
@@ -1226,7 +1196,7 @@ async fn interval_read_opening_binding_all_or_none_close_and_former_device_row()
 /// exists.
 #[tokio::test]
 async fn schedule_terminal_proof_is_exact_device_zero_or_one() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = test_pool(4).await;
     let fixture = seed_fixture(&pool).await;
     let sibling_device = seed_sibling_device(&pool, &fixture.actor_did).await;
     let proof_transition = creation_transition_of(&pool, fixture.conversation_id).await;
@@ -1321,7 +1291,7 @@ async fn schedule_terminal_proof_is_exact_device_zero_or_one() {
 /// what the caller can see. It advances as entries are appended.
 #[tokio::test]
 async fn snapshot_seq_is_next_entry_seq_minus_one_not_an_entry_cursor() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let pool = test_pool(4).await;
     let fixture = seed_fixture(&pool).await;
     let now = clock_now(&pool).await;
 

@@ -11,43 +11,24 @@
 
 #![allow(dead_code)]
 
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-mod repository {
-    pub(crate) mod inventory {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/inventory.rs"
-        ));
-    }
-}
-
-mod cursor {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/chat_protocol/cursor.rs"
-    ));
-}
-
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{TimeZone, Utc};
-use cursor::{
-    mint_capability_token, CapabilityToken, CursorCodec, CursorSealer, InventoryPageDomain,
-    SealedCapability, SealerBinding, SealerError, SecureRandom, SecureRandomError,
-};
-use repository::inventory::{
-    lock_inventory_session_for_test, InventoryCompletionEvidence, InventoryRepositoryError,
-    InventorySessionLockFixture,
-};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, Mutex};
 use uuid::Uuid;
-use validation::{ed25519_key_id, KeyThumbprint};
 use zeroize::Zeroizing;
+
+use crate::chat_protocol::cursor::{
+    self, mint_capability_token, CapabilityToken, CursorCodec, CursorSealer, InventoryPageDomain,
+    SealedCapability, SealerBinding, SealerError, SecureRandom, SecureRandomError,
+};
+use crate::chat_protocol::model;
+use crate::chat_protocol::repository::inventory::{
+    self, lock_inventory_session_for_test, page_last_ordinal, CanonicalInventoryResponse,
+    InventoryCompletionEvidence, InventoryRepositoryError, InventorySessionLockFixture,
+};
+use crate::chat_protocol::validation::{self, ed25519_key_id, KeyThumbprint};
 
 const DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
 const DEVICE_ID: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
@@ -225,11 +206,11 @@ fn fixture_with_capability(
 }
 
 /// The canonical no-filter conversations request binding.
-fn conversations_request(limit: u16) -> repository::inventory::InventoryPublicRequestBinding {
-    repository::inventory::InventoryPublicRequestBinding::new(
+fn conversations_request(limit: u16) -> inventory::InventoryPublicRequestBinding {
+    inventory::InventoryPublicRequestBinding::new(
         ENDPOINT_NSID,
         1,
-        repository::inventory::InventoryDomain::Conversations,
+        inventory::InventoryDomain::Conversations,
         limit,
         Sha256::digest([]).into(),
     )
@@ -298,7 +279,7 @@ struct ReceiptStore {
 /// the receipt row's own columns derive every AAD field.
 #[allow(clippy::too_many_arguments)]
 fn page_receipt_binding(
-    request: &repository::inventory::InventoryPublicRequestBinding,
+    request: &inventory::InventoryPublicRequestBinding,
     fields: &SessionFields,
     receipt_created_at: u64,
     receipt_expires_at: u64,
@@ -423,7 +404,7 @@ fn session_capability_text(fields: &SessionFields, sealer: &CursorSealer) -> Str
 fn replay_served_receipt(
     receipt: &ServedReceipt,
     fields: &SessionFields,
-    request: &repository::inventory::InventoryPublicRequestBinding,
+    request: &inventory::InventoryPublicRequestBinding,
     items: &[Vec<u8>],
     sealer: &CursorSealer,
 ) -> Vec<u8> {
@@ -469,7 +450,7 @@ fn replay_served_receipt(
 /// page binding, assemble the canonical response, and record the receipt.
 fn fresh_serve(
     fields: &SessionFields,
-    request: &repository::inventory::InventoryPublicRequestBinding,
+    request: &inventory::InventoryPublicRequestBinding,
     items: &[Vec<u8>],
     has_more: bool,
     after_ordinal: Option<u64>,
@@ -527,7 +508,7 @@ fn serve_or_replay(
     store: &ReceiptStore,
     key: &BoundaryKey,
     fields: &SessionFields,
-    request: &repository::inventory::InventoryPublicRequestBinding,
+    request: &inventory::InventoryPublicRequestBinding,
     items: &[Vec<u8>],
     has_more: bool,
     after_ordinal: Option<u64>,
@@ -1006,7 +987,7 @@ fn source_transitions_after_creation_do_not_change_retained_bytes() {
 
     // Structural proof over the PRODUCTION assembly: the response is assembled
     // ONLY from the retained inputs — never from any live source coordinate.
-    let inventory_source = include_str!("../src/chat_protocol/repository/inventory.rs");
+    let inventory_source = include_str!("inventory.rs");
     let assembly_body = inventory_source
         .split_once("fn assemble_inventory_page_response(")
         .expect("the response assembly function exists")
@@ -1358,11 +1339,11 @@ fn page_item_response_and_session_byte_ceilings_fail_closed_at_the_exact_limits(
     const PER_DOMAIN_CEILING: usize = 10_000;
     const TOTAL_CEILING: usize = 30_000;
     assert_eq!(
-        repository::inventory::MAX_INVENTORY_PAGE_ITEMS as usize,
+        inventory::MAX_INVENTORY_PAGE_ITEMS as usize,
         PAGE_CEILING,
         "the test is pinned to the production page ceiling"
     );
-    let inventory_source = include_str!("../src/chat_protocol/repository/inventory.rs");
+    let inventory_source = include_str!("inventory.rs");
     assert!(
         inventory_source
             .contains("const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024 + 64 * 1024;"),
@@ -1373,7 +1354,7 @@ fn page_item_response_and_session_byte_ceilings_fail_closed_at_the_exact_limits(
         "the production per-item read ceiling is pinned in the source"
     );
     let g7_migration =
-        include_str!("../migrations/20260729000001_chat_g7_inventory_entitlement.sql");
+        include_str!("../../../migrations/20260729000001_chat_g7_inventory_entitlement.sql");
     for pin in [
         "IF conversation_count > 10000",
         "IF welcome_count > 10000",
@@ -1397,7 +1378,7 @@ fn page_item_response_and_session_byte_ceilings_fail_closed_at_the_exact_limits(
             .collect();
         let mut kept = 0usize;
         for _item in &items {
-            if kept >= repository::inventory::MAX_INVENTORY_PAGE_ITEMS as usize {
+            if kept >= inventory::MAX_INVENTORY_PAGE_ITEMS as usize {
                 break;
             }
             kept += 1;
@@ -1509,7 +1490,7 @@ fn page_item_response_and_session_byte_ceilings_fail_closed_at_the_exact_limits(
     // the actual D-2 transaction and rollback paths rather than an in-memory
     // transaction imitation. The failed attempt inserts only inside a SQL
     // transaction; SnapshotConflict rolls it back before the retry continues.
-    let production = include_str!("../src/chat_protocol/repository/inventory.rs");
+    let production = include_str!("inventory.rs");
     let attempt = production
         .split_once("async fn create_inventory_snapshot_attempt(")
         .expect("the D-2 attempt function exists")
@@ -1557,8 +1538,8 @@ fn page_item_response_and_session_byte_ceilings_fail_closed_at_the_exact_limits(
 /// capability, and the exactly-one fence-constructor caller in inventory.rs.
 #[test]
 fn no_plaintext_capability_storage_or_logging_in_the_receipt_surface() {
-    let inventory_source = include_str!("../src/chat_protocol/repository/inventory.rs");
-    let cursor_source = include_str!("../src/chat_protocol/cursor.rs");
+    let inventory_source = include_str!("inventory.rs");
+    let cursor_source = include_str!("../cursor.rs");
 
     // The serve path stores only the SHA-256 lookup hash and the sealed
     // nonce/ciphertext pair — never the 32-byte plaintext or its text form.
@@ -1589,7 +1570,10 @@ fn no_plaintext_capability_storage_or_logging_in_the_receipt_surface() {
     let serve_region = inventory_source
         .split_once("fn serve_page_receipt(")
         .expect("the serve function exists")
-        .1;
+        .1
+        .split_once("pub(crate) async fn serve_initial_inventory_page(")
+        .expect("the serve region terminates")
+        .0;
     for banned in ["eprintln!", "println!", "tracing::", "log::", "panic!("] {
         assert!(
             !serve_region.contains(banned),
@@ -1729,13 +1713,13 @@ fn no_plaintext_capability_storage_or_logging_in_the_receipt_surface() {
 fn session_fence_and_receipt_lifetimes_fail_closed_at_fifteen_minutes() {
     // The schema's exact bound (the sealed migrations).
     let delivery_migration =
-        include_str!("../migrations/20260722000002_chat_protocol_delivery.sql");
+        include_str!("../../../migrations/20260722000002_chat_protocol_delivery.sql");
     assert!(
         delivery_migration.contains("expires_at <= created_at + INTERVAL '15 minutes'"),
         "the inventory session lifetime is exactly 15 minutes"
     );
     let g7_migration =
-        include_str!("../migrations/20260729000001_chat_g7_inventory_entitlement.sql");
+        include_str!("../../../migrations/20260729000001_chat_g7_inventory_entitlement.sql");
     assert_eq!(
         g7_migration
             .matches("expires_at <= created_at + interval '15 minutes'")
@@ -1746,7 +1730,7 @@ fn session_fence_and_receipt_lifetimes_fail_closed_at_fifteen_minutes() {
 
     // The B-read temporal bound (read_authority.rs `verify_inventory_fence`):
     // a fence captured more than 15 minutes ago is refused.
-    let read_authority_source = include_str!("../src/chat_protocol/read_authority.rs");
+    let read_authority_source = include_str!("../read_authority.rs");
     let fence_region = read_authority_source
         .split_once("// Temporal bounds: the fence was captured now or in the recent past")
         .expect("the temporal bound comment exists")
@@ -1803,7 +1787,7 @@ fn session_fence_and_receipt_lifetimes_fail_closed_at_fifteen_minutes() {
 /// behavior.
 #[test]
 fn d2_receipt_retry_and_continuation_paths_are_source_pinned() {
-    let source = include_str!("../src/chat_protocol/repository/inventory.rs");
+    let source = include_str!("inventory.rs");
     let body = |signature: &str| {
         let tail = source
             .split_once(signature)
@@ -1949,7 +1933,7 @@ fn d2_receipt_retry_and_continuation_paths_are_source_pinned() {
 /// the path-include mount — not a test-local replica.
 #[test]
 fn page_last_ordinal_is_the_production_boundary_arithmetic() {
-    use repository::inventory::page_last_ordinal;
+    // use inventory::page_last_ordinal;
     // The initial arm: a page starting at ordinal 0 with N items ends at N-1.
     assert_eq!(page_last_ordinal(0, 1), Some(0));
     assert_eq!(page_last_ordinal(0, 100), Some(99));
@@ -1975,7 +1959,7 @@ fn page_last_ordinal_is_the_production_boundary_arithmetic() {
 /// `Debug` output. Behavioural check over the real production type.
 #[test]
 fn canonical_inventory_response_debug_is_redacted() {
-    use repository::inventory::CanonicalInventoryResponse;
+    // use inventory::CanonicalInventoryResponse;
     let secret_text = "SECRET-CAPABILITY-TEXT-THAT-MUST-NEVER-DEBUG";
     let bytes = format!("{{\"inventorySessionId\":\"{secret_text}\"}}").into_bytes();
     let sha256: [u8; 32] = Sha256::digest(&bytes).into();
@@ -1988,7 +1972,7 @@ fn canonical_inventory_response_debug_is_redacted() {
     );
     assert!(rendered.contains("REDACTED"));
     // The source side: no derived Debug remains on the struct.
-    let source = include_str!("../src/chat_protocol/repository/inventory.rs");
+    let source = include_str!("inventory.rs");
     let derive_line = source
         .split_once("pub(crate) struct CanonicalInventoryResponse {")
         .expect("the response struct exists")
