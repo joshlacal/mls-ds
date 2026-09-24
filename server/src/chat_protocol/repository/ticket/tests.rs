@@ -1087,3 +1087,74 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
     );
     replay.rollback().await.expect("rollback replay consume");
 }
+
+#[tokio::test]
+async fn subscription_ticket_mints_when_session_created_at_is_in_the_future() {
+    let pool = test_pool(4).await;
+    http::ensure_fence(&pool).await;
+    let owner = http::seed_device(&pool).await;
+    let db_now = clock_now(&pool).await;
+    let owner_fixture = DeviceFixture {
+        did: owner.did.clone(),
+        device_id: owner.device_id,
+        jkt: owner.jkt.clone(),
+        auth_generation: 1,
+    };
+    // Seed an inventory session whose whole-second created_at is strictly in the future
+    // (simulating the next whole second after session creation transaction).
+    let future_created_at = (db_now + Duration::seconds(5))
+        .with_nanosecond(0)
+        .expect("normalize future session creation timestamp");
+    let session_expires_at = future_created_at + Duration::minutes(15);
+    let session = seed_session(
+        &pool,
+        &owner_fixture,
+        future_created_at,
+        session_expires_at,
+        true,
+    )
+    .await;
+    assert!(
+        session.created_at > clock_now(&pool).await,
+        "session created_at must be strictly in the future"
+    );
+
+    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "actorDeviceId": owner.device_id.hyphenated().to_string(),
+        "inventorySessionId": session.capability.clone(),
+        "eventCursor": session.capability.clone(),
+    }))
+    .expect("ticket body");
+
+    let (owner_status, owner_response) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            &owner,
+            "blue.catbird.chat.getSubscriptionTicket",
+            body,
+        ),
+    )
+    .await;
+    assert_eq!(
+        owner_status,
+        axum::http::StatusCode::OK,
+        "owner_response: {owner_response:?}"
+    );
+    assert_eq!(owner_response["ticket"].as_str().map(str::len), Some(43));
+
+    // Expiry must be derived from the clamped created_at:
+    // expires_at = (session.created_at + 30s).min(session.expires_at)
+    let expected_expiry = session.created_at + Duration::seconds(30);
+    let returned_expiry = owner_response["expiresAt"]
+        .as_str()
+        .expect("expiresAt in response");
+    let parsed_expiry = DateTime::parse_from_rfc3339(returned_expiry)
+        .expect("valid rfc3339 returned")
+        .with_timezone(&Utc);
+    assert_eq!(
+        parsed_expiry,
+        expected_expiry,
+        "ticket expiry must be derived from clamped session.created_at"
+    );
+}

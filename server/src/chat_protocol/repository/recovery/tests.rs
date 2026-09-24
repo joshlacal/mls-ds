@@ -941,3 +941,41 @@ fn recovery_terminal_locator_row_carries_request_id() {
         "the old locator row name must be completely renamed"
     );
 }
+
+#[test]
+fn recovery_fulfillment_and_replay_present_welcome_bytes_objects() {
+    let source = include_str!("../recovery.rs");
+    // Assert fulfillment_response_bytes uses $bytes for welcome byte fields.
+    assert!(
+        source.contains("\"opaqueWelcome\": { \"$bytes\": STANDARD.encode(welcome.opaque_welcome()) }"),
+        "fulfillment_response_bytes must present opaqueWelcome as $bytes object"
+    );
+    assert!(
+        source.contains("\"sha256\": { \"$bytes\": STANDARD.encode(welcome.sha256()) }"),
+        "fulfillment_response_bytes must present sha256 as $bytes object"
+    );
+    assert!(
+        source.contains("\"keyPackageRef\": { \"$bytes\": STANDARD.encode(welcome.key_package_ref()) }"),
+        "fulfillment_response_bytes must present keyPackageRef as $bytes object"
+    );
+
+    // Assert lock_recovery_fulfillment_replay_graph uses $bytes for welcome byte fields.
+    assert!(
+        source.contains("\"opaqueWelcome\": { \"$bytes\": STANDARD.encode(&row.welcome_wrapper_bytes) }"),
+        "lock_recovery_fulfillment_replay_graph must present opaqueWelcome as $bytes object"
+    );
+    assert!(
+        source.contains("\"sha256\": { \"$bytes\": STANDARD.encode(&row.welcome_wrapper_sha256) }"),
+        "lock_recovery_fulfillment_replay_graph must present sha256 as $bytes object"
+    );
+    assert!(
+        source.contains("\"keyPackageRef\": { \"$bytes\": STANDARD.encode(&row.delivery_key_package_ref) }"),
+        "lock_recovery_fulfillment_replay_graph must present keyPackageRef as $bytes object"
+    );
+
+    // Assert response_coordinate uses $bytes objects.
+    assert!(
+        source.contains("\"groupId\": { \"$bytes\": STANDARD.encode(group_id) }"),
+        "response_coordinate must present groupId as $bytes object"
+    );
+}

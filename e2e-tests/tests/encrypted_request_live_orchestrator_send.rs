@@ -146,6 +146,49 @@ async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request
     let welcomes = fulfilled["welcomes"].as_array().context("welcomes")?;
     assert_eq!(welcomes.len(), 1, "{fulfilled}");
     assert!(welcomes[0]["opaqueWelcome"]["$bytes"].is_string(), "{fulfilled}");
+
+    // F41 replay regression: re-submitting the exact fulfillment mutation request
+    // returns 200 and decodes into SubmitTransitionOutput with presented $bytes.
+    let fulfillment_req = orchestrator
+        .api_client()
+        .last_request_body("blue.catbird.chat.submitTransition")
+        .context("fulfillment request body")?;
+    let (replay_status, replay_body) = alice
+        .forward_exact_service_request(
+            &client,
+            &server.base_url,
+            reqwest::Method::POST,
+            "blue.catbird.chat.submitTransition",
+            None,
+            Some(&fulfillment_req),
+        )
+        .await
+        .context("replay fulfillment request")?;
+    anyhow::ensure!(
+        replay_status == reqwest::StatusCode::OK,
+        "replay fulfillment status {replay_status}: {}",
+        String::from_utf8_lossy(&replay_body)
+    );
+    let replayed: SubmitTransitionOutput = serde_json::from_slice(&replay_body)
+        .context("replayed fulfillment must decode into generated SubmitTransitionOutput")?;
+    assert_eq!(replayed.welcomes.len(), 1, "replayed welcomes count");
+    let replay_raw: Value = serde_json::from_slice(&replay_body)?;
+    assert!(
+        replay_raw["welcomes"][0]["opaqueWelcome"]["$bytes"].is_string(),
+        "replayed opaqueWelcome must be $bytes: {replay_raw}"
+    );
+    assert!(
+        replay_raw["welcomes"][0]["sha256"]["$bytes"].is_string(),
+        "replayed sha256 must be $bytes: {replay_raw}"
+    );
+    assert!(
+        replay_raw["welcomes"][0]["provenance"]["keyPackageRef"]["$bytes"].is_string(),
+        "replayed keyPackageRef must be $bytes: {replay_raw}"
+    );
+    assert!(
+        replay_raw["coordinates"]["groupId"]["$bytes"].is_string(),
+        "replayed groupId must be $bytes: {replay_raw}"
+    );
     let sent = orchestrator
         .send_message(&cid, "F37 live send through the real orchestrator")
         .await

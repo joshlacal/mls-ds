@@ -32,8 +32,8 @@ pub struct LiveApiClient {
     /// Recipient packages the test obtained out of band; the router has no
     /// ordinary package-claim read.
     key_packages: Vec<catbird_mls::orchestrator::KeyPackageRef>,
-    /// Every forwarded exchange (NSID, status, response body), in order.
-    exchanges: std::sync::Mutex<Vec<(String, u16, Vec<u8>)>>,
+    /// Every forwarded exchange (NSID, request body, status, response body), in order.
+    exchanges: std::sync::Mutex<Vec<(String, Option<Vec<u8>>, u16, Vec<u8>)>>,
 }
 
 impl LiveApiClient {
@@ -59,9 +59,20 @@ impl LiveApiClient {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(recorded, _, _)| recorded == nsid)
-            .map(|(_, status, body)| (*status, body.clone()))
+            .filter(|(recorded, _, _, _)| recorded == nsid)
+            .map(|(_, _, status, body)| (*status, body.clone()))
             .collect()
+    }
+
+    /// The most recent request body submitted to `nsid`.
+    pub fn last_request_body(&self, nsid: &str) -> Option<Vec<u8>> {
+        self.exchanges
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(recorded, _, _, _)| recorded == nsid)
+            .and_then(|(_, req, _, _)| req.clone())
     }
 }
 
@@ -109,7 +120,7 @@ impl MLSAPIClient for LiveApiClient {
         self.exchanges
             .lock()
             .unwrap()
-            .push((nsid.to_owned(), status.as_u16(), body.clone()));
+            .push((nsid.to_owned(), request.body.clone(), status.as_u16(), body.clone()));
         Ok(GatewayResponse {
             status: status.as_u16(),
             content_type: Some("application/json".into()),

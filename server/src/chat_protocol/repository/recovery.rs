@@ -2141,10 +2141,10 @@ fn response_coordinate(
         "conversationId": conversation_id.hyphenated().to_string(),
         "generation": generation,
         "stateVersion": state_version,
-        "groupId": STANDARD.encode(group_id),
+        "groupId": { "$bytes": STANDARD.encode(group_id) },
         "epoch": epoch,
-        "groupContextHash": STANDARD.encode(group_context_hash),
-        "confirmationTag": STANDARD.encode(confirmation_tag),
+        "groupContextHash": { "$bytes": STANDARD.encode(group_context_hash) },
+        "confirmationTag": { "$bytes": STANDARD.encode(confirmation_tag) },
         "lifecycle": "active",
     }))
 }
@@ -2152,24 +2152,11 @@ fn response_coordinate(
 fn response_coordinate_from_snapshot(
     coordinate: &super::super::snapshot::PublicGroupSnapshotCoordinate,
 ) -> Result<JsonValue, RecoveryRepositoryError> {
-    let generation = i64::try_from(coordinate.generation())
-        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
-    let state_version = i64::try_from(coordinate.state_version())
-        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
-    let epoch = i64::try_from(coordinate.epoch())
-        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
     if coordinate.lifecycle() != super::super::snapshot::PublicGroupSnapshotLifecycle::Active {
         return Err(RecoveryRepositoryError::InvalidDurableRow);
     }
-    response_coordinate(
-        Uuid::from_bytes(*coordinate.conversation_id()),
-        generation,
-        state_version,
-        coordinate.group_id(),
-        epoch,
-        coordinate.group_context_hash(),
-        coordinate.confirmation_tag(),
-    )
+    super::coordinate::canonical_coordinate_json(coordinate)
+        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)
 }
 
 fn canonical_datetime(value: DateTime<Utc>) -> String {
@@ -2352,14 +2339,14 @@ fn fulfillment_response_bytes(
             "transitionSeq": welcome.transition_seq(),
             "coordinates": response_coordinate_from_snapshot(successor)?,
             "status": "pending",
-            "opaqueWelcome": STANDARD.encode(welcome.opaque_welcome()),
-            "sha256": STANDARD.encode(welcome.sha256()),
+            "opaqueWelcome": { "$bytes": STANDARD.encode(welcome.opaque_welcome()) },
+            "sha256": { "$bytes": STANDARD.encode(welcome.sha256()) },
             "recipientDid": recipient_did,
             "recipientDeviceId":
                 Uuid::from_bytes(*welcome.recipient().device_id()).hyphenated().to_string(),
             "provenance": {
                 "recoveryRequestId": witness.request.recovery_request_id.hyphenated().to_string(),
-                "keyPackageRef": STANDARD.encode(welcome.key_package_ref()),
+                "keyPackageRef": { "$bytes": STANDARD.encode(welcome.key_package_ref()) },
             },
             "expiresAt": canonical_datetime(expires_at),
         }],
@@ -5240,13 +5227,13 @@ async fn lock_recovery_fulfillment_replay_graph(
                 &row.confirmation_tag,
             )?,
             "status": "pending",
-            "opaqueWelcome": STANDARD.encode(&row.welcome_wrapper_bytes),
-            "sha256": STANDARD.encode(&row.welcome_wrapper_sha256),
+            "opaqueWelcome": { "$bytes": STANDARD.encode(&row.welcome_wrapper_bytes) },
+            "sha256": { "$bytes": STANDARD.encode(&row.welcome_wrapper_sha256) },
             "recipientDid": row.recipient_did,
             "recipientDeviceId": row.recipient_device_id.hyphenated().to_string(),
             "provenance": {
                 "recoveryRequestId": row.recovery_request_id.hyphenated().to_string(),
-                "keyPackageRef": STANDARD.encode(&row.delivery_key_package_ref),
+                "keyPackageRef": { "$bytes": STANDARD.encode(&row.delivery_key_package_ref) },
             },
             "expiresAt": canonical_datetime(row.delivery_expires_at),
         }],
