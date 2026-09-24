@@ -1405,6 +1405,29 @@ impl HydrationAuthority {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test_with_locked_instant(
+        expected_conversation_id: [u8; 16],
+        instant: &TrustedRequestInstant,
+        expected_prior: Option<PublicGroupSnapshotCoordinate>,
+    ) -> Result<Self, StateMachineError> {
+        if !is_uuid_v4(&expected_conversation_id) {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        Ok(Self {
+            expected_conversation_id,
+            locked: Some(LockedHydrationBinding {
+                transaction_id: "test".to_string(),
+                expected_prior,
+                expected_next_entry_seq: 1,
+                locked_at: ServerTimestamp::from_trusted_request_instant(instant)?,
+                locked_head_digest: [1; 32],
+                locked_graph_digest: None,
+                locked_snapshot_digest: None,
+            }),
+        })
+    }
+
     pub(crate) fn from_locked_conversation(
         locked: &LockedConversationStateGuard,
     ) -> Result<Self, StateMachineError> {
@@ -20420,3 +20443,6 @@ mod direct_request_history_tests {
             .is_err());
     }
 }
+
+#[cfg(test)]
+mod tests;

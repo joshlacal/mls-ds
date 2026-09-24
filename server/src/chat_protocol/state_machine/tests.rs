@@ -1,237 +1,7 @@
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-#[allow(dead_code)]
-mod snapshot {
-    pub use catbird_server::chat_protocol::snapshot::*;
-}
-// `cursor.rs` is mounted at this crate root, so its `super::repository::*`
-// references resolve here rather than inside `chat_protocol`.
-mod repository {
-    pub(crate) use crate::chat_protocol::repository::*;
-}
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-mod chat_protocol {
-    pub mod direct_request_transcript {
-        pub use catbird_server::chat_protocol::direct_request_transcript::*;
-    }
-    pub mod model {
-        pub use crate::model::*;
-    }
-
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-
-    pub mod read_authority {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/read_authority.rs"
-        ));
-    }
-
-    // The E2b-2/E2b-3 transition executor lives in `state_machine.rs` (included
-    // below) and is now compiled unconditionally, so its `super::repository::*`
-    // references must resolve inside this test crate too. The repository writer
-    // modules are self-contained (only `chrono`/`sha2`/`sqlx`/`uuid`), so they
-    // `include!` directly — mirroring `chat_protocol_transition_repository.rs`.
-    // The existing 27 state-machine tests do not use these; they are inert here.
-    pub mod repository {
-        pub mod recovery {
-            #[derive(Debug)]
-            pub(crate) struct RecoverySqlAuthoritySeal;
-
-            pub(crate) struct RecoveryPersistenceWitness {
-                _private: (),
-            }
-
-            impl RecoveryPersistenceWitness {
-                pub(crate) async fn apply_open(
-                    &self,
-                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-                ) -> Result<(), super::super::state_machine::ExecutorError> {
-                    unreachable!("state-machine tests cannot mint a Recovery witness")
-                }
-
-                pub(crate) async fn apply_terminal(
-                    &self,
-                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-                ) -> Result<(), super::super::state_machine::ExecutorError> {
-                    unreachable!("state-machine tests cannot mint a Recovery witness")
-                }
-            }
-
-            #[allow(dead_code)]
-            pub(crate) struct RecoveryExecutorWriteAuthority<'witness> {
-                _witness: &'witness RecoveryPersistenceWitness,
-            }
-
-            impl RecoveryExecutorWriteAuthority<'_> {
-                pub(crate) async fn apply_open(
-                    &self,
-                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-                ) -> Result<(), super::super::state_machine::ExecutorError> {
-                    unreachable!("state-machine tests cannot mint a Recovery write authority")
-                }
-
-                pub(crate) async fn apply_terminal(
-                    &self,
-                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-                ) -> Result<(), super::super::state_machine::ExecutorError> {
-                    unreachable!("state-machine tests cannot mint a Recovery write authority")
-                }
-            }
-        }
-
-        pub mod blobs {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-
-        pub mod execution_context {
-            pub(crate) struct ExecutionContextHydrationProof;
-            pub(crate) struct RevocationBatchHydrationProof;
-        }
-
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-
-        pub mod prelude {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-
-        pub mod key_packages {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-
-        pub mod relationship {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-
-        pub mod core {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-    }
-
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
-}
-
-use std::{
-    fs,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine,
-};
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
-
-use chat_protocol::{
+use super::*;
+use super::hydrate_conversation_state as hydrate_graph;
+use crate::chat_protocol;
+use crate::chat_protocol::{
     public_state::{
         decode_public_tree_summary, encode_public_tree_summary, rebind_active_snapshot,
         verify_genesis_group_info, verify_recovery_welcome, verify_reset_successor_group_info,
@@ -239,25 +9,6 @@ use chat_protocol::{
     },
     snapshot::{
         PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
-    },
-    state_machine::{
-        acceptance_recovery_package_artifact_matches, hydrate_conversation_state as hydrate_graph,
-        plan_accept_conversation, plan_close, plan_commit, plan_creation,
-        plan_leaf_recovery_cancellation, plan_leaf_recovery_expiry, plan_leaf_recovery_fulfillment,
-        plan_leaf_recovery_request, plan_leave_cancellation, plan_leave_fulfillment,
-        plan_leave_request, plan_reset_activation, plan_reset_request, plan_zero_leaf_leave,
-        AcceptConversation, CloseConversation, CommitCommand, ConversationKind,
-        ConversationStateHydration, CreationCommand, CreationDecision, DeviceIdentity,
-        DurableSignedRequestEnvelope, HydrationAuthority, IntervalHydrationRow,
-        InvitationHydrationRow, LeafHydrationRow, LeafRecoveryCancellation,
-        LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
-        LeaveFulfillment, LeaveFulfillmentTestMutation, LeaveRequestCommand, LeaveRequestStatus,
-        LockedRecoveryReservationProjection, LockedRegistrationProjection, OpeningKind,
-        PackageStatus, ParticipantHydrationRow, ParticipantRole, ParticipantStatus,
-        PersistedRegistrationRow, PersistedRegistrationStatus, PersistedSignedRequestRow,
-        PrincipalId, RecoveryExpiryPlanAuthority, RecoveryRequestStatus, RecoverySource,
-        RequestEntryKind, RequestEvidence, ReservationStatus, ResetActivation, ResetRequestCommand,
-        ResetRequestStatus, ServerTimestamp, StateMachineError, TransitionEvidence, ZeroLeafLeave,
     },
     transcript::{
         decode_and_verify_signed_mutation, decode_canonical_signed_mutation, SignedMutationKind,
@@ -271,6 +22,18 @@ use chat_protocol::{
         XWING_CIPHERSUITE,
     },
 };
+
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
+use catbird_atproto::generated::blue_catbird::chat as chat_dto;
 use ed25519_dalek::{Signer, SigningKey};
 use openmls::prelude::{tls_codec::Serialize as TlsSerialize, *};
 use openmls_basic_credential::SignatureKeyPair;
@@ -280,7 +43,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-#[path = "common/frozen_public_state.rs"]
+#[path = "../../../tests/common/frozen_public_state.rs"]
 mod frozen_public_state;
 
 const GENESIS_SEQ: u64 = 1;
@@ -602,11 +365,16 @@ fn persisted_signed_request_restart_reverifies_raw_authority_and_frozen_row() {
     let signing_key = SigningKey::from_bytes(&[0x42; 32]);
     let raw =
         signed_leaf_recovery_request_raw(state.coordinate(), &actor, request_id, &signing_key);
-    let authority = HydrationAuthority::new(conversation_id).unwrap();
     let received_at_text = "2030-01-01T00:00:00.000Z";
     let trusted_received_at = TrustedRequestInstant::from_canonical_for_test(
         CanonicalTimestamp::parse(received_at_text).unwrap(),
     );
+    let authority = HydrationAuthority::for_test_with_locked_instant(
+        conversation_id,
+        &trusted_received_at,
+        Some(*state.coordinate()),
+    )
+    .unwrap();
     let admitted = authority
         .signed_request(
             DurableSignedRequestEnvelope::new(conversation_id, &trusted_received_at).unwrap(),
