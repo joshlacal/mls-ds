@@ -502,6 +502,10 @@ pub(super) fn mint_signed_repository_authority(
     stored_public_key: &[u8],
     repository_receipt: RepositoryAuthorityReceipt,
 ) -> Result<VerifiedChatDeviceRequest, AuthPrimitiveError> {
+    // Host clock by design: `signed_at` is the client's signed wall time, and
+    // the window bounds client/server wall-clock skew at request arrival (like
+    // the JWT iat/exp and DPoP iat checks on the same trusted instant). No
+    // database timestamp takes part in this comparison.
     validate_first_execution_signed_at(canonical.signed_at(), pre_replay.trusted_instant())?;
     let mutation = verify_signed_mutation(canonical, stored_public_key)?;
     Ok(VerifiedChatDeviceRequest {

@@ -256,6 +256,11 @@ const SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES: usize = 15 * 1024 * 1024;
 // plus the signed-request envelope; 12 MiB gives headroom without truncating a
 // valid maximal batch (OQ-10).
 const CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES: usize = 12 * 1024 * 1024;
+// T16 request-specific publish tier: the signed publication and the request
+// key batch carry their own 16 MiB wire budget (the same value as their route
+// `DefaultBodyLimit`), never widening the 4 MiB default. Nest mirrors this
+// exact table in `services/xrpc_ingress.rs` so it refuses before forwarding.
+const CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const INGRESS_BODY_BUDGET_MIB: usize = 64;
 const BYTES_PER_INGRESS_PERMIT: usize = 1024 * 1024;
 const DEFAULT_REQUEST_BODY_READ_TIMEOUT_MS: u64 = 15_000;
@@ -341,6 +346,10 @@ fn request_body_limit(path: &str) -> usize {
         BLOB_UPLOAD_PATH => BLOB_UPLOAD_BODY_LIMIT_BYTES,
         "/xrpc/blue.catbird.chat.enrollDevice" | "/xrpc/blue.catbird.chat.replenishKeyPackages" => {
             CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES
+        }
+        "/xrpc/blue.catbird.chat.publishDirectRequest"
+        | "/xrpc/blue.catbird.chat.publishDirectRequestKeys" => {
+            CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES
         }
         "/xrpc/blue.catbird.mlsDS.deliverMessage"
         | "/xrpc/blue.catbird.mlsDS.deliverWelcome"
@@ -1558,6 +1567,47 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(within.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn direct_request_publication_tier_admits_exact_16mib_through_ingress() {
+        // F4/T16: Nest forwards exact 16 MiB publications; the ingress layer
+        // must admit exactly that (it used to cut them at the 4 MiB default,
+        // which Nest surfaced as a 500) and refuse one byte more. The route
+        // carries the same limit as its production registration.
+        for path in [
+            "/xrpc/blue.catbird.chat.publishDirectRequest",
+            "/xrpc/blue.catbird.chat.publishDirectRequestKeys",
+        ] {
+            let base_router = Router::new().route(
+                path,
+                post(consume_body).layer(DefaultBodyLimit::max(16_777_216)),
+            );
+            let app = merge_application_routers(
+                base_router,
+                Router::new(),
+                lazy_test_pool(),
+                test_ingress_policy(),
+            );
+            for (size, status) in [
+                (CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES, StatusCode::NO_CONTENT),
+                (
+                    CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES + 1,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                ),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::post(path)
+                            .body(Body::from(vec![0_u8; size]))
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), status, "{path} {size}");
+            }
+        }
     }
 
     #[tokio::test]

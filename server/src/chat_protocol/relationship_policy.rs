@@ -3011,12 +3011,36 @@ pub trait ProjectionClock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemProjectionClock;
+/// Production projection clock on the PostgreSQL timebase.
+///
+/// Collection timestamps (`started_at`, `completed_at`, `fetched_at`) are later
+/// judged against post-lock `clock_timestamp()` decisions, so they must share
+/// the database clock rather than this process's wall clock. The anchor is a
+/// database sample taken immediately before collection; readings advance it by
+/// this process's monotonic elapsed time. The anchor is sampled on the server
+/// before the reply travels back, so readings lag the database clock by the
+/// round trip and never run ahead of a later database decision.
+#[derive(Debug, Clone, Copy)]
+pub struct DatabaseAnchoredProjectionClock {
+    database_anchor: DateTime<Utc>,
+    local_anchor: std::time::Instant,
+}
 
-impl ProjectionClock for SystemProjectionClock {
+impl DatabaseAnchoredProjectionClock {
+    pub(crate) fn from_database_sample(database_now: DateTime<Utc>) -> Self {
+        Self {
+            database_anchor: database_now,
+            local_anchor: std::time::Instant::now(),
+        }
+    }
+}
+
+impl ProjectionClock for DatabaseAnchoredProjectionClock {
     fn now(&self) -> DateTime<Utc> {
-        Utc::now()
+        let elapsed = TimeDelta::from_std(self.local_anchor.elapsed()).unwrap_or(TimeDelta::MAX);
+        self.database_anchor
+            .checked_add_signed(elapsed)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
     }
 }
 
@@ -3127,13 +3151,14 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
 
     pub(crate) async fn collect_admission_projection(
         &self,
+        clock: &DatabaseAnchoredProjectionClock,
         allocated_revision: AllocatedProjectionRevisionGuard,
         operation_scope: ProjectionOperationScope,
         request: AdmissionRequest,
     ) -> Result<RelationshipProjection, ProjectionRefreshFailure> {
         collect_admission_projection_with_kind(
             self,
-            &SystemProjectionClock,
+            clock,
             allocated_revision,
             operation_scope,
             request,
@@ -3144,13 +3169,14 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
 
     pub(crate) async fn collect_block_projection(
         &self,
+        clock: &DatabaseAnchoredProjectionClock,
         allocated_revision: AllocatedProjectionRevisionGuard,
         operation_scope: ProjectionOperationScope,
         roster: Vec<String>,
     ) -> Result<RelationshipProjection, ProjectionRefreshFailure> {
         collect_block_projection_with_kind(
             self,
-            &SystemProjectionClock,
+            clock,
             allocated_revision,
             operation_scope,
             roster,
@@ -3161,13 +3187,14 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
 
     pub(crate) async fn collect_traffic_projection(
         &self,
+        clock: &DatabaseAnchoredProjectionClock,
         allocated_revision: AllocatedProjectionRevisionGuard,
         actor: String,
         roster: Vec<String>,
     ) -> Result<TrafficProjection, ProjectionRefreshFailure> {
         collect_traffic_projection_with_kind(
             self,
-            &SystemProjectionClock,
+            clock,
             allocated_revision,
             actor,
             roster,
@@ -5056,3 +5083,31 @@ mod projection_integrity_tests {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod database_anchored_clock_tests {
+    use super::*;
+
+    /// F2: projection collection stamps live on the database timebase. With the
+    /// database clock ten minutes away from this host in either direction, a
+    /// window collected on the anchored clock is fresh at the later post-lock
+    /// database decision, while a window stamped from the host clock (the old
+    /// `SystemProjectionClock`) is refused as future or stale.
+    #[test]
+    fn projection_window_is_fresh_at_a_later_database_decision_despite_host_skew() {
+        for skew in [TimeDelta::minutes(10), TimeDelta::minutes(-10)] {
+            let database_clock = || Utc::now() - skew;
+            let clock = DatabaseAnchoredProjectionClock::from_database_sample(database_clock());
+            let (started, completed) = (clock.now(), clock.now());
+            let host_started = Utc::now();
+            let host_completed = Utc::now();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let decision = database_clock();
+            assert!(fresh_window(started, completed, decision), "anchored, skew {skew}");
+            assert!(
+                !fresh_window(host_started, host_completed, decision),
+                "host clock window must not pass at skew {skew}"
+            );
+        }
+    }
+}

@@ -70,13 +70,16 @@ async fn mint_block_only_fallback(
         .await
         .map_err(|error| format!("commit {label} projection revision allocation: {error}"))?;
 
+    let clock = crate::chat_protocol::repository::relationship::anchor_projection_clock(pool)
+        .await
+        .map_err(|error| format!("anchor {label} projection clock: {error}"))?;
     let live = authority
-        .collect_block_projection(live_allocation, operation_scope, roster)
+        .collect_block_projection(&clock, live_allocation, operation_scope, roster)
         .await
         .map_err(|failure| format!("collect live {label} relationship projection: {failure:?}"))?;
 
     let observation =
-        crate::chat_protocol::repository::relationship::observe_relationship_persistence();
+        crate::chat_protocol::repository::relationship::observe_relationship_persistence(&clock);
     let sealed = live
         .export_persisted_fallback(fallback_allocation, &authority, &observation)
         .map_err(|error| format!("seal {label} relationship fallback: {error:?}"))?;

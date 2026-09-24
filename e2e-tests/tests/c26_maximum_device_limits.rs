@@ -60,7 +60,7 @@ use uuid::Uuid;
 const PUBLISH: &str = "blue.catbird.chat.publishDirectRequest";
 const PREPARE: &str = "blue.catbird.chat.prepareDirectRequest";
 const PUBLICATION_BODY_LIMIT: usize = 16 * 1024 * 1024;
-const ORDINARY_BODY_LIMIT: usize = 10 * 1024 * 1024;
+const PREPARE_BODY_LIMIT: usize = 64 * 1024;
 const MAINTENANCE_URL: &str = "postgresql://127.0.0.1:5432/postgres";
 
 fn maintenance(sql: &str) -> Result<()> {
@@ -318,7 +318,7 @@ async fn prepare_and_build(
     let preparation = prepare_json
         .pointer("/outcome/preparation")
         .with_context(|| format!("prepare returned no preparation: {prepare_json}"))?;
-    protocol::verify_direct_request_preparation(
+    let preparation = protocol::verify_direct_request_preparation(
         &serde_json::to_vec(preparation)?,
         &ds.receipt_public_key,
     )?;
@@ -345,11 +345,12 @@ async fn prepare_and_build(
         "preparationDigest":preparation["preparationDigest"]
     });
     let decode = |device: &Value, field: &str| -> Result<Vec<u8>> {
-        Ok(STANDARD.decode(
-            device["keyPackage"][field]
-                .as_str()
-                .context("selected package field")?,
-        )?)
+        let val = &device["keyPackage"][field];
+        let text = val
+            .as_str()
+            .or_else(|| val.get("$bytes").and_then(Value::as_str))
+            .context("selected package field")?;
+        Ok(STANDARD.decode(text)?)
     };
     let journal = alice_engine.prepare_direct_request(&DirectRequestBootstrapInput {
         draft_id: Uuid::new_v4().to_string(),
@@ -605,9 +606,15 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
     // 5. Separate real Nest process in front of the real DS.
     let paired_dir = std::env::temp_dir().join(format!("c26-paired-nest-{run}"));
     std::fs::create_dir_all(&paired_dir)?;
-    let nest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../nest/catbird")
-        .canonicalize()?;
+    let nest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../nest-ServerHardening/catbird");
+    let nest_root = if nest_candidate.exists() {
+        nest_candidate.canonicalize()?
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../nest/catbird")
+            .canonicalize()?
+    };
     let mut child = Command::new("cargo")
         .args([
             "test",
@@ -686,7 +693,7 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
         &serde_json::to_vec(&publication)?,
         &alice_public,
     )?;
-    let verified_receipt = protocol::verify_signed_request(
+    let verified_receipt = protocol::verify_received_signed_request(
         DirectRequestKind::Outcome,
         &serde_json::to_vec(&receipt)?,
         &ds_server.receipt_public_key,
@@ -708,8 +715,8 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
     for (nsid, size, admitted) in [
         (PUBLISH, PUBLICATION_BODY_LIMIT, true),
         (PUBLISH, PUBLICATION_BODY_LIMIT + 1, false),
-        (PREPARE, ORDINARY_BODY_LIMIT, true),
-        (PREPARE, ORDINARY_BODY_LIMIT + 1, false),
+        (PREPARE, PREPARE_BODY_LIMIT, true),
+        (PREPARE, PREPARE_BODY_LIMIT + 1, false),
     ] {
         nest.arm(&alice, nsid)?;
         let before = nest.forwarding_attempts()?;
@@ -736,8 +743,25 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
             );
         }
     }
-    println!("Assertion: exactly 16 MiB publish and 10 MiB ordinary forwarded; one byte more refused 413 by Nest before DS.");
+    println!("Assertion: exactly 16 MiB publish and 64 KiB prepare forwarded; one byte more refused 413 by Nest before DS.");
 
+    // 7b. DS direct 413: direct request to DS exceeding route limit returns 413.
+    let (ds_status, ds_body) = alice
+        .forward_exact_service_request(
+            &client,
+            &ds_server.base_url,
+            reqwest::Method::POST,
+            PUBLISH,
+            None,
+            Some(&vec![0_u8; PUBLICATION_BODY_LIMIT + 1]),
+        )
+        .await?;
+    anyhow::ensure!(
+        ds_status == reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "DS must return 413 directly for body exceeding publish limit, got {ds_status}: {}",
+        String::from_utf8_lossy(&ds_body)
+    );
+    println!("Assertion: DS returns 413 directly when request body exceeds publication limit.");
     // 8. Clean shutdown; Nest's own count must agree.
     std::fs::write(&nest.stop_path, b"stop\n")?;
     let result = wait_json(&nest.result_path, Duration::from_secs(30)).await?;
@@ -811,7 +835,7 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
         .as_object_mut()
         .context("probe outcome object")?
         .remove("$type");
-    let verified = protocol::verify_signed_request(
+    let verified = protocol::verify_received_signed_request(
         DirectRequestKind::Outcome,
         &serde_json::to_vec(&receipt)?,
         &ds_server.receipt_public_key,

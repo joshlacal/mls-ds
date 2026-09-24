@@ -30,6 +30,7 @@ use super::super::relationship_policy::{
     fixed_production_relationship_policy_config,
     hydrate_persisted_fallback_relationship_projection,
     hydrate_persisted_fallback_traffic_projection, AdmissionOperation, AdmissionRequest,
+    DatabaseAnchoredProjectionClock,
     DeclarationRecordEvidenceKind, EvidenceKind, IncomingPolicy, PersistedDeclarationEvidence,
     PersistedGraphRelationshipEvidence, PersistedRelationshipProjection,
     PersistedTrafficProjection, ProductionRelationshipTransport, ProjectionOperationScope,
@@ -431,9 +432,25 @@ impl TrustedRelationshipDecisionInstant {
 
 /// Capture persistence time after collection. Export rejects observations
 /// before `completed_at`, so capturing this before collection cannot authorize
-/// a projection that finishes later.
-pub(crate) fn observe_relationship_persistence() -> TrustedRelationshipPersistenceInstant {
-    TrustedRelationshipPersistenceInstant(Utc::now())
+/// a projection that finishes later. Read from the same database-anchored
+/// clock that stamped the collection window, because the persisted window is
+/// later judged against post-lock `clock_timestamp()` decisions.
+pub(crate) fn observe_relationship_persistence(
+    clock: &DatabaseAnchoredProjectionClock,
+) -> TrustedRelationshipPersistenceInstant {
+    use super::super::relationship_policy::ProjectionClock as _;
+    TrustedRelationshipPersistenceInstant(clock.now())
+}
+
+/// Anchor a live projection's clock on PostgreSQL immediately before
+/// collection, so collection stamps share the decision clock's timebase.
+pub(crate) async fn anchor_projection_clock<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+) -> Result<DatabaseAnchoredProjectionClock, sqlx::Error> {
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(executor)
+        .await?;
+    Ok(DatabaseAnchoredProjectionClock::from_database_sample(now))
 }
 
 /// Load the production relationship authority. This intentionally accepts no
@@ -1447,23 +1464,34 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
         _ => {
             let live_allocation = allocate_projection_revision(transaction).await?;
             let fallback_allocation = allocate_projection_revision(transaction).await?;
+            let clock = anchor_projection_clock(&mut **transaction).await?;
             let live = match &scope {
                 ProjectionScope::Admission(req) => authority
-                    .collect_admission_projection(live_allocation, operation_scope, req.clone())
+                    .collect_admission_projection(
+                        &clock,
+                        live_allocation,
+                        operation_scope,
+                        req.clone(),
+                    )
                     .await
                     .map_err(|e| {
                         tracing::error!("collect_admission_projection failed: {:?}", e);
                         RelationshipRepositoryError::InvalidProjection
                     })?,
                 ProjectionScope::BlockOnly(s) => authority
-                    .collect_block_projection(live_allocation, operation_scope, s.members.clone())
+                    .collect_block_projection(
+                        &clock,
+                        live_allocation,
+                        operation_scope,
+                        s.members.clone(),
+                    )
                     .await
                     .map_err(|e| {
                         tracing::error!("collect_block_projection failed: {:?}", e);
                         RelationshipRepositoryError::InvalidProjection
                     })?,
             };
-            let observation = observe_relationship_persistence();
+            let observation = observe_relationship_persistence(&clock);
             let sealed = live
                 .export_persisted_fallback(fallback_allocation, authority, &observation)
                 .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
@@ -1550,8 +1578,10 @@ pub(crate) async fn load_fallback_traffic_projection<T: PublicTransport>(
         _ => {
             let live_allocation = allocate_projection_revision(transaction).await?;
             let fallback_allocation = allocate_projection_revision(transaction).await?;
+            let clock = anchor_projection_clock(&mut **transaction).await?;
             let live = authority
                 .collect_traffic_projection(
+                    &clock,
                     live_allocation,
                     scope.actor.clone(),
                     scope.members.clone(),
@@ -1561,7 +1591,7 @@ pub(crate) async fn load_fallback_traffic_projection<T: PublicTransport>(
                     tracing::error!(?error, "collect_traffic_projection failed");
                     RelationshipRepositoryError::InvalidProjection
                 })?;
-            let observation = observe_relationship_persistence();
+            let observation = observe_relationship_persistence(&clock);
             let sealed = live
                 .export_persisted_fallback(fallback_allocation, authority, &observation)
                 .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
@@ -2605,15 +2635,20 @@ pub(super) async fn verify_direct_request_push_policy<T: PublicTransport>(
     };
     require_witness_transaction(transaction, transaction_id).await?;
     let allocation = allocate_projection_revision(transaction).await?;
+    // Collection stamps and the persistence observation share the database
+    // timebase of the post-lock decision below; a host-clock window would let
+    // any host-ahead skew fail `decision >= completed_at`.
+    let clock = anchor_projection_clock(&mut **transaction).await?;
     let projection = authority
         .collect_block_projection(
+            &clock,
             allocation,
             ProjectionOperationScope::DirectRequestPushEligibility,
             roster,
         )
         .await
         .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
-    let persistence = observe_relationship_persistence();
+    let persistence = observe_relationship_persistence(&clock);
     let sealed = projection
         .export_persisted(authority, &persistence)
         .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;

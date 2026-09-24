@@ -289,7 +289,7 @@ pub(crate) async fn eligibility(
         checked_at: canonical_time(checked_at),
         expires_at: canonical_time(checked_at + ChronoDuration::seconds(5)),
     };
-    match signer.seal_request_push_eligibility(response) {
+    match signer.seal_request_push_eligibility(response, checked_at) {
         Ok(envelope) => (StatusCode::OK, Json(envelope)).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
