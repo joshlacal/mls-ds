@@ -53,6 +53,8 @@ pub(crate) mod direct_request_lifecycle;
 pub(crate) mod push_binding;
 
 #[cfg(test)]
+mod concurrency_tests;
+#[cfg(test)]
 mod rollback_tests;
 #[cfg(test)]
 mod inventory_repository_tests;
