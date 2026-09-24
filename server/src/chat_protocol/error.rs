@@ -157,6 +157,7 @@ define_error_codes!(
     UnavailableIntroduction,
     StaleAuthGeneration,
     RegistrationConflict,
+    RecipientAuthorityUnsupported,
 );
 
 impl ChatProtocolErrorCode {
@@ -278,7 +279,8 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         RequestNotAccepted,
         UnavailableIntroduction,
-        RateLimited
+        RateLimited,
+        RecipientAuthorityUnsupported
     ]),
     PrepareDirectRequest => ("blue.catbird.chat.prepareDirectRequest", [
         AccountSessionExpired,
@@ -306,7 +308,8 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         RequestNotAccepted,
         UnavailableIntroduction,
-        RateLimited
+        RateLimited,
+        RecipientAuthorityUnsupported
     ]),
     GetDirectRequestOutcome => ("blue.catbird.chat.getDirectRequestOutcome", [
         AccountSessionExpired,
@@ -334,7 +337,8 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         RequestNotAccepted,
         UnavailableIntroduction,
-        RateLimited
+        RateLimited,
+        RecipientAuthorityUnsupported
     ]),
     CancelDirectRequestPreparation => ("blue.catbird.chat.cancelDirectRequestPreparation", [
         AccountSessionExpired,
@@ -362,7 +366,8 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         RequestNotAccepted,
         UnavailableIntroduction,
-        RateLimited
+        RateLimited,
+        RecipientAuthorityUnsupported
     ]),
     PublishDirectRequest => ("blue.catbird.chat.publishDirectRequest", [
         AccountSessionExpired,
@@ -390,7 +395,8 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         RequestNotAccepted,
         UnavailableIntroduction,
-        RateLimited
+        RateLimited,
+        RecipientAuthorityUnsupported
     ]),
     AcceptConversation => ("blue.catbird.chat.acceptConversation", [
         AccountSessionExpired,
@@ -439,6 +445,7 @@ define_endpoint_contracts!(
     ActivateReset => ("blue.catbird.chat.activateReset", [
         AccountSessionExpired,
         AdminRequired,
+        ConversationNotAccepted,
         ConversationNotFound,
         CoordinateOverflow,
         CutoverRequired,
@@ -464,6 +471,7 @@ define_endpoint_contracts!(
     CancelLeafRecovery => ("blue.catbird.chat.cancelLeafRecovery", [
         AccountSessionExpired,
         CancellationConflict,
+        ConversationNotAccepted,
         CutoverRequired,
         DeviceNotRegistered,
         DeviceRevoked,
@@ -479,6 +487,7 @@ define_endpoint_contracts!(
     CancelLeave => ("blue.catbird.chat.cancelLeave", [
         AccountSessionExpired,
         CancellationConflict,
+        ConversationNotAccepted,
         CutoverRequired,
         DeviceNotRegistered,
         DeviceRevoked,
@@ -539,6 +548,7 @@ define_endpoint_contracts!(
         AccountSessionExpired,
         BlobBound,
         BlobNotFound,
+        ConversationNotAccepted,
         CutoverRequired,
         DeviceNotRegistered,
         DeviceRevoked,
@@ -611,6 +621,7 @@ define_endpoint_contracts!(
         DeviceNotRegistered,
         DeviceRevoked,
         InvalidRequest,
+        InventorySessionMismatch,
         RateLimited,
         ProtocolUpgradeRequired,
         NotAuthorized,
@@ -705,6 +716,7 @@ define_endpoint_contracts!(
         AccountSessionExpired,
         BlobAlreadyExists,
         BlobQuotaExceeded,
+        ConversationNotAccepted,
         ConversationNotFound,
         CutoverRequired,
         DeviceNotLeaf,
@@ -794,6 +806,7 @@ define_endpoint_contracts!(
     ]),
     RequestLeave => ("blue.catbird.chat.requestLeave", [
         AccountSessionExpired,
+        ConversationNotAccepted,
         ConversationNotFound,
         CoordinateOverflow,
         CutoverRequired,
@@ -814,6 +827,7 @@ define_endpoint_contracts!(
     ]),
     RequestReset => ("blue.catbird.chat.requestReset", [
         AccountSessionExpired,
+        ConversationNotAccepted,
         ConversationNotFound,
         CutoverRequired,
         DeviceNotRegistered,
@@ -875,6 +889,7 @@ define_endpoint_contracts!(
         BlockedRelationship,
         CommitterSelfRemovalForbidden,
         ConversationLeafLimitReached,
+        ConversationNotAccepted,
         ConversationNotFound,
         CoordinateOverflow,
         CutoverRequired,

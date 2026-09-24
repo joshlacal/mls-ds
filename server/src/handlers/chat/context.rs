@@ -447,4 +447,47 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn direct_request_consent_refusal_maps_to_conversation_not_accepted_for_all_endpoints() {
+        use crate::chat_protocol::repository::prelude::PreludeError;
+
+        let endpoints = [
+            ChatEndpoint::SendMessage,
+            ChatEndpoint::PublishTyping,
+            ChatEndpoint::SubmitTransition,
+            ChatEndpoint::RequestReset,
+            ChatEndpoint::ActivateReset,
+            ChatEndpoint::RequestLeave,
+            ChatEndpoint::CancelLeave,
+            ChatEndpoint::CancelLeafRecovery,
+            ChatEndpoint::PrepareBlobUpload,
+            ChatEndpoint::DeleteBlob,
+        ];
+
+        for endpoint in endpoints {
+            assert!(
+                endpoint.declares(ChatProtocolErrorCode::ConversationNotAccepted),
+                "endpoint {} must declare ConversationNotAccepted",
+                endpoint.nsid()
+            );
+            let failure = operation_prelude_failure(
+                endpoint,
+                PreludeError::DirectRequestConsentRequired,
+            );
+            assert_eq!(
+                failure.code(),
+                Some(ChatProtocolErrorCode::ConversationNotAccepted),
+                "endpoint {} did not map DirectRequestConsentRequired to ConversationNotAccepted",
+                endpoint.nsid()
+            );
+            let resp = failure.into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "endpoint {} did not produce 400 Bad Request",
+                endpoint.nsid()
+            );
+        }
+    }
 }

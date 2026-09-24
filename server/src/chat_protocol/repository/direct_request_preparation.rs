@@ -895,6 +895,21 @@ pub(crate) async fn prepare_direct_request<
     super::relationship::verify_direct_request_policy(tx, &witness, policy, quota_exceeded)
         .await
         .map_err(|_| DirectRequestStoreError::PolicyDenied)?;
+    // Atomic publication spans exactly one canonical authority. A recipient
+    // whose public chat declaration names another delivery service has no
+    // transaction here to join: refuse typed, before any package selection or
+    // reservation, and never degrade to legacy federation delivery. An absent
+    // declaration keeps the canonical path; an unreadable one fails closed
+    // exactly like the consent declaration read above.
+    match policy.recipient_chat_authority(&i.recipient_did).await {
+        Ok(Some(authority))
+            if authority != super::direct_request_receipts::REQUEST_RECEIPT_AUTHORITY =>
+        {
+            return Err(DirectRequestStoreError::RecipientAuthorityUnsupported);
+        }
+        Ok(_) => {}
+        Err(_) => return Err(DirectRequestStoreError::PolicyDenied),
+    }
     let now = request_database_instant(tx).await?;
     signed_admission::require_fresh_at(&actor, now)?;
     let selected = select_devices(tx, &lock, now).await?;
@@ -940,6 +955,9 @@ pub(crate) async fn prepare_direct_request<
                 DirectRequestStoreError::PolicyDenied => "RequestPolicyDenied",
                 DirectRequestStoreError::QuotaExceeded => "CapacityUnavailable",
                 DirectRequestStoreError::RecipientKeysUnavailable => "RecipientKeysUnavailable",
+                DirectRequestStoreError::RecipientAuthorityUnsupported => {
+                    "RecipientAuthorityUnsupported"
+                }
                 DirectRequestStoreError::IncludedAuthorityChanged => "PreparationRevoked",
                 DirectRequestStoreError::Expired => "PreparationExpired",
                 DirectRequestStoreError::IdentityConflict => "PreparationConflict",

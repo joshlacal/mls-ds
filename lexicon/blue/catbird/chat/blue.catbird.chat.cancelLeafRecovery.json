@@ -40,6 +40,9 @@
           "name": "CancellationConflict"
         },
         {
+          "name": "ConversationNotAccepted"
+        },
+        {
           "name": "CutoverRequired"
         },
         {

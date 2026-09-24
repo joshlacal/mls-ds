@@ -66,6 +66,7 @@ const UNTRUSTED_TEST_SOURCE_PROFILE: &[u8] = b"untrusted-test-source";
 const GRAPH_PATH: &str = "/xrpc/app.bsky.graph.getRelationships";
 const GET_RECORD_PATH: &str = "/xrpc/com.atproto.repo.getRecord";
 const DECLARATION_COLLECTION: &str = "chat.bsky.actor.declaration";
+const CHAT_DECLARATION_COLLECTION: &str = "blue.catbird.chat.declaration";
 const DECLARATION_RKEY: &str = "self";
 const RELATIONSHIP_TYPE: &str = "app.bsky.graph.defs#relationship";
 const DECLARATION_TYPE: &str = "chat.bsky.actor.declaration";
@@ -1349,18 +1350,7 @@ pub fn parse_declaration_response(
     let value = strict_json(bytes)?;
     let root = object(&value)?;
     if status != 200 {
-        if status != 400 && status != 404 {
-            return Err(AuthorityError::Unavailable);
-        }
-        reject_unknown(root, &["error", "message"])?;
-        if required_string(root, "error")? != "RecordNotFound" {
-            return Err(AuthorityError::Unavailable);
-        }
-        if let Some(message) = root.get("message") {
-            if !message.is_string() {
-                return Err(AuthorityError::Malformed);
-            }
-        }
+        require_record_not_found(status, root)?;
         return Ok(DeclarationRecord {
             incoming: IncomingPolicy::Following,
             group: IncomingPolicy::Following,
@@ -1405,6 +1395,77 @@ pub fn parse_declaration_response(
         absent: false,
         cid,
     })
+}
+
+/// A non-200 getRecord response is absence only when it is exactly the
+/// PDS's typed `RecordNotFound`; every other status is unavailability.
+fn require_record_not_found(
+    status: u16,
+    root: &Map<String, Value>,
+) -> Result<(), AuthorityError> {
+    if status != 400 && status != 404 {
+        return Err(AuthorityError::Unavailable);
+    }
+    reject_unknown(root, &["error", "message"])?;
+    if required_string(root, "error")? != "RecordNotFound" {
+        return Err(AuthorityError::Unavailable);
+    }
+    if let Some(message) = root.get("message") {
+        if !message.is_string() {
+            return Err(AuthorityError::Malformed);
+        }
+    }
+    Ok(())
+}
+
+/// Strict `blue.catbird.chat.declaration/self` projection: the recipient's
+/// declared clean-chat delivery service DID, or `None` when no record exists.
+/// Every lexicon-required field must be present and no undeclared field is
+/// accepted; this never loosens the separate `chat.bsky.actor.declaration`
+/// consent parser.
+pub fn parse_chat_declaration_response(
+    recipient: &str,
+    status: u16,
+    bytes: &[u8],
+) -> Result<Option<String>, AuthorityError> {
+    if !validate_bare_did(recipient) {
+        return Err(AuthorityError::Malformed);
+    }
+    let value = strict_json(bytes)?;
+    let root = object(&value)?;
+    if status != 200 {
+        require_record_not_found(status, root)?;
+        return Ok(None);
+    }
+    reject_unknown(root, &["uri", "cid", "value"])?;
+    let expected_uri = format!("at://{recipient}/{CHAT_DECLARATION_COLLECTION}/{DECLARATION_RKEY}");
+    if required_string(root, "uri")? != expected_uri {
+        return Err(AuthorityError::Malformed);
+    }
+    if let Some(cid) = root.get("cid") {
+        if !cid.as_str().is_some_and(valid_cid) {
+            return Err(AuthorityError::Malformed);
+        }
+    }
+    let record = root
+        .get("value")
+        .ok_or(AuthorityError::Malformed)
+        .and_then(object)?;
+    reject_unknown(
+        record,
+        &["$type", "allowIncoming", "deliveryService", "protocolVersion", "createdAt"],
+    )?;
+    if required_string(record, "$type")? != CHAT_DECLARATION_COLLECTION {
+        return Err(AuthorityError::Malformed);
+    }
+    required_string(record, "allowIncoming")?;
+    required_string(record, "protocolVersion")?;
+    required_string(record, "createdAt")?;
+    let delivery_service = required_string(record, "deliveryService")?;
+    if !validate_bare_did(delivery_service) {
+        return Err(AuthorityError::Malformed);
+    }
+    Ok(Some(delivery_service.to_owned()))
 }
 
 fn valid_cid(cid: &str) -> bool {
@@ -2464,7 +2525,7 @@ fn hydrate_declaration_evidence(
             .map_err(|_| ProjectionPersistenceError::Invalid)?,
     );
     let expected_record_request_digest = request_evidence_digest(
-        &declaration_record_url(&resolved_pds_origin, expected_recipient)
+        &declaration_record_url(&resolved_pds_origin, expected_recipient, DECLARATION_COLLECTION)
             .map_err(|_| ProjectionPersistenceError::Invalid)?,
     );
     let absent = match values.record_evidence_kind {
@@ -3148,7 +3209,7 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         }
         let did_digest = sha256(&did_response.body);
         let pds = parse_did_document_service(recipient, &did_response.body)?;
-        let record_url = declaration_record_url(&pds.origin, recipient)?;
+        let record_url = declaration_record_url(&pds.origin, recipient, DECLARATION_COLLECTION)?;
         let record_request_digest = request_evidence_digest(&record_url);
         let record_response = self
             .send_public(PublicGet::new(
@@ -3169,6 +3230,38 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
             record_request_digest,
             record_digest,
         ))
+    }
+
+    /// The recipient's declared clean-chat delivery service, read from its
+    /// public `blue.catbird.chat.declaration/self` through the same pinned,
+    /// rate-limited DID-document → PDS path as the consent declaration.
+    /// `None` means no declaration record exists.
+    pub(crate) async fn recipient_chat_authority(
+        &self,
+        recipient: &str,
+    ) -> Result<Option<String>, AuthorityError> {
+        let deadline = Instant::now() + self.config.total_deadline;
+        let did_response = self
+            .send_public(PublicGet::new(
+                did_document_url(&self.config, recipient)?,
+                deadline,
+                self.config.max_response_bytes,
+            ))
+            .await?;
+        ensure_body_cap(&did_response, self.config.max_response_bytes)?;
+        if did_response.status != 200 {
+            return Err(AuthorityError::Unavailable);
+        }
+        let pds = parse_did_document_service(recipient, &did_response.body)?;
+        let record_response = self
+            .send_public(PublicGet::new(
+                declaration_record_url(&pds.origin, recipient, CHAT_DECLARATION_COLLECTION)?,
+                deadline,
+                self.config.max_response_bytes,
+            ))
+            .await?;
+        ensure_body_cap(&record_response, self.config.max_response_bytes)?;
+        parse_chat_declaration_response(recipient, record_response.status, &record_response.body)
     }
 
     async fn graph(
@@ -3216,6 +3309,7 @@ fn did_document_url(config: &RelationshipPolicyConfig, did: &str) -> Result<Url,
 fn declaration_record_url(
     pds_origin: &CanonicalOrigin,
     recipient: &str,
+    collection: &str,
 ) -> Result<Url, AuthorityError> {
     if !validate_bare_did(recipient) {
         return Err(AuthorityError::Malformed);
@@ -3223,7 +3317,7 @@ fn declaration_record_url(
     let mut url = pds_origin.append_path(GET_RECORD_PATH)?;
     url.query_pairs_mut()
         .append_pair("repo", recipient)
-        .append_pair("collection", DECLARATION_COLLECTION)
+        .append_pair("collection", collection)
         .append_pair("rkey", DECLARATION_RKEY);
     Ok(url)
 }

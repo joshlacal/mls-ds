@@ -76,7 +76,7 @@ pub(crate) async fn enforce_ordinary_mutation(
         Some(id) => Some(id),
         None if mutation.kind() == SignedMutationKind::BlobDeletion => match body.get("blobId") {
             Some(CanonicalValueRef::Uuid(id)) => {
-                sqlx::query_scalar("SELECT conversation_id FROM chat.blobs WHERE blob_id=$1")
+                sqlx::query_scalar("SELECT conversation_id FROM chat.blob_bindings WHERE blob_id=$1")
                     .bind(Uuid::from_bytes(*id.as_bytes()))
                     .fetch_optional(&mut **tx)
                     .await?

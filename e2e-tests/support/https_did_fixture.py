@@ -45,8 +45,22 @@ class DidHandler(http.server.SimpleHTTPRequestHandler):
             repo = query.get("repo", [""])[0]
             collection = query.get("collection", [""])[0]
             rkey = query.get("rkey", [""])[0]
-            if (collection != "chat.bsky.actor.declaration" or rkey != "self"
-                    or repo != f"did:web:{host}"):
+            if rkey != "self" or repo != f"did:web:{host}":
+                self.send_error(400)
+                return
+            if collection == "blue.catbird.chat.declaration":
+                # Catbird chat-authority declaration: absent unless a test
+                # installs _policy/catbirdDeclaration/<did>.
+                value = policy_override("catbirdDeclaration", repo)
+                if value is None:
+                    self.send_json({"error": "RecordNotFound"}, status=400)
+                else:
+                    self.send_json({
+                        "uri": f"at://{repo}/blue.catbird.chat.declaration/self",
+                        "value": value
+                    })
+                return
+            if collection != "chat.bsky.actor.declaration":
                 self.send_error(400)
                 return
             value = policy_override("declaration", repo) or {
@@ -76,9 +90,9 @@ class DidHandler(http.server.SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
-    def send_json(self, value):
+    def send_json(self, value, status=200):
         body = json.dumps(value, separators=(",", ":")).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

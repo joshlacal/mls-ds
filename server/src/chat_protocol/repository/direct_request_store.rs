@@ -103,6 +103,10 @@ pub(crate) enum DirectRequestStoreError {
     PolicyDenied,
     #[error("recipient request keys unavailable")]
     RecipientKeysUnavailable,
+    /// The recipient's public chat declaration names another delivery
+    /// service; atomic publication spans exactly one canonical authority.
+    #[error("recipient is homed on another chat authority")]
+    RecipientAuthorityUnsupported,
     #[error("included device authority changed")]
     IncludedAuthorityChanged,
     #[error("request receipt or snapshot is invalid")]
