@@ -342,6 +342,8 @@ pub(crate) fn operation_prelude_failure(
             endpoint,
             if endpoint.declares(C::ConversationNotAccepted) {
                 C::ConversationNotAccepted
+            } else if endpoint.declares(C::WelcomeSuperseded) {
+                C::WelcomeSuperseded
             } else {
                 C::NotParticipant
             },
@@ -479,6 +481,31 @@ mod tests {
                 failure.code(),
                 Some(ChatProtocolErrorCode::ConversationNotAccepted),
                 "endpoint {} did not map DirectRequestConsentRequired to ConversationNotAccepted",
+                endpoint.nsid()
+            );
+            let resp = failure.into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "endpoint {} did not produce 400 Bad Request",
+                endpoint.nsid()
+            );
+        }
+
+        for endpoint in [ChatEndpoint::AcknowledgeWelcome, ChatEndpoint::RejectWelcome] {
+            assert!(
+                endpoint.declares(ChatProtocolErrorCode::WelcomeSuperseded),
+                "endpoint {} must declare WelcomeSuperseded",
+                endpoint.nsid()
+            );
+            let failure = operation_prelude_failure(
+                endpoint,
+                PreludeError::DirectRequestConsentRequired,
+            );
+            assert_eq!(
+                failure.code(),
+                Some(ChatProtocolErrorCode::WelcomeSuperseded),
+                "endpoint {} did not map DirectRequestConsentRequired to WelcomeSuperseded",
                 endpoint.nsid()
             );
             let resp = failure.into_response();
