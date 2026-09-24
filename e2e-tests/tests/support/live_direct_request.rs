@@ -559,13 +559,18 @@ async fn publish_request_variant_configured(
         receipt_mismatches.is_empty(),
         "shipping receipt differs from native Welcome contract in fields: {receipt_mismatches:?}"
     );
+    let normalized_receipt = protocol::normalize_read_presentation(
+        &serde_json::to_vec(&receipt)?,
+        "signedDirectRequestReceipt",
+        false,
+    )?;
     let welcome_input = DirectRequestWelcomeInput {
         bootstrap: bootstrap.clone(),
         local_identity: bob_identity.as_bytes().to_vec(),
         local_package_ref: bob_package_ref,
         publication_request: serde_json::to_vec(&publication)?,
         actor_signature_public_key: alice_public,
-        published_receipt: serde_json::to_vec(&receipt)?,
+        published_receipt: serde_json::to_vec(&normalized_receipt)?,
         receipt_authority_key: server.receipt_public_key.clone(),
         preparation_request_digest: *verified_prepare.request_digest(),
     };
