@@ -1887,7 +1887,26 @@ fn is_transient_catalog_conflict(error: &sqlx::migrate::MigrateError) -> bool {
 /// itself is handled by the bounded retry in `fresh_executor_db`.
 pub const FRESH_DB_MIGRATION_LOCK_KEY: i64 = 0x6361_7462_6972_6473;
 
+/// Process-wide gate serializing fresh-database creation plus migration.
+///
+/// The cluster-catalog collision described on [`FRESH_DB_MIGRATION_LOCK_KEY`]
+/// only needs two migrators to *overlap*; with one test binary's cases running
+/// on several threads that is the common case, not the exception (the two
+/// `welcome::tests` Part-4 cases raced on every parallel run and never when run
+/// alone). Serializing the create-plus-migrate section inside this process
+/// removes that overlap by construction, leaving the retry above to absorb a
+/// genuinely concurrent sibling *process*.
+static FRESH_DB_CREATION_GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+/// The single shared gate value, initialized on first use.
+fn fresh_db_creation_gate() -> &'static tokio::sync::Mutex<()> {
+    FRESH_DB_CREATION_GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+
 pub async fn fresh_executor_db() -> (PgPool, FreshDbGuard) {
+    let _creation_guard = fresh_db_creation_gate().lock().await;
     let maintenance_url = maintenance_url_from_env();
     let admin = PgPoolOptions::new()
         .max_connections(1)

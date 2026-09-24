@@ -53,6 +53,8 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_devhandlers_",
     // `tests/chat_protocol_auth_repository.rs`
     "chat_authrepo_",
+    // `src/chat_protocol/repository/concurrency_tests.rs`
+    "chat_concurrency_",
     // `tests/db_tests.rs`
     "mlsds_dbtests_",
     // `tests/federation_hostile_peers.rs`
@@ -309,7 +311,26 @@ impl Drop for DisposableDatabase {
 /// transient `XX000` conflict rather than relying on this key alone.
 pub const FRESH_DB_MIGRATION_LOCK_KEY: i64 = 0x6361_7462_6972_6473;
 
+/// Process-wide gate serializing fresh-database creation plus migration.
+///
+/// The cluster-catalog collision described on [`FRESH_DB_MIGRATION_LOCK_KEY`]
+/// only needs two migrators to *overlap*; with one test binary's cases running
+/// on several threads that is the common case, not the exception (the two
+/// `welcome::tests` Part-4 cases raced on every parallel run and never when run
+/// alone). Serializing the create-plus-migrate section inside this process
+/// removes that overlap by construction, leaving the retry above to absorb a
+/// genuinely concurrent sibling *process*.
+static FRESH_DB_CREATION_GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+/// The single shared gate value, initialized on first use.
+fn fresh_db_creation_gate() -> &'static tokio::sync::Mutex<()> {
+    FRESH_DB_CREATION_GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+
 pub async fn fresh_fully_migrated_db(prefix: &str) -> DisposableDatabase {
+    let _creation_guard = fresh_db_creation_gate().lock().await;
     let database = DisposableDatabase::mint(prefix).await;
     let pool = database.connect(1).await;
     let mut migration_connection = pool
@@ -420,6 +441,7 @@ pub async fn fresh_clean_protocol_db(
     prefix: &str,
     max_connections: u32,
 ) -> (PgPool, DisposableDatabase) {
+    let _creation_guard = fresh_db_creation_gate().lock().await;
     let database = DisposableDatabase::mint(prefix).await;
     let migrator = crate::common::chat_protocol::reviewed_clean_protocol_migrator()
         .await
