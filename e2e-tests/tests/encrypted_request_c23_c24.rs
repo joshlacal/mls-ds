@@ -1426,3 +1426,217 @@ async fn c24_retained_old_client_and_capable_scoped_reader() -> anyhow::Result<(
     release(&f, cid, &upgrade).await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Controlled race orders (F36): a psql session holds the conversation head row
+// FOR UPDATE (a lock only; it writes nothing). The first request is queued
+// behind it, then the second; PostgreSQL grants row-lock waiters in arrival
+// order, so releasing the lock makes the first-queued request win.
+// ---------------------------------------------------------------------------
+
+struct RowBarrier {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    pid: i64,
+}
+
+impl RowBarrier {
+    fn hold_conversation(cid: Uuid) -> anyhow::Result<Self> {
+        use std::io::{BufRead, Write};
+        anyhow::ensure!(
+            encrypted_requests::dedicated_request_database_name(request_database_url()).is_some(),
+            "controlled races must run on a dedicated database"
+        );
+        let mut child = std::process::Command::new("psql")
+            .args([request_database_url(), "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()?;
+        let mut stdin = child.stdin.take().context("barrier stdin")?;
+        writeln!(
+            stdin,
+            "BEGIN;\nSELECT pg_backend_pid();\n\
+             SELECT 1 FROM chat.conversations WHERE conversation_id='{cid}' FOR UPDATE;\n\
+             \\echo BARRIER-HELD"
+        )?;
+        stdin.flush()?;
+        let mut lines = std::io::BufReader::new(child.stdout.take().context("barrier stdout")?).lines();
+        let pid: i64 = lines.next().context("barrier pid")??.trim().parse()?;
+        for line in lines.by_ref() {
+            if line?.trim() == "BARRIER-HELD" {
+                return Ok(Self { child, stdin, pid });
+            }
+        }
+        anyhow::bail!("barrier session exited before holding the conversation lock")
+    }
+
+    /// Sessions blocked, directly or transitively, by the barrier session.
+    fn waiters(&self) -> anyhow::Result<i64> {
+        Ok(db(&format!(
+            "WITH RECURSIVE w(pid) AS (SELECT pid FROM pg_stat_activity WHERE {b}=ANY(pg_blocking_pids(pid)) \
+             UNION SELECT a.pid FROM pg_stat_activity a JOIN w ON w.pid=ANY(pg_blocking_pids(a.pid))) \
+             SELECT count(*) FROM w",
+            b = self.pid
+        ))?
+        .parse()?)
+    }
+
+    async fn wait_for_waiters(&self, at_least: i64) -> anyhow::Result<i64> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let n = self.waiters()?;
+            if n >= at_least {
+                return Ok(n);
+            }
+            anyhow::ensure!(std::time::Instant::now() < deadline, "only {n}/{at_least} sessions queued");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    fn release(mut self) -> anyhow::Result<()> {
+        use std::io::Write;
+        writeln!(self.stdin, "COMMIT;\n\\q")?;
+        self.stdin.flush()?;
+        anyhow::ensure!(self.child.wait()?.success(), "barrier session failed");
+        Ok(())
+    }
+}
+
+type PostHandle = tokio::task::JoinHandle<anyhow::Result<(reqwest::StatusCode, Vec<u8>)>>;
+
+fn spawn_post(f: &Fixture, who: &Party, nsid: &'static str, envelope: Value) -> PostHandle {
+    let (id, client, base) = (who.id.clone(), f.client.clone(), f.server.base_url.clone());
+    tokio::spawn(async move { id.post(&client, &base, nsid, &envelope, true).await })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Order {
+    UpgradeFirst,
+    CompetitorFirst,
+}
+
+/// The declared code a competitor must receive when a committed v1->v2
+/// upgrade precedes it (observed under controlled order; each is in that
+/// endpoint's lexicon error list):
+/// - requestReset: the head is now a pending v2 request -> ConversationNotAccepted.
+/// - closeConversation (declares no ConversationNotAccepted): its signed
+///   generation-0 prior is stale -> StaleCoordinates.
+/// - v1 acceptConversation: the pending invitation now belongs to the v2
+///   request, not the v1 participant path -> NotParticipant.
+fn expected_loser_code(leg: RaceLeg) -> &'static str {
+    match leg {
+        RaceLeg::Accept => "NotParticipant",
+        RaceLeg::Close => "StaleCoordinates",
+        RaceLeg::Reset => "ConversationNotAccepted",
+        RaceLeg::SecondUpgrade => unreachable!(),
+    }
+}
+
+async fn controlled(leg: RaceLeg, order: Order, label: &str) -> anyhow::Result<String> {
+    let l = legacy_fixture().await?;
+    let (f, cid) = (&l.f, l.cid);
+    let upgrade = prepare_upgrade(f, cid, l.origin.clone(), l.next_seq).await?;
+    let (nsid, envelope) = competing(&l, leg).await?;
+    let competitor = match leg {
+        RaceLeg::Accept => &f.bob,
+        _ => &f.alice,
+    };
+    let publish_envelope = json!({"signedRequest":upgrade.publication});
+    let upgrade_first = matches!(order, Order::UpgradeFirst);
+    let barrier = RowBarrier::hold_conversation(cid)?;
+    let spawn_upgrade = || spawn_post(f, &f.alice, "blue.catbird.chat.publishDirectRequest", publish_envelope.clone());
+    let spawn_competitor = || spawn_post(f, competitor, nsid, envelope.clone());
+    let first = if upgrade_first { spawn_upgrade() } else { spawn_competitor() };
+    let queued_first = barrier.wait_for_waiters(1).await?;
+    let second = if upgrade_first { spawn_competitor() } else { spawn_upgrade() };
+    let queued_both = barrier.wait_for_waiters(2).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    barrier.release()?;
+    let (first_status, first_bytes) = first.await??;
+    let (second_status, second_bytes) = second.await??;
+    let ((u_status, u_bytes), (c_status, c_bytes)) = if upgrade_first {
+        ((first_status, first_bytes), (second_status, second_bytes))
+    } else {
+        ((second_status, second_bytes), (first_status, first_bytes))
+    };
+    let receipt = publication_receipt(f, u_status, &u_bytes)?;
+    let after = head(cid)?;
+    let c_body: Value = serde_json::from_slice(&c_bytes).unwrap_or(Value::Null);
+    println!(
+        "[{label}] queued first={queued_first} both={queued_both}; upgrade {:?}; competitor {nsid} {c_status} {}; head {after}",
+        receipt_kind(&receipt),
+        c_body["error"].as_str().unwrap_or("ok")
+    );
+    assert_eq!(legacy_rows(cid)?, l.rows, "[{label}] v1 authority byte-exact");
+    let outcome = match order {
+        Order::UpgradeFirst => {
+            assert_eq!(receipt_kind(&receipt).0, PUBLISHED, "[{label}] upgrade queued first must publish");
+            assert_eq!(after["protocolVersion"], "2", "[{label}]");
+            assert_eq!(after["generation"], 1, "[{label}]");
+            assert_eq!(after["lifecycle"], "active", "[{label}]");
+            assert_eq!(after["requests"], 1, "[{label}]");
+            assert_eq!(after["pending"], 1, "[{label}]");
+            assert_eq!(pending_resets(cid)?, "0", "[{label}]");
+            assert_eq!(
+                (c_status, c_body["error"].as_str().unwrap_or_default()),
+                (reqwest::StatusCode::BAD_REQUEST, expected_loser_code(leg)),
+                "[{label}] typed loser code, body {}",
+                String::from_utf8_lossy(&c_bytes)
+            );
+            release(f, cid, &upgrade).await?;
+            format!("upgrade; loser {}", expected_loser_code(leg))
+        }
+        Order::CompetitorFirst => {
+            assert_eq!(c_status, reqwest::StatusCode::OK, "[{label}] competitor queued first must win: {}", String::from_utf8_lossy(&c_bytes));
+            assert_eq!(receipt_kind(&receipt), (REJECTED, "StaleLegacyPrior"), "[{label}]");
+            assert_eq!(after["protocolVersion"], "1", "[{label}]");
+            assert_eq!(after["requests"], 0, "[{label}]");
+            match leg {
+                RaceLeg::Accept => assert_eq!(after["pending"], 0, "[{label}]"),
+                RaceLeg::Close => assert_eq!(after["lifecycle"], "superseded", "[{label}]"),
+                RaceLeg::Reset => assert_eq!(pending_resets(cid)?, "1", "[{label}]"),
+                RaceLeg::SecondUpgrade => unreachable!(),
+            }
+            "competitor; upgrade StaleLegacyPrior".to_owned()
+        }
+    };
+    println!("[{label}] outcome {outcome}");
+    Ok(outcome)
+}
+
+async fn controlled_rounds(leg: RaceLeg, order: Order) -> anyhow::Result<()> {
+    let _db = dedicated_database().await?;
+    let label = format!("{leg:?}-{order:?}");
+    let mut outcomes = Vec::new();
+    for round in 0..5 {
+        outcomes.push(controlled(leg, order, &format!("{label}#{round}")).await?);
+    }
+    println!("[{label}] outcomes {outcomes:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c23_controlled_reset_loses_to_upgrade() -> anyhow::Result<()> {
+    controlled_rounds(RaceLeg::Reset, Order::UpgradeFirst).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c23_controlled_close_loses_to_upgrade() -> anyhow::Result<()> {
+    controlled_rounds(RaceLeg::Close, Order::UpgradeFirst).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c23_controlled_accept_loses_to_upgrade() -> anyhow::Result<()> {
+    controlled_rounds(RaceLeg::Accept, Order::UpgradeFirst).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c23_controlled_upgrade_loses_to_reset() -> anyhow::Result<()> {
+    controlled_rounds(RaceLeg::Reset, Order::CompetitorFirst).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c23_controlled_upgrade_loses_to_close() -> anyhow::Result<()> {
+    controlled_rounds(RaceLeg::Close, Order::CompetitorFirst).await
+}
