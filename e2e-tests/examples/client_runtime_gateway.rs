@@ -427,10 +427,31 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
     }
     if matches!(
         path.as_str(),
-        "/fixture/enroll" | "/xrpc/com.atproto.repo.putRecord"
+        "/fixture/enroll" | "/xrpc/com.atproto.repo.putRecord" | "/xrpc/com.atproto.repo.createRecord"
     ) && catbird_mls::chat_v2::transcript::decode_strict_json(&bytes).is_err()
     {
         return error(StatusCode::BAD_REQUEST, "InvalidJson");
+    }
+    // Bluesky block published before a request is closed ("Block and Close").
+    // Only the authenticated actor may block a known fixture actor.
+    if path == "/xrpc/com.atproto.repo.createRecord" && method == Method::POST {
+        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+            return error(StatusCode::BAD_REQUEST, "InvalidJson");
+        };
+        let known = |did: &Value| proxy.actors.iter().any(|a| *did == a.identity.did);
+        if v["repo"] != actor.identity.did
+            || v["collection"] != "app.bsky.graph.block"
+            || v["record"]["$type"] != "app.bsky.graph.block"
+            || !known(&v["record"]["subject"])
+            || v["record"]["subject"] == actor.identity.did
+            || v["record"]["createdAt"].as_str().is_none()
+        {
+            return error(StatusCode::BAD_REQUEST, "UnsupportedRecord");
+        }
+        return response(
+            StatusCode::OK,
+            json!({"uri": format!("at://{}/app.bsky.graph.block/{}", actor.identity.did, uuid::Uuid::new_v4().simple()), "cid": CID}),
+        );
     }
     if path == "/fixture/enroll" && method == Method::POST {
         #[derive(Deserialize)]
