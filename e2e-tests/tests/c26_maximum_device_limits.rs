@@ -606,15 +606,9 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
     // 5. Separate real Nest process in front of the real DS.
     let paired_dir = std::env::temp_dir().join(format!("c26-paired-nest-{run}"));
     std::fs::create_dir_all(&paired_dir)?;
-    let nest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../nest-ServerHardening/catbird");
-    let nest_root = if nest_candidate.exists() {
-        nest_candidate.canonicalize()?
-    } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../nest/catbird")
-            .canonicalize()?
-    };
+    let nest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../nest/catbird")
+        .canonicalize()?;
     let mut child = Command::new("cargo")
         .args([
             "test",
