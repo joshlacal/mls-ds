@@ -1085,6 +1085,70 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
     assert_eq!(request_database_snapshot(f.request_id)?.message_rows, 1);
     assert_generated_accepted_reads(&f, &state_bytes, &bytes).await
 }
+pub async fn accept_reply_offline_with_followup() -> anyhow::Result<Uuid> {
+    use catbird_mls::chat_v2::transcript::{decode_strict_json, VerifiedApplicationEntry};
+    use catbird_mls::orchestrator::{canonical_application_aad_bytes, MLSMessagePayload};
+    let mut f = publish_request(false).await?;
+    let (pending_status, pending_bytes) = f.bob.get(&f.client, &f.server.base_url, "blue.catbird.chat.getConversationState", &[("conversationId".into(), f.conversation_id.to_string())]).await?;
+    anyhow::ensure!(pending_status == reqwest::StatusCode::OK, "pending state failed");
+    let pending: Value = serde_json::from_slice(&pending_bytes)?;
+    assert_eq!(pending["state"]["directRequest"]["consent"], "incomingPending");
+    let prior = f.welcome_input.bootstrap.coordinates.clone();
+    let group = STANDARD.decode(prior["groupId"].as_str().context("group ID")?)?;
+    let epoch = prior["epoch"].as_u64().context("epoch")?;
+    let alice_engine = f.alice_engine.take().context("sender native store")?;
+    alice_engine.confirm_request_publication(&f.request_id.to_string(), &serde_json::to_vec(&f.receipt)?, &f.server.receipt_public_key)?;
+    let offline_sender = alice_engine.close_for_offline()?;
+    f.bob_engine.process_direct_request(&f.welcome_input)?;
+    let bob_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
+    let bob_public = f.bob_engine.identity_public_key(&bob_identity)?;
+    let transition = Uuid::new_v4();
+    let mut next = prior.clone();
+    next["stateVersion"] = json!(prior["stateVersion"].as_u64().context("state version")? + 1);
+    let acceptance = signed_mls_request(&f.bob_engine, &bob_identity, DirectRequestKind::Accept, json!({
+        "$type":"blue.catbird.chat.defs#directRequestAcceptanceBody", "signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPT\0", "protocolVersion":"2",
+        "actorDid":f.bob.did, "actorDeviceId":f.bob.device_id.to_string(), "keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)), "authGeneration":1,
+        "requestId":f.request_id.to_string(), "transitionId":transition.to_string(), "prior":prior, "next":next,
+        "invitationProvenance":{"invitationTransitionId":f.request_id.to_string(),"invitedByDid":f.alice.did,"invitedByDeviceId":f.alice.device_id.to_string()},
+        "idempotencyKey":transition.to_string(),"signedAt":canonical_now()
+    }))?;
+    let envelope = json!({"directRequest":acceptance});
+    let _ = checked_post(&f, &f.bob, "blue.catbird.chat.acceptConversation", &envelope).await?;
+    let message = Uuid::new_v4();
+    let mut aad_prior = next.clone();
+    aad_prior["conversationId"] = json!(STANDARD.encode(f.conversation_id.as_bytes()));
+    let aad = json!({"protocolVersion":"1","conversationId":STANDARD.encode(f.conversation_id.as_bytes()),"generation":next["generation"],"messageId":STANDARD.encode(message.as_bytes()),"prior":aad_prior});
+    let text = "Reply while the original sender is offline";
+    let content = MLSMessagePayload::text(text).encode()?;
+    let ciphertext = f.bob_engine.encrypt_canonical(&group, &content, canonical_application_aad_bytes(&aad)?, epoch)?;
+    let application = signed_ordinary(&f.bob_engine, &bob_identity, json!({
+        "$type":"blue.catbird.chat.defs#applicationSendBody","signatureDomain":"CATBIRD-CHAT-MESSAGE\0","messageId":message.to_string(),
+        "actorDid":f.bob.did,"actorDeviceId":f.bob.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"authGeneration":1,
+        "prior":next,"aad":aad,"applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication","bytes":STANDARD.encode(&ciphertext),"sha256":STANDARD.encode(Sha256::digest(&ciphertext))},"blobBindings":[],"signedAt":canonical_now()
+    }))?;
+    let send_envelope = json!({"signedRequest":application});
+    let _ = checked_post(&f, &f.bob, "blue.catbird.chat.sendMessage", &send_envelope).await?;
+    let sender = offline_sender.reopen()?;
+    let message2 = Uuid::new_v4();
+    let mut aad_prior2 = next.clone();
+    aad_prior2["conversationId"] = json!(STANDARD.encode(f.conversation_id.as_bytes()));
+    let aad2 = json!({"protocolVersion":"1","conversationId":STANDARD.encode(f.conversation_id.as_bytes()),"generation":next["generation"],"messageId":STANDARD.encode(message2.as_bytes()),"prior":aad_prior2});
+    let text2 = "Follow-up reply after restart";
+    let content2 = MLSMessagePayload::text(text2).encode()?;
+    let ciphertext2 = sender.encrypt_canonical(&group, &content2, canonical_application_aad_bytes(&aad2)?, epoch)?;
+    let alice_identity = format!("{}#{}", f.alice.did, f.alice.device_id);
+    let alice_public = sender.identity_public_key(&alice_identity)?;
+    let application2 = signed_ordinary(&sender, &alice_identity, json!({
+        "$type":"blue.catbird.chat.defs#applicationSendBody","signatureDomain":"CATBIRD-CHAT-MESSAGE\0","messageId":message2.to_string(),
+        "actorDid":f.alice.did,"actorDeviceId":f.alice.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public)),"authGeneration":1,
+        "prior":next,"aad":aad2,"applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication","bytes":STANDARD.encode(&ciphertext2), "sha256":STANDARD.encode(Sha256::digest(&ciphertext2))},"blobBindings":[],"signedAt":canonical_now()
+    }))?;
+    let send_envelope2 = json!({"signedRequest":application2});
+    let sent_bytes2 = checked_post(&f, &f.alice, "blue.catbird.chat.sendMessage", &send_envelope2).await?;
+    let sent2: Value = serde_json::from_slice(&sent_bytes2)?;
+    assert_eq!(sent2["entry"]["seq"], 4);
+    Ok(f.conversation_id)
+}
 
 /// Every read of an accepted request decodes into the generated
 /// catbird-atproto response types, with byte fields (including the

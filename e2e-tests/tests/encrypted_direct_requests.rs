@@ -482,3 +482,10 @@ async fn c06_both_recipient_devices_import_same_welcome_after_account_acceptance
 ) -> anyhow::Result<()> {
     live_direct_request::accept_before_both_recipient_imports().await
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c02_four_entries_flow() -> anyhow::Result<()> {
+    let cid = live_direct_request::accept_reply_offline_with_followup().await?;
+    eprintln!("QUALIFIED_FOUR_ENTRIES_CID={cid}");
+    Ok(())
+}
