@@ -400,6 +400,9 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
     if path == "/xrpc/app.bsky.graph.getBlocks" && method == Method::GET {
         return response(StatusCode::OK, json!({"blocks":[]}));
     }
+    if path == "/xrpc/app.bsky.actor.getPreferences" && method == Method::GET {
+        return response(StatusCode::OK, json!({"preferences":[]}));
+    }
     if !matches!(method, Method::GET | Method::POST) {
         return error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed");
     }
