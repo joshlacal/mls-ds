@@ -322,7 +322,19 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
             );
         }
         if q.get("collection").map(String::as_str) == Some("blue.catbird.chat.declaration") {
-            return error(StatusCode::NOT_FOUND, "RecordNotFound");
+            return response(
+                StatusCode::OK,
+                json!({
+                    "uri": format!("at://{}/blue.catbird.chat.declaration/self", q["repo"]),
+                    "value": {
+                        "$type": "blue.catbird.chat.declaration",
+                        "allowIncoming": "all",
+                        "deliveryService": "did:web:chat.catbird.blue",
+                        "protocolVersion": "1",
+                        "createdAt": "2026-09-24T00:00:00.000Z"
+                    }
+                }),
+            );
         }
         return error(StatusCode::BAD_REQUEST, "InvalidQuery");
     }
@@ -458,6 +470,13 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
     if path == "/xrpc/com.atproto.repo.putRecord" && method == Method::POST {
         let result = (|| -> Result<Value> {
             let v: Value = serde_json::from_slice(&bytes)?;
+            let collection = v["collection"].as_str().context("collection")?;
+            if collection == "blue.catbird.chat.declaration" {
+                return Ok(json!({
+                    "uri": format!("at://{}/blue.catbird.chat.declaration/{}", actor.identity.did, v["rkey"].as_str().unwrap_or("self")),
+                    "cid": CID,
+                }));
+            }
             let o = v.as_object().context("object")?;
             ensure!(
                 o.keys()
