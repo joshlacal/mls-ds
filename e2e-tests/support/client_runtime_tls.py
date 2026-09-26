@@ -154,6 +154,16 @@ def main():
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", int(raw_port)), Handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ca_candidate = os.path.join(os.path.dirname(certificate), "ca.pem")
+    if os.path.isfile(ca_candidate):
+        with open(certificate, "r") as f_cert, open(ca_candidate, "r") as f_ca:
+            cert_text = f_cert.read()
+            ca_text = f_ca.read()
+        if ca_text.strip() not in cert_text:
+            chain_file = os.path.join(os.path.dirname(certificate), "server-chain.pem")
+            with open(chain_file, "w") as f_out:
+                f_out.write(cert_text.strip() + "\n" + ca_text.strip() + "\n")
+            certificate = chain_file
     context.load_cert_chain(certificate, private_key)
     server.socket = context.wrap_socket(server.socket, server_side=True)
     print(json.dumps({"port": server.server_port}), flush=True)

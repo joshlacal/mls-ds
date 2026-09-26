@@ -935,6 +935,10 @@ impl HttpsDidFixture {
                 .arg(&server_pem),
             "sign HTTPS fixture certificate",
         )?;
+        let mut full_chain = std::fs::read(&server_pem)?;
+        full_chain.push(b'\n');
+        full_chain.extend_from_slice(&std::fs::read(&ca_pem)?);
+        std::fs::write(&server_pem, full_chain)?;
         for (did, document) in documents {
             let host = did
                 .strip_prefix("did:web:")
