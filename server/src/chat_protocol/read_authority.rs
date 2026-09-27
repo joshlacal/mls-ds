@@ -99,8 +99,7 @@ use crate::chat_protocol::{
         ConversationStateHydrationError, LockedConversationStateGuard,
     },
     state_machine::{
-        AccessInterval, AccessIntervalEnd, ConversationState, DeviceIdentity, OpeningKind,
-        PrincipalId,
+        AccessInterval, AccessIntervalEnd, ConversationState, DeviceIdentity, PrincipalId,
     },
 };
 
@@ -1387,43 +1386,13 @@ pub(crate) async fn authorize_entries(
         .await
         .map_err(map_hydration_error)?;
     let facts = exact_device_interval_facts(device.user_did(), device.device_id(), locked.state())?;
-    let terminal_control_interval = if let Some(open_interval) = facts.open {
+    let terminal_control_interval = if facts.open.is_some() {
         // Preserve the current-open row witnesses required by the old gate.
         load_participant_period_id(tx, conversation_id, device.user_did()).await?;
         load_leaf_period_id(tx, conversation_id, device.user_did(), device.device_id()).await?;
-        let principal = PrincipalId::new(device.user_did().as_bytes().to_vec())
-            .map_err(|_| ReadAuthorityError::Invariant)?;
-        let is_direct_request_pending = open_interval.opening_kind() == OpeningKind::DirectRequest
-            && locked
-                .state()
-                .participant(&principal)
-                .is_some_and(|p| p.is_pending());
-
-        if is_direct_request_pending {
-            let has_control_entitlement: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM chat.entry_recipients
-                    WHERE conversation_id = $1
-                      AND user_did = $2
-                      AND device_id = $3
-                      AND entitlement_kind = 'control'
-                )",
-            )
-            .bind(conversation_id)
-            .bind(device.user_did())
-            .bind(device.device_id())
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(|_| ReadAuthorityError::Storage)?;
-
-            if !has_control_entitlement {
-                return Err(ReadAuthorityError::NotEntitled);
-            }
-        } else {
-            locked
-                .locked_snapshot_digest()
-                .ok_or(ReadAuthorityError::Invariant)?;
-        }
+        locked
+            .locked_snapshot_digest()
+            .ok_or(ReadAuthorityError::Invariant)?;
         None
     } else if let Some(interval) = facts.latest_finite {
         let end = interval.end().ok_or(ReadAuthorityError::Invariant)?;
