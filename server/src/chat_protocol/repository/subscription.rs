@@ -5,11 +5,10 @@
 //! conversation membership and cannot accidentally broaden a historical event.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use catbird_atproto::generated::blue_catbird::chat::{
-    EventEnvelope, ProtocolEventPayload, SubscriptionMessage,
-};
-use chrono::{DateTime, Utc};
+use catbird_atproto::generated::blue_catbird::chat::ProtocolEventPayload;
+use chrono::{DateTime, SecondsFormat, Utc};
 use jacquard_common::DefaultStr;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
 
@@ -32,6 +31,20 @@ pub(crate) struct VisibleEvent {
     pub(crate) payload: ProtocolEventPayload<DefaultStr>,
     pub(crate) created_at: DateTime<Utc>,
 }
+// Jacquard's generated CanonicalDatetime alias serializes six fractional digits;
+// the clean-chat wire contract requires exactly three. Keep the generated payload
+// but serialize this envelope with its canonical UTC millisecond timestamp.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireEventEnvelope<'a> {
+    #[serde(rename = "$type")]
+    kind: &'static str,
+    created_at: &'a str,
+    cursor: &'a str,
+    payload: &'a ProtocolEventPayload<DefaultStr>,
+    previous_cursor: &'a str,
+}
+
 
 /// Freeze the durable replay boundary after the ticket/device/protocol locks
 /// have been acquired. Events appended after this value are reconciled by the
@@ -173,8 +186,8 @@ pub(crate) async fn ensure_initial_receipt(
     .await
 }
 
-/// Materialize or replay the next cursor-bound generated envelope. The
-/// receipt is committed before the caller writes the frame, so a dropped
+/// Materialize or replay the next cursor-bound event envelope. The receipt is
+/// committed before the caller writes the same canonical frame bytes, so a dropped
 /// response can be reconstructed byte-for-byte on a later ticket.
 pub(crate) async fn materialize_envelope(
     transaction: &mut Transaction<'_, Postgres>,
@@ -183,7 +196,7 @@ pub(crate) async fn materialize_envelope(
     previous_cursor: &str,
     previous_cursor_hash: [u8; 32],
     sealer: &CursorSealer,
-) -> Result<(SubscriptionMessage<DefaultStr>, String, [u8; 32]), TicketRepositoryError> {
+) -> Result<(String, String, [u8; 32]), TicketRepositoryError> {
     let existing = sqlx::query(
         r#"SELECT cursor_hash, predecessor_cursor_hash, retained_floor_at_issue,
                   cursor_nonce, cursor_ciphertext, canonical_envelope_sha256,
@@ -259,26 +272,18 @@ pub(crate) async fn materialize_envelope(
             .map_err(|_| TicketRepositoryError::InvalidReceipt)?;
         let cursor = token.encode();
         let cursor_hash = token.lookup_hash();
-        // The envelope hash is filled after constructing the generated union.
+        // The envelope hash is filled after serializing the canonical wire frame.
         (cursor, cursor_hash, [0; 32])
     };
 
-    let message = SubscriptionMessage::EventEnvelope(Box::new(EventEnvelope {
-        created_at: chrono_to_datetime(event.created_at),
-        cursor: cursor.clone().into(),
-        payload: event.payload,
-        previous_cursor: previous_cursor.into(),
-        extra_data: None,
-    }));
-    let canonical_bytes =
-        serde_json::to_vec(&message).map_err(|_| TicketRepositoryError::InvalidReceipt)?;
-    let envelope_hash: [u8; 32] = Sha256::digest(&canonical_bytes).into();
+    let (frame, envelope_hash) = resolve_replayed_envelope(
+        &event,
+        &cursor,
+        previous_cursor,
+        expected_envelope_hash,
+    )?;
 
-    if expected_envelope_hash != [0; 32] {
-        if expected_envelope_hash != envelope_hash {
-            return Err(TicketRepositoryError::InvalidReceipt);
-        }
-    } else {
+    if expected_envelope_hash == [0; 32] {
         // Recreate the sealing inputs after envelope construction. This is
         // intentionally inside the transaction that persists the receipt.
         let created_at: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
@@ -320,7 +325,137 @@ pub(crate) async fn materialize_envelope(
         )
         .await?;
     }
-    Ok((message, cursor, cursor_hash))
+    Ok((frame, cursor, cursor_hash))
+}
+
+fn serialize_event_envelope(
+    event: &VisibleEvent,
+    cursor: &str,
+    previous_cursor: &str,
+    created_at: &str,
+) -> Result<(Vec<u8>, [u8; 32]), TicketRepositoryError> {
+    let wire = WireEventEnvelope {
+        kind: "blue.catbird.chat.defs#eventEnvelope",
+        created_at,
+        cursor,
+        payload: &event.payload,
+        previous_cursor,
+    };
+    let canonical_bytes =
+        serde_json::to_vec(&wire).map_err(|_| TicketRepositoryError::InvalidReceipt)?;
+    let envelope_hash: [u8; 32] = Sha256::digest(&canonical_bytes).into();
+    Ok((canonical_bytes, envelope_hash))
+}
+
+fn resolve_replayed_envelope(
+    event: &VisibleEvent,
+    cursor: &str,
+    previous_cursor: &str,
+    expected_envelope_hash: [u8; 32],
+) -> Result<(String, [u8; 32]), TicketRepositoryError> {
+    let canonical_created_at = canonical_event_time(event.created_at);
+    let (canonical_bytes, canonical_hash) = serialize_event_envelope(
+        event,
+        cursor,
+        previous_cursor,
+        &canonical_created_at,
+    )?;
+
+    if expected_envelope_hash == [0; 32] {
+        // Fresh materialization: always produce strict three-digit millisecond wire frame.
+        let frame = String::from_utf8(canonical_bytes)
+            .map_err(|_| TicketRepositoryError::InvalidReceipt)?;
+        return Ok((frame, canonical_hash));
+    }
+
+    if expected_envelope_hash == canonical_hash {
+        // Replaying a post-cutover receipt that hashed three-digit milliseconds.
+        let frame = String::from_utf8(canonical_bytes)
+            .map_err(|_| TicketRepositoryError::InvalidReceipt)?;
+        return Ok((frame, canonical_hash));
+    }
+
+    // Retained pre-recut receipts hashed Jacquard's 6-digit microsecond timestamp.
+    // If the stored receipt matches the byte-identical legacy representation,
+    // replay it verbatim so dropped responses and reconnects succeed without
+    // weakening integrity or rewriting the immutable receipt row.
+    let legacy_created_at = chrono_to_datetime(event.created_at);
+    let (legacy_bytes, legacy_hash) = serialize_event_envelope(
+        event,
+        cursor,
+        previous_cursor,
+        legacy_created_at.as_str(),
+    )?;
+
+    if expected_envelope_hash == legacy_hash {
+        let frame = String::from_utf8(legacy_bytes)
+            .map_err(|_| TicketRepositoryError::InvalidReceipt)?;
+        Ok((frame, legacy_hash))
+    } else {
+        Err(TicketRepositoryError::InvalidReceipt)
+    }
+}
+
+fn canonical_event_time(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use catbird_atproto::generated::blue_catbird::chat::{EventEnvelope, SubscriptionMessage};
+
+    #[test]
+    fn pre_recut_receipt_replay_preserves_bytes_and_rejects_tampering() {
+        let payload: ProtocolEventPayload<DefaultStr> = serde_json::from_value(serde_json::json!({
+            "$type": "blue.catbird.chat.defs#watermarkEvent",
+            "issuedAt": "2026-09-27T08:31:28.000000Z"
+        }))
+        .unwrap();
+        let cursor = "successor";
+        let previous = "predecessor";
+        for timestamp in ["2026-09-27T08:31:28.827456Z", "2026-09-27T08:31:28.827000Z"] {
+            let event = VisibleEvent {
+                event_position: 42,
+                payload: payload.clone(),
+                created_at: DateTime::parse_from_rfc3339(timestamp)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            };
+            let legacy = SubscriptionMessage::EventEnvelope(Box::new(EventEnvelope {
+                created_at: chrono_to_datetime(event.created_at),
+                cursor: cursor.into(),
+                payload: payload.clone(),
+                previous_cursor: previous.into(),
+                extra_data: None,
+            }));
+            let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+            let legacy_hash: [u8; 32] = Sha256::digest(&legacy_bytes).into();
+
+            let (fresh, fresh_hash) =
+                resolve_replayed_envelope(&event, cursor, previous, [0; 32]).unwrap();
+            assert_ne!(fresh_hash, legacy_hash);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&fresh).unwrap()["createdAt"],
+                "2026-09-27T08:31:28.827Z"
+            );
+            assert_eq!(
+                resolve_replayed_envelope(&event, cursor, previous, fresh_hash).unwrap().0,
+                fresh
+            );
+
+            let (replayed, hash) =
+                resolve_replayed_envelope(&event, cursor, previous, legacy_hash).unwrap();
+            assert_eq!(replayed.as_bytes(), legacy_bytes);
+            assert_eq!(hash, legacy_hash);
+            let mut tampered = legacy_hash;
+            tampered[0] ^= 1;
+            assert!(matches!(
+                resolve_replayed_envelope(&event, cursor, previous, tampered),
+                Err(TicketRepositoryError::InvalidReceipt)
+            ));
+        }
+    }
 }
 
 fn event_binding(

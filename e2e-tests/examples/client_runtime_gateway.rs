@@ -293,7 +293,14 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
             && q.get("repo") == Some(&a.identity.did)
     });
     if path == "/xrpc/com.atproto.repo.listRecords" && method == Method::GET {
-        let Some(a) = public_actor else {
+        let owned_actor = public_actor.or_else(|| {
+            let session = actor_for_session(proxy, &request)?;
+            proxy
+                .actors
+                .iter()
+                .find(|a| a.identity.did == session.identity.did && q.get("repo") == Some(&a.identity.did))
+        });
+        let Some(a) = owned_actor else {
             return error(StatusCode::FORBIDDEN, "InvalidRepo");
         };
         let coll = q.get("collection").map(String::as_str);

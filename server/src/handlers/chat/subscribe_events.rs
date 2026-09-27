@@ -365,7 +365,7 @@ async fn send_through(
         let mut frames = Vec::with_capacity(events.len());
         for event in events {
             *scan_position = event.event_position;
-            let (message, cursor, cursor_hash) = match materialize_envelope(
+            let (frame, cursor, cursor_hash) = match materialize_envelope(
                 &mut transaction,
                 ticket,
                 event,
@@ -378,10 +378,7 @@ async fn send_through(
                 Ok(value) => value,
                 Err(_) => return false,
             };
-            let frame = match serde_json::to_string(&message) {
-                Ok(frame) => frame,
-                Err(_) => return false,
-            };
+            // Materialization already hashed these exact canonical wire bytes.
             *previous_cursor = cursor;
             *previous_hash = cursor_hash;
             frames.push(frame);
