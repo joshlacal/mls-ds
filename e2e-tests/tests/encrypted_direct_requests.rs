@@ -311,9 +311,42 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
             ],
         )
         .await?;
-    assert_eq!(closed_get_status, reqwest::StatusCode::BAD_REQUEST);
-    let closed_err: Value = serde_json::from_slice(&closed_get_bytes)?;
-    assert_eq!(closed_err["error"], "AccessOutsideMembershipInterval", "closed request must be rejected");
+    // Bob legitimately holds a terminal proof on the closed conversation;
+    // under ruling BREAD-04 / line 1370, an exact device whose interval ended in Close
+    // obtains only separately entitled control entries within terminal_control_interval.
+    assert_eq!(closed_get_status, reqwest::StatusCode::OK, "terminal proof holder receives control entries in closed interval");
+    let closed_entries_json: Value = serde_json::from_slice(&closed_get_bytes)?;
+    let closed_entries = closed_entries_json["entries"].as_array().context("closed entries array")?;
+    for entry in closed_entries {
+        assert_ne!(
+            entry["$type"],
+            "blue.catbird.chat.defs#message",
+            "closed interval must never leak application ciphertext"
+        );
+        assert_ne!(
+            entry["$type"],
+            "blue.catbird.chat.defs#applicationEntry",
+            "closed interval must never leak application ciphertext"
+        );
+    }
+
+    // Conversely, the unaddressed sibling without terminal proof must be denied.
+    let (sibling_closed_status, sibling_closed_bytes) = sibling
+        .service
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getEntries",
+            &[
+                ("conversationId".into(), f.conversation_id.to_string()),
+                ("afterSeq".into(), "0".into()),
+                ("limit".into(), "100".into()),
+            ],
+        )
+        .await?;
+    assert_eq!(sibling_closed_status, reqwest::StatusCode::BAD_REQUEST);
+    let sibling_closed_err: Value = serde_json::from_slice(&sibling_closed_bytes)?;
+    assert_eq!(sibling_closed_err["error"], "NotEntitled", "sibling without interval must be rejected");
 
     Ok(())
 }
