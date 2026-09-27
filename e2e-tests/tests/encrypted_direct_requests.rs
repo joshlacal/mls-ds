@@ -157,11 +157,166 @@ async fn unavailable_request_handlers_fail_closed_instead_of_passing() -> anyhow
 
 #[path = "support/live_direct_request.rs"]
 mod live_direct_request;
+#[path = "support/live_direct_request_siblings.rs"]
+mod live_direct_request_siblings;
+use live_direct_request_siblings as siblings;
 
+fn signed_ordinary(engine: &MlsEngine, identity: &str, body: Value) -> anyhow::Result<Value> {
+    use catbird_mls::chat_v2::transcript::{
+        decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
+    };
+    let canonical = project_signed_body(
+        SignedMutationKind::from_type_id(body["$type"].as_str().context("signed type")?)
+            .context("signed kind")?,
+        &decode_strict_json(&serde_json::to_vec(&body)?)?,
+    )?;
+    let transcript = SigningTranscript::build_for(
+        SignedMutationKind::from_type_id(body["$type"].as_str().context("signed type")?)
+            .context("signed kind")?,
+        &canonical,
+    )?;
+    let signature = engine.sign_identity(identity, transcript.bytes().to_vec())?;
+    Ok(json!({
+        "body": body,
+        "signature": STANDARD.encode(signature)
+    }))
+}
 #[tokio::test(flavor = "multi_thread")]
 async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() -> anyhow::Result<()>
 {
     let _fixture = live_direct_request::publish_request(true).await?;
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow::Result<()> {
+    let f = live_direct_request::publish_request(false).await?;
+
+    // 1. Addressed recipient: getConversationState returns 200 OK and incomingPending consent
+    let (state_status, state_bytes) = f
+        .bob
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getConversationState",
+            &[("conversationId".into(), f.conversation_id.to_string())],
+        )
+        .await?;
+    assert_eq!(state_status, reqwest::StatusCode::OK);
+    let state_json: Value = serde_json::from_slice(&state_bytes)?;
+    assert_eq!(state_json["state"]["directRequest"]["consent"], "incomingPending");
+
+    // 2. Addressed recipient: getConversations returns 200 OK
+    let (inv_status, _inv_bytes) = f
+        .bob
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getConversations",
+            &[
+                ("limit".into(), "100".into()),
+                ("supportedProtocolVersions".into(), "1".into()),
+                ("supportedProtocolVersions".into(), "2".into()),
+            ],
+        )
+        .await?;
+    assert_eq!(inv_status, reqwest::StatusCode::OK);
+
+    // 3. Addressed recipient: getEntries returns 200 OK with exactly one directRequestEntry
+    let (entries_status, entries_bytes) = f
+        .bob
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getEntries",
+            &[
+                ("conversationId".into(), f.conversation_id.to_string()),
+                ("afterSeq".into(), "0".into()),
+                ("limit".into(), "100".into()),
+            ],
+        )
+        .await?;
+    assert_eq!(entries_status, reqwest::StatusCode::OK);
+    let entries_json: Value = serde_json::from_slice(&entries_bytes)?;
+    let entries = entries_json["entries"].as_array().context("entries array")?;
+    assert_eq!(entries.len(), 1, "pending request delivers only the control request entry");
+    assert_eq!(entries[0]["$type"], "blue.catbird.chat.defs#directRequestEntry");
+    assert_eq!(entries[0]["conversationId"], f.conversation_id.to_string());
+    assert_eq!(entries[0]["seq"], 1);
+
+    // 4. Unaddressed sibling: enrolled after publication, not addressed in request
+    let sibling = siblings::enroll(&f.bob, &f.client, &f.server.base_url).await?;
+    let (sibling_status, sibling_bytes) = sibling
+        .service
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getEntries",
+            &[
+                ("conversationId".into(), f.conversation_id.to_string()),
+                ("afterSeq".into(), "0".into()),
+                ("limit".into(), "100".into()),
+            ],
+        )
+        .await?;
+    assert_eq!(sibling_status, reqwest::StatusCode::BAD_REQUEST);
+    let sibling_err: Value = serde_json::from_slice(&sibling_bytes)?;
+    assert_eq!(sibling_err["error"], "NotEntitled", "unaddressed sibling must fail with NotEntitled");
+
+    // 5. Closed request: creator closes conversation, getEntries denied as AccessOutsideMembershipInterval
+    let prior_coord = f.publication["body"]["next"].clone();
+    let mut retired = prior_coord.clone();
+    retired["stateVersion"] = json!(prior_coord["stateVersion"].as_u64().context("sv")? + 1);
+    retired["lifecycle"] = json!("superseded");
+    let transition_id = Uuid::new_v4();
+    let close_body = json!({
+        "$type": "blue.catbird.chat.defs#conversationCloseBody",
+        "signatureDomain": "CATBIRD-CHAT-CLOSE\0",
+        "transitionId": transition_id.to_string(),
+        "conversationKind": "direct",
+        "actorDid": f.alice.did,
+        "actorDeviceId": f.alice.device_id.to_string(),
+        "keyId": f.publication["body"]["keyId"],
+        "authGeneration": 1,
+        "prior": prior_coord,
+        "retired": retired,
+        "idempotencyKey": transition_id.to_string(),
+        "signedAt": canonical_now()
+    });
+    let alice_identity = format!("{}#{}", f.alice.did, f.alice.device_id);
+    let close_signed = signed_ordinary(
+        f.alice_engine.as_ref().context("alice engine")?,
+        &alice_identity,
+        close_body,
+    )?;
+    let (close_status, close_bytes) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.closeConversation",
+            &json!({"signedRequest": close_signed}),
+            true,
+        )
+        .await?;
+    assert_eq!(close_status, reqwest::StatusCode::OK, "closeConversation must succeed: {}", String::from_utf8_lossy(&close_bytes));
+
+    let (closed_get_status, closed_get_bytes) = f
+        .bob
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getEntries",
+            &[
+                ("conversationId".into(), f.conversation_id.to_string()),
+                ("afterSeq".into(), "0".into()),
+                ("limit".into(), "100".into()),
+            ],
+        )
+        .await?;
+    assert_eq!(closed_get_status, reqwest::StatusCode::BAD_REQUEST);
+    let closed_err: Value = serde_json::from_slice(&closed_get_bytes)?;
+    assert_eq!(closed_err["error"], "AccessOutsideMembershipInterval", "closed request must be rejected");
+
     Ok(())
 }
 
