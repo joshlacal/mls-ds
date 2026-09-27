@@ -1,7 +1,10 @@
 use once_cell::sync::Lazy;
 use sqlx::PgPool;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{LazyLock, OnceLock};
+use tokio::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, info};
 
@@ -64,6 +67,17 @@ impl DsResolver {
             cache_ttl_secs: cache_ttl_secs as i64,
         }
     }
+    /// Build an HTTP client for resolver operations with redirects disabled.
+    pub fn build_resolver_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(10)
+            .user_agent("catbird-mls-ds/1.0")
+            .build()
+            .expect("failed to build resolver HTTP client")
+    }
 
     /// Check if a DID refers to this DS.
     pub fn is_self(&self, ds_did: &str) -> bool {
@@ -101,6 +115,15 @@ impl DsResolver {
         );
         metrics::counter!("ds_resolve_outcome_total", 1, "outcome" => outcome);
         result
+    }
+    /// Resolve a DS endpoint for an authoritative DS DID.
+    pub async fn resolve_authority_ds_endpoint(&self, ds_did: &str) -> Result<DsEndpoint, FederationError> {
+        self.resolve(ds_did).await
+    }
+
+    /// Resolve an authoritative DS endpoint for a given DS DID.
+    pub async fn resolve_authoritative_ds(&self, ds_did: &str) -> Result<DsEndpoint, FederationError> {
+        self.resolve(ds_did).await
     }
 
     async fn resolve_with_outcome(
@@ -317,8 +340,18 @@ impl DsResolver {
         let profile_url = profile_record_url(&pds_endpoint, user_did);
         let deadline = checked_outbound_deadline(user_did, Duration::from_secs(10))?;
 
+        let parsed = validate_endpoint_url(&profile_url)?;
+        let (host, addrs) = resolve_and_pin_destination(&parsed).await?;
+        let client = get_or_build_pinned_client(
+            &host,
+            &addrs,
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        )
+        .await?;
+
         let resp = send_resolution_request(
-            self.http.get(&profile_url),
+            client.get(parsed.as_str()),
             deadline,
             user_did,
             "HTTP request failed",
@@ -410,11 +443,19 @@ impl DsResolver {
             });
         };
 
-        self.validate_remote_url(&did_doc_url).await?;
+        let parsed = validate_endpoint_url(&did_doc_url)?;
+        let (host, addrs) = resolve_and_pin_destination(&parsed).await?;
+        let client = get_or_build_pinned_client(
+            &host,
+            &addrs,
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        )
+        .await?;
         let deadline = checked_outbound_deadline(did, Duration::from_secs(10))?;
 
         let resp = send_resolution_request(
-            self.http.get(&did_doc_url),
+            client.get(parsed.as_str()),
             deadline,
             did,
             "DID resolution HTTP error",
@@ -451,16 +492,27 @@ impl DsResolver {
                     "{}/xrpc/com.atproto.repo.listRecords",
                     pds_endpoint.trim_end_matches('/')
                 );
+                let parsed = validate_endpoint_url(&list_records_url).map_err(|_| ())?;
+                let (host, addrs) = resolve_and_pin_destination(&parsed)
+                    .await
+                    .map_err(|_| ())?;
+                let client = get_or_build_pinned_client(
+                    &host,
+                    &addrs,
+                    Duration::from_secs(5),
+                    outbound_timeout(),
+                )
+                .await
+                .map_err(|_| ())?;
                 let did_owned = did.to_string();
-                let http = self.http.clone();
 
                 collect_authoritative_device_key_pages(
                     move |cursor| {
-                        let http = http.clone();
+                        let client = client.clone();
                         let list_records_url = list_records_url.clone();
                         let did = did_owned.clone();
                         async move {
-                            let mut request = http.get(list_records_url).query(&[
+                            let mut request = client.get(list_records_url).query(&[
                                 ("repo", did.as_str()),
                                 ("collection", "blue.catbird.chat.device"),
                                 ("limit", AUTHORITY_PAGE_SIZE_PARAM),
@@ -473,7 +525,7 @@ impl DsResolver {
                                 .await
                                 .map_err(|_| ())?
                                 .map_err(|_| ())?;
-                            if !response.status().is_success() {
+                            if response.status().is_redirection() || !response.status().is_success() {
                                 return Err(());
                             }
                             decode_json_bounded(
@@ -543,7 +595,7 @@ async fn send_resolution_request(
     did: &str,
     context: &str,
 ) -> Result<reqwest::Response, FederationError> {
-    tokio::time::timeout_at(deadline, request.send())
+    let response = tokio::time::timeout_at(deadline, request.send())
         .await
         .map_err(|_| FederationError::ResolutionFailed {
             did: did.to_string(),
@@ -552,8 +604,19 @@ async fn send_resolution_request(
         .map_err(|error| FederationError::ResolutionFailed {
             did: did.to_string(),
             reason: format!("{context}: {error}"),
-        })
-}
+        })?;
+
+    if response.status().is_redirection() {
+        return Err(FederationError::ResolutionFailed {
+            did: did.to_string(),
+            reason: format!(
+                "{context}: redirect rejected (status {})",
+                response.status()
+            ),
+        });
+    }
+
+    Ok(response)
 
 async fn decode_resolution_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
@@ -752,15 +815,26 @@ fn derive_ds_did_from_https_endpoint(endpoint: &str) -> Option<String> {
     }
 }
 
-/// Returns `true` if the IP is private, loopback, link-local, or unspecified.
-fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+/// Returns `true` if the IP is private, loopback, link-local, unspecified,
+/// documentation, carrier-grade NAT, or reserved for future/special use.
+pub(crate) fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_unspecified()
-                || v4.is_link_local()
-                || v4.is_multicast()
+            let octets = v4.octets();
+            octets[0] == 0 // 0.0.0.0/8 (RFC 1122 "this network")
+                || octets[0] == 10 // 10.0.0.0/8 (RFC 1918 private)
+                || octets[0] == 127 // 127.0.0.0/8 (RFC 1122 loopback)
+                || (octets[0] == 100 && (64..=127).contains(&octets[1])) // 100.64.0.0/10 (RFC 6598 CGNAT)
+                || (octets[0] == 169 && octets[1] == 254) // 169.254.0.0/16 (RFC 3927 link-local)
+                || (octets[0] == 172 && (16..=31).contains(&octets[1])) // 172.16.0.0/12 (RFC 1918 private)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // 192.0.0.0/24 (RFC 6890 IETF protocol assignments)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2) // 192.0.2.0/24 (RFC 5737 TEST-NET-1)
+                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99) // 192.88.99.0/24 (RFC 7526 6to4 relay anycast)
+                || (octets[0] == 192 && octets[1] == 168) // 192.168.0.0/16 (RFC 1918 private)
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)) // 198.18.0.0/15 (RFC 2544 network benchmark)
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100) // 198.51.100.0/24 (RFC 5737 TEST-NET-2)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113) // 203.0.113.0/24 (RFC 5737 TEST-NET-3)
+                || octets[0] >= 224 // 224.0.0.0/4 multicast & 240.0.0.0/4 reserved & 255.255.255.255 broadcast
         }
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -768,6 +842,11 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
                 || v6.is_unique_local()
                 || v6.is_multicast()
                 || v6.is_unicast_link_local()
+                // IPv4-mapped IPv6 addresses (::ffff:a.b.c.d)
+                || match v6.to_ipv4_mapped() {
+                    Some(v4) => is_private_ip(&std::net::IpAddr::V4(v4)),
+                    None => false,
+                }
         }
     }
 }
@@ -811,6 +890,73 @@ pub(crate) fn validate_endpoint_url(url_str: &str) -> Result<url::Url, Federatio
     validate_endpoint_url_with_policy(url_str, allow_insecure_http())
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone)]
+struct TestFixtureHosts {
+    hosts: Vec<String>,
+    port: u16,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static TEST_FIXTURE_HOSTS: OnceLock<TestFixtureHosts> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_test_fixture_host_resolver(hosts: &[String], port: u16) -> Result<(), String> {
+    TEST_FIXTURE_HOSTS
+        .set(TestFixtureHosts {
+            hosts: hosts.iter().map(|h| h.to_ascii_lowercase()).collect(),
+            port,
+        })
+        .map_err(|_| "test fixture host resolver already installed".to_string())
+}
+
+pub(crate) fn is_explicit_debug_fixture(host: &str, port: u16, is_http: bool) -> bool {
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let _ = (host, port, is_http);
+        false
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let host_lc = host.to_ascii_lowercase();
+
+        if let Some(fixture) = TEST_FIXTURE_HOSTS.get() {
+            if fixture.port == port
+                && fixture.hosts.iter().any(|h| h.eq_ignore_ascii_case(&host_lc))
+            {
+                return true;
+            }
+        }
+
+        if let Ok(fixture_hosts_raw) = std::env::var("REQUEST_FIXTURE_DID_HOSTS") {
+            let fixture_port = std::env::var("REQUEST_FIXTURE_DID_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(443);
+            if port == fixture_port {
+                for allowed in fixture_hosts_raw.split(',') {
+                    if allowed.trim().eq_ignore_ascii_case(&host_lc) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Loopback is allowed only when insecure HTTP is explicitly enabled in test/dev
+        if is_http && (cfg!(test) || allow_insecure_http()) {
+            if host_lc == "localhost"
+                || host_lc == "127.0.0.1"
+                || host_lc == "::1"
+                || host_lc.ends_with(".localhost")
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
 fn validate_endpoint_url_with_policy(
     url_str: &str,
     allow_http: bool,
@@ -825,34 +971,35 @@ fn validate_endpoint_url_with_policy(
             did: String::new(),
             reason: if parsed.scheme() == "http" {
                 "HTTP federation endpoint rejected; set FEDERATION_ALLOW_INSECURE_HTTP=true only in trusted development"
-          .to_string()
+                    .to_string()
             } else {
                 format!("URL scheme must be https, got {}", parsed.scheme())
             },
         });
     }
 
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or(if parsed.scheme() == "http" { 80 } else { 443 });
+
     if let Some(host) = parsed.host_str() {
         let host_lc = host.to_ascii_lowercase();
+        let is_fixture = is_explicit_debug_fixture(host, port, parsed.scheme() == "http");
+
         let blocked = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
-        if blocked.contains(&host_lc.as_str()) || host_lc.ends_with(".localhost") {
+        if (blocked.contains(&host_lc.as_str()) || host_lc.ends_with(".localhost")) && !is_fixture {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
                 reason: format!("Blocked private address: {host}"),
             });
         }
-        // IPv6 hosts are returned by `host_str()` as bracketed
-        // strings (e.g. `[::1]`), which do NOT parse as
-        // `std::net::IpAddr`. Use `parsed.host()` to access the typed
-        // host enum and inspect the IP variant directly. Without this
-        // path, `https://[::1]` slips through the SSRF check.
         let typed_ip: Option<std::net::IpAddr> = match parsed.host() {
             Some(url::Host::Ipv4(v4)) => Some(std::net::IpAddr::V4(v4)),
             Some(url::Host::Ipv6(v6)) => Some(std::net::IpAddr::V6(v6)),
             _ => host.parse::<std::net::IpAddr>().ok(),
         };
         if let Some(ip) = typed_ip {
-            if is_private_ip(&ip) {
+            if is_private_ip(&ip) && !is_fixture {
                 return Err(FederationError::ResolutionFailed {
                     did: String::new(),
                     reason: format!("Blocked non-global IP: {ip}"),
@@ -860,7 +1007,7 @@ fn validate_endpoint_url_with_policy(
             }
         }
         if let Some(allowlist) = FEDERATION_HOST_ALLOWLIST.as_ref() {
-            if !host_is_allowlisted(host, allowlist) {
+            if !host_is_allowlisted(host, allowlist) && !is_fixture {
                 return Err(FederationError::ResolutionFailed {
                     did: String::new(),
                     reason: format!("Host {host} is not in FEDERATION_OUTBOUND_HOST_ALLOWLIST"),
@@ -872,27 +1019,45 @@ fn validate_endpoint_url_with_policy(
     Ok(parsed)
 }
 
-pub(crate) async fn validate_resolved_host_is_public(
-    parsed: &url::Url,
-) -> Result<(), FederationError> {
-    let Some(host) = parsed.host_str() else {
+/// Resolve the host for a validated URL and verify all resolved IP addresses
+/// are public (unless explicitly allowed by a debug fixture).
+///
+/// Returns the hostname and the validated socket addresses to which the
+/// connection MUST be pinned to close DNS rebinding.
+pub(crate) async fn resolve_and_pin_destination(
+    url: &url::Url,
+) -> Result<(String, Vec<std::net::SocketAddr>), FederationError> {
+    let Some(host) = url.host_str() else {
         return Err(FederationError::ResolutionFailed {
             did: String::new(),
             reason: "URL host is missing".to_string(),
         });
     };
+    let port = url
+        .port_or_known_default()
+        .unwrap_or(if url.scheme() == "http" { 80 } else { 443 });
+    let is_debug_fixture = is_explicit_debug_fixture(host, port, url.scheme() == "http");
 
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if is_private_ip(&ip) {
+        if is_private_ip(&ip) && !is_debug_fixture {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
                 reason: format!("Blocked non-global IP: {ip}"),
             });
         }
-        return Ok(());
+        let addr = std::net::SocketAddr::new(ip, port);
+        return Ok((host.to_string(), vec![addr]));
     }
 
-    let port = parsed.port_or_known_default().unwrap_or(443);
+    #[cfg(any(test, feature = "test-support"))]
+    if is_debug_fixture {
+        let loopback = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            port,
+        );
+        return Ok((host.to_string(), vec![loopback]));
+    }
+
     let addrs = tokio::time::timeout(
         federation_dns_timeout(),
         tokio::net::lookup_host((host, port)),
@@ -907,25 +1072,90 @@ pub(crate) async fn validate_resolved_host_is_public(
         reason: format!("Failed to resolve host {host}: {e}"),
     })?;
 
-    let mut resolved_any = false;
+    let mut validated_addrs = Vec::new();
     for addr in addrs {
-        resolved_any = true;
-        if is_private_ip(&addr.ip()) {
+        if is_private_ip(&addr.ip()) && !is_debug_fixture {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
                 reason: format!("Host {host} resolved to blocked IP {}", addr.ip()),
             });
         }
+        validated_addrs.push(addr);
     }
 
-    if !resolved_any {
+    if validated_addrs.is_empty() {
         return Err(FederationError::ResolutionFailed {
             did: String::new(),
             reason: format!("Host {host} did not resolve to any address"),
         });
     }
 
-    Ok(())
+    validated_addrs.sort_unstable();
+    validated_addrs.dedup();
+
+    Ok((host.to_string(), validated_addrs))
+}
+
+static PINNED_CLIENT_POOL: LazyLock<
+    Mutex<
+        BTreeMap<
+            (String, Vec<SocketAddr>, Duration, Duration),
+            reqwest::Client,
+        >,
+    >,
+> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+pub(crate) async fn get_or_build_pinned_client(
+    host: &str,
+    addrs: &[SocketAddr],
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<reqwest::Client, FederationError> {
+    let key = (host.to_string(), addrs.to_vec(), connect_timeout, request_timeout);
+    let mut pool = PINNED_CLIENT_POOL.lock().await;
+    if let Some(client) = pool.get(&key) {
+        return Ok(client.clone());
+    }
+    let client = build_pinned_client(host, addrs, connect_timeout, request_timeout)?;
+    if pool.len() < 256 {
+        pool.insert(key, client.clone());
+    }
+    Ok(client)
+}
+
+pub(crate) fn build_pinned_client(
+    host: &str,
+    addrs: &[SocketAddr],
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<reqwest::Client, FederationError> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(10)
+        .user_agent("catbird-mls-ds/1.0")
+        .resolve_to_addrs(host, addrs);
+
+    #[cfg(any(test, feature = "test-support"))]
+    if let Ok(ca_path) = std::env::var("REQUEST_FIXTURE_DID_CA_PEM") {
+        if let Ok(ca_bytes) = std::fs::read(&ca_path) {
+            if let Ok(cert) = reqwest::Certificate::from_pem(&ca_bytes) {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+    }
+
+    builder.build().map_err(|e| FederationError::ResolutionFailed {
+        did: String::new(),
+        reason: format!("Failed to build pinned HTTP client for {host}: {e}"),
+    })
+}
+
+pub(crate) async fn validate_resolved_host_is_public(
+    parsed: &url::Url,
+) -> Result<(), FederationError> {
+    resolve_and_pin_destination(parsed).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -1955,5 +2185,144 @@ mod tests {
             .await
             .expect("cache read succeeds");
         assert!(after_invalidate.is_none());
+    }
+    #[tokio::test]
+    async fn send_resolution_request_rejects_307_redirect_to_private_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test request");
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let response = b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(response).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let result = send_resolution_request(
+            client.get(format!("http://{address}/")),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            "did:plc:test",
+            "test context",
+        )
+        .await;
+
+        let error = result.expect_err("307 redirect must be rejected");
+        assert!(error.to_string().contains("redirect rejected"));
+        assert!(error.to_string().contains("307"));
+    }
+
+    #[tokio::test]
+    async fn send_resolution_request_rejects_308_redirect_to_private_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test request");
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let response = b"HTTP/1.1 308 Permanent Redirect\r\nLocation: http://10.0.0.1:8080/sensitive\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(response).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let result = send_resolution_request(
+            client.get(format!("http://{address}/")),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            "did:plc:test",
+            "test context",
+        )
+        .await;
+
+        let error = result.expect_err("308 redirect must be rejected");
+        assert!(error.to_string().contains("redirect rejected"));
+        assert!(error.to_string().contains("308"));
+    }
+
+    #[tokio::test]
+    async fn resolve_and_pin_destination_rejects_private_ips_fail_closed() {
+        let private_urls = [
+            "https://10.0.0.1/",
+            "https://172.16.0.1/",
+            "https://172.31.255.254/",
+            "https://192.168.1.1/",
+            "https://169.254.169.254/",
+            "https://100.64.0.1/",
+            "https://192.0.2.1/",
+            "https://198.51.100.1/",
+            "https://203.0.113.1/",
+            "https://[fc00::1]/",
+            "https://[fe80::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://[::ffff:10.0.0.1]/",
+            "https://[::ffff:169.254.169.254]/",
+        ];
+
+        for target in private_urls {
+            let parsed = url::Url::parse(target).unwrap();
+            let result = resolve_and_pin_destination(&parsed).await;
+            assert!(
+                result.is_err(),
+                "expected error for private target {target}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_private_ip_coverage() {
+        // Loopback
+        assert!(is_private_ip(&"127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"127.255.255.255".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::1".parse::<IpAddr>().unwrap()));
+
+        // RFC 1918
+        assert!(is_private_ip(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"10.255.255.254".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"172.16.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"172.31.255.254".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"192.168.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"192.168.255.254".parse::<IpAddr>().unwrap()));
+
+        // Link-local
+        assert!(is_private_ip(&"169.254.169.254".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"fe80::1".parse::<IpAddr>().unwrap()));
+
+        // CGNAT
+        assert!(is_private_ip(&"100.64.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"100.127.255.254".parse::<IpAddr>().unwrap()));
+
+        // Documentation / Test networks
+        assert!(is_private_ip(&"192.0.2.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"198.51.100.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"203.0.113.1".parse::<IpAddr>().unwrap()));
+
+        // IPv6 Unique Local
+        assert!(is_private_ip(&"fc00::1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"fd12:3456:789a::1".parse::<IpAddr>().unwrap()));
+
+        // IPv4-mapped IPv6
+        assert!(is_private_ip(&"::ffff:127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:169.254.169.254".parse::<IpAddr>().unwrap()));
+
+        // Public IPs should NOT be private
+        assert!(!is_private_ip(&"8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_ip(&"1.1.1.1".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_ip(&"93.184.216.34".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_ip(&"2606:4700:4700::1111".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_ip(&"::ffff:8.8.8.8".parse::<IpAddr>().unwrap()));
     }
 }

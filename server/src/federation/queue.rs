@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use super::errors::FederationError;
 use super::outbound::{OutboundClient, OutboundError};
 use super::peer_policy;
-use super::resolver::{validate_endpoint_url, validate_resolved_host_is_public};
+use super::resolver::{validate_endpoint_url, validate_resolved_host_is_public, DsResolver};
 use crate::auth::AuthMiddleware;
 use crate::identity::{canonical_did, did_web_service_endpoint};
 
@@ -69,6 +69,7 @@ pub struct OutboundQueue {
     auth_middleware: AuthMiddleware,
     per_peer_pending_cap: i64,
     per_convo_peer_pending_cap: i64,
+    resolver: Arc<DsResolver>,
 }
 
 impl OutboundQueue {
@@ -85,11 +86,25 @@ impl OutboundQueue {
             per_peer_pending_cap,
             per_convo_peer_pending_cap, "Outbound queue resource fencing configured"
         );
+        let http = super::resolver::build_resolver_http_client();
+        let cache_ttl: u64 = std::env::var("ENDPOINT_CACHE_TTL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
+        let resolver = Arc::new(DsResolver::new(
+            pool.clone(),
+            http,
+            crate::identity::service_did(),
+            crate::identity::self_endpoint(),
+            std::env::var("DEFAULT_DS_ENDPOINT").ok(),
+            cache_ttl,
+        ));
         Self {
             pool,
             auth_middleware,
             per_peer_pending_cap,
             per_convo_peer_pending_cap,
+            resolver,
         }
     }
 
@@ -265,7 +280,11 @@ impl OutboundQueue {
         auth_sign: Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>,
         shutdown: CancellationToken,
     ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let tick_ms: u64 = std::env::var("OUTBOUND_QUEUE_TICK_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000);
+        let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         info!("Outbound queue worker started");
@@ -296,12 +315,20 @@ impl OutboundQueue {
     ) -> Result<usize, sqlx::Error> {
         let rows: Vec<(String, String, String, String, Vec<u8>, String, i32, i32)> =
             sqlx::query_as(
-                "SELECT id, target_ds_did, target_endpoint, method, payload, convo_id, \
-                    retry_count, max_retries \
-             FROM outbound_queue \
-             WHERE status = 'pending' AND next_retry_at <= NOW() \
-             ORDER BY next_retry_at ASC \
-             LIMIT 10",
+                "WITH oldest_pending AS ( \
+                     SELECT DISTINCT ON (CASE WHEN convo_id = '' THEN id ELSE convo_id END, target_ds_did) \
+                         id, target_ds_did, target_endpoint, method, payload, convo_id, \
+                         retry_count, max_retries, created_at, next_retry_at \
+                     FROM outbound_queue \
+                     WHERE status = 'pending' \
+                     ORDER BY (CASE WHEN convo_id = '' THEN id ELSE convo_id END), target_ds_did, created_at ASC, id ASC \
+                 ) \
+                 SELECT id, target_ds_did, target_endpoint, method, payload, convo_id, \
+                        retry_count, max_retries \
+                 FROM oldest_pending \
+                 WHERE next_retry_at <= NOW() \
+                 ORDER BY next_retry_at ASC \
+                 LIMIT 10",
             )
             .fetch_all(&self.pool)
             .await?;
@@ -459,23 +486,52 @@ impl OutboundQueue {
                 let _ = self.mark_delivered(&item.id).await;
             }
             Ok(resp) => {
-                let rejection_category = classify_remote_rejection_category(
-                    resp.reason_code.as_deref(),
-                    resp.error.as_deref(),
-                    resp.message.as_deref(),
-                );
-                crate::metrics::record_federation_rejection_reason(rejection_category);
                 let reason = resp
                     .reason_code
                     .or(resp.message)
                     .unwrap_or_else(|| "rejected".to_string());
+                if is_predecessor_error(&reason)
+                    || resp.error.as_deref().map(is_predecessor_error).unwrap_or(false)
+                {
+                    let delay = backoff_delay(item.retry_count);
+                    warn!(
+                        queue_id = %item.id,
+                        retry = item.retry_count,
+                        next_retry_secs = delay.as_secs(),
+                        reason = %reason,
+                        "Predecessor missing for queued item; scheduling retry without exhausting"
+                    );
+                    let _ = self
+                        .schedule_retry(&item.id, item.retry_count, &reason, delay)
+                        .await;
+                } else {
+                    let rejection_category = classify_remote_rejection_category(
+                        resp.reason_code.as_deref(),
+                        resp.error.as_deref(),
+                        None,
+                    );
+                    crate::metrics::record_federation_rejection_reason(rejection_category);
+                    warn!(
+                        queue_id = %item.id,
+                        reason = %reason,
+                        rejection_category,
+                        "Remote DS rejected delivery"
+                    );
+                    let _ = self.mark_failed(&item.id, &reason).await;
+                }
+            }
+            Err(e) if is_outbound_predecessor_error(&e) => {
+                let delay = backoff_delay(item.retry_count);
                 warn!(
                     queue_id = %item.id,
-                    reason = %reason,
-                    rejection_category,
-                    "Remote DS rejected delivery"
+                    retry = item.retry_count,
+                    next_retry_secs = delay.as_secs(),
+                    error = %e,
+                    "Predecessor missing on remote DS; scheduling retry without exhausting"
                 );
-                let _ = self.mark_failed(&item.id, &reason).await;
+                let _ = self
+                    .schedule_retry(&item.id, item.retry_count, &e.to_string(), delay)
+                    .await;
             }
             Err(e) if e.is_retryable() && item.retry_count < item.max_retries => {
                 let delay = backoff_delay(item.retry_count);
@@ -505,6 +561,41 @@ impl OutboundQueue {
     async fn resolve_target_endpoint(&self, item: &QueueItem) -> Result<String, OutboundError> {
         let canonical_target_ds_did = canonical_did(&item.target_ds_did).to_string();
 
+        if is_c33_method(&item.method) {
+            let endpoint_info = match self
+                .resolver
+                .resolve_authority_ds_endpoint(&canonical_target_ds_did)
+                .await
+            {
+                Ok(ep) => ep,
+                Err(e) => match self.resolver.resolve_authoritative_ds(&canonical_target_ds_did).await {
+                    Ok(ep) => ep,
+                    Err(_) => {
+                        return Err(OutboundError::RequestFailed {
+                            endpoint: canonical_target_ds_did.clone(),
+                            reason: format!(
+                                "C33 authority resolution failed for {canonical_target_ds_did}: {e}"
+                            ),
+                        });
+                    }
+                },
+            };
+
+            if canonical_did(&endpoint_info.did) != canonical_target_ds_did {
+                return Err(OutboundError::RequestFailed {
+                    endpoint: endpoint_info.endpoint,
+                    reason: format!(
+                        "Resolved authority DID mismatch: expected {canonical_target_ds_did}, got {}",
+                        endpoint_info.did
+                    ),
+                });
+            }
+
+            return self
+                .validate_endpoint_candidate(&endpoint_info.endpoint, &canonical_target_ds_did)
+                .await;
+        }
+
         let cached_endpoint = sqlx::query_scalar::<_, String>(
             "SELECT endpoint FROM ds_endpoints WHERE did = $1 AND expires_at > NOW()",
         )
@@ -531,6 +622,7 @@ impl OutboundQueue {
             reason: "target endpoint missing and DS endpoint could not be resolved".to_string(),
         })
     }
+
 
     async fn validate_endpoint_candidate(
         &self,
@@ -673,11 +765,36 @@ fn classify_remote_rejection_category(
 // Backoff
 // ---------------------------------------------------------------------------
 
-/// Exponential backoff: 5 s → 10 s → 20 s → 40 s → 80 s (capped at 5 min).
 fn backoff_delay(retry_count: i32) -> Duration {
+    if let Ok(ms) = std::env::var("OUTBOUND_QUEUE_RETRY_DELAY_MS") {
+        if let Ok(parsed) = ms.parse::<u64>() {
+            return Duration::from_millis(parsed);
+        }
+    }
     let base = 5u64;
     let delay = base.saturating_mul(2u64.saturating_pow(retry_count as u32));
     Duration::from_secs(delay.min(300))
+}
+
+fn is_c33_method(method: &str) -> bool {
+    matches!(
+        method,
+        "blue.catbird.mlsDS.deliverDirectRequest"
+            | "blue.catbird.mlsDS.deliverAcceptanceEntry"
+            | "blue.catbird.mlsDS.deliverMessageEntry"
+    )
+}
+
+fn is_predecessor_error(err_str: &str) -> bool {
+    let lower = err_str.to_ascii_lowercase();
+    lower.contains("predecessor")
+}
+
+fn is_outbound_predecessor_error(err: &OutboundError) -> bool {
+    match err {
+        OutboundError::RemoteError { body, .. } => is_predecessor_error(body),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -709,5 +826,23 @@ mod tests {
         assert_eq!(backoff_delay(5), Duration::from_secs(160));
         assert_eq!(backoff_delay(6), Duration::from_secs(300)); // capped
         assert_eq!(backoff_delay(10), Duration::from_secs(300)); // still capped
+    }
+
+    #[test]
+    fn c33_method_matching() {
+        assert!(is_c33_method("blue.catbird.mlsDS.deliverDirectRequest"));
+        assert!(is_c33_method("blue.catbird.mlsDS.deliverAcceptanceEntry"));
+        assert!(is_c33_method("blue.catbird.mlsDS.deliverMessageEntry"));
+        assert!(!is_c33_method("blue.catbird.mlsDS.deliverMessage"));
+        assert!(!is_c33_method("blue.catbird.mls.sendMessage"));
+    }
+
+    #[test]
+    fn predecessor_error_detection() {
+        assert!(is_predecessor_error("missing signed predecessor entry"));
+        assert!(is_predecessor_error("predecessor entry missing"));
+        assert!(is_predecessor_error("Predecessor chain mismatch"));
+        assert!(!is_predecessor_error("rate limited"));
+        assert!(!is_predecessor_error("invalid auth"));
     }
 }

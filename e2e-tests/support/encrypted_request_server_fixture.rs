@@ -113,7 +113,11 @@ async fn main() -> Result<()> {
         .map_err(anyhow::Error::msg)?;
 
     let pool = PgPoolOptions::new()
-        .max_connections(4)
+        .max_connections(32)
+        .test_before_acquire(false)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .acquire_timeout(std::time::Duration::from_secs(60))
         .connect(&database_url)
         .await
         .context("connect guarded request database")?;
@@ -162,6 +166,26 @@ async fn main() -> Result<()> {
             pool.clone(),
             runtime.clone(),
         ));
+    }
+    if std::env::var("REQUEST_FIXTURE_OUTBOUND_WORKER").as_deref() == Ok("1") {
+        anyhow::ensure!(
+            is_dedicated_database_url(&database_url),
+            "REQUEST_FIXTURE_OUTBOUND_WORKER requires a dedicated request database"
+        );
+        let queue = Arc::new(catbird_server::federation::queue::OutboundQueue::new(
+            pool.clone(),
+            catbird_server::auth::AuthMiddleware::new(),
+        ));
+        let outbound = Arc::new(catbird_server::federation::outbound::OutboundClient::new(10, 30));
+        let auth_fn: Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync> =
+            Arc::new(|target: &str, method: &str| {
+                catbird_server::federation::canonical_relay::mint_s2s_auth_token(target, method)
+                    .map_err(|e| e.to_string())
+            });
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(async move {
+            queue.run_worker(outbound, auth_fn, shutdown).await;
+        });
     }
     if let Some((event_id, trigger, result)) = push_event {
         let push_pool = pool.clone();
