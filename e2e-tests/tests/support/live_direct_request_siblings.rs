@@ -233,7 +233,7 @@ pub async fn accept_before_both_recipient_imports() -> anyhow::Result<()> {
             anyhow::bail!("recipient introduction unavailable after account acceptance");
         };
         assert_eq!(
-            protocol::decode_direct_request_introduction(plaintext)?["text"],
+            protocol::decode_direct_request_introduction(&plaintext)?["text"],
             "Real encrypted first contact"
         );
         assert_eq!(engine.decrypt_direct_request(input)?, preview);

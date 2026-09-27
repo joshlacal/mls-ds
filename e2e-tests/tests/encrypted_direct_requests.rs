@@ -157,9 +157,7 @@ async fn unavailable_request_handlers_fail_closed_instead_of_passing() -> anyhow
 
 #[path = "support/live_direct_request.rs"]
 mod live_direct_request;
-#[path = "support/live_direct_request_siblings.rs"]
-mod live_direct_request_siblings;
-use live_direct_request_siblings as siblings;
+use live_direct_request::siblings;
 
 fn signed_ordinary(engine: &MlsEngine, identity: &str, body: Value) -> anyhow::Result<Value> {
     use catbird_mls::chat_v2::transcript::{
