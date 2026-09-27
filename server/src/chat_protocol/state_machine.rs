@@ -17750,7 +17750,10 @@ fn validate_transition_evidence(evidence: &TransitionEvidence) -> bool {
                 && !authority.signed_request_bytes.is_empty()
                 && !authority.canonical_projection.is_empty()
                 && !authority.transcript_bytes.is_empty()
-                && authority.signed_at <= evidence.received_at
+                && (authority.signed_at <= evidence.received_at
+                    || (authority.kind == SignedMutationKind::DirectRequestAcceptance
+                        && evidence.received_at.checked_add_millis(30_000)
+                            .is_ok_and(|deadline| authority.signed_at <= deadline)))
         })
 }
 

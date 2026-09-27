@@ -674,7 +674,7 @@ pub(crate) fn graph(conversation: Uuid) -> anyhow::Result<Value> {
     Ok(serde_json::from_slice(&result.stdout)?)
 }
 
-pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<()> {
+pub async fn accept_reply_offline(accept_before_import: bool, future_signed_at: bool) -> anyhow::Result<()> {
     use catbird_mls::chat_v2::transcript::{decode_strict_json, VerifiedApplicationEntry};
     use catbird_mls::orchestrator::{canonical_application_aad_bytes, MLSMessagePayload};
     // Both scenarios start with an unimported recipient. The sender must be
@@ -835,13 +835,14 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
             "actorDid":f.bob.did, "actorDeviceId":f.bob.device_id.to_string(), "keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)), "authGeneration":1,
             "requestId":f.request_id.to_string(), "transitionId":transition.to_string(), "prior":prior, "next":next,
             "invitationProvenance":{"invitationTransitionId":f.request_id.to_string(),"invitedByDid":f.alice.did,"invitedByDeviceId":f.alice.device_id.to_string()},
-            "idempotencyKey":transition.to_string(),"signedAt":canonical_now()
+            "idempotencyKey":transition.to_string(),"signedAt":if future_signed_at { (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true) } else { canonical_now() }
         }),
     )?;
     // A correctly signed but stale successor must leave the complete durable
     // graph unchanged, including both pointers and the exact replay claim.
     let stale_operation = Uuid::new_v4();
     let mut stale_body = acceptance["body"].clone();
+    stale_body["signedAt"] = json!(canonical_now());
     stale_body["transitionId"] = json!(stale_operation.to_string());
     stale_body["idempotencyKey"] = json!(stale_operation.to_string());
     stale_body["prior"]["stateVersion"] = next["stateVersion"].clone();
@@ -893,6 +894,28 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
     assert_eq!(proof["receipt"]["body"]["prior"], prior);
     assert_eq!(proof["receipt"]["body"]["next"], next);
     assert_eq!(proof["entry"]["signedRequest"], acceptance);
+    if future_signed_at {
+        let signed_at = chrono::DateTime::parse_from_rfc3339(
+            acceptance["body"]["signedAt"].as_str().context("acceptance signedAt")?
+        )?;
+        let received_at = chrono::DateTime::parse_from_rfc3339(
+            proof["entry"]["receivedAt"].as_str().context("acceptance receivedAt")?
+        )?;
+        anyhow::ensure!(signed_at > received_at, "fixture failed to exercise accepted future-signed clock skew");
+    }
+    let (accepted_state_status, accepted_state_bytes) = f.bob.get(
+        &f.client,
+        &f.server.base_url,
+        "blue.catbird.chat.getConversationState",
+        &[("conversationId".into(), f.conversation_id.to_string())],
+    ).await?;
+    anyhow::ensure!(
+        accepted_state_status == reqwest::StatusCode::OK,
+        "accepted recipient state read failed {accepted_state_status}: {}",
+        String::from_utf8_lossy(&accepted_state_bytes)
+    );
+    let accepted_state: Value = serde_json::from_slice(&accepted_state_bytes)?;
+    assert_eq!(accepted_state["state"]["directRequest"]["consent"], "accepted");
     let replay = checked_post(
         &f,
         &f.bob,

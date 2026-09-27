@@ -497,12 +497,17 @@ async fn fresh_service_jwts_preserve_device_generation_and_replay_fails_closed(
 #[tokio::test(flavor = "multi_thread")]
 async fn c02_sender_offline_recipient_accepts_replies_sender_reopens_and_decrypts(
 ) -> anyhow::Result<()> {
-    live_direct_request::accept_reply_offline(false).await
+    live_direct_request::accept_reply_offline(false, false).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn c06_acceptance_before_welcome_import_does_not_require_another_add() -> anyhow::Result<()> {
-    live_direct_request::accept_reply_offline(true).await
+    live_direct_request::accept_reply_offline(true, false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c02_accepted_future_signed_request_rehydrates_before_reply() -> anyhow::Result<()> {
+    live_direct_request::accept_reply_offline(false, true).await
 }
 
 struct ChildGuard(Option<std::process::Child>);
