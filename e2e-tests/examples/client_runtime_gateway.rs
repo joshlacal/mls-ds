@@ -81,6 +81,7 @@ struct Actor {
     identity: ServiceIdentity,
     session: String,
     records: Mutex<BTreeMap<String, Value>>,
+    blocks: Mutex<BTreeMap<String, Value>>,
     seeded: Mutex<Option<Vec<u8>>>,
 }
 struct Proxy {
@@ -295,13 +296,18 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
         let Some(a) = public_actor else {
             return error(StatusCode::FORBIDDEN, "InvalidRepo");
         };
-        if q.get("collection").map(String::as_str) != Some(COLLECTION)
+        let coll = q.get("collection").map(String::as_str);
+        if !matches!(coll, Some(COLLECTION) | Some("app.bsky.graph.block"))
             || q.keys()
-                .any(|k| !["repo", "collection", "limit"].contains(&k.as_str()))
+                .any(|k| !["repo", "collection", "limit", "cursor"].contains(&k.as_str()))
             || q.get("limit")
                 .is_some_and(|s| s.parse::<usize>().map_or(true, |n| !(1..=100).contains(&n)))
         {
             return error(StatusCode::BAD_REQUEST, "InvalidQuery");
+        }
+        if coll == Some("app.bsky.graph.block") {
+            let recs: Vec<Value> = a.blocks.lock().unwrap().values().cloned().collect();
+            return response(StatusCode::OK, json!({"records": recs}));
         }
         return response(
             StatusCode::OK,
@@ -349,9 +355,23 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
         {
             return error(StatusCode::BAD_REQUEST, "InvalidQuery");
         }
+        let actor_did = &q["actor"];
+        let other_did = &q["others"];
+        let actor = proxy.actors.iter().find(|a| &a.identity.did == actor_did).unwrap();
+        let blocking_uri = actor.blocks.lock().unwrap().values().find_map(|r| {
+            if r["value"]["subject"] == *other_did {
+                r["uri"].as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        });
+        let mut rel = json!({"$type":"app.bsky.graph.defs#relationship","did":other_did});
+        if let Some(uri) = blocking_uri {
+            rel["blocking"] = json!(uri);
+        }
         return response(
             StatusCode::OK,
-            json!({"actor":q["actor"],"relationships":[{"$type":"app.bsky.graph.defs#relationship","did":q["others"]}]}),
+            json!({"actor":actor_did,"relationships":[rel]}),
         );
     }
     let Some(actor) = actor_for_session(proxy, &request) else {
@@ -410,7 +430,19 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
         return response(StatusCode::OK, profile(a));
     }
     if path == "/xrpc/app.bsky.graph.getBlocks" && method == Method::GET {
-        return response(StatusCode::OK, json!({"blocks":[]}));
+        let Some(actor) = actor_for_session(proxy, &request) else {
+            return error(StatusCode::UNAUTHORIZED, "AuthenticationRequired");
+        };
+        let blocks_map = actor.blocks.lock().unwrap();
+        let blocks: Vec<Value> = blocks_map
+            .values()
+            .filter_map(|r| {
+                let subject = r["value"]["subject"].as_str()?;
+                let a = proxy.actors.iter().find(|a| a.identity.did == subject)?;
+                Some(profile(a))
+            })
+            .collect();
+        return response(StatusCode::OK, json!({"blocks": blocks}));
     }
     if path == "/xrpc/app.bsky.actor.getPreferences" && method == Method::GET {
         return response(StatusCode::OK, json!({"preferences":[]}));
@@ -430,7 +462,7 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
     }
     if matches!(
         path.as_str(),
-        "/fixture/enroll" | "/xrpc/com.atproto.repo.putRecord" | "/xrpc/com.atproto.repo.createRecord"
+        "/fixture/enroll" | "/xrpc/com.atproto.repo.putRecord" | "/xrpc/com.atproto.repo.createRecord" | "/xrpc/com.atproto.repo.deleteRecord"
     ) && catbird_mls::chat_v2::transcript::decode_strict_json(&bytes).is_err()
     {
         return error(StatusCode::BAD_REQUEST, "InvalidJson");
@@ -441,20 +473,54 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
         let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
             return error(StatusCode::BAD_REQUEST, "InvalidJson");
         };
-        let known = |did: &Value| proxy.actors.iter().any(|a| *did == a.identity.did);
-        if v["repo"] != actor.identity.did
-            || v["collection"] != "app.bsky.graph.block"
-            || v["record"]["$type"] != "app.bsky.graph.block"
+        let known = |did: &Value| {
+            did.as_str().is_some_and(|d| proxy.actors.iter().any(|a| a.identity.did == d))
+        };
+        let subject = v["record"]["subject"].as_str().unwrap_or("");
+        eprintln!(
+            "createRecord check: repo={:?} actor={:?} coll={:?} type={:?} subject={:?} known={:?}",
+            v["repo"].as_str(),
+            Some(actor.identity.did.as_str()),
+            v["collection"].as_str(),
+            v["record"]["$type"].as_str(),
+            subject,
+            known(&v["record"]["subject"]),
+        );
+        if v["repo"].as_str() != Some(actor.identity.did.as_str())
+            || v["collection"].as_str() != Some("app.bsky.graph.block")
+            || v["record"]["$type"].as_str() != Some("app.bsky.graph.block")
             || !known(&v["record"]["subject"])
-            || v["record"]["subject"] == actor.identity.did
+            || subject == actor.identity.did
             || v["record"]["createdAt"].as_str().is_none()
         {
             return error(StatusCode::BAD_REQUEST, "UnsupportedRecord");
         }
+        let rkey = uuid::Uuid::new_v4().simple().to_string();
+        let uri = format!("at://{}/app.bsky.graph.block/{}", actor.identity.did, rkey);
+        let record = json!({
+            "uri": uri.clone(),
+            "cid": CID,
+            "value": v["record"],
+        });
+        actor.blocks.lock().unwrap().insert(rkey, record);
         return response(
             StatusCode::OK,
-            json!({"uri": format!("at://{}/app.bsky.graph.block/{}", actor.identity.did, uuid::Uuid::new_v4().simple()), "cid": CID}),
+            json!({"uri": uri, "cid": CID}),
         );
+    }
+    if path == "/xrpc/com.atproto.repo.deleteRecord" && method == Method::POST {
+        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+            return error(StatusCode::BAD_REQUEST, "InvalidJson");
+        };
+        if v["repo"] != actor.identity.did
+            || v["collection"] != "app.bsky.graph.block"
+            || v["rkey"].as_str().is_none()
+        {
+            return error(StatusCode::BAD_REQUEST, "UnsupportedRecord");
+        }
+        let rkey = v["rkey"].as_str().unwrap();
+        actor.blocks.lock().unwrap().remove(rkey);
+        return response(StatusCode::OK, json!({}));
     }
     if path == "/fixture/enroll" && method == Method::POST {
         #[derive(Deserialize)]
@@ -653,6 +719,7 @@ async fn main() -> Result<()> {
                 )),
                 session: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
                 records: Mutex::new(BTreeMap::new()),
+                blocks: Mutex::new(BTreeMap::new()),
                 seeded: Mutex::new(None),
             })
         })
@@ -935,6 +1002,7 @@ mod tests {
             identity: ServiceIdentity::new("did:web:alice.request-fixture.catbird.blue".into()),
             session: "opaque".into(),
             records: Mutex::new(BTreeMap::new()),
+            blocks: Mutex::new(BTreeMap::new()),
             seeded: Mutex::new(None),
         };
         let id = Uuid::new_v4().to_string();
@@ -956,6 +1024,7 @@ mod tests {
             identity,
             session: "opaque".into(),
             records: Mutex::new(BTreeMap::new()),
+            blocks: Mutex::new(BTreeMap::new()),
             seeded: Mutex::new(None),
         });
         let proxy = Arc::new(Proxy {
