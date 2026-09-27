@@ -575,6 +575,17 @@ async fn publish_request_variant_configured(
         preparation_request_digest: *verified_prepare.request_digest(),
     };
     if import_recipient {
+        use catbird_mls::orchestrator::{RequestCapabilities, RequestConsent, RequestCrypto};
+        let state_query = &[("conversationId".into(), conversation_id.to_string())];
+        let (before_status, before_bytes) = bob
+            .get(&client, &server.base_url, "blue.catbird.chat.getConversationState", state_query)
+            .await?;
+        anyhow::ensure!(before_status == reqwest::StatusCode::OK, "pending state before import: {before_status}");
+        let before: Value = serde_json::from_slice(&before_bytes)?;
+        assert_eq!(before["state"]["directRequest"]["consent"], "incomingPending");
+        let before_capabilities = RequestCapabilities::derive(
+            RequestConsent::IncomingPending, RequestCrypto::WelcomeAvailable, false,
+        );
         bob_engine.process_direct_request(&welcome_input)?;
         let decrypted = bob_engine.decrypt_direct_request(&welcome_input)?;
         let DirectRequestIntroductionResult::Ready { plaintext } = decrypted else {
@@ -582,6 +593,20 @@ async fn publish_request_variant_configured(
         };
         let introduction = protocol::decode_direct_request_introduction(&plaintext)?;
         assert_eq!(introduction["text"], "Real encrypted first contact");
+        let (after_status, after_bytes) = bob
+            .get(&client, &server.base_url, "blue.catbird.chat.getConversationState", state_query)
+            .await?;
+        anyhow::ensure!(after_status == reqwest::StatusCode::OK, "pending state after import: {after_status}");
+        let after: Value = serde_json::from_slice(&after_bytes)?;
+        assert_eq!(before["state"], after["state"], "local preview must not change server consent");
+        let after_capabilities = RequestCapabilities::derive(
+            RequestConsent::IncomingPending, RequestCrypto::Ready, true,
+        );
+        assert!(after_capabilities.can_preview, "decrypted introduction must be previewable");
+        for capabilities in [before_capabilities, after_capabilities] {
+            assert!(!capabilities.can_send && !capabilities.can_emit_receipts && !capabilities.can_administer,
+                "pending consent must gate ordinary send, receipts and administration even after preview");
+        }
     }
     let snapshot = request_database_snapshot(request_id)?;
     assert_eq!(snapshot.request_rows, 1);

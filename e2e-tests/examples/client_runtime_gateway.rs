@@ -25,7 +25,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
     time::Duration,
 };
 use uuid::Uuid;
@@ -40,6 +40,10 @@ struct Config {
     cors_origin: String,
     #[serde(default = "lifetime")]
     lifetime_seconds: u64,
+    #[serde(default)]
+    foreign_bob_authority: bool,
+    #[serde(default)]
+    withhold_first_foreign_prepare_response: bool,
 }
 fn lifetime() -> u64 {
     1800
@@ -52,6 +56,10 @@ fn validate_config(c: &Config) -> Result<()> {
     ensure!(
         (1..=3600).contains(&c.lifetime_seconds),
         "lifetime must be 1..3600 seconds"
+    );
+    ensure!(
+        !c.withhold_first_foreign_prepare_response || c.foreign_bob_authority,
+        "response loss requires foreign Bob authority"
     );
     let u = url::Url::parse(&c.cors_origin)?;
     ensure!(
@@ -90,6 +98,8 @@ struct Proxy {
     service: Mutex<Option<String>>,
     http: reqwest::Client,
     origin: String,
+    foreign_recipient_did: Option<String>,
+    withhold_first_foreign_prepare_response: AtomicBool,
 }
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -108,6 +118,16 @@ fn profile(actor: &Actor) -> Value {
         .unwrap_or("Synthetic");
     json!({"did":actor.identity.did,"handle":actor.identity.did.trim_start_matches("did:web:"),"displayName":format!("{label} request fixture"),"description":"Synthetic local request qualification account"})
 }
+fn chat_declaration(authority: &str) -> Value {
+    json!({
+        "$type": "blue.catbird.chat.declaration",
+        "allowIncoming": "all",
+        "deliveryService": authority,
+        "protocolVersion": "1",
+        "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    })
+}
+
 fn response(status: StatusCode, value: Value) -> Response {
     (status, axum::Json(value)).into_response()
 }
@@ -269,6 +289,13 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
     if !proxy.documents.lock().unwrap().contains_key(&host) {
         return error(StatusCode::BAD_REQUEST, "FixtureHostMismatch");
     }
+    // Fixture evidence records endpoint names only, never query, auth or body.
+    if path.starts_with("/xrpc/") {
+        eprintln!(
+            "fixture-xrpc-path-only {:?}",
+            if path.len() <= 256 { path.as_str() } else { "<overlong>" }
+        );
+    }
     let method = request.method().clone();
     if path == "/.well-known/did.json" && method == Method::GET {
         return response(
@@ -335,17 +362,16 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
             );
         }
         if q.get("collection").map(String::as_str) == Some("blue.catbird.chat.declaration") {
+            let authority = if proxy.foreign_recipient_did.as_deref() == Some(q["repo"].as_str()) {
+                "did:web:chat.federated-peer.org"
+            } else {
+                "did:web:chat.catbird.blue"
+            };
             return response(
                 StatusCode::OK,
                 json!({
                     "uri": format!("at://{}/blue.catbird.chat.declaration/self", q["repo"]),
-                    "value": {
-                        "$type": "blue.catbird.chat.declaration",
-                        "allowIncoming": "all",
-                        "deliveryService": "did:web:chat.catbird.blue",
-                        "protocolVersion": "1",
-                        "createdAt": "2026-09-24T00:00:00.000Z"
-                    }
+                    "value": chat_declaration(authority)
                 }),
             );
         }
@@ -657,11 +683,22 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
         )
         .await
     {
-        Ok((status, body)) => Response::builder()
-            .status(status.as_u16())
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .unwrap(),
+        Ok((status, body)) => {
+            if nsid == "blue.catbird.chat.prepareDirectRequest"
+                && status == reqwest::StatusCode::OK
+                && serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .is_some_and(|v| v["outcome"]["body"]["receipt"]["code"] == "RecipientAuthorityUnsupported")
+                && proxy.withhold_first_foreign_prepare_response.swap(false, Ordering::SeqCst)
+            {
+                return error(StatusCode::SERVICE_UNAVAILABLE, "FixtureWithheldSignedRefusal");
+            }
+            Response::builder()
+                .status(status.as_u16())
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        }
         Err(_) => error(StatusCode::BAD_GATEWAY, "FixtureUpstreamFailed"),
     }
 }
@@ -744,6 +781,16 @@ async fn main() -> Result<()> {
         json!({"id":format!("did:web:{gateway}")}),
     ));
     let mut https = HttpsDidFixture::start(HttpsDidFixture::reserve_port()?, &docs)?;
+    if config.foreign_bob_authority {
+        let directory = https.root.join("_policy").join("catbirdDeclaration");
+        std::fs::create_dir_all(&directory)?;
+        let bob = &actors[1].identity.did;
+        let encoded = url::form_urlencoded::byte_serialize(bob.as_bytes()).collect::<String>();
+        std::fs::write(
+            directory.join(encoded),
+            serde_json::to_vec(&chat_declaration("did:web:chat.federated-peer.org"))?,
+        )?;
+    }
     let tls_port = HttpsDidFixture::reserve_port()?;
     let http = reqwest::Client::builder()
         .no_proxy()
@@ -761,6 +808,8 @@ async fn main() -> Result<()> {
     }
     // Receipt document is deterministic and populated after service startup.
     let proxy = Arc::new(Proxy {
+        foreign_recipient_did: config.foreign_bob_authority.then(|| actors[1].identity.did.clone()),
+        withhold_first_foreign_prepare_response: AtomicBool::new(config.withhold_first_foreign_prepare_response),
         actors,
         documents: Mutex::new(documents),
         service: Mutex::new(None),
@@ -963,13 +1012,26 @@ mod tests {
             output_dir: PathBuf::from("/tmp").join(format!("never-created-{}", Uuid::new_v4())),
             cors_origin: "http://127.0.0.1:5173".into(),
             lifetime_seconds: 60,
+            foreign_bob_authority: false,
+            withhold_first_foreign_prepare_response: false,
         };
         assert!(validate_config(&c).is_ok());
+        let loss = Config {
+            output_dir: c.output_dir.clone(),
+            cors_origin: c.cors_origin.clone(),
+            lifetime_seconds: c.lifetime_seconds,
+            foreign_bob_authority: false,
+            withhold_first_foreign_prepare_response: true,
+        };
+        assert!(validate_config(&loss).is_err(), "never withhold a canonical recipient response");
+        assert!(validate_config(&Config { foreign_bob_authority: true, ..loss }).is_ok());
         for seconds in [0, 3601] {
             assert!(validate_config(&Config {
                 output_dir: c.output_dir.clone(),
                 cors_origin: c.cors_origin.clone(),
-                lifetime_seconds: seconds
+                lifetime_seconds: seconds,
+                foreign_bob_authority: false,
+                withhold_first_foreign_prepare_response: false,
             })
             .is_err());
         }
@@ -984,7 +1046,9 @@ mod tests {
                 ..Config {
                     output_dir: c.output_dir.clone(),
                     cors_origin: c.cors_origin.clone(),
-                    lifetime_seconds: 60
+                    lifetime_seconds: 60,
+                    foreign_bob_authority: false,
+                    withhold_first_foreign_prepare_response: false,
                 }
             })
             .is_err());
@@ -992,7 +1056,9 @@ mod tests {
         assert!(validate_config(&Config {
             output_dir: PathBuf::from("/tmp"),
             cors_origin: c.cors_origin,
-            lifetime_seconds: 60
+            lifetime_seconds: 60,
+            foreign_bob_authority: false,
+            withhold_first_foreign_prepare_response: false,
         })
         .is_err());
     }
@@ -1038,6 +1104,8 @@ mod tests {
             actors: vec![actor.clone()],
             documents: Mutex::new(BTreeMap::from([(host.clone(), json!({}))])),
             service: Mutex::new(None),
+            foreign_recipient_did: None,
+            withhold_first_foreign_prepare_response: AtomicBool::new(false),
             http: reqwest::Client::new(),
             origin: "http://127.0.0.1:5173".into(),
         });
@@ -1069,5 +1137,49 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert!(actor.records.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn foreign_bob_declaration_requires_explicit_fixture_option() {
+        let actors: Vec<_> = ["alice", "bob"].into_iter().map(|label| {
+            Arc::new(Actor {
+                identity: ServiceIdentity::new(format!("did:web:{label}.request-fixture.catbird.blue")),
+                session: "opaque".into(),
+                records: Mutex::new(BTreeMap::new()),
+                blocks: Mutex::new(BTreeMap::new()),
+                seeded: Mutex::new(None),
+            })
+        }).collect();
+        let bob = actors[1].identity.did.clone();
+        for foreign in [false, true] {
+            let proxy = Arc::new(Proxy {
+                documents: Mutex::new(actors.iter().map(|actor| (
+                    actor.identity.did.trim_start_matches("did:web:").to_owned(),
+                    json!({"id": actor.identity.did}),
+                )).collect()),
+                foreign_recipient_did: foreign.then(|| bob.clone()),
+                withhold_first_foreign_prepare_response: AtomicBool::new(false),
+                actors: actors.clone(),
+                service: Mutex::new(None),
+                http: reqwest::Client::new(),
+                origin: "http://127.0.0.1:5173".into(),
+            });
+            for actor in &actors {
+                let request = Request::builder()
+                    .uri(format!("/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.declaration&rkey=self", actor.identity.did))
+                    .header("host", actor.identity.did.trim_start_matches("did:web:"))
+                    .body(Body::empty())
+                    .unwrap();
+                let result = serve(State(proxy.clone()), request).await;
+                assert_eq!(result.status(), StatusCode::OK);
+                let bytes = to_bytes(result.into_body(), 4096).await.unwrap();
+                let record: Value = serde_json::from_slice(&bytes).unwrap();
+                let expected = if foreign && actor.identity.did == bob {
+                    "did:web:chat.federated-peer.org"
+                } else {
+                    "did:web:chat.catbird.blue"
+                };
+                assert_eq!(record["value"]["deliveryService"], expected);
+            }
+        }
     }
 }

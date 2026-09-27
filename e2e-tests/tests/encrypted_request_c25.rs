@@ -14,6 +14,9 @@
 //! - `subscribeEvents` (real WebSocket upgrade handshake over TCP): a ticket
 //!   minted under one scope is refused (`InvalidTicket`) with the other
 //!   scope's cursor, upgrades (101) with its own, and is one-use;
+//!   post-upgrade event frames are decoded and verified for correct payload,
+//!   previousCursor binding, successor cursor advancement, and nonleakage
+//!   across [1] versus [1,2] inventory scopes;
 //! - real core sync (`MLSOrchestrator::ingest_authenticated_inventory_snapshot`)
 //!   over the exact server pages, with and without one unknown inventory item
 //!   next to the valid ones. The observed behaviour is recorded as-is.
@@ -24,6 +27,10 @@
 mod encrypted_requests;
 #[path = "support/live_orchestrator.rs"]
 mod live_orchestrator;
+
+use std::collections::HashSet;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use base64::{
@@ -90,6 +97,7 @@ struct World {
     server: ShippingServerFixture,
     client: reqwest::Client,
     _https: HttpsDidFixture,
+    accepted: Mutex<HashSet<Uuid>>,
 }
 
 fn key_entry(p: &Party) -> anyhow::Result<Value> {
@@ -235,7 +243,15 @@ async fn world() -> anyhow::Result<World> {
         .map(|(i, s)| Party::new(s, &format!("c25-sender{i}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let server = ShippingServerFixture::start(&https)?;
-    let mut w = World { owner, senders, published: Vec::new(), server, client: reqwest::Client::new(), _https: https };
+    let mut w = World {
+        owner,
+        senders,
+        published: Vec::new(),
+        server,
+        client: reqwest::Client::new(),
+        _https: https,
+        accepted: Mutex::new(HashSet::new()),
+    };
 
     // The owner publishes one request-only package per sender (revision 1).
     let keys = (0..SENDERS).map(|_| key_entry(&w.owner)).collect::<anyhow::Result<Vec<_>>>()?;
@@ -267,6 +283,9 @@ async fn world() -> anyhow::Result<World> {
 async fn accept_all(w: &World) -> anyhow::Result<()> {
     let mut refused = Vec::new();
     for p in &w.published {
+        if w.accepted.lock().map_or(false, |g| g.contains(&p.request_id)) {
+            continue;
+        }
         if let Err(error) = accept_one(w, p).await {
             refused.push(format!("{}: {error:#}", p.request_id));
         }
@@ -276,6 +295,9 @@ async fn accept_all(w: &World) -> anyhow::Result<()> {
 }
 
 async fn accept_one(w: &World, p: &Published) -> anyhow::Result<()> {
+    if w.accepted.lock().map_or(false, |g| g.contains(&p.request_id)) {
+        return Ok(());
+    }
     let s = &w.senders[p.sender];
     let transition = Uuid::new_v4();
     let mut next = p.coordinates.clone();
@@ -292,6 +314,9 @@ async fn accept_one(w: &World, p: &Published) -> anyhow::Result<()> {
     }))?;
     let (status, body) = post(w, &w.owner.svc, "blue.catbird.chat.acceptConversation", &json!({"directRequest":signed})).await?;
     anyhow::ensure!(status == StatusCode::OK, "release accept {status}: {body}");
+    if let Ok(mut set) = w.accepted.lock() {
+        set.insert(p.request_id);
+    }
     Ok(())
 }
 
@@ -417,6 +442,155 @@ async fn subscribe(w: &World, cursor: &str, ticket: &str) -> anyhow::Result<(u16
         buffer.extend_from_slice(&chunk[..n]);
     }
     Ok((status, serde_json::from_slice(&buffer[head_end..head_end + length])?))
+}
+
+struct WsConnection {
+    stream: tokio::net::TcpStream,
+    unread: Vec<u8>,
+}
+
+impl WsConnection {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            if !self.unread.is_empty() {
+                let take = (buf.len() - offset).min(self.unread.len());
+                buf[offset..offset + take].copy_from_slice(&self.unread[..take]);
+                self.unread.drain(..take);
+                offset += take;
+            } else {
+                let n = self.stream.read(&mut buf[offset..]).await?;
+                anyhow::ensure!(n > 0, "WebSocket connection closed while reading frame");
+                offset += n;
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_frame(&mut self, timeout: Duration) -> anyhow::Result<Option<Value>> {
+        let read_fut = async {
+            loop {
+                let mut header = [0u8; 2];
+                self.read_exact(&mut header).await?;
+                let byte0 = header[0];
+                let byte1 = header[1];
+                let opcode = byte0 & 0x0f;
+                let masked = (byte1 & 0x80) != 0;
+                let len_indicator = (byte1 & 0x7f) as usize;
+
+                let payload_len = match len_indicator {
+                    126 => {
+                        let mut len_bytes = [0u8; 2];
+                        self.read_exact(&mut len_bytes).await?;
+                        u16::from_be_bytes(len_bytes) as usize
+                    }
+                    127 => {
+                        let mut len_bytes = [0u8; 8];
+                        self.read_exact(&mut len_bytes).await?;
+                        u64::from_be_bytes(len_bytes) as usize
+                    }
+                    len => len,
+                };
+
+                let mask_key = if masked {
+                    let mut mask = [0u8; 4];
+                    self.read_exact(&mut mask).await?;
+                    Some(mask)
+                } else {
+                    None
+                };
+
+                let mut payload = vec![0u8; payload_len];
+                self.read_exact(&mut payload).await?;
+
+                if let Some(mask) = mask_key {
+                    for (i, byte) in payload.iter_mut().enumerate() {
+                        *byte ^= mask[i % 4];
+                    }
+                }
+
+                match opcode {
+                    0x9 => {
+                        let mask = rand::random::<[u8; 4]>();
+                        let mut pong = vec![0x8a, 0x80 | (payload.len() as u8)];
+                        pong.extend_from_slice(&mask);
+                        for (i, b) in payload.iter().enumerate() {
+                            pong.push(b ^ mask[i % 4]);
+                        }
+                        let _ = self.stream.write_all(&pong).await;
+                        continue;
+                    }
+                    0xA => return Ok(json!({"pong": STANDARD.encode(payload)})),
+                    0x1 => {
+                        let text = String::from_utf8(payload)
+                            .context("WebSocket text frame was not valid UTF-8")?;
+                        let value: Value = serde_json::from_str(&text)
+                            .with_context(|| format!("WebSocket frame text was not valid JSON: {text}"))?;
+                        return Ok(value);
+                    }
+                    0x8 => {
+                        anyhow::bail!("WebSocket received close frame");
+                    }
+                    other => {
+                        anyhow::bail!("Unexpected WebSocket opcode: {other:#x}");
+                    }
+                }
+            }
+        };
+
+        match tokio::time::timeout(timeout, read_fut).await {
+            Ok(res) => res.map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn ping(&mut self) -> anyhow::Result<()> {
+        let body = rand::random::<[u8; 8]>();
+        let mask = rand::random::<[u8; 4]>();
+        let mut frame = vec![0x89, 0x80 | (body.len() as u8)];
+        frame.extend_from_slice(&mask);
+        for (i, byte) in body.iter().enumerate() {
+            frame.push(byte ^ mask[i % 4]);
+        }
+        self.stream.write_all(&frame).await?;
+        let reply = self.read_frame(Duration::from_secs(5)).await?
+            .context("stream did not process client Ping")?;
+        assert_eq!(reply["pong"], STANDARD.encode(body), "stream must echo Ping after processing backlog");
+        Ok(())
+    }
+
+    async fn close(&mut self) {
+        let mask = rand::random::<[u8; 4]>();
+        let mut close_frame = vec![0x88, 0x80];
+        close_frame.extend_from_slice(&mask);
+        let _ = self.stream.write_all(&close_frame).await;
+        let _ = self.stream.shutdown().await;
+    }
+}
+
+async fn subscribe_upgrade(w: &World, cursor: &str, ticket: &str) -> anyhow::Result<WsConnection> {
+    let authority = w.server.base_url.strip_prefix("http://").context("plain loopback fixture")?;
+    let mut stream = tokio::net::TcpStream::connect(authority).await?;
+    let request = format!(
+        "GET /xrpc/blue.catbird.chat.subscribeEvents?cursor={cursor}&ticket={ticket} HTTP/1.1\r\n\
+         Host: {authority}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {}\r\n\r\n",
+        STANDARD.encode(rand::random::<[u8; 16]>())
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk)).await??;
+        anyhow::ensure!(n > 0, "subscribeEvents closed before response head");
+        buffer.extend_from_slice(&chunk[..n]);
+        if let Some(i) = buffer.windows(4).position(|w| w == b"\r\n\r\n") { break i + 4; }
+    };
+    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+    let status: u16 = head.split_whitespace().nth(1).context("status")?.parse()?;
+    anyhow::ensure!(status == 101, "expected 101 Switching Protocols, got {status}: {head}");
+    let unread = buffer[head_end..].to_vec();
+    Ok(WsConnection { stream, unread })
 }
 
 fn snapshot(w: &World, s: &Session) -> anyhow::Result<AuthenticatedInventorySnapshot> {
@@ -560,6 +734,9 @@ async fn scenario(w: std::sync::Arc<World>) -> anyhow::Result<Vec<String>> {
     assert_ne!(t12["ticket"], t12b["ticket"], "each mint is a distinct one-use ticket");
     let (st, t1) = mint(w, &s1.id, &s1.id, Some(&["1"])).await?;
     assert_eq!(st, StatusCode::OK, "compatible [1] ticket: {t1}");
+    let (st, t1b) = mint(w, &s1.id, &s1.id, Some(&["1"])).await?;
+    assert_eq!(st, StatusCode::OK, "fresh unused [1] control ticket: {t1b}");
+    let t1b = t1b["ticket"].as_str().context("unused [1] ticket")?.to_owned();
     let (t12, t12b, t1) = (
         t12["ticket"].as_str().context("ticket")?.to_owned(),
         t12b["ticket"].as_str().context("ticket")?.to_owned(),
@@ -578,17 +755,94 @@ async fn scenario(w: std::sync::Arc<World>) -> anyhow::Result<Vec<String>> {
     assert_eq!(code, 101, "[1,2] ticket upgrades with its own cursor after the refused attempt");
     let (code, b) = subscribe(w, &s12.id, &t12).await?;
     assert_eq!((code, b["error"].as_str()), (400, Some("InvalidTicket")), "consumed ticket is one-use: {b}");
-    let (code, _) = subscribe(w, &s1.id, &t1).await?;
-    assert_eq!(code, 101, "[1] ticket upgrades with its own cursor");
-    let (code, _) = subscribe(w, &s12.id, &t12b).await?;
-    assert_eq!(code, 101, "second compatible [1,2] ticket upgrades");
-    println!("C25 subscribeEvents: foreign-scope cursors refused, own cursors upgraded (101), replay refused");
+    // Upgrade and keep live subscriptions open across both scopes:
+    // ws1 under inventory scope [1], ws12 under inventory scope [1,2].
+    let mut ws1 = subscribe_upgrade(w, &s1.id, &t1).await?;
+    println!("C25 subscribeEvents: [1] ticket upgrades (101) with its own cursor and establishes stream");
+    let mut ws12 = subscribe_upgrade(w, &s12.id, &t12b).await?;
+    println!("C25 subscribeEvents: second compatible [1,2] ticket upgrades (101) and establishes stream");
+    // A Pong is emitted only by the active server stream loop after its replay
+    // and scope-filtering pass, unlike the HTTP upgrade response.
+    ws1.ping().await?;
+    ws12.ping().await?;
+
+    // Trigger a new signed real-server event after subscription: owner accepts published request 0.
+    accept_one(w, &w.published[0]).await?;
+    println!("C25 accepted published request 0 to produce live conversationChangedEvent");
+
+    // Read and decode the scoped event frame from ws12 ([1, 2] scope).
+    let frame12 = ws12
+        .read_frame(Duration::from_secs(5))
+        .await?
+        .context("timed out waiting for scoped event frame on ws12 ([1,2] scope)")?;
+    println!("C25 received scoped event frame on ws12: {frame12}");
+
+    assert_eq!(
+        frame12["$type"], "blue.catbird.chat.defs#eventEnvelope",
+        "WS frame must be a typed event envelope"
+    );
+    assert_eq!(
+        frame12["previousCursor"].as_str(),
+        Some(s12.id.as_str()),
+        "previousCursor must match initial session cursor"
+    );
+    let successor = frame12["cursor"]
+        .as_str()
+        .context("event envelope must carry a successor cursor")?;
+    assert_ne!(
+        successor, s12.id,
+        "successor cursor must advance beyond initial session cursor"
+    );
+    assert_eq!(
+        frame12["payload"]["$type"], "blue.catbird.chat.defs#conversationChangedEvent",
+        "event payload must be conversationChangedEvent"
+    );
+    assert_eq!(
+        frame12["payload"]["conversationId"],
+        w.published[0].conversation_id.to_string(),
+        "event payload conversationId must match accepted request"
+    );
+    // Two post-event round-trips force the [1] stream through at least one
+    // durable-event reconciliation pass after the v2 event was committed.
+    ws1.ping().await?;
+    ws1.ping().await?;
+
+    // Verify nonleakage: ws1 ([1] scope) MUST NOT receive this v2 event frame.
+    let frame1 = ws1
+        .read_frame(Duration::from_millis(800))
+        .await?;
+    assert!(
+        frame1.is_none(),
+        "scope [1] subscriber must not receive scope [1,2] event frame: {frame1:?}"
+    );
+    println!("C25 nonleakage verified: ws1 ([1] scope) received no leaked v2 events");
+
+    // The event cursor is bound to the [1,2] stream; a fresh, unconsumed [1]
+    // ticket cannot upgrade on it, but remains valid for its own snapshot.
+    let (code, b) = subscribe(w, successor, &t1b).await?;
+    assert_eq!((code, b["error"].as_str()), (400, Some("InvalidTicket")),
+        "foreign successor cursor must not consume [1] ticket: {b}");
+    let mut own_scope = subscribe_upgrade(w, &s1.id, &t1b).await?;
+    own_scope.ping().await?;
+    own_scope.close().await;
+
+    ws12.close().await;
+    ws1.close().await;
+    println!("C25 subscribeEvents: foreign-scope cursors refused, own cursors upgraded (101), replay refused, frame decoded, nonleakage proven");
 
     // 5. Real core sync over the exact server pages (single page per domain).
     //    Contract (Main decision): an unknown item fails the whole snapshot
     //    closed with typed InvalidInput, applies nothing, leaves existing local
     //    state byte-unchanged, and the next clean snapshot applies everything.
     let exact = scoped_session(w, 100, &["1", "2"]).await?;
+    // After the event, a new same-scope inventory session is the supported
+    // continuation authority; ticket minting only accepts its snapshot cursor.
+    let (st, continued) = mint(w, &exact.id, &exact.id, Some(&["1", "2"])).await?;
+    assert_eq!(st, StatusCode::OK, "refreshed compatible [1,2] ticket: {continued}");
+    let mut continuation = subscribe_upgrade(w, &exact.id,
+        continued["ticket"].as_str().context("continuation ticket")?).await?;
+    continuation.ping().await?;
+    continuation.close().await;
     let clean = snapshot(w, &exact)?;
     let mut poisoned = clean.clone();
     let mut page: Value = serde_json::from_slice(&poisoned.conversation_pages[0])?;

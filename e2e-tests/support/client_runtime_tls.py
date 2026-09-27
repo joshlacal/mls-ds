@@ -118,6 +118,11 @@ def main():
             except (OSError, ValueError, KeyError):
                 self.send_error(400)
                 return
+            trace_path = os.getenv("REQUEST_TLS_TRACE")
+            def trace(reason):
+                if trace_path:
+                    with open(trace_path, "a", encoding="utf-8") as log:
+                        log.write(f"{time.monotonic():.3f} ws {reason}\n")
             try:
                 upstream = socket.create_connection(("127.0.0.1", config["port"]), timeout=5)
                 # The query is copied byte-for-byte; the shipping router alone
@@ -133,12 +138,13 @@ def main():
                     for source in ready:
                         chunk = source.recv(65536)
                         if not chunk:
+                            trace("client-eof" if source is self.connection else "upstream-eof")
                             return
                         target = upstream if source is self.connection else self.connection
                         target.sendall(chunk)
                         last_activity = time.monotonic()
-            except (OSError, ValueError):
-                pass  # No ticket, headers, credentials, or payload in logs.
+            except (OSError, ValueError) as error:
+                trace(f"transport-error {type(error).__name__} errno={getattr(error, 'errno', None)}")
             finally:
                 self.close_connection = True
                 if upstream:

@@ -24,9 +24,10 @@ use catbird_mls::{
             DirectRequestWelcomeInput,
         },
         direct_request_journal::DirectRequestJournal,
+        direct_requests::DirectRequestIntent,
         MlsCryptoContext,
     },
-    KeychainAccess, MLSContext, MLSError,
+    DirectRequestInput, KeychainAccess, MLSContext, MLSError,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -129,6 +130,7 @@ pub struct StagedRequest {
     pub bob_engine: MlsEngine,
     pub server: ShippingServerFixture,
     pub client: reqwest::Client,
+    pub draft_id: String,
     pub request_id: Uuid,
     pub conversation_id: Uuid,
     pub first_message_id: Uuid,
@@ -307,9 +309,10 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
         "actorKeyId":alice_key_id,"recipientDid":bob.did,
         "preparationDigest":preparation["preparationDigest"]
     });
+    let draft_id = Uuid::new_v4().to_string();
     let journal_record = sender
         .prepare_direct_request_bootstrap(&DirectRequestBootstrapInput {
-            draft_id: Uuid::new_v4().to_string(),
+            draft_id: draft_id.clone(),
             context_json: serde_json::to_vec(&context)?,
             group_id: rand::random::<[u8; 32]>().to_vec(),
             generation: 0,
@@ -397,6 +400,31 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
     sender
         .persist_direct_request_publish(&request_id.to_string(), &exact_publication)
         .map_err(|error| anyhow::anyhow!("persist publication: {error}"))?;
+    let intent = DirectRequestIntent {
+        input: DirectRequestInput {
+            draft_id: draft_id.clone(),
+            recipient_did: bob.did.clone(),
+            text: "Real encrypted first contact".into(),
+            invitation: None,
+        },
+        actor_did: alice.did.clone(),
+        actor_device_id: alice.device_id.to_string(),
+        actor_public_key: alice_public.clone(),
+        prepare_wrapper: serde_json::to_vec(&prepare)?,
+        legacy_origin_snapshot: None,
+        trusted_authority_document: server.receipt_document.clone(),
+        preparation_response: Some(serde_json::to_vec(&preparation)?),
+        cancel_wrapper: None,
+        publication_wrapper: Some(serde_json::to_vec(&publication)?),
+        terminal_response: None,
+        publication_attempted: true,
+        cancellation_requested: false,
+        projection_completed: false,
+        previous_attempts: Vec::new(),
+    };
+    sender
+        .compare_exchange_direct_request_intent(&draft_id, None, &intent.encode()?)
+        .map_err(|error| anyhow::anyhow!("persist intent: {error}"))?;
     Ok(StagedRequest {
         alice,
         bob,
@@ -405,6 +433,7 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
         bob_engine,
         server,
         client,
+        draft_id,
         request_id,
         conversation_id,
         first_message_id,

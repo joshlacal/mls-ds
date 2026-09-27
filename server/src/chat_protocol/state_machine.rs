@@ -17751,8 +17751,15 @@ fn validate_transition_evidence(evidence: &TransitionEvidence) -> bool {
                 && !authority.canonical_projection.is_empty()
                 && !authority.transcript_bytes.is_empty()
                 && (authority.signed_at <= evidence.received_at
+                    || (authority.kind == SignedMutationKind::DirectRequestPublication
+                        && evidence
+                            .received_at
+                            .checked_add_millis(60_000)
+                            .is_ok_and(|deadline| authority.signed_at <= deadline))
                     || (authority.kind == SignedMutationKind::DirectRequestAcceptance
-                        && evidence.received_at.checked_add_millis(30_000)
+                        && evidence
+                            .received_at
+                            .checked_add_millis(30_000)
                             .is_ok_and(|deadline| authority.signed_at <= deadline)))
         })
 }
@@ -20130,6 +20137,7 @@ mod direct_request_history_tests {
         kind: &str,
         key: &SigningKey,
         seq: u64,
+        expected_valid: bool,
     ) -> (TransitionEvidence, Vec<u8>, Vec<u8>) {
         use super::super::direct_request_transcript::{
             direct_request_signing_bytes, DirectRequestKind,
@@ -20168,7 +20176,7 @@ mod direct_request_history_tests {
             .unwrap()
             .into_transition()
             .unwrap();
-        assert!(validate_transition_evidence(&evidence));
+        assert_eq!(validate_transition_evidence(&evidence), expected_valid);
         let mut wire = entry.clone();
         wire.as_object_mut().unwrap().remove("$type");
         let wire = serde_json::to_vec(&wire).unwrap();
@@ -20181,11 +20189,30 @@ mod direct_request_history_tests {
         assert_eq!(evidence.outer_entry_fingerprint, expected);
         (evidence, row, signed)
     }
+
+    #[test]
+    fn future_signed_direct_request_publication_respects_admission_skew() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        for (signed_at, expected_valid) in [
+            ("2026-09-19T12:00:45.000Z", true),
+            ("2026-09-19T12:01:00.000Z", true),
+            ("2026-09-19T12:01:00.001Z", false),
+        ] {
+            let mut body = publication_body(&key);
+            body["signedAt"] = json!(signed_at);
+            let (evidence, _, _) = hydrate(body, "directRequestEntry", &key, 1, expected_valid);
+            if expected_valid {
+                let mut tampered = evidence.clone();
+                tampered.durable_row_digest = [0; 32];
+                assert!(!validate_transition_evidence(&tampered));
+            }
+        }
+    }
     #[test]
     fn direct_request_history_binds_metadata_pending_leaves_and_recipient_acceptance() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let body = publication_body(&key);
-        let (publication, row, signed) = hydrate(body.clone(), "directRequestEntry", &key, 1);
+        let (publication, row, signed) = hydrate(body.clone(), "directRequestEntry", &key, 1, true);
         let Some(TransitionBodyBinding::DirectRequestPublication {
             next,
             recipient,
@@ -20337,7 +20364,7 @@ mod direct_request_history_tests {
         accept["next"] = body["next"].clone();
         accept["next"]["stateVersion"] = json!(2);
         accept["invitationProvenance"] = json!({"invitationTransitionId":body["requestId"],"invitedByDid":body["actorDid"],"invitedByDeviceId":body["actorDeviceId"]});
-        let (accepted, _, _) = hydrate(accept, "directRequestAcceptanceEntry", &key, 2);
+        let (accepted, _, _) = hydrate(accept, "directRequestAcceptanceEntry", &key, 2, true);
         state.coordinate = coordinate_only_successor(next).unwrap();
         state.producer = accepted.clone();
         participant.status = ParticipantStatus::Active;

@@ -24,6 +24,12 @@ printf '%s' '{"output_dir":"/tmp/catbird-client-gateway-run-001","cors_origin":"
 
 The database must already have the reviewed baseline and additive migrations. This launcher uses the exact guard and does not migrate another database. All listeners bind `127.0.0.1`. Startup writes a new mode-0700 directory and mode-0600 files. Stdout contains only `{"manifest":"/absolute/path/manifest.json"}` after TLS/session checks pass. Never print, copy into reports, or commit `sessions.json`.
 
+For an isolated C33 recipient-authority refusal, add `"foreign_bob_authority": true` to the gateway stdin configuration. The default is `false`; synthetic Bob's public `blue.catbird.chat.declaration/self` **and** the server HTTPS DID/PDS policy fixture name `did:web:chat.federated-peer.org`. Enroll Bob and publish an available direct-request key package first, or the real server will instead reject the missing keys as `RecipientKeysUnavailable`. This fixture option does not change production routing or any other account's declaration.
+
+To exercise first-response loss in the same local foreign-authority path, also set `"withhold_first_foreign_prepare_response": true`. The gateway forwards the first successful, typed `RecipientAuthorityUnsupported` prepare to the actual service, then returns a synthetic 503 **only** for that first response; exact retry receives the signed service replay. This flag is rejected unless `foreign_bob_authority` is true. It changes neither the signed request nor the service's database state, and must not be used as evidence of a production transport fault.
+
+For installed-client wire evidence, gateway stderr prints `fixture-xrpc-path-only` and a quoted XRPC path (capped at 256 bytes); it never logs query strings, authentication headers, or request bodies. Keep only these lines in a bounded case receipt, and remove the synthetic fixture afterward.
+
 ## Public manifest and protected sessions
 
 `manifest.json` contains:
