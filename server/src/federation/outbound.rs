@@ -6,6 +6,7 @@ use tracing::{debug, warn};
 
 use super::ack::DeliveryAck;
 use super::receipt::SequencerReceipt;
+use super::resolver::{get_or_build_pinned_client, resolve_and_pin_destination, validate_endpoint_url};
 use crate::util::outbound_body::{
     collect_bounded, decode_json_bounded, summarize_error_body, OutboundBodyError,
     ResponseBodyBudget, SanitizedErrorSummary, ERROR_RESPONSE_MAX_BYTES,
@@ -65,6 +66,7 @@ impl OutboundClient {
             .pool_max_idle_per_host(10)
             .user_agent("catbird-mls-ds/1.0");
 
+        #[cfg(any(test, feature = "test-support"))]
         if let (Ok(hosts), Ok(port_str), Ok(ca_path)) = (
             std::env::var("REQUEST_FIXTURE_DID_HOSTS"),
             std::env::var("REQUEST_FIXTURE_DID_PORT"),
@@ -92,41 +94,41 @@ impl OutboundClient {
         }
     }
 
-    async fn http_for_endpoint(&self, endpoint: &str) -> Result<Client, OutboundError> {
+    async fn pinned_client_for_endpoint(
+        &self,
+        endpoint: &str,
+    ) -> Result<(reqwest::Client, url::Url), OutboundError> {
         #[cfg(test)]
         if endpoint.starts_with("http://127.0.0.1:") {
-            return Ok(self.http.clone());
-        }
-        let parsed = super::resolver::validate_endpoint_url(endpoint).map_err(|error| {
-            OutboundError::ResolutionFailed {
-                endpoint: REMOTE_DS.into(),
-                reason: error.to_string(),
-                retryable: false,
-            }
-        })?;
-        let (host, addrs) = super::resolver::resolve_and_pin_destination(&parsed)
-            .await
-            .map_err(|error| OutboundError::ResolutionFailed {
-                endpoint: REMOTE_DS.into(),
-                reason: error.to_string(),
-                retryable: false,
+            let parsed = url::Url::parse(endpoint).map_err(|e| OutboundError::ConnectionFailed {
+                endpoint: REMOTE_DS.to_string(),
+                reason: format!("endpoint URL validation failed: {e}"),
             })?;
-        if addrs.is_empty() {
-            return Ok(self.http.clone());
+            return Ok((self.http.clone(), parsed));
         }
-        Client::builder()
-            .no_proxy()
-            .connect_timeout(self.connect_timeout)
-            .timeout(self.request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(&host, &addrs)
-            .build()
-            .map_err(|error| OutboundError::RequestFailed {
-                endpoint: REMOTE_DS.into(),
-                reason: format!("Cannot connect to validated DS address: {error}"),
-            })
+        let parsed = validate_endpoint_url(endpoint).map_err(|e| OutboundError::ConnectionFailed {
+            endpoint: REMOTE_DS.to_string(),
+            reason: format!("endpoint URL validation failed: {e}"),
+        })?;
+        let (host, addrs) = resolve_and_pin_destination(&parsed)
+            .await
+            .map_err(|e| OutboundError::ConnectionFailed {
+                endpoint: REMOTE_DS.to_string(),
+                reason: format!("destination address validation failed: {e}"),
+            })?;
+        let client = get_or_build_pinned_client(
+            &host,
+            &addrs,
+            self.connect_timeout,
+            self.request_timeout,
+        )
+        .await
+        .map_err(|e| OutboundError::ConnectionFailed {
+            endpoint: REMOTE_DS.to_string(),
+            reason: format!("client initialization failed: {e}"),
+        })?;
+        Ok((client, parsed))
     }
-
     /// Make an authenticated XRPC procedure call to a remote DS.
     pub async fn call_procedure(
         &self,
@@ -135,12 +137,12 @@ impl OutboundClient {
         auth_token: &str,
         body: &impl Serialize,
     ) -> Result<DsResponse, OutboundError> {
-        let url = format!("{}/xrpc/{}", endpoint.trim_end_matches('/'), method);
+        let (client, parsed) = self.pinned_client_for_endpoint(endpoint).await?;
+        let url = format!("{}/xrpc/{}", parsed.as_str().trim_end_matches('/'), method);
         debug!(method, "Outbound DS call");
         let deadline = self.deadline(method)?;
 
-        let send = self
-            .http_for_endpoint(endpoint).await?
+        let send = client
             .post(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .header("Content-Type", "application/json")
@@ -162,12 +164,12 @@ impl OutboundClient {
         auth_token: &str,
         params: &[(&str, &str)],
     ) -> Result<DsResponse, OutboundError> {
-        let url = format!("{}/xrpc/{}", endpoint.trim_end_matches('/'), method);
+        let (client, parsed) = self.pinned_client_for_endpoint(endpoint).await?;
+        let url = format!("{}/xrpc/{}", parsed.as_str().trim_end_matches('/'), method);
         debug!(method, "Outbound DS query");
         let deadline = self.deadline(method)?;
 
-        let send = self
-            .http_for_endpoint(endpoint).await?
+        let send = client
             .get(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .query(params)
@@ -188,12 +190,12 @@ impl OutboundClient {
         auth_token: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, OutboundError> {
-        let url = format!("{}/xrpc/{}", endpoint.trim_end_matches('/'), method);
+        let (client, parsed) = self.pinned_client_for_endpoint(endpoint).await?;
+        let url = format!("{}/xrpc/{}", parsed.as_str().trim_end_matches('/'), method);
         debug!(method, "Outbound DS query (raw json)");
         let deadline = self.deadline(method)?;
 
-        let send = self
-            .http_for_endpoint(endpoint).await?
+        let send = client
             .get(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .query(params)
@@ -204,6 +206,11 @@ impl OutboundClient {
             .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
 
         let status = resp.status();
+        if status.is_redirection() {
+            return Err(OutboundError::InvalidResponse {
+                reason: format!("Redirect rejected from remote DS: HTTP {status}"),
+            });
+        }
         if status.is_success() {
             decode_json_bounded(
                 resp,
@@ -230,12 +237,12 @@ impl OutboundClient {
         auth_token: &str,
         body: &impl Serialize,
     ) -> Result<serde_json::Value, OutboundError> {
-        let url = format!("{}/xrpc/{}", endpoint.trim_end_matches('/'), method);
+        let (client, parsed) = self.pinned_client_for_endpoint(endpoint).await?;
+        let url = format!("{}/xrpc/{}", parsed.as_str().trim_end_matches('/'), method);
         debug!(method, "Outbound DS procedure (raw json)");
         let deadline = self.deadline(method)?;
 
-        let send = self
-            .http_for_endpoint(endpoint).await?
+        let send = client
             .post(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .header("Content-Type", "application/json")
@@ -247,6 +254,11 @@ impl OutboundClient {
             .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
 
         let status = resp.status();
+        if status.is_redirection() {
+            return Err(OutboundError::InvalidResponse {
+                reason: format!("Redirect rejected from remote DS: HTTP {status}"),
+            });
+        }
         if status.is_success() {
             decode_json_bounded(
                 resp,
@@ -324,6 +336,11 @@ async fn parse_response(
     deadline: Instant,
 ) -> Result<DsResponse, OutboundError> {
     let status = resp.status();
+    if status.is_redirection() {
+        return Err(OutboundError::InvalidResponse {
+            reason: format!("Redirect rejected from remote DS: HTTP {status}"),
+        });
+    }
     if status.is_success() {
         decode_json_bounded(
             resp,
@@ -928,7 +945,120 @@ mod tests {
             .call_procedure_json(&redirect, TEST_METHOD, "secret", &json!({}))
             .await
             .unwrap_err();
-        assert!(matches!(failure, OutboundError::RemoteError { status: 307, .. }));
+        assert!(
+            matches!(failure, OutboundError::InvalidResponse { ref reason } if reason.contains("307"))
+                || matches!(failure, OutboundError::RemoteError { status: 307, .. })
+        );
         assert_eq!(sink_hits.load(Ordering::SeqCst), 0, "redirected request reached private sink");
+    }
+    #[tokio::test]
+    async fn procedure_rejects_307_redirect_to_private_target_without_following() {
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::TEMPORARY_REDIRECT)
+                    .header("Location", "http://10.0.0.1:8080/sensitive-admin")
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_ds(router).await;
+        let client = OutboundClient::new(1, 1);
+
+        let error = client
+            .call_procedure(&endpoint, TEST_METHOD, "token", &json!({ "private_data": "secret" }))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OutboundError::InvalidResponse { ref reason }
+                if reason.contains("Redirect rejected") && reason.contains("307")
+        ));
+        assert!(!error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn query_rejects_308_redirect_to_private_target_without_following() {
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            get(|| async {
+                Response::builder()
+                    .status(StatusCode::PERMANENT_REDIRECT)
+                    .header("Location", "http://169.254.169.254/latest/meta-data/")
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_ds(router).await;
+        let client = OutboundClient::new(1, 1);
+
+        let error = client
+            .call_query(&endpoint, TEST_METHOD, "token", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OutboundError::InvalidResponse { ref reason }
+                if reason.contains("Redirect rejected") && reason.contains("308")
+        ));
+        assert!(!error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn raw_json_query_rejects_307_redirect_to_private_target() {
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            get(|| async {
+                Response::builder()
+                    .status(StatusCode::TEMPORARY_REDIRECT)
+                    .header("Location", "http://192.168.1.1:8080/admin")
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_ds(router).await;
+        let client = OutboundClient::new(1, 1);
+
+        let error = client
+            .call_query_json(&endpoint, TEST_METHOD, "token", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OutboundError::InvalidResponse { ref reason }
+                if reason.contains("Redirect rejected") && reason.contains("307")
+        ));
+        assert!(!error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn outbound_fails_closed_on_private_ip_target_without_connecting() {
+        let client = OutboundClient::new(1, 1);
+        for private_target in [
+            "https://10.0.0.1:8443",
+            "https://172.16.0.1:8443",
+            "https://192.168.1.1:8443",
+            "https://169.254.169.254:8443",
+            "https://100.64.0.1:8443",
+            "https://[fc00::1]:8443",
+            "https://[::ffff:10.0.0.1]:8443",
+        ] {
+            let error = client
+                .call_procedure(private_target, TEST_METHOD, "token", &json!({}))
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(error, OutboundError::ConnectionFailed { .. }),
+                "expected ConnectionFailed for {private_target}, got {error:?}"
+            );
+        }
     }
 }

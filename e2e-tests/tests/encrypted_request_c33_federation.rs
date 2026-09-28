@@ -2223,7 +2223,6 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
             (false, bob_req_id, bob_convo_id, bob_first_msg_id, bob_prep_bytes, bob_prepare_body)
         };
 
-
     // -------------------------------------------------------------------------
     // Phase 2: Winner First Send with Lost-Peer and Lost-Client-Response Retry
     // -------------------------------------------------------------------------

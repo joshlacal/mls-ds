@@ -724,7 +724,7 @@ impl OutboundQueue {
                 let reason = resp.reason_code.as_deref()
                     .or(resp.message.as_deref())
                     .unwrap_or("rejected");
-                if is_predecessor_error(&reason)
+                if is_predecessor_error(reason)
                     || resp.error.as_deref().map(is_predecessor_error).unwrap_or(false)
                 {
                     let delay = backoff_delay(item.retry_count);
@@ -736,7 +736,7 @@ impl OutboundQueue {
                         "Predecessor missing for queued item; scheduling retry without exhausting"
                     );
                     let _ = self
-                        .schedule_retry(&item.id, item.retry_count, &reason, delay)
+                        .schedule_retry(&item.id, item.retry_count, reason, delay)
                         .await;
                 } else {
                     let rejection_category = classify_remote_rejection_category(
@@ -751,7 +751,7 @@ impl OutboundQueue {
                         rejection_category,
                         "Remote DS rejected delivery"
                     );
-                    let _ = self.mark_failed(&item.id, &reason).await;
+                    let _ = self.mark_failed(&item.id, reason).await;
                 }
             }
             Err(e) if is_outbound_predecessor_error(&e) => {
@@ -764,7 +764,6 @@ impl OutboundQueue {
                     queue_id = %item.id,
                     retry = item.retry_count,
                     next_retry_secs = delay.as_secs(),
-                    reason = %reason,
                     error = %e,
                     "Predecessor missing on remote DS; scheduling retry without exhausting"
                 );
@@ -803,11 +802,18 @@ impl OutboundQueue {
         let canonical_target_ds_did = canonical_did(&item.target_ds_did).to_string();
 
         if is_c33_method(&item.method) {
-            let endpoint_info = self
+            let endpoint_info = match self
                 .resolver
                 .resolve_authority_ds_endpoint(&canonical_target_ds_did)
                 .await
-                .map_err(|error| classify_resolution_error(&canonical_target_ds_did, error))?;
+            {
+                Ok(ep) => ep,
+                Err(_) => self
+                    .resolver
+                    .resolve_authoritative_ds(&canonical_target_ds_did)
+                    .await
+                    .map_err(|error| classify_resolution_error(&canonical_target_ds_did, error))?,
+            };
 
             if canonical_did(&endpoint_info.did) != canonical_target_ds_did {
                 return Err(OutboundError::ResolutionFailed {
@@ -824,7 +830,6 @@ impl OutboundQueue {
                 .validate_endpoint_candidate(&endpoint_info.endpoint, &canonical_target_ds_did)
                 .await;
         }
-
         let cached_endpoint = sqlx::query_scalar::<_, String>(
             "SELECT endpoint FROM ds_endpoints WHERE did = $1 AND expires_at > NOW()",
         )
