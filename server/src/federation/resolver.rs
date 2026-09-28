@@ -1353,7 +1353,11 @@ pub(crate) async fn resolve_and_pin_destination(
         .unwrap_or(if url.scheme() == "http" { 80 } else { 443 });
     let is_debug_fixture = is_explicit_debug_fixture(host, port, url.scheme() == "http");
 
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+    if let Some(ip) = match url.host() {
+        Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
+        _ => None,
+    } {
         if is_private_ip(&ip) && !is_debug_fixture {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
@@ -1361,7 +1365,7 @@ pub(crate) async fn resolve_and_pin_destination(
             });
         }
         let addr = std::net::SocketAddr::new(ip, port);
-        return Ok((host.to_string(), vec![addr]));
+        return Ok((ip.to_string(), vec![addr]));
     }
 
     #[cfg(any(test, feature = "test-support"))]
