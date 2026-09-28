@@ -2669,3 +2669,40 @@ pub(super) async fn verify_direct_request_push_policy<T: PublicTransport>(
         }
     }
 }
+
+/// Reuse the production live AppView traffic graph for a coordinator-verified
+/// federated sender while its signed mutation and conversation head are locked.
+pub(crate) async fn verify_federated_send_policy<T: PublicTransport>(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    peer: &str,
+    authenticated_request_digest: [u8; 32],
+    locked_head_digest: [u8; 32],
+    authority: &RelationshipAuthority<T>,
+) -> Result<(), RelationshipConsumptionError> {
+    let roster = vec![actor.to_owned(), peer.to_owned()];
+    let scope = plan_traffic_graph(actor, &roster)
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?
+        .scope;
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    let revision = allocate_projection_revision(tx)
+        .await
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    let clock = anchor_projection_clock(&mut **tx)
+        .await
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    let projection = authority.collect_traffic_projection(
+        &clock, revision, actor.to_owned(), roster,
+    ).await.map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    let observed_at = observe_post_lock_time(tx)
+        .await
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    let decision = TrustedRelationshipDecisionInstant::from_locked_traffic_scope(
+        transaction_id, scope, authenticated_request_digest, locked_head_digest, observed_at,
+    ).ok_or(RelationshipConsumptionError::InvalidWitness)?;
+    consume_traffic_projection(&projection, authority, &decision)
+        .map_err(|_| RelationshipConsumptionError::PolicyDenied)
+}

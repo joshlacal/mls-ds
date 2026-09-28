@@ -259,6 +259,54 @@ pub async fn setup() -> PgPool {
         MigrationType::Simple,
         Cow::Borrowed(capacity_abuse_fix),
     ));
+    let federated_transport_inbox =
+        include_str!("../../migrations/20260919000022_federated_transport_inbox.sql");
+    assert_eq!(
+        format!("{:x}", sha2::Sha384::digest(federated_transport_inbox.as_bytes())),
+        "392d0137456574b46aeb05d71fdd6a9084bc364c102fa206f64a48c26441355fad52b3568386b5574aa8bedc15882e5a"
+    );
+    migrations.push(Migration::new(
+        20260919000022,
+        Cow::Borrowed("federated transport inbox"),
+        MigrationType::Simple,
+        Cow::Borrowed(federated_transport_inbox),
+    ));
+    let lease_release =
+        include_str!("../../migrations/20260919000023_expired_federated_lease_release.sql");
+    assert_eq!(
+        format!("{:x}", sha2::Sha384::digest(lease_release.as_bytes())),
+        "f8b78fd5368f0d9521ec0498f14aaf7f928be8ca4cef35c7e794aac7ed72970a7337e348675ab9eaf873351df3c5b0c5"
+    );
+    migrations.push(Migration::new(
+        20260919000023,
+        Cow::Borrowed("expired federated lease release"),
+        MigrationType::Simple,
+        Cow::Borrowed(lease_release),
+    ));
+    let coordinator_hardening =
+        include_str!("../../migrations/20260919000024_c33_coordinator_hardening.sql");
+    assert_eq!(
+        format!("{:x}", sha2::Sha384::digest(coordinator_hardening.as_bytes())),
+        "ebc8d84f7b7ad0dd3005fb268956f52a4b9c8bea8134ae5fdeee94fda232e222d816dbbbf16a45d7420f3a5099a7c5e7"
+    );
+    migrations.push(Migration::new(
+        20260919000024,
+        Cow::Borrowed("C33 coordinator hardening"),
+        MigrationType::Simple,
+        Cow::Borrowed(coordinator_hardening),
+    ));
+    let federated_conversation_items =
+        include_str!("../../migrations/20260919000025_federated_inventory_conversation_items.sql");
+    assert_eq!(
+        format!("{:x}", sha2::Sha384::digest(federated_conversation_items.as_bytes())),
+        "b0b0b5dd997f6c5594a6f6c4520d8b6e80a13d9355c29254ee911616a7bb49f81ffa18fdea9edb6d9a5c40bd32445ee8"
+    );
+    migrations.push(Migration::new(
+        20260919000025,
+        Cow::Borrowed("federated inventory conversation items"),
+        MigrationType::Simple,
+        Cow::Borrowed(federated_conversation_items),
+    ));
     let migrator = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,

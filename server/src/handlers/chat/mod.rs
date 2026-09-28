@@ -311,6 +311,11 @@ where
                 .layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
+            "/xrpc/blue.catbird.mlsDS.releaseRecipientBootstrap",
+            post(crate::handlers::ds::direct_requests::release_recipient_bootstrap)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
             "/xrpc/blue.catbird.mlsDS.prepareDirectRequest",
             post(crate::handlers::ds::direct_requests::prepare_direct_request)
                 .layer(DefaultBodyLimit::max(65_536)),
@@ -348,7 +353,7 @@ where
         .route(
             "/xrpc/blue.catbird.mlsDS.getDirectRequestOutcome",
             get(crate::handlers::ds::direct_requests::get_direct_request_outcome),
-        )
+        );
     router
 }
 fn xrpc_path(endpoint: ChatEndpoint) -> String {

@@ -369,8 +369,14 @@ async fn select_devices(
            AND g.protocol_version='2' AND g.profile='encryptedIntroduction1' AND g.expires_at >= $4
            AND p.usage_scope='direct-request' AND p.status='available' AND p.not_before < $5 AND p.not_after >= $4
            AND NOT EXISTS(SELECT 1 FROM chat.direct_request_selected_devices s WHERE s.key_package_ref=p.key_package_ref)
+           AND NOT EXISTS(SELECT 1 FROM chat.direct_request_remote_leases l WHERE l.key_package_ref=p.key_package_ref AND l.status IN ('active','expired'))
+           AND (
+               p.owner_did <> $2
+               OR NOT EXISTS (SELECT 1 FROM chat.direct_request_reserved_remote_packages r WHERE r.request_id = $6)
+               OR EXISTS (SELECT 1 FROM chat.direct_request_reserved_remote_packages r WHERE r.request_id = $6 AND r.key_package_ref = p.key_package_ref AND r.owner_device_id = p.owner_device_id)
+           )
          ORDER BY p.owner_did,p.owner_device_id,p.created_at,p.key_package_ref
-    "#).bind(&lock.identity.actor_did).bind(&lock.identity.recipient_did).bind(lock.identity.actor_device_id).bind(horizon).bind(now)
+    "#).bind(&lock.identity.actor_did).bind(&lock.identity.recipient_did).bind(lock.identity.actor_device_id).bind(horizon).bind(now).bind(lock.identity.request_id)
         .fetch_all(&mut **tx).await?;
     if !rows
         .iter()
@@ -443,6 +449,22 @@ async fn reserve_preparation(
             .bind(i.request_id).bind(&device.owner_did).bind(device.owner_device_id).bind(&device.owner_key_id).bind(device.auth_generation).bind(device.grant_id)
             .bind(&device.grant_digest).bind(device.capability_revision).bind(&device.key_package_ref).execute(&mut **tx).await?;
     }
+    // Mark unselected remote staged packages unusable locally so they are never mistakenly reused
+    sqlx::query(
+        "UPDATE chat.key_packages SET status = 'expired', terminal_at = clock_timestamp() \
+         WHERE status = 'available' AND usage_scope = 'direct-request' \
+           AND key_package_ref IN ( \
+               SELECT r.key_package_ref FROM chat.direct_request_reserved_remote_packages r \
+               WHERE r.request_id = $1 \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM chat.direct_request_selected_devices s \
+                     WHERE s.request_id = $1 AND s.key_package_ref = r.key_package_ref \
+                 ) \
+           )"
+    )
+    .bind(i.request_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(signed_response.to_vec())
 }
 

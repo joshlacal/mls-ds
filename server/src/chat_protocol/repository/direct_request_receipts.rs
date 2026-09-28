@@ -1,8 +1,8 @@
 // Dedicated protocol-two receipt authority. Never signs with service-auth or
 // cursor keys, never trusts a public key supplied by a receipt.
 use super::super::direct_request_transcript::{
-    direct_request_preparation_signing_bytes, direct_request_receipt_key_id_for_authority,
-    direct_request_signing_bytes, DirectRequestKind,
+    direct_request_preparation_signing_bytes, direct_request_receipt_key_id,
+    direct_request_receipt_key_id_for_authority, direct_request_signing_bytes, DirectRequestKind,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey},
@@ -54,9 +54,6 @@ impl DirectRequestReceiptSigner {
         let doc_id = document["id"]
             .as_str()
             .ok_or("missing receipt authority DID in document")?;
-        if !crate::chat_protocol::is_bare_did(doc_id) {
-            return Err("invalid receipt authority DID in document".into());
-        }
         let authority_did = doc_id.to_owned();
         let key_id = direct_request_receipt_key_id_for_authority(&authority_did, public.as_bytes())
             .map_err(|e| e.to_string())?;

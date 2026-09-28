@@ -714,6 +714,7 @@ pub(crate) async fn read_direct_request_pool_hint(
         AND p.owner_key_id=c.owner_key_id AND p.owner_auth_generation=c.auth_generation
         AND p.usage_scope='direct-request' AND p.status IN('available','reserved')
         AND p.not_before<=instant.at AND p.not_after>=instant.at+INTERVAL '605400 seconds'
+        AND NOT EXISTS (SELECT 1 FROM chat.direct_request_remote_leases l WHERE l.key_package_ref=p.key_package_ref AND l.status = 'active' AND l.expires_at > clock_timestamp())
         AND EXISTS(SELECT 1 FROM chat.direct_request_grants g WHERE g.key_package_ref=p.key_package_ref
           AND g.owner_did=p.owner_did AND g.owner_device_id=p.owner_device_id AND g.owner_key_id=p.owner_key_id
           AND g.auth_generation=p.owner_auth_generation AND g.revoked_at IS NULL

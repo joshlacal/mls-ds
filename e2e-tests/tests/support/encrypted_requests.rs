@@ -152,7 +152,7 @@ pub fn reviewed_baseline() -> [BaselineMigration; 14] {
     ]
 }
 
-pub fn reviewed_request_migrations() -> [BaselineMigration; 20] {
+pub fn reviewed_request_migrations() -> [BaselineMigration; 24] {
     [
         baseline!(20260919000001, "direct request preparation", "20260919000001_direct_request_preparation.sql", "d4d3527aa77b8fe91d8d754f72290b682571cc6731866d72c059f10d4b2f7cf8ef629069737addeedaabd6f6eee682ca"),
         baseline!(20260919000002, "direct request publication", "20260919000002_direct_request_publication.sql", "7fda0b09fcdef20e4da2e1701f6a56c12f636f7881b46e2f6e249cb0d5fc2aa63c734dc07cbb543169398253e29cec9e"),
@@ -174,6 +174,10 @@ pub fn reviewed_request_migrations() -> [BaselineMigration; 20] {
         baseline!(20260919000018, "fix direct request lifecycle close fence", "20260919000018_fix_direct_request_lifecycle_close_fence.sql", "db45c270c4f162078319724213518f3d3186ab5883ff75729e253663874738a001fa61af41791065eeca2f8c76bc1974"),
         baseline!(20260919000019, "variable receipt authority keys", "20260919000019_variable_receipt_authority_keys.sql", "dc201702f4e21d124b664a81d8cc60105d92c2ba7fa9e7fe3ea8523e4a091adfc54b0f57663efab00cb46815cf6029ea"),
         baseline!(20260919000021, "direct request capacity abuse fix", "20260919000021_direct_request_capacity_abuse_fix.sql", "5b6d18e3f9a43bccf357ee37f0df7b322d956369fb55cd036fbbbdb4e63f5c291730ac10885b6de511a697cb365939ca"),
+        baseline!(20260919000022, "federated transport inbox", "20260919000022_federated_transport_inbox.sql", "392d0137456574b46aeb05d71fdd6a9084bc364c102fa206f64a48c26441355fad52b3568386b5574aa8bedc15882e5a"),
+        baseline!(20260919000023, "expired federated lease release", "20260919000023_expired_federated_lease_release.sql", "f8b78fd5368f0d9521ec0498f14aaf7f928be8ca4cef35c7e794aac7ed72970a7337e348675ab9eaf873351df3c5b0c5"),
+        baseline!(20260919000024, "C33 coordinator hardening", "20260919000024_c33_coordinator_hardening.sql", "ebc8d84f7b7ad0dd3005fb268956f52a4b9c8bea8134ae5fdeee94fda232e222d816dbbbf16a45d7420f3a5099a7c5e7"),
+        baseline!(20260919000025, "federated inventory conversation items", "20260919000025_federated_inventory_conversation_items.sql", "b0b0b5dd997f6c5594a6f6c4520d8b6e80a13d9355c29254ee911616a7bb49f81ffa18fdea9edb6d9a5c40bd32445ee8"),
     ]
 }
 
@@ -1001,7 +1005,8 @@ pub struct ServiceIdentity {
     pub did: String,
     pub device_id: Uuid,
     jwt_key: SigningKey,
-    jwt_jwk: Value,
+    pub jwt_jwk: Value,
+    audience: String,
 }
 
 impl ServiceIdentity {
@@ -1018,7 +1023,13 @@ impl ServiceIdentity {
             device_id: Uuid::new_v4(),
             jwt_key,
             jwt_jwk,
+            audience: "did:web:chat.catbird.blue#atproto_mls".to_owned(),
         }
+    }
+
+    pub fn with_audience(mut self, audience: &str) -> Self {
+        self.audience = format!("{audience}#atproto_mls");
+        self
     }
 
     pub fn did_document(&self) -> Value {
@@ -1048,7 +1059,7 @@ impl ServiceIdentity {
             .unwrap(),
         );
         let claims = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&json!({"iss":self.did,"aud":"did:web:chat.catbird.blue#atproto_mls","lxm":nsid,"iat":now,"exp":now+60,"jti":jti.to_string()})).unwrap(),
+            serde_json::to_vec(&json!({"iss":self.did,"aud":self.audience,"lxm":nsid,"iat":now,"exp":now+60,"jti":jti.to_string()})).unwrap(),
         );
         let input = format!("{header}.{claims}");
         let signature: Signature = if valid_signature {
@@ -1448,6 +1459,7 @@ impl ShippingServerFixture {
             .env("REQUEST_FIXTURE_DID_PORT", https.port.to_string())
             .env("REQUEST_FIXTURE_DID_CA_PEM", &https.ca_pem)
             .env("DID_RESOLUTION_HOST_ALLOWLIST", https.hosts.join(","))
+            .env("SERVICE_DID", "did:web:chat.catbird.blue")
             .env("CHAT_CUTOVER_ENABLED", "1")
             .env("CHAT_DIRECT_REQUESTS_ENABLED", "1")
             .env("CHAT_CURSOR_KEY_ID", &cursor_key_id)

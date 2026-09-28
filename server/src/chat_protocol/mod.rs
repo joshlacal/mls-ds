@@ -73,6 +73,11 @@ pub(crate) fn xwing_kem_output_is_valid(bytes: &[u8]) -> bool {
         && x25519_component_is_canonical_and_usable(&bytes[XWING_X25519_KEM_OUTPUT_OFFSET..])
 }
 
+/// Exact validation for a bare did:plc or hostname-only did:web identifier.
+pub fn is_bare_did(value: &str) -> bool {
+    validation::BareDid::parse(value).is_ok()
+}
+
 mod cursor;
 pub(crate) use cursor::{
     mint_capability_token, CursorCodecError, CursorSealer, OsSecureRandom, SealedCapability,

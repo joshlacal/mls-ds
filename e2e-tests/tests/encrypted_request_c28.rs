@@ -553,6 +553,7 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
         publication_request: exact_publication.clone(),
         actor_signature_public_key: alice_public.clone(),
         published_receipt: serde_json::to_vec(&normalized_receipt)?,
+        receipt_authority_did: "did:web:chat.catbird.blue".into(),
         receipt_authority_key: server.receipt_public_key.clone(),
         preparation_request_digest: *verified_prepare.request_digest(),
     };

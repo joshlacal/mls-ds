@@ -86,32 +86,101 @@ async fn read_conversation_state_in_transaction(
     // This call holds the locked conversation head and the exact requester
     // proof through all source and pending-request reads below.
     let requester_did = device.user_did().to_owned();
-    let authority = authorize_conversation_state(transaction, device, conversation_id)
-        .await
-        .map_err(map_authority_error)?;
+    let requester_device_id = device.device_id();
 
-    let source = super::inventory::load_conversation_state_source(
+    let local_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id = $1)",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| ConversationStateReadError::Storage)?;
+
+    if local_exists {
+        let authority = authorize_conversation_state(transaction, device, conversation_id)
+            .await
+            .map_err(map_authority_error)?;
+
+        let source = super::inventory::load_conversation_state_source(
+            transaction,
+            conversation_id,
+            &requester_did,
+        )
+        .await
+        .map_err(map_inventory_error)?;
+        let state = conversation_state_view(&source).map_err(|error| {
+            tracing::error!(class = ?error.kind(), "conversation state projection failed");
+            ConversationStateReadError::Invariant
+        })?;
+        let (pending_leave_requests, pending_reset_requests) =
+            load_pending_requests(transaction, conversation_id).await?;
+
+        let pending_leaf_recovery_requests =
+            recovery::load_pending_leaf_recoveries(transaction, &authority).await?;
+
+        let output = catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
+            GetConversationStateOutput {
+                pending_leave_requests,
+                pending_leaf_recovery_requests: Some(pending_leaf_recovery_requests),
+                pending_reset_requests,
+                state,
+                extra_data: None,
+            };
+        let mut wire =
+            serde_json::to_value(&output).map_err(|_| ConversationStateReadError::Invariant)?;
+        if let Some(request) = &output.state.direct_request {
+            wire["state"]["directRequest"] =
+                crate::chat_protocol::transcript::direct_request_generated_view_wire(
+                    request,
+                    "directRequestState",
+                    false,
+                )
+                .map_err(|_| ConversationStateReadError::Invariant)?;
+        }
+        return Ok(CanonicalConversationStateResponse {
+            bytes: crate::chat_protocol::direct_request_transcript::present_endpoint_output(
+                "blue.catbird.chat.getConversationState",
+                serde_json::to_vec(&wire).map_err(|_| ConversationStateReadError::Invariant)?,
+            )
+            .map_err(|_| ConversationStateReadError::Invariant)?,
+        });
+    }
+
+    // A remote conversation may have separate inbox rows for sibling devices.
+    // Look up the authenticated device, never whichever row PostgreSQL returns first.
+    let inbox_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_transport_inbox \
+          WHERE conversation_id = $1 AND recipient_did = $2 AND recipient_device_id = $3)",
+    )
+    .bind(conversation_id)
+    .bind(&requester_did)
+    .bind(requester_device_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| ConversationStateReadError::Storage)?;
+    if !inbox_exists {
+        return Err(ConversationStateReadError::ConversationNotFound);
+    }
+
+    let (_delivery_id, source) = super::inventory::load_remote_transport_conversation_source(
         transaction,
         conversation_id,
         &requester_did,
+        requester_device_id,
     )
     .await
     .map_err(map_inventory_error)?;
+
     let state = conversation_state_view(&source).map_err(|error| {
-        tracing::error!(class = ?error.kind(), "conversation state projection failed");
+        tracing::error!(class = ?error.kind(), "remote conversation state projection failed");
         ConversationStateReadError::Invariant
     })?;
-    let (pending_leave_requests, pending_reset_requests) =
-        load_pending_requests(transaction, conversation_id).await?;
-
-    let pending_leaf_recovery_requests =
-        recovery::load_pending_leaf_recoveries(transaction, &authority).await?;
 
     let output = catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
         GetConversationStateOutput {
-            pending_leave_requests,
-            pending_leaf_recovery_requests: Some(pending_leaf_recovery_requests),
-            pending_reset_requests,
+            pending_leave_requests: Vec::new(),
+            pending_leaf_recovery_requests: Some(Vec::new()),
+            pending_reset_requests: Vec::new(),
             state,
             extra_data: None,
         };

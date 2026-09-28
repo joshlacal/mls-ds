@@ -1811,16 +1811,35 @@ pub(crate) async fn create_inventory_session(
         for version in versions {
             digest.update(version.as_bytes());
         }
-        for authority in &authorities {
-            digest.update(authority.conversation_id().as_bytes());
+        let mut scoped_ids: Vec<Uuid> = authorities.iter().map(|a| a.conversation_id()).collect();
+
+        if versions.iter().any(|v| v == "2") {
+            let inbox_convo_ids: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT conversation_id FROM chat.direct_request_transport_inbox \
+                 WHERE recipient_did = $1 AND recipient_device_id = $2 \
+                   AND (status = 'accepted' OR (status = 'pending' AND import_until > transaction_timestamp()))"
+            )
+            .bind(&user_did)
+            .bind(device_id)
+            .fetch_all(&mut **transaction)
+            .await?;
+
+            for id in inbox_convo_ids {
+                if !scoped_ids.contains(&id) {
+                    scoped_ids.push(id);
+                }
+            }
+        }
+
+        for id in &scoped_ids {
+            digest.update(id.as_bytes());
         }
         let hash: [u8; 32] = digest.finalize().into();
         use base64::Engine as _;
         let scope = serde_json::json!({"scopeDigest": base64::engine::general_purpose::STANDARD.encode(hash), "supportedProtocolVersions": versions});
         sqlx::query("UPDATE chat.inventory_sessions SET inventory_scope=$2, supported_protocol_versions=$3, scoped_conversation_ids=$4 WHERE inventory_session_id=$1")
-            .bind(request.inventory_session_id).bind(scope).bind(versions).bind(authorities.iter().map(|a|a.conversation_id()).collect::<Vec<_>>()).execute(&mut **transaction).await?;
+            .bind(request.inventory_session_id).bind(scope).bind(versions).bind(&scoped_ids).execute(&mut **transaction).await?;
     }
-
     // 6. Materialize each domain from the C1 typed loaders -> projections ->
     //    canonical encoder, encoding every item EXACTLY ONCE and retaining the
     //    canonical bytes as the item payloads.
@@ -1850,8 +1869,71 @@ pub(crate) async fn create_inventory_session(
             arm_columns,
             canonical.bytes().to_vec(),
             payload_sha256,
+            None::<Uuid>,
         ));
         conversation_ordinal += 1;
+    }
+
+    if request
+        .supported_protocol_versions
+        .as_ref()
+        .is_some_and(|v| v.iter().any(|v| v == "2"))
+    {
+        let inbox_convos: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT conversation_id FROM chat.direct_request_transport_inbox \
+             WHERE recipient_did = $1 AND recipient_device_id = $2 \
+               AND (status = 'accepted' OR (status = 'pending' AND import_until > transaction_timestamp())) \
+             ORDER BY conversation_id",
+        )
+        .bind(&user_did)
+        .bind(device_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+
+        for convo_id in inbox_convos {
+            if conversation_items.iter().any(|item| item.1 == convo_id) {
+                continue;
+            }
+            let (delivery_id, source) = load_remote_transport_conversation_source(
+                transaction,
+                convo_id,
+                &user_did,
+                device_id,
+            )
+            .await?;
+            let dto = super::super::read_projection::conversation_inventory_item(&source)
+                .map_err(InventoryRepositoryError::Projection)?;
+            let canonical = super::super::read_projection::encode_canonical_generated_chat_json_v1(
+                &dto,
+                "blue.catbird.chat.defs#conversationInventoryItem",
+            )
+            .map_err(InventoryRepositoryError::Projection)?;
+            let payload_sha256 = canonical.sha256();
+            let arm_columns = ConversationArmColumns {
+                item_kind: "blue.catbird.chat.defs#conversationInventoryState",
+                participant_period_id: None,
+                membership_interval_id: None,
+                interval_terminal_seq: None,
+                interval_closing_transition_id: None,
+                interval_closing_outer_entry_fingerprint: None,
+                interval_removed_at: None,
+                schedule_terminal_seq: None,
+                schedule_terminal_transition_id: None,
+                schedule_terminal_outer_entry_fingerprint: None,
+            };
+            conversation_items.push((
+                0,
+                convo_id,
+                arm_columns,
+                canonical.bytes().to_vec(),
+                payload_sha256,
+                Some(delivery_id),
+            ));
+        }
+        conversation_items.sort_by_key(|item| item.1);
+        for (ordinal, item) in conversation_items.iter_mut().enumerate() {
+            item.0 = ordinal as i64;
+        }
     }
 
     const INVENTORY_INSERT_CHUNK_ROWS: usize = 64;
@@ -1866,13 +1948,14 @@ pub(crate) async fn create_inventory_session(
                 interval_closing_outer_entry_fingerprint, interval_removed_at,
                 schedule_terminal_seq, schedule_terminal_transition_id,
                 schedule_terminal_outer_entry_fingerprint,
-                item_key_bytes, payload_bytes, payload_sha256
+                item_key_bytes, payload_bytes, payload_sha256,
+                transport_inbox_delivery_id
             )
             "#,
         );
         query.push_values(
             chunk,
-            |mut values, (ordinal, conversation_id, arm_columns, payload_bytes, payload_sha256)| {
+            |mut values, (ordinal, conversation_id, arm_columns, payload_bytes, payload_sha256, transport_inbox_delivery_id)| {
                 values
                     .push_bind(request.inventory_session_id)
                     .push_bind(*ordinal)
@@ -1899,7 +1982,8 @@ pub(crate) async fn create_inventory_session(
                     )
                     .push_bind(conversation_id.as_bytes().as_slice())
                     .push_bind(payload_bytes.as_slice())
-                    .push_bind(payload_sha256.as_slice());
+                    .push_bind(payload_sha256.as_slice())
+                    .push_bind(*transport_inbox_delivery_id);
             },
         );
         query.build().execute(&mut **transaction).await?;
@@ -1933,6 +2017,7 @@ pub(crate) async fn create_inventory_session(
             canonical.bytes().to_vec(),
             payload_sha256,
             None::<Uuid>,
+            None::<Uuid>,
         ));
     }
     if request
@@ -1946,9 +2031,9 @@ pub(crate) async fn create_inventory_session(
             device_id,
         )
         .await?;
-        for (id, bytes) in request_items {
+        for (id, bytes, transport_delivery_id) in request_items {
             let hash: [u8; 32] = Sha256::digest(&bytes).into();
-            welcome_items.push((0, id, bytes, hash, Some(id)));
+            welcome_items.push((0, id, bytes, hash, transport_delivery_id.is_none().then_some(id), transport_delivery_id));
         }
         welcome_items.sort_by_key(|item| item.1);
         for (ordinal, item) in welcome_items.iter_mut().enumerate() {
@@ -1960,13 +2045,14 @@ pub(crate) async fn create_inventory_session(
             r#"
             INSERT INTO chat.inventory_welcome_items(
                 inventory_session_id, ordinal, welcome_id, recipient_did,
-                recipient_device_id, item_key_bytes, payload_bytes, payload_sha256, direct_request_id
+                recipient_device_id, item_key_bytes, payload_bytes, payload_sha256,
+                direct_request_id, transport_inbox_delivery_id
             )
             "#,
         );
         query.push_values(
             chunk,
-            |mut values, (ordinal, welcome_id, payload_bytes, payload_sha256, request_id)| {
+            |mut values, (ordinal, welcome_id, payload_bytes, payload_sha256, request_id, transport_delivery_id)| {
                 values
                     .push_bind(request.inventory_session_id)
                     .push_bind(*ordinal)
@@ -1976,7 +2062,8 @@ pub(crate) async fn create_inventory_session(
                     .push_bind(welcome_id.as_bytes().as_slice())
                     .push_bind(payload_bytes.as_slice())
                     .push_bind(payload_sha256.as_slice())
-                    .push_bind(*request_id);
+                    .push_bind(*request_id)
+                    .push_bind(*transport_delivery_id);
             },
         );
         query.build().execute(&mut **transaction).await?;
@@ -4813,6 +4900,26 @@ async fn create_inventory_snapshot_attempt(
         digest.update(b"CATBIRD-CHAT-SCOPED-INVENTORY-SESSION\0");
         digest.update(legacy_session_id.as_bytes());
         digest.update(request.canonical_filter_sha256);
+        if request.supported_protocol_versions.as_ref().is_some_and(|versions| versions.iter().any(|v| v == "2")) {
+            // Remote inbox deliveries do not advance this authority's local
+            // chat.events head. Bind the session to the exact device's current
+            // remote state so a prior empty page cannot mask an introduction.
+            digest.update(b"CATBIRD-REMOTE-INBOX-SESSION\0");
+            let remote_state: Vec<(Uuid, String)> = sqlx::query_as(
+                "SELECT delivery_id, status FROM chat.direct_request_transport_inbox \
+                 WHERE recipient_did = $1 AND recipient_device_id = $2 \
+                   AND (status = 'accepted' OR (status = 'pending' AND import_until > transaction_timestamp())) \
+                 ORDER BY delivery_id"
+            )
+            .bind(device.user_did())
+            .bind(device.device_id())
+            .fetch_all(&mut **transaction)
+            .await?;
+            for (delivery_id, status) in remote_state {
+                digest.update(delivery_id.as_bytes());
+                digest.update(status.as_bytes());
+            }
+        }
         let bytes: [u8; 32] = digest.finalize().into();
         let mut id: [u8; 16] = bytes[..16].try_into().expect("fixed digest prefix");
         id[6] = (id[6] & 0x0f) | 0x40;
@@ -5692,6 +5799,295 @@ pub(crate) async fn load_conversation_state_source(
             .map_err(InventoryRepositoryError::Projection),
         None => Ok(source),
     }
+}
+
+pub(crate) async fn load_remote_transport_conversation_source(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    requester_did: &str,
+    requester_device_id: Uuid,
+) -> Result<
+    (Uuid, crate::chat_protocol::read_projection::ConversationProjectionSource),
+    InventoryRepositoryError,
+> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde_json::Value;
+    use sqlx::Row;
+    use crate::chat_protocol::read_projection::{
+        CheckedConversationCoordinates, CheckedDeviceLeafView, CheckedInvitationProvenance,
+        CheckedMetadataAuthorProof, CheckedMetadataCryptoContext, CheckedMetadataSnapshot,
+        CheckedParticipantView, ConversationProjectionSource,
+    };
+
+    let row = sqlx::query(
+        "SELECT delivery_id, request_id, conversation_id, first_message_id, \
+                coordinator_did, sender_did, sender_device_id, \
+                recipient_did, recipient_device_id, \
+                request_entry, signed_publication, full_welcome, full_welcome_sha256, \
+                provenance, publication_receipt, import_until, status, \
+                acceptance_proof, acceptance_outcome \
+           FROM chat.direct_request_transport_inbox \
+          WHERE conversation_id = $1 \
+            AND recipient_did = $2 \
+            AND recipient_device_id = $3",
+    )
+    .bind(conversation_id)
+    .bind(requester_did)
+    .bind(requester_device_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+
+    let delivery_id: Uuid = row.try_get("delivery_id")?;
+    let request_id: Uuid = row.try_get("request_id")?;
+    let first_message_id: Uuid = row.try_get("first_message_id")?;
+    let sender_did: String = row.try_get("sender_did")?;
+    let sender_device_id: Uuid = row.try_get("sender_device_id")?;
+    let recipient_did: String = row.try_get("recipient_did")?;
+    let recipient_device_id: Uuid = row.try_get("recipient_device_id")?;
+    let signed_pub_bytes: Vec<u8> = row.try_get("signed_publication")?;
+    let provenance_bytes: Vec<u8> = row.try_get("provenance")?;
+    let status: String = row.try_get("status")?;
+    let acceptance_proof: Option<Vec<u8>> = row.try_get("acceptance_proof")?;
+
+    let signed_val: Value = serde_json::from_slice(&signed_pub_bytes)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let body = &signed_val["body"];
+
+    let sender_key: Vec<u8> = sqlx::query_scalar(
+        "SELECT sender_signing_key FROM chat.direct_request_remote_leases \
+          WHERE request_id = $1 AND recipient_did = $2 AND owner_device_id = $3 \
+            AND sender_signing_key IS NOT NULL LIMIT 1",
+    )
+    .bind(request_id)
+    .bind(&recipient_did)
+    .bind(recipient_device_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+
+    let verified_pub = crate::chat_protocol::direct_request_transcript::verify_signed_request(
+        crate::chat_protocol::direct_request_transcript::DirectRequestKind::Publish,
+        &signed_pub_bytes,
+        &sender_key,
+    )
+    .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+
+    let next = &body["next"];
+    let state_version = if status == "accepted" {
+        2
+    } else {
+        next["stateVersion"].as_i64().unwrap_or(1).max(1)
+    };
+    let lifecycle = if status == "rejected" || status == "expired" {
+        "superseded"
+    } else {
+        "active"
+    };
+
+    let group_id = STANDARD.decode(next["groupId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let ctx_hash = STANDARD.decode(next["groupContextHash"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let tag = STANDARD.decode(next["confirmationTag"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+
+    let coordinates = CheckedConversationCoordinates::new(
+        &conversation_id.to_string(),
+        next["generation"].as_i64().unwrap_or(0),
+        state_version,
+        &group_id,
+        next["epoch"].as_i64().unwrap_or(0),
+        &ctx_hash,
+        &tag,
+        lifecycle,
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+
+    let prov: Value = serde_json::from_slice(&provenance_bytes)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let pkg_ref_b64 = prov["keyPackageRef"].as_str()
+        .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+    let pkg_ref = STANDARD.decode(pkg_ref_b64)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+
+    let recipient_key_id: String = match sqlx::query_scalar(
+        "SELECT owner_key_id FROM chat.direct_request_grants WHERE key_package_ref = $1",
+    )
+    .bind(&pkg_ref)
+    .fetch_optional(&mut **transaction)
+    .await? {
+        Some(k) => k,
+        None => sqlx::query_scalar(
+            "SELECT key_id FROM chat.device_keys \
+              WHERE user_did = $1 AND device_id = $2 AND revoked_at IS NULL \
+              ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&recipient_did)
+        .bind(recipient_device_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+    };
+
+    let sender_key_id = body["keyId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+    let sender_leaf = CheckedDeviceLeafView::new(
+        &sender_did,
+        &sender_device_id.to_string(),
+        "genesis",
+        sender_key_id,
+        "active",
+        None,
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+    let recipient_leaf = CheckedDeviceLeafView::new(
+        &recipient_did,
+        &recipient_device_id.to_string(),
+        "keyPackage",
+        &recipient_key_id,
+        "active",
+        Some(&pkg_ref),
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+
+    let leaves = if (&sender_did, sender_device_id) <= (&recipient_did, recipient_device_id) {
+        vec![sender_leaf, recipient_leaf]
+    } else {
+        vec![recipient_leaf, sender_leaf]
+    };
+
+    let meta = &body["artifacts"]["metadataSnapshot"];
+    let meta_coord_obj = &meta["coordinate"];
+    let meta_convo_id = STANDARD.decode(meta_coord_obj["conversationId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let meta_group_id = STANDARD.decode(meta_coord_obj["groupId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let meta_ctx_hash = STANDARD.decode(meta_coord_obj["groupContextHash"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let meta_conf_tag = STANDARD.decode(meta_coord_obj["confirmationTag"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+
+    let meta_coord = CheckedMetadataCryptoContext::new(
+        &meta_convo_id,
+        meta_coord_obj["generation"].as_i64().unwrap_or(0),
+        &meta_group_id,
+        meta_coord_obj["epoch"].as_i64().unwrap_or(0),
+        &meta_ctx_hash,
+        &meta_conf_tag,
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+
+    let proof = &meta["authorProof"];
+    let sig_pub_key = STANDARD.decode(proof["signaturePublicKey"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+
+    let author_proof = CheckedMetadataAuthorProof::new(
+        proof["authorDid"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        proof["authorDeviceId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        proof["authorKeyId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        &sig_pub_key,
+        proof["authGenerationAtOrigin"].as_i64().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        proof["originTransitionId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        proof["originSeq"].as_i64().unwrap_or(1),
+        proof["roleAtOrigin"].as_str().unwrap_or("admin"),
+        proof["deviceStatusAtOrigin"].as_str().unwrap_or("active"),
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+
+    let nonce = STANDARD.decode(meta["nonce"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let ciphertext = STANDARD.decode(meta["ciphertext"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let ciphertext_sha256 = STANDARD.decode(meta["ciphertextSha256"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+
+    let metadata_snapshot = CheckedMetadataSnapshot::new(
+        meta_coord,
+        meta["originTransitionId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        meta["metadataVersion"].as_i64().unwrap_or(1),
+        &nonce,
+        &ciphertext,
+        &ciphertext_sha256,
+        meta["ciphertextSize"].as_i64().unwrap_or(ciphertext.len() as i64),
+        author_proof,
+        None,
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+
+    let sender_participant = CheckedParticipantView::new(
+        &sender_did,
+        "admin",
+        "active",
+        1,
+        None,
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+
+    let invitation = Some(CheckedInvitationProvenance::new(
+        &request_id.to_string(),
+        &sender_did,
+        &sender_device_id.to_string(),
+    ).map_err(InventoryRepositoryError::Projection)?);
+    let recipient_participant = CheckedParticipantView::for_direct_request(
+        &recipient_did,
+        "admin",
+        if status == "accepted" { "active" } else { "pending" },
+        1,
+        invitation,
+        &verified_pub,
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+
+    let participants = if sender_did <= recipient_did {
+        vec![sender_participant, recipient_participant]
+    } else {
+        vec![recipient_participant, sender_participant]
+    };
+
+    let source = ConversationProjectionSource::state(
+        INVENTORY_CIPHER_SUITE_V1,
+        "direct",
+        coordinates,
+        leaves,
+        metadata_snapshot,
+        participants,
+        1,
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+
+    let consent = match status.as_str() {
+        "accepted" => "accepted",
+        "rejected" | "expired" => "closed",
+        _ if requester_did == recipient_did => "incomingPending",
+        _ => "outgoingPending",
+    };
+
+    let mut dr_val = serde_json::json!({
+        "requestId": request_id.to_string(),
+        "senderDid": sender_did,
+        "recipientDid": recipient_did,
+        "firstMessageId": first_message_id.to_string(),
+        "contextHash": body["contextHash"],
+        "preparationDigest": body["preparationDigest"],
+        "importUntil": body["importUntil"],
+        "consent": consent,
+    });
+    if let Some(proof_bytes) = &acceptance_proof {
+        if let Ok(proof_json) = serde_json::from_slice::<Value>(proof_bytes) {
+            dr_val["acceptanceProof"] = proof_json;
+        }
+    }
+    let direct_request = crate::chat_protocol::transcript::decode_direct_request_generated_view(
+        &serde_json::to_vec(&dr_val).map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
+        "directRequestState",
+        false,
+    )
+    .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+
+    let source = source.with_direct_request(direct_request)
+        .map_err(InventoryRepositoryError::Projection)?;
+
+    Ok((delivery_id, source))
 }
 
 #[derive(Debug, FromRow)]

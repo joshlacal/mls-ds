@@ -733,9 +733,9 @@ impl PublicTransport for ProductionRelationshipTransport {
 #[cfg(feature = "test-support")]
 #[derive(Clone)]
 pub(crate) struct TestHttpsRelationshipTransport {
-    hosts: Arc<BTreeSet<String>>,
-    port: u16,
-    client: reqwest::Client,
+    pub(crate) hosts: Arc<BTreeSet<String>>,
+    pub(crate) port: u16,
+    pub(crate) client: reqwest::Client,
 }
 
 #[cfg(feature = "test-support")]

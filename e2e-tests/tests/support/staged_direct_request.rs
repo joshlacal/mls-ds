@@ -524,6 +524,7 @@ impl StagedRequest {
             publication_request: serde_json::to_vec(&self.publication)?,
             actor_signature_public_key: self.alice_public.clone(),
             published_receipt: serde_json::to_vec(receipt)?,
+            receipt_authority_did: "did:web:chat.catbird.blue".into(),
             receipt_authority_key: self.server.receipt_public_key.clone(),
             preparation_request_digest: self.preparation_request_digest,
         })

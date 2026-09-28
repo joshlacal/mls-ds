@@ -1231,6 +1231,7 @@ async fn c09_live_snapshot_includes_every_deliverable_device_and_ignores_unrelat
             publication_request: publication_request.clone(),
             actor_signature_public_key: alice.public.clone(),
             published_receipt: serde_json::to_vec(&published)?,
+            receipt_authority_did: "did:web:chat.catbird.blue".into(),
             receipt_authority_key: rig.server.receipt_public_key.clone(),
             preparation_request_digest: prep.prepare_digest,
         };

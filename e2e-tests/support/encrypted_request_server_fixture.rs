@@ -167,6 +167,26 @@ async fn main() -> Result<()> {
             runtime.clone(),
         ));
     }
+    if std::env::var("REQUEST_FIXTURE_OUTBOUND_WORKER").as_deref() == Ok("1") {
+        anyhow::ensure!(
+            is_dedicated_database_url(&database_url),
+            "REQUEST_FIXTURE_OUTBOUND_WORKER requires a dedicated request database"
+        );
+        let queue = Arc::new(catbird_server::federation::queue::OutboundQueue::new(
+            pool.clone(),
+            catbird_server::auth::AuthMiddleware::new(),
+        ));
+        let outbound = Arc::new(catbird_server::federation::outbound::OutboundClient::new(10, 30));
+        let auth_fn: Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync> =
+            Arc::new(|target: &str, method: &str| {
+                catbird_server::federation::canonical_relay::mint_s2s_auth_token(target, method)
+                    .map_err(|e| e.to_string())
+            });
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(async move {
+            queue.run_worker(outbound, auth_fn, shutdown).await;
+        });
+    }
     if let Some((event_id, trigger, result)) = push_event {
         let push_pool = pool.clone();
         let push_runtime = runtime.clone();

@@ -86,6 +86,23 @@ pub enum FederationError {
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("Storage error: {0}")]
+    Storage(String),
+
+    #[error("Not found: {0}")]
+    NotFound(String),
+
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+
+    #[error("Invariant violation: {0}")]
+    Invariant(String),
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
+    #[error("Unsupported: {0}")]
+    Unsupported(String),
 }
 
 impl FederationError {
@@ -94,11 +111,16 @@ impl FederationError {
             Self::EndpointNotFound { .. }
             | Self::ConversationNotFound { .. }
             | Self::RecipientNotFound { .. }
-            | Self::NoKeyPackagesAvailable { .. } => StatusCode::NOT_FOUND,
+            | Self::NoKeyPackagesAvailable { .. }
+            | Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::CommitConflict { .. } | Self::TermStale { .. } => StatusCode::CONFLICT,
             Self::NotSequencer { .. } => StatusCode::FORBIDDEN,
             Self::AuthFailed { .. } => StatusCode::UNAUTHORIZED,
-            Self::InvalidProof | Self::InvalidCommitFraming { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidProof
+            | Self::InvalidCommitFraming { .. }
+            | Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Self::DsUnreachable { .. } | Self::ResolutionFailed { .. } | Self::Http(_) => {
                 StatusCode::BAD_GATEWAY
             }
@@ -107,7 +129,11 @@ impl FederationError {
             Self::RemoteError { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
-            Self::TransferFailed { .. } | Self::ConfigError { .. } | Self::Database(_) => {
+            Self::TransferFailed { .. }
+            | Self::ConfigError { .. }
+            | Self::Database(_)
+            | Self::Storage(_)
+            | Self::Invariant(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::Json(_) => StatusCode::BAD_REQUEST,
@@ -136,6 +162,12 @@ impl FederationError {
             Self::Database(_) => "InternalError",
             Self::Http(_) => "NetworkError",
             Self::Json(_) => "InvalidRequest",
+            Self::Storage(_) => "StorageError",
+            Self::NotFound(_) => "NotFound",
+            Self::InvalidRequest(_) => "InvalidRequest",
+            Self::Invariant(_) => "InvariantViolation",
+            Self::Forbidden(_) => "Forbidden",
+            Self::Unsupported(_) => "Unsupported",
         }
     }
 
@@ -151,6 +183,10 @@ impl FederationError {
             Self::Json(_) | Self::InvalidProof | Self::InvalidCommitFraming { .. } => {
                 "invalid_payload"
             }
+            Self::NotFound(_) => "not_found",
+            Self::InvalidRequest(_) => "invalid_request",
+            Self::Forbidden(_) => "forbidden",
+            Self::Unsupported(_) => "unsupported",
             _ => "conflict",
         }
     }
@@ -272,6 +308,22 @@ mod tests {
             }
             .status_code(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            FederationError::Storage("x".into()).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            FederationError::NotFound("x".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            FederationError::InvalidRequest("x".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            FederationError::Invariant("x".into()).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

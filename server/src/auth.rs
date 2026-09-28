@@ -21,6 +21,15 @@ use thiserror::Error;
 use tracing::debug;
 
 pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
+
+/// Exact expected MLS service audience for this DS instance.
+pub fn expected_mls_service_ref() -> String {
+    if let Some(base) = crate::identity::service_did_base_opt() {
+        format!("{base}#atproto_mls")
+    } else {
+        MLS_APPVIEW_SERVICE_REF.to_string()
+    }
+}
 const SERVICE_AUTH_MAX_LIFETIME_SECONDS: i64 = 60;
 const SERVICE_AUTH_FUTURE_IAT_LEEWAY_SECONDS: i64 = 60;
 
@@ -1048,6 +1057,41 @@ pub fn install_test_https_did_resolver(
 pub async fn cache_test_did_document(doc: DidDocument) {
     shared_auth_middleware().cache_did_document(doc).await;
 }
+pub fn is_test_fixture_host(host: &str) -> bool {
+    #[cfg(feature = "test-support")]
+    let host_lc = host.trim().to_ascii_lowercase();
+    #[cfg(feature = "test-support")]
+    if let Some(middleware) = TEST_AUTH_MIDDLEWARE.get() {
+        if let Some(fixture) = &middleware.test_https_fixture {
+            if fixture.hosts.iter().any(|h| *h == host_lc) {
+                return true;
+            }
+        }
+    }
+    #[cfg(feature = "test-support")]
+    if let Some(transport) = crate::chat_protocol::relationship_policy::installed_test_https_relationship_transport() {
+        if transport.hosts.iter().any(|h| *h == host_lc) {
+            return true;
+        }
+    }
+    #[cfg(feature = "test-support")]
+    if let Ok(hosts) = std::env::var("REQUEST_FIXTURE_DID_HOSTS") {
+        if hosts.split(',').map(|h| h.trim().to_ascii_lowercase()).any(|h| h == host_lc) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(feature = "test-support")]
+pub fn test_fixture_http_client() -> Option<reqwest::Client> {
+    TEST_AUTH_MIDDLEWARE.get().map(|m| m.http_client.clone())
+}
+
+#[cfg(not(feature = "test-support"))]
+pub fn test_fixture_http_client() -> Option<reqwest::Client> {
+    None
+}
 
 /// Keep the binary startup gate and library request gate on identical flag semantics.
 #[doc(hidden)]
@@ -1387,8 +1431,9 @@ pub(crate) async fn verify_mls_service_principal(
     let token = authorization
         .strip_prefix("Bearer ")
         .ok_or(AuthError::InvalidAuthFormat)?;
+    let expected_service_ref = expected_mls_service_ref();
     let claims = shared_auth_middleware()
-        .verify_jwt_for_audience(token, Some(MLS_APPVIEW_SERVICE_REF))
+        .verify_jwt_for_audience(token, Some(&expected_service_ref))
         .await?;
     let now = Utc::now().timestamp();
     let (issuer, iat) = validate_mls_service_claims(&claims, endpoint_nsid, now)?;
@@ -1417,7 +1462,8 @@ fn validate_mls_service_claims<'a>(
     endpoint_nsid: &str,
     now: i64,
 ) -> Result<(&'a str, i64), AuthError> {
-    if claims.aud != MLS_APPVIEW_SERVICE_REF {
+    let expected_aud = expected_mls_service_ref();
+    if claims.aud != expected_aud {
         return Err(AuthError::InvalidToken(
             "aud does not match the MLS AppView service reference".into(),
         ));

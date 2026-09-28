@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
+import base64
+import hashlib
 import http.server
 import json
 import os
 import ssl
 import sys
 import urllib.parse
+
+def make_cid(data: bytes) -> str:
+    h = hashlib.sha256(data).digest()
+    raw = bytes([0x01, 0x71, 0x12, 0x20]) + h
+    return "b" + base64.b32encode(raw).decode("ascii").lower().rstrip("=")
 
 root, certificate, private_key, raw_port = sys.argv[1:]
 
@@ -41,6 +48,13 @@ class DidHandler(http.server.SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
         host = self.headers.get("Host", "").split(":", 1)[0].lower()
+        if parsed.path == "/xrpc/com.atproto.repo.listRecords":
+            repo = query.get("repo", [""])[0]
+            if repo != f"did:web:{host}" or query.get("collection", [""])[0] != "blue.catbird.chat.device":
+                self.send_error(400)
+                return
+            self.send_json(policy_override("deviceKeys", repo) or {"records": []})
+            return
         if parsed.path == "/xrpc/com.atproto.repo.getRecord":
             repo = query.get("repo", [""])[0]
             collection = query.get("collection", [""])[0]
@@ -55,8 +69,10 @@ class DidHandler(http.server.SimpleHTTPRequestHandler):
                 if value is None:
                     self.send_json({"error": "RecordNotFound"}, status=400)
                 else:
+                    cid = make_cid(json.dumps(value, sort_keys=True).encode())
                     self.send_json({
                         "uri": f"at://{repo}/blue.catbird.chat.declaration/self",
+                        "cid": cid,
                         "value": value
                     })
                 return
@@ -67,8 +83,10 @@ class DidHandler(http.server.SimpleHTTPRequestHandler):
                 "$type": "chat.bsky.actor.declaration",
                 "allowIncoming": "all"
             }
+            cid = make_cid(json.dumps(value, sort_keys=True).encode())
             self.send_json({
                 "uri": f"at://{repo}/chat.bsky.actor.declaration/self",
+                "cid": cid,
                 "value": value
             })
             return

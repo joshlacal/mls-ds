@@ -82,6 +82,27 @@ async fn publish_request_variant_configured(
     let (bob_package, bob_package_ref) = bob_engine.create_key_package(&bob_identity)?;
     let alice_public = alice_engine.identity_public_key(&alice_identity)?;
     let bob_public = bob_engine.identity_public_key(&bob_identity)?;
+    for (identity, public_key) in [(&alice, &alice_public), (&bob, &bob_public)] {
+        let name = identity.did.replace(':', "%3A");
+        let declarations = https.root.join("_policy/catbirdDeclaration");
+        std::fs::create_dir_all(&declarations)?;
+        std::fs::write(declarations.join(&name), serde_json::to_vec(&json!({
+            "$type": "blue.catbird.chat.declaration",
+            "protocolVersion": "1",
+            "allowIncoming": "all",
+            "deliveryService": "did:web:chat.catbird.blue",
+            "createdAt": canonical_now()
+        }))?)?;
+        let devices = https.root.join("_policy/deviceKeys");
+        std::fs::create_dir_all(&devices)?;
+        std::fs::write(devices.join(name), serde_json::to_vec(&json!({
+            "records": [{"value": {
+                "algorithm": "ed25519",
+                "mlsSignaturePublicKey": {"$bytes": STANDARD.encode(public_key)},
+                "createdAt": canonical_now()
+            }}]
+        }))?)?;
+    }
     seed_service_device(&alice, &alice_public)?;
     seed_service_device(&bob, &bob_public)?;
 
@@ -571,6 +592,7 @@ async fn publish_request_variant_configured(
         publication_request: serde_json::to_vec(&publication)?,
         actor_signature_public_key: alice_public,
         published_receipt: serde_json::to_vec(&normalized_receipt)?,
+        receipt_authority_did: "did:web:chat.catbird.blue".into(),
         receipt_authority_key: server.receipt_public_key.clone(),
         preparation_request_digest: *verified_prepare.request_digest(),
     };

@@ -818,6 +818,9 @@ pub(crate) fn seal_read_admission(
 }
 
 impl VerifiedReadAdmission {
+    pub(crate) fn locked_did(&self) -> &str {
+        &self.binding.locked_did
+    }
     /// Private endpoint gate shared by both conversions. It is not a seam: the
     /// closed endpoint/method are module constants supplied by the two public
     /// conversion methods below, never by a caller.

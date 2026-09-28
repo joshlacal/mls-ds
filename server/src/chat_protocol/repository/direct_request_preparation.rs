@@ -902,12 +902,11 @@ pub(crate) async fn prepare_direct_request<
     // declaration keeps the canonical path; an unreadable one fails closed
     // exactly like the consent declaration read above.
     match policy.recipient_chat_authority(&i.recipient_did).await {
-        Ok(Some(authority))
-            if authority != super::direct_request_receipts::REQUEST_RECEIPT_AUTHORITY =>
-        {
-            return Err(DirectRequestStoreError::RecipientAuthorityUnsupported);
+        Ok(Some(authority)) => {
+            crate::chat_protocol::validation::BareDid::parse(&authority)
+                .map_err(|_| DirectRequestStoreError::PolicyDenied)?;
         }
-        Ok(_) => {}
+        Ok(None) => {}
         Err(_) => return Err(DirectRequestStoreError::PolicyDenied),
     }
     let now = request_database_instant(tx).await?;

@@ -1,19 +1,17 @@
-//! Case C33 (unsupported federation), recipient-homed-elsewhere branch, through
-//! the live shipping router against the guarded request database.
+//! Case C33 Negative Controls: untrusted foreign delivery service, missing declaration,
+//! and malformed declaration branches through the live shipping router against the guarded
+//! request database. Real multi-authority canonical federation is qualified in
+//! `encrypted_request_c33_federation.rs`.
 //!
-//! The recipient's public `blue.catbird.chat.declaration/self` names another
-//! delivery service while the sender's authority is canonical. The router reads
-//! that declaration from the recipient's PDS (the HTTPS DID fixture's opt-in
-//! `_policy/catbirdDeclaration/<did>` override) and must refuse preparation
-//! with the typed `RecipientAuthorityUnsupported` signed receipt before any
-//! package selection or lease. The recipient deliberately *has* available
-//! direct-request packages here, so the refusal cannot be the old
-//! `RecipientKeysUnavailable` degradation.
+//! When the recipient's public `blue.catbird.chat.declaration/self` names an unpeered or
+//! untrusted foreign delivery service without federation peering, the router refuses preparation
+//! with the typed `RecipientAuthorityUnsupported` signed receipt before any package selection
+//! or lease.
 //!
-//! The second test drives the real `MLSOrchestrator::start_direct_request`
-//! over the same router: the client surfaces the typed unsupported capability,
-//! retains the draft, reserves nothing, and submits only canonical
-//! direct-request wire requests (no legacy federation fallback).
+//! Controls verify that:
+//! - Canonical authority recipient is prepared normally (then cancelled to release).
+//! - Missing declaration (RecordNotFound) keeps `RecipientKeysUnavailable`.
+//! - Malformed/unreadable declaration fails closed with `RequestPolicyDenied`.
 #![allow(dead_code)]
 
 #[path = "support/encrypted_requests.rs"]
@@ -52,8 +50,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const CANONICAL_AUTHORITY: &str = "did:web:chat.catbird.blue";
-/// A publicly shaped foreign delivery service. It is never contacted: the
-/// canonical authority refuses from the declaration alone.
+/// An unpeered foreign delivery service without federation peering policy.
+/// Used as negative control for untrusted foreign home refusal.
 const FOREIGN_AUTHORITY: &str = "did:web:chat.federated-peer.org";
 /// Special-use TLDs are not public DIDs; such a declaration is malformed.
 const NON_PUBLIC_AUTHORITY: &str = "did:web:chat.federation.example";
