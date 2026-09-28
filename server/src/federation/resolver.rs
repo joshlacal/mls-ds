@@ -2597,7 +2597,7 @@ mod tests {
        tokio::spawn(async move {
            let (mut stream, _) = source.accept().await.unwrap();
            let mut buffer = [0u8; 1024];
-           stream.read(&mut buffer).await.unwrap();
+           assert!(stream.read(&mut buffer).await.unwrap() > 0);
            let response = format!(
                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
            );
