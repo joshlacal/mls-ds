@@ -205,6 +205,101 @@ fn is_line_comment(line: &str) -> bool {
     line.trim_start().starts_with("//")
 }
 
+/// In-crate test modules that are EXEMPT from the two "src tests must mint
+/// their own database" guards below.
+///
+/// These came in with the encrypted-requests line. They deliberately connect to
+/// the reviewed gate databases — the fixed-target clean-chat DB pinned to the
+/// reviewed migration ledger (`catbird_chat_protocol_test_20260722`, via
+/// `TEST_DATABASE_URL`) and the dedicated direct-request DB
+/// (`catbird_direct_requests_test_20260919`, via `REQUEST_TEST_DATABASE_URL`).
+/// Those targets are validation-only and are never migrated or repaired by the
+/// tests, so adopting them is the point of the test rather than an isolation
+/// leak. Exempting them was an explicit decision (2026-10-04 line merge);
+/// do NOT rewrite them onto `fresh_db`, and do NOT add entries without the same
+/// justification.
+///
+/// Each entry is `(path relative to src/, first line marker)`. Only lines at or
+/// after the first line containing the marker are exempt (`""` = whole file,
+/// for files that are test-only modules in their entirety). Every entry must
+/// still match at least one guarded site, so a stale exemption fails loudly.
+const REVIEWED_GATE_DB_TEST_EXEMPTIONS: &[(&str, &str)] = &[
+    (
+        "chat_protocol/repository/conversation_substrate_tests.rs",
+        "",
+    ),
+    ("chat_protocol/repository/delivery/read_tests.rs", ""),
+    (
+        "chat_protocol/repository/recovery/production_inventory_lock_proof.rs",
+        "",
+    ),
+    (
+        "chat_protocol/repository/recovery/production_recovery_inventory_proof.rs",
+        "",
+    ),
+    ("chat_protocol/repository/reset/tests.rs", ""),
+    ("chat_protocol/repository/rollback_tests.rs", ""),
+    ("chat_protocol/repository/ticket/tests.rs", ""),
+    ("chat_protocol/repository/transition/tests.rs", ""),
+    ("chat_protocol/state_machine/executor_tests.rs", ""),
+    // Production worker file: only its `#[cfg(test)] mod tests` is exempt.
+    ("workers/request_push.rs", "mod tests {"),
+];
+
+/// Splits `offenders` (`"<relative>:<line>"`) into still-failing offenders,
+/// dropping sites covered by `REVIEWED_GATE_DB_TEST_EXEMPTIONS`, and asserts no
+/// exemption has gone stale for this guard.
+fn without_reviewed_gate_db_exemptions(
+    guard: &str,
+    sources: &[(String, String)],
+    offenders: Vec<String>,
+    exemptions_expected_to_match: &[&str],
+) -> Vec<String> {
+    let mut used = std::collections::BTreeSet::new();
+    let remaining = offenders
+        .into_iter()
+        .filter(|offender| {
+            let (relative, line) = offender.rsplit_once(':').expect("offender is path:line");
+            let line: usize = line.parse().expect("offender line number");
+            let Some((path, marker)) = REVIEWED_GATE_DB_TEST_EXEMPTIONS
+                .iter()
+                .find(|(path, _)| *path == relative)
+            else {
+                return true;
+            };
+            let source = &sources
+                .iter()
+                .find(|(candidate, _)| candidate == relative)
+                .expect("offender source present")
+                .1;
+            let start = if marker.is_empty() {
+                1
+            } else {
+                match source.lines().position(|text| text.contains(marker)) {
+                    Some(index) => index + 1,
+                    None => return true,
+                }
+            };
+            if line >= start {
+                used.insert(*path);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let stale: Vec<&&str> = exemptions_expected_to_match
+        .iter()
+        .filter(|path| !used.contains(**path))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "{guard}: reviewed-gate exemptions no longer match any site: {stale:?}. \
+         Remove them from REVIEWED_GATE_DB_TEST_EXEMPTIONS."
+    );
+    remaining
+}
+
 /// `db::init_db` runs `sqlx::migrate!("./migrations")` against whatever URL it
 /// is handed. That is the mechanism that took the shared clean-chat database's
 /// `_sqlx_migrations` ledger from the reviewed 13 to 69 — silently, while the
@@ -464,6 +559,16 @@ fn no_src_test_source_defaults_a_database_connection_to_a_hardcoded_name() {
             }
         }
     }
+    let offenders = without_reviewed_gate_db_exemptions(
+        "hardcoded-name guard",
+        &sources,
+        offenders,
+        &[
+            "chat_protocol/repository/delivery/read_tests.rs",
+            "chat_protocol/repository/rollback_tests.rs",
+            "chat_protocol/repository/ticket/tests.rs",
+        ],
+    );
     assert!(
         offenders.is_empty(),
         "src test sources default a database connection to a hardcoded name: \
@@ -513,6 +618,16 @@ fn no_src_test_adopts_connection_directly_from_test_database_url() {
         }
     }
 
+    let all_exempt_paths: Vec<&str> = REVIEWED_GATE_DB_TEST_EXEMPTIONS
+        .iter()
+        .map(|(path, _)| *path)
+        .collect();
+    let offenders = without_reviewed_gate_db_exemptions(
+        "TEST_DATABASE_URL adoption guard",
+        &src_sources,
+        offenders,
+        &all_exempt_paths,
+    );
     assert!(
         offenders.is_empty(),
         "src tests adopt connections directly from TEST_DATABASE_URL: {offenders:?}. Use crate::test_support::fresh_db instead."
