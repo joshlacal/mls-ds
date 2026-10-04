@@ -362,6 +362,13 @@ pub async fn run_federation_fixture() -> Result<(), String> {
     let input: FederationFixtureInput = serde_json::from_slice(&buffer)
         .map_err(|e| format!("failed to parse selector JSON: {e}"))?;
 
+    // Conversation ids minted by the server and the e2e harness are UUIDv4; a
+    // nil or other-version id in a selector is a malformed fixture, not a
+    // conversation, so refuse it before any database or network work.
+    if input.conversation_id.get_version_num() != 4 {
+        return Err("invalid bootstrap selector: conversationId must be a UUIDv4".to_string());
+    }
+
     let selector = crate::federation::RemotePrefixBootstrapSelector::new(
         input.conversation_id,
         input.configured_sequencer_did,
