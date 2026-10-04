@@ -3864,3 +3864,38 @@ pub(super) mod test_support {
         .map(Some)
     }
 }
+
+// Ported from main (b7838df3): pins the coordinate $bytes regression
+// against the shared canonical builder used on the merged line.
+
+#[cfg(test)]
+mod canonical_response_tests {
+    use super::*;
+
+    /// Regression: the echoed coordinate's bytes fields were emitted as bare
+    /// base64 strings, which the generated coordinate DTO (and so every
+    /// `requestReset`/`activateReset` response) rejects — each first
+    /// `requestReset` failed closed with a 500.
+    #[test]
+    fn coordinate_json_decodes_as_generated_dto() {
+        let coordinate = PublicGroupSnapshotCoordinate::new(
+            *Uuid::new_v4().as_bytes(),
+            0,
+            2,
+            [0x11; 32],
+            1,
+            [0x22; 32],
+            [0x33; 32],
+            PublicGroupSnapshotLifecycle::Active,
+        );
+        let json = coordinate_json(&coordinate).expect("coordinate encodes");
+        for field in ["groupId", "groupContextHash", "confirmationTag"] {
+            assert!(
+                json[field].get("$bytes").is_some(),
+                "{field} must be a $bytes object"
+            );
+        }
+        serde_json::from_value::<chat_dto::ConversationCoordinates<DefaultStr>>(json)
+            .expect("coordinate must decode as the generated DTO");
+    }
+}

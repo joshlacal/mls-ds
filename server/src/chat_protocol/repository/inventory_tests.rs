@@ -3738,6 +3738,97 @@ async fn conversations_consumed_state(
     .expect("read the consumption state")
 }
 
+#[tokio::test]
+async fn production_empty_initial_pages_allow_alternate_limit_after_consumption() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let fence = ensure_fence(&pool).await;
+    let now = whole_second(clock_now(&pool).await);
+    let device = seed_device_with_key(&pool, now).await;
+    let session_id = Uuid::new_v4();
+    let mut random = DeterministicRandom::new(0xC1E0);
+    seed_session_via_create_shape(
+        &pool,
+        &fence,
+        &device,
+        session_id,
+        now,
+        now + Duration::minutes(15),
+        &mut random,
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    let request_100 = conversations_request(100);
+    let mut tx = pool.begin().await.expect("begin the limit-100 empty serve");
+    let served_100 = repository::inventory::serve_initial_inventory_page(
+        &mut tx,
+        Some(paging_device(&device)),
+        session_id,
+        &request_100,
+        &fence.sealer,
+        &mut random,
+    )
+    .await
+    .expect("the limit-100 empty page serves");
+    tx.commit().await.expect("commit the limit-100 empty serve");
+    assert_eq!(
+        extract_next_page_cursor(served_100.bytes()),
+        None,
+        "an empty initial page is final and mints no successor"
+    );
+    let consumed = conversations_consumed_state(&pool, session_id).await;
+    assert!(consumed.0, "the first empty final page consumes the domain");
+
+    let request_50 = conversations_request(50);
+    let mut tx = pool.begin().await.expect("begin the limit-50 empty serve");
+    let served_50 = repository::inventory::serve_initial_inventory_page(
+        &mut tx,
+        Some(paging_device(&device)),
+        session_id,
+        &request_50,
+        &fence.sealer,
+        &mut random,
+    )
+    .await
+    .expect("an alternate-limit empty page serves after domain consumption");
+    tx.commit().await.expect("commit the limit-50 empty serve");
+    assert_eq!(
+        served_50.bytes(),
+        served_100.bytes(),
+        "an empty page is limit-independent"
+    );
+    assert_eq!(
+        conversations_consumed_state(&pool, session_id).await,
+        consumed,
+        "the alternate limit does not repeat the consumption CAS"
+    );
+
+    let mut tx = pool.begin().await.expect("begin the limit-50 empty replay");
+    let replayed_50 = repository::inventory::serve_initial_inventory_page(
+        &mut tx,
+        Some(paging_device(&device)),
+        session_id,
+        &request_50,
+        &fence.sealer,
+        &mut random,
+    )
+    .await
+    .expect("the alternate-limit empty page replays");
+    tx.commit().await.expect("commit the limit-50 empty replay");
+    assert_eq!(
+        replayed_50.bytes(),
+        served_50.bytes(),
+        "the alternate-limit replay is byte-identical"
+    );
+    assert_eq!(
+        conversations_consumed_state(&pool, session_id).await,
+        consumed,
+        "replay does not repeat the consumption CAS"
+    );
+}
+
 /// Final-review fix-round coverage (C-1/C-2): the PRODUCTION paging
 /// entrypoints — `serve_initial_inventory_page`,
 /// `issue_next_inventory_page_cursor`, `complete_inventory_page`, and through
@@ -4361,6 +4452,182 @@ async fn gc_reclaim_of_the_expired_session_permits_a_new_session_under_the_same_
     );
 }
 
+#[tokio::test]
+async fn targeted_inventory_gc_does_not_sweep_cross_device_orphans() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let fence = ensure_fence(&pool).await;
+    seed_fixed_admission_device(&pool).await;
+    let device = fixed_admission_device();
+    let now = whole_second(clock_now(&pool).await);
+    let session_id = derive_inventory_session_uuid(&device.did, device.device_id, &device.jkt, 1);
+    let mut random = DeterministicRandom::new(0xD3F4);
+    let session = seed_session_via_create_shape(
+        &pool,
+        &fence,
+        &device,
+        session_id,
+        now,
+        now + Duration::minutes(15),
+        &mut random,
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    let mut transaction = pool.begin().await.expect("begin receipt fixture");
+    serve_page_receipt_seed(
+        &mut transaction,
+        &fence,
+        &session,
+        "conversations",
+        "blue.catbird.chat.getConversations",
+        &conversations_request(100),
+        None,
+        None,
+        &[],
+        false,
+        &mut random,
+    )
+    .await;
+    transaction.commit().await.expect("commit receipt fixture");
+
+    let mut orphan = pool.begin().await.expect("begin legacy orphan fixture");
+    sqlx::query("SET LOCAL session_replication_role = 'replica'")
+        .execute(&mut *orphan)
+        .await
+        .expect("disable triggers for the isolated legacy fixture");
+    sqlx::query("DELETE FROM chat.inventory_sessions WHERE inventory_session_id = $1")
+        .bind(session_id)
+        .execute(&mut *orphan)
+        .await
+        .expect("remove the legacy fixture parent");
+    orphan.commit().await.expect("commit legacy orphan fixture");
+
+    let count_receipts_sql = "SELECT count(*) FROM chat.inventory_page_receipts \
+                              WHERE inventory_session_id = $1";
+    let orphan_receipts: i64 = sqlx::query_scalar(count_receipts_sql)
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count orphan receipts");
+    assert_eq!(orphan_receipts, 1);
+
+    let mut targeted = pool.begin().await.expect("begin targeted GC");
+    sqlx::query("SELECT set_config('chat.inventory_gc_target_user_did',$1,true)")
+        .bind(&device.did)
+        .execute(&mut *targeted)
+        .await
+        .expect("set targeted GC user");
+    sqlx::query("SELECT set_config('chat.inventory_gc_target_device_id',$1,true)")
+        .bind(device.device_id.to_string())
+        .execute(&mut *targeted)
+        .await
+        .expect("set targeted GC device");
+    sqlx::query_scalar::<_, i64>("SELECT chat.gc_expired_inventory_sessions(100)")
+        .fetch_one(&mut *targeted)
+        .await
+        .expect("run targeted GC");
+    targeted.commit().await.expect("commit targeted GC");
+    let orphan_receipts: i64 = sqlx::query_scalar(count_receipts_sql)
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count orphan receipts after targeted GC");
+    assert_eq!(
+        orphan_receipts, 1,
+        "request-path targeted GC must not sweep legacy orphans"
+    );
+
+    sqlx::query_scalar::<_, i64>("SELECT chat.gc_expired_inventory_sessions(1)")
+        .fetch_one(&pool)
+        .await
+        .expect("run bounded background GC");
+    let orphan_receipts: i64 = sqlx::query_scalar(count_receipts_sql)
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count orphan receipts after background GC");
+    assert_eq!(
+        orphan_receipts, 0,
+        "untargeted background GC drains the orphan"
+    );
+}
+
+#[tokio::test]
+async fn exact_inventory_session_delete_reclaims_live_snapshot_children() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let fence = ensure_fence(&pool).await;
+    seed_fixed_admission_device(&pool).await;
+    let device = fixed_admission_device();
+    let now = whole_second(clock_now(&pool).await);
+    let session_id = derive_inventory_session_uuid(&device.did, device.device_id, &device.jkt, 1);
+    let mut random = DeterministicRandom::new(0xD3F5);
+    let session = seed_session_via_create_shape(
+        &pool,
+        &fence,
+        &device,
+        session_id,
+        now,
+        now + Duration::minutes(15),
+        &mut random,
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    let mut transaction = pool.begin().await.expect("begin receipt fixture");
+    serve_page_receipt_seed(
+        &mut transaction,
+        &fence,
+        &session,
+        "conversations",
+        "blue.catbird.chat.getConversations",
+        &conversations_request(100),
+        None,
+        None,
+        &[],
+        false,
+        &mut random,
+    )
+    .await;
+    transaction.commit().await.expect("commit receipt fixture");
+
+    let wrong_identity: bool =
+        sqlx::query_scalar("SELECT chat.delete_inventory_session_exact($1,$2,$3)")
+            .bind(session_id)
+            .bind(&device.did)
+            .bind(Uuid::new_v4())
+            .fetch_one(&pool)
+            .await
+            .expect("run mismatched exact delete");
+    assert!(
+        !wrong_identity,
+        "a mismatched device cannot delete the session"
+    );
+
+    let deleted: bool = sqlx::query_scalar("SELECT chat.delete_inventory_session_exact($1,$2,$3)")
+        .bind(session_id)
+        .bind(&device.did)
+        .bind(device.device_id)
+        .fetch_one(&pool)
+        .await
+        .expect("run exact session delete");
+    assert!(deleted, "the exact live session is deleted");
+
+    let (sessions, receipts): (i64, i64) = sqlx::query_as(
+        "SELECT \
+         (SELECT count(*) FROM chat.inventory_sessions WHERE inventory_session_id=$1), \
+         (SELECT count(*) FROM chat.inventory_page_receipts WHERE inventory_session_id=$1)",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count exact-delete residue");
+    assert_eq!((sessions, receipts), (0, 0));
+}
+
 // ===========================================================================
 // Production-contract source pins (findings round): the SQL statement shapes,
 // the response-assembly field order, and the response ceiling duplicated in
@@ -4820,273 +5087,4 @@ async fn http_inventory_bootstrap_round_trip_emitter_to_all_consumers_end_to_end
         "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents"
     );
     assert_eq!(ticket_body["ticket"].as_str().map(str::len), Some(43));
-}
-
-
-// ---- ported from main (b7838df3) during the line merge ----
-#[tokio::test]
-async fn exact_inventory_session_delete_reclaims_live_snapshot_children() {
-    let (pool, _guard) = executor_seed::setup().await;
-    let fence = ensure_fence(&pool).await;
-    seed_fixed_admission_device(&pool).await;
-    let device = fixed_admission_device();
-    let now = whole_second(clock_now(&pool).await);
-    let session_id = derive_inventory_session_uuid(&device.did, device.device_id, &device.jkt, 1);
-    let mut random = DeterministicRandom::new(0xD3F5);
-    let session = seed_session_via_create_shape(
-        &pool,
-        &fence,
-        &device,
-        session_id,
-        now,
-        now + Duration::minutes(15),
-        &mut random,
-        &[],
-        &[],
-        &[],
-    )
-    .await;
-
-    let mut transaction = pool.begin().await.expect("begin receipt fixture");
-    serve_page_receipt_seed(
-        &mut transaction,
-        &fence,
-        &session,
-        "conversations",
-        "blue.catbird.chat.getConversations",
-        &conversations_request(100),
-        None,
-        None,
-        &[],
-        false,
-        &mut random,
-    )
-    .await;
-    transaction.commit().await.expect("commit receipt fixture");
-
-    let wrong_identity: bool =
-        sqlx::query_scalar("SELECT chat.delete_inventory_session_exact($1,$2,$3)")
-            .bind(session_id)
-            .bind(&device.did)
-            .bind(Uuid::new_v4())
-            .fetch_one(&pool)
-            .await
-            .expect("run mismatched exact delete");
-    assert!(
-        !wrong_identity,
-        "a mismatched device cannot delete the session"
-    );
-
-    let deleted: bool = sqlx::query_scalar("SELECT chat.delete_inventory_session_exact($1,$2,$3)")
-        .bind(session_id)
-        .bind(&device.did)
-        .bind(device.device_id)
-        .fetch_one(&pool)
-        .await
-        .expect("run exact session delete");
-    assert!(deleted, "the exact live session is deleted");
-
-    let (sessions, receipts): (i64, i64) = sqlx::query_as(
-        "SELECT \
-         (SELECT count(*) FROM chat.inventory_sessions WHERE inventory_session_id=$1), \
-         (SELECT count(*) FROM chat.inventory_page_receipts WHERE inventory_session_id=$1)",
-    )
-    .bind(session_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count exact-delete residue");
-    assert_eq!((sessions, receipts), (0, 0));
-}
-
-#[tokio::test]
-async fn production_empty_initial_pages_allow_alternate_limit_after_consumption() {
-    let (pool, _guard) = executor_seed::setup().await;
-    let fence = ensure_fence(&pool).await;
-    let now = whole_second(clock_now(&pool).await);
-    let device = seed_device_with_key(&pool, now).await;
-    let session_id = Uuid::new_v4();
-    let mut random = DeterministicRandom::new(0xC1E0);
-    seed_session_via_create_shape(
-        &pool,
-        &fence,
-        &device,
-        session_id,
-        now,
-        now + Duration::minutes(15),
-        &mut random,
-        &[],
-        &[],
-        &[],
-    )
-    .await;
-
-    let request_100 = conversations_request(100);
-    let mut tx = pool.begin().await.expect("begin the limit-100 empty serve");
-    let served_100 = repository::inventory::serve_initial_inventory_page(
-        &mut tx,
-        Some(paging_device(&device)),
-        session_id,
-        &request_100,
-        &fence.sealer,
-        &mut random,
-    )
-    .await
-    .expect("the limit-100 empty page serves");
-    tx.commit().await.expect("commit the limit-100 empty serve");
-    assert_eq!(
-        extract_next_page_cursor(served_100.bytes()),
-        None,
-        "an empty initial page is final and mints no successor"
-    );
-    let consumed = conversations_consumed_state(&pool, session_id).await;
-    assert!(consumed.0, "the first empty final page consumes the domain");
-
-    let request_50 = conversations_request(50);
-    let mut tx = pool.begin().await.expect("begin the limit-50 empty serve");
-    let served_50 = repository::inventory::serve_initial_inventory_page(
-        &mut tx,
-        Some(paging_device(&device)),
-        session_id,
-        &request_50,
-        &fence.sealer,
-        &mut random,
-    )
-    .await
-    .expect("an alternate-limit empty page serves after domain consumption");
-    tx.commit().await.expect("commit the limit-50 empty serve");
-    assert_eq!(
-        served_50.bytes(),
-        served_100.bytes(),
-        "an empty page is limit-independent"
-    );
-    assert_eq!(
-        conversations_consumed_state(&pool, session_id).await,
-        consumed,
-        "the alternate limit does not repeat the consumption CAS"
-    );
-
-    let mut tx = pool.begin().await.expect("begin the limit-50 empty replay");
-    let replayed_50 = repository::inventory::serve_initial_inventory_page(
-        &mut tx,
-        Some(paging_device(&device)),
-        session_id,
-        &request_50,
-        &fence.sealer,
-        &mut random,
-    )
-    .await
-    .expect("the alternate-limit empty page replays");
-    tx.commit().await.expect("commit the limit-50 empty replay");
-    assert_eq!(
-        replayed_50.bytes(),
-        served_50.bytes(),
-        "the alternate-limit replay is byte-identical"
-    );
-    assert_eq!(
-        conversations_consumed_state(&pool, session_id).await,
-        consumed,
-        "replay does not repeat the consumption CAS"
-    );
-}
-
-#[tokio::test]
-async fn targeted_inventory_gc_does_not_sweep_cross_device_orphans() {
-    let (pool, _guard) = executor_seed::setup().await;
-    let fence = ensure_fence(&pool).await;
-    seed_fixed_admission_device(&pool).await;
-    let device = fixed_admission_device();
-    let now = whole_second(clock_now(&pool).await);
-    let session_id = derive_inventory_session_uuid(&device.did, device.device_id, &device.jkt, 1);
-    let mut random = DeterministicRandom::new(0xD3F4);
-    let session = seed_session_via_create_shape(
-        &pool,
-        &fence,
-        &device,
-        session_id,
-        now,
-        now + Duration::minutes(15),
-        &mut random,
-        &[],
-        &[],
-        &[],
-    )
-    .await;
-
-    let mut transaction = pool.begin().await.expect("begin receipt fixture");
-    serve_page_receipt_seed(
-        &mut transaction,
-        &fence,
-        &session,
-        "conversations",
-        "blue.catbird.chat.getConversations",
-        &conversations_request(100),
-        None,
-        None,
-        &[],
-        false,
-        &mut random,
-    )
-    .await;
-    transaction.commit().await.expect("commit receipt fixture");
-
-    let mut orphan = pool.begin().await.expect("begin legacy orphan fixture");
-    sqlx::query("SET LOCAL session_replication_role = 'replica'")
-        .execute(&mut *orphan)
-        .await
-        .expect("disable triggers for the isolated legacy fixture");
-    sqlx::query("DELETE FROM chat.inventory_sessions WHERE inventory_session_id = $1")
-        .bind(session_id)
-        .execute(&mut *orphan)
-        .await
-        .expect("remove the legacy fixture parent");
-    orphan.commit().await.expect("commit legacy orphan fixture");
-
-    let count_receipts_sql = "SELECT count(*) FROM chat.inventory_page_receipts \
-                              WHERE inventory_session_id = $1";
-    let orphan_receipts: i64 = sqlx::query_scalar(count_receipts_sql)
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count orphan receipts");
-    assert_eq!(orphan_receipts, 1);
-
-    let mut targeted = pool.begin().await.expect("begin targeted GC");
-    sqlx::query("SELECT set_config('chat.inventory_gc_target_user_did',$1,true)")
-        .bind(&device.did)
-        .execute(&mut *targeted)
-        .await
-        .expect("set targeted GC user");
-    sqlx::query("SELECT set_config('chat.inventory_gc_target_device_id',$1,true)")
-        .bind(device.device_id.to_string())
-        .execute(&mut *targeted)
-        .await
-        .expect("set targeted GC device");
-    sqlx::query_scalar::<_, i64>("SELECT chat.gc_expired_inventory_sessions(100)")
-        .fetch_one(&mut *targeted)
-        .await
-        .expect("run targeted GC");
-    targeted.commit().await.expect("commit targeted GC");
-    let orphan_receipts: i64 = sqlx::query_scalar(count_receipts_sql)
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count orphan receipts after targeted GC");
-    assert_eq!(
-        orphan_receipts, 1,
-        "request-path targeted GC must not sweep legacy orphans"
-    );
-
-    sqlx::query_scalar::<_, i64>("SELECT chat.gc_expired_inventory_sessions(1)")
-        .fetch_one(&pool)
-        .await
-        .expect("run bounded background GC");
-    let orphan_receipts: i64 = sqlx::query_scalar(count_receipts_sql)
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count orphan receipts after background GC");
-    assert_eq!(
-        orphan_receipts, 0,
-        "untargeted background GC drains the orphan"
-    );
 }

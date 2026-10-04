@@ -1339,9 +1339,12 @@ mod tests {
             .await
             .unwrap_err();
 
+        // Merged line: redirects are rejected explicitly (encrypted-requests'
+        // classification) instead of surfacing as a generic RemoteError 302.
         assert!(matches!(
-            error,
-            OutboundError::RemoteError { status: 302, .. }
+            &error,
+            OutboundError::InvalidResponse { reason }
+                if reason.contains("Redirect rejected") && reason.contains("302")
         ));
         assert_eq!(decoy_hits.load(Ordering::SeqCst), 0);
     }

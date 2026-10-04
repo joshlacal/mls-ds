@@ -82,13 +82,13 @@ struct CorpusActor {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CorpusChain {
+    #[serde(default)]
     generation: u64,
     genesis_state_version: u64,
     genesis_epoch: u64,
     genesis_group_context_hash_hex: String,
     genesis_confirmation_tag_hex: String,
     group_id_hex: String,
-    inner_key_package_ref_hex: String,
 }
 
 fn corpus_dir() -> PathBuf {

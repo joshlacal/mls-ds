@@ -546,8 +546,6 @@ fn enrollment_evidence(
     )
 }
 
-
-
 fn first_authority(
     outcome: AuthorizationOutcome,
 ) -> crate::chat_protocol::dpop::VerifiedChatDeviceRequest {
@@ -568,9 +566,6 @@ async fn prepare_enrollment_first(
         }
     }
 }
-
-
-
 async fn persist_and_complete_enrollment(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     admission: EnrollmentOperationAdmission,
@@ -615,9 +610,6 @@ async fn validate_enrollment_replay(
         }
     }
 }
-
-
-
 async fn seed_registered_device(pool: &sqlx::PgPool) {
     let public_key = registered_signing_key().verifying_key().to_bytes();
     sqlx::query(
@@ -1280,8 +1272,6 @@ async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion(
     conflict_transaction.rollback().await.unwrap();
 }
 
-
-
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn replenishment_exact_replay_survives_next_day_but_stale_first_creates_no_claim() {
@@ -1512,7 +1502,46 @@ async fn replenishment_replay_rejects_missing_ref_hash_and_owner_manifest_drift(
     tx.rollback().await.unwrap();
 }
 
+#[tokio::test]
+#[ignore = "requires the isolated clean-chat PostgreSQL database"]
+async fn stale_enrollment_first_execution_creates_no_operation_claim() {
+    let (pool, _database) = setup_auth_repository_db(3).await;
+    let late = "2026-07-24T14:05:09.123Z";
 
+    let enrollment_fixture = DeviceFixture::fresh();
+    let enrollment_id = uuid::Uuid::new_v4();
+    let enrollment_raw =
+        enrollment_body(&enrollment_fixture, enrollment_id, "Stale first", FIRST_T);
+    let enrollment = authorize_enrollment_operation_only(
+        &pool,
+        enrollment_evidence(
+            &enrollment_raw,
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            uuid::Uuid::new_v4(),
+            late,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut enrollment_tx = pool.begin().await.unwrap();
+    let error = prelude::prepare_enrollment_operation(&mut enrollment_tx, enrollment)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PreludeError::Authorization(AuthRepositoryError::Primitive(_))
+    ));
+    enrollment_tx.rollback().await.unwrap();
+
+    let claim_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.operation_claims WHERE operation_id=$1")
+            .bind(enrollment_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(claim_count, 0, "stale first execution created a claim");
+}
 
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
@@ -1664,10 +1693,6 @@ async fn identical_enrollment_business_racers_converge_on_one_device_and_respons
     .unwrap();
     assert_eq!(row_counts, (1, 1));
 }
-
-
-
-
 
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
@@ -1941,47 +1966,4 @@ async fn business_convergence_revalidates_completed_authority_and_post_state() {
         "business convergence replay ignored missing enrollment post-state: {error:?}"
     );
     enrollment_transaction.rollback().await.unwrap();
-}
-
-
-// ---- ported from main (b7838df3) during the line merge ----
-#[tokio::test]
-#[ignore = "requires the isolated clean-chat PostgreSQL database"]
-async fn stale_enrollment_first_execution_creates_no_operation_claim() {
-    let (pool, _database) = setup_auth_repository_db(3).await;
-    let late = "2026-07-24T14:05:09.123Z";
-
-    let enrollment_fixture = DeviceFixture::fresh();
-    let enrollment_id = uuid::Uuid::new_v4();
-    let enrollment_raw =
-        enrollment_body(&enrollment_fixture, enrollment_id, "Stale first", FIRST_T);
-    let enrollment = authorize_enrollment_operation_only(
-        &pool,
-        enrollment_evidence(
-            &enrollment_raw,
-            uuid::Uuid::new_v4(),
-            random_proof_jti(),
-            uuid::Uuid::new_v4(),
-            late,
-        ),
-    )
-    .await
-    .unwrap();
-    let mut enrollment_tx = pool.begin().await.unwrap();
-    let error = prelude::prepare_enrollment_operation(&mut enrollment_tx, enrollment)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        PreludeError::Authorization(AuthRepositoryError::Primitive(_))
-    ));
-    enrollment_tx.rollback().await.unwrap();
-
-    let claim_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM chat.operation_claims WHERE operation_id=$1")
-            .bind(enrollment_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(claim_count, 0, "stale first execution created a claim");
 }

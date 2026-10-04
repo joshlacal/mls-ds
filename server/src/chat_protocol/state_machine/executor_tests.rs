@@ -14506,7 +14506,7 @@ async fn seed_alice_open_recovery(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
-    is_remote: false,
+        is_remote: false,
         sequencer_ds: None,
         sequencer_term: 0,
         participant_ds_dids: std::collections::HashMap::new(),

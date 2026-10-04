@@ -588,15 +588,20 @@ fn production_executor_requires_exact_recovery_write_authority_and_fences_legacy
             >= 4,
         "request, cancellation, expiry, and fulfillment must each reject missing write authority"
     );
+    let compact = source.split_whitespace().collect::<Vec<_>>().join(" ");
     assert_eq!(
         source
             .matches("#[cfg(test)]\n    if recovery_write_authority.is_none()")
             .count(),
-        4,
-        "every status-only Recovery fallback must be a genuine cfg(test) seam"
+        3,
+        "open, cancellation, and expiry status-only fallbacks must be genuine cfg(test) seams"
     );
     assert!(
-        !source.contains("#[cfg(not(test))]\n        if recovery_write_authority.is_none()"),
+        compact.contains("#[cfg(not(test))] { if historical_write_authority.is_none()"),
+        "historical fulfillment must fail closed without Recovery or historical write authority"
+    );
+    assert!(
+        !compact.contains("#[cfg(not(test))] if recovery_write_authority.is_none()"),
         "production must reject, never execute a witnessless fallback"
     );
 }

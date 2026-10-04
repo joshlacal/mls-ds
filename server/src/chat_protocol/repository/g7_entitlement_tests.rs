@@ -539,6 +539,19 @@ mod chat_protocol {
         use sqlx::{PgPool, Postgres, Transaction};
         use uuid::Uuid;
 
+        /// The BREAD-05 precedence predicate, handed to the crate root: the
+        /// gate pins the invitation/interval sequence boundary directly rather
+        /// than seeding one graph per sequence relationship.
+        pub fn finite_interval_takes_precedence(
+            interval_end_seq: u64,
+            pending_invitation_seq: Option<u64>,
+        ) -> bool {
+            super::read_authority::finite_interval_takes_precedence(
+                interval_end_seq,
+                pending_invitation_seq,
+            )
+        }
+
         /// Mint the ordinary budget and spend its single attempt, dropping it
         /// unspent on purpose: this probes the endpoint gate, which runs
         /// before any SQL.
@@ -1622,18 +1635,25 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
 // consumed the row through activation without re-parsing the request. The
 // fixture now signs `idempotencyKey: request_id`, which is what production
 // requires; every suite that consumes the seed is unchanged by it.
+// Re-pinned for the OpenMLS 0.9 clean cutover: the helper now consumes the
+// sealed v0.9 corpus and mints only routing- and lock-bound authority.
 // Re-pin only alongside a reviewed change to `tests/common/executor_seed.rs`;
 // an unexplained mismatch here still means the seed drifted.
+// Re-pinned 2026-10-04 for the main + encrypted-requests line merge: the
+// helper is main's file plus encrypted-requests' fresh-database migration
+// retry/advisory lock and clock-anchored seeds.
 const FROZEN_EXECUTOR_SEED_SHA256: &str =
-    "70de1ae2c7277ffdfbc26eb6c2b7fd2d74a5a0d415233b9b7b8779039e6a74ea";
+    "33877d5fc1031e88e36ba5b191976442527d3e2f5691c377f487230f5db182b4";
 // Re-pinned 2026-08-15 for finding 3 fix (b): `load_reset_request_hydration_rows`
 // admits the ratified `revoked` status and selects `terminal_revocation_id`,
 // `select_reset_terminal` gained the revocation arm (and now checks the
 // revocation column on every arm, mirroring the DB shape check), and
 // `graph_digest_reset` encodes the fifth status. Taken from POST-rustfmt bytes.
+// Re-pinned for the clean cutover's fail-closed routing and locked-hydration
+// repository changes.
 // An unexplained mismatch here still means core.rs drifted.
 const SEALED_REPOSITORY_CORE_SHA256: &str =
-    "f118cc9c303cb013e20b8752a6f36edb250ec744cac39215fe52212fc5b74258";
+    "420ad7d9c040bb33be7a411de14a1eeed47b8f26b8de3cc9e32be0122edb24a5";
 
 #[test]
 fn frozen_executor_seed_helper_is_byte_identical_to_the_sealed_baseline() {
@@ -2323,10 +2343,8 @@ fn declaration_with_attributes<'a>(source: &'a str, item: &str) -> &'a str {
 const B_AUTH_SEAL_ORDERED_REJECTIONS: &[&str] = &[
     "if request.mutation().is_some()",
     "ReadAdmissionBindingError::OperationShape",
-    "pre_replay.enrollment.is_some()",
-    "pre_replay.enrollment_body.is_some()",
-    "pre_replay.rebind.is_some()",
-    "pre_replay.auth_transaction_replay.is_some()",
+    "pre_replay.enrollment_body().is_some()",
+    "pre_replay.auth_transaction_replay().is_some()",
     "ReadAdmissionBindingError::OperationShape",
     "receipt.class() != RepositoryAuthorityClass::ExistingDevice",
     "ReadAdmissionBindingError::AuthorityClass",
@@ -2340,9 +2358,10 @@ const B_AUTH_SEAL_ORDERED_REJECTIONS: &[&str] = &[
     "coordinates.did != pre_replay.subject().as_str()",
     "coordinates.device_id.as_bytes() != pre_replay.device_id().as_bytes()",
     "ReadAdmissionBindingError::RequesterCoordinates",
-    "coordinates.textual_jkt != pre_replay.dpop_jkt().as_str()",
+    "let locked_jkt_digest = if let Some(jkt) = pre_replay.dpop_jkt()",
+    "coordinates.textual_jkt != Some(jkt.as_str())",
     "ReadAdmissionBindingError::Thumbprint",
-    "decode_canonical_thumbprint_digest(coordinates.textual_jkt)",
+    "decode_canonical_thumbprint_digest(jkt.as_str())",
     "coordinates.auth_generation <= 0",
     "ReadAdmissionBindingError::Generation",
 ];
@@ -2361,7 +2380,9 @@ const B_AUTH_VERIFIER_ORDERED_REJECTIONS: &[&str] = &[
     "ReadAdmissionBindingError::KeyRevoked",
     "if &*row.did != binding.locked_did.as_str() || row.device_id != binding.locked_device_id",
     "ReadAdmissionBindingError::RequesterCoordinates",
-    "if decode_canonical_thumbprint_digest(&row.textual_jkt)? != binding.locked_jkt_digest",
+    "if let Some(expected_digest) = binding.locked_jkt_digest",
+    ".ok_or(ReadAdmissionBindingError::Thumbprint)?",
+    "if decode_canonical_thumbprint_digest(textual)? != expected_digest",
     "ReadAdmissionBindingError::Thumbprint",
     "if row.auth_generation <= 0 || row.auth_generation != binding.locked_auth_generation",
     "ReadAdmissionBindingError::Generation",
@@ -3144,7 +3165,7 @@ fn b_auth_get_own_devices_budget_mints_fixed_three_attempts() {
 const B_AUTH_G7_SELF_SOURCE: &str = include_str!("g7_entitlement_tests.rs");
 
 // ---------------------------------------------------------------------------
-// 8. Nonignored source/compile: privacy, call graph, and the exact thirteen.
+// 8. Nonignored source/compile: privacy, call graph, and the exact nine.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4144,12 +4165,12 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     assert_eq!(
         hex::encode(Sha256::digest(B_AUTH_DEVICE_DIRECTORY_SOURCE.as_bytes())),
         B_AUTH_DEVICE_DIRECTORY_SHA256,
-        "device_directory.rs is read-only through Stage B"
+        "device_directory.rs matches the reviewed clean-cutover surface"
     );
     assert_eq!(
         hex::encode(Sha256::digest(B_AUTH_DEVICE_VIEWS_SOURCE.as_bytes())),
         B_AUTH_DEVICE_VIEWS_SHA256,
-        "device_views.rs is read-only through Stage B"
+        "device_views.rs matches the reviewed clean-cutover surface"
     );
     assert_eq!(
         hex::encode(Sha256::digest(include_bytes!("../../../tests/common/executor_seed.rs"))),
@@ -4158,11 +4179,11 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     );
 }
 
-/// Lane-P pins for the paths that stay byte-identical through Stage B.
+/// Clean-cutover pins after removing the legacy device-directory and view APIs.
 const B_AUTH_DEVICE_DIRECTORY_SHA256: &str =
-    "0e0933e7a20bc5abf5744b2e322fde0d7ac55677ce6bddb87c350665cb35be36";
+    "e7118078b3490d4483f37bf7b7506914ec6dfd7595a2d8974c0798b0d2231ec7";
 const B_AUTH_DEVICE_VIEWS_SHA256: &str =
-    "aa154f2dd7043cb15b05a6293228ae866929cde78ace6ced468984e6777959a0";
+    "12a2bbe6eb78dd459880b8e314b648b353ce0ea4c64101a5bc9fe992c6af708d";
 
 // ---------------------------------------------------------------------------
 // 4-7. Ignored Tokio database cases, class `commit-write`. Task B6 runs these.
@@ -5920,9 +5941,19 @@ async fn revocation_jkt_and_generation_drift_after_admission_fail_closed() {
     assert_executor_db_absent(&maintenance_url, &db_name).await;
 }
 
+#[test]
+fn only_a_later_pending_invitation_bypasses_a_finite_interval() {
+    // The interval closed at seq 6: no re-invitation and a same-seq
+    // re-invitation leave it in force, and only a strictly later invitation
+    // reopens consent.
+    assert!(crate::chat_protocol::read_authority::finite_interval_takes_precedence(6, None));
+    assert!(crate::chat_protocol::read_authority::finite_interval_takes_precedence(6, Some(6)));
+    assert!(!crate::chat_protocol::read_authority::finite_interval_takes_precedence(6, Some(7)));
+}
+
 #[tokio::test]
 #[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
-async fn pending_invitations_authorize_state_only_for_group_and_direct() {
+async fn pending_participants_get_state_only() {
     let fixture = executor_seed::private_genuine_group_pending_graph().await;
     let pool = fixture.pool.clone();
     let conversation_id = fixture.graph.conversation_id;
@@ -5968,8 +5999,8 @@ async fn pending_invitations_authorize_state_only_for_group_and_direct() {
     );
     rollback_with_constraints(tx).await;
 
-    // The group-pending invitee authorizes current state only, with the
-    // pending-participant witness.
+    // The group-pending invitee authorizes current state only, with a
+    // state-only pending witness.
     let invitee_admission = fixture_read_admission(
         &pool,
         "blue.catbird.chat.getConversationState",
@@ -5998,7 +6029,7 @@ async fn pending_invitations_authorize_state_only_for_group_and_direct() {
             invitee_view.relationship.arm,
             chat_protocol::read_authority_bridge::RelationshipArmView::PendingParticipant
         ),
-        "the group-pending invitee carries the pending participant witness"
+        "the group-pending invitee carries the pending witness"
     );
     assert_eq!(
         invitee_view.relationship.participant_period_id, fixture.invitee.participant_period_id,
@@ -6053,7 +6084,8 @@ async fn pending_invitations_authorize_state_only_for_group_and_direct() {
         "group-pending authorizes state only, never application entries"
     );
 
-    // A direct-pending invitee authorizes current state only, identically to group-pending.
+    // A direct-pending invitee can point-read the exact state needed to sign
+    // acceptConversation, while remaining absent from enumerable inventory.
     let direct = executor_seed::private_genuine_direct_pending_graph().await;
     let direct_pool = direct.pool.clone();
     let direct_admission = fixture_read_admission(
@@ -6077,14 +6109,14 @@ async fn pending_invitations_authorize_state_only_for_group_and_direct() {
         direct.graph.conversation_id,
     )
     .await
-    .expect("a direct-pending participant authorizes current state");
+    .expect("a direct-pending invitee can point-read state for acceptance");
     let direct_view = chat_protocol::read_authority_bridge::state_authority_view(&direct_state);
     assert!(
         matches!(
             direct_view.relationship.arm,
             chat_protocol::read_authority_bridge::RelationshipArmView::PendingParticipant
         ),
-        "the direct-pending invitee carries the pending participant witness"
+        "the direct-pending invitee carries a state-only pending witness"
     );
     assert_eq!(
         direct_view.relationship.participant_period_id, direct.invitee.participant_period_id,
@@ -6108,135 +6140,33 @@ async fn pending_invitations_authorize_state_only_for_group_and_direct() {
     );
     rollback_with_constraints(tx).await;
 
-    // Entries require a current open leaf: the direct-pending invitee is
-    // denied application entries.
-    let direct_entry_outcome = {
-        let admission = fixture_read_admission(
-            &direct_pool,
-            "blue.catbird.chat.getEntries",
-            &direct.invitee.did,
-            direct.invitee.device_id,
-            &direct.invitee.dpop_jkt,
-        )
-        .await;
-        let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
-            &direct_pool,
-            admission,
-            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
-        )
-        .await
-        .expect("direct invitee entry single-attempt lock");
-        let outcome = chat_protocol::read_authority::authorize_entries(
-            &mut tx,
-            guard,
-            direct.graph.conversation_id,
-        )
-        .await
-        .err()
-        .expect("a direct-pending participant has no entry authority");
-        rollback_with_constraints(tx).await;
-        outcome
-    };
-    assert_eq!(
-        direct_entry_outcome,
-        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
-        "direct-pending authorizes state only, never application entries"
-    );
-
-    // No pending write authorization: pending participants have 0 active leaves
-    // and 0 application intervals in the database.
-    let direct_leaves: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM chat.member_devices \
-         WHERE conversation_id=$1 AND user_did=$2 AND active",
-    )
-    .bind(direct.graph.conversation_id)
-    .bind(&direct.invitee.did)
-    .fetch_one(&direct_pool)
-    .await
-    .expect("count the direct invitee's active leaves");
-    assert_eq!(
-        direct_leaves, 0,
-        "a direct-pending participant has zero active leaves (no write capability)"
-    );
-
-    let direct_intervals: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM chat.application_intervals \
-         WHERE conversation_id=$1 AND recipient_did=$2",
-    )
-    .bind(direct.graph.conversation_id)
-    .bind(&direct.invitee.did)
-    .fetch_one(&direct_pool)
-    .await
-    .expect("count the direct invitee's application intervals");
-    assert_eq!(
-        direct_intervals, 0,
-        "a direct-pending participant has zero application intervals"
-    );
-
-    // Unrelated DID remains NotEntitled to direct conversation state and entries.
-    let unrelated_did = b_read_fresh_did(0x0E);
-    let unrelated_device = Uuid::new_v4();
-    let unrelated_jkt = register_read_device(&direct_pool, &unrelated_did, unrelated_device).await;
-    let unrelated_admission = fixture_read_admission(
+    let wire_admission = fixture_read_admission(
         &direct_pool,
         "blue.catbird.chat.getConversationState",
-        &unrelated_did,
-        unrelated_device,
-        &unrelated_jkt,
+        &direct.invitee.did,
+        direct.invitee.device_id,
+        &direct.invitee.dpop_jkt,
     )
     .await;
-    let (unrelated_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+    let response = chat_protocol::repository::conversation::read_conversation_state_for_admission(
         &direct_pool,
-        unrelated_admission,
-        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
-    )
-    .await
-    .expect("unrelated single-attempt lock");
-    let unrelated_state_outcome = chat_protocol::read_authority::authorize_conversation_state(
-        &mut tx,
-        unrelated_guard,
+        wire_admission,
         direct.graph.conversation_id,
     )
     .await
-    .err()
-    .expect("an unrelated requester is not entitled to direct conversation state");
+    .expect("the repository returns the acceptance coordinates");
+    let output: serde_json::Value =
+        serde_json::from_slice(&response.into_response_bytes()).expect("canonical state response");
     assert_eq!(
-        unrelated_state_outcome,
-        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
-        "an unrelated DID remains NotEntitled to direct-pending conversation state"
+        output["pendingLeaveRequests"],
+        serde_json::json!([]),
+        "a pending invitee cannot inspect established members' leave requests"
     );
-    rollback_with_constraints(tx).await;
-
-    let unrelated_entry_admission = fixture_read_admission(
-        &direct_pool,
-        "blue.catbird.chat.getEntries",
-        &unrelated_did,
-        unrelated_device,
-        &unrelated_jkt,
-    )
-    .await;
-    let (unrelated_entry_guard, mut tx) =
-        chat_protocol::read_authority_bridge::lock_single_attempt(
-            &direct_pool,
-            unrelated_entry_admission,
-            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
-        )
-        .await
-        .expect("unrelated entry single-attempt lock");
-    let unrelated_entry_outcome = chat_protocol::read_authority::authorize_entries(
-        &mut tx,
-        unrelated_entry_guard,
-        direct.graph.conversation_id,
-    )
-    .await
-    .err()
-    .expect("an unrelated requester has no entry authority on direct conversation");
     assert_eq!(
-        unrelated_entry_outcome,
-        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
-        "an unrelated DID has no entry authority on direct conversation"
+        output["pendingResetRequests"],
+        serde_json::json!([]),
+        "a pending invitee cannot inspect established members' reset requests"
     );
-    rollback_with_constraints(tx).await;
 }
 
 #[tokio::test]
@@ -9288,202 +9218,324 @@ fn c1_2_source_guards_pin_checked_surface_and_encoder_byte_flow() {
     }
     // The guarded fixtures' byte helpers are all exercised by the tests.
     assert!(C1_2_ENTITLEMENT_SOURCE.contains("c1_2_contains_bytes"));
+}
 
+// Ported from encrypted-requests (581ae855); dropped by the whole-file test merge.
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn pending_invitations_authorize_state_only_for_group_and_direct() {
+    let fixture = executor_seed::private_genuine_group_pending_graph().await;
+    let pool = fixture.pool.clone();
+    let conversation_id = fixture.graph.conversation_id;
 
-            // ---- ported from main (b7838df3) during the line merge ----
-            #[test]
-            fn only_a_later_pending_invitation_bypasses_a_finite_interval() {
-                // The interval closed at seq 6: no re-invitation and a same-seq
-                // re-invitation leave it in force, and only a strictly later invitation
-                // reopens consent.
-                assert!(crate::chat_protocol::read_authority::finite_interval_takes_precedence(6, None));
-                assert!(crate::chat_protocol::read_authority::finite_interval_takes_precedence(6, Some(6)));
-                assert!(!crate::chat_protocol::read_authority::finite_interval_takes_precedence(6, Some(7)));
-            }
+    // The creator keeps its open leaf: state authority with the open-leaf arm.
+    let creator_admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversationState",
+        &fixture.graph.creator_did,
+        fixture.graph.creator_device_id,
+        &fixture.graph.creator_dpop_jkt,
+    )
+    .await;
+    let (creator_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        creator_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("creator single-attempt lock");
+    let creator_state = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        creator_guard,
+        conversation_id,
+    )
+    .await
+    .expect("the creator's current open leaf authorizes state");
+    let creator_view = chat_protocol::read_authority_bridge::state_authority_view(&creator_state);
+    assert!(
+        matches!(
+            creator_view.relationship.arm,
+            chat_protocol::read_authority_bridge::RelationshipArmView::OpenLeaf
+        ),
+        "the creator carries the current open-leaf witness"
+    );
+    assert_ne!(
+        creator_view.graph_digest, [0_u8; 32],
+        "the sealed aggregate carries a nonzero graph digest"
+    );
+    assert_ne!(
+        creator_view.snapshot_digest, [0_u8; 32],
+        "the sealed aggregate carries a nonzero snapshot digest"
+    );
+    rollback_with_constraints(tx).await;
 
-            #[tokio::test]
-            #[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
-            async fn pending_participants_get_state_only() {
-                let fixture = executor_seed::private_genuine_group_pending_graph().await;
-                let pool = fixture.pool.clone();
-                let conversation_id = fixture.graph.conversation_id;
+    // The group-pending invitee authorizes current state only, with the
+    // pending-participant witness.
+    let invitee_admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversationState",
+        &fixture.invitee.did,
+        fixture.invitee.device_id,
+        &fixture.invitee.dpop_jkt,
+    )
+    .await;
+    let (invitee_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        invitee_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("invitee single-attempt lock");
+    let invitee_state = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        invitee_guard,
+        conversation_id,
+    )
+    .await
+    .expect("a group-pending participant authorizes current state");
+    let invitee_view = chat_protocol::read_authority_bridge::state_authority_view(&invitee_state);
+    assert!(
+        matches!(
+            invitee_view.relationship.arm,
+            chat_protocol::read_authority_bridge::RelationshipArmView::PendingParticipant
+        ),
+        "the group-pending invitee carries the pending participant witness"
+    );
+    assert_eq!(
+        invitee_view.relationship.participant_period_id, fixture.invitee.participant_period_id,
+        "the witness binds the durable participant period"
+    );
+    assert_eq!(
+        invitee_view.relationship.leaf_period_id, None,
+        "the group-pending state capability carries no leaf period"
+    );
+    assert_eq!(
+        invitee_view.relationship.open_membership_interval_id, None,
+        "the group-pending state capability carries no open membership interval"
+    );
+    assert_ne!(
+        invitee_view.graph_digest, [0_u8; 32],
+        "the group-pending state aggregate carries a nonzero graph digest"
+    );
+    assert_ne!(
+        invitee_view.snapshot_digest, [0_u8; 32],
+        "the group-pending state aggregate carries a nonzero snapshot digest"
+    );
+    rollback_with_constraints(tx).await;
+    // Entries require a current open leaf: the group-pending invitee is
+    // denied application entries.
+    let entry_outcome = {
+        let admission = fixture_read_admission(
+            &pool,
+            "blue.catbird.chat.getEntries",
+            &fixture.invitee.did,
+            fixture.invitee.device_id,
+            &fixture.invitee.dpop_jkt,
+        )
+        .await;
+        let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+            &pool,
+            admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+        )
+        .await
+        .expect("invitee entry single-attempt lock");
+        let outcome =
+            chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
+                .await
+                .err()
+                .expect("a group-pending participant has no entry authority");
+        rollback_with_constraints(tx).await;
+        outcome
+    };
+    assert_eq!(
+        entry_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
+        "group-pending authorizes state only, never application entries"
+    );
 
-                // The creator keeps its open leaf: state authority with the open-leaf arm.
-                let creator_admission = fixture_read_admission(
-                    &pool,
-                    "blue.catbird.chat.getConversationState",
-                    &fixture.graph.creator_did,
-                    fixture.graph.creator_device_id,
-                    &fixture.graph.creator_dpop_jkt,
-                )
-                .await;
-                let (creator_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
-                    &pool,
-                    creator_admission,
-                    chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
-                )
-                .await
-                .expect("creator single-attempt lock");
-                let creator_state = chat_protocol::read_authority::authorize_conversation_state(
-                    &mut tx,
-                    creator_guard,
-                    conversation_id,
-                )
-                .await
-                .expect("the creator's current open leaf authorizes state");
-                let creator_view = chat_protocol::read_authority_bridge::state_authority_view(&creator_state);
-                assert!(
-                    matches!(
-                        creator_view.relationship.arm,
-                        chat_protocol::read_authority_bridge::RelationshipArmView::OpenLeaf
-                    ),
-                    "the creator carries the current open-leaf witness"
-                );
-                assert_ne!(
-                    creator_view.graph_digest, [0_u8; 32],
-                    "the sealed aggregate carries a nonzero graph digest"
-                );
-                assert_ne!(
-                    creator_view.snapshot_digest, [0_u8; 32],
-                    "the sealed aggregate carries a nonzero snapshot digest"
-                );
-                rollback_with_constraints(tx).await;
+    // A direct-pending invitee authorizes current state only, identically to group-pending.
+    let direct = executor_seed::private_genuine_direct_pending_graph().await;
+    let direct_pool = direct.pool.clone();
+    let direct_admission = fixture_read_admission(
+        &direct_pool,
+        "blue.catbird.chat.getConversationState",
+        &direct.invitee.did,
+        direct.invitee.device_id,
+        &direct.invitee.dpop_jkt,
+    )
+    .await;
+    let (direct_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &direct_pool,
+        direct_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("direct invitee single-attempt lock");
+    let direct_state = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        direct_guard,
+        direct.graph.conversation_id,
+    )
+    .await
+    .expect("a direct-pending participant authorizes current state");
+    let direct_view = chat_protocol::read_authority_bridge::state_authority_view(&direct_state);
+    assert!(
+        matches!(
+            direct_view.relationship.arm,
+            chat_protocol::read_authority_bridge::RelationshipArmView::PendingParticipant
+        ),
+        "the direct-pending invitee carries the pending participant witness"
+    );
+    assert_eq!(
+        direct_view.relationship.participant_period_id, direct.invitee.participant_period_id,
+        "the direct-pending witness binds the durable participant period"
+    );
+    assert_eq!(
+        direct_view.relationship.leaf_period_id, None,
+        "the direct-pending state capability carries no leaf period"
+    );
+    assert_eq!(
+        direct_view.relationship.open_membership_interval_id, None,
+        "the direct-pending state capability carries no open membership interval"
+    );
+    assert_ne!(
+        direct_view.graph_digest, [0_u8; 32],
+        "the direct-pending state aggregate carries a nonzero graph digest"
+    );
+    assert_ne!(
+        direct_view.snapshot_digest, [0_u8; 32],
+        "the direct-pending state aggregate carries a nonzero snapshot digest"
+    );
+    rollback_with_constraints(tx).await;
 
-                // The group-pending invitee authorizes current state only, with a
-                // state-only pending witness.
-                let invitee_admission = fixture_read_admission(
-                    &pool,
-                    "blue.catbird.chat.getConversationState",
-                    &fixture.invitee.did,
-                    fixture.invitee.device_id,
-                    &fixture.invitee.dpop_jkt,
-                )
-                .await;
-                let (invitee_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
-                    &pool,
-                    invitee_admission,
-                    chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
-                )
-                .await
-                .expect("invitee single-attempt lock");
-                let invitee_state = chat_protocol::read_authority::authorize_conversation_state(
-                    &mut tx,
-                    invitee_guard,
-                    conversation_id,
-                )
-                .await
-                .expect("a group-pending participant authorizes current state");
-                let invitee_view = chat_protocol::read_authority_bridge::state_authority_view(&invitee_state);
-                assert!(
-                    matches!(
-                        invitee_view.relationship.arm,
-                        chat_protocol::read_authority_bridge::RelationshipArmView::PendingParticipant
-                    ),
-                    "the group-pending invitee carries the pending witness"
-                );
-                assert_eq!(
-                    invitee_view.relationship.participant_period_id, fixture.invitee.participant_period_id,
-                    "the witness binds the durable participant period"
-                );
-                rollback_with_constraints(tx).await;
-                // Entries require a current open leaf: the group-pending invitee is
-                // denied application entries.
-                let entry_outcome = {
-                    let admission = fixture_read_admission(
-                        &pool,
-                        "blue.catbird.chat.getEntries",
-                        &fixture.invitee.did,
-                        fixture.invitee.device_id,
-                        &fixture.invitee.dpop_jkt,
-                    )
-                    .await;
-                    let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
-                        &pool,
-                        admission,
-                        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
-                    )
-                    .await
-                    .expect("invitee entry single-attempt lock");
-                    let outcome =
-                        chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
-                            .await
-                            .err()
-                            .expect("a group-pending participant has no entry authority");
-                    rollback_with_constraints(tx).await;
-                    outcome
-                };
-                assert_eq!(
-                    entry_outcome,
-                    chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
-                    "group-pending authorizes state only, never application entries"
-                );
+    // Entries require a current open leaf: the direct-pending invitee is
+    // denied application entries.
+    let direct_entry_outcome = {
+        let admission = fixture_read_admission(
+            &direct_pool,
+            "blue.catbird.chat.getEntries",
+            &direct.invitee.did,
+            direct.invitee.device_id,
+            &direct.invitee.dpop_jkt,
+        )
+        .await;
+        let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+            &direct_pool,
+            admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+        )
+        .await
+        .expect("direct invitee entry single-attempt lock");
+        let outcome = chat_protocol::read_authority::authorize_entries(
+            &mut tx,
+            guard,
+            direct.graph.conversation_id,
+        )
+        .await
+        .err()
+        .expect("a direct-pending participant has no entry authority");
+        rollback_with_constraints(tx).await;
+        outcome
+    };
+    assert_eq!(
+        direct_entry_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
+        "direct-pending authorizes state only, never application entries"
+    );
 
-                // A direct-pending invitee can point-read the exact state needed to sign
-                // acceptConversation, while remaining absent from enumerable inventory.
-                let direct = executor_seed::private_genuine_direct_pending_graph().await;
-                let direct_pool = direct.pool.clone();
-                let direct_admission = fixture_read_admission(
-                    &direct_pool,
-                    "blue.catbird.chat.getConversationState",
-                    &direct.invitee.did,
-                    direct.invitee.device_id,
-                    &direct.invitee.dpop_jkt,
-                )
-                .await;
-                let (direct_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
-                    &direct_pool,
-                    direct_admission,
-                    chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
-                )
-                .await
-                .expect("direct invitee single-attempt lock");
-                let direct_state = chat_protocol::read_authority::authorize_conversation_state(
-                    &mut tx,
-                    direct_guard,
-                    direct.graph.conversation_id,
-                )
-                .await
-                .expect("a direct-pending invitee can point-read state for acceptance");
-                let direct_view = chat_protocol::read_authority_bridge::state_authority_view(&direct_state);
-                assert!(
-                    matches!(
-                        direct_view.relationship.arm,
-                        chat_protocol::read_authority_bridge::RelationshipArmView::PendingParticipant
-                    ),
-                    "the direct-pending invitee carries a state-only pending witness"
-                );
-                assert_eq!(
-                    direct_view.relationship.participant_period_id, direct.invitee.participant_period_id,
-                    "the direct-pending witness binds the durable participant period"
-                );
-                rollback_with_constraints(tx).await;
+    // No pending write authorization: pending participants have 0 active leaves
+    // and 0 application intervals in the database.
+    let direct_leaves: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.member_devices \
+         WHERE conversation_id=$1 AND user_did=$2 AND active",
+    )
+    .bind(direct.graph.conversation_id)
+    .bind(&direct.invitee.did)
+    .fetch_one(&direct_pool)
+    .await
+    .expect("count the direct invitee's active leaves");
+    assert_eq!(
+        direct_leaves, 0,
+        "a direct-pending participant has zero active leaves (no write capability)"
+    );
 
-                let wire_admission = fixture_read_admission(
-                    &direct_pool,
-                    "blue.catbird.chat.getConversationState",
-                    &direct.invitee.did,
-                    direct.invitee.device_id,
-                    &direct.invitee.dpop_jkt,
-                )
-                .await;
-                let response = chat_protocol::repository::conversation::read_conversation_state_for_admission(
-                    &direct_pool,
-                    wire_admission,
-                    direct.graph.conversation_id,
-                )
-                .await
-                .expect("the repository returns the acceptance coordinates");
-                let output: serde_json::Value =
-                    serde_json::from_slice(&response.into_response_bytes()).expect("canonical state response");
-                assert_eq!(
-                    output["pendingLeaveRequests"],
-                    serde_json::json!([]),
-                    "a pending invitee cannot inspect established members' leave requests"
-                );
-                assert_eq!(
-                    output["pendingResetRequests"],
-                    serde_json::json!([]),
-                    "a pending invitee cannot inspect established members' reset requests"
-                );
-            }
+    let direct_intervals: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.application_intervals \
+         WHERE conversation_id=$1 AND recipient_did=$2",
+    )
+    .bind(direct.graph.conversation_id)
+    .bind(&direct.invitee.did)
+    .fetch_one(&direct_pool)
+    .await
+    .expect("count the direct invitee's application intervals");
+    assert_eq!(
+        direct_intervals, 0,
+        "a direct-pending participant has zero application intervals"
+    );
+
+    // Unrelated DID remains NotEntitled to direct conversation state and entries.
+    let unrelated_did = b_read_fresh_did(0x0E);
+    let unrelated_device = Uuid::new_v4();
+    let unrelated_jkt = register_read_device(&direct_pool, &unrelated_did, unrelated_device).await;
+    let unrelated_admission = fixture_read_admission(
+        &direct_pool,
+        "blue.catbird.chat.getConversationState",
+        &unrelated_did,
+        unrelated_device,
+        &unrelated_jkt,
+    )
+    .await;
+    let (unrelated_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &direct_pool,
+        unrelated_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("unrelated single-attempt lock");
+    let unrelated_state_outcome = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        unrelated_guard,
+        direct.graph.conversation_id,
+    )
+    .await
+    .err()
+    .expect("an unrelated requester is not entitled to direct conversation state");
+    assert_eq!(
+        unrelated_state_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
+        "an unrelated DID remains NotEntitled to direct-pending conversation state"
+    );
+    rollback_with_constraints(tx).await;
+
+    let unrelated_entry_admission = fixture_read_admission(
+        &direct_pool,
+        "blue.catbird.chat.getEntries",
+        &unrelated_did,
+        unrelated_device,
+        &unrelated_jkt,
+    )
+    .await;
+    let (unrelated_entry_guard, mut tx) =
+        chat_protocol::read_authority_bridge::lock_single_attempt(
+            &direct_pool,
+            unrelated_entry_admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+        )
+        .await
+        .expect("unrelated entry single-attempt lock");
+    let unrelated_entry_outcome = chat_protocol::read_authority::authorize_entries(
+        &mut tx,
+        unrelated_entry_guard,
+        direct.graph.conversation_id,
+    )
+    .await
+    .err()
+    .expect("an unrelated requester has no entry authority on direct conversation");
+    assert_eq!(
+        unrelated_entry_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
+        "an unrelated DID has no entry authority on direct conversation"
+    );
+    rollback_with_constraints(tx).await;
 }

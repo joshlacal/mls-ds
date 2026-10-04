@@ -174,8 +174,6 @@ fn enrollment_body(_dpop_jkt: &str, signing_key: &Ed25519SigningKey, package_ref
     })
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Challenge 1: DPoP Token Parsing & Claim Validation
 // ---------------------------------------------------------------------------
@@ -1053,12 +1051,6 @@ fn challenge_2_enrollment_claims_auth_time_window_validation() {
         "Must reject enrollment where now - auth_time > 300s"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Challenge 3: Rebind Ed25519 Signature Checks vs New DPoP JKTs
-// ---------------------------------------------------------------------------
-
-
 
 // ---------------------------------------------------------------------------
 // Challenge 4: 32 `blue.catbird.chat.*` Endpoints Cutover Rejection

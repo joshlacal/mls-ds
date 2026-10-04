@@ -6944,30 +6944,30 @@ mod historical_control_loader {
         // losslessly through Postgres microsecond storage). `EXPIRES_AT` is
         // exactly `LEAST(REQUESTED_AT + 5min, KP.not_after)`, the expiry the
         // deferred `assert_recovery_fulfillment_mapping` constraint requires.
-        const KP_NOT_BEFORE: &str = "2026-07-27T03:05:08.000Z";
-        const KP_NOT_AFTER: &str = "2026-07-28T03:06:08.000Z";
-        const CREATION_SIGNED_AT: &str = "2026-07-27T03:06:08.000Z";
-        const CREATION_RECEIVED_AT: &str = "2026-07-27T03:06:09.000Z";
-        const POLICY_ADD_AT: &str = "2026-07-27T04:06:08.000Z";
-        const SIGNED_AT: &str = "2026-07-27T04:06:08.500Z";
-        const REQUESTED_AT: &str = "2026-07-27T04:06:09.000Z";
-        const EXPIRES_AT: &str = "2026-07-27T04:11:09.000Z";
-        const FULFILLMENT_SIGNED_AT: &str = "2026-07-27T04:06:09.500Z";
-        const FULFILLED_AT: &str = "2026-07-27T04:06:10.000Z";
-        const GENERIC_SIGNED_AT: &str = "2026-07-27T04:06:10.500Z";
-        const GENERIC_AT: &str = "2026-07-27T04:06:11.000Z";
-        const LEAVE_SIGNED_AT: &str = "2026-07-27T04:06:11.500Z";
-        const LEAVE_AT: &str = "2026-07-27T04:06:12.000Z";
-        const LEAVE_FULFILLMENT_SIGNED_AT: &str = "2026-07-27T04:06:12.500Z";
-        const LEAVE_FULFILLED_AT: &str = "2026-07-27T04:06:13.000Z";
-        const REINVITE_AT: &str = "2026-07-27T04:06:14.000Z";
-        const REACCEPT_SIGNED_AT: &str = "2026-07-27T04:06:14.500Z";
-        const REACCEPT_AT: &str = "2026-07-27T04:06:15.000Z";
-        const REACCEPT_EXPIRES_AT: &str = "2026-07-27T04:11:15.000Z";
-        const REJOIN_SIGNED_AT: &str = "2026-07-27T04:06:15.500Z";
-        const REJOIN_AT: &str = "2026-07-27T04:06:16.000Z";
-        const ROLE_ADMIN_AT: &str = "2026-07-27T04:06:11.000Z";
-        const ROLE_MEMBER_AT: &str = "2026-07-27T04:06:12.000Z";
+        const KP_NOT_BEFORE: &str = "2026-08-29T01:05:22.000Z";
+        const KP_NOT_AFTER: &str = "2026-08-30T01:06:22.000Z";
+        const CREATION_SIGNED_AT: &str = "2026-08-29T01:04:22.000Z";
+        const CREATION_RECEIVED_AT: &str = "2026-08-29T01:06:22.000Z";
+        const POLICY_ADD_AT: &str = "2026-08-29T02:06:22.000Z";
+        const SIGNED_AT: &str = "2026-08-29T02:06:22.500Z";
+        const REQUESTED_AT: &str = "2026-08-29T02:06:23.000Z";
+        const EXPIRES_AT: &str = "2026-08-29T02:11:23.000Z";
+        const FULFILLMENT_SIGNED_AT: &str = "2026-08-29T02:06:23.500Z";
+        const FULFILLED_AT: &str = "2026-08-29T02:06:24.000Z";
+        const GENERIC_SIGNED_AT: &str = "2026-08-29T02:06:24.500Z";
+        const GENERIC_AT: &str = "2026-08-29T02:06:25.000Z";
+        const LEAVE_SIGNED_AT: &str = "2026-08-29T02:06:25.500Z";
+        const LEAVE_AT: &str = "2026-08-29T02:06:26.000Z";
+        const LEAVE_FULFILLMENT_SIGNED_AT: &str = "2026-08-29T02:06:26.500Z";
+        const LEAVE_FULFILLED_AT: &str = "2026-08-29T02:06:27.000Z";
+        const REINVITE_AT: &str = "2026-08-29T02:06:28.000Z";
+        const REACCEPT_SIGNED_AT: &str = "2026-08-29T02:06:28.500Z";
+        const REACCEPT_AT: &str = "2026-08-29T02:06:29.000Z";
+        const REACCEPT_EXPIRES_AT: &str = "2026-08-29T02:11:29.000Z";
+        const REJOIN_SIGNED_AT: &str = "2026-08-29T02:06:29.500Z";
+        const REJOIN_AT: &str = "2026-08-29T02:06:30.000Z";
+        const ROLE_ADMIN_AT: &str = "2026-08-29T02:06:25.000Z";
+        const ROLE_MEMBER_AT: &str = "2026-08-29T02:06:26.000Z";
 
         async fn g6_gate_pool(label: &str) -> PgPool {
             const FIXED_GATE_DB: &str =
@@ -10580,10 +10580,10 @@ mod historical_control_loader {
         fn corpus_file(name: &str) -> Vec<u8> {
             std::fs::read(
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/crypto-wire")
+                    .join("tests/fixtures/crypto-wire-v09")
                     .join(name),
             )
-            .expect("read frozen crypto-wire artifact")
+            .expect("read frozen OpenMLS 0.9 crypto-wire artifact")
         }
 
         fn corpus_manifest() -> Value {
@@ -20988,14 +20988,14 @@ mod historical_control_loader {
             validate_corpus_recovery_artifacts(
                 "key-package.mls",
                 "welcome.mls",
-                "innerKeyPackageRefHex",
+                "key-package-ref.bin",
             )
         }
 
         fn validate_corpus_recovery_artifacts(
             key_package_file: &str,
             welcome_file: &str,
-            manifest_ref_field: &str,
+            key_package_ref_file: &str,
         ) -> [u8; 32] {
             let manifest = corpus_manifest();
             let bob = &manifest["identity"]["bob"];
@@ -21020,9 +21020,9 @@ mod historical_control_loader {
             .expect("production KeyPackage validation accepts the frozen corpus wrapper");
             let key_package_ref = *validated.key_package_ref();
             assert_eq!(
-                key_package_ref,
-                corpus_hex::<32>(&manifest["chain"][manifest_ref_field]),
-                "production-derived KeyPackageRef remains manifest-bound"
+                key_package_ref.as_slice(),
+                corpus_file(key_package_ref_file),
+                "production-derived KeyPackageRef remains corpus-bound"
             );
             verify_recovery_welcome(
                 &corpus_file(welcome_file),
@@ -33703,9 +33703,9 @@ mod real_tree_genesis_seed {
 
     fn corpus_file(name: &str) -> Vec<u8> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/crypto-wire")
+            .join("tests/fixtures/crypto-wire-v09")
             .join(name);
-        fs::read(path).expect("read frozen crypto-wire corpus artifact")
+        fs::read(path).expect("read frozen OpenMLS 0.9 crypto-wire corpus artifact")
     }
 
     fn corpus_manifest() -> serde_json::Value {

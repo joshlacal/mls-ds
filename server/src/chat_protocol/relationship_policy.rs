@@ -5203,7 +5203,8 @@ mod projection_integrity_tests {
 
         for (field, value) in [
             ("deliveryService", "not-a-did"),
-            ("protocolVersion", "2"),
+            // "2" is the encrypted-requests profile and is valid after the merge.
+            ("protocolVersion", "3"),
             ("createdAt", "not-a-date"),
         ] {
             let mut invalid: Value = serde_json::from_str(&body).unwrap();

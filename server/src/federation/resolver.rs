@@ -4304,10 +4304,12 @@ mod tests {
         });
         assert!(validate_declaration_record_value(wrong_type.as_object().unwrap()).is_err());
 
-        // 5. Unsupported protocolVersion ("2")
+        // 5. Unsupported protocolVersion. The merged line accepts "1" and "2"
+        // (encrypted-requests publishes v2 declarations), so "3" is the
+        // first unsupported value.
         let wrong_version = serde_json::json!({
             "$type": "blue.catbird.chat.declaration",
-            "protocolVersion": "2",
+            "protocolVersion": "3",
             "allowIncoming": "all",
             "deliveryService": "did:web:chat.catbird.blue",
             "createdAt": "2026-08-24T12:00:00Z"
@@ -4762,6 +4764,10 @@ mod tests {
 
     #[tokio::test]
     async fn destination_pin_preserves_public_ipv6_and_rejects_mapped_private_ipv4() {
+        // Other tests in this binary leave APP_ENV=test + insecure HTTP set;
+        // this SSRF check must run under the production policy.
+        std::env::remove_var("FEDERATION_ALLOW_INSECURE_HTTP");
+        std::env::remove_var("APP_ENV");
         let public = url::Url::parse("https://[2606:4700::1111]/").unwrap();
         let (host, addrs) = resolve_and_pin_destination(&public).await.unwrap();
         assert_eq!(host, "[2606:4700::1111]");
@@ -4829,6 +4835,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_and_pin_destination_rejects_private_ips_fail_closed() {
+        // Other tests in this binary leave APP_ENV=test + insecure HTTP set;
+        // this SSRF check must run under the production policy.
+        std::env::remove_var("FEDERATION_ALLOW_INSECURE_HTTP");
+        std::env::remove_var("APP_ENV");
         for target in [
             "https://10.0.0.1/",
             "https://172.16.0.1/",
