@@ -2425,6 +2425,7 @@ pub(crate) fn conversation_state_view(
                         extra_data: None,
                     },
                 ),
+                labyrinth_head: None,
                 extra_data: None,
             })
             .collect(),
@@ -2567,6 +2568,7 @@ pub(crate) fn conversation_inventory_item(
                                             .clone(),
                                         extra_data: None,
                                     }),
+                                labyrinth_head: None,
                                 extra_data: None,
                             })
                             .collect(),

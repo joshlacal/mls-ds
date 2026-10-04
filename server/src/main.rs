@@ -1336,6 +1336,19 @@ async fn main() -> anyhow::Result<()> {
         catbird_server::handlers::chat::chat_router::<AppState>().with_state(app_state.clone());
     let base_router = base_router.merge(chat_router);
 
+    // Labyrinth encrypted-history backend (`blue.catbird.labyrinth.*`),
+    // opt-in until its rollout is approved. It also requires the chat
+    // cutover gate per request.
+    let base_router = if truthy_env_var("LABYRINTH_ENABLED") {
+        tracing::info!("Labyrinth backend enabled (blue.catbird.labyrinth.*)");
+        base_router.merge(
+            catbird_server::handlers::labyrinth::labyrinth_router::<AppState>()
+                .with_state(app_state.clone()),
+        )
+    } else {
+        base_router
+    };
+
     let app = merge_application_routers(
         base_router,
         ds_router,

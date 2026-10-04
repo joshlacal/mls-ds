@@ -78,6 +78,7 @@ pub mod health;
 pub mod identity;
 pub mod jacquard_json;
 pub mod jobs;
+pub mod labyrinth;
 pub mod metrics;
 pub mod middleware;
 pub mod mls_group_info_verifier;

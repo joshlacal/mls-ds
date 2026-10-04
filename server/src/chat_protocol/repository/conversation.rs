@@ -111,10 +111,13 @@ async fn read_conversation_state_in_transaction(
         )
         .await
         .map_err(map_inventory_error)?;
-        let state = conversation_state_view(&source).map_err(|error| {
+        let mut state = conversation_state_view(&source).map_err(|error| {
             tracing::error!(class = ?error.kind(), "conversation state projection failed");
             ConversationStateReadError::Invariant
         })?;
+        attach_labyrinth_heads(transaction, &mut state.participants)
+            .await
+            .map_err(|_| ConversationStateReadError::Storage)?;
         let (pending_leave_requests, pending_reset_requests) =
             if includes_pending_requests(authority.relationship()) {
                 load_pending_requests(transaction, conversation_id).await?
@@ -492,6 +495,57 @@ fn leave_view(
     )
 }
 
+/// `participantView.labyrinthHead` (labyrinth design §1a, Y5): each
+/// participant's latest head in the mls-ds Labyrinth directory
+/// (`labyrinth.epoch_heads`, migration 20261004100001). A database without
+/// the `labyrinth` schema (the frozen clean-chat test ledger, or a
+/// deployment without the Labyrinth migrations) projects no heads instead of
+/// failing the chat read. Kept here, not in `crate::labyrinth`, because the
+/// test harnesses `include!` this file into their own crates.
+async fn attach_labyrinth_heads(
+    transaction: &mut Transaction<'_, Postgres>,
+    participants: &mut [catbird_atproto::generated::blue_catbird::chat::ParticipantView<SmolStr>],
+) -> Result<(), sqlx::Error> {
+    if participants.is_empty() {
+        return Ok(());
+    }
+    let installed: bool =
+        sqlx::query_scalar("SELECT to_regclass('labyrinth.epoch_heads') IS NOT NULL")
+            .fetch_one(&mut **transaction)
+            .await?;
+    if !installed {
+        return Ok(());
+    }
+    let dids: Vec<String> = participants
+        .iter()
+        .map(|participant| participant.user_did.as_str().to_owned())
+        .collect();
+    let heads: Vec<(String, i64, Vec<u8>, String)> = sqlx::query_as(
+        "SELECT DISTINCT ON (did) did, epoch_number, epoch_head, attestation_key_id \
+           FROM labyrinth.epoch_heads WHERE did = ANY($1) \
+          ORDER BY did, epoch_number DESC",
+    )
+    .bind(&dids)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for participant in participants.iter_mut() {
+        if let Some((_, epoch_number, head, key_id)) = heads
+            .iter()
+            .find(|(did, ..)| did == participant.user_did.as_str())
+        {
+            participant.labyrinth_head = Some(
+                catbird_atproto::generated::blue_catbird::chat::LabyrinthHead {
+                    attestation_key_id: SmolStr::from(key_id.as_str()),
+                    epoch_head: jacquard_common::deps::bytes::Bytes::copy_from_slice(head),
+                    epoch_number: *epoch_number,
+                    extra_data: None,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     mod fresh_db {
@@ -631,5 +685,47 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn conversation_state_response_carries_participant_labyrinth_head() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/chat_protocol_g7_canonical_json_v1.json"
+        ))
+        .expect("parse fixture");
+        let mut state: catbird_atproto::generated::blue_catbird::chat::ConversationState<
+            jacquard_common::DefaultStr,
+        > = serde_json::from_value(fixture["vectors"][0]["value"].clone())
+            .expect("decode fixture state");
+        let without: serde_json::Value = serde_json::from_slice(
+            &canonical_conversation_state_response(&state, &[], &[], &[])
+                .expect("encode without head"),
+        )
+        .expect("decode");
+        assert!(without
+            .pointer("/state/participants/0/labyrinthHead")
+            .is_none());
+        state.participants[0].labyrinth_head = Some(
+            catbird_atproto::generated::blue_catbird::chat::LabyrinthHead {
+                attestation_key_id: SmolStr::from("key-id"),
+                epoch_head: jacquard_common::deps::bytes::Bytes::from_static(&[7; 32]),
+                epoch_number: 3,
+                extra_data: None,
+            },
+        );
+        let with: serde_json::Value = serde_json::from_slice(
+            &canonical_conversation_state_response(&state, &[], &[], &[])
+                .expect("encode with head"),
+        )
+        .expect("decode");
+        let head = with
+            .pointer("/state/participants/0/labyrinthHead")
+            .expect("labyrinthHead projected");
+        assert_eq!(head["epochNumber"], 3);
+        assert_eq!(head["attestationKeyId"], "key-id");
+        assert!(head
+            .pointer("/epochHead/$bytes")
+            .and_then(serde_json::Value::as_str)
+            .is_some());
     }
 }
