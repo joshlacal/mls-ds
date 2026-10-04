@@ -1,0 +1,123 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.prepareDirectRequest",
+  "description": "Wire protocol 2 encrypted direct requests. Standard service authentication plus canonical device signature. Unknown outcome is never proof of non-publication.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedDirectRequestPreparation"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "outcome"
+          ],
+          "properties": {
+            "outcome": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#directRequestOutcome"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "RecipientKeysUnavailable"
+        },
+        {
+          "name": "RequestPolicyDenied"
+        },
+        {
+          "name": "PreparationExpired"
+        },
+        {
+          "name": "PreparationCancelled"
+        },
+        {
+          "name": "PreparationRevoked"
+        },
+        {
+          "name": "PreparationConflict"
+        },
+        {
+          "name": "ExistingDirect"
+        },
+        {
+          "name": "ArtifactTooLarge"
+        },
+        {
+          "name": "CapacityUnavailable"
+        },
+        {
+          "name": "InvalidBootstrap"
+        },
+        {
+          "name": "ImportHorizonTooShort"
+        },
+        {
+          "name": "StaleLegacyPrior"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RequestNotAccepted"
+        },
+        {
+          "name": "UnavailableIntroduction"
+        },
+        {
+          "name": "RateLimited"
+        },
+        {
+          "name": "RecipientAuthorityUnsupported"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "SignedOperationExpired"
+        }
+      ]
+    }
+  }
+}

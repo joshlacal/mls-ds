@@ -13,6 +13,7 @@ use crate::{
     chat_protocol::{
         error::{ChatEndpoint, ChatProtocolErrorCode},
         repository::{
+            core::LockedG6PreludeError,
             prelude,
             revocation::{self, DeviceRevocationFacadeError, DeviceRevocationTransactionOutcome},
         },
@@ -56,7 +57,7 @@ async fn revoke(
 
     let response = match outcome {
         DeviceRevocationTransactionOutcome::Replay(replay) => {
-            context::replay_response(replay.response())
+            context::replay_response(ENDPOINT, replay.response())?
         }
         DeviceRevocationTransactionOutcome::First(mut first) => {
             let application = first
@@ -96,6 +97,12 @@ fn revocation_failure(error: DeviceRevocationFacadeError) -> ChatFailure {
         E::Conversation(
             crate::chat_protocol::repository::core::ConversationStateHydrationError::ReadSetMismatch,
         ) => ChatFailure::protocol(ENDPOINT, C::IdempotencyConflict),
+        // No declared revokeDevice code describes a transient scope race; the
+        // facade already retried, so exhaustion stays an invariant but is named.
+        E::G6Prelude(LockedG6PreludeError::DiscoveryDrift) => {
+            tracing::warn!("revokeDevice G6 scope kept drifting; retry attempts exhausted");
+            ChatFailure::invariant(ENDPOINT)
+        }
         E::G6Prelude(_)
         | E::Conversation(_)
         | E::TargetProjection

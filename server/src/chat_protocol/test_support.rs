@@ -186,15 +186,20 @@ pub async fn seed_deterministic_creation_fallback(
     let fallback_allocation = allocate_projection_revision(&mut fallback_tx)
         .await
         .map_err(|e| format!("allocate fallback revision: {e:?}"))?;
+    // Encrypted-requests: collection and persistence observe the database clock.
+    let clock = anchor_projection_clock(&mut *fallback_tx)
+        .await
+        .map_err(|e| format!("anchor projection clock: {e}"))?;
     let live_rel = rel_authority
         .collect_admission_projection(
+            &clock,
             live_allocation,
             ProjectionOperationScope::Creation,
             admission_req,
         )
         .await
         .map_err(|e| format!("collect admission projection: {e:?}"))?;
-    let observation = observe_relationship_persistence();
+    let observation = observe_relationship_persistence(&clock);
     let sealed_fallback = live_rel
         .export_persisted_fallback(fallback_allocation, &rel_authority, &observation)
         .map_err(|e| format!("seal fallback: {e:?}"))?;
@@ -236,15 +241,20 @@ pub async fn seed_deterministic_pending_add_fallback(
     let fallback_allocation = allocate_projection_revision(&mut fallback_tx)
         .await
         .map_err(|e| format!("allocate fallback revision: {e:?}"))?;
+    // Encrypted-requests: collection and persistence observe the database clock.
+    let clock = anchor_projection_clock(&mut *fallback_tx)
+        .await
+        .map_err(|e| format!("anchor projection clock: {e}"))?;
     let live_rel = rel_authority
         .collect_admission_projection(
+            &clock,
             live_allocation,
             ProjectionOperationScope::PendingAdd,
             admission_req,
         )
         .await
         .map_err(|e| format!("collect admission projection: {e:?}"))?;
-    let observation = observe_relationship_persistence();
+    let observation = observe_relationship_persistence(&clock);
     let sealed_fallback = live_rel
         .export_persisted_fallback(fallback_allocation, &rel_authority, &observation)
         .map_err(|e| format!("seal fallback: {e:?}"))?;

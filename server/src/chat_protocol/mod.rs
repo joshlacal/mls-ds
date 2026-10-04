@@ -73,6 +73,11 @@ pub(crate) fn xwing_kem_output_is_valid(bytes: &[u8]) -> bool {
         && x25519_component_is_canonical_and_usable(&bytes[XWING_X25519_KEM_OUTPUT_OFFSET..])
 }
 
+/// Exact validation for a bare did:plc or hostname-only did:web identifier.
+pub fn is_bare_did(value: &str) -> bool {
+    validation::BareDid::parse(value).is_ok()
+}
+
 #[cfg(not(any(test, feature = "test-support")))]
 mod cursor;
 #[cfg(any(test, feature = "test-support"))]
@@ -82,6 +87,7 @@ pub(crate) use cursor::{
     mint_capability_token, CursorCodecError, CursorSealer, OsSecureRandom, SealedCapability,
     SealerBinding, SecureRandom,
 };
+pub mod direct_request_transcript;
 /// Trusted-Nest token and DPoP cryptographic verification for clean chat.
 ///
 /// Successful values are deliberately pre-replay evidence. They are
@@ -129,6 +135,7 @@ pub mod relationship_policy;
 pub(crate) mod repository;
 #[cfg(any(test, feature = "test-support"))]
 pub mod repository;
+pub(crate) mod request_push;
 
 pub mod snapshot;
 
@@ -151,6 +158,21 @@ pub(crate) mod validation;
 pub mod validation;
 
 pub mod wire;
+#[cfg(test)]
+#[path = "state_machine/tests.rs"]
+mod state_machine_tests;
+#[cfg(test)]
+#[path = "state_machine/executor_tests.rs"]
+mod state_machine_executor_tests;
+#[cfg(test)]
+#[path = "transcript/application_entry_tests.rs"]
+mod application_entry_tests;
+#[cfg(test)]
+#[path = "relationship_policy/tests.rs"]
+mod relationship_policy_tests;
+#[cfg(test)]
+#[path = "dpop/adversarial_challenger_m4_tests.rs"]
+mod adversarial_challenger_m4_tests;
 
 /// Non-shipping executable proof runners. Only zero-authority scenario
 /// functions are exported; opaque protocol authorities and prepared graphs
@@ -161,21 +183,37 @@ pub mod wire;
 ))]
 #[doc(hidden)]
 pub mod production_proof {
+    pub use super::repository::recovery::production_composition_proof::run_creation_with_enrolled_sibling;
+    pub use super::repository::recovery::production_composition_proof::run_inventory_lock_order;
+    pub use super::repository::recovery::production_composition_proof::run_request_inventory_concurrency;
     pub use super::repository::recovery::production_composition_proof::{
         commit_open_recovery_request, mint_singleton_recovery_reservation_fallback,
-        mint_two_party_recovery_fallbacks, run_aggregate_graph_drift_negative,
-        run_foreign_transaction_negative, run_leaf_recovery_cancellation_due_for_expiry_ordering,
+        mint_two_party_recovery_fallbacks, run_acceptance_with_open_recovery,
+        run_aggregate_graph_drift_negative, run_foreign_transaction_negative,
+        run_leaf_recovery_cancellation_due_for_expiry_ordering,
         run_leaf_recovery_cancellation_happy_path,
         run_leaf_recovery_fulfillment_due_for_expiry_ordering,
-        run_leaf_recovery_fulfillment_happy_path, run_package_row_drift_negative,
-        run_postwrite_cancellation_rollback_negative, run_postwrite_panic_rollback_negative,
-        run_prepare_abandon_negative, run_public_snapshot_drift_negative,
+        run_leaf_recovery_fulfillment_happy_path, run_leafless_direct_close_with_open_recovery,
+        run_package_row_drift_negative, run_postwrite_cancellation_rollback_negative,
+        run_postwrite_panic_rollback_negative, run_prepare_abandon_negative,
+        run_public_snapshot_drift_negative, run_removed_device_terminal_entry_read,
         run_request_leaf_recovery_completion_rollback_negative,
         run_request_leaf_recovery_happy_path,
         run_request_leaf_recovery_operation_claim_drift_negative,
         run_request_leaf_recovery_scope_drift_negative, run_request_row_drift_negative,
         run_reservation_row_drift_negative, run_scheduler_expiry_lifecycle,
-        run_terminal_head_cas_rollback_negative,
+        run_signed_operation_age_fence, run_terminal_head_cas_rollback_negative,
+        run_zero_leaf_leave_with_open_recovery,
+    };
+    pub use super::repository::recovery::production_composition_proof::{
+        run_cancelled_recovery_package_reuse, run_superseded_recovery_package_reuse,
+    };
+    pub use super::repository::recovery::production_composition_proof::{
+        run_concurrent_signed_sends, run_unlocked_send_audience_rejected,
+    };
+    pub use super::repository::recovery::production_composition_proof::{
+        run_control_close_historical_scope, run_control_pending_welcome_scope,
+        run_control_prospective_scope_and_drift,
     };
 
     /// Execute the real metadata executor's sealed pure preflight against one

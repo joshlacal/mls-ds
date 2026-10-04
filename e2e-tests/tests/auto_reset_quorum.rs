@@ -51,7 +51,9 @@ async fn quorum_2of3_stale_authenticators_no_auto_reset() {
 
     for u in [&mut alice, &mut bob, &mut carol] {
         u.register_device().await.expect("register_device");
-        u.publish_key_packages(3).await.expect("publish_key_packages");
+        u.publish_key_packages(3)
+            .await
+            .expect("publish_key_packages");
     }
 
     let convo = alice
@@ -78,13 +80,20 @@ async fn quorum_2of3_stale_authenticators_no_auto_reset() {
         assert_eq!(resp.status(), 200, "{} report should be HTTP 200", label);
         let json: serde_json::Value = resp.json().await.expect("json body");
         let reason = json.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-        let recorded = json.get("recorded").and_then(|v| v.as_bool()).unwrap_or(true);
+        let recorded = json
+            .get("recorded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let auto_reset = json
             .get("autoResetTriggered")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         assert_eq!(reason, "stale_authenticator", "{} reason", label);
-        assert!(!recorded, "{} should NOT be recorded with stale auth", label);
+        assert!(
+            !recorded,
+            "{} should NOT be recorded with stale auth",
+            label
+        );
         assert!(
             !auto_reset,
             "{} stale-auth report must NOT trigger auto-reset",

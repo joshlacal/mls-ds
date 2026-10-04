@@ -50,6 +50,7 @@ const OK: i32 = 200;
 
 #[derive(Debug)]
 pub(crate) enum LeaveFacadeError {
+    Retention(super::direct_request_retention::RetentionError),
     MissingMutation,
     UnsupportedMutation,
     InvalidCanonicalMaterial,
@@ -71,6 +72,7 @@ macro_rules! from_err {
     };
 }
 from_err!(
+    super::direct_request_retention::RetentionError => Retention,
     PreludeError => Prelude,
     ConversationStateHydrationError => Conversation,
     StateMachineError => StateMachine,
@@ -178,11 +180,14 @@ async fn execute_first(
     .await?;
     if aggregate.head().transaction_id() != scope_authority.transaction_id()
         || aggregate.head().prior_coordinate() != Some(aggregate.state().coordinate())
-        || parsed
-            .prior
-            .is_some_and(|prior| aggregate.state().coordinate() != &prior)
     {
         return Err(LeaveFacadeError::InvalidCanonicalMaterial);
+    }
+    if parsed
+        .prior
+        .is_some_and(|prior| aggregate.state().coordinate() != &prior)
+    {
+        return Err(LeaveFacadeError::StateMachine(crate::chat_protocol::state_machine::StateMachineError::StaleCoordinates));
     }
     // The head may have changed between discovery and its lock. Rediscovery
     // uses the same complete audience recipe, including historical Close
@@ -204,6 +209,9 @@ async fn execute_first(
             .actor_signing_public_key()
             .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?,
     )?;
+    let retention_server_fields = entry
+        .server_fields_dag_cbor()
+        .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
     let products = CanonicalControlEntryProducts::mint(&entry)
         .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
     // Closing or removing a zero-leaf participant changes the coordinate and
@@ -240,6 +248,58 @@ async fn execute_first(
     };
     let plan = planned.into_persistence_plan()?;
     let response_bytes = response_for_plan(&plan, products.canonical_response_json(), parsed)?;
+    if parsed.kind == SignedMutationKind::ConversationClose {
+        let pending: Option<(Uuid,i64)> = sqlx::query_as("SELECT p.request_id,octet_length(s.public_snapshot_bytes)::bigint+octet_length(s.tree_summary_bytes)::bigint FROM chat.direct_request_publications p LEFT JOIN chat.direct_request_lifecycle l USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id JOIN chat.generation_states s ON s.conversation_id=c.conversation_id AND s.generation=c.current_generation AND s.state_version=c.current_state_version WHERE p.conversation_id=$1 AND COALESCE(l.consent,'pending')='pending'")
+            .bind(parsed.conversation_id).fetch_optional(&mut **transaction).await?;
+        if let Some((request_id, snapshot_tree)) = pending {
+            let raw = mutation
+                .accepted_wrapper_bytes()
+                .ok_or(LeaveFacadeError::MissingMutation)?;
+            let event = serde_json::to_vec(&json!({"$type":"blue.catbird.chat.defs#conversationClosedEvent","conversationId":parsed.conversation_id,"conversationKind":"direct","terminalSeq":aggregate.head().next_entry_seq()}))
+                .map_err(|_|LeaveFacadeError::InvalidCanonicalMaterial)?;
+            let effects = plan.effects();
+            // These are complete locked audiences, including all historical
+            // schedules; never substitute current leaves or truncate fanout.
+            let rows = 16
+                + 3 * initial_scope.devices().len() as u64
+                + effects.recovery_request_changes().len() as u64
+                + effects.reservation_changes().len() as u64
+                + effects.reset_request_changes().len() as u64
+                + effects.leave_request_changes().len() as u64
+                + effects.welcome_changes().len() as u64;
+            let charged = super::direct_request_retention::logical_charge(
+                &[
+                    raw,
+                    raw,
+                    raw,
+                    mutation.canonical_projection(),
+                    mutation.transcript_bytes(),
+                    mutation.transcript_bytes(),
+                    mutation.signature().as_slice(),
+                    mutation.signature().as_slice(),
+                    mutation.signature().as_slice(),
+                    products.durable_json(),
+                    &retention_server_fields,
+                    &response_bytes,
+                    &event,
+                ],
+                snapshot_tree as u64,
+                rows,
+            )?;
+            super::direct_request_retention::consume_decision(
+                transaction,
+                request_id,
+                authority
+                    .repository_receipt()
+                    .operation_id()
+                    .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?,
+                "close",
+                charged,
+            )
+            .await?;
+        }
+    }
+
     let (scope_authority, completion) = prepared.into_execution_parts();
     let event_scope = scope_authority.event_lock_scope();
     let execution = prepare_leave_lifecycle_execution(
@@ -250,6 +310,10 @@ async fn execute_first(
     )
     .await?;
     let applied = apply_prepared_leave_lifecycle_execution(execution).await?;
+    if parsed.kind == SignedMutationKind::ConversationClose {
+        sqlx::query("INSERT INTO chat.direct_request_lifecycle(request_id,conversation_id,consent,closed_at) SELECT request_id,conversation_id,'closed',$2 FROM chat.direct_request_publications WHERE conversation_id=$1 ON CONFLICT(request_id) DO UPDATE SET consent='closed',closed_at=EXCLUDED.closed_at")
+            .bind(parsed.conversation_id).bind(authority.trusted_instant().datetime()).execute(&mut **transaction).await?;
+    }
     let event_position = applied.event_positions.first().copied();
     if event_position.is_none() {
         return Err(LeaveFacadeError::InvalidCanonicalMaterial);
@@ -747,4 +811,18 @@ impl LeaveReplayPostStateProof {
     pub(in crate::chat_protocol::repository) fn validates_seal(&self) -> bool {
         self.seal != [0; 32]
     }
+}
+
+#[cfg(all(
+    feature = "chat-protocol-production-proof",
+    not(feature = "server-bin")
+))]
+pub(crate) async fn discover_control_scope_for_proof(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    conversation_id: Uuid,
+) -> Result<CanonicalLockScope, String> {
+    discover_scope(transaction, authority, conversation_id)
+        .await
+        .map_err(|e| format!("leave scope: {e:?}"))
 }

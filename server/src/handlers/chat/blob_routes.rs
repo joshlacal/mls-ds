@@ -157,7 +157,7 @@ async fn prepare_blob_upload_inner(
         SignedMutationKind::BlobUploadPreparation,
     )
     .await
-    .map_err(|_| ChatFailure::invariant(PREPARE))?;
+    .map_err(|error| context::operation_prelude_failure(PREPARE, error))?;
     let PreparedBlobOperation::First(prepared) = prepared else {
         let PreparedBlobOperation::Replay(response) = prepared else {
             unreachable!()
@@ -166,7 +166,7 @@ async fn prepare_blob_upload_inner(
             .commit()
             .await
             .map_err(|_| ChatFailure::storage(PREPARE))?;
-        return Ok(context::replay_response(&response));
+        return context::replay_response(PREPARE, &response);
     };
     let authority = prepared.authority();
     let mutation = authority
@@ -417,7 +417,7 @@ async fn delete_blob_inner(
         SignedMutationKind::BlobDeletion,
     )
     .await
-    .map_err(|_| ChatFailure::invariant(DELETE))?;
+    .map_err(|error| context::operation_prelude_failure(DELETE, error))?;
     let PreparedBlobOperation::First(prepared) = prepared else {
         let PreparedBlobOperation::Replay(response) = prepared else {
             unreachable!()
@@ -426,7 +426,7 @@ async fn delete_blob_inner(
             .commit()
             .await
             .map_err(|_| ChatFailure::storage(DELETE))?;
-        return Ok(context::replay_response(&response));
+        return context::replay_response(DELETE, &response);
     };
     let authority = prepared.authority();
     let mutation = authority

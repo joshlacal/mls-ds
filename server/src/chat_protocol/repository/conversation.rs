@@ -5,6 +5,7 @@
 // locks and authorizes the exact requester device, and keeps that transaction
 // open while projecting the state and pending control-plane requests.
 
+#[path = "conversation/recovery.rs"]
 mod recovery;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -73,64 +74,149 @@ pub(crate) async fn read_conversation_state_for_admission(
     let result =
         read_conversation_state_in_transaction(&mut transaction, attempt, conversation_id).await;
     let _ = transaction.rollback().await;
-    let output = result?;
-    Ok(CanonicalConversationStateResponse {
-        bytes: canonical_conversation_state_response(
-            &output.state,
-            output
-                .pending_leaf_recovery_requests
-                .as_deref()
-                .unwrap_or_default(),
-            &output.pending_leave_requests,
-            &output.pending_reset_requests,
-        )?,
-    })
+    result
 }
 
 async fn read_conversation_state_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
     conversation_id: Uuid,
-) -> Result<
-    catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
-        GetConversationStateOutput,
-    ConversationStateReadError,
->{
+) -> Result<CanonicalConversationStateResponse, ConversationStateReadError> {
     let device = lock_read_device_authority_once(transaction, attempt)
         .await
         .map_err(map_authority_error)?;
-    // Keep the checked relationship witness through projection: a pending
-    // invitee receives the conversation state it must sign acceptance over,
-    // but never the established members' pending control-plane requests.
-    let authority = authorize_conversation_state(transaction, device, conversation_id)
-        .await
-        .map_err(map_authority_error)?;
+    let requester_did = device.user_did().to_owned();
+    let requester_device_id = device.device_id();
 
-    let source = super::inventory::load_conversation_state_source(transaction, conversation_id)
+    let local_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id = $1)",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| ConversationStateReadError::Storage)?;
+
+    if local_exists {
+        // Keep the checked relationship witness through projection: a pending
+        // invitee receives the conversation state it must sign acceptance over,
+        // but never the established members' pending control-plane requests.
+        let authority = authorize_conversation_state(transaction, device, conversation_id)
+            .await
+            .map_err(map_authority_error)?;
+
+        let source = super::inventory::load_conversation_state_source(
+            transaction,
+            conversation_id,
+            &requester_did,
+        )
         .await
         .map_err(map_inventory_error)?;
-    let state =
-        conversation_state_view(&source).map_err(|_| ConversationStateReadError::Invariant)?;
-    let (pending_leave_requests, pending_reset_requests) =
-        if includes_pending_requests(authority.relationship()) {
-            load_pending_requests(transaction, conversation_id).await?
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let state = conversation_state_view(&source).map_err(|error| {
+            tracing::error!(class = ?error.kind(), "conversation state projection failed");
+            ConversationStateReadError::Invariant
+        })?;
+        let (pending_leave_requests, pending_reset_requests) =
+            if includes_pending_requests(authority.relationship()) {
+                load_pending_requests(transaction, conversation_id).await?
+            } else {
+                (Vec::new(), Vec::new())
+            };
+        let pending_leaf_recovery_requests =
+            recovery::load_pending_leaf_recoveries(transaction, &authority).await?;
 
-    let pending_leaf_recovery_requests =
-        recovery::load_pending_leaf_recoveries(transaction, &authority).await?;
+        return conversation_state_response(
+            catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
+                GetConversationStateOutput {
+                    pending_leave_requests,
+                    pending_leaf_recovery_requests: Some(pending_leaf_recovery_requests),
+                    pending_reset_requests,
+                    state,
+                    extra_data: None,
+                },
+        );
+    }
 
-    Ok(
+    // A remote conversation may have separate inbox rows for sibling devices.
+    // Look up the authenticated device, never whichever row PostgreSQL returns first.
+    let inbox_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_transport_inbox \
+          WHERE conversation_id = $1 AND recipient_did = $2 AND recipient_device_id = $3)",
+    )
+    .bind(conversation_id)
+    .bind(&requester_did)
+    .bind(requester_device_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| ConversationStateReadError::Storage)?;
+    if !inbox_exists {
+        return Err(ConversationStateReadError::ConversationNotFound);
+    }
+
+    let (_delivery_id, source) = super::inventory::load_remote_transport_conversation_source(
+        transaction,
+        conversation_id,
+        &requester_did,
+        requester_device_id,
+    )
+    .await
+    .map_err(map_inventory_error)?;
+
+    let state = conversation_state_view(&source).map_err(|error| {
+        tracing::error!(class = ?error.kind(), "remote conversation state projection failed");
+        ConversationStateReadError::Invariant
+    })?;
+
+    conversation_state_response(
         catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
             GetConversationStateOutput {
-                pending_leave_requests,
-                pending_leaf_recovery_requests: Some(pending_leaf_recovery_requests),
-                pending_reset_requests,
+                pending_leave_requests: Vec::new(),
+                pending_leaf_recovery_requests: Some(Vec::new()),
+                pending_reset_requests: Vec::new(),
                 state,
                 extra_data: None,
             },
     )
+}
+
+/// Present one `getConversationState` output.
+///
+/// Ordinary conversations use main's canonical JCS encoder. A conversation
+/// carrying a `directRequest` uses the encrypted-requests presentation bridge,
+/// which re-projects the generated view and proves no signed request material
+/// changed before emitting `{"$bytes"}` presentation.
+fn conversation_state_response(
+    output: catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
+        GetConversationStateOutput,
+) -> Result<CanonicalConversationStateResponse, ConversationStateReadError> {
+    let Some(request) = &output.state.direct_request else {
+        return Ok(CanonicalConversationStateResponse {
+            bytes: canonical_conversation_state_response(
+                &output.state,
+                output
+                    .pending_leaf_recovery_requests
+                    .as_deref()
+                    .unwrap_or_default(),
+                &output.pending_leave_requests,
+                &output.pending_reset_requests,
+            )?,
+        });
+    };
+    let mut wire =
+        serde_json::to_value(&output).map_err(|_| ConversationStateReadError::Invariant)?;
+    wire["state"]["directRequest"] =
+        crate::chat_protocol::transcript::direct_request_generated_view_wire(
+            request,
+            "directRequestState",
+            false,
+        )
+        .map_err(|_| ConversationStateReadError::Invariant)?;
+    Ok(CanonicalConversationStateResponse {
+        bytes: crate::chat_protocol::direct_request_transcript::present_endpoint_output(
+            "blue.catbird.chat.getConversationState",
+            serde_json::to_vec(&wire).map_err(|_| ConversationStateReadError::Invariant)?,
+        )
+        .map_err(|_| ConversationStateReadError::Invariant)?,
+    })
 }
 
 fn append_canonical_array<T: serde::Serialize>(
@@ -213,6 +299,10 @@ fn map_authority_error(error: ReadAuthorityError) -> ConversationStateReadError 
 fn map_inventory_error(
     error: super::inventory::InventoryRepositoryError,
 ) -> ConversationStateReadError {
+    tracing::error!(class = ?std::mem::discriminant(&error), "conversation state source failed");
+    if let super::inventory::InventoryRepositoryError::Projection(projection) = &error {
+        tracing::error!(class = ?projection.kind(), "conversation state source projection failed");
+    }
     match error {
         super::inventory::InventoryRepositoryError::Database(_) => {
             ConversationStateReadError::Storage

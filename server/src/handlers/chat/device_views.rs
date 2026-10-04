@@ -91,6 +91,7 @@ pub(super) fn own_device_view(
     device: chat_dto::DeviceView<DefaultStr>,
 ) -> chat_dto::OwnDeviceView<DefaultStr> {
     chat_dto::OwnDeviceView {
+        direct_request_key_pool: None,
         device,
         extra_data: None,
     }

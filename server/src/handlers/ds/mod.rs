@@ -1,4 +1,5 @@
 pub mod deliver_message;
+pub mod direct_requests;
 pub mod deliver_welcome;
 pub mod fetch_key_package;
 pub mod get_convo_digest;
@@ -9,6 +10,7 @@ pub mod transfer_sequencer;
 
 pub use deliver_message::deliver_message;
 pub use deliver_welcome::deliver_welcome;
+pub use direct_requests::*;
 pub use fetch_key_package::fetch_key_package;
 pub use get_convo_digest::get_convo_digest;
 pub use get_convo_events::get_convo_events;

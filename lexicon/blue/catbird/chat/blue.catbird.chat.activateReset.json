@@ -50,6 +50,9 @@
           "name": "AdminRequired"
         },
         {
+          "name": "ConversationNotAccepted"
+        },
+        {
           "name": "ConversationNotFound"
         },
         {

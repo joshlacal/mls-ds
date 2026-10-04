@@ -54,11 +54,16 @@ compile_error!(
     "`subscription-production-proof` is a non-shipping test surface and cannot coexist with `server-bin`"
 );
 
+extern crate self as catbird_server;
+#[cfg(test)]
+#[path = "common_tests.rs"]
+pub mod common;
+
+
 pub mod actors;
 pub mod atproto_bytes;
 pub mod auth;
 pub mod blob_store;
-pub mod block_sync;
 pub mod chat_protocol;
 pub mod config;
 pub mod crypto;
@@ -98,8 +103,6 @@ pub use catbird_atproto::builder_types;
 // sqlx conversion helpers for jacquard-common types
 pub mod sqlx_jacquard;
 
-#[cfg(all(test, feature = "test-support"))]
-extern crate self as catbird_server;
 
 #[cfg(all(test, feature = "test-support"))]
 #[path = "../tests/common/chat_protocol_heartbeat_transport.rs"]

@@ -116,7 +116,13 @@ async fn read_entries_in_transaction(
 }
 
 fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
-    let entry = if row.entry_kind == delivery::APPLICATION_ENTRY_KIND {
+    let is_direct_request_entry = matches!(
+        row.entry_kind.as_str(),
+        "blue.catbird.chat.defs#directRequestEntry"
+            | "blue.catbird.chat.defs#directRequestAcceptanceEntry"
+    );
+    let mut entry = if row.entry_kind == delivery::APPLICATION_ENTRY_KIND || is_direct_request_entry
+    {
         let signed_request: Value = serde_json::from_slice(&row.signed_request_bytes)
             .map_err(|_| EntryReadFacadeError::Invariant)?;
         json!({
@@ -140,6 +146,17 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
         .map_err(|_| EntryReadFacadeError::Invariant)?;
         serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant)?
     };
+    if is_direct_request_entry {
+        // Encrypted-request entries echo their retained signed wrapper; the
+        // encrypted-requests presentation bridge emits their declared bytes as
+        // lexicon `{"$bytes"}` at read time only.
+        crate::chat_protocol::direct_request_transcript::present_read_presentation(
+            "conversationEntry",
+            &mut entry,
+        )
+        .map_err(|_| EntryReadFacadeError::Invariant)?;
+        return Ok(entry);
+    }
     let canonical =
         encode_canonical_generated_chat_json_v1(&entry, "blue.catbird.chat.defs#conversationEntry")
             .map_err(|error| {

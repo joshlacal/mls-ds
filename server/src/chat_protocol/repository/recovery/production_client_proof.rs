@@ -130,17 +130,21 @@ async fn prepare_request(
             return Err("fresh client Recovery proof unexpectedly replayed".to_owned())
         }
     };
-    let prelude = crate::chat_protocol::repository::prelude::prepare_actor_prelude(
-        transaction,
-        &proof.authority,
-        reservation,
-    )
-    .await
-    .map_err(|error| format!("prepare client Recovery actor/scope prelude: {error:?}"))?;
     let mutation = proof
         .authority
         .mutation()
         .ok_or_else(|| "authorized Recovery request lacks canonical mutation".to_owned())?;
+    let scope = discover_recovery_event_scope(transaction, &proof.authority, mutation)
+        .await
+        .map_err(|e| format!("discover Recovery proof event scope: {e:?}"))?;
+    let prelude = crate::chat_protocol::repository::prelude::prepare_identity_scope_prelude(
+        transaction,
+        &proof.authority,
+        reservation,
+        scope,
+    )
+    .await
+    .map_err(|error| format!("prepare client Recovery actor/scope prelude: {error:?}"))?;
     let authority = prepare_recovery_request_authority(transaction, prelude, mutation)
         .await
         .map_err(|error| format!("prepare client Recovery authority: {error:?}"))?;
@@ -661,16 +665,20 @@ async fn prepare_cancellation(
             return Err("fresh Recovery cancellation unexpectedly replayed".to_owned())
         }
     };
-    let prelude = crate::chat_protocol::repository::prelude::prepare_actor_prelude(
-        transaction,
-        authority,
-        reservation,
-    )
-    .await
-    .map_err(|e| format!("prepare Recovery cancellation prelude: {e:?}"))?;
     let mutation = authority
         .mutation()
         .ok_or_else(|| "authorized Recovery cancellation lacks canonical mutation".to_owned())?;
+    let scope = discover_recovery_event_scope(transaction, authority, mutation)
+        .await
+        .map_err(|e| format!("discover Recovery proof event scope: {e:?}"))?;
+    let prelude = crate::chat_protocol::repository::prelude::prepare_identity_scope_prelude(
+        transaction,
+        authority,
+        reservation,
+        scope,
+    )
+    .await
+    .map_err(|e| format!("prepare Recovery cancellation prelude: {e:?}"))?;
     let read = prepare_recovery_cancellation_authority(transaction, prelude, mutation)
         .await
         .map_err(|e| format!("prepare Recovery cancellation authority: {e:?}"))?;

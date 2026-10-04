@@ -1,7 +1,7 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.chat.getConversations",
-  "description": "The first call creates one opaque retained inventorySession with a single event fence and materialized audience snapshots for active conversation states, device-removal tombstones, terminal close tombstones, pending Welcomes, and recovery inbox. Every page returns the same inventorySessionId, snapshotEventCursor, and expiry. pageCursor is domain-specific, audience/device/session-bound, and never an event cursor; nextPageCursor is absent after the final page. Mixed, expired, or device-mismatched sessions are rejected.",
+  "description": "The first call creates one opaque retained inventorySession with a single event fence and materialized audience snapshots for active conversation states, device-removal tombstones, terminal close tombstones, pending Welcomes, and recovery inbox. Every page returns the same inventorySessionId, snapshotEventCursor, and expiry. pageCursor is domain-specific, audience/device/session-bound, and never an event cursor; nextPageCursor is absent after the final page. Mixed, expired, or device-mismatched sessions are rejected. Protocol-two scopes bind audience, inventory/page/event cursors and ticket. Unscoped legacy sessions must fail ProtocolUpgradeRequired before any successful partial inventory if unsupported state exists. Omission is never removal evidence.",
   "defs": {
     "main": {
       "type": "query",
@@ -28,6 +28,18 @@
             "minimum": 1,
             "maximum": 100,
             "default": 50
+          },
+          "supportedProtocolVersions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "1",
+                "2"
+              ]
+            },
+            "minLength": 1,
+            "maxLength": 2
           }
         }
       },
@@ -73,6 +85,10 @@
             "snapshotExpiresAt": {
               "type": "ref",
               "ref": "blue.catbird.chat.defs#canonicalDatetime"
+            },
+            "inventoryScope": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#directRequestInventoryScope"
             }
           }
         }
@@ -95,6 +111,9 @@
         },
         {
           "name": "AccountSessionExpired"
+        },
+        {
+          "name": "InventorySessionMismatch"
         },
         {
           "name": "NotAuthorized"

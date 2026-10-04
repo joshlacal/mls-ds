@@ -4,6 +4,7 @@ pub(crate) mod bootstrap;
 #[cfg(any(test, feature = "test-support"))]
 pub mod bootstrap;
 pub mod commit_submitter;
+pub mod canonical_relay;
 pub mod declaration_client;
 pub mod envelope;
 pub mod errors;
@@ -33,6 +34,7 @@ pub(crate) use bootstrap::{
     RemotePrefixBootstrapError, RemotePrefixBootstrapSelector, VerifiedRemotePrefixAdmission,
 };
 pub use commit_submitter::*;
+pub use canonical_relay::*;
 pub use declaration_client::{DeviceRecord, DeviceRecordClient, DeviceRecordValue, MLSChatPolicy};
 pub use envelope::*;
 pub use errors::{FederationError, ResolutionFailureKind};

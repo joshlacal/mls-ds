@@ -27,18 +27,22 @@ mod context;
 mod conversation_state;
 mod create_conversation;
 mod device_views;
+mod direct_requests;
 mod enroll_device;
 mod errors;
 mod expiry_worker;
+mod get_device_key;
 mod get_devices;
 mod get_entries;
 mod get_own_devices;
 mod inventory;
 mod leave;
+mod publish_direct_request;
 mod publish_typing;
 mod recovery;
 mod recovery_scheduler;
 mod replenish_key_packages;
+pub(crate) mod request_push;
 mod reset;
 mod revoke_device;
 mod runtime;
@@ -53,6 +57,8 @@ pub use errors::ChatFailure;
 pub use expiry_worker::{
     run_chat_expiry_sweeper, run_chat_expiry_sweeper_with_blob_store, ChatExpirySweepConfig,
 };
+#[cfg(feature = "test-support")]
+pub use runtime::install_test_https_relationship_resolver;
 pub use runtime::ChatRuntime;
 pub use subscribe_events::{parse_query as parse_subscribe_events_query, SubscribeEventsQuery};
 
@@ -102,8 +108,14 @@ where
 fn is_implemented(endpoint: ChatEndpoint) -> bool {
     matches!(
         endpoint,
-        ChatEndpoint::EnrollDevice
+        ChatEndpoint::PublishDirectRequestKeys
+            | ChatEndpoint::PublishDirectRequest
+            | ChatEndpoint::PrepareDirectRequest
+            | ChatEndpoint::GetDirectRequestOutcome
+            | ChatEndpoint::CancelDirectRequestPreparation
+            | ChatEndpoint::EnrollDevice
             | ChatEndpoint::ReplenishKeyPackages
+            | ChatEndpoint::GetDeviceKey
             | ChatEndpoint::GetDevices
             | ChatEndpoint::GetOwnDevices
             | ChatEndpoint::RequestLeave
@@ -147,12 +159,36 @@ where
 {
     let router = Router::new()
         .route(
+            &xrpc_path(ChatEndpoint::PublishDirectRequestKeys),
+            post(direct_requests::publish_keys).layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::PublishDirectRequest),
+            post(publish_direct_request::handle).layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::PrepareDirectRequest),
+            post(direct_requests::prepare).layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::CancelDirectRequestPreparation),
+            post(direct_requests::cancel).layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetDirectRequestOutcome),
+            get(direct_requests::outcome),
+        )
+        .route(
             &xrpc_path(ChatEndpoint::EnrollDevice),
             post(enroll_device::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::ReplenishKeyPackages),
             post(replenish_key_packages::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetDeviceKey),
+            get(get_device_key::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetDevices),
@@ -271,8 +307,63 @@ where
             post(update_push_token::handle),
         )
         .route(
+            "/internal/chat/request-push-eligibility",
+            post(request_push::eligibility).layer(DefaultBodyLimit::max(
+                crate::chat_protocol::request_push::MAX_INTERNAL_BODY_BYTES,
+            )),
+        )
+        .route(
             &xrpc_path(ChatEndpoint::GetBlob),
             get(blob_routes::get_blob),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.reserveRecipientBootstrap",
+            post(crate::handlers::ds::direct_requests::reserve_recipient_bootstrap)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.releaseRecipientBootstrap",
+            post(crate::handlers::ds::direct_requests::release_recipient_bootstrap)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.prepareDirectRequest",
+            post(crate::handlers::ds::direct_requests::prepare_direct_request)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.publishDirectRequest",
+            post(crate::handlers::ds::direct_requests::publish_direct_request)
+                .layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.deliverDirectRequest",
+            post(crate::handlers::ds::direct_requests::deliver_direct_request)
+                .layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.deliverAcceptance",
+            post(crate::handlers::ds::direct_requests::deliver_acceptance)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.deliverAcceptanceEntry",
+            post(crate::handlers::ds::direct_requests::deliver_acceptance_entry)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.relaySendMessage",
+            post(crate::handlers::ds::direct_requests::relay_send_message)
+                .layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.deliverMessageEntry",
+            post(crate::handlers::ds::direct_requests::deliver_message_entry)
+                .layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getDirectRequestOutcome",
+            get(crate::handlers::ds::direct_requests::get_direct_request_outcome),
         );
     router
 }
@@ -372,4 +463,19 @@ mod tests {
             let _ = uses_http_get(endpoint);
         }
     }
+}
+
+#[cfg(all(
+    feature = "chat-protocol-production-proof",
+    not(feature = "server-bin")
+))]
+pub(crate) fn production_proof_signed_operation_failure(
+    error: crate::chat_protocol::repository::prelude::PreludeError,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    context::operation_prelude_failure(
+        crate::chat_protocol::error::ChatEndpoint::SubmitTransition,
+        error,
+    )
+    .into_response()
 }

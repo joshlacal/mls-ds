@@ -51,6 +51,23 @@ pub mod dpop;
 #[allow(dead_code)]
 #[path = "../../../server/src/chat_protocol/public_state.rs"]
 pub mod public_state;
+
+// Encrypted-requests modules referenced by the mounted repository/state files.
+#[allow(dead_code)]
+#[path = "../../../server/src/chat_protocol/direct_request_transcript.rs"]
+pub mod direct_request_transcript;
+
+#[allow(dead_code)]
+#[path = "../../../server/src/chat_protocol/request_push.rs"]
+pub mod request_push;
+pub mod error {
+    pub use catbird_server::chat_protocol::error::*;
+}
+
+#[allow(dead_code)]
+pub fn is_bare_did(value: &str) -> bool {
+    catbird_server::chat_protocol::is_bare_did(value)
+}
 pub mod snapshot {
     pub use catbird_server::chat_protocol::snapshot::*;
 }
@@ -79,6 +96,22 @@ pub mod repository {
     pub mod delivery;
     #[path = "../../../server/src/chat_protocol/repository/device_directory.rs"]
     pub mod device_directory;
+    #[path = "../../../server/src/chat_protocol/repository/direct_request_lifecycle.rs"]
+    pub mod direct_request_lifecycle;
+    #[path = "../../../server/src/chat_protocol/repository/direct_request_preparation.rs"]
+    pub mod direct_request_preparation;
+    #[path = "../../../server/src/chat_protocol/repository/direct_request_publication.rs"]
+    pub mod direct_request_publication;
+    #[path = "../../../server/src/chat_protocol/repository/direct_request_push.rs"]
+    pub mod direct_request_push;
+    #[path = "../../../server/src/chat_protocol/repository/direct_request_receipts.rs"]
+    pub mod direct_request_receipts;
+    #[path = "../../../server/src/chat_protocol/repository/direct_request_retention.rs"]
+    pub mod direct_request_retention;
+    #[path = "../../../server/src/chat_protocol/repository/message_event.rs"]
+    pub mod message_event;
+    #[path = "../../../server/src/chat_protocol/repository/push_binding.rs"]
+    pub mod push_binding;
     #[path = "../../../server/src/chat_protocol/repository/entry_read.rs"]
     pub mod entry_read;
     #[path = "../../../server/src/chat_protocol/repository/execution_context.rs"]

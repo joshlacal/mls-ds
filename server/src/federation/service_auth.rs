@@ -101,6 +101,11 @@ impl ServiceAuthClient {
         Ok(token)
     }
 
+    /// Mint an authenticated S2S service token with explicit target audience and method NSID.
+    pub fn mint_token(&self, target_did: &str, method: &str) -> Result<String, FederationError> {
+        self.sign_request(target_did, method)
+    }
+
     pub fn self_did(&self) -> &str {
         &self.self_did
     }

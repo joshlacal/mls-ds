@@ -75,6 +75,79 @@ async fn handle(
     // post-state checks occur under this one caller-owned transaction.
     let admission =
         context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
+    let actor_did = admission.subject().to_string();
+    let actor_device_id = admission.device_id();
+
+    let body_json: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+    let signed_req = body_json.as_ref()
+        .and_then(|v| v.get("signedRequest"))
+        .unwrap_or(body_json.as_ref().unwrap_or(&serde_json::Value::Null));
+    let welcome_id_str = signed_req.pointer("/body/welcomeId")
+        .or_else(|| signed_req.pointer("/body/id"))
+        .and_then(|v| v.as_str());
+
+    if let Some(welcome_str) = welcome_id_str {
+        if let Ok(welcome_id) = uuid::Uuid::parse_str(welcome_str) {
+            let in_transport_inbox: Option<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+                "SELECT status, updated_at FROM chat.direct_request_transport_inbox \
+                 WHERE request_id = $1 AND recipient_did = $2 AND recipient_device_id = $3"
+            )
+            .bind(welcome_id)
+            .bind(&actor_did)
+            .bind(actor_device_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+
+            if let Some((existing_status, updated_at)) = in_transport_inbox {
+                let now = chrono::Utc::now();
+                let (target_status, output_dto) = match endpoint {
+                    ChatEndpoint::AcknowledgeWelcome => {
+                        let ts = if existing_status == "accepted" { updated_at } else { now };
+                        (
+                            "accepted",
+                            serde_json::json!({
+                                "status": "acknowledged",
+                                "acknowledgedAt": ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                            }),
+                        )
+                    }
+                    ChatEndpoint::RejectWelcome => {
+                        let ts = if existing_status == "rejected" { updated_at } else { now };
+                        (
+                            "rejected",
+                            serde_json::json!({
+                                "status": "rejected",
+                                "rejectedAt": ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                            }),
+                        )
+                    }
+                    _ => return Err(ChatFailure::invariant(endpoint)),
+                };
+
+                if existing_status != target_status {
+                    sqlx::query(
+                        "UPDATE chat.direct_request_transport_inbox \
+                         SET status = $1, updated_at = $2 \
+                         WHERE request_id = $3 AND recipient_did = $4 AND recipient_device_id = $5"
+                    )
+                    .bind(target_status)
+                    .bind(now)
+                    .bind(welcome_id)
+                    .bind(&actor_did)
+                    .bind(actor_device_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|_| ChatFailure::storage(endpoint))?;
+                }
+
+                let resp_bytes = serde_json::to_vec(&output_dto)
+                    .map_err(|_| ChatFailure::invariant(endpoint))?;
+                return context::canonical_json_response(endpoint, 200, resp_bytes);
+            }
+        }
+    }
     let mut transaction = pool
         .begin()
         .await
@@ -88,7 +161,7 @@ async fn handle(
 
     let response = match outcome {
         WelcomeTerminalTransactionOutcome::Replay { response, .. } => {
-            context::replay_response(&response)
+            context::replay_response(endpoint, &response)?
         }
         WelcomeTerminalTransactionOutcome::Prepared(first) => {
             let applied = first
@@ -137,6 +210,10 @@ fn welcome_failure(endpoint: ChatEndpoint, error: WelcomeTerminalFacadeError) ->
     use WelcomeTerminalFacadeError as E;
 
     match error {
+        E::FreshMissing => ChatFailure::protocol(endpoint,C::WelcomeNotFound),
+        E::FreshTerminal => ChatFailure::protocol(endpoint, if endpoint == ChatEndpoint::AcknowledgeWelcome { C::AcknowledgementConflict } else { C::RejectionConflict }),
+        E::Retention(crate::chat_protocol::repository::direct_request_retention::RetentionError::Database(_)) => ChatFailure::storage(endpoint),
+        E::Retention(_) => ChatFailure::protocol_with_retry(endpoint, C::CapacityUnavailable, Some(30)),
         E::InvalidRequest => ChatFailure::protocol(endpoint, C::InvalidRequest),
         E::Prelude(error) => context::operation_prelude_failure(endpoint, error),
         // A quarantined aggregate fails the exact read-set check before the

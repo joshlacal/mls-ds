@@ -98,10 +98,7 @@ async fn stress_message_throughput() {
             .await
             .unwrap_or_else(|e| panic!("get_messages user {i}: {e}"));
         read_latencies.push(t.elapsed());
-        let count = resp["messages"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0);
+        let count = resp["messages"].as_array().map(|a| a.len()).unwrap_or(0);
         total_retrieved += count;
     }
 
@@ -184,10 +181,7 @@ async fn stress_large_group() {
             .await
             .unwrap_or_else(|e| panic!("get_messages user {i}: {e}"));
         read_latencies.push(t.elapsed());
-        let count = resp["messages"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0);
+        let count = resp["messages"].as_array().map(|a| a.len()).unwrap_or(0);
         assert!(
             count >= num_messages,
             "user {i} expected >= {num_messages} messages, got {count}"
@@ -277,7 +271,9 @@ async fn stress_many_convos() {
     let gc_start = Instant::now();
     let convos_resp = main_user.get_convos().await.expect("get_convos");
     let gc_elapsed = gc_start.elapsed();
-    let convo_list = convos_resp["conversations"].as_array().expect("convos array");
+    let convo_list = convos_resp["conversations"]
+        .as_array()
+        .expect("convos array");
     assert!(
         convo_list.len() >= num_convos,
         "expected >= {num_convos} convos, got {}",
@@ -418,10 +414,7 @@ async fn stress_read_heavy() {
                     .get_messages_with_limit(&cid, since_seq, Some(100))
                     .await
                     .unwrap_or_else(|e| panic!("reader {i} get_messages: {e}"));
-                let msgs = resp["messages"]
-                    .as_array()
-                    .map(|a| a.len())
-                    .unwrap_or(0);
+                let msgs = resp["messages"].as_array().map(|a| a.len()).unwrap_or(0);
                 if msgs == 0 {
                     break;
                 }

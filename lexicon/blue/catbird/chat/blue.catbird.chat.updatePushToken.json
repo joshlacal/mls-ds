@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Register, update, or clear the APNs device token for the caller's active device.",
+      "description": "Register, rotate or disable a canonical device-signed APNs/FCM push binding. Unsigned token-only input retains legacy registration behavior and never enables encrypted-request notification delivery.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -13,7 +13,11 @@
             "token": {
               "type": "string",
               "maxLength": 512,
-              "description": "APNs device token (e.g. hex-encoded). Omit to unregister/clear."
+              "description": "Provider token; required with an enabled signed registration, omitted to disable. For signed bindings its SHA256 must equal the signed tokenSha256."
+            },
+            "registration": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedPushRegistration"
             }
           }
         }
@@ -29,6 +33,10 @@
             "device": {
               "type": "ref",
               "ref": "blue.catbird.chat.defs#deviceView"
+            },
+            "pushBinding": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#pushRegistrationBinding"
             }
           }
         }
@@ -57,6 +65,18 @@
         },
         {
           "name": "RateLimited"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "StaleAuthGeneration"
+        },
+        {
+          "name": "RegistrationConflict"
+        },
+        {
+          "name": "CapacityUnavailable"
         }
       ]
     }

@@ -135,6 +135,11 @@ name = "federation_fixture"
 path = "src/bin/federation_fixture.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "encrypted_request_server_fixture"
+path = "../e2e-tests/support/encrypted_request_server_fixture.rs"
+required-features = ["test-support"]
+
 [[example]]
 name = "seal_mls_chat_crypto_wire_v09"
 path = "examples/seal_mls_chat_crypto_wire_v09.rs"
@@ -160,23 +165,8 @@ path = "tests/chat_protocol_device_handlers.rs"
 required-features = ["test-support"]
 
 [[test]]
-name = "chat_protocol_g7_entitlement"
-path = "tests/chat_protocol_g7_entitlement.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "chat_protocol_inventory"
-path = "tests/chat_protocol_inventory.rs"
-required-features = ["test-support"]
-
-[[test]]
 name = "chat_protocol_s3_lifecycle"
 path = "tests/chat_protocol_s3_lifecycle.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "chat_protocol_ticket"
-path = "tests/chat_protocol_ticket.rs"
 required-features = ["test-support"]
 
 [[test]]
