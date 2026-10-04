@@ -210,6 +210,26 @@ name = "federation_fixture_cli"
 path = "tests/federation_fixture_cli.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "labyrinth_directory"
+path = "tests/labyrinth_directory.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_mailbox"
+path = "tests/labyrinth_mailbox.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_thread"
+path = "tests/labyrinth_thread.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_crate_trace"
+path = "tests/labyrinth_crate_trace.rs"
+required-features = ["test-support"]
+
 [features]
 default = ["namespace-bluecatbird", "server-bin"]
 namespace-bluecatbird = []
