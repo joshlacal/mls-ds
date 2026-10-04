@@ -1,0 +1,75 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.putAttachmentRef",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Store an attachment reference under orf_server_map(caller device state, blindedIndex); pins the blob against GC. ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "deviceKeyPubkey",
+            "blindedIndex",
+            "blindedToken",
+            "conversationId",
+            "blobId",
+            "messageId"
+          ],
+          "properties": {
+            "deviceKeyPubkey": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "The device."
+            },
+            "blindedIndex": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "orf_client_map output."
+            },
+            "blindedToken": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "orf_client_map output for the access token."
+            },
+            "conversationId": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "Conversation id."
+            },
+            "blobId": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "chat.blobs id."
+            },
+            "messageId": {
+              "type": "string",
+              "maxLength": 256,
+              "description": "Message id."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "RecordAlreadyExists"
+        },
+        {
+          "name": "OrfStateNotFound"
+        }
+      ]
+    }
+  }
+}

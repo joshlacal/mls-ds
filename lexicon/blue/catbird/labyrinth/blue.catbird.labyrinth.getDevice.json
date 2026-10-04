@@ -1,0 +1,44 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.getDevice",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "One device record. Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "deviceKeyPubkey"
+        ],
+        "properties": {
+          "deviceKeyPubkey": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "description": "deviceKeyPubkey of the device (lowercase hex)."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "record"
+          ],
+          "properties": {
+            "record": {
+              "type": "unknown",
+              "description": "A blue.catbird.labyrinth.device record."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "DeviceNotFound"
+        }
+      ]
+    }
+  }
+}

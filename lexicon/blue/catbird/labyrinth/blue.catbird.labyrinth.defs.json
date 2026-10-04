@@ -1,0 +1,235 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.defs",
+  "defs": {
+    "epochPublic": {
+      "type": "object",
+      "description": "Public data of one mailbox epoch (SPEC \u00a75.2-5.3). Everything needed to recompute and verify the epoch head.",
+      "required": [
+        "epochNumber",
+        "authPubkey",
+        "encryptionPubkey",
+        "signingPubkey",
+        "epochHead",
+        "selfSig",
+        "attestation"
+      ],
+      "properties": {
+        "epochNumber": {
+          "type": "integer",
+          "description": "epochSequenceID, starting at 0.",
+          "minimum": 0,
+          "maximum": 1099511627776
+        },
+        "authPubkey": {
+          "type": "bytes",
+          "description": "Hawk auth public key (X25519, 32 bytes).",
+          "maxLength": 32,
+          "minLength": 32
+        },
+        "encryptionPubkey": {
+          "type": "bytes",
+          "description": "Hawk encryption public key: X25519(32) || ML-KEM-768 ek(1184).",
+          "maxLength": 1216,
+          "minLength": 1216
+        },
+        "signingPubkey": {
+          "type": "bytes",
+          "description": "XEdDSA mailbox signing public key (32 bytes).",
+          "maxLength": 32,
+          "minLength": 32
+        },
+        "previousEpochHead": {
+          "type": "bytes",
+          "description": "Head of epoch N-1; absent for epoch 0.",
+          "maxLength": 32,
+          "minLength": 32
+        },
+        "epochHead": {
+          "type": "bytes",
+          "description": "sha256 epoch head (SPEC \u00a75.3).",
+          "maxLength": 32,
+          "minLength": 32
+        },
+        "selfSig": {
+          "type": "bytes",
+          "description": "XEdDSA by this epoch's signing key over 'minos.unstructured_signature.epoch_self:' || head.",
+          "maxLength": 64,
+          "minLength": 64
+        },
+        "prevSig": {
+          "type": "bytes",
+          "description": "XEdDSA by the previous epoch's signing key over 'minos.unstructured_signature.epoch_prev:' || head.",
+          "maxLength": 64,
+          "minLength": 64
+        },
+        "attestation": {
+          "type": "ref",
+          "ref": "#transportAttestation"
+        }
+      }
+    },
+    "transportAttestation": {
+      "type": "object",
+      "description": "[CB-18] Binds an epoch head to the account's MLS chat identity: Ed25519 by a chat device transport key over 'catbird.labyrinth.epoch_head_attest:' || did || ':' || head.",
+      "required": [
+        "transportPubkey",
+        "sig"
+      ],
+      "properties": {
+        "transportPubkey": {
+          "type": "bytes",
+          "description": "Ed25519 public key of the attesting chat device.",
+          "maxLength": 32,
+          "minLength": 32
+        },
+        "sig": {
+          "type": "bytes",
+          "description": "Ed25519 signature.",
+          "maxLength": 64,
+          "minLength": 64
+        }
+      }
+    },
+    "sealedMessage": {
+      "type": "object",
+      "description": "One v1.1 sender-encrypted message (SPEC \u00a77.2).",
+      "required": [
+        "messageId",
+        "timestamp",
+        "mekId",
+        "senderTransportPubkey",
+        "signedEncMessage"
+      ],
+      "properties": {
+        "messageId": {
+          "type": "string",
+          "description": "Chat message id.",
+          "maxLength": 128
+        },
+        "timestamp": {
+          "type": "integer",
+          "description": "Milliseconds since Unix epoch.",
+          "minimum": 0
+        },
+        "mekId": {
+          "type": "bytes",
+          "description": "12-byte MEK id.",
+          "maxLength": 12,
+          "minLength": 12
+        },
+        "senderTransportPubkey": {
+          "type": "bytes",
+          "description": "Sender chat device Ed25519 key.",
+          "maxLength": 32,
+          "minLength": 32
+        },
+        "signedEncMessage": {
+          "type": "bytes",
+          "description": "Ed25519 sig(64) || suite-tagged AEAD ciphertext of the padded frame.",
+          "maxLength": 262144,
+          "minLength": 64
+        }
+      }
+    },
+    "ownerMessage": {
+      "type": "object",
+      "description": "One v1.0 owner-encrypted message (SPEC \u00a77.1).",
+      "required": [
+        "threadId",
+        "messageId",
+        "timestamp",
+        "epochNumber",
+        "version",
+        "encrypted"
+      ],
+      "properties": {
+        "threadId": {
+          "type": "string",
+          "description": "Conversation id.",
+          "maxLength": 256
+        },
+        "messageId": {
+          "type": "string",
+          "description": "Message id.",
+          "maxLength": 128
+        },
+        "timestamp": {
+          "type": "integer",
+          "description": "ms since Unix epoch.",
+          "minimum": 0
+        },
+        "epochNumber": {
+          "type": "integer",
+          "description": "Epoch whose root key derived the message key.",
+          "minimum": 0,
+          "maximum": 1099511627776
+        },
+        "version": {
+          "type": "integer",
+          "description": "Cipher version. Writers use 3; readers also accept 0, 2 and 4 (SPEC \u00a77.1).",
+          "minimum": 0,
+          "maximum": 4
+        },
+        "encrypted": {
+          "type": "bytes",
+          "description": "Suite-tagged AEAD ciphertext of the padded frame.",
+          "maxLength": 262144
+        }
+      }
+    },
+    "mekRecipient": {
+      "type": "object",
+      "required": [
+        "did",
+        "recipientEpochHead",
+        "ciphertext"
+      ],
+      "properties": {
+        "did": {
+          "type": "string",
+          "description": "Recipient account.",
+          "format": "did"
+        },
+        "recipientEpochHead": {
+          "type": "bytes",
+          "description": "Head of the recipient epoch the MEK is encrypted to.",
+          "maxLength": 32,
+          "minLength": 32
+        },
+        "ciphertext": {
+          "type": "bytes",
+          "description": "hawk_encrypt output: 0x01 || eph(32) || kemCt(1088) || ct.",
+          "maxLength": 1200
+        }
+      }
+    },
+    "serverOrder": {
+      "type": "object",
+      "description": "The order mls-ds assigned to a record when it was written ([CB-27]). Readers bound a removed chat key by it instead of the sender's timestamp.",
+      "required": [
+        "seq",
+        "receivedAt"
+      ],
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Per-conversation (owner batches: per-mailbox) Labyrinth write counter."
+        },
+        "chatSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The conversation's last chat entry seq at the write, linearized against MLS commits; absent outside a conversation."
+        },
+        "receivedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Receive time on the server clock."
+        }
+      }
+    }
+  }
+}

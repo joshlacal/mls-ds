@@ -1,0 +1,67 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.createVirtualDevice",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Store a recovery bundle. member and orf are optional: when present they are written in the same transaction (the epoch membership, and the bundle's ORF state evolved from the parent). Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "record"
+          ],
+          "properties": {
+            "record": {
+              "type": "unknown",
+              "description": "A blue.catbird.labyrinth.virtualDevice record."
+            },
+            "member": {
+              "type": "unknown",
+              "description": "A blue.catbird.labyrinth.epochMember record."
+            },
+            "orf": {
+              "type": "ref",
+              "ref": "#orfParent"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "RecordAlreadyExists"
+        }
+      ]
+    },
+    "orfParent": {
+      "type": "object",
+      "required": [
+        "deviceKeyPubkey",
+        "evolveToken"
+      ],
+      "properties": {
+        "deviceKeyPubkey": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32,
+          "description": "Parent device key."
+        },
+        "evolveToken": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32,
+          "description": "ORF evolve token."
+        }
+      }
+    }
+  }
+}

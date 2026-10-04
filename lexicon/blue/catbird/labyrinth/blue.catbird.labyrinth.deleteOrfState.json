@@ -1,0 +1,35 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.deleteOrfState",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Delete a device's ORF server state (revocation, SPEC 5.6). Idempotent. ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "deviceKeyPubkey"
+          ],
+          "properties": {
+            "deviceKeyPubkey": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "The device."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      }
+    }
+  }
+}

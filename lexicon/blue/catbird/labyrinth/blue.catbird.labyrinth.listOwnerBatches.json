@@ -1,0 +1,94 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.listOwnerBatches",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Owner batches of one thread holding a message in [fromMs, untilMs), oldest first. Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "threadId"
+        ],
+        "properties": {
+          "threadId": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Conversation id."
+          },
+          "fromMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Window start (ms)."
+          },
+          "untilMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Window end (ms), exclusive."
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Opaque cursor from the previous page."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Page size (at most 100)."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "items"
+          ],
+          "properties": {
+            "items": {
+              "type": "array",
+              "maxLength": 100,
+              "items": {
+                "type": "ref",
+                "ref": "#ownerBatchView"
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "Opaque cursor from the previous page."
+            }
+          },
+          "description": "One page of results."
+        }
+      }
+    },
+    "ownerBatchView": {
+      "type": "object",
+      "required": [
+        "rkey",
+        "record",
+        "order"
+      ],
+      "properties": {
+        "rkey": {
+          "type": "string",
+          "maxLength": 13,
+          "description": "TID."
+        },
+        "record": {
+          "type": "unknown",
+          "description": "A blue.catbird.labyrinth.ownerBatch record."
+        },
+        "order": {
+          "type": "ref",
+          "ref": "blue.catbird.labyrinth.defs#serverOrder"
+        }
+      }
+    }
+  }
+}

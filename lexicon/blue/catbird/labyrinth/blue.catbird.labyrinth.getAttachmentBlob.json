@@ -1,0 +1,49 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.getAttachmentBlob",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Read an attachment blob with the ORF access token, for a restored device that has no application interval at the attachment's entry. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded. ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "deviceKeyPubkey",
+          "blindedIndex",
+          "blindedToken"
+        ],
+        "properties": {
+          "deviceKeyPubkey": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "description": "deviceKeyPubkey of the device (lowercase hex)."
+          },
+          "blindedIndex": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "description": "blinded index (lowercase hex)."
+          },
+          "blindedToken": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "description": "blinded token (lowercase hex)."
+          }
+        }
+      },
+      "output": {
+        "encoding": "*/*"
+      },
+      "errors": [
+        {
+          "name": "OrfStateNotFound"
+        },
+        {
+          "name": "NotFound"
+        }
+      ]
+    }
+  }
+}

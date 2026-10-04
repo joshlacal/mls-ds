@@ -1,0 +1,46 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.markDeviceRevoked",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Set a device's revokedAt once (idempotent) and delete its ORF server state in the same transaction. Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "deviceKeyPubkey",
+            "revokedAt"
+          ],
+          "properties": {
+            "deviceKeyPubkey": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "The device key."
+            },
+            "revokedAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "Revocation time."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "DeviceNotFound"
+        }
+      ]
+    }
+  }
+}

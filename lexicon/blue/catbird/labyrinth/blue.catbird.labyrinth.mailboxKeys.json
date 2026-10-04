@@ -1,0 +1,36 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.mailboxKeys",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Published in the account's PUBLIC repo so any sender can address MEKs to the account's latest Labyrinth epoch ([CB-19]). Works on every PDS, with or without Spaces. rkey `self` holds the latest epoch and is overwritten on rotation; rkey = epochNumber zero-padded to 12 digits holds an immutable copy of every published epoch, so senders can verify the prev_sig chain from a pinned head ([CB-29]).",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "current",
+          "updatedAt"
+        ],
+        "properties": {
+          "current": {
+            "type": "ref",
+            "ref": "blue.catbird.labyrinth.defs#epochPublic"
+          },
+          "backend": {
+            "type": "string",
+            "description": "Where the mailbox lives.",
+            "knownValues": [
+              "space",
+              "mlsDs"
+            ]
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}
