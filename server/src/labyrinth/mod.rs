@@ -23,6 +23,7 @@ pub mod digest;
 pub mod error;
 pub mod heads;
 pub mod orf;
+pub mod read_auth;
 pub mod relay;
 pub mod repo;
 pub mod tid;

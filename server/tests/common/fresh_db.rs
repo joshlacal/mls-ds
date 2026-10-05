@@ -390,7 +390,6 @@ fn fresh_db_creation_gate() -> &'static tokio::sync::Mutex<()> {
     FRESH_DB_CREATION_GATE.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-
 pub async fn fresh_fully_migrated_db(prefix: &str) -> DisposableDatabase {
     let _migration_guard = acquire_migration_lock().await;
     let database = DisposableDatabase::mint(prefix).await;
@@ -423,10 +422,7 @@ pub async fn fresh_fully_migrated_db(prefix: &str) -> DisposableDatabase {
                     if is_transient_catalog_conflict(&error)
                         && attempt < FRESH_DB_MIGRATION_ATTEMPTS =>
                 {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        20 * attempt as u64,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(20 * attempt as u64)).await;
                 }
                 other => break other,
             }

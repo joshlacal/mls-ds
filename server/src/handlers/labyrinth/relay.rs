@@ -11,6 +11,7 @@ use crate::handlers::chat::ChatRuntime;
 use crate::handlers::ds::deliver_message::enforce_ds_request_security;
 use crate::labyrinth::auth::{decode_b64, relayed_read, verify_signed_write};
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
+use crate::labyrinth::read_auth::{canonical_query, Expected, ReadProof};
 use crate::labyrinth::relay::{not_home_ds, not_sequencer, RelayOp, RelayRequest, NSID};
 use crate::labyrinth::repo::retention::home_ds;
 use crate::labyrinth::repo::thread::parse_thread_id;
@@ -98,16 +99,40 @@ async fn relay(
         }
         exec_write(pool, op, adm, &payload.0, Some(&requester)).await
     } else {
-        let (Some(query), None, None, None) = (
+        let (Some(query), None, None, None, Some(header), Some(signature)) = (
             &req.query,
             &req.payload,
             &req.write_body,
             &req.write_signature,
+            req.read_header.clone(),
+            req.read_signature.clone(),
         ) else {
-            return Err(LabyrinthError::invalid("a relayed read carries query only"));
+            return Err(LabyrinthError::invalid(
+                "a relayed read carries query, readHeader and readSignature only",
+            ));
         };
         let p = super::params::Params::parse(Some(query), read_params(op))?;
-        let adm = relayed_read(&req.actor_did, &req.actor_device_id)?;
+        let nsid = op.read_nsid();
+        let canonical = canonical_query(Some(query));
+        let expected = Expected {
+            did: &req.actor_did,
+            nsid: &nsid,
+            // messageLive is asked on behalf of getAttachmentBlob, whose
+            // signed query names the same thread and message (checked below).
+            query: (op != RelayOp::MessageLive).then_some(canonical.as_str()),
+        };
+        let proof = ReadProof { header, signature };
+        let (adm, claim) = relayed_read(pool, proof, expected, &req.actor_device_id).await?;
+        if op == RelayOp::MessageLive {
+            let signed = super::params::Params::parse_any(&claim.query);
+            for key in ["threadId", "messageId"] {
+                if signed.get(key).map(String::as_str) != Some(p.req(key)?) {
+                    return Err(LabyrinthError::invalid(
+                        "the signed read does not name this message",
+                    ));
+                }
+            }
+        }
         if op == RelayOp::ListThreads {
             // Filtered in SQL to the conversations sequenced here in which
             // the requester is the actor's home DS.

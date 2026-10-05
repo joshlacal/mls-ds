@@ -819,11 +819,38 @@ impl Device {
         for (k, v) in params {
             query.append_pair(k, v);
         }
-        let request = Request::get(format!("/xrpc/{nsid}?{}", query.finish()))
+        let query = query.finish();
+        let (read, read_sig) = self.read_headers(&nsid, &query);
+        let request = Request::get(format!("/xrpc/{nsid}?{query}"))
             .header("authorization", format!("Bearer {}", self.token(&nsid)))
+            .header("catbird-labyrinth-read", read)
+            .header("catbird-labyrinth-read-signature", read_sig)
             .body(Body::empty())
             .unwrap();
         send(&self.router, request).await
+    }
+
+    /// The device-signed read headers for `query` on `nsid` (finding 3).
+    pub fn read_headers(&self, nsid: &str, query: &str) -> (String, String) {
+        self.read_headers_at(nsid, query, Utc::now().timestamp_millis())
+    }
+
+    pub fn read_headers_at(&self, nsid: &str, query: &str, issued_at: i64) -> (String, String) {
+        use catbird_server::labyrinth::read_auth::{canonical_query, signing_input, ReadClaim};
+        let claim = ReadClaim {
+            v: 1,
+            nsid: nsid.to_owned(),
+            query: canonical_query(Some(query)),
+            did: self.did.clone(),
+            device_id: self.device_id.to_string(),
+            issued_at,
+        };
+        let bytes = serde_json::to_vec(&claim).unwrap();
+        let sig = self.chat_key.sign(&signing_input(&bytes));
+        (
+            URL_SAFE_NO_PAD.encode(&bytes),
+            URL_SAFE_NO_PAD.encode(sig.to_bytes()),
+        )
     }
 
     /// The signed write headers for `body` under `operation_id`.

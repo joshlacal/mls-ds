@@ -31,6 +31,7 @@ use sqlx::{PgConnection, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::error::{LabyrinthError, LabyrinthResult};
+use super::read_auth::{self, ReadProof};
 use crate::auth::AuthError;
 use crate::storage::DbPool;
 
@@ -62,6 +63,8 @@ pub struct Admission {
     pub instant: DateTime<Utc>,
     /// Present on procedures.
     pub write: Option<WriteBody>,
+    /// Present on device-signed reads; forwarded by `labyrinthRelay`.
+    pub read: Option<ReadProof>,
 }
 
 /// `labyrinthWriteBody`.
@@ -132,7 +135,7 @@ pub fn actor_device_from_query(query: Option<&str>) -> LabyrinthResult<Uuid> {
     }
 }
 
-fn parse_device_id(value: &str) -> LabyrinthResult<Uuid> {
+pub(crate) fn parse_device_id(value: &str) -> LabyrinthResult<Uuid> {
     let id = Uuid::parse_str(value)
         .map_err(|_| LabyrinthError::invalid("actorDeviceId is not a UUID"))?;
     if id.hyphenated().to_string() != value || id.get_version_num() != 4 {
@@ -143,7 +146,8 @@ fn parse_device_id(value: &str) -> LabyrinthResult<Uuid> {
     Ok(id)
 }
 
-/// Admit a query: service auth for `nsid` plus the `actorDeviceId` param.
+/// Admit a query: service auth for `nsid`, the `actorDeviceId` param, and
+/// the device-signed read claim over this exact query (`read_auth`).
 pub async fn admit_query(
     pool: &DbPool,
     cutover_enabled: bool,
@@ -156,11 +160,26 @@ pub async fn admit_query(
         .await
         .map_err(|e| service_auth_failure(nsid, e))?;
     let device_id = actor_device_from_query(query)?;
+    let proof = read_auth::read_proof(headers)?;
+    let instant = now_ms();
+    let canonical = read_auth::canonical_query(query);
+    let expected = read_auth::Expected {
+        did: principal.did(),
+        nsid,
+        query: Some(&canonical),
+    };
+    let (signed_device, _) = read_auth::verify(pool, &proof, expected, instant).await?;
+    if signed_device != device_id {
+        return Err(LabyrinthError::invalid(
+            "device-signed read: deviceId is not actorDeviceId",
+        ));
+    }
     Ok(Admission {
         did: principal.did().to_owned(),
         device_id,
-        instant: now_ms(),
+        instant,
         write: None,
+        read: Some(proof),
     })
 }
 
@@ -256,18 +275,35 @@ pub async fn verify_signed_write(
         device_id,
         instant,
         write: Some(write),
+        read: None,
     })
 }
 
-/// A relayed read: the home DS authenticated `device_id` of `did`; this DS
-/// re-checks it is current when the request transaction locks it.
-pub fn relayed_read(did: &str, device_id: &str) -> LabyrinthResult<Admission> {
-    Ok(Admission {
-        did: did.to_owned(),
-        device_id: parse_device_id(device_id)?,
-        instant: now_ms(),
+/// A relayed read: the device's own read claim, forwarded by its home DS,
+/// re-verified here against this DS's replicated device keys. `expected`
+/// names the endpoint the device called; `device_id` must be the signer.
+pub async fn relayed_read(
+    pool: &DbPool,
+    proof: ReadProof,
+    expected: read_auth::Expected<'_>,
+    device_id: &str,
+) -> LabyrinthResult<(Admission, read_auth::ReadClaim)> {
+    let did = expected.did.to_owned();
+    let instant = now_ms();
+    let (signed, claim) = read_auth::verify(pool, &proof, expected, instant).await?;
+    if signed != parse_device_id(device_id)? {
+        return Err(LabyrinthError::invalid(
+            "actorDeviceId differs from the signed read claim",
+        ));
+    }
+    let admission = Admission {
+        did,
+        device_id: signed,
+        instant,
         write: None,
-    })
+        read: Some(proof),
+    };
+    Ok((admission, claim))
 }
 
 fn check_write_body(

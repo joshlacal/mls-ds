@@ -37,6 +37,16 @@ impl Params {
         Ok(Self(map))
     }
 
+    /// Every parameter of a query string, first value per key, unchecked
+    /// (reading a signed claim's query).
+    pub fn parse_any(query: &str) -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            map.entry(k.into_owned()).or_insert_with(|| v.into_owned());
+        }
+        map
+    }
+
     pub fn opt(&self, k: &str) -> Option<&str> {
         self.0.get(k).and_then(|v| v.first()).map(String::as_str)
     }

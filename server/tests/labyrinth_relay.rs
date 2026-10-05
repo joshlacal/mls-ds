@@ -310,10 +310,15 @@ async fn the_sequencer_verifies_peer_home_device_and_signature() {
     )
     .await
     .fails(403, "NotHomeDs");
-    let read = |device: &Device, thread: Uuid| {
+    let signed_read = |device: &Device, signer: &Device, signed_query: &str, query: &str| {
+        let (header, sig) = signer.read_headers(&format!("{PREFIX}listBatches"), signed_query);
         json!({ "op": "listBatches", "actorDid": device.did,
                 "actorDeviceId": device.device_id.to_string(),
-                "query": format!("threadId={thread}") })
+                "query": query, "readHeader": header, "readSignature": sig })
+    };
+    let read = |device: &Device, thread: Uuid| {
+        let q = format!("threadId={thread}");
+        signed_read(device, device, &q, &q)
     };
     relay_as(&w, HOME_DS, &home_key, &read(&w.bob, w.thread))
         .await
@@ -334,6 +339,41 @@ async fn the_sequencer_verifies_peer_home_device_and_signature() {
     relay_as(&w, HOME_DS, &home_key, &read(&w.alice, elsewhere))
         .await
         .fails(400, "NotSequencer");
+
+    // Relayed reads carry the device's own signed read claim (finding 3):
+    // missing, signed by another key, or over another query, they fail.
+    let q = format!("threadId={}", w.thread);
+    let mut unsigned = read(&w.alice, w.thread);
+    unsigned.as_object_mut().unwrap().remove("readHeader");
+    relay_as(&w, HOME_DS, &home_key, &unsigned)
+        .await
+        .fails(400, "InvalidRequest");
+    relay_as(
+        &w,
+        HOME_DS,
+        &home_key,
+        &signed_read(&w.alice, &impostor, &q, &q),
+    )
+    .await
+    .fails(401, "InvalidSignature");
+    relay_as(
+        &w,
+        HOME_DS,
+        &home_key,
+        &signed_read(&w.alice, &w.alice, &format!("{q}&limit=1"), &q),
+    )
+    .await
+    .fails(400, "InvalidRequest");
+    // A claim by bob cannot be relayed as alice's read.
+    let mut swapped = signed_read(&w.bob, &w.bob, &q, &q);
+    swapped["actorDid"] = json!(w.alice.did);
+    swapped["actorDeviceId"] = json!(w.alice.device_id.to_string());
+    relay_as(&w, HOME_DS, &home_key, &swapped)
+        .await
+        .fails(400, "InvalidRequest");
+    relay_as(&w, HOME_DS, &home_key, &read(&w.alice, w.thread))
+        .await
+        .ok();
 
     // The real thing works, until the device is revoked on the sequencer.
     relay_as(

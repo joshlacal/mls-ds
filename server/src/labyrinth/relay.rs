@@ -81,6 +81,15 @@ impl RelayOp {
         )
     }
 
+    /// The endpoint the device signed its read claim for.
+    pub fn read_nsid(self) -> String {
+        let endpoint = match self {
+            Self::MessageLive => "getAttachmentBlob",
+            other => other.name(),
+        };
+        format!("blue.catbird.labyrinth.{endpoint}")
+    }
+
     /// The endpoint the device signed its write body for.
     pub fn signed_nsid(self) -> String {
         let endpoint = match self {
@@ -106,6 +115,12 @@ pub struct RelayRequest {
     pub write_body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_signature: Option<String>,
+    /// Reads: the device's `catbird-labyrinth-read` header value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_header: Option<String>,
+    /// Reads: the device's `catbird-labyrinth-read-signature` header value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_signature: Option<String>,
 }
 
 pub fn not_home_ds() -> LabyrinthError {

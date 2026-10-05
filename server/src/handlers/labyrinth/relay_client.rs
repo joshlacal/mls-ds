@@ -93,6 +93,14 @@ impl Relay {
             tracing::warn!("labyrinth relay needed but federation service auth is not configured");
             LabyrinthError::relay_unavailable()
         })?;
+        let read = match &forwarded {
+            Forwarded::Read { .. } => {
+                // A forwarded read always carries the device's own claim.
+                let proof = actor.read.as_ref().ok_or_else(LabyrinthError::internal)?;
+                (Some(proof.header.clone()), Some(proof.signature.clone()))
+            }
+            Forwarded::Write { .. } => (None, None),
+        };
         let (query, payload, write_body, write_signature) = match forwarded {
             Forwarded::Read { query } => (Some(query.to_owned()), None, None, None),
             Forwarded::Write {
@@ -114,6 +122,8 @@ impl Relay {
             payload,
             write_body,
             write_signature,
+            read_header: read.0,
+            read_signature: read.1,
         };
         let unavailable = |what: &str, error: &dyn std::fmt::Display| {
             tracing::warn!(%sequencer, op = op.name(), %error, "labyrinth relay {what} failed");

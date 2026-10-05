@@ -96,6 +96,144 @@ async fn admission_requires_cutover_service_auth_and_a_current_device() {
         .fails(400, "CutoverRequired");
 }
 
+/// A `GET` of `name` by `device` with explicit read headers.
+fn get_with(
+    device: &Device,
+    name: &str,
+    query: &str,
+    headers: Option<(String, String)>,
+) -> Request<Body> {
+    let nsid = format!("{PREFIX}{name}");
+    let mut request = Request::get(format!("/xrpc/{nsid}?{query}"))
+        .header("authorization", format!("Bearer {}", device.token(&nsid)));
+    if let Some((read, sig)) = headers {
+        request = request
+            .header("catbird-labyrinth-read", read)
+            .header("catbird-labyrinth-read-signature", sig);
+    }
+    request.body(Body::empty()).unwrap()
+}
+
+/// Finding 3: a query names its device only through a claim that device
+/// signed, bound to the account, endpoint, exact query and a fresh instant.
+#[tokio::test]
+async fn reads_require_a_device_signed_claim_over_the_exact_query() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    let alice2 = env.device_for(&alice.did, random_seed()).await;
+    let nsid = format!("{PREFIX}listDevices");
+    let q = format!("actorDeviceId={}", alice.device_id);
+    let ok = |device: &Device, query: &str| Some(device.read_headers(&nsid, query));
+
+    send(&env.router, get_with(&alice, "listDevices", &q, None))
+        .await
+        .fails(400, "InvalidRequest");
+    // Signed by another key (an impostor holding the account JWT).
+    let mut impostor = alice.clone();
+    impostor.chat_key = SigningKey::from_bytes(&random_seed());
+    send(
+        &env.router,
+        get_with(&alice, "listDevices", &q, ok(&impostor, &q)),
+    )
+    .await
+    .fails(401, "InvalidSignature");
+    // Another current device of the same account cannot be named: its claim
+    // carries its own deviceId, not actorDeviceId.
+    send(
+        &env.router,
+        get_with(&alice, "listDevices", &q, ok(&alice2, &q)),
+    )
+    .await
+    .fails(400, "InvalidRequest");
+    // Claim over another query, another endpoint, or a stale instant.
+    let tampered = format!("{q}&limit=1");
+    send(
+        &env.router,
+        get_with(&alice, "listDevices", &tampered, ok(&alice, &q)),
+    )
+    .await
+    .fails(400, "InvalidRequest");
+    let other_nsid = Some(alice.read_headers(&format!("{PREFIX}listEpochs"), &q));
+    send(&env.router, get_with(&alice, "listDevices", &q, other_nsid))
+        .await
+        .fails(400, "InvalidRequest");
+    let stale = chrono::Utc::now().timestamp_millis() - 301_000;
+    let old = Some(alice.read_headers_at(&nsid, &q, stale));
+    send(&env.router, get_with(&alice, "listDevices", &q, old))
+        .await
+        .fails(400, "InvalidRequest");
+    // Parameter order and encoding do not matter; the canonical form does.
+    let reordered = format!("limit=5&{q}");
+    let canonical_twin = format!("{q}&limit=5");
+    send(
+        &env.router,
+        get_with(
+            &alice,
+            "listDevices",
+            &reordered,
+            ok(&alice, &canonical_twin),
+        ),
+    )
+    .await
+    .ok();
+    send(
+        &env.router,
+        get_with(&alice, "listDevices", &q, ok(&alice, &q)),
+    )
+    .await
+    .ok();
+}
+
+/// getVirtualDevice stamps `lastUsedAt` only on a valid device-signed read.
+#[tokio::test]
+async fn bundle_use_is_recorded_only_for_device_signed_reads() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    alice
+        .call(
+            "createVirtualDevice",
+            &json!({ "record": vdevice_record([0x51; 16], [0x52; 32]) }),
+        )
+        .await
+        .ok();
+    let last_used = || async {
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT last_used_at FROM labyrinth.virtual_devices WHERE owner_did = $1",
+        )
+        .bind(&alice.did)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap()
+    };
+    let nsid = format!("{PREFIX}getVirtualDevice");
+    let q = format!(
+        "actorDeviceId={}&vdeviceId={}",
+        alice.device_id,
+        hex::encode([0x51; 16])
+    );
+    let mut impostor = alice.clone();
+    impostor.chat_key = SigningKey::from_bytes(&random_seed());
+    let forged = Some(impostor.read_headers(&nsid, &q));
+    send(
+        &env.router,
+        get_with(&alice, "getVirtualDevice", &q, forged),
+    )
+    .await
+    .fails(401, "InvalidSignature");
+    send(&env.router, get_with(&alice, "getVirtualDevice", &q, None))
+        .await
+        .fails(400, "InvalidRequest");
+    assert!(last_used().await.is_none(), "refused reads record no use");
+    let genuine = Some(alice.read_headers(&nsid, &q));
+    send(
+        &env.router,
+        get_with(&alice, "getVirtualDevice", &q, genuine),
+    )
+    .await
+    .ok();
+    assert!(last_used().await.is_some());
+}
+
 #[tokio::test]
 async fn writes_require_a_valid_signed_write_body() {
     let env = Env::new().await;
