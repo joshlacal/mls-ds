@@ -54,6 +54,8 @@ mod update_push_token;
 mod welcome;
 
 pub use errors::ChatFailure;
+#[cfg(any(test, feature = "test-support"))]
+pub use expiry_worker::reclaim_due_blob_objects_recording;
 pub use expiry_worker::{
     run_chat_expiry_sweeper, run_chat_expiry_sweeper_with_blob_store, ChatExpirySweepConfig,
 };

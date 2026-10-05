@@ -241,6 +241,11 @@ path = "tests/labyrinth_retention.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "labyrinth_blob_gc_pin"
+path = "tests/labyrinth_blob_gc_pin.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "labyrinth_device_binding"
 path = "tests/labyrinth_device_binding.rs"
 required-features = ["test-support"]

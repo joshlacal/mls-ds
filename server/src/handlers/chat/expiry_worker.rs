@@ -47,7 +47,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::query_as;
+use sqlx::{query_as, query_scalar};
 use tokio::time::interval;
 use uuid::Uuid;
 
@@ -427,23 +427,48 @@ async fn reclaim_due_blob_objects_with_deleter<D: BlobObjectDeleter + ?Sized>(
     batch: i64,
 ) -> Result<BlobGcCounts, BlobGcError> {
     let mut transaction = pool.begin().await?;
-    let rows: Vec<(Uuid, String, Vec<u8>)> = query_as(
+    // Labyrinth attachment references pin their blob's object (migration
+    // 20261004100007). A database without the labyrinth schema (the frozen
+    // clean-chat test ledger) has no pins.
+    let pins: bool = query_scalar(
+        "SELECT to_regprocedure('labyrinth.blob_object_pinned(uuid)') IS NOT NULL",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    let claim = format!(
         "SELECT blob_id, object_store_key, ciphertext_sha256 \
            FROM chat.blobs \
           WHERE object_gc_status = 'pending' \
-            AND object_gc_after <= clock_timestamp() \
+            AND object_gc_after <= clock_timestamp() {} \
           ORDER BY object_gc_after, blob_id \
           FOR UPDATE SKIP LOCKED \
           LIMIT $1",
-    )
-    .bind(batch)
-    .fetch_all(&mut *transaction)
-    .await?;
+        if pins {
+            "AND NOT labyrinth.blob_object_pinned(blob_id)"
+        } else {
+            ""
+        }
+    );
+    let rows: Vec<(Uuid, String, Vec<u8>)> = query_as(&claim)
+        .bind(batch)
+        .fetch_all(&mut *transaction)
+        .await?;
     let mut counts = BlobGcCounts {
         due: rows.len(),
         ..BlobGcCounts::default()
     };
     for (blob_id, object_store_key, hash) in rows {
+        // Re-check the pin under the row lock in a fresh statement: a
+        // reference committed after the claim's snapshot still pins.
+        if pins
+            && query_scalar::<_, bool>("SELECT labyrinth.blob_object_pinned($1)")
+                .bind(blob_id)
+                .fetch_one(&mut *transaction)
+                .await?
+        {
+            counts.due -= 1;
+            continue;
+        }
         let expected_hash: [u8; 32] = match hash.as_slice().try_into() {
             Ok(hash) => hash,
             Err(_) => {
@@ -482,4 +507,30 @@ async fn reclaim_due_blob_objects_with_deleter<D: BlobObjectDeleter + ?Sized>(
     }
     transaction.commit().await?;
     Ok(counts)
+}
+
+/// Test seam: one object-GC pass that records the keys it would delete
+/// instead of touching an object store. Returns how many rows the pass
+/// claimed (after pin re-checks) and the deleted keys.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn reclaim_due_blob_objects_recording(
+    pool: &DbPool,
+    batch: i64,
+) -> Result<(usize, Vec<String>), sqlx::Error> {
+    struct Recording(std::sync::Mutex<Vec<String>>);
+    #[async_trait]
+    impl BlobObjectDeleter for Recording {
+        async fn delete_exact(&self, object_store_key: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .map_err(|_| "poisoned".to_owned())?
+                .push(object_store_key.to_owned());
+            Ok(())
+        }
+    }
+    let recording = Recording(std::sync::Mutex::new(Vec::new()));
+    let counts = reclaim_due_blob_objects_with_deleter(pool, &recording, batch)
+        .await
+        .map_err(|BlobGcError::Database(error)| error)?;
+    Ok((counts.due, recording.0.into_inner().unwrap_or_default()))
 }
