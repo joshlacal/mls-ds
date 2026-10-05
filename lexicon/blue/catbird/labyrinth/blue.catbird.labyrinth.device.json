@@ -50,6 +50,11 @@
             "type": "boolean",
             "description": "True for a recovery (virtual) device, which has no epochStorageAuthKey."
           },
+          "chatBinding": {
+            "type": "ref",
+            "ref": "blue.catbird.labyrinth.defs#transportAttestation",
+            "description": "[CB-36] Ed25519(chat key, \"catbird.labyrinth.device_binding:\" || did || \":\" || deviceKeyPubkey) by the chat device that enrolled this physical device. Absent for virtual devices; a physical device without a valid binding to a current chat device is dropped at the next rotation."
+          },
           "revokedAt": {
             "type": "string",
             "description": "Set once when the device is revoked; the revoking device opens a new epoch that excludes it ([CB-11]).",

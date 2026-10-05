@@ -39,6 +39,9 @@
       "errors": [
         {
           "name": "DeviceNotFound"
+        },
+        {
+          "name": "LabyrinthDeviceNotBound"
         }
       ]
     }

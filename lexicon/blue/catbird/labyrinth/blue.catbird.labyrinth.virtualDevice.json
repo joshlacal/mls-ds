@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "A recovery bundle (SPEC \u00a76.2). rkey = hex(vdeviceId). Every encrypted* field is AEAD-sealed under vdeviceDecryptionKey with the paper's AAD strings. Immutable.",
+      "description": "A recovery bundle (SPEC \u00a76.2). rkey = hex(vdeviceId). Every encrypted* field is AEAD-sealed under vdeviceDecryptionKey with the paper's AAD strings. Immutable except lastUsedAt (server-stamped); deletable by the owner (remove a recovery method, [CB-39]).",
       "key": "any",
       "record": {
         "type": "object",
@@ -100,6 +100,11 @@
           "createdAt": {
             "type": "string",
             "format": "datetime"
+          },
+          "lastUsedAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "[CB-39] Last successful restore or keep-alive, stamped by the server from its own clock (clients never write it). Keychain and passkey bundles expire 180 days after max(createdAt, lastUsedAt)."
           }
         }
       }

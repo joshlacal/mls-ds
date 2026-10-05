@@ -39,6 +39,12 @@
       "errors": [
         {
           "name": "RecordAlreadyExists"
+        },
+        {
+          "name": "LabyrinthDeviceNotBound"
+        },
+        {
+          "name": "MemberDeviceNotRegistered"
         }
       ]
     },

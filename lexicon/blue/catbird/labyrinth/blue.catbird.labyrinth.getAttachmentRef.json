@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Look up an attachment reference by blinded index. ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "description": "Whether an attachment reference exists at this blinded index (decision J4: the server keeps no readable conversation, message or blob linkage to return). ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
       "parameters": {
         "type": "params",
         "required": [
@@ -31,32 +31,12 @@
         "schema": {
           "type": "object",
           "required": [
-            "conversationId",
-            "blobId",
-            "messageId",
-            "tokenMac"
+            "createdAt"
           ],
           "properties": {
-            "conversationId": {
+            "createdAt": {
               "type": "string",
-              "maxLength": 64,
-              "description": "Conversation id."
-            },
-            "blobId": {
-              "type": "string",
-              "maxLength": 128,
-              "description": "chat.blobs id."
-            },
-            "messageId": {
-              "type": "string",
-              "maxLength": 256,
-              "description": "Message id."
-            },
-            "tokenMac": {
-              "type": "bytes",
-              "minLength": 32,
-              "maxLength": 32,
-              "description": "MAC over the access token."
+              "format": "datetime"
             }
           }
         }

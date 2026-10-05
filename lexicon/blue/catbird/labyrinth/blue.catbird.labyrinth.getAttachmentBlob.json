@@ -4,13 +4,15 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Read an attachment blob with the ORF access token, for a restored device that has no application interval at the attachment's entry. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded. ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one.",
+      "description": "Read an attachment blob with the ORF access token, for a restored device that has no application interval at the attachment's entry. The server recomputes the token MAC from blindedTokenSalt and the presented threadId and messageId, checks that the blob is still bound to that message and not deleted or expired, and that the message still exists for the caller: an unredacted thread item readable by the caller, or an item of the caller's own owner archive (whitepaper p.42). Every refusal reads as NotFound. ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
       "parameters": {
         "type": "params",
         "required": [
           "deviceKeyPubkey",
           "blindedIndex",
-          "blindedToken"
+          "blindedTokenSalt",
+          "threadId",
+          "messageId"
         ],
         "properties": {
           "deviceKeyPubkey": {
@@ -25,11 +27,21 @@
             "maxLength": 64,
             "description": "blinded index (lowercase hex)."
           },
-          "blindedToken": {
+          "messageId": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Message id."
+          },
+          "blindedTokenSalt": {
             "type": "string",
             "minLength": 64,
             "maxLength": 64,
-            "description": "blinded token (lowercase hex)."
+            "description": "blinded token salt (lowercase hex)."
+          },
+          "threadId": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Conversation id."
           }
         }
       },
@@ -42,6 +54,12 @@
         },
         {
           "name": "NotFound"
+        },
+        {
+          "name": "AttachmentsUnavailable"
+        },
+        {
+          "name": "RelayUnavailable"
         }
       ]
     }

@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "One recovery bundle by vdeviceId. Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "description": "One recovery bundle by vdeviceId. Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded. Reading a bundle also records it as used (touchVirtualDevice); the returned record carries the server's lastUsedAt.",
       "parameters": {
         "type": "params",
         "required": [

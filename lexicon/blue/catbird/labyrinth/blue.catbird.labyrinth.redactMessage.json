@@ -1,0 +1,65 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.redactMessage",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Unsend (decision J1): redact the caller's own sender copies of one message in a conversation's thread records. Every matching item of the caller keeps its batch, server order, messageId, timestamp, mekId and senderTransportPubkey; its signedEncMessage becomes empty and it gains the author's signed redaction (defs#redaction, with redactedAt set by the server). Author only: items written by other DIDs are never touched, even under a reused messageId ([CB-31]). Every attachment reference to the message is invalidated. Current membership is not required. Thread endpoint on the conversation's sequencer DS; a device homed elsewhere is relayed (labyrinthRelay). Idempotent: an unknown or already-redacted id counts zero. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "threadId",
+            "messageId",
+            "redaction"
+          ],
+          "properties": {
+            "threadId": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "The chat conversation id ([CB-2])."
+            },
+            "messageId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "redaction": {
+              "type": "ref",
+              "ref": "blue.catbird.labyrinth.defs#redaction",
+              "description": "The author's signed request (transportPubkey, sig); redactedAt is set by the server and must be absent."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "redacted"
+          ],
+          "properties": {
+            "redacted": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "How many stored items this call redacted."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRedaction"
+        },
+        {
+          "name": "RelayUnavailable"
+        },
+        {
+          "name": "ConversationMoved"
+        }
+      ]
+    }
+  }
+}

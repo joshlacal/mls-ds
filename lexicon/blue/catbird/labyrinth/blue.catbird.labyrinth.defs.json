@@ -93,7 +93,7 @@
     },
     "sealedMessage": {
       "type": "object",
-      "description": "One v1.1 sender-encrypted message (SPEC \u00a77.2).",
+      "description": "One v1.1 sender-encrypted message (SPEC \u00a77.2). A redacted item ([CB-38]) keeps messageId, timestamp, mekId and senderTransportPubkey, carries redaction, and has an empty signedEncMessage.",
       "required": [
         "messageId",
         "timestamp",
@@ -126,15 +126,20 @@
         },
         "signedEncMessage": {
           "type": "bytes",
-          "description": "Ed25519 sig(64) || suite-tagged AEAD ciphertext of the padded frame.",
+          "description": "Ed25519 sig(64) || suite-tagged AEAD ciphertext of the padded frame; empty once redacted.",
           "maxLength": 262144,
-          "minLength": 64
+          "minLength": 0
+        },
+        "redaction": {
+          "type": "ref",
+          "ref": "#redaction",
+          "description": "Present when the author unsent the message ([CB-38])."
         }
       }
     },
     "ownerMessage": {
       "type": "object",
-      "description": "One v1.0 owner-encrypted message (SPEC \u00a77.1).",
+      "description": "One owner-encrypted message or delete-for-me tombstone (SPEC \u00a77.1, [CB-37], [CB-38]).",
       "required": [
         "threadId",
         "messageId",
@@ -167,9 +172,9 @@
         },
         "version": {
           "type": "integer",
-          "description": "Cipher version. Writers use 3; readers also accept 0, 2 and 4 (SPEC \u00a77.1).",
+          "description": "Cipher version. Writers use 5 ([CB-37]: binds messageId and timestamp; content kind byte for delete-for-me tombstones); readers also accept 0, 2, 3 and 4 (SPEC \u00a77.1).",
           "minimum": 0,
-          "maximum": 4
+          "maximum": 5
         },
         "encrypted": {
           "type": "bytes",
@@ -228,6 +233,30 @@
           "type": "string",
           "format": "datetime",
           "description": "Receive time on the server clock."
+        }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "description": "[CB-38] An author's unsend request: Ed25519 by one of the author's chat device keys over 'catbird.labyrinth.redaction:did=' || did || ';message_id=' || messageId || ';thread_id=' || hex(threadId). transportPubkey and sig are absent exactly when the server redacted the item for an account deletion (deleteAccountData); readers show such items as deleted (account removed), never as an author unsend.",
+      "required": [],
+      "properties": {
+        "transportPubkey": {
+          "type": "bytes",
+          "description": "The author's chat device Ed25519 key.",
+          "maxLength": 32,
+          "minLength": 32
+        },
+        "sig": {
+          "type": "bytes",
+          "description": "Ed25519 signature.",
+          "maxLength": 64,
+          "minLength": 64
+        },
+        "redactedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Set by the server when it applied the redaction."
         }
       }
     }

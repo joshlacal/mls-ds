@@ -1,0 +1,78 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.labyrinthRelay",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Server-to-server only (design Y3). A device's home DS uses this to forward a Labyrinth thread operation for a conversation that the receiving DS sequences. Authentication is standard DS service auth: iss is the home DS, aud is the sequencer, lxm is this NSID, under the federation peer policy. The receiver requires three things: the requesting DS is the actor's home DS in the conversation's participant rows, the actor's chat device is current in its replicated device table, and, for writes, the device's labyrinthWriteBody signature over the forwarded payload re-verifies. The output and errors are exactly those of the relayed endpoint.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "op",
+            "actorDid",
+            "actorDeviceId"
+          ],
+          "properties": {
+            "op": {
+              "type": "string",
+              "maxLength": 64,
+              "knownValues": [
+                "createMek",
+                "appendBatch",
+                "findMeks",
+                "listBatches",
+                "redactMessage",
+                "messageLive",
+                "purgeAuthor"
+              ],
+              "description": "The relayed operation. messageLive answers whether a message of the conversation is stored unredacted and readable by the actor; it gates attachment access. purgeAuthor redacts every item the actor authored in conversations the receiver sequences; it is the remote part of deleteAccountData. Both exist only on the relay."
+            },
+            "actorDid": {
+              "type": "string",
+              "format": "did"
+            },
+            "actorDeviceId": {
+              "type": "string",
+              "maxLength": 36,
+              "description": "The actor's chat device (canonical UUIDv4)."
+            },
+            "query": {
+              "type": "string",
+              "maxLength": 4096,
+              "description": "Reads: the original query string."
+            },
+            "payload": {
+              "type": "bytes",
+              "maxLength": 1048576,
+              "description": "Writes: the exact request body the device signed."
+            },
+            "writeBody": {
+              "type": "string",
+              "maxLength": 4096,
+              "description": "Writes: the catbird-labyrinth-write header value."
+            },
+            "writeSignature": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "Writes: the catbird-labyrinth-write-signature header value."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "description": "The relayed endpoint's output, byte for byte."
+      },
+      "errors": [
+        {
+          "name": "NotHomeDs"
+        },
+        {
+          "name": "NotSequencer"
+        }
+      ]
+    }
+  }
+}
