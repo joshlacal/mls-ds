@@ -3,27 +3,22 @@
 //! memory-backed reference server (`MemoryXrpcServer`) through the real
 //! mls-ds handlers, and require the same outcome for every call.
 //!
-//! The fixture `tests/fixtures/labyrinth_crate_xrpc_trace.json` was recorded
-//! by the lane-local generator `vectorgen/src/bin/xrpc_trace.rs` (crate
-//! 7518b62b): three accounts initialize Labyrinth with mls-ds mailboxes, send
-//! four messages in one conversation, flush, and two of them read the whole
-//! thread back. mls-ds takes no dependency on the (private) crate; the
-//! recorded payloads are the crate's own wire bytes, so this proves mls-ds
-//! accepts exactly what the crate sends and answers in the shapes it reads.
+//! The fixture `tests/fixtures/labyrinth_crate_xrpc_trace.json` (180 calls)
+//! was recorded by the crate's own `tests/xrpc_trace.rs` (bookmark
+//! `labyrinth-1.1`): three accounts (four physical devices) initialize
+//! Labyrinth with mls-ds mailboxes and exchange messages in one
+//! conversation, then exercise attachments, redaction, the lookup endpoints,
+//! virtual devices, revocation and account deletion. Each physical device
+//! sends its own signed `chatBinding` (keyed by the seeded chat key) before
+//! its genesis epoch, so the calls replay verbatim. mls-ds takes no
+//! dependency on the (private) crate; the recorded payloads are the crate's
+//! own wire bytes, so this proves mls-ds accepts exactly what the crate
+//! sends and answers in the shapes it reads.
 //!
 //! Values that legitimately differ between the two servers are compared by
 //! presence and JSON type only: `epochId` (mls-ds: bigserial, reference:
-//! padded seq), `receivedAt`, chat `keyId`s, chat-key `createdAt`, and
-//! server-assigned TID `rkey`s.
-//!
-//! Binding-era adapter (gap audit G-P0-2, migration `20261004100004`): the
-//! trace predates `device.chatBinding` and registers each device right
-//! after its genesis epoch. mls-ds now requires a bound device before any
-//! epoch write, so the replay adds the binding (signed by the seeded chat
-//! key) to every physical `createDevice` and runs that call before the
-//! `createEpoch` it follows. A `chatBinding` mls-ds returns that the
-//! reference lacks is not a divergence. Re-record the fixture once the
-//! crate sends bindings itself.
+//! padded seq), `receivedAt`, `lastUsedAt`, `redactedAt`, chat `keyId`s,
+//! chat-key `createdAt`, and server-assigned TID `rkey`s.
 
 mod common;
 
@@ -34,7 +29,7 @@ use harness::*;
 use serde_json::Value;
 use uuid::Uuid;
 
-const VOLATILE: &[&str] = &["epochId", "receivedAt", "keyId"];
+const VOLATILE: &[&str] = &["epochId", "receivedAt", "lastUsedAt", "redactedAt", "keyId"];
 
 fn is_tid(v: &Value) -> bool {
     v.as_str()
@@ -68,7 +63,6 @@ fn compare(path: &str, got: &Value, want: &Value, diffs: &mut Vec<String>) {
                             compare(&p, gv, wv, diffs);
                         }
                     }
-                    (Some(_), None) if k == "chatBinding" => {}
                     (gv, wv) => diffs.push(format!("{p}: mls-ds {gv:?} vs reference {wv:?}")),
                 }
             }
@@ -90,26 +84,22 @@ fn compare(path: &str, got: &Value, want: &Value, diffs: &mut Vec<String>) {
     }
 }
 
-/// The trace with every `createDevice` moved ahead of a directly preceding
-/// `createEpoch` by the same device (see the module docs).
-fn binding_era(calls: &[Value]) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::with_capacity(calls.len());
-    for call in calls {
-        let swap = out.last().is_some_and(|prev| {
-            prev["nsid"] == format!("{PREFIX}createEpoch")
-                && call["nsid"] == format!("{PREFIX}createDevice")
-                && prev["did"] == call["did"]
-                && prev["seed"] == call["seed"]
-        });
-        if swap {
-            let prev = out.pop().unwrap();
-            out.push(call.clone());
-            out.push(prev);
-        } else {
-            out.push(call.clone());
-        }
+async fn send(device: &Device, name: &str, call: &Value) -> Reply {
+    if call["kind"] == "query" {
+        let params: Vec<(&str, String)> = call["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p[0].as_str().unwrap(), p[1].as_str().unwrap().to_owned()))
+            .collect();
+        device.query(name, &params).await
+    } else {
+        let op: [u8; 16] = hex::decode(call["operationId"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        device.call_op(name, &call["payload"], op).await
     }
-    out
 }
 
 #[tokio::test]
@@ -143,8 +133,8 @@ async fn crate_client_trace_replays_identically_against_mls_ds() {
     )
     .await;
 
-    let calls = binding_era(trace["calls"].as_array().unwrap());
-    assert!(calls.len() > 50, "the trace covers the full client flow");
+    let calls = trace["calls"].as_array().unwrap();
+    assert!(calls.len() >= 180, "the trace covers the full client flow");
     let mut replayed = std::collections::BTreeSet::new();
     let mut failures = Vec::new();
     for (i, call) in calls.iter().enumerate() {
@@ -158,27 +148,17 @@ async fn crate_client_trace_replays_identically_against_mls_ds() {
             .iter()
             .find(|(d, s, _)| d == did && *s == seed)
             .expect("caller is a seeded device");
-        let reply = if call["kind"] == "query" {
-            let params: Vec<(&str, String)> = call["params"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|p| (p[0].as_str().unwrap(), p[1].as_str().unwrap().to_owned()))
-                .collect();
-            device.query(name, &params).await
-        } else {
-            let op: [u8; 16] = hex::decode(call["operationId"].as_str().unwrap())
-                .unwrap()
-                .try_into()
-                .unwrap();
-            let mut payload = call["payload"].clone();
-            if name == "createDevice" && payload["record"]["virtual"] == false {
-                let key: [u8; 32] = unb(&payload["record"]["deviceKeyPubkey"])
-                    .try_into()
-                    .unwrap();
-                payload["record"]["chatBinding"] = device.chat_binding(key);
+        // The process-wide per-DID service-auth limiter throttles the
+        // trace's bursts; a throttled call is resent after Retry-After like
+        // any client would (it never reached the handler).
+        let mut attempts = 0;
+        let reply = loop {
+            let reply = send(device, name, call).await;
+            if reply.status != axum::http::StatusCode::TOO_MANY_REQUESTS || attempts == 10 {
+                break reply;
             }
-            device.call_op(name, &payload, op).await
+            attempts += 1;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         };
         replayed.insert(name.to_owned());
         let want_status = call["status"].as_u64().unwrap() as u16;
@@ -192,8 +172,19 @@ async fn crate_client_trace_replays_identically_against_mls_ds() {
             continue;
         }
         if want_status == 200 {
+            let (mut got, mut want) = (reply.json.clone(), call["response"].clone());
+            if name == "getChatDeviceKeys" {
+                // The lexicon fixes no order for a DID's chat keys (mls-ds
+                // pages by key id, the reference by registration), so the
+                // page is compared as a set.
+                for v in [&mut got, &mut want] {
+                    if let Some(items) = v["items"].as_array_mut() {
+                        items.sort_by_key(|k| k["signingPublicKey"]["$bytes"].to_string());
+                    }
+                }
+            }
             let mut diffs = Vec::new();
-            compare("", &reply.json, &call["response"], &mut diffs);
+            compare("", &got, &want, &mut diffs);
             for d in diffs {
                 failures.push(format!("#{i} {name}: {d}"));
             }
@@ -212,6 +203,15 @@ async fn crate_client_trace_replays_identically_against_mls_ds() {
         "appendBatch",
         "findMeks",
         "listBatches",
+        "getVirtualDevice",
+        "touchVirtualDevice",
+        "redactMessage",
+        "putAttachmentRef",
+        "getMessages",
+        "listThreads",
+        "listOwnerThreads",
+        "deleteAccountData",
+        "purgeMailbox",
     ] {
         assert!(replayed.contains(name), "trace exercised {name}");
     }
