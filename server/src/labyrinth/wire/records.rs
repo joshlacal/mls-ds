@@ -369,6 +369,19 @@ impl Mek {
     }
 }
 
+/// `defs#redaction` ([CB-38]): present on a redacted sealed message. Writers
+/// never send it; only the server's redaction adds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Redaction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_pubkey: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_at: Option<String>,
+}
+
 /// `defs#sealedMessage`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -377,7 +390,10 @@ pub struct SealedMessage {
     pub timestamp: u64,
     pub mek_id: Bytes,
     pub sender_transport_pubkey: Bytes,
+    /// Empty exactly when `redaction` is present.
     pub signed_enc_message: Bytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction: Option<Redaction>,
 }
 
 /// `batch` record.
@@ -404,6 +420,11 @@ impl Batch {
                 .check("items.senderTransportPubkey", 32, 32)?;
             item.signed_enc_message
                 .check("items.signedEncMessage", 64, 262_144)?;
+            if item.redaction.is_some() {
+                return Err(LabyrinthError::invalid(
+                    "items.redaction is set only by the server",
+                ));
+            }
         }
         check_datetime("createdAt", &self.created_at)
     }

@@ -277,7 +277,11 @@ async fn virtual_devices_register_member_and_orf_state_atomically() {
             &[("vdeviceId", hex::encode([0xAAu8; 16]))],
         )
         .await;
-    assert_eq!(got.ok()["record"], vdevice_record([0xAA; 16], [0xBB; 32]));
+    // The server projects its lastUsedAt stamp (J2) into the record.
+    let mut record = got.ok()["record"].clone();
+    assert!(record["lastUsedAt"].as_str().unwrap().ends_with('Z'));
+    record.as_object_mut().unwrap().remove("lastUsedAt");
+    assert_eq!(record, vdevice_record([0xAA; 16], [0xBB; 32]));
     // The evolved ORF state exists: registering it again conflicts.
     d0.call(
         "registerOrfState",

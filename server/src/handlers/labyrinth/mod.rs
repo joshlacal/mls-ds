@@ -17,6 +17,7 @@ mod directory;
 mod mailbox;
 mod orf;
 mod params;
+mod retention;
 mod thread;
 
 use std::sync::Arc;
@@ -58,6 +59,11 @@ pub const PROCEDURES: &[(&str, usize)] = &[
     ("deleteOrfState", LIMIT_DEFAULT),
     ("putAttachmentRef", LIMIT_DEFAULT),
     ("deleteAttachmentRef", LIMIT_DEFAULT),
+    ("redactMessage", LIMIT_DEFAULT),
+    ("purgeMailbox", LIMIT_DEFAULT),
+    ("deleteAccountData", LIMIT_DEFAULT),
+    ("deleteVirtualDevice", LIMIT_DEFAULT),
+    ("touchVirtualDevice", LIMIT_DEFAULT),
 ];
 
 /// The queries.
@@ -159,6 +165,20 @@ where
             post(thread::append_batch).layer(DefaultBodyLimit::max(limit("appendBatch"))),
         )
         .route(&path("listBatches"), get(thread::list_batches))
+        .route(&path("redactMessage"), post(thread::redact_message))
+        .route(&path("purgeMailbox"), post(retention::purge_mailbox))
+        .route(
+            &path("deleteAccountData"),
+            post(retention::delete_account_data),
+        )
+        .route(
+            &path("deleteVirtualDevice"),
+            post(retention::delete_virtual_device),
+        )
+        .route(
+            &path("touchVirtualDevice"),
+            post(retention::touch_virtual_device),
+        )
         .route(
             &path("publishEpochHead"),
             post(directory::publish_epoch_head),

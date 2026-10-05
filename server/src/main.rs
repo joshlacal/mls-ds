@@ -1341,6 +1341,12 @@ async fn main() -> anyhow::Result<()> {
     // cutover gate per request.
     let base_router = if truthy_env_var("LABYRINTH_ENABLED") {
         tracing::info!("Labyrinth backend enabled (blue.catbird.labyrinth.*)");
+        // Retention pass: idle keychain/passkey recovery bundles (J2) and
+        // old idempotency records.
+        tokio::spawn(catbird_server::labyrinth::repo::retention::gc_worker(
+            db_pool.clone(),
+            std::time::Duration::from_secs(3600),
+        ));
         base_router.merge(
             catbird_server::handlers::labyrinth::labyrinth_router::<AppState>()
                 .with_state(app_state.clone()),

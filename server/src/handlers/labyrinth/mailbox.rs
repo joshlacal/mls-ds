@@ -332,7 +332,7 @@ pub async fn get_virtual_device(
             .await?;
             let id = hex_array::<16>("vdeviceId", p.req("vdeviceId")?)?;
             let mut r = begin_read(&pool, adm).await?;
-            let record = repo::get_virtual_device(&mut r.tx, &r.caller.did, &id)
+            let record = repo::get_virtual_device(&mut r.tx, &r.caller.did, &id, r.instant)
                 .await?
                 .ok_or_else(|| LabyrinthError::not_found("VirtualDeviceNotFound"))?;
             r.finish_read().await?;

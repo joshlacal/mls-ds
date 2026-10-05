@@ -14,6 +14,7 @@ use super::params::{admit_procedure, admit_query, begin_write};
 use super::respond;
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth::begin_read;
+use crate::labyrinth::repo::retention::{self, RedactionIn};
 use crate::labyrinth::repo::thread::{self as repo, parse_thread_id, AuthoredRow};
 use crate::labyrinth::wire::bytes::{check_did, hex_array};
 use crate::labyrinth::wire::io::{body, to_bytes, Page, Received, RecordIn};
@@ -144,6 +145,43 @@ pub async fn list_batches(
                 items: authored(rows),
                 cursor,
             })
+        }
+        .await,
+    )
+}
+
+/// `redactMessage` input.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RedactMessageIn {
+    thread_id: String,
+    message_id: String,
+    redaction: RedactionIn,
+}
+
+pub async fn redact_message(
+    State(pool): Pool,
+    State(rt): Runtime,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    respond(
+        async {
+            let adm = admit_procedure(&pool, &rt, "redactMessage", &headers, &bytes).await?;
+            let input: RedactMessageIn = body(&bytes)?;
+            let mut w = begin_write!(&pool, adm);
+            let (caller, at) = (w.caller.clone(), w.instant);
+            let redacted = retention::redact_message(
+                &mut w.tx,
+                &caller,
+                &input.thread_id,
+                &input.message_id,
+                &input.redaction,
+                at,
+            )
+            .await?;
+            w.finish_write(to_bytes(&json!({ "redacted": redacted }))?)
+                .await
         }
         .await,
     )

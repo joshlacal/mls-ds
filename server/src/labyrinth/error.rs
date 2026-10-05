@@ -91,14 +91,13 @@ impl LabyrinthError {
         Self::new(StatusCode::BAD_REQUEST, "QuotaExceeded", message)
     }
 
-    /// Federation relay to a remote sequencer DS is not built yet (design §3
-    /// "Federation", Y3); a typed refusal instead of a silent local write.
-    pub fn relay_not_implemented() -> Self {
+    /// The conversation became sequenced by another DS while the request was
+    /// in flight (a sequencer transfer); a retry routes it there.
+    pub fn conversation_moved() -> Self {
         Self::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "MethodNotImplemented",
-            "this conversation is sequenced by another DS; the labyrinthRelay \
-             server-to-server procedure is not implemented",
+            StatusCode::CONFLICT,
+            "ConversationMoved",
+            "this conversation is now sequenced by another DS; retry",
         )
     }
 

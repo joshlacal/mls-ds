@@ -53,8 +53,13 @@ pub fn parse_thread_id(value: &str) -> LabyrinthResult<Uuid> {
 }
 
 /// Lock the conversation row `FOR SHARE` and return its last chat entry seq.
-/// Remote conversations are sequenced elsewhere (design §3, Y3).
-async fn lock_conversation(conn: &mut PgConnection, conversation_id: Uuid) -> LabyrinthResult<i64> {
+/// Handlers route remote conversations to their sequencer before calling
+/// this (design §3, Y3); one that turned remote meanwhile is
+/// `ConversationMoved`.
+pub(crate) async fn lock_local_conversation(
+    conn: &mut PgConnection,
+    conversation_id: Uuid,
+) -> LabyrinthResult<i64> {
     let row: Option<(i64, bool)> = sqlx::query_as(
         "SELECT next_entry_seq, is_remote FROM chat.conversations \
           WHERE conversation_id = $1 FOR SHARE",
@@ -64,7 +69,7 @@ async fn lock_conversation(conn: &mut PgConnection, conversation_id: Uuid) -> La
     .await?;
     match row {
         None => Err(not_participant()),
-        Some((_, true)) => Err(LabyrinthError::relay_not_implemented()),
+        Some((_, true)) => Err(LabyrinthError::conversation_moved()),
         Some((next, false)) => Ok(next - 1),
     }
 }
@@ -155,7 +160,7 @@ pub async fn create_mek(
     let mek = &rec.value;
     mek.validate()?;
     let conversation_id = parse_thread_id(&mek.thread_id)?;
-    let chat_seq = lock_conversation(conn, conversation_id).await?;
+    let chat_seq = lock_local_conversation(conn, conversation_id).await?;
     require_active_leaf(conn, conversation_id, caller).await?;
     let (kind, attestation_key_id) = match &mek.sender {
         MekSender::Labyrinth(s) => {
@@ -295,7 +300,7 @@ pub async fn append_batch(
     let batch = &rec.value;
     batch.validate()?;
     let conversation_id = parse_thread_id(&batch.thread_id)?;
-    let chat_seq = lock_conversation(conn, conversation_id).await?;
+    let chat_seq = lock_local_conversation(conn, conversation_id).await?;
     require_active_leaf(conn, conversation_id, caller).await?;
     let mek_id = &batch.items[0].mek_id;
     if batch.items.iter().any(|i| &i.mek_id != mek_id) {

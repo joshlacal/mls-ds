@@ -236,6 +236,11 @@ path = "tests/labyrinth_attachments.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "labyrinth_retention"
+path = "tests/labyrinth_retention.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "labyrinth_device_binding"
 path = "tests/labyrinth_device_binding.rs"
 required-features = ["test-support"]

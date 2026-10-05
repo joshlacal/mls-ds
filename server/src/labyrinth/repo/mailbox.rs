@@ -462,15 +462,32 @@ pub async fn create_virtual_device(
     Ok(())
 }
 
+/// A bundle's record with the server's `lastUsedAt` (J2) projected in.
+const VDEVICE_JSON: &str = "(CASE WHEN last_used_at IS NULL THEN record \
+     ELSE jsonb_set(record, '{lastUsedAt}', \
+       to_jsonb(to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))) \
+     END)::text";
+
+/// `getVirtualDevice`; reading a bundle also records it as used (J2).
 pub async fn get_virtual_device(
     conn: &mut PgConnection,
     owner: &str,
     id: &[u8; 16],
+    at: DateTime<Utc>,
 ) -> LabyrinthResult<Option<serde_json::Value>> {
-    let text: Option<String> = sqlx::query_scalar(
-        "SELECT record::text FROM labyrinth.virtual_devices \
+    sqlx::query(
+        "UPDATE labyrinth.virtual_devices SET last_used_at = $3 \
           WHERE owner_did = $1 AND vdevice_id = $2",
     )
+    .bind(owner)
+    .bind(id.as_slice())
+    .bind(at)
+    .execute(&mut *conn)
+    .await?;
+    let text: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT {VDEVICE_JSON} FROM labyrinth.virtual_devices \
+          WHERE owner_did = $1 AND vdevice_id = $2"
+    ))
     .bind(owner)
     .bind(id.as_slice())
     .fetch_optional(&mut *conn)
@@ -484,8 +501,10 @@ pub async fn list_virtual_devices(
     page: &PageReq,
 ) -> LabyrinthResult<(Vec<serde_json::Value>, Option<String>)> {
     let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
-        "SELECT vdevice_id, record::text FROM labyrinth.virtual_devices \
-          WHERE owner_did = $1 AND vdevice_id > $2 ORDER BY vdevice_id LIMIT $3",
+        &format!(
+            "SELECT vdevice_id, {VDEVICE_JSON} FROM labyrinth.virtual_devices \
+              WHERE owner_did = $1 AND vdevice_id > $2 ORDER BY vdevice_id LIMIT $3"
+        ),
     )
     .bind(owner)
     .bind(hex_cursor(page)?)

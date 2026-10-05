@@ -7,6 +7,7 @@ pub mod binding;
 pub mod directory;
 pub mod mailbox;
 pub mod orf;
+pub mod retention;
 pub mod thread;
 
 use chrono::{DateTime, Utc};
