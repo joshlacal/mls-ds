@@ -455,4 +455,80 @@ async fn own_archive_copies_count_and_deletion_revokes() {
         .query("getAttachmentBlob", &client.get("2", thread, &message))
         .await
         .fails(404, "OrfStateNotFound");
+
+    // Finding 5: the retention pass releases references (and their blob
+    // pins) created through a deleted ORF state.
+    assert_eq!(table_rows(&env, "attachment_refs").await, 1);
+    let gc = catbird_server::labyrinth::repo::retention::run_gc(&env.pool, chrono::Utc::now(), 100)
+        .await
+        .unwrap();
+    assert_eq!(gc.released_refs, 1);
+    assert_eq!(table_rows(&env, "attachment_refs").await, 0);
+    assert_eq!(table_rows(&env, "orf_state_tombstones").await, 0);
+}
+
+async fn table_rows(env: &Env, table: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT count(*) FROM labyrinth.{table}"))
+        .fetch_one(&env.pool)
+        .await
+        .unwrap()
+}
+
+/// Findings 5 and 9: a reader's own archive copy never vouches for another
+/// author's message; unsend revokes the reader's reference and refuses new
+/// ones.
+#[tokio::test]
+async fn another_authors_message_lives_only_through_its_sender_copy() {
+    let object = object();
+    let env = Env::with(true, Some(&object)).await;
+    let alice = env.account().await;
+    let bob = env.account().await;
+    let thread = seed_conversation(&env, &leaves(&[&alice, &bob]), 10).await;
+    grant_interval(&env, thread, &bob, 1, None).await;
+    let (blob, message) = seed_bound_attachment(&env, &alice, thread, &object, 5).await;
+    let message = message.to_string();
+    let client = Client {
+        device_key: [0xB1; 32],
+        c: Scalar::from(7u64),
+    };
+    register(&bob, client.device_key).await;
+    bob.call("putAttachmentRef", &client.put("1", blob, thread, &message))
+        .await
+        .ok();
+    let fetch = || async {
+        bob.query("getAttachmentBlob", &client.get("1", thread, &message))
+            .await
+    };
+    // Bob archived the message himself; that is not alice's sender copy.
+    let mut archive = owner_batch_record(&thread.to_string(), &[1000]);
+    archive["items"][0]["messageId"] = json!(message);
+    bob.call("appendOwnerBatch", &json!({ "record": archive }))
+        .await
+        .ok();
+    fetch().await.fails(404, "NotFound");
+    // Alice's sender copy addressed to bob makes it live.
+    send_message(&alice, thread, &message, &[&alice.did, &bob.did]).await;
+    let got = fetch().await;
+    assert_eq!(got.status.as_u16(), 200, "{}", got.json);
+    // Alice unsends: bob's reference goes, and no new one can be put.
+    let signed = format!(
+        "catbird.labyrinth.redaction:did={};message_id={message};thread_id={}",
+        alice.did,
+        hex::encode(thread.to_string().as_bytes())
+    );
+    use ed25519_dalek::Signer as _;
+    alice
+        .call(
+            "redactMessage",
+            &json!({ "threadId": thread.to_string(), "messageId": message, "redaction": {
+                "transportPubkey": b(&alice.chat_pub()),
+                "sig": b(&alice.chat_key.sign(signed.as_bytes()).to_bytes()) } }),
+        )
+        .await
+        .ok();
+    assert_eq!(table_rows(&env, "attachment_refs").await, 0);
+    fetch().await.fails(404, "NotFound");
+    bob.call("putAttachmentRef", &client.put("2", blob, thread, &message))
+        .await
+        .fails(410, "MessageRedacted");
 }

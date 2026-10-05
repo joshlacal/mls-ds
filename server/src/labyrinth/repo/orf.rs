@@ -70,12 +70,15 @@ pub async fn register(
     Ok(())
 }
 
-/// Delete `device_key`'s state (revocation). Idempotent.
+/// Delete `device_key`'s state (revocation). Idempotent. The deletion
+/// leaves a tombstone; the retention pass releases the references created
+/// through the state (migration `20261004100009`).
 pub async fn delete(
     conn: &mut PgConnection,
     owner: &str,
     device_key: &[u8; 32],
 ) -> LabyrinthResult<()> {
+    super::open_retention_scope(conn).await?;
     sqlx::query("DELETE FROM labyrinth.orf_states WHERE owner_did = $1 AND device_key = $2")
         .bind(owner)
         .bind(device_key.as_slice())

@@ -18,9 +18,11 @@ mod directory;
 mod lookup;
 mod mailbox;
 mod orf;
+pub mod outbox;
 mod params;
 mod relay;
-mod relay_client;
+pub mod relay_client;
+mod relay_jobs;
 mod retention;
 mod thread;
 

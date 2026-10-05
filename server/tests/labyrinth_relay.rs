@@ -219,6 +219,12 @@ async fn thread_operations_of_a_remote_conversation_run_on_its_sequencer() {
 
 /// A hand-built relay request from DS `iss` signed with `key`.
 async fn relay_as(w: &World, iss: &str, key: &P256Key, input: &Value) -> Reply {
+    relay_to(&w.seq, iss, key, input).await
+}
+
+/// A hand-built relay request to `env` (the token audience is this
+/// process's SERVICE_DID, which every env checks).
+async fn relay_to(env: &Env, iss: &str, key: &P256Key, input: &Value) -> Reply {
     let now = Utc::now().timestamp();
     let header = json!({ "alg": "ES256", "typ": "JWT" });
     let claims = json!({ "iss": iss, "sub": iss, "aud": sequencer_did(), "lxm": RELAY,
@@ -235,7 +241,7 @@ async fn relay_as(w: &World, iss: &str, key: &P256Key, input: &Value) -> Reply {
         .header("authorization", format!("Bearer {token}"))
         .body(Body::from(serde_json::to_vec(input).unwrap()))
         .unwrap();
-    send(&w.seq.router, request).await
+    send(&env.router, request).await
 }
 
 /// A relayed write of `name` for `device`, its write body signed by
@@ -395,8 +401,40 @@ fn point(label: &[u8]) -> [u8; 32] {
     RistrettoPoint::from_uniform_bytes(&h).compress().to_bytes()
 }
 
+fn unsend(device: &Device, thread: Uuid, message: &str) -> Value {
+    let signed = format!(
+        "catbird.labyrinth.redaction:did={};message_id={message};thread_id={}",
+        device.did,
+        hex::encode(thread.to_string().as_bytes())
+    );
+    json!({ "threadId": thread.to_string(), "messageId": message, "redaction": {
+        "transportPubkey": b(&device.chat_pub()),
+        "sig": b(&device.chat_key.sign(signed.as_bytes()).to_bytes()) } })
+}
+
+/// Every item of bob's `listBatches` page: (author, messageId, redaction).
+async fn sender_items(w: &World) -> Vec<(String, String, Option<Value>)> {
+    let page = w
+        .bob
+        .query("listBatches", &[("threadId", w.thread.to_string())])
+        .await;
+    let mut out = Vec::new();
+    for b in page.ok()["items"].as_array().unwrap() {
+        for item in b["record"]["items"].as_array().unwrap() {
+            out.push((
+                b["author"].as_str().unwrap().to_owned(),
+                item["messageId"].as_str().unwrap().to_owned(),
+                item.get("redaction").cloned(),
+            ));
+        }
+    }
+    out
+}
+
+/// Findings 5 and 9: attachment liveness comes from the author's sender
+/// copy on the sequencer, unsend revokes durably across DSes.
 #[tokio::test]
-async fn attachment_existence_and_account_deletion_reach_the_sequencer() {
+async fn attachment_liveness_follows_the_authors_sender_copy_across_dses() {
     let object = TestObject {
         key: "bafy-relay-object".to_owned(),
         data: vec![0x21; 40],
@@ -410,15 +448,12 @@ async fn attachment_existence_and_account_deletion_reach_the_sequencer() {
         .call("registerOrfState", &json!({ "deviceKeyPubkey": b(&key) }))
         .await
         .ok();
-    w.alice
-        .call(
-            "putAttachmentRef",
-            &json!({ "deviceKeyPubkey": b(&key), "blindedIndex": b(&point(b"i")),
-                     "blindedTokenSalt": b(&point(b"t")), "blobId": blob.to_string(),
-                     "threadId": w.thread.to_string(), "messageId": message }),
-        )
-        .await
-        .ok();
+    let put = |label: &'static [u8]| {
+        json!({ "deviceKeyPubkey": b(&key), "blindedIndex": b(&point(label)),
+                "blindedTokenSalt": b(&point(b"t")), "blobId": blob.to_string(),
+                "threadId": w.thread.to_string(), "messageId": message })
+    };
+    w.alice.call("putAttachmentRef", &put(b"i")).await.ok();
     let fetch = || async {
         w.alice
             .query(
@@ -435,44 +470,157 @@ async fn attachment_existence_and_account_deletion_reach_the_sequencer() {
     };
     // Not yet stored on the sequencer.
     fetch().await.fails(404, "NotFound");
-    // Bob's copy on the sequencer, addressed to alice, makes it exist.
+    // Bob's item reusing the id does not vouch for alice's message.
+    let to = [w.alice.did.as_str(), w.bob.did.as_str()];
     w.bob
-        .call("createMek", &json!({ "record": transport_mek(w.thread, MEK_B, w.bob.chat_pub(), &[&w.alice.did, &w.bob.did]) }))
+        .call("createMek", &json!({ "record": transport_mek(w.thread, MEK_B, w.bob.chat_pub(), &to) }))
         .await
         .ok();
     w.bob
         .call("appendBatch", &batch(w.thread, &w.bob, MEK_B, &[&message]))
         .await
         .ok();
+    fetch().await.fails(404, "NotFound");
+    // Alice's own sender copy on the sequencer does.
+    w.alice
+        .call("createMek", &json!({ "record": transport_mek(w.thread, MEK_A, w.alice.chat_pub(), &to) }))
+        .await
+        .ok();
+    w.alice
+        .call("appendBatch", &batch(w.thread, &w.alice, MEK_A, &[&message]))
+        .await
+        .ok();
     let got = fetch().await;
     assert_eq!(got.status.as_u16(), 200, "{}", got.json);
     assert_eq!(got.bytes, object.data);
 
-    // deleteAccountData: the sequencer redacts alice's items, unsigned.
+    // Unsend on the sequencer: gone at once (messageLive reports it
+    // redacted), and announced durably to alice's home DS.
     w.alice
-        .call("createMek", &json!({ "record": transport_mek(w.thread, MEK_A, w.alice.chat_pub(), &[&w.alice.did, &w.bob.did]) }))
+        .call("redactMessage", &unsend(&w.alice, w.thread, &message))
+        .await
+        .ok();
+    fetch().await.fails(404, "NotFound");
+    let (target, request): (String, Value) = sqlx::query_as(
+        "SELECT target_ds, request FROM labyrinth.relay_outbox WHERE op = 'invalidateMessages'",
+    )
+    .fetch_one(&w.seq.pool)
+    .await
+    .unwrap();
+    assert_eq!(target, HOME_DS);
+    // Only the conversation's sequencer may announce.
+    let third = "did:web:third.labyrinth-relay.dev";
+    let third_key = ds_key("third");
+    cache_did_key(third, &third_key).await;
+    allow_peer(&w.home, third).await;
+    relay_to(&w.home, third, &third_key, &request)
+        .await
+        .fails(403, "NotSequencer");
+    let seq_key = ds_key("seq");
+    cache_did_key(&sequencer_did(), &seq_key).await;
+    let delivered = relay_to(&w.home, &sequencer_did(), &seq_key, &request).await;
+    assert_eq!(delivered.ok()["invalidated"], 1);
+    assert_eq!(rows(&w.home, "attachment_refs").await, 0);
+    // Finding 9: no new reference to an unsent message's attachment.
+    w.alice
+        .call("putAttachmentRef", &put(b"j"))
+        .await
+        .fails(410, "MessageRedacted");
+}
+
+/// Finding 4: deleteAccountData purges locally first and reaches the
+/// sequencer through the durable outbox.
+#[tokio::test]
+async fn account_deletion_reaches_the_sequencer_through_the_outbox() {
+    let w = world(None).await;
+    let to = [w.alice.did.as_str(), w.bob.did.as_str()];
+    w.alice
+        .call("createMek", &json!({ "record": transport_mek(w.thread, MEK_A, w.alice.chat_pub(), &to) }))
         .await
         .ok();
     w.alice
-        .call(
-            "appendBatch",
-            &batch(w.thread, &w.alice, MEK_A, &["a1", "a2"]),
-        )
+        .call("appendBatch", &batch(w.thread, &w.alice, MEK_A, &["a1", "a2"]))
         .await
         .ok();
     w.alice.enroll([0xA0; 32]).await;
     w.alice.call("deleteAccountData", &json!({})).await.ok();
-    let page = w
-        .bob
-        .query("listBatches", &[("threadId", w.thread.to_string())])
-        .await;
-    for b in page.ok()["items"].as_array().unwrap() {
-        for item in b["record"]["items"].as_array().unwrap() {
-            let redacted = item.get("redaction").is_some();
-            assert_eq!(redacted, b["author"] == w.alice.did.as_str(), "{item}");
-        }
+    assert_eq!(rows(&w.home, "devices").await, 0, "home mailbox purged");
+    // Nothing reached the sequencer yet; the job is queued.
+    assert!(sender_items(&w).await.iter().all(|i| i.2.is_none()));
+    assert_eq!(w.home.drain_outbox().await.delivered, 1);
+    let items = sender_items(&w).await;
+    assert_eq!(items.len(), 2);
+    for (author, _, redaction) in items {
+        assert_eq!(author, w.alice.did);
+        let r = redaction.expect("redacted");
+        assert_eq!(r["reason"], "accountDeleted");
+        assert!(r.get("by").is_some() && r.get("sig").is_some());
     }
-    assert_eq!(rows(&w.home, "orf_states").await, 0, "home mailbox purged");
+    let (status, attempts): (String, i32) =
+        sqlx::query_as("SELECT status, attempts FROM labyrinth.relay_outbox")
+            .fetch_one(&w.home.pool)
+            .await
+            .unwrap();
+    assert_eq!((status.as_str(), attempts), ("done", 1));
+    assert_eq!(w.home.drain_outbox().await.delivered, 0);
+}
+
+/// The sequencer accepts a queued purge long after it was signed, but only
+/// redacts what it received before then, and only under the device's key.
+#[tokio::test]
+async fn relayed_purges_are_fenced_at_their_signing_time() {
+    let w = world(None).await;
+    let home_key = ds_key("home");
+    let to = [w.alice.did.as_str(), w.bob.did.as_str()];
+    w.alice
+        .call("createMek", &json!({ "record": transport_mek(w.thread, MEK_A, w.alice.chat_pub(), &to) }))
+        .await
+        .ok();
+    w.alice
+        .call("appendBatch", &batch(w.thread, &w.alice, MEK_A, &["a1"]))
+        .await
+        .ok();
+    let purge = |signer: &Device, signed_at: chrono::DateTime<Utc>| {
+        let payload = b"{}".to_vec();
+        let (write, sig) = signer.write_headers_at(
+            &format!("{PREFIX}deleteAccountData"),
+            &payload,
+            [9; 16],
+            signed_at,
+        );
+        json!({ "op": "purgeAuthor", "actorDid": w.alice.did,
+                "actorDeviceId": w.alice.device_id.to_string(),
+                "payload": b(&payload), "writeBody": write, "writeSignature": sig })
+    };
+    let mut impostor = w.alice.clone();
+    impostor.chat_key = ed25519_dalek::SigningKey::from_bytes(&random_seed());
+    relay_as(&w, HOME_DS, &home_key, &purge(&impostor, Utc::now()))
+        .await
+        .fails(401, "InvalidSignature");
+    relay_as(&w, HOME_DS, &home_key, &purge(&w.alice, Utc::now() - chrono::Duration::days(31)))
+        .await
+        .fails(400, "InvalidRequest");
+    // Signed an hour ago (a retry from the outbox) by a key that was
+    // current then: accepted, but a1 was received after that, so it stays.
+    let mut tx = w.seq.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chat.device_keys SET created_at = created_at - INTERVAL '2 days' \
+          WHERE user_did = $1",
+    )
+    .bind(&w.alice.did)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let old = relay_as(&w, HOME_DS, &home_key, &purge(&w.alice, Utc::now() - chrono::Duration::hours(1))).await;
+    assert_eq!(old.ok()["redacted"], 0);
+    assert!(sender_items(&w).await.iter().all(|i| i.2.is_none()));
+    let fresh = relay_as(&w, HOME_DS, &home_key, &purge(&w.alice, Utc::now())).await;
+    assert_eq!(fresh.ok()["redacted"], 1);
 }
 
 #[tokio::test]

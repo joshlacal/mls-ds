@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Delete a device's ORF server state (revocation, SPEC 5.6). Idempotent. ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "description": "Delete a device's ORF server state (revocation, SPEC 5.6). Idempotent. ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one. Requires a bound Labyrinth device (a current, non-virtual device registered by the calling chat device). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -29,7 +29,12 @@
           "required": [],
           "properties": {}
         }
-      }
+      },
+      "errors": [
+        {
+          "name": "LabyrinthDeviceNotBound"
+        }
+      ]
     }
   }
 }

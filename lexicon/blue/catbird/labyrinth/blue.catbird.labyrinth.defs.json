@@ -238,7 +238,7 @@
     },
     "redaction": {
       "type": "object",
-      "description": "[CB-38] An author's unsend request: Ed25519 by one of the author's chat device keys over 'catbird.labyrinth.redaction:did=' || did || ';message_id=' || messageId || ';thread_id=' || hex(threadId). transportPubkey and sig are absent exactly when the server redacted the item for an account deletion (deleteAccountData); readers show such items as deleted (account removed), never as an author unsend.",
+      "description": "A redaction of a sender item. Two variants. (1) [CB-38] author unsend: transportPubkey and sig, Ed25519 by one of the author's chat device keys over 'catbird.labyrinth.redaction:did=' || did || ';message_id=' || messageId || ';thread_id=' || hex(threadId). (2) Server redaction for an account deletion (deleteAccountData / purgeAuthor): transportPubkey is absent; by is the redacting (sequencer) DS's DID, reason is 'accountDeleted', redactedAt is the server's, and sig, when present, is Ed25519 by that DS's redaction key over the UTF-8 string 'catbird.labyrinth.ds_redaction:by=' || by || ';did=' || author DID || ';message_id=' || messageId || ';reason=accountDeleted;redacted_at=' || redactedAt || ';thread_id=' || hex(utf8(threadId)). Readers show variant 2 as 'account deleted' only when sig verifies under the key of the conversation's sequencer DID, and otherwise as 'removed by server'; never as an author unsend.",
       "required": [],
       "properties": {
         "transportPubkey": {
@@ -249,7 +249,7 @@
         },
         "sig": {
           "type": "bytes",
-          "description": "Ed25519 signature.",
+          "description": "Ed25519 signature: by the author's chat device key (unsend) or by the DS redaction key (server redactions; optional there).",
           "maxLength": 64,
           "minLength": 64
         },
@@ -257,6 +257,19 @@
           "type": "string",
           "format": "datetime",
           "description": "Set by the server when it applied the redaction."
+        },
+        "by": {
+          "type": "string",
+          "format": "did",
+          "description": "Server redactions: the DID of the DS that applied it (the conversation's sequencer)."
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 64,
+          "knownValues": [
+            "accountDeleted"
+          ],
+          "description": "Server redactions: why the server redacted the item."
         }
       }
     }

@@ -6,8 +6,8 @@
 //! `listThreads` spans conversations sequenced anywhere: the home DS lists
 //! its own, asks every remote sequencer of a conversation the caller takes
 //! or took part in for the same page (`labyrinthRelay listThreads`), and
-//! merges. One unreachable sequencer fails the call (`RelayUnavailable`)
-//! rather than answer an incomplete list. `listOwnerThreads` reads the
+//! merges. A sequencer that cannot answer in time is listed in the
+//! response's `incomplete` instead of failing the call. `listOwnerThreads` reads the
 //! caller's own mailbox, which is always local.
 
 use std::sync::Arc;
@@ -53,13 +53,21 @@ pub(super) fn threads_page(
     pages: Vec<Vec<Uuid>>,
     more: bool,
     limit: i64,
+    incomplete: &[String],
 ) -> LabyrinthResult<Vec<u8>> {
     let (ids, cursor) = repo::merge_thread_pages(pages, more, limit);
-    let items = ids
+    let items: Vec<_> = ids
         .into_iter()
         .map(|id| json!({ "threadId": id.hyphenated().to_string() }))
         .collect();
-    to_bytes(&Page { items, cursor })
+    let mut out = json!({ "items": items });
+    if let Some(cursor) = cursor {
+        out["cursor"] = json!(cursor);
+    }
+    if !incomplete.is_empty() {
+        out["incomplete"] = json!(incomplete);
+    }
+    to_bytes(&out)
 }
 
 /// One remote sequencer's `listThreads` page: its ids and whether it has more.
@@ -90,6 +98,20 @@ fn remote_page(bytes: &[u8]) -> LabyrinthResult<(Vec<Uuid>, bool)> {
     Ok((ids, page.cursor.is_some()))
 }
 
+/// Remote sequencers asked at once by one `listThreads` call.
+const FANOUT_CONCURRENCY: usize = 8;
+/// Remote sequencers asked at all by one call; the rest are reported
+/// incomplete.
+const FANOUT_MAX_SEQUENCERS: usize = 64;
+/// Per-sequencer deadline.
+const FANOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Largest per-sequencer answer (100 thread ids fit in well under this).
+const FANOUT_MAX_RESPONSE: usize = 64 * 1024;
+
+/// `listThreads` (finding 4): the local page merged with every remote
+/// sequencer's, asked in parallel (bounded concurrency, per-sequencer
+/// timeout and response cap). A sequencer that fails, times out or is past
+/// the fan-out cap is named in `incomplete` instead of failing the call.
 async fn list_threads_all(
     pool: &DbPool,
     rt: &ChatRuntime,
@@ -97,27 +119,57 @@ async fn list_threads_all(
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> LabyrinthResult<Vec<u8>> {
+    use futures::stream::{self, StreamExt};
     let op = RelayOp::ListThreads;
     let (adm, p) = admit_query(pool, rt, op.name(), headers, query, read_params(op)).await?;
     let page = p.page()?;
     let after = repo::thread_cursor(&page)?;
     let mut r = begin_read(pool, adm.clone()).await?;
     let local = repo::list_threads(&mut r.tx, &r.caller.did, after, None, page.limit() + 1).await?;
-    let sequencers = retention::remote_sequencers(&mut r.tx, &r.caller.did).await?;
+    let mut sequencers = retention::remote_sequencers(&mut r.tx, &r.caller.did).await?;
     r.finish_read().await?;
+    let mut incomplete: Vec<String> = sequencers
+        .split_off(sequencers.len().min(FANOUT_MAX_SEQUENCERS));
+    let query = query.unwrap_or_default();
+    let answers: Vec<(String, LabyrinthResult<(Vec<Uuid>, bool)>)> = stream::iter(sequencers)
+        .map(|sequencer| {
+            let adm = &adm;
+            async move {
+                let call = relay.forward_capped(
+                    pool,
+                    &sequencer,
+                    op,
+                    adm,
+                    Forwarded::Read { query },
+                    FANOUT_MAX_RESPONSE,
+                );
+                let result = match tokio::time::timeout(FANOUT_TIMEOUT, call).await {
+                    Ok(Ok(bytes)) => remote_page(&bytes),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(LabyrinthError::relay_unavailable()),
+                };
+                (sequencer, result)
+            }
+        })
+        .buffer_unordered(FANOUT_CONCURRENCY)
+        .collect()
+        .await;
     let mut pages = vec![local];
     let mut more = false;
-    // The device was verified current above (begin_read).
-    for sequencer in &sequencers {
-        let forwarded = Forwarded::Read {
-            query: query.unwrap_or_default(),
-        };
-        let bytes = relay.forward(pool, sequencer, op, &adm, forwarded).await?;
-        let (ids, has_more) = remote_page(&bytes)?;
-        more |= has_more;
-        pages.push(ids);
+    for (sequencer, result) in answers {
+        match result {
+            Ok((ids, has_more)) => {
+                more |= has_more;
+                pages.push(ids);
+            }
+            Err(error) => {
+                tracing::warn!(%sequencer, %error, "listThreads: sequencer incomplete");
+                incomplete.push(sequencer);
+            }
+        }
     }
-    threads_page(pages, more, page.limit())
+    incomplete.sort();
+    threads_page(pages, more, page.limit(), &incomplete)
 }
 
 pub async fn list_threads(

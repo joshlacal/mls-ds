@@ -17,6 +17,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::ct_eq;
+use super::liveness::{self, Liveness};
 use super::orf::{orf_not_found, state};
 use crate::labyrinth::auth::Caller;
 use crate::labyrinth::digest;
@@ -70,10 +71,10 @@ pub(crate) fn parse_uuid(what: &str, value: &str) -> LabyrinthResult<Uuid> {
     Ok(id)
 }
 
-/// SQL: `blob` ($1) is a live, bound attachment whose application binding is
-/// in conversation $2 for chat message $3, outside any pending direct
-/// request.
-const BOUND_TO_MESSAGE: &str = "EXISTS (SELECT 1 FROM chat.blobs b \
+/// SQL: the author (binding owner) of `blob` ($1) when it is a live, bound
+/// attachment whose application binding is in conversation $2 for chat
+/// message $3, outside any pending direct request.
+const BOUND_TO_MESSAGE: &str = "SELECT bb.owner_did FROM chat.blobs b \
        JOIN chat.blob_bindings bb ON bb.blob_id = b.blob_id \
       WHERE b.blob_id = $1 AND b.purpose = 'attachment' AND b.status = 'bound' \
         AND b.object_store_key IS NOT NULL \
@@ -83,7 +84,15 @@ const BOUND_TO_MESSAGE: &str = "EXISTS (SELECT 1 FROM chat.blobs b \
               LEFT JOIN chat.direct_request_lifecycle l USING (request_id) \
              WHERE p.conversation_id = bb.conversation_id \
                AND COALESCE(l.consent, 'pending') = 'pending') \
-        AND {EXTRA})";
+        AND {EXTRA}";
+
+fn unsent() -> LabyrinthError {
+    LabyrinthError::new(
+        axum::http::StatusCode::GONE,
+        "MessageRedacted",
+        "the message was unsent; its attachments cannot be referenced",
+    )
+}
 
 /// The caller's device holds an application interval covering the entry.
 const DEVICE_INTERVAL: &str = "EXISTS (SELECT 1 FROM chat.application_intervals i \
@@ -115,22 +124,24 @@ pub async fn put(
         .bind(blob)
         .fetch_optional(&mut *conn)
         .await?;
-    let sql = format!(
-        "SELECT {}",
-        BOUND_TO_MESSAGE.replace("{EXTRA}", DEVICE_INTERVAL)
-    );
-    let entitled: bool = sqlx::query_scalar(&sql)
+    let sql = BOUND_TO_MESSAGE.replace("{EXTRA}", DEVICE_INTERVAL);
+    let author: String = sqlx::query_scalar(&sql)
         .bind(blob)
         .bind(conversation)
         .bind(chat_message)
         .bind(&caller.did)
         .bind(caller.device_id)
-        .fetch_one(&mut *conn)
-        .await?;
-    if !entitled {
-        return Err(not_entitled());
-    }
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(not_entitled)?;
     let message_digest = digest::message(&key, &msg.thread_id, &msg.message_id);
+    // Finding 9: an unsent message's attachments stay revoked. The sender
+    // copy is checked here when this DS sequences the conversation; the
+    // sequencer's redaction announcements (`invalidateMessages`) cover the
+    // rest.
+    if is_redacted(conn, &key, &message_digest, &author, conversation, &msg.message_id).await? {
+        return Err(unsent());
+    }
     sqlx::query(
         "INSERT INTO labyrinth.attachment_blobs (blob_id, message_digest, created_at) \
          VALUES ($1, $2, $3) ON CONFLICT (blob_id) DO NOTHING",
@@ -158,8 +169,9 @@ pub async fn put(
     let token_mac = digest::token_mac(&salt, &msg.thread_id, &msg.message_id);
     let inserted = sqlx::query(
         "INSERT INTO labyrinth.attachment_refs \
-           (orf_index, owner_digest, message_digest, blob_id, token_mac, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+           (orf_index, owner_digest, message_digest, blob_id, token_mac, created_at, \
+            state_digest) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
     )
     .bind(index.as_slice())
     .bind(digest::owner(&key, &caller.did).as_slice())
@@ -167,6 +179,7 @@ pub async fn put(
     .bind(blob)
     .bind(token_mac.as_slice())
     .bind(at)
+    .bind(digest::orf_state(&key, &caller.did, &blinded.device_key).as_slice())
     .execute(&mut *conn)
     .await?;
     if inserted.rows_affected() == 0 {
@@ -238,6 +251,7 @@ pub async fn delete(
         .await?
         .ok_or_else(orf_not_found)?;
     let index = server_map(s, ATTACHMENT_INDEX_DOMAIN, blinded_index)?;
+    super::open_retention_scope(conn).await?;
     sqlx::query("DELETE FROM labyrinth.attachment_refs WHERE orf_index = $1 AND owner_digest = $2")
         .bind(index.as_slice())
         .bind(digest::owner(&key, &caller.did).as_slice())
@@ -246,51 +260,21 @@ pub async fn delete(
     Ok(())
 }
 
-/// Whether a message still exists for a reader.
-pub enum Liveness {
-    Known(bool),
-    /// The conversation's sender records live on this sequencer DS.
-    Remote(String),
-}
-
-/// `labyrinth.message_live_for` for local conversations; a remote
-/// conversation's own-archive copies are checked here, its sender copies
-/// only on the sequencer.
-pub async fn liveness(
-    conn: &mut PgConnection,
-    reader: &str,
-    conversation: Uuid,
-    message_id: &str,
-) -> LabyrinthResult<Liveness> {
-    let live: bool = sqlx::query_scalar("SELECT labyrinth.message_live_for($1, $2, $3)")
-        .bind(reader)
-        .bind(conversation)
-        .bind(message_id)
-        .fetch_one(&mut *conn)
-        .await?;
-    if live {
-        return Ok(Liveness::Known(true));
-    }
-    let remote: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT CASE WHEN is_remote THEN sequencer_ds END FROM chat.conversations \
-          WHERE conversation_id = $1",
-    )
-    .bind(conversation)
-    .fetch_optional(&mut *conn)
-    .await?;
-    Ok(match remote {
-        Some(Some(sequencer)) => Liveness::Remote(sequencer),
-        _ => Liveness::Known(false),
-    })
-}
-
 /// Where a token-authorized attachment's bytes live.
 pub struct AttachmentObject {
     pub object_store_key: String,
     pub ciphertext_size: i64,
     pub ciphertext_sha256: Vec<u8>,
-    /// Message existence still to be confirmed by the sequencer.
-    pub pending_remote: Option<String>,
+    /// The message's sender state still to be read from this sequencer.
+    pub pending_remote: Option<RemoteCheck>,
+}
+
+/// A liveness question for a remote conversation's sequencer.
+pub struct RemoteCheck {
+    pub sequencer: String,
+    pub author: String,
+    /// The reader is the author and keeps its own archive copy.
+    pub own_copy: bool,
 }
 
 /// `getAttachmentBlob` authorization. Every refusal reads as `NotFound`.
@@ -311,20 +295,27 @@ pub async fn authorize(
     }
     let conversation = msg.conversation()?;
     let chat_message = Uuid::parse_str(&msg.message_id).map_err(|_| not_found())?;
-    let sql = format!("SELECT {}", BOUND_TO_MESSAGE.replace("{EXTRA}", "TRUE"));
-    let bound: bool = sqlx::query_scalar(&sql)
+    let sql = BOUND_TO_MESSAGE.replace("{EXTRA}", "TRUE");
+    let author: String = sqlx::query_scalar(&sql)
         .bind(row.blob_id)
         .bind(conversation)
         .bind(chat_message)
-        .fetch_one(&mut *conn)
-        .await?;
-    if !bound {
-        return Err(not_found());
-    }
-    let pending_remote = match liveness(conn, &caller.did, conversation, &msg.message_id).await? {
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(not_found)?;
+    let pending_remote = match liveness::check(
+        conn,
+        &key,
+        &caller.did,
+        conversation,
+        &msg.message_id,
+        &author,
+    )
+    .await?
+    {
         Liveness::Known(true) => None,
         Liveness::Known(false) => return Err(not_found()),
-        Liveness::Remote(sequencer) => Some(sequencer),
+        Liveness::Remote(check) => Some(check),
     };
     let (object_store_key, ciphertext_size, ciphertext_sha256): (Option<String>, i64, Vec<u8>) =
         sqlx::query_as(
@@ -342,12 +333,34 @@ pub async fn authorize(
     })
 }
 
-/// Delete every reference to these messages of a conversation (redaction).
-/// Without a configured digest key no reference can exist to delete.
+/// Whether `author`'s message is redacted, per the local sender copy or a
+/// recorded redaction announcement.
+async fn is_redacted(
+    conn: &mut PgConnection,
+    key: &[u8; 32],
+    message_digest: &[u8; 32],
+    author: &str,
+    conversation: Uuid,
+    message_id: &str,
+) -> LabyrinthResult<bool> {
+    if liveness::announced_redacted(conn, key, message_digest, author).await? {
+        return Ok(true);
+    }
+    let (_, redacted) = liveness::sender_state(conn, author, conversation, message_id, author).await?;
+    Ok(redacted)
+}
+
+/// Revoke `author`'s messages of a conversation (unsend, account deletion,
+/// or the sequencer's announcement of either): delete every reference to an
+/// attachment `author` bound to one of them, and record the redaction so no
+/// new reference can be put. Without a configured digest key no reference
+/// can exist.
 pub async fn invalidate_messages(
     conn: &mut PgConnection,
     thread_id: &str,
+    author: &str,
     message_ids: &[String],
+    at: DateTime<Utc>,
 ) -> LabyrinthResult<u64> {
     let Some(key) = digest::configured_key() else {
         return Ok(0);
@@ -356,13 +369,28 @@ pub async fn invalidate_messages(
         .iter()
         .map(|m| digest::message(&key, thread_id, m).to_vec())
         .collect();
-    Ok(
-        sqlx::query("DELETE FROM labyrinth.attachment_refs WHERE message_digest = ANY($1)")
-            .bind(&digests)
-            .execute(&mut *conn)
-            .await?
-            .rows_affected(),
+    let author_digest = digest::owner(&key, author);
+    sqlx::query(
+        "INSERT INTO labyrinth.redacted_messages (message_digest, author_digest, created_at) \
+         SELECT d, $2, $3 FROM unnest($1::bytea[]) AS d ON CONFLICT DO NOTHING",
     )
+    .bind(&digests)
+    .bind(author_digest.as_slice())
+    .bind(at)
+    .execute(&mut *conn)
+    .await?;
+    super::open_retention_scope(conn).await?;
+    Ok(sqlx::query(
+        "DELETE FROM labyrinth.attachment_refs r \
+          WHERE r.message_digest = ANY($1) \
+            AND EXISTS (SELECT 1 FROM chat.blob_bindings bb \
+                         WHERE bb.blob_id = r.blob_id AND bb.owner_did = $2)",
+    )
+    .bind(&digests)
+    .bind(author)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected())
 }
 
 /// Delete every reference `did` owns (mailbox purge).
@@ -371,6 +399,7 @@ pub async fn delete_owned(conn: &mut PgConnection, did: &str) -> LabyrinthResult
         tracing::warn!("no attachment digest key; owned references cannot be located");
         return Ok(0);
     };
+    super::open_retention_scope(conn).await?;
     Ok(
         sqlx::query("DELETE FROM labyrinth.attachment_refs WHERE owner_digest = $1")
             .bind(digest::owner(&key, did).as_slice())
@@ -378,4 +407,35 @@ pub async fn delete_owned(conn: &mut PgConnection, did: &str) -> LabyrinthResult
             .await?
             .rows_affected(),
     )
+}
+
+/// Release the references created through deleted ORF states (finding 5):
+/// drain up to `limit` tombstones. Returns the references removed.
+pub async fn release_deleted_states(conn: &mut PgConnection, limit: i64) -> LabyrinthResult<u64> {
+    let tombstones: Vec<(i64, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT tombstone_id, owner_did, device_key FROM labyrinth.orf_state_tombstones \
+          ORDER BY tombstone_id LIMIT $1 FOR UPDATE SKIP LOCKED",
+    )
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await?;
+    let Some(key) = digest::configured_key() else {
+        return Ok(0);
+    };
+    let mut removed = 0;
+    super::open_retention_scope(conn).await?;
+    for (id, owner, device_key) in tombstones {
+        if let Ok(device_key) = <[u8; 32]>::try_from(device_key.as_slice()) {
+            removed += sqlx::query("DELETE FROM labyrinth.attachment_refs WHERE state_digest = $1")
+                .bind(digest::orf_state(&key, &owner, &device_key).as_slice())
+                .execute(&mut *conn)
+                .await?
+                .rows_affected();
+        }
+        sqlx::query("DELETE FROM labyrinth.orf_state_tombstones WHERE tombstone_id = $1")
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(removed)
 }

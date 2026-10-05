@@ -23,7 +23,7 @@ use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth::{self, begin_read, Admission};
 use crate::labyrinth::error::LabyrinthResult;
 use crate::labyrinth::relay::RelayOp;
-use crate::labyrinth::repo::lookup;
+use crate::labyrinth::repo::{liveness, lookup};
 use crate::labyrinth::repo::retention::{self, RedactionIn};
 use crate::labyrinth::repo::thread::{self as repo, parse_thread_id, AuthoredRow};
 use crate::labyrinth::wire::bytes::{check_did, check_str, hex_array};
@@ -61,7 +61,7 @@ pub(super) fn read_params(op: RelayOp) -> &'static [&'static str] {
         ],
         RelayOp::GetMessages => &["threadId", "messageIds", "cursor", "limit"],
         RelayOp::ListThreads => &["cursor", "limit"],
-        RelayOp::MessageLive => &["threadId", "messageId"],
+        RelayOp::MessageLive => &["threadId", "messageId", "author"],
         _ => &[],
     }
 }
@@ -84,7 +84,6 @@ pub(super) async fn exec_write(
     op: RelayOp,
     adm: Admission,
     bytes: &[u8],
-    home_ds: Option<&str>,
 ) -> LabyrinthResult<Vec<u8>> {
     let mut w = begin_write!(pool, adm);
     let (caller, at) = (w.caller.clone(), w.instant);
@@ -114,12 +113,9 @@ pub(super) async fn exec_write(
             .await?;
             json!({ "redacted": redacted })
         }
-        RelayOp::PurgeAuthor => {
-            let home = home_ds.ok_or_else(crate::labyrinth::error::LabyrinthError::internal)?;
-            retention::redact_author(&mut w.tx, &caller.did, Some(home), at).await?;
-            json!({})
-        }
-        RelayOp::FindMeks
+        RelayOp::PurgeAuthor
+        | RelayOp::InvalidateMessages
+        | RelayOp::FindMeks
         | RelayOp::ListBatches
         | RelayOp::GetMessages
         | RelayOp::ListThreads
@@ -150,7 +146,7 @@ pub(super) async fn exec_read(
         )
         .await?;
         r.finish_read().await?;
-        return super::lookup::threads_page(vec![ids], false, page.limit());
+        return super::lookup::threads_page(vec![ids], false, page.limit(), &[]);
     }
     let thread = parse_thread_id(p.req("threadId")?)?;
     match op {
@@ -201,17 +197,18 @@ pub(super) async fn exec_read(
             })
         }
         RelayOp::MessageLive => {
+            // The sender-side state of `author`'s message for the actor
+            // (finding 5); the home DS adds the author's own archive copy.
             let message_id = p.req("messageId")?;
             check_str("messageId", message_id, 128)?;
+            let author = p.req("author")?;
+            check_did("author", author)?;
             let mut r = begin_read(pool, adm).await?;
-            let live: bool = sqlx::query_scalar("SELECT labyrinth.message_live_for($1, $2, $3)")
-                .bind(&r.caller.did)
-                .bind(thread)
-                .bind(message_id)
-                .fetch_one(&mut *r.tx)
-                .await?;
+            let caller = r.caller.did.clone();
+            let (live, redacted) =
+                liveness::sender_state(&mut r.tx, &caller, thread, message_id, author).await?;
             r.finish_read().await?;
-            to_bytes(&json!({ "live": live }))
+            to_bytes(&json!({ "live": live, "redacted": redacted }))
         }
         _ => Err(crate::labyrinth::error::LabyrinthError::internal()),
     }
@@ -237,7 +234,7 @@ async fn write(
             return relay.forward(pool, &sequencer, op, &adm, forwarded).await;
         }
     }
-    exec_write(pool, op, adm, bytes, None).await
+    exec_write(pool, op, adm, bytes).await
 }
 
 pub(super) async fn read(

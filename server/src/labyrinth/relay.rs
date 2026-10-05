@@ -39,8 +39,12 @@ pub enum RelayOp {
     /// Whether a message of the conversation is stored unredacted and
     /// readable by the actor (attachment access on the home DS).
     MessageLive,
-    /// The remote part of `deleteAccountData`.
+    /// The remote part of `deleteAccountData` (from the outbox; the device's
+    /// signed write body is accepted for up to 30 days).
     PurgeAuthor,
+    /// Sequencer → member home DS: the actor's messages were redacted;
+    /// drop references to its attachments (DS-originated, no device).
+    InvalidateMessages,
 }
 
 impl RelayOp {
@@ -55,6 +59,7 @@ impl RelayOp {
             "listThreads" => Self::ListThreads,
             "messageLive" => Self::MessageLive,
             "purgeAuthor" => Self::PurgeAuthor,
+            "invalidateMessages" => Self::InvalidateMessages,
             _ => return Err(LabyrinthError::invalid("unknown relay op")),
         })
     }
@@ -70,6 +75,7 @@ impl RelayOp {
             Self::ListThreads => "listThreads",
             Self::MessageLive => "messageLive",
             Self::PurgeAuthor => "purgeAuthor",
+            Self::InvalidateMessages => "invalidateMessages",
         }
     }
 
@@ -106,7 +112,10 @@ impl RelayOp {
 pub struct RelayRequest {
     pub op: String,
     pub actor_did: String,
-    pub actor_device_id: String,
+    /// The actor's chat device; absent only on DS-originated
+    /// `invalidateMessages`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_device_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -205,6 +214,7 @@ mod tests {
             RelayOp::ListThreads,
             RelayOp::MessageLive,
             RelayOp::PurgeAuthor,
+            RelayOp::InvalidateMessages,
         ] {
             assert_eq!(RelayOp::parse(op.name()).unwrap(), op);
         }

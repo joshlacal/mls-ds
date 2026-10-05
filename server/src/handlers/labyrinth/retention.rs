@@ -1,6 +1,7 @@
 //! Retention endpoints (decisions J1, J2; `crate::labyrinth::repo::retention`):
 //! `purgeMailbox`, `deleteAccountData`, `deleteVirtualDevice` and
 //! `touchVirtualDevice`. Unsend (`redactMessage`) is a thread endpoint.
+//! Every destructive endpoint requires a bound Labyrinth device (finding 6).
 
 use std::sync::Arc;
 
@@ -9,11 +10,11 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::params::{admit_procedure, begin_write};
-use super::relay_client::{Forwarded, Relay};
 use super::respond;
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth;
-use crate::labyrinth::relay::RelayOp;
+use crate::labyrinth::relay::{RelayOp, RelayRequest};
+use crate::labyrinth::repo::outbox;
 use crate::labyrinth::repo::binding;
 use crate::labyrinth::repo::retention as repo;
 use crate::labyrinth::wire::bytes::Bytes as AtBytes;
@@ -96,15 +97,15 @@ pub async fn touch_virtual_device(
     )
 }
 
-/// `deleteAccountData`: first every remote sequencer redacts the DID's
-/// items there (`labyrinthRelay purgeAuthor`, the device's own signed write
-/// re-verified by each), then the local purge commits. A sequencer that
-/// cannot be reached fails the call before anything local changes; a retry
-/// replays the sequencers that already finished.
+/// `deleteAccountData` (finding 4): the local purge and redaction commit
+/// first, in one transaction that also enqueues a durable `purgeAuthor` job
+/// for every remote sequencer of a conversation the account takes or took
+/// part in (departed ones included: they still hold its authored items).
+/// The outbox worker delivers those jobs with retries, so an unreachable DS
+/// neither blocks the deletion nor loses its remote part.
 pub async fn delete_account_data(
     State(pool): Pool,
     State(rt): Runtime,
-    relay: Relay,
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Response {
@@ -112,28 +113,25 @@ pub async fn delete_account_data(
         async {
             let adm = admit_procedure(&pool, &rt, "deleteAccountData", &headers, &bytes).await?;
             let EmptyIn {} = body(&bytes)?;
-            let sequencers = {
-                let mut conn = pool.acquire().await?;
-                let caller =
-                    auth::load_current_device(&mut conn, &adm.did, adm.device_id, false).await?;
-                binding::require_bound(&mut conn, &caller, None).await?;
-                repo::remote_sequencers(&mut conn, &adm.did).await?
-            };
-            for sequencer in &sequencers {
-                let (write_body, write_signature) = auth::write_headers(&headers)?;
-                let forwarded = Forwarded::Write {
-                    payload: &bytes,
-                    write_body,
-                    write_signature,
-                };
-                relay
-                    .forward(&pool, sequencer, RelayOp::PurgeAuthor, &adm, forwarded)
-                    .await?;
-            }
+            let (write_body, write_signature) = auth::write_headers(&headers)?;
             let mut w = begin_write!(&pool, adm);
             let (caller, at) = (w.caller.clone(), w.instant);
             binding::require_bound(&mut w.tx, &caller, None).await?;
             repo::purge_account(&mut w.tx, &caller.did, at).await?;
+            let request = RelayRequest {
+                op: RelayOp::PurgeAuthor.name().to_owned(),
+                actor_did: caller.did.clone(),
+                actor_device_id: Some(caller.device_id.hyphenated().to_string()),
+                query: None,
+                payload: Some(AtBytes(bytes.to_vec())),
+                write_body: Some(write_body),
+                write_signature: Some(write_signature),
+                read_header: None,
+                read_signature: None,
+            };
+            for sequencer in repo::remote_sequencers(&mut w.tx, &caller.did).await? {
+                outbox::enqueue(&mut w.tx, &sequencer, &request, at).await?;
+            }
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,

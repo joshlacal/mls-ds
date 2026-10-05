@@ -321,21 +321,23 @@ pub async fn append_batch(
             "senderTransportPubkey is not the caller's",
         ));
     }
+    // One MEK per id and conversation (finding 8): its author is part of
+    // the batch's identity, so readability joins on (mekId, author).
     let sql = format!(
-        "SELECT count(*), count(*) FILTER (WHERE {}) \
-           FROM labyrinth.meks m WHERE m.conversation_id = $1 AND m.mek_id = $2",
+        "SELECT m.author_did, {} FROM labyrinth.meks m \
+          WHERE m.conversation_id = $1 AND m.mek_id = $2",
         mek_readable("$3")
     );
-    let (known, usable): (i64, i64) = sqlx::query_as(&sql)
+    let mek: Option<(String, bool)> = sqlx::query_as(&sql)
         .bind(conversation_id)
         .bind(&mek_id.0)
         .bind(&caller.did)
-        .fetch_one(&mut *conn)
+        .fetch_optional(&mut *conn)
         .await?;
-    if known == 0 {
+    let Some((mek_author, usable)) = mek else {
         return Err(named(400, "UnknownMek", "no such MEK in the conversation"));
-    }
-    if usable == 0 {
+    };
+    if !usable {
         return Err(named(
             403,
             "NotRecipient",
@@ -349,8 +351,8 @@ pub async fn append_batch(
     sqlx::query(
         "INSERT INTO labyrinth.batches \
            (conversation_id, author_did, rkey, mek_id, writer_device_id, min_ts, max_ts, \
-            record, record_bytes, seq, chat_seq, received_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12)",
+            record, record_bytes, seq, chat_seq, received_at, mek_author_did) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13)",
     )
     .bind(conversation_id)
     .bind(&caller.did)
@@ -364,18 +366,21 @@ pub async fn append_batch(
     .bind(seq)
     .bind(chat_seq)
     .bind(at)
+    .bind(&mek_author)
     .execute(&mut *conn)
     .await?;
     Ok((rkey, order(seq, Some(chat_seq), at)))
 }
 
 /// SQL predicate: batch row `b` is readable by `$reader`: the reader wrote
-/// it, or can read a MEK with its `mekId` (design §3).
+/// it, or can read the MEK it is sealed under, identified by `mekId` **and**
+/// that MEK's author (design §3; finding 8).
 pub(crate) fn batch_readable(param: &str) -> String {
     format!(
         "(b.author_did = {param} OR EXISTS ( \
            SELECT 1 FROM labyrinth.meks m \
-            WHERE m.conversation_id = b.conversation_id AND m.mek_id = b.mek_id AND {}))",
+            WHERE m.conversation_id = b.conversation_id AND m.mek_id = b.mek_id \
+              AND m.author_did = b.mek_author_did AND {}))",
         mek_readable(param)
     )
 }

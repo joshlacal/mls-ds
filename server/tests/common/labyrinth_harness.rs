@@ -35,11 +35,14 @@ use catbird_server::federation::resolver::ValidatedRemoteDestination;
 use catbird_server::federation::{DsResolver, ServiceAuthClient};
 use catbird_server::handlers::chat::ChatRuntime;
 use catbird_server::handlers::labyrinth::labyrinth_router;
+use catbird_server::handlers::labyrinth::relay_client::RelayClient;
 use catbird_server::storage::DbPool;
 
 use crate::common::fresh_db::{fresh_fully_migrated_db, DisposableDatabase};
 
 pub const PREFIX: &str = "blue.catbird.labyrinth.";
+/// The DS redaction signing seed every test process configures.
+pub const REDACTION_SEED: [u8; 32] = [0x5E; 32];
 
 #[derive(Clone)]
 struct TestState {
@@ -100,6 +103,10 @@ fn ensure_runtime_env() {
             URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
         );
         std::env::set_var(
+            "LABYRINTH_REDACTION_SIGNING_KEY",
+            URL_SAFE_NO_PAD.encode(REDACTION_SEED),
+        );
+        std::env::set_var(
             "LABYRINTH_ATTACHMENT_DIGEST_KEY",
             URL_SAFE_NO_PAD.encode([0x3C_u8; 32]),
         );
@@ -131,6 +138,9 @@ pub fn runtime(cutover: bool) -> Arc<ChatRuntime> {
 pub struct Env {
     pub pool: PgPool,
     pub router: Router,
+    /// This DS's federation client (federated envs), for draining the
+    /// Labyrinth relay outbox.
+    pub relay: Option<RelayClient>,
     _db: DisposableDatabase,
 }
 
@@ -202,19 +212,33 @@ impl Env {
                     .unwrap(),
             )
         });
+        let resolver = Arc::new(resolver);
+        let outbound = Arc::new(OutboundClient::new(2, 10));
+        let relay = service_auth
+            .clone()
+            .map(|sa| RelayClient::new(resolver.clone(), outbound.clone(), sa));
         let router = labyrinth_router::<TestState>().with_state(TestState {
             pool: pool.clone(),
             runtime: runtime(cutover),
             blob_store,
-            resolver: Arc::new(resolver),
-            outbound: Arc::new(OutboundClient::new(2, 10)),
+            resolver,
+            outbound,
             service_auth,
         });
         Self {
             pool,
             router,
+            relay,
             _db: db,
         }
+    }
+
+    /// Deliver every due relay-outbox job once.
+    pub async fn drain_outbox(&self) -> catbird_server::handlers::labyrinth::outbox::Drained {
+        let client = self.relay.as_ref().expect("a federated env");
+        catbird_server::handlers::labyrinth::outbox::drain_once(&self.pool, client, 100)
+            .await
+            .expect("outbox pass")
     }
 
     pub async fn now(&self) -> DateTime<Utc> {
@@ -860,12 +884,23 @@ impl Device {
         body: &[u8],
         operation_id: [u8; 16],
     ) -> (String, String) {
+        self.write_headers_at(nsid, body, operation_id, Utc::now())
+    }
+
+    /// [`write_headers`](Self::write_headers) signed at `signed_at`.
+    pub fn write_headers_at(
+        &self,
+        nsid: &str,
+        body: &[u8],
+        operation_id: [u8; 16],
+        signed_at: DateTime<Utc>,
+    ) -> (String, String) {
         let write = json!({
             "operationId": hex::encode(operation_id),
             "actorDeviceId": self.device_id.to_string(),
             "endpointNsid": nsid,
             "payloadSha256": hex::encode(Sha256::digest(body)),
-            "signedAt": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "signedAt": signed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         });
         let write = serde_json::to_vec(&write).unwrap();
         let sig = self

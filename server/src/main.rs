@@ -1347,6 +1347,21 @@ async fn main() -> anyhow::Result<()> {
             db_pool.clone(),
             std::time::Duration::from_secs(3600),
         ));
+        // Durable DS-to-DS jobs: remote account purges and redaction
+        // announcements (review 2, findings 4 and 5).
+        if let Some(service_auth) = app_state.service_auth.clone() {
+            use catbird_server::handlers::labyrinth::{outbox, relay_client::RelayClient};
+            let client = RelayClient::new(
+                app_state.resolver.clone(),
+                app_state.outbound.clone(),
+                service_auth,
+            );
+            tokio::spawn(outbox::worker(
+                db_pool.clone(),
+                client,
+                std::time::Duration::from_secs(15),
+            ));
+        }
         base_router.merge(
             catbird_server::handlers::labyrinth::labyrinth_router::<AppState>()
                 .with_state(app_state.clone()),

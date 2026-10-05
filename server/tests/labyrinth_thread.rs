@@ -78,13 +78,14 @@ async fn mek_writes_check_leaf_sender_and_recipients() {
         )
         .await
         .fails(409, "RecordAlreadyExists");
-    // Another author may use the same mekId (rkey is per author repo).
+    // Another author may not claim the same mekId in the conversation
+    // (review 2, finding 8): one id names one MEK.
     bob.call(
         "createMek",
         &record(transport_mek(thread, MEK1, bob.chat_pub(), &to)),
     )
     .await
-    .ok();
+    .fails(409, "RecordAlreadyExists");
 
     alice
         .call(

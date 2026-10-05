@@ -361,17 +361,13 @@ async fn purge_mailbox_resets_the_account_and_nothing_else() {
 }
 
 #[tokio::test]
-async fn delete_account_data_purges_and_redacts_without_a_signature() {
+async fn delete_account_data_purges_signs_redactions_and_keeps_operations() {
     let env = Env::new().await;
     let (alice, bob, thread) = chat(&env).await;
     alice.enroll([0xA0; 32]).await;
-    alice
-        .call(
-            "appendOwnerBatch",
-            &json!({ "record": owner_batch_record("t", &[1]) }),
-        )
-        .await
-        .ok();
+    let owner_batch = json!({ "record": owner_batch_record("t", &[1]) });
+    let before = alice.call_op("appendOwnerBatch", &owner_batch, [0x0B; 16]).await;
+    before.ok();
 
     alice.call("deleteAccountData", &json!({})).await.ok();
     for (table, column) in MAILBOX_TABLES {
@@ -381,24 +377,48 @@ async fn delete_account_data_purges_and_redacts_without_a_signature() {
             "{table} purged"
         );
     }
-    // Only deleteAccountData's own idempotency record remains.
-    assert_eq!(count(&env, "operations", "owner_did", &alice.did).await, 1);
+    // Finding 10: idempotency records survive the deletion, so a replayed
+    // pre-deletion write answers from its record and writes nothing.
+    let ops = count(&env, "operations", "owner_did", &alice.did).await;
+    assert!(ops >= 5, "operations kept: {ops}");
+    let replay = alice.call_op("appendOwnerBatch", &owner_batch, [0x0B; 16]).await;
+    assert_eq!(replay.bytes, before.bytes);
+    assert_eq!(count(&env, "owner_batches", "owner_did", &alice.did).await, 0);
     // The MEK stays: bob's batch is sealed under it.
     assert_eq!(count(&env, "meks", "author_did", &alice.did).await, 1);
+    // Finding 7: each account-deletion redaction names this DS and the
+    // reason, and is signed by the DS redaction key over the agreed message.
+    let by = catbird_server::identity::service_did();
+    let ds_key = ed25519_dalek::SigningKey::from_bytes(&REDACTION_SEED).verifying_key();
+    let mut seen = 0;
     for (author, item) in items(&bob, thread).await {
         if author == alice.did {
             assert_eq!(item["signedEncMessage"], json!({ "$bytes": "" }));
-            let r = item["redaction"].as_object().unwrap();
-            assert_eq!(r.len(), 1, "account-deletion redactions carry no signature");
-            assert!(r.contains_key("redactedAt"));
+            let r = &item["redaction"];
+            assert!(r.get("transportPubkey").is_none());
+            assert_eq!(r["by"], json!(by));
+            assert_eq!(r["reason"], "accountDeleted");
+            let message = catbird_server::labyrinth::ds_sign::message(
+                &by,
+                &alice.did,
+                item["messageId"].as_str().unwrap(),
+                r["redactedAt"].as_str().unwrap(),
+                &thread.to_string(),
+            );
+            let sig: [u8; 64] = unb(&r["sig"]).try_into().unwrap();
+            ds_key
+                .verify_strict(message.as_bytes(), &ed25519_dalek::Signature::from_bytes(&sig))
+                .expect("DS redaction signature verifies");
+            seen += 1;
         } else {
             assert_eq!(unb(&item["signedEncMessage"]).len(), 96, "bob's items stay");
             assert!(item.get("redaction").is_none());
         }
     }
+    assert_eq!(seen, 2);
 
-    // A participant of a conversation sequenced elsewhere must reach that
-    // sequencer too.
+    // Finding 4: a conversation sequenced elsewhere does not block the
+    // deletion; its purge is queued durably for that sequencer.
     let carol = env.account().await;
     let remote = seed_conversation(&env, &[leaf(&carol)], 2).await;
     make_remote(&env, remote).await;
@@ -407,10 +427,19 @@ async fn delete_account_data_purges_and_redacts_without_a_signature() {
         .await
         .fails(403, "LabyrinthDeviceNotBound");
     carol.enroll([0xC0; 32]).await;
-    carol
-        .call("deleteAccountData", &json!({}))
-        .await
-        .fails(503, "RelayUnavailable");
+    carol.call("deleteAccountData", &json!({})).await.ok();
+    assert_eq!(count(&env, "devices", "owner_did", &carol.did).await, 0);
+    let queued: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT op, status, request->>'actorDid' FROM labyrinth.relay_outbox",
+    )
+    .fetch_all(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(
+        queued[0],
+        ("purgeAuthor".to_owned(), "pending".to_owned(), carol.did.clone())
+    );
 }
 
 fn vdevice(id: u8, mechanism: &str) -> Value {

@@ -5,9 +5,11 @@
 pub mod attachments;
 pub mod binding;
 pub mod directory;
+pub mod liveness;
 pub mod lookup;
 pub mod mailbox;
 pub mod orf;
+pub mod outbox;
 pub mod retention;
 pub mod thread;
 
@@ -114,6 +116,15 @@ pub fn stored_json(text: &str) -> LabyrinthResult<serde_json::Value> {
 pub async fn advisory_lock(conn: &mut PgConnection, key: &str) -> LabyrinthResult<()> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(key)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Open the transaction-bound retention scope (migration `20261004100006`):
+/// every DELETE of a labyrinth row must run inside it.
+pub async fn open_retention_scope(conn: &mut PgConnection) -> LabyrinthResult<()> {
+    sqlx::query("SELECT labyrinth.open_retention_scope()")
         .execute(&mut *conn)
         .await?;
     Ok(())

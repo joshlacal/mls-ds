@@ -85,6 +85,19 @@ pub fn message(key: &[u8; 32], thread_id: &str, message_id: &str) -> [u8; 32] {
     )
 }
 
+/// Digest of the ORF state (owner, Labyrinth device key) a reference was
+/// created through, so deleting that state can release its references.
+pub fn orf_state(key: &[u8; 32], owner_did: &str, device_key: &[u8; 32]) -> [u8; 32] {
+    hmac(
+        key,
+        &[
+            b"catbird.labyrinth.attachment_orf_state",
+            owner_did.as_bytes(),
+            device_key,
+        ],
+    )
+}
+
 /// The access token MAC: `HMAC(salt, json([threadId, messageId]))`.
 pub fn token_mac(salt: &[u8; 32], thread_id: &str, message_id: &str) -> [u8; 32] {
     let json = serde_json::to_vec(&[thread_id, message_id]).expect("strings serialize");

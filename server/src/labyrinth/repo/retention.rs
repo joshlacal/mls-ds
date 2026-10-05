@@ -13,6 +13,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::attachments;
+use crate::labyrinth::ds_sign;
 use crate::labyrinth::auth::Caller;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
 use crate::labyrinth::wire::bytes::{check_str, Bytes};
@@ -90,7 +91,9 @@ pub async fn redact_message(
         at,
     )
     .await?;
-    attachments::invalidate_messages(conn, thread_id, &[message_id.to_owned()]).await?;
+    let ids = [message_id.to_owned()];
+    attachments::invalidate_messages(conn, thread_id, &caller.did, &ids, at).await?;
+    super::outbox::announce_redaction(conn, conversation, &caller.did, &ids, at).await?;
     Ok(redacted)
 }
 
@@ -114,27 +117,34 @@ async fn redact(
 }
 
 /// Redact every item `author` wrote in conversations this DS sequences
-/// (account deletion; the redaction carries no signature). With `home_ds`
-/// (a relayed `purgeAuthor`), only conversations where that DS is the
-/// author's home DS (its latest participant period's `ds_did`). Returns the
-/// number of items redacted.
+/// that it received at or before `received_by` (account deletion). Each
+/// message's redaction is server-signed (`ds_sign`, finding 7). With
+/// `home_ds` (a relayed `purgeAuthor`), only conversations where that DS is
+/// the author's home DS (its latest participant period's `ds_did`). The
+/// redacted messages' attachment references are dropped here and announced
+/// to the other members' home DSes. Returns the number of items redacted.
 pub async fn redact_author(
     conn: &mut PgConnection,
     author: &str,
     home_ds: Option<&str>,
+    received_by: DateTime<Utc>,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<i64> {
     let threads: Vec<(Uuid, Vec<String>, Option<String>)> = sqlx::query_as(
-        "SELECT bi.conversation_id, array_agg(DISTINCT bi.message_id), \
+        "SELECT bi.conversation_id, array_agg(DISTINCT bi.message_id ORDER BY bi.message_id), \
                 (SELECT p.ds_did FROM chat.participants p \
                   WHERE p.conversation_id = bi.conversation_id AND p.user_did = $1 \
                   ORDER BY p.created_at DESC, p.participant_period_id DESC LIMIT 1) \
            FROM labyrinth.batch_items bi \
+           JOIN labyrinth.batches b ON b.conversation_id = bi.conversation_id \
+            AND b.author_did = bi.author_did AND b.rkey = bi.rkey \
            JOIN chat.conversations c ON c.conversation_id = bi.conversation_id \
           WHERE bi.author_did = $1 AND bi.redacted_at IS NULL AND NOT c.is_remote \
+            AND b.received_at <= $2 \
           GROUP BY bi.conversation_id",
     )
     .bind(author)
+    .bind(received_by)
     .fetch_all(&mut *conn)
     .await?;
     let mut total = 0;
@@ -144,8 +154,13 @@ pub async fn redact_author(
                 continue;
             }
         }
-        total += redact(conn, conversation, author, None, serde_json::json!({}), at).await?;
-        attachments::invalidate_messages(conn, &conversation.to_string(), &messages).await?;
+        let thread_id = conversation.to_string();
+        for message in &messages {
+            let marker = ds_sign::marker(author, &thread_id, message, at);
+            total += redact(conn, conversation, author, Some(&[message.clone()]), marker, at).await?;
+        }
+        attachments::invalidate_messages(conn, &thread_id, author, &messages, at).await?;
+        super::outbox::announce_redaction(conn, conversation, author, &messages, at).await?;
     }
     Ok(total)
 }
@@ -161,20 +176,17 @@ pub async fn purge_mailbox(conn: &mut PgConnection, did: &str) -> LabyrinthResul
     Ok(())
 }
 
-/// The local part of `deleteAccountData`: purge the mailbox, redact every
-/// item the DID authored here, and drop its idempotency records.
+/// The local part of `deleteAccountData`: purge the mailbox and redact every
+/// item the DID authored here. Idempotency records are **kept** (finding
+/// 10): a replay of an operation completed before the deletion must replay
+/// its stored response, not run again; the 7-day operation GC removes them.
 pub async fn purge_account(
     conn: &mut PgConnection,
     did: &str,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<i64> {
     purge_mailbox(conn, did).await?;
-    let redacted = redact_author(conn, did, None, at).await?;
-    sqlx::query("SELECT labyrinth.purge_operations($1)")
-        .bind(did)
-        .execute(&mut *conn)
-        .await?;
-    Ok(redacted)
+    redact_author(conn, did, None, at, at).await
 }
 
 /// `did`'s home DS in a conversation, per this DS's participant rows (its
@@ -257,10 +269,13 @@ pub async fn touch_virtual_device(
 pub struct GcCounts {
     pub virtual_devices: i64,
     pub operations: i64,
+    /// Attachment references released because their ORF state was deleted.
+    pub released_refs: i64,
 }
 
 /// One retention pass at `now`: expire idle keychain/passkey bundles and
-/// old idempotency records, `batch` rows of each at most.
+/// old idempotency records, and release the attachment references of
+/// deleted ORF states, `batch` rows of each at most.
 pub async fn run_gc(pool: &DbPool, now: DateTime<Utc>, batch: i32) -> LabyrinthResult<GcCounts> {
     let mut tx = pool.begin().await?;
     let virtual_devices: i32 =
@@ -277,9 +292,13 @@ pub async fn run_gc(pool: &DbPool, now: DateTime<Utc>, batch: i32) -> LabyrinthR
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
+    let mut tx = pool.begin().await?;
+    let released_refs = attachments::release_deleted_states(&mut tx, i64::from(batch)).await?;
+    tx.commit().await?;
     Ok(GcCounts {
         virtual_devices: i64::from(virtual_devices),
         operations: i64::from(operations),
+        released_refs: released_refs as i64,
     })
 }
 

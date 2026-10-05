@@ -380,6 +380,12 @@ pub struct Redaction {
     pub sig: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redacted_at: Option<String>,
+    /// Server redactions (account deletion, finding 7): the redacting DS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    /// Server redactions: why (`accountDeleted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// `defs#sealedMessage`.

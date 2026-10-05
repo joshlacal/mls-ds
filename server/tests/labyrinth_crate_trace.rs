@@ -29,6 +29,7 @@ use harness::*;
 use serde_json::Value;
 use uuid::Uuid;
 
+const SERVER_REDACTION_FIELDS: &[&str] = &["by", "reason", "sig"];
 const VOLATILE: &[&str] = &["epochId", "receivedAt", "lastUsedAt", "redactedAt", "keyId"];
 
 fn is_tid(v: &Value) -> bool {
@@ -63,6 +64,14 @@ fn compare(path: &str, got: &Value, want: &Value, diffs: &mut Vec<String>) {
                             compare(&p, gv, wv, diffs);
                         }
                     }
+                    // Server-signed account-deletion markers (review 2,
+                    // finding 7) postdate the recorded reference; until the
+                    // trace is re-recorded they are the only extra keys a
+                    // transport-key-less redaction may carry.
+                    (Some(_), None)
+                        if path.ends_with("/redaction")
+                            && !w.contains_key("transportPubkey")
+                            && SERVER_REDACTION_FIELDS.contains(&k.as_str()) => {}
                     (gv, wv) => diffs.push(format!("{p}: mls-ds {gv:?} vs reference {wv:?}")),
                 }
             }

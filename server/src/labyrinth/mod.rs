@@ -20,9 +20,11 @@
 
 pub mod auth;
 pub mod digest;
+pub mod ds_sign;
 pub mod error;
 pub mod heads;
 pub mod orf;
+pub mod purge_auth;
 pub mod read_auth;
 pub mod relay;
 pub mod repo;

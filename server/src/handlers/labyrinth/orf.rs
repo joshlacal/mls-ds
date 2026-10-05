@@ -22,6 +22,7 @@ use crate::labyrinth::auth::begin_read;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
 use crate::labyrinth::relay::RelayOp;
 use crate::labyrinth::repo::attachments::{self, Blinded, MessageRef};
+use crate::labyrinth::repo::liveness;
 use crate::labyrinth::repo::binding;
 use crate::labyrinth::repo::orf as repo;
 use crate::labyrinth::wire::bytes::hex_array;
@@ -216,26 +217,29 @@ pub async fn get_attachment_blob(
         let caller = r.caller.clone();
         let object = attachments::authorize(&mut r.tx, &caller, &blinded, &msg).await?;
         r.finish_read().await?;
-        if let Some(sequencer) = &object.pending_remote {
-            // Sender copies of a remote conversation live on its sequencer.
+        if let Some(check) = &object.pending_remote {
+            // Another author's message lives on the sequencer; even the
+            // author's own archive copy only counts if it was not unsent.
             let query = url::form_urlencoded::Serializer::new(String::new())
                 .append_pair("threadId", &msg.thread_id)
                 .append_pair("messageId", &msg.message_id)
+                .append_pair("author", &check.author)
                 .finish();
             let reply = relay
                 .forward(
                     &pool,
-                    sequencer,
+                    &check.sequencer,
                     RelayOp::MessageLive,
                     &adm,
                     Forwarded::Read { query: &query },
                 )
                 .await?;
-            let live = serde_json::from_slice::<serde_json::Value>(&reply)
-                .ok()
-                .and_then(|v| v["live"].as_bool())
-                .ok_or_else(LabyrinthError::relay_unavailable)?;
-            if !live {
+            let state = serde_json::from_slice::<serde_json::Value>(&reply).ok();
+            let flag = |k: &str| state.as_ref().and_then(|v| v[k].as_bool());
+            let (Some(live), Some(redacted)) = (flag("live"), flag("redacted")) else {
+                return Err(LabyrinthError::relay_unavailable());
+            };
+            if !liveness::decide(live, redacted, check.own_copy) {
                 return Err(LabyrinthError::not_found("NotFound"));
             }
         }

@@ -490,9 +490,20 @@ async fn stored_rows_are_immutable() {
         .execute(&env.pool)
         .await
         .is_err());
-    // ORF states are the one deletable row (revocation).
-    sqlx::query("DELETE FROM labyrinth.orf_states")
+    // ORF states (and attachment references) are deletable, but only inside
+    // the retention scope like every other row (review 2, finding 11).
+    assert!(sqlx::query("DELETE FROM labyrinth.orf_states")
         .execute(&env.pool)
         .await
+        .is_err());
+    let mut tx = env.pool.begin().await.unwrap();
+    sqlx::query("SELECT labyrinth.open_retention_scope()")
+        .execute(&mut *tx)
+        .await
         .unwrap();
+    sqlx::query("DELETE FROM labyrinth.orf_states")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }

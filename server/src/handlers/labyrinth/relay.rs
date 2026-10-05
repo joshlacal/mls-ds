@@ -26,7 +26,7 @@ fn peer_refused(error: crate::federation::FederationError) -> LabyrinthError {
 
 /// The conversation must be sequenced here and the peer must be the actor's
 /// home DS in it.
-async fn require_home(
+pub(super) async fn require_home(
     pool: &DbPool,
     conversation: uuid::Uuid,
     actor: &str,
@@ -67,6 +67,15 @@ async fn relay(
     let req: RelayRequest = body(bytes)?;
     let op = RelayOp::parse(&req.op)?;
     check_did("actorDid", &req.actor_did)?;
+    match op {
+        RelayOp::InvalidateMessages => return super::relay_jobs::invalidate(pool, &req, &requester).await,
+        RelayOp::PurgeAuthor => return super::relay_jobs::purge_author(pool, &req, &requester).await,
+        _ => {}
+    }
+    let actor_device_id = req
+        .actor_device_id
+        .clone()
+        .ok_or_else(|| LabyrinthError::invalid("actorDeviceId is required"))?;
     if op.is_write() {
         let (Some(payload), Some(write_body), Some(write_signature), None) = (
             &req.payload,
@@ -87,17 +96,15 @@ async fn relay(
             &payload.0,
         )
         .await?;
-        if adm.device_id.hyphenated().to_string() != req.actor_device_id {
+        if adm.device_id.hyphenated().to_string() != actor_device_id {
             return Err(LabyrinthError::invalid(
                 "actorDeviceId differs from the signed write body",
             ));
         }
-        if op != RelayOp::PurgeAuthor {
-            let thread = write_thread(op, &payload.0)
-                .ok_or_else(|| LabyrinthError::invalid("the payload names no conversation"))?;
-            require_home(pool, thread, &req.actor_did, &requester).await?;
-        }
-        exec_write(pool, op, adm, &payload.0, Some(&requester)).await
+        let thread = write_thread(op, &payload.0)
+            .ok_or_else(|| LabyrinthError::invalid("the payload names no conversation"))?;
+        require_home(pool, thread, &req.actor_did, &requester).await?;
+        exec_write(pool, op, adm, &payload.0).await
     } else {
         let (Some(query), None, None, None, Some(header), Some(signature)) = (
             &req.query,
@@ -122,7 +129,7 @@ async fn relay(
             query: (op != RelayOp::MessageLive).then_some(canonical.as_str()),
         };
         let proof = ReadProof { header, signature };
-        let (adm, claim) = relayed_read(pool, proof, expected, &req.actor_device_id).await?;
+        let (adm, claim) = relayed_read(pool, proof, expected, &actor_device_id).await?;
         if op == RelayOp::MessageLive {
             let signed = super::params::Params::parse_any(&claim.query);
             for key in ["threadId", "messageId"] {

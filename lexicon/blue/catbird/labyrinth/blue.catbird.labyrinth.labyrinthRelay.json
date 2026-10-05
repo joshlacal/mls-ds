@@ -4,15 +4,14 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Server-to-server only (design Y3). A device's home DS uses this to forward a Labyrinth thread operation for a conversation that the receiving DS sequences. Authentication is standard DS service auth: iss is the home DS, aud is the sequencer, lxm is this NSID, under the federation peer policy. The receiver requires three things: the requesting DS is the actor's home DS in the conversation's participant rows, the actor's chat device is current in its replicated device table, and, for writes, the device's labyrinthWriteBody signature over the forwarded payload re-verifies. The output and errors are exactly those of the relayed endpoint.",
+      "description": "Server-to-server only (design Y3). A device's home DS uses this to forward a Labyrinth thread operation for a conversation that the receiving DS sequences. Authentication is standard DS service auth: iss is the home DS, aud is the sequencer, lxm is this NSID, under the federation peer policy. The receiver requires three things: the requesting DS is the actor's home DS in the conversation's participant rows, the actor's chat device is current in its replicated device table, for writes, the device's labyrinthWriteBody signature over the forwarded payload re-verifies, and for reads the device's signed read claim (readHeader/readSignature) re-verifies. The output and errors are exactly those of the relayed endpoint.",
       "input": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
           "required": [
             "op",
-            "actorDid",
-            "actorDeviceId"
+            "actorDid"
           ],
           "properties": {
             "op": {
@@ -27,9 +26,10 @@
                 "listThreads",
                 "redactMessage",
                 "messageLive",
-                "purgeAuthor"
+                "purgeAuthor",
+                "invalidateMessages"
               ],
-              "description": "The relayed operation. messageLive answers whether a message of the conversation is stored unredacted and readable by the actor; it gates attachment access. purgeAuthor redacts every item the actor authored in conversations the receiver sequences; it is the remote part of deleteAccountData. Both exist only on the relay. listThreads carries no threadId: the receiver lists only conversations it sequences in which the requesting DS is the actor's home DS."
+              "description": "The relayed operation. messageLive (query threadId, messageId, author) answers {live, redacted}: whether author's sender item for the message is stored unredacted and readable by the actor, and whether any of them was redacted; it gates attachment access and is authorized by the device's signed getAttachmentBlob read. purgeAuthor redacts every item the actor authored in conversations the receiver sequences, received before the signed write body's signedAt + 5 minutes; it is the remote part of deleteAccountData, delivered from the home DS's durable outbox, and the receiver accepts that signed body for 30 days under a key of the device that was current at signedAt. invalidateMessages (sequencer to member home DS, DS-originated, no actorDeviceId; payload {threadId, messageIds}) announces that actorDid's messages were redacted so the receiver drops references to that author's attachments and refuses new ones; the receiver requires the requesting DS to be the conversation's sequencer. listThreads carries no threadId: the receiver lists only conversations it sequences in which the requesting DS is the actor's home DS."
             },
             "actorDid": {
               "type": "string",
@@ -38,7 +38,7 @@
             "actorDeviceId": {
               "type": "string",
               "maxLength": 36,
-              "description": "The actor's chat device (canonical UUIDv4)."
+              "description": "The actor's chat device (canonical UUIDv4). Required for every op except invalidateMessages."
             },
             "query": {
               "type": "string",
@@ -59,6 +59,16 @@
               "type": "string",
               "maxLength": 128,
               "description": "Writes: the catbird-labyrinth-write-signature header value."
+            },
+            "readHeader": {
+              "type": "string",
+              "maxLength": 8192,
+              "description": "Reads: the device's catbird-labyrinth-read header value, re-verified by the receiver."
+            },
+            "readSignature": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "Reads: the device's catbird-labyrinth-read-signature header value."
             }
           }
         }
@@ -73,6 +83,9 @@
         },
         {
           "name": "NotSequencer"
+        },
+        {
+          "name": "InvalidSignature"
         }
       ]
     }
