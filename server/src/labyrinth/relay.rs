@@ -33,6 +33,9 @@ pub enum RelayOp {
     RedactMessage,
     FindMeks,
     ListBatches,
+    GetMessages,
+    /// The conversations sequenced there that list the actor (no threadId).
+    ListThreads,
     /// Whether a message of the conversation is stored unredacted and
     /// readable by the actor (attachment access on the home DS).
     MessageLive,
@@ -48,6 +51,8 @@ impl RelayOp {
             "redactMessage" => Self::RedactMessage,
             "findMeks" => Self::FindMeks,
             "listBatches" => Self::ListBatches,
+            "getMessages" => Self::GetMessages,
+            "listThreads" => Self::ListThreads,
             "messageLive" => Self::MessageLive,
             "purgeAuthor" => Self::PurgeAuthor,
             _ => return Err(LabyrinthError::invalid("unknown relay op")),
@@ -61,6 +66,8 @@ impl RelayOp {
             Self::RedactMessage => "redactMessage",
             Self::FindMeks => "findMeks",
             Self::ListBatches => "listBatches",
+            Self::GetMessages => "getMessages",
+            Self::ListThreads => "listThreads",
             Self::MessageLive => "messageLive",
             Self::PurgeAuthor => "purgeAuthor",
         }
@@ -179,6 +186,8 @@ mod tests {
             RelayOp::RedactMessage,
             RelayOp::FindMeks,
             RelayOp::ListBatches,
+            RelayOp::GetMessages,
+            RelayOp::ListThreads,
             RelayOp::MessageLive,
             RelayOp::PurgeAuthor,
         ] {

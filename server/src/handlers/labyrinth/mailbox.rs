@@ -398,7 +398,9 @@ pub async fn list_owner_batches(
                 "listOwnerBatches",
                 &headers,
                 q.as_deref(),
-                &["threadId", "fromMs", "untilMs", "cursor", "limit"],
+                &[
+                    "threadId", "fromMs", "untilMs", "since", "until", "reverse", "cursor", "limit",
+                ],
             )
             .await?;
             let thread_id = p.req("threadId")?.to_owned();

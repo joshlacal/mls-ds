@@ -107,10 +107,15 @@ async fn relay(
             return Err(LabyrinthError::invalid("a relayed read carries query only"));
         };
         let p = super::params::Params::parse(Some(query), read_params(op))?;
+        let adm = relayed_read(&req.actor_did, &req.actor_device_id)?;
+        if op == RelayOp::ListThreads {
+            // Filtered in SQL to the conversations sequenced here in which
+            // the requester is the actor's home DS.
+            return exec_read(pool, op, adm, Some(query), Some(&requester)).await;
+        }
         let thread = parse_thread_id(p.req("threadId")?)?;
         require_home(pool, thread, &req.actor_did, &requester).await?;
-        let adm = relayed_read(&req.actor_did, &req.actor_device_id)?;
-        exec_read(pool, op, adm, Some(query)).await
+        exec_read(pool, op, adm, Some(query), None).await
     }
 }
 

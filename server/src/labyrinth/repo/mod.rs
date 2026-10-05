@@ -5,6 +5,7 @@
 pub mod attachments;
 pub mod binding;
 pub mod directory;
+pub mod lookup;
 pub mod mailbox;
 pub mod orf;
 pub mod retention;
@@ -19,11 +20,13 @@ use super::wire::io::{datetime, ServerOrder};
 /// Most items any list returns per page (design §2).
 pub const MAX_PAGE: i64 = 100;
 
-/// A page request: an opaque cursor and a 1..=100 limit.
+/// A page request: an opaque cursor, a 1..=100 limit and, for
+/// `seq`-ordered lists, the direction (`reverse` = newest first).
 #[derive(Clone, Debug, Default)]
 pub struct PageReq {
     pub cursor: Option<String>,
     pub limit: Option<i64>,
+    pub reverse: bool,
 }
 
 impl PageReq {
@@ -42,13 +45,45 @@ impl PageReq {
                 .ok_or_else(|| LabyrinthError::invalid("cursor is not valid")),
         }
     }
+
+    /// The `seq` bound of this page in direction order: rows strictly after
+    /// it are `<seq column> {seq_cmp} bound`. A reverse page with no cursor
+    /// starts above every seq.
+    pub fn seq_bound(&self) -> LabyrinthResult<i64> {
+        match (self.reverse, &self.cursor) {
+            (true, None) => Ok(i64::MAX),
+            _ => self.seq_cursor(),
+        }
+    }
+
+    /// The comparison that keeps rows after [`seq_bound`](Self::seq_bound).
+    pub fn seq_cmp(&self) -> &'static str {
+        if self.reverse {
+            "<"
+        } else {
+            ">"
+        }
+    }
+
+    /// The `ORDER BY` direction.
+    pub fn seq_dir(&self) -> &'static str {
+        if self.reverse {
+            "DESC"
+        } else {
+            "ASC"
+        }
+    }
 }
 
-/// `TimeRange` of the list queries: items with `from <= ts < until`.
+/// `TimeRange` of the list queries: items with `from <= ts < until` by the
+/// sender's timestamp, and records the server received in
+/// `since <= receivedAt < until` (the server clock, `serverOrder`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TimeRange {
     pub from_ms: Option<i64>,
     pub until_ms: Option<i64>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
 }
 
 impl TimeRange {

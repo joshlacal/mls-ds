@@ -23,6 +23,7 @@ use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth::{self, begin_read, Admission};
 use crate::labyrinth::error::LabyrinthResult;
 use crate::labyrinth::relay::RelayOp;
+use crate::labyrinth::repo::lookup;
 use crate::labyrinth::repo::retention::{self, RedactionIn};
 use crate::labyrinth::repo::thread::{self as repo, parse_thread_id, AuthoredRow};
 use crate::labyrinth::wire::bytes::{check_did, check_str, hex_array};
@@ -54,7 +55,12 @@ struct RedactMessageIn {
 pub(super) fn read_params(op: RelayOp) -> &'static [&'static str] {
     match op {
         RelayOp::FindMeks => &["threadId", "mekId", "cursor", "limit"],
-        RelayOp::ListBatches => &["threadId", "sender", "fromMs", "untilMs", "cursor", "limit"],
+        RelayOp::ListBatches => &[
+            "threadId", "sender", "fromMs", "untilMs", "since", "until", "reverse", "cursor",
+            "limit",
+        ],
+        RelayOp::GetMessages => &["threadId", "messageIds", "cursor", "limit"],
+        RelayOp::ListThreads => &["cursor", "limit"],
         RelayOp::MessageLive => &["threadId", "messageId"],
         _ => &[],
     }
@@ -113,21 +119,39 @@ pub(super) async fn exec_write(
             retention::redact_author(&mut w.tx, &caller.did, Some(home), at).await?;
             json!({})
         }
-        RelayOp::FindMeks | RelayOp::ListBatches | RelayOp::MessageLive => {
-            return Err(crate::labyrinth::error::LabyrinthError::internal())
-        }
+        RelayOp::FindMeks
+        | RelayOp::ListBatches
+        | RelayOp::GetMessages
+        | RelayOp::ListThreads
+        | RelayOp::MessageLive => return Err(crate::labyrinth::error::LabyrinthError::internal()),
     };
     w.finish_write(to_bytes(&response)?).await
 }
 
-/// Run a thread read on this DS.
+/// Run a thread read on this DS. `home_ds` is the requesting DS of a
+/// relayed `listThreads` (see `lookup::list_threads`).
 pub(super) async fn exec_read(
     pool: &DbPool,
     op: RelayOp,
     adm: Admission,
     query: Option<&str>,
+    home_ds: Option<&str>,
 ) -> LabyrinthResult<Vec<u8>> {
     let p = Params::parse(query, read_params(op))?;
+    if op == RelayOp::ListThreads {
+        let page = p.page()?;
+        let mut r = begin_read(pool, adm).await?;
+        let ids = lookup::list_threads(
+            &mut r.tx,
+            &r.caller.did,
+            lookup::thread_cursor(&page)?,
+            home_ds,
+            page.limit() + 1,
+        )
+        .await?;
+        r.finish_read().await?;
+        return super::lookup::threads_page(vec![ids], false, page.limit());
+    }
     let thread = parse_thread_id(p.req("threadId")?)?;
     match op {
         RelayOp::FindMeks => {
@@ -158,6 +182,18 @@ pub(super) async fn exec_read(
                 &page,
             )
             .await?;
+            r.finish_read().await?;
+            to_bytes(&Page {
+                items: authored(rows),
+                cursor,
+            })
+        }
+        RelayOp::GetMessages => {
+            let ids = super::lookup::message_ids(&p)?;
+            let page = p.page()?;
+            let mut r = begin_read(pool, adm).await?;
+            let (rows, cursor) =
+                lookup::get_messages(&mut r.tx, &r.caller.did, thread, ids, &page).await?;
             r.finish_read().await?;
             to_bytes(&Page {
                 items: authored(rows),
@@ -204,7 +240,7 @@ async fn write(
     exec_write(pool, op, adm, bytes, None).await
 }
 
-async fn read(
+pub(super) async fn read(
     pool: &DbPool,
     rt: &ChatRuntime,
     relay: &Relay,
@@ -224,7 +260,7 @@ async fn read(
         };
         return relay.forward(pool, &sequencer, op, &adm, forwarded).await;
     }
-    exec_read(pool, op, adm, query).await
+    exec_read(pool, op, adm, query, None).await
 }
 
 pub async fn create_mek(

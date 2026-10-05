@@ -433,3 +433,97 @@ async fn attachment_existence_and_account_deletion_reach_the_sequencer() {
     }
     assert_eq!(rows(&w.home, "orf_states").await, 0, "home mailbox purged");
 }
+
+#[tokio::test]
+async fn lookups_of_remote_conversations_reach_the_sequencer() {
+    let w = world(None).await;
+    let to = [w.alice.did.as_str(), w.bob.did.as_str()];
+    let mek = |sender: &Device, id| json!({ "record": transport_mek(w.thread, id, sender.chat_pub(), &to) });
+    w.alice.call("createMek", &mek(&w.alice, MEK_A)).await.ok();
+    w.alice
+        .call(
+            "appendBatch",
+            &batch(w.thread, &w.alice, MEK_A, &["a1", "a2"]),
+        )
+        .await
+        .ok();
+    w.bob
+        .call("appendBatch", &batch(w.thread, &w.bob, MEK_A, &["b1"]))
+        .await
+        .ok();
+
+    // getMessages: relayed, identical to a direct read on the sequencer.
+    let params = [
+        ("threadId", w.thread.to_string()),
+        ("messageIds", "a2".to_owned()),
+        ("messageIds", "b1".to_owned()),
+    ];
+    let via_relay = w.alice.query("getMessages", &params).await;
+    let direct = w.alice_on_seq.query("getMessages", &params).await;
+    assert_eq!(via_relay.ok()["items"].as_array().unwrap().len(), 2);
+    assert_eq!(via_relay.json, direct.json);
+    // Newest-first listBatches through the relay.
+    let newest = w
+        .alice
+        .query(
+            "listBatches",
+            &[
+                ("threadId", w.thread.to_string()),
+                ("reverse", "true".into()),
+            ],
+        )
+        .await;
+    let seqs: Vec<i64> = newest.ok()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["order"]["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seqs, vec![3, 2]);
+
+    // listThreads merges the home DS's own conversations with the
+    // sequencer's. A sequencer conversation in which the home DS is not
+    // alice's home DS is not listed through the relay.
+    let carol = w.home.account().await;
+    let leaf = |device| Leaf {
+        device,
+        joined_seq: 1,
+        removed_seq: None,
+    };
+    let local = seed_conversation(&w.home, &[leaf(&w.alice), leaf(&carol)], 2).await;
+    w.alice
+        .call(
+            "createMek",
+            &json!({ "record": transport_mek(local, MEK_B, w.alice.chat_pub(), &[&carol.did]) }),
+        )
+        .await
+        .ok();
+    let elsewhere = seed_conversation(&w.seq, &[leaf(&w.alice_on_seq), leaf(&w.bob)], 2).await;
+    w.bob
+        .call("createMek", &json!({ "record": transport_mek(elsewhere, MEK_B, w.bob.chat_pub(), &[&w.alice.did]) }))
+        .await
+        .ok();
+    let ids = |reply: &Reply| -> Vec<String> {
+        reply.ok()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["threadId"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let mut expected = [w.thread, local];
+    expected.sort();
+    let expected: Vec<String> = expected.iter().map(Uuid::to_string).collect();
+    assert_eq!(ids(&w.alice.query("listThreads", &[]).await), expected);
+    let first = w.alice.query("listThreads", &[("limit", "1".into())]).await;
+    assert_eq!(ids(&first), expected[..1]);
+    let cursor = first.json["cursor"].as_str().unwrap().to_owned();
+    let rest = w.alice.query("listThreads", &[("cursor", cursor)]).await;
+    assert_eq!(ids(&rest), expected[1..]);
+    assert!(rest.json.get("cursor").is_none());
+    // Bob, homed on the sequencer, lists both of his there directly.
+    let mut bobs = [w.thread, elsewhere];
+    bobs.sort();
+    let bobs: Vec<String> = bobs.iter().map(Uuid::to_string).collect();
+    assert_eq!(ids(&w.bob.query("listThreads", &[]).await), bobs);
+}

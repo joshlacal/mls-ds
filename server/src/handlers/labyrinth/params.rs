@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use axum::http::HeaderMap;
+use chrono::{DateTime, Utc};
 
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth::{self, Admission};
@@ -13,26 +14,56 @@ use crate::storage::DbPool;
 
 use super::NSID_PREFIX;
 
-/// Strict query parameters: each at most once, only the declared names
-/// (plus `actorDeviceId`, consumed by admission).
-pub struct Params(BTreeMap<String, String>);
+/// Array parameters: repeated keys (`messageIds=a&messageIds=b`).
+const ARRAY_PARAMS: &[&str] = &["messageIds"];
+
+/// Strict query parameters: only the declared names (plus `actorDeviceId`,
+/// consumed by admission), each at most once unless it is an array.
+pub struct Params(BTreeMap<String, Vec<String>>);
 
 impl Params {
     pub fn parse(query: Option<&str>, allowed: &[&str]) -> LabyrinthResult<Self> {
-        let mut map = BTreeMap::new();
+        let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (k, v) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
             if k != "actorDeviceId" && !allowed.contains(&k.as_ref()) {
                 return Err(LabyrinthError::invalid(format!("unknown parameter {k}")));
             }
-            if map.insert(k.into_owned(), v.into_owned()).is_some() {
+            let values = map.entry(k.clone().into_owned()).or_default();
+            if !values.is_empty() && !ARRAY_PARAMS.contains(&k.as_ref()) {
                 return Err(LabyrinthError::invalid("a parameter is repeated"));
             }
+            values.push(v.into_owned());
         }
         Ok(Self(map))
     }
 
     pub fn opt(&self, k: &str) -> Option<&str> {
-        self.0.get(k).map(String::as_str)
+        self.0.get(k).and_then(|v| v.first()).map(String::as_str)
+    }
+
+    /// Every value of an array parameter (empty when absent).
+    pub fn all(&self, k: &str) -> &[String] {
+        self.0.get(k).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// A boolean parameter (`true` / `false`).
+    pub fn flag(&self, k: &str) -> LabyrinthResult<bool> {
+        match self.opt(k) {
+            None | Some("false") => Ok(false),
+            Some("true") => Ok(true),
+            Some(_) => Err(LabyrinthError::invalid(format!("{k} is not a boolean"))),
+        }
+    }
+
+    /// An RFC 3339 datetime parameter.
+    pub fn datetime(&self, k: &str) -> LabyrinthResult<Option<DateTime<Utc>>> {
+        self.opt(k)
+            .map(|v| {
+                DateTime::parse_from_rfc3339(v)
+                    .map(|at| at.with_timezone(&Utc))
+                    .map_err(|_| LabyrinthError::invalid(format!("{k} is not a datetime")))
+            })
+            .transpose()
     }
 
     pub fn req(&self, k: &str) -> LabyrinthResult<&str> {
@@ -67,14 +98,19 @@ impl Params {
         Ok(PageReq {
             cursor,
             limit: limit.map(|l| l as i64),
+            reverse: self.flag("reverse")?,
         })
     }
 
+    /// The sender-timestamp window (`fromMs`, `untilMs`) and the server
+    /// `receivedAt` window (`since`, `until`) of a list.
     pub fn range(&self) -> LabyrinthResult<TimeRange> {
         const MAX: u64 = (1 << 53) - 1;
         Ok(TimeRange {
             from_ms: self.int("fromMs", MAX)?.map(|v| v as i64),
             until_ms: self.int("untilMs", MAX)?.map(|v| v as i64),
+            since: self.datetime("since")?,
+            until: self.datetime("until")?,
         })
     }
 }

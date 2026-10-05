@@ -566,9 +566,10 @@ pub struct OwnerBatchRow {
     pub order: ServerOrder,
 }
 
-/// Owner batches of a thread holding an item in `range`, in seq order. The
-/// cursor is the last scanned seq, so a page may hold fewer items than the
-/// limit while more remain.
+/// Owner batches of a thread holding an item in `range`'s sender window and
+/// received in its server window, in seq order (newest first when
+/// `page.reverse`). The cursor is the last scanned seq, so a page may hold
+/// fewer items than the limit while more remain.
 pub async fn list_owner_batches(
     conn: &mut PgConnection,
     owner: &str,
@@ -576,21 +577,28 @@ pub async fn list_owner_batches(
     range: TimeRange,
     page: &PageReq,
 ) -> LabyrinthResult<(Vec<OwnerBatchRow>, Option<String>)> {
-    let mut rows: Vec<(i64, String, String, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT seq, rkey, record::text, received_at FROM labyrinth.owner_batches \
-          WHERE owner_did = $1 AND thread_id = $2 AND seq > $3 \
+    let sql = format!(
+        "SELECT seq, rkey, record::text, received_at FROM labyrinth.owner_batches o \
+          WHERE owner_did = $1 AND thread_id = $2 AND seq {cmp} $3 \
             AND ($4::bigint IS NULL OR max_ts >= $4) \
             AND ($5::bigint IS NULL OR min_ts < $5) \
-          ORDER BY seq LIMIT $6",
-    )
-    .bind(owner)
-    .bind(thread_id)
-    .bind(page.seq_cursor()?)
-    .bind(range.from_ms)
-    .bind(range.until_ms)
-    .bind(page.limit() + 1)
-    .fetch_all(&mut *conn)
-    .await?;
+            AND {received} \
+          ORDER BY seq {dir} LIMIT $6",
+        cmp = page.seq_cmp(),
+        dir = page.seq_dir(),
+        received = super::thread::received_in("o", "$7", "$8"),
+    );
+    let mut rows: Vec<(i64, String, String, DateTime<Utc>)> = sqlx::query_as(&sql)
+        .bind(owner)
+        .bind(thread_id)
+        .bind(page.seq_bound()?)
+        .bind(range.from_ms)
+        .bind(range.until_ms)
+        .bind(page.limit() + 1)
+        .bind(range.since)
+        .bind(range.until)
+        .fetch_all(&mut *conn)
+        .await?;
     let more = rows.len() as i64 > page.limit();
     rows.truncate(page.limit() as usize);
     let cursor = more.then(|| rows.last().map(|r| r.0.to_string())).flatten();

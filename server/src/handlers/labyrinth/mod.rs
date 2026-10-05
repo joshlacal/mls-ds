@@ -2,7 +2,7 @@
 //! labyrinth `docs/MLSDS_BACKEND.md` §2–§3; domain code in
 //! `crate::labyrinth`).
 //!
-//! All 34 XRPC endpoints of the lexicons are registered by
+//! All 37 XRPC endpoints of the lexicons are registered by
 //! [`labyrinth_router`]. Every one requires the clean-chat cutover gate and a
 //! standard service-auth JWT whose `lxm` is the endpoint NSID; queries name
 //! the calling device with `actorDeviceId`, procedures with a signed
@@ -15,6 +15,7 @@
 //! also serves for peers.
 
 mod directory;
+mod lookup;
 mod mailbox;
 mod orf;
 mod params;
@@ -84,6 +85,9 @@ pub const QUERIES: &[&str] = &[
     "listOwnerBatches",
     "findMeks",
     "listBatches",
+    "getMessages",
+    "listThreads",
+    "listOwnerThreads",
     "getEpochHead",
     "getChatDeviceKeys",
     "getMemberDevices",
@@ -174,6 +178,9 @@ where
             post(thread::append_batch).layer(DefaultBodyLimit::max(limit("appendBatch"))),
         )
         .route(&path("listBatches"), get(thread::list_batches))
+        .route(&path("getMessages"), get(lookup::get_messages))
+        .route(&path("listThreads"), get(lookup::list_threads))
+        .route(&path("listOwnerThreads"), get(lookup::list_owner_threads))
         .route(&path("redactMessage"), post(thread::redact_message))
         .route(
             &path("labyrinthRelay"),
@@ -247,6 +254,6 @@ mod tests {
             assert!(served.insert(((*name).to_owned(), "query".to_owned())));
         }
         assert_eq!(served, lexicon);
-        assert_eq!(served.len(), 34);
+        assert_eq!(served.len(), 37);
     }
 }

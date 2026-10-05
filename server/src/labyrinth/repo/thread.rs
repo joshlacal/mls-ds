@@ -369,9 +369,60 @@ pub async fn append_batch(
     Ok((rkey, order(seq, Some(chat_seq), at)))
 }
 
+/// SQL predicate: batch row `b` is readable by `$reader`: the reader wrote
+/// it, or can read a MEK with its `mekId` (design §3).
+pub(crate) fn batch_readable(param: &str) -> String {
+    format!(
+        "(b.author_did = {param} OR EXISTS ( \
+           SELECT 1 FROM labyrinth.meks m \
+            WHERE m.conversation_id = b.conversation_id AND m.mek_id = b.mek_id AND {}))",
+        mek_readable(param)
+    )
+}
+
+/// SQL predicate: `received_at` of alias `t` in `[since, until)`.
+pub(crate) fn received_in(t: &str, since: &str, until: &str) -> String {
+    format!(
+        "({since}::timestamptz IS NULL OR {t}.received_at >= {since}) \
+         AND ({until}::timestamptz IS NULL OR {t}.received_at < {until})"
+    )
+}
+
+/// Columns of an [`AuthoredRow`] query over `labyrinth.batches b`.
+pub(crate) const BATCH_COLUMNS: &str =
+    "b.seq, b.author_did, b.rkey, b.record::text, b.chat_seq, b.received_at";
+
+pub(crate) type BatchTuple = (i64, String, String, String, i64, DateTime<Utc>);
+
+/// Truncate a `limit + 1` fetch to one page; the cursor is the last
+/// returned seq when more rows follow.
+pub(crate) fn page_of<T>(
+    mut rows: Vec<T>,
+    page: &PageReq,
+    seq: impl Fn(&T) -> i64,
+) -> (Vec<T>, Option<String>) {
+    let more = rows.len() as i64 > page.limit();
+    rows.truncate(page.limit() as usize);
+    let cursor = more
+        .then(|| rows.last().map(|r| seq(r).to_string()))
+        .flatten();
+    (rows, cursor)
+}
+
+pub(crate) fn authored_row(row: BatchTuple) -> LabyrinthResult<AuthoredRow> {
+    let (seq, author, rkey, text, chat_seq, at) = row;
+    Ok(AuthoredRow {
+        author,
+        rkey,
+        record: stored_json(&text)?,
+        order: order(seq, Some(chat_seq), at),
+    })
+}
+
 /// `listBatches`: batches the caller wrote or whose MEK it can read, in
-/// `seq` order, optionally from one sender, holding an item in `range`. The
-/// cursor is the last scanned seq.
+/// `seq` order (newest first when `page.reverse`), optionally from one
+/// sender, holding an item in the sender-timestamp window and received in
+/// the server window of `range`. The cursor is the last scanned seq.
 pub async fn list_batches(
     conn: &mut PgConnection,
     reader: &str,
@@ -381,45 +432,39 @@ pub async fn list_batches(
     page: &PageReq,
 ) -> LabyrinthResult<(Vec<AuthoredRow>, Option<String>)> {
     let sql = format!(
-        "SELECT b.seq, b.author_did, b.rkey, b.record::text, b.chat_seq, b.received_at \
-           FROM labyrinth.batches b \
-          WHERE b.conversation_id = $1 AND b.seq > $3 \
+        "SELECT {BATCH_COLUMNS} FROM labyrinth.batches b \
+          WHERE b.conversation_id = $1 AND b.seq {cmp} $3 \
             AND ($4::text IS NULL OR b.author_did = $4) \
             AND ($5::bigint IS NULL OR b.max_ts >= $5) \
             AND ($6::bigint IS NULL OR b.min_ts < $6) \
-            AND (b.author_did = $2 OR EXISTS ( \
-                  SELECT 1 FROM labyrinth.meks m \
-                   WHERE m.conversation_id = b.conversation_id AND m.mek_id = b.mek_id \
-                     AND {})) \
-          ORDER BY b.seq LIMIT $7",
-        mek_readable("$2")
+            AND {received} AND {readable} \
+          ORDER BY b.seq {dir} LIMIT $7",
+        cmp = page.seq_cmp(),
+        dir = page.seq_dir(),
+        received = received_in("b", "$8", "$9"),
+        readable = batch_readable("$2"),
     );
-    let mut rows: Vec<(i64, String, String, String, i64, DateTime<Utc>)> = sqlx::query_as(&sql)
+    let rows: Vec<BatchTuple> = sqlx::query_as(&sql)
         .bind(conversation_id)
         .bind(reader)
-        .bind(page.seq_cursor()?)
+        .bind(page.seq_bound()?)
         .bind(sender)
         .bind(range.from_ms)
         .bind(range.until_ms)
         .bind(page.limit() + 1)
+        .bind(range.since)
+        .bind(range.until)
         .fetch_all(&mut *conn)
         .await?;
-    let more = rows.len() as i64 > page.limit();
-    rows.truncate(page.limit() as usize);
-    let cursor = more.then(|| rows.last().map(|r| r.0.to_string())).flatten();
+    let (rows, cursor) = page_of(rows, page, |r| r.0);
     let mut items = Vec::with_capacity(rows.len());
-    for (seq, author, rkey, text, chat_seq, at) in rows {
-        let batch: Batch = serde_json::from_str(&text).map_err(|error| {
+    for row in rows {
+        let batch: Batch = serde_json::from_str(&row.3).map_err(|error| {
             tracing::error!(?error, "stored batch does not parse");
             LabyrinthError::internal()
         })?;
         if batch.items.iter().any(|i| range.contains(i.timestamp)) {
-            items.push(AuthoredRow {
-                author,
-                rkey,
-                record: stored_json(&text)?,
-                order: order(seq, Some(chat_seq), at),
-            });
+            items.push(authored_row(row)?);
         }
     }
     Ok((items, cursor))
