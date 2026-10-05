@@ -9,8 +9,11 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::params::{admit_procedure, begin_write};
+use super::relay_client::{Forwarded, Relay};
 use super::respond;
 use crate::handlers::chat::ChatRuntime;
+use crate::labyrinth::auth;
+use crate::labyrinth::relay::RelayOp;
 use crate::labyrinth::repo::retention as repo;
 use crate::labyrinth::wire::bytes::Bytes as AtBytes;
 use crate::labyrinth::wire::io::{body, to_bytes};
@@ -58,8 +61,7 @@ pub async fn delete_virtual_device(
 ) -> Response {
     respond(
         async {
-            let adm =
-                admit_procedure(&pool, &rt, "deleteVirtualDevice", &headers, &bytes).await?;
+            let adm = admit_procedure(&pool, &rt, "deleteVirtualDevice", &headers, &bytes).await?;
             let input: VirtualDeviceIdIn = body(&bytes)?;
             let id = input.vdevice_id.array::<16>("vdeviceId")?;
             let mut w = begin_write!(&pool, adm);
@@ -91,9 +93,15 @@ pub async fn touch_virtual_device(
     )
 }
 
+/// `deleteAccountData`: first every remote sequencer redacts the DID's
+/// items there (`labyrinthRelay purgeAuthor`, the device's own signed write
+/// re-verified by each), then the local purge commits. A sequencer that
+/// cannot be reached fails the call before anything local changes; a retry
+/// replays the sequencers that already finished.
 pub async fn delete_account_data(
     State(pool): Pool,
     State(rt): Runtime,
+    relay: Relay,
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Response {
@@ -101,13 +109,23 @@ pub async fn delete_account_data(
         async {
             let adm = admit_procedure(&pool, &rt, "deleteAccountData", &headers, &bytes).await?;
             let EmptyIn {} = body(&bytes)?;
+            let sequencers = {
+                let mut conn = pool.acquire().await?;
+                repo::remote_sequencers(&mut conn, &adm.did).await?
+            };
+            for sequencer in &sequencers {
+                let (write_body, write_signature) = auth::write_headers(&headers)?;
+                let forwarded = Forwarded::Write {
+                    payload: &bytes,
+                    write_body,
+                    write_signature,
+                };
+                relay
+                    .forward(&pool, sequencer, RelayOp::PurgeAuthor, &adm, forwarded)
+                    .await?;
+            }
             let mut w = begin_write!(&pool, adm);
             let (did, at) = (w.caller.did.clone(), w.instant);
-            if !repo::remote_sequencers(&mut w.tx, &did).await?.is_empty() {
-                // Thread records on other sequencers are purged through the
-                // relay (labyrinthRelay purgeAuthor).
-                return Err(crate::labyrinth::error::LabyrinthError::relay_unavailable());
-            }
             repo::purge_account(&mut w.tx, &did, at).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }

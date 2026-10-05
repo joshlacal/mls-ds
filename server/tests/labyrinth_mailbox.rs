@@ -17,7 +17,10 @@ async fn devices_create_read_list_and_revoke_once() {
     let other_device = env.device_for(&alice.did, random_seed()).await;
 
     let created = alice
-        .call("createDevice", &json!({ "record": alice.device_record([1; 32]) }))
+        .call(
+            "createDevice",
+            &json!({ "record": alice.device_record([1; 32]) }),
+        )
         .await;
     assert_eq!(created.ok()["rkey"], hex::encode([1u8; 32]));
     // A second bound device keeps alice able to revoke after [1] is revoked.
@@ -28,7 +31,10 @@ async fn devices_create_read_list_and_revoke_once() {
         .await;
     assert_eq!(got.ok()["record"], alice.device_record([1; 32]));
     alice
-        .call("createDevice", &json!({ "record": alice.device_record([1; 32]) }))
+        .call(
+            "createDevice",
+            &json!({ "record": alice.device_record([1; 32]) }),
+        )
         .await
         .fails(409, "RecordAlreadyExists");
     alice
@@ -115,11 +121,17 @@ async fn procedure_retries_replay_the_exact_response_and_reject_reuse() {
         .fails(409, "IdempotencyConflict");
     // A new operation on an existing rkey is RecordAlreadyExists.
     alice
-        .call("createDevice", &json!({ "record": alice.device_record([5; 32]) }))
+        .call(
+            "createDevice",
+            &json!({ "record": alice.device_record([5; 32]) }),
+        )
         .await
         .ok();
     alice
-        .call("createDevice", &json!({ "record": alice.device_record([5; 32]) }))
+        .call(
+            "createDevice",
+            &json!({ "record": alice.device_record([5; 32]) }),
+        )
         .await
         .fails(409, "RecordAlreadyExists");
 }
@@ -373,7 +385,10 @@ async fn mailbox_and_virtual_device_quotas_are_enforced() {
     let env = Env::new().await;
     let alice = env.account().await;
     alice
-        .call("createDevice", &json!({ "record": alice.device_record([1; 32]) }))
+        .call(
+            "createDevice",
+            &json!({ "record": alice.device_record([1; 32]) }),
+        )
         .await
         .ok();
     // Fill the mailbox to just under 256 MiB through the counter column the
@@ -384,7 +399,10 @@ async fn mailbox_and_virtual_device_quotas_are_enforced() {
         .await
         .unwrap();
     alice
-        .call("createDevice", &json!({ "record": alice.device_record([2; 32]) }))
+        .call(
+            "createDevice",
+            &json!({ "record": alice.device_record([2; 32]) }),
+        )
         .await
         .fails(400, "QuotaExceeded");
 

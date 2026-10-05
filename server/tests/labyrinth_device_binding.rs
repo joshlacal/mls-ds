@@ -29,12 +29,18 @@ async fn create_device_requires_a_valid_binding_to_the_calling_chat_device() {
     let other = env.device_for(&alice.did, random_seed()).await;
 
     alice
-        .call("createDevice", &json!({ "record": unbound_device_record([1; 32]) }))
+        .call(
+            "createDevice",
+            &json!({ "record": unbound_device_record([1; 32]) }),
+        )
         .await
         .fails(400, "InvalidChatBinding");
     // Bound by another chat device of the same DID: not the caller's key.
     alice
-        .call("createDevice", &json!({ "record": other.device_record([1; 32]) }))
+        .call(
+            "createDevice",
+            &json!({ "record": other.device_record([1; 32]) }),
+        )
         .await
         .fails(400, "InvalidChatBinding");
     // The caller's key, but a signature over another device key.
@@ -54,7 +60,10 @@ async fn create_device_requires_a_valid_binding_to_the_calling_chat_device() {
 
     alice.enroll([1; 32]).await;
     alice
-        .call("createDevice", &json!({ "record": virtual_device_record([3; 32]) }))
+        .call(
+            "createDevice",
+            &json!({ "record": virtual_device_record([3; 32]) }),
+        )
         .await
         .ok();
 }
@@ -98,9 +107,12 @@ async fn a_chat_device_without_its_own_labyrinth_device_cannot_write_epochs() {
     d1.call("createEpoch", &epoch(&v, 1, [0xD0; 32], &[]))
         .await
         .fails(403, "LabyrinthDeviceNotBound");
-    d1.call("createEpoch", &epoch(&v, 1, [0xD1; 32], &[[0xD0; 32], [0xD1; 32]]))
-        .await
-        .ok();
+    d1.call(
+        "createEpoch",
+        &epoch(&v, 1, [0xD1; 32], &[[0xD0; 32], [0xD1; 32]]),
+    )
+    .await
+    .ok();
 }
 
 #[tokio::test]
@@ -111,9 +123,12 @@ async fn members_must_be_current_labyrinth_devices_of_the_account() {
     d0.enroll([0xD0; 32]).await;
     d0.enroll([0xD5; 32]).await;
 
-    d0.call("createEpoch", &epoch(&v, 0, [0xD0; 32], &[[0xD0; 32], [0xEE; 32]]))
-        .await
-        .fails(400, "MemberDeviceNotRegistered");
+    d0.call(
+        "createEpoch",
+        &epoch(&v, 0, [0xD0; 32], &[[0xD0; 32], [0xEE; 32]]),
+    )
+    .await
+    .fails(400, "MemberDeviceNotRegistered");
     // Another account's device does not count.
     let bob = env.account().await;
     bob.enroll([0xB0; 32]).await;
@@ -170,7 +185,10 @@ async fn a_virtual_device_never_opens_an_epoch() {
         .await
         .fails(403, "LabyrinthDeviceNotBound");
     // A virtual device may be a member.
-    d0.call("createEpoch", &epoch(&v, 0, [0xD0; 32], &[[0xD0; 32], [0xBB; 32]]))
-        .await
-        .ok();
+    d0.call(
+        "createEpoch",
+        &epoch(&v, 0, [0xD0; 32], &[[0xD0; 32], [0xBB; 32]]),
+    )
+    .await
+    .ok();
 }

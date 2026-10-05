@@ -62,8 +62,14 @@ impl Client {
     fn get(&self, label: &str, thread: Uuid, message: &str) -> Vec<(&'static str, String)> {
         vec![
             ("deviceKeyPubkey", hex::encode(self.device_key)),
-            ("blindedIndex", hex::encode(blind(self.c, format!("idx-{label}").as_bytes()))),
-            ("blindedTokenSalt", hex::encode(blind(self.c, format!("tok-{label}").as_bytes()))),
+            (
+                "blindedIndex",
+                hex::encode(blind(self.c, format!("idx-{label}").as_bytes())),
+            ),
+            (
+                "blindedTokenSalt",
+                hex::encode(blind(self.c, format!("tok-{label}").as_bytes())),
+            ),
             ("threadId", thread.to_string()),
             ("messageId", message.to_owned()),
         ]
@@ -122,7 +128,10 @@ async fn orf_states_register_evolve_and_delete() {
     let (parent, child) = ([0xA1; 32], [0xA2; 32]);
     register(&alice, parent).await;
     alice
-        .call("registerOrfState", &json!({ "deviceKeyPubkey": b(&parent) }))
+        .call(
+            "registerOrfState",
+            &json!({ "deviceKeyPubkey": b(&parent) }),
+        )
         .await
         .fails(409, "RecordAlreadyExists");
     let evolve = |from: [u8; 32], token: [u8; 32]| {
@@ -130,7 +139,10 @@ async fn orf_states_register_evolve_and_delete() {
                 "parent": { "deviceKeyPubkey": b(&from), "evolveToken": b(&token) } })
     };
     alice
-        .call("registerOrfState", &evolve([0xEE; 32], Scalar::from(3u64).to_bytes()))
+        .call(
+            "registerOrfState",
+            &evolve([0xEE; 32], Scalar::from(3u64).to_bytes()),
+        )
         .await
         .fails(404, "OrfStateNotFound");
     alice
@@ -138,7 +150,10 @@ async fn orf_states_register_evolve_and_delete() {
         .await
         .fails(400, "InvalidRequest");
     alice
-        .call("registerOrfState", &evolve(parent, Scalar::from(3u64).to_bytes()))
+        .call(
+            "registerOrfState",
+            &evolve(parent, Scalar::from(3u64).to_bytes()),
+        )
         .await
         .ok();
     alice
@@ -219,7 +234,10 @@ async fn put_requires_a_bound_blob_of_that_message_the_device_may_read() {
         ("c", blob, other, message.clone()),
     ] {
         alice
-            .call("putAttachmentRef", &client.put(label, blob_id, thread, &msg))
+            .call(
+                "putAttachmentRef",
+                &client.put(label, blob_id, thread, &msg),
+            )
             .await
             .fails(403, "AttachmentNotEntitled");
     }
@@ -255,10 +273,11 @@ async fn put_requires_a_bound_blob_of_that_message_the_device_may_read() {
 
     // No clear linkage is stored: the row holds no DID, conversation or
     // message id (decision J4).
-    let rows: Vec<String> = sqlx::query_scalar("SELECT to_jsonb(r)::text FROM labyrinth.attachment_refs r")
-        .fetch_all(&env.pool)
-        .await
-        .unwrap();
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT to_jsonb(r)::text FROM labyrinth.attachment_refs r")
+            .fetch_all(&env.pool)
+            .await
+            .unwrap();
     assert_eq!(rows.len(), 1);
     for needle in [alice.did.as_str(), &a.to_string(), &message] {
         assert!(!rows[0].contains(needle), "attachment_refs leaks {needle}");
@@ -276,8 +295,16 @@ async fn get_checks_token_blob_state_and_that_the_message_exists() {
     let thread = seed_conversation(
         &env,
         &[
-            Leaf { device: &alice, joined_seq: 1, removed_seq: None },
-            Leaf { device: &bob, joined_seq: 1, removed_seq: None },
+            Leaf {
+                device: &alice,
+                joined_seq: 1,
+                removed_seq: None,
+            },
+            Leaf {
+                device: &bob,
+                joined_seq: 1,
+                removed_seq: None,
+            },
         ],
         10,
     )
@@ -319,7 +346,9 @@ async fn get_checks_token_blob_state_and_that_the_message_exists() {
         let alice = alice.clone();
         async move { alice.query("getAttachmentBlob", &params).await }
     };
-    fetch(child.get("1", thread, &message)).await.fails(404, "NotFound");
+    fetch(child.get("1", thread, &message))
+        .await
+        .fails(404, "NotFound");
     // Bob's sender copy, addressed to alice, makes it exist.
     send_message(&bob, thread, &message, &[&alice.did, &bob.did]).await;
     let bytes = fetch(child.get("1", thread, &message)).await;
@@ -345,7 +374,9 @@ async fn get_checks_token_blob_state_and_that_the_message_exists() {
 
     // A blob that left the bound state is no longer served.
     force_blob_state(&env, blob, "expired").await;
-    fetch(child.get("1", thread, &message)).await.fails(404, "NotFound");
+    fetch(child.get("1", thread, &message))
+        .await
+        .fails(404, "NotFound");
 }
 
 #[tokio::test]
@@ -355,7 +386,11 @@ async fn own_archive_copies_count_and_deletion_revokes() {
     let alice = env.account().await;
     let thread = seed_conversation(
         &env,
-        &[Leaf { device: &alice, joined_seq: 1, removed_seq: None }],
+        &[Leaf {
+            device: &alice,
+            joined_seq: 1,
+            removed_seq: None,
+        }],
         10,
     )
     .await;
@@ -404,7 +439,10 @@ async fn own_archive_copies_count_and_deletion_revokes() {
         .await
         .ok();
     alice
-        .call("deleteOrfState", &json!({ "deviceKeyPubkey": b(&client.device_key) }))
+        .call(
+            "deleteOrfState",
+            &json!({ "deviceKeyPubkey": b(&client.device_key) }),
+        )
         .await
         .ok();
     alice

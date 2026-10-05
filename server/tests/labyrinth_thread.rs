@@ -148,7 +148,9 @@ async fn mek_writes_check_leaf_sender_and_recipients() {
         .await
         .fails(400, "InvalidRequest");
 
-    // Remote conversations are sequenced elsewhere: typed refusal.
+    // Remote conversations are relayed to their sequencer; this DS has no
+    // federation service auth configured, so the relay is unavailable
+    // (labyrinth_relay covers the configured path).
     make_remote(&env, thread).await;
     alice
         .call(
@@ -156,7 +158,7 @@ async fn mek_writes_check_leaf_sender_and_recipients() {
             &record(transport_mek(thread, [5; 12], alice.chat_pub(), &to)),
         )
         .await
-        .fails(501, "MethodNotImplemented");
+        .fails(503, "RelayUnavailable");
 }
 
 #[tokio::test]

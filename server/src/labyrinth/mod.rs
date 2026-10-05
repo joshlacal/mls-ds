@@ -14,15 +14,16 @@
 //! `handlers::labyrinth`; the `labyrinthHead` projection of
 //! `getConversationState` lives in `chat_protocol::repository::conversation`.
 //!
-//! Not built here (see the handler module docs): the `labyrinthRelay`
-//! federation procedure (remote conversations get a typed 501), retention
-//! purge, and pinning attachment objects against chat object GC.
+//! Also: `relay` (the `labyrinthRelay` federation procedure, design Y3),
+//! `digest` (keyed attachment-reference digests, J4) and
+//! `repo::retention` (unsend, purges, recovery-bundle lifecycle, J1/J2).
 
 pub mod auth;
 pub mod digest;
 pub mod error;
 pub mod heads;
 pub mod orf;
+pub mod relay;
 pub mod repo;
 pub mod tid;
 pub mod wire;

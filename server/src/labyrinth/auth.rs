@@ -189,24 +189,59 @@ pub async fn admit_procedure(
     let principal = crate::auth::verify_mls_service_principal(headers, pool, nsid)
         .await
         .map_err(|e| service_auth_failure(nsid, e))?;
-    let instant = now_ms();
     let signed = header_b64(headers, WRITE_BODY_HEADER)?;
     let sig = header_b64(headers, WRITE_SIGNATURE_HEADER)?;
-    let wire: WriteBodyWire = serde_json::from_slice(&signed)
+    verify_signed_write(pool, principal.did(), nsid, &signed, &sig, body).await
+}
+
+/// The raw `labyrinthWriteBody` header values of a procedure, for the
+/// federation relay to forward verbatim.
+pub fn write_headers(headers: &HeaderMap) -> LabyrinthResult<(String, String)> {
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .ok_or_else(|| LabyrinthError::invalid(format!("missing {name} header")))
+    };
+    Ok((get(WRITE_BODY_HEADER)?, get(WRITE_SIGNATURE_HEADER)?))
+}
+
+/// Decode one forwarded base64url header value.
+pub fn decode_b64(what: &str, value: &str) -> LabyrinthResult<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| LabyrinthError::invalid(format!("{what} is not base64url")))
+}
+
+/// Verify a signed `labyrinthWriteBody` (decoded bytes `signed`, signature
+/// `sig`) for `nsid` over `body`, by a current chat device of `did`. Used for
+/// the device's own request and, on a sequencer, for one its home DS
+/// relayed (design §3: the sequencer re-verifies against its replicated
+/// device keys).
+pub async fn verify_signed_write(
+    pool: &DbPool,
+    did: &str,
+    nsid: &str,
+    signed: &[u8],
+    sig: &[u8],
+    body: &[u8],
+) -> LabyrinthResult<Admission> {
+    let instant = now_ms();
+    let wire: WriteBodyWire = serde_json::from_slice(signed)
         .map_err(|e| LabyrinthError::invalid(format!("labyrinthWriteBody: {e}")))?;
     let device_id = parse_device_id(&wire.actor_device_id)?;
     let write = check_write_body(&wire, nsid, body, instant)?;
 
     let mut conn = pool.acquire().await?;
-    let caller = load_current_device(&mut conn, principal.did(), device_id, false).await?;
+    let caller = load_current_device(&mut conn, did, device_id, false).await?;
     let sig: [u8; 64] = sig
-        .as_slice()
         .try_into()
         .map_err(|_| LabyrinthError::invalid("write signature must be 64 bytes"))?;
     let key =
         VerifyingKey::from_bytes(&caller.signing_key).map_err(|_| LabyrinthError::internal())?;
     key.verify_strict(
-        &[WRITE_DOMAIN, &signed].concat(),
+        &[WRITE_DOMAIN, signed].concat(),
         &Signature::from_bytes(&sig),
     )
     .map_err(|_| {
@@ -217,10 +252,21 @@ pub async fn admit_procedure(
         )
     })?;
     Ok(Admission {
-        did: principal.did().to_owned(),
+        did: did.to_owned(),
         device_id,
         instant,
         write: Some(write),
+    })
+}
+
+/// A relayed read: the home DS authenticated `device_id` of `did`; this DS
+/// re-checks it is current when the request transaction locks it.
+pub fn relayed_read(did: &str, device_id: &str) -> LabyrinthResult<Admission> {
+    Ok(Admission {
+        did: did.to_owned(),
+        device_id: parse_device_id(device_id)?,
+        instant: now_ms(),
+        write: None,
     })
 }
 

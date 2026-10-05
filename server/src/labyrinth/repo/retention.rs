@@ -114,15 +114,21 @@ async fn redact(
 }
 
 /// Redact every item `author` wrote in conversations this DS sequences
-/// (account deletion; the redaction carries no signature). Returns the
+/// (account deletion; the redaction carries no signature). With `home_ds`
+/// (a relayed `purgeAuthor`), only conversations where that DS is the
+/// author's home DS (its latest participant period's `ds_did`). Returns the
 /// number of items redacted.
 pub async fn redact_author(
     conn: &mut PgConnection,
     author: &str,
+    home_ds: Option<&str>,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<i64> {
-    let threads: Vec<(Uuid, Vec<String>)> = sqlx::query_as(
-        "SELECT bi.conversation_id, array_agg(DISTINCT bi.message_id) \
+    let threads: Vec<(Uuid, Vec<String>, Option<String>)> = sqlx::query_as(
+        "SELECT bi.conversation_id, array_agg(DISTINCT bi.message_id), \
+                (SELECT p.ds_did FROM chat.participants p \
+                  WHERE p.conversation_id = bi.conversation_id AND p.user_did = $1 \
+                  ORDER BY p.created_at DESC, p.participant_period_id DESC LIMIT 1) \
            FROM labyrinth.batch_items bi \
            JOIN chat.conversations c ON c.conversation_id = bi.conversation_id \
           WHERE bi.author_did = $1 AND bi.redacted_at IS NULL AND NOT c.is_remote \
@@ -132,16 +138,13 @@ pub async fn redact_author(
     .fetch_all(&mut *conn)
     .await?;
     let mut total = 0;
-    for (conversation, messages) in threads {
-        total += redact(
-            conn,
-            conversation,
-            author,
-            None,
-            serde_json::json!({}),
-            at,
-        )
-        .await?;
+    for (conversation, messages, ds_did) in threads {
+        if let Some(home) = home_ds {
+            if !ds_did.is_some_and(|d| crate::identity::dids_equivalent(&d, home)) {
+                continue;
+            }
+        }
+        total += redact(conn, conversation, author, None, serde_json::json!({}), at).await?;
         attachments::invalidate_messages(conn, &conversation.to_string(), &messages).await?;
     }
     Ok(total)
@@ -166,12 +169,29 @@ pub async fn purge_account(
     at: DateTime<Utc>,
 ) -> LabyrinthResult<i64> {
     purge_mailbox(conn, did).await?;
-    let redacted = redact_author(conn, did, at).await?;
+    let redacted = redact_author(conn, did, None, at).await?;
     sqlx::query("SELECT labyrinth.purge_operations($1)")
         .bind(did)
         .execute(&mut *conn)
         .await?;
     Ok(redacted)
+}
+
+/// `did`'s home DS in a conversation, per this DS's participant rows (its
+/// latest participant period; NULL means this DS).
+pub async fn home_ds(
+    conn: &mut PgConnection,
+    conversation: Uuid,
+    did: &str,
+) -> LabyrinthResult<Option<Option<String>>> {
+    Ok(sqlx::query_scalar(
+        "SELECT ds_did FROM chat.participants WHERE conversation_id = $1 AND user_did = $2 \
+          ORDER BY created_at DESC, participant_period_id DESC LIMIT 1",
+    )
+    .bind(conversation)
+    .bind(did)
+    .fetch_optional(&mut *conn)
+    .await?)
 }
 
 /// Remote sequencer DSes of conversations `did` takes or took part in.
@@ -243,11 +263,12 @@ pub struct GcCounts {
 /// old idempotency records, `batch` rows of each at most.
 pub async fn run_gc(pool: &DbPool, now: DateTime<Utc>, batch: i32) -> LabyrinthResult<GcCounts> {
     let mut tx = pool.begin().await?;
-    let virtual_devices: i32 = sqlx::query_scalar("SELECT labyrinth.expire_virtual_devices($1, $2)")
-        .bind(now - Duration::days(VIRTUAL_DEVICE_IDLE_DAYS))
-        .bind(batch)
-        .fetch_one(&mut *tx)
-        .await?;
+    let virtual_devices: i32 =
+        sqlx::query_scalar("SELECT labyrinth.expire_virtual_devices($1, $2)")
+            .bind(now - Duration::days(VIRTUAL_DEVICE_IDLE_DAYS))
+            .bind(batch)
+            .fetch_one(&mut *tx)
+            .await?;
     tx.commit().await?;
     let mut tx = pool.begin().await?;
     let operations: i32 = sqlx::query_scalar("SELECT labyrinth.gc_operations($1, $2)")

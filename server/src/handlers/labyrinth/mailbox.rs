@@ -298,15 +298,8 @@ pub async fn create_virtual_device(
                 .transpose()?;
             let mut w = begin_write!(&pool, adm);
             let caller = w.caller.clone();
-            repo::create_virtual_device(
-                &mut w.tx,
-                &caller,
-                &rec,
-                member.as_ref(),
-                orf,
-                w.instant,
-            )
-            .await?;
+            repo::create_virtual_device(&mut w.tx, &caller, &rec, member.as_ref(), orf, w.instant)
+                .await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,

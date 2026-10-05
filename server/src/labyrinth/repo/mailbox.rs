@@ -500,12 +500,10 @@ pub async fn list_virtual_devices(
     owner: &str,
     page: &PageReq,
 ) -> LabyrinthResult<(Vec<serde_json::Value>, Option<String>)> {
-    let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
-        &format!(
-            "SELECT vdevice_id, {VDEVICE_JSON} FROM labyrinth.virtual_devices \
+    let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(&format!(
+        "SELECT vdevice_id, {VDEVICE_JSON} FROM labyrinth.virtual_devices \
               WHERE owner_did = $1 AND vdevice_id > $2 ORDER BY vdevice_id LIMIT $3"
-        ),
-    )
+    ))
     .bind(owner)
     .bind(hex_cursor(page)?)
     .bind(page.limit() + 1)

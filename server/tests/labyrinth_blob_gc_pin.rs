@@ -87,7 +87,11 @@ async fn referenced_blobs_survive_object_gc_until_the_reference_is_deleted() {
     let alice = env.account().await;
     let thread = seed_conversation(
         &env,
-        &[Leaf { device: &alice, joined_seq: 1, removed_seq: None }],
+        &[Leaf {
+            device: &alice,
+            joined_seq: 1,
+            removed_seq: None,
+        }],
         10,
     )
     .await;
@@ -117,7 +121,9 @@ async fn referenced_blobs_survive_object_gc_until_the_reference_is_deleted() {
     make_gc_due(&env, control).await;
 
     // The Rust worker claims only the unreferenced blob (positive control).
-    let (claimed, _) = reclaim_due_blob_objects_recording(&env.pool, 100).await.unwrap();
+    let (claimed, _) = reclaim_due_blob_objects_recording(&env.pool, 100)
+        .await
+        .unwrap();
     assert_eq!(claimed, 1, "only the unreferenced blob is due");
     // The SQL claim function reclaims the control and skips the pinned blob.
     let reclaimed = claim(&env).await;
@@ -132,7 +138,9 @@ async fn referenced_blobs_survive_object_gc_until_the_reference_is_deleted() {
         )
         .await
         .ok();
-    let (claimed, _) = reclaim_due_blob_objects_recording(&env.pool, 100).await.unwrap();
+    let (claimed, _) = reclaim_due_blob_objects_recording(&env.pool, 100)
+        .await
+        .unwrap();
     assert_eq!(claimed, 1, "the released blob is due again");
     let reclaimed = claim(&env).await;
     assert_eq!(reclaimed, vec![pinned]);

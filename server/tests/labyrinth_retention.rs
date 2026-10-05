@@ -182,12 +182,12 @@ async fn unsend_redacts_only_the_authors_items_and_keeps_their_order() {
         .execute(&env.pool)
         .await
         .is_err());
-    assert!(
-        sqlx::query("UPDATE labyrinth.batches SET record = record || '{}'::jsonb, record_bytes = 1")
-            .execute(&env.pool)
-            .await
-            .is_err()
-    );
+    assert!(sqlx::query(
+        "UPDATE labyrinth.batches SET record = record || '{}'::jsonb, record_bytes = 1"
+    )
+    .execute(&env.pool)
+    .await
+    .is_err());
 }
 
 #[tokio::test]
@@ -266,11 +266,13 @@ async fn unsend_invalidates_attachment_references_to_the_message() {
 }
 
 async fn count(env: &Env, table: &str, column: &str, did: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT count(*) FROM labyrinth.{table} WHERE {column} = $1"))
-        .bind(did)
-        .fetch_one(&env.pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM labyrinth.{table} WHERE {column} = $1"
+    ))
+    .bind(did)
+    .fetch_one(&env.pool)
+    .await
+    .unwrap()
 }
 
 const MAILBOX_TABLES: &[(&str, &str)] = &[
@@ -308,9 +310,12 @@ async fn fill_mailbox(d0: &Device, v: &Vectors) {
     )
     .await
     .ok();
-    d0.call("registerOrfState", &json!({ "deviceKeyPubkey": b(&[0xD0; 32]) }))
-        .await
-        .ok();
+    d0.call(
+        "registerOrfState",
+        &json!({ "deviceKeyPubkey": b(&[0xD0; 32]) }),
+    )
+    .await
+    .ok();
 }
 
 #[tokio::test]
@@ -324,7 +329,11 @@ async fn purge_mailbox_resets_the_account_and_nothing_else() {
 
     d0.call("purgeMailbox", &json!({})).await.ok();
     for (table, column) in MAILBOX_TABLES {
-        assert_eq!(count(&env, table, column, &v.did).await, 0, "{table} purged");
+        assert_eq!(
+            count(&env, table, column, &v.did).await,
+            0,
+            "{table} purged"
+        );
     }
     assert_eq!(count(&env, "devices", "owner_did", &bob.did).await, 1);
     d0.query("getEpochHead", &[("did", v.did.clone())])
@@ -349,13 +358,20 @@ async fn delete_account_data_purges_and_redacts_without_a_signature() {
     let (alice, bob, thread) = chat(&env).await;
     alice.enroll([0xA0; 32]).await;
     alice
-        .call("appendOwnerBatch", &json!({ "record": owner_batch_record("t", &[1]) }))
+        .call(
+            "appendOwnerBatch",
+            &json!({ "record": owner_batch_record("t", &[1]) }),
+        )
         .await
         .ok();
 
     alice.call("deleteAccountData", &json!({})).await.ok();
     for (table, column) in MAILBOX_TABLES {
-        assert_eq!(count(&env, table, column, &alice.did).await, 0, "{table} purged");
+        assert_eq!(
+            count(&env, table, column, &alice.did).await,
+            0,
+            "{table} purged"
+        );
     }
     // Only deleteAccountData's own idempotency record remains.
     assert_eq!(count(&env, "operations", "owner_did", &alice.did).await, 1);
@@ -394,7 +410,12 @@ fn vdevice(id: u8, mechanism: &str) -> Value {
 async fn recovery_bundles_record_use_expire_when_idle_and_can_be_deleted() {
     let env = Env::new().await;
     let alice = env.account().await;
-    for (id, mechanism) in [(1, "keychain"), (2, "passkey"), (3, "code"), (4, "keychain")] {
+    for (id, mechanism) in [
+        (1, "keychain"),
+        (2, "passkey"),
+        (3, "code"),
+        (4, "keychain"),
+    ] {
         alice
             .call("createVirtualDevice", &vdevice(id, mechanism))
             .await
@@ -411,7 +432,10 @@ async fn recovery_bundles_record_use_expire_when_idle_and_can_be_deleted() {
     let got = alice
         .query("getVirtualDevice", &[("vdeviceId", hex::encode([1u8; 16]))])
         .await;
-    assert!(got.ok()["record"]["lastUsedAt"].as_str().unwrap().ends_with('Z'));
+    assert!(got.ok()["record"]["lastUsedAt"]
+        .as_str()
+        .unwrap()
+        .ends_with('Z'));
     alice
         .call("touchVirtualDevice", &json!({ "vdeviceId": b(&[4; 16]) }))
         .await
@@ -423,7 +447,10 @@ async fn recovery_bundles_record_use_expire_when_idle_and_can_be_deleted() {
 
     // Delete one bundle: its row, its ORF state and its counters go.
     alice
-        .call("registerOrfState", &json!({ "deviceKeyPubkey": b(&[0xAA; 32]) }))
+        .call(
+            "registerOrfState",
+            &json!({ "deviceKeyPubkey": b(&[0xAA; 32]) }),
+        )
         .await
         .ok();
     alice
@@ -431,11 +458,12 @@ async fn recovery_bundles_record_use_expire_when_idle_and_can_be_deleted() {
             "parent": { "deviceKeyPubkey": b(&[0xAA; 32]), "evolveToken": b(&{ let mut t = [0u8; 32]; t[0] = 7; t }) } }))
         .await
         .ok();
-    let vdevices: i64 = sqlx::query_scalar("SELECT vdevice_count FROM labyrinth.mailboxes WHERE owner_did = $1")
-        .bind(&alice.did)
-        .fetch_one(&env.pool)
-        .await
-        .unwrap();
+    let vdevices: i64 =
+        sqlx::query_scalar("SELECT vdevice_count FROM labyrinth.mailboxes WHERE owner_did = $1")
+            .bind(&alice.did)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
     alice
         .call("deleteVirtualDevice", &json!({ "vdeviceId": b(&[4; 16]) }))
         .await
@@ -444,11 +472,12 @@ async fn recovery_bundles_record_use_expire_when_idle_and_can_be_deleted() {
         .call("deleteVirtualDevice", &json!({ "vdeviceId": b(&[4; 16]) }))
         .await
         .fails(404, "VirtualDeviceNotFound");
-    let after: i64 = sqlx::query_scalar("SELECT vdevice_count FROM labyrinth.mailboxes WHERE owner_did = $1")
-        .bind(&alice.did)
-        .fetch_one(&env.pool)
-        .await
-        .unwrap();
+    let after: i64 =
+        sqlx::query_scalar("SELECT vdevice_count FROM labyrinth.mailboxes WHERE owner_did = $1")
+            .bind(&alice.did)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
     assert_eq!(after, vdevices - 1);
     let orf: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM labyrinth.orf_states WHERE owner_did = $1 AND device_key = $2",
@@ -463,11 +492,15 @@ async fn recovery_bundles_record_use_expire_when_idle_and_can_be_deleted() {
     // GC: idempotency records go after 7 days; idle keychain/passkey bundles
     // after 180; code bundles never.
     let now = env.now().await;
-    let first = run_gc(&env.pool, now + Duration::days(8), 500).await.unwrap();
+    let first = run_gc(&env.pool, now + Duration::days(8), 500)
+        .await
+        .unwrap();
     assert!(first.operations >= 6, "{first:?}");
     assert_eq!(first.virtual_devices, 0);
     assert_eq!(count(&env, "operations", "owner_did", &alice.did).await, 0);
-    let later = run_gc(&env.pool, now + Duration::days(181), 500).await.unwrap();
+    let later = run_gc(&env.pool, now + Duration::days(181), 500)
+        .await
+        .unwrap();
     assert_eq!(later.virtual_devices, 2, "{later:?}");
     let left: Vec<String> = sqlx::query_scalar(
         "SELECT record->>'mechanism' FROM labyrinth.virtual_devices WHERE owner_did = $1",

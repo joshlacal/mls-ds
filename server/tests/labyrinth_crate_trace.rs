@@ -37,12 +37,8 @@ use uuid::Uuid;
 const VOLATILE: &[&str] = &["epochId", "receivedAt", "keyId"];
 
 fn is_tid(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| {
-        s.len() == 13
-            && s
-                .bytes()
-                .all(|b| matches!(b, b'2'..=b'7' | b'a'..=b'z'))
-    })
+    v.as_str()
+        .is_some_and(|s| s.len() == 13 && s.bytes().all(|b| matches!(b, b'2'..=b'7' | b'a'..=b'z')))
 }
 
 fn same_type(a: &Value, b: &Value) -> bool {
@@ -118,10 +114,8 @@ fn binding_era(calls: &[Value]) -> Vec<Value> {
 
 #[tokio::test]
 async fn crate_client_trace_replays_identically_against_mls_ds() {
-    let trace: Value = serde_json::from_str(include_str!(
-        "fixtures/labyrinth_crate_xrpc_trace.json"
-    ))
-    .unwrap();
+    let trace: Value =
+        serde_json::from_str(include_str!("fixtures/labyrinth_crate_xrpc_trace.json")).unwrap();
     let env = Env::new().await;
     let mut devices = Vec::new();
     for m in trace["members"].as_array().unwrap() {
@@ -141,7 +135,13 @@ async fn crate_client_trace_replays_identically_against_mls_ds() {
         })
         .collect();
     let thread = Uuid::parse_str(trace["thread"].as_str().unwrap()).unwrap();
-    seed_conversation_with_id(&env, thread, &leaves, trace["nextEntrySeq"].as_i64().unwrap()).await;
+    seed_conversation_with_id(
+        &env,
+        thread,
+        &leaves,
+        trace["nextEntrySeq"].as_i64().unwrap(),
+    )
+    .await;
 
     let calls = binding_era(trace["calls"].as_array().unwrap());
     assert!(calls.len() > 50, "the trace covers the full client flow");

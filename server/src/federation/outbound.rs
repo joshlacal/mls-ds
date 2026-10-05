@@ -206,6 +206,51 @@ impl OutboundClient {
         parse_response(resp, method, deadline).await
     }
 
+    /// Make an authenticated XRPC procedure call over the pinned client and
+    /// return the raw status and body, success or not (the Labyrinth relay
+    /// forwards the remote endpoint's own output and typed errors). A
+    /// success body is bounded by `max_success_bytes`, an error body by
+    /// `ERROR_RESPONSE_MAX_BYTES`; redirects are refused.
+    pub async fn call_procedure_pinned_raw(
+        &self,
+        destination: &ValidatedRemoteDestination,
+        method: &str,
+        auth_token: &str,
+        body: &impl Serialize,
+        max_success_bytes: usize,
+    ) -> Result<(u16, Vec<u8>), OutboundError> {
+        let endpoint = destination.url.as_str().trim_end_matches('/');
+        let url = format!("{}/xrpc/{}", endpoint, method);
+        debug!(method, host = %destination.host, "Outbound pinned DS call (raw)");
+        let deadline = self.deadline(method)?;
+        let client = self.build_pinned_client(destination)?;
+        let send = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {auth_token}"))
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send();
+        let resp = tokio::time::timeout_at(deadline, send)
+            .await
+            .map_err(|_| timeout_error(method))?
+            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
+        let status = resp.status();
+        if status.is_redirection() {
+            return Err(OutboundError::InvalidResponse {
+                reason: format!("Redirect rejected from remote DS: HTTP {status}"),
+            });
+        }
+        let limit = if status.is_success() {
+            max_success_bytes
+        } else {
+            ERROR_RESPONSE_MAX_BYTES
+        };
+        let bytes = collect_bounded(resp, ResponseBodyBudget::new(limit, deadline))
+            .await
+            .map_err(|error| map_ordinary_body_error(error, method))?;
+        Ok((status.as_u16(), bytes.to_vec()))
+    }
+
     /// Make an authenticated XRPC query call returning raw JSON with pinned SSRF-validated socket addresses.
     pub async fn call_query_json_pinned(
         &self,

@@ -67,7 +67,10 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 
 /// Digest of a reference owner.
 pub fn owner(key: &[u8; 32], did: &str) -> [u8; 32] {
-    hmac(key, &[b"catbird.labyrinth.attachment_owner", did.as_bytes()])
+    hmac(
+        key,
+        &[b"catbird.labyrinth.attachment_owner", did.as_bytes()],
+    )
 }
 
 /// Digest of the message an attachment belongs to.

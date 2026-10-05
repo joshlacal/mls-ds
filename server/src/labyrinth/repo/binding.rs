@@ -100,10 +100,7 @@ pub async fn require_registered(
     .bind(keys)
     .fetch_one(&mut *conn)
     .await?;
-    let distinct = keys
-        .iter()
-        .collect::<std::collections::BTreeSet<_>>()
-        .len() as i64;
+    let distinct = keys.iter().collect::<std::collections::BTreeSet<_>>().len() as i64;
     if found == distinct {
         Ok(())
     } else {

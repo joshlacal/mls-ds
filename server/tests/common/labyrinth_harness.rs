@@ -30,6 +30,9 @@ use tower_util::ServiceExt;
 use uuid::Uuid;
 
 use catbird_server::blob_store::BlobStore;
+use catbird_server::federation::outbound::OutboundClient;
+use catbird_server::federation::resolver::ValidatedRemoteDestination;
+use catbird_server::federation::{DsResolver, ServiceAuthClient};
 use catbird_server::handlers::chat::ChatRuntime;
 use catbird_server::handlers::labyrinth::labyrinth_router;
 use catbird_server::storage::DbPool;
@@ -43,6 +46,33 @@ struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
     blob_store: BlobStore,
+    resolver: Arc<DsResolver>,
+    outbound: Arc<OutboundClient>,
+    service_auth: Option<Arc<ServiceAuthClient>>,
+}
+
+impl FromRef<TestState> for Arc<DsResolver> {
+    fn from_ref(state: &TestState) -> Arc<DsResolver> {
+        state.resolver.clone()
+    }
+}
+impl FromRef<TestState> for Arc<OutboundClient> {
+    fn from_ref(state: &TestState) -> Arc<OutboundClient> {
+        state.outbound.clone()
+    }
+}
+impl FromRef<TestState> for Option<Arc<ServiceAuthClient>> {
+    fn from_ref(state: &TestState) -> Option<Arc<ServiceAuthClient>> {
+        state.service_auth.clone()
+    }
+}
+
+/// This DS's federation identity in a two-DS relay test: its DID, its
+/// service-auth key, and where its one peer (the sequencer) listens.
+pub struct Federation {
+    pub self_did: String,
+    pub key: P256Key,
+    pub peer: Option<std::net::SocketAddr>,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -116,6 +146,19 @@ impl Env {
     }
 
     pub async fn with(cutover: bool, object: Option<&TestObject>) -> Self {
+        Self::build(cutover, object, None).await
+    }
+
+    /// An env with a federation identity (see [`Federation`]).
+    pub async fn federated(federation: Federation, object: Option<&TestObject>) -> Self {
+        Self::build(true, object, Some(federation)).await
+    }
+
+    async fn build(
+        cutover: bool,
+        object: Option<&TestObject>,
+        federation: Option<Federation>,
+    ) -> Self {
         let db = fresh_fully_migrated_db("labyrinth_srv_").await;
         let pool = db.connect(8).await;
         let blob_store = match object {
@@ -128,10 +171,44 @@ impl Env {
                 "image/png".to_owned(),
             ),
         };
+        let self_did = federation
+            .as_ref()
+            .map(|f| f.self_did.clone())
+            .unwrap_or_else(|| "did:web:labyrinth-test.invalid".to_owned());
+        let mut resolver = DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            self_did.clone(),
+            "https://labyrinth-test.invalid".to_owned(),
+            None,
+            3600,
+        );
+        if let Some(addr) = federation.as_ref().and_then(|f| f.peer) {
+            resolver = resolver.with_destination_resolver_hook(Arc::new(move |_did| {
+                Some(Box::pin(async move {
+                    Ok(ValidatedRemoteDestination {
+                        url: url::Url::parse(&format!("http://{addr}")).unwrap(),
+                        host: "127.0.0.1".to_owned(),
+                        addrs: vec![addr],
+                    })
+                }))
+            }));
+        }
+        let service_auth = federation.as_ref().map(|f| {
+            use p256::pkcs8::EncodePrivateKey;
+            let pem = f.key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF).unwrap();
+            Arc::new(
+                ServiceAuthClient::from_es256_pem(f.self_did.clone(), pem.as_bytes(), None)
+                    .unwrap(),
+            )
+        });
         let router = labyrinth_router::<TestState>().with_state(TestState {
             pool: pool.clone(),
             runtime: runtime(cutover),
             blob_store,
+            resolver: Arc::new(resolver),
+            outbound: Arc::new(OutboundClient::new(2, 10)),
+            service_auth,
         });
         Self {
             pool,
@@ -161,6 +238,22 @@ impl Env {
             jwt_key: jwt_key_for(did),
             router: self.router.clone(),
         };
+        self.insert_device(&device).await;
+        device
+    }
+
+    /// `device` (registered on another DS) replicated into this DS's chat
+    /// device tables, as federation leaves a remote member's device on the
+    /// sequencer; the returned handle drives this env's router.
+    pub async fn replicate(&self, device: &Device) -> Device {
+        let mut copy = device.clone();
+        copy.router = self.router.clone();
+        self.insert_device(&copy).await;
+        copy
+    }
+
+    async fn insert_device(&self, device: &Device) {
+        let did = device.did.as_str();
         let key = device.chat_pub();
         let now = self.now().await;
         sqlx::query(
@@ -202,7 +295,17 @@ impl Env {
         .await
         .expect("device key");
         device.cache_did_document().await;
-        device
+    }
+
+    /// Serve this env's router on loopback (a peer DS for relay tests).
+    pub async fn serve(&self) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = self.router.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        addr
     }
 
     /// Revoke a chat device the way chat revocation leaves it.
@@ -650,26 +753,8 @@ impl Device {
         self.chat_key.verifying_key().to_bytes()
     }
 
-    async fn cache_did_document(&self) {
-        let point = self.jwt_key.verifying_key().to_encoded_point(false);
-        let jwk = json!({
-            "kty": "EC",
-            "crv": "P-256",
-            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
-            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
-        });
-        let document = catbird_server::auth::DidDocument {
-            id: self.did.clone(),
-            verification_method: vec![catbird_server::auth::VerificationMethod {
-                id: format!("{}#atproto", self.did),
-                key_type: "JsonWebKey2020".to_string(),
-                controller: self.did.clone(),
-                public_key_jwk: Some(serde_json::from_value(jwk).unwrap()),
-                public_key_multibase: None,
-            }],
-            service: None,
-        };
-        catbird_server::auth::cache_test_did_document(document).await;
+    pub async fn cache_did_document(&self) {
+        cache_did_key(&self.did, &self.jwt_key).await;
     }
 
     /// A standard service-auth token for `nsid`.
@@ -718,9 +803,12 @@ impl Device {
 
     /// Register Labyrinth device `key` bound to this chat device.
     pub async fn enroll(&self, key: [u8; 32]) {
-        self.call("createDevice", &json!({ "record": self.device_record(key) }))
-            .await
-            .ok();
+        self.call(
+            "createDevice",
+            &json!({ "record": self.device_record(key) }),
+        )
+        .await
+        .ok();
     }
 
     /// `GET` a Labyrinth query as this device.
@@ -798,6 +886,75 @@ pub async fn send(router: &Router, request: Request<Body>) -> Reply {
     }
 }
 
+/// Publish `key` as `did`'s `#atproto` verification method in the
+/// process-wide DID-document cache.
+pub async fn cache_did_key(did: &str, key: &P256Key) {
+    let point = key.verifying_key().to_encoded_point(false);
+    let jwk = json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+        "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+    });
+    let document = catbird_server::auth::DidDocument {
+        id: did.to_owned(),
+        verification_method: vec![catbird_server::auth::VerificationMethod {
+            id: format!("{did}#atproto"),
+            key_type: "JsonWebKey2020".to_string(),
+            controller: did.to_owned(),
+            public_key_jwk: Some(serde_json::from_value(jwk).unwrap()),
+            public_key_multibase: None,
+        }],
+        service: None,
+    };
+    catbird_server::auth::cache_test_did_document(document).await;
+}
+
+/// Record `ds` as `device`'s home DS in the conversation (the sequencer's
+/// view of a remote participant).
+pub async fn set_home_ds(env: &Env, conversation_id: Uuid, device: &Device, ds: &str) {
+    let mut tx = env.pool.begin().await.unwrap();
+    replica(&mut tx).await;
+    sqlx::query(
+        "UPDATE chat.participants SET ds_did = $3 WHERE conversation_id = $1 AND user_did = $2",
+    )
+    .bind(conversation_id)
+    .bind(&device.did)
+    .bind(ds)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Mark a conversation as sequenced by `sequencer`.
+pub async fn make_remote_to(env: &Env, conversation_id: Uuid, sequencer: &str) {
+    let mut tx = env.pool.begin().await.unwrap();
+    replica(&mut tx).await;
+    sqlx::query(
+        "UPDATE chat.conversations SET is_remote = TRUE, sequencer_ds = $2 \
+          WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .bind(sequencer)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Allow `ds` in this DS's federation peer table.
+pub async fn allow_peer(env: &Env, ds: &str) {
+    sqlx::query(
+        "INSERT INTO federation_peers (ds_did, status, updated_at) VALUES ($1, 'allow', NOW()) \
+         ON CONFLICT (ds_did) DO UPDATE SET status = 'allow', updated_at = NOW()",
+    )
+    .bind(catbird_server::identity::canonical_did(ds))
+    .execute(&env.pool)
+    .await
+    .unwrap();
+}
+
 pub fn random_seed() -> [u8; 32] {
     let mut seed = [0u8; 32];
     seed[..16].copy_from_slice(Uuid::new_v4().as_bytes());
@@ -807,7 +964,7 @@ pub fn random_seed() -> [u8; 32] {
 
 /// One deterministic service-auth key per DID: the DID-document cache is
 /// process-wide, so concurrent tests sharing a DID must agree on it.
-fn jwt_key_for(did: &str) -> P256Key {
+pub fn jwt_key_for(did: &str) -> P256Key {
     let mut counter = 0u32;
     loop {
         let seed: [u8; 32] = Sha256::digest(format!("labyrinth-jwt:{did}:{counter}")).into();

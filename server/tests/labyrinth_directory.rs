@@ -78,7 +78,10 @@ async fn admission_requires_cutover_service_auth_and_a_current_device() {
         .await
         .fails(401, "DeviceRevoked");
     alice
-        .call("createDevice", &json!({ "record": alice.device_record([1; 32]) }))
+        .call(
+            "createDevice",
+            &json!({ "record": alice.device_record([1; 32]) }),
+        )
         .await
         .fails(401, "DeviceRevoked");
 

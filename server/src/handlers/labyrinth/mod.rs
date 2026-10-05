@@ -2,21 +2,24 @@
 //! labyrinth `docs/MLSDS_BACKEND.md` §2–§3; domain code in
 //! `crate::labyrinth`).
 //!
-//! All 27 XRPC endpoints of the lexicons are registered by
+//! All 34 XRPC endpoints of the lexicons are registered by
 //! [`labyrinth_router`]. Every one requires the clean-chat cutover gate and a
 //! standard service-auth JWT whose `lxm` is the endpoint NSID; queries name
 //! the calling device with `actorDeviceId`, procedures with a signed
 //! `labyrinthWriteBody` (see `crate::labyrinth::auth`). `main.rs` merges the
 //! router only when `LABYRINTH_ENABLED` is set.
 //!
-//! Federation: thread writes to a conversation sequenced by another DS
-//! return a typed `501 MethodNotImplemented`; the `labyrinthRelay`
-//! server-to-server procedure of design §3 is not built.
+//! Federation: thread operations on a conversation sequenced by another DS
+//! are forwarded there through the server-to-server `labyrinthRelay`
+//! procedure (design §3, Y3; `crate::labyrinth::relay`), which this router
+//! also serves for peers.
 
 mod directory;
 mod mailbox;
 mod orf;
 mod params;
+mod relay;
+mod relay_client;
 mod retention;
 mod thread;
 
@@ -43,6 +46,8 @@ const KIB: usize = 1024;
 const LIMIT_RECORD_STREAM: usize = 1024 * KIB;
 const LIMIT_CREATE_EPOCH: usize = 512 * KIB;
 const LIMIT_DEFAULT: usize = 64 * KIB;
+/// A relayed write carries a `LIMIT_RECORD_STREAM` payload base64-encoded.
+const LIMIT_RELAY: usize = 2048 * KIB;
 
 /// The procedures, with their body limits.
 pub const PROCEDURES: &[(&str, usize)] = &[
@@ -64,6 +69,7 @@ pub const PROCEDURES: &[(&str, usize)] = &[
     ("deleteAccountData", LIMIT_DEFAULT),
     ("deleteVirtualDevice", LIMIT_DEFAULT),
     ("touchVirtualDevice", LIMIT_DEFAULT),
+    ("labyrinthRelay", LIMIT_RELAY),
 ];
 
 /// The queries.
@@ -113,6 +119,9 @@ where
     DbPool: FromRef<S>,
     Arc<ChatRuntime>: FromRef<S>,
     BlobStore: FromRef<S>,
+    Arc<crate::federation::DsResolver>: FromRef<S>,
+    Arc<crate::federation::outbound::OutboundClient>: FromRef<S>,
+    Option<Arc<crate::federation::ServiceAuthClient>>: FromRef<S>,
 {
     let limit = |name: &str| {
         PROCEDURES
@@ -166,6 +175,10 @@ where
         )
         .route(&path("listBatches"), get(thread::list_batches))
         .route(&path("redactMessage"), post(thread::redact_message))
+        .route(
+            &path("labyrinthRelay"),
+            post(relay::labyrinth_relay).layer(DefaultBodyLimit::max(limit("labyrinthRelay"))),
+        )
         .route(&path("purgeMailbox"), post(retention::purge_mailbox))
         .route(
             &path("deleteAccountData"),
@@ -234,6 +247,6 @@ mod tests {
             assert!(served.insert(((*name).to_owned(), "query".to_owned())));
         }
         assert_eq!(served, lexicon);
-        assert_eq!(served.len(), 27);
+        assert_eq!(served.len(), 34);
     }
 }

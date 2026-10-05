@@ -14,11 +14,13 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::params::{admit_procedure, admit_query, begin_write, Params};
+use super::relay_client::{Forwarded, Relay};
 use super::respond;
 use crate::blob_store::BlobStore;
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth::begin_read;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
+use crate::labyrinth::relay::RelayOp;
 use crate::labyrinth::repo::attachments::{self, Blinded, MessageRef};
 use crate::labyrinth::repo::orf as repo;
 use crate::labyrinth::wire::bytes::hex_array;
@@ -99,8 +101,15 @@ pub async fn put_attachment_ref(
             };
             let mut w = begin_write!(&pool, adm);
             let caller = w.caller.clone();
-            attachments::put(&mut w.tx, &caller, &blinded, &msg, &input.blob_id, w.instant)
-                .await?;
+            attachments::put(
+                &mut w.tx,
+                &caller,
+                &blinded,
+                &msg,
+                &input.blob_id,
+                w.instant,
+            )
+            .await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,
@@ -170,6 +179,7 @@ pub async fn get_attachment_blob(
     State(pool): Pool,
     State(rt): Runtime,
     State(store): State<BlobStore>,
+    relay: Relay,
     headers: HeaderMap,
     RawQuery(q): RawQuery,
 ) -> Response {
@@ -199,13 +209,32 @@ pub async fn get_attachment_blob(
             thread_id: p.req("threadId")?.to_owned(),
             message_id: p.req("messageId")?.to_owned(),
         };
-        let mut r = begin_read(&pool, adm).await?;
+        let mut r = begin_read(&pool, adm.clone()).await?;
         let caller = r.caller.clone();
         let object = attachments::authorize(&mut r.tx, &caller, &blinded, &msg).await?;
         r.finish_read().await?;
-        if object.pending_remote.is_some() {
+        if let Some(sequencer) = &object.pending_remote {
             // Sender copies of a remote conversation live on its sequencer.
-            return Err(LabyrinthError::relay_unavailable());
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("threadId", &msg.thread_id)
+                .append_pair("messageId", &msg.message_id)
+                .finish();
+            let reply = relay
+                .forward(
+                    &pool,
+                    sequencer,
+                    RelayOp::MessageLive,
+                    &adm,
+                    Forwarded::Read { query: &query },
+                )
+                .await?;
+            let live = serde_json::from_slice::<serde_json::Value>(&reply)
+                .ok()
+                .and_then(|v| v["live"].as_bool())
+                .ok_or_else(LabyrinthError::relay_unavailable)?;
+            if !live {
+                return Err(LabyrinthError::not_found("NotFound"));
+            }
         }
         let data = store
             .get_committed(&object.object_store_key)
