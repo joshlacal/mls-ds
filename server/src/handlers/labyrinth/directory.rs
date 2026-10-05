@@ -1,5 +1,6 @@
-//! Directory endpoints (`MailboxDirectory`; the caller is any authenticated
-//! chat device).
+//! Directory endpoints (`MailboxDirectory`). Reads: any authenticated chat
+//! device. `publishEpochHead`: only a chat device holding a bound Labyrinth
+//! device, and only to re-publish an epoch its mailbox already holds.
 
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use super::respond;
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth::begin_read;
 use crate::labyrinth::error::LabyrinthError;
+use crate::labyrinth::repo::binding;
 use crate::labyrinth::repo::directory as repo;
 use crate::labyrinth::repo::thread::parse_thread_id;
 use crate::labyrinth::wire::bytes::{check_did, Bytes as AtBytes, MAX_EPOCH_NUMBER};
@@ -38,7 +40,9 @@ pub async fn publish_epoch_head(
             let input: PublishHeadIn = body(&bytes)?;
             let epoch = Received::<EpochPublic>::parse(&input.epoch, "epoch")?;
             let mut w = begin_write!(&pool, adm);
-            repo::record_head(&mut w.tx, &w.caller.did, &epoch.value, w.instant).await?;
+            let caller = w.caller.clone();
+            binding::require_bound(&mut w.tx, &caller, None).await?;
+            repo::republish_head(&mut w.tx, &caller, &epoch.value, w.instant).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,

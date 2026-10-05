@@ -14,6 +14,7 @@ use super::respond;
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth;
 use crate::labyrinth::relay::RelayOp;
+use crate::labyrinth::repo::binding;
 use crate::labyrinth::repo::retention as repo;
 use crate::labyrinth::wire::bytes::Bytes as AtBytes;
 use crate::labyrinth::wire::io::{body, to_bytes};
@@ -45,8 +46,9 @@ pub async fn purge_mailbox(
             let adm = admit_procedure(&pool, &rt, "purgeMailbox", &headers, &bytes).await?;
             let EmptyIn {} = body(&bytes)?;
             let mut w = begin_write!(&pool, adm);
-            let did = w.caller.did.clone();
-            repo::purge_mailbox(&mut w.tx, &did).await?;
+            let caller = w.caller.clone();
+            binding::require_bound(&mut w.tx, &caller, None).await?;
+            repo::purge_mailbox(&mut w.tx, &caller.did).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,
@@ -65,8 +67,9 @@ pub async fn delete_virtual_device(
             let input: VirtualDeviceIdIn = body(&bytes)?;
             let id = input.vdevice_id.array::<16>("vdeviceId")?;
             let mut w = begin_write!(&pool, adm);
-            let did = w.caller.did.clone();
-            repo::delete_virtual_device(&mut w.tx, &did, &id).await?;
+            let caller = w.caller.clone();
+            binding::require_bound(&mut w.tx, &caller, None).await?;
+            repo::delete_virtual_device(&mut w.tx, &caller.did, &id).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,
@@ -111,6 +114,9 @@ pub async fn delete_account_data(
             let EmptyIn {} = body(&bytes)?;
             let sequencers = {
                 let mut conn = pool.acquire().await?;
+                let caller =
+                    auth::load_current_device(&mut conn, &adm.did, adm.device_id, false).await?;
+                binding::require_bound(&mut conn, &caller, None).await?;
                 repo::remote_sequencers(&mut conn, &adm.did).await?
             };
             for sequencer in &sequencers {
@@ -125,8 +131,9 @@ pub async fn delete_account_data(
                     .await?;
             }
             let mut w = begin_write!(&pool, adm);
-            let (did, at) = (w.caller.did.clone(), w.instant);
-            repo::purge_account(&mut w.tx, &did, at).await?;
+            let (caller, at) = (w.caller.clone(), w.instant);
+            binding::require_bound(&mut w.tx, &caller, None).await?;
+            repo::purge_account(&mut w.tx, &caller.did, at).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,

@@ -107,9 +107,17 @@ async fn a_chat_device_without_its_own_labyrinth_device_cannot_write_epochs() {
     d1.call("createEpoch", &epoch(&v, 1, [0xD0; 32], &[]))
         .await
         .fails(403, "LabyrinthDeviceNotBound");
+    // Bound and naming its own device, d1 still cannot open an epoch whose
+    // head another chat device attested (review 2, finding 1).
     d1.call(
         "createEpoch",
         &epoch(&v, 1, [0xD1; 32], &[[0xD0; 32], [0xD1; 32]]),
+    )
+    .await
+    .fails(400, "AttestationNotCaller");
+    d0.call(
+        "createEpoch",
+        &epoch(&v, 1, [0xD0; 32], &[[0xD0; 32], [0xD1; 32]]),
     )
     .await
     .ok();

@@ -6,17 +6,10 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::{advisory_lock, PageReq};
+use crate::labyrinth::auth::Caller;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
-use crate::labyrinth::heads::{check_chain_link, verify_epoch_public};
+use crate::labyrinth::heads::{check_chain_link, verify_epoch_public, verify_prev_sig};
 use crate::labyrinth::wire::records::EpochPublic;
-
-fn not_current() -> LabyrinthError {
-    LabyrinthError::new(
-        axum::http::StatusCode::BAD_REQUEST,
-        "AttestationNotCurrent",
-        "the attesting key is not a current chat device key of this DID",
-    )
-}
 
 /// The key id of `did`'s *current* chat device key `key`, if any.
 pub async fn current_chat_key_id(
@@ -36,20 +29,48 @@ pub async fn current_chat_key_id(
     .await?)
 }
 
-/// Accept `epoch` into `did`'s head chain (design §1a checks 1–5; check 6,
-/// the caller being a device of `did`, holds because `did` is always the
-/// authenticated DID). Re-sending an identical head succeeds; a different
-/// head under a taken number is `EpochHeadConflict`.
+fn not_caller() -> LabyrinthError {
+    LabyrinthError::new(
+        axum::http::StatusCode::BAD_REQUEST,
+        "AttestationNotCaller",
+        "the head must be attested by the calling chat device's own key",
+    )
+}
+
+fn head_conflict() -> LabyrinthError {
+    LabyrinthError::new(
+        axum::http::StatusCode::CONFLICT,
+        "EpochHeadConflict",
+        "a different head is already recorded for this epoch",
+    )
+}
+
+fn parse_stored(text: &str) -> LabyrinthResult<EpochPublic> {
+    serde_json::from_str(text).map_err(|error| {
+        tracing::error!(?error, "stored epoch head does not parse");
+        LabyrinthError::internal()
+    })
+}
+
+/// Accept `epoch` into the caller DID's head chain (design §1a checks 1-6,
+/// tightened by the second security review). The head recomputes, its
+/// `selfSig` verifies, it is attested by the **calling** chat device's own
+/// key (not merely any current key of the DID), and it extends the stored
+/// latest head by one with a `prevSig` by that head's signing key.
+/// Re-sending an identical head succeeds; a different head under a taken
+/// number is `EpochHeadConflict`. Only `createEpoch` (inside its
+/// transaction, after the binding check) and [`republish_head`] call this.
 pub async fn record_head(
     conn: &mut PgConnection,
-    did: &str,
+    caller: &Caller,
     epoch: &EpochPublic,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<()> {
+    let did = caller.did.as_str();
     let parts = verify_epoch_public(did, epoch)?;
-    let key_id = current_chat_key_id(conn, did, &parts.attestation_key)
-        .await?
-        .ok_or_else(not_current)?;
+    if parts.attestation_key != caller.signing_key {
+        return Err(not_caller());
+    }
     advisory_lock(conn, &format!("labyrinth.epoch_heads:{did}")).await?;
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT epoch_public::text FROM labyrinth.epoch_heads \
@@ -60,38 +81,35 @@ pub async fn record_head(
     .fetch_optional(&mut *conn)
     .await?;
     if let Some(text) = existing {
-        let stored: EpochPublic = serde_json::from_str(&text).map_err(|error| {
-            tracing::error!(?error, "stored epoch head does not parse");
-            LabyrinthError::internal()
-        })?;
-        return if &stored == epoch {
+        return if &parse_stored(&text)? == epoch {
             Ok(())
         } else {
-            Err(LabyrinthError::new(
-                axum::http::StatusCode::CONFLICT,
-                "EpochHeadConflict",
-                "a different head is already recorded for this epoch",
-            ))
+            Err(head_conflict())
         };
     }
-    let latest: Option<(i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT epoch_number, epoch_head FROM labyrinth.epoch_heads \
+    let latest: Option<(i64, Vec<u8>, String)> = sqlx::query_as(
+        "SELECT epoch_number, epoch_head, epoch_public::text FROM labyrinth.epoch_heads \
           WHERE did = $1 ORDER BY epoch_number DESC LIMIT 1",
     )
     .bind(did)
     .fetch_optional(&mut *conn)
     .await?;
     let latest = latest
-        .map(|(n, head)| -> LabyrinthResult<(u64, [u8; 32])> {
-            Ok((
-                n as u64,
-                head.as_slice()
-                    .try_into()
-                    .map_err(|_| LabyrinthError::internal())?,
-            ))
+        .map(|(n, head, text)| -> LabyrinthResult<_> {
+            let head: [u8; 32] = head
+                .as_slice()
+                .try_into()
+                .map_err(|_| LabyrinthError::internal())?;
+            let signing = parse_stored(&text)?
+                .signing_pubkey
+                .array::<32>("signingPubkey")?;
+            Ok((n as u64, head, signing))
         })
         .transpose()?;
-    check_chain_link(&parts, latest)?;
+    check_chain_link(&parts, latest.map(|(n, head, _)| (n, head)))?;
+    if let Some((_, _, previous_signing_key)) = latest {
+        verify_prev_sig(&parts, &previous_signing_key)?;
+    }
     let text = serde_json::to_string(epoch).map_err(|_| LabyrinthError::internal())?;
     sqlx::query(
         "INSERT INTO labyrinth.epoch_heads \
@@ -105,11 +123,38 @@ pub async fn record_head(
     .bind(parts.previous_head.map(|h| h.to_vec()))
     .bind(&text)
     .bind(text.len() as i32)
-    .bind(&key_id)
+    .bind(&caller.key_id)
     .bind(at)
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// `publishEpochHead`: re-publish the head of an epoch the caller's mailbox
+/// already holds. Heads enter the directory only through `createEpoch`
+/// (atomically, behind the Labyrinth device binding); this endpoint can
+/// neither introduce an epoch nor squat the next number. The epoch must
+/// exist in `labyrinth.epochs` with exactly this `public`, and the caller
+/// must be the chat device that attested it.
+pub async fn republish_head(
+    conn: &mut PgConnection,
+    caller: &Caller,
+    epoch: &EpochPublic,
+    at: DateTime<Utc>,
+) -> LabyrinthResult<()> {
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT (record->'public')::text FROM labyrinth.epochs \
+          WHERE owner_did = $1 AND epoch_number = $2",
+    )
+    .bind(&caller.did)
+    .bind(epoch.epoch_number as i64)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let stored = stored.ok_or_else(|| LabyrinthError::not_found("EpochNotFound"))?;
+    if &parse_stored(&stored)? != epoch {
+        return Err(head_conflict());
+    }
+    record_head(conn, caller, epoch, at).await
 }
 
 /// `getEpochHead`: the record and when it was received; `None` for latest.

@@ -420,6 +420,7 @@ async fn attachment_existence_and_account_deletion_reach_the_sequencer() {
         )
         .await
         .ok();
+    w.alice.enroll([0xA0; 32]).await;
     w.alice.call("deleteAccountData", &json!({})).await.ok();
     let page = w
         .bob

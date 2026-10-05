@@ -10,6 +10,9 @@ mod common;
 #[path = "common/labyrinth_harness.rs"]
 mod harness;
 
+#[path = "common/labyrinth_chain.rs"]
+mod chain;
+
 use axum::{body::Body, http::Request};
 use ed25519_dalek::{Signer as _, SigningKey};
 use harness::*;
@@ -149,25 +152,44 @@ async fn writes_require_a_valid_signed_write_body() {
 }
 
 // ---------------------------------------------------------------------------
-// Head chain acceptance (design §1a)
+// Head chain acceptance (design §1a; second security review finding 1)
 // ---------------------------------------------------------------------------
+
+/// `createEpoch` input opening `public` with Labyrinth device `opened_by`.
+fn open_epoch(public: &Value, opened_by: [u8; 32]) -> Value {
+    json!({ "epoch": epoch_record(public, opened_by), "members": [] })
+}
+
+/// The vector DID's two chat devices, each holding a bound Labyrinth device
+/// (d0: 0xD0, d1: 0xD1). Epochs 0-1 are attested by d0, epoch 2 by d1.
+async fn vector_devices(env: &Env, v: &Vectors) -> (Device, Device) {
+    let d0 = env.device_for(&v.did, v.seeds[0]).await;
+    let d1 = env.device_for(&v.did, v.seeds[1]).await;
+    d0.enroll([0xD0; 32]).await;
+    d1.enroll([0xD1; 32]).await;
+    (d0, d1)
+}
 
 #[tokio::test]
 async fn head_chain_accepts_crate_vectors_in_order_and_serves_them() {
     let env = Env::new().await;
     let v = vectors();
-    let d0 = env.device_for(&v.did, v.seeds[0]).await;
-    let _d1 = env.device_for(&v.did, v.seeds[1]).await;
+    let (d0, d1) = vector_devices(&env, &v).await;
     let reader = env.account().await;
 
     reader
         .query("getEpochHead", &[("did", v.did.clone())])
         .await
         .fails(404, "EpochNotFound");
-    for epoch in &v.chain {
-        d0.call("publishEpochHead", &publish(epoch)).await.ok();
+    for epoch in &v.chain[..2] {
+        d0.call("createEpoch", &open_epoch(epoch, [0xD0; 32]))
+            .await
+            .ok();
     }
-    // Re-sending identical bytes is accepted.
+    d1.call("createEpoch", &open_epoch(&v.chain[2], [0xD1; 32]))
+        .await
+        .ok();
+    // Re-publishing an existing epoch's head is accepted (identical bytes).
     d0.call("publishEpochHead", &publish(&v.chain[1]))
         .await
         .ok();
@@ -197,31 +219,35 @@ async fn head_chain_accepts_crate_vectors_in_order_and_serves_them() {
 async fn head_chain_rejects_gaps_non_genesis_starts_and_forks() {
     let env = Env::new().await;
     let v = vectors();
-    let d0 = env.device_for(&v.did, v.seeds[0]).await;
-    env.device_for(&v.did, v.seeds[1]).await;
+    let (d0, d1) = vector_devices(&env, &v).await;
 
     // Not genesis on an empty chain.
-    d0.call("publishEpochHead", &publish(&v.chain[1]))
+    d0.call("createEpoch", &open_epoch(&v.chain[1], [0xD0; 32]))
         .await
         .fails(400, "InvalidEpochChain");
-    d0.call("publishEpochHead", &publish(&v.chain[0]))
+    d0.call("createEpoch", &open_epoch(&v.chain[0], [0xD0; 32]))
         .await
         .ok();
     // Skips epoch 1.
-    d0.call("publishEpochHead", &publish(&v.chain[2]))
+    d1.call("createEpoch", &open_epoch(&v.chain[2], [0xD1; 32]))
         .await
         .fails(400, "InvalidEpochChain");
-    d0.call("publishEpochHead", &publish(&v.chain[1]))
+    d0.call("createEpoch", &open_epoch(&v.chain[1], [0xD0; 32]))
         .await
         .ok();
-    // A different epoch 1 (same predecessor) is a fork.
+    // A different epoch 1 (same predecessor) is a fork: the [CB-9] race
+    // guard on createEpoch, a conflict on publishEpochHead.
+    d0.call("createEpoch", &open_epoch(&v.fork, [0xD0; 32]))
+        .await
+        .fails(409, "RecordAlreadyExists");
     d0.call("publishEpochHead", &publish(&v.fork))
         .await
         .fails(409, "EpochHeadConflict");
 }
 
 /// Re-attest `epoch` after replacing its predecessor link, recomputing the
-/// head as the server does (selfSig/prevSig are client-verified only).
+/// head as the server does. Its `selfSig` no longer verifies (the vector's
+/// signing key is the crate's), which is exactly what the server checks.
 fn relinked(did: &str, epoch: &Value, previous: [u8; 32], seed: [u8; 32]) -> Value {
     let mut e = epoch.clone();
     let n = e["epochNumber"].as_u64().unwrap();
@@ -241,60 +267,154 @@ fn relinked(did: &str, epoch: &Value, previous: [u8; 32], seed: [u8; 32]) -> Val
 }
 
 #[tokio::test]
-async fn head_chain_requires_the_previous_head_link_and_a_recomputable_head() {
+async fn head_chain_requires_a_recomputable_self_signed_attested_head() {
     let env = Env::new().await;
     let v = vectors();
-    let d0 = env.device_for(&v.did, v.seeds[0]).await;
-    d0.call("publishEpochHead", &publish(&v.chain[0]))
+    let (d0, _d1) = vector_devices(&env, &v).await;
+    d0.call("createEpoch", &open_epoch(&v.chain[0], [0xD0; 32]))
         .await
         .ok();
+    let create = |e: &Value| open_epoch(e, [0xD0; 32]);
 
-    // Well-formed and attested, but linked to a head that is not epoch 0's.
+    // Re-headed onto another predecessor: selfSig no longer verifies.
     let wrong_link = relinked(&v.did, &v.chain[1], [0xAB; 32], v.seeds[0]);
-    d0.call("publishEpochHead", &publish(&wrong_link))
+    d0.call("createEpoch", &create(&wrong_link))
         .await
-        .fails(400, "InvalidEpochChain");
-
+        .fails(400, "InvalidRequest");
     // A head that does not recompute from its keys.
     let mut tampered = v.chain[1].clone();
     tampered["authPubkey"] = b(&[0x5A; 32]);
-    d0.call("publishEpochHead", &publish(&tampered))
+    d0.call("createEpoch", &create(&tampered))
         .await
         .fails(400, "InvalidRequest");
-
-    // A forged attestation signature.
+    // A forged attestation or self signature.
     let mut forged = v.chain[1].clone();
     forged["attestation"]["sig"] = b(&[0x11; 64]);
-    d0.call("publishEpochHead", &publish(&forged))
+    d0.call("createEpoch", &create(&forged))
         .await
         .fails(400, "InvalidRequest");
-
+    let mut forged = v.chain[1].clone();
+    forged["selfSig"] = v.chain[0]["selfSig"].clone();
+    d0.call("createEpoch", &create(&forged))
+        .await
+        .fails(400, "InvalidRequest");
     // A head for another DID (the caller's own DID is always the subject).
     let other = env.account().await;
+    other.enroll([0x0B; 32]).await;
     other
-        .call("publishEpochHead", &publish(&v.chain[0]))
+        .call("createEpoch", &open_epoch(&v.chain[0], [0x0B; 32]))
         .await
         .fails(400, "InvalidRequest");
 }
 
 #[tokio::test]
-async fn head_attestation_must_be_a_current_chat_key_of_the_did() {
+async fn prev_sig_must_be_signed_by_the_previous_epochs_key() {
     let env = Env::new().await;
-    let v = vectors();
-    let d0 = env.device_for(&v.did, v.seeds[0]).await;
-    let d1 = env.device_for(&v.did, v.seeds[1]).await;
-    for epoch in &v.chain[..2] {
-        d1.call("publishEpochHead", &publish(epoch)).await.ok();
-    }
-    // Epoch 2 is attested by d1's key; revoke d1 and publish from d0.
-    env.revoke(&d1).await;
-    d0.call("publishEpochHead", &publish(&v.chain[2]))
-        .await
-        .fails(400, "AttestationNotCurrent");
-    // d0's own epochs stay publishable (identical resend).
-    d0.call("publishEpochHead", &publish(&v.chain[1]))
+    let alice = env.account().await;
+    alice.enroll([0xA0; 32]).await;
+    let (genesis, g) = chain::epoch_public(&alice, 0, [1; 32], None, None);
+    alice
+        .call("createEpoch", &open_epoch(&genesis, [0xA0; 32]))
         .await
         .ok();
+    // Correct head, self signature and attestation, but prevSig by a key
+    // that is not epoch 0's.
+    let (bad, _) = chain::epoch_public(&alice, 1, [2; 32], Some(g), Some([9; 32]));
+    alice
+        .call("createEpoch", &open_epoch(&bad, [0xA0; 32]))
+        .await
+        .fails(400, "InvalidRequest");
+    let (good, _) = chain::epoch_public(&alice, 1, [2; 32], Some(g), None);
+    alice
+        .call("createEpoch", &open_epoch(&good, [0xA0; 32]))
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn head_attestation_must_be_the_callers_own_chat_key() {
+    let env = Env::new().await;
+    let v = vectors();
+    let (d0, d1) = vector_devices(&env, &v).await;
+    for epoch in &v.chain[..2] {
+        d0.call("createEpoch", &open_epoch(epoch, [0xD0; 32]))
+            .await
+            .ok();
+    }
+    // Epoch 2 is attested by d1's key: d0 can neither open nor publish it,
+    // although d1's key is a current chat key of the DID.
+    d0.call("createEpoch", &open_epoch(&v.chain[2], [0xD0; 32]))
+        .await
+        .fails(400, "AttestationNotCaller");
+    // d1 cannot re-publish d0's epoch either.
+    d1.call("publishEpochHead", &publish(&v.chain[1]))
+        .await
+        .fails(400, "AttestationNotCaller");
+    // Once d1 is revoked it cannot act at all.
+    env.revoke(&d1).await;
+    d1.call("createEpoch", &open_epoch(&v.chain[2], [0xD1; 32]))
+        .await
+        .fails(401, "DeviceRevoked");
+}
+
+/// Finding 1 repro: before the fix an unbound chat device of the DID could
+/// publish a self-attested head n+1 through publishEpochHead and squat the
+/// number, wedging every later rotation.
+#[tokio::test]
+async fn unbound_device_cannot_squat_the_next_head_and_rotation_proceeds() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    alice.enroll([0xA0; 32]).await;
+    let (genesis, g) = chain::epoch_public(&alice, 0, [1; 32], None, None);
+    alice
+        .call("createEpoch", &open_epoch(&genesis, [0xA0; 32]))
+        .await
+        .ok();
+
+    // A second chat device of the same DID with no Labyrinth device builds
+    // a fully valid epoch 1 (it cannot sign prevSig without epoch 0's key,
+    // so give it that key too: the attack must fail on authority alone).
+    let rogue = env.device_for(&alice.did, random_seed()).await;
+    let (squat, _) = chain::epoch_public(&rogue, 1, [6; 32], Some(g), None);
+    rogue
+        .call("publishEpochHead", &publish(&squat))
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+    // Bound, but the epoch is not in its mailbox: publishEpochHead never
+    // introduces a head.
+    rogue.enroll([0x7E; 32]).await;
+    rogue
+        .call("publishEpochHead", &publish(&squat))
+        .await
+        .fails(404, "EpochNotFound");
+    // The rogue's own bound device may open its own epoch only with its own
+    // attestation; alice's attestation is refused for it.
+    let (alices_next, _) = chain::epoch_public(&alice, 1, [2; 32], Some(g), None);
+    rogue
+        .call("createEpoch", &open_epoch(&alices_next, [0x7E; 32]))
+        .await
+        .fails(400, "AttestationNotCaller");
+    let heads: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM labyrinth.epoch_heads WHERE did = $1")
+            .bind(&alice.did)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(heads, 1, "nothing was squatted");
+
+    // The real rotation succeeds, and its head can be re-published.
+    alice
+        .call("createEpoch", &open_epoch(&alices_next, [0xA0; 32]))
+        .await
+        .ok();
+    alice
+        .call("publishEpochHead", &publish(&alices_next))
+        .await
+        .ok();
+    let latest = alice
+        .query("getEpochHead", &[("did", alice.did.clone())])
+        .await;
+    assert_eq!(latest.ok()["epoch"], alices_next);
 }
 
 // ---------------------------------------------------------------------------

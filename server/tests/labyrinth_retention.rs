@@ -347,9 +347,17 @@ async fn purge_mailbox_resets_the_account_and_nothing_else() {
     )
     .await
     .ok();
-    // Idempotent.
-    d0.call("purgeMailbox", &json!({})).await.ok();
-    d0.call("purgeMailbox", &json!({})).await.ok();
+    // A retry of the same operation replays; a fresh purge of an emptied
+    // mailbox has no bound device left to authorize it (finding 6).
+    d0.call_op("purgeMailbox", &json!({}), [0x77; 16])
+        .await
+        .ok();
+    d0.call_op("purgeMailbox", &json!({}), [0x77; 16])
+        .await
+        .ok();
+    d0.call("purgeMailbox", &json!({}))
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
 }
 
 #[tokio::test]
@@ -394,6 +402,11 @@ async fn delete_account_data_purges_and_redacts_without_a_signature() {
     let carol = env.account().await;
     let remote = seed_conversation(&env, &[leaf(&carol)], 2).await;
     make_remote(&env, remote).await;
+    carol
+        .call("deleteAccountData", &json!({}))
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+    carol.enroll([0xC0; 32]).await;
     carol
         .call("deleteAccountData", &json!({}))
         .await
@@ -464,6 +477,12 @@ async fn recovery_bundles_record_use_expire_when_idle_and_can_be_deleted() {
             .fetch_one(&env.pool)
             .await
             .unwrap();
+    // Deleting a bundle needs a bound Labyrinth device (review 2, finding 6).
+    alice
+        .call("deleteVirtualDevice", &json!({ "vdeviceId": b(&[4; 16]) }))
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+    alice.enroll([0xA7; 32]).await;
     alice
         .call("deleteVirtualDevice", &json!({ "vdeviceId": b(&[4; 16]) }))
         .await

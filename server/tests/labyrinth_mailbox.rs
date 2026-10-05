@@ -240,8 +240,11 @@ async fn concurrent_create_epoch_for_one_number_admits_exactly_one() {
     .await
     .ok();
     let a = json!({ "epoch": epoch_record(&v.chain[1], [0xD0; 32]), "members": [] });
-    let b_input = json!({ "epoch": epoch_record(&v.fork, [0xD1; 32]), "members": [] });
-    let (ra, rb) = tokio::join!(d0.call("createEpoch", &a), d1.call("createEpoch", &b_input));
+    // The fork is attested by d0's key too; only its own attester may open
+    // an epoch (review 2, finding 1), so both racers are d0's requests.
+    let _ = d1;
+    let b_input = json!({ "epoch": epoch_record(&v.fork, [0xD0; 32]), "members": [] });
+    let (ra, rb) = tokio::join!(d0.call("createEpoch", &a), d0.call("createEpoch", &b_input));
     let outcomes = [ra.status.as_u16(), rb.status.as_u16()];
     assert!(
         outcomes.contains(&200),

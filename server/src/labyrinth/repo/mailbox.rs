@@ -227,7 +227,7 @@ pub async fn create_epoch(
     binding::require_registered(conn, owner, &member_keys).await?;
     // The head directory row (design §1a); a different head under a taken
     // number is the [CB-9] race and reads as RecordAlreadyExists here.
-    directory::record_head(conn, owner, &epoch.value.public, at)
+    directory::record_head(conn, caller, &epoch.value.public, at)
         .await
         .map_err(|e| {
             if e.name() == "EpochHeadConflict" {

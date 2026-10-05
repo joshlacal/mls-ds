@@ -27,5 +27,6 @@ pub mod relay;
 pub mod repo;
 pub mod tid;
 pub mod wire;
+pub mod xeddsa;
 
 pub use error::{LabyrinthError, LabyrinthResult};

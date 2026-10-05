@@ -1,20 +1,23 @@
 //! Epoch-head checks mls-ds performs itself (design §1a, Y1).
 //!
-//! The labyrinth crate is private, so mls-ds re-implements exactly two small
-//! pieces of it: the sha256 epoch-head recomputation of SPEC §5.3 (with the
-//! account DID in place of Meta's fbid, [CB-1]) and the [CB-18] Ed25519
-//! attestation by a chat device key. It does NOT verify the XEdDSA
-//! `selfSig`/`prevSig`: clients verify those (`src/client/pins.rs`), and the
-//! server chain is anchored by contiguity, the previous-head link and the
-//! live chat identity of the attesting key instead.
+//! The labyrinth crate is private, so mls-ds re-implements the small pieces
+//! it needs: the sha256 epoch-head recomputation of SPEC §5.3 (with the
+//! account DID in place of Meta's fbid, [CB-1]), the [CB-18] Ed25519
+//! attestation by a chat device key, and (second security review) the
+//! XEdDSA `selfSig` here and the `prevSig` chain link in
+//! `repo::directory::record_head` (`super::xeddsa`).
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use super::error::{LabyrinthError, LabyrinthResult};
 use super::wire::records::EpochPublic;
+use super::xeddsa;
 
 const ATTEST_PREFIX: &str = "catbird.labyrinth.epoch_head_attest:";
+/// SPEC §5.3 `self_sig` / `prev_sig` prefixes (unstructured, no use-case byte).
+const SELF_SIG_PREFIX: &[u8] = b"minos.unstructured_signature.epoch_self:";
+const PREV_SIG_PREFIX: &[u8] = b"minos.unstructured_signature.epoch_prev:";
 
 /// The parsed fixed-size parts of an `epochPublic` the server checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,6 +26,9 @@ pub struct HeadParts {
     pub head: [u8; 32],
     pub previous_head: Option<[u8; 32]>,
     pub attestation_key: [u8; 32],
+    /// The epoch's XEdDSA signing key (X25519 u-coordinate).
+    pub signing_key: [u8; 32],
+    pub prev_sig: Option<[u8; 64]>,
 }
 
 fn sha256(data: &[u8]) -> [u8; 32] {
@@ -63,8 +69,13 @@ pub fn attestation_message(did: &str, head: &[u8; 32]) -> Vec<u8> {
     [format!("{ATTEST_PREFIX}{did}:").as_bytes(), head.as_slice()].concat()
 }
 
-/// Checks 3 and 4 of design §1a: the head recomputes from the public keys
-/// and the attestation is a valid Ed25519 signature over it. Also enforces
+fn bad_sig(what: &str) -> LabyrinthError {
+    LabyrinthError::invalid(format!("{what} does not verify"))
+}
+
+/// Checks 3 and 4 of design §1a: the head recomputes from the public keys,
+/// the attestation is a valid Ed25519 signature over it, and `selfSig` is a
+/// valid XEdDSA signature by the epoch's own signing key. Also enforces
 /// the genesis shape (epoch 0 has no predecessor and no `prevSig`; later
 /// epochs have both). Returns the parts the chain checks need.
 pub fn verify_epoch_public(did: &str, epoch: &EpochPublic) -> LabyrinthResult<HeadParts> {
@@ -106,12 +117,41 @@ pub fn verify_epoch_public(did: &str, epoch: &EpochPublic) -> LabyrinthResult<He
         &Signature::from_bytes(&sig),
     )
     .map_err(|_| LabyrinthError::invalid("attestation signature does not verify"))?;
+    let signing_key = epoch.signing_pubkey.array::<32>("signingPubkey")?;
+    let self_sig = epoch.self_sig.array::<64>("selfSig")?;
+    if !xeddsa::verify(&signing_key, &[SELF_SIG_PREFIX, &head].concat(), &self_sig) {
+        return Err(bad_sig("selfSig"));
+    }
+    let prev_sig = epoch
+        .prev_sig
+        .as_ref()
+        .map(|s| s.array::<64>("prevSig"))
+        .transpose()?;
     Ok(HeadParts {
         epoch_number: epoch.epoch_number,
         head,
         previous_head,
         attestation_key,
+        signing_key,
+        prev_sig,
     })
+}
+
+/// SPEC §5.3 `prev_sig`: epoch n's head signed by epoch n-1's signing key.
+/// Genesis carries none (enforced by [`verify_epoch_public`]).
+pub fn verify_prev_sig(parts: &HeadParts, previous_signing_key: &[u8; 32]) -> LabyrinthResult<()> {
+    match &parts.prev_sig {
+        Some(sig)
+            if xeddsa::verify(
+                previous_signing_key,
+                &[PREV_SIG_PREFIX, &parts.head].concat(),
+                sig,
+            ) =>
+        {
+            Ok(())
+        }
+        _ => Err(bad_sig("prevSig")),
+    }
 }
 
 /// Check 1 and 2 of design §1a against the stored latest head of the DID:
@@ -146,6 +186,8 @@ mod tests {
             head: [9; 32],
             previous_head: prev,
             attestation_key: [0; 32],
+            signing_key: [0; 32],
+            prev_sig: None,
         };
         assert!(check_chain_link(&parts(0, None), None).is_ok());
         assert!(check_chain_link(&parts(1, Some([1; 32])), None).is_err());

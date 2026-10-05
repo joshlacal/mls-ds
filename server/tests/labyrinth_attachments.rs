@@ -159,6 +159,11 @@ async fn orf_states_register_evolve_and_delete() {
     alice
         .call("deleteOrfState", &json!({ "deviceKeyPubkey": b(&child) }))
         .await
+        .fails(403, "LabyrinthDeviceNotBound");
+    alice.enroll([0xE1; 32]).await;
+    alice
+        .call("deleteOrfState", &json!({ "deviceKeyPubkey": b(&child) }))
+        .await
         .ok();
     alice
         .call("deleteOrfState", &json!({ "deviceKeyPubkey": b(&child) }))
@@ -434,6 +439,7 @@ async fn own_archive_copies_count_and_deletion_revokes() {
         .fails(404, "NotFound");
 
     // Deleting the ORF state revokes every read through it.
+    alice.enroll([0xE1; 32]).await;
     alice
         .call("putAttachmentRef", &client.put("2", blob, thread, &message))
         .await

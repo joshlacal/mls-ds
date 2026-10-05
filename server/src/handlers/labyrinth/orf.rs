@@ -22,6 +22,7 @@ use crate::labyrinth::auth::begin_read;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
 use crate::labyrinth::relay::RelayOp;
 use crate::labyrinth::repo::attachments::{self, Blinded, MessageRef};
+use crate::labyrinth::repo::binding;
 use crate::labyrinth::repo::orf as repo;
 use crate::labyrinth::wire::bytes::hex_array;
 use crate::labyrinth::wire::io::{
@@ -73,7 +74,9 @@ pub async fn delete_orf_state(
             let input: DeviceKeyIn = body(&bytes)?;
             let key = input.device_key_pubkey.array::<32>("deviceKeyPubkey")?;
             let mut w = begin_write!(&pool, adm);
-            repo::delete(&mut w.tx, &w.caller.did, &key).await?;
+            let caller = w.caller.clone();
+            binding::require_bound(&mut w.tx, &caller, None).await?;
+            repo::delete(&mut w.tx, &caller.did, &key).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,
