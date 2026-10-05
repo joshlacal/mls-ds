@@ -703,7 +703,7 @@ async fn orf_states_register_evolve_map_and_delete() {
 
     // markDeviceRevoked deletes the revoked device's state too.
     alice
-        .call("createDevice", &json!({ "record": device_record(parent) }))
+        .call("createDevice", &json!({ "record": alice.device_record(parent) }))
         .await
         .ok();
     alice

@@ -17,20 +17,22 @@ async fn devices_create_read_list_and_revoke_once() {
     let other_device = env.device_for(&alice.did, random_seed()).await;
 
     let created = alice
-        .call("createDevice", &json!({ "record": device_record([1; 32]) }))
+        .call("createDevice", &json!({ "record": alice.device_record([1; 32]) }))
         .await;
     assert_eq!(created.ok()["rkey"], hex::encode([1u8; 32]));
+    // A second bound device keeps alice able to revoke after [1] is revoked.
+    alice.enroll([2; 32]).await;
     // Any current chat device of the DID reads the same mailbox.
     let got = other_device
         .query("getDevice", &[("deviceKeyPubkey", hex::encode([1u8; 32]))])
         .await;
-    assert_eq!(got.ok()["record"], device_record([1; 32]));
+    assert_eq!(got.ok()["record"], alice.device_record([1; 32]));
     alice
-        .call("createDevice", &json!({ "record": device_record([1; 32]) }))
+        .call("createDevice", &json!({ "record": alice.device_record([1; 32]) }))
         .await
         .fails(409, "RecordAlreadyExists");
     alice
-        .query("getDevice", &[("deviceKeyPubkey", hex::encode([2u8; 32]))])
+        .query("getDevice", &[("deviceKeyPubkey", hex::encode([6u8; 32]))])
         .await
         .fails(404, "DeviceNotFound");
 
@@ -62,11 +64,8 @@ async fn devices_create_read_list_and_revoke_once() {
         .await
         .fails(404, "DeviceNotFound");
 
-    for k in 2..5u8 {
-        alice
-            .call("createDevice", &json!({ "record": device_record([k; 32]) }))
-            .await
-            .ok();
+    for k in 3..5u8 {
+        alice.enroll([k; 32]).await;
     }
     let page = alice.query("listDevices", &[("limit", "3".into())]).await;
     assert_eq!(page.ok()["items"].as_array().unwrap().len(), 3);
@@ -79,11 +78,11 @@ async fn devices_create_read_list_and_revoke_once() {
 async fn records_are_validated_against_the_lexicon() {
     let env = Env::new().await;
     let alice = env.account().await;
-    let mut short_key = device_record([1; 32]);
+    let mut short_key = alice.device_record([1; 32]);
     short_key["deviceKeyPubkey"] = b(&[1; 31]);
-    let mut wrong_type = device_record([1; 32]);
+    let mut wrong_type = alice.device_record([1; 32]);
     wrong_type["$type"] = json!("blue.catbird.labyrinth.epoch");
-    let mut extra = device_record([1; 32]);
+    let mut extra = alice.device_record([1; 32]);
     extra["surprise"] = json!(true);
     for record in [short_key, wrong_type, extra] {
         alice
@@ -116,11 +115,11 @@ async fn procedure_retries_replay_the_exact_response_and_reject_reuse() {
         .fails(409, "IdempotencyConflict");
     // A new operation on an existing rkey is RecordAlreadyExists.
     alice
-        .call("createDevice", &json!({ "record": device_record([5; 32]) }))
+        .call("createDevice", &json!({ "record": alice.device_record([5; 32]) }))
         .await
         .ok();
     alice
-        .call("createDevice", &json!({ "record": device_record([5; 32]) }))
+        .call("createDevice", &json!({ "record": alice.device_record([5; 32]) }))
         .await
         .fails(409, "RecordAlreadyExists");
 }
@@ -130,7 +129,10 @@ async fn epochs_are_created_with_members_and_their_directory_head() {
     let env = Env::new().await;
     let v = vectors();
     let d0 = env.device_for(&v.did, v.seeds[0]).await;
-    env.device_for(&v.did, v.seeds[1]).await;
+    let d1 = env.device_for(&v.did, v.seeds[1]).await;
+    d0.enroll([0xD0; 32]).await;
+    d1.enroll([0xD1; 32]).await;
+    d0.enroll([0xD2; 32]).await;
 
     let input = json!({
         "epoch": epoch_record(&v.chain[0], [0xD0; 32]),
@@ -217,6 +219,8 @@ async fn concurrent_create_epoch_for_one_number_admits_exactly_one() {
     let v = vectors();
     let d0 = env.device_for(&v.did, v.seeds[0]).await;
     let d1 = env.device_for(&v.did, v.seeds[1]).await;
+    d0.enroll([0xD0; 32]).await;
+    d1.enroll([0xD1; 32]).await;
     d0.call(
         "createEpoch",
         &json!({ "epoch": epoch_record(&v.chain[0], [0xD0; 32]), "members": [] }),
@@ -242,6 +246,13 @@ async fn virtual_devices_register_member_and_orf_state_atomically() {
     let env = Env::new().await;
     let v = vectors();
     let d0 = env.device_for(&v.did, v.seeds[0]).await;
+    d0.enroll([0xD0; 32]).await;
+    d0.call(
+        "createDevice",
+        &json!({ "record": virtual_device_record([0xBB; 32]) }),
+    )
+    .await
+    .ok();
     d0.call(
         "createEpoch",
         &json!({ "epoch": epoch_record(&v.chain[0], [0xD0; 32]), "members": [] }),
@@ -358,7 +369,7 @@ async fn mailbox_and_virtual_device_quotas_are_enforced() {
     let env = Env::new().await;
     let alice = env.account().await;
     alice
-        .call("createDevice", &json!({ "record": device_record([1; 32]) }))
+        .call("createDevice", &json!({ "record": alice.device_record([1; 32]) }))
         .await
         .ok();
     // Fill the mailbox to just under 256 MiB through the counter column the
@@ -369,7 +380,7 @@ async fn mailbox_and_virtual_device_quotas_are_enforced() {
         .await
         .unwrap();
     alice
-        .call("createDevice", &json!({ "record": device_record([2; 32]) }))
+        .call("createDevice", &json!({ "record": alice.device_record([2; 32]) }))
         .await
         .fails(400, "QuotaExceeded");
 
@@ -394,12 +405,11 @@ async fn stored_rows_are_immutable() {
     let env = Env::new().await;
     let v = vectors();
     let d0 = env.device_for(&v.did, v.seeds[0]).await;
+    d0.enroll([0xD0; 32]).await;
     d0.call("createEpoch", &json!({ "epoch": epoch_record(&v.chain[0], [0xD0; 32]), "members": [member_record(0, [0xD0; 32])] }))
         .await
         .ok();
-    d0.call("createDevice", &json!({ "record": device_record([1; 32]) }))
-        .await
-        .ok();
+    d0.enroll([1; 32]).await;
     d0.call(
         "appendOwnerBatch",
         &json!({ "record": owner_batch_record("t", &[1]) }),

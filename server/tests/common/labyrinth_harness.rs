@@ -556,6 +556,35 @@ impl Device {
         format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
     }
 
+    /// The `[CB-36]` chatBinding of Labyrinth device `key` by this chat
+    /// device.
+    pub fn chat_binding(&self, key: [u8; 32]) -> Value {
+        let message = [
+            format!("catbird.labyrinth.device_binding:{}:", self.did).as_bytes(),
+            key.as_slice(),
+        ]
+        .concat();
+        json!({
+            "transportPubkey": b(&self.chat_pub()),
+            "sig": b(&self.chat_key.sign(&message).to_bytes()),
+        })
+    }
+
+    /// A physical Labyrinth `device` record for `key`, bound to this chat
+    /// device.
+    pub fn device_record(&self, key: [u8; 32]) -> Value {
+        let mut record = unbound_device_record(key);
+        record["chatBinding"] = self.chat_binding(key);
+        record
+    }
+
+    /// Register Labyrinth device `key` bound to this chat device.
+    pub async fn enroll(&self, key: [u8; 32]) {
+        self.call("createDevice", &json!({ "record": self.device_record(key) }))
+            .await
+            .ok();
+    }
+
     /// `GET` a Labyrinth query as this device.
     pub async fn query(&self, name: &str, params: &[(&str, String)]) -> Reply {
         let nsid = format!("{PREFIX}{name}");
@@ -704,8 +733,9 @@ pub fn unb(value: &Value) -> Vec<u8> {
         .unwrap()
 }
 
-/// A Labyrinth `device` record for key `key`.
-pub fn device_record(key: [u8; 32]) -> Value {
+/// A physical Labyrinth `device` record for key `key` without a
+/// `chatBinding` (refused by `createDevice`; see [`Device::device_record`]).
+pub fn unbound_device_record(key: [u8; 32]) -> Value {
     json!({
         "$type": "blue.catbird.labyrinth.device",
         "deviceKeyPubkey": b(&key),
@@ -714,6 +744,18 @@ pub fn device_record(key: [u8; 32]) -> Value {
         "epochStorageAuthKeyPubkey": b(&[9; 32]),
         "epochStorageAuthKeySig": b(&[10; 64]),
         "virtual": false,
+        "createdAt": "2026-10-04T12:00:00.000Z",
+    })
+}
+
+/// A virtual (recovery) Labyrinth `device` record for key `key`.
+pub fn virtual_device_record(key: [u8; 32]) -> Value {
+    json!({
+        "$type": "blue.catbird.labyrinth.device",
+        "deviceKeyPubkey": b(&key),
+        "epochStorageKeyPubkey": b(&[7; 32]),
+        "epochStorageKeySig": b(&[8; 64]),
+        "virtual": true,
         "createdAt": "2026-10-04T12:00:00.000Z",
     })
 }

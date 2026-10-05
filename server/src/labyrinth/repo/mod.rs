@@ -2,6 +2,7 @@
 //! request transaction (`auth::RequestTx`), which already holds the calling
 //! device's lock.
 
+pub mod binding;
 pub mod directory;
 pub mod mailbox;
 pub mod orf;

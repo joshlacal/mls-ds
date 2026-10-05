@@ -54,6 +54,11 @@ impl LabyrinthError {
         Self::new(StatusCode::BAD_REQUEST, "InvalidRequest", message)
     }
 
+    /// A `400` with a specific lexicon error name.
+    pub fn invalid_named(name: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, name, message)
+    }
+
     pub fn not_authorized(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "NotAuthorized", message)
     }

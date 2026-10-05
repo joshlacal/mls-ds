@@ -81,6 +81,10 @@ pub struct Device {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch_storage_auth_key_sig: Option<Bytes>,
     pub r#virtual: bool,
+    /// [CB-36] The enrolling chat device's signature binding this physical
+    /// device to it; absent on virtual devices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_binding: Option<TransportAttestation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<String>,
     pub created_at: String,
@@ -99,6 +103,11 @@ impl Device {
         }
         if let Some(b) = &self.epoch_storage_auth_key_sig {
             b.check("epochStorageAuthKeySig", 64, 64)?;
+        }
+        if let Some(b) = &self.chat_binding {
+            b.transport_pubkey
+                .check("chatBinding.transportPubkey", 32, 32)?;
+            b.sig.check("chatBinding.sig", 64, 64)?;
         }
         if let Some(t) = &self.revoked_at {
             check_datetime("revokedAt", t)?;

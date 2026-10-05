@@ -78,7 +78,7 @@ async fn admission_requires_cutover_service_auth_and_a_current_device() {
         .await
         .fails(401, "DeviceRevoked");
     alice
-        .call("createDevice", &json!({ "record": device_record([1; 32]) }))
+        .call("createDevice", &json!({ "record": alice.device_record([1; 32]) }))
         .await
         .fails(401, "DeviceRevoked");
 
@@ -95,7 +95,7 @@ async fn writes_require_a_valid_signed_write_body() {
     let env = Env::new().await;
     let alice = env.account().await;
     let nsid = format!("{PREFIX}createDevice");
-    let input = serde_json::to_vec(&json!({ "record": device_record([1; 32]) })).unwrap();
+    let input = serde_json::to_vec(&json!({ "record": alice.device_record([1; 32]) })).unwrap();
     let op = *uuid::Uuid::new_v4().as_bytes();
 
     let post = |write: String, sig: String, body: Vec<u8>| {

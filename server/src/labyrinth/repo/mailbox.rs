@@ -5,7 +5,8 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
 
-use super::{directory, order, stored_json, PageReq, TimeRange};
+use super::{binding, directory, order, stored_json, PageReq, TimeRange};
+use crate::labyrinth::auth::Caller;
 use crate::labyrinth::error::{is_unique_violation, LabyrinthError, LabyrinthResult};
 use crate::labyrinth::tid::next_tid;
 use crate::labyrinth::wire::bytes::check_datetime;
@@ -52,11 +53,13 @@ async fn charge(
 
 pub async fn create_device(
     conn: &mut PgConnection,
-    owner: &str,
+    caller: &Caller,
     rec: &Received<Device>,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<String> {
     rec.value.validate()?;
+    binding::verify_chat_binding(caller, &rec.value)?;
+    let owner = caller.did.as_str();
     let key = rec.value.device_key_pubkey.array::<32>("deviceKeyPubkey")?;
     charge(
         conn,
@@ -71,8 +74,9 @@ pub async fn create_device(
     .await?;
     let inserted = sqlx::query(
         "INSERT INTO labyrinth.devices \
-           (owner_did, device_key, record, record_bytes, is_virtual, revoked_at, created_at) \
-         VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+           (owner_did, device_key, record, record_bytes, is_virtual, revoked_at, created_at, \
+            chat_device_id, chat_key_id) \
+         VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
     )
     .bind(owner)
     .bind(key.as_slice())
@@ -81,6 +85,8 @@ pub async fn create_device(
     .bind(rec.value.r#virtual)
     .bind(&rec.value.revoked_at)
     .bind(at)
+    .bind(caller.device_id)
+    .bind(&caller.key_id)
     .execute(&mut *conn)
     .await?;
     if inserted.rows_affected() == 0 {
@@ -93,11 +99,13 @@ pub async fn create_device(
 /// ORF state in the same transaction.
 pub async fn mark_device_revoked(
     conn: &mut PgConnection,
-    owner: &str,
+    caller: &Caller,
     key: &[u8; 32],
     revoked_at: &str,
 ) -> LabyrinthResult<()> {
     check_datetime("revokedAt", revoked_at)?;
+    let owner = caller.did.as_str();
+    binding::require_bound(conn, caller, None).await?;
     let exists: Option<Option<String>> = sqlx::query_scalar(
         "SELECT revoked_at FROM labyrinth.devices \
           WHERE owner_did = $1 AND device_key = $2 FOR UPDATE",
@@ -192,12 +200,13 @@ fn keyed_page(
 /// atomically. Returns the backend epochID ([CB-9]).
 pub async fn create_epoch(
     conn: &mut PgConnection,
-    owner: &str,
+    caller: &Caller,
     epoch: &Received<Epoch>,
     members: &[Received<EpochMember>],
     at: DateTime<Utc>,
 ) -> LabyrinthResult<(i64, u64)> {
     epoch.value.validate()?;
+    let owner = caller.did.as_str();
     if members.len() > 256 {
         return Err(LabyrinthError::invalid("at most 256 members"));
     }
@@ -210,6 +219,12 @@ pub async fn create_epoch(
             ));
         }
     }
+    binding::require_bound(conn, caller, Some(&epoch.value.opened_by.0)).await?;
+    let member_keys: Vec<Vec<u8>> = members
+        .iter()
+        .map(|m| m.value.device_key_pubkey.0.clone())
+        .collect();
+    binding::require_registered(conn, owner, &member_keys).await?;
     // The head directory row (design §1a); a different head under a taken
     // number is the [CB-9] race and reads as RecordAlreadyExists here.
     directory::record_head(conn, owner, &epoch.value.public, at)
@@ -302,11 +317,14 @@ async fn epoch_exists(conn: &mut PgConnection, owner: &str, n: u64) -> Labyrinth
 
 pub async fn create_epoch_member(
     conn: &mut PgConnection,
-    owner: &str,
+    caller: &Caller,
     m: &Received<EpochMember>,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<()> {
     m.value.validate()?;
+    let owner = caller.did.as_str();
+    binding::require_bound(conn, caller, None).await?;
+    binding::require_registered(conn, owner, &[m.value.device_key_pubkey.0.clone()]).await?;
     if !epoch_exists(conn, owner, m.value.epoch_number).await? {
         return Err(LabyrinthError::not_found("EpochNotFound"));
     }
@@ -397,13 +415,14 @@ pub async fn list_epoch_members(
 /// evolved ORF state, in one transaction.
 pub async fn create_virtual_device(
     conn: &mut PgConnection,
-    owner: &str,
+    caller: &Caller,
     rec: &Received<VirtualDevice>,
     member: Option<&Received<EpochMember>>,
     orf_parent: Option<([u8; 32], [u8; 32])>,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<()> {
     rec.value.validate()?;
+    let owner = caller.did.as_str();
     let id = rec.value.vdevice_id.array::<16>("vdeviceId")?;
     let key = rec.value.device_key_pubkey.array::<32>("deviceKeyPubkey")?;
     charge(
@@ -435,7 +454,7 @@ pub async fn create_virtual_device(
         return Err(LabyrinthError::already_exists());
     }
     if let Some(m) = member {
-        create_epoch_member(conn, owner, m, at).await?;
+        create_epoch_member(conn, caller, m, at).await?;
     }
     if let Some(parent) = orf_parent {
         super::orf::register(conn, owner, &key, Some(parent), at).await?;

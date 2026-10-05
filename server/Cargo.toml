@@ -230,6 +230,11 @@ name = "labyrinth_crate_trace"
 path = "tests/labyrinth_crate_trace.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "labyrinth_device_binding"
+path = "tests/labyrinth_device_binding.rs"
+required-features = ["test-support"]
+
 [features]
 default = ["namespace-bluecatbird", "server-bin"]
 namespace-bluecatbird = []

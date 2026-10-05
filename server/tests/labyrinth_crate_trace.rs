@@ -15,6 +15,15 @@
 //! presence and JSON type only: `epochId` (mls-ds: bigserial, reference:
 //! padded seq), `receivedAt`, chat `keyId`s, chat-key `createdAt`, and
 //! server-assigned TID `rkey`s.
+//!
+//! Binding-era adapter (gap audit G-P0-2, migration `20261004100004`): the
+//! trace predates `device.chatBinding` and registers each device right
+//! after its genesis epoch. mls-ds now requires a bound device before any
+//! epoch write, so the replay adds the binding (signed by the seeded chat
+//! key) to every physical `createDevice` and runs that call before the
+//! `createEpoch` it follows. A `chatBinding` mls-ds returns that the
+//! reference lacks is not a divergence. Re-record the fixture once the
+//! crate sends bindings itself.
 
 mod common;
 
@@ -63,6 +72,7 @@ fn compare(path: &str, got: &Value, want: &Value, diffs: &mut Vec<String>) {
                             compare(&p, gv, wv, diffs);
                         }
                     }
+                    (Some(_), None) if k == "chatBinding" => {}
                     (gv, wv) => diffs.push(format!("{p}: mls-ds {gv:?} vs reference {wv:?}")),
                 }
             }
@@ -82,6 +92,28 @@ fn compare(path: &str, got: &Value, want: &Value, diffs: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// The trace with every `createDevice` moved ahead of a directly preceding
+/// `createEpoch` by the same device (see the module docs).
+fn binding_era(calls: &[Value]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(calls.len());
+    for call in calls {
+        let swap = out.last().is_some_and(|prev| {
+            prev["nsid"] == format!("{PREFIX}createEpoch")
+                && call["nsid"] == format!("{PREFIX}createDevice")
+                && prev["did"] == call["did"]
+                && prev["seed"] == call["seed"]
+        });
+        if swap {
+            let prev = out.pop().unwrap();
+            out.push(call.clone());
+            out.push(prev);
+        } else {
+            out.push(call.clone());
+        }
+    }
+    out
 }
 
 #[tokio::test]
@@ -111,7 +143,7 @@ async fn crate_client_trace_replays_identically_against_mls_ds() {
     let thread = Uuid::parse_str(trace["thread"].as_str().unwrap()).unwrap();
     seed_conversation_with_id(&env, thread, &leaves, trace["nextEntrySeq"].as_i64().unwrap()).await;
 
-    let calls = trace["calls"].as_array().unwrap();
+    let calls = binding_era(trace["calls"].as_array().unwrap());
     assert!(calls.len() > 50, "the trace covers the full client flow");
     let mut replayed = std::collections::BTreeSet::new();
     let mut failures = Vec::new();
@@ -139,7 +171,14 @@ async fn crate_client_trace_replays_identically_against_mls_ds() {
                 .unwrap()
                 .try_into()
                 .unwrap();
-            device.call_op(name, &call["payload"], op).await
+            let mut payload = call["payload"].clone();
+            if name == "createDevice" && payload["record"]["virtual"] == false {
+                let key: [u8; 32] = unb(&payload["record"]["deviceKeyPubkey"])
+                    .try_into()
+                    .unwrap();
+                payload["record"]["chatBinding"] = device.chat_binding(key);
+            }
+            device.call_op(name, &payload, op).await
         };
         replayed.insert(name.to_owned());
         let want_status = call["status"].as_u64().unwrap() as u16;

@@ -39,7 +39,8 @@ pub async fn create_device(
             let input: RecordIn = body(&bytes)?;
             let rec = Received::<Device>::parse(&input.record, "record")?;
             let mut w = begin_write!(&pool, adm);
-            let rkey = repo::create_device(&mut w.tx, &w.caller.did, &rec, w.instant).await?;
+            let caller = w.caller.clone();
+            let rkey = repo::create_device(&mut w.tx, &caller, &rec, w.instant).await?;
             w.finish_write(to_bytes(&json!({ "rkey": rkey }))?).await
         }
         .await,
@@ -58,7 +59,8 @@ pub async fn mark_device_revoked(
             let input: MarkRevokedIn = body(&bytes)?;
             let key = input.device_key_pubkey.array::<32>("deviceKeyPubkey")?;
             let mut w = begin_write!(&pool, adm);
-            repo::mark_device_revoked(&mut w.tx, &w.caller.did, &key, &input.revoked_at).await?;
+            let caller = w.caller.clone();
+            repo::mark_device_revoked(&mut w.tx, &caller, &key, &input.revoked_at).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,
@@ -145,8 +147,9 @@ pub async fn create_epoch(
                 .map(|m| Received::<EpochMember>::parse(m, "members"))
                 .collect::<LabyrinthResult<Vec<_>>>()?;
             let mut w = begin_write!(&pool, adm);
+            let caller = w.caller.clone();
             let (epoch_id, n) =
-                repo::create_epoch(&mut w.tx, &w.caller.did, &epoch, &members, w.instant).await?;
+                repo::create_epoch(&mut w.tx, &caller, &epoch, &members, w.instant).await?;
             let out = json!({ "epochId": epoch_id.to_string(), "epochNumber": n });
             w.finish_write(to_bytes(&out)?).await
         }
@@ -228,7 +231,8 @@ pub async fn create_epoch_member(
             let input: RecordIn = body(&bytes)?;
             let rec = Received::<EpochMember>::parse(&input.record, "record")?;
             let mut w = begin_write!(&pool, adm);
-            repo::create_epoch_member(&mut w.tx, &w.caller.did, &rec, w.instant).await?;
+            let caller = w.caller.clone();
+            repo::create_epoch_member(&mut w.tx, &caller, &rec, w.instant).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,
@@ -293,9 +297,10 @@ pub async fn create_virtual_device(
                 })
                 .transpose()?;
             let mut w = begin_write!(&pool, adm);
+            let caller = w.caller.clone();
             repo::create_virtual_device(
                 &mut w.tx,
-                &w.caller.did,
+                &caller,
                 &rec,
                 member.as_ref(),
                 orf,
