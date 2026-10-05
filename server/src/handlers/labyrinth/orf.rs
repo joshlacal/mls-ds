@@ -19,9 +19,12 @@ use crate::blob_store::BlobStore;
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth::begin_read;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
-use crate::labyrinth::repo::orf::{self as repo, NewAttachmentRef};
-use crate::labyrinth::wire::bytes::{hex_array, Bytes as AtBytes};
-use crate::labyrinth::wire::io::{body, to_bytes, DeviceKeyIn, PutAttachmentRefIn, RegisterOrfIn};
+use crate::labyrinth::repo::attachments::{self, Blinded, MessageRef};
+use crate::labyrinth::repo::orf as repo;
+use crate::labyrinth::wire::bytes::hex_array;
+use crate::labyrinth::wire::io::{
+    body, datetime, to_bytes, AttachmentIndexIn, DeviceKeyIn, PutAttachmentRefIn, RegisterOrfIn,
+};
 use crate::storage::DbPool;
 
 type Pool = State<DbPool>;
@@ -85,16 +88,40 @@ pub async fn put_attachment_ref(
         async {
             let adm = admit_procedure(&pool, &rt, "putAttachmentRef", &headers, &bytes).await?;
             let input: PutAttachmentRefIn = body(&bytes)?;
-            let new = NewAttachmentRef {
+            let blinded = Blinded {
                 device_key: input.device_key_pubkey.array::<32>("deviceKeyPubkey")?,
-                blinded_index: input.blinded_index.array::<32>("blindedIndex")?,
-                blinded_token: input.blinded_token.array::<32>("blindedToken")?,
-                conversation_id: input.conversation_id,
-                blob_id: input.blob_id,
+                index: input.blinded_index.array::<32>("blindedIndex")?,
+                token_salt: input.blinded_token_salt.array::<32>("blindedTokenSalt")?,
+            };
+            let msg = MessageRef {
+                thread_id: input.thread_id,
                 message_id: input.message_id,
             };
             let mut w = begin_write!(&pool, adm);
-            repo::put_attachment_ref(&mut w.tx, &w.caller.did, &new, w.instant).await?;
+            let caller = w.caller.clone();
+            attachments::put(&mut w.tx, &caller, &blinded, &msg, &input.blob_id, w.instant)
+                .await?;
+            w.finish_write(to_bytes(&json!({}))?).await
+        }
+        .await,
+    )
+}
+
+pub async fn delete_attachment_ref(
+    State(pool): Pool,
+    State(rt): Runtime,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    respond(
+        async {
+            let adm = admit_procedure(&pool, &rt, "deleteAttachmentRef", &headers, &bytes).await?;
+            let input: AttachmentIndexIn = body(&bytes)?;
+            let key = input.device_key_pubkey.array::<32>("deviceKeyPubkey")?;
+            let index = input.blinded_index.array::<32>("blindedIndex")?;
+            let mut w = begin_write!(&pool, adm);
+            let caller = w.caller.clone();
+            attachments::delete(&mut w.tx, &caller, &key, index).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,
@@ -127,14 +154,10 @@ pub async fn get_attachment_ref(
             .await?;
             let (key, index) = key_and_index(&p)?;
             let mut r = begin_read(&pool, adm).await?;
-            let found = repo::get_attachment_ref(&mut r.tx, &r.caller.did, &key, index).await?;
+            let caller = r.caller.clone();
+            let at = attachments::created_at(&mut r.tx, &caller, &key, index).await?;
             r.finish_read().await?;
-            to_bytes(&json!({
-                "conversationId": found.conversation_id.to_string(),
-                "blobId": found.blob_id.to_string(),
-                "messageId": found.message_id,
-                "tokenMac": AtBytes::from_slice(&found.token_mac),
-            }))
+            to_bytes(&json!({ "createdAt": datetime(at) }))
         }
         .await,
     )
@@ -157,15 +180,33 @@ pub async fn get_attachment_blob(
             "getAttachmentBlob",
             &headers,
             q.as_deref(),
-            &["deviceKeyPubkey", "blindedIndex", "blindedToken"],
+            &[
+                "deviceKeyPubkey",
+                "blindedIndex",
+                "blindedTokenSalt",
+                "threadId",
+                "messageId",
+            ],
         )
         .await?;
         let (key, index) = key_and_index(&p)?;
-        let token = hex_array::<32>("blindedToken", p.req("blindedToken")?)?;
+        let blinded = Blinded {
+            device_key: key,
+            index,
+            token_salt: hex_array::<32>("blindedTokenSalt", p.req("blindedTokenSalt")?)?,
+        };
+        let msg = MessageRef {
+            thread_id: p.req("threadId")?.to_owned(),
+            message_id: p.req("messageId")?.to_owned(),
+        };
         let mut r = begin_read(&pool, adm).await?;
-        let object =
-            repo::authorize_attachment_blob(&mut r.tx, &r.caller.did, &key, index, token).await?;
+        let caller = r.caller.clone();
+        let object = attachments::authorize(&mut r.tx, &caller, &blinded, &msg).await?;
         r.finish_read().await?;
+        if object.pending_remote.is_some() {
+            // Sender copies of a remote conversation live on its sequencer.
+            return Err(LabyrinthError::relay_unavailable());
+        }
         let data = store
             .get_committed(&object.object_store_key)
             .await

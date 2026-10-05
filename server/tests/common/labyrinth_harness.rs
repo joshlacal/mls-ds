@@ -70,6 +70,10 @@ fn ensure_runtime_env() {
             URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
         );
         std::env::set_var(
+            "LABYRINTH_ATTACHMENT_DIGEST_KEY",
+            URL_SAFE_NO_PAD.encode([0x3C_u8; 32]),
+        );
+        std::env::set_var(
             "CHAT_SUBSCRIPTION_ENDPOINT",
             "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
         );
@@ -460,6 +464,140 @@ pub async fn seed_attachment_blob(env: &Env, owner: &Device, object: &TestObject
     .expect("blob");
     tx.commit().await.unwrap();
     blob_id
+}
+
+/// A bound attachment blob of `conversation`: uploaded by `owner`, stored at
+/// `object.key`, bound to chat message `message_id` at entry `entry_seq`.
+pub async fn seed_bound_attachment(
+    env: &Env,
+    owner: &Device,
+    conversation: Uuid,
+    object: &TestObject,
+    entry_seq: i64,
+) -> (Uuid, Uuid) {
+    let (blob_id, message_id) = (Uuid::new_v4(), Uuid::new_v4());
+    let now = env.now().await;
+    let size = object.data.len() as i64;
+    let hash = Sha256::digest(&object.data).to_vec();
+    let mut tx = env.pool.begin().await.unwrap();
+    replica(&mut tx).await;
+    sqlx::query(
+        "INSERT INTO chat.blobs(blob_id, owner_did, owner_device_id, owner_key_id, \
+           owner_auth_generation, purpose, media_type, plaintext_size, ciphertext_size, \
+           ciphertext_sha256, object_store_key, status, prepared_at, upload_expires_at, \
+           uploaded_at, unbound_expires_at, bound_at) \
+         VALUES ($1, $2, $3, chat.ed25519_key_id($4), 1, 'attachment', 'image/png', $5, $6, $7, \
+           $8, 'bound', $9, $9 + INTERVAL '5 minutes', $9, $9 + INTERVAL '1 hour', \
+           $9 + INTERVAL '1 second')",
+    )
+    .bind(blob_id)
+    .bind(&owner.did)
+    .bind(owner.device_id)
+    .bind(owner.chat_pub().as_slice())
+    .bind(size - 16)
+    .bind(size)
+    .bind(&hash)
+    .bind(&object.key)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .expect("bound blob");
+    sqlx::query(
+        "INSERT INTO chat.blob_bindings(blob_id, binding_kind, conversation_id, entry_seq, \
+           message_id, owner_did, owner_device_id, descriptor_bytes, descriptor_sha256, \
+           aad_bytes, aad_sha256, ciphertext_sha256, plaintext_size, ciphertext_size, purpose, \
+           bound_at, uploaded_at, unbound_expires_at) \
+         VALUES ($1, 'application', $2, $3, $4, $5, $6, '\\x01', digest('\\x01'::bytea, 'sha256'), \
+           '\\x02', digest('\\x02'::bytea, 'sha256'), $7, $8, $9, 'attachment', \
+           $10 + INTERVAL '1 second', $10, $10 + INTERVAL '1 hour')",
+    )
+    .bind(blob_id)
+    .bind(conversation)
+    .bind(entry_seq)
+    .bind(message_id)
+    .bind(&owner.did)
+    .bind(owner.device_id)
+    .bind(&hash)
+    .bind(size - 16)
+    .bind(size)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .expect("blob binding");
+    tx.commit().await.unwrap();
+    (blob_id, message_id)
+}
+
+/// An application interval of `device` in `conversation` from `start_seq`,
+/// closed at `terminal_seq` when given.
+pub async fn grant_interval(
+    env: &Env,
+    conversation: Uuid,
+    device: &Device,
+    start_seq: i64,
+    terminal_seq: Option<i64>,
+) {
+    let id = Uuid::new_v4();
+    let now = env.now().await;
+    let closed = terminal_seq.is_some();
+    let mut tx = env.pool.begin().await.unwrap();
+    replica(&mut tx).await;
+    sqlx::query(
+        "INSERT INTO chat.application_intervals(membership_interval_id, conversation_id, \
+           generation, recipient_did, recipient_device_id, start_seq, opening_kind, \
+           opening_transition_id, opening_outer_entry_fingerprint, opening_state_version, \
+           opening_group_id, opening_epoch, opening_group_context_hash, \
+           opening_confirmation_tag, opening_leaf_period_id, terminal_seq, \
+           closing_state_version, closing_transition_id, closing_outer_entry_fingerprint, \
+           closing_kind, closing_leaf_period_id, removed_at, created_at) \
+         VALUES ($1, $2, 1, $3, $4, $5, 'creation', $1, $6, 1, $6, 0, $6, $6, $7, $8, \
+           $9, $10, $11, $12, $13, $14, $15)",
+    )
+    .bind(id)
+    .bind(conversation)
+    .bind(&device.did)
+    .bind(device.device_id)
+    .bind(start_seq)
+    .bind(vec![0x77_u8; 32])
+    .bind(Uuid::new_v4())
+    .bind(terminal_seq)
+    .bind(closed.then_some(2_i64))
+    .bind(closed.then(Uuid::new_v4))
+    .bind(closed.then(|| vec![0x78_u8; 32]))
+    .bind(closed.then_some("remove"))
+    .bind(closed.then(Uuid::new_v4))
+    .bind(closed.then_some(now))
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .expect("application interval");
+    tx.commit().await.unwrap();
+}
+
+/// Rewrite a chat blob's lifecycle columns below the API (`expired` with
+/// its object kept, or `reclaimed` by object GC).
+pub async fn force_blob_state(env: &Env, blob_id: Uuid, state: &str) {
+    let mut tx = env.pool.begin().await.unwrap();
+    replica(&mut tx).await;
+    let sql = match state {
+        "expired" => {
+            "UPDATE chat.blobs SET status = 'expired', bound_at = NULL, \
+               expired_at = unbound_expires_at WHERE blob_id = $1"
+        }
+        "reclaimed" => {
+            "UPDATE chat.blobs SET status = 'expired', bound_at = NULL, \
+               expired_at = unbound_expires_at, object_store_key = NULL, \
+               object_gc_status = 'reclaimed', object_gc_after = unbound_expires_at, \
+               object_deleted_at = unbound_expires_at WHERE blob_id = $1"
+        }
+        other => panic!("unknown blob state {other}"),
+    };
+    sqlx::query(sql)
+        .bind(blob_id)
+        .execute(&mut *tx)
+        .await
+        .expect("blob state");
+    tx.commit().await.unwrap();
 }
 
 /// An authenticated chat device driving the router.

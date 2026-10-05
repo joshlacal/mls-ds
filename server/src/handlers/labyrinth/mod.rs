@@ -57,6 +57,7 @@ pub const PROCEDURES: &[(&str, usize)] = &[
     ("registerOrfState", LIMIT_DEFAULT),
     ("deleteOrfState", LIMIT_DEFAULT),
     ("putAttachmentRef", LIMIT_DEFAULT),
+    ("deleteAttachmentRef", LIMIT_DEFAULT),
 ];
 
 /// The queries.
@@ -174,6 +175,10 @@ where
         .route(&path("registerOrfState"), post(orf::register_orf_state))
         .route(&path("deleteOrfState"), post(orf::delete_orf_state))
         .route(&path("putAttachmentRef"), post(orf::put_attachment_ref))
+        .route(
+            &path("deleteAttachmentRef"),
+            post(orf::delete_attachment_ref),
+        )
         .route(&path("getAttachmentRef"), get(orf::get_attachment_ref))
         .route(&path("getAttachmentBlob"), get(orf::get_attachment_blob))
         .layer(DefaultBodyLimit::max(LIMIT_DEFAULT))

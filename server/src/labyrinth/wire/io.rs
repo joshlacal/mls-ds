@@ -105,10 +105,18 @@ pub struct PublishHeadIn {
 pub struct PutAttachmentRefIn {
     pub device_key_pubkey: Bytes,
     pub blinded_index: Bytes,
-    pub blinded_token: Bytes,
-    pub conversation_id: String,
+    pub blinded_token_salt: Bytes,
     pub blob_id: String,
+    pub thread_id: String,
     pub message_id: String,
+}
+
+/// `deleteAttachmentRef` input.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentIndexIn {
+    pub device_key_pubkey: Bytes,
+    pub blinded_index: Bytes,
 }
 
 /// `defs#serverOrder`.

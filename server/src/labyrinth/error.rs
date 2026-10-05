@@ -102,6 +102,16 @@ impl LabyrinthError {
         )
     }
 
+    /// The conversation's sequencer DS could not be reached (or federation
+    /// is not configured here).
+    pub fn relay_unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RelayUnavailable",
+            "the conversation's sequencer DS could not be reached",
+        )
+    }
+
     pub fn internal() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,

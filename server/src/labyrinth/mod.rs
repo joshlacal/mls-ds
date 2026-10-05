@@ -19,6 +19,7 @@
 //! purge, and pinning attachment objects against chat object GC.
 
 pub mod auth;
+pub mod digest;
 pub mod error;
 pub mod heads;
 pub mod orf;
