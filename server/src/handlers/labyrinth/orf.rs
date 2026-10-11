@@ -76,7 +76,12 @@ pub async fn delete_orf_state(
             let key = input.device_key_pubkey.array::<32>("deviceKeyPubkey")?;
             let mut w = begin_write!(&pool, adm);
             let caller = w.caller.clone();
-            binding::require_bound(&mut w.tx, &caller, None).await?;
+            // An account whose mailbox lives in its PDS Space has no bound
+            // device here; registration needs none either, so any current
+            // chat device of the DID may drop one of its states (revocation).
+            if binding::hosts_mailbox(&mut w.tx, &caller.did).await? {
+                binding::require_bound(&mut w.tx, &caller, None).await?;
+            }
             repo::delete(&mut w.tx, &caller.did, &key).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }

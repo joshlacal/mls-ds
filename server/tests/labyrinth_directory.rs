@@ -555,6 +555,129 @@ async fn unbound_device_cannot_squat_the_next_head_and_rotation_proceeds() {
     assert_eq!(latest.ok()["epoch"], alices_next);
 }
 
+/// An account whose mailbox lives in its own PDS Space keeps no mailbox
+/// here. Its chat devices publish heads straight into the chain, under the
+/// same checks as `createEpoch`: genesis first, contiguous numbers, a valid
+/// `prevSig`, an attestation by the calling device, no second head for a
+/// number. The account can then also drop its ORF states without a bound
+/// device. Once it keeps a mailbox here, the binding rules apply again.
+#[tokio::test]
+async fn a_space_hosted_account_publishes_heads_without_a_mailbox_here() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    let (genesis, g) = chain::epoch_public(&alice, 0, [1; 32], None, None);
+    let (one, l1) = chain::epoch_public(&alice, 1, [2; 32], Some(g), None);
+
+    // Genesis first, then each number once, chained.
+    alice
+        .call("publishEpochHead", &publish(&one))
+        .await
+        .fails(400, "InvalidEpochChain");
+    alice
+        .call("publishEpochHead", &publish(&genesis))
+        .await
+        .ok();
+    let (bad, _) = chain::epoch_public(&alice, 1, [2; 32], Some(g), Some([9; 32]));
+    alice
+        .call("publishEpochHead", &publish(&bad))
+        .await
+        .fails(400, "InvalidRequest");
+    alice.call("publishEpochHead", &publish(&one)).await.ok();
+    // Re-publishing identical bytes is fine; another head for 1 is a fork.
+    alice.call("publishEpochHead", &publish(&one)).await.ok();
+    let (fork, _) = chain::epoch_public(&alice, 1, [3; 32], Some(g), None);
+    alice
+        .call("publishEpochHead", &publish(&fork))
+        .await
+        .fails(409, "EpochHeadConflict");
+
+    // Another chat device of the DID cannot publish a head attested by
+    // alice's key.
+    let other = env.device_for(&alice.did, random_seed()).await;
+    let (two, _) = chain::epoch_public(&alice, 2, [4; 32], Some(l1), None);
+    other
+        .call("publishEpochHead", &publish(&two))
+        .await
+        .fails(400, "AttestationNotCaller");
+    alice.call("publishEpochHead", &publish(&two)).await.ok();
+    let latest = other
+        .query("getEpochHead", &[("did", alice.did.clone())])
+        .await;
+    assert_eq!(latest.ok()["epoch"], two);
+    let mailboxes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM labyrinth.mailboxes WHERE owner_did = $1")
+            .bind(&alice.did)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(mailboxes, 0, "the heads created no mailbox");
+
+    // Revocation drops an ORF state with no bound device.
+    let key = [0xA5; 32];
+    alice
+        .call("registerOrfState", &json!({ "deviceKeyPubkey": b(&key) }))
+        .await
+        .ok();
+    other
+        .call("deleteOrfState", &json!({ "deviceKeyPubkey": b(&key) }))
+        .await
+        .ok();
+
+    // An mls-ds mailbox for the same DID cannot fork the published chain:
+    // its genesis head differs from the recorded one (the [CB-9] race
+    // guard, which createEpoch reports as RecordAlreadyExists).
+    alice.enroll([0xA0; 32]).await;
+    let (other_genesis, _) = chain::epoch_public(&alice, 0, [7; 32], None, None);
+    alice
+        .call("createEpoch", &open_epoch(&other_genesis, [0xA0; 32]))
+        .await
+        .fails(409, "RecordAlreadyExists");
+    // With a mailbox here, an unbound device is refused again.
+    other
+        .call("publishEpochHead", &publish(&two))
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+}
+
+/// Such an account deletes what this DS holds for it (head chain, ORF
+/// states, authored items) from any of its chat devices.
+#[tokio::test]
+async fn a_space_hosted_account_deletes_its_data_without_a_bound_device() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    let (genesis, _) = chain::epoch_public(&alice, 0, [1; 32], None, None);
+    alice
+        .call("publishEpochHead", &publish(&genesis))
+        .await
+        .ok();
+    alice
+        .call(
+            "registerOrfState",
+            &json!({ "deviceKeyPubkey": b(&[0xA5; 32]) }),
+        )
+        .await
+        .ok();
+
+    let other = env.device_for(&alice.did, random_seed()).await;
+    other.call("deleteAccountData", &json!({})).await.ok();
+    other
+        .query("getEpochHead", &[("did", alice.did.clone())])
+        .await
+        .fails(404, "EpochNotFound");
+    let states: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM labyrinth.orf_states WHERE owner_did = $1")
+            .bind(&alice.did)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(states, 0);
+    // The account can start a new chain.
+    alice
+        .call("publishEpochHead", &publish(&genesis))
+        .await
+        .ok();
+}
+
 // ---------------------------------------------------------------------------
 // Device views
 // ---------------------------------------------------------------------------

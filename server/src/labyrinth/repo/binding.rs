@@ -50,6 +50,21 @@ pub fn verify_chat_binding(caller: &Caller, device: &Device) -> LabyrinthResult<
     }
 }
 
+/// Whether `did` keeps its Labyrinth mailbox on this DS (a mailbox row
+/// exists once any mailbox record was written). An account whose mailbox
+/// lives in its own PDS Space (labyrinth SPEC §9, backend A) has none: this
+/// DS is then only its independent head directory ([CB-28]) and ORF
+/// server, and the binding rules, which need mailbox device rows, cannot
+/// apply to it.
+pub async fn hosts_mailbox(conn: &mut PgConnection, did: &str) -> LabyrinthResult<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM labyrinth.mailboxes WHERE owner_did = $1)")
+            .bind(did)
+            .fetch_one(&mut *conn)
+            .await?,
+    )
+}
+
 fn not_bound() -> LabyrinthError {
     LabyrinthError::forbidden(
         "LabyrinthDeviceNotBound",

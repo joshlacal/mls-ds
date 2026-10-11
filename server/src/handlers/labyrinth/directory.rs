@@ -1,6 +1,13 @@
 //! Directory endpoints (`MailboxDirectory`). Reads: any authenticated chat
-//! device. `publishEpochHead`: only a chat device holding a bound Labyrinth
-//! device, and only to re-publish an epoch its mailbox already holds.
+//! device. `publishEpochHead`: for an account whose mailbox is on this DS,
+//! only a chat device holding a bound Labyrinth device, and only to
+//! re-publish an epoch its mailbox already holds. For an account whose
+//! mailbox lives in its PDS Space (no mailbox here), the head itself is the
+//! only thing this DS can check: it must recompute, be attested by the
+//! calling chat device and extend the stored chain by one with a valid
+//! `prevSig` ([`repo::record_head`]). A chat device of such an account can
+//! therefore take the next number; the client's PDS × mls-ds cross-check
+//! reports that as a directory fork.
 
 use std::sync::Arc;
 
@@ -41,8 +48,12 @@ pub async fn publish_epoch_head(
             let epoch = Received::<EpochPublic>::parse(&input.epoch, "epoch")?;
             let mut w = begin_write!(&pool, adm);
             let caller = w.caller.clone();
-            binding::require_bound(&mut w.tx, &caller, None).await?;
-            repo::republish_head(&mut w.tx, &caller, &epoch.value, w.instant).await?;
+            if binding::hosts_mailbox(&mut w.tx, &caller.did).await? {
+                binding::require_bound(&mut w.tx, &caller, None).await?;
+                repo::republish_head(&mut w.tx, &caller, &epoch.value, w.instant).await?;
+            } else {
+                repo::record_head(&mut w.tx, &caller, &epoch.value, w.instant).await?;
+            }
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,

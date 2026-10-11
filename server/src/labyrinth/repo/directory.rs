@@ -130,8 +130,9 @@ pub async fn record_head(
     Ok(())
 }
 
-/// `publishEpochHead`: re-publish the head of an epoch the caller's mailbox
-/// already holds. Heads enter the directory only through `createEpoch`
+/// `publishEpochHead` for an account whose mailbox is on this DS: re-publish
+/// the head of an epoch the caller's mailbox already holds. Such an
+/// account's heads enter the directory only through `createEpoch`
 /// (atomically, behind the Labyrinth device binding); this endpoint can
 /// neither introduce an epoch nor squat the next number. The epoch must
 /// exist in `labyrinth.epochs` with exactly this `public`, and the caller
