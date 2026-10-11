@@ -156,6 +156,12 @@ async fn orf_states_register_evolve_and_delete() {
         )
         .await
         .ok();
+    // Once the account keeps its mailbox here (another chat device of it
+    // enrolled), deleting a state needs a bound device.
+    env.device_for(&alice.did, [0xE2; 32])
+        .await
+        .enroll([0xE3; 32])
+        .await;
     alice
         .call("deleteOrfState", &json!({ "deviceKeyPubkey": b(&child) }))
         .await

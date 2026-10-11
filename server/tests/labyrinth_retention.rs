@@ -347,17 +347,21 @@ async fn purge_mailbox_resets_the_account_and_nothing_else() {
     )
     .await
     .ok();
-    // A retry of the same operation replays; a fresh purge of an emptied
-    // mailbox has no bound device left to authorize it (finding 6).
-    d0.call_op("purgeMailbox", &json!({}), [0x77; 16])
-        .await
-        .ok();
-    d0.call_op("purgeMailbox", &json!({}), [0x77; 16])
-        .await
-        .ok();
-    d0.call("purgeMailbox", &json!({}))
+    // Only a bound device purges a mailbox kept here (finding 6).
+    let other = env.device_for(&v.did, random_seed()).await;
+    other
+        .call("purgeMailbox", &json!({}))
         .await
         .fails(403, "LabyrinthDeviceNotBound");
+    // A retry of the same operation replays; once no mailbox is kept here,
+    // a fresh purge has nothing to guard and is a no-op.
+    d0.call_op("purgeMailbox", &json!({}), [0x77; 16])
+        .await
+        .ok();
+    d0.call_op("purgeMailbox", &json!({}), [0x77; 16])
+        .await
+        .ok();
+    d0.call("purgeMailbox", &json!({})).await.ok();
 }
 
 #[tokio::test]
@@ -422,11 +426,12 @@ async fn delete_account_data_purges_signs_redactions_and_keeps_operations() {
     let carol = env.account().await;
     let remote = seed_conversation(&env, &[leaf(&carol)], 2).await;
     make_remote(&env, remote).await;
-    carol
+    carol.enroll([0xC0; 32]).await;
+    let unbound = env.device_for(&carol.did, random_seed()).await;
+    unbound
         .call("deleteAccountData", &json!({}))
         .await
         .fails(403, "LabyrinthDeviceNotBound");
-    carol.enroll([0xC0; 32]).await;
     carol.call("deleteAccountData", &json!({})).await.ok();
     assert_eq!(count(&env, "devices", "owner_did", &carol.did).await, 0);
     let queued: Vec<(String, String, String)> = sqlx::query_as(

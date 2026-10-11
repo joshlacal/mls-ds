@@ -1,7 +1,11 @@
 //! Retention endpoints (decisions J1, J2; `crate::labyrinth::repo::retention`):
 //! `purgeMailbox`, `deleteAccountData`, `deleteVirtualDevice` and
 //! `touchVirtualDevice`. Unsend (`redactMessage`) is a thread endpoint.
-//! Every destructive endpoint requires a bound Labyrinth device (finding 6).
+//! Every destructive endpoint requires a bound Labyrinth device (finding 6),
+//! except that an account whose mailbox lives in its PDS Space has none
+//! here: any of its chat devices may purge what this DS holds for it (its
+//! head chain, ORF states and authored thread items). A chat device could
+//! reach the same result by enrolling a device first.
 
 use std::sync::Arc;
 
@@ -48,7 +52,9 @@ pub async fn purge_mailbox(
             let EmptyIn {} = body(&bytes)?;
             let mut w = begin_write!(&pool, adm);
             let caller = w.caller.clone();
-            binding::require_bound(&mut w.tx, &caller, None).await?;
+            if binding::hosts_mailbox(&mut w.tx, &caller.did).await? {
+                binding::require_bound(&mut w.tx, &caller, None).await?;
+            }
             repo::purge_mailbox(&mut w.tx, &caller.did).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
@@ -116,7 +122,9 @@ pub async fn delete_account_data(
             let (write_body, write_signature) = auth::write_headers(&headers)?;
             let mut w = begin_write!(&pool, adm);
             let (caller, at) = (w.caller.clone(), w.instant);
-            binding::require_bound(&mut w.tx, &caller, None).await?;
+            if binding::hosts_mailbox(&mut w.tx, &caller.did).await? {
+                binding::require_bound(&mut w.tx, &caller, None).await?;
+            }
             repo::purge_account(&mut w.tx, &caller.did, at).await?;
             let request = RelayRequest {
                 op: RelayOp::PurgeAuthor.name().to_owned(),
