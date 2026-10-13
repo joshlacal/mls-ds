@@ -318,6 +318,76 @@ async fn a_virtual_device_row_records_no_chat_binding() {
     assert_eq!((device, key), (None, None));
 }
 
+/// MLSDS-I2: on an account whose mailbox is here, registering ORF state
+/// needs a bound device, like deleting it.
+#[tokio::test]
+async fn an_unbound_chat_device_cannot_register_orf_state_on_a_hosted_mailbox() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    alice.enroll([0xA0; 32]).await;
+    let other = env.device_for(&alice.did, random_seed()).await;
+    other
+        .call(
+            "registerOrfState",
+            &json!({ "deviceKeyPubkey": b(&[0xA5; 32]) }),
+        )
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+    alice
+        .call(
+            "registerOrfState",
+            &json!({ "deviceKeyPubkey": b(&[0xA0; 32]) }),
+        )
+        .await
+        .ok();
+}
+
+/// MLSDS-I2: ORF states are capped per account, so a Space account (which
+/// registers without a binding) cannot grow them without bound.
+#[tokio::test]
+async fn orf_states_are_capped_per_account() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    let max = catbird_server::labyrinth::repo::orf::MAX_ORF_STATES;
+    sqlx::query(
+        "INSERT INTO labyrinth.orf_states (owner_did, device_key, server_state, created_at) \
+         SELECT $1, sha256(int4send(i)), sha256(int4send(i)), now() \
+           FROM generate_series(1, $2) AS i",
+    )
+    .bind(&alice.did)
+    .bind(max as i32)
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    alice
+        .call(
+            "registerOrfState",
+            &json!({ "deviceKeyPubkey": b(&[0xA5; 32]) }),
+        )
+        .await
+        .fails(400, "QuotaExceeded");
+    // Dropping one frees a slot.
+    alice
+        .call(
+            "deleteOrfState",
+            &json!({ "deviceKeyPubkey": b(&sha256_of_int(1)) }),
+        )
+        .await
+        .ok();
+    alice
+        .call(
+            "registerOrfState",
+            &json!({ "deviceKeyPubkey": b(&[0xA5; 32]) }),
+        )
+        .await
+        .ok();
+}
+
+fn sha256_of_int(i: i32) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(i.to_be_bytes()).into()
+}
+
 /// MLSDS-C1(a): a destructive request that found no mailbox here must not
 /// wipe one a concurrent first `createDevice` commits while it runs. The
 /// `createDevice` transaction is held open (the real repository call) and
