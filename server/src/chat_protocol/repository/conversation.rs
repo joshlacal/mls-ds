@@ -164,10 +164,15 @@ async fn read_conversation_state_in_transaction(
     .await
     .map_err(map_inventory_error)?;
 
-    let state = conversation_state_view(&source).map_err(|error| {
+    let mut state = conversation_state_view(&source).map_err(|error| {
         tracing::error!(class = ?error.kind(), "remote conversation state projection failed");
         ConversationStateReadError::Invariant
     })?;
+    // The heads come from this DS's own directory, as on the local path and
+    // in getEpochHead, whichever DS sequences the conversation.
+    attach_labyrinth_heads(transaction, &mut state.participants)
+        .await
+        .map_err(|_| ConversationStateReadError::Storage)?;
 
     conversation_state_response(
         catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
