@@ -291,6 +291,33 @@ async fn a_bound_device_writes_virtual_devices_and_owner_batches() {
         .ok();
 }
 
+/// MLSDS-I1: `createDevice` accepts a virtual device (the lexicon's device
+/// record is "physical or virtual", and only `labyrinth.devices` rows can be
+/// epoch members), but a virtual row carries no chat binding.
+#[tokio::test]
+async fn a_virtual_device_row_records_no_chat_binding() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    alice.enroll([0xA0; 32]).await;
+    alice
+        .call(
+            "createDevice",
+            &json!({ "record": virtual_device_record([0xBB; 32]) }),
+        )
+        .await
+        .ok();
+    let (device, key): (Option<uuid::Uuid>, Option<String>) = sqlx::query_as(
+        "SELECT chat_device_id, chat_key_id FROM labyrinth.devices \
+          WHERE owner_did = $1 AND device_key = $2",
+    )
+    .bind(&alice.did)
+    .bind([0xBB_u8; 32].as_slice())
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!((device, key), (None, None));
+}
+
 /// MLSDS-C1(a): a destructive request that found no mailbox here must not
 /// wipe one a concurrent first `createDevice` commits while it runs. The
 /// `createDevice` transaction is held open (the real repository call) and

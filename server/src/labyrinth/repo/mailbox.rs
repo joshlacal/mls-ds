@@ -96,8 +96,8 @@ pub async fn create_device(
     .bind(is_virtual)
     .bind(&rec.value.revoked_at)
     .bind(at)
-    .bind(caller.device_id)
-    .bind(&caller.key_id)
+    .bind((!is_virtual).then_some(caller.device_id))
+    .bind((!is_virtual).then_some(caller.key_id.as_str()))
     .execute(&mut *conn)
     .await?;
     if inserted.rows_affected() == 0 {
