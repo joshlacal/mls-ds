@@ -79,9 +79,7 @@ pub async fn delete_orf_state(
             // An account whose mailbox lives in its PDS Space has no bound
             // device here; registration needs none either, so any current
             // chat device of the DID may drop one of its states (revocation).
-            if binding::hosts_mailbox(&mut w.tx, &caller.did).await? {
-                binding::require_bound(&mut w.tx, &caller, None).await?;
-            }
+            binding::require_bound_if_hosted(&mut w.tx, &caller).await?;
             repo::delete(&mut w.tx, &caller.did, &key).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }

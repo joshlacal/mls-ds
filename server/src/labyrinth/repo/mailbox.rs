@@ -23,13 +23,16 @@ struct Charge {
 }
 
 /// Add to the owner's counters, creating the mailbox row on first use. A
-/// quota CHECK violation surfaces as `QuotaExceeded`.
+/// quota CHECK violation surfaces as `QuotaExceeded`. Takes the owner's
+/// mailbox lock ([`binding::lock_mailbox`]), so the row never appears under
+/// a request that found none.
 async fn charge(
     conn: &mut PgConnection,
     owner: &str,
     c: Charge,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<()> {
+    binding::lock_mailbox(conn, owner).await?;
     sqlx::query(
         "INSERT INTO labyrinth.mailboxes \
            (owner_did, bytes_used, record_count, epoch_count, vdevice_count, created_at) \
@@ -61,6 +64,14 @@ pub async fn create_device(
     binding::verify_chat_binding(caller, &rec.value)?;
     let owner = caller.did.as_str();
     let key = rec.value.device_key_pubkey.array::<32>("deviceKeyPubkey")?;
+    // A physical device bootstraps (and binds) the calling chat device; a
+    // virtual one binds nothing, so only a bound chat device may add it.
+    // Otherwise any chat device could create the mailbox row of an account
+    // whose mailbox lives in its PDS Space.
+    let is_virtual = rec.value.r#virtual;
+    if is_virtual {
+        binding::require_bound(conn, caller, None).await?;
+    }
     charge(
         conn,
         owner,
@@ -82,7 +93,7 @@ pub async fn create_device(
     .bind(key.as_slice())
     .bind(&rec.text)
     .bind(rec.bytes)
-    .bind(rec.value.r#virtual)
+    .bind(is_virtual)
     .bind(&rec.value.revoked_at)
     .bind(at)
     .bind(caller.device_id)
@@ -219,6 +230,9 @@ pub async fn create_epoch(
             ));
         }
     }
+    // The mailbox lock before the head-directory lock (record_head), as in
+    // publishEpochHead.
+    binding::lock_mailbox(conn, owner).await?;
     binding::require_bound(conn, caller, Some(&epoch.value.opened_by.0)).await?;
     let member_keys: Vec<Vec<u8>> = members
         .iter()
@@ -423,6 +437,7 @@ pub async fn create_virtual_device(
 ) -> LabyrinthResult<()> {
     rec.value.validate()?;
     let owner = caller.did.as_str();
+    binding::require_bound(conn, caller, None).await?;
     let id = rec.value.vdevice_id.array::<16>("vdeviceId")?;
     let key = rec.value.device_key_pubkey.array::<32>("deviceKeyPubkey")?;
     charge(
@@ -512,14 +527,17 @@ pub async fn list_virtual_devices(
     keyed_page(rows, page.limit())
 }
 
-/// `appendOwnerBatch`: a server TID and the per-mailbox order stamp.
+/// `appendOwnerBatch`: a server TID and the per-mailbox order stamp. Only a
+/// bound chat device writes its account's archive.
 pub async fn append_owner_batch(
     conn: &mut PgConnection,
-    owner: &str,
+    caller: &Caller,
     rec: &Received<OwnerBatch>,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<(String, ServerOrder)> {
     rec.value.validate()?;
+    let owner = caller.did.as_str();
+    binding::require_bound(conn, caller, None).await?;
     charge(
         conn,
         owner,

@@ -395,6 +395,8 @@ async fn own_archive_copies_count_and_deletion_revokes() {
     let object = object();
     let env = Env::with(true, Some(&object)).await;
     let alice = env.account().await;
+    // Owner-archive and bundle writes need a bound Labyrinth device.
+    alice.enroll([0xE0; 32]).await;
     let thread = seed_conversation(
         &env,
         &[Leaf {
@@ -489,6 +491,8 @@ async fn another_authors_message_lives_only_through_its_sender_copy() {
     let env = Env::with(true, Some(&object)).await;
     let alice = env.account().await;
     let bob = env.account().await;
+    // Owner-archive and bundle writes need a bound Labyrinth device.
+    bob.enroll([0xE1; 32]).await;
     let thread = seed_conversation(&env, &leaves(&[&alice, &bob]), 10).await;
     grant_interval(&env, thread, &bob, 1, None).await;
     let (blob, message) = seed_bound_attachment(&env, &alice, thread, &object, 5).await;

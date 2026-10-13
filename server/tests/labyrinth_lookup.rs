@@ -285,7 +285,11 @@ async fn list_threads_lists_authored_and_addressed_conversations() {
 async fn list_owner_threads_pages_the_callers_archive_only() {
     let env = Env::new().await;
     let alice = env.account().await;
+    // Owner-archive and bundle writes need a bound Labyrinth device.
+    alice.enroll([0xE0; 32]).await;
     let bob = env.account().await;
+    // Owner-archive and bundle writes need a bound Labyrinth device.
+    bob.enroll([0xE1; 32]).await;
     for thread in ["thread-b", "thread-a", "thread-b", "thread-c"] {
         alice
             .call(
@@ -397,6 +401,8 @@ async fn list_batches_pages_newest_first_and_by_receive_window() {
 async fn list_owner_batches_pages_newest_first_and_by_receive_window() {
     let env = Env::new().await;
     let alice = env.account().await;
+    // Owner-archive and bundle writes need a bound Labyrinth device.
+    alice.enroll([0xE0; 32]).await;
     let mut received = Vec::new();
     for ts in [10u64, 20, 30, 40] {
         tick().await;

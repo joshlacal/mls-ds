@@ -189,6 +189,8 @@ async fn reads_require_a_device_signed_claim_over_the_exact_query() {
 async fn bundle_use_is_recorded_only_for_device_signed_reads() {
     let env = Env::new().await;
     let alice = env.account().await;
+    // Owner-archive and bundle writes need a bound Labyrinth device.
+    alice.enroll([0xE0; 32]).await;
     alice
         .call(
             "createVirtualDevice",

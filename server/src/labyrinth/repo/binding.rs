@@ -50,19 +50,43 @@ pub fn verify_chat_binding(caller: &Caller, device: &Device) -> LabyrinthResult<
     }
 }
 
+/// Serialize, until commit, every decision on and change to whether `did`
+/// keeps a mailbox here. [`hosts_mailbox`] and the mailbox charge (which
+/// creates the row) both take it, so a request that found no mailbox runs
+/// its whole transaction before any concurrent first mailbox write commits,
+/// and a destructive request can never wipe a mailbox it did not check.
+/// Lock order: this lock before `labyrinth.epoch_heads:{did}`.
+pub async fn lock_mailbox(conn: &mut PgConnection, did: &str) -> LabyrinthResult<()> {
+    super::advisory_lock(conn, &format!("labyrinth.mailboxes:{did}")).await
+}
+
 /// Whether `did` keeps its Labyrinth mailbox on this DS (a mailbox row
 /// exists once any mailbox record was written). An account whose mailbox
 /// lives in its own PDS Space (labyrinth SPEC §9, backend A) has none: this
 /// DS is then only its independent head directory ([CB-28]) and ORF
 /// server, and the binding rules, which need mailbox device rows, cannot
-/// apply to it.
+/// apply to it. Takes [`lock_mailbox`], so the answer holds until the
+/// caller's transaction ends.
 pub async fn hosts_mailbox(conn: &mut PgConnection, did: &str) -> LabyrinthResult<bool> {
+    lock_mailbox(conn, did).await?;
     Ok(
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM labyrinth.mailboxes WHERE owner_did = $1)")
             .bind(did)
             .fetch_one(&mut *conn)
             .await?,
     )
+}
+
+/// [`require_bound`] when the caller's DID keeps its mailbox here; nothing
+/// otherwise (a PDS-Space account has no device rows here to bind).
+pub async fn require_bound_if_hosted(
+    conn: &mut PgConnection,
+    caller: &Caller,
+) -> LabyrinthResult<()> {
+    if hosts_mailbox(conn, &caller.did).await? {
+        require_bound(conn, caller, None).await?;
+    }
+    Ok(())
 }
 
 fn not_bound() -> LabyrinthError {
