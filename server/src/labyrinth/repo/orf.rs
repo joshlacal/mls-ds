@@ -8,6 +8,12 @@ use sqlx::PgConnection;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
 use crate::labyrinth::orf::{server_evolve, server_init};
 
+/// Most ORF states one account keeps here. A Space account registers
+/// without a bound device, so only this bounds its rows; a real account
+/// holds one per physical or virtual device plus short-lived one-time-code
+/// states.
+pub const MAX_ORF_STATES: i64 = 1024;
+
 pub(super) fn orf_not_found() -> LabyrinthError {
     LabyrinthError::not_found("OrfStateNotFound")
 }
@@ -44,6 +50,19 @@ pub async fn register(
 ) -> LabyrinthResult<()> {
     if state(conn, owner, device_key).await?.is_some() {
         return Err(LabyrinthError::already_exists());
+    }
+    // Every caller holds the owner's mailbox lock (`binding::lock_mailbox`,
+    // taken by `hosts_mailbox` or the createVirtualDevice charge), so
+    // concurrent registrations cannot both pass the count.
+    let held: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM labyrinth.orf_states WHERE owner_did = $1")
+            .bind(owner)
+            .fetch_one(&mut *conn)
+            .await?;
+    if held >= MAX_ORF_STATES {
+        return Err(LabyrinthError::quota(
+            "too many ORF states for this account",
+        ));
     }
     let new_state = match parent {
         None => server_init(),

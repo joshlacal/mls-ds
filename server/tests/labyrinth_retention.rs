@@ -457,6 +457,8 @@ fn vdevice(id: u8, mechanism: &str) -> Value {
 async fn recovery_bundles_record_use_expire_when_idle_and_can_be_deleted() {
     let env = Env::new().await;
     let alice = env.account().await;
+    // Owner-archive and bundle writes need a bound Labyrinth device.
+    alice.enroll([0xA7; 32]).await;
     for (id, mechanism) in [
         (1, "keychain"),
         (2, "passkey"),
@@ -512,11 +514,11 @@ async fn recovery_bundles_record_use_expire_when_idle_and_can_be_deleted() {
             .await
             .unwrap();
     // Deleting a bundle needs a bound Labyrinth device (review 2, finding 6).
-    alice
+    let unbound = env.device_for(&alice.did, random_seed()).await;
+    unbound
         .call("deleteVirtualDevice", &json!({ "vdeviceId": b(&[4; 16]) }))
         .await
         .fails(403, "LabyrinthDeviceNotBound");
-    alice.enroll([0xA7; 32]).await;
     alice
         .call("deleteVirtualDevice", &json!({ "vdeviceId": b(&[4; 16]) }))
         .await

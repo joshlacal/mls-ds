@@ -102,6 +102,8 @@ async fn records_are_validated_against_the_lexicon() {
 async fn procedure_retries_replay_the_exact_response_and_reject_reuse() {
     let env = Env::new().await;
     let alice = env.account().await;
+    // Owner-archive and bundle writes need a bound Labyrinth device.
+    alice.enroll([0xE0; 32]).await;
     let op = [0x42; 16];
     let input = json!({ "record": owner_batch_record("thread-a", &[10, 20]) });
     let first = alice.call_op("appendOwnerBatch", &input, op).await;
@@ -338,6 +340,8 @@ pub fn scalar_token(n: u8) -> [u8; 32] {
 async fn owner_batches_are_stamped_in_order_and_filtered_by_time() {
     let env = Env::new().await;
     let alice = env.account().await;
+    // Owner-archive and bundle writes need a bound Labyrinth device.
+    alice.enroll([0xE0; 32]).await;
     let mut seqs = Vec::new();
     for (i, ts) in [[100u64, 150], [200, 250], [300, 350]].iter().enumerate() {
         let thread = if i == 1 { "thread-b" } else { "thread-a" };

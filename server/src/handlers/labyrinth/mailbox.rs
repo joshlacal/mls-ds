@@ -375,8 +375,9 @@ pub async fn append_owner_batch(
             let input: RecordIn = body(&bytes)?;
             let rec = Received::<OwnerBatch>::parse(&input.record, "record")?;
             let mut w = begin_write!(&pool, adm);
+            let caller = w.caller.clone();
             let (rkey, order) =
-                repo::append_owner_batch(&mut w.tx, &w.caller.did, &rec, w.instant).await?;
+                repo::append_owner_batch(&mut w.tx, &caller, &rec, w.instant).await?;
             w.finish_write(to_bytes(&json!({ "rkey": rkey, "order": order }))?)
                 .await
         }

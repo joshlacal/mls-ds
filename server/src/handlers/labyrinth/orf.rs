@@ -56,7 +56,14 @@ pub async fn register_orf_state(
                 })
                 .transpose()?;
             let mut w = begin_write!(&pool, adm);
-            repo::register(&mut w.tx, &w.caller.did, &key, parent, w.instant).await?;
+            let caller = w.caller.clone();
+            // Every client registration on an account whose mailbox is here
+            // comes from a bound device (genesis, enrollment, recovery and
+            // one-time-code flows all create their device first). A Space
+            // account has no device rows here and registers unbound, within
+            // the per-account cap.
+            binding::require_bound_if_hosted(&mut w.tx, &caller).await?;
+            repo::register(&mut w.tx, &caller.did, &key, parent, w.instant).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,
@@ -79,9 +86,7 @@ pub async fn delete_orf_state(
             // An account whose mailbox lives in its PDS Space has no bound
             // device here; registration needs none either, so any current
             // chat device of the DID may drop one of its states (revocation).
-            if binding::hosts_mailbox(&mut w.tx, &caller.did).await? {
-                binding::require_bound(&mut w.tx, &caller, None).await?;
-            }
+            binding::require_bound_if_hosted(&mut w.tx, &caller).await?;
             repo::delete(&mut w.tx, &caller.did, &key).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
