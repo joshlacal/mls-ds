@@ -6,6 +6,10 @@ edition = "2021"
 [features]
 default = []
 local-runtime-fixture = ["dep:axum", "dep:url"]
+# Labyrinth encrypted history backup through the live orchestrator
+# (`tests/labyrinth_live_orchestrator.rs`); needs the `labyrinth` crate at
+# the path catbird-mls names (`../../labyrinth-wire` from catbird-mls).
+labyrinth = ["catbird_mls/labyrinth"]
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json"] }
