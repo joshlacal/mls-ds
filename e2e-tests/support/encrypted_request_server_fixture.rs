@@ -5,7 +5,9 @@ use axum::{extract::FromRef, Router};
 use catbird_server::{
     auth::install_test_https_did_resolver,
     blob_store::BlobStore,
+    federation::{outbound::OutboundClient, DsResolver, ServiceAuthClient},
     handlers::chat::{chat_router, install_test_https_relationship_resolver, ChatRuntime},
+    handlers::labyrinth::labyrinth_router,
     realtime::SseState,
     storage::DbPool,
 };
@@ -55,6 +57,10 @@ struct FixtureState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
     blob_store: BlobStore,
+    /// Federation handles the Labyrinth router needs (`LABYRINTH_ENABLED`).
+    /// Fixture conversations are all local, so no peer is ever contacted.
+    resolver: Arc<DsResolver>,
+    outbound: Arc<OutboundClient>,
 }
 
 impl FromRef<FixtureState> for DbPool {
@@ -73,6 +79,33 @@ impl FromRef<FixtureState> for BlobStore {
     fn from_ref(state: &FixtureState) -> Self {
         state.blob_store.clone()
     }
+}
+
+impl FromRef<FixtureState> for Arc<DsResolver> {
+    fn from_ref(state: &FixtureState) -> Self {
+        state.resolver.clone()
+    }
+}
+
+impl FromRef<FixtureState> for Arc<OutboundClient> {
+    fn from_ref(state: &FixtureState) -> Self {
+        state.outbound.clone()
+    }
+}
+
+/// No server-to-server identity: the fixture never relays Labyrinth
+/// operations to another DS.
+impl FromRef<FixtureState> for Option<Arc<ServiceAuthClient>> {
+    fn from_ref(_: &FixtureState) -> Self {
+        None
+    }
+}
+
+/// Same predicate as `main.rs` `truthy_env_var`.
+fn truthy_env_var(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 #[tokio::main]
@@ -231,10 +264,42 @@ async fn main() -> Result<()> {
         });
     }
 
-    let app: Router = chat_router::<FixtureState>().with_state(FixtureState {
+    // The shipping server merges the Labyrinth router only when
+    // `LABYRINTH_ENABLED` is set (`main.rs`); the fixture mirrors that gate.
+    let labyrinth_enabled = truthy_env_var("LABYRINTH_ENABLED");
+    // Only the Labyrinth router reads the resolver. Without it the fixture
+    // must not touch the fail-loudly SERVICE_DID accessor, so callers that
+    // set no SERVICE_DID (the C34 compatible reader) start as before.
+    let (service_did, self_endpoint) = if labyrinth_enabled {
+        (
+            catbird_server::identity::service_did(),
+            catbird_server::identity::self_endpoint(),
+        )
+    } else {
+        (
+            "did:web:labyrinth-disabled.invalid".to_owned(),
+            "https://labyrinth-disabled.invalid".to_owned(),
+        )
+    };
+    let resolver = Arc::new(DsResolver::with_default_endpoint(
+        pool.clone(),
+        catbird_server::federation::resolver::build_resolver_http_client(),
+        service_did,
+        self_endpoint,
+        None,
+        3600,
+    ));
+    let router = if labyrinth_enabled {
+        chat_router::<FixtureState>().merge(labyrinth_router::<FixtureState>())
+    } else {
+        chat_router::<FixtureState>()
+    };
+    let app: Router = router.with_state(FixtureState {
         pool,
         runtime,
         blob_store: BlobStore::for_route_tests(),
+        resolver,
+        outbound: Arc::new(OutboundClient::new(10, 30)),
     });
     let configured_listen = std::env::var("REQUEST_FIXTURE_LISTEN").ok();
     let listen: std::net::SocketAddr = configured_listen
