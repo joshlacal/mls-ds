@@ -264,17 +264,32 @@ async fn main() -> Result<()> {
         });
     }
 
+    // The shipping server merges the Labyrinth router only when
+    // `LABYRINTH_ENABLED` is set (`main.rs`); the fixture mirrors that gate.
+    let labyrinth_enabled = truthy_env_var("LABYRINTH_ENABLED");
+    // Only the Labyrinth router reads the resolver. Without it the fixture
+    // must not touch the fail-loudly SERVICE_DID accessor, so callers that
+    // set no SERVICE_DID (the C34 compatible reader) start as before.
+    let (service_did, self_endpoint) = if labyrinth_enabled {
+        (
+            catbird_server::identity::service_did(),
+            catbird_server::identity::self_endpoint(),
+        )
+    } else {
+        (
+            "did:web:labyrinth-disabled.invalid".to_owned(),
+            "https://labyrinth-disabled.invalid".to_owned(),
+        )
+    };
     let resolver = Arc::new(DsResolver::with_default_endpoint(
         pool.clone(),
         catbird_server::federation::resolver::build_resolver_http_client(),
-        catbird_server::identity::service_did(),
-        catbird_server::identity::self_endpoint(),
+        service_did,
+        self_endpoint,
         None,
         3600,
     ));
-    // The shipping server merges the Labyrinth router only when
-    // `LABYRINTH_ENABLED` is set (`main.rs`); the fixture mirrors that gate.
-    let router = if truthy_env_var("LABYRINTH_ENABLED") {
+    let router = if labyrinth_enabled {
         chat_router::<FixtureState>().merge(labyrinth_router::<FixtureState>())
     } else {
         chat_router::<FixtureState>()

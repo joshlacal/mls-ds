@@ -7,8 +7,13 @@ edition = "2021"
 default = []
 local-runtime-fixture = ["dep:axum", "dep:url"]
 # Labyrinth encrypted history backup through the live orchestrator
-# (`tests/labyrinth_live_orchestrator.rs`); needs the `labyrinth` crate at
-# the path catbird-mls names (`../../labyrinth-wire` from catbird-mls).
+# (`tests/labyrinth_live_orchestrator.rs`). Cargo checks this feature and
+# resolves catbird-mls's optional `labyrinth` dependency for every build, not
+# only `--features labyrinth`: every e2e build needs a catbird-mls that has
+# the `labyrinth` feature (labyrinth-backend-20261004 or later) and fetches
+# the crate from github.com/joshlacal/labyrinth at the rev catbird-mls pins.
+# While that repo is private, set CARGO_NET_GIT_FETCH_WITH_CLI=true so Cargo
+# uses your git credentials.
 labyrinth = ["catbird_mls/labyrinth"]
 
 [dependencies]

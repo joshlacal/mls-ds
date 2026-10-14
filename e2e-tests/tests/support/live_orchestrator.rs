@@ -92,6 +92,76 @@ impl LiveApiClient {
             .find(|(recorded, _, _, _)| recorded == nsid)
             .and_then(|(_, req, _, _)| req.clone())
     }
+
+    /// The Labyrinth gateway's request, without the recording
+    /// (`MLSAPIClient::submit_labyrinth_request`).
+    #[cfg(feature = "labyrinth")]
+    async fn send_labyrinth_request(
+        &self,
+        request: &catbird_mls::labyrinth::LabyrinthRequest,
+    ) -> ApiResult<GatewayResponse> {
+        let api = |message: String| OrchestratorError::Api(message);
+        let endpoint = request
+            .nsid
+            .strip_prefix("blue.catbird.labyrinth.")
+            .filter(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric()));
+        if endpoint.is_none() {
+            return Err(api(format!("not a Labyrinth endpoint: {}", request.nsid)));
+        }
+        let (path, query) = match request.path.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (request.path.as_str(), None),
+        };
+        if path != format!("/xrpc/{}", request.nsid) {
+            return Err(api(format!("path {path} does not name {}", request.nsid)));
+        }
+        let method = match (request.method.as_str(), &request.body) {
+            ("GET", None) => reqwest::Method::GET,
+            ("POST", Some(_)) => reqwest::Method::POST,
+            (other, _) => return Err(api(format!("Labyrinth {other} request shape"))),
+        };
+        let mut url = format!("{}{path}", self.base_url);
+        if let Some(query) = query.filter(|query| !query.is_empty()) {
+            url.push('?');
+            url.push_str(query);
+        }
+        let mut builder = self.client.request(method, url).bearer_auth(
+            self.service
+                .scoped_jwt_with_jti(&request.nsid, uuid::Uuid::new_v4()),
+        );
+        for (name, value) in &request.headers {
+            // Only the core's own admission headers; never transport or auth.
+            if !name.starts_with("catbird-labyrinth-") {
+                return Err(api(format!("unexpected Labyrinth header {name}")));
+            }
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        if let Some(body) = &request.body {
+            builder = builder
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.clone());
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| api(format!("Labyrinth transport: {error}")))?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| api(format!("Labyrinth response body: {error}")))?
+            .to_vec();
+        Ok(GatewayResponse {
+            status,
+            content_type,
+            body,
+        })
+    }
 }
 
 fn outside_projection(method: &str) -> OrchestratorError {
@@ -151,78 +221,24 @@ impl MLSAPIClient for LiveApiClient {
     /// admission headers (signed `labyrinthWriteBody` on procedures, the
     /// device-signed read claim on queries) forwarded verbatim, and the raw
     /// response returned. Query strings and bodies are the core's exact bytes.
+    ///
+    /// Every outcome is recorded for [`LiveApiClient::failures`]: a request
+    /// this gateway refuses, or one that fails in transport, as status 0.
     #[cfg(feature = "labyrinth")]
     async fn submit_labyrinth_request(
         &self,
         request: catbird_mls::labyrinth::LabyrinthRequest,
     ) -> ApiResult<GatewayResponse> {
-        let api = |message: String| OrchestratorError::Api(message);
-        let endpoint = request
-            .nsid
-            .strip_prefix("blue.catbird.labyrinth.")
-            .filter(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric()));
-        if endpoint.is_none() {
-            return Err(api(format!("not a Labyrinth endpoint: {}", request.nsid)));
-        }
-        let (path, query) = match request.path.split_once('?') {
-            Some((path, query)) => (path, Some(query)),
-            None => (request.path.as_str(), None),
+        let result = self.send_labyrinth_request(&request).await;
+        let (status, body) = match &result {
+            Ok(response) => (response.status, response.body.clone()),
+            Err(error) => (0, error.to_string().into_bytes()),
         };
-        if path != format!("/xrpc/{}", request.nsid) {
-            return Err(api(format!("path {path} does not name {}", request.nsid)));
-        }
-        let method = match (request.method.as_str(), &request.body) {
-            ("GET", None) => reqwest::Method::GET,
-            ("POST", Some(_)) => reqwest::Method::POST,
-            (other, _) => return Err(api(format!("Labyrinth {other} request shape"))),
-        };
-        let mut url = format!("{}{path}", self.base_url);
-        if let Some(query) = query.filter(|query| !query.is_empty()) {
-            url.push('?');
-            url.push_str(query);
-        }
-        let mut builder = self.client.request(method, url).bearer_auth(
-            self.service
-                .scoped_jwt_with_jti(&request.nsid, uuid::Uuid::new_v4()),
-        );
-        for (name, value) in &request.headers {
-            // Only the core's own admission headers; never transport or auth.
-            if !name.starts_with("catbird-labyrinth-") {
-                return Err(api(format!("unexpected Labyrinth header {name}")));
-            }
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-        if let Some(body) = &request.body {
-            builder = builder
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body.clone());
-        }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| api(format!("Labyrinth transport: {error}")))?;
-        let status = response.status().as_u16();
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| api(format!("Labyrinth response body: {error}")))?
-            .to_vec();
-        self.exchanges.lock().unwrap().push((
-            request.nsid.clone(),
-            request.body.clone(),
-            status,
-            body.clone(),
-        ));
-        Ok(GatewayResponse {
-            status,
-            content_type,
-            body,
-        })
+        self.exchanges
+            .lock()
+            .unwrap()
+            .push((request.nsid.clone(), request.body.clone(), status, body));
+        result
     }
 
     /// Canonical `getConversations` inventory mapped to host views, as a

@@ -610,17 +610,66 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
         server_view.trim() == "true,2,2",
         "server view (tablet revoked, alice epochs, batch authors): {server_view}"
     );
-    // The revoked tablet can no longer open the mailbox.
-    tablet.labyrinth_close();
-    let revoked = tablet.labyrinth_load_history(&cid, None, None).await;
+    // Forward secrecy of the revocation: the post-rotation MEKs (each
+    // author's newest batch, the phone's `third` and Bob's message) address
+    // Alice at the epoch the revocation opened, whose head the directory
+    // serves, and not at epoch 0, which the revoked tablet still holds.
+    // Alice also minted a second MEK rather than reusing the epoch-0 one.
+    let addressed = psql(
+        &database.url,
+        &format!(
+            "SELECT (SELECT max(epoch_number) FROM labyrinth.epoch_heads WHERE did = '{alice}') \
+                 || ',' || (SELECT count(DISTINCT mek_id) FROM labyrinth.batches \
+                             WHERE conversation_id = '{cid}' AND author_did = '{alice}') \
+                 || ',' || (SELECT count(*) FROM labyrinth.batches b \
+                              JOIN labyrinth.meks m USING (conversation_id, author_did, mek_id) \
+                              CROSS JOIN LATERAL jsonb_array_elements(m.record->'recipients') r \
+                             WHERE b.conversation_id = '{cid}' \
+                               AND b.seq IN (SELECT max(seq) FROM labyrinth.batches \
+                                              WHERE conversation_id = '{cid}' GROUP BY author_did) \
+                               AND r->>'did' = '{alice}' \
+                               AND r->'recipientEpochHead'->>'$bytes' = \
+                                   (SELECT rtrim(encode(epoch_head, 'base64'), '=') \
+                                      FROM labyrinth.epoch_heads \
+                                     WHERE did = '{alice}' AND epoch_number = {epoch}));",
+            alice = alice.did,
+        ),
+    )?;
     anyhow::ensure!(
-        revoked.is_err(),
-        "a revoked device reopened the mailbox: {:?}",
-        revoked.map(|p| p.messages.len())
+        addressed.trim() == format!("{epoch},2,2"),
+        "post-rotation addressing (alice head epoch, alice MEKs, alice entries at the new head): {addressed}"
+    );
+    // The revoked tablet can no longer open the mailbox, because it is not a
+    // member of the new epoch.
+    tablet.labyrinth_close();
+    let refusal = match tablet.labyrinth_load_history(&cid, None, None).await {
+        Ok(page) => anyhow::bail!(
+            "a revoked device reopened the mailbox: {} messages",
+            page.messages.len()
+        ),
+        Err(error) => error.to_string(),
+    };
+    anyhow::ensure!(
+        refusal.contains("device is not a member of this epoch"),
+        "revoked tablet refused for another reason: {refusal}"
+    );
+    // The crate also reports a failed member lookup as NotEpochMember, so
+    // check the exclusion on the server: the tablet is in epoch 0 only.
+    let tablet_epochs = psql(
+        &database.url,
+        &format!(
+            "SELECT string_agg(epoch_number::text, ',' ORDER BY epoch_number) \
+               FROM labyrinth.epoch_members \
+              WHERE owner_did = '{}' AND device_key = decode('{tablet_key}', 'hex');",
+            alice.did
+        ),
+    )?;
+    anyhow::ensure!(
+        tablet_epochs.trim() == "0",
+        "tablet epoch memberships: {tablet_epochs}"
     );
     println!(
-        "phone revoked the tablet (epoch {epoch}); post-rotation sends by the phone and bob archived; tablet refused: {}",
-        revoked.err().map(|e| e.to_string()).unwrap_or_default()
+        "phone revoked the tablet (epoch {epoch}); post-rotation sends by the phone and bob address only the new epoch; tablet refused: {refusal}"
     );
 
     // The only refusals are the crate's own "absent" probes (`get_opt`: the
