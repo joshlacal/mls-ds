@@ -36,6 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let corpus = LexiconCorpus::load_from_dir(normalized_lexdir.path())?;
     let codegen = CodeGenerator::new(&corpus, "crate::generated");
     codegen.write_to_disk(&args.outdir)?;
+    let patched = patch_schemaless_json_outputs(&args.outdir)?;
+    if patched > 0 {
+        println!("  Gave {patched} schemaless application/json output(s) raw-byte codecs");
+    }
 
     println!("✓ Code generation complete!");
     Ok(())
@@ -99,8 +103,9 @@ fn inline_bytes_refs(
     match value {
         Value::Object(map) if map.get("type").and_then(Value::as_str) == Some("ref") => {
             let reference = map.get("ref").and_then(Value::as_str).unwrap_or_default();
-            let target = canonicalize_ref(nsid, reference)
-                .map_err(|error| invalid_union_contract(format!("{nsid} ref {reference}: {error}")))?;
+            let target = canonicalize_ref(nsid, reference).map_err(|error| {
+                invalid_union_contract(format!("{nsid} ref {reference}: {error}"))
+            })?;
             let Some(schema) = aliases.get(&target) else {
                 return Ok(0);
             };
@@ -218,6 +223,14 @@ fn load_preflight_documents(
 }
 
 fn collect_json_files(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+    collect_files_with_extension(directory, "json", files)
+}
+
+fn collect_files_with_extension(
+    directory: &Path,
+    wanted: &str,
+    files: &mut Vec<PathBuf>,
+) -> io::Result<()> {
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
 
@@ -225,15 +238,105 @@ fn collect_json_files(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result<
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_json_files(&path, files)?;
+            collect_files_with_extension(&path, wanted, files)?;
         } else if file_type.is_file()
-            && path.extension().and_then(|extension| extension.to_str()) == Some("json")
+            && path.extension().and_then(|extension| extension.to_str()) == Some(wanted)
         {
             files.push(path);
         }
     }
 
     Ok(())
+}
+
+const XRPC_RESP_IMPL: &str = "impl jacquard_common::xrpc::XrpcResp for ";
+const JSON_OUTPUT_ENCODING: &str = "const ENCODING: &'static str = \"application/json\";";
+const OUTPUT_TYPE_DECL: &str = "type Output<S: jacquard_common::BosStr> = ";
+
+/// Jacquard gives an output with no schema a raw `body: Bytes` struct, and
+/// for every encoding except `application/json` it also emits raw
+/// `encode_output`/`decode_output`. For a schemaless `application/json`
+/// output (a byte-for-byte JSON body, like `labyrinthRelay`'s) it keeps the
+/// default JSON codec, which tries to parse the body as `{"body": …}` and
+/// fails. Add the same raw codecs to those responses. Returns how many
+/// responses were patched; a second run patches none.
+fn patch_schemaless_json_outputs(outdir: &Path) -> io::Result<usize> {
+    let mut files = Vec::new();
+    collect_files_with_extension(outdir, "rs", &mut files)?;
+    let mut patched = 0usize;
+    for file in files {
+        let source = fs::read_to_string(&file)?;
+        let (rewritten, count) = patch_schemaless_json_output_source(&source);
+        if count > 0 {
+            fs::write(&file, rewritten)?;
+            patched += count;
+        }
+    }
+    Ok(patched)
+}
+
+fn patch_schemaless_json_output_source(source: &str) -> (String, usize) {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    let mut count = 0usize;
+    while let Some(start) = rest.find(XRPC_RESP_IMPL) {
+        // The impl sits at column 0, so its closing brace is the first
+        // `\n}` after it.
+        let Some(len) = rest[start..].find("\n}") else {
+            break;
+        };
+        let end = start + len;
+        out.push_str(&rest[..end]);
+        if let Some(output) = schemaless_json_output(&rest[start..end]) {
+            out.push_str(&raw_output_codecs(output));
+            count += 1;
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    (out, count)
+}
+
+/// The output struct of an `XrpcResp` impl block whose output is schemaless
+/// `application/json` without its own codecs.
+fn schemaless_json_output(block: &str) -> Option<&str> {
+    if !block.contains(JSON_OUTPUT_ENCODING)
+        || block.contains("fn encode_output")
+        || block.contains("fn decode_output")
+    {
+        return None;
+    }
+    let after = &block[block.find(OUTPUT_TYPE_DECL)? + OUTPUT_TYPE_DECL.len()..];
+    let ty = after[..after.find(';')?].trim();
+    // A schema output is generic (`FooOutput<S>`) and a unit output is `()`.
+    let raw = ty.ends_with("Output") && ty.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    raw.then_some(ty)
+}
+
+/// The codecs Jacquard emits for a raw output (as in `getAttachmentBlob`).
+fn raw_output_codecs(output: &str) -> String {
+    format!(
+        "
+    fn encode_output<S: jacquard_common::BosStr>(
+        output: &Self::Output<S>,
+    ) -> Result<Vec<u8>, jacquard_common::xrpc::EncodeError>
+    where
+        Self::Output<S>: serde::Serialize,
+    {{
+        Ok(output.body.to_vec())
+    }}
+    fn decode_output<'de, S>(
+        body: &'de [u8],
+    ) -> Result<Self::Output<S>, jacquard_common::error::DecodeError>
+    where
+        S: jacquard_common::BosStr + serde::Deserialize<'de>,
+        Self::Output<S>: serde::Deserialize<'de>,
+    {{
+        Ok({output} {{
+            body: jacquard_common::deps::bytes::Bytes::copy_from_slice(body),
+        }})
+    }}"
+    )
 }
 
 fn validate_union_value(
@@ -533,6 +636,7 @@ mod tests {
     use super::load_preflight_documents;
     use super::normalize_lexicon_dirs;
     use super::normalize_raw_byte_xrpc_bodies;
+    use super::patch_schemaless_json_outputs;
     use super::validate_strict_union_contracts;
     use jacquard_lexicon::codegen::CodeGenerator;
     use jacquard_lexicon::corpus::LexiconCorpus;
@@ -1106,5 +1210,56 @@ mod tests {
         ));
         assert!(compact.contains("#[serde(with=\"jacquard_common::serde_bytes_helper\")]publocal:"));
         assert!(generated.contains("kept"));
+    }
+
+    fn procedure_fixture(output: Value) -> Value {
+        json!({
+            "lexicon": 1,
+            "id": FIXTURE_ID,
+            "defs": {
+                "main": {
+                    "type": "procedure",
+                    "input": { "encoding": "application/json", "schema": object_definition() },
+                    "output": output
+                }
+            }
+        })
+    }
+
+    fn generate_and_patch(lexicon: &Value) -> (String, usize, usize) {
+        let fixture = write_fixture(lexicon);
+        let corpus = LexiconCorpus::load_from_dir(fixture.path()).expect("load fixture corpus");
+        let output = tempfile::tempdir().expect("generated output tempdir");
+        CodeGenerator::new(&corpus, "crate::generated")
+            .write_to_disk(output.path())
+            .expect("generate fixture corpus");
+        let first = patch_schemaless_json_outputs(output.path()).expect("patch outputs");
+        let second = patch_schemaless_json_outputs(output.path()).expect("patch outputs again");
+        let generated =
+            fs::read_to_string(output.path().join("blue_catbird/chat/union_fixture.rs"))
+                .expect("read generated fixture module");
+        (generated, first, second)
+    }
+
+    #[test]
+    fn schemaless_json_outputs_get_raw_byte_codecs() {
+        let (generated, first, second) = generate_and_patch(&procedure_fixture(
+            json!({ "encoding": "application/json", "description": "byte for byte" }),
+        ));
+        assert_eq!((first, second), (1, 0));
+        let compact: String = generated.split_whitespace().collect();
+        assert!(compact.contains("Ok(output.body.to_vec())"));
+        assert!(compact.contains(
+            "Ok(UnionFixtureOutput{body:jacquard_common::deps::bytes::Bytes::copy_from_slice(body),})"
+        ));
+    }
+
+    #[test]
+    fn schema_json_outputs_keep_the_json_codec() {
+        let (generated, first, _) = generate_and_patch(&procedure_fixture(
+            json!({ "encoding": "application/json", "schema": object_definition() }),
+        ));
+        assert_eq!(first, 0);
+        assert!(!generated.contains("fn decode_output"));
     }
 }
