@@ -1578,14 +1578,20 @@ impl DsResolver {
         &self,
         user_did: &str,
     ) -> Result<DsEndpoint, FederationError> {
+        let authority_did = self.resolve_declared_authority(user_did).await?;
+        self.admit_declared_authority(&authority_did).await
+    }
+
+    /// The delivery-service DID a user's live `blue.catbird.chat.declaration/self`
+    /// names, read and validated but not yet admitted. An absent declaration
+    /// fails closed with `Unsupported`.
+    pub async fn resolve_declared_authority(
+        &self,
+        user_did: &str,
+    ) -> Result<String, FederationError> {
         let canonical_user = canonical_did(user_did).to_string();
         if self.is_self(&canonical_user) {
-            return Ok(DsEndpoint {
-                did: self.self_did.clone(),
-                endpoint: self.self_endpoint.clone(),
-                supported_cipher_suites: None,
-                federation_capabilities: Some(super::local_federation_capabilities()),
-            });
+            return Ok(self.self_did.clone());
         }
 
         let pds_endpoint = match self.resolve_did_to_pds(&canonical_user).await {
@@ -1710,13 +1716,23 @@ impl DsResolver {
             });
         };
 
-        let authority_endpoint = self.resolve_authority_ds_endpoint(&authority_did).await?;
-        // Peer admission governs outbound federation, not this authority's own accounts.
-        if canonical_did(&authority_endpoint.did) != canonical_did(&self.self_did) {
-            super::peer_policy::enforce_outbound_peer_policy(&self.pool, &authority_endpoint.did)
+        Ok(authority_did)
+    }
+
+    /// Admit a declared chat authority: this authority itself, or an allowed
+    /// peer whose DID document names its delivery-service endpoint. Peer
+    /// admission governs outbound federation, not this authority's own
+    /// accounts, and it runs first so an unpeered authority is never contacted.
+    pub async fn admit_declared_authority(
+        &self,
+        authority_did: &str,
+    ) -> Result<DsEndpoint, FederationError> {
+        let canonical_authority = canonical_did(authority_did);
+        if !self.is_self(canonical_authority) {
+            super::peer_policy::enforce_outbound_peer_policy(&self.pool, canonical_authority)
                 .await?;
         }
-        Ok(authority_endpoint)
+        self.resolve_authority_ds_endpoint(authority_did).await
     }
 
     /// Map a delivery-service authority DID to the exact HTTPS endpoint its DID

@@ -8,9 +8,13 @@
 //! with the typed `RecipientAuthorityUnsupported` signed receipt before any package selection
 //! or lease.
 //!
+//! The sender is homed here, so this router signs that refusal itself.
+//!
 //! Controls verify that:
 //! - Canonical authority recipient is prepared normally (then cancelled to release).
-//! - Missing declaration (RecordNotFound) keeps `RecipientKeysUnavailable`.
+//! - A canonical recipient without request keys keeps `RecipientKeysUnavailable`.
+//! - Missing declaration (RecordNotFound) means chat is off: a signed
+//!   `RequestPolicyDenied`, never "unsupported" and never a lease.
 //! - Malformed/unreadable declaration fails closed with `RequestPolicyDenied`.
 #![allow(dead_code)]
 
@@ -357,15 +361,21 @@ fn receipt(response: &Value, key: &[u8]) -> anyhow::Result<(String, Option<Strin
 /// `RecipientAuthorityUnsupported` receipt; no lease, no package reservation,
 /// no publication/conversation/Welcome. Controls: the same recipient declaring
 /// the canonical authority is prepared normally (then cancelled to release),
-/// and an undeclared recipient without keys keeps `RecipientKeysUnavailable`.
+/// a canonical recipient without keys keeps `RecipientKeysUnavailable`, and an
+/// undeclared recipient with keys is refused by policy.
 async fn router_refuses_foreign_recipient_before_any_lease() -> anyhow::Result<()> {
     let run = Uuid::new_v4().simple().to_string();
-    let (alice_id, bob_id, carol_id) = (identity("alice", &run), identity("bob", &run), identity("carol", &run));
-    let rig = rig(&[&alice_id, &bob_id, &carol_id]).await?;
+    let (alice_id, bob_id, carol_id, dave_id) =
+        (identity("alice", &run), identity("bob", &run), identity("carol", &run), identity("dave", &run));
+    let rig = rig(&[&alice_id, &bob_id, &carol_id, &dave_id]).await?;
     let alice = Account::new(alice_id, "c33-alice")?;
     let bob = Account::new(bob_id, "c33-bob")?;
     let carol = Account::new(carol_id, "c33-carol")?;
+    let dave = Account::new(dave_id, "c33-dave")?;
+    // The sender is homed on this (canonical) authority.
+    rig.https.declare_local_chat_account(alice.did())?;
     publish_keys(&rig, &bob).await?;
+    publish_keys(&rig, &dave).await?;
     assert_eq!(available_request_packages(bob.did())?, 1, "bob has a usable request package");
 
     // Foreign-homed recipient (sender's authority canonical).
@@ -406,12 +416,23 @@ async fn router_refuses_foreign_recipient_before_any_lease() -> anyhow::Result<(
     let released = attempt_footprint(prepared.request_id, prepared.conversation_id)?;
     assert!(released.starts_with("cancelled|"), "control lease released by signed cancel: {released}");
 
-    // Control 2: a recipient with no chat declaration at all (fixture answers
-    // the typed RecordNotFound) and no request keys keeps the pre-existing
-    // RecipientKeysUnavailable refusal: absence never becomes "unsupported".
+    // Control 2: a canonical-homed recipient with no request keys keeps the
+    // RecipientKeysUnavailable refusal.
+    rig.https.declare_local_chat_account(carol.did())?;
     let keyless = prepare(&rig, &alice, carol.did()).await?;
     let (_, keyless_code, _) = receipt(&keyless.response, &rig.server.receipt_public_key)?;
     assert_eq!(keyless_code.as_deref(), Some("RecipientKeysUnavailable"));
+
+    // Control 2b: a recipient with request keys but no chat declaration at all
+    // (fixture answers the typed RecordNotFound) has not turned chat on. The
+    // absence fails closed as a signed policy refusal: never "unsupported",
+    // never a lease, and the package stays available.
+    let undeclared = prepare(&rig, &alice, dave.did()).await?;
+    assert_eq!(undeclared.status, reqwest::StatusCode::OK, "{}", undeclared.response);
+    let (_, undeclared_code, _) = receipt(&undeclared.response, &rig.server.receipt_public_key)?;
+    assert_eq!(undeclared_code.as_deref(), Some("RequestPolicyDenied"));
+    assert_eq!(attempt_footprint(undeclared.request_id, undeclared.conversation_id)?, "rejected|0|0|0|0|0|0");
+    assert_eq!(available_request_packages(dave.did())?, 1, "no undeclared recipient package reserved");
 
     // Control 3: an unreadable/malformed chat declaration (non-public DID)
     // fails closed like the consent declaration read, never as "unsupported"
@@ -543,6 +564,7 @@ async fn orchestrator_foreign_recipient_typed_unsupported_draft_retained() -> an
     let rig = rig(&[&alice_id, &bob_id]).await?;
     let alice = Account::new(alice_id, "c33-orch-alice")?;
     let bob = Account::new(bob_id, "c33-orch-bob")?;
+    rig.https.declare_local_chat_account(alice.did())?;
     publish_keys(&rig, &bob).await?;
     declare_chat_authority(&rig.https.root, bob.did(), FOREIGN_AUTHORITY)?;
 

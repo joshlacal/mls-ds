@@ -44,6 +44,18 @@ fn failure(endpoint: ChatEndpoint, error: DirectRequestStoreError) -> ChatFailur
     };
     ChatFailure::protocol(endpoint, code)
 }
+fn pair_failure(endpoint: ChatEndpoint, error: crate::federation::FederationError) -> ChatFailure {
+    use crate::federation::FederationError;
+    match error {
+        FederationError::Unsupported(_)
+        | FederationError::AuthFailed { .. }
+        | FederationError::EndpointNotFound { .. } => failure(
+            endpoint,
+            DirectRequestStoreError::RecipientAuthorityUnsupported,
+        ),
+        _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
+    }
+}
 fn output(result: DirectRequestResult, endpoint: ChatEndpoint) -> Result<Vec<u8>, ChatFailure> {
     let mut payload = match result {
         DirectRequestResult::Keys(bytes) => return Ok(bytes),
@@ -197,16 +209,25 @@ async fn mutate(
         .map_err(|_| failure(endpoint, DirectRequestStoreError::InvalidSignature))?;
 
 
-        let coord = crate::federation::canonical_relay::resolve_pair_coordinator(pool, actor_did, recipient_did)
+        // A recipient with no chat authority this DS can join still gets a
+        // signed terminal refusal when the sender is homed here: the repository
+        // claims the attempt and signs it, and never prepares one (C33).
+        let (coord, refusal_only) =
+            match crate::federation::canonical_relay::resolve_pair_coordinator_by_side(
+                pool,
+                actor_did,
+                recipient_did,
+            )
             .await
-            .map_err(|e| match e {
-                crate::federation::FederationError::Unsupported(_)
-                | crate::federation::FederationError::AuthFailed { .. }
-                | crate::federation::FederationError::EndpointNotFound { .. } => {
-                    failure(endpoint, DirectRequestStoreError::RecipientAuthorityUnsupported)
+            {
+                Ok(coord) => (coord, false),
+                Err(error) => {
+                    match error.local_refusal_coordinator(&crate::identity::service_did()) {
+                        Some(coord) => (coord, true),
+                        None => return Err(pair_failure(endpoint, error.into_federation_error())),
+                    }
                 }
-                _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
-            })?;
+            };
         if !coord.is_sender_home {
             return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
         }
@@ -405,6 +426,15 @@ async fn mutate(
                     return Err(failure(endpoint, error));
                 }
             };
+            if refusal_only && matches!(&result, DirectRequestResult::Prepared(_)) {
+                // The recipient's authority was refused above; dropping the
+                // transaction rolls back a preparation that slipped past the
+                // repository's own gate.
+                return Err(failure(
+                    endpoint,
+                    DirectRequestStoreError::RecipientAuthorityUnsupported,
+                ));
+            }
 
             // C33-LEASE-004: Release remote leases for non-Prepared outcomes (e.g. Terminal receipts)
             if !coord.is_recipient_home

@@ -49,12 +49,90 @@ impl CanonicalPairCoordinator {
     }
 }
 
+/// Which side of a pair failed to resolve to an admitted chat authority.
+#[derive(Debug)]
+pub enum PairResolutionError {
+    Sender(FederationError),
+    /// The sender's home resolved. `declared_authority` is the delivery
+    /// service the recipient's declaration names, when it could be read.
+    Recipient {
+        sender_home: DsEndpoint,
+        declared_authority: Option<String>,
+        error: FederationError,
+    },
+}
+
+impl PairResolutionError {
+    pub fn into_federation_error(self) -> FederationError {
+        match self {
+            Self::Sender(error) | Self::Recipient { error, .. } => error,
+        }
+    }
+
+    /// When the sender is homed on `self_did` and the recipient has no chat authority
+    /// this DS could ever join (no declaration, a malformed or unsupported
+    /// one, or an authority that is not an allowed peer), this DS coordinates
+    /// the attempt alone so the repository can sign its terminal refusal.
+    /// Clients verify receipts against the lower of the two authority DIDs, so
+    /// a declared authority that sorts below this one gets no signed refusal.
+    /// Transient failures are not refusals and return `None`.
+    pub fn local_refusal_coordinator(&self, self_did: &str) -> Option<CanonicalPairCoordinator> {
+        let Self::Recipient {
+            sender_home,
+            declared_authority,
+            error,
+        } = self
+        else {
+            return None;
+        };
+        let home = canonical_did(&sender_home.did);
+        if home != canonical_did(self_did) {
+            return None;
+        }
+        let refusal = matches!(
+            error,
+            FederationError::Unsupported(_)
+                | FederationError::AuthFailed { .. }
+                | FederationError::ResolutionFailed {
+                    kind: super::errors::ResolutionFailureKind::InvalidDeclaration(_),
+                    ..
+                }
+        );
+        if !refusal
+            || declared_authority
+                .as_deref()
+                .is_some_and(|a| canonical_did(a) < home)
+        {
+            return None;
+        }
+        Some(CanonicalPairCoordinator {
+            sender_home: sender_home.clone(),
+            recipient_home: sender_home.clone(),
+            coordinator_did: home.to_string(),
+            is_coordinator: true,
+            is_sender_home: true,
+            is_recipient_home: true,
+        })
+    }
+}
+
 /// Resolve the deterministic pair coordinator for a sender and recipient pair.
 pub async fn resolve_pair_coordinator(
     pool: &DbPool,
     sender_did: &str,
     recipient_did: &str,
 ) -> Result<CanonicalPairCoordinator, FederationError> {
+    resolve_pair_coordinator_by_side(pool, sender_did, recipient_did)
+        .await
+        .map_err(PairResolutionError::into_federation_error)
+}
+
+/// [`resolve_pair_coordinator`], saying which side failed.
+pub async fn resolve_pair_coordinator_by_side(
+    pool: &DbPool,
+    sender_did: &str,
+    recipient_did: &str,
+) -> Result<CanonicalPairCoordinator, PairResolutionError> {
     let self_did = crate::identity::service_did();
     let self_endpoint = crate::identity::self_endpoint();
     let default_ds = std::env::var("DEFAULT_DS_ENDPOINT").ok();
@@ -74,8 +152,30 @@ pub async fn resolve_pair_coordinator(
         cache_ttl,
     );
 
-    let sender_home = resolver.resolve_authoritative_ds(sender_did).await?;
-    let recipient_home = resolver.resolve_authoritative_ds(recipient_did).await?;
+    let sender_home = resolver
+        .resolve_authoritative_ds(sender_did)
+        .await
+        .map_err(PairResolutionError::Sender)?;
+    let declared_authority = match resolver.resolve_declared_authority(recipient_did).await {
+        Ok(authority) => authority,
+        Err(error) => {
+            return Err(PairResolutionError::Recipient {
+                sender_home,
+                declared_authority: None,
+                error,
+            })
+        }
+    };
+    let recipient_home = match resolver.admit_declared_authority(&declared_authority).await {
+        Ok(home) => home,
+        Err(error) => {
+            return Err(PairResolutionError::Recipient {
+                sender_home,
+                declared_authority: Some(declared_authority),
+                error,
+            })
+        }
+    };
     let sender_home_did = canonical_did(&sender_home.did).to_string();
     let recipient_home_did = canonical_did(&recipient_home.did).to_string();
 
@@ -3780,4 +3880,91 @@ pub async fn coordinator_get_outcome(
         resp["entry"] = entry;
     }
     Ok(resp)
+}
+
+#[cfg(test)]
+mod pair_resolution_tests {
+    use super::*;
+    use crate::federation::errors::ResolutionFailureKind;
+
+    const HOME: &str = "did:web:chat.catbird.blue";
+
+    fn home(did: &str) -> DsEndpoint {
+        DsEndpoint {
+            did: did.to_string(),
+            endpoint: format!("https://{}", did.trim_start_matches("did:web:")),
+            supported_cipher_suites: None,
+            federation_capabilities: None,
+        }
+    }
+
+    fn recipient(declared: Option<&str>, error: FederationError) -> PairResolutionError {
+        PairResolutionError::Recipient {
+            sender_home: home(HOME),
+            declared_authority: declared.map(str::to_string),
+            error,
+        }
+    }
+
+    fn unpeered(did: &str) -> FederationError {
+        FederationError::AuthFailed {
+            reason: format!("Peer DS '{did}' is not allowlisted"),
+        }
+    }
+
+    #[test]
+    fn refused_recipient_authorities_get_a_local_refusal() {
+        for error in [
+            recipient(None, FederationError::Unsupported("absent".into())),
+            recipient(
+                None,
+                FederationError::ResolutionFailed {
+                    did: "did:web:bob.test".into(),
+                    kind: ResolutionFailureKind::InvalidDeclaration("non-public".into()),
+                },
+            ),
+            recipient(
+                Some("did:web:chat.federated-peer.org"),
+                unpeered("did:web:chat.federated-peer.org"),
+            ),
+        ] {
+            let coord = error
+                .local_refusal_coordinator(HOME)
+                .expect("local refusal");
+            assert_eq!(coord.coordinator_did, HOME);
+            assert!(coord.is_coordinator && coord.is_sender_home && coord.is_recipient_home);
+        }
+    }
+
+    #[test]
+    fn no_local_refusal_when_it_would_not_verify_or_is_not_final() {
+        // Clients verify receipts against the lower authority DID.
+        assert!(recipient(
+            Some("did:web:aaa.example-peer.org"),
+            unpeered("did:web:aaa.example-peer.org")
+        )
+        .local_refusal_coordinator(HOME)
+        .is_none());
+        // A transient failure is not a refusal.
+        assert!(recipient(
+            Some("did:web:chat.federated-peer.org"),
+            FederationError::ResolutionFailed {
+                did: "did:web:chat.federated-peer.org".into(),
+                kind: ResolutionFailureKind::Timeout("slow".into()),
+            },
+        )
+        .local_refusal_coordinator(HOME)
+        .is_none());
+        // Only the sender's own home may refuse alone.
+        assert!(
+            recipient(None, FederationError::Unsupported("absent".into()))
+                .local_refusal_coordinator("did:web:other.catbird.blue")
+                .is_none()
+        );
+        assert!(
+            PairResolutionError::Sender(FederationError::Unsupported("absent".into()))
+                .local_refusal_coordinator(HOME)
+                .is_none()
+        );
+    }
 }
