@@ -85,15 +85,7 @@ fn maintenance(sql: &str) -> Result<()> {
 }
 
 fn db_exec(url: &str, sql: &str) -> Result<()> {
-    let output = Command::new("psql")
-        .args([url, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql])
-        .output()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "db_exec failed on {url}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
+    psql_exec_on(url, sql).with_context(|| format!("db_exec failed on {url}"))
 }
 
 fn db_query(url: &str, sql: &str) -> Result<String> {
@@ -306,7 +298,7 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         actual_auth_sha, AUTH_JTI_SHA384,
         "auth_jti_nonce checksum drift"
     );
-    db_exec(&dedicated_url, AUTH_JTI_SQL)?;
+    db_exec(&dedicated_url, &format!("BEGIN;\n{AUTH_JTI_SQL}\nCOMMIT;"))?;
     let jti_table = db_query(
         &dedicated_url,
         "SELECT to_regclass('public.auth_jti_nonce')::text",

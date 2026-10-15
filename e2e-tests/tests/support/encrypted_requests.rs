@@ -11,7 +11,7 @@
 
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Mutex, OnceLock},
@@ -177,7 +177,7 @@ pub fn reviewed_request_migrations() -> [BaselineMigration; 24] {
         baseline!(20260919000022, "federated transport inbox", "20260919000022_federated_transport_inbox.sql", "392d0137456574b46aeb05d71fdd6a9084bc364c102fa206f64a48c26441355fad52b3568386b5574aa8bedc15882e5a"),
         baseline!(20260919000023, "expired federated lease release", "20260919000023_expired_federated_lease_release.sql", "f8b78fd5368f0d9521ec0498f14aaf7f928be8ca4cef35c7e794aac7ed72970a7337e348675ab9eaf873351df3c5b0c5"),
         baseline!(20260919000024, "C33 coordinator hardening", "20260919000024_c33_coordinator_hardening.sql", "ebc8d84f7b7ad0dd3005fb268956f52a4b9c8bea8134ae5fdeee94fda232e222d816dbbbf16a45d7420f3a5099a7c5e7"),
-        baseline!(20260919000025, "federated inventory conversation items", "20260919000025_federated_inventory_conversation_items.sql", "b0b0b5dd997f6c5594a6f6c4520d8b6e80a13d9355c29254ee911616a7bb49f81ffa18fdea9edb6d9a5c40bd32445ee8"),
+        baseline!(20260919000025, "federated inventory conversation items", "20260919000025_federated_inventory_conversation_items.sql", "c8cd858bc6805485334ad90e96673123b215591282f9625c55e2315a624430f77460fdda0e444a61abffe45433f0a9b1"),
     ]
 }
 
@@ -482,7 +482,7 @@ fn install_auth_replay_prerequisite() -> Result<()> {
         hex::encode(Sha384::digest(AUTH_JTI_MIGRATION.as_bytes())) == AUTH_JTI_MIGRATION_SHA384,
         "canonical auth JTI migration checksum drift"
     );
-    psql_exec(AUTH_JTI_MIGRATION)?;
+    psql_exec(&format!("BEGIN;\n{AUTH_JTI_MIGRATION}\nCOMMIT;"))?;
     anyhow::ensure!(
         psql_query("SELECT to_regclass('public.auth_jti_nonce')::text")?.trim() == "auth_jti_nonce",
         "canonical auth JTI replay store is unavailable"
@@ -499,7 +499,7 @@ fn install_service_auth_prerequisite() -> Result<()> {
     let exists =
         psql_query("SELECT to_regclass('chat.service_auth_admissions') IS NOT NULL")? == "t\n";
     if !exists {
-        psql_exec(SERVICE_AUTH_MIGRATION)?;
+        psql_exec(&format!("BEGIN;\n{SERVICE_AUTH_MIGRATION}\nCOMMIT;"))?;
     }
     let columns = psql_query(
         "SELECT string_agg(attname||':'||format_type(atttypid,atttypmod)||':'||attnotnull::text,',' ORDER BY attnum) \
@@ -675,24 +675,41 @@ fn psql_query(sql: &str) -> Result<String> {
 }
 
 fn psql_exec(sql: &str) -> Result<()> {
-    let output = Command::new("psql")
-        .args([
-            "-X",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-q",
-            "-d",
-            request_database_url(),
-            "-c",
-            sql,
-        ])
-        .output()
+    psql_exec_on(request_database_url(), sql)
+}
+
+/// Runs a mutation script against `url`. The SQL goes in on stdin, not as a
+/// `-c` argument: some reviewed migrations are larger than Linux's 128 KiB
+/// per-argument limit (E2BIG). Unlike `-c`, a multi-statement script is not
+/// one implicit transaction, so scripts that must be atomic carry their own
+/// `BEGIN; ... COMMIT;`.
+pub fn psql_exec_on(url: &str, sql: &str) -> Result<()> {
+    let mut child = Command::new("psql")
+        .args(["-X", "-v", "ON_ERROR_STOP=1", "-q", "-d", url, "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("launch psql mutation for encrypted-request harness")?;
+    let mut stdin = child.stdin.take().context("psql mutation stdin")?;
+    let input = sql.to_owned();
+    // Write from another thread so a chatty psql can't fill its output pipes
+    // while this thread is still blocked on stdin.
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let output = child
+        .wait_with_output()
+        .context("wait for psql mutation for encrypted-request harness")?;
+    let written = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("psql mutation stdin writer panicked"))?;
     anyhow::ensure!(
         output.status.success(),
         "psql mutation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // Checked after the exit status: psql stopping on an error closes the
+    // pipe early, and its stderr explains the failure better than EPIPE.
+    written.context("write psql mutation to stdin")?;
     Ok(())
 }
 
