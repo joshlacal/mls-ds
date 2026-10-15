@@ -7,13 +7,10 @@
 //!
 //! Verified flow:
 //! 1. Create a dedicated loopback database `catbird_direct_requests_fault_<16 hex>`.
-//! 2. Install pre-request baseline ledger in strict production version order:
-//!    - 14 baseline migrations (reviewed checksums verified)
-//!    - 6 prerequisites (20260816000001, 20260820000001, 20260820000002,
-//!      20260821000001, 20260824000001, 20260907000001)
-//!    - public.auth_jti_nonce replay table
-//!    - 17 additive migrations (20260919000001–000017)
-//!    - Full 37-migration ledger validated in public._sqlx_migrations.
+//! 2. Install the server's whole migration catalog in strict production
+//!    version order, as its startup migrator would (the reviewed baseline,
+//!    prerequisite and request migrations are checked against their pinned
+//!    checksums), and validate the full ledger in public._sqlx_migrations.
 //! 3. Route test harness to the dedicated DB and connect authority.
 //! 4. Create v2 request histories through the live shipping router:
 //!    - Request 1: published, previewed, and accepted by Bob (acceptance history).
@@ -30,8 +27,10 @@
 //!      * Accepted outcome (getDirectRequestOutcome) returns accepted receipt.
 //!      * Accepted entries (getEntries) returns introduction message.
 //! 7. Build and run pre-change baseline server (revision c9fd0c5f85610de70b5d083bfec2c597cba5b247):
-//!    - Assert standard startup migration check REFUSES against the v2 DB with exact failure:
-//!      "migration 20260919000001 was previously applied but is missing in the resolved migrations".
+//!    - Assert standard startup migration check REFUSES against the v2 DB with the exact
+//!      failure "migration <v> was previously applied but is missing in the resolved
+//!      migrations", where <v> is the first installed migration the baseline revision's
+//!      `server/migrations` does not ship (20260919000001 before the 2026-10-04 merge).
 //!    - Assert SKIP_MIGRATIONS=1 run has no direct request endpoints.
 //! 8. Drop dedicated database cleanly.
 
@@ -58,8 +57,9 @@ use p256::{
     pkcs8::{EncodePrivateKey, LineEnding},
 };
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256, Sha384};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     io::BufRead,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -82,10 +82,6 @@ fn maintenance(sql: &str) -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
-}
-
-fn db_exec(url: &str, sql: &str) -> Result<()> {
-    psql_exec_on(url, sql).with_context(|| format!("db_exec failed on {url}"))
 }
 
 fn db_query(url: &str, sql: &str) -> Result<String> {
@@ -111,76 +107,39 @@ impl Drop for DedicatedDatabase {
     }
 }
 
-fn apply_verified_migration(url: &str, migration: &BaselineMigration) -> Result<()> {
-    let actual_sha384 = hex::encode(Sha384::digest(migration.sql.as_bytes()));
+/// The pre-change baseline server's revision. Its binary is prebuilt at
+/// /tmp/catbird-server-baseline-c34.
+const BASELINE_REVISION: &str = "c9fd0c5f85610de70b5d083bfec2c597cba5b247";
+
+/// The first installed migration that the baseline revision does not ship:
+/// the version its sqlx migrator names when it refuses the database.
+fn first_migration_missing_from_baseline(installed: &[i64]) -> Result<i64> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            env!("CARGO_MANIFEST_DIR"),
+            "ls-tree",
+            "--name-only",
+            &format!("{BASELINE_REVISION}:server/migrations"),
+        ])
+        .output()
+        .context("list the baseline revision's migrations")?;
     anyhow::ensure!(
-        actual_sha384 == migration.reviewed_sha384,
-        "SHA-384 checksum mismatch for migration {} ({}): expected {}, got {}",
-        migration.version,
-        migration.filename,
-        migration.reviewed_sha384,
-        actual_sha384
+        output.status.success(),
+        "git ls-tree {BASELINE_REVISION}: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let escaped_desc = migration.description.replace('\'', "''");
-    let script = format!(
-        "BEGIN;\nSELECT pg_advisory_xact_lock(20260919);\nSET LOCAL statement_timeout = '60s';\nSET LOCAL chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed';\n{}\nINSERT INTO public._sqlx_migrations(version, description, success, checksum, execution_time)\nVALUES({}, '{}', TRUE, decode('{}', 'hex'), 0);\nCOMMIT;",
-        migration.sql, migration.version, escaped_desc, migration.reviewed_sha384
-    );
-    db_exec(url, &script)?;
-    Ok(())
+    let shipped: HashSet<i64> = String::from_utf8(output.stdout)?
+        .lines()
+        .filter(|name| name.ends_with(".sql"))
+        .filter_map(|name| name.split_once('_')?.0.parse().ok())
+        .collect();
+    installed
+        .iter()
+        .copied()
+        .find(|version| !shipped.contains(version))
+        .context("the baseline revision ships every installed migration")
 }
-
-fn prerequisite_migrations() -> [BaselineMigration; 6] {
-    [
-        BaselineMigration {
-            version: 20260816000001,
-            description: "enable send message operation claims",
-            filename: "20260816000001_enable_send_message_operation_claims.sql",
-            sql: include_str!("../../server/migrations/20260816000001_enable_send_message_operation_claims.sql"),
-            reviewed_sha384: "ae9cc21dd145c3608a57e1f96654b67d53709dba17e3f347758aa8b93830c725d380230751d83f85c497132b8669a30e",
-        },
-        BaselineMigration {
-            version: 20260820000001,
-            description: "chat service auth admissions",
-            filename: "20260820000001_chat_service_auth_admissions.sql",
-            sql: include_str!("../../server/migrations/20260820000001_chat_service_auth_admissions.sql"),
-            reviewed_sha384: "2e8cb6bf47498402e56ba5c2fc753114c1d46e0767c98aa243c47993eb4f51a84de89469a8ae9af6bfac751ddadd18ac",
-        },
-        BaselineMigration {
-            version: 20260820000002,
-            description: "chat nullable legacy dpop jkt",
-            filename: "20260820000002_chat_nullable_legacy_dpop_jkt.sql",
-            sql: include_str!("../../server/migrations/20260820000002_chat_nullable_legacy_dpop_jkt.sql"),
-            reviewed_sha384: "d1914c731e0fbf81f5b0a9bf9cd77c12f2943fd940c36b9a351b1156b5ca09b55f2b4b44c6810012b4377f6ac283955d",
-        },
-        BaselineMigration {
-            version: 20260821000001,
-            description: "fix expired inventory session gc",
-            filename: "20260821000001_fix_expired_inventory_session_gc.sql",
-            sql: include_str!("../../server/migrations/20260821000001_fix_expired_inventory_session_gc.sql"),
-            reviewed_sha384: "42790274fbeb43bce44aa9638d23328223042933af03e6453a0c8c3640b9bcf236d0bc0b8cd76e1e5d846be7c6bfc78a",
-        },
-        BaselineMigration {
-            version: 20260824000001,
-            description: "chat performance indices",
-            filename: "20260824000001_chat_performance_indices.sql",
-            sql: include_str!("../../server/migrations/20260824000001_chat_performance_indices.sql"),
-            reviewed_sha384: "e5f3f169724d2afc84043d80057bf9e494fbc9ad617ced0feaebb469d1be68788e7c19e19a67fb36296b85ee803139e0",
-        },
-        BaselineMigration {
-            version: 20260907000001,
-            description: "chat direct pending inventory",
-            filename: "20260907000001_chat_direct_pending_inventory.sql",
-            sql: include_str!("../../server/migrations/20260907000001_chat_direct_pending_inventory.sql"),
-            reviewed_sha384: "82708d24b2deb72452ebdaf28749aa86ed95075f7ed920c4cc5526962e2ae9f9d8561a5029fc853ba654564d76ef63f1",
-        },
-    ]
-}
-
-const AUTH_JTI_SQL: &str =
-    include_str!("../../server/migrations/20260214000002_auth_jti_nonce.sql");
-const AUTH_JTI_SHA384: &str =
-    "a653190a473ce3535c946769e8e269173fcf22c1cc6196063eb9461e4766bc084a57c61d2b3a4ffee4b5a1b4da06856b";
 
 struct ReaderServerProcess {
     child: Child,
@@ -271,63 +230,20 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
     maintenance(&format!("CREATE DATABASE {db_name}"))?;
     let _dedicated_guard = DedicatedDatabase(db_name.clone());
 
-    // 1a. Create _sqlx_migrations table
-    db_exec(
-        &dedicated_url,
-        "CREATE TABLE public._sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)",
-    )?;
+    // 1a. Install the server's whole migration catalog, as its startup
+    //     migrator would, with the reviewed pins checked.
+    println!("C34: Installing the server migration catalog...");
+    let installed = install_server_migration_catalog(&dedicated_url)?;
 
-    // 1b. Install 14 baseline migrations (everything before 20260816000001)
-    let baseline = reviewed_baseline();
-    assert_eq!(baseline.len(), 14);
-    println!("C34: Installing 14 reviewed baseline migrations...");
-    for migration in &baseline {
-        apply_verified_migration(&dedicated_url, migration)?;
-    }
-
-    // 1c. Install 6 prerequisites in exact production version order
-    let prerequisites = prerequisite_migrations();
-    println!("C34: Installing 6 reviewed prerequisite migrations in production order...");
-    for migration in &prerequisites {
-        apply_verified_migration(&dedicated_url, migration)?;
-    }
-
-    // 1d. Install public.auth_jti_nonce
-    let actual_auth_sha = hex::encode(Sha384::digest(AUTH_JTI_SQL.as_bytes()));
-    assert_eq!(
-        actual_auth_sha, AUTH_JTI_SHA384,
-        "auth_jti_nonce checksum drift"
-    );
-    db_exec(&dedicated_url, &format!("BEGIN;\n{AUTH_JTI_SQL}\nCOMMIT;"))?;
-    let jti_table = db_query(
-        &dedicated_url,
-        "SELECT to_regclass('public.auth_jti_nonce')::text",
-    )?;
-    assert_eq!(jti_table.trim(), "auth_jti_nonce");
-
-    // 1e. Install additive migrations (20260919000001+)
-    let additive = reviewed_request_migrations();
-    println!(
-        "C34: Installing {} additive direct-request migrations...",
-        additive.len()
-    );
-    for migration in &additive {
-        apply_verified_migration(&dedicated_url, migration)?;
-    }
-
-    // 1f. Verify the full migration ledger in public._sqlx_migrations
+    // 1b. Verify the full migration ledger in public._sqlx_migrations
     let ledger_rows: Vec<Value> = serde_json::from_str(&db_query(
         &dedicated_url,
         "SELECT coalesce(json_agg(json_build_object('version',version,'description',description,'success',success,'checksum',encode(checksum,'hex')) ORDER BY version),'[]'::json)::text FROM public._sqlx_migrations",
     )?)?;
-    let expected_total_migrations = baseline.len() + prerequisites.len() + additive.len();
     assert_eq!(
         ledger_rows.len(),
-        expected_total_migrations,
-        "ledger must contain exactly {expected_total_migrations} migrations ({} baseline + {} prerequisites + {} additive)",
-        baseline.len(),
-        prerequisites.len(),
-        additive.len()
+        installed,
+        "ledger must contain exactly the {installed}-migration server catalog"
     );
     for row in &ledger_rows {
         assert_eq!(
@@ -336,17 +252,22 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
             row["version"]
         );
     }
-    println!(
-        "C34: Verified {expected_total_migrations}/{expected_total_migrations} migrations installed successfully in strict order."
-    );
+    let ledger_versions = ledger_rows
+        .iter()
+        .map(|row| row["version"].as_i64().context("ledger version"))
+        .collect::<Result<Vec<_>>>()?;
+    println!("C34: Verified {installed}/{installed} migrations installed successfully in strict order.");
 
     // 1g. Route test harness to dedicated DB and connect authority
     std::env::set_var("REQUEST_TEST_DATABASE_URL", &dedicated_url);
     route_to_dedicated_database(&dedicated_url)?;
     assert_eq!(request_database_url(), dedicated_url);
     let authority = connect_guarded_request_database(5).await?;
-    assert_eq!(authority.baseline_migrations, baseline.len());
-    assert_eq!(authority.additive_migrations, additive.len());
+    assert_eq!(authority.baseline_migrations, reviewed_baseline().len());
+    assert_eq!(
+        authority.additive_migrations,
+        reviewed_request_migrations().len()
+    );
     println!("C34: Connected guarded authority to dedicated database {db_name}");
 
     // =========================================================================
@@ -762,10 +683,12 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
     let stderr_str = String::from_utf8_lossy(&output.stderr);
     let combined_refusal = format!("{stdout_str}\n{stderr_str}");
 
-    let expected_refusal_phrase =
-        "migration 20260919000001 was previously applied but is missing in the resolved migrations";
+    let expected_refusal_phrase = format!(
+        "migration {} was previously applied but is missing in the resolved migrations",
+        first_migration_missing_from_baseline(&ledger_versions)?
+    );
     assert!(
-        combined_refusal.contains(expected_refusal_phrase),
+        combined_refusal.contains(&expected_refusal_phrase),
         "refusal output must contain exact migration check failure. Got:\n{combined_refusal}"
     );
     assert!(

@@ -1,9 +1,11 @@
 //! Fail-closed support for the encrypted direct-request acceptance suite.
 //!
 //! This module deliberately owns no product behavior. It establishes the local
-//! authority boundary for later request tests: one exact PostgreSQL database,
-//! the immutable 14-migration clean-chat baseline, an executable shipping
-//! server artifact, and separate real MLS stores for every enrolled device.
+//! authority boundary for later request tests: one exact PostgreSQL database
+//! holding the server's whole migration catalog (with the 14-migration
+//! clean-chat baseline, its prerequisites and the request migrations pinned to
+//! reviewed checksums), an executable shipping server artifact, and separate
+//! real MLS stores for every enrolled device.
 //! Until the request handlers and isolated preparation API land, methods that
 //! need them return a typed dependency error rather than manufacturing a pass.
 
@@ -176,7 +178,7 @@ pub fn reviewed_request_migrations() -> [BaselineMigration; 24] {
         baseline!(20260919000021, "direct request capacity abuse fix", "20260919000021_direct_request_capacity_abuse_fix.sql", "5b6d18e3f9a43bccf357ee37f0df7b322d956369fb55cd036fbbbdb4e63f5c291730ac10885b6de511a697cb365939ca"),
         baseline!(20260919000022, "federated transport inbox", "20260919000022_federated_transport_inbox.sql", "392d0137456574b46aeb05d71fdd6a9084bc364c102fa206f64a48c26441355fad52b3568386b5574aa8bedc15882e5a"),
         baseline!(20260919000023, "expired federated lease release", "20260919000023_expired_federated_lease_release.sql", "f8b78fd5368f0d9521ec0498f14aaf7f928be8ca4cef35c7e794aac7ed72970a7337e348675ab9eaf873351df3c5b0c5"),
-        baseline!(20260919000024, "C33 coordinator hardening", "20260919000024_c33_coordinator_hardening.sql", "ebc8d84f7b7ad0dd3005fb268956f52a4b9c8bea8134ae5fdeee94fda232e222d816dbbbf16a45d7420f3a5099a7c5e7"),
+        baseline!(20260919000024, "c33 coordinator hardening", "20260919000024_c33_coordinator_hardening.sql", "ebc8d84f7b7ad0dd3005fb268956f52a4b9c8bea8134ae5fdeee94fda232e222d816dbbbf16a45d7420f3a5099a7c5e7"),
         baseline!(20260919000025, "federated inventory conversation items", "20260919000025_federated_inventory_conversation_items.sql", "c8cd858bc6805485334ad90e96673123b215591282f9625c55e2315a624430f77460fdda0e444a61abffe45433f0a9b1"),
     ]
 }
@@ -397,74 +399,40 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
         "SELECT coalesce(json_agg(json_build_object('version',version,'description',description,'success',success,'checksum',encode(checksum,'hex')) ORDER BY version),'[]'::json)::text FROM public._sqlx_migrations",
     )?)
     .context("decode encrypted-request migration ledger")?;
-    let baseline = reviewed_baseline();
+    let catalog = server_migration_catalog()?;
     anyhow::ensure!(
-        ledger.len() >= baseline.len(),
-        "migration ledger lost reviewed baseline rows"
+        ledger.len() == catalog.len(),
+        "migration ledger count drift: expected the {}-migration server catalog, found {} rows",
+        catalog.len(),
+        ledger.len()
     );
-    for (actual, expected) in ledger.iter().take(14).zip(baseline.iter()) {
-        anyhow::ensure!(
-            actual.version == expected.version,
-            "reviewed baseline version drift"
-        );
-        anyhow::ensure!(
-            actual.description == expected.description,
-            "reviewed baseline description drift"
-        );
-        anyhow::ensure!(
-            actual.success,
-            "reviewed baseline contains a failed migration"
-        );
-        anyhow::ensure!(
-            actual.checksum == hex::encode(Sha384::digest(expected.sql.as_bytes())),
-            "reviewed baseline checksum drift"
-        );
-    }
-    let prerequisites = reviewed_prerequisites();
-    anyhow::ensure!(
-        ledger.len() >= baseline.len() + prerequisites.len(),
-        "migration ledger lost reviewed prerequisite rows"
-    );
-    for (actual, expected) in ledger[baseline.len()..]
-        .iter()
-        .zip(prerequisites.iter())
-    {
-        anyhow::ensure!(
-            actual.version == expected.version
-                && actual.description == expected.description
-                && actual.success
-                && actual.checksum == expected.reviewed_sha384,
-            "reviewed prerequisite ledger drift at {}",
-            expected.version
-        );
-    }
-    let expected_request = reviewed_request_migrations();
-    let actual_request = &ledger[baseline.len() + prerequisites.len()..];
-    anyhow::ensure!(
-        actual_request.len() == expected_request.len(),
-        "request migration ledger count drift: expected {}, found {}",
-        expected_request.len(),
-        actual_request.len()
-    );
-    for (row, expected) in actual_request.iter().zip(expected_request.iter()) {
+    for (row, expected) in ledger.iter().zip(&catalog) {
         anyhow::ensure!(
             row.version == expected.version,
-            "request migration version drift"
+            "migration ledger version drift at {}",
+            expected.version
         );
         anyhow::ensure!(
             row.description == expected.description,
-            "request migration description drift at {}",
+            "migration description drift at {}",
             row.version
         );
+        anyhow::ensure!(row.success, "migration {} failed", row.version);
         anyhow::ensure!(
-            row.success,
-            "request additive migration {} failed",
+            row.checksum == expected.sha384,
+            "migration checksum drift at {}",
             row.version
         );
+    }
+    let baseline = reviewed_baseline();
+    let expected_request = reviewed_request_migrations();
+    for reviewed in reviewed_migrations() {
         anyhow::ensure!(
-            row.checksum == expected.reviewed_sha384,
-            "request migration checksum drift at {}",
-            row.version
+            ledger.iter().any(|row| row.version == reviewed.version
+                && row.description == reviewed.description
+                && row.checksum == reviewed.reviewed_sha384),
+            "reviewed migration ledger drift at {}",
+            reviewed.version
         );
     }
     Ok(DatabaseAuthority {
@@ -472,8 +440,8 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
         user,
         owner,
         server_address,
-        baseline_migrations: 14,
-        additive_migrations: actual_request.len(),
+        baseline_migrations: baseline.len(),
+        additive_migrations: expected_request.len(),
     })
 }
 
@@ -555,49 +523,133 @@ struct InstalledMigration {
     checksum: String,
 }
 
-fn install_or_validate_reviewed_baseline() -> Result<()> {
+/// One file of the server's migration catalog, as the shipping server's sqlx
+/// migrator resolves it: the version and description come from the file name
+/// (`<version>_<description>.sql`, `_` read as a space).
+#[derive(Clone, Debug)]
+pub struct CatalogMigration {
+    pub version: i64,
+    pub description: String,
+    pub filename: String,
+    pub sql: String,
+    pub sha384: String,
+}
+
+/// Every migration the harness pins to a reviewed checksum.
+fn reviewed_migrations() -> Vec<BaselineMigration> {
+    let mut reviewed = reviewed_baseline().to_vec();
+    reviewed.extend(reviewed_prerequisites());
+    reviewed.extend(reviewed_request_migrations());
+    reviewed
+}
+
+/// The server's whole migration catalog in version order. Every reviewed
+/// migration must be in it unchanged.
+pub fn server_migration_catalog() -> Result<Vec<CatalogMigration>> {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../server/migrations");
+    let mut catalog = Vec::new();
+    for entry in
+        std::fs::read_dir(&directory).with_context(|| format!("read {}", directory.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sql") {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("migration file name is not UTF-8")?
+            .to_owned();
+        let (version, description) = filename
+            .trim_end_matches(".sql")
+            .split_once('_')
+            .with_context(|| format!("migration file name {filename}"))?;
+        let version = version
+            .parse::<i64>()
+            .with_context(|| format!("migration version in {filename}"))?;
+        let description = description.replace('_', " ");
+        let sql =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let sha384 = hex::encode(Sha384::digest(sql.as_bytes()));
+        catalog.push(CatalogMigration {
+            version,
+            description,
+            filename,
+            sql,
+            sha384,
+        });
+    }
+    catalog.sort_by_key(|migration| migration.version);
+    anyhow::ensure!(
+        catalog
+            .windows(2)
+            .all(|pair| pair[0].version < pair[1].version),
+        "server migration catalog repeats a version"
+    );
+    for reviewed in reviewed_migrations() {
+        let entry = catalog
+            .iter()
+            .find(|migration| migration.version == reviewed.version)
+            .with_context(|| {
+                format!(
+                    "reviewed migration {} is not in the server catalog",
+                    reviewed.filename
+                )
+            })?;
+        anyhow::ensure!(
+            entry.filename == reviewed.filename
+                && entry.description == reviewed.description
+                && entry.sha384 == reviewed.reviewed_sha384,
+            "reviewed migration {} differs from the server catalog",
+            reviewed.filename
+        );
+    }
+    Ok(catalog)
+}
+
+/// Installs the server's migration catalog into `url` as the shipping
+/// server's startup migrator would: version order, one transaction each,
+/// with the operation-claim activation approval on the migrating session and
+/// the sqlx ledger row. A database whose ledger is a prefix of the catalog
+/// (an earlier, shorter catalog) gets the remaining migrations; any other
+/// ledger is refused. Returns the catalog length.
+pub fn install_server_migration_catalog(url: &str) -> Result<usize> {
     validate_reviewed_baseline_source()?;
     validate_reviewed_request_sources()?;
-    let ledger_exists = psql_query(
-        "SELECT CASE WHEN to_regclass('public._sqlx_migrations') IS NULL THEN '0' ELSE '1' END",
-    )? == "1\n";
-    let installed_versions = if ledger_exists {
-        psql_query("SELECT version::text FROM public._sqlx_migrations ORDER BY version")?
-            .lines()
-            .map(str::parse::<i64>)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("parse installed migration versions")?
-    } else {
-        Vec::new()
-    };
-    if !installed_versions.is_empty() && installed_versions.len() < 14 {
-        bail!("encrypted-request database contains a partial reviewed baseline")
+    let catalog = server_migration_catalog()?;
+    psql_exec_on(
+        url,
+        "CREATE TABLE IF NOT EXISTS public._sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)",
+    )?;
+    let installed = psql_query_on(
+        url,
+        "SELECT version::text FROM public._sqlx_migrations ORDER BY version",
+    )?
+    .lines()
+    .map(str::parse::<i64>)
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .context("parse installed migration versions")?;
+    let is_prefix = installed.len() <= catalog.len()
+        && installed
+            .iter()
+            .zip(&catalog)
+            .all(|(version, migration)| *version == migration.version);
+    if !is_prefix {
+        let name = url.rsplit('/').next().unwrap_or(url);
+        bail!(
+            "{name}'s migration ledger is not a prefix of the server catalog; it was \
+             probably installed by the older reviewed-subset harness. Recreate it: \
+             dropdb -h 127.0.0.1 {name} && createdb -h 127.0.0.1 {name}"
+        )
     }
-    if installed_versions.is_empty() {
-        psql_exec(
-            "CREATE TABLE IF NOT EXISTS public._sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)",
-        )?;
-        for migration in reviewed_baseline() {
-            apply_migration(&migration)?;
-        }
+    for migration in &catalog[installed.len()..] {
+        apply_migration(url, migration)?;
     }
+    Ok(catalog.len())
+}
 
-    let send_message = reviewed_send_message_prerequisite();
-    anyhow::ensure!(
-        hex::encode(Sha384::digest(send_message.sql.as_bytes())) == send_message.reviewed_sha384,
-        "send-message prerequisite source checksum mismatch"
-    );
-    if !installed_versions.contains(&send_message.version) {
-        apply_migration(&send_message)?;
-    }
-    let inventory_gc = reviewed_inventory_gc_prerequisite();
-    anyhow::ensure!(
-        hex::encode(Sha384::digest(inventory_gc.sql.as_bytes())) == inventory_gc.reviewed_sha384,
-        "inventory-GC prerequisite source checksum mismatch"
-    );
-    if !installed_versions.contains(&inventory_gc.version) {
-        apply_migration(&inventory_gc)?;
-    }
+fn install_or_validate_reviewed_baseline() -> Result<()> {
+    install_server_migration_catalog(request_database_url())?;
     let inventory_gc_contract = psql_query(
         "SELECT (position('device_inventory_items' in immutable.prosrc)>0 AND position('session_replication_role' in immutable.prosrc)=0)::text||E'\\t'||(count(gc.oid)=2 AND bool_and(position('session_replication_role' in gc.prosrc)=0))::text FROM pg_proc immutable JOIN pg_namespace immutable_ns ON immutable_ns.oid=immutable.pronamespace LEFT JOIN pg_proc gc ON gc.pronamespace=immutable.pronamespace AND gc.proname IN ('gc_expired_inventory_sessions','gc_expired_device_inventory_sessions') WHERE immutable_ns.nspname='chat' AND immutable.proname='enforce_immutable_identity' GROUP BY immutable.prosrc",
     )?;
@@ -605,51 +657,23 @@ fn install_or_validate_reviewed_baseline() -> Result<()> {
         inventory_gc_contract.trim() == "true\ttrue",
         "inventory-GC immutable-row allowlist contract is unavailable"
     );
-    let legacy_dpop = reviewed_legacy_dpop_prerequisite();
-    anyhow::ensure!(
-        hex::encode(Sha384::digest(legacy_dpop.sql.as_bytes())) == legacy_dpop.reviewed_sha384,
-        "legacy-DPoP prerequisite source checksum mismatch"
-    );
-    if !installed_versions.contains(&legacy_dpop.version) {
-        apply_migration(&legacy_dpop)?;
-    }
-    let performance_indices = reviewed_performance_indices_prerequisite();
-    anyhow::ensure!(
-        hex::encode(Sha384::digest(performance_indices.sql.as_bytes()))
-            == performance_indices.reviewed_sha384,
-        "performance-indices prerequisite source checksum mismatch"
-    );
-    if !installed_versions.contains(&performance_indices.version) {
-        apply_migration(&performance_indices)?;
-    }
-    let pending_inventory = reviewed_pending_inventory_prerequisite();
-    anyhow::ensure!(
-        hex::encode(Sha384::digest(pending_inventory.sql.as_bytes()))
-            == pending_inventory.reviewed_sha384,
-        "pending-inventory prerequisite source checksum mismatch"
-    );
-    if !installed_versions.contains(&pending_inventory.version) {
-        apply_migration(&pending_inventory)?;
-    }
-    for migration in reviewed_request_migrations() {
-        if !installed_versions.contains(&migration.version) {
-            apply_migration(&migration)?;
-        }
-    }
     Ok(())
 }
 
-fn apply_migration(migration: &BaselineMigration) -> Result<()> {
-    let checksum = hex::encode(Sha384::digest(migration.sql.as_bytes()));
+fn apply_migration(url: &str, migration: &CatalogMigration) -> Result<()> {
     let escaped_description = migration.description.replace('\'', "''");
     let script = format!(
-        "BEGIN; SELECT pg_advisory_xact_lock(20260919); SET LOCAL chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'; {}\nINSERT INTO public._sqlx_migrations(version,description,success,checksum,execution_time) VALUES({},'{}',TRUE,decode('{}','hex'),0); COMMIT;",
-        migration.sql, migration.version, escaped_description, checksum
+        "BEGIN; SELECT pg_advisory_xact_lock(20260919); SET LOCAL chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'; {}\n;\nINSERT INTO public._sqlx_migrations(version,description,success,checksum,execution_time) VALUES({},'{}',TRUE,decode('{}','hex'),0); COMMIT;",
+        migration.sql, migration.version, escaped_description, migration.sha384
     );
-    psql_exec(&script).with_context(|| format!("apply {}", migration.filename))
+    psql_exec_on(url, &script).with_context(|| format!("apply {}", migration.filename))
 }
 
 fn psql_query(sql: &str) -> Result<String> {
+    psql_query_on(request_database_url(), sql)
+}
+
+fn psql_query_on(url: &str, sql: &str) -> Result<String> {
     let output = Command::new("psql")
         .args([
             "-X",
@@ -660,7 +684,7 @@ fn psql_query(sql: &str) -> Result<String> {
             "-F",
             "\t",
             "-d",
-            request_database_url(),
+            url,
             "-c",
             sql,
         ])
