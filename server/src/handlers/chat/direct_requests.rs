@@ -56,6 +56,26 @@ fn pair_failure(endpoint: ChatEndpoint, error: crate::federation::FederationErro
         _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
     }
 }
+/// Whether a prepare answered by this DS alone ended in a refusal that holds
+/// wherever the recipient is homed: its authority is not admitted, policy
+/// refused, or the sender's own request is stale, conflicting or over quota.
+fn confirms_local_refusal(result: &DirectRequestResult) -> bool {
+    let DirectRequestResult::Terminal(bytes) = result else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|receipt| {
+        matches!(
+            receipt["body"]["receipt"]["code"].as_str(),
+            Some(
+                "RecipientAuthorityUnsupported"
+                    | "RequestPolicyDenied"
+                    | "PreparationExpired"
+                    | "PreparationConflict"
+                    | "CapacityUnavailable"
+            )
+        )
+    })
+}
 fn output(result: DirectRequestResult, endpoint: ChatEndpoint) -> Result<Vec<u8>, ChatFailure> {
     let mut payload = match result {
         DirectRequestResult::Keys(bytes) => return Ok(bytes),
@@ -212,7 +232,7 @@ async fn mutate(
         // A recipient with no chat authority this DS can join still gets a
         // signed terminal refusal when the sender is homed here: the repository
         // claims the attempt and signs it, and never prepares one (C33).
-        let (coord, refusal_only) =
+        let (coord, refusal) =
             match crate::federation::canonical_relay::resolve_pair_coordinator_by_side(
                 pool,
                 actor_did,
@@ -220,10 +240,10 @@ async fn mutate(
             )
             .await
             {
-                Ok(coord) => (coord, false),
+                Ok(coord) => (coord, None),
                 Err(error) => {
                     match error.local_refusal_coordinator(&crate::identity::service_did()) {
-                        Some(coord) => (coord, true),
+                        Some(coord) => (coord, Some(error)),
                         None => return Err(pair_failure(endpoint, error.into_federation_error())),
                     }
                 }
@@ -426,14 +446,15 @@ async fn mutate(
                     return Err(failure(endpoint, error));
                 }
             };
-            if refusal_only && matches!(&result, DirectRequestResult::Prepared(_)) {
-                // The recipient's authority was refused above; dropping the
-                // transaction rolls back a preparation that slipped past the
-                // repository's own gate.
-                return Err(failure(
-                    endpoint,
-                    DirectRequestStoreError::RecipientAuthorityUnsupported,
-                ));
+            if let Some(refused) = refusal {
+                // Nothing was staged for a remote recipient, so only a refusal
+                // the repository reached itself may be signed. Anything else
+                // (a preparation, or keys missing because the recipient's
+                // authority changed meanwhile) is rolled back with the
+                // transaction and answered unsigned.
+                if !confirms_local_refusal(&result) {
+                    return Err(pair_failure(endpoint, refused.into_federation_error()));
+                }
             }
 
             // C33-LEASE-004: Release remote leases for non-Prepared outcomes (e.g. Terminal receipts)
@@ -679,5 +700,43 @@ pub(super) async fn outcome(
     match run(&pool, &runtime, &headers, query.as_deref()).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod local_refusal_tests {
+    use super::*;
+
+    fn terminal(code: &str) -> DirectRequestResult {
+        DirectRequestResult::Terminal(
+            serde_json::to_vec(&serde_json::json!({
+                "body": {"receipt": {
+                    "$type": "blue.catbird.chat.defs#directRequestRejectedReceipt",
+                    "code": code
+                }},
+                "signature": "AA=="
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn only_refusals_that_hold_anywhere_are_kept() {
+        for code in [
+            "RecipientAuthorityUnsupported",
+            "RequestPolicyDenied",
+            "PreparationExpired",
+            "PreparationConflict",
+            "CapacityUnavailable",
+        ] {
+            assert!(confirms_local_refusal(&terminal(code)), "{code}");
+        }
+        // Keys may live on the recipient's peer, which was never asked.
+        assert!(!confirms_local_refusal(&terminal(
+            "RecipientKeysUnavailable"
+        )));
+        assert!(!confirms_local_refusal(&DirectRequestResult::Prepared(
+            b"{}".to_vec()
+        )));
     }
 }

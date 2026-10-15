@@ -1602,6 +1602,11 @@ impl DsResolver {
                     error = %e,
                     "Failed to resolve PDS for chat declaration"
                 );
+                // An outage says nothing about the declaration; only a
+                // definitive failure makes the account unsupported.
+                if e.is_retryable() {
+                    return Err(e);
+                }
                 return Err(FederationError::Unsupported(format!(
                     "Failed to resolve PDS endpoint from DID document: {e}"
                 )));
