@@ -177,6 +177,12 @@ async fn fixture() -> anyhow::Result<Fixture> {
     };
     let alice = make(alice_id, "alice")?;
     let bob = make(bob_id, "bob")?;
+    // Both accounts are homed here and admit the direct conversation; the
+    // upgrade publication must also match the sender's PDS device key.
+    for party in [&alice, &bob] {
+        https.declare_local_chat_account(&party.id.did)?;
+        https.publish_device_key(&party.id.did, &party.public)?;
+    }
     let server = ShippingServerFixture::start(&https)?;
     Ok(Fixture {
         alice,

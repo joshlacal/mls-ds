@@ -488,6 +488,11 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
             (carol.did.clone(), carol.did_document()),
         ],
     )?;
+    // Prepare resolves every party's chat authority, which fails closed
+    // without a declaration; the recipients' declarations are also their consent.
+    for identity in [&alice, &bob, &carol] {
+        https.declare_local_chat_account(&identity.did)?;
+    }
     let ds_server = ShippingServerFixture::start(&https)?;
     let client = reqwest::Client::builder().build()?;
     println!("C26 run {run}: DS at {}", ds_server.base_url);
@@ -498,6 +503,9 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
     alice_engine.create_key_package(&alice_identity)?;
     let alice_public = alice_engine.identity_public_key(&alice_identity)?;
     seed_service_device(&alice, &alice_public)?;
+    // Alice is the only publisher; a local publication's sender key must match
+    // her PDS device record.
+    https.publish_device_key(&alice.did, &alice_public)?;
     for _ in 0..19 {
         enroll_device(&alice, &client, &ds_server.base_url).await?;
     }

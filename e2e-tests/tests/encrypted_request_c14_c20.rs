@@ -480,16 +480,14 @@ async fn publish_direct_keys(
     Ok(())
 }
 
-/// Real signed prepareDirectRequest from `sender` to `recipient_did`, then the
-/// sender's native engine builds the bootstrap and the signed publication.
-/// Returns (signed publication, request id, candidate conversation id).
-async fn prepare_direct_publication(
-    f: &live_direct_request::PublishedRequestFixture,
+/// A signed fresh-direct prepareDirectRequest from `sender` to `recipient_did`.
+/// Returns (signed preparation, request id, first message id, candidate
+/// conversation id).
+fn sign_direct_preparation(
     sender: &ServiceIdentity,
     engine: &MlsEngine,
     recipient_did: &str,
-    text: &str,
-) -> anyhow::Result<(Value, Uuid, Uuid)> {
+) -> anyhow::Result<(Value, Uuid, Uuid, Uuid)> {
     let identity = format!("{}#{}", sender.did, sender.device_id);
     let public = engine.identity_public_key(&identity)?;
     let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&public));
@@ -513,11 +511,44 @@ async fn prepare_direct_publication(
         "idempotencyKey": request_id.to_string(),
         "signedAt": canonical_now()
     }))?;
+    Ok((prepare, request_id, first_msg_id, candidate))
+}
+
+/// Real signed prepareDirectRequest from `sender` to `recipient_did`, then the
+/// sender's native engine builds the bootstrap and the signed publication.
+/// Returns (signed publication, request id, candidate conversation id).
+async fn prepare_direct_publication(
+    f: &live_direct_request::PublishedRequestFixture,
+    sender: &ServiceIdentity,
+    engine: &MlsEngine,
+    recipient_did: &str,
+    text: &str,
+) -> anyhow::Result<(Value, Uuid, Uuid)> {
+    let prepared = sign_direct_preparation(sender, engine, recipient_did)?;
     let (prepare_status, prepare_body) = sender
-        .post(&f.client, &f.server.base_url, "blue.catbird.chat.prepareDirectRequest", &json!({"signedRequest": prepare}), true)
+        .post(&f.client, &f.server.base_url, "blue.catbird.chat.prepareDirectRequest", &json!({"signedRequest": prepared.0}), true)
         .await?;
     anyhow::ensure!(prepare_status == reqwest::StatusCode::OK, "{} prepare failed {prepare_status}: {}", sender.did, String::from_utf8_lossy(&prepare_body));
-    let prep_resp: Value = serde_json::from_slice(&prepare_body)?;
+    let publication = direct_publication(f, sender, engine, recipient_did, &prepared, &prepare_body, text)?;
+    Ok((publication, prepared.1, prepared.3))
+}
+
+/// The sender's native engine builds the bootstrap and the signed publication
+/// for `prepared`, from the server's 200 prepareDirectRequest response.
+fn direct_publication(
+    f: &live_direct_request::PublishedRequestFixture,
+    sender: &ServiceIdentity,
+    engine: &MlsEngine,
+    recipient_did: &str,
+    prepared: &(Value, Uuid, Uuid, Uuid),
+    prepare_body: &[u8],
+    text: &str,
+) -> anyhow::Result<Value> {
+    let (prepare, request_id, first_msg_id, candidate) = prepared;
+    let identity = format!("{}#{}", sender.did, sender.device_id);
+    let public = engine.identity_public_key(&identity)?;
+    let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&public));
+    let prep_resp: Value = serde_json::from_slice(prepare_body)?;
     let prep_snapshot = protocol::verify_direct_request_preparation(
         &serde_json::to_vec(prep_resp.pointer("/outcome/preparation").context("preparation snapshot")?)?,
         &f.server.receipt_public_key,
@@ -643,8 +674,7 @@ async fn prepare_direct_publication(
             "ciphertextSize": bootstrap.metadata_ciphertext.len(), "authorProof": author
         }
     });
-    let publication = signed_mls_request(engine, &identity, DirectRequestKind::Publish, body)?;
-    Ok((publication, request_id, candidate))
+    signed_mls_request(engine, &identity, DirectRequestKind::Publish, body)
 }
 
 // ============================================================================
@@ -740,41 +770,70 @@ async fn c14_concurrent_crossed_publications_barrier_one_direct() -> anyhow::Res
     publish_direct_keys(&f, &f.alice, alice_engine, 1).await?;
     publish_direct_keys(&f, &f.bob, &f.bob_engine, 2).await?;
 
-    // Both sides prepare real candidates (A -> B and B -> A) before either publishes.
-    let (a_pub, a_req, a_convo) = prepare_direct_publication(&f, &f.alice, alice_engine, &f.bob.did, "Alice crossed start").await?;
-    let (b_pub, b_req, b_convo) = prepare_direct_publication(&f, &f.bob, &f.bob_engine, &f.alice.did, "Bob crossed start").await?;
-
-    // Both publications queue behind a barrier holding the request budget and
-    // both principals' locks, then are released together.
+    // Crossed starts converge at preparation: the pair fence admits one
+    // in-progress request per pair (f38efd4b). Both real preparations (A -> B
+    // and B -> A) queue behind a barrier holding the request budget and both
+    // principals' locks, then are released together.
+    let a_prep = sign_direct_preparation(&f.alice, alice_engine, &f.bob.did)?;
+    let b_prep = sign_direct_preparation(&f.bob, &f.bob_engine, &f.alice.did)?;
     let barrier = Barrier::hold(&[&f.alice.did, &f.bob.did])?;
     let a_future = {
-        let (who, client, base, env) = (f.alice.clone(), f.client.clone(), f.server.base_url.clone(), json!({"signedRequest": a_pub.clone()}));
-        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.publishDirectRequest", &env, true).await })
+        let (who, client, base, env) = (f.alice.clone(), f.client.clone(), f.server.base_url.clone(), json!({"signedRequest": a_prep.0.clone()}));
+        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.prepareDirectRequest", &env, true).await })
     };
     let b_future = {
-        let (who, client, base, env) = (f.bob.clone(), f.client.clone(), f.server.base_url.clone(), json!({"signedRequest": b_pub.clone()}));
-        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.publishDirectRequest", &env, true).await })
+        let (who, client, base, env) = (f.bob.clone(), f.client.clone(), f.server.base_url.clone(), json!({"signedRequest": b_prep.0.clone()}));
+        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.prepareDirectRequest", &env, true).await })
     };
     let queued = barrier.wait_for_waiters(2).await?;
     barrier.release()?;
     let (a_status, a_bytes) = a_future.await??;
     let (b_status, b_bytes) = b_future.await??;
-    anyhow::ensure!(a_status == reqwest::StatusCode::OK, "Alice publish {a_status}: {}", String::from_utf8_lossy(&a_bytes));
-    anyhow::ensure!(b_status == reqwest::StatusCode::OK, "Bob publish {b_status}: {}", String::from_utf8_lossy(&b_bytes));
-    let a_receipt = serde_json::from_slice::<Value>(&a_bytes)?["outcome"]["body"]["receipt"].clone();
-    let b_receipt = serde_json::from_slice::<Value>(&b_bytes)?["outcome"]["body"]["receipt"].clone();
+    let alice_won = a_status == reqwest::StatusCode::OK;
+    let (won_status, lost_status, lost_bytes) = if alice_won { (a_status, b_status, &b_bytes) } else { (b_status, a_status, &a_bytes) };
+    anyhow::ensure!(
+        won_status == reqwest::StatusCode::OK,
+        "exactly one preparation must win: Alice {a_status}: {} / Bob {b_status}: {}",
+        String::from_utf8_lossy(&a_bytes),
+        String::from_utf8_lossy(&b_bytes)
+    );
+    anyhow::ensure!(
+        lost_status == reqwest::StatusCode::BAD_REQUEST
+            && serde_json::from_slice::<Value>(lost_bytes)?["error"] == "PreparationConflict",
+        "the crossed preparation must lose with PreparationConflict: {lost_status}: {}",
+        String::from_utf8_lossy(lost_bytes)
+    );
+    let alice = (&f.alice, alice_engine, &a_prep, &a_bytes);
+    let bob = (&f.bob, &f.bob_engine, &b_prep, &b_bytes);
+    let ((winner, winner_engine, winner_prep, winner_bytes), (loser, loser_engine, loser_prep, _)) =
+        if alice_won { (alice, bob) } else { (bob, alice) };
+    eprintln!("C14 concurrent crossed start: queued={queued} winner={}", if alice_won { "alice" } else { "bob" });
+    assert_eq!(
+        psql_cmd(&format!("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{}'", loser_prep.1))?,
+        "0",
+        "the losing preparation leaves no attempt"
+    );
+
+    // The winner publishes its preparation; the loser's later start finds
+    // the winner's direct instead of creating a second one.
     const PUBLISHED: &str = "blue.catbird.chat.defs#directRequestPublishedReceipt";
     const EXISTING: &str = "blue.catbird.chat.defs#directRequestExistingDirectReceipt";
-    let alice_won = a_receipt["$type"] == PUBLISHED;
-    let (winner_convo, loser_convo, loser_req, loser_receipt, winner_pub) = if alice_won {
-        assert_eq!(b_receipt["$type"], EXISTING, "loser must get existing-direct receipt: {b_receipt}");
-        (a_convo, b_convo, b_req, &b_receipt, &a_pub)
-    } else {
-        assert_eq!(b_receipt["$type"], PUBLISHED, "exactly one publication must win: {a_receipt} / {b_receipt}");
-        assert_eq!(a_receipt["$type"], EXISTING, "loser must get existing-direct receipt: {a_receipt}");
-        (b_convo, a_convo, a_req, &a_receipt, &b_pub)
-    };
-    eprintln!("C14 concurrent crossed start: queued={queued} winner={}", if alice_won { "alice" } else { "bob" });
+    let winner_pub = direct_publication(&f, winner, winner_engine, &loser.did, winner_prep, winner_bytes, "Winner crossed start")?;
+    let (publish_status, publish_bytes) = winner
+        .post(&f.client, &f.server.base_url, "blue.catbird.chat.publishDirectRequest", &json!({"signedRequest": winner_pub}), true)
+        .await?;
+    anyhow::ensure!(publish_status == reqwest::StatusCode::OK, "winner publish {publish_status}: {}", String::from_utf8_lossy(&publish_bytes));
+    let winner_receipt = serde_json::from_slice::<Value>(&publish_bytes)?["outcome"]["body"]["receipt"].clone();
+    assert_eq!(winner_receipt["$type"], PUBLISHED, "the prepared side publishes the direct: {winner_receipt}");
+    let winner_convo = winner_prep.3;
+    let (loser_pub, loser_req, loser_convo) =
+        prepare_direct_publication(&f, loser, loser_engine, &winner.did, "Loser crossed start").await?;
+    let (loser_status, loser_bytes) = loser
+        .post(&f.client, &f.server.base_url, "blue.catbird.chat.publishDirectRequest", &json!({"signedRequest": loser_pub}), true)
+        .await?;
+    anyhow::ensure!(loser_status == reqwest::StatusCode::OK, "loser publish {loser_status}: {}", String::from_utf8_lossy(&loser_bytes));
+    let loser_receipt = serde_json::from_slice::<Value>(&loser_bytes)?["outcome"]["body"]["receipt"].clone();
+    assert_eq!(loser_receipt["$type"], EXISTING, "loser must get existing-direct receipt: {loser_receipt}");
     assert_eq!(loser_receipt["conversationId"], winner_convo.to_string(), "loser receipt names the winner");
     assert_eq!(loser_receipt["requiresAcceptance"], true, "loser is pending recipient; nothing silently accepted");
 
@@ -784,7 +843,9 @@ async fn c14_concurrent_crossed_publications_barrier_one_direct() -> anyhow::Res
         "1",
         "exactly one active direct for the pair"
     );
-    assert_eq!(psql_cmd(&format!("SELECT count(*) FROM chat.conversations WHERE conversation_id='{loser_convo}'"))?, "0", "loser candidate not created");
+    for candidate in [loser_prep.3, loser_convo] {
+        assert_eq!(psql_cmd(&format!("SELECT count(*) FROM chat.conversations WHERE conversation_id='{candidate}'"))?, "0", "loser candidate not created");
+    }
     assert_eq!(psql_cmd(&format!("SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{loser_req}'"))?, "0", "loser ciphertext not transplanted");
     assert_eq!(
         psql_cmd(&format!("SELECT count(*) FROM chat.transitions WHERE conversation_id='{winner_convo}' AND kind='directRequestAcceptance'"))?,
@@ -794,8 +855,7 @@ async fn c14_concurrent_crossed_publications_barrier_one_direct() -> anyhow::Res
 
     // Release capacity: close the winner through the real signed RPC.
     let (close_env, _) = close_envelope(&f, alice_won, Some(winner_pub["body"]["next"].clone()))?;
-    let who = if alice_won { &f.alice } else { &f.bob };
-    let (close_status, close_bytes) = who.post(&f.client, &f.server.base_url, "blue.catbird.chat.closeConversation", &close_env, true).await?;
+    let (close_status, close_bytes) = winner.post(&f.client, &f.server.base_url, "blue.catbird.chat.closeConversation", &close_env, true).await?;
     anyhow::ensure!(close_status == reqwest::StatusCode::OK, "winner close {close_status}: {}", String::from_utf8_lossy(&close_bytes));
     Ok(())
 }
