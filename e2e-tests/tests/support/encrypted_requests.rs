@@ -623,29 +623,72 @@ pub fn install_server_migration_catalog(url: &str) -> Result<usize> {
     )?;
     let installed = psql_query_on(
         url,
-        "SELECT version::text FROM public._sqlx_migrations ORDER BY version",
-    )?
-    .lines()
-    .map(str::parse::<i64>)
-    .collect::<std::result::Result<Vec<_>, _>>()
-    .context("parse installed migration versions")?;
+        "SELECT version, description, success, encode(checksum, 'hex') FROM public._sqlx_migrations ORDER BY version",
+    )?;
+    let installed = installed.lines().collect::<Vec<_>>();
     let is_prefix = installed.len() <= catalog.len()
-        && installed
-            .iter()
-            .zip(&catalog)
-            .all(|(version, migration)| *version == migration.version);
+        && installed.iter().zip(&catalog).all(|(row, migration)| {
+            *row == format!(
+                "{}\t{}\tt\t{}",
+                migration.version, migration.description, migration.sha384
+            )
+        });
     if !is_prefix {
-        let name = url.rsplit('/').next().unwrap_or(url);
-        bail!(
-            "{name}'s migration ledger is not a prefix of the server catalog; it was \
-             probably installed by the older reviewed-subset harness. Recreate it: \
-             dropdb -h 127.0.0.1 {name} && createdb -h 127.0.0.1 {name}"
-        )
+        bail!("{}", recreate_hint(url))
     }
-    for migration in &catalog[installed.len()..] {
+    let pending = &catalog[installed.len()..];
+    if pending
+        .iter()
+        .any(|migration| migration.version == 20250101000000)
+    {
+        // The greenfield migration grants on a `catbird` database to a
+        // `catbird` role, as CI provides before it migrates.
+        let identities = psql_query_on(
+            url,
+            "SELECT (EXISTS(SELECT 1 FROM pg_roles WHERE rolname = 'catbird') AND EXISTS(SELECT 1 FROM pg_database WHERE datname = 'catbird'))::text",
+        )?;
+        anyhow::ensure!(
+            identities.trim() == "true",
+            "the server catalog needs a `catbird` role and a `catbird` database on this cluster: \
+             psql {} -c 'CREATE ROLE catbird NOLOGIN' -c 'CREATE DATABASE catbird'",
+            database_location(url).map_or_else(String::new, |(host, port, _)| format!(
+                "-h {host} -p {port} -d postgres"
+            ))
+        );
+    }
+    for migration in pending {
         apply_migration(url, migration)?;
     }
     Ok(catalog.len())
+}
+
+/// Says how to recreate the database a stale ledger came from. A faketime
+/// cluster replays the shared guarded ledger, so that is the one to recreate.
+fn recreate_hint(url: &str) -> String {
+    let faketime = dedicated_request_database_name(url)
+        .is_some_and(|name| name.starts_with("catbird_direct_requests_faketime_"));
+    let target = if faketime {
+        REQUEST_TEST_DATABASE_URL
+    } else {
+        url
+    };
+    let (host, port, name) = database_location(target).unwrap_or(("127.0.0.1", "5432", target));
+    format!(
+        "{name}'s migration ledger is not a prefix of the server catalog; it was probably \
+         installed by the older reviewed-subset harness{}. Recreate it: dropdb -h {host} -p {port} \
+         {name} && createdb -h {host} -p {port} {name}",
+        if faketime {
+            " (faketime clusters replay it)"
+        } else {
+            ""
+        }
+    )
+}
+
+fn database_location(url: &str) -> Option<(&str, &str, &str)> {
+    let (authority, name) = url.strip_prefix("postgresql://")?.split_once('/')?;
+    let (host, port) = authority.rsplit_once(':')?;
+    Some((host, port, name))
 }
 
 fn install_or_validate_reviewed_baseline() -> Result<()> {
@@ -662,11 +705,29 @@ fn install_or_validate_reviewed_baseline() -> Result<()> {
 
 fn apply_migration(url: &str, migration: &CatalogMigration) -> Result<()> {
     let escaped_description = migration.description.replace('\'', "''");
+    // The ledger is read again under the lock, so a concurrent installer that
+    // already applied this migration is skipped rather than re-applied.
     let script = format!(
-        "BEGIN; SELECT pg_advisory_xact_lock(20260919); SET LOCAL chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'; {}\n;\nINSERT INTO public._sqlx_migrations(version,description,success,checksum,execution_time) VALUES({},'{}',TRUE,decode('{}','hex'),0); COMMIT;",
-        migration.sql, migration.version, escaped_description, migration.sha384
+        "BEGIN;\nSELECT pg_advisory_xact_lock(20260919);\nSELECT CASE WHEN EXISTS(SELECT 1 FROM public._sqlx_migrations WHERE version = {version}) THEN 'true' ELSE 'false' END AS already_applied \\gset\n\\if :already_applied\nCOMMIT;\n\\else\nSET LOCAL chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed';\n{sql}\n;\nINSERT INTO public._sqlx_migrations(version,description,success,checksum,execution_time) VALUES({version},'{escaped_description}',TRUE,decode('{checksum}','hex'),0);\nCOMMIT;\n\\endif\n",
+        version = migration.version,
+        sql = migration.sql,
+        checksum = migration.sha384,
     );
-    psql_exec_on(url, &script).with_context(|| format!("apply {}", migration.filename))
+    // Installs into other databases on the cluster can race this one on the
+    // shared `catbird` pg_database row the greenfield GRANT rewrites. The
+    // transaction rolls back whole, so re-running it is safe.
+    let mut attempt = 1;
+    loop {
+        match psql_exec_on(url, &script) {
+            Err(error)
+                if attempt < 5 && error.to_string().contains("tuple concurrently updated") =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(200 * attempt));
+                attempt += 1;
+            }
+            result => return result.with_context(|| format!("apply {}", migration.filename)),
+        }
+    }
 }
 
 fn psql_query(sql: &str) -> Result<String> {
@@ -1018,6 +1079,44 @@ impl HttpsDidFixture {
             hosts,
             _process: FixtureProcess { child },
         })
+    }
+
+    /// Publishes, on the fixture PDS, the Catbird chat declaration that homes
+    /// `did` on this service and admits every incoming request and invitation.
+    /// The server reads it both to resolve the account's chat authority, which
+    /// fails closed when it is absent, and as the account's consent policy.
+    pub fn declare_local_chat_account(&self, did: &str) -> Result<()> {
+        let declarations = self.root.join("_policy/catbirdDeclaration");
+        std::fs::create_dir_all(&declarations)?;
+        std::fs::write(
+            declarations.join(did.replace(':', "%3A")),
+            serde_json::to_vec(&json!({
+                "$type": "blue.catbird.chat.declaration",
+                "protocolVersion": "1",
+                "allowIncoming": "all",
+                "deliveryService": "did:web:chat.catbird.blue",
+                "createdAt": canonical_now()
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    /// Publishes the account's MLS signature key as its PDS device record,
+    /// which a direct request's sender must match on the local publish path.
+    pub fn publish_device_key(&self, did: &str, signature_public_key: &[u8]) -> Result<()> {
+        let devices = self.root.join("_policy/deviceKeys");
+        std::fs::create_dir_all(&devices)?;
+        std::fs::write(
+            devices.join(did.replace(':', "%3A")),
+            serde_json::to_vec(&json!({
+                "records": [{"value": {
+                    "algorithm": "ed25519",
+                    "mlsSignaturePublicKey": {"$bytes": STANDARD.encode(signature_public_key)},
+                    "createdAt": canonical_now()
+                }}]
+            }))?,
+        )?;
+        Ok(())
     }
 }
 

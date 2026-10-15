@@ -109,31 +109,20 @@ fn create_database_clone(source: &str, target: &str) -> anyhow::Result<Dedicated
     Ok(DedicatedDatabase(target.to_string()))
 }
 
-fn bootstrap_federation_tables(db_url: &str) -> anyhow::Result<()> {
-    // The guarded chat template deliberately omits the older public federation schema.
-    psql_on(
-        db_url,
-        "CREATE TABLE ds_endpoints( \
-            did TEXT PRIMARY KEY, endpoint TEXT NOT NULL, supported_cipher_suites TEXT, \
-            resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-            expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '1 hour')",
-    )?;
-    psql_on(
-        db_url,
-        "CREATE TABLE outbound_queue( \
-            id TEXT PRIMARY KEY, target_ds_did TEXT NOT NULL, target_endpoint TEXT NOT NULL, \
-            method TEXT NOT NULL, payload BYTEA NOT NULL, convo_id TEXT NOT NULL, \
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-            next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-            retry_count INTEGER NOT NULL DEFAULT 0, max_retries INTEGER NOT NULL DEFAULT 5, \
-            last_error TEXT, status TEXT NOT NULL DEFAULT 'pending')",
-    )?;
-    for migration in [
-        include_str!("../../server/migrations/20260214000001_federation_peer_policy.sql"),
-        include_str!("../../server/migrations/20260214000002_auth_jti_nonce.sql"),
-        include_str!("../../server/migrations/20260222000001_federation_peer_policy_audit_log.sql"),
+fn require_federation_tables(db_url: &str) -> anyhow::Result<()> {
+    // The guarded template holds the server's whole migration catalog, which
+    // already creates the public federation schema this node relies on.
+    for table in [
+        "ds_endpoints",
+        "outbound_queue",
+        "federation_peers",
+        "auth_jti_nonce",
+        "federation_peer_policy_audit_log",
     ] {
-        psql_on(db_url, migration)?;
+        anyhow::ensure!(
+            psql_value(db_url, &format!("SELECT to_regclass('public.{table}') IS NOT NULL"))? == "t",
+            "guarded template lacks public.{table}"
+        );
     }
     Ok(())
 }
@@ -291,7 +280,7 @@ impl FederatedAuthorityServer {
             &db_url,
             include_str!("../../server/migrations/20260919000025_federated_inventory_conversation_items.sql"),
         )?;
-        bootstrap_federation_tables(&db_url)?;
+        require_federation_tables(&db_url)?;
         // Each private clone is a new authority; discard the base fixture's unrelated receipt history.
         psql_on(&db_url, "TRUNCATE chat.direct_request_receipt_keys")?;
 
@@ -1807,11 +1796,13 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         ("A", &server_a.database_url),
         ("B", &server_b.database_url),
     ] {
+        // The catalog still creates the legacy tables; a canonical node never
+        // writes to them.
         for table in ["messages", "welcome_messages", "pending_welcomes"] {
             assert_eq!(
-                psql_value(database_url, &format!("SELECT to_regclass('public.{table}') IS NULL"))?,
-                "t",
-                "Server {node} must not use a legacy {table} table"
+                psql_count(database_url, &format!("SELECT count(*) FROM public.{table}"))?,
+                0,
+                "Server {node} must not use the legacy {table} table"
             );
         }
         assert_eq!(

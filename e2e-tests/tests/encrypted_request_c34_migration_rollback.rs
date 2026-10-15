@@ -26,11 +26,11 @@
 //!      * Accepted conversation state (getConversationState) returns accepted state.
 //!      * Accepted outcome (getDirectRequestOutcome) returns accepted receipt.
 //!      * Accepted entries (getEntries) returns introduction message.
-//! 7. Build and run pre-change baseline server (revision c9fd0c5f85610de70b5d083bfec2c597cba5b247):
+//! 7. Build and run pre-change baseline server (revision b7838df3533e3fff1b5e93bbfc433ec6cbc5b67a,
+//!    mls-ds main as the 2026-10-04 merge found it):
 //!    - Assert standard startup migration check REFUSES against the v2 DB with the exact
-//!      failure "migration <v> was previously applied but is missing in the resolved
-//!      migrations", where <v> is the first installed migration the baseline revision's
-//!      `server/migrations` does not ship (20260919000001 before the 2026-10-04 merge).
+//!      failure "migration 20260907000001 was previously applied but is missing in the
+//!      resolved migrations": the first installed migration the baseline does not ship.
 //!    - Assert SKIP_MIGRATIONS=1 run has no direct request endpoints.
 //! 8. Drop dedicated database cleanly.
 
@@ -59,7 +59,6 @@ use p256::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
     io::BufRead,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -107,39 +106,20 @@ impl Drop for DedicatedDatabase {
     }
 }
 
-/// The pre-change baseline server's revision. Its binary is prebuilt at
-/// /tmp/catbird-server-baseline-c34.
-const BASELINE_REVISION: &str = "c9fd0c5f85610de70b5d083bfec2c597cba5b247";
+/// The pre-change baseline server: mls-ds main as the 2026-10-04 merge found
+/// it (that merge's first parent), which is what rolling back the merged
+/// server returns to. Build it with the dev profile beside catbird-atproto at
+/// b4a03d5, its `../../catbird-atproto` path dependency, and copy
+/// target/debug/catbird-server to /tmp/catbird-server-baseline-c34.
+const BASELINE_REVISION: &str = "b7838df3533e3fff1b5e93bbfc433ec6cbc5b67a";
 
-/// The first installed migration that the baseline revision does not ship:
-/// the version its sqlx migrator names when it refuses the database.
-fn first_migration_missing_from_baseline(installed: &[i64]) -> Result<i64> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            env!("CARGO_MANIFEST_DIR"),
-            "ls-tree",
-            "--name-only",
-            &format!("{BASELINE_REVISION}:server/migrations"),
-        ])
-        .output()
-        .context("list the baseline revision's migrations")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "git ls-tree {BASELINE_REVISION}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let shipped: HashSet<i64> = String::from_utf8(output.stdout)?
-        .lines()
-        .filter(|name| name.ends_with(".sql"))
-        .filter_map(|name| name.split_once('_')?.0.parse().ok())
-        .collect();
-    installed
-        .iter()
-        .copied()
-        .find(|version| !shipped.contains(version))
-        .context("the baseline revision ships every installed migration")
-}
+/// The newest migration BASELINE_REVISION ships. Every request migration is
+/// newer, so the baseline cannot carry the v2 request schema.
+const BASELINE_NEWEST_MIGRATION: i64 = 20260905000001;
+
+/// The first catalog migration BASELINE_REVISION does not ship: the version
+/// its sqlx migrator names when it refuses the installed database.
+const BASELINE_FIRST_MISSING_MIGRATION: i64 = 20260907000001;
 
 struct ReaderServerProcess {
     child: Child,
@@ -257,6 +237,26 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         .iter()
         .map(|row| row["version"].as_i64().context("ledger version"))
         .collect::<Result<Vec<_>>>()?;
+    // The pinned baseline facts must still describe this catalog: the refusal
+    // names an installed migration, and none of the request migrations can be
+    // one the baseline ships.
+    assert!(
+        ledger_versions.contains(&BASELINE_FIRST_MISSING_MIGRATION),
+        "the ledger lacks {BASELINE_FIRST_MISSING_MIGRATION}, the version the baseline refuses on"
+    );
+    assert!(
+        ledger_versions
+            .iter()
+            .take_while(|version| **version != BASELINE_FIRST_MISSING_MIGRATION)
+            .all(|version| *version <= BASELINE_NEWEST_MIGRATION),
+        "a catalog migration older than {BASELINE_FIRST_MISSING_MIGRATION} is newer than the baseline"
+    );
+    assert!(
+        reviewed_request_migrations()
+            .iter()
+            .all(|migration| migration.version > BASELINE_NEWEST_MIGRATION),
+        "a request migration is not newer than the baseline's newest migration"
+    );
     println!("C34: Verified {installed}/{installed} migrations installed successfully in strict order.");
 
     // 1g. Route test harness to dedicated DB and connect authority
@@ -661,7 +661,7 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
     // =========================================================================
     // Step 4: Prove pre-change baseline server refuses selection against v2 DB
     // =========================================================================
-    println!("C34: Testing pre-change baseline server binary against v2 DB...");
+    println!("C34: Testing pre-change baseline server binary ({BASELINE_REVISION}) against v2 DB...");
     let baseline_binary = Path::new("/tmp/catbird-server-baseline-c34");
     anyhow::ensure!(
         baseline_binary.exists(),
@@ -672,6 +672,7 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
     // 4a. Standard startup: migration check refuses missing migrations
     let output = Command::new(baseline_binary)
         .env("DATABASE_URL", &dedicated_url)
+        .env("APP_ENV", "development")
         .output()
         .context("execute baseline binary")?;
 
@@ -685,8 +686,8 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
     let combined_refusal = format!("{stdout_str}\n{stderr_str}");
 
     let expected_refusal_phrase = format!(
-        "migration {} was previously applied but is missing in the resolved migrations",
-        first_migration_missing_from_baseline(&ledger_versions)?
+        "migration {BASELINE_FIRST_MISSING_MIGRATION} was previously applied but is missing in \
+         the resolved migrations"
     );
     assert!(
         combined_refusal.contains(&expected_refusal_phrase),
@@ -706,6 +707,7 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
     let mut skip_child = Command::new(baseline_binary)
         .env("DATABASE_URL", &dedicated_url)
         .env("SKIP_MIGRATIONS", "1")
+        .env("APP_ENV", "development")
         .env("SERVICE_DID", "did:web:chat.catbird.blue")
         .env("SELF_ENDPOINT", "https://chat.catbird.blue")
         .env("SERVER_HOST", "127.0.0.1")

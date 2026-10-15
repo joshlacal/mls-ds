@@ -260,18 +260,7 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
     // Both accounts publish the Catbird chat declaration (served by the PDS
     // fixture), which admits Bob's group invitation and names this service.
     for identity in [&alice, &bob] {
-        let declarations = https.root.join("_policy/catbirdDeclaration");
-        std::fs::create_dir_all(&declarations)?;
-        std::fs::write(
-            declarations.join(identity.did.replace(':', "%3A")),
-            serde_json::to_vec(&serde_json::json!({
-                "$type": "blue.catbird.chat.declaration",
-                "protocolVersion": "1",
-                "allowIncoming": "all",
-                "deliveryService": "did:web:chat.catbird.blue",
-                "createdAt": encrypted_requests::canonical_now()
-            }))?,
-        )?;
+        https.declare_local_chat_account(&identity.did)?;
     }
     // The fixture inherits this process's environment; the shipping server
     // gates the Labyrinth router on the same variable.
