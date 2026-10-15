@@ -47,7 +47,8 @@ struct TransportInboxRow {
 }
 
 /// Verify an accept request with the principal's active key at the device and
-/// keyId it names, before any answer depends on conversation state.
+/// keyId it names, before any answer depends on conversation state, and
+/// return that key.
 async fn verify_accept_signer(
     pool: &DbPool,
     endpoint: ChatEndpoint,
@@ -55,7 +56,7 @@ async fn verify_accept_signer(
     device_id: uuid::Uuid,
     key_id: &str,
     signed_request: &[u8],
-) -> Result<(), ChatFailure> {
+) -> Result<Vec<u8>, ChatFailure> {
     let device_key: Option<(Vec<u8>, i64)> = sqlx::query_as(
         "SELECT k.signing_public_key, d.auth_generation FROM chat.device_keys k \
          JOIN chat.devices d ON d.user_did=k.user_did AND d.device_id=k.device_id \
@@ -86,7 +87,7 @@ async fn verify_accept_signer(
             ChatProtocolErrorCode::NotAuthorized,
         ));
     }
-    Ok(())
+    Ok(public_key)
 }
 
 async fn handle_inner(
@@ -207,7 +208,7 @@ async fn handle_inner(
             let transition_id = uuid::Uuid::parse_str(transition_id_str)
                 .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
 
-            verify_accept_signer(
+            let public_key = verify_accept_signer(
                 pool,
                 endpoint,
                 principal.did(),
