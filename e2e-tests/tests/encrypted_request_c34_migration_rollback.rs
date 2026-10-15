@@ -179,6 +179,7 @@ fn start_reader_server(
         .env("REQUEST_FIXTURE_DID_PORT", https.port.to_string())
         .env("REQUEST_FIXTURE_DID_CA_PEM", &https.ca_pem)
         .env("DID_RESOLUTION_HOST_ALLOWLIST", https.hosts.join(","))
+        .env("SERVICE_DID", "did:web:chat.catbird.blue")
         .env("CHAT_CUTOVER_ENABLED", "1")
         .env("CHAT_DIRECT_REQUESTS_ENABLED", "0")
         .env("CHAT_CURSOR_KEY_ID", cursor_key_id)
