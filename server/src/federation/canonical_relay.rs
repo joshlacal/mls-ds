@@ -237,6 +237,21 @@ pub async fn check_pair_owner_fence(
     request_id: Uuid,
     expected_coordinator_did: Option<&str>,
 ) -> Result<Option<PairFenceConflict>, FederationError> {
+    // A request whose own attempt already ended only replays its durable
+    // outcome, which nothing else on the pair can change (C12).
+    let own_terminal: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts \
+         WHERE request_id = $1 AND actor_did = $2 AND recipient_did = $3 AND status <> 'prepared')",
+    )
+    .bind(request_id)
+    .bind(actor_did)
+    .bind(recipient_did)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| FederationError::Storage(e.to_string()))?;
+    if own_terminal {
+        return Ok(None);
+    }
     let service_did = crate::identity::service_did();
     let row: Option<(Option<String>, String, String)> = sqlx::query_as(
         "SELECT coordinator_did, source_table, status FROM ( \
