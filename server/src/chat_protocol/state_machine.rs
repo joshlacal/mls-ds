@@ -18916,7 +18916,7 @@ fn require_commit_body(
             let c_commit_sha = commit.verified_commit_sha256() == Some(commit_sha256);
             let c_aad_sha = commit.verified_aad_sha256() == Some(aad_digest);
             let c_meta = commit_metadata_matches(prior_state, metadata, next);
-            tracing::error!("LeafRecoveryFulfillment check: prior={}, next={}, req={}, commit_sha={}, aad_sha={}, meta={}", c_prior, c_next, c_req, c_commit_sha, c_aad_sha, c_meta);
+            tracing::debug!("LeafRecoveryFulfillment check: prior={}, next={}, req={}, commit_sha={}, aad_sha={}, meta={}", c_prior, c_next, c_req, c_commit_sha, c_aad_sha, c_meta);
             if !c_prior {
                 tracing::error!(
                     "prior mismatch: signed_prior={:?} != prior={:?}",
@@ -18996,12 +18996,12 @@ fn commit_metadata_matches(
     let c_auth = next_metadata.author_proof == prior_metadata.author_proof;
     let c_avatar = next_metadata.avatar_binding == prior_metadata.avatar_binding;
     let c_nonce = next_metadata.nonce != prior_metadata.nonce;
-    tracing::error!(
+    tracing::debug!(
         "commit_metadata_matches: next_len={}, prior_len={}",
         next_metadata.ciphertext.len(),
         prior_metadata.ciphertext.len()
     );
-    tracing::error!(
+    tracing::debug!(
         "commit_metadata_matches: coord={}, ver={}, ot={}, len={}, auth={}, avatar={}, nonce={}",
         c_coord,
         c_ver,
@@ -19131,7 +19131,7 @@ fn require_commit_manifest(
             let c_w_wire = signed_welcome.opaque_welcome == welcome.wire_bytes();
             let c_w_sha =
                 signed_welcome.sha256 == <[u8; 32]>::from(Sha256::digest(welcome.wire_bytes()));
-            tracing::error!("InvalidWelcomeMapping checks: pc={}, adds_len={}, adds_tgt={}, adds_req={}, adds_kp={}, m_req={}, w_id={}, w_rcp={}, w_req={}, w_kp={}, w_wire={}, w_sha={}", c_pc, c_adds_len, c_adds_tgt, c_adds_req, c_adds_kp, c_m_req, c_w_id, c_w_rcp, c_w_req, c_w_kp, c_w_wire, c_w_sha);
+            tracing::debug!("InvalidWelcomeMapping checks: pc={}, adds_len={}, adds_tgt={}, adds_req={}, adds_kp={}, m_req={}, w_id={}, w_rcp={}, w_req={}, w_kp={}, w_wire={}, w_sha={}", c_pc, c_adds_len, c_adds_tgt, c_adds_req, c_adds_kp, c_m_req, c_w_id, c_w_rcp, c_w_req, c_w_kp, c_w_wire, c_w_sha);
             if !c_pc
                 || !c_adds_len
                 || !c_adds_tgt
