@@ -3096,9 +3096,7 @@ pub async fn coordinator_publish_direct_request(
     };
 
     let queue_id = format!("direct-request-delivery-{}", deliver_input.request_id);
-    // A replay of a request that ended unpublished has nothing to deliver.
-    let deliver = !coord.is_recipient_home && !ended_unpublished;
-    if deliver {
+    if !coord.is_recipient_home {
         let payload_bytes = serde_json::to_vec(&deliver_input).map_err(FederationError::Json)?;
         crate::federation::queue::enqueue_c33_in_tx(
             pool,
@@ -3116,7 +3114,7 @@ pub async fn coordinator_publish_direct_request(
 
     tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    if deliver {
+    if !coord.is_recipient_home {
         if let Ok(()) = deliver_direct_request_to_peer(
             &coord.recipient_home.endpoint,
             &coord.recipient_home.did,

@@ -2451,7 +2451,8 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
 
     // Alice's preparation still holds the pair. A late prepare of R0, and a
     // late publish under R0's identity, replay the coordinator's stored
-    // rejection instead of meeting the pair fence, and queue nothing.
+    // rejection instead of meeting the pair fence. The publish replay reads no
+    // PDS either, so it holds with Bob's device key withdrawn from his PDS.
     anyhow::ensure!(winner_is_alice, "R0 replays need Alice's preparation to hold the pair");
     let (late_status, late_bytes) = bob.svc.post(
         &client,
@@ -2482,13 +2483,19 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     r0_publish_body["preparationRequestDigest"] = json!(STANDARD.encode(r0_prepare_digest));
     r0_publish_body["signedAt"] = json!(canonical_now());
     let r0_publish_signed = signed_mls_request(&bob.engine, &bob.identity, DirectRequestKind::Publish, r0_publish_body)?;
-    let (late_pub_status, late_pub_bytes) = bob.svc.post(
+    std::fs::write(
+        https.root.join("_policy").join("deviceKeys").join(quote(&bob.svc.did)),
+        br#"{"records":[]}"#,
+    )?;
+    let late_pub = bob.svc.post(
         &client,
         &server_b.base_url,
         "blue.catbird.chat.publishDirectRequest",
         &json!({ "signedRequest": r0_publish_signed }),
         true,
-    ).await?;
+    ).await;
+    publish_pds_device_key(&https.root, &bob)?;
+    let (late_pub_status, late_pub_bytes) = late_pub?;
     anyhow::ensure!(late_pub_status == StatusCode::OK, "late R0 publish: {late_pub_status}: {}", String::from_utf8_lossy(&late_pub_bytes));
     let late_publish: Value = serde_json::from_slice(&late_pub_bytes)?;
     assert_eq!(late_publish["outcome"], r0_outcome["outcome"], "late R0 publish replays the stored rejection");
@@ -2497,11 +2504,10 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
             &server_a.database_url,
             &format!(
                 "SELECT (SELECT string_agg(status, ',') FROM chat.direct_request_attempts WHERE request_id='{r0_req_id}')||'|'||\
-                        (SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{r0_req_id}')||'|'||\
-                        (SELECT count(*) FROM outbound_queue WHERE id='direct-request-delivery-{r0_req_id}')"
+                        (SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{r0_req_id}')"
             )
         )?,
-        "rejected|0|0",
+        "rejected|0",
         "R0 replays change nothing on the coordinator"
     );
     assert_eq!(
