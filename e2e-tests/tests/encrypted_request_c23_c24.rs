@@ -1079,13 +1079,17 @@ async fn competing(
         ),
         RaceLeg::SecondUpgrade => {
             // A second upgrade of the same legacy head cannot even be prepared
-            // while the first preparation is live.
+            // while the first preparation is live: the router's pair owner
+            // fence refuses it before the repository's live pair quota.
             let refused = match prepare_upgrade(f, l.cid, l.origin.clone(), l.next_seq).await {
                 Ok(_) => anyhow::bail!("second concurrent upgrade preparation was admitted"),
                 Err(error) => format!("{error:#}"),
             };
             println!("second concurrent upgrade preparation refused: {refused}");
-            anyhow::ensure!(refused.contains("no live preparation"), "unexpected refusal {refused}");
+            anyhow::ensure!(
+                refused.contains("prepare 400 Bad Request") && refused.contains("\"PreparationConflict\""),
+                "unexpected refusal {refused}"
+            );
             // The race is then the same signed publication delivered twice at once.
             ("blue.catbird.chat.publishDirectRequest", Value::Null)
         }

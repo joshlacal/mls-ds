@@ -909,12 +909,17 @@ pub(crate) async fn prepare_direct_request<
             let authority = crate::identity::canonical_did(authority.as_str());
             let local = authority == crate::identity::canonical_did(signer.authority_did())
                 || crate::identity::service_did_base_opt().as_deref() == Some(authority);
-            if !local
-                && crate::federation::peer_policy::enforce_outbound_peer_policy_tx(tx, authority)
+            if !local {
+                match crate::federation::peer_policy::enforce_outbound_peer_policy_tx(tx, authority)
                     .await
-                    .is_err()
-            {
-                return Err(DirectRequestStoreError::RecipientAuthorityUnsupported);
+                {
+                    Ok(_) => {}
+                    // A storage failure is not a refusal to sign.
+                    Err(crate::federation::FederationError::Database(error)) => {
+                        return Err(DirectRequestStoreError::Database(error))
+                    }
+                    Err(_) => return Err(DirectRequestStoreError::RecipientAuthorityUnsupported),
+                }
             }
         }
         Ok(None) => {}

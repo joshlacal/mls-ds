@@ -64,14 +64,17 @@ fn confirms_local_refusal(result: &DirectRequestResult) -> bool {
         return false;
     };
     serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|receipt| {
-        matches!(
-            receipt["body"]["receipt"]["code"].as_str(),
-            Some(
-                "RecipientAuthorityUnsupported"
-                    | "RequestPolicyDenied"
-                    | "PreparationExpired"
-                    | "PreparationConflict"
-                    | "CapacityUnavailable"
+        let receipt = &receipt["body"]["receipt"];
+        receipt["$type"] == "blue.catbird.chat.defs#directRequestExpiredReceipt"
+            || matches!(
+                receipt["code"].as_str(),
+                Some(
+                    "RecipientAuthorityUnsupported"
+                        | "RequestPolicyDenied"
+                        | "PreparationExpired"
+                        | "PreparationConflict"
+                        | "CapacityUnavailable"
+                )
             )
         )
     })
@@ -362,18 +365,11 @@ async fn mutate(
                 .await
                 .map_err(|_| ChatFailure::storage(endpoint))?;
 
-            if let Some(_conflict) = crate::federation::canonical_relay::check_pair_owner_fence(
-                &mut tx,
-                actor_did,
-                recipient_did,
-                request_id,
-                Some(&coord.coordinator_did),
-            )
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))? {
-                return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
-            }
-            // Repository replay must not reserve another peer package for the same attempt.
+            // Repository replay must not reserve another peer package for the
+            // same attempt. A replay only returns what the attempt already
+            // recorded, so it answers before the pair fence: a late prepare of
+            // a cancelled request gets its tombstone even while another
+            // request holds the pair (C12).
             let existing: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)"
             )
@@ -391,6 +387,18 @@ async fn mutate(
                 let bytes = output(result, endpoint)?;
                 tx.commit().await.map_err(|_| ChatFailure::storage(endpoint))?;
                 return Ok(context::json_ok(bytes));
+            }
+            if let Some(_conflict) = crate::federation::canonical_relay::check_pair_owner_fence(
+                &mut tx,
+                actor_did,
+                recipient_did,
+                request_id,
+                Some(&coord.coordinator_did),
+            )
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?
+            {
+                return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
             }
 
 
@@ -731,6 +739,17 @@ mod local_refusal_tests {
         ] {
             assert!(confirms_local_refusal(&terminal(code)), "{code}");
         }
+        let expired = DirectRequestResult::Terminal(
+            serde_json::to_vec(&serde_json::json!({
+                "body": {"receipt": {
+                    "$type": "blue.catbird.chat.defs#directRequestExpiredReceipt",
+                    "requestKind": "expiry"
+                }},
+                "signature": "AA=="
+            }))
+            .unwrap(),
+        );
+        assert!(confirms_local_refusal(&expired));
         // Keys may live on the recipient's peer, which was never asked.
         assert!(!confirms_local_refusal(&terminal(
             "RecipientKeysUnavailable"

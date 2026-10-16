@@ -90,6 +90,35 @@ async fn verify_accept_signer(
     Ok(public_key)
 }
 
+/// [`verify_accept_signer`] for the device and keyId the unverified request
+/// body names.
+async fn verify_accept_request(
+    pool: &DbPool,
+    endpoint: ChatEndpoint,
+    principal_did: &str,
+    parsed_req: &serde_json::Value,
+    signed_request: &[u8],
+) -> Result<Vec<u8>, ChatFailure> {
+    let device_id = parsed_req
+        .pointer("/body/actorDeviceId")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized))?;
+    let key_id = parsed_req
+        .pointer("/body/keyId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    verify_accept_signer(
+        pool,
+        endpoint,
+        principal_did,
+        device_id,
+        key_id,
+        signed_request,
+    )
+    .await
+}
+
 async fn handle_inner(
     pool: &DbPool,
     runtime: &ChatRuntime,
@@ -149,34 +178,45 @@ async fn handle_inner(
         let Some(creator) = creator_did.as_ref() else {
             // prior.conversationId is not authenticated yet: only a request
             // its device signed learns that nothing is pending (C03).
-            let device_id = parsed_req
-                .pointer("/body/actorDeviceId")
-                .and_then(|v| v.as_str())
-                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                .ok_or_else(|| {
-                    ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
-                })?;
-            let key_id = parsed_req
-                .pointer("/body/keyId")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-                })?;
-            verify_accept_signer(
+            verify_accept_request(
                 pool,
                 endpoint,
                 principal.did(),
-                device_id,
-                key_id,
+                &parsed_req,
                 envelope.request.get().as_bytes(),
             )
             .await?;
-            return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvitationNotPending));
+            return Err(ChatFailure::protocol(
+                endpoint,
+                ChatProtocolErrorCode::InvitationNotPending,
+            ));
         };
 
-        let coord = crate::federation::canonical_relay::resolve_pair_coordinator(pool, creator, principal.did())
-            .await
-            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::RelationshipPolicyUnavailable))?;
+        let coord = match crate::federation::canonical_relay::resolve_pair_coordinator(
+            pool,
+            creator,
+            principal.did(),
+        )
+        .await
+        {
+            Ok(coord) => coord,
+            Err(_) => {
+                // Likewise, only a signed request learns that the conversation
+                // exists but its pair cannot be resolved now.
+                verify_accept_request(
+                    pool,
+                    endpoint,
+                    principal.did(),
+                    &parsed_req,
+                    envelope.request.get().as_bytes(),
+                )
+                .await?;
+                return Err(ChatFailure::protocol(
+                    endpoint,
+                    ChatProtocolErrorCode::RelationshipPolicyUnavailable,
+                ));
+            }
+        };
         if !coord.is_coordinator {
             let device_id = parsed_req
                 .pointer("/body/actorDeviceId")

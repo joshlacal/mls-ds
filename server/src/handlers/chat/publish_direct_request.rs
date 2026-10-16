@@ -216,16 +216,35 @@ async fn inner(
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
 
-    if let Some(_conflict) = crate::federation::canonical_relay::check_pair_owner_fence(
-        &mut tx,
-        actor_did,
-        recipient_did,
-        request_id,
-        Some(&coord.coordinator_did),
+    // A request that already ended without a publication only replays that
+    // receipt, so the pair fence does not apply: a late publish of a cancelled
+    // request gets its tombstone even while another request holds the pair
+    // (C12). A published request still passes the fence, because its replay
+    // can queue delivery again.
+    let ended_unpublished: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts \
+         WHERE request_id=$1 AND actor_did=$2 AND recipient_did=$3 \
+           AND status IN ('cancelled','expired','rejected'))",
     )
+    .bind(request_id)
+    .bind(actor_did)
+    .bind(recipient_did)
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|_| ChatFailure::storage(endpoint))? {
-        return Err(failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::IdentityConflict)));
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+    if !ended_unpublished {
+        if let Some(_conflict) = crate::federation::canonical_relay::check_pair_owner_fence(
+            &mut tx,
+            actor_did,
+            recipient_did,
+            request_id,
+            Some(&coord.coordinator_did),
+        )
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?
+        {
+            return Err(failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::IdentityConflict)));
+        }
     }
 
     // C33-AUTH-002: Revalidate actor and every selected recipient key against fresh PDS snapshot at commit boundary
