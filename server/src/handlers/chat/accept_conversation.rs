@@ -47,8 +47,8 @@ struct TransportInboxRow {
 }
 
 /// Verify an accept request with the principal's active key at the device and
-/// keyId it names, before any answer depends on conversation state, and
-/// return that key.
+/// keyId it names, and return that key. A request no active key verifies is
+/// InvalidSignature, the code the repository's own admission gives.
 async fn verify_accept_signer(
     pool: &DbPool,
     endpoint: ChatEndpoint,
@@ -71,7 +71,7 @@ async fn verify_accept_signer(
     .await
     .map_err(|_| ChatFailure::storage(endpoint))?;
     let (public_key, generation) = device_key
-        .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized))?;
+        .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidSignature))?;
     let verified = crate::chat_protocol::direct_request_transcript::verify_signed_request(
         crate::chat_protocol::direct_request_transcript::DirectRequestKind::Accept,
         signed_request,
@@ -103,7 +103,7 @@ async fn verify_accept_request(
         .pointer("/body/actorDeviceId")
         .and_then(|v| v.as_str())
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized))?;
+        .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidSignature))?;
     let key_id = parsed_req
         .pointer("/body/keyId")
         .and_then(|v| v.as_str())
@@ -153,6 +153,17 @@ async fn handle_inner(
         let convo_id_str = parsed_req["body"]["prior"]["conversationId"].as_str().unwrap_or_default();
         let conversation_id = uuid::Uuid::parse_str(convo_id_str)
             .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+        // Every answer below depends on conversation state, so only a request
+        // its device signed gets one, whichever branch the conversation takes
+        // (C03).
+        let signer_key = verify_accept_request(
+            pool,
+            endpoint,
+            principal.did(),
+            &parsed_req,
+            envelope.request.get().as_bytes(),
+        )
+        .await?;
 
         let creator_did: Option<String> = sqlx::query_scalar(
             "SELECT created_by_did FROM chat.participants WHERE conversation_id=$1 AND current_membership"
@@ -176,16 +187,6 @@ async fn handle_inner(
         };
 
         let Some(creator) = creator_did.as_ref() else {
-            // prior.conversationId is not authenticated yet: only a request
-            // its device signed learns that nothing is pending (C03).
-            verify_accept_request(
-                pool,
-                endpoint,
-                principal.did(),
-                &parsed_req,
-                envelope.request.get().as_bytes(),
-            )
-            .await?;
             return Err(ChatFailure::protocol(
                 endpoint,
                 ChatProtocolErrorCode::InvitationNotPending,
@@ -201,16 +202,6 @@ async fn handle_inner(
         {
             Ok(coord) => coord,
             Err(_) => {
-                // Likewise, only a signed request learns that the conversation
-                // exists but its pair cannot be resolved now.
-                verify_accept_request(
-                    pool,
-                    endpoint,
-                    principal.did(),
-                    &parsed_req,
-                    envelope.request.get().as_bytes(),
-                )
-                .await?;
                 return Err(ChatFailure::protocol(
                     endpoint,
                     ChatProtocolErrorCode::RelationshipPolicyUnavailable,
@@ -224,12 +215,6 @@ async fn handle_inner(
                 .and_then(|s| uuid::Uuid::parse_str(s).ok())
                 .ok_or_else(|| {
                     ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
-                })?;
-            let key_id = parsed_req
-                .pointer("/body/keyId")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
                 })?;
             let request_id_str = parsed_req
                 .pointer("/body/requestId")
@@ -248,15 +233,7 @@ async fn handle_inner(
             let transition_id = uuid::Uuid::parse_str(transition_id_str)
                 .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
 
-            let public_key = verify_accept_signer(
-                pool,
-                endpoint,
-                principal.did(),
-                device_id,
-                key_id,
-                envelope.request.get().as_bytes(),
-            )
-            .await?;
+            let public_key = signer_key;
 
             if is_inbox {
                 let inbox_rows: Vec<TransportInboxRow> = sqlx::query_as(

@@ -219,12 +219,13 @@ async fn inner(
     // A request that already ended without a publication only replays that
     // receipt, so the pair fence does not apply: a late publish of a cancelled
     // request gets its tombstone even while another request holds the pair
-    // (C12). A published request still passes the fence, because its replay
-    // can queue delivery again.
+    // (C12), and an existing-direct one its stored receipt (C14). A published
+    // request still passes the fence, because its replay can queue delivery
+    // again.
     let ended_unpublished: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts \
          WHERE request_id=$1 AND actor_did=$2 AND recipient_did=$3 \
-           AND status IN ('cancelled','expired','rejected'))",
+           AND status IN ('cancelled','expired','rejected','existing-direct'))",
     )
     .bind(request_id)
     .bind(actor_did)

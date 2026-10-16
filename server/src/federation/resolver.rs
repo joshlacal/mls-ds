@@ -1686,11 +1686,13 @@ impl DsResolver {
             )
             .await
             .ok();
+            // Only a typed answer says the record is absent: an untyped 404
+            // (an error page, a proxy, a body cut off mid-read) may be an
+            // outage, and absence can end in a signed refusal (C33).
             let is_not_found = err_val
                 .as_ref()
                 .and_then(|v| v.get("error").and_then(|e| e.as_str()))
-                .map(|e| e == "RecordNotFound" || e == "CouldNotLocateRecord")
-                .unwrap_or(status == reqwest::StatusCode::NOT_FOUND);
+                .is_some_and(|e| e == "RecordNotFound" || e == "CouldNotLocateRecord");
             if is_not_found {
                 debug!(
                     did = %crate::crypto::redact_for_log(&canonical_user),
