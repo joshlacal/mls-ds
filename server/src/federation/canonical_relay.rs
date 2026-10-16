@@ -2508,27 +2508,10 @@ pub async fn coordinator_prepare_direct_request(
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    if let Some(conflict) = check_pair_owner_fence(
-        &mut tx,
-        actor_did,
-        recipient_did,
-        request_id,
-        Some(&coord.coordinator_did),
-    )
-    .await? {
-        let msg = match conflict {
-            PairFenceConflict::ForeignCoordinator { coordinator_did, .. } => {
-                format!("Direct request or pair already owned by coordinator {coordinator_did}")
-            }
-            PairFenceConflict::LocalConflict { .. } => {
-                "Direct request already in progress for this pair".to_string()
-            }
-        };
-        return Err(FederationError::RemoteError {
-            status: 409,
-            body: format!("{{\"error\":\"PreparationConflict\",\"message\":\"{msg}\"}}"),
-        });
-    }
+    // An existing attempt replays before the pair fence, as on a local
+    // prepare: the replay can only return its stored outcome, its live
+    // preparation or its own expiry, so another request holding the pair
+    // does not change its answer (C12).
     let existing_attempt: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)"
     )
@@ -2575,6 +2558,31 @@ pub async fn coordinator_prepare_direct_request(
         }
         tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
         return Ok(json!({"outcome": outcome}));
+    }
+
+    if let Some(conflict) = check_pair_owner_fence(
+        &mut tx,
+        actor_did,
+        recipient_did,
+        request_id,
+        Some(&coord.coordinator_did),
+    )
+    .await?
+    {
+        let msg = match conflict {
+            PairFenceConflict::ForeignCoordinator {
+                coordinator_did, ..
+            } => {
+                format!("Direct request or pair already owned by coordinator {coordinator_did}")
+            }
+            PairFenceConflict::LocalConflict { .. } => {
+                "Direct request already in progress for this pair".to_string()
+            }
+        };
+        return Err(FederationError::RemoteError {
+            status: 409,
+            body: format!("{{\"error\":\"PreparationConflict\",\"message\":\"{msg}\"}}"),
+        });
     }
 
     if !coord.is_sender_home {
@@ -2906,76 +2914,102 @@ pub async fn coordinator_publish_direct_request(
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    if let Some(conflict) = check_pair_owner_fence(
-        &mut tx,
-        actor_did,
-        recipient_did,
-        request_id,
-        Some(&coord.coordinator_did),
-    )
-    .await? {
-        let msg = match conflict {
-            PairFenceConflict::ForeignCoordinator { coordinator_did, .. } => {
-                format!("Direct request or pair already owned by coordinator {coordinator_did}")
-            }
-            PairFenceConflict::LocalConflict { .. } => {
-                "Direct request or pair already in progress for this pair".to_string()
-            }
-        };
-        return Err(FederationError::RemoteError {
-            status: 409,
-            body: format!("{{\"error\":\"PreparationConflict\",\"message\":\"{msg}\"}}"),
-        });
-    }
-
-
-    // C33-AUTH-002: Revalidate actor and every selected recipient key against fresh PDS snapshot at commit boundary
-    let http = super::resolver::build_resolver_http_client();
-    let resolver = DsResolver::with_default_endpoint(
-        pool.clone(),
-        http,
-        crate::identity::service_did(),
-        crate::identity::self_endpoint(),
-        std::env::var("DEFAULT_DS_ENDPOINT").ok(),
-        3600,
-    );
-    let actor_authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await?;
-    let actor_key_id = signed_req.pointer("/body/keyId").and_then(|v| v.as_str()).unwrap_or_default();
-    let actor_key_authorized = actor_authorized_keys.iter().any(|k| {
-        URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == actor_key_id
-            || STANDARD.encode(k) == actor_key_id
-            || crate::chat_protocol::validation::ed25519_key_id(k).map(|id| id.as_str() == actor_key_id).unwrap_or(false)
-    });
-    if !actor_key_authorized {
-        return Err(FederationError::Forbidden(format!(
-            "actor {actor_did} key {actor_key_id} is not authorized by PDS at publication commit"
-        )));
-    }
-
-    let recipient_authorized_keys = resolver.resolve_authorized_device_keys(recipient_did).await?;
-    if recipient_authorized_keys.is_empty() {
-        return Err(FederationError::Forbidden(format!(
-            "recipient {recipient_did} authorizes no MLS device keys on PDS at publication commit"
-        )));
-    }
-
-    let selected_recipient_keys: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT k.signing_public_key \
-         FROM chat.direct_request_selected_devices s \
-         JOIN chat.device_keys k ON k.user_did = s.owner_did AND k.device_id = s.owner_device_id AND k.key_id = s.owner_key_id \
-         WHERE s.request_id = $1 AND s.owner_did = $2"
+    // As on a local publish: a request that ended without a publication only
+    // replays its stored receipt, so neither the pair fence nor the PDS
+    // revalidation below applies to it (C12, C14).
+    let ended_unpublished: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts \
+         WHERE request_id=$1 AND actor_did=$2 AND recipient_did=$3 \
+           AND status IN ('cancelled','expired','rejected','existing-direct'))",
     )
     .bind(request_id)
+    .bind(actor_did)
     .bind(recipient_did)
-    .fetch_all(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    for pk in &selected_recipient_keys {
-        if !recipient_authorized_keys.iter().any(|k| k == pk) {
+    if !ended_unpublished {
+        if let Some(conflict) = check_pair_owner_fence(
+            &mut tx,
+            actor_did,
+            recipient_did,
+            request_id,
+            Some(&coord.coordinator_did),
+        )
+        .await?
+        {
+            let msg = match conflict {
+                PairFenceConflict::ForeignCoordinator {
+                    coordinator_did, ..
+                } => {
+                    format!("Direct request or pair already owned by coordinator {coordinator_did}")
+                }
+                PairFenceConflict::LocalConflict { .. } => {
+                    "Direct request or pair already in progress for this pair".to_string()
+                }
+            };
+            return Err(FederationError::RemoteError {
+                status: 409,
+                body: format!("{{\"error\":\"PreparationConflict\",\"message\":\"{msg}\"}}"),
+            });
+        }
+
+        // C33-AUTH-002: Revalidate actor and every selected recipient key against fresh PDS snapshot at commit boundary
+        let http = super::resolver::build_resolver_http_client();
+        let resolver = DsResolver::with_default_endpoint(
+            pool.clone(),
+            http,
+            crate::identity::service_did(),
+            crate::identity::self_endpoint(),
+            std::env::var("DEFAULT_DS_ENDPOINT").ok(),
+            3600,
+        );
+        let actor_authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await?;
+        let actor_key_id = signed_req
+            .pointer("/body/keyId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let actor_key_authorized = actor_authorized_keys.iter().any(|k| {
+            URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == actor_key_id
+                || STANDARD.encode(k) == actor_key_id
+                || crate::chat_protocol::validation::ed25519_key_id(k)
+                    .map(|id| id.as_str() == actor_key_id)
+                    .unwrap_or(false)
+        });
+        if !actor_key_authorized {
             return Err(FederationError::Forbidden(format!(
-                "selected recipient key for {recipient_did} is no longer authorized by PDS at publication commit"
+                "actor {actor_did} key {actor_key_id} is not authorized by PDS at publication commit"
             )));
+        }
+
+        let recipient_authorized_keys = resolver
+            .resolve_authorized_device_keys(recipient_did)
+            .await?;
+        if recipient_authorized_keys.is_empty() {
+            return Err(FederationError::Forbidden(format!(
+                "recipient {recipient_did} authorizes no MLS device keys on PDS at publication commit"
+            )));
+        }
+
+        let selected_recipient_keys: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT k.signing_public_key \
+             FROM chat.direct_request_selected_devices s \
+             JOIN chat.device_keys k ON k.user_did = s.owner_did AND k.device_id = s.owner_device_id AND k.key_id = s.owner_key_id \
+             WHERE s.request_id = $1 AND s.owner_did = $2"
+        )
+        .bind(request_id)
+        .bind(recipient_did)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
+
+        for pk in &selected_recipient_keys {
+            if !recipient_authorized_keys.iter().any(|k| k == pk) {
+                return Err(FederationError::Forbidden(format!(
+                    "selected recipient key for {recipient_did} is no longer authorized by PDS at publication commit"
+                )));
+            }
         }
     }
 
@@ -3062,7 +3096,9 @@ pub async fn coordinator_publish_direct_request(
     };
 
     let queue_id = format!("direct-request-delivery-{}", deliver_input.request_id);
-    if !coord.is_recipient_home {
+    // A replay of a request that ended unpublished has nothing to deliver.
+    let deliver = !coord.is_recipient_home && !ended_unpublished;
+    if deliver {
         let payload_bytes = serde_json::to_vec(&deliver_input).map_err(FederationError::Json)?;
         crate::federation::queue::enqueue_c33_in_tx(
             pool,
@@ -3080,7 +3116,7 @@ pub async fn coordinator_publish_direct_request(
 
     tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    if !coord.is_recipient_home {
+    if deliver {
         if let Ok(()) = deliver_direct_request_to_peer(
             &coord.recipient_home.endpoint,
             &coord.recipient_home.did,

@@ -551,6 +551,23 @@ impl FederatedParty {
     }
 }
 
+/// Verify a signed receipt outcome against an authority's receipt key and
+/// return its refusal code.
+fn receipt_code(response: &Value, key: &[u8]) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(
+        response["outcome"]["$type"] == "blue.catbird.chat.defs#signedDirectRequestReceipt",
+        "expected a signed receipt, got {response}"
+    );
+    let mut signed = response["outcome"].clone();
+    signed.as_object_mut().context("receipt object")?.remove("$type");
+    let verified = protocol::verify_received_signed_request(
+        DirectRequestKind::Outcome,
+        &serde_json::to_vec(&signed)?,
+        key,
+    )?;
+    Ok(verified.body()["receipt"]["code"].as_str().map(str::to_owned))
+}
+
 fn signed_ordinary(engine: &MlsEngine, identity: &str, body: Value) -> anyhow::Result<Value> {
     use catbird_mls::chat_v2::transcript::{
         decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
@@ -2051,6 +2068,54 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
 
     let client = reqwest::Client::new();
 
+    // C12/C14 on a federated pair. Bob's request R0 is relayed from his home to
+    // the coordinator before Alice has published request keys, so it ends in a
+    // signed RecipientKeysUnavailable rejection that the coordinator keeps.
+    // Phase 2 replays it while Alice's preparation holds the pair.
+    let r0_req_id = Uuid::new_v4();
+    let r0_convo_id = Uuid::new_v4();
+    let r0_first_msg_id = Uuid::new_v4();
+    let r0_prepare_signed = signed_mls_request(
+        &bob.engine,
+        &bob.identity,
+        DirectRequestKind::Prepare,
+        json!({
+            "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\0",
+            "protocolVersion": "2",
+            "actorDid": bob.svc.did,
+            "actorDeviceId": bob.svc.device_id.to_string(),
+            "keyId": bob.key_id,
+            "authGeneration": 1,
+            "requestId": r0_req_id.to_string(),
+            "firstMessageId": r0_first_msg_id.to_string(),
+            "conversationId": r0_convo_id.to_string(),
+            "recipientDid": alice.svc.did,
+            "origin": { "$type": "blue.catbird.chat.defs#freshDirectOrigin" },
+            "profile": "encryptedIntroduction1",
+            "idempotencyKey": r0_req_id.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (r0_status, r0_bytes) = bob.svc.post(
+        &client,
+        &server_b.base_url,
+        "blue.catbird.chat.prepareDirectRequest",
+        &json!({ "signedRequest": r0_prepare_signed }),
+        true,
+    ).await?;
+    anyhow::ensure!(r0_status == StatusCode::OK, "R0 prepare: {r0_status}: {}", String::from_utf8_lossy(&r0_bytes));
+    let r0_outcome: Value = serde_json::from_slice(&r0_bytes)?;
+    anyhow::ensure!(
+        receipt_code(&r0_outcome, &server_a.receipt_public_key)?.as_deref() == Some("RecipientKeysUnavailable"),
+        "R0 must end in the coordinator's signed RecipientKeysUnavailable rejection: {r0_outcome}"
+    );
+    assert_eq!(
+        psql_value(&server_a.database_url, &format!("SELECT status FROM chat.direct_request_attempts WHERE request_id='{r0_req_id}'"))?,
+        "rejected",
+        "the coordinator keeps R0's rejection"
+    );
+
     // Publish direct request keys on home servers:
     // Alice on Server A:
     let (a_key_status, a_key_bytes) = alice.svc.post(
@@ -2382,6 +2447,70 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         publish_body,
     )?;
     winner_party.engine.persist_request_publication(&journal.request_id, &serde_json::to_vec(&publish_signed)?)?;
+
+    // Alice's preparation still holds the pair. A late prepare of R0, and a
+    // late publish under R0's identity, replay the coordinator's stored
+    // rejection instead of meeting the pair fence, and queue nothing.
+    anyhow::ensure!(winner_is_alice, "R0 replays need Alice's preparation to hold the pair");
+    let (late_status, late_bytes) = bob.svc.post(
+        &client,
+        &server_b.base_url,
+        "blue.catbird.chat.prepareDirectRequest",
+        &json!({ "signedRequest": r0_prepare_signed }),
+        true,
+    ).await?;
+    anyhow::ensure!(late_status == StatusCode::OK, "late R0 prepare: {late_status}: {}", String::from_utf8_lossy(&late_bytes));
+    let late_prepare: Value = serde_json::from_slice(&late_bytes)?;
+    assert_eq!(late_prepare["outcome"], r0_outcome["outcome"], "late R0 prepare replays the stored rejection");
+
+    let r0_prepare_digest = *protocol::verify_signed_request(
+        DirectRequestKind::Prepare,
+        &serde_json::to_vec(&r0_prepare_signed)?,
+        &bob.public,
+    )?
+    .request_digest();
+    let mut r0_publish_body = publish_signed["body"].clone();
+    r0_publish_body["actorDid"] = json!(bob.svc.did);
+    r0_publish_body["actorDeviceId"] = json!(bob.svc.device_id.to_string());
+    r0_publish_body["keyId"] = json!(bob.key_id);
+    r0_publish_body["recipientDid"] = json!(alice.svc.did);
+    r0_publish_body["requestId"] = json!(r0_req_id.to_string());
+    r0_publish_body["conversationId"] = json!(r0_convo_id.to_string());
+    r0_publish_body["firstMessageId"] = json!(r0_first_msg_id.to_string());
+    r0_publish_body["idempotencyKey"] = json!(r0_req_id.to_string());
+    r0_publish_body["preparationRequestDigest"] = json!(STANDARD.encode(r0_prepare_digest));
+    r0_publish_body["signedAt"] = json!(canonical_now());
+    let r0_publish_signed = signed_mls_request(&bob.engine, &bob.identity, DirectRequestKind::Publish, r0_publish_body)?;
+    let (late_pub_status, late_pub_bytes) = bob.svc.post(
+        &client,
+        &server_b.base_url,
+        "blue.catbird.chat.publishDirectRequest",
+        &json!({ "signedRequest": r0_publish_signed }),
+        true,
+    ).await?;
+    anyhow::ensure!(late_pub_status == StatusCode::OK, "late R0 publish: {late_pub_status}: {}", String::from_utf8_lossy(&late_pub_bytes));
+    let late_publish: Value = serde_json::from_slice(&late_pub_bytes)?;
+    assert_eq!(late_publish["outcome"], r0_outcome["outcome"], "late R0 publish replays the stored rejection");
+    assert_eq!(
+        psql_value(
+            &server_a.database_url,
+            &format!(
+                "SELECT (SELECT string_agg(status, ',') FROM chat.direct_request_attempts WHERE request_id='{r0_req_id}')||'|'||\
+                        (SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{r0_req_id}')||'|'||\
+                        (SELECT count(*) FROM outbound_queue WHERE id='direct-request-delivery-{r0_req_id}')"
+            )
+        )?,
+        "rejected|0|0",
+        "R0 replays change nothing on the coordinator"
+    );
+    assert_eq!(
+        psql_count(
+            &server_a.database_url,
+            &format!("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{winner_req_id}' AND status='prepared'")
+        )?,
+        1,
+        "Alice's preparation still holds the pair"
+    );
 
     // Simulate lost peer: recipient server is killed before publication commits
     server_b._child.0.kill()?;

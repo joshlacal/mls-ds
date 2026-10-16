@@ -248,48 +248,63 @@ async fn inner(
         }
     }
 
-    // C33-AUTH-002: Revalidate actor and every selected recipient key against fresh PDS snapshot at commit boundary
-    let http = crate::federation::resolver::build_resolver_http_client();
-    let resolver = crate::federation::resolver::DsResolver::with_default_endpoint(
-        pool.clone(),
-        http,
-        crate::identity::service_did(),
-        crate::identity::self_endpoint(),
-        std::env::var("DEFAULT_DS_ENDPOINT").ok(),
-        3600,
-    );
-    let actor_authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await.map_err(|_| failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::PolicyDenied)))?;
-    let actor_key_id = parsed_req.pointer("/body/keyId").and_then(|v| v.as_str()).unwrap_or_default();
-    let actor_key_authorized = actor_authorized_keys.iter().any(|k| {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(k)) == actor_key_id
-            || base64::engine::general_purpose::STANDARD.encode(k) == actor_key_id
-            || crate::chat_protocol::validation::ed25519_key_id(k).map(|id| id.as_str() == actor_key_id).unwrap_or(false)
-    });
-    if !actor_key_authorized {
-        return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
-    }
-
-    if coord.is_coordinator && !coord.is_recipient_home {
-        let recipient_authorized_keys = resolver.resolve_authorized_device_keys(recipient_did).await.map_err(|_| failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::RecipientKeysUnavailable)))?;
-        if recipient_authorized_keys.is_empty() {
-            return Err(failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::RecipientKeysUnavailable)));
+    // C33-AUTH-002 guards new publication effects, so it reads the PDS only
+    // when this publish can still publish. A request that ended unpublished
+    // gets its stored receipt from prepare_publication, after the signature
+    // check above, whatever the PDS says now.
+    if !ended_unpublished {
+        // C33-AUTH-002: Revalidate actor and every selected recipient key against fresh PDS snapshot at commit boundary
+        let http = crate::federation::resolver::build_resolver_http_client();
+        let resolver = crate::federation::resolver::DsResolver::with_default_endpoint(
+            pool.clone(),
+            http,
+            crate::identity::service_did(),
+            crate::identity::self_endpoint(),
+            std::env::var("DEFAULT_DS_ENDPOINT").ok(),
+            3600,
+        );
+        let actor_authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await.map_err(|_| failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::PolicyDenied)))?;
+        let actor_key_id = parsed_req
+            .pointer("/body/keyId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let actor_key_authorized = actor_authorized_keys.iter().any(|k| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(k))
+                == actor_key_id
+                || base64::engine::general_purpose::STANDARD.encode(k) == actor_key_id
+                || crate::chat_protocol::validation::ed25519_key_id(k)
+                    .map(|id| id.as_str() == actor_key_id)
+                    .unwrap_or(false)
+        });
+        if !actor_key_authorized {
+            return Err(ChatFailure::protocol(
+                endpoint,
+                ChatProtocolErrorCode::NotAuthorized,
+            ));
         }
 
-        let selected_recipient_keys: Vec<Vec<u8>> = sqlx::query_scalar(
-            "SELECT k.signing_public_key \
-             FROM chat.direct_request_selected_devices s \
-             JOIN chat.device_keys k ON k.user_did = s.owner_did AND k.device_id = s.owner_device_id AND k.key_id = s.owner_key_id \
-             WHERE s.request_id = $1 AND s.owner_did = $2"
-        )
-        .bind(request_id)
-        .bind(recipient_did)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|_| ChatFailure::storage(endpoint))?;
-
-        for pk in &selected_recipient_keys {
-            if !recipient_authorized_keys.iter().any(|k| k == pk) {
+        if coord.is_coordinator && !coord.is_recipient_home {
+            let recipient_authorized_keys = resolver.resolve_authorized_device_keys(recipient_did).await.map_err(|_| failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::RecipientKeysUnavailable)))?;
+            if recipient_authorized_keys.is_empty() {
                 return Err(failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::RecipientKeysUnavailable)));
+            }
+
+            let selected_recipient_keys: Vec<Vec<u8>> = sqlx::query_scalar(
+                "SELECT k.signing_public_key \
+                 FROM chat.direct_request_selected_devices s \
+                 JOIN chat.device_keys k ON k.user_did = s.owner_did AND k.device_id = s.owner_device_id AND k.key_id = s.owner_key_id \
+                 WHERE s.request_id = $1 AND s.owner_did = $2"
+            )
+            .bind(request_id)
+            .bind(recipient_did)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
+
+            for pk in &selected_recipient_keys {
+                if !recipient_authorized_keys.iter().any(|k| k == pk) {
+                    return Err(failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::RecipientKeysUnavailable)));
+                }
             }
         }
     }

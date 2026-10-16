@@ -84,6 +84,17 @@ async fn c12_unknown_to_cancelled_tombstone_blocks_late_prepare_and_publish() ->
     assert_eq!(status, OK, "{late_published}");
     assert_eq!(late_published["outcome"], cancelled["outcome"], "late publish returns the tombstone");
 
+    // The replay reads no PDS: with Alice's device key withdrawn from her PDS
+    // it still returns the tombstone, because the publish-time key check
+    // guards only a publish that can still publish.
+    let alice_device_keys = s._https.root.join("_policy/deviceKeys").join(s.alice.did.replace(':', "%3A"));
+    std::fs::write(&alice_device_keys, br#"{"records":[]}"#)?;
+    let keyless = post(&s, PUBLISH_NSID, &late_publish).await;
+    s._https.publish_device_key(&s.alice.did, &s.alice_public)?;
+    let (status, keyless) = keyless?;
+    assert_eq!(status, OK, "{keyless}");
+    assert_eq!(keyless["outcome"], cancelled["outcome"], "a late publish without a PDS key returns the tombstone");
+
     assert_eq!(stored_terminal(b)?, tombstone, "tombstone unchanged by late prepare/publish");
     assert_eq!(
         db_query(&format!(
