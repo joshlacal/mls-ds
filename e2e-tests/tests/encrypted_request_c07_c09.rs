@@ -95,6 +95,11 @@ async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> any
             (charlie.did.clone(), charlie.did_document()),
         ],
     )?;
+    // Prepare resolves every party's chat authority, which fails closed
+    // without a declaration.
+    for identity in [&alice, &bob, &charlie] {
+        https.declare_local_chat_account(&identity.did)?;
+    }
 
     let alice_engine = MlsEngine::new("c07-alice")?;
     let bob_engine = MlsEngine::new("c07-bob")?;

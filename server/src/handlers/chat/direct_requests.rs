@@ -34,7 +34,8 @@ fn failure(endpoint: ChatEndpoint, error: DirectRequestStoreError) -> ChatFailur
         DirectRequestStoreError::RecipientKeysUnavailable => {
             ChatProtocolErrorCode::RecipientKeysUnavailable
         }
-        DirectRequestStoreError::RecipientAuthorityUnsupported => {
+        DirectRequestStoreError::RecipientAuthorityUnsupported
+        | DirectRequestStoreError::CoordinatorMoved => {
             ChatProtocolErrorCode::RecipientAuthorityUnsupported
         }
         DirectRequestStoreError::IncludedAuthorityChanged => {
@@ -43,6 +44,40 @@ fn failure(endpoint: ChatEndpoint, error: DirectRequestStoreError) -> ChatFailur
         DirectRequestStoreError::PolicyDenied => ChatProtocolErrorCode::RequestPolicyDenied,
     };
     ChatFailure::protocol(endpoint, code)
+}
+fn pair_failure(endpoint: ChatEndpoint, error: crate::federation::FederationError) -> ChatFailure {
+    use crate::federation::FederationError;
+    match error {
+        FederationError::Unsupported(_)
+        | FederationError::AuthFailed { .. }
+        | FederationError::EndpointNotFound { .. } => failure(
+            endpoint,
+            DirectRequestStoreError::RecipientAuthorityUnsupported,
+        ),
+        _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
+    }
+}
+/// Whether a prepare answered by this DS alone ended in a refusal that holds
+/// wherever the recipient is homed: its authority is not admitted, policy
+/// refused, or the sender's own request is stale, conflicting or over quota.
+fn confirms_local_refusal(result: &DirectRequestResult) -> bool {
+    let DirectRequestResult::Terminal(bytes) = result else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|receipt| {
+        let receipt = &receipt["body"]["receipt"];
+        receipt["$type"] == "blue.catbird.chat.defs#directRequestExpiredReceipt"
+            || matches!(
+                receipt["code"].as_str(),
+                Some(
+                    "RecipientAuthorityUnsupported"
+                        | "RequestPolicyDenied"
+                        | "PreparationExpired"
+                        | "PreparationConflict"
+                        | "CapacityUnavailable"
+                )
+            )
+    })
 }
 fn output(result: DirectRequestResult, endpoint: ChatEndpoint) -> Result<Vec<u8>, ChatFailure> {
     let mut payload = match result {
@@ -197,16 +232,25 @@ async fn mutate(
         .map_err(|_| failure(endpoint, DirectRequestStoreError::InvalidSignature))?;
 
 
-        let coord = crate::federation::canonical_relay::resolve_pair_coordinator(pool, actor_did, recipient_did)
+        // A recipient with no chat authority this DS can join still gets a
+        // signed terminal refusal when the sender is homed here: the repository
+        // claims the attempt and signs it, and never prepares one (C33).
+        let (coord, refusal) =
+            match crate::federation::canonical_relay::resolve_pair_coordinator_by_side(
+                pool,
+                actor_did,
+                recipient_did,
+            )
             .await
-            .map_err(|e| match e {
-                crate::federation::FederationError::Unsupported(_)
-                | crate::federation::FederationError::AuthFailed { .. }
-                | crate::federation::FederationError::EndpointNotFound { .. } => {
-                    failure(endpoint, DirectRequestStoreError::RecipientAuthorityUnsupported)
+            {
+                Ok(coord) => (coord, None),
+                Err(error) => {
+                    match error.local_refusal_coordinator(&crate::identity::service_did()) {
+                        Some(coord) => (coord, Some(error)),
+                        None => return Err(pair_failure(endpoint, error.into_federation_error())),
+                    }
                 }
-                _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
-            })?;
+            };
         if !coord.is_sender_home {
             return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
         }
@@ -321,18 +365,11 @@ async fn mutate(
                 .await
                 .map_err(|_| ChatFailure::storage(endpoint))?;
 
-            if let Some(_conflict) = crate::federation::canonical_relay::check_pair_owner_fence(
-                &mut tx,
-                actor_did,
-                recipient_did,
-                request_id,
-                Some(&coord.coordinator_did),
-            )
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))? {
-                return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
-            }
-            // Repository replay must not reserve another peer package for the same attempt.
+            // Repository replay must not reserve another peer package for the
+            // same attempt. A replay only returns what the attempt already
+            // recorded, so it answers before the pair fence: a late prepare of
+            // a cancelled request gets its tombstone even while another
+            // request holds the pair (C12).
             let existing: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)"
             )
@@ -343,13 +380,25 @@ async fn mutate(
             if existing {
                 let result = requests::prepare_direct_request(
                     &mut tx, &principal, envelope.signed_request.get().as_bytes(), signer,
-                    runtime.relationship_authority().as_ref(), now,
+                    runtime.relationship_authority().as_ref(), &coord.sender_home.did, now,
                 )
                 .await
                 .map_err(|e| failure(endpoint, e))?;
                 let bytes = output(result, endpoint)?;
                 tx.commit().await.map_err(|_| ChatFailure::storage(endpoint))?;
                 return Ok(context::json_ok(bytes));
+            }
+            if let Some(_conflict) = crate::federation::canonical_relay::check_pair_owner_fence(
+                &mut tx,
+                actor_did,
+                recipient_did,
+                request_id,
+                Some(&coord.coordinator_did),
+            )
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?
+            {
+                return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
             }
 
 
@@ -388,6 +437,7 @@ async fn mutate(
                 envelope.signed_request.get().as_bytes(),
                 signer,
                 runtime.relationship_authority().as_ref(),
+                &coord.sender_home.did,
                 now,
             )
             .await;
@@ -405,6 +455,38 @@ async fn mutate(
                     return Err(failure(endpoint, error));
                 }
             };
+            if let Some(refused) = refusal {
+                // Nothing was staged for a remote recipient, so only a refusal
+                // the repository reached itself may be signed. Anything else
+                // (a preparation, or keys missing because the recipient's
+                // authority changed meanwhile) is rolled back with the
+                // transaction and answered unsigned.
+                if !confirms_local_refusal(&result) {
+                    return Err(pair_failure(endpoint, refused.into_federation_error()));
+                }
+                // The repository read the recipient's declaration again, so
+                // its refusal can rest on an authority other than the one
+                // that made this DS the signer. Before committing, read it
+                // once more: the refusal stays signed only while no declared
+                // authority sorts below this DS, the authority the client
+                // checks the receipt against.
+                match crate::federation::canonical_relay::resolve_pair_coordinator_by_side(
+                    pool,
+                    actor_did,
+                    recipient_did,
+                )
+                .await
+                {
+                    Err(error)
+                        if error
+                            .local_refusal_coordinator(&crate::identity::service_did())
+                            .is_some() => {}
+                    Err(error) => {
+                        return Err(pair_failure(endpoint, error.into_federation_error()))
+                    }
+                    Ok(_) => return Err(pair_failure(endpoint, refused.into_federation_error())),
+                }
+            }
 
             // C33-LEASE-004: Release remote leases for non-Prepared outcomes (e.g. Terminal receipts)
             if !coord.is_recipient_home
@@ -649,5 +731,54 @@ pub(super) async fn outcome(
     match run(&pool, &runtime, &headers, query.as_deref()).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod local_refusal_tests {
+    use super::*;
+
+    fn terminal(code: &str) -> DirectRequestResult {
+        DirectRequestResult::Terminal(
+            serde_json::to_vec(&serde_json::json!({
+                "body": {"receipt": {
+                    "$type": "blue.catbird.chat.defs#directRequestRejectedReceipt",
+                    "code": code
+                }},
+                "signature": "AA=="
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn only_refusals_that_hold_anywhere_are_kept() {
+        for code in [
+            "RecipientAuthorityUnsupported",
+            "RequestPolicyDenied",
+            "PreparationExpired",
+            "PreparationConflict",
+            "CapacityUnavailable",
+        ] {
+            assert!(confirms_local_refusal(&terminal(code)), "{code}");
+        }
+        let expired = DirectRequestResult::Terminal(
+            serde_json::to_vec(&serde_json::json!({
+                "body": {"receipt": {
+                    "$type": "blue.catbird.chat.defs#directRequestExpiredReceipt",
+                    "requestKind": "expiry"
+                }},
+                "signature": "AA=="
+            }))
+            .unwrap(),
+        );
+        assert!(confirms_local_refusal(&expired));
+        // Keys may live on the recipient's peer, which was never asked.
+        assert!(!confirms_local_refusal(&terminal(
+            "RecipientKeysUnavailable"
+        )));
+        assert!(!confirms_local_refusal(&DirectRequestResult::Prepared(
+            b"{}".to_vec()
+        )));
     }
 }

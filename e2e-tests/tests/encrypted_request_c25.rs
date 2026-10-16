@@ -242,6 +242,12 @@ async fn world() -> anyhow::Result<World> {
     let senders = sender_svcs.into_iter().enumerate()
         .map(|(i, s)| Party::new(s, &format!("c25-sender{i}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // Every party is homed here; a sender's publication must also match its
+    // PDS device key.
+    for party in std::iter::once(&owner).chain(&senders) {
+        https.declare_local_chat_account(&party.svc.did)?;
+        https.publish_device_key(&party.svc.did, &party.public)?;
+    }
     let server = ShippingServerFixture::start(&https)?;
     let mut w = World {
         owner,
@@ -521,13 +527,7 @@ impl WsConnection {
                         continue;
                     }
                     0xA => return Ok(json!({"pong": STANDARD.encode(payload)})),
-                    0x1 => {
-                        let text = String::from_utf8(payload)
-                            .context("WebSocket text frame was not valid UTF-8")?;
-                        let value: Value = serde_json::from_str(&text)
-                            .with_context(|| format!("WebSocket frame text was not valid JSON: {text}"))?;
-                        return Ok(value);
-                    }
+                    0x2 => return decode_subscription_frame(&payload),
                     0x8 => {
                         anyhow::bail!("WebSocket received close frame");
                     }
@@ -566,6 +566,34 @@ impl WsConnection {
         let _ = self.stream.write_all(&close_frame).await;
         let _ = self.stream.shutdown().await;
     }
+}
+
+/// A subscribeEvents frame is an atproto event-stream message: a DAG-CBOR
+/// header naming the union variant, then that variant's DAG-CBOR body. Returns
+/// the body's JSON view with the header's variant as `$type`.
+fn decode_subscription_frame(frame: &[u8]) -> anyhow::Result<Value> {
+    use catbird_atproto::generated::blue_catbird::chat::{EventEnvelope, TypingEvent};
+    use serde_ipld_dagcbor::de::from_reader_once;
+    #[derive(serde::Deserialize)]
+    struct Header {
+        op: i64,
+        t: String,
+    }
+    let mut reader = std::io::Cursor::new(frame);
+    let header: Header = from_reader_once(&mut reader).context("subscription frame header")?;
+    anyhow::ensure!(header.op == 1, "subscription frame op {}", header.op);
+    let mut body = match header.t.as_str() {
+        "blue.catbird.chat.defs#eventEnvelope" => {
+            serde_json::to_value(from_reader_once::<EventEnvelope, _>(&mut reader).context("event envelope")?)?
+        }
+        "blue.catbird.chat.defs#typingEvent" => {
+            serde_json::to_value(from_reader_once::<TypingEvent, _>(&mut reader).context("typing event")?)?
+        }
+        other => anyhow::bail!("unknown subscription frame type {other}"),
+    };
+    anyhow::ensure!(reader.position() as usize == frame.len(), "trailing bytes after the frame body");
+    body["$type"] = json!(header.t);
+    Ok(body)
 }
 
 async fn subscribe_upgrade(w: &World, cursor: &str, ticket: &str) -> anyhow::Result<WsConnection> {

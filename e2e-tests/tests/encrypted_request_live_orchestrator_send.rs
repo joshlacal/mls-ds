@@ -45,6 +45,10 @@ async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request
             (bob.did.clone(), bob.did_document()),
         ],
     )?;
+    // Both accounts are homed here and accept the group invitation.
+    for identity in [&alice, &bob] {
+        https.declare_local_chat_account(&identity.did)?;
+    }
     // The client admits only the canonical subscription authority.
     let server = ShippingServerFixture::start_with_client_runtime(
         &https,

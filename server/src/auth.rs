@@ -476,7 +476,10 @@ impl AuthMiddleware {
             .unwrap_or(10);
         let mut middleware = Self::with_config(300, 100, 60);
         let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        // Every fixture host is pinned to loopback, which a proxy can never
+        // reach, so ignore HTTPS_PROXY (as the relationship transport does).
         let mut client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(timeout_seconds))
             .redirect(reqwest::redirect::Policy::none())
             .tls_built_in_root_certs(false)

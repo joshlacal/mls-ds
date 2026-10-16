@@ -139,6 +139,11 @@ def start(a):
         time.sleep(0.25)
     else:
         sys.exit("postgres did not become ready")
+    # The greenfield migration grants on a `catbird` database to a `catbird`
+    # role; provide both, as CI does before it migrates.
+    psql(admin, "-c", "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='catbird') "
+         "THEN CREATE ROLE catbird NOLOGIN; END IF; END $$")
+    psql(admin, "-c", "CREATE DATABASE catbird")
     psql(admin, "-c", f"CREATE DATABASE {a.db}")
     url = f"postgresql://127.0.0.1:{a.port}/{a.db}"
     psql(url, "-c", "CREATE EXTENSION IF NOT EXISTS pgcrypto")

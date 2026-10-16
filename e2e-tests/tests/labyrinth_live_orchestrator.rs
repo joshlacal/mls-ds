@@ -56,20 +56,19 @@ mod epoch_secret_test_support;
 mod live_orchestrator;
 
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result};
 use catbird_mls::labyrinth::QueueConfig;
 use catbird_mls::orchestrator::MLSStorageBackend as _;
 use encrypted_requests::{
-    route_to_dedicated_database, seed_service_device, HttpsDidFixture, ServiceIdentity,
-    ShippingServerFixture,
+    install_server_migration_catalog, route_to_dedicated_database, seed_service_device,
+    HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
 };
 use live_orchestrator::{mock_credentials::MockCredentials, LiveOrchestrator};
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::Value;
-use sha2::{Digest as _, Sha384};
+use sha2::Digest as _;
 use uuid::Uuid;
 
 const MAINTENANCE_URL: &str = "postgresql://127.0.0.1:5432/postgres";
@@ -141,50 +140,6 @@ impl Drop for DedicatedDatabase {
             eprintln!("could not drop {}: {error:#}", self.name);
         }
     }
-}
-
-/// Installs the server's whole migration catalog, as the shipping server's
-/// startup migrator does: version order, one transaction each, the
-/// operation-claim activation approval set on the migrating session, and
-/// the sqlx ledger row (SHA-384 checksum of the file).
-fn install_full_migration_catalog(url: &str) -> Result<usize> {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../server/migrations");
-    let mut migrations: Vec<(i64, String, PathBuf)> = std::fs::read_dir(&directory)
-        .with_context(|| format!("read {}", directory.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
-        .map(|path| {
-            let stem = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .context("migration file name")?
-                .to_owned();
-            let (version, description) = stem.split_once('_').context("migration file name")?;
-            Ok((
-                version.parse::<i64>().context("migration version")?,
-                description.replace('_', " "),
-                path,
-            ))
-        })
-        .collect::<Result<_>>()?;
-    migrations.sort();
-    psql(
-        url,
-        "CREATE TABLE public._sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, \
-         installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, \
-         checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL);",
-    )?;
-    for (version, description, path) in &migrations {
-        let sql = std::fs::read(path)?;
-        let checksum = hex::encode(Sha384::digest(&sql));
-        let script = format!(
-            "BEGIN;\nSET LOCAL chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed';\n{}\n;\nINSERT INTO public._sqlx_migrations(version,description,success,checksum,execution_time) VALUES({version},'{}',TRUE,decode('{checksum}','hex'),0);\nCOMMIT;\n",
-            String::from_utf8(sql)?,
-            description.replace('\'', "''"),
-        );
-        psql(url, &script).with_context(|| format!("apply {}", path.display()))?;
-    }
-    Ok(migrations.len())
 }
 
 /// The key `owner` registered for its device, as served by the live device
@@ -279,7 +234,7 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
     // ── server: dedicated database, full catalog, chat + Labyrinth router ──
     let database = DedicatedDatabase::create()?;
     route_to_dedicated_database(&database.url)?;
-    let installed = install_full_migration_catalog(&database.url)?;
+    let installed = install_server_migration_catalog(&database.url)?;
     println!("installed {installed} migrations into {}", database.name);
 
     let run = Uuid::new_v4().simple().to_string();
@@ -305,18 +260,7 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
     // Both accounts publish the Catbird chat declaration (served by the PDS
     // fixture), which admits Bob's group invitation and names this service.
     for identity in [&alice, &bob] {
-        let declarations = https.root.join("_policy/catbirdDeclaration");
-        std::fs::create_dir_all(&declarations)?;
-        std::fs::write(
-            declarations.join(identity.did.replace(':', "%3A")),
-            serde_json::to_vec(&serde_json::json!({
-                "$type": "blue.catbird.chat.declaration",
-                "protocolVersion": "1",
-                "allowIncoming": "all",
-                "deliveryService": "did:web:chat.catbird.blue",
-                "createdAt": encrypted_requests::canonical_now()
-            }))?,
-        )?;
+        https.declare_local_chat_account(&identity.did)?;
     }
     // The fixture inherits this process's environment; the shipping server
     // gates the Labyrinth router on the same variable.

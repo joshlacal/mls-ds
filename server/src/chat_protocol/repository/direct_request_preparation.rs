@@ -785,6 +785,7 @@ pub(crate) async fn prepare_direct_request<
     raw: &[u8],
     signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
     policy: &crate::chat_protocol::relationship_policy::RelationshipAuthority<T>,
+    sender_authority: &str,
     now: DateTime<Utc>,
 ) -> Result<DirectRequestResult, DirectRequestStoreError> {
     use crate::chat_protocol::{
@@ -895,16 +896,43 @@ pub(crate) async fn prepare_direct_request<
     super::relationship::verify_direct_request_policy(tx, &witness, policy, quota_exceeded)
         .await
         .map_err(|_| DirectRequestStoreError::PolicyDenied)?;
-    // Atomic publication spans exactly one canonical authority. A recipient
-    // whose public chat declaration names another delivery service has no
-    // transaction here to join: refuse typed, before any package selection or
-    // reservation, and never degrade to legacy federation delivery. An absent
-    // declaration keeps the canonical path; an unreadable one fails closed
-    // exactly like the consent declaration read above.
+    // A recipient whose public chat declaration names another delivery
+    // service is reachable only through an allowed peer: otherwise there is no
+    // transaction to join, so refuse typed, before any package selection or
+    // reservation, and never degrade to legacy federation delivery. The peer
+    // row is read in this transaction, so a peer refused before it began stays
+    // refused. An unreadable declaration fails closed exactly like the consent
+    // declaration read above, which already refuses an absent one.
     match policy.recipient_chat_authority(&i.recipient_did).await {
         Ok(Some(authority)) => {
-            crate::chat_protocol::validation::BareDid::parse(&authority)
+            let authority = crate::chat_protocol::validation::BareDid::parse(&authority)
                 .map_err(|_| DirectRequestStoreError::PolicyDenied)?;
+            let authority = crate::identity::canonical_did(authority.as_str());
+            let is_local = |did: &str| {
+                did == crate::identity::canonical_did(signer.authority_did())
+                    || crate::identity::service_did_base_opt().as_deref() == Some(did)
+            };
+            if !is_local(authority) {
+                // Clients check what this DS signs for the pair against the
+                // lower of the sender's home and this authority. The router
+                // chose the coordinator from an earlier read, so when the
+                // declaration has moved and that lower DID is no longer this
+                // DS, nothing signed here would verify: answer unsigned.
+                let sender = crate::identity::canonical_did(sender_authority);
+                if !is_local(sender.min(authority)) {
+                    return Err(DirectRequestStoreError::CoordinatorMoved);
+                }
+                match crate::federation::peer_policy::enforce_outbound_peer_policy_tx(tx, authority)
+                    .await
+                {
+                    Ok(_) => {}
+                    // A storage failure is not a refusal to sign.
+                    Err(crate::federation::FederationError::Database(error)) => {
+                        return Err(DirectRequestStoreError::Database(error))
+                    }
+                    Err(_) => return Err(DirectRequestStoreError::RecipientAuthorityUnsupported),
+                }
+            }
         }
         Ok(None) => {}
         Err(_) => return Err(DirectRequestStoreError::PolicyDenied),

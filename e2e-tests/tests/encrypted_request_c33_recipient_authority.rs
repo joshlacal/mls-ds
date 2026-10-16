@@ -8,9 +8,13 @@
 //! with the typed `RecipientAuthorityUnsupported` signed receipt before any package selection
 //! or lease.
 //!
+//! The sender is homed here, so this router signs that refusal itself.
+//!
 //! Controls verify that:
 //! - Canonical authority recipient is prepared normally (then cancelled to release).
-//! - Missing declaration (RecordNotFound) keeps `RecipientKeysUnavailable`.
+//! - A canonical recipient without request keys keeps `RecipientKeysUnavailable`.
+//! - Missing declaration (RecordNotFound) means chat is off: a signed
+//!   `RequestPolicyDenied`, never "unsupported" and never a lease.
 //! - Malformed/unreadable declaration fails closed with `RequestPolicyDenied`.
 #![allow(dead_code)]
 
@@ -34,7 +38,7 @@ use catbird_mls::{DirectRequestInput, MLSContext, MLSError};
 use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database,
     request_database_url, reviewed_request_migrations, route_to_dedicated_database,
-    seed_service_device, signed_mls_request, HttpsDidFixture, ServiceIdentity,
+    seed_service_device, signed_mls_request, HttpsDidFixture, PairLockBarrier, ServiceIdentity,
     ShippingServerFixture,
 };
 use live_orchestrator::{mock_credentials::MockCredentials, mock_storage::MockStorage};
@@ -55,6 +59,9 @@ const CANONICAL_AUTHORITY: &str = "did:web:chat.catbird.blue";
 const FOREIGN_AUTHORITY: &str = "did:web:chat.federated-peer.org";
 /// Special-use TLDs are not public DIDs; such a declaration is malformed.
 const NON_PUBLIC_AUTHORITY: &str = "did:web:chat.federation.example";
+/// An unpeered foreign delivery service that sorts below this DS, so the
+/// client checks any receipt for its recipients against it.
+const LOWER_FOREIGN_AUTHORITY: &str = "did:web:chat.alpha-peer.org";
 
 // ---------------------------------------------------------------------------
 // Read-only database projections
@@ -156,13 +163,23 @@ fn quote(part: &str) -> String {
 /// Publish `did`'s public `blue.catbird.chat.declaration/self` naming
 /// `delivery_service` on the fixture PDS.
 fn declare_chat_authority(root: &Path, did: &str, delivery_service: &str) -> anyhow::Result<()> {
+    declare_chat_consent(root, did, delivery_service, "all")
+}
+
+/// [`declare_chat_authority`] with `allowIncoming` set to `allow_incoming`.
+fn declare_chat_consent(
+    root: &Path,
+    did: &str,
+    delivery_service: &str,
+    allow_incoming: &str,
+) -> anyhow::Result<()> {
     let dir = root.join("_policy").join("catbirdDeclaration");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
         dir.join(quote(did)),
         serde_json::to_vec(&json!({
             "$type": "blue.catbird.chat.declaration",
-            "allowIncoming": "all",
+            "allowIncoming": allow_incoming,
             "deliveryService": delivery_service,
             "protocolVersion": "1",
             "createdAt": canonical_now(),
@@ -357,15 +374,21 @@ fn receipt(response: &Value, key: &[u8]) -> anyhow::Result<(String, Option<Strin
 /// `RecipientAuthorityUnsupported` receipt; no lease, no package reservation,
 /// no publication/conversation/Welcome. Controls: the same recipient declaring
 /// the canonical authority is prepared normally (then cancelled to release),
-/// and an undeclared recipient without keys keeps `RecipientKeysUnavailable`.
+/// a canonical recipient without keys keeps `RecipientKeysUnavailable`, and an
+/// undeclared recipient with keys is refused by policy.
 async fn router_refuses_foreign_recipient_before_any_lease() -> anyhow::Result<()> {
     let run = Uuid::new_v4().simple().to_string();
-    let (alice_id, bob_id, carol_id) = (identity("alice", &run), identity("bob", &run), identity("carol", &run));
-    let rig = rig(&[&alice_id, &bob_id, &carol_id]).await?;
+    let (alice_id, bob_id, carol_id, dave_id) =
+        (identity("alice", &run), identity("bob", &run), identity("carol", &run), identity("dave", &run));
+    let rig = rig(&[&alice_id, &bob_id, &carol_id, &dave_id]).await?;
     let alice = Account::new(alice_id, "c33-alice")?;
     let bob = Account::new(bob_id, "c33-bob")?;
     let carol = Account::new(carol_id, "c33-carol")?;
+    let dave = Account::new(dave_id, "c33-dave")?;
+    // The sender is homed on this (canonical) authority.
+    rig.https.declare_local_chat_account(alice.did())?;
     publish_keys(&rig, &bob).await?;
+    publish_keys(&rig, &dave).await?;
     assert_eq!(available_request_packages(bob.did())?, 1, "bob has a usable request package");
 
     // Foreign-homed recipient (sender's authority canonical).
@@ -406,12 +429,23 @@ async fn router_refuses_foreign_recipient_before_any_lease() -> anyhow::Result<(
     let released = attempt_footprint(prepared.request_id, prepared.conversation_id)?;
     assert!(released.starts_with("cancelled|"), "control lease released by signed cancel: {released}");
 
-    // Control 2: a recipient with no chat declaration at all (fixture answers
-    // the typed RecordNotFound) and no request keys keeps the pre-existing
-    // RecipientKeysUnavailable refusal: absence never becomes "unsupported".
+    // Control 2: a canonical-homed recipient with no request keys keeps the
+    // RecipientKeysUnavailable refusal.
+    rig.https.declare_local_chat_account(carol.did())?;
     let keyless = prepare(&rig, &alice, carol.did()).await?;
     let (_, keyless_code, _) = receipt(&keyless.response, &rig.server.receipt_public_key)?;
     assert_eq!(keyless_code.as_deref(), Some("RecipientKeysUnavailable"));
+
+    // Control 2b: a recipient with request keys but no chat declaration at all
+    // (fixture answers the typed RecordNotFound) has not turned chat on. The
+    // absence fails closed as a signed policy refusal: never "unsupported",
+    // never a lease, and the package stays available.
+    let undeclared = prepare(&rig, &alice, dave.did()).await?;
+    assert_eq!(undeclared.status, reqwest::StatusCode::OK, "{}", undeclared.response);
+    let (_, undeclared_code, _) = receipt(&undeclared.response, &rig.server.receipt_public_key)?;
+    assert_eq!(undeclared_code.as_deref(), Some("RequestPolicyDenied"));
+    assert_eq!(attempt_footprint(undeclared.request_id, undeclared.conversation_id)?, "rejected|0|0|0|0|0|0");
+    assert_eq!(available_request_packages(dave.did())?, 1, "no undeclared recipient package reserved");
 
     // Control 3: an unreadable/malformed chat declaration (non-public DID)
     // fails closed like the consent declaration read, never as "unsupported"
@@ -421,6 +455,103 @@ async fn router_refuses_foreign_recipient_before_any_lease() -> anyhow::Result<(
     let (_, malformed_code, _) = receipt(&malformed.response, &rig.server.receipt_public_key)?;
     assert_eq!(malformed_code.as_deref(), Some("RequestPolicyDenied"));
     assert_eq!(attempt_footprint(malformed.request_id, malformed.conversation_id)?, "rejected|0|0|0|0|0|0");
+    Ok(())
+}
+
+/// Prepare `alice`'s request to `recipient` while holding the pair lock the
+/// router takes once it has chosen the coordinator, apply `moved` while the
+/// router waits on it, then let it go: the router's choice rests on the
+/// declaration before the move, and the repository reads the moved one.
+async fn prepare_across_a_move(
+    rig: &Rig,
+    alice: &Account,
+    recipient: &str,
+    moved: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<Prep> {
+    let barrier = PairLockBarrier::hold(request_database_url(), alice.did(), recipient).await?;
+    let mover = async {
+        barrier.wait_for_router().await?;
+        moved()?;
+        barrier.release().await
+    };
+    let (prep, ()) = tokio::try_join!(prepare(rig, alice, recipient), mover)?;
+    Ok(prep)
+}
+
+/// The router answered unsigned with `RecipientAuthorityUnsupported` and kept
+/// no attempt.
+fn unsigned_unsupported(prep: &Prep) -> anyhow::Result<()> {
+    anyhow::ensure!(prep.status == reqwest::StatusCode::BAD_REQUEST, "{} {}", prep.status, prep.response);
+    anyhow::ensure!(prep.response["error"] == "RecipientAuthorityUnsupported", "{}", prep.response);
+    anyhow::ensure!(prep.response.get("outcome").is_none(), "a signed receipt: {}", prep.response);
+    let attempts = count(&format!(
+        "SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{}'",
+        prep.request_id
+    ))?;
+    anyhow::ensure!(attempts == 0, "the router kept {attempts} attempt(s)");
+    Ok(())
+}
+
+/// C33: the router chooses the pair's coordinator, and so the signer of any
+/// receipt, from one read of the recipient's declaration, and the repository
+/// decides from its own reads. When the declaration moves in between to an
+/// unpeered authority that sorts below this DS, the client checks receipts
+/// against that authority, so this DS must sign nothing for the attempt:
+/// - on the refusal path (the recipient's authority started out unpeered and
+///   higher), whether the repository refuses for the authority or for consent;
+/// - on the local path (the recipient started out homed here).
+async fn declaration_moves_while_the_router_waits() -> anyhow::Result<()> {
+    let run = Uuid::new_v4().simple().to_string();
+    let (alice_id, erin_id, gina_id, frank_id) =
+        (identity("alice", &run), identity("erin", &run), identity("gina", &run), identity("frank", &run));
+    let rig = rig(&[&alice_id, &erin_id, &gina_id, &frank_id]).await?;
+    let alice = Account::new(alice_id, "c33-move-alice")?;
+    let erin = Account::new(erin_id, "c33-move-erin")?;
+    let gina = Account::new(gina_id, "c33-move-gina")?;
+    let frank = Account::new(frank_id, "c33-move-frank")?;
+    rig.https.declare_local_chat_account(alice.did())?;
+    let root = &rig.https.root;
+    let mut failed = Vec::new();
+
+    // Refusal path: the repository reads the lower authority and would refuse
+    // it as unpeered.
+    declare_chat_authority(root, erin.did(), FOREIGN_AUTHORITY)?;
+    let moved = prepare_across_a_move(&rig, &alice, erin.did(), || {
+        declare_chat_authority(root, erin.did(), LOWER_FOREIGN_AUTHORITY)
+    })
+    .await?;
+    if let Err(error) = unsigned_unsupported(&moved) {
+        failed.push(format!("refusal path, authority refusal: {error:#}"));
+    }
+
+    // Refusal path: the moved declaration also turns consent off, so the
+    // repository refuses for consent before it reads the authority.
+    declare_chat_authority(root, gina.did(), FOREIGN_AUTHORITY)?;
+    let moved = prepare_across_a_move(&rig, &alice, gina.did(), || {
+        declare_chat_consent(root, gina.did(), LOWER_FOREIGN_AUTHORITY, "none")
+    })
+    .await?;
+    if let Err(error) = unsigned_unsupported(&moved) {
+        failed.push(format!("refusal path, consent refusal: {error:#}"));
+    }
+
+    // Local path: the recipient was homed here when the router chose itself.
+    rig.https.declare_local_chat_account(frank.did())?;
+    let moved = prepare_across_a_move(&rig, &alice, frank.did(), || {
+        declare_chat_authority(root, frank.did(), LOWER_FOREIGN_AUTHORITY)
+    })
+    .await?;
+    if let Err(error) = unsigned_unsupported(&moved) {
+        failed.push(format!("local path, authority refusal: {error:#}"));
+    }
+
+    // Control: with the lower authority declared from the start, the router
+    // never chooses itself.
+    let lower = prepare(&rig, &alice, erin.did()).await?;
+    if let Err(error) = unsigned_unsupported(&lower) {
+        failed.push(format!("lower authority from the start: {error:#}"));
+    }
+    anyhow::ensure!(failed.is_empty(), "{}", failed.join("\n"));
     Ok(())
 }
 
@@ -543,6 +674,7 @@ async fn orchestrator_foreign_recipient_typed_unsupported_draft_retained() -> an
     let rig = rig(&[&alice_id, &bob_id]).await?;
     let alice = Account::new(alice_id, "c33-orch-alice")?;
     let bob = Account::new(bob_id, "c33-orch-bob")?;
+    rig.https.declare_local_chat_account(alice.did())?;
     publish_keys(&rig, &bob).await?;
     declare_chat_authority(&rig.https.root, bob.did(), FOREIGN_AUTHORITY)?;
 
@@ -647,7 +779,7 @@ async fn orchestrator_foreign_recipient_typed_unsupported_draft_retained() -> an
     Ok(())
 }
 
-/// Both C33 recipient-authority scenarios on one dedicated fault database
+/// The C33 recipient-authority scenarios on one dedicated fault database
 /// (harness routing is fixed per process), dropped at the end.
 #[tokio::test(flavor = "multi_thread")]
 async fn c33_live_recipient_homed_on_foreign_authority() -> anyhow::Result<()> {
@@ -661,5 +793,7 @@ async fn c33_live_recipient_homed_on_foreign_authority() -> anyhow::Result<()> {
     println!("C33 router scenario: pass");
     orchestrator_foreign_recipient_typed_unsupported_draft_retained().await?;
     println!("C33 orchestrator scenario: pass");
+    declaration_moves_while_the_router_waits().await?;
+    println!("C33 declaration move scenario: pass");
     Ok(())
 }

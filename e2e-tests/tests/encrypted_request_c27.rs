@@ -3,8 +3,9 @@
 //!   pending) or via the group-note path (a second publication carrying a
 //!   group-invitation reference) — both refused with no new conversation,
 //!   Welcome, entry or delivery;
-//! - capacity refusal (live pair quota → CapacityUnavailable) never evicts the
-//!   existing published history, and the original Welcome stays importable;
+//! - pair refusal (a live preparation holds the pair → PreparationConflict at
+//!   the router's pair owner fence) never evicts the existing published
+//!   history, and the original Welcome stays importable;
 //! - the only pending-capacity release for a published request is a consent
 //!   transition (acceptance here), which writes exactly its published charge.
 //! Repository-level quota/budget clauses: server/tests/chat_protocol_direct_request_c27.rs.
@@ -285,15 +286,19 @@ async fn c27_live_no_second_introduction_and_capacity_refusal_preserve_history()
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{refused}");
     assert_eq!(refused["error"], "ConversationNotAccepted", "{refused}");
 
-    // Capacity refusal: one live preparation holds the pair; the next is
-    // refused with CapacityUnavailable and evicts nothing.
+    // Pair refusal: one live preparation holds the pair; the next is refused
+    // and evicts nothing. The router's pair owner fence refuses it with
+    // PreparationConflict before the repository's live pair quota is reached,
+    // so no attempt is recorded for it.
     let third = alice_prepares(&f).await?;
     assert_eq!(third.response.0, reqwest::StatusCode::OK, "{}", third.response.1);
     assert!(third.response.1.pointer("/outcome/preparation").is_some(), "{}", third.response.1);
     let fourth = alice_prepares(&f).await?;
-    assert_eq!(fourth.response.0, reqwest::StatusCode::OK, "{}", fourth.response.1);
-    assert_eq!(fourth.response.1.pointer("/outcome/body/receipt/code").and_then(Value::as_str), Some("CapacityUnavailable"), "{}", fourth.response.1);
-    assert_eq!(durable(&f)?, before, "second introduction, refused send and capacity refusal leave the published history byte-identical");
+    assert_eq!(fourth.response.0, reqwest::StatusCode::BAD_REQUEST, "{}", fourth.response.1);
+    assert_eq!(fourth.response.1["error"], "PreparationConflict", "{}", fourth.response.1);
+    assert_eq!(psql(&format!("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{}'", fourth.request_id))?, "0",
+        "the fenced preparation records no attempt");
+    assert_eq!(durable(&f)?, before, "second introduction, refused send and pair refusal leave the published history byte-identical");
 
     // Release the live reservation through the real cancellation RPC.
     let cancel = signed_mls_request(engine, &identity, DirectRequestKind::Cancel, json!({

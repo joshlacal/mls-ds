@@ -36,7 +36,7 @@ use catbird_mls::{
 };
 use encrypted_requests::{
     canonical_future, canonical_now, signed_mls_request, DeterministicFaultTransport,
-    FaultBoundary, HttpsDidFixture, ServiceIdentity,
+    FaultBoundary, HttpsDidFixture, PairLockBarrier, ServiceIdentity,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use p256::ecdsa::SigningKey;
@@ -109,31 +109,20 @@ fn create_database_clone(source: &str, target: &str) -> anyhow::Result<Dedicated
     Ok(DedicatedDatabase(target.to_string()))
 }
 
-fn bootstrap_federation_tables(db_url: &str) -> anyhow::Result<()> {
-    // The guarded chat template deliberately omits the older public federation schema.
-    psql_on(
-        db_url,
-        "CREATE TABLE ds_endpoints( \
-            did TEXT PRIMARY KEY, endpoint TEXT NOT NULL, supported_cipher_suites TEXT, \
-            resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-            expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '1 hour')",
-    )?;
-    psql_on(
-        db_url,
-        "CREATE TABLE outbound_queue( \
-            id TEXT PRIMARY KEY, target_ds_did TEXT NOT NULL, target_endpoint TEXT NOT NULL, \
-            method TEXT NOT NULL, payload BYTEA NOT NULL, convo_id TEXT NOT NULL, \
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-            next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-            retry_count INTEGER NOT NULL DEFAULT 0, max_retries INTEGER NOT NULL DEFAULT 5, \
-            last_error TEXT, status TEXT NOT NULL DEFAULT 'pending')",
-    )?;
-    for migration in [
-        include_str!("../../server/migrations/20260214000001_federation_peer_policy.sql"),
-        include_str!("../../server/migrations/20260214000002_auth_jti_nonce.sql"),
-        include_str!("../../server/migrations/20260222000001_federation_peer_policy_audit_log.sql"),
+fn require_federation_tables(db_url: &str) -> anyhow::Result<()> {
+    // The guarded template holds the server's whole migration catalog, which
+    // already creates the public federation schema this node relies on.
+    for table in [
+        "ds_endpoints",
+        "outbound_queue",
+        "federation_peers",
+        "auth_jti_nonce",
+        "federation_peer_policy_audit_log",
     ] {
-        psql_on(db_url, migration)?;
+        anyhow::ensure!(
+            psql_value(db_url, &format!("SELECT to_regclass('public.{table}') IS NOT NULL"))? == "t",
+            "guarded template lacks public.{table}"
+        );
     }
     Ok(())
 }
@@ -291,7 +280,7 @@ impl FederatedAuthorityServer {
             &db_url,
             include_str!("../../server/migrations/20260919000025_federated_inventory_conversation_items.sql"),
         )?;
-        bootstrap_federation_tables(&db_url)?;
+        require_federation_tables(&db_url)?;
         // Each private clone is a new authority; discard the base fixture's unrelated receipt history.
         psql_on(&db_url, "TRUNCATE chat.direct_request_receipt_keys")?;
 
@@ -560,6 +549,24 @@ impl FederatedParty {
         )?;
         Ok(json!({"signedRequest": keys}))
     }
+}
+
+/// Verify a signed receipt outcome against an authority's receipt key and
+/// return its refusal code.
+fn receipt_code(response: &Value, authority: &str, key: &[u8]) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(
+        response["outcome"]["$type"] == "blue.catbird.chat.defs#signedDirectRequestReceipt",
+        "expected a signed receipt, got {response}"
+    );
+    let mut signed = response["outcome"].clone();
+    signed.as_object_mut().context("receipt object")?.remove("$type");
+    let verified = protocol::verify_received_signed_request_for_authority(
+        authority,
+        DirectRequestKind::Outcome,
+        &serde_json::to_vec(&signed)?,
+        key,
+    )?;
+    Ok(verified.body()["receipt"]["code"].as_str().map(str::to_owned))
 }
 
 fn signed_ordinary(engine: &MlsEngine, identity: &str, body: Value) -> anyhow::Result<Value> {
@@ -1807,11 +1814,13 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         ("A", &server_a.database_url),
         ("B", &server_b.database_url),
     ] {
+        // The catalog still creates the legacy tables; a canonical node never
+        // writes to them.
         for table in ["messages", "welcome_messages", "pending_welcomes"] {
             assert_eq!(
-                psql_value(database_url, &format!("SELECT to_regclass('public.{table}') IS NULL"))?,
-                "t",
-                "Server {node} must not use a legacy {table} table"
+                psql_count(database_url, &format!("SELECT count(*) FROM public.{table}"))?,
+                0,
+                "Server {node} must not use the legacy {table} table"
             );
         }
         assert_eq!(
@@ -2059,6 +2068,114 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         &format!("INSERT INTO federation_peers(ds_did, status) VALUES('{ds1_did}', 'allow') ON CONFLICT DO NOTHING;"))?;
 
     let client = reqwest::Client::new();
+
+    // C12/C14 on a federated pair. Bob's request R0 is relayed from his home to
+    // the coordinator before Alice has published request keys, so it ends in a
+    // signed RecipientKeysUnavailable rejection that the coordinator keeps.
+    // Phase 2 replays it while Alice's preparation holds the pair.
+    let r0_req_id = Uuid::new_v4();
+    let r0_convo_id = Uuid::new_v4();
+    let r0_first_msg_id = Uuid::new_v4();
+    let r0_prepare_signed = signed_mls_request(
+        &bob.engine,
+        &bob.identity,
+        DirectRequestKind::Prepare,
+        json!({
+            "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\0",
+            "protocolVersion": "2",
+            "actorDid": bob.svc.did,
+            "actorDeviceId": bob.svc.device_id.to_string(),
+            "keyId": bob.key_id,
+            "authGeneration": 1,
+            "requestId": r0_req_id.to_string(),
+            "firstMessageId": r0_first_msg_id.to_string(),
+            "conversationId": r0_convo_id.to_string(),
+            "recipientDid": alice.svc.did,
+            "origin": { "$type": "blue.catbird.chat.defs#freshDirectOrigin" },
+            "profile": "encryptedIntroduction1",
+            "idempotencyKey": r0_req_id.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (r0_status, r0_bytes) = bob.svc.post(
+        &client,
+        &server_b.base_url,
+        "blue.catbird.chat.prepareDirectRequest",
+        &json!({ "signedRequest": r0_prepare_signed }),
+        true,
+    ).await?;
+    anyhow::ensure!(r0_status == StatusCode::OK, "R0 prepare: {r0_status}: {}", String::from_utf8_lossy(&r0_bytes));
+    let r0_outcome: Value = serde_json::from_slice(&r0_bytes)?;
+    anyhow::ensure!(
+        receipt_code(&r0_outcome, &server_a.did, &server_a.receipt_public_key)?.as_deref() == Some("RecipientKeysUnavailable"),
+        "R0 must end in the coordinator's signed RecipientKeysUnavailable rejection: {r0_outcome}"
+    );
+    assert_eq!(
+        psql_value(&server_a.database_url, &format!("SELECT status FROM chat.direct_request_attempts WHERE request_id='{r0_req_id}'"))?,
+        "rejected",
+        "the coordinator keeps R0's rejection"
+    );
+
+    // C33 on the relay path. The coordinator chooses itself from Alice's
+    // declaration and its repository reads the declaration again. When it
+    // moves in between to an authority other than the coordinator, clients
+    // check receipts against min(Bob's home, that authority), so the
+    // coordinator signs nothing and Bob's home answers unsigned.
+    let moved_req_id = Uuid::new_v4();
+    let moved_prepare = signed_mls_request(
+        &bob.engine,
+        &bob.identity,
+        DirectRequestKind::Prepare,
+        json!({
+            "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\0",
+            "protocolVersion": "2",
+            "actorDid": bob.svc.did,
+            "actorDeviceId": bob.svc.device_id.to_string(),
+            "keyId": bob.key_id,
+            "authGeneration": 1,
+            "requestId": moved_req_id.to_string(),
+            "firstMessageId": Uuid::new_v4().to_string(),
+            "conversationId": Uuid::new_v4().to_string(),
+            "recipientDid": alice.svc.did,
+            "origin": { "$type": "blue.catbird.chat.defs#freshDirectOrigin" },
+            "profile": "encryptedIntroduction1",
+            "idempotencyKey": moved_req_id.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let barrier = PairLockBarrier::hold(&server_a.database_url, &bob.svc.did, &alice.svc.did).await?;
+    let mover = async {
+        barrier.wait_for_router().await?;
+        declare_chat_authority(&https.root, &alice.svc.did, "did:web:chat.federated-peer.org")?;
+        barrier.release().await
+    };
+    let moved_body = json!({ "signedRequest": moved_prepare });
+    let ((moved_status, moved_bytes), ()) = tokio::try_join!(
+        bob.svc.post(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.prepareDirectRequest",
+            &moved_body,
+            true,
+        ),
+        mover,
+    )?;
+    declare_chat_authority(&https.root, &alice.svc.did, &ds1_did)?;
+    let moved: Value = serde_json::from_slice(&moved_bytes).unwrap_or(Value::Null);
+    anyhow::ensure!(
+        moved_status == StatusCode::BAD_REQUEST && moved.get("outcome").is_none(),
+        "a request whose recipient moved must get no receipt: {moved_status}: {}",
+        String::from_utf8_lossy(&moved_bytes)
+    );
+    assert_eq!(
+        psql_count(&server_a.database_url, &format!(
+            "SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{moved_req_id}'"
+        ))?,
+        0,
+        "the coordinator keeps no attempt for the moved request"
+    );
 
     // Publish direct request keys on home servers:
     // Alice on Server A:
@@ -2391,6 +2508,76 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         publish_body,
     )?;
     winner_party.engine.persist_request_publication(&journal.request_id, &serde_json::to_vec(&publish_signed)?)?;
+
+    // Alice's preparation still holds the pair. A late prepare of R0, and a
+    // late publish under R0's identity, replay the coordinator's stored
+    // rejection instead of meeting the pair fence. The publish replay reads no
+    // PDS either, so it holds with Bob's device key withdrawn from his PDS.
+    anyhow::ensure!(winner_is_alice, "R0 replays need Alice's preparation to hold the pair");
+    let (late_status, late_bytes) = bob.svc.post(
+        &client,
+        &server_b.base_url,
+        "blue.catbird.chat.prepareDirectRequest",
+        &json!({ "signedRequest": r0_prepare_signed }),
+        true,
+    ).await?;
+    anyhow::ensure!(late_status == StatusCode::OK, "late R0 prepare: {late_status}: {}", String::from_utf8_lossy(&late_bytes));
+    let late_prepare: Value = serde_json::from_slice(&late_bytes)?;
+    assert_eq!(late_prepare["outcome"], r0_outcome["outcome"], "late R0 prepare replays the stored rejection");
+
+    let r0_prepare_digest = *protocol::verify_signed_request(
+        DirectRequestKind::Prepare,
+        &serde_json::to_vec(&r0_prepare_signed)?,
+        &bob.public,
+    )?
+    .request_digest();
+    let mut r0_publish_body = publish_signed["body"].clone();
+    r0_publish_body["actorDid"] = json!(bob.svc.did);
+    r0_publish_body["actorDeviceId"] = json!(bob.svc.device_id.to_string());
+    r0_publish_body["keyId"] = json!(bob.key_id);
+    r0_publish_body["recipientDid"] = json!(alice.svc.did);
+    r0_publish_body["requestId"] = json!(r0_req_id.to_string());
+    r0_publish_body["conversationId"] = json!(r0_convo_id.to_string());
+    r0_publish_body["firstMessageId"] = json!(r0_first_msg_id.to_string());
+    r0_publish_body["idempotencyKey"] = json!(r0_req_id.to_string());
+    r0_publish_body["preparationRequestDigest"] = json!(STANDARD.encode(r0_prepare_digest));
+    r0_publish_body["signedAt"] = json!(canonical_now());
+    let r0_publish_signed = signed_mls_request(&bob.engine, &bob.identity, DirectRequestKind::Publish, r0_publish_body)?;
+    std::fs::write(
+        https.root.join("_policy").join("deviceKeys").join(quote(&bob.svc.did)),
+        br#"{"records":[]}"#,
+    )?;
+    let late_pub = bob.svc.post(
+        &client,
+        &server_b.base_url,
+        "blue.catbird.chat.publishDirectRequest",
+        &json!({ "signedRequest": r0_publish_signed }),
+        true,
+    ).await;
+    publish_pds_device_key(&https.root, &bob)?;
+    let (late_pub_status, late_pub_bytes) = late_pub?;
+    anyhow::ensure!(late_pub_status == StatusCode::OK, "late R0 publish: {late_pub_status}: {}", String::from_utf8_lossy(&late_pub_bytes));
+    let late_publish: Value = serde_json::from_slice(&late_pub_bytes)?;
+    assert_eq!(late_publish["outcome"], r0_outcome["outcome"], "late R0 publish replays the stored rejection");
+    assert_eq!(
+        psql_value(
+            &server_a.database_url,
+            &format!(
+                "SELECT (SELECT string_agg(status, ',') FROM chat.direct_request_attempts WHERE request_id='{r0_req_id}')||'|'||\
+                        (SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{r0_req_id}')"
+            )
+        )?,
+        "rejected|0",
+        "R0 replays change nothing on the coordinator"
+    );
+    assert_eq!(
+        psql_count(
+            &server_a.database_url,
+            &format!("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{winner_req_id}' AND status='prepared'")
+        )?,
+        1,
+        "Alice's preparation still holds the pair"
+    );
 
     // Simulate lost peer: recipient server is killed before publication commits
     server_b._child.0.kill()?;

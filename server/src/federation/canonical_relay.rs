@@ -49,12 +49,90 @@ impl CanonicalPairCoordinator {
     }
 }
 
+/// Which side of a pair failed to resolve to an admitted chat authority.
+#[derive(Debug)]
+pub enum PairResolutionError {
+    Sender(FederationError),
+    /// The sender's home resolved. `declared_authority` is the delivery
+    /// service the recipient's declaration names, when it could be read.
+    Recipient {
+        sender_home: DsEndpoint,
+        declared_authority: Option<String>,
+        error: FederationError,
+    },
+}
+
+impl PairResolutionError {
+    pub fn into_federation_error(self) -> FederationError {
+        match self {
+            Self::Sender(error) | Self::Recipient { error, .. } => error,
+        }
+    }
+
+    /// When the sender is homed on `self_did` and the recipient has no chat authority
+    /// this DS could ever join (no declaration, a malformed or unsupported
+    /// one, or an authority that is not an allowed peer), this DS coordinates
+    /// the attempt alone so the repository can sign its terminal refusal.
+    /// Clients verify receipts against the lower of the two authority DIDs, so
+    /// a declared authority that sorts below this one gets no signed refusal.
+    /// Transient failures are not refusals and return `None`.
+    pub fn local_refusal_coordinator(&self, self_did: &str) -> Option<CanonicalPairCoordinator> {
+        let Self::Recipient {
+            sender_home,
+            declared_authority,
+            error,
+        } = self
+        else {
+            return None;
+        };
+        let home = canonical_did(&sender_home.did);
+        if home != canonical_did(self_did) {
+            return None;
+        }
+        let refusal = matches!(
+            error,
+            FederationError::Unsupported(_)
+                | FederationError::AuthFailed { .. }
+                | FederationError::ResolutionFailed {
+                    kind: super::errors::ResolutionFailureKind::InvalidDeclaration(_),
+                    ..
+                }
+        );
+        if !refusal
+            || declared_authority
+                .as_deref()
+                .is_some_and(|a| canonical_did(a) < home)
+        {
+            return None;
+        }
+        Some(CanonicalPairCoordinator {
+            sender_home: sender_home.clone(),
+            recipient_home: sender_home.clone(),
+            coordinator_did: home.to_string(),
+            is_coordinator: true,
+            is_sender_home: true,
+            is_recipient_home: true,
+        })
+    }
+}
+
 /// Resolve the deterministic pair coordinator for a sender and recipient pair.
 pub async fn resolve_pair_coordinator(
     pool: &DbPool,
     sender_did: &str,
     recipient_did: &str,
 ) -> Result<CanonicalPairCoordinator, FederationError> {
+    resolve_pair_coordinator_by_side(pool, sender_did, recipient_did)
+        .await
+        .map_err(PairResolutionError::into_federation_error)
+}
+
+/// [`resolve_pair_coordinator`], saying which side failed.
+pub async fn resolve_pair_coordinator_by_side(
+    pool: &DbPool,
+    sender_did: &str,
+    recipient_did: &str,
+) -> Result<CanonicalPairCoordinator, PairResolutionError> {
     let self_did = crate::identity::service_did();
     let self_endpoint = crate::identity::self_endpoint();
     let default_ds = std::env::var("DEFAULT_DS_ENDPOINT").ok();
@@ -74,8 +152,30 @@ pub async fn resolve_pair_coordinator(
         cache_ttl,
     );
 
-    let sender_home = resolver.resolve_authoritative_ds(sender_did).await?;
-    let recipient_home = resolver.resolve_authoritative_ds(recipient_did).await?;
+    let sender_home = resolver
+        .resolve_authoritative_ds(sender_did)
+        .await
+        .map_err(PairResolutionError::Sender)?;
+    let declared_authority = match resolver.resolve_declared_authority(recipient_did).await {
+        Ok(authority) => authority,
+        Err(error) => {
+            return Err(PairResolutionError::Recipient {
+                sender_home,
+                declared_authority: None,
+                error,
+            })
+        }
+    };
+    let recipient_home = match resolver.admit_declared_authority(&declared_authority).await {
+        Ok(home) => home,
+        Err(error) => {
+            return Err(PairResolutionError::Recipient {
+                sender_home,
+                declared_authority: Some(declared_authority),
+                error,
+            })
+        }
+    };
     let sender_home_did = canonical_did(&sender_home.did).to_string();
     let recipient_home_did = canonical_did(&recipient_home.did).to_string();
 
@@ -2408,27 +2508,10 @@ pub async fn coordinator_prepare_direct_request(
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    if let Some(conflict) = check_pair_owner_fence(
-        &mut tx,
-        actor_did,
-        recipient_did,
-        request_id,
-        Some(&coord.coordinator_did),
-    )
-    .await? {
-        let msg = match conflict {
-            PairFenceConflict::ForeignCoordinator { coordinator_did, .. } => {
-                format!("Direct request or pair already owned by coordinator {coordinator_did}")
-            }
-            PairFenceConflict::LocalConflict { .. } => {
-                "Direct request already in progress for this pair".to_string()
-            }
-        };
-        return Err(FederationError::RemoteError {
-            status: 409,
-            body: format!("{{\"error\":\"PreparationConflict\",\"message\":\"{msg}\"}}"),
-        });
-    }
+    // An existing attempt replays before the pair fence, as on a local
+    // prepare: the replay can only return its stored outcome, its live
+    // preparation or its own expiry, so another request holding the pair
+    // does not change its answer (C12).
     let existing_attempt: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)"
     )
@@ -2446,7 +2529,7 @@ pub async fn coordinator_prepare_direct_request(
         let signed_bytes = serde_json::to_vec(signed_req).map_err(FederationError::Json)?;
         let result = crate::chat_protocol::repository::direct_request_preparation::prepare_direct_request(
             &mut tx, &principal, &signed_bytes, signer,
-            runtime.relationship_authority().as_ref(), now,
+            runtime.relationship_authority().as_ref(), &coord.sender_home.did, now,
         ).await.map_err(|error| FederationError::RemoteError {
             status: 409, body: format!("prepare replay rejected: {error:?}"),
         })?;
@@ -2475,6 +2558,31 @@ pub async fn coordinator_prepare_direct_request(
         }
         tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
         return Ok(json!({"outcome": outcome}));
+    }
+
+    if let Some(conflict) = check_pair_owner_fence(
+        &mut tx,
+        actor_did,
+        recipient_did,
+        request_id,
+        Some(&coord.coordinator_did),
+    )
+    .await?
+    {
+        let msg = match conflict {
+            PairFenceConflict::ForeignCoordinator {
+                coordinator_did, ..
+            } => {
+                format!("Direct request or pair already owned by coordinator {coordinator_did}")
+            }
+            PairFenceConflict::LocalConflict { .. } => {
+                "Direct request already in progress for this pair".to_string()
+            }
+        };
+        return Err(FederationError::RemoteError {
+            status: 409,
+            body: format!("{{\"error\":\"PreparationConflict\",\"message\":\"{msg}\"}}"),
+        });
     }
 
     if !coord.is_sender_home {
@@ -2687,6 +2795,7 @@ pub async fn coordinator_prepare_direct_request(
         &signed_bytes,
         signer,
         runtime.relationship_authority().as_ref(),
+        &coord.sender_home.did,
         now,
     )
     .await {
@@ -2806,76 +2915,102 @@ pub async fn coordinator_publish_direct_request(
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    if let Some(conflict) = check_pair_owner_fence(
-        &mut tx,
-        actor_did,
-        recipient_did,
-        request_id,
-        Some(&coord.coordinator_did),
-    )
-    .await? {
-        let msg = match conflict {
-            PairFenceConflict::ForeignCoordinator { coordinator_did, .. } => {
-                format!("Direct request or pair already owned by coordinator {coordinator_did}")
-            }
-            PairFenceConflict::LocalConflict { .. } => {
-                "Direct request or pair already in progress for this pair".to_string()
-            }
-        };
-        return Err(FederationError::RemoteError {
-            status: 409,
-            body: format!("{{\"error\":\"PreparationConflict\",\"message\":\"{msg}\"}}"),
-        });
-    }
-
-
-    // C33-AUTH-002: Revalidate actor and every selected recipient key against fresh PDS snapshot at commit boundary
-    let http = super::resolver::build_resolver_http_client();
-    let resolver = DsResolver::with_default_endpoint(
-        pool.clone(),
-        http,
-        crate::identity::service_did(),
-        crate::identity::self_endpoint(),
-        std::env::var("DEFAULT_DS_ENDPOINT").ok(),
-        3600,
-    );
-    let actor_authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await?;
-    let actor_key_id = signed_req.pointer("/body/keyId").and_then(|v| v.as_str()).unwrap_or_default();
-    let actor_key_authorized = actor_authorized_keys.iter().any(|k| {
-        URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == actor_key_id
-            || STANDARD.encode(k) == actor_key_id
-            || crate::chat_protocol::validation::ed25519_key_id(k).map(|id| id.as_str() == actor_key_id).unwrap_or(false)
-    });
-    if !actor_key_authorized {
-        return Err(FederationError::Forbidden(format!(
-            "actor {actor_did} key {actor_key_id} is not authorized by PDS at publication commit"
-        )));
-    }
-
-    let recipient_authorized_keys = resolver.resolve_authorized_device_keys(recipient_did).await?;
-    if recipient_authorized_keys.is_empty() {
-        return Err(FederationError::Forbidden(format!(
-            "recipient {recipient_did} authorizes no MLS device keys on PDS at publication commit"
-        )));
-    }
-
-    let selected_recipient_keys: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT k.signing_public_key \
-         FROM chat.direct_request_selected_devices s \
-         JOIN chat.device_keys k ON k.user_did = s.owner_did AND k.device_id = s.owner_device_id AND k.key_id = s.owner_key_id \
-         WHERE s.request_id = $1 AND s.owner_did = $2"
+    // As on a local publish: a request that ended without a publication only
+    // replays its stored receipt, so neither the pair fence nor the PDS
+    // revalidation below applies to it (C12, C14).
+    let ended_unpublished: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts \
+         WHERE request_id=$1 AND actor_did=$2 AND recipient_did=$3 \
+           AND status IN ('cancelled','expired','rejected','existing-direct'))",
     )
     .bind(request_id)
+    .bind(actor_did)
     .bind(recipient_did)
-    .fetch_all(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    for pk in &selected_recipient_keys {
-        if !recipient_authorized_keys.iter().any(|k| k == pk) {
+    if !ended_unpublished {
+        if let Some(conflict) = check_pair_owner_fence(
+            &mut tx,
+            actor_did,
+            recipient_did,
+            request_id,
+            Some(&coord.coordinator_did),
+        )
+        .await?
+        {
+            let msg = match conflict {
+                PairFenceConflict::ForeignCoordinator {
+                    coordinator_did, ..
+                } => {
+                    format!("Direct request or pair already owned by coordinator {coordinator_did}")
+                }
+                PairFenceConflict::LocalConflict { .. } => {
+                    "Direct request or pair already in progress for this pair".to_string()
+                }
+            };
+            return Err(FederationError::RemoteError {
+                status: 409,
+                body: format!("{{\"error\":\"PreparationConflict\",\"message\":\"{msg}\"}}"),
+            });
+        }
+
+        // C33-AUTH-002: Revalidate actor and every selected recipient key against fresh PDS snapshot at commit boundary
+        let http = super::resolver::build_resolver_http_client();
+        let resolver = DsResolver::with_default_endpoint(
+            pool.clone(),
+            http,
+            crate::identity::service_did(),
+            crate::identity::self_endpoint(),
+            std::env::var("DEFAULT_DS_ENDPOINT").ok(),
+            3600,
+        );
+        let actor_authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await?;
+        let actor_key_id = signed_req
+            .pointer("/body/keyId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let actor_key_authorized = actor_authorized_keys.iter().any(|k| {
+            URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == actor_key_id
+                || STANDARD.encode(k) == actor_key_id
+                || crate::chat_protocol::validation::ed25519_key_id(k)
+                    .map(|id| id.as_str() == actor_key_id)
+                    .unwrap_or(false)
+        });
+        if !actor_key_authorized {
             return Err(FederationError::Forbidden(format!(
-                "selected recipient key for {recipient_did} is no longer authorized by PDS at publication commit"
+                "actor {actor_did} key {actor_key_id} is not authorized by PDS at publication commit"
             )));
+        }
+
+        let recipient_authorized_keys = resolver
+            .resolve_authorized_device_keys(recipient_did)
+            .await?;
+        if recipient_authorized_keys.is_empty() {
+            return Err(FederationError::Forbidden(format!(
+                "recipient {recipient_did} authorizes no MLS device keys on PDS at publication commit"
+            )));
+        }
+
+        let selected_recipient_keys: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT k.signing_public_key \
+             FROM chat.direct_request_selected_devices s \
+             JOIN chat.device_keys k ON k.user_did = s.owner_did AND k.device_id = s.owner_device_id AND k.key_id = s.owner_key_id \
+             WHERE s.request_id = $1 AND s.owner_did = $2"
+        )
+        .bind(request_id)
+        .bind(recipient_did)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
+
+        for pk in &selected_recipient_keys {
+            if !recipient_authorized_keys.iter().any(|k| k == pk) {
+                return Err(FederationError::Forbidden(format!(
+                    "selected recipient key for {recipient_did} is no longer authorized by PDS at publication commit"
+                )));
+            }
         }
     }
 
@@ -3780,4 +3915,91 @@ pub async fn coordinator_get_outcome(
         resp["entry"] = entry;
     }
     Ok(resp)
+}
+
+#[cfg(test)]
+mod pair_resolution_tests {
+    use super::*;
+    use crate::federation::errors::ResolutionFailureKind;
+
+    const HOME: &str = "did:web:chat.catbird.blue";
+
+    fn home(did: &str) -> DsEndpoint {
+        DsEndpoint {
+            did: did.to_string(),
+            endpoint: format!("https://{}", did.trim_start_matches("did:web:")),
+            supported_cipher_suites: None,
+            federation_capabilities: None,
+        }
+    }
+
+    fn recipient(declared: Option<&str>, error: FederationError) -> PairResolutionError {
+        PairResolutionError::Recipient {
+            sender_home: home(HOME),
+            declared_authority: declared.map(str::to_string),
+            error,
+        }
+    }
+
+    fn unpeered(did: &str) -> FederationError {
+        FederationError::AuthFailed {
+            reason: format!("Peer DS '{did}' is not allowlisted"),
+        }
+    }
+
+    #[test]
+    fn refused_recipient_authorities_get_a_local_refusal() {
+        for error in [
+            recipient(None, FederationError::Unsupported("absent".into())),
+            recipient(
+                None,
+                FederationError::ResolutionFailed {
+                    did: "did:web:bob.test".into(),
+                    kind: ResolutionFailureKind::InvalidDeclaration("non-public".into()),
+                },
+            ),
+            recipient(
+                Some("did:web:chat.federated-peer.org"),
+                unpeered("did:web:chat.federated-peer.org"),
+            ),
+        ] {
+            let coord = error
+                .local_refusal_coordinator(HOME)
+                .expect("local refusal");
+            assert_eq!(coord.coordinator_did, HOME);
+            assert!(coord.is_coordinator && coord.is_sender_home && coord.is_recipient_home);
+        }
+    }
+
+    #[test]
+    fn no_local_refusal_when_it_would_not_verify_or_is_not_final() {
+        // Clients verify receipts against the lower authority DID.
+        assert!(recipient(
+            Some("did:web:aaa.example-peer.org"),
+            unpeered("did:web:aaa.example-peer.org")
+        )
+        .local_refusal_coordinator(HOME)
+        .is_none());
+        // A transient failure is not a refusal.
+        assert!(recipient(
+            Some("did:web:chat.federated-peer.org"),
+            FederationError::ResolutionFailed {
+                did: "did:web:chat.federated-peer.org".into(),
+                kind: ResolutionFailureKind::Timeout("slow".into()),
+            },
+        )
+        .local_refusal_coordinator(HOME)
+        .is_none());
+        // Only the sender's own home may refuse alone.
+        assert!(
+            recipient(None, FederationError::Unsupported("absent".into()))
+                .local_refusal_coordinator("did:web:other.catbird.blue")
+                .is_none()
+        );
+        assert!(
+            PairResolutionError::Sender(FederationError::Unsupported("absent".into()))
+                .local_refusal_coordinator(HOME)
+                .is_none()
+        );
+    }
 }

@@ -86,6 +86,13 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
     let (bob_group_package, _) = bob_engine.create_key_package(&bob_identity)?;
     let alice_public = alice_engine.identity_public_key(&alice_identity)?;
     let bob_public = bob_engine.identity_public_key(&bob_identity)?;
+    // Both accounts are homed here. Bob's declaration admits the group
+    // invitation, prepare resolves each party's chat authority from its
+    // declaration, and Alice's publication must match her PDS device key.
+    for (identity, public_key) in [(&alice, &alice_public), (&bob, &bob_public)] {
+        https.declare_local_chat_account(&identity.did)?;
+        https.publish_device_key(&identity.did, public_key)?;
+    }
     seed_service_device(&alice, &alice_public)?;
     seed_service_device(&bob, &bob_public)?;
 
@@ -317,6 +324,34 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
                 .context("package field")?,
         )?)
     };
+    // Import until the selected grants expire. minimumImportUntil is only the
+    // floor measured from the prepare instant: a publication that lands in a
+    // later second than prepare no longer meets it and is rejected
+    // (ImportHorizonTooShort).
+    let minimum_import_until = u64::try_from(
+        chrono::DateTime::parse_from_rfc3339(
+            snapshot["minimumImportUntil"]
+                .as_str()
+                .context("minimumImportUntil")?,
+        )?
+        .timestamp(),
+    )?;
+    let mut authority_import_until = u64::MAX;
+    for device in selected {
+        let expires_at = u64::try_from(
+            chrono::DateTime::parse_from_rfc3339(
+                device["grant"]["body"]["expiresAt"]
+                    .as_str()
+                    .context("selected grant expiresAt")?,
+            )?
+            .timestamp(),
+        )?;
+        authority_import_until = authority_import_until.min(expires_at);
+    }
+    anyhow::ensure!(
+        authority_import_until >= minimum_import_until,
+        "selected grant expires before the preparation's import floor"
+    );
     let journal = alice_engine.prepare_direct_request(&DirectRequestBootstrapInput {
         draft_id: Uuid::new_v4().to_string(),
         context_json: serde_json::to_vec(&context)?,
@@ -331,14 +366,7 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
             .iter()
             .map(|d| decode_pkg(d, "keyPackageRef"))
             .collect::<anyhow::Result<_>>()?,
-        authority_import_until: u64::try_from(
-            chrono::DateTime::parse_from_rfc3339(
-                snapshot["minimumImportUntil"]
-                    .as_str()
-                    .context("minimumImportUntil")?,
-            )?
-            .timestamp(),
-        )?,
+        authority_import_until,
         preparation_request_digest: *verified_prepare.request_digest(),
         receipt_authority_key: server.receipt_public_key.clone(),
         text: "Please join our group chat".into(),

@@ -166,11 +166,18 @@ fn set_recipient_view(root: &Path, recipient: &str, inviter: &str, row: Value) -
     set_policy(root, &["relationship", recipient, inviter], &row)
 }
 
+/// Consent is read from the recipient's Catbird chat declaration, the record
+/// that also homes it here, so the override keeps it local and changes only
+/// `allowIncoming`.
 fn set_incoming(root: &Path, recipient: &str, incoming: &str) -> anyhow::Result<()> {
     set_policy(
         root,
-        &["declaration", recipient],
-        &json!({"$type":"chat.bsky.actor.declaration","allowIncoming":incoming}),
+        &["catbirdDeclaration", recipient],
+        &json!({
+            "$type":"blue.catbird.chat.declaration","protocolVersion":"1",
+            "allowIncoming":incoming,"deliveryService":"did:web:chat.catbird.blue",
+            "createdAt":canonical_now()
+        }),
     )
 }
 
@@ -233,6 +240,11 @@ async fn rig(identities: &[&ServiceIdentity]) -> anyhow::Result<Rig> {
         .map(|id| (id.did.clone(), id.did_document()))
         .collect::<Vec<_>>();
     let https = HttpsDidFixture::start(HttpsDidFixture::reserve_port()?, &documents)?;
+    // Prepare, publish and accept resolve every party's chat authority, which
+    // fails closed without a declaration.
+    for id in identities {
+        https.declare_local_chat_account(&id.did)?;
+    }
     let server = ShippingServerFixture::start(&https)?;
     Ok(Rig {
         https,
@@ -792,6 +804,8 @@ async fn c08_live_block_and_preference_denials_use_real_projection() -> anyhow::
     all.push(&alice_id);
     let rig = rig(&all).await?;
     let alice = Account::new(alice_id.clone(), "c08-alice")?;
+    // Alice publishes, so her signature key must match her PDS device record.
+    rig.https.publish_device_key(alice.did(), &alice.public)?;
     let bobs = ids
         .iter()
         .zip(labels)
@@ -875,6 +889,7 @@ async fn c08_live_publish_time_policy_recheck_denies_after_preparation() -> anyh
     let none_id = identity("c08-rc-none", &run);
     let rig = rig(&[&alice_id, &block_id, &none_id]).await?;
     let alice = Account::new(alice_id, "c08-alice")?;
+    rig.https.publish_device_key(alice.did(), &alice.public)?;
     let blocked = Account::new(block_id, "c08-rc-block")?;
     let disabled = Account::new(none_id, "c08-rc-none")?;
     publish_keys(&rig, &blocked).await?;
@@ -921,6 +936,7 @@ async fn grant_disable_race(mutation_first: bool) -> anyhow::Result<()> {
     let bob_id = identity("c08-grant-race", &run);
     let rig = rig(&[&alice_id, &bob_id]).await?;
     let alice = Account::new(alice_id, "c08-alice")?;
+    rig.https.publish_device_key(alice.did(), &alice.public)?;
     let bob = Account::new(bob_id, "c08-grant-race")?;
     publish_keys(&rig, &bob).await?;
     let prep = prepare(&rig, &alice, bob.did()).await?;
@@ -998,6 +1014,7 @@ async fn device_revoke_race(mutation_first: bool) -> anyhow::Result<()> {
     let bob_id = identity("c08-rv-race", &run);
     let rig = rig(&[&alice_id, &bob_id]).await?;
     let alice = Account::new(alice_id, "c08-alice")?;
+    rig.https.publish_device_key(alice.did(), &alice.public)?;
     let bob = Account::new(bob_id, "c08-rv-race")?;
     publish_keys(&rig, &bob).await?;
     let sibling = siblings::enroll(&bob.svc, &rig.client, &rig.server.base_url).await?;
@@ -1171,6 +1188,7 @@ async fn c09_live_snapshot_includes_every_deliverable_device_and_ignores_unrelat
     let carol_id = identity("c09-carol", &run);
     let rig = rig(&[&alice_id, &bob_id, &carol_id]).await?;
     let alice = Account::new(alice_id, "c09-alice")?;
+    rig.https.publish_device_key(alice.did(), &alice.public)?;
     let bob = Account::new(bob_id, "c09-bob")?;
     let carol = Account::new(carol_id, "c09-carol")?;
     publish_keys(&rig, &bob).await?;

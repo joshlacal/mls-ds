@@ -216,8 +216,12 @@ async fn schema_valid_nested_publication_mutations_fail_before_graph_effects() -
             )
             .await?;
         let response: Value = serde_json::from_slice(&raw)?;
-        let expected = if matches!(path, "/actorDid" | "/actorDeviceId") {
-            "PreparationConflict"
+        // Since f38efd4b the publish handler verifies the signature before store
+        // admission, with the key of the authenticated principal at the claimed
+        // device and keyId: an unknown device or keyId has no signer key, and a
+        // foreign actorDid fails that signature.
+        let expected = if matches!(path, "/actorDeviceId" | "/keyId") {
+            "NotAuthorized"
         } else {
             "InvalidSignature"
         };

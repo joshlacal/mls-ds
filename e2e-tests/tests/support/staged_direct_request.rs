@@ -180,6 +180,13 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
         .identity_public_key(alice_identity.clone())
         .map_err(|error| anyhow::anyhow!("sender public key: {error}"))?;
     let bob_public = bob_engine.identity_public_key(&bob_identity)?;
+    // Prepare resolves both parties' chat authority from their declarations,
+    // which fails closed without one; publish matches the sender's key with
+    // its PDS device record.
+    for (identity, public_key) in [(&alice, &alice_public), (&bob, &bob_public)] {
+        https.declare_local_chat_account(&identity.did)?;
+        https.publish_device_key(&identity.did, public_key)?;
+    }
     seed_service_device(&alice, &alice_public)?;
     seed_service_device(&bob, &bob_public)?;
     let server = ShippingServerFixture::start(&https)?;
