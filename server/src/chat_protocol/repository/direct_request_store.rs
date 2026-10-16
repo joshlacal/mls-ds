@@ -110,6 +110,11 @@ pub(crate) enum DirectRequestStoreError {
     /// service; atomic publication spans exactly one canonical authority.
     #[error("recipient is homed on another chat authority")]
     RecipientAuthorityUnsupported,
+    /// The recipient's declaration moved after the coordinator was chosen and
+    /// now leaves another DS as the pair's coordinator, so this DS signs
+    /// nothing for the attempt.
+    #[error("recipient's chat authority moved off this coordinator")]
+    CoordinatorMoved,
     #[error("included device authority changed")]
     IncludedAuthorityChanged,
     #[error("request receipt or snapshot is invalid")]

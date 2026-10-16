@@ -2529,7 +2529,7 @@ pub async fn coordinator_prepare_direct_request(
         let signed_bytes = serde_json::to_vec(signed_req).map_err(FederationError::Json)?;
         let result = crate::chat_protocol::repository::direct_request_preparation::prepare_direct_request(
             &mut tx, &principal, &signed_bytes, signer,
-            runtime.relationship_authority().as_ref(), now,
+            runtime.relationship_authority().as_ref(), &coord.sender_home.did, now,
         ).await.map_err(|error| FederationError::RemoteError {
             status: 409, body: format!("prepare replay rejected: {error:?}"),
         })?;
@@ -2795,6 +2795,7 @@ pub async fn coordinator_prepare_direct_request(
         &signed_bytes,
         signer,
         runtime.relationship_authority().as_ref(),
+        &coord.sender_home.did,
         now,
     )
     .await {

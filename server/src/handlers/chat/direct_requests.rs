@@ -34,7 +34,8 @@ fn failure(endpoint: ChatEndpoint, error: DirectRequestStoreError) -> ChatFailur
         DirectRequestStoreError::RecipientKeysUnavailable => {
             ChatProtocolErrorCode::RecipientKeysUnavailable
         }
-        DirectRequestStoreError::RecipientAuthorityUnsupported => {
+        DirectRequestStoreError::RecipientAuthorityUnsupported
+        | DirectRequestStoreError::CoordinatorMoved => {
             ChatProtocolErrorCode::RecipientAuthorityUnsupported
         }
         DirectRequestStoreError::IncludedAuthorityChanged => {
@@ -379,7 +380,7 @@ async fn mutate(
             if existing {
                 let result = requests::prepare_direct_request(
                     &mut tx, &principal, envelope.signed_request.get().as_bytes(), signer,
-                    runtime.relationship_authority().as_ref(), now,
+                    runtime.relationship_authority().as_ref(), &coord.sender_home.did, now,
                 )
                 .await
                 .map_err(|e| failure(endpoint, e))?;
@@ -436,6 +437,7 @@ async fn mutate(
                 envelope.signed_request.get().as_bytes(),
                 signer,
                 runtime.relationship_authority().as_ref(),
+                &coord.sender_home.did,
                 now,
             )
             .await;
@@ -461,6 +463,28 @@ async fn mutate(
                 // transaction and answered unsigned.
                 if !confirms_local_refusal(&result) {
                     return Err(pair_failure(endpoint, refused.into_federation_error()));
+                }
+                // The repository read the recipient's declaration again, so
+                // its refusal can rest on an authority other than the one
+                // that made this DS the signer. Before committing, read it
+                // once more: the refusal stays signed only while no declared
+                // authority sorts below this DS, the authority the client
+                // checks the receipt against.
+                match crate::federation::canonical_relay::resolve_pair_coordinator_by_side(
+                    pool,
+                    actor_did,
+                    recipient_did,
+                )
+                .await
+                {
+                    Err(error)
+                        if error
+                            .local_refusal_coordinator(&crate::identity::service_did())
+                            .is_some() => {}
+                    Err(error) => {
+                        return Err(pair_failure(endpoint, error.into_federation_error()))
+                    }
+                    Ok(_) => return Err(pair_failure(endpoint, refused.into_federation_error())),
                 }
             }
 

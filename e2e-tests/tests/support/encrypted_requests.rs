@@ -242,6 +242,73 @@ pub fn request_database_url() -> &'static str {
     })
 }
 
+/// Holds, from its own session, the advisory lock a router takes on a
+/// direct-request pair once it has chosen the pair's coordinator, so a test
+/// can change what the router reads between that choice and its repository's
+/// reads. Dropping it ends the session, which releases the lock.
+pub struct PairLockBarrier {
+    client: tokio_postgres::Client,
+    connection: tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>,
+    key: String,
+}
+
+impl PairLockBarrier {
+    pub async fn hold(database_url: &str, actor_did: &str, recipient_did: &str) -> Result<Self> {
+        let (low, high) = if actor_did <= recipient_did {
+            (actor_did, recipient_did)
+        } else {
+            (recipient_did, actor_did)
+        };
+        let key = format!("chat-direct-request-pair:{low}:{high}");
+        let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+            .await
+            .context("pair lock session")?;
+        let connection = tokio::spawn(connection);
+        client
+            .execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&key])
+            .await
+            .context("take the pair lock")?;
+        Ok(Self { client, connection, key })
+    }
+
+    /// Wait until another session queues on the pair lock.
+    pub async fn wait_for_router(&self) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let waiting: i64 = self
+                .client
+                .query_one(
+                    "SELECT count(*) FROM pg_locks, hashtextextended($1, 0) AS h \
+                     WHERE locktype='advisory' AND NOT granted AND objsubid=1 \
+                       AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) \
+                       AND classid::bigint=((h >> 32) & 4294967295) AND objid::bigint=(h & 4294967295)",
+                    &[&self.key],
+                )
+                .await?
+                .get(0);
+            if waiting > 0 {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "no router queued on {}",
+                self.key
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    pub async fn release(self) -> Result<()> {
+        self.client
+            .execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", &[&self.key])
+            .await
+            .context("release the pair lock")?;
+        drop(self.client);
+        let _ = self.connection.await;
+        Ok(())
+    }
+}
+
 /// Route this whole test process to one dedicated database. Must precede the
 /// first harness database use; rerouting to a different target fails.
 pub fn route_to_dedicated_database(url: &str) -> Result<()> {

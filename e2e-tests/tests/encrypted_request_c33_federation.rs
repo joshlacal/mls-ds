@@ -36,7 +36,7 @@ use catbird_mls::{
 };
 use encrypted_requests::{
     canonical_future, canonical_now, signed_mls_request, DeterministicFaultTransport,
-    FaultBoundary, HttpsDidFixture, ServiceIdentity,
+    FaultBoundary, HttpsDidFixture, PairLockBarrier, ServiceIdentity,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use p256::ecdsa::SigningKey;
@@ -2115,6 +2115,66 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         psql_value(&server_a.database_url, &format!("SELECT status FROM chat.direct_request_attempts WHERE request_id='{r0_req_id}'"))?,
         "rejected",
         "the coordinator keeps R0's rejection"
+    );
+
+    // C33 on the relay path. The coordinator chooses itself from Alice's
+    // declaration and its repository reads the declaration again. When it
+    // moves in between to an authority other than the coordinator, clients
+    // check receipts against min(Bob's home, that authority), so the
+    // coordinator signs nothing and Bob's home answers unsigned.
+    let moved_req_id = Uuid::new_v4();
+    let moved_prepare = signed_mls_request(
+        &bob.engine,
+        &bob.identity,
+        DirectRequestKind::Prepare,
+        json!({
+            "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\0",
+            "protocolVersion": "2",
+            "actorDid": bob.svc.did,
+            "actorDeviceId": bob.svc.device_id.to_string(),
+            "keyId": bob.key_id,
+            "authGeneration": 1,
+            "requestId": moved_req_id.to_string(),
+            "firstMessageId": Uuid::new_v4().to_string(),
+            "conversationId": Uuid::new_v4().to_string(),
+            "recipientDid": alice.svc.did,
+            "origin": { "$type": "blue.catbird.chat.defs#freshDirectOrigin" },
+            "profile": "encryptedIntroduction1",
+            "idempotencyKey": moved_req_id.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let barrier = PairLockBarrier::hold(&server_a.database_url, &bob.svc.did, &alice.svc.did).await?;
+    let mover = async {
+        barrier.wait_for_router().await?;
+        declare_chat_authority(&https.root, &alice.svc.did, "did:web:chat.federated-peer.org")?;
+        barrier.release().await
+    };
+    let moved_body = json!({ "signedRequest": moved_prepare });
+    let ((moved_status, moved_bytes), ()) = tokio::try_join!(
+        bob.svc.post(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.prepareDirectRequest",
+            &moved_body,
+            true,
+        ),
+        mover,
+    )?;
+    declare_chat_authority(&https.root, &alice.svc.did, &ds1_did)?;
+    let moved: Value = serde_json::from_slice(&moved_bytes).unwrap_or(Value::Null);
+    anyhow::ensure!(
+        moved_status == StatusCode::BAD_REQUEST && moved.get("outcome").is_none(),
+        "a request whose recipient moved must get no receipt: {moved_status}: {}",
+        String::from_utf8_lossy(&moved_bytes)
+    );
+    assert_eq!(
+        psql_count(&server_a.database_url, &format!(
+            "SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{moved_req_id}'"
+        ))?,
+        0,
+        "the coordinator keeps no attempt for the moved request"
     );
 
     // Publish direct request keys on home servers:

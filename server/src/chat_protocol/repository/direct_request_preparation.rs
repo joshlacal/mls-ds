@@ -785,6 +785,7 @@ pub(crate) async fn prepare_direct_request<
     raw: &[u8],
     signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
     policy: &crate::chat_protocol::relationship_policy::RelationshipAuthority<T>,
+    sender_authority: &str,
     now: DateTime<Utc>,
 ) -> Result<DirectRequestResult, DirectRequestStoreError> {
     use crate::chat_protocol::{
@@ -907,9 +908,20 @@ pub(crate) async fn prepare_direct_request<
             let authority = crate::chat_protocol::validation::BareDid::parse(&authority)
                 .map_err(|_| DirectRequestStoreError::PolicyDenied)?;
             let authority = crate::identity::canonical_did(authority.as_str());
-            let local = authority == crate::identity::canonical_did(signer.authority_did())
-                || crate::identity::service_did_base_opt().as_deref() == Some(authority);
-            if !local {
+            let is_local = |did: &str| {
+                did == crate::identity::canonical_did(signer.authority_did())
+                    || crate::identity::service_did_base_opt().as_deref() == Some(did)
+            };
+            if !is_local(authority) {
+                // Clients check what this DS signs for the pair against the
+                // lower of the sender's home and this authority. The router
+                // chose the coordinator from an earlier read, so when the
+                // declaration has moved and that lower DID is no longer this
+                // DS, nothing signed here would verify: answer unsigned.
+                let sender = crate::identity::canonical_did(sender_authority);
+                if !is_local(sender.min(authority)) {
+                    return Err(DirectRequestStoreError::CoordinatorMoved);
+                }
                 match crate::federation::peer_policy::enforce_outbound_peer_policy_tx(tx, authority)
                     .await
                 {
