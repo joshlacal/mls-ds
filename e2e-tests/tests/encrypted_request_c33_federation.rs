@@ -553,14 +553,15 @@ impl FederatedParty {
 
 /// Verify a signed receipt outcome against an authority's receipt key and
 /// return its refusal code.
-fn receipt_code(response: &Value, key: &[u8]) -> anyhow::Result<Option<String>> {
+fn receipt_code(response: &Value, authority: &str, key: &[u8]) -> anyhow::Result<Option<String>> {
     anyhow::ensure!(
         response["outcome"]["$type"] == "blue.catbird.chat.defs#signedDirectRequestReceipt",
         "expected a signed receipt, got {response}"
     );
     let mut signed = response["outcome"].clone();
     signed.as_object_mut().context("receipt object")?.remove("$type");
-    let verified = protocol::verify_received_signed_request(
+    let verified = protocol::verify_received_signed_request_for_authority(
+        authority,
         DirectRequestKind::Outcome,
         &serde_json::to_vec(&signed)?,
         key,
@@ -2107,7 +2108,7 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     anyhow::ensure!(r0_status == StatusCode::OK, "R0 prepare: {r0_status}: {}", String::from_utf8_lossy(&r0_bytes));
     let r0_outcome: Value = serde_json::from_slice(&r0_bytes)?;
     anyhow::ensure!(
-        receipt_code(&r0_outcome, &server_a.receipt_public_key)?.as_deref() == Some("RecipientKeysUnavailable"),
+        receipt_code(&r0_outcome, &server_a.did, &server_a.receipt_public_key)?.as_deref() == Some("RecipientKeysUnavailable"),
         "R0 must end in the coordinator's signed RecipientKeysUnavailable rejection: {r0_outcome}"
     );
     assert_eq!(
