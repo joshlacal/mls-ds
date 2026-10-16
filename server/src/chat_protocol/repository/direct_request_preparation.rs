@@ -717,6 +717,18 @@ fn terminal_receipt(
     signer.seal_outcome(serde_json::json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":signer.authority_did(),"keyId":signer.key_id(),"receipt":receipt})).map_err(|_|DirectRequestStoreError::InvalidReceipt)
 }
 
+/// Take the operation and budget locks a cancel's admission takes, in its
+/// order, so a caller can write the actor's device rows first without
+/// inverting the order every admission locks them in. Admission re-enters
+/// both locks in the same transaction.
+pub(crate) async fn lock_cancel_admission(
+    tx: &mut Transaction<'_, Postgres>,
+    request_id: uuid::Uuid,
+) -> Result<(), DirectRequestStoreError> {
+    super::prelude::lock_direct_request_operation_set(tx, request_id, &[]).await?;
+    Ok(())
+}
+
 pub(crate) async fn cancel_direct_request(
     tx: &mut Transaction<'_, Postgres>,
     principal: &crate::auth::VerifiedServicePrincipal,

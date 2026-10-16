@@ -367,7 +367,17 @@ where
             "/xrpc/blue.catbird.mlsDS.getDirectRequestOutcome",
             get(crate::handlers::ds::direct_requests::get_direct_request_outcome),
         );
-    router
+    // A test-support build can leave the cancel procedure out to stand in for
+    // a coordinator that predates it.
+    #[cfg(feature = "test-support")]
+    if std::env::var("CATBIRD_TEST_DISABLE_MLSDS_CANCEL").as_deref() == Ok("1") {
+        return router;
+    }
+    router.route(
+        "/xrpc/blue.catbird.mlsDS.cancelDirectRequestPreparation",
+        post(crate::handlers::ds::direct_requests::cancel_direct_request_preparation)
+            .layer(DefaultBodyLimit::max(65_536)),
+    )
 }
 fn xrpc_path(endpoint: ChatEndpoint) -> String {
     format!("/xrpc/{}", endpoint.nsid())

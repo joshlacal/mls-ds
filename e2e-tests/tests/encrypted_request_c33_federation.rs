@@ -13,6 +13,7 @@
 //! 10. Zero legacy fallback: verify no legacy table interaction and one canonical DB graph.
 //! 11. Lost-peer and lost-client-response retry preserve single Welcome/package consumption.
 //! 12. Recipient getEntries seq=2 acceptance entry hashes to the returned acceptance proof entry.
+//! 13. A sender's cancel reaches the pair's coordinator through the sender's home, and only the coordinator signs it.
 #![allow(dead_code, unused_imports)]
 #[path = "support/encrypted_requests.rs"]
 mod encrypted_requests;
@@ -373,6 +374,16 @@ impl FederatedAuthorityServer {
         https: &HttpsDidFixture,
         seed_byte: u8,
     ) -> anyhow::Result<()> {
+        self.restart_with_env(port, https, seed_byte, &[])
+    }
+
+    pub fn restart_with_env(
+        &mut self,
+        port: u16,
+        https: &HttpsDidFixture,
+        seed_byte: u8,
+        extra_env: &[(&str, &str)],
+    ) -> anyhow::Result<()> {
         let receipt_key = SigningKey::from_bytes((&[seed_byte; 32]).into())?;
         let service_key = SigningKey::from_bytes((&[seed_byte + 1; 32]).into())?;
         let cursor_key_id = psql_value(
@@ -425,6 +436,7 @@ impl FederatedAuthorityServer {
             .env("RUST_LOG", "warn")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        command.envs(extra_env.iter().copied());
 
         let _ = self._child.0.kill();
         let _ = self._child.0.wait();
@@ -1136,6 +1148,88 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     assert_eq!(
         first_published_receipt, replayed_receipt,
         "replayed publication must return exact identical outcome receipt"
+    );
+
+    // A cancel that comes after the publication gets the coordinator's
+    // published receipt, through Alice's home when the coordinator is not
+    // her home, and changes nothing on either DS.
+    let inbox_count = |db: &str| {
+        psql_count(db, &format!("SELECT count(*) FROM chat.direct_request_transport_inbox WHERE request_id='{request_id}'"))
+    };
+    let inbox_before = (
+        inbox_count(&server_a.database_url)?,
+        inbox_count(&server_b.database_url)?,
+    );
+    // When the coordinator is not Alice's home, her home rebuilds a lost
+    // mirror of the publication from the cancel's answer, as a relayed
+    // publish would. The rows are immutable, so the loss is staged with
+    // triggers off.
+    let mirror = || {
+        psql_value(&server_b.database_url, &format!(
+            "SELECT (SELECT count(*) FROM chat.direct_request_transport_inbox \
+                     WHERE request_id='{request_id}' AND sender_did='{}' AND coordinator_did='{}')||'|'||\
+                    (SELECT count(*) FROM chat.direct_request_transport_entries WHERE conversation_id='{conversation_id}')",
+            alice.svc.did, server_a.did
+        ))
+    };
+    let mirror_before = mirror()?;
+    if reverse {
+        anyhow::ensure!(
+            mirror_before != "0|0",
+            "Alice's home mirrors the publication"
+        );
+        psql_on(&server_b.database_url, &format!(
+            "BEGIN; SET LOCAL session_replication_role = replica; \
+             DELETE FROM chat.direct_request_transport_inbox WHERE request_id='{request_id}' AND sender_did='{}'; \
+             DELETE FROM chat.direct_request_transport_entries WHERE conversation_id='{conversation_id}'; COMMIT;",
+            alice.svc.did
+        ))?;
+        assert_eq!(mirror()?, "0|0");
+    }
+    let (status, late_cancel) = post_json(
+        &alice,
+        &client,
+        &alice_home,
+        "blue.catbird.chat.cancelDirectRequestPreparation",
+        &signed_cancel(&alice, &prepare_signed)?,
+    )
+    .await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "cancel after publication {status}: {late_cancel}"
+    );
+    let late_receipt =
+        authority_receipt(&late_cancel, &server_a.did, &server_a.receipt_public_key)?;
+    assert_eq!(
+        late_receipt["$type"],
+        "blue.catbird.chat.defs#directRequestPublishedReceipt"
+    );
+    assert_eq!(
+        bare_bytes(&late_cancel["outcome"]),
+        bare_bytes(&first_published_receipt),
+        "a cancel after publication answers with the publication"
+    );
+    assert_eq!(
+        psql_value(
+            &server_a.database_url,
+            &format!(
+                "SELECT status FROM chat.direct_request_attempts WHERE request_id='{request_id}'"
+            )
+        )?,
+        "published"
+    );
+    assert_eq!(
+        (
+            inbox_count(&server_a.database_url)?,
+            inbox_count(&server_b.database_url)?
+        ),
+        inbox_before,
+        "the cancel writes no delivery"
+    );
+    assert_eq!(
+        mirror()?,
+        mirror_before,
+        "the cancel restores Alice's home's mirror"
     );
 
     // -------------------------------------------------------------------------
@@ -2579,6 +2673,120 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         "Alice's preparation still holds the pair"
     );
 
+    // C12 for cancels on a federated pair, while Alice's preparation holds
+    // it. Bob's cancel of R0 reaches the coordinator and replays its stored
+    // rejection. His cancel of R5, which neither DS has seen, leaves the
+    // coordinator's tombstone, and a late prepare and a late publish of R5
+    // replay it.
+    const CANCEL: &str = "blue.catbird.chat.cancelDirectRequestPreparation";
+    let (status, r0_cancel) = post_json(
+        &bob,
+        &client,
+        &server_b.base_url,
+        CANCEL,
+        &signed_cancel(&bob, &r0_prepare_signed)?,
+    )
+    .await?;
+    anyhow::ensure!(status == StatusCode::OK, "R0 cancel {status}: {r0_cancel}");
+    authority_receipt(&r0_cancel, &server_a.did, &server_a.receipt_public_key)?;
+    assert_eq!(
+        bare_bytes(&r0_cancel["outcome"]),
+        bare_bytes(&r0_outcome["outcome"]),
+        "R0's cancel replays its rejection"
+    );
+    let r5_id = Uuid::new_v4();
+    let r5_prepare = signed_prepare(&bob, &alice.svc.did, r5_id)?;
+    let (status, r5_cancel) = post_json(
+        &bob,
+        &client,
+        &server_b.base_url,
+        CANCEL,
+        &signed_cancel(&bob, &r5_prepare)?,
+    )
+    .await?;
+    anyhow::ensure!(status == StatusCode::OK, "R5 cancel {status}: {r5_cancel}");
+    let r5_receipt = authority_receipt(&r5_cancel, &server_a.did, &server_a.receipt_public_key)?;
+    assert_eq!(
+        r5_receipt["$type"],
+        "blue.catbird.chat.defs#directRequestCancelledReceipt"
+    );
+    let (status, late) = post_json(
+        &bob,
+        &client,
+        &server_b.base_url,
+        "blue.catbird.chat.prepareDirectRequest",
+        &r5_prepare,
+    )
+    .await?;
+    anyhow::ensure!(status == StatusCode::OK, "late R5 prepare {status}: {late}");
+    assert_eq!(
+        bare_bytes(&late["outcome"]),
+        bare_bytes(&r5_cancel["outcome"]),
+        "a late R5 prepare replays the tombstone"
+    );
+    let mut r5_publish_body = r0_publish_signed["body"].clone();
+    for field in [
+        "requestId",
+        "conversationId",
+        "firstMessageId",
+        "idempotencyKey",
+    ] {
+        r5_publish_body[field] = r5_prepare["body"][field].clone();
+    }
+    r5_publish_body["preparationRequestDigest"] = json!(STANDARD.encode(request_digest(
+        &bob,
+        DirectRequestKind::Prepare,
+        &r5_prepare
+    )?));
+    r5_publish_body["signedAt"] = json!(canonical_now());
+    let r5_publish = signed_mls_request(
+        &bob.engine,
+        &bob.identity,
+        DirectRequestKind::Publish,
+        r5_publish_body,
+    )?;
+    let (status, late) = post_json(
+        &bob,
+        &client,
+        &server_b.base_url,
+        "blue.catbird.chat.publishDirectRequest",
+        &r5_publish,
+    )
+    .await?;
+    anyhow::ensure!(status == StatusCode::OK, "late R5 publish {status}: {late}");
+    assert_eq!(
+        bare_bytes(&late["outcome"]),
+        bare_bytes(&r5_cancel["outcome"]),
+        "a late R5 publish replays the tombstone"
+    );
+    assert_eq!(
+        psql_value(
+            &server_a.database_url,
+            &format!(
+                "SELECT (SELECT string_agg(status, ',') FROM chat.direct_request_attempts WHERE request_id IN ('{r0_req_id}','{r5_id}'))||'|'||\
+                        (SELECT count(*) FROM chat.direct_request_publications WHERE request_id IN ('{r0_req_id}','{r5_id}'))"
+            )
+        )?
+        .split('|')
+        .map(|part| {
+            let mut statuses = part.split(',').collect::<Vec<_>>();
+            statuses.sort();
+            statuses.join(",")
+        })
+        .collect::<Vec<_>>()
+        .join("|"),
+        "cancelled,rejected|0",
+        "the coordinator keeps R0's rejection and R5's tombstone and publishes neither"
+    );
+    assert_eq!(
+        psql_count(
+            &server_b.database_url,
+            &format!("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id IN ('{r0_req_id}','{r5_id}')")
+        )?,
+        0,
+        "Bob's home writes no tombstone of its own"
+    );
+
     // Simulate lost peer: recipient server is killed before publication commits
     server_b._child.0.kill()?;
     server_b._child.0.wait()?;
@@ -3021,5 +3229,702 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         assert_eq!(decoded.display_text(), text, "peer successfully decrypted converged MLS reply");
     }
 
+    Ok(())
+}
+
+fn signed_prepare(
+    party: &FederatedParty,
+    recipient_did: &str,
+    request_id: Uuid,
+) -> anyhow::Result<Value> {
+    signed_mls_request(
+        &party.engine,
+        &party.identity,
+        DirectRequestKind::Prepare,
+        json!({
+            "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\0",
+            "protocolVersion": "2",
+            "actorDid": party.svc.did,
+            "actorDeviceId": party.svc.device_id.to_string(),
+            "keyId": party.key_id,
+            "authGeneration": 1,
+            "requestId": request_id.to_string(),
+            "firstMessageId": Uuid::new_v4().to_string(),
+            "conversationId": Uuid::new_v4().to_string(),
+            "recipientDid": recipient_did,
+            "origin": { "$type": "blue.catbird.chat.defs#freshDirectOrigin" },
+            "profile": "encryptedIntroduction1",
+            "idempotencyKey": request_id.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )
+}
+
+fn request_digest(
+    party: &FederatedParty,
+    kind: DirectRequestKind,
+    signed: &Value,
+) -> anyhow::Result<[u8; 32]> {
+    Ok(
+        *protocol::verify_signed_request(kind, &serde_json::to_vec(signed)?, &party.public)?
+            .request_digest(),
+    )
+}
+
+/// `party`'s cancel of the request it signed as `prepare`.
+fn signed_cancel(party: &FederatedParty, prepare: &Value) -> anyhow::Result<Value> {
+    signed_mls_request(
+        &party.engine,
+        &party.identity,
+        DirectRequestKind::Cancel,
+        json!({
+            "$type": "blue.catbird.chat.defs#directRequestCancellationBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-CANCEL\0",
+            "protocolVersion": "2",
+            "actorDid": party.svc.did,
+            "actorDeviceId": party.svc.device_id.to_string(),
+            "keyId": party.key_id,
+            "authGeneration": 1,
+            "requestId": prepare["body"]["requestId"],
+            "recipientDid": prepare["body"]["recipientDid"],
+            "preparationRequestDigest": STANDARD.encode(request_digest(party, DirectRequestKind::Prepare, prepare)?),
+            "idempotencyKey": Uuid::new_v4().to_string(),
+            "signedAt": canonical_now()
+        }),
+    )
+}
+
+/// A response with `{"$bytes"}` presentations folded to bare base64, so a
+/// receipt compares equal however the DS that returned it presented it.
+fn bare_bytes(value: &Value) -> Value {
+    match value {
+        Value::Object(map) if map.len() == 1 && map.get("$bytes").is_some_and(Value::is_string) => {
+            map["$bytes"].clone()
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), bare_bytes(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(bare_bytes).collect()),
+        other => other.clone(),
+    }
+}
+
+/// The receipt in a cancel response, which must be exactly `{"outcome"}`
+/// (the client refuses anything else) and verify for `authority`.
+fn authority_receipt(response: &Value, authority: &str, key: &[u8]) -> anyhow::Result<Value> {
+    anyhow::ensure!(
+        response.as_object().is_some_and(|object| object.len() == 1),
+        "a cancel answers with the outcome alone: {response}"
+    );
+    anyhow::ensure!(
+        response["outcome"]["$type"] == "blue.catbird.chat.defs#signedDirectRequestReceipt",
+        "expected a signed receipt, got {response}"
+    );
+    let mut signed = response["outcome"].clone();
+    signed
+        .as_object_mut()
+        .context("receipt object")?
+        .remove("$type");
+    let verified = protocol::verify_received_signed_request_for_authority(
+        authority,
+        DirectRequestKind::Outcome,
+        &serde_json::to_vec(&signed)?,
+        key,
+    )?;
+    Ok(verified.body()["receipt"].clone())
+}
+
+async fn post_json(
+    party: &FederatedParty,
+    client: &reqwest::Client,
+    base_url: &str,
+    nsid: &str,
+    signed: &Value,
+) -> anyhow::Result<(StatusCode, Value)> {
+    let (status, bytes) = party
+        .svc
+        .post(
+            client,
+            base_url,
+            nsid,
+            &json!({ "signedRequest": signed }),
+            true,
+        )
+        .await?;
+    Ok((
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    ))
+}
+
+/// C33 cancel on a federated pair. A sender's cancel reaches the pair's
+/// coordinator through the sender's home, and the coordinator signs it: the
+/// client checks the receipt against the coordinator it pinned. The cancel
+/// releases the pair, replays after the PDS withdraws the key, gives back a remote
+/// reservation when the coordinator is the sender's own home, and still gets
+/// the coordinator's stored answer from a coordinator that predates it.
+#[tokio::test(flavor = "multi_thread")]
+async fn c33_two_authority_relayed_cancel_e2e() -> anyhow::Result<()> {
+    let template = "postgresql://127.0.0.1:5432/catbird_direct_requests_test_20260919";
+    anyhow::ensure!(
+        std::env::var("REQUEST_TEST_DATABASE_URL").as_deref() == Ok(template),
+        "C33 requires the exact guarded local synthetic template"
+    );
+
+    let did_port = HttpsDidFixture::reserve_port()?;
+    let run = Uuid::new_v4().simple().to_string();
+    let ds1_did = format!("did:web:ds1-{run}.catbird.blue");
+    let ds2_did = format!("did:web:ds2-{run}.catbird.blue");
+    anyhow::ensure!(ds1_did < ds2_did, "ds1 must be the pair coordinator");
+
+    // Alice is homed on the coordinator; Bob and Carol on the other DS.
+    let alice = FederatedParty::new(
+        format!("did:web:alice-{run}.catbird.blue"),
+        "c33-cancel-alice",
+        &ds1_did,
+    )?;
+    let bob = FederatedParty::new(
+        format!("did:web:bob-{run}.catbird.blue"),
+        "c33-cancel-bob",
+        &ds2_did,
+    )?;
+    let carol = FederatedParty::new(
+        format!("did:web:carol-{run}.catbird.blue"),
+        "c33-cancel-carol",
+        &ds2_did,
+    )?;
+
+    let port_a = reserve_loopback_port()?;
+    let port_b = reserve_loopback_port()?;
+    let server_a_url = format!("http://127.0.0.1:{port_a}");
+    let server_b_url = format!("http://127.0.0.1:{port_b}");
+    let home_document = |party: &FederatedParty, endpoint: &str| -> anyhow::Result<Value> {
+        let mut doc = party.svc.did_document();
+        doc["service"]
+            .as_array_mut()
+            .context("account DID document services")?
+            .push(json!({
+                "id": format!("{}#atproto_mls", party.svc.did),
+                "type": "AtprotoMLSDeliveryService",
+                "serviceEndpoint": endpoint
+            }));
+        Ok(doc)
+    };
+    let (ds1_doc, _, _) = ds_did_document(&ds1_did, &server_a_url, 81)?;
+    let (ds2_doc, _, _) = ds_did_document(&ds2_did, &server_b_url, 91)?;
+    let https = HttpsDidFixture::start(
+        did_port,
+        &[
+            (ds1_did.clone(), ds1_doc),
+            (ds2_did.clone(), ds2_doc),
+            (alice.svc.did.clone(), home_document(&alice, &server_a_url)?),
+            (bob.svc.did.clone(), home_document(&bob, &server_b_url)?),
+            (carol.svc.did.clone(), home_document(&carol, &server_b_url)?),
+        ],
+    )?;
+    declare_chat_authority(&https.root, &alice.svc.did, &ds1_did)?;
+    declare_chat_authority(&https.root, &bob.svc.did, &ds2_did)?;
+    declare_chat_authority(&https.root, &carol.svc.did, &ds2_did)?;
+    publish_pds_device_key(&https.root, &alice)?;
+    publish_pds_device_key(&https.root, &bob)?;
+    publish_pds_device_key(&https.root, &carol)?;
+
+    let db1_name = format!("catbird_direct_requests_fault_{}", &run[..16]);
+    let db2_name = format!("catbird_direct_requests_fault_{}", &run[16..]);
+    let mut server_a = FederatedAuthorityServer::start(&ds1_did, port_a, &db1_name, &https, 81)?;
+    let server_b = FederatedAuthorityServer::start(&ds2_did, port_b, &db2_name, &https, 91)?;
+    alice.seed_into_database(&server_a.database_url)?;
+    bob.seed_into_database(&server_b.database_url)?;
+    carol.seed_into_database(&server_b.database_url)?;
+    psql_on(&server_a.database_url,
+        &format!("INSERT INTO federation_peers(ds_did, status) VALUES('{ds2_did}', 'allow') ON CONFLICT DO NOTHING;"))?;
+    psql_on(&server_b.database_url,
+        &format!("INSERT INTO federation_peers(ds_did, status) VALUES('{ds1_did}', 'allow') ON CONFLICT DO NOTHING;"))?;
+
+    let client = reqwest::Client::new();
+    let a_db = server_a.database_url.clone();
+    let a_count = |sql: String| psql_count(&a_db, &sql);
+    let b_count = |sql: String| psql_count(&server_b.database_url, &sql);
+    const CANCEL: &str = "blue.catbird.chat.cancelDirectRequestPreparation";
+    const PREPARE: &str = "blue.catbird.chat.prepareDirectRequest";
+
+    for (party, home) in [(&alice, &server_a.base_url), (&bob, &server_b.base_url)] {
+        let (status, bytes) = party
+            .svc
+            .post(
+                &client,
+                home,
+                "blue.catbird.chat.publishDirectRequestKeys",
+                &party.key_entry()?,
+                true,
+            )
+            .await?;
+        anyhow::ensure!(
+            status == StatusCode::OK,
+            "key publish {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    // A cancel can be the first either DS hears of a request, from a device
+    // the coordinator has never seen. The coordinator authorizes Carol's key
+    // against her PDS, mirrors her device and keeps a tombstone; her home
+    // keeps only the route, so a late prepare and an outcome read reach the
+    // coordinator and get the same tombstone.
+    let c1_id = Uuid::new_v4();
+    let c1_prepare = signed_prepare(&carol, &alice.svc.did, c1_id)?;
+    let c1_cancel = signed_cancel(&carol, &c1_prepare)?;
+    let (status, c1_response) =
+        post_json(&carol, &client, &server_b.base_url, CANCEL, &c1_cancel).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "cold cancel {status}: {c1_response}"
+    );
+    let c1_receipt = authority_receipt(&c1_response, &server_a.did, &server_a.receipt_public_key)?;
+    assert_eq!(
+        c1_receipt["$type"],
+        "blue.catbird.chat.defs#directRequestCancelledReceipt"
+    );
+    assert_eq!(c1_receipt["requestKind"], "cancel");
+    assert_eq!(
+        c1_receipt["requestDigest"],
+        STANDARD.encode(request_digest(
+            &carol,
+            DirectRequestKind::Cancel,
+            &c1_cancel
+        )?)
+    );
+    assert_eq!(
+        c1_receipt["preparationRequestDigest"],
+        STANDARD.encode(request_digest(
+            &carol,
+            DirectRequestKind::Prepare,
+            &c1_prepare
+        )?)
+    );
+    assert_eq!(
+        psql_value(&server_a.database_url, &format!(
+            "SELECT (SELECT status FROM chat.direct_request_attempts WHERE request_id='{c1_id}')||'|'||\
+                    (SELECT device_name FROM chat.devices WHERE user_did='{}' AND device_id='{}')",
+            carol.svc.did, carol.svc.device_id
+        ))?,
+        "cancelled|federated-sender",
+        "the coordinator keeps the tombstone and mirrors Carol's device"
+    );
+    assert_eq!(
+        b_count(format!(
+            "SELECT (SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{c1_id}') + \
+                    (SELECT count(*) FROM chat.direct_request_retained_charges WHERE request_id='{c1_id}')"
+        ))?,
+        0,
+        "the sender's home signs and charges nothing for a request it routed"
+    );
+    assert_eq!(
+        b_count(format!(
+            "SELECT count(*) FROM chat.direct_request_outbound_routes WHERE request_id='{c1_id}' AND coordinator_did='{ds1_did}'"
+        ))?,
+        1,
+        "Carol's home routes the request to the coordinator"
+    );
+    let (status, late) =
+        post_json(&carol, &client, &server_b.base_url, PREPARE, &c1_prepare).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "late prepare after a cold cancel {status}: {late}"
+    );
+    assert_eq!(
+        bare_bytes(&late["outcome"]),
+        bare_bytes(&c1_response["outcome"]),
+        "a late prepare replays the tombstone"
+    );
+    let (status, outcome_bytes) = carol
+        .svc
+        .get(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.getDirectRequestOutcome",
+            &[("requestId".into(), c1_id.to_string())],
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "outcome read {status}: {}",
+        String::from_utf8_lossy(&outcome_bytes)
+    );
+    let outcome: Value = serde_json::from_slice(&outcome_bytes)?;
+    assert_eq!(
+        bare_bytes(&outcome["outcome"]),
+        bare_bytes(&c1_response["outcome"]),
+        "the outcome read returns the tombstone"
+    );
+
+    // Carol's home rebinds her device. The coordinator mirrored it at the
+    // first generation, and the home now vouches for the second, which the
+    // coordinator records before it checks her next cancel.
+    psql_on(&server_b.database_url, &format!(
+        "UPDATE chat.devices SET auth_generation=2, dpop_jkt=translate(rtrim(encode(sha256(random()::text::bytea),'base64'),'='),'+/','-_'), updated_at=now() \
+         WHERE user_did='{}' AND device_id='{}';",
+        carol.svc.did, carol.svc.device_id
+    ))?;
+    let c2_id = Uuid::new_v4();
+    let mut c2_body =
+        signed_cancel(&carol, &signed_prepare(&carol, &alice.svc.did, c2_id)?)?["body"].clone();
+    c2_body["authGeneration"] = json!(2);
+    let c2_cancel = signed_mls_request(
+        &carol.engine,
+        &carol.identity,
+        DirectRequestKind::Cancel,
+        c2_body,
+    )?;
+    let (status, c2_response) =
+        post_json(&carol, &client, &server_b.base_url, CANCEL, &c2_cancel).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "cancel after a device rebind {status}: {c2_response}"
+    );
+    let c2_receipt = authority_receipt(&c2_response, &server_a.did, &server_a.receipt_public_key)?;
+    assert_eq!(
+        c2_receipt["$type"],
+        "blue.catbird.chat.defs#directRequestCancelledReceipt"
+    );
+    assert_eq!(
+        psql_value(&server_a.database_url, &format!(
+            "SELECT (SELECT status FROM chat.direct_request_attempts WHERE request_id='{c2_id}')||'|'||\
+                    (SELECT auth_generation FROM chat.devices WHERE user_did='{}' AND device_id='{}')",
+            carol.svc.did, carol.svc.device_id
+        ))?,
+        "cancelled|2",
+        "the coordinator mirrors the rebound generation"
+    );
+
+    // While the recipient's declaration cannot be read, Carol's home cannot
+    // tell which coordinator her client pinned, so it signs nothing and keeps
+    // nothing, for a recipient homed with her as for one homed elsewhere.
+    // Once the read succeeds, the same cancel is answered by that coordinator.
+    let carol_cancel = |recipient: &str, id: Uuid| -> anyhow::Result<Value> {
+        let mut body =
+            signed_cancel(&carol, &signed_prepare(&carol, recipient, id)?)?["body"].clone();
+        body["authGeneration"] = json!(2);
+        signed_mls_request(
+            &carol.engine,
+            &carol.identity,
+            DirectRequestKind::Cancel,
+            body,
+        )
+    };
+    let declarations = https.root.join("_policy").join("catbirdDeclaration");
+    for (recipient, authority, coordinator) in
+        [(&bob, &ds2_did, &server_b), (&alice, &ds1_did, &server_a)]
+    {
+        let id = Uuid::new_v4();
+        let cancel = carol_cancel(&recipient.svc.did, id)?;
+        std::fs::write(declarations.join(quote(&recipient.svc.did)), b"[]")?;
+        let outage = post_json(&carol, &client, &server_b.base_url, CANCEL, &cancel).await;
+        declare_chat_authority(&https.root, &recipient.svc.did, authority)?;
+        let (status, unanswered) = outage?;
+        anyhow::ensure!(
+            status != StatusCode::OK && unanswered.get("outcome").is_none(),
+            "a cancel during an outage stays unanswered: {status}: {unanswered}"
+        );
+        assert_eq!(
+            b_count(format!(
+                "SELECT (SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{id}') + \
+                        (SELECT count(*) FROM chat.direct_request_outbound_routes WHERE request_id='{id}')"
+            ))?,
+            0,
+            "Carol's home keeps nothing for a cancel it could not route"
+        );
+        let (status, response) =
+            post_json(&carol, &client, &server_b.base_url, CANCEL, &cancel).await?;
+        anyhow::ensure!(
+            status == StatusCode::OK,
+            "the same cancel after the outage {status}: {response}"
+        );
+        let receipt =
+            authority_receipt(&response, &coordinator.did, &coordinator.receipt_public_key)?;
+        assert_eq!(
+            receipt["$type"],
+            "blue.catbird.chat.defs#directRequestCancelledReceipt"
+        );
+    }
+    // A sender without a declaration has a client that pins the canonical
+    // authority, which Carol's home is not, so it signs nothing for her.
+    let id = Uuid::new_v4();
+    std::fs::remove_file(declarations.join(quote(&carol.svc.did)))?;
+    let undeclared = post_json(
+        &carol,
+        &client,
+        &server_b.base_url,
+        CANCEL,
+        &carol_cancel(&bob.svc.did, id)?,
+    )
+    .await;
+    declare_chat_authority(&https.root, &carol.svc.did, &ds2_did)?;
+    let (status, unanswered) = undeclared?;
+    anyhow::ensure!(
+        status != StatusCode::OK && unanswered.get("outcome").is_none(),
+        "an undeclared sender's cancel on a non-canonical DS stays unanswered: {status}: {unanswered}"
+    );
+    assert_eq!(
+        b_count(format!(
+            "SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{id}'"
+        ))?,
+        0
+    );
+
+    // Bob's request R is relayed to the coordinator and holds the pair, so
+    // Alice cannot start her own.
+    let r_id = Uuid::new_v4();
+    let r_prepare = signed_prepare(&bob, &alice.svc.did, r_id)?;
+    let (status, prepared) =
+        post_json(&bob, &client, &server_b.base_url, PREPARE, &r_prepare).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK
+            && prepared["outcome"]["$type"]
+                == "blue.catbird.chat.defs#directRequestPreparedOutcome",
+        "R prepare {status}: {prepared}"
+    );
+    let a_id = Uuid::new_v4();
+    let a_prepare = signed_prepare(&alice, &bob.svc.did, a_id)?;
+    let (status, fenced) =
+        post_json(&alice, &client, &server_a.base_url, PREPARE, &a_prepare).await?;
+    anyhow::ensure!(
+        status != StatusCode::OK
+            && fenced.get("outcome").is_none()
+            && fenced["error"] == "PreparationConflict",
+        "R holds the pair: {status}: {fenced}"
+    );
+
+    // Bob cancels R at his home, and the coordinator signs the cancellation.
+    let r_cancel = signed_cancel(&bob, &r_prepare)?;
+    let (status, r_response) =
+        post_json(&bob, &client, &server_b.base_url, CANCEL, &r_cancel).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "relayed cancel {status}: {r_response}"
+    );
+    let r_receipt = authority_receipt(&r_response, &server_a.did, &server_a.receipt_public_key)?;
+    assert_eq!(
+        r_receipt["$type"],
+        "blue.catbird.chat.defs#directRequestCancelledReceipt"
+    );
+    assert_eq!(
+        r_receipt["requestDigest"],
+        STANDARD.encode(request_digest(&bob, DirectRequestKind::Cancel, &r_cancel)?)
+    );
+    assert_eq!(
+        psql_value(&server_a.database_url, &format!(
+            "SELECT (SELECT status FROM chat.direct_request_attempts WHERE request_id='{r_id}')||'|'||\
+                    (SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{r_id}')||'|'||\
+                    (SELECT count(*) FROM outbound_queue WHERE id='direct-request-delivery-{r_id}')||'|'||\
+                    (SELECT count(*) FROM chat.direct_request_retained_charges WHERE request_id='{r_id}')"
+        ))?,
+        "cancelled|0|0|1",
+        "the coordinator cancels R and publishes nothing"
+    );
+    assert_eq!(
+        psql_value(&server_b.database_url, &format!(
+            "SELECT (SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{r_id}')||'|'||\
+                    (SELECT count(*) FROM chat.direct_request_outbound_routes WHERE request_id='{r_id}')||'|'||\
+                    (SELECT count(*) FROM chat.direct_request_transport_inbox WHERE request_id='{r_id}')"
+        ))?,
+        "0|1|0",
+        "Bob's home writes no tombstone of its own"
+    );
+
+    // Replays get the same receipt and charge nothing more: the same bytes,
+    // a cancel signed again, and one sent after Bob's PDS stops listing his
+    // key, since the coordinator already holds his device.
+    let charge = |id: Uuid| {
+        psql_value(&a_db, &format!(
+            "SELECT count(*)||'|'||encode((SELECT terminal_response_sha256 FROM chat.direct_request_attempts WHERE request_id='{id}'),'hex') \
+             FROM chat.direct_request_retained_charges WHERE request_id='{id}'"
+        ))
+    };
+    let r_charge = charge(r_id)?;
+    let (status, replay) = post_json(&bob, &client, &server_b.base_url, CANCEL, &r_cancel).await?;
+    anyhow::ensure!(status == StatusCode::OK, "cancel replay {status}: {replay}");
+    assert_eq!(
+        replay, r_response,
+        "the same cancel replays the same receipt"
+    );
+    let (status, resigned) = post_json(
+        &bob,
+        &client,
+        &server_b.base_url,
+        CANCEL,
+        &signed_cancel(&bob, &r_prepare)?,
+    )
+    .await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "re-signed cancel {status}: {resigned}"
+    );
+    assert_eq!(
+        resigned, r_response,
+        "a cancel signed again gets the stored receipt"
+    );
+    let bob_keys = https
+        .root
+        .join("_policy")
+        .join("deviceKeys")
+        .join(quote(&bob.svc.did));
+    std::fs::write(&bob_keys, br#"{"records":[]}"#)?;
+    let without_pds = post_json(&bob, &client, &server_b.base_url, CANCEL, &r_cancel).await;
+    publish_pds_device_key(&https.root, &bob)?;
+    let (status, without_pds) = without_pds?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "cancel replay without the PDS key {status}: {without_pds}"
+    );
+    assert_eq!(
+        without_pds, r_response,
+        "a replay for a mirrored device does not re-read the PDS key list"
+    );
+    assert_eq!(charge(r_id)?, r_charge, "replays add no retained charge");
+    // The receipt authority stays with the attempt. Once Alice's declaration
+    // names another authority, Bob's home still relays to the coordinator it
+    // recorded, and the coordinator still answers for the attempt it holds.
+    declare_chat_authority(
+        &https.root,
+        &alice.svc.did,
+        "did:web:chat.federated-peer.org",
+    )?;
+    let moved = post_json(&bob, &client, &server_b.base_url, CANCEL, &r_cancel).await;
+    declare_chat_authority(&https.root, &alice.svc.did, &ds1_did)?;
+    let (status, moved) = moved?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "cancel replay after a declaration move {status}: {moved}"
+    );
+    assert_eq!(
+        moved, r_response,
+        "the recorded coordinator answers after a declaration move"
+    );
+    let mut wrong = r_cancel["body"].clone();
+    wrong["preparationRequestDigest"] = json!(STANDARD.encode([7u8; 32]));
+    wrong["signedAt"] = json!(canonical_now());
+    let wrong = signed_mls_request(&bob.engine, &bob.identity, DirectRequestKind::Cancel, wrong)?;
+    let (status, refused) = post_json(&bob, &client, &server_b.base_url, CANCEL, &wrong).await?;
+    anyhow::ensure!(
+        status.is_client_error() && refused.get("outcome").is_none(),
+        "a cancel of another preparation is refused: {status}: {refused}"
+    );
+
+    // The cancellation released the pair: Alice's request now prepares, and
+    // reserves Bob's packages on his home.
+    let (status, prepared) =
+        post_json(&alice, &client, &server_a.base_url, PREPARE, &a_prepare).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK
+            && prepared["outcome"]["$type"]
+                == "blue.catbird.chat.defs#directRequestPreparedOutcome",
+        "A prepare after the cancel {status}: {prepared}"
+    );
+    let lease = |id: Uuid| {
+        psql_value(&server_b.database_url, &format!(
+            "SELECT coalesce(string_agg(status||'@'||coordinator_did, ','), '') FROM chat.direct_request_remote_leases WHERE request_id='{id}'"
+        ))
+    };
+    assert_eq!(
+        lease(a_id)?,
+        format!("active@{ds1_did}"),
+        "the coordinator leases Bob's packages for A"
+    );
+
+    // A late prepare of R replays the tombstone while A holds the pair.
+    let (status, late) = post_json(&bob, &client, &server_b.base_url, PREPARE, &r_prepare).await?;
+    anyhow::ensure!(status == StatusCode::OK, "late R prepare {status}: {late}");
+    assert_eq!(
+        bare_bytes(&late["outcome"]),
+        bare_bytes(&r_response["outcome"]),
+        "a late prepare replays the tombstone"
+    );
+
+    // The coordinator is Alice's own home, so her cancel is answered there,
+    // and it gives Bob's packages back to his home. The attempt her home
+    // holds answers even beside a route to another DS, which a prepare retry
+    // relayed after a declaration move would have left.
+    psql_on(
+        &server_a.database_url,
+        &format!(
+            "INSERT INTO chat.direct_request_outbound_routes \
+            (request_id, actor_did, actor_device_id, recipient_did, coordinator_did) \
+         VALUES ('{a_id}', '{}', '{}', '{}', '{ds2_did}');",
+            alice.svc.did, alice.svc.device_id, bob.svc.did
+        ),
+    )?;
+    let a_cancel = signed_cancel(&alice, &a_prepare)?;
+    let (status, a_response) =
+        post_json(&alice, &client, &server_a.base_url, CANCEL, &a_cancel).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "local cancel {status}: {a_response}"
+    );
+    let a_receipt = authority_receipt(&a_response, &server_a.did, &server_a.receipt_public_key)?;
+    assert_eq!(
+        a_receipt["$type"],
+        "blue.catbird.chat.defs#directRequestCancelledReceipt"
+    );
+    assert_eq!(
+        lease(a_id)?,
+        format!("released@{ds1_did}"),
+        "the cancel releases the remote lease"
+    );
+    assert_eq!(
+        a_count(format!(
+            "SELECT count(*) FROM chat.direct_request_reservation_intents WHERE request_id='{a_id}' AND status='cancelled'"
+        ))?,
+        1
+    );
+
+    // A coordinator that predates the procedure answers 404. Bob's home then
+    // reads the coordinator's stored outcome, which still answers R. For a
+    // request the coordinator never saw there is nothing to read, so the
+    // cancel stays unanswered and nobody keeps a tombstone.
+    server_a.restart_with_env(
+        port_a,
+        &https,
+        81,
+        &[("CATBIRD_TEST_DISABLE_MLSDS_CANCEL", "1")],
+    )?;
+    let (status, old) = post_json(&bob, &client, &server_b.base_url, CANCEL, &r_cancel).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "cancel through an old coordinator {status}: {old}"
+    );
+    assert_eq!(
+        old, r_response,
+        "the old coordinator's stored outcome answers the cancel"
+    );
+    let r6_id = Uuid::new_v4();
+    let r6_prepare = signed_prepare(&bob, &alice.svc.did, r6_id)?;
+    let (status, unanswered) = post_json(
+        &bob,
+        &client,
+        &server_b.base_url,
+        CANCEL,
+        &signed_cancel(&bob, &r6_prepare)?,
+    )
+    .await?;
+    anyhow::ensure!(
+        status == StatusCode::INTERNAL_SERVER_ERROR && unanswered.get("outcome").is_none(),
+        "an old coordinator that never saw the request leaves the cancel unanswered: {status}: {unanswered}"
+    );
+    assert_eq!(
+        a_count(format!(
+            "SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{r6_id}'"
+        ))?,
+        0
+    );
+    assert_eq!(
+        b_count(format!(
+            "SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{r6_id}'"
+        ))?,
+        0
+    );
     Ok(())
 }

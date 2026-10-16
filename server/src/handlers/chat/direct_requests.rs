@@ -112,6 +112,538 @@ fn output(result: DirectRequestResult, endpoint: ChatEndpoint) -> Result<Vec<u8>
     }
     Ok(bytes)
 }
+/// The active, unrevoked signing key of a sender's device at the generation
+/// its request names.
+async fn active_device_key(
+    pool: &DbPool,
+    endpoint: ChatEndpoint,
+    actor_did: &str,
+    actor_device_id: uuid::Uuid,
+    key_id: &str,
+    auth_generation: i64,
+) -> Result<(Vec<u8>, i64), ChatFailure> {
+    let sender_key_row: Option<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT k.signing_public_key, d.auth_generation \
+         FROM chat.device_keys k \
+         JOIN chat.devices d ON d.user_did = k.user_did AND d.device_id = k.device_id \
+         WHERE k.user_did = $1 \
+           AND k.device_id = $2 \
+           AND k.key_id = $3 \
+           AND d.auth_generation = $4 \
+           AND d.status = 'active' \
+           AND d.revoked_at IS NULL \
+           AND k.revoked_at IS NULL",
+    )
+    .bind(actor_did)
+    .bind(actor_device_id)
+    .bind(key_id)
+    .bind(auth_generation)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+
+    sender_key_row.ok_or_else(|| {
+        tracing::warn!(
+            actor_did,
+            %actor_device_id,
+            key_id,
+            auth_generation,
+            "sender active non-revoked device/key not found or generation mismatch"
+        );
+        failure(endpoint, DirectRequestStoreError::IdentityConflict)
+    })
+}
+
+/// A request this DS relays to the pair's coordinator.
+struct OutboundRoute<'a> {
+    request_id: uuid::Uuid,
+    actor_did: &'a str,
+    actor_device_id: uuid::Uuid,
+    recipient_did: &'a str,
+    coordinator_did: &'a str,
+}
+
+/// Record, before the first relay, which coordinator a request goes to, so
+/// every later prepare, cancel or outcome read of it reaches the same one.
+/// `fenced` also refuses a pair that another coordinator already holds.
+async fn record_outbound_route(
+    pool: &DbPool,
+    endpoint: ChatEndpoint,
+    route: OutboundRoute<'_>,
+    fenced: bool,
+) -> Result<(), ChatFailure> {
+    let OutboundRoute {
+        request_id,
+        actor_did,
+        actor_device_id,
+        recipient_did,
+        coordinator_did,
+    } = route;
+    let mut route_tx = pool
+        .begin()
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    let (p1, p2) = if actor_did <= recipient_did {
+        (actor_did, recipient_did)
+    } else {
+        (recipient_did, actor_did)
+    };
+    let pair_lock_key = format!("chat-direct-request-pair:{p1}:{p2}");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&pair_lock_key)
+        .execute(&mut *route_tx)
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("chat-direct-request-outbound:{actor_did}"))
+        .execute(&mut *route_tx)
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    let (recent, existing): (i64, bool) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM chat.direct_request_outbound_routes WHERE actor_did=$1 AND created_at>clock_timestamp()-INTERVAL '1 hour'), \
+                EXISTS(SELECT 1 FROM chat.direct_request_outbound_routes WHERE request_id=$2 AND actor_did=$1)",
+    )
+    .bind(actor_did)
+    .bind(request_id)
+    .fetch_one(&mut *route_tx)
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+    if recent >= 20 && !existing {
+        return Err(failure(endpoint, DirectRequestStoreError::QuotaExceeded));
+    }
+    if fenced {
+        if let Some(crate::federation::canonical_relay::PairFenceConflict::ForeignCoordinator {
+            ..
+        }) = crate::federation::canonical_relay::check_pair_owner_fence(
+            &mut route_tx,
+            actor_did,
+            recipient_did,
+            request_id,
+            Some(coordinator_did),
+        )
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?
+        {
+            return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
+        }
+    }
+    let route: Option<uuid::Uuid> = sqlx::query_scalar(
+        "INSERT INTO chat.direct_request_outbound_routes \
+            (request_id, actor_did, actor_device_id, recipient_did, coordinator_did) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (request_id) DO UPDATE SET request_id=EXCLUDED.request_id \
+         WHERE chat.direct_request_outbound_routes.actor_did=EXCLUDED.actor_did \
+           AND chat.direct_request_outbound_routes.actor_device_id=EXCLUDED.actor_device_id \
+           AND chat.direct_request_outbound_routes.recipient_did=EXCLUDED.recipient_did \
+           AND chat.direct_request_outbound_routes.coordinator_did=EXCLUDED.coordinator_did \
+         RETURNING request_id",
+    )
+    .bind(request_id)
+    .bind(actor_did)
+    .bind(actor_device_id)
+    .bind(recipient_did)
+    .bind(coordinator_did)
+    .fetch_optional(&mut *route_tx)
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+    if route.is_none() {
+        return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
+    }
+    route_tx
+        .commit()
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    Ok(())
+}
+
+/// What a cancel names, read before verification only to find where it goes.
+struct CancelTarget {
+    request_id: uuid::Uuid,
+    actor_device_id: uuid::Uuid,
+    key_id: String,
+    auth_generation: i64,
+    recipient_did: String,
+}
+
+impl CancelTarget {
+    fn parse(raw: &str, actor_did: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let body = &value["body"];
+        let recipient_did = body["recipientDid"].as_str()?;
+        if body["actorDid"].as_str()? != actor_did
+            || !crate::chat_protocol::is_bare_did(recipient_did)
+            || recipient_did == actor_did
+        {
+            return None;
+        }
+        Some(Self {
+            request_id: uuid::Uuid::parse_str(body["requestId"].as_str()?).ok()?,
+            actor_device_id: uuid::Uuid::parse_str(body["actorDeviceId"].as_str()?).ok()?,
+            key_id: body["keyId"].as_str()?.to_owned(),
+            auth_generation: body["authGeneration"].as_i64()?,
+            recipient_did: recipient_did.to_owned(),
+        })
+    }
+}
+
+/// How a sender's home answers a coordinator's refusal of a relayed cancel.
+/// Only the status survives the relay, so it is the whole contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelRelayDisposition {
+    /// 404, 405, 501: the coordinator predates the cancel procedure.
+    Unsupported,
+    /// 410: the cancel is too old to sign and nothing ended the request yet.
+    Stale,
+    Conflict,
+    BadSignature,
+    NotAuthorized,
+    RateLimited,
+    Capacity,
+    Invalid,
+    Transient,
+}
+
+impl CancelRelayDisposition {
+    fn of(status: u16) -> Self {
+        match status {
+            404 | 405 | 501 => Self::Unsupported,
+            410 => Self::Stale,
+            409 => Self::Conflict,
+            422 => Self::BadSignature,
+            401 | 403 => Self::NotAuthorized,
+            429 => Self::RateLimited,
+            507 => Self::Capacity,
+            400 => Self::Invalid,
+            _ => Self::Transient,
+        }
+    }
+
+    /// Whether the coordinator's stored outcome may still answer the cancel.
+    fn reads_outcome(self) -> bool {
+        matches!(self, Self::Unsupported | Self::Stale)
+    }
+
+    fn failure(self, endpoint: ChatEndpoint) -> ChatFailure {
+        let code = match self {
+            Self::Unsupported | Self::Transient => return ChatFailure::storage(endpoint),
+            Self::Stale => ChatProtocolErrorCode::PreparationExpired,
+            Self::Conflict => ChatProtocolErrorCode::PreparationConflict,
+            Self::BadSignature => ChatProtocolErrorCode::InvalidSignature,
+            Self::NotAuthorized => ChatProtocolErrorCode::NotAuthorized,
+            Self::RateLimited => ChatProtocolErrorCode::RateLimited,
+            Self::Capacity => ChatProtocolErrorCode::CapacityUnavailable,
+            Self::Invalid => ChatProtocolErrorCode::InvalidRequest,
+        };
+        ChatFailure::protocol(endpoint, code)
+    }
+}
+
+const SIGNED_RECEIPT: &str = "blue.catbird.chat.defs#signedDirectRequestReceipt";
+
+/// A cancel is answered by the coordinator that holds the request. The client
+/// checks the receipt against the coordinator it pinned when it minted the
+/// request, so a request this DS routed elsewhere is cancelled there, never
+/// here. A cancel this DS cannot read is left to the repository to refuse.
+async fn cancel_routed(
+    pool: &DbPool,
+    principal: &crate::auth::VerifiedServicePrincipal,
+    signed_request: &serde_json::value::RawValue,
+    signer: &crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response, ChatFailure> {
+    use crate::federation::canonical_relay;
+    let endpoint = ChatEndpoint::CancelDirectRequestPreparation;
+    let Some(target) = CancelTarget::parse(signed_request.get(), principal.did()) else {
+        return cancel_locally(pool, principal, signed_request, signer, now, None).await;
+    };
+    // Only this DS's own coordination writes an attempt here, and the client
+    // pinned the coordinator that signed it. That attempt answers even if a
+    // later retry was relayed elsewhere after a declaration move.
+    let held: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)",
+    )
+    .bind(target.request_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+    if held {
+        return cancel_locally(
+            pool,
+            principal,
+            signed_request,
+            signer,
+            now,
+            Some(target.request_id),
+        )
+        .await;
+    }
+    let route: Option<(String, uuid::Uuid, String, String)> = sqlx::query_as(
+        "SELECT actor_did, actor_device_id, recipient_did, coordinator_did \
+         FROM chat.direct_request_outbound_routes WHERE request_id=$1",
+    )
+    .bind(target.request_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+    let routed = route.is_some();
+
+    // This DS vouches for the sender's key to the coordinator, so it checks
+    // the cancel under that key before it resolves or contacts anyone, in the
+    // order a local cancel would: the device's key, the signature under it,
+    // then that it is the device's active key at the signed generation.
+    let registered: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT signing_public_key FROM chat.device_keys WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(principal.did())
+    .bind(target.actor_device_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+    let registered =
+        registered.ok_or_else(|| failure(endpoint, DirectRequestStoreError::IdentityConflict))?;
+    crate::chat_protocol::direct_request_transcript::verify_signed_request(
+        crate::chat_protocol::direct_request_transcript::DirectRequestKind::Cancel,
+        signed_request.get().as_bytes(),
+        &registered,
+    )
+    .map_err(|_| failure(endpoint, DirectRequestStoreError::InvalidSignature))?;
+    let (signing_public_key, auth_generation) = active_device_key(
+        pool,
+        endpoint,
+        principal.did(),
+        target.actor_device_id,
+        &target.key_id,
+        target.auth_generation,
+    )
+    .await?;
+    if signing_public_key != registered {
+        return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
+    }
+
+    let (coordinator_did, coordinator_endpoint) = match route {
+        Some((actor_did, actor_device_id, recipient_did, coordinator_did)) => {
+            if actor_did != principal.did()
+                || actor_device_id != target.actor_device_id
+                || recipient_did != target.recipient_did
+            {
+                return Err(ChatFailure::protocol(
+                    endpoint,
+                    ChatProtocolErrorCode::NotAuthorized,
+                ));
+            }
+            // The recorded coordinator, not the live one: the declaration
+            // may have moved since the request was minted.
+            let home = canonical_relay::admit_recorded_coordinator(pool, &coordinator_did)
+                .await
+                .map_err(|error| pair_failure(endpoint, error))?;
+            (coordinator_did, home.endpoint)
+        }
+        None => {
+            match canonical_relay::resolve_pair_coordinator_by_side(
+                pool,
+                principal.did(),
+                &target.recipient_did,
+            )
+            .await
+            {
+                Ok(coord) if !coord.is_sender_home => {
+                    return Err(ChatFailure::protocol(
+                        endpoint,
+                        ChatProtocolErrorCode::NotAuthorized,
+                    ))
+                }
+                Ok(coord) if !coord.is_coordinator => {
+                    let coordinator_endpoint = coord.coordinator_endpoint().to_owned();
+                    (coord.coordinator_did, coordinator_endpoint)
+                }
+                Ok(_) => {
+                    return cancel_locally(
+                        pool,
+                        principal,
+                        signed_request,
+                        signer,
+                        now,
+                        Some(target.request_id),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    let self_did = crate::identity::service_did();
+                    // The pair has no federated coordinator: the recipient
+                    // has no authority this DS could join, or the sender has
+                    // none and the client pinned the canonical authority,
+                    // which is this DS. The cancel is answered here, as it
+                    // was before relaying existed. Anything else, a
+                    // resolution that failed in transit included, could
+                    // name another coordinator, so this DS signs nothing.
+                    let local = error.local_refusal_coordinator(&self_did).is_some()
+                        || (error.sender_has_no_authority()
+                            && crate::identity::canonical_did(&self_did)
+                                == canonical_relay::CANONICAL_DIRECT_REQUEST_AUTHORITY);
+                    if !local {
+                        return Err(pair_failure(endpoint, error.into_federation_error()));
+                    }
+                    return cancel_locally(
+                        pool,
+                        principal,
+                        signed_request,
+                        signer,
+                        now,
+                        Some(target.request_id),
+                    )
+                    .await;
+                }
+            }
+        }
+    };
+
+    if !routed {
+        // A cancel can be the first this DS hears of a request, and a later
+        // prepare or outcome read must still reach the same coordinator.
+        record_outbound_route(
+            pool,
+            endpoint,
+            OutboundRoute {
+                request_id: target.request_id,
+                actor_did: principal.did(),
+                actor_device_id: target.actor_device_id,
+                recipient_did: &target.recipient_did,
+                coordinator_did: &coordinator_did,
+            },
+            false,
+        )
+        .await?;
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RelayedCancel<'a> {
+        signed_request: &'a serde_json::value::RawValue,
+        sender_device_key: canonical_relay::SenderDeviceKey,
+    }
+    let payload = RelayedCancel {
+        signed_request,
+        sender_device_key: canonical_relay::SenderDeviceKey {
+            device_id: target.actor_device_id,
+            key_id: target.key_id.clone(),
+            signing_public_key: base64::engine::general_purpose::STANDARD
+                .encode(&signing_public_key),
+            auth_generation,
+        },
+    };
+    let response = match canonical_relay::relay_cancel_direct_request(
+        &coordinator_endpoint,
+        &coordinator_did,
+        &payload,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let status = match &error {
+                crate::federation::FederationError::RemoteError { status, .. } => *status,
+                _ => 502,
+            };
+            let disposition = CancelRelayDisposition::of(status);
+            tracing::warn!(
+                ?error,
+                ?disposition,
+                "coordinator refused the relayed cancel"
+            );
+            // A coordinator without the procedure, or one that will not sign a
+            // stale cancel, may still have ended the request: its own expiry,
+            // rejection or publication answers the cancel.
+            let stored = match disposition.reads_outcome() {
+                true => canonical_relay::relay_get_outcome(
+                    &coordinator_endpoint,
+                    &coordinator_did,
+                    target.request_id,
+                    target.actor_device_id,
+                )
+                .await
+                .ok()
+                .filter(|response| response["outcome"]["$type"] == SIGNED_RECEIPT),
+                false => None,
+            };
+            stored.ok_or_else(|| disposition.failure(endpoint))?
+        }
+    };
+
+    let outcome = response
+        .get("outcome")
+        .filter(|outcome| outcome["$type"] == SIGNED_RECEIPT)
+        .ok_or_else(|| ChatFailure::storage(endpoint))?;
+    let published = outcome
+        .pointer("/body/receipt/$type")
+        .and_then(|t| t.as_str())
+        == Some("blue.catbird.chat.defs#directRequestPublishedReceipt");
+    let mut outcome = if published {
+        // A cancel that lost the race to publish gets the publication, and
+        // this DS mirrors it as a relayed publish would.
+        crate::handlers::chat::publish_direct_request::materialize_sender_home_published_mirror(
+            pool,
+            &coordinator_did,
+            principal.did(),
+            target.actor_device_id,
+            &target.recipient_did,
+            target.request_id,
+            outcome,
+            response.get("entry"),
+            None,
+            now,
+            endpoint,
+        )
+        .await?
+    } else {
+        outcome.clone()
+    };
+    crate::chat_protocol::direct_request_transcript::present_read_presentation(
+        "directRequestOutcome",
+        &mut outcome,
+    )
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+    let bytes = serde_json::to_vec(&serde_json::json!({ "outcome": outcome }))
+        .map_err(|_| ChatFailure::invariant(endpoint))?;
+    Ok(context::json_ok(bytes))
+}
+
+/// A cancel this DS answers itself, as the pair's coordinator. A request it
+/// had reserved recipient packages for on another DS gives them back.
+async fn cancel_locally(
+    pool: &DbPool,
+    principal: &crate::auth::VerifiedServicePrincipal,
+    signed_request: &serde_json::value::RawValue,
+    signer: &crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner,
+    now: chrono::DateTime<chrono::Utc>,
+    request_id: Option<uuid::Uuid>,
+) -> Result<Response, ChatFailure> {
+    let endpoint = ChatEndpoint::CancelDirectRequestPreparation;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    let result = requests::cancel_direct_request(
+        &mut tx,
+        principal,
+        signed_request.get().as_bytes(),
+        signer,
+        now,
+    )
+    .await
+    .map_err(|e| failure(endpoint, e))?;
+    let bytes = output(result, endpoint)?;
+    tx.commit()
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    if let Some(request_id) = request_id {
+        crate::federation::canonical_relay::release_remote_reservation_if_unpublished(
+            pool, request_id,
+        )
+        .await;
+    }
+    Ok(context::json_ok(bytes))
+}
 async fn mutate(
     pool: &DbPool,
     runtime: &ChatRuntime,
@@ -193,36 +725,15 @@ async fn mutate(
         let request_id = uuid::Uuid::parse_str(request_id_str)
             .map_err(|_| failure(endpoint, DirectRequestStoreError::InvalidReceipt))?;
 
-        let sender_key_row: Option<(Vec<u8>, i64)> = sqlx::query_as(
-            "SELECT k.signing_public_key, d.auth_generation \
-             FROM chat.device_keys k \
-             JOIN chat.devices d ON d.user_did = k.user_did AND d.device_id = k.device_id \
-             WHERE k.user_did = $1 \
-               AND k.device_id = $2 \
-               AND k.key_id = $3 \
-               AND d.auth_generation = $4 \
-               AND d.status = 'active' \
-               AND d.revoked_at IS NULL \
-               AND k.revoked_at IS NULL",
+        let (signing_public_key, verified_auth_gen) = active_device_key(
+            pool,
+            endpoint,
+            actor_did,
+            actor_device_id,
+            key_id,
+            auth_generation,
         )
-        .bind(actor_did)
-        .bind(actor_device_id)
-        .bind(key_id)
-        .bind(auth_generation)
-        .fetch_optional(pool)
-        .await
-        .map_err(|_| ChatFailure::storage(endpoint))?;
-
-        let (signing_public_key, verified_auth_gen) = sender_key_row.ok_or_else(|| {
-            tracing::warn!(
-                actor_did,
-                %actor_device_id,
-                key_id,
-                auth_generation,
-                "sender active non-revoked device/key not found or generation mismatch"
-            );
-            failure(endpoint, DirectRequestStoreError::IdentityConflict)
-        })?;
+        .await?;
 
         crate::chat_protocol::direct_request_transcript::verify_signed_request(
             crate::chat_protocol::direct_request_transcript::DirectRequestKind::Prepare,
@@ -257,71 +768,19 @@ async fn mutate(
 
 
         if !coord.is_coordinator {
-            let mut route_tx = pool.begin().await.map_err(|_| ChatFailure::storage(endpoint))?;
-            let (p1, p2) = if actor_did <= recipient_did {
-                (actor_did, recipient_did)
-            } else {
-                (recipient_did, actor_did)
-            };
-            let pair_lock_key = format!("chat-direct-request-pair:{p1}:{p2}");
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(&pair_lock_key)
-                .execute(&mut *route_tx)
-                .await
-                .map_err(|_| ChatFailure::storage(endpoint))?;
-
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(format!("chat-direct-request-outbound:{actor_did}"))
-                .execute(&mut *route_tx)
-                .await
-                .map_err(|_| ChatFailure::storage(endpoint))?;
-            let (recent, existing): (i64, bool) = sqlx::query_as(
-                "SELECT (SELECT count(*) FROM chat.direct_request_outbound_routes WHERE actor_did=$1 AND created_at>clock_timestamp()-INTERVAL '1 hour'), \
-                        EXISTS(SELECT 1 FROM chat.direct_request_outbound_routes WHERE request_id=$2 AND actor_did=$1)",
+            record_outbound_route(
+                pool,
+                endpoint,
+                OutboundRoute {
+                    request_id,
+                    actor_did,
+                    actor_device_id,
+                    recipient_did,
+                    coordinator_did: &coord.coordinator_did,
+                },
+                true,
             )
-            .bind(actor_did)
-            .bind(request_id)
-            .fetch_one(&mut *route_tx)
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))?;
-            if recent >= 20 && !existing {
-                return Err(failure(endpoint, DirectRequestStoreError::QuotaExceeded));
-            }
-            if let Some(crate::federation::canonical_relay::PairFenceConflict::ForeignCoordinator { .. }) =
-                crate::federation::canonical_relay::check_pair_owner_fence(
-                &mut route_tx,
-                actor_did,
-                recipient_did,
-                request_id,
-                Some(&coord.coordinator_did),
-            )
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))? {
-                return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
-            }
-            let route: Option<uuid::Uuid> = sqlx::query_scalar(
-                "INSERT INTO chat.direct_request_outbound_routes \
-                    (request_id, actor_did, actor_device_id, recipient_did, coordinator_did) \
-                 VALUES ($1, $2, $3, $4, $5) \
-                 ON CONFLICT (request_id) DO UPDATE SET request_id=EXCLUDED.request_id \
-                 WHERE chat.direct_request_outbound_routes.actor_did=EXCLUDED.actor_did \
-                   AND chat.direct_request_outbound_routes.actor_device_id=EXCLUDED.actor_device_id \
-                   AND chat.direct_request_outbound_routes.recipient_did=EXCLUDED.recipient_did \
-                   AND chat.direct_request_outbound_routes.coordinator_did=EXCLUDED.coordinator_did \
-                 RETURNING request_id",
-            )
-            .bind(request_id)
-            .bind(actor_did)
-            .bind(actor_device_id)
-            .bind(recipient_did)
-            .bind(&coord.coordinator_did)
-            .fetch_optional(&mut *route_tx)
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))?;
-            if route.is_none() {
-                return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
-            }
-            route_tx.commit().await.map_err(|_| ChatFailure::storage(endpoint))?;
+            .await?;
             let relay_payload = serde_json::json!({
                 "signedRequest": parsed_req,
                 "senderDeviceKey": {
@@ -508,6 +967,10 @@ async fn mutate(
         }
     }
 
+    if endpoint == ChatEndpoint::CancelDirectRequestPreparation {
+        return cancel_routed(pool, &principal, envelope.signed_request, signer, now).await;
+    }
+
     let mut tx = pool
         .begin()
         .await
@@ -518,16 +981,6 @@ async fn mutate(
                 &mut tx,
                 &principal,
                 envelope.signed_request.get().as_bytes(),
-                now,
-            )
-            .await
-        }
-        ChatEndpoint::CancelDirectRequestPreparation => {
-            requests::cancel_direct_request(
-                &mut tx,
-                &principal,
-                envelope.signed_request.get().as_bytes(),
-                signer,
                 now,
             )
             .await
@@ -676,7 +1129,7 @@ pub(super) async fn outcome(
             if is_published {
                 let receipt = crate::handlers::chat::publish_direct_request::materialize_sender_home_published_mirror(
                     pool,
-                    &coord,
+                    &coordinator_did,
                     &actor_did,
                     actor_device_id,
                     &recipient_did,

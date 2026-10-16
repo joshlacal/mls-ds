@@ -176,7 +176,7 @@ async fn inner(
 
         let receipt = materialize_sender_home_published_mirror(
             pool,
-            &coord,
+            &coord.coordinator_did,
             actor_did,
             actor_device_id,
             recipient_did,
@@ -428,7 +428,7 @@ async fn inner(
 }
 pub(super) async fn materialize_sender_home_published_mirror(
     pool: &DbPool,
-    coord: &crate::federation::canonical_relay::CanonicalPairCoordinator,
+    coordinator_did: &str,
     actor_did: &str,
     actor_device_id: uuid::Uuid,
     recipient_did: &str,
@@ -536,8 +536,10 @@ pub(super) async fn materialize_sender_home_published_mirror(
             tracing::error!("receipt missing authorityDid");
             ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
         })?;
-    if crate::identity::canonical_did(receipt_authority_did) != crate::identity::canonical_did(&coord.coordinator_did) {
-        tracing::error!("receipt authorityDid {receipt_authority_did} does not match coordinator {}", coord.coordinator_did);
+    if crate::identity::canonical_did(receipt_authority_did)
+        != crate::identity::canonical_did(coordinator_did)
+    {
+        tracing::error!("receipt authorityDid {receipt_authority_did} does not match coordinator {coordinator_did}");
         return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
     }
 
@@ -744,7 +746,7 @@ pub(super) async fn materialize_sender_home_published_mirror(
         .bind(request_id)
         .bind(conversation_id)
         .bind(first_message_id)
-        .bind(&coord.coordinator_did)
+        .bind(coordinator_did)
         .bind(actor_did)
         .bind(actor_device_id)
         .bind(rec_did)

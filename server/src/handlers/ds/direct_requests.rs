@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use axum::{
+    body::Bytes,
     extract::{Query, State},
     Json,
 };
@@ -37,6 +38,7 @@ const DELIVER_ACCEPT_ENTRY_NSID: &str = "blue.catbird.mlsDS.deliverAcceptanceEnt
 const RELAY_SEND_MESSAGE_NSID: &str = "blue.catbird.mlsDS.relaySendMessage";
 const DELIVER_MESSAGE_ENTRY_NSID: &str = "blue.catbird.mlsDS.deliverMessageEntry";
 const GET_OUTCOME_NSID: &str = "blue.catbird.mlsDS.getDirectRequestOutcome";
+const CANCEL_NSID: &str = canonical_relay::CANCEL_PREPARATION_NSID;
 
 /// POST /xrpc/blue.catbird.mlsDS.reserveRecipientBootstrap
 pub async fn reserve_recipient_bootstrap(
@@ -82,6 +84,42 @@ pub async fn publish_direct_request(
     let security = enforce_ds_request_security(&pool, &auth_user, PUBLISH_NSID, None).await?;
     let outcome = canonical_relay::coordinator_publish_direct_request(&pool, &runtime, &security.requester_ds, &input).await?;
     Ok(Json(outcome))
+}
+
+/// Input of cancelDirectRequestPreparation. The signed request stays raw, so
+/// the coordinator checks the bytes the client signed and a duplicate key in
+/// them is refused rather than collapsed.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CancelPreparationInput<'a> {
+    #[serde(borrow)]
+    signed_request: &'a serde_json::value::RawValue,
+    sender_device_key: canonical_relay::SenderDeviceKey,
+}
+
+/// POST /xrpc/blue.catbird.mlsDS.cancelDirectRequestPreparation
+pub async fn cancel_direct_request_preparation(
+    State(pool): State<DbPool>,
+    State(runtime): State<Arc<ChatRuntime>>,
+    auth_user: AuthUser,
+    body: Bytes,
+) -> Result<Json<Value>, FederationError> {
+    async {
+        let security = enforce_ds_request_security(&pool, &auth_user, CANCEL_NSID, None).await?;
+        let input: CancelPreparationInput = serde_json::from_slice(&body)
+            .map_err(|e| FederationError::InvalidRequest(format!("invalid cancel input: {e}")))?;
+        canonical_relay::coordinator_cancel_direct_request(
+            &pool,
+            &runtime,
+            &security.requester_ds,
+            input.signed_request.get(),
+            &input.sender_device_key,
+        )
+        .await
+    }
+    .await
+    .map(Json)
+    .map_err(canonical_relay::cancel_relay_failure)
 }
 
 /// POST /xrpc/blue.catbird.mlsDS.deliverDirectRequest

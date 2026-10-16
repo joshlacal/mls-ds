@@ -417,6 +417,24 @@ async fn cancel_field_mutations_fail_before_graph_effects() -> anyhow::Result<()
         println!("C03 Cancel field binding rejected with unchanged graph: {path}");
     }
 
+    // The unmutated cancel is answered here. Alice has no chat declaration,
+    // so the pair has no federated coordinator to relay it to.
+    let (status, raw): (reqwest::StatusCode, Vec<u8>) = alice
+        .post(
+            &client,
+            &server.base_url,
+            "blue.catbird.chat.cancelDirectRequestPreparation",
+            &json!({"signedRequest":cancel_envelope}),
+            true,
+        )
+        .await?;
+    let response: Value = serde_json::from_slice(&raw)?;
+    anyhow::ensure!(
+        status.is_success()
+            && response["outcome"]["$type"] == "blue.catbird.chat.defs#signedDirectRequestReceipt",
+        "unmutated cancel without a declaration {status}: {response}"
+    );
+
     Ok(())
 }
 
