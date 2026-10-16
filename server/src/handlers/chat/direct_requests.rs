@@ -76,7 +76,6 @@ fn confirms_local_refusal(result: &DirectRequestResult) -> bool {
                         | "CapacityUnavailable"
                 )
             )
-        )
     })
 }
 fn output(result: DirectRequestResult, endpoint: ChatEndpoint) -> Result<Vec<u8>, ChatFailure> {
