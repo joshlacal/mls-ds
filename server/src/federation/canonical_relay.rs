@@ -590,6 +590,78 @@ pub async fn admit_recorded_coordinator(
         .await
 }
 
+/// Who created a direct-request attempt this DS holds
+/// (`chat.direct_request_attempt_origins`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptOrigin {
+    /// The sender's home, for its own user, as the pair's coordinator.
+    Home,
+    /// This DS, coordinating for a sender homed on another DS, which alone
+    /// drives the attempt over mlsDS.
+    Relayed,
+    /// The sender's home, signing a refusal because the recipient had no
+    /// authority it could join. A retry reads the pair again.
+    LocalRefusal,
+}
+
+impl AttemptOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Home => "home",
+            Self::Relayed => "relayed",
+            Self::LocalRefusal => "local-refusal",
+        }
+    }
+}
+
+/// The origin of the attempt this DS holds for `request_id`, or `None` when
+/// it holds none.
+pub async fn held_attempt_origin<'e, E>(
+    executor: E,
+    request_id: Uuid,
+) -> Result<Option<AttemptOrigin>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT o.origin FROM chat.direct_request_attempts a \
+         LEFT JOIN chat.direct_request_attempt_origins o ON o.request_id = a.request_id \
+         WHERE a.request_id = $1",
+    )
+    .bind(request_id)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(|origin| match origin.as_deref() {
+        Some("relayed") => AttemptOrigin::Relayed,
+        Some("local-refusal") => AttemptOrigin::LocalRefusal,
+        _ => AttemptOrigin::Home,
+    }))
+}
+
+/// Record who created the attempt `request_id`, in the transaction that
+/// created it. A home attempt needs no row.
+pub async fn record_attempt_origin(
+    tx: &mut Transaction<'_, Postgres>,
+    request_id: Uuid,
+    origin: AttemptOrigin,
+    sender_home_did: &str,
+) -> Result<(), sqlx::Error> {
+    if origin == AttemptOrigin::Home {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO chat.direct_request_attempt_origins (request_id, origin, sender_home_did) \
+         SELECT request_id, $2, $3 FROM chat.direct_request_attempts WHERE request_id = $1 \
+         ON CONFLICT (request_id) DO NOTHING",
+    )
+    .bind(request_id)
+    .bind(origin.as_str())
+    .bind(canonical_did(sender_home_did))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// The actor's PDS must list a relayed key before this DS takes the sender
 /// home's word for it.
 async fn authorize_sender_key(
@@ -2741,13 +2813,29 @@ pub async fn coordinator_prepare_direct_request(
         FederationError::InvalidRequest("invalid requestId".into())
     })?;
 
-    let coord = resolve_pair_coordinator(pool, actor_did, recipient_did).await?;
-    if !coord.is_coordinator {
-        return Err(FederationError::Forbidden("Local node is not coordinator".into()));
-    }
-    if canonical_did(&coord.sender_home.did) != canonical_did(requester_ds) {
+    // An attempt this DS holds replays here whatever the declarations say
+    // now: the client pinned this coordinator when it minted the request, and
+    // checks every receipt against it. Only the sender's live home drives it.
+    let held = held_attempt_origin(pool, request_id)
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?
+        .is_some();
+    let (coord, sender_home_did) = if held {
+        let sender_home = local_resolver(pool)
+            .resolve_authoritative_ds(actor_did)
+            .await?;
+        (None, sender_home.did)
+    } else {
+        let coord = resolve_pair_coordinator(pool, actor_did, recipient_did).await?;
+        if !coord.is_coordinator {
+            return Err(FederationError::Forbidden("Local node is not coordinator".into()));
+        }
+        let sender_home_did = coord.sender_home.did.clone();
+        (Some(coord), sender_home_did)
+    };
+    if canonical_did(&sender_home_did) != canonical_did(requester_ds) {
         return Err(FederationError::AuthFailed {
-            reason: format!("Requester {requester_ds} is not sender home DS {}", coord.sender_home.did),
+            reason: format!("Requester {requester_ds} is not sender home DS {sender_home_did}"),
         });
     }
 
@@ -2792,7 +2880,7 @@ pub async fn coordinator_prepare_direct_request(
         let signed_bytes = serde_json::to_vec(signed_req).map_err(FederationError::Json)?;
         let result = crate::chat_protocol::repository::direct_request_preparation::prepare_direct_request(
             &mut tx, &principal, &signed_bytes, signer,
-            runtime.relationship_authority().as_ref(), &coord.sender_home.did, now,
+            runtime.relationship_authority().as_ref(), &sender_home_did, now,
         ).await.map_err(|error| FederationError::RemoteError {
             status: 409, body: format!("prepare replay rejected: {error:?}"),
         })?;
@@ -2810,18 +2898,15 @@ pub async fn coordinator_prepare_direct_request(
             }
             _ => return Err(FederationError::Invariant("invalid retained preparation outcome".into())),
         };
-        if rejected && !coord.is_recipient_home {
-            release_remote_recipient_bootstrap(
-                pool,
-                &coord.recipient_home.endpoint,
-                &coord.recipient_home.did,
-                request_id,
-                recipient_did,
-            ).await?;
-        }
         tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+        if rejected {
+            // The reservation recorded at prepare, not today's recipient home.
+            release_remote_reservation_if_unpublished(pool, request_id).await;
+        }
         return Ok(json!({"outcome": outcome}));
     }
+    // Attempts are never deleted, so one held before the lock is still here.
+    let coord = coord.ok_or_else(|| FederationError::Storage("attempt changed; retry".into()))?;
 
     if let Some(conflict) = check_pair_owner_fence(
         &mut tx,
@@ -2962,8 +3047,110 @@ pub async fn coordinator_prepare_direct_request(
         }
     };
 
+    let origin = if coord.is_sender_home {
+        AttemptOrigin::Home
+    } else {
+        AttemptOrigin::Relayed
+    };
+    record_attempt_origin(&mut tx, request_id, origin, &coord.sender_home.did)
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
     tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
     Ok(json!({ "outcome": output_val }))
+}
+
+/// How far a publish of a request this DS coordinates may go. The client
+/// checks every receipt against the coordinator it pinned when it minted the
+/// request, so this DS answers for the requests it holds whatever the
+/// declarations say now, but moves one forward only while the pair still
+/// resolves to it and to the recipient home it was prepared against.
+pub enum HeldPublication {
+    /// The full publication path, under this resolution.
+    Forward(CanonicalPairCoordinator),
+    /// A prepared request the pair has moved away from ends with a signed
+    /// `PreparationRevoked`, so the client can resend it as a new request.
+    Revoke { sender_home_did: String },
+    /// A request that already ended replays its stored receipt, and nothing
+    /// is delivered to a recipient home that may have moved.
+    Replay { sender_home_did: String },
+}
+
+impl HeldPublication {
+    pub fn sender_home_did(&self) -> &str {
+        match self {
+            Self::Forward(coord) => &coord.sender_home.did,
+            Self::Revoke { sender_home_did } | Self::Replay { sender_home_did } => sender_home_did,
+        }
+    }
+}
+
+/// [`HeldPublication`] for the request `request_id` between `actor_did` and
+/// `recipient_did`, or `None` when this DS holds no such attempt. A prepared
+/// request gets no answer while the pair cannot be read.
+pub async fn route_held_publication(
+    pool: &DbPool,
+    actor_did: &str,
+    recipient_did: &str,
+    request_id: Uuid,
+) -> Result<Option<HeldPublication>, FederationError> {
+    // The intent counts only when this attempt staged the packages it
+    // reserved: an intent left by a reservation that failed before a retry
+    // prepared against local packages does not name the recipient home.
+    let held: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT a.status, i.recipient_ds_did FROM chat.direct_request_attempts a \
+         LEFT JOIN chat.direct_request_reservation_intents i ON i.request_id = a.request_id \
+           AND EXISTS (SELECT 1 FROM chat.direct_request_reserved_remote_packages r \
+                       WHERE r.request_id = a.request_id) \
+         WHERE a.request_id=$1 AND a.actor_did=$2 AND a.recipient_did=$3",
+    )
+    .bind(request_id)
+    .bind(actor_did)
+    .bind(recipient_did)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| FederationError::Storage(e.to_string()))?;
+    let Some((status, recorded_recipient_ds)) = held else {
+        return Ok(None);
+    };
+    // The staged intent names the recipient's home when it was remote.
+    let prepared_against = |coord: &CanonicalPairCoordinator| {
+        coord.is_coordinator
+            && match &recorded_recipient_ds {
+                Some(ds) => canonical_did(ds) == canonical_did(&coord.recipient_home.did),
+                None => coord.is_recipient_home,
+            }
+    };
+    let prepared = status == "prepared";
+    Ok(Some(
+        match resolve_pair_coordinator(pool, actor_did, recipient_did).await {
+            Ok(coord) if prepared_against(&coord) => HeldPublication::Forward(coord),
+            Ok(coord) if prepared => HeldPublication::Revoke {
+                sender_home_did: coord.sender_home.did,
+            },
+            Ok(coord) => HeldPublication::Replay {
+                sender_home_did: coord.sender_home.did,
+            },
+            Err(error) if prepared => return Err(error),
+            Err(_) => HeldPublication::Replay {
+                sender_home_did: local_resolver(pool)
+                    .resolve_authoritative_ds(actor_did)
+                    .await?
+                    .did,
+            },
+        },
+    ))
+}
+
+/// The entry a published request created, which a sender's home needs to
+/// mirror the conversation.
+pub async fn published_entry(pool: &DbPool, request_id: Uuid) -> Result<Option<Value>, sqlx::Error> {
+    let entry: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT accepted_payload_bytes FROM chat.entries WHERE transition_id = $1",
+    )
+    .bind(request_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(entry.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
 }
 
 /// Coordinator execution for publishDirectRequest relayed from sender home DS or direct.
@@ -2981,13 +3168,23 @@ pub async fn coordinator_publish_direct_request(
         FederationError::InvalidRequest("missing recipientDid".into())
     })?;
 
-    let coord = resolve_pair_coordinator(pool, actor_did, recipient_did).await?;
-    if !coord.is_coordinator {
-        return Err(FederationError::Forbidden("Local node is not coordinator".into()));
-    }
-    if canonical_did(&coord.sender_home.did) != canonical_did(requester_ds) {
+    let request_id = Uuid::parse_str(signed_req["body"]["requestId"].as_str().unwrap_or_default())
+        .unwrap_or_default();
+
+    let route = match route_held_publication(pool, actor_did, recipient_did, request_id).await? {
+        Some(route) => route,
+        None => {
+            let coord = resolve_pair_coordinator(pool, actor_did, recipient_did).await?;
+            if !coord.is_coordinator {
+                return Err(FederationError::Forbidden("Local node is not coordinator".into()));
+            }
+            HeldPublication::Forward(coord)
+        }
+    };
+    let sender_home_did = route.sender_home_did();
+    if canonical_did(sender_home_did) != canonical_did(requester_ds) {
         return Err(FederationError::AuthFailed {
-            reason: format!("Requester {requester_ds} is not sender home DS {}", coord.sender_home.did),
+            reason: format!("Requester {requester_ds} is not sender home DS {sender_home_did}"),
         });
     }
 
@@ -3011,8 +3208,6 @@ pub async fn coordinator_publish_direct_request(
 
     let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    let request_id = Uuid::parse_str(signed_req["body"]["requestId"].as_str().unwrap_or_default())
-        .unwrap_or_default();
     let conversation_id = Uuid::parse_str(signed_req["body"]["conversationId"].as_str().unwrap_or_default())
         .unwrap_or_default();
     let first_message_id = Uuid::parse_str(signed_req["body"]["firstMessageId"].as_str().unwrap_or_default())
@@ -3028,6 +3223,51 @@ pub async fn coordinator_publish_direct_request(
         .execute(&mut *tx)
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;
+
+    let coord = match route {
+        HeldPublication::Forward(coord) => coord,
+        held => {
+            // Neither the fence nor the PDS applies, since nothing is
+            // published, and nothing is delivered.
+            let bytes = crate::chat_protocol::repository::direct_request_publication::end_held_publication(
+                &mut tx,
+                &principal,
+                &signed_bytes,
+                signer,
+                runtime.relationship_authority().as_ref(),
+                now,
+                runtime.request_producers_enabled(),
+                matches!(held, HeldPublication::Revoke { .. }),
+            )
+            .await
+            .map_err(|e| FederationError::RemoteError {
+                status: 400,
+                body: format!("held publication error: {e:?}"),
+            })?;
+            let mut receipt: Value = serde_json::from_slice(&bytes).map_err(FederationError::Json)?;
+            receipt["$type"] = json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
+            tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+            release_remote_reservation_if_unpublished(pool, request_id).await;
+            let mut response = json!({ "outcome": receipt });
+            if let Some(entry) = published_entry(pool, request_id)
+                .await
+                .map_err(|e| FederationError::Storage(e.to_string()))?
+            {
+                response["entry"] = entry;
+            }
+            return Ok(response);
+        }
+    };
+
+    // A publish that is the first this DS hears of a request still ends it,
+    // and records the attempt it writes as relayed.
+    let held: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)",
+    )
+    .bind(request_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     // As on a local publish: a request that ended without a publication only
     // replays its stored receipt, so neither the pair fence nor the PDS
@@ -3209,6 +3449,17 @@ pub async fn coordinator_publish_direct_request(
         full_welcome_bytes: full_welcome_b64,
         signed_publication: signed_pub_val,
     };
+
+    if !held {
+        let origin = if coord.is_sender_home {
+            AttemptOrigin::Home
+        } else {
+            AttemptOrigin::Relayed
+        };
+        record_attempt_origin(&mut tx, request_id, origin, &coord.sender_home.did)
+            .await
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+    }
 
     let queue_id = format!("direct-request-delivery-{}", deliver_input.request_id);
     if !coord.is_recipient_home {
@@ -4046,6 +4297,18 @@ pub async fn coordinator_cancel_direct_request(
     };
     let mut receipt: Value = serde_json::from_slice(&bytes).map_err(FederationError::Json)?;
     receipt["$type"] = json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
+    if !held {
+        // The cancel ended a request this DS had not heard of, for a sender
+        // homed elsewhere.
+        let origin = if resolver.is_self(&sender_home.did) {
+            AttemptOrigin::Home
+        } else {
+            AttemptOrigin::Relayed
+        };
+        record_attempt_origin(&mut tx, request_id, origin, &sender_home.did)
+            .await
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+    }
     tx.commit()
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;

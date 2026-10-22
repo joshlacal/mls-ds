@@ -273,6 +273,11 @@ impl PairLockBarrier {
 
     /// Wait until another session queues on the pair lock.
     pub async fn wait_for_router(&self) -> Result<()> {
+        self.wait_for_routers(1).await
+    }
+
+    /// Wait until `routers` other sessions queue on the pair lock.
+    pub async fn wait_for_routers(&self, routers: i64) -> Result<()> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let waiting: i64 = self
@@ -286,7 +291,7 @@ impl PairLockBarrier {
                 )
                 .await?
                 .get(0);
-            if waiting > 0 {
+            if waiting >= routers {
                 return Ok(());
             }
             anyhow::ensure!(

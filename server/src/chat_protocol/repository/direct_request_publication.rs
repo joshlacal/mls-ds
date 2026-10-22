@@ -112,6 +112,55 @@ async fn terminal(
     ))
 }
 
+/// Answers a publish that must not move its request forward, because the
+/// pair no longer resolves to the coordinator or recipient home it was
+/// prepared against. A request that already ended replays its stored receipt.
+/// With `revoke`, a prepared one ends with a signed `PreparationRevoked` bound
+/// to this publish, so the client ends its draft; without it, a prepared one
+/// is an invariant failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn end_held_publication<T: PublicTransport>(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: &crate::auth::VerifiedServicePrincipal,
+    raw: &[u8],
+    signer: &DirectRequestReceiptSigner,
+    policy: &RelationshipAuthority<T>,
+    now: DateTime<Utc>,
+    producers_enabled: bool,
+    revoke: bool,
+) -> Result<Vec<u8>, PublicationError> {
+    if !revoke {
+        return match prepare_publication(tx, principal, raw, signer, policy, now, producers_enabled)
+            .await?
+        {
+            PublicationPreparation::Terminal(bytes) => Ok(bytes),
+            PublicationPreparation::Ready(_) => Err(PublicationError::Invariant),
+        };
+    }
+    let candidate = match preparation::admit_publication(tx, principal, raw, now).await? {
+        DirectRequestPublicationAdmission::Terminal(bytes) => return Ok(bytes),
+        DirectRequestPublicationAdmission::Candidate(candidate) => candidate,
+    };
+    let code = match candidate.validate_preparation(tx).await {
+        Err(DirectRequestStoreError::Expired) => "PreparationExpired",
+        Err(DirectRequestStoreError::Database(error)) => return Err(error.into()),
+        _ => "PreparationRevoked",
+    };
+    match terminal(
+        tx,
+        candidate,
+        signer,
+        PublicationDisposition::Rejected,
+        "directRequestRejectedReceipt",
+        json!({"code":code}),
+    )
+    .await?
+    {
+        PublicationPreparation::Terminal(bytes) => Ok(bytes),
+        PublicationPreparation::Ready(_) => Err(PublicationError::Invariant),
+    }
+}
+
 /// Does not write a candidate conversation. Terminal decisions are durably
 /// recorded under the same operation lock as cancel; caller commits that result.
 pub(crate) async fn prepare_publication<T: PublicTransport>(
