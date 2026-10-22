@@ -236,6 +236,10 @@ fn prepare_dedicated_federation_database(db_url: &str) -> Result<()> {
         db_url,
         include_str!("../../server/migrations/20260919000025_federated_inventory_conversation_items.sql"),
     )?;
+    psql_on(
+        db_url,
+        include_str!("../../server/migrations/20261016000001_direct_request_attempt_origins.sql"),
+    )?;
     bootstrap_federation_tables(db_url)?;
     psql_on(db_url, "TRUNCATE chat.direct_request_receipt_keys")?;
     let cursor_key_id = psql_value(

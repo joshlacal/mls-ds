@@ -14,6 +14,7 @@
 //! 11. Lost-peer and lost-client-response retry preserve single Welcome/package consumption.
 //! 12. Recipient getEntries seq=2 acceptance entry hashes to the returned acceptance proof entry.
 //! 13. A sender's cancel reaches the pair's coordinator through the sender's home, and only the coordinator signs it.
+//! 14. After a recipient's declaration moves, retries reach the coordinator that prepared the request, which ends a publish it can no longer complete with a signed revocation, and a reservation that failed before the move does not revoke a request prepared after it.
 #![allow(dead_code, unused_imports)]
 #[path = "support/encrypted_requests.rs"]
 mod encrypted_requests;
@@ -281,6 +282,10 @@ impl FederatedAuthorityServer {
             &db_url,
             include_str!("../../server/migrations/20260919000025_federated_inventory_conversation_items.sql"),
         )?;
+        psql_on(
+            &db_url,
+            include_str!("../../server/migrations/20261016000001_direct_request_attempt_origins.sql"),
+        )?;
         require_federation_tables(&db_url)?;
         // Each private clone is a new authority; discard the base fixture's unrelated receipt history.
         psql_on(&db_url, "TRUNCATE chat.direct_request_receipt_keys")?;
@@ -506,6 +511,40 @@ impl FederatedParty {
     }
 
     fn key_entry(&self) -> anyhow::Result<Value> {
+        self.key_entry_n(1)
+    }
+
+    /// A first key publication with `n` packages, each with its own grant.
+    /// A prepare reserves a package for good, so each request to this party
+    /// needs one.
+    fn key_entry_n(&self, n: usize) -> anyhow::Result<Value> {
+        let mut entries = Vec::with_capacity(n);
+        for _ in 0..n {
+            entries.push(self.key_package_entry()?);
+        }
+        let keys = signed_mls_request(
+            &self.engine,
+            &self.identity,
+            DirectRequestKind::Keys,
+            json!({
+                "$type": "blue.catbird.chat.defs#directRequestKeysPublicationBody",
+                "signatureDomain": "CATBIRD-DIRECT-REQUEST-KEYS\0",
+                "protocolVersion": "2",
+                "actorDid": self.svc.did,
+                "actorDeviceId": self.svc.device_id.to_string(),
+                "keyId": self.key_id,
+                "authGeneration": 1,
+                "revision": 1,
+                "enabled": true,
+                "keys": entries,
+                "idempotencyKey": Uuid::new_v4().to_string(),
+                "signedAt": canonical_now()
+            }),
+        )?;
+        Ok(json!({"signedRequest": keys}))
+    }
+
+    fn key_package_entry(&self) -> anyhow::Result<Value> {
         let (package, reference) = self.engine.create_key_package(&self.identity)?;
         let grant_id = Uuid::new_v4();
         let grant = signed_mls_request(
@@ -531,35 +570,16 @@ impl FederatedParty {
                 "signedAt": canonical_now()
             }),
         )?;
-        let keys = signed_mls_request(
-            &self.engine,
-            &self.identity,
-            DirectRequestKind::Keys,
-            json!({
-                "$type": "blue.catbird.chat.defs#directRequestKeysPublicationBody",
-                "signatureDomain": "CATBIRD-DIRECT-REQUEST-KEYS\0",
-                "protocolVersion": "2",
-                "actorDid": self.svc.did,
-                "actorDeviceId": self.svc.device_id.to_string(),
-                "keyId": self.key_id,
-                "authGeneration": 1,
-                "revision": 1,
-                "enabled": true,
-                "keys": [{
-                    "keyPackage": {
-                        "framing": "mlsMessage",
-                        "contentType": "keyPackage",
-                        "bytes": STANDARD.encode(&package),
-                        "sha256": STANDARD.encode(Sha256::digest(&package)),
-                        "keyPackageRef": STANDARD.encode(&reference)
-                    },
-                    "grant": grant
-                }],
-                "idempotencyKey": Uuid::new_v4().to_string(),
-                "signedAt": canonical_now()
-            }),
-        )?;
-        Ok(json!({"signedRequest": keys}))
+        Ok(json!({
+            "keyPackage": {
+                "framing": "mlsMessage",
+                "contentType": "keyPackage",
+                "bytes": STANDARD.encode(&package),
+                "sha256": STANDARD.encode(Sha256::digest(&package)),
+                "keyPackageRef": STANDARD.encode(&reference)
+            },
+            "grant": grant
+        }))
     }
 }
 
@@ -3926,5 +3946,894 @@ async fn c33_two_authority_relayed_cancel_e2e() -> anyhow::Result<()> {
         ))?,
         0
     );
+    Ok(())
+}
+
+/// `party`'s publish of the request it prepared as `prepare`, built from the
+/// preparation `authority` returned (`prepared` is the prepare response), as
+/// the client builds it.
+fn signed_publish(
+    party: &FederatedParty,
+    prepare: &Value,
+    prepared: &Value,
+    authority: &str,
+    authority_key: &[u8],
+) -> anyhow::Result<Value> {
+    let raw_preparation = prepared
+        .pointer("/outcome/preparation")
+        .context("missing preparation outcome")?;
+    let preparation = protocol::verify_direct_request_preparation_for_authority(
+        authority,
+        &serde_json::to_vec(raw_preparation)?,
+        authority_key,
+    )?;
+    let selected = preparation["selectedDevices"]
+        .as_array()
+        .context("preparation selectedDevices missing")?;
+    let body = &prepare["body"];
+    let request_id = body["requestId"].as_str().context("requestId")?;
+    let context_val = json!({
+        "protocolVersion": "2",
+        "requestId": request_id,
+        "firstMessageId": body["firstMessageId"],
+        "conversationId": body["conversationId"],
+        "origin": { "$type": "blue.catbird.chat.defs#freshDirectOrigin" },
+        "actorDid": party.svc.did,
+        "actorDeviceId": party.svc.device_id.to_string(),
+        "actorKeyId": party.key_id,
+        "recipientDid": body["recipientDid"],
+        "preparationDigest": preparation["preparationDigest"]
+    });
+    let verified_prepare = protocol::verify_signed_request(
+        DirectRequestKind::Prepare,
+        &serde_json::to_vec(prepare)?,
+        &party.public,
+    )?;
+    let package = |device: &Value, field: &str| -> anyhow::Result<Vec<u8>> {
+        Ok(STANDARD.decode(
+            device["keyPackage"][field]["$bytes"]
+                .as_str()
+                .or_else(|| device["keyPackage"][field].as_str())
+                .context("selected package field")?,
+        )?)
+    };
+    let journal = party.engine.prepare_direct_request(&DirectRequestBootstrapInput {
+        draft_id: Uuid::new_v4().to_string(),
+        context_json: serde_json::to_vec(&context_val)?,
+        group_id: rand::random::<[u8; 32]>().to_vec(),
+        generation: 0,
+        state_version: 1,
+        key_packages: selected
+            .iter()
+            .map(|device| package(device, "bytes"))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        expected_package_refs: selected
+            .iter()
+            .map(|device| package(device, "keyPackageRef"))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        authority_import_until: 4_000_000_000,
+        preparation_request_digest: *verified_prepare.request_digest(),
+        receipt_authority_key: authority_key.to_vec(),
+        text: "Hello across a declaration move".into(),
+        invitation: None,
+        metadata: GroupMetadataV1 {
+            version: 1,
+            title: String::new(),
+            description: String::new(),
+            avatar_blob_locator: None,
+            avatar_content_type: None,
+        },
+    })?;
+
+    let bootstrap = &journal.bootstrap;
+    let mut publish_body = body.clone();
+    publish_body["$type"] = json!("blue.catbird.chat.defs#directRequestPublicationBody");
+    publish_body["signatureDomain"] = json!("CATBIRD-DIRECT-REQUEST-PUBLISH\0");
+    publish_body["signedAt"] = json!(canonical_now());
+    publish_body["preparationDigest"] = preparation["preparationDigest"].clone();
+    publish_body["preparationRequestDigest"] =
+        json!(STANDARD.encode(verified_prepare.request_digest()));
+    publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
+    publish_body["next"] = bootstrap.coordinates.clone();
+    publish_body["importUntil"] = json!(
+        chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
+            .context("MLS final-tree import deadline")?
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    );
+    let artifact = |data: &[u8], content_type: &str| {
+        json!({
+            "framing": "mlsMessage",
+            "contentType": content_type,
+            "bytes": STANDARD.encode(data),
+            "sha256": STANDARD.encode(Sha256::digest(data))
+        })
+    };
+    let deliveries = selected
+        .iter()
+        .map(|device| {
+            json!({
+                "recipientDid": device["actorDid"],
+                "recipientDeviceId": device["actorDeviceId"],
+                "provenance": {
+                    "requestId": request_id,
+                    "preparationDigest": preparation["preparationDigest"],
+                    "contextHash": STANDARD.encode(bootstrap.context_hash),
+                    "grantId": device["grant"]["body"]["grantId"],
+                    "grantRevision": device["grant"]["body"]["grantRevision"],
+                    "keyPackageRef": device["keyPackage"]["keyPackageRef"],
+                    "importUntil": publish_body["importUntil"]
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let author = json!({
+        "authorDid": party.svc.did,
+        "authorDeviceId": party.svc.device_id.to_string(),
+        "authorKeyId": party.key_id,
+        "signaturePublicKey": STANDARD.encode(&party.public),
+        "authGenerationAtOrigin": 1,
+        "originTransitionId": request_id,
+        "originSeq": 1,
+        "roleAtOrigin": "admin",
+        "deviceStatusAtOrigin": "active"
+    });
+    let metadata_snapshot = json!({
+        "coordinate": metadata_coordinate(&bootstrap.coordinates)?,
+        "originTransitionId": request_id,
+        "metadataVersion": 1,
+        "nonce": STANDARD.encode(&bootstrap.metadata_nonce),
+        "ciphertext": STANDARD.encode(&bootstrap.metadata_ciphertext),
+        "ciphertextSha256": STANDARD.encode(Sha256::digest(&bootstrap.metadata_ciphertext)),
+        "ciphertextSize": bootstrap.metadata_ciphertext.len(),
+        "authorProof": author
+    });
+    publish_body["artifacts"] = json!({
+        "genesisGroupInfo": artifact(&bootstrap.genesis_group_info, "groupInfo"),
+        "addCommit": artifact(&bootstrap.add_commit, "publicMessageCommit"),
+        "finalGroupInfo": artifact(&bootstrap.final_group_info, "groupInfo"),
+        "welcome": {
+            "opaqueWelcome": STANDARD.encode(&bootstrap.welcome),
+            "sha256": STANDARD.encode(Sha256::digest(&bootstrap.welcome)),
+            "deliveries": deliveries
+        },
+        "metadataSnapshot": metadata_snapshot,
+        "initialCiphertext": STANDARD.encode(&bootstrap.initial_ciphertext)
+    });
+    signed_mls_request(
+        &party.engine,
+        &party.identity,
+        DirectRequestKind::Publish,
+        publish_body,
+    )
+}
+
+/// C33 declaration moves. The client pins the pair's coordinator when it
+/// mints a request and checks every receipt against it, so after a recipient
+/// moves, a retry still reaches the coordinator that prepared the request,
+/// which answers for it. That coordinator moves a prepared request forward
+/// only while the pair still resolves to it: a publish after the move ends
+/// the request with a signed `PreparationRevoked`, or, while the pair cannot
+/// be read at all, gets no signature and changes nothing. A sender's home
+/// never both answers a request and relays it, even when a retry races.
+#[tokio::test(flavor = "multi_thread")]
+async fn c33_two_authority_declaration_move_e2e() -> anyhow::Result<()> {
+    let template = "postgresql://127.0.0.1:5432/catbird_direct_requests_test_20260919";
+    anyhow::ensure!(
+        std::env::var("REQUEST_TEST_DATABASE_URL").as_deref() == Ok(template),
+        "C33 requires the exact guarded local synthetic template"
+    );
+
+    let did_port = HttpsDidFixture::reserve_port()?;
+    let run = Uuid::new_v4().simple().to_string();
+    // ds0 is a peer both DSes admit that sorts below them. It runs no server:
+    // a move to it only changes who the pair's coordinator is.
+    let ds0_did = format!("did:web:ds0-{run}.catbird.blue");
+    let ds1_did = format!("did:web:ds1-{run}.catbird.blue");
+    let ds2_did = format!("did:web:ds2-{run}.catbird.blue");
+    anyhow::ensure!(ds0_did < ds1_did && ds1_did < ds2_did, "ds0 < ds1 < ds2");
+    const UNPEERED: &str = "did:web:chat.federated-peer.org";
+
+    let party = |name: &str, home: &str| {
+        FederatedParty::new(
+            format!("did:web:{name}-{run}.catbird.blue"),
+            &format!("c33-move-{name}"),
+            home,
+        )
+    };
+    let alice = party("alice", &ds1_did)?;
+    let frank = party("frank", &ds1_did)?;
+    let bob = party("bob", &ds2_did)?;
+    let carol = party("carol", &ds2_did)?;
+    let erin = party("erin", &ds2_did)?;
+    let gina = party("gina", &ds2_did)?;
+    // Hank starts homed on ds2 with no packages there, and moves to ds1.
+    let hank = party("hank", &ds2_did)?;
+
+    let port_0 = reserve_loopback_port()?;
+    let port_a = reserve_loopback_port()?;
+    let port_b = reserve_loopback_port()?;
+    let server_a_url = format!("http://127.0.0.1:{port_a}");
+    let server_b_url = format!("http://127.0.0.1:{port_b}");
+    let home_document = |party: &FederatedParty, endpoint: &str| -> anyhow::Result<Value> {
+        let mut doc = party.svc.did_document();
+        doc["service"]
+            .as_array_mut()
+            .context("account DID document services")?
+            .push(json!({
+                "id": format!("{}#atproto_mls", party.svc.did),
+                "type": "AtprotoMLSDeliveryService",
+                "serviceEndpoint": endpoint
+            }));
+        Ok(doc)
+    };
+    let (ds0_doc, _, _) = ds_did_document(&ds0_did, &format!("http://127.0.0.1:{port_0}"), 101)?;
+    let (ds1_doc, _, _) = ds_did_document(&ds1_did, &server_a_url, 111)?;
+    let (ds2_doc, _, _) = ds_did_document(&ds2_did, &server_b_url, 121)?;
+    let ds1_parties = [&alice, &frank];
+    let ds2_parties = [&bob, &carol, &erin, &gina];
+    let mut documents = vec![
+        (ds0_did.clone(), ds0_doc),
+        (ds1_did.clone(), ds1_doc),
+        (ds2_did.clone(), ds2_doc),
+    ];
+    for p in ds1_parties {
+        documents.push((p.svc.did.clone(), home_document(p, &server_a_url)?));
+    }
+    for p in ds2_parties.iter().chain([&&hank]) {
+        documents.push((p.svc.did.clone(), home_document(p, &server_b_url)?));
+    }
+    let https = HttpsDidFixture::start(did_port, &documents)?;
+    for p in ds1_parties {
+        declare_chat_authority(&https.root, &p.svc.did, &ds1_did)?;
+        publish_pds_device_key(&https.root, p)?;
+    }
+    for p in ds2_parties.iter().chain([&&hank]) {
+        declare_chat_authority(&https.root, &p.svc.did, &ds2_did)?;
+        publish_pds_device_key(&https.root, p)?;
+    }
+
+    let db1_name = format!("catbird_direct_requests_fault_{}", &run[..16]);
+    let db2_name = format!("catbird_direct_requests_fault_{}", &run[16..]);
+    let server_a = FederatedAuthorityServer::start(&ds1_did, port_a, &db1_name, &https, 111)?;
+    let server_b = FederatedAuthorityServer::start(&ds2_did, port_b, &db2_name, &https, 121)?;
+    for p in ds1_parties {
+        p.seed_into_database(&server_a.database_url)?;
+    }
+    for p in ds2_parties.iter().chain([&&hank]) {
+        p.seed_into_database(&server_b.database_url)?;
+    }
+    for (db, peers) in [
+        (&server_a.database_url, [&ds0_did, &ds2_did]),
+        (&server_b.database_url, [&ds0_did, &ds1_did]),
+    ] {
+        for peer in peers {
+            psql_on(db, &format!(
+                "INSERT INTO federation_peers(ds_did, status) VALUES('{peer}', 'allow') ON CONFLICT DO NOTHING;"
+            ))?;
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let a_db = server_a.database_url.clone();
+    let b_db = server_b.database_url.clone();
+    const CANCEL: &str = "blue.catbird.chat.cancelDirectRequestPreparation";
+    const PREPARE: &str = "blue.catbird.chat.prepareDirectRequest";
+    const PUBLISH: &str = "blue.catbird.chat.publishDirectRequest";
+    const OUTCOME: &str = "blue.catbird.chat.getDirectRequestOutcome";
+
+    // Alice receives four requests (R1, R2, R3, R5), and each reserves one
+    // of her packages for good.
+    for (p, home) in ds1_parties
+        .iter()
+        .map(|p| (*p, &server_a.base_url))
+        .chain(ds2_parties.iter().map(|p| (*p, &server_b.base_url)))
+    {
+        let (status, bytes) = p
+            .svc
+            .post(
+                &client,
+                home,
+                "blue.catbird.chat.publishDirectRequestKeys",
+                &p.key_entry_n(4)?,
+                true,
+            )
+            .await?;
+        anyhow::ensure!(
+            status == StatusCode::OK,
+            "key publish {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    let prepare = |p: &ServiceIdentity, home: &str, signed: &Value| {
+        let (p, home, signed) = (p.clone(), home.to_owned(), signed.clone());
+        let client = client.clone();
+        async move {
+            let (status, bytes) = p
+                .post(&client, &home, PREPARE, &json!({ "signedRequest": signed }), true)
+                .await?;
+            anyhow::Ok((status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)))
+        }
+    };
+    let outcome = |p: &ServiceIdentity, home: &str, id: Uuid| {
+        let (p, home) = (p.clone(), home.to_owned());
+        let client = client.clone();
+        async move {
+            let (status, bytes) = p
+                .get(&client, &home, OUTCOME, &[("requestId".into(), id.to_string())])
+                .await?;
+            anyhow::Ok((status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)))
+        }
+    };
+    // The attempt a DS holds for a request, and how many publications.
+    let attempt = |db: &str, id: Uuid| {
+        psql_value(db, &format!(
+            "SELECT coalesce((SELECT status FROM chat.direct_request_attempts WHERE request_id='{id}'),'none')||'|'||\
+                    (SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{id}')"
+        ))
+    };
+    let mirrored = |id: Uuid| {
+        psql_count(&b_db, &format!(
+            "SELECT count(*) FROM chat.direct_request_transport_inbox WHERE request_id='{id}'"
+        ))
+    };
+    let prepared_ok = |status: StatusCode, response: &Value| {
+        status == StatusCode::OK
+            && response["outcome"]["$type"] == "blue.catbird.chat.defs#directRequestPreparedOutcome"
+    };
+    let revoked = |response: &Value, authority: &FederatedAuthorityServer| -> anyhow::Result<()> {
+        let receipt = authority_receipt(response, &authority.did, &authority.receipt_public_key)?;
+        anyhow::ensure!(
+            receipt["$type"] == "blue.catbird.chat.defs#directRequestRejectedReceipt"
+                && receipt["code"] == "PreparationRevoked"
+                && receipt["requestKind"] == "publish",
+            "expected a signed PreparationRevoked for the publish, got {receipt}"
+        );
+        Ok(())
+    };
+
+    // 1. Bob's request R1 to Alice is relayed from his home to ds1, the
+    // pair's coordinator. Alice then moves to ds0, which makes ds0 the
+    // coordinator for new requests. Bob's retries still reach ds1: the prepare
+    // and the outcome read get ds1's answers, and the publish gets ds1's
+    // signed PreparationRevoked, so his client can resend toward ds0.
+    let r1_id = Uuid::new_v4();
+    let r1_prepare = signed_prepare(&bob, &alice.svc.did, r1_id)?;
+    let (status, r1_prepared) = prepare(&bob.svc, &server_b.base_url, &r1_prepare).await?;
+    anyhow::ensure!(prepared_ok(status, &r1_prepared), "R1 prepare {status}: {r1_prepared}");
+    let r1_publish = signed_publish(
+        &bob,
+        &r1_prepare,
+        &r1_prepared,
+        &server_a.did,
+        &server_a.receipt_public_key,
+    )?;
+    declare_chat_authority(&https.root, &alice.svc.did, &ds0_did)?;
+    let moved = async {
+        let retry = prepare(&bob.svc, &server_b.base_url, &r1_prepare).await?;
+        let read = outcome(&bob.svc, &server_b.base_url, r1_id).await?;
+        let published = post_json(&bob, &client, &server_b.base_url, PUBLISH, &r1_publish).await?;
+        let replayed = post_json(&bob, &client, &server_b.base_url, PUBLISH, &r1_publish).await?;
+        anyhow::Ok((retry, read, published, replayed))
+    }
+    .await;
+    declare_chat_authority(&https.root, &alice.svc.did, &ds1_did)?;
+    let (
+        (status, retry),
+        (read_status, read),
+        (publish_status, published),
+        (replay_status, replayed),
+    ) = moved?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "R1 prepare retry after Alice moved to ds0 {status}: {retry}"
+    );
+    assert_eq!(
+        bare_bytes(&retry["outcome"]),
+        bare_bytes(&r1_prepared["outcome"]),
+        "the prepare retry gets ds1's stored preparation"
+    );
+    anyhow::ensure!(
+        read_status == StatusCode::OK,
+        "R1 outcome after Alice moved to ds0 {read_status}: {read}"
+    );
+    assert_eq!(
+        bare_bytes(&read["outcome"]["preparation"]),
+        bare_bytes(&r1_prepared["outcome"]["preparation"]),
+        "the outcome read gets ds1's preparation"
+    );
+    anyhow::ensure!(
+        publish_status == StatusCode::OK,
+        "R1 publish after Alice moved to ds0 {publish_status}: {published}"
+    );
+    revoked(&published, &server_a)?;
+    anyhow::ensure!(
+        replay_status == StatusCode::OK,
+        "R1 publish replay while Alice is on ds0 {replay_status}: {replayed}"
+    );
+    assert_eq!(
+        bare_bytes(&replayed),
+        bare_bytes(&published),
+        "ds1 replays the revocation though the pair resolves elsewhere"
+    );
+    assert_eq!(attempt(&a_db, r1_id)?, "rejected|0", "ds1 ends R1 unpublished");
+    assert_eq!(
+        format!("{}|{}", attempt(&b_db, r1_id)?, mirrored(r1_id)?),
+        "none|0|0",
+        "Bob's home keeps no attempt or mirror for R1"
+    );
+    let (status, replay) = post_json(&bob, &client, &server_b.base_url, PUBLISH, &r1_publish).await?;
+    anyhow::ensure!(status == StatusCode::OK, "R1 publish replay {status}: {replay}");
+    assert_eq!(
+        bare_bytes(&replay),
+        bare_bytes(&published),
+        "the publish replays the revocation"
+    );
+
+    // 2. Alice moves to ds2, Bob's own home, which then coordinates new
+    // requests for the pair. A retry of Bob's R2 is still ds1's to answer, so
+    // Bob's home prepares nothing of its own and signs nothing.
+    let r2_id = Uuid::new_v4();
+    let r2_prepare = signed_prepare(&bob, &alice.svc.did, r2_id)?;
+    let (status, r2_prepared) = prepare(&bob.svc, &server_b.base_url, &r2_prepare).await?;
+    anyhow::ensure!(prepared_ok(status, &r2_prepared), "R2 prepare {status}: {r2_prepared}");
+    let r2_publish = signed_publish(
+        &bob,
+        &r2_prepare,
+        &r2_prepared,
+        &server_a.did,
+        &server_a.receipt_public_key,
+    )?;
+    declare_chat_authority(&https.root, &alice.svc.did, &ds2_did)?;
+    let moved = async {
+        let retry = prepare(&bob.svc, &server_b.base_url, &r2_prepare).await?;
+        let published = post_json(&bob, &client, &server_b.base_url, PUBLISH, &r2_publish).await?;
+        anyhow::Ok((retry, published))
+    }
+    .await;
+    declare_chat_authority(&https.root, &alice.svc.did, &ds1_did)?;
+    let ((status, retry), (publish_status, published)) = moved?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "R2 prepare retry after Alice moved to ds2 {status}: {retry}"
+    );
+    assert_eq!(
+        bare_bytes(&retry["outcome"]),
+        bare_bytes(&r2_prepared["outcome"]),
+        "the prepare retry gets ds1's stored preparation"
+    );
+    anyhow::ensure!(
+        publish_status == StatusCode::OK,
+        "R2 publish after Alice moved to ds2 {publish_status}: {published}"
+    );
+    revoked(&published, &server_a)?;
+    assert_eq!(attempt(&a_db, r2_id)?, "rejected|0");
+    assert_eq!(
+        attempt(&b_db, r2_id)?,
+        "none|0",
+        "Bob's home, now the live coordinator, never prepares R2 itself"
+    );
+
+    // 3. Alice moves to an authority neither DS admits. The pair then has no
+    // coordinator anyone can join, but the request is still ds1's: the
+    // retries get its answers, and the publish gets no signature and changes
+    // nothing. Once the declaration reads again, the same publish publishes.
+    let r3_id = Uuid::new_v4();
+    let r3_prepare = signed_prepare(&carol, &alice.svc.did, r3_id)?;
+    let (status, r3_prepared) = prepare(&carol.svc, &server_b.base_url, &r3_prepare).await?;
+    anyhow::ensure!(prepared_ok(status, &r3_prepared), "R3 prepare {status}: {r3_prepared}");
+    let r3_publish = signed_publish(
+        &carol,
+        &r3_prepare,
+        &r3_prepared,
+        &server_a.did,
+        &server_a.receipt_public_key,
+    )?;
+    declare_chat_authority(&https.root, &alice.svc.did, UNPEERED)?;
+    let moved = async {
+        let retry = prepare(&carol.svc, &server_b.base_url, &r3_prepare).await?;
+        let read = outcome(&carol.svc, &server_b.base_url, r3_id).await?;
+        let published = post_json(&carol, &client, &server_b.base_url, PUBLISH, &r3_publish).await?;
+        anyhow::Ok((retry, read, published))
+    }
+    .await;
+    declare_chat_authority(&https.root, &alice.svc.did, &ds1_did)?;
+    let ((status, retry), (read_status, read), (publish_status, unanswered)) = moved?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "R3 prepare retry after an unpeered move {status}: {retry}"
+    );
+    assert_eq!(
+        bare_bytes(&retry["outcome"]),
+        bare_bytes(&r3_prepared["outcome"])
+    );
+    anyhow::ensure!(
+        read_status == StatusCode::OK,
+        "R3 outcome after an unpeered move {read_status}: {read}"
+    );
+    assert_eq!(
+        bare_bytes(&read["outcome"]["preparation"]),
+        bare_bytes(&r3_prepared["outcome"]["preparation"])
+    );
+    anyhow::ensure!(
+        publish_status != StatusCode::OK && unanswered.get("outcome").is_none(),
+        "a publish while the pair cannot be read stays unanswered: {publish_status}: {unanswered}"
+    );
+    assert_eq!(attempt(&a_db, r3_id)?, "prepared|0", "ds1 keeps R3 prepared");
+    assert_eq!(
+        format!("{}|{}", attempt(&b_db, r3_id)?, mirrored(r3_id)?),
+        "none|0|0"
+    );
+    let (status, published) = post_json(&carol, &client, &server_b.base_url, PUBLISH, &r3_publish).await?;
+    anyhow::ensure!(status == StatusCode::OK, "R3 publish after the restore {status}: {published}");
+    let receipt = authority_receipt(&published, &server_a.did, &server_a.receipt_public_key)?;
+    assert_eq!(
+        receipt["$type"],
+        "blue.catbird.chat.defs#directRequestPublishedReceipt",
+        "R3 still publishes once the pair resolves to ds1 again"
+    );
+    assert_eq!(attempt(&a_db, r3_id)?, "published|1");
+    assert_eq!(mirrored(r3_id)?, 1, "Carol's home mirrors R3");
+    // Carol's home loses its mirror, and Alice moves to ds0. ds1's replay of
+    // the publication carries its entry, so Carol's home rebuilds the mirror.
+    let r3_conversation = r3_prepare["body"]["conversationId"]
+        .as_str()
+        .context("R3 conversationId")?;
+    psql_on(&b_db, &format!(
+        "BEGIN; SET LOCAL session_replication_role = replica; \
+         DELETE FROM chat.direct_request_transport_inbox WHERE request_id='{r3_id}'; \
+         DELETE FROM chat.direct_request_transport_entries WHERE conversation_id='{r3_conversation}'; COMMIT;"
+    ))?;
+    assert_eq!(mirrored(r3_id)?, 0);
+    declare_chat_authority(&https.root, &alice.svc.did, &ds0_did)?;
+    let replayed = post_json(&carol, &client, &server_b.base_url, PUBLISH, &r3_publish).await;
+    declare_chat_authority(&https.root, &alice.svc.did, &ds1_did)?;
+    let (status, replayed) = replayed?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "R3 publish replay after Alice moved to ds0 {status}: {replayed}"
+    );
+    assert_eq!(
+        authority_receipt(&replayed, &server_a.did, &server_a.receipt_public_key)?,
+        receipt,
+        "ds1 replays R3's publication receipt"
+    );
+    assert_eq!(
+        attempt(&a_db, r3_id)?,
+        "published|1",
+        "the replay publishes nothing new"
+    );
+    assert_eq!(
+        mirrored(r3_id)?,
+        1,
+        "Carol's home rebuilds its mirror from the replayed entry"
+    );
+
+    // 4. Alice's request R4 to Gina, who is homed on ds2, is coordinated by
+    // Alice's own home, which reserves Gina's packages on ds2. Gina moves to
+    // ds0. Alice's retry replays her home's preparation, and her publish ends
+    // R4 with her home's signed PreparationRevoked and gives the packages back.
+    let r4_id = Uuid::new_v4();
+    let r4_prepare = signed_prepare(&alice, &gina.svc.did, r4_id)?;
+    let (status, r4_prepared) = prepare(&alice.svc, &server_a.base_url, &r4_prepare).await?;
+    anyhow::ensure!(prepared_ok(status, &r4_prepared), "R4 prepare {status}: {r4_prepared}");
+    let lease = |id: Uuid| {
+        psql_value(&b_db, &format!(
+            "SELECT coalesce(string_agg(status||'@'||coordinator_did, ','), '') FROM chat.direct_request_remote_leases WHERE request_id='{id}'"
+        ))
+    };
+    assert_eq!(lease(r4_id)?, format!("active@{ds1_did}"));
+    let r4_publish = signed_publish(
+        &alice,
+        &r4_prepare,
+        &r4_prepared,
+        &server_a.did,
+        &server_a.receipt_public_key,
+    )?;
+    declare_chat_authority(&https.root, &gina.svc.did, &ds0_did)?;
+    let moved = async {
+        let retry = prepare(&alice.svc, &server_a.base_url, &r4_prepare).await?;
+        let published = post_json(&alice, &client, &server_a.base_url, PUBLISH, &r4_publish).await?;
+        anyhow::Ok((retry, published))
+    }
+    .await;
+    declare_chat_authority(&https.root, &gina.svc.did, &ds2_did)?;
+    let ((status, retry), (publish_status, published)) = moved?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "R4 prepare retry after Gina moved {status}: {retry}"
+    );
+    assert_eq!(
+        bare_bytes(&retry["outcome"]),
+        bare_bytes(&r4_prepared["outcome"]),
+        "the retry replays Alice's home's preparation"
+    );
+    anyhow::ensure!(
+        publish_status == StatusCode::OK,
+        "R4 publish after Gina moved {publish_status}: {published}"
+    );
+    revoked(&published, &server_a)?;
+    assert_eq!(attempt(&a_db, r4_id)?, "rejected|0");
+    assert_eq!(
+        psql_count(&a_db, &format!(
+            "SELECT count(*) FROM chat.direct_request_outbound_routes WHERE request_id='{r4_id}'"
+        ))?,
+        0,
+        "Alice's home never routes its own request elsewhere"
+    );
+    assert_eq!(
+        lease(r4_id)?,
+        format!("released@{ds1_did}"),
+        "the revocation gives Gina's packages back"
+    );
+
+    // 5. A request ds1 holds for a sender homed on ds2 is driven only through
+    // that home. Bob, calling ds1's own endpoints, can read R5 there but not
+    // prepare or cancel it.
+    let r5_id = Uuid::new_v4();
+    let r5_prepare = signed_prepare(&bob, &alice.svc.did, r5_id)?;
+    let (status, r5_prepared) = prepare(&bob.svc, &server_b.base_url, &r5_prepare).await?;
+    anyhow::ensure!(prepared_ok(status, &r5_prepared), "R5 prepare {status}: {r5_prepared}");
+    let bob_at_ds1 = bob.svc.clone().with_audience(&ds1_did);
+    let (status, read) = outcome(&bob_at_ds1, &server_a.base_url, r5_id).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK
+            && bare_bytes(&read["outcome"]["preparation"])
+                == bare_bytes(&r5_prepared["outcome"]["preparation"]),
+        "ds1 accepts Bob's own call: {status}: {read}"
+    );
+    for (nsid, signed) in [
+        (PREPARE, r5_prepare.clone()),
+        (CANCEL, signed_cancel(&bob, &r5_prepare)?),
+    ] {
+        let (status, bytes) = bob_at_ds1
+            .post(&client, &server_a.base_url, nsid, &json!({ "signedRequest": signed }), true)
+            .await?;
+        let refused: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        anyhow::ensure!(
+            status.is_client_error()
+                && refused.get("outcome").is_none()
+                && refused["error"] == "NotAuthorized",
+            "{nsid} of a relayed request at the coordinator's own endpoint: {status}: {refused}"
+        );
+    }
+    assert_eq!(attempt(&a_db, r5_id)?, "prepared|0", "R5 is untouched");
+    let (status, cancelled) =
+        post_json(&bob, &client, &server_b.base_url, CANCEL, &signed_cancel(&bob, &r5_prepare)?)
+            .await?;
+    anyhow::ensure!(status == StatusCode::OK, "R5 cancel at Bob's home {status}: {cancelled}");
+    authority_receipt(&cancelled, &server_a.did, &server_a.receipt_public_key)?;
+
+    // 6. While Frank's declaration cannot be found, Erin's home has no
+    // authority to join, so it signs a refusal itself. Erin's client pinned
+    // ds1 from the declaration it read, so it cannot use that refusal and
+    // resends the prepare. Once the declaration reads again, the retry reaches
+    // ds1, which prepares the request.
+    let declarations = https.root.join("_policy").join("catbirdDeclaration");
+    let r6_id = Uuid::new_v4();
+    let r6_prepare = signed_prepare(&erin, &frank.svc.did, r6_id)?;
+    std::fs::remove_file(declarations.join(quote(&frank.svc.did)))?;
+    let refusal = prepare(&erin.svc, &server_b.base_url, &r6_prepare).await;
+    declare_chat_authority(&https.root, &frank.svc.did, &ds1_did)?;
+    let (status, refusal) = refusal?;
+    anyhow::ensure!(status == StatusCode::OK, "R6 refusal {status}: {refusal}");
+    anyhow::ensure!(
+        receipt_code(&refusal, &server_b.did, &server_b.receipt_public_key)?.is_some(),
+        "Erin's home signs a refusal: {refusal}"
+    );
+    assert_eq!(
+        psql_value(&b_db, &format!(
+            "SELECT (SELECT status FROM chat.direct_request_attempts WHERE request_id='{r6_id}')||'|'||\
+                    (SELECT origin FROM chat.direct_request_attempt_origins WHERE request_id='{r6_id}')"
+        ))?,
+        "rejected|local-refusal"
+    );
+    let (status, retry) = prepare(&erin.svc, &server_b.base_url, &r6_prepare).await?;
+    anyhow::ensure!(prepared_ok(status, &retry), "R6 retry {status}: {retry}");
+    protocol::verify_direct_request_preparation_for_authority(
+        &server_a.did,
+        &serde_json::to_vec(retry.pointer("/outcome/preparation").context("R6 preparation")?)?,
+        &server_a.receipt_public_key,
+    )?;
+    assert_eq!(attempt(&a_db, r6_id)?, "prepared|0", "ds1 prepares R6");
+    assert_eq!(
+        psql_value(&a_db, &format!(
+            "SELECT origin||'|'||sender_home_did FROM chat.direct_request_attempt_origins WHERE request_id='{r6_id}'"
+        ))?,
+        format!("relayed|{ds2_did}"),
+        "ds1 records R6 as relayed from Erin's home"
+    );
+    assert_eq!(
+        psql_count(&b_db, &format!(
+            "SELECT count(*) FROM chat.direct_request_outbound_routes WHERE request_id='{r6_id}' AND coordinator_did='{ds1_did}'"
+        ))?,
+        1
+    );
+
+    // 7. Alice's request R7 to Hank, homed on ds2 with no packages there:
+    // ds1 cannot reserve any, so the prepare fails unsigned and leaves its
+    // reservation intent naming ds2. Hank then moves to ds1 and publishes
+    // packages there. Alice's retry prepares R7 against them, and her
+    // publish publishes it: the intent of the failed reservation does not
+    // make ds1 think R7 was prepared against ds2.
+    let r7_id = Uuid::new_v4();
+    let r7_prepare = signed_prepare(&alice, &hank.svc.did, r7_id)?;
+    let (status, failed) = prepare(&alice.svc, &server_a.base_url, &r7_prepare).await?;
+    anyhow::ensure!(
+        status != StatusCode::OK && failed.get("outcome").is_none(),
+        "R7 prepare with no packages on ds2 fails unsigned: {status}: {failed}"
+    );
+    assert_eq!(
+        psql_value(&a_db, &format!(
+            "SELECT recipient_ds_did FROM chat.direct_request_reservation_intents WHERE request_id='{r7_id}'"
+        ))?,
+        ds2_did,
+        "the failed reservation leaves its intent"
+    );
+    declare_chat_authority(&https.root, &hank.svc.did, &ds1_did)?;
+    hank.seed_into_database(&a_db)?;
+    let (status, bytes) = hank
+        .svc
+        .clone()
+        .with_audience(&ds1_did)
+        .post(
+            &client,
+            &server_a.base_url,
+            "blue.catbird.chat.publishDirectRequestKeys",
+            &hank.key_entry()?,
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "Hank's key publish on ds1 {status}: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let (status, r7_prepared) = prepare(&alice.svc, &server_a.base_url, &r7_prepare).await?;
+    anyhow::ensure!(prepared_ok(status, &r7_prepared), "R7 retry {status}: {r7_prepared}");
+    let r7_publish = signed_publish(
+        &alice,
+        &r7_prepare,
+        &r7_prepared,
+        &server_a.did,
+        &server_a.receipt_public_key,
+    )?;
+    let (status, published) = post_json(&alice, &client, &server_a.base_url, PUBLISH, &r7_publish).await?;
+    anyhow::ensure!(status == StatusCode::OK, "R7 publish {status}: {published}");
+    let receipt = authority_receipt(&published, &server_a.did, &server_a.receipt_public_key)?;
+    assert_eq!(
+        receipt["$type"],
+        "blue.catbird.chat.defs#directRequestPublishedReceipt",
+        "R7 publishes against Hank's packages on ds1"
+    );
+    assert_eq!(attempt(&a_db, r7_id)?, "published|1");
+
+    // 8. A sender's home decides whether it answers a request or relays it
+    // before it takes the pair lock, so it checks again under the lock. Each
+    // call below waits on the pair lock while the other side commits, then
+    // gets an unsigned conflict, and the request stays with whoever has it.
+    let submit = |p: &ServiceIdentity, home: &str, nsid: &'static str, signed: &Value| {
+        let (p, home, signed) = (p.clone(), home.to_owned(), signed.clone());
+        let client = client.clone();
+        async move {
+            let (status, bytes) = p
+                .post(
+                    &client,
+                    &home,
+                    nsid,
+                    &json!({ "signedRequest": signed }),
+                    true,
+                )
+                .await?;
+            anyhow::Ok((
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            ))
+        }
+    };
+    let routes = |id: Uuid| {
+        psql_count(
+            &a_db,
+            &format!(
+                "SELECT count(*) FROM chat.direct_request_outbound_routes WHERE request_id='{id}'"
+            ),
+        )
+    };
+    let unsigned_conflict = |status: StatusCode, response: &Value| {
+        status.is_client_error()
+            && response.get("outcome").is_none()
+            && response["error"] == "PreparationConflict"
+    };
+    // Alice's prepare and her cancel of requests to Gina resolve to her own
+    // home, and a relay of the same request records its route while they
+    // wait. Neither answers the request at her home.
+    for nsid in [PREPARE, CANCEL] {
+        let id = Uuid::new_v4();
+        let mut signed = signed_prepare(&alice, &gina.svc.did, id)?;
+        if nsid == CANCEL {
+            signed = signed_cancel(&alice, &signed)?;
+        }
+        let barrier = PairLockBarrier::hold(&a_db, &alice.svc.did, &gina.svc.did).await?;
+        let call = tokio::spawn(submit(&alice.svc, &server_a.base_url, nsid, &signed));
+        let queued = barrier.wait_for_router().await;
+        let routed = queued.and_then(|()| {
+            psql_on(
+                &a_db,
+                &format!(
+                    "INSERT INTO chat.direct_request_outbound_routes \
+                    (request_id, actor_did, actor_device_id, recipient_did, coordinator_did) \
+                 VALUES ('{id}', '{}', '{}', '{}', '{ds0_did}')",
+                    alice.svc.did, alice.svc.device_id, gina.svc.did
+                ),
+            )
+        });
+        barrier.release().await?;
+        routed?;
+        let (status, response) = call.await??;
+        anyhow::ensure!(
+            unsigned_conflict(status, &response),
+            "{nsid} that raced a relay of the same request: {status}: {response}"
+        );
+        assert_eq!(
+            attempt(&a_db, id)?,
+            "none|0",
+            "Alice's home holds nothing for a routed request"
+        );
+        assert_eq!(
+            lease(id)?,
+            "",
+            "and reserves none of Gina's packages for it"
+        );
+    }
+    // Alice's cancel of R9 resolves to her own home and waits for the pair.
+    // Gina then moves to ds0, so Alice's prepare of R9 resolves to ds0 and
+    // waits to record its route. The cancel ends R9 at her home first, so the
+    // route is never recorded and the prepare is never relayed.
+    let r9_id = Uuid::new_v4();
+    let r9_prepare = signed_prepare(&alice, &gina.svc.did, r9_id)?;
+    let r9_cancel = signed_cancel(&alice, &r9_prepare)?;
+    let barrier = PairLockBarrier::hold(&a_db, &alice.svc.did, &gina.svc.did).await?;
+    let cancel = tokio::spawn(submit(&alice.svc, &server_a.base_url, CANCEL, &r9_cancel));
+    let queued = async {
+        barrier.wait_for_routers(1).await?;
+        declare_chat_authority(&https.root, &gina.svc.did, &ds0_did)?;
+        let relay = tokio::spawn(submit(&alice.svc, &server_a.base_url, PREPARE, &r9_prepare));
+        barrier.wait_for_routers(2).await?;
+        anyhow::Ok(relay)
+    }
+    .await;
+    declare_chat_authority(&https.root, &gina.svc.did, &ds2_did)?;
+    barrier.release().await?;
+    let relay = queued?;
+    let (status, cancelled) = cancel.await??;
+    anyhow::ensure!(status == StatusCode::OK, "R9 cancel {status}: {cancelled}");
+    authority_receipt(&cancelled, &server_a.did, &server_a.receipt_public_key)?;
+    let (status, refused) = relay.await??;
+    anyhow::ensure!(
+        unsigned_conflict(status, &refused),
+        "R9 prepare that raced its home cancel: {status}: {refused}"
+    );
+    assert_eq!(attempt(&a_db, r9_id)?, "cancelled|0");
+    assert_eq!(routes(r9_id)?, 0, "Alice's home never routes R9 elsewhere");
+
+    // 9. Frank publishes a request naming R4, which Alice's home holds, to
+    // Gina while she is on ds0. His home refuses it rather than route R4.
+    let stray_prepare = signed_prepare(&frank, &gina.svc.did, r4_id)?;
+    let stray_publish = signed_publish(
+        &frank,
+        &stray_prepare,
+        &r4_prepared,
+        &server_a.did,
+        &server_a.receipt_public_key,
+    )?;
+    declare_chat_authority(&https.root, &gina.svc.did, &ds0_did)?;
+    let stray = post_json(&frank, &client, &server_a.base_url, PUBLISH, &stray_publish).await;
+    declare_chat_authority(&https.root, &gina.svc.did, &ds2_did)?;
+    let (status, refused) = stray?;
+    anyhow::ensure!(
+        unsigned_conflict(status, &refused),
+        "Frank's publish naming Alice's R4: {status}: {refused}"
+    );
+    assert_eq!(routes(r4_id)?, 0, "Alice's home never routes R4 elsewhere");
     Ok(())
 }

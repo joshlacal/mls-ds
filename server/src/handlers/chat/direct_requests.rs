@@ -163,6 +163,69 @@ struct OutboundRoute<'a> {
     coordinator_did: &'a str,
 }
 
+/// The coordinator this DS relayed a request to when it first saw it, which
+/// stays the request's receipt authority whatever the declarations say now.
+pub(super) struct RecordedRoute {
+    pub(super) actor_did: String,
+    pub(super) actor_device_id: uuid::Uuid,
+    pub(super) recipient_did: String,
+    pub(super) coordinator_did: String,
+}
+
+impl RecordedRoute {
+    pub(super) async fn load(
+        pool: &DbPool,
+        endpoint: ChatEndpoint,
+        request_id: uuid::Uuid,
+    ) -> Result<Option<Self>, ChatFailure> {
+        let route: Option<(String, uuid::Uuid, String, String)> = sqlx::query_as(
+            "SELECT actor_did, actor_device_id, recipient_did, coordinator_did \
+             FROM chat.direct_request_outbound_routes WHERE request_id=$1",
+        )
+        .bind(request_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+        Ok(route.map(
+            |(actor_did, actor_device_id, recipient_did, coordinator_did)| Self {
+                actor_did,
+                actor_device_id,
+                recipient_did,
+                coordinator_did,
+            },
+        ))
+    }
+
+    /// Whether the route was recorded for this sender's device and, when the
+    /// caller names one, this recipient.
+    pub(super) fn belongs_to(
+        &self,
+        actor_did: &str,
+        actor_device_id: uuid::Uuid,
+        recipient_did: Option<&str>,
+    ) -> bool {
+        self.actor_did == actor_did
+            && self.actor_device_id == actor_device_id
+            && recipient_did.is_none_or(|recipient| self.recipient_did == recipient)
+    }
+}
+
+/// Whether this DS has relayed `request_id` to another coordinator, read
+/// under the pair lock by a writer that would otherwise answer it here.
+async fn request_routed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    endpoint: ChatEndpoint,
+    request_id: uuid::Uuid,
+) -> Result<bool, ChatFailure> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_outbound_routes WHERE request_id=$1)",
+    )
+    .bind(request_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))
+}
+
 /// Record, before the first relay, which coordinator a request goes to, so
 /// every later prepare, cancel or outcome read of it reaches the same one.
 /// `fenced` also refuses a pair that another coordinator already holds.
@@ -194,6 +257,16 @@ async fn record_outbound_route(
         .execute(&mut *route_tx)
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
+    // A request this DS prepared or cancelled as the sender's home while the
+    // caller was resolving the pair is never routed elsewhere. The caller
+    // gets an unsigned conflict, and its retry replays the home attempt.
+    if crate::federation::canonical_relay::held_attempt_origin(&mut *route_tx, request_id)
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?
+        == Some(crate::federation::canonical_relay::AttemptOrigin::Home)
+    {
+        return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
+    }
 
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("chat-direct-request-outbound:{actor_did}"))
@@ -352,40 +425,31 @@ async fn cancel_routed(
     signer: &crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response, ChatFailure> {
-    use crate::federation::canonical_relay;
+    use crate::federation::canonical_relay::{self, AttemptOrigin};
     let endpoint = ChatEndpoint::CancelDirectRequestPreparation;
     let Some(target) = CancelTarget::parse(signed_request.get(), principal.did()) else {
         return cancel_locally(pool, principal, signed_request, signer, now, None).await;
     };
-    // Only this DS's own coordination writes an attempt here, and the client
-    // pinned the coordinator that signed it. That attempt answers even if a
-    // later retry was relayed elsewhere after a declaration move.
-    let held: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)",
-    )
-    .bind(target.request_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|_| ChatFailure::storage(endpoint))?;
-    if held {
+    // A request this DS prepared as the sender's home is cancelled here: the
+    // client pinned this DS, which signed what it holds, even if a later retry
+    // was relayed elsewhere after a declaration move. A refusal this DS signed
+    // alone, or an attempt it holds for a sender homed elsewhere, does not
+    // decide where the cancel goes.
+    let origin = canonical_relay::held_attempt_origin(pool, target.request_id)
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    if origin == Some(AttemptOrigin::Home) {
         return cancel_locally(
             pool,
             principal,
             signed_request,
             signer,
             now,
-            Some(target.request_id),
+            Some((&target, AttemptOrigin::Home)),
         )
         .await;
     }
-    let route: Option<(String, uuid::Uuid, String, String)> = sqlx::query_as(
-        "SELECT actor_did, actor_device_id, recipient_did, coordinator_did \
-         FROM chat.direct_request_outbound_routes WHERE request_id=$1",
-    )
-    .bind(target.request_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|_| ChatFailure::storage(endpoint))?;
+    let route = RecordedRoute::load(pool, endpoint, target.request_id).await?;
     let routed = route.is_some();
 
     // This DS vouches for the sender's key to the coordinator, so it checks
@@ -422,11 +486,12 @@ async fn cancel_routed(
     }
 
     let (coordinator_did, coordinator_endpoint) = match route {
-        Some((actor_did, actor_device_id, recipient_did, coordinator_did)) => {
-            if actor_did != principal.did()
-                || actor_device_id != target.actor_device_id
-                || recipient_did != target.recipient_did
-            {
+        Some(route) => {
+            if !route.belongs_to(
+                principal.did(),
+                target.actor_device_id,
+                Some(&target.recipient_did),
+            ) {
                 return Err(ChatFailure::protocol(
                     endpoint,
                     ChatProtocolErrorCode::NotAuthorized,
@@ -434,10 +499,10 @@ async fn cancel_routed(
             }
             // The recorded coordinator, not the live one: the declaration
             // may have moved since the request was minted.
-            let home = canonical_relay::admit_recorded_coordinator(pool, &coordinator_did)
+            let home = canonical_relay::admit_recorded_coordinator(pool, &route.coordinator_did)
                 .await
                 .map_err(|error| pair_failure(endpoint, error))?;
-            (coordinator_did, home.endpoint)
+            (route.coordinator_did, home.endpoint)
         }
         None => {
             match canonical_relay::resolve_pair_coordinator_by_side(
@@ -464,7 +529,7 @@ async fn cancel_routed(
                         signed_request,
                         signer,
                         now,
-                        Some(target.request_id),
+                        Some((&target, AttemptOrigin::Home)),
                     )
                     .await
                 }
@@ -477,20 +542,23 @@ async fn cancel_routed(
                     // was before relaying existed. Anything else, a
                     // resolution that failed in transit included, could
                     // name another coordinator, so this DS signs nothing.
-                    let local = error.local_refusal_coordinator(&self_did).is_some()
-                        || (error.sender_has_no_authority()
-                            && crate::identity::canonical_did(&self_did)
-                                == canonical_relay::CANONICAL_DIRECT_REQUEST_AUTHORITY);
-                    if !local {
+                    let origin = if error.local_refusal_coordinator(&self_did).is_some() {
+                        AttemptOrigin::LocalRefusal
+                    } else if error.sender_has_no_authority()
+                        && crate::identity::canonical_did(&self_did)
+                            == canonical_relay::CANONICAL_DIRECT_REQUEST_AUTHORITY
+                    {
+                        AttemptOrigin::Home
+                    } else {
                         return Err(pair_failure(endpoint, error.into_federation_error()));
-                    }
+                    };
                     return cancel_locally(
                         pool,
                         principal,
                         signed_request,
                         signer,
                         now,
-                        Some(target.request_id),
+                        Some((&target, origin)),
                     )
                     .await;
                 }
@@ -608,21 +676,55 @@ async fn cancel_routed(
     Ok(context::json_ok(bytes))
 }
 
-/// A cancel this DS answers itself, as the pair's coordinator. A request it
-/// had reserved recipient packages for on another DS gives them back.
+/// A cancel this DS answers itself, as the pair's coordinator. A cancel that
+/// is the first this DS hears of a request records `origin` for the attempt
+/// it ends. A request it had reserved recipient packages for on another DS
+/// gives them back.
 async fn cancel_locally(
     pool: &DbPool,
     principal: &crate::auth::VerifiedServicePrincipal,
     signed_request: &serde_json::value::RawValue,
     signer: &crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner,
     now: chrono::DateTime<chrono::Utc>,
-    request_id: Option<uuid::Uuid>,
+    target: Option<(&CancelTarget, crate::federation::canonical_relay::AttemptOrigin)>,
 ) -> Result<Response, ChatFailure> {
     let endpoint = ChatEndpoint::CancelDirectRequestPreparation;
     let mut tx = pool
         .begin()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
+    // The pair lock orders the cancel against a prepare, as on the
+    // coordinator, so whether it creates the attempt is read reliably.
+    let created = match target {
+        Some((target, _)) => {
+            let actor_did = principal.did();
+            let recipient_did = target.recipient_did.as_str();
+            let (p1, p2) = if actor_did <= recipient_did {
+                (actor_did, recipient_did)
+            } else {
+                (recipient_did, actor_did)
+            };
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!("chat-direct-request-pair:{p1}:{p2}"))
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| ChatFailure::storage(endpoint))?;
+            let held: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)",
+            )
+            .bind(target.request_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
+            // A request relayed elsewhere while this cancel resolved the pair
+            // is the coordinator's to end; its retry follows the route.
+            if !held && request_routed(&mut tx, endpoint, target.request_id).await? {
+                return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
+            }
+            !held
+        }
+        None => false,
+    };
     let result = requests::cancel_direct_request(
         &mut tx,
         principal,
@@ -633,10 +735,126 @@ async fn cancel_locally(
     .await
     .map_err(|e| failure(endpoint, e))?;
     let bytes = output(result, endpoint)?;
+    if let Some((target, origin)) = target.filter(|_| created) {
+        crate::federation::canonical_relay::record_attempt_origin(
+            &mut tx,
+            target.request_id,
+            origin,
+            &crate::identity::service_did(),
+        )
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    }
     tx.commit()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
-    if let Some(request_id) = request_id {
+    if let Some((target, _)) = target {
+        crate::federation::canonical_relay::release_remote_reservation_if_unpublished(
+            pool,
+            target.request_id,
+        )
+        .await;
+    }
+    Ok(context::json_ok(bytes))
+}
+
+/// A prepare this DS relays to the coordinator that holds its pair.
+struct RelayedPrepare<'a> {
+    route: OutboundRoute<'a>,
+    coordinator_endpoint: &'a str,
+    signed_request: &'a serde_json::Value,
+    key_id: &'a str,
+    signing_public_key: &'a [u8],
+    auth_generation: i64,
+}
+
+/// Relay a prepare, after recording (and fencing) its route.
+async fn relay_prepare(pool: &DbPool, relay: RelayedPrepare<'_>) -> Result<Response, ChatFailure> {
+    let endpoint = ChatEndpoint::PrepareDirectRequest;
+    let RelayedPrepare {
+        route,
+        coordinator_endpoint,
+        signed_request,
+        key_id,
+        signing_public_key,
+        auth_generation,
+    } = relay;
+    let actor_device_id = route.actor_device_id;
+    let coordinator_did = route.coordinator_did;
+    record_outbound_route(pool, endpoint, route, true).await?;
+    let relay_payload = serde_json::json!({
+        "signedRequest": signed_request,
+        "senderDeviceKey": {
+            "deviceId": actor_device_id.to_string(),
+            "keyId": key_id,
+            "signingPublicKey": base64::engine::general_purpose::STANDARD.encode(signing_public_key),
+            "authGeneration": auth_generation,
+        }
+    });
+
+    let outcome = crate::federation::canonical_relay::relay_prepare_direct_request(
+        coordinator_endpoint,
+        coordinator_did,
+        &relay_payload,
+    )
+    .await
+    .map_err(|e| match e {
+        crate::federation::FederationError::RemoteError { status: 409, .. } => {
+            failure(endpoint, DirectRequestStoreError::IdentityConflict)
+        }
+        _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
+    })?;
+    let bytes = serde_json::to_vec(&outcome).map_err(|_| ChatFailure::invariant(endpoint))?;
+    Ok(context::json_ok(bytes))
+}
+
+/// Replay a prepare of a request this DS prepared as the sender's home. The
+/// repository returns what the attempt recorded, or signs its expiry, so the
+/// pair need not be read.
+#[allow(clippy::too_many_arguments)]
+async fn replay_prepare(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    principal: &crate::auth::VerifiedServicePrincipal,
+    signed_request: &serde_json::value::RawValue,
+    signer: &crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner,
+    now: chrono::DateTime<chrono::Utc>,
+    recipient_did: &str,
+    request_id: uuid::Uuid,
+) -> Result<Response, ChatFailure> {
+    let endpoint = ChatEndpoint::PrepareDirectRequest;
+    let actor_did = principal.did();
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    let (p1, p2) = if actor_did <= recipient_did {
+        (actor_did, recipient_did)
+    } else {
+        (recipient_did, actor_did)
+    };
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("chat-direct-request-pair:{p1}:{p2}"))
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    let result = requests::prepare_direct_request(
+        &mut tx,
+        principal,
+        signed_request.get().as_bytes(),
+        signer,
+        runtime.relationship_authority().as_ref(),
+        &crate::identity::service_did(),
+        now,
+    )
+    .await
+    .map_err(|e| failure(endpoint, e))?;
+    let ended = !matches!(result, DirectRequestResult::Prepared(_));
+    let bytes = output(result, endpoint)?;
+    tx.commit()
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    if ended {
         crate::federation::canonical_relay::release_remote_reservation_if_unpublished(
             pool, request_id,
         )
@@ -644,6 +862,7 @@ async fn cancel_locally(
     }
     Ok(context::json_ok(bytes))
 }
+
 async fn mutate(
     pool: &DbPool,
     runtime: &ChatRuntime,
@@ -742,6 +961,57 @@ async fn mutate(
         )
         .map_err(|_| failure(endpoint, DirectRequestStoreError::InvalidSignature))?;
 
+        // The client checks every receipt against the coordinator it pinned
+        // when it minted the request, so a retry goes where the request
+        // first went: this DS when it prepared the request as the sender's
+        // home, or the coordinator it was first relayed to. Only a request
+        // this DS has neither, a refusal it signed alone, or one it holds for
+        // another DS reads the pair again.
+        let origin = crate::federation::canonical_relay::held_attempt_origin(pool, request_id)
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
+        if origin == Some(crate::federation::canonical_relay::AttemptOrigin::Home) {
+            return replay_prepare(
+                pool,
+                runtime,
+                &principal,
+                envelope.signed_request,
+                signer,
+                now,
+                recipient_did,
+                request_id,
+            )
+            .await;
+        }
+        if let Some(route) = RecordedRoute::load(pool, endpoint, request_id).await? {
+            if !route.belongs_to(actor_did, actor_device_id, Some(recipient_did)) {
+                return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
+            }
+            let home = crate::federation::canonical_relay::admit_recorded_coordinator(
+                pool,
+                &route.coordinator_did,
+            )
+            .await
+            .map_err(|error| pair_failure(endpoint, error))?;
+            return relay_prepare(
+                pool,
+                RelayedPrepare {
+                    route: OutboundRoute {
+                        request_id,
+                        actor_did,
+                        actor_device_id,
+                        recipient_did,
+                        coordinator_did: &route.coordinator_did,
+                    },
+                    coordinator_endpoint: &home.endpoint,
+                    signed_request: &parsed_req,
+                    key_id,
+                    signing_public_key: &signing_public_key,
+                    auth_generation: verified_auth_gen,
+                },
+            )
+            .await;
+        }
 
         // A recipient with no chat authority this DS can join still gets a
         // signed terminal refusal when the sender is homed here: the repository
@@ -768,44 +1038,24 @@ async fn mutate(
 
 
         if !coord.is_coordinator {
-            record_outbound_route(
+            return relay_prepare(
                 pool,
-                endpoint,
-                OutboundRoute {
-                    request_id,
-                    actor_did,
-                    actor_device_id,
-                    recipient_did,
-                    coordinator_did: &coord.coordinator_did,
+                RelayedPrepare {
+                    route: OutboundRoute {
+                        request_id,
+                        actor_did,
+                        actor_device_id,
+                        recipient_did,
+                        coordinator_did: &coord.coordinator_did,
+                    },
+                    coordinator_endpoint: coord.coordinator_endpoint(),
+                    signed_request: &parsed_req,
+                    key_id,
+                    signing_public_key: &signing_public_key,
+                    auth_generation: verified_auth_gen,
                 },
-                true,
             )
-            .await?;
-            let relay_payload = serde_json::json!({
-                "signedRequest": parsed_req,
-                "senderDeviceKey": {
-                    "deviceId": actor_device_id.to_string(),
-                    "keyId": key_id,
-                    "signingPublicKey": base64::engine::general_purpose::STANDARD.encode(&signing_public_key),
-                    "authGeneration": verified_auth_gen,
-                }
-            });
-
-            let outcome = crate::federation::canonical_relay::relay_prepare_direct_request(
-                coord.coordinator_endpoint(),
-                &coord.coordinator_did,
-                &relay_payload,
-            )
-            .await
-            .map_err(|e| match e {
-                crate::federation::FederationError::RemoteError { status: 409, .. } => {
-                    failure(endpoint, DirectRequestStoreError::IdentityConflict)
-                }
-                _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
-            })?;
-            let bytes = serde_json::to_vec(&outcome)
-                .map_err(|_| ChatFailure::invariant(endpoint))?;
-            return Ok(context::json_ok(bytes));
+            .await;
         } else {
             let mut tx = pool
                 .begin()
@@ -823,6 +1073,13 @@ async fn mutate(
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| ChatFailure::storage(endpoint))?;
+
+            // A retry that raced the relay of this request to another
+            // coordinator does not prepare it here too. It gets an unsigned
+            // conflict, and the next retry follows the route.
+            if request_routed(&mut tx, endpoint, request_id).await? {
+                return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
+            }
 
             // Repository replay must not reserve another peer package for the
             // same attempt. A replay only returns what the attempt already
@@ -945,6 +1202,17 @@ async fn mutate(
                     }
                     Ok(_) => return Err(pair_failure(endpoint, refused.into_federation_error())),
                 }
+                // A retry reads the pair again rather than replaying this
+                // refusal, in case the client pinned a lower authority this
+                // DS could not read.
+                crate::federation::canonical_relay::record_attempt_origin(
+                    &mut tx,
+                    request_id,
+                    crate::federation::canonical_relay::AttemptOrigin::LocalRefusal,
+                    &coord.sender_home.did,
+                )
+                .await
+                .map_err(|_| ChatFailure::storage(endpoint))?;
             }
 
             // C33-LEASE-004: Release remote leases for non-Prepared outcomes (e.g. Terminal receipts)
@@ -1063,31 +1331,26 @@ pub(super) async fn outcome(
         let now = crate::chat_protocol::validation::TrustedRequestInstant::capture()
             .map_err(|_| ChatFailure::invariant(endpoint))?
             .datetime();
-        let route: Option<(String, uuid::Uuid, String, String)> = sqlx::query_as(
-            "SELECT actor_did, actor_device_id, recipient_did, coordinator_did \
-             FROM chat.direct_request_outbound_routes WHERE request_id=$1",
-        )
-        .bind(request)
-        .fetch_optional(pool)
-        .await
-        .map_err(|_| ChatFailure::storage(endpoint))?;
-        if let Some((actor_did, actor_device_id, recipient_did, coordinator_did)) = route {
+        // A request this DS prepared as the sender's home is answered here,
+        // and one it relayed by the coordinator it was first sent to,
+        // whatever the declarations say now.
+        let home_held = crate::federation::canonical_relay::held_attempt_origin(pool, request)
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?
+            == Some(crate::federation::canonical_relay::AttemptOrigin::Home);
+        let route = match home_held {
+            true => None,
+            false => RecordedRoute::load(pool, endpoint, request).await?,
+        };
+        if let Some(RecordedRoute {
+            actor_did,
+            actor_device_id,
+            recipient_did,
+            coordinator_did,
+        }) = route
+        {
             if actor_did != principal.did() || actor_device_id != device {
                 return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
-            }
-            let coord = crate::federation::canonical_relay::resolve_pair_coordinator(
-                pool, &actor_did, &recipient_did,
-            ).await.map_err(|_| ChatFailure::storage(endpoint))?;
-            if !coord.is_sender_home || coord.is_coordinator {
-                return Err(ChatFailure::invariant(endpoint));
-            }
-            if crate::identity::canonical_did(&coord.coordinator_did)
-                != crate::identity::canonical_did(&coordinator_did)
-            {
-                tracing::warn!(
-                    "Declaration rotation observed for request {request}: recorded coordinator {coordinator_did} vs live {}",
-                    coord.coordinator_did
-                );
             }
 
             // Fast local idempotent replay check: if mirror already exists on sender home
@@ -1109,8 +1372,17 @@ pub(super) async fn outcome(
                 return Ok(context::json_ok(bytes));
             }
 
+            let home = crate::federation::canonical_relay::admit_recorded_coordinator(
+                pool,
+                &coordinator_did,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(?error, "recorded coordinator unavailable");
+                ChatFailure::storage(endpoint)
+            })?;
             let result = crate::federation::canonical_relay::relay_get_outcome(
-                coord.coordinator_endpoint(), &coordinator_did, request, device,
+                &home.endpoint, &coordinator_did, request, device,
             ).await.map_err(|error| {
                 tracing::warn!(?error, "Coordinator outcome unavailable");
                 ChatFailure::storage(endpoint)

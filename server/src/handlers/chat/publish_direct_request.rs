@@ -92,105 +92,101 @@ async fn inner(
     }
 
 
-    let coord = crate::federation::canonical_relay::resolve_pair_coordinator(pool, actor_did, recipient_did)
-        .await
-        .map_err(|_| failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::PolicyDenied)))?;
+    use crate::federation::canonical_relay::{self, AttemptOrigin, HeldPublication};
+    let policy_denied = || {
+        failure(PublicationError::Store(
+            crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::PolicyDenied,
+        ))
+    };
+    let routed_request_id = parsed_req["body"]["requestId"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    // Which coordinator answers this publish: this DS for a request it
+    // prepared as the sender's home, the coordinator a relayed request was
+    // first sent to, and otherwise the pair as it resolves now.
+    let coord = 'route: {
+        let Some(request_id) = routed_request_id else {
+            break 'route None;
+        };
+        let origin = canonical_relay::held_attempt_origin(pool, request_id)
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
+        if origin == Some(AttemptOrigin::Home) {
+            match canonical_relay::route_held_publication(pool, actor_did, recipient_did, request_id)
+                .await
+                .map_err(|_| policy_denied())?
+            {
+                Some(HeldPublication::Forward(coord)) => break 'route Some(coord),
+                Some(held) => {
+                    return end_held_publication(
+                        pool,
+                        runtime,
+                        &principal,
+                        envelope.signed_request,
+                        signer,
+                        now,
+                        request_id,
+                        matches!(held, HeldPublication::Revoke { .. }),
+                    )
+                    .await
+                }
+                // Held under another sender or recipient. A request this DS
+                // holds as home is never routed elsewhere.
+                None => {
+                    return Err(failure(PublicationError::Store(
+                        crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::IdentityConflict,
+                    )))
+                }
+            }
+        }
+        if let Some(route) = super::direct_requests::RecordedRoute::load(pool, endpoint, request_id).await? {
+            if !route.belongs_to(actor_did, actor_device_id, Some(recipient_did)) {
+                return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
+            }
+            let home = canonical_relay::admit_recorded_coordinator(pool, &route.coordinator_did)
+                .await
+                .map_err(|_| policy_denied())?;
+            return relay_publish(
+                pool,
+                &parsed_req,
+                actor_did,
+                actor_device_id,
+                recipient_did,
+                request_id,
+                &route.coordinator_did,
+                &home.endpoint,
+                false,
+                now,
+            )
+            .await;
+        }
+        None
+    };
+    let coord = match coord {
+        Some(coord) => coord,
+        None => canonical_relay::resolve_pair_coordinator(pool, actor_did, recipient_did)
+            .await
+            .map_err(|_| policy_denied())?,
+    };
     if !coord.is_sender_home {
         return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
     }
     if !coord.is_coordinator {
-        let request_id = parsed_req["body"]["requestId"].as_str()
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        let request_id = routed_request_id
             .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-
-        // Fast local idempotent replay check
-        let existing: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
-            "SELECT publication_receipt, signed_publication \
-             FROM chat.direct_request_transport_inbox \
-             WHERE request_id=$1 AND sender_did=$2 AND sender_device_id=$3 \
-             LIMIT 1"
-        )
-        .bind(request_id)
-        .bind(actor_did)
-        .bind(actor_device_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|_| ChatFailure::storage(endpoint))?;
-        if let Some((receipt_bytes, signed_bytes)) = existing {
-            let signed: serde_json::Value = serde_json::from_slice(&signed_bytes)
-                .map_err(|_| ChatFailure::invariant(endpoint))?;
-            if signed != parsed_req {
-                return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::IdempotencyConflict));
-            }
-            let receipt: serde_json::Value = serde_json::from_slice(&receipt_bytes)
-                .map_err(|_| ChatFailure::invariant(endpoint))?;
-            let resp_bytes = serde_json::to_vec(&serde_json::json!({ "outcome": receipt }))
-                .map_err(|_| ChatFailure::invariant(endpoint))?;
-            return Ok(context::json_ok(resp_bytes));
-        }
-
-        let _ = sqlx::query(
-            "INSERT INTO chat.direct_request_outbound_routes \
-                (request_id, actor_did, actor_device_id, recipient_did, coordinator_did) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (request_id) DO UPDATE SET request_id=EXCLUDED.request_id \
-             WHERE chat.direct_request_outbound_routes.actor_did=EXCLUDED.actor_did \
-               AND chat.direct_request_outbound_routes.actor_device_id=EXCLUDED.actor_device_id \
-               AND chat.direct_request_outbound_routes.recipient_did=EXCLUDED.recipient_did \
-               AND chat.direct_request_outbound_routes.coordinator_did=EXCLUDED.coordinator_did"
-        )
-        .bind(request_id)
-        .bind(actor_did)
-        .bind(actor_device_id)
-        .bind(recipient_did)
-        .bind(&coord.coordinator_did)
-        .execute(pool)
-        .await;
-
-        let relayed = crate::federation::canonical_relay::relay_publish_direct_request(
-            &coord.coordinator_endpoint(),
-            &coord.coordinator_did,
-            &parsed_req,
-        ).await.map_err(|e| {
-            tracing::error!("relay_publish_direct_request failed: {e:?}");
-            failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::PolicyDenied))
-        })?;
-
-        let receipt_val = relayed.get("outcome").unwrap_or(&relayed);
-        let receipt_type = receipt_val.pointer("/receipt/$type")
-            .or_else(|| receipt_val.pointer("/body/receipt/$type"))
-            .or_else(|| receipt_val.get("$type"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let is_published = receipt_type == "blue.catbird.chat.defs#directRequestPublishedReceipt"
-            || (receipt_type == "blue.catbird.chat.defs#signedDirectRequestReceipt"
-                && receipt_val.pointer("/receipt/$type").and_then(|v| v.as_str()) == Some("blue.catbird.chat.defs#directRequestPublishedReceipt"));
-
-        if !is_published {
-            // A non-published outcome (e.g. rejection) has no published conversation.
-            // Return the relayed receipt without writing phantom transport rows.
-            let bytes = serde_json::to_vec(&relayed)
-                .map_err(|_| ChatFailure::invariant(endpoint))?;
-            return Ok(context::json_ok(bytes));
-        }
-
-        let receipt = materialize_sender_home_published_mirror(
+        return relay_publish(
             pool,
-            &coord.coordinator_did,
+            &parsed_req,
             actor_did,
             actor_device_id,
             recipient_did,
             request_id,
-            receipt_val,
-            relayed.get("entry"),
-            Some(&parsed_req),
+            &coord.coordinator_did,
+            coord.coordinator_endpoint(),
+            true,
             now,
-            endpoint,
-        ).await?;
-
-        let resp_bytes = serde_json::to_vec(&serde_json::json!({ "outcome": receipt }))
-            .map_err(|_| ChatFailure::invariant(endpoint))?;
-        return Ok(context::json_ok(resp_bytes));
+        )
+        .await;
     }
 
     let mut tx = pool.begin().await.map_err(|error| {
@@ -426,6 +422,165 @@ async fn inner(
 
     Ok(context::json_ok(response))
 }
+/// Relay a publish to the coordinator that holds the request, and mirror a
+/// publication here. `cold` is a request this DS has no route for yet: one
+/// it never prepared, so its sender moved here after preparing it elsewhere.
+#[allow(clippy::too_many_arguments)]
+async fn relay_publish(
+    pool: &DbPool,
+    parsed_req: &serde_json::Value,
+    actor_did: &str,
+    actor_device_id: uuid::Uuid,
+    recipient_did: &str,
+    request_id: uuid::Uuid,
+    coordinator_did: &str,
+    coordinator_endpoint: &str,
+    cold: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response, ChatFailure> {
+    let endpoint = ChatEndpoint::PublishDirectRequest;
+    // Fast local idempotent replay check
+    let existing: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT publication_receipt, signed_publication \
+         FROM chat.direct_request_transport_inbox \
+         WHERE request_id=$1 AND sender_did=$2 AND sender_device_id=$3 \
+         LIMIT 1"
+    )
+    .bind(request_id)
+    .bind(actor_did)
+    .bind(actor_device_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+    if let Some((receipt_bytes, signed_bytes)) = existing {
+        let signed: serde_json::Value = serde_json::from_slice(&signed_bytes)
+            .map_err(|_| ChatFailure::invariant(endpoint))?;
+        if signed != *parsed_req {
+            return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::IdempotencyConflict));
+        }
+        let receipt: serde_json::Value = serde_json::from_slice(&receipt_bytes)
+            .map_err(|_| ChatFailure::invariant(endpoint))?;
+        let resp_bytes = serde_json::to_vec(&serde_json::json!({ "outcome": receipt }))
+            .map_err(|_| ChatFailure::invariant(endpoint))?;
+        return Ok(context::json_ok(resp_bytes));
+    }
+
+    if cold {
+        let _ = sqlx::query(
+            "INSERT INTO chat.direct_request_outbound_routes \
+                (request_id, actor_did, actor_device_id, recipient_did, coordinator_did) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (request_id) DO UPDATE SET request_id=EXCLUDED.request_id \
+             WHERE chat.direct_request_outbound_routes.actor_did=EXCLUDED.actor_did \
+               AND chat.direct_request_outbound_routes.actor_device_id=EXCLUDED.actor_device_id \
+               AND chat.direct_request_outbound_routes.recipient_did=EXCLUDED.recipient_did \
+               AND chat.direct_request_outbound_routes.coordinator_did=EXCLUDED.coordinator_did"
+        )
+        .bind(request_id)
+        .bind(actor_did)
+        .bind(actor_device_id)
+        .bind(recipient_did)
+        .bind(coordinator_did)
+        .execute(pool)
+        .await;
+    }
+
+    let relayed = crate::federation::canonical_relay::relay_publish_direct_request(
+        coordinator_endpoint,
+        coordinator_did,
+        parsed_req,
+    ).await.map_err(|e| {
+        tracing::error!("relay_publish_direct_request failed: {e:?}");
+        failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::PolicyDenied))
+    })?;
+
+    let receipt_val = relayed.get("outcome").unwrap_or(&relayed);
+    let receipt_type = receipt_val.pointer("/receipt/$type")
+        .or_else(|| receipt_val.pointer("/body/receipt/$type"))
+        .or_else(|| receipt_val.get("$type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let is_published = receipt_type == "blue.catbird.chat.defs#directRequestPublishedReceipt"
+        || (receipt_type == "blue.catbird.chat.defs#signedDirectRequestReceipt"
+            && receipt_val.pointer("/receipt/$type").and_then(|v| v.as_str()) == Some("blue.catbird.chat.defs#directRequestPublishedReceipt"));
+
+    if !is_published {
+        // A non-published outcome (e.g. rejection) has no published conversation.
+        // Return the relayed receipt without writing phantom transport rows.
+        let bytes = serde_json::to_vec(&relayed)
+            .map_err(|_| ChatFailure::invariant(endpoint))?;
+        return Ok(context::json_ok(bytes));
+    }
+
+    let receipt = materialize_sender_home_published_mirror(
+        pool,
+        coordinator_did,
+        actor_did,
+        actor_device_id,
+        recipient_did,
+        request_id,
+        receipt_val,
+        relayed.get("entry"),
+        Some(parsed_req),
+        now,
+        endpoint,
+    ).await?;
+
+    let resp_bytes = serde_json::to_vec(&serde_json::json!({ "outcome": receipt }))
+        .map_err(|_| ChatFailure::invariant(endpoint))?;
+    Ok(context::json_ok(resp_bytes))
+}
+
+/// Answer a publish of a request this DS prepared as the sender's home when
+/// the pair no longer resolves to it or to the recipient home it prepared
+/// against: a prepared request ends with a signed `PreparationRevoked`, and
+/// one that already ended replays its receipt. Nothing is delivered.
+#[allow(clippy::too_many_arguments)]
+async fn end_held_publication(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    principal: &crate::auth::VerifiedServicePrincipal,
+    signed_request: &serde_json::value::RawValue,
+    signer: &crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner,
+    now: chrono::DateTime<chrono::Utc>,
+    request_id: uuid::Uuid,
+    revoke: bool,
+) -> Result<Response, ChatFailure> {
+    let endpoint = ChatEndpoint::PublishDirectRequest;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    let bytes = direct_request_publication::end_held_publication(
+        &mut tx,
+        principal,
+        signed_request.get().as_bytes(),
+        signer,
+        runtime.relationship_authority().as_ref(),
+        now,
+        runtime.request_producers_enabled(),
+        revoke,
+    )
+    .await
+    .map_err(failure)?;
+    tx.commit()
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    crate::federation::canonical_relay::release_remote_reservation_if_unpublished(pool, request_id)
+        .await;
+    let mut receipt: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| ChatFailure::invariant(endpoint))?;
+    receipt["$type"] = serde_json::json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
+    crate::chat_protocol::direct_request_transcript::present_read_presentation(
+        "directRequestOutcome",
+        &mut receipt,
+    )
+    .map_err(|_| ChatFailure::invariant(endpoint))?;
+    let response = serde_json::to_vec(&serde_json::json!({"outcome":receipt}))
+        .map_err(|_| ChatFailure::invariant(endpoint))?;
+    Ok(context::json_ok(response))
+}
+
 pub(super) async fn materialize_sender_home_published_mirror(
     pool: &DbPool,
     coordinator_did: &str,
