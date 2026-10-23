@@ -62,6 +62,8 @@ pub const PROCEDURES: &[(&str, usize)] = &[
     ("appendOwnerBatch", LIMIT_RECORD_STREAM),
     ("createMek", LIMIT_RECORD_STREAM),
     ("appendBatch", LIMIT_RECORD_STREAM),
+    ("appendSpaceBatch", LIMIT_RECORD_STREAM),
+    ("deleteSpaceGeneration", LIMIT_DEFAULT),
     ("publishEpochHead", LIMIT_DEFAULT),
     ("registerOrfState", LIMIT_DEFAULT),
     ("deleteOrfState", LIMIT_DEFAULT),
@@ -87,6 +89,9 @@ pub const QUERIES: &[&str] = &[
     "listOwnerBatches",
     "findMeks",
     "listBatches",
+    "getThreadStorage",
+    "getSpaceMembership",
+    "listSpaceBatches",
     "getMessages",
     "listThreads",
     "listOwnerThreads",
@@ -180,6 +185,21 @@ where
             post(thread::append_batch).layer(DefaultBodyLimit::max(limit("appendBatch"))),
         )
         .route(&path("listBatches"), get(thread::list_batches))
+        .route(&path("getThreadStorage"), get(thread::get_thread_storage))
+        .route(
+            &path("getSpaceMembership"),
+            get(thread::get_space_membership),
+        )
+        .route(&path("listSpaceBatches"), get(thread::list_space_batches))
+        .route(
+            &path("deleteSpaceGeneration"),
+            post(thread::delete_space_generation),
+        )
+        .route(
+            &path("appendSpaceBatch"),
+            post(thread::append_space_batch)
+                .layer(DefaultBodyLimit::max(limit("appendSpaceBatch"))),
+        )
         .route(&path("getMessages"), get(lookup::get_messages))
         .route(&path("listThreads"), get(lookup::list_threads))
         .route(&path("listOwnerThreads"), get(lookup::list_owner_threads))
@@ -256,6 +276,6 @@ mod tests {
             assert!(served.insert(((*name).to_owned(), "query".to_owned())));
         }
         assert_eq!(served, lexicon);
-        assert_eq!(served.len(), 37);
+        assert_eq!(served.len(), 42);
     }
 }

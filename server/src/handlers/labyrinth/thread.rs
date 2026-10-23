@@ -23,9 +23,9 @@ use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth::{self, begin_read, Admission};
 use crate::labyrinth::error::LabyrinthResult;
 use crate::labyrinth::relay::RelayOp;
-use crate::labyrinth::repo::{liveness, lookup};
 use crate::labyrinth::repo::retention::{self, RedactionIn};
 use crate::labyrinth::repo::thread::{self as repo, parse_thread_id, AuthoredRow};
+use crate::labyrinth::repo::{liveness, lookup, space};
 use crate::labyrinth::wire::bytes::{check_did, check_str, hex_array};
 use crate::labyrinth::wire::io::{body, to_bytes, Page, Received, RecordIn};
 use crate::labyrinth::wire::records::{Batch, Mek};
@@ -55,6 +55,19 @@ struct RedactMessageIn {
 pub(super) fn read_params(op: RelayOp) -> &'static [&'static str] {
     match op {
         RelayOp::FindMeks => &["threadId", "mekId", "cursor", "limit"],
+        RelayOp::GetThreadStorage => &["threadId"],
+        RelayOp::ListSpaceBatches => &[
+            "threadId",
+            "generation",
+            "sender",
+            "fromMs",
+            "untilMs",
+            "since",
+            "until",
+            "reverse",
+            "cursor",
+            "limit",
+        ],
         RelayOp::ListBatches => &[
             "threadId", "sender", "fromMs", "untilMs", "since", "until", "reverse", "cursor",
             "limit",
@@ -71,7 +84,9 @@ pub(super) fn read_params(op: RelayOp) -> &'static [&'static str] {
 pub(super) fn write_thread(op: RelayOp, payload: &[u8]) -> Option<Uuid> {
     let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
     let thread = match op {
-        RelayOp::CreateMek | RelayOp::AppendBatch => value.get("record")?.get("threadId")?,
+        RelayOp::CreateMek | RelayOp::AppendBatch | RelayOp::AppendSpaceBatch => {
+            value.get("record")?.get("threadId")?
+        }
         RelayOp::RedactMessage => value.get("threadId")?,
         _ => return None,
     };
@@ -100,6 +115,11 @@ pub(super) async fn exec_write(
             let (rkey, order) = repo::append_batch(&mut w.tx, &caller, &rec, at).await?;
             json!({ "rkey": rkey, "order": order })
         }
+        RelayOp::AppendSpaceBatch => {
+            let input: space::AppendSpaceBatch = body(bytes)?;
+            let (rkey, order) = space::append(&mut w.tx, &caller, &input, at).await?;
+            json!({ "rkey": rkey, "order": order })
+        }
         RelayOp::RedactMessage => {
             let input: RedactMessageIn = body(bytes)?;
             let redacted = retention::redact_message(
@@ -115,6 +135,8 @@ pub(super) async fn exec_write(
         }
         RelayOp::PurgeAuthor
         | RelayOp::InvalidateMessages
+        | RelayOp::GetThreadStorage
+        | RelayOp::ListSpaceBatches
         | RelayOp::FindMeks
         | RelayOp::ListBatches
         | RelayOp::GetMessages
@@ -150,6 +172,32 @@ pub(super) async fn exec_read(
     }
     let thread = parse_thread_id(p.req("threadId")?)?;
     match op {
+        RelayOp::GetThreadStorage => {
+            let mut r = begin_read(pool, adm).await?;
+            let placement = space::get_storage(&mut r.tx, &r.caller.did, thread).await?;
+            r.finish_read().await?;
+            to_bytes(&placement)
+        }
+        RelayOp::ListSpaceBatches => {
+            let sender = p.opt("sender").map(str::to_owned);
+            if let Some(s) = &sender {
+                check_did("sender", s)?;
+            }
+            let (range, page) = (p.range()?, p.page()?);
+            let mut r = begin_read(pool, adm).await?;
+            let (items, cursor) = space::list(
+                &mut r.tx,
+                &r.caller.did,
+                thread,
+                p.req("generation")?,
+                sender.as_deref(),
+                range,
+                &page,
+            )
+            .await?;
+            r.finish_read().await?;
+            to_bytes(&Page { items, cursor })
+        }
         RelayOp::FindMeks => {
             let mek_id = hex_array::<12>("mekId", p.req("mekId")?)?;
             let page = p.page()?;
@@ -328,4 +376,141 @@ pub async fn list_batches(
         )
         .await,
     )
+}
+
+/// Signed write admitting one immutable sender-owned ciphertext reference.
+pub async fn append_space_batch(
+    State(pool): Pool,
+    State(rt): Runtime,
+    relay: Relay,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    respond(
+        write(
+            &pool,
+            &rt,
+            &relay,
+            RelayOp::AppendSpaceBatch,
+            &headers,
+            &bytes,
+        )
+        .await,
+    )
+}
+pub async fn get_thread_storage(
+    State(pool): Pool,
+    State(rt): Runtime,
+    relay: Relay,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Response {
+    respond(
+        read(
+            &pool,
+            &rt,
+            &relay,
+            RelayOp::GetThreadStorage,
+            &headers,
+            q.as_deref(),
+        )
+        .await,
+    )
+}
+pub async fn list_space_batches(
+    State(pool): Pool,
+    State(rt): Runtime,
+    relay: Relay,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Response {
+    respond(
+        read(
+            &pool,
+            &rt,
+            &relay,
+            RelayOp::ListSpaceBatches,
+            &headers,
+            q.as_deref(),
+        )
+        .await,
+    )
+}
+
+/// Internal authority-to-DS policy lookup. It deliberately uses service auth,
+/// not a user/device claim unavailable in the canonical Space credential wire.
+pub async fn get_space_membership(
+    State(pool): Pool,
+    State(rt): Runtime,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Response {
+    let mut response = respond(space_membership(&pool, &rt, &headers, q.as_deref()).await);
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+async fn space_membership(
+    pool: &DbPool,
+    rt: &ChatRuntime,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> LabyrinthResult<Vec<u8>> {
+    const NSID: &str = "blue.catbird.labyrinth.getSpaceMembership";
+    let authority = space_authority(pool, rt, headers, NSID).await?;
+    let p = Params::parse(query, &["space", "user"])?;
+    let mut tx = pool.begin().await?;
+    let policy = space::membership(&mut tx, &authority, p.req("space")?, p.req("user")?).await?;
+    tx.commit().await?;
+    to_bytes(&policy)
+}
+
+async fn space_authority(
+    pool: &DbPool,
+    rt: &ChatRuntime,
+    headers: &HeaderMap,
+    nsid: &str,
+) -> LabyrinthResult<String> {
+    use crate::labyrinth::error::LabyrinthError;
+    if !rt.cutover_enabled() {
+        return Err(LabyrinthError::invalid_named(
+            "CutoverRequired",
+            "clean-chat protocol is inactive",
+        ));
+    }
+    let principal = crate::auth::verify_mls_service_principal(headers, pool, nsid)
+        .await
+        .map_err(|_| LabyrinthError::not_authorized("Space authority service auth failed"))?;
+    if principal.exp() - principal.iat() > 60 {
+        return Err(LabyrinthError::not_authorized(
+            "Space authority policy token lifetime exceeds 60 seconds",
+        ));
+    }
+    Ok(principal.did().to_owned())
+}
+
+pub async fn delete_space_generation(
+    State(pool): Pool,
+    State(rt): Runtime,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    respond(delete_space_generation_inner(&pool, &rt, &headers, &bytes).await)
+}
+
+async fn delete_space_generation_inner(
+    pool: &DbPool,
+    rt: &ChatRuntime,
+    headers: &HeaderMap,
+    bytes: &[u8],
+) -> LabyrinthResult<Vec<u8>> {
+    const NSID: &str = "blue.catbird.labyrinth.deleteSpaceGeneration";
+    let authority = space_authority(pool, rt, headers, NSID).await?;
+    let input: space::DeleteSpaceGeneration = body(bytes)?;
+    let mut tx = pool.begin().await?;
+    let result = space::delete_generation(&mut tx, &authority, &input).await?;
+    tx.commit().await?;
+    to_bytes(&result)
 }

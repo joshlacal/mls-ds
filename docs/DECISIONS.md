@@ -1,0 +1,26 @@
+# Decisions
+
+## 2026-10-23 · mls-ds conversation Spaces · Persist immutable creation-time placement
+
+Chose: creation-time `mlsds` or `space` placement with a UUID generation, with existing conversations backfilled to `mlsds` (provisional). Because: existing histories must not silently move, and a deleted Space must not create a second conversation history under the same identity. The configured hosted authority requires an explicit issuer-readiness acknowledgement before new Space placements can be created. Rejected: choosing storage per write or silently falling back when the configured service is unavailable.
+Reversible until: merge of the Space release bookmark; production migration remains separately authorized. Override by: changing the creation initializer and migration together before deployment. Governing implementation and verification boundaries: [Conversation Space storage](SPACE_CONVERSATION_STORAGE.md).
+
+## 2026-10-23 · mls-ds conversation Spaces · Reuse retained batch metadata and deny unsupported policy cases
+
+Chose: store ciphertext-free batch metadata plus immutable source reference/CID in the existing retention tables, preserving signed tombstones, per-MEK read authorization, attachment invalidation and deletion outbox (provisional). Because: a separate reference table would bypass established retention paths unless every consumer were rewritten. A database trigger independently forbids retaining ciphertext in Space rows. Rejected: copying ciphertext into both stores or assuming remote/pending-request membership implies a Space credential grant.
+Reversible until: merge of the Space release bookmark. Override by: implementing equivalent retention and lifecycle invariants in a separate reference table before merge. Mixed-host and pending-participant Space operations fail explicitly until their authority lifecycle is implemented.
+
+## 2026-10-23 · mls-ds and Swan · Use authority service authentication for live credential policy
+
+Chose: Swan derives the user DID from canonical Space delegation and queries `getSpaceMembership(space,user)` with a short-lived authority service JWT (provisional). Because: the canonical credential request has no field for a separate Labyrinth device-proof transcript. The DS binds the authority, exact immutable Space generation, accepted member and current registered leaf to committed state; the response is not cacheable. Rejected: adding noncanonical credential fields, DID-only readiness, or using a stale issuer-owned member list for conversation Spaces.
+Reversible until: merge of the Space release bookmark. Override by: coordinating the authority lookup schema and Swan policy adapter before merge. This policy permits encrypted-byte access; MLS decryption and exact device-bound archive admission remain separate.
+
+## 2026-10-23 · mls-ds and Swan · Commit terminal DS generation before authority deletion success
+
+Chose: authority-authenticated `deleteSpaceGeneration` with exact immutable Space/generation binding, preceded by Swan's durable pending-deletion state and followed by durable standard notifications to registered PDS recipients (provisional). Because: stopping new grants alone leaves existing credentials usable, and a callback after successful local deletion can leave the DS serving a supposedly deleted generation during failures. The DS transition is idempotent with a fresh service JWT and also prevents attachment liveness from surviving a deleted Space. Rejected: in-memory callbacks, implicit generation replacement, and reporting success before DS termination and durable notification fanout.
+Reversible until: merge of the Space release bookmark. Override by: coordinating both authority and DS lifecycle transactions and their retry tests before merge. This is local implementation work; deploying the new lifecycle and provisioning a real authority remain separate operator actions.
+
+## 2026-10-23 · mls-ds service authentication · Decode declared legacy secp256k1 keys explicitly
+
+Chose: support the AT Protocol legacy `EcdsaSecp256k1VerificationKey2019` representation only when explicitly declared, with base58btc of a 65-byte uncompressed SEC1 point and normal secp256k1 signature verification (provisional). Because: the actual local PLC document uses this documented legacy format; the previous server incorrectly required a Multikey codec prefix for every multibase field. The ES256K branch also requires the resolved document, controller and selected `#atproto` method to belong to the exact issuer. Multikey and JWK remain separate declared encodings; malformed/ambiguous encodings cannot fall back into the legacy path. Rejected: rewriting real DID documents in the smoke fixture, accepting raw points after any codec error, or weakening signature verification.
+Reversible until: merge of the Space release bookmark. Override by: removing the explicit legacy decoder and retaining the qualified interoperability failure. Authoritative format: [AT Protocol DID legacy representation](https://atproto.com/specs/did#legacy-representation); implementation and evidence are in [the verification report](SPACE_CONVERSATION_STORAGE_VERIFICATION.md). No production authentication configuration was changed.

@@ -272,6 +272,87 @@
           "description": "Server redactions: why the server redacted the item."
         }
       }
+    },
+    "spaceBatchRedaction": {
+      "type": "object",
+      "description": "Authoritative tombstone overlay for an item in an immutable sender batch. Apply after verifying the source record.",
+      "required": [
+        "messageId",
+        "timestamp",
+        "redaction"
+      ],
+      "properties": {
+        "messageId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "timestamp": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "redaction": {
+          "type": "ref",
+          "ref": "blue.catbird.labyrinth.defs#redaction"
+        }
+      }
+    },
+    "spaceBatchView": {
+      "type": "object",
+      "description": "An immutable Space batch reference and its authenticated sequencer order. Server tombstones remain authoritative even if the source ciphertext is still readable.",
+      "required": [
+        "author",
+        "rkey",
+        "space",
+        "generation",
+        "cid",
+        "order",
+        "redactions",
+        "itemCount"
+      ],
+      "properties": {
+        "author": {
+          "type": "string",
+          "format": "did"
+        },
+        "rkey": {
+          "type": "string",
+          "format": "record-key",
+          "maxLength": 64
+        },
+        "space": {
+          "type": "string",
+          "format": "space-ref",
+          "description": "Conversation Space reference, bound to the storage generation."
+        },
+        "generation": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "description": "Immutable UUID identifying this conversation storage lifecycle. A recreated Space requires a new generation."
+        },
+        "cid": {
+          "type": "string",
+          "format": "cid"
+        },
+        "order": {
+          "type": "ref",
+          "ref": "blue.catbird.labyrinth.defs#serverOrder"
+        },
+        "redactions": {
+          "type": "array",
+          "maxLength": 256,
+          "items": {
+            "type": "ref",
+            "ref": "blue.catbird.labyrinth.defs#spaceBatchRedaction"
+          }
+        },
+        "itemCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256,
+          "description": "Original batch item count. Only a complete distinct redaction overlay can replace a purged source record."
+        }
+      }
     }
   }
 }

@@ -38,6 +38,7 @@ pub async fn sender_state(
     message_id: &str,
     author: &str,
 ) -> LabyrinthResult<(bool, bool)> {
+    super::space::require_not_deleted(conn, conversation).await?;
     Ok(
         sqlx::query_as("SELECT live, redacted FROM labyrinth.sender_message_state($1, $2, $3, $4)")
             .bind(reader)
@@ -100,7 +101,14 @@ pub async fn check(
     author: &str,
 ) -> LabyrinthResult<Liveness> {
     let thread_id = conversation.to_string();
-    if announced_redacted(conn, key, &digest::message(key, &thread_id, message_id), author).await? {
+    if announced_redacted(
+        conn,
+        key,
+        &digest::message(key, &thread_id, message_id),
+        author,
+    )
+    .await?
+    {
         return Ok(Liveness::Known(false));
     }
     let own = reader == author && own_copy(conn, reader, conversation, message_id).await?;

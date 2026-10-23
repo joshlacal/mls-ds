@@ -597,6 +597,7 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
         };
         sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,direct_did_low,direct_did_high,created_at,protocol_version) VALUES($1,'direct','active',0,1,2,$2,$3,$4,'2')")
             .bind(convo).bind(low).bind(high).bind(now).execute(&mut **tx).await?;
+        crate::labyrinth::repo::space::initialize_from_environment(&mut **tx, convo, false).await?;
     }
     sqlx::query("INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,$2,$3,'active',$4,$5,1,$6,$7)")
         .bind(convo).bind(generation).bind(next.group_id().as_slice()).bind(&genesis_info).bind(binary(&a["genesisGroupInfo"]["sha256"])?).bind(seq).bind(now).execute(&mut **tx).await?;

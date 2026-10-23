@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Every MEK record with this id that the caller wrote or is a recipient of. Thread endpoint on the conversation's sequencer DS; threadId is the chat conversation id ([CB-2]). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "description": "Every MEK record with this id that the caller wrote or is a recipient of. Thread endpoint on the conversation's sequencer DS; threadId is the chat conversation id ([CB-2]). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded. For a thread backed by a conversation Space, a permanently deleted storage generation returns SpaceDeleted without returning data. This is terminal: do not retry by rebinding to another generation or falling back to another storage placement.",
       "parameters": {
         "type": "params",
         "required": [
@@ -64,6 +64,10 @@
       "errors": [
         {
           "name": "NotRecipient"
+        },
+        {
+          "name": "SpaceDeleted",
+          "description": "The conversation Space storage generation is permanently deleted."
         }
       ]
     },

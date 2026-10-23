@@ -33,6 +33,7 @@ pub async fn get_messages(
     message_ids: &[String],
     page: &PageReq,
 ) -> LabyrinthResult<(Vec<AuthoredRow>, Option<String>)> {
+    super::space::require_legacy(conn, conversation_id).await?;
     let sql = format!(
         "SELECT {BATCH_COLUMNS} FROM labyrinth.batches b \
           WHERE b.conversation_id = $1 AND b.seq > $3 \

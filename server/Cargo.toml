@@ -52,6 +52,7 @@ sha2 = "0.10"
 zeroize = "1"
 base64 = "0.21"
 multibase = "0.9"
+cid = "0.11"
 
 # Auth/JWT
 jsonwebtoken = "9"
@@ -262,3 +263,13 @@ server-bin = []
 chat-protocol-production-proof = []
 subscription-production-proof = []
 test-support = []
+
+[[test]]
+name = "labyrinth_space"
+path = "tests/labyrinth_space.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "conversation_storage_smoke_fixture"
+path = "tests/conversation_storage_smoke_fixture.rs"
+required-features = ["test-support"]

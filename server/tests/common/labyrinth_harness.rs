@@ -392,6 +392,18 @@ pub async fn seed_conversation_with_id(
     leaves: &[Leaf<'_>],
     next_entry_seq: i64,
 ) -> Uuid {
+    seed_conversation_with_storage(env, conversation_id, leaves, next_entry_seq, None).await
+}
+
+/// Fixture creator runs the production immutable storage initializer in the
+/// same transaction as the new conversation; no mutable placement override.
+pub async fn seed_conversation_with_storage(
+    env: &Env,
+    conversation_id: Uuid,
+    leaves: &[Leaf<'_>],
+    next_entry_seq: i64,
+    authority: Option<&str>,
+) -> Uuid {
     let now = env.now().await;
     let mut tx = env.pool.begin().await.unwrap();
     replica(&mut tx).await;
@@ -406,6 +418,9 @@ pub async fn seed_conversation_with_id(
     .execute(&mut *tx)
     .await
     .expect("conversation");
+    catbird_server::labyrinth::repo::space::initialize(&mut tx, conversation_id, authority)
+        .await
+        .unwrap();
     insert_members(&mut tx, conversation_id, leaves, now, 0).await;
     tx.commit().await.unwrap();
     conversation_id
@@ -779,6 +794,11 @@ impl Device {
 
     pub async fn cache_did_document(&self) {
         cache_did_key(&self.did, &self.jwt_key).await;
+    }
+
+    /// Ephemeral fixture key only, for the opt-in loopback issuer integration.
+    pub fn service_auth_secret_bytes(&self) -> Vec<u8> {
+        self.jwt_key.to_bytes().to_vec()
     }
 
     /// A standard service-auth token for `nsid`.

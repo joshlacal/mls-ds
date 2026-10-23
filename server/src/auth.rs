@@ -610,9 +610,28 @@ impl AuthMiddleware {
             "ES256K" => {
                 use k256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
                 let did_doc = self.resolve_did(issuer_did).await?;
-                let vm = select_verification_method(&did_doc, header.kid.as_deref())?;
+                let absolute_atproto = format!("{issuer_did}#atproto");
+                // A legacy document can use a relative method id even when
+                // the JWT names that same method with its absolute issuer id.
+                // Normalize only this exact identity, never a foreign DID.
+                let kid = header.kid.as_deref().map(|kid| {
+                    if kid == absolute_atproto {
+                        "#atproto"
+                    } else {
+                        kid
+                    }
+                });
+                let vm = select_verification_method(&did_doc, kid)?;
+                if did_doc.id != issuer_did
+                    || vm.controller != issuer_did
+                    || (vm.id != "#atproto" && vm.id != absolute_atproto)
+                {
+                    return Err(AuthError::InvalidToken(
+                        "ES256K verification method does not belong to the issuer".into(),
+                    ));
+                }
 
-                // Extract public key from either Multikey or JWK format
+                // The declared verification-method type determines its encoding.
                 let key_bytes = Self::extract_secp256k1_key(vm)?;
 
                 // Create verifying key from the public key bytes
@@ -640,15 +659,39 @@ impl AuthMiddleware {
     }
 
     /// Extract secp256k1 public key bytes from DID verification method
-    /// Supports both JWK and Multikey formats
+    /// Support explicit JWK, Multikey, and legacy ATProto secp256k1 types.
+    /// The legacy format is base58btc of an uncompressed SEC1 point, without
+    /// a multicodec prefix: https://atproto.com/specs/did#legacy-representation.
+    /// Never infer that format after a failed Multikey decode.
     fn extract_secp256k1_key(vm: &VerificationMethod) -> Result<Vec<u8>, AuthError> {
-        // Try Multikey format first (newer AT Protocol standard)
+        if vm.public_key_multibase.is_some() && vm.public_key_jwk.is_some() {
+            return Err(AuthError::InvalidToken(
+                "ambiguous secp256k1 verification method encoding".into(),
+            ));
+        }
         if let Some(multibase) = &vm.public_key_multibase {
-            return Self::decode_multikey_secp256k1(multibase);
+            return match vm.key_type.as_str() {
+                "Multikey" => Self::decode_multikey_secp256k1(multibase),
+                "EcdsaSecp256k1VerificationKey2019" => {
+                    let (base, bytes) = multibase::decode(multibase).map_err(|e| {
+                        AuthError::InvalidToken(format!("legacy multibase decode failed: {e}"))
+                    })?;
+                    if base != multibase::Base::Base58Btc || bytes.len() != 65 || bytes[0] != 0x04 {
+                        return Err(AuthError::InvalidToken(
+                            "legacy secp256k1 requires base58btc of an uncompressed SEC1 point"
+                                .into(),
+                        ));
+                    }
+                    Ok(bytes)
+                }
+                _ => Err(AuthError::UnsupportedKeyType(vm.key_type.clone())),
+            };
         }
 
-        // Fall back to JWK format (older)
         if let Some(jwk) = &vm.public_key_jwk {
+            if vm.key_type != "JsonWebKey2020" {
+                return Err(AuthError::UnsupportedKeyType(vm.key_type.clone()));
+            }
             if jwk.kty != "EC" {
                 return Err(AuthError::UnsupportedKeyType(format!(
                     "Expected EC, got {}",
@@ -669,6 +712,11 @@ impl AuthMiddleware {
             let y = URL_SAFE_NO_PAD
                 .decode(jwk.y.as_ref().ok_or(AuthError::MissingVerificationMethod)?)
                 .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
+            if x.len() != 32 || y.len() != 32 {
+                return Err(AuthError::InvalidToken(
+                    "invalid secp256k1 JWK coordinate length".into(),
+                ));
+            }
 
             // Uncompressed point: 0x04 || x || y
             let mut key_bytes = Vec::with_capacity(65);
@@ -2418,6 +2466,299 @@ mod tests {
 
         assert_eq!(verified.iss, issuer);
         assert!(middleware.did_cache.get(issuer).await.is_some());
+    }
+
+    const ES256K_FIXTURE_ISSUER: &str = "did:plc:es256k-legacy-compatibility";
+    const ES256K_FIXTURE_AUDIENCE: &str = "did:web:mls.example.com#atproto_mls";
+
+    fn es256k_fixture_key() -> k256::ecdsa::SigningKey {
+        let mut scalar = [0_u8; 32];
+        scalar[31] = 7;
+        k256::ecdsa::SigningKey::from_slice(&scalar).unwrap()
+    }
+
+    fn es256k_fixture_document() -> DidDocument {
+        let point = es256k_fixture_key().verifying_key().to_encoded_point(false);
+        DidDocument {
+            id: ES256K_FIXTURE_ISSUER.into(),
+            verification_method: vec![VerificationMethod {
+                id: "#atproto".into(),
+                key_type: "EcdsaSecp256k1VerificationKey2019".into(),
+                controller: ES256K_FIXTURE_ISSUER.into(),
+                public_key_multibase: Some(multibase::encode(
+                    multibase::Base::Base58Btc,
+                    point.as_bytes(),
+                )),
+                public_key_jwk: None,
+            }],
+            service: None,
+        }
+    }
+
+    fn es256k_fixture_token(algorithm: &str, kid: Option<&str>) -> String {
+        use k256::ecdsa::{signature::Signer, Signature};
+        let mut header = json!({"alg": algorithm, "typ": "JWT"});
+        if let Some(kid) = kid {
+            header["kid"] = json!(kid);
+        }
+        let now = Utc::now().timestamp();
+        let claims = json!({
+            "iss": ES256K_FIXTURE_ISSUER,
+            "aud": ES256K_FIXTURE_AUDIENCE,
+            "iat": now,
+            "exp": now + 60,
+            "lxm": "blue.catbird.labyrinth.getThreadStorage",
+            "jti": uuid::Uuid::new_v4().to_string(),
+        });
+        let message = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap()),
+        );
+        let signature: Signature = es256k_fixture_key().sign(message.as_bytes());
+        format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    }
+
+    async fn es256k_verify_fixture_document(
+        document: DidDocument,
+        algorithm: &str,
+        kid: Option<&str>,
+    ) -> Result<AtProtoClaims, AuthError> {
+        let middleware = AuthMiddleware::with_config(300, 100, 60);
+        // Cache under the requested issuer, just as a resolver would. The
+        // wrong-document-id case must be denied by production JWT verification.
+        middleware
+            .did_cache
+            .insert(
+                ES256K_FIXTURE_ISSUER.into(),
+                CachedDidDoc {
+                    doc: document,
+                    cached_at: Utc::now(),
+                },
+            )
+            .await;
+        middleware
+            .verify_jwt_for_audience(
+                &es256k_fixture_token(algorithm, kid),
+                Some(ES256K_FIXTURE_AUDIENCE),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn es256k_legacy_multikey_and_jwk_verify_signed_service_jwts() {
+        let legacy = es256k_fixture_document();
+        let mut modern = legacy.clone();
+        modern.verification_method[0].key_type = "Multikey".into();
+        let compressed = es256k_fixture_key().verifying_key().to_encoded_point(true);
+        let mut multikey = vec![0xe7, 0x01];
+        multikey.extend_from_slice(compressed.as_bytes());
+        modern.verification_method[0].public_key_multibase =
+            Some(multibase::encode(multibase::Base::Base58Btc, multikey));
+        let mut jwk = legacy.clone();
+        let point = es256k_fixture_key().verifying_key().to_encoded_point(false);
+        jwk.verification_method[0].key_type = "JsonWebKey2020".into();
+        jwk.verification_method[0].public_key_multibase = None;
+        jwk.verification_method[0].public_key_jwk = Some(PublicKeyJwk {
+            kty: "EC".into(),
+            crv: "secp256k1".into(),
+            x: URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            y: Some(URL_SAFE_NO_PAD.encode(point.y().unwrap())),
+        });
+        for document in [legacy, modern, jwk] {
+            for kid in [
+                None,
+                Some("#atproto"),
+                Some("did:plc:es256k-legacy-compatibility#atproto"),
+            ] {
+                let verified = es256k_verify_fixture_document(document.clone(), "ES256K", kid)
+                    .await
+                    .expect("declared secp256k1 encoding verifies its real signature");
+                assert_eq!(verified.iss, ES256K_FIXTURE_ISSUER);
+                assert_eq!(verified.aud, ES256K_FIXTURE_AUDIENCE);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn es256k_rejects_mislabeled_malformed_and_wrong_curve_keys() {
+        let original = es256k_fixture_document();
+        let point = es256k_fixture_key().verifying_key().to_encoded_point(false);
+        let compressed = es256k_fixture_key().verifying_key().to_encoded_point(true);
+        let p256_point = p256::ecdsa::SigningKey::from_slice(&[9_u8; 32])
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(false);
+        let mut cases: Vec<(&str, DidDocument)> = Vec::new();
+        for kind in [
+            "Multikey",
+            "EcdsaSecp256r1VerificationKey2019",
+            "JsonWebKey2020",
+            "OtherKey",
+        ] {
+            let mut doc = original.clone();
+            doc.verification_method[0].key_type = kind.into();
+            cases.push((kind, doc));
+        }
+        let mut prefixed = vec![0xe7, 0x01];
+        prefixed.extend_from_slice(point.as_bytes());
+        let mut mislabeled_multikey = original.clone();
+        mislabeled_multikey.verification_method[0].key_type = "OtherKey".into();
+        mislabeled_multikey.verification_method[0].public_key_multibase =
+            Some(multibase::encode(multibase::Base::Base58Btc, &prefixed));
+        cases.push((
+            "unrecognized type with valid multicodec",
+            mislabeled_multikey,
+        ));
+        for (label, bytes) in [
+            ("compressed legacy", compressed.as_bytes().to_vec()),
+            ("multicodec in legacy", prefixed),
+            ("short SEC1", point.as_bytes()[..64].to_vec()),
+            ("long SEC1", [point.as_bytes(), &[0]].concat()),
+            ("non-point", vec![0x04; 65]),
+            ("wrong curve", p256_point.as_bytes().to_vec()),
+            ("point at infinity", vec![0]),
+        ] {
+            let mut doc = original.clone();
+            doc.verification_method[0].public_key_multibase =
+                Some(multibase::encode(multibase::Base::Base58Btc, bytes));
+            cases.push((label, doc));
+        }
+        let mut wrong_base = original.clone();
+        wrong_base.verification_method[0].public_key_multibase =
+            Some(multibase::encode(multibase::Base::Base64, point.as_bytes()));
+        cases.push(("legacy non-base58btc", wrong_base));
+        for (label, doc) in cases {
+            assert!(
+                es256k_verify_fixture_document(doc, "ES256K", None)
+                    .await
+                    .is_err(),
+                "accepted invalid key: {label}"
+            );
+        }
+        for algorithm in ["ES256", "HS256", "none"] {
+            assert!(
+                es256k_verify_fixture_document(original.clone(), algorithm, None)
+                    .await
+                    .is_err(),
+                "accepted wrong algorithm: {algorithm}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn es256k_legacy_rejects_bad_signatures_and_wrong_audiences() {
+        let middleware = AuthMiddleware::with_config(300, 100, 60);
+        middleware
+            .cache_did_document(es256k_fixture_document())
+            .await;
+        let token = es256k_fixture_token("ES256K", None);
+        assert!(middleware
+            .verify_jwt_for_audience(&token, Some("did:web:other.example"))
+            .await
+            .is_err());
+        let (message, encoded_signature) = token.rsplit_once('.').unwrap();
+        let mut signature = URL_SAFE_NO_PAD.decode(encoded_signature).unwrap();
+        signature[10] ^= 1;
+        let tampered = format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature));
+        assert!(matches!(
+            middleware
+                .verify_jwt_for_audience(&tampered, Some(ES256K_FIXTURE_AUDIENCE))
+                .await,
+            Err(AuthError::InvalidSignature)
+        ));
+    }
+
+    #[tokio::test]
+    async fn es256k_rejects_foreign_document_controller_and_method_identity() {
+        for field in ["document", "controller", "foreign method", "wrong fragment"] {
+            let mut document = es256k_fixture_document();
+            match field {
+                "document" => document.id = "did:plc:other".into(),
+                "controller" => document.verification_method[0].controller = "did:plc:other".into(),
+                "foreign method" => {
+                    document.verification_method[0].id = "did:plc:other#atproto".into()
+                }
+                _ => document.verification_method[0].id = "#atproto_kem".into(),
+            }
+            assert!(
+                es256k_verify_fixture_document(document, "ES256K", None)
+                    .await
+                    .is_err(),
+                "accepted foreign identity: {field}"
+            );
+        }
+        for kid in ["did:plc:other#atproto", "#atproto_kem"] {
+            assert!(
+                es256k_verify_fixture_document(es256k_fixture_document(), "ES256K", Some(kid))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn es256k_jwk_coordinates_curve_and_encoding_are_unambiguous() {
+        let point = es256k_fixture_key().verifying_key().to_encoded_point(false);
+        let mut original = es256k_fixture_document();
+        original.verification_method[0].key_type = "JsonWebKey2020".into();
+        original.verification_method[0].public_key_multibase = None;
+        original.verification_method[0].public_key_jwk = Some(PublicKeyJwk {
+            kty: "EC".into(),
+            crv: "secp256k1".into(),
+            x: URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            y: Some(URL_SAFE_NO_PAD.encode(point.y().unwrap())),
+        });
+        for field in ["coordinate split", "curve", "kty", "type", "ambiguous"] {
+            let mut document = original.clone();
+            let method = &mut document.verification_method[0];
+            let jwk = method.public_key_jwk.as_mut().unwrap();
+            match field {
+                "coordinate split" => {
+                    // Same concatenated SEC1 bytes, but invalid 31/33-byte JWK
+                    // coordinates. Length must be checked before concatenation.
+                    jwk.x = URL_SAFE_NO_PAD.encode(&point.as_bytes()[1..32]);
+                    jwk.y = Some(URL_SAFE_NO_PAD.encode(&point.as_bytes()[32..]));
+                }
+                "curve" => jwk.crv = "P-256".into(),
+                "kty" => jwk.kty = "RSA".into(),
+                "type" => method.key_type = "Multikey".into(),
+                _ => {
+                    method.public_key_multibase = es256k_fixture_document().verification_method[0]
+                        .public_key_multibase
+                        .clone()
+                }
+            }
+            assert!(
+                es256k_verify_fixture_document(document, "ES256K", None)
+                    .await
+                    .is_err(),
+                "accepted invalid JWK: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn es256k_official_legacy_vector_and_actual_plc_public_key_decode() {
+        // Independent public example from https://atproto.com/specs/did,
+        // plus the unchanged public #atproto key captured from the local PLC.
+        let mut vm = es256k_fixture_document().verification_method.remove(0);
+        vm.public_key_multibase = Some("zQYEBzXeuTM9UR3rfvNag6L3RNAs5pQZyYPsomTsgQhsxLdEgCrPTLgFna8yqCnxPpNT7DBk6Ym3dgPKNu86vt9GR".into());
+        let legacy = k256::ecdsa::VerifyingKey::from_sec1_bytes(
+            &AuthMiddleware::extract_secp256k1_key(&vm).unwrap(),
+        )
+        .unwrap();
+        let modern_bytes = AuthMiddleware::decode_multikey_secp256k1(
+            "zQ3shXjHeiBuRCKmM36cuYnm7YEMzhGnCmCyW92sRJ9pribSF",
+        )
+        .unwrap();
+        let modern = k256::ecdsa::VerifyingKey::from_sec1_bytes(&modern_bytes).unwrap();
+        assert_eq!(legacy, modern);
+        vm.public_key_multibase = Some("zNVCaBSJF2qk9ZcQ9kMSoXHDx8AiuuwpPuuSNEoewTZXkw67X7FLn32TXAxFWxZW7cBSu6j7R4XWnobjd3wsDkqUk".into());
+        k256::ecdsa::VerifyingKey::from_sec1_bytes(
+            &AuthMiddleware::extract_secp256k1_key(&vm).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]

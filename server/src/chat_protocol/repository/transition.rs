@@ -2837,6 +2837,12 @@ pub(crate) async fn insert_conversation_head(
     .bind(head.sequencer_term)
     .execute(&mut **transaction)
     .await?;
+    crate::labyrinth::repo::space::initialize_from_environment(
+        &mut **transaction,
+        head.conversation_id,
+        head.is_remote,
+    )
+    .await?;
     Ok(())
 }
 

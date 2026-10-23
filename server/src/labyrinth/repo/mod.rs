@@ -11,6 +11,7 @@ pub mod mailbox;
 pub mod orf;
 pub mod outbox;
 pub mod retention;
+pub mod space;
 pub mod thread;
 
 use chrono::{DateTime, Utc};

@@ -38,6 +38,9 @@ impl Bytes {
 
 impl Serialize for Bytes {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !serializer.is_human_readable() {
+            return serializer.serialize_bytes(&self.0);
+        }
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(Some(1))?;
         map.serialize_entry("$bytes", &STANDARD_NO_PAD.encode(&self.0))?;
@@ -47,6 +50,9 @@ impl Serialize for Bytes {
 
 impl<'de> Deserialize<'de> for Bytes {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if !deserializer.is_human_readable() {
+            return serde_bytes::ByteBuf::deserialize(deserializer).map(|b| Bytes(b.into_vec()));
+        }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {

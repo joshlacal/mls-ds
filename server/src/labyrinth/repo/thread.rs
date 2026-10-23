@@ -74,7 +74,7 @@ pub(crate) async fn lock_local_conversation(
     }
 }
 
-async fn require_active_leaf(
+pub(crate) async fn require_active_leaf(
     conn: &mut PgConnection,
     conversation_id: Uuid,
     caller: &Caller,
@@ -98,7 +98,10 @@ async fn require_active_leaf(
 
 /// The next per-conversation Labyrinth seq (from 1); the counter row lock
 /// serializes stamping within a conversation until commit.
-async fn next_seq(conn: &mut PgConnection, conversation_id: Uuid) -> LabyrinthResult<i64> {
+pub(crate) async fn next_seq(
+    conn: &mut PgConnection,
+    conversation_id: Uuid,
+) -> LabyrinthResult<i64> {
     Ok(sqlx::query_scalar(
         "INSERT INTO labyrinth.thread_counters (conversation_id, next_seq) VALUES ($1, 2) \
          ON CONFLICT (conversation_id) DO UPDATE \
@@ -111,7 +114,11 @@ async fn next_seq(conn: &mut PgConnection, conversation_id: Uuid) -> LabyrinthRe
 }
 
 /// Charge the author's thread-record quota (design Y6: 1 GiB).
-async fn charge_author(conn: &mut PgConnection, did: &str, bytes: i32) -> LabyrinthResult<()> {
+pub(crate) async fn charge_author(
+    conn: &mut PgConnection,
+    did: &str,
+    bytes: i32,
+) -> LabyrinthResult<()> {
     sqlx::query(
         "INSERT INTO labyrinth.author_usage (author_did, bytes_used) VALUES ($1, $2) \
          ON CONFLICT (author_did) DO UPDATE \
@@ -162,6 +169,7 @@ pub async fn create_mek(
     let conversation_id = parse_thread_id(&mek.thread_id)?;
     let chat_seq = lock_local_conversation(conn, conversation_id).await?;
     require_active_leaf(conn, conversation_id, caller).await?;
+    super::space::validate_mek_writer(conn, caller, conversation_id, chat_seq).await?;
     let (kind, attestation_key_id) = match &mek.sender {
         MekSender::Labyrinth(s) => {
             if s.did != caller.did {
@@ -197,8 +205,9 @@ pub async fn create_mek(
     let inserted = sqlx::query(
         "INSERT INTO labyrinth.meks \
            (conversation_id, author_did, mek_id, sender_kind, attestation_key_id, \
-            writer_device_id, record, record_bytes, seq, chat_seq, received_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11) ON CONFLICT DO NOTHING",
+            writer_device_id, record, record_bytes, seq, chat_seq, received_at, chat_generation) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, \
+            (SELECT current_generation FROM chat.conversations WHERE conversation_id = $1)) ON CONFLICT DO NOTHING",
     )
     .bind(conversation_id)
     .bind(&caller.did)
@@ -257,6 +266,7 @@ pub async fn find_meks(
     mek_id: &[u8; 12],
     page: &PageReq,
 ) -> LabyrinthResult<(Vec<AuthoredRow>, Option<String>)> {
+    super::space::require_not_deleted(conn, conversation_id).await?;
     let sql = format!(
         "SELECT m.seq, m.author_did, m.record::text, m.chat_seq, m.received_at \
            FROM labyrinth.meks m \
@@ -302,6 +312,7 @@ pub async fn append_batch(
     let conversation_id = parse_thread_id(&batch.thread_id)?;
     let chat_seq = lock_local_conversation(conn, conversation_id).await?;
     require_active_leaf(conn, conversation_id, caller).await?;
+    super::space::require_legacy(conn, conversation_id).await?;
     let mek_id = &batch.items[0].mek_id;
     if batch.items.iter().any(|i| &i.mek_id != mek_id) {
         return Err(named(
@@ -436,6 +447,7 @@ pub async fn list_batches(
     range: TimeRange,
     page: &PageReq,
 ) -> LabyrinthResult<(Vec<AuthoredRow>, Option<String>)> {
+    super::space::require_legacy(conn, conversation_id).await?;
     let sql = format!(
         "SELECT {BATCH_COLUMNS} FROM labyrinth.batches b \
           WHERE b.conversation_id = $1 AND b.seq {cmp} $3 \

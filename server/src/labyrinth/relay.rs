@@ -30,6 +30,9 @@ pub const NSID: &str = "blue.catbird.labyrinth.labyrinthRelay";
 pub enum RelayOp {
     CreateMek,
     AppendBatch,
+    AppendSpaceBatch,
+    GetThreadStorage,
+    ListSpaceBatches,
     RedactMessage,
     FindMeks,
     ListBatches,
@@ -52,6 +55,9 @@ impl RelayOp {
         Ok(match value {
             "createMek" => Self::CreateMek,
             "appendBatch" => Self::AppendBatch,
+            "appendSpaceBatch" => Self::AppendSpaceBatch,
+            "getThreadStorage" => Self::GetThreadStorage,
+            "listSpaceBatches" => Self::ListSpaceBatches,
             "redactMessage" => Self::RedactMessage,
             "findMeks" => Self::FindMeks,
             "listBatches" => Self::ListBatches,
@@ -68,6 +74,9 @@ impl RelayOp {
         match self {
             Self::CreateMek => "createMek",
             Self::AppendBatch => "appendBatch",
+            Self::AppendSpaceBatch => "appendSpaceBatch",
+            Self::GetThreadStorage => "getThreadStorage",
+            Self::ListSpaceBatches => "listSpaceBatches",
             Self::RedactMessage => "redactMessage",
             Self::FindMeks => "findMeks",
             Self::ListBatches => "listBatches",
@@ -83,7 +92,11 @@ impl RelayOp {
     pub fn is_write(self) -> bool {
         matches!(
             self,
-            Self::CreateMek | Self::AppendBatch | Self::RedactMessage | Self::PurgeAuthor
+            Self::CreateMek
+                | Self::AppendBatch
+                | Self::AppendSpaceBatch
+                | Self::RedactMessage
+                | Self::PurgeAuthor
         )
     }
 
@@ -146,6 +159,9 @@ pub fn not_sequencer() -> LabyrinthError {
 /// Error names a sequencer may answer with that the home DS passes through
 /// unchanged (each is a `&'static str` in `LabyrinthError`).
 const PASSTHROUGH: &[&str] = &[
+    "StorageGenerationMismatch",
+    "StorageNotConfigured",
+    "SpaceDeleted",
     "NotParticipant",
     "RecipientNotParticipant",
     "SenderMismatch",
@@ -182,7 +198,11 @@ pub fn passthrough_error(status: u16, body: &[u8]) -> LabyrinthError {
     let parsed: Option<Wire> = serde_json::from_slice(body).ok();
     let code = axum::http::StatusCode::from_u16(status).ok();
     match (parsed, code) {
-        (Some(wire), Some(code)) if code.is_client_error() => {
+        (Some(wire), Some(code))
+            if code.is_client_error()
+                || (code == axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    && wire.error == "StorageNotConfigured") =>
+        {
             match PASSTHROUGH.iter().find(|n| **n == wire.error) {
                 Some(name) => LabyrinthError::new(code, name, wire.message),
                 None => {
@@ -207,6 +227,9 @@ mod tests {
         for op in [
             RelayOp::CreateMek,
             RelayOp::AppendBatch,
+            RelayOp::AppendSpaceBatch,
+            RelayOp::GetThreadStorage,
+            RelayOp::ListSpaceBatches,
             RelayOp::RedactMessage,
             RelayOp::FindMeks,
             RelayOp::ListBatches,
