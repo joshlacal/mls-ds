@@ -1328,6 +1328,213 @@ fn exact_wrapper_fields(
     Ok((body, signature))
 }
 
+// Generated clients encode the closed signedTransition union using an outer
+// discriminator. These are the only wrappers for which the generated wire
+// presentation is accepted; all other signed operations retain their existing
+// exact field and representation rules.
+fn generated_transition_body_name(type_id: &str) -> Result<&'static str, AuthPrimitiveError> {
+    let (wrapper_name, body_name) = match type_id.strip_prefix(TYPE_PREFIX) {
+        Some("signedCommitTransition") => ("signedCommitTransition", "commitTransitionBody"),
+        Some("signedPolicyTransition") => ("signedPolicyTransition", "policyTransitionBody"),
+        Some("signedLeafRecoveryFulfillment") => (
+            "signedLeafRecoveryFulfillment",
+            "leafRecoveryFulfillmentBody",
+        ),
+        Some("signedMetadataTransition") => ("signedMetadataTransition", "metadataTransitionBody"),
+        Some("signedLeaveCommitFulfillment") => {
+            ("signedLeaveCommitFulfillment", "leaveCommitFulfillmentBody")
+        }
+        _ => {
+            return Err(AuthPrimitiveError::invalid(
+                "unknown generated transition wrapper",
+            ))
+        }
+    };
+    let union = definition("signedTransition")?;
+    let wrapper_ref = format!("#{wrapper_name}");
+    let body_ref = format!("#{body_name}");
+    let allowed_wrapper = union["type"] == "union"
+        && union["closed"] == true
+        && union["refs"]
+            .as_array()
+            .is_some_and(|refs| refs.iter().any(|item| item.as_str() == Some(&wrapper_ref)));
+    let body = &definition(wrapper_name)?["properties"]["body"];
+    let exact_body = body["type"] == "union"
+        && body["closed"] == true
+        && body["refs"]
+            .as_array()
+            .is_some_and(|refs| refs.len() == 1 && refs[0].as_str() == Some(body_ref.as_str()));
+    if !allowed_wrapper || !exact_body {
+        return Err(AuthPrimitiveError::invalid(
+            "embedded generated transition contract",
+        ));
+    }
+    Ok(body_name)
+}
+
+// This walk changes presentation only. It validates optional generated tags on
+// concrete references against the exact embedded definition before omitting
+// them. Closed-union tags remain mandatory and are preserved. The existing
+// strict projector below still validates every scalar, required field, bound,
+// ordering constraint and canonical byte representation.
+fn generated_transition_body_presentation(
+    schema: &SchemaValue,
+    input: RawJson,
+    definition_name: Option<&str>,
+    tagged: bool,
+) -> Result<RawJson, AuthPrimitiveError> {
+    match schema["type"].as_str() {
+        Some("ref") => {
+            let name = schema["ref"]
+                .as_str()
+                .and_then(|value| value.strip_prefix('#'))
+                .ok_or_else(|| AuthPrimitiveError::invalid("invalid generated transition ref"))?;
+            generated_transition_body_presentation(definition(name)?, input, Some(name), false)
+        }
+        Some("union") => {
+            let RawJson::Object(values) = &input else {
+                return Err(AuthPrimitiveError::invalid(
+                    "generated transition union object",
+                ));
+            };
+            let name = match values.get("$type") {
+                Some(RawJson::String(type_id)) => {
+                    type_id.strip_prefix(TYPE_PREFIX).ok_or_else(|| {
+                        AuthPrimitiveError::invalid("generated transition union namespace")
+                    })?
+                }
+                _ => {
+                    return Err(AuthPrimitiveError::invalid(
+                        "generated transition union exact $type",
+                    ))
+                }
+            };
+            let allowed = schema["refs"].as_array().is_some_and(|refs| {
+                refs.iter().any(|value| {
+                    value.as_str().and_then(|value| value.strip_prefix('#')) == Some(name)
+                })
+            });
+            if !allowed {
+                return Err(AuthPrimitiveError::invalid(
+                    "unknown generated transition union variant",
+                ));
+            }
+            let definition = definition(name)?;
+            let name = name.to_owned();
+            generated_transition_body_presentation(definition, input, Some(&name), true)
+        }
+        Some("object") => {
+            let RawJson::Object(mut values) = input else {
+                return Err(AuthPrimitiveError::invalid(
+                    "generated transition object field type",
+                ));
+            };
+            if let Some(type_value) = values.get("$type") {
+                let name = definition_name.ok_or_else(|| {
+                    AuthPrimitiveError::invalid("unexpected generated object $type")
+                })?;
+                let expected = format!("{TYPE_PREFIX}{name}");
+                if !matches!(type_value, RawJson::String(actual) if actual == &expected) {
+                    return Err(AuthPrimitiveError::invalid("wrong generated object $type"));
+                }
+                if !tagged {
+                    values.remove("$type");
+                }
+            } else if tagged {
+                return Err(AuthPrimitiveError::invalid("missing generated union $type"));
+            }
+            let properties = schema["properties"].as_object().ok_or_else(|| {
+                AuthPrimitiveError::invalid("invalid generated object properties")
+            })?;
+            let mut output = BTreeMap::new();
+            for (name, value) in values {
+                if name == "$type" {
+                    output.insert(name, value);
+                    continue;
+                }
+                let property = properties
+                    .get(&name)
+                    .ok_or_else(|| AuthPrimitiveError::invalid("unknown generated object field"))?;
+                output.insert(
+                    name,
+                    generated_transition_body_presentation(property, value, None, false)?,
+                );
+            }
+            Ok(RawJson::Object(output))
+        }
+        Some("array") => {
+            let RawJson::Array(values) = input else {
+                return Err(AuthPrimitiveError::invalid(
+                    "generated transition array field type",
+                ));
+            };
+            let items = schema.get("items").ok_or_else(|| {
+                AuthPrimitiveError::invalid("invalid generated transition array items")
+            })?;
+            values
+                .into_iter()
+                .map(|value| generated_transition_body_presentation(items, value, None, false))
+                .collect::<Result<Vec<_>, _>>()
+                .map(RawJson::Array)
+        }
+        _ => Ok(input),
+    }
+}
+
+fn generated_transition_wrapper_fields(
+    mut object: BTreeMap<String, RawJson>,
+) -> Result<(RawJson, [u8; 64]), AuthPrimitiveError> {
+    if object.len() != 3 {
+        return Err(AuthPrimitiveError::invalid(
+            "generated signed wrapper field set",
+        ));
+    }
+    let body_name = match object.remove("$type") {
+        Some(RawJson::String(type_id)) => generated_transition_body_name(&type_id)?,
+        _ => {
+            return Err(AuthPrimitiveError::invalid(
+                "generated signed wrapper exact $type",
+            ))
+        }
+    };
+    let Some(RawJson::Object(mut body)) = object.remove("body") else {
+        return Err(AuthPrimitiveError::invalid(
+            "generated signed body must be object",
+        ));
+    };
+    // Rust represents this singleton union as a concrete body DTO. Only the
+    // validated outer union can supply its missing tag; an existing tag is
+    // checked by the schema walk and may never be replaced.
+    body.entry("$type".to_owned())
+        .or_insert_with(|| RawJson::String(format!("{TYPE_PREFIX}{body_name}")));
+    let signature = match object.remove("signature") {
+        Some(RawJson::String(value)) => decode_standard_base64(&value)?,
+        Some(RawJson::Object(mut values)) if values.len() == 1 => match values.remove("$bytes") {
+            Some(RawJson::String(value)) => decode_standard_base64(&value)?,
+            _ => {
+                return Err(AuthPrimitiveError::invalid(
+                    "generated signed wrapper signature",
+                ))
+            }
+        },
+        _ => {
+            return Err(AuthPrimitiveError::invalid(
+                "generated signed wrapper signature",
+            ))
+        }
+    };
+    let signature = signature
+        .try_into()
+        .map_err(|_| AuthPrimitiveError::invalid("Ed25519 signature length"))?;
+    let body = generated_transition_body_presentation(
+        definition(body_name)?,
+        RawJson::Object(body),
+        Some(body_name),
+        true,
+    )?;
+    Ok((body, signature))
+}
+
 fn canonical_from_projected(
     body: BTreeMap<String, DagValue>,
     signature: [u8; 64],
@@ -1375,7 +1582,11 @@ fn decode_historical_signed_mutation(
     let RawJson::Object(wrapper) = raw else {
         return Err(AuthPrimitiveError::invalid("signed wrapper must be object"));
     };
-    let (body, signature) = exact_wrapper_fields(wrapper)?;
+    let (body, signature) = if wrapper.contains_key("$type") {
+        generated_transition_wrapper_fields(wrapper)?
+    } else {
+        exact_wrapper_fields(wrapper)?
+    };
     let RawJson::Object(body_fields) = &body else {
         return Err(AuthPrimitiveError::invalid("signed body must be object"));
     };
@@ -3282,8 +3493,24 @@ pub(crate) fn persisted_control_entry_response_json(
             )]))
         }
     };
-    let signed_request: SchemaValue = serde_json::from_slice(signed_request_bytes)
+    let mut signed_request: SchemaValue = serde_json::from_slice(signed_request_bytes)
         .map_err(|_| AuthPrimitiveError::invalid("persisted control signed JSON"))?;
+    if signed_request.get("$type").is_some() {
+        // The exact submitted representation remains in signed_request_bytes
+        // and the operation journal. Public rows carry the canonical semantic
+        // body instead, as do the independently persisted control-row products.
+        // Neither stored payload hash is exposed as a hash of this presentation.
+        signed_request = dag_value_json(
+            &DagValue::Map(BTreeMap::from([
+                ("body".to_owned(), DagValue::Map(signed.body.clone())),
+                (
+                    "signature".to_owned(),
+                    DagValue::Bytes(signed.signature().to_vec()),
+                ),
+            ])),
+            ControlJsonBytes::DagJson,
+        );
+    }
     let mut object = serde_json::Map::from_iter([
         (
             "$type".to_owned(),

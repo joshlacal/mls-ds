@@ -98,6 +98,7 @@ fn map_failure(error: MessageDeliveryError) -> ChatFailure {
         MessageDeliveryError::ConversationNotAccepted => {
             ChatFailure::protocol(ENDPOINT, C::ConversationNotAccepted)
         }
+        MessageDeliveryError::NotAuthorized => ChatFailure::protocol(ENDPOINT, C::NotAuthorized),
         MessageDeliveryError::IdempotencyConflict => {
             ChatFailure::protocol(ENDPOINT, C::IdempotencyConflict)
         }

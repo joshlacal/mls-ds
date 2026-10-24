@@ -311,6 +311,28 @@ async fn deliver_message_entry_to_remote_peers(
     let entry_id = entry["entryId"].as_str()
         .and_then(|value| uuid::Uuid::parse_str(value).ok())
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
+    let conversation_routing: Option<(String, bool)> =
+        sqlx::query_as("SELECT kind, is_remote FROM chat.conversations WHERE conversation_id = $1")
+            .bind(convo_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+    match conversation_routing
+        .as_ref()
+        .map(|(kind, remote)| (kind.as_str(), *remote))
+    {
+        // Only the local sequencer enqueues ordinary group delivery. Apply the
+        // same authority rule to completed replay before reporting success.
+        Some(("group", false)) => return Ok(()),
+        Some(("group", true)) => {
+            return Err(ChatFailure::protocol(
+                ENDPOINT,
+                ChatProtocolErrorCode::NotAuthorized,
+            ));
+        }
+        Some(("direct", _)) => {}
+        _ => return Err(ChatFailure::invariant(ENDPOINT)),
+    }
     let participants: Vec<String> = sqlx::query_scalar(
         "SELECT user_did FROM chat.participants WHERE conversation_id=$1 AND current_membership",
     )
@@ -387,6 +409,7 @@ fn map_failure(error: MessageDeliveryError) -> ChatFailure {
         MessageDeliveryError::ConversationNotAccepted => {
             ChatFailure::protocol(ENDPOINT, C::ConversationNotAccepted)
         }
+        MessageDeliveryError::NotAuthorized => ChatFailure::protocol(ENDPOINT, C::NotAuthorized),
         MessageDeliveryError::DeviceNotLeaf => ChatFailure::protocol(ENDPOINT, C::DeviceNotLeaf),
         MessageDeliveryError::RecipientNotReady => {
             ChatFailure::protocol(ENDPOINT, C::RecipientNotReady)

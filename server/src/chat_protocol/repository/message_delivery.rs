@@ -31,6 +31,7 @@ pub(crate) enum MessageDeliveryError {
     InvalidCoordinates,
     ConversationNotFound,
     ConversationNotAccepted,
+    NotAuthorized,
     DeviceNotLeaf,
     RecipientNotReady,
     RelationshipPolicyUnavailable,
@@ -513,6 +514,11 @@ pub(crate) async fn send<T: PublicTransport>(
     let expected = coordinate(projection.prior())?;
     let head = lock_head(tx, expected).await?;
     require_current_leaf(tx, head.coordinate, &scope).await?;
+    // A replica cannot allocate an authoritative group sequence. Its ordinary
+    // federation outbox is intentionally disabled, so fail before any append.
+    if head.kind == "group" && head.is_remote {
+        return Err(MessageDeliveryError::NotAuthorized);
+    }
     require_locked_application_audience(tx, head.coordinate, head.next_seq, scope).await?;
     require_recipient_ready(tx, head.coordinate, &scope, &head).await?;
     require_relationship_policy(tx, scope, head.coordinate, relationship_authority).await?;

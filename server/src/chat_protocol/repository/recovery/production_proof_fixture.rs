@@ -44,7 +44,6 @@ use crate::chat_protocol::{
         verify_genesis_group_info, verify_recovery_welcome, ActivePublicState,
         GenesisGroupInfoExpectations,
     },
-    repository::auth::{authorize_signed_request, AuthorizationOutcome},
     snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle},
     transcript::{
         decode_and_verify_control_entry, decode_and_verify_signed_mutation,
@@ -60,6 +59,9 @@ use crate::chat_protocol::{
         MAX_WELCOME_WIRE_BYTES, XWING_CIPHERSUITE,
     },
 };
+
+#[cfg(any(test, feature = "chat-protocol-production-proof"))]
+use crate::chat_protocol::repository::auth::{authorize_signed_request, AuthorizationOutcome};
 
 const NEST_ISSUER: &str = "did:web:recovery-proof.catbird.invalid";
 const NEST_AUDIENCE: &str = "did:web:recovery-proof-client.catbird.invalid";
@@ -566,6 +568,15 @@ struct TwoMemberFulfillmentProducts {
     application_message: Vec<u8>,
 }
 
+#[derive(Default)]
+struct TwoMemberFixtureOptions<'a> {
+    after_policy: bool,
+    direct: bool,
+    application_message_id: Option<Uuid>,
+    recipient_service_did: Option<&'a str>,
+    sequencer_service_did: Option<&'a str>,
+}
+
 struct RealAcceptanceEntry {
     entry_id: Uuid,
     transition_id: Uuid,
@@ -660,6 +671,38 @@ fn build_real_creation_entry_with_pending(
             .map_err(|error| format!("verify pending Recovery creation row: {error:?}"))?
             .outer_control_fingerprint();
     Ok(entry)
+}
+
+fn make_direct_creation_entry(
+    identity: &FixtureIdentity,
+    creation: &mut RealCreationEntry,
+) -> Result<(), String> {
+    let mut wrapper: Value = serde_json::from_slice(&creation.raw_wrapper)
+        .map_err(|error| format!("decode direct fixture creation: {error}"))?;
+    wrapper["body"]["conversationKind"] = json!("direct");
+    let participants = wrapper["body"]["manifest"]["participants"]
+        .as_array_mut()
+        .ok_or_else(|| "direct fixture creation lacks participants".to_owned())?;
+    for participant in participants {
+        participant["role"] = json!("admin");
+    }
+    let signed = sign_canonical_wrapper(
+        identity,
+        wrapper["body"].clone(),
+        SignedMutationKind::Creation,
+    )?;
+    creation.raw_wrapper = signed.raw_wrapper;
+    let mut row: Value = serde_json::from_slice(&creation.public_row_json)
+        .map_err(|error| format!("decode direct fixture creation row: {error}"))?;
+    row["signedRequest"] = serde_json::from_slice(&creation.raw_wrapper)
+        .map_err(|error| format!("decode signed direct fixture creation: {error}"))?;
+    creation.public_row_json = serde_json::to_vec(&row)
+        .map_err(|error| format!("encode direct fixture creation row: {error}"))?;
+    creation.outer_fingerprint =
+        *decode_and_verify_control_entry(&creation.public_row_json, &identity.signing_public_key())
+            .map_err(|error| format!("verify direct fixture creation: {error:?}"))?
+            .outer_control_fingerprint();
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -990,6 +1033,59 @@ fn recovery_commit_aad(
     Ok(aad)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplicationRoutingAad<'a> {
+    protocol_version: &'static str,
+    #[serde(with = "serde_bytes")]
+    conversation_id: &'a [u8],
+    generation: u64,
+    #[serde(with = "serde_bytes")]
+    message_id: &'a [u8],
+    prior: RecoveryCommitPriorAad<'a>,
+}
+
+fn application_routing_aad_bytes(
+    prior: &PublicGroupSnapshotCoordinate,
+    message_id: Uuid,
+) -> Result<Vec<u8>, String> {
+    let canonical = serde_ipld_dagcbor::to_vec(&ApplicationRoutingAad {
+        protocol_version: "1",
+        conversation_id: prior.conversation_id(),
+        generation: prior.generation(),
+        message_id: message_id.as_bytes(),
+        prior: RecoveryCommitPriorAad {
+            conversation_id: prior.conversation_id(),
+            generation: prior.generation(),
+            state_version: prior.state_version(),
+            group_id: prior.group_id(),
+            epoch: prior.epoch(),
+            group_context_hash: prior.group_context_hash(),
+            confirmation_tag: prior.confirmation_tag(),
+            lifecycle: "active",
+        },
+    })
+    .map_err(|error| format!("encode canonical application routing AAD: {error}"))?;
+    let mut aad = b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0".to_vec();
+    aad.extend_from_slice(&canonical);
+    Ok(aad)
+}
+
+pub(super) fn application_routing_aad(
+    prior: &PublicGroupSnapshotCoordinate,
+    message_id: Uuid,
+) -> Value {
+    let mut aad_prior = coordinate_json(prior);
+    aad_prior["conversationId"] = json!(STANDARD.encode(prior.conversation_id()));
+    json!({
+        "protocolVersion": "1",
+        "conversationId": STANDARD.encode(prior.conversation_id()),
+        "generation": prior.generation(),
+        "messageId": STANDARD.encode(message_id.as_bytes()),
+        "prior": aad_prior,
+    })
+}
+
 fn public_state_from_group_info(
     group_info: &[u8],
     identity: &FixtureIdentity,
@@ -1134,8 +1230,9 @@ fn build_two_member_fulfillment_products(
     add_transition_id: Uuid,
     fulfillment_transition_id: Uuid,
     at: DateTime<Utc>,
-    after_policy: bool,
+    options: &TwoMemberFixtureOptions<'_>,
 ) -> Result<TwoMemberFulfillmentProducts, String> {
+    let after_policy = options.after_policy;
     let provider = openmls_libcrux_crypto::Provider::new()
         .map_err(|error| format!("create Recovery fulfillment OpenMLS provider: {error:?}"))?;
     // The fulfiller is a genuinely separate MLS client and needs its own
@@ -1266,12 +1363,19 @@ fn build_two_member_fulfillment_products(
     )
     .map_err(|error| format!("verify genuine fulfiller Recovery Welcome: {error:?}"))?;
     let prior = add_verified.into_next();
-    requester_group.set_aad(Vec::new());
     let mut application_messages = Vec::new();
-    for plaintext in [
+    for (index, plaintext) in [
         b"inventory-generation-first".as_slice(),
         b"inventory-generation-second".as_slice(),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let aad = match (index, options.application_message_id) {
+            (0, Some(message_id)) => application_routing_aad_bytes(prior.coordinate(), message_id)?,
+            _ => Vec::new(),
+        };
+        requester_group.set_aad(aad);
         let message = requester_group
             .create_message(&provider, &requester_signer, plaintext)
             .map_err(|error| format!("create actual retained-generation application: {error:?}"))?;
@@ -1643,18 +1747,7 @@ pub(super) async fn seed_durable_recovery_fixture_with_pending(
         )?,
     };
     if direct {
-        let mut wrapper: Value = serde_json::from_slice(&creation.raw_wrapper).map_err(|e| e.to_string())?;
-        wrapper["body"]["conversationKind"] = json!("direct");
-        for participant in wrapper["body"]["manifest"]["participants"].as_array_mut().unwrap() {
-            participant["role"] = json!("admin");
-        }
-        let signed = sign_canonical_wrapper(&identity, wrapper["body"].clone(), SignedMutationKind::Creation)?;
-        creation.raw_wrapper = signed.raw_wrapper;
-        let mut row: Value = serde_json::from_slice(&creation.public_row_json).map_err(|e| e.to_string())?;
-        row["signedRequest"] = serde_json::from_slice(&creation.raw_wrapper).map_err(|e| e.to_string())?;
-        creation.public_row_json = serde_json::to_vec(&row).map_err(|e| e.to_string())?;
-        creation.outer_fingerprint = *decode_and_verify_control_entry(&creation.public_row_json, &identity.signing_public_key())
-            .map_err(|e| format!("verify direct fixture creation: {e:?}"))?.outer_control_fingerprint();
+        make_direct_creation_entry(&identity, &mut creation)?;
     }
     let (key_package_ref, key_package_wrapper, init_key) =
         build_available_key_package(&identity, at)?;
@@ -1773,6 +1866,57 @@ pub(super) async fn seed_recovery_package_reuse_fixture(
     fulfillment_transition_id: Uuid,
     after_policy: bool,
 ) -> Result<DurableRecoveryFulfillmentFixture, String> {
+    seed_two_member_fixture(
+        pool,
+        trusted_instant,
+        requester,
+        fulfiller,
+        fulfillment_transition_id,
+        TwoMemberFixtureOptions {
+            after_policy,
+            ..TwoMemberFixtureOptions::default()
+        },
+    )
+    .await
+}
+
+/// Seed genuine signed Creation, acceptance, and Add history with one native
+/// application bound to the supplied message ID and current MLS coordinate.
+pub(super) async fn seed_application_routing_fixture(
+    pool: &PgPool,
+    trusted_instant: &TrustedRequestInstant,
+    requester: FixtureIdentity,
+    fulfiller: FixtureIdentity,
+    direct: bool,
+    message_id: Uuid,
+    recipient_service_did: &str,
+    sequencer_service_did: Option<&str>,
+) -> Result<DurableRecoveryFulfillmentFixture, String> {
+    seed_two_member_fixture(
+        pool,
+        trusted_instant,
+        requester,
+        fulfiller,
+        Uuid::new_v4(),
+        TwoMemberFixtureOptions {
+            direct,
+            application_message_id: Some(message_id),
+            recipient_service_did: Some(recipient_service_did),
+            sequencer_service_did,
+            ..TwoMemberFixtureOptions::default()
+        },
+    )
+    .await
+}
+
+async fn seed_two_member_fixture(
+    pool: &PgPool,
+    trusted_instant: &TrustedRequestInstant,
+    requester: FixtureIdentity,
+    fulfiller: FixtureIdentity,
+    fulfillment_transition_id: Uuid,
+    options: TwoMemberFixtureOptions<'_>,
+) -> Result<DurableRecoveryFulfillmentFixture, String> {
     if requester.did == fulfiller.did {
         return Err("Recovery fulfillment fixture requires two distinct DIDs".to_owned());
     }
@@ -1786,10 +1930,10 @@ pub(super) async fn seed_recovery_package_reuse_fixture(
         add_transition_id,
         fulfillment_transition_id,
         at,
-        after_policy,
+        &options,
     )?;
     let prior = products.prior.coordinate().clone();
-    let creation = build_real_creation_entry_with_pending(
+    let mut creation = build_real_creation_entry_with_pending(
         &requester,
         &fulfiller,
         conversation_id,
@@ -1797,6 +1941,9 @@ pub(super) async fn seed_recovery_package_reuse_fixture(
         &products.genesis_group_info,
         trusted_instant.as_str(),
     )?;
+    if options.direct {
+        make_direct_creation_entry(&requester, &mut creation)?;
+    }
     let acceptance = build_real_acceptance_entry(
         &requester,
         &fulfiller,
@@ -1875,7 +2022,7 @@ pub(super) async fn seed_recovery_package_reuse_fixture(
         || products.genesis.coordinate().state_version() != 0
         || products.acceptance.coordinate().state_version() != 1
         || products.prior.coordinate().state_version() != 2
-        || products.next.coordinate().state_version() != 3 + u64::from(after_policy)
+        || products.next.coordinate().state_version() != 3 + u64::from(options.after_policy)
         || products.genesis.coordinate().epoch() != 0
         || products.acceptance.coordinate().epoch() != 0
         || products.prior.coordinate().epoch() != 1
@@ -1903,8 +2050,19 @@ pub(super) async fn seed_recovery_package_reuse_fixture(
         .begin()
         .await
         .map_err(|error| format!("begin valid two-member Recovery history: {error}"))?;
-    sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at) VALUES($1,'group','active',0,2,4,$2)")
-        .bind(conversation_id).bind(at).execute(&mut *transaction).await
+    let fulfiller_role = if options.direct { "admin" } else { "member" };
+    let direct_pair = options.direct.then(|| {
+        if requester.did < fulfiller.did {
+            (&requester.did, &fulfiller.did)
+        } else {
+            (&fulfiller.did, &requester.did)
+        }
+    });
+    sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at,direct_did_low,direct_did_high,is_remote,sequencer_ds) VALUES($1,$3,'active',0,2,4,$2,$4,$5,$6,$7)")
+        .bind(conversation_id).bind(at).bind(if options.direct { "direct" } else { "group" })
+        .bind(direct_pair.map(|pair| pair.0)).bind(direct_pair.map(|pair| pair.1))
+        .bind(options.sequencer_service_did.is_some()).bind(options.sequencer_service_did)
+        .execute(&mut *transaction).await
         .map_err(|error| format!("insert valid Recovery conversation head: {error}"))?;
     sqlx::query("INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,2,1,$5)")
         .bind(conversation_id).bind(products.genesis.coordinate().group_id()).bind(&products.genesis_group_info).bind(Sha256::digest(&products.genesis_group_info).to_vec()).bind(at)
@@ -1913,9 +2071,9 @@ pub(super) async fn seed_recovery_package_reuse_fixture(
         .bind(creation.transition_id).bind(conversation_id).bind(&requester.did).bind(requester.device_id).bind(&requester.key_id)
         .bind(&creation.raw_wrapper).bind(creation_verified.canonical_projection()).bind(creation_verified.transcript_bytes()).bind(creation_verified.request_digest().to_vec()).bind(creation_verified.signature().to_vec()).bind(creation_metadata_snapshot_id).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert singleton Recovery creation transition: {error}"))?;
-    sqlx::query(r#"INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,prior_generation,prior_state_version,next_generation,next_state_version,entry_seq,accepted_at) VALUES($1,$2,'acceptConversation',$3,$4,$5,1,'member','active',$6,$7,$8,$9,$10,0,0,0,1,2,$11)"#)
+    sqlx::query(r#"INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,prior_generation,prior_state_version,next_generation,next_state_version,entry_seq,accepted_at) VALUES($1,$2,'acceptConversation',$3,$4,$5,1,$12,'active',$6,$7,$8,$9,$10,0,0,0,1,2,$11)"#)
         .bind(acceptance.transition_id).bind(conversation_id).bind(&fulfiller.did).bind(fulfiller.device_id).bind(&fulfiller.key_id)
-        .bind(&acceptance.raw_wrapper).bind(&acceptance.canonical_projection).bind(&acceptance.signing_transcript).bind(&acceptance.request_digest).bind(&acceptance.signature).bind(at)
+        .bind(&acceptance.raw_wrapper).bind(&acceptance.canonical_projection).bind(&acceptance.signing_transcript).bind(&acceptance.request_digest).bind(&acceptance.signature).bind(at).bind(fulfiller_role)
         .execute(&mut *transaction).await.map_err(|error| format!("insert genuine Recovery acceptance transition: {error}"))?;
     sqlx::query(r#"INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,prior_generation,prior_state_version,next_generation,next_state_version,metadata_snapshot_id,entry_seq,accepted_at) VALUES($1,$2,'leafRecovery',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,0,1,0,2,$11,3,$12)"#)
         .bind(add_fulfillment.transition_id).bind(conversation_id).bind(&requester.did).bind(requester.device_id).bind(&requester.key_id)
@@ -1956,8 +2114,8 @@ pub(super) async fn seed_recovery_package_reuse_fixture(
     sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,current_membership,created_at) VALUES($1,$2,$3,'active',$4,$5,$6,$7,$8,true,$6)"#)
         .bind(requester_participant_period_id).bind(conversation_id).bind(&requester.did).bind("admin").bind(creation.transition_id).bind(at).bind(&requester.did).bind(requester.device_id)
         .execute(&mut *transaction).await.map_err(|error| format!("insert Recovery requester participant: {error}"))?;
-    sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,invitation_entry_id,invited_at,acceptance_transition_id,acceptance_entry_id,accepted_at,current_membership,created_at) VALUES($1,$2,$3,'active','member',$4,$5,$6,$7,$4,$8,$5,$9,$10,$5,true,$5)"#)
-        .bind(fulfiller_participant_period_id).bind(conversation_id).bind(&fulfiller.did).bind(creation.transition_id).bind(at).bind(&requester.did).bind(requester.device_id).bind(creation.entry_id).bind(acceptance.transition_id).bind(acceptance.entry_id)
+    sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,invitation_entry_id,invited_at,acceptance_transition_id,acceptance_entry_id,accepted_at,current_membership,created_at,ds_did) VALUES($1,$2,$3,'active',$11,$4,$5,$6,$7,$4,$8,$5,$9,$10,$5,true,$5,$12)"#)
+        .bind(fulfiller_participant_period_id).bind(conversation_id).bind(&fulfiller.did).bind(creation.transition_id).bind(at).bind(&requester.did).bind(requester.device_id).bind(creation.entry_id).bind(acceptance.transition_id).bind(acceptance.entry_id).bind(fulfiller_role).bind(options.recipient_service_did)
         .execute(&mut *transaction).await.map_err(|error| format!("insert Recovery fulfiller participant: {error}"))?;
     // Both KeyPackage rows must exist before the member_devices leaves below:
     // `member_devices_package_fk` references (join_key_package_ref, user_did,
@@ -2206,6 +2364,7 @@ pub(super) async fn seed_identity(
 /// Build an ordinary Nest JWT and DPoP proof, validate them with the actual
 /// verifier, decode the exact canonical signed mutation, then have the real
 /// authorizer consume both replay identities and lock the stored device/key.
+#[cfg(any(test, feature = "chat-protocol-production-proof"))]
 pub(super) async fn authorize(
     pool: &PgPool,
     identity: &FixtureIdentity,

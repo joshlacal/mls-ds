@@ -212,6 +212,19 @@ path = "tests/federation_fixture_cli.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "chat_send_message_routing"
+path = "tests/chat_send_message_routing.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_generated_transition_compat"
+path = "tests/chat_protocol_generated_transition_compat.rs"
+
+[[test]]
+name = "chat_protocol_generated_transition_migration"
+path = "tests/chat_protocol_generated_transition_migration.rs"
+
+[[test]]
 name = "labyrinth_directory"
 path = "tests/labyrinth_directory.rs"
 required-features = ["test-support"]

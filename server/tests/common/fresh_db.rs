@@ -84,6 +84,8 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_fedrouter_",
     // `tests/chat_protocol_federation_outbox_retry.rs`
     "chat_fedoutbox_",
+    // `tests/chat_send_message_routing.rs`
+    "chat_sendrouting_",
     // `tests/chat_protocol_remote_prefix_bootstrap.rs`
     "chat_remoteprefix_",
     "chat_devhandlers_",
