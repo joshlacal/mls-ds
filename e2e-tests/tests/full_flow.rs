@@ -21,7 +21,10 @@ async fn test_full_messaging_flow() {
     let mut bob = client.test_user("bob");
 
     // 2. Register devices
-    alice.register_device().await.expect("alice register_device");
+    alice
+        .register_device()
+        .await
+        .expect("alice register_device");
     bob.register_device().await.expect("bob register_device");
 
     // 3. Publish extra key packages (5 each)
@@ -91,14 +94,18 @@ async fn test_full_messaging_flow() {
 
     // 9. Both users list conversations — convo should appear
     let alice_convos = alice.get_convos().await.expect("alice get_convos");
-    let alice_convo_list = alice_convos["conversations"].as_array().expect("conversations array");
+    let alice_convo_list = alice_convos["conversations"]
+        .as_array()
+        .expect("conversations array");
     assert!(
         alice_convo_list.iter().any(|c| c["groupId"] == convo_id),
         "alice should see the conversation"
     );
 
     let bob_convos = bob.get_convos().await.expect("bob get_convos");
-    let bob_convo_list = bob_convos["conversations"].as_array().expect("convos array");
+    let bob_convo_list = bob_convos["conversations"]
+        .as_array()
+        .expect("convos array");
     assert!(
         bob_convo_list.iter().any(|c| c["groupId"] == convo_id),
         "bob should see the conversation"
@@ -128,10 +135,7 @@ async fn test_register_multiple_devices() {
     // Each call generates a fresh deviceUuid so the server should track them separately.
     let mut user = client.test_user("multi-device");
 
-    let r1 = user
-        .register_device()
-        .await
-        .expect("first register_device");
+    let r1 = user.register_device().await.expect("first register_device");
     let device_id_1 = r1["deviceId"]
         .as_str()
         .expect("deviceId in first response")
@@ -149,10 +153,7 @@ async fn test_register_multiple_devices() {
         .to_string();
 
     user.device_id = None;
-    let r3 = user
-        .register_device()
-        .await
-        .expect("third register_device");
+    let r3 = user.register_device().await.expect("third register_device");
     let device_id_3 = r3["deviceId"]
         .as_str()
         .expect("deviceId in third response")

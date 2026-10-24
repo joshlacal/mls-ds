@@ -26,7 +26,6 @@ async fn test_three_user_group() {
     charlie.register_device().await.expect("charlie register");
 
     for user in [&alice, &bob, &charlie] {
-        
         user.publish_key_packages(3)
             .await
             .expect("publish_key_packages");
@@ -38,10 +37,7 @@ async fn test_three_user_group() {
         .create_convo(&[bob.did.clone(), charlie.did.clone()], Some(&welcome))
         .await
         .expect("create 3-user convo");
-    let convo_id = convo["groupId"]
-        .as_str()
-        .expect("groupId")
-        .to_string();
+    let convo_id = convo["groupId"].as_str().expect("groupId").to_string();
 
     // 3. Each user sends a message
     let ct_alice = TestUser::padded_ciphertext(b"hello from alice");
@@ -92,7 +88,6 @@ async fn test_user_in_multiple_convos() {
     charlie.register_device().await.expect("charlie register");
 
     for user in [&alice, &bob, &charlie] {
-        
         user.publish_key_packages(3)
             .await
             .expect("publish_key_packages");
@@ -104,10 +99,7 @@ async fn test_user_in_multiple_convos() {
         .create_convo(&[bob.did.clone()], Some(&welcome1))
         .await
         .expect("create convo with bob");
-    let convo_id_1 = convo1["groupId"]
-        .as_str()
-        .expect("groupId 1")
-        .to_string();
+    let convo_id_1 = convo1["groupId"].as_str().expect("groupId 1").to_string();
 
     // 3. Alice creates a separate convo with Charlie
     let welcome2 = TestUser::random_bytes(256);
@@ -115,14 +107,13 @@ async fn test_user_in_multiple_convos() {
         .create_convo(&[charlie.did.clone()], Some(&welcome2))
         .await
         .expect("create convo with charlie");
-    let convo_id_2 = convo2["groupId"]
-        .as_str()
-        .expect("groupId 2")
-        .to_string();
+    let convo_id_2 = convo2["groupId"].as_str().expect("groupId 2").to_string();
 
     // 4. Alice lists conversations — should see both
     let alice_convos = alice.get_convos().await.expect("alice get_convos");
-    let convo_list = alice_convos["conversations"].as_array().expect("convos array");
+    let convo_list = alice_convos["conversations"]
+        .as_array()
+        .expect("convos array");
     let ids: Vec<&str> = convo_list
         .iter()
         .filter_map(|c| c["groupId"].as_str())
@@ -149,10 +140,7 @@ async fn test_user_in_multiple_convos() {
         .await
         .expect("bob get_messages convo1");
     assert!(
-        !bob_msgs["messages"]
-            .as_array()
-            .expect("array")
-            .is_empty(),
+        !bob_msgs["messages"].as_array().expect("array").is_empty(),
         "bob should see messages in convo1"
     );
 

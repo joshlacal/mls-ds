@@ -1,0 +1,31 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.deleteAccountData",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Account deletion (decision J1). Requires a bound Labyrinth device. Locally, in one transaction: purge the mailbox exactly as purgeMailbox does (including every ORF state), redact every thread item the DID authored in conversations this DS sequences with a server redaction (defs#redaction variant 2: by, reason accountDeleted, redactedAt, and a DS signature), and queue a durable purgeAuthor job for the sequencer of every other conversation the DID takes or took part in; those are delivered with retries, so an unreachable DS neither blocks nor loses the deletion. Idempotency records are kept (they expire after 7 days), so a replayed pre-deletion write answers from its record instead of running again. MEK records stay, because other members' batches can be sealed under them. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "LabyrinthDeviceNotBound"
+        }
+      ]
+    }
+  }
+}

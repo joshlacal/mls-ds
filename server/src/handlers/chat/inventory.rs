@@ -122,7 +122,9 @@ async fn serve(
         parsed.limit,
         Sha256::digest([]).into(),
     )
-    .map_err(|_| ChatFailure::invariant(endpoint))?;
+    .map_err(|_| ChatFailure::invariant(endpoint))?
+    .with_protocol_versions(parsed.supported_protocol_versions)
+    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
 
     let response = if let Some(cursor) = parsed.page_cursor.as_deref() {
         continue_inventory_page_for_admission(
@@ -157,6 +159,7 @@ async fn serve(
 }
 
 struct QueryParams {
+    supported_protocol_versions: Option<Vec<String>>,
     actor_device_id: String,
     limit: u16,
     page_cursor: Option<String>,
@@ -165,6 +168,7 @@ struct QueryParams {
 
 impl QueryParams {
     fn parse(query: Option<&str>, domain: InventoryDomain) -> Result<Self, ChatProtocolErrorCode> {
+        let mut supported_protocol_versions = Vec::new();
         let mut actor_device_id = None;
         let mut limit = None;
         let mut page_cursor = None;
@@ -180,6 +184,15 @@ impl QueryParams {
             let key = percent_decode(raw_key).ok_or(ChatProtocolErrorCode::InvalidRequest)?;
             let value = percent_decode(raw_value).ok_or(ChatProtocolErrorCode::InvalidRequest)?;
             match key.as_str() {
+                "supportedProtocolVersions" => {
+                    if !matches!(value.as_str(), "1" | "2")
+                        || supported_protocol_versions.contains(&value)
+                        || supported_protocol_versions.len() >= 2
+                    {
+                        return Err(ChatProtocolErrorCode::InvalidRequest);
+                    }
+                    supported_protocol_versions.push(value);
+                }
                 "actorDeviceId" if actor_device_id.is_none() => {
                     let canonical = CanonicalUuidV4::parse(&value)
                         .map_err(|_| ChatProtocolErrorCode::InvalidRequest)?;
@@ -219,7 +232,13 @@ impl QueryParams {
                 Some(inventory_session_id.ok_or(ChatProtocolErrorCode::InvalidRequest)?)
             }
         };
+        supported_protocol_versions.sort();
         Ok(Self {
+            supported_protocol_versions: if supported_protocol_versions.is_empty() {
+                None
+            } else {
+                Some(supported_protocol_versions)
+            },
             actor_device_id,
             limit,
             page_cursor,
@@ -266,6 +285,7 @@ fn percent_decode(value: &str) -> Option<String> {
 fn map_repository_error(endpoint: ChatEndpoint, error: InventoryRepositoryError) -> ChatFailure {
     use InventoryRepositoryError as E;
     match error {
+        E::ProtocolUpgradeRequired => ChatFailure::protocol(endpoint, ChatProtocolErrorCode::ProtocolUpgradeRequired),
         E::SessionNotFound | E::SessionPresentationMismatch => {
             ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InventorySessionMismatch)
         }
@@ -370,5 +390,22 @@ mod tests {
             assert!(QueryParams::parse(Some(&query), InventoryDomain::Recovery).is_err());
         }
         assert!(QueryParams::parse(Some(&oversized), InventoryDomain::Recovery).is_err());
+    }
+
+    #[test]
+    fn session_mismatch_maps_to_inventory_session_mismatch_for_conversations() {
+        assert!(ChatEndpoint::GetConversations.declares(ChatProtocolErrorCode::InventorySessionMismatch));
+        let failure = map_repository_error(
+            ChatEndpoint::GetConversations,
+            InventoryRepositoryError::SessionPresentationMismatch,
+        );
+        assert_eq!(
+            failure.code(),
+            Some(ChatProtocolErrorCode::InventorySessionMismatch)
+        );
+        assert_eq!(
+            failure.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
     }
 }

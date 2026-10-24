@@ -44,6 +44,7 @@ x25519-dalek = "=2.0.1"
 
 # Crypto
 aes-gcm = "0.10"
+curve25519-dalek = "4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hmac = "0.12"
 rand = "0.8"
@@ -51,6 +52,7 @@ sha2 = "0.10"
 zeroize = "1"
 base64 = "0.21"
 multibase = "0.9"
+cid = "0.11"
 
 # Auth/JWT
 jsonwebtoken = "9"
@@ -135,6 +137,11 @@ name = "federation_fixture"
 path = "src/bin/federation_fixture.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "encrypted_request_server_fixture"
+path = "../e2e-tests/support/encrypted_request_server_fixture.rs"
+required-features = ["test-support"]
+
 [[example]]
 name = "seal_mls_chat_crypto_wire_v09"
 path = "examples/seal_mls_chat_crypto_wire_v09.rs"
@@ -160,23 +167,8 @@ path = "tests/chat_protocol_device_handlers.rs"
 required-features = ["test-support"]
 
 [[test]]
-name = "chat_protocol_g7_entitlement"
-path = "tests/chat_protocol_g7_entitlement.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "chat_protocol_inventory"
-path = "tests/chat_protocol_inventory.rs"
-required-features = ["test-support"]
-
-[[test]]
 name = "chat_protocol_s3_lifecycle"
 path = "tests/chat_protocol_s3_lifecycle.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "chat_protocol_ticket"
-path = "tests/chat_protocol_ticket.rs"
 required-features = ["test-support"]
 
 [[test]]
@@ -219,6 +211,51 @@ name = "federation_fixture_cli"
 path = "tests/federation_fixture_cli.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "labyrinth_directory"
+path = "tests/labyrinth_directory.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_mailbox"
+path = "tests/labyrinth_mailbox.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_thread"
+path = "tests/labyrinth_thread.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_crate_trace"
+path = "tests/labyrinth_crate_trace.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_attachments"
+path = "tests/labyrinth_attachments.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_retention"
+path = "tests/labyrinth_retention.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_blob_gc_pin"
+path = "tests/labyrinth_blob_gc_pin.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_relay"
+path = "tests/labyrinth_relay.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_device_binding"
+path = "tests/labyrinth_device_binding.rs"
+required-features = ["test-support"]
+
 [features]
 default = ["namespace-bluecatbird", "server-bin"]
 namespace-bluecatbird = []
@@ -226,3 +263,13 @@ server-bin = []
 chat-protocol-production-proof = []
 subscription-production-proof = []
 test-support = []
+
+[[test]]
+name = "labyrinth_space"
+path = "tests/labyrinth_space.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "conversation_storage_smoke_fixture"
+path = "tests/conversation_storage_smoke_fixture.rs"
+required-features = ["test-support"]

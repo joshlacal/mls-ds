@@ -4,6 +4,7 @@ pub mod ds;
 mod federation_mode_admin;
 mod federation_peers_admin;
 pub mod get_request_count;
+pub mod labyrinth;
 pub mod resolve_delivery_service;
 pub mod subscription_ticket;
 

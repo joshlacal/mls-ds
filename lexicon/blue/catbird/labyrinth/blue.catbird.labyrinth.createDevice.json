@@ -1,0 +1,49 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.createDevice",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Create a device record (create-if-absent). Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "record"
+          ],
+          "properties": {
+            "record": {
+              "type": "unknown",
+              "description": "A blue.catbird.labyrinth.device record."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "rkey"
+          ],
+          "properties": {
+            "rkey": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "hex(deviceKeyPubkey)."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "RecordAlreadyExists"
+        },
+        {
+          "name": "InvalidChatBinding"
+        }
+      ]
+    }
+  }
+}

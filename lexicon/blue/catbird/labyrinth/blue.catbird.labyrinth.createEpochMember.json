@@ -1,0 +1,47 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.createEpochMember",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Add a device to an existing epoch (create-if-absent). Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "record"
+          ],
+          "properties": {
+            "record": {
+              "type": "unknown",
+              "description": "A blue.catbird.labyrinth.epochMember record."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "RecordAlreadyExists"
+        },
+        {
+          "name": "EpochNotFound"
+        },
+        {
+          "name": "LabyrinthDeviceNotBound"
+        },
+        {
+          "name": "MemberDeviceNotRegistered"
+        }
+      ]
+    }
+  }
+}

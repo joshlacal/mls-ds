@@ -1,0 +1,63 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.createMek",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Write a MEK distribution in the caller's repo. A Labyrinth sender's attestation key must be a current chat device of the caller; a transport sender's key must be the caller's own. Thread endpoint on the conversation's sequencer DS; threadId is the chat conversation id ([CB-2]). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "record"
+          ],
+          "properties": {
+            "record": {
+              "type": "unknown",
+              "description": "A blue.catbird.labyrinth.mek record."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "rkey",
+            "order"
+          ],
+          "properties": {
+            "rkey": {
+              "type": "string",
+              "maxLength": 24,
+              "description": "hex(mekId)."
+            },
+            "order": {
+              "type": "ref",
+              "ref": "blue.catbird.labyrinth.defs#serverOrder"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "RecordAlreadyExists"
+        },
+        {
+          "name": "NotParticipant"
+        },
+        {
+          "name": "RecipientNotParticipant"
+        },
+        {
+          "name": "SenderMismatch"
+        },
+        {
+          "name": "AttestationNotCurrent"
+        }
+      ]
+    }
+  }
+}

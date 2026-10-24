@@ -37,11 +37,10 @@
 //   definition, re-encodes with this encoder, and requires byte-for-byte
 //   equality.
 //
-// The generated chat DTO surface accepts byte fields in two input shapes
-// (`{"$bytes": <padded base64>}` for `serde_bytes_helper` fields and plain
-// byte arrays for the bare `bytes::Bytes` aliases such as `ArtifactHash` and
-// `IdentifierBytes`). The normalizer also accepts bare base64 strings when
-// validating compatibility input trees, but a v2 server must not be mixed with
+// The generated chat DTO surface serializes every byte field, including the
+// `ArtifactHash` and `IdentifierBytes` aliases, as `{"$bytes": <padded
+// base64>}`. The normalizer also accepts byte arrays and bare base64 strings
+// when validating compatibility input trees, but a v2 server must not be mixed with
 // pre-v2 retained sessions: replay serves retained bytes verbatim. Stop old
 // instances, wait the full 15-minute session TTL, and only then resume v2
 // protocol availability. All accepted forms normalize to the one lexicon wire shape
@@ -431,7 +430,48 @@ fn normalize_def(
         ));
     };
     match definition {
-        LexUserType::Object(object) => normalize_object(doc, object, value, depth, path),
+        LexUserType::Object(object) => {
+            // Request proofs retain the exact signed body tag inside generated
+            // DTO extra_data. Permit only these schema-selected identities;
+            // an arbitrary or mismatched tag remains an unknown-field error.
+            let signed_request_body = matches!(
+                def_name,
+                "directRequestAcceptanceBody"
+                    | "directRequestAcceptanceCommitReceiptBody"
+                    | "directRequestGrantBody"
+                    | "directRequestPublicationBody"
+                    | "directRequestCancellationBody"
+                    | "directRequestKeysPublicationBody"
+            );
+            if signed_request_body {
+                if let CanonValue::Object(entries) = value {
+                    if let Some((_, tag)) = entries.iter().find(|(key, _)| key == "$type") {
+                        if tag != &CanonValue::String(format!("{TYPE_PREFIX}{def_name}")) {
+                            return Err(ProjectionError::new(
+                                ProjectionErrorKind::UnknownUnionTag,
+                                path,
+                                "request proof body type must match its exact schema",
+                            ));
+                        }
+                        let body = CanonValue::Object(
+                            entries
+                                .iter()
+                                .filter(|(key, _)| key != "$type")
+                                .cloned()
+                                .collect(),
+                        );
+                        let CanonValue::Object(mut normalized) =
+                            normalize_object(doc, object, &body, depth, path)?
+                        else {
+                            unreachable!("object normalizer returns an object")
+                        };
+                        normalized.push(("$type".into(), tag.clone()));
+                        return Ok(CanonValue::Object(normalized));
+                    }
+                }
+            }
+            normalize_object(doc, object, value, depth, path)
+        }
         LexUserType::Union(union) => normalize_union(doc, union, value, depth, path),
         LexUserType::String(string) => normalize_string(string, value, path),
         LexUserType::Integer(integer) => normalize_integer(integer, value, path),
@@ -1324,6 +1364,42 @@ pub(crate) struct CheckedParticipantView {
 }
 
 impl CheckedParticipantView {
+    pub(crate) fn for_direct_request(
+        user_did: &str,
+        role: &str,
+        status: &str,
+        leaf_count: i64,
+        invitation: Option<CheckedInvitationProvenance>,
+        publication: &crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest,
+    ) -> Result<Self, ProjectionError> {
+        use crate::chat_protocol::direct_request_transcript::DirectRequestKind;
+        if status != PARTICIPANT_STATUS_PENDING || leaf_count == 0 {
+            return Self::new(user_did, role, status, leaf_count, invitation);
+        }
+        let body = publication.body();
+        let included = body["artifacts"]["welcome"]["deliveries"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| row["recipientDid"].as_str() == Some(user_did))
+                    .count()
+            })
+            .unwrap_or(0);
+        if publication.kind() != DirectRequestKind::Publish
+            || body["recipientDid"].as_str() != Some(user_did)
+            || included as i64 != leaf_count
+            || role != MEMBER_ROLE_ADMIN
+        {
+            return Err(source_inconsistency(
+                "participant.leafCount",
+                "pending request leaves require exact signed publication coverage",
+            ));
+        }
+        let mut view = Self::new(user_did, role, status, 0, invitation)?;
+        view.leaf_count = leaf_count;
+        Ok(view)
+    }
+
     pub(crate) fn new(
         user_did: &str,
         role: &str,
@@ -1696,6 +1772,7 @@ pub(crate) enum ConversationProjectionSource {
 }
 
 pub(crate) struct CheckedConversationState {
+    direct_request: Option<chat_dto::DirectRequestState<DefaultStr>>,
     cipher_suite: SmolStr,
     conversation_kind: SmolStr,
     coordinates: CheckedConversationCoordinates,
@@ -1726,6 +1803,26 @@ pub(crate) struct CheckedConversationClose {
     terminal_seq: i64,
 }
 impl ConversationProjectionSource {
+    pub(crate) fn with_direct_request(
+        mut self,
+        request: chat_dto::DirectRequestState<DefaultStr>,
+    ) -> Result<Self, ProjectionError> {
+        let Self::State(state) = &mut self else {
+            return Err(source_inconsistency(
+                "directRequest",
+                "request state requires conversation state",
+            ));
+        };
+        if state.conversation_kind != CONVERSATION_KIND_DIRECT {
+            return Err(source_inconsistency(
+                "directRequest",
+                "request state requires direct conversation",
+            ));
+        }
+        state.direct_request = Some(request);
+        Ok(self)
+    }
+
     pub(crate) fn state(
         cipher_suite: &str,
         conversation_kind: &str,
@@ -1767,6 +1864,7 @@ impl ConversationProjectionSource {
             }
         }
         Ok(Self::State(CheckedConversationState {
+            direct_request: None,
             cipher_suite: SmolStr::from(cipher_suite),
             conversation_kind: SmolStr::from(conversation_kind),
             coordinates,
@@ -2230,6 +2328,7 @@ pub(crate) fn conversation_state_view(
         ));
     };
     Ok(chat_dto::ConversationState {
+        direct_request: state.direct_request.clone(),
         cipher_suite: state.cipher_suite.clone(),
         conversation_kind: state.conversation_kind.clone(),
         coordinates: conversation_coordinates_dto(&state.coordinates),
@@ -2326,6 +2425,7 @@ pub(crate) fn conversation_state_view(
                         extra_data: None,
                     },
                 ),
+                labyrinth_head: None,
                 extra_data: None,
             })
             .collect(),
@@ -2347,7 +2447,9 @@ pub(crate) fn conversation_inventory_item(
         ConversationProjectionSource::State(state) => Ok(
             chat_dto::ConversationInventoryItem::ConversationInventoryState(Box::new(
                 chat_dto::ConversationInventoryState {
+                    direct_request: state.direct_request.clone(),
                     state: chat_dto::ConversationState {
+                        direct_request: state.direct_request.clone(),
                         cipher_suite: state.cipher_suite.clone(),
                         conversation_kind: state.conversation_kind.clone(),
                         coordinates: conversation_coordinates_dto(&state.coordinates),
@@ -2466,6 +2568,7 @@ pub(crate) fn conversation_inventory_item(
                                             .clone(),
                                         extra_data: None,
                                     }),
+                                labyrinth_head: None,
                                 extra_data: None,
                             })
                             .collect(),

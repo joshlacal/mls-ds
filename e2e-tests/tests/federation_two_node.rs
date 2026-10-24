@@ -79,8 +79,18 @@ impl TestIdentity {
         ed25519_dalek::Signature::from_bytes(&bytes)
     }
 
-    fn mint_chat_jwt(&self, cluster: &TwoNodeCluster, endpoint_nsid: &str) -> String {
-        cluster.mint_chat_jwt(&self.did, &self.p256_signing_key, endpoint_nsid)
+    fn mint_chat_jwt(
+        &self,
+        cluster: &TwoNodeCluster,
+        destination_service_did: &str,
+        endpoint_nsid: &str,
+    ) -> String {
+        cluster.mint_chat_jwt(
+            &self.did,
+            &self.p256_signing_key,
+            destination_service_did,
+            endpoint_nsid,
+        )
     }
 }
 
@@ -1064,7 +1074,11 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         Uuid::new_v4(),
         now,
     );
-    let alice_enroll_jwt = alice.mint_chat_jwt(&cluster, "blue.catbird.chat.enrollDevice");
+    let alice_enroll_jwt = alice.mint_chat_jwt(
+        &cluster,
+        &cluster.ds1_service_did,
+        "blue.catbird.chat.enrollDevice",
+    );
     let alice_enroll_res = post_signed_chat_op(
         &http,
         &cluster.ds1_url,
@@ -1079,7 +1093,11 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     tracing::info!("Step 4: Enrolling Bob on DS1 via enrollDevice...");
     let (bob_enroll_wrapper_ds1, _) =
         make_device_enrollment_body(&bob, vec![bob_kp_val.clone()], Uuid::new_v4(), now);
-    let bob_enroll_jwt_ds1 = bob.mint_chat_jwt(&cluster, "blue.catbird.chat.enrollDevice");
+    let bob_enroll_jwt_ds1 = bob.mint_chat_jwt(
+        &cluster,
+        &cluster.ds1_service_did,
+        "blue.catbird.chat.enrollDevice",
+    );
     let bob_enroll_res_ds1 = post_signed_chat_op(
         &http,
         &cluster.ds1_url,
@@ -1094,7 +1112,11 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     tracing::info!("Step 5: Enrolling Bob on DS2 via enrollDevice...");
     let (bob_enroll_wrapper_ds2, _) =
         make_device_enrollment_body(&bob, vec![bob_kp_val], Uuid::new_v4(), now);
-    let bob_enroll_jwt_ds2 = bob.mint_chat_jwt(&cluster, "blue.catbird.chat.enrollDevice");
+    let bob_enroll_jwt_ds2 = bob.mint_chat_jwt(
+        &cluster,
+        &cluster.ds2_service_did,
+        "blue.catbird.chat.enrollDevice",
+    );
     let bob_enroll_res_ds2 = post_signed_chat_op(
         &http,
         &cluster.ds2_url,
@@ -1109,7 +1131,11 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     tracing::info!("Step 5a: Enrolling Alice authority material on DS2...");
     let (alice_enroll_wrapper_ds2, _) =
         make_device_enrollment_body(&alice, vec![alice_kp_val], Uuid::new_v4(), now);
-    let alice_enroll_jwt_ds2 = alice.mint_chat_jwt(&cluster, "blue.catbird.chat.enrollDevice");
+    let alice_enroll_jwt_ds2 = alice.mint_chat_jwt(
+        &cluster,
+        &cluster.ds2_service_did,
+        "blue.catbird.chat.enrollDevice",
+    );
     let alice_enroll_res_ds2 = post_signed_chat_op(
         &http,
         &cluster.ds2_url,
@@ -1161,7 +1187,11 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         &metadata_ciphertext,
         now,
     );
-    let create_jwt = alice.mint_chat_jwt(&cluster, "blue.catbird.chat.createConversation");
+    let create_jwt = alice.mint_chat_jwt(
+        &cluster,
+        &cluster.ds1_service_did,
+        "blue.catbird.chat.createConversation",
+    );
     let create_res = post_signed_chat_op(
         &http,
         &cluster.ds1_url,
@@ -1187,7 +1217,11 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         &genesis_ctag,
         now,
     );
-    let acc_jwt = bob.mint_chat_jwt(&cluster, "blue.catbird.chat.acceptConversation");
+    let acc_jwt = bob.mint_chat_jwt(
+        &cluster,
+        &cluster.ds1_service_did,
+        "blue.catbird.chat.acceptConversation",
+    );
     let acc_res = post_signed_chat_op(
         &http,
         &cluster.ds1_url,
@@ -1244,7 +1278,11 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         &bob_kp_ref,
         now,
     );
-    let fulfill_jwt = alice.mint_chat_jwt(&cluster, "blue.catbird.chat.submitTransition");
+    let fulfill_jwt = alice.mint_chat_jwt(
+        &cluster,
+        &cluster.ds1_service_did,
+        "blue.catbird.chat.submitTransition",
+    );
     let fulfill_res = post_signed_chat_op(
         &http,
         &cluster.ds1_url,
@@ -1331,7 +1369,11 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         &msg1_ciphertext,
         now,
     );
-    let msg1_jwt = alice.mint_chat_jwt(&cluster, "blue.catbird.chat.sendMessage");
+    let msg1_jwt = alice.mint_chat_jwt(
+        &cluster,
+        &cluster.ds1_service_did,
+        "blue.catbird.chat.sendMessage",
+    );
     let msg1_res = post_signed_chat_op(
         &http,
         &cluster.ds1_url,
@@ -1446,7 +1488,11 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         &metadata_ciphertext,
         Utc::now(),
     );
-    let commit_jwt = bob.mint_chat_jwt(&cluster, "blue.catbird.chat.submitTransition");
+    let commit_jwt = bob.mint_chat_jwt(
+        &cluster,
+        &cluster.ds2_service_did,
+        "blue.catbird.chat.submitTransition",
+    );
     let commit_res = post_signed_chat_op(
         &http,
         &cluster.ds2_url,
@@ -1542,7 +1588,11 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         &msg2_ciphertext,
         Utc::now(),
     );
-    let msg2_jwt = alice.mint_chat_jwt(&cluster, "blue.catbird.chat.sendMessage");
+    let msg2_jwt = alice.mint_chat_jwt(
+        &cluster,
+        &cluster.ds1_service_did,
+        "blue.catbird.chat.sendMessage",
+    );
     let msg2_res = post_signed_chat_op(
         &http,
         &cluster.ds1_url,

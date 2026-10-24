@@ -1,0 +1,49 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.epochMember",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Membership of one device in one epoch (SPEC \u00a75.4-5.5). rkey = '<12-digit epoch>-<hex deviceKeyPubkey>'. Separate from the epoch record so adding a device never rewrites shared state. Immutable.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "epochNumber",
+          "deviceKeyPubkey",
+          "deviceMac",
+          "createdAt"
+        ],
+        "properties": {
+          "epochNumber": {
+            "type": "integer",
+            "description": "Sequence number of the epoch.",
+            "minimum": 0,
+            "maximum": 1099511627776
+          },
+          "deviceKeyPubkey": {
+            "type": "bytes",
+            "description": "The member device's deviceKeyPubkey.",
+            "maxLength": 32,
+            "minLength": 32
+          },
+          "deviceMac": {
+            "type": "bytes",
+            "description": "HMAC(epochDeviceMacKey, deviceKeyPubkey).",
+            "maxLength": 32,
+            "minLength": 32
+          },
+          "encryptedEntropy": {
+            "type": "bytes",
+            "description": "labyrinth_hpke(epochStorageKey, openerAuth, distPsk, 'epoch__'||seq, entropy); present for devices that carried over when the epoch opened.",
+            "maxLength": 128
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

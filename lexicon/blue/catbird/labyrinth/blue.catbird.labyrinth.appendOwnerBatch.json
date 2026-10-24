@@ -1,0 +1,46 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.appendOwnerBatch",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Append an owner batch; the server assigns the TID rkey and a server order. Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "record"
+          ],
+          "properties": {
+            "record": {
+              "type": "unknown",
+              "description": "A blue.catbird.labyrinth.ownerBatch record."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "rkey",
+            "order"
+          ],
+          "properties": {
+            "rkey": {
+              "type": "string",
+              "maxLength": 13,
+              "description": "TID."
+            },
+            "order": {
+              "type": "ref",
+              "ref": "blue.catbird.labyrinth.defs#serverOrder"
+            }
+          }
+        }
+      }
+    }
+  }
+}

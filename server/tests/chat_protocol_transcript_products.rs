@@ -1,3 +1,17 @@
+mod chat_protocol {
+    pub mod read_projection {
+        pub struct DummyCanonical;
+        impl DummyCanonical {
+            pub fn bytes(&self) -> &[u8] { &[] }
+        }
+        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
+            _value: &T,
+            _schema: &str,
+        ) -> Result<DummyCanonical, String> {
+            Ok(DummyCanonical)
+        }
+    }
+}
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
@@ -35,18 +49,22 @@ use validation::{
 
 fn control_endpoint(kind: ControlEntryKind) -> &'static str {
     match kind {
+        ControlEntryKind::DirectRequestPublication | ControlEntryKind::DirectRequestAcceptance => {
+            panic!("v2 history is not a v1 append route")
+        }
         ControlEntryKind::Creation => "blue.catbird.chat.createConversation",
         ControlEntryKind::ParticipantAcceptance => "blue.catbird.chat.acceptConversation",
         ControlEntryKind::ConversationClose => "blue.catbird.chat.closeConversation",
         ControlEntryKind::ResetRequest => "blue.catbird.chat.requestReset",
         ControlEntryKind::ResetActivation => "blue.catbird.chat.activateReset",
-        ControlEntryKind::LeaveRequest => "blue.catbird.chat.requestLeave",
+        ControlEntryKind::LeaveRequest | ControlEntryKind::ZeroLeafLeave => {
+            "blue.catbird.chat.requestLeave"
+        }
         ControlEntryKind::LeaveCancellation => "blue.catbird.chat.cancelLeave",
         ControlEntryKind::Commit
         | ControlEntryKind::Policy
         | ControlEntryKind::Metadata
         | ControlEntryKind::LeafRecoveryFulfillment
-        | ControlEntryKind::ZeroLeafLeave
         | ControlEntryKind::LeaveCommitFulfillment => "blue.catbird.chat.submitTransition",
     }
 }
@@ -66,6 +84,13 @@ fn all_thirteen_verified_control_variants_mint_one_strict_durable_and_response_p
     assert_eq!(cases.len(), 13);
     let actual_kinds = ControlEntryKind::ALL
         .into_iter()
+        .filter(|kind| {
+            !matches!(
+                kind,
+                ControlEntryKind::DirectRequestPublication
+                    | ControlEntryKind::DirectRequestAcceptance
+            )
+        })
         .map(ControlEntryKind::type_id)
         .collect::<BTreeSet<_>>();
     let expected_kinds = BTreeSet::from([

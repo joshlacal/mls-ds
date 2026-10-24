@@ -555,10 +555,16 @@ fn origin_hostname_is_valid(host: &str) -> bool {
     })
 }
 
-const CHAT_ENDPOINTS: [&str; 32] = [
+const CHAT_ENDPOINTS: [&str; 38] = [
+    "blue.catbird.chat.publishDirectRequestKeys",
+    "blue.catbird.chat.prepareDirectRequest",
+    "blue.catbird.chat.getDirectRequestOutcome",
+    "blue.catbird.chat.cancelDirectRequestPreparation",
+    "blue.catbird.chat.publishDirectRequest",
     "blue.catbird.chat.enrollDevice",
     "blue.catbird.chat.replenishKeyPackages",
     "blue.catbird.chat.revokeDevice",
+    "blue.catbird.chat.getDeviceKey",
     "blue.catbird.chat.getDevices",
     "blue.catbird.chat.getOwnDevices",
     "blue.catbird.chat.createConversation",
@@ -609,8 +615,10 @@ impl ValidatedChatNsid {
 
     pub(crate) fn dpop_method(&self) -> Result<CanonicalHttpMethod, AuthPrimitiveError> {
         match self.0 {
-            "blue.catbird.chat.getDevices"
+            "blue.catbird.chat.getDeviceKey"
+            | "blue.catbird.chat.getDevices"
             | "blue.catbird.chat.getOwnDevices"
+            | "blue.catbird.chat.getDirectRequestOutcome"
             | "blue.catbird.chat.getConversations"
             | "blue.catbird.chat.getConversationState"
             | "blue.catbird.chat.getEntries"

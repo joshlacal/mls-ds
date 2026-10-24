@@ -22,7 +22,7 @@
           },
           "protocolVersion": {
             "type": "string",
-            "knownValues": ["1"],
+            "knownValues": ["1", "2"],
             "description": "Secure chat protocol version."
           },
           "createdAt": {

@@ -1,0 +1,41 @@
+{
+  "description": "Device-signed Labyrinth read headers (catbird-labyrinth-read / catbird-labyrinth-read-signature). Ed25519 (RFC 8032, deterministic) over CATBIRD-LABYRINTH-READ\\0 || claim bytes. params are every query parameter on the wire, in wire order; canonicalQuery sorts them by (key, value) on raw UTF-8 bytes, then RFC 3986 percent-encodes (unreserved A-Z a-z 0-9 -._~ kept, every other byte %XX uppercase). Claim JSON: fixed key order v,nsid,query,did,deviceId,issuedAt, no whitespace, serde_json escaping (only \" \\ and control chars escaped; / and non-ASCII raw). Headers are base64url without padding.",
+  "input": {
+    "deviceId": "0b6f1c2a-7d3e-4f5a-9b8c-1d2e3f4a5b6c",
+    "did": "did:plc:alice\"/x",
+    "ed25519SeedHex": "4242424242424242424242424242424242424242424242424242424242424242",
+    "issuedAt": 1791000000123,
+    "nsid": "blue.catbird.labyrinth.getMessages",
+    "params": [
+      [
+        "threadId",
+        "3f2b8c1e-5a4d-4e6f-9b7a-1c2d3e4f5a6b"
+      ],
+      [
+        "messageIds",
+        "msg:2/b"
+      ],
+      [
+        "messageIds",
+        "msg 1+é"
+      ],
+      [
+        "actorDeviceId",
+        "0b6f1c2a-7d3e-4f5a-9b8c-1d2e3f4a5b6c"
+      ],
+      [
+        "messageIds",
+        "Msg~3"
+      ]
+    ]
+  },
+  "output": {
+    "canonicalQuery": "actorDeviceId=0b6f1c2a-7d3e-4f5a-9b8c-1d2e3f4a5b6c&messageIds=Msg~3&messageIds=msg%201%2B%C3%A9&messageIds=msg%3A2%2Fb&threadId=3f2b8c1e-5a4d-4e6f-9b7a-1c2d3e4f5a6b",
+    "claimHex": "7b2276223a312c226e736964223a22626c75652e636174626972642e6c61627972696e74682e6765744d65737361676573222c227175657279223a226163746f7244657669636549643d30623666316332612d376433652d346635612d396238632d316432653366346135623663266d6573736167654964733d4d73677e33266d6573736167654964733d6d736725323031253242254333254139266d6573736167654964733d6d736725334132253246622674687265616449643d33663262386331652d356134642d346536662d396237612d316332643365346635613662222c22646964223a226469643a706c633a616c6963655c222f78222c226465766963654964223a2230623666316332612d376433652d346635612d396238632d316432653366346135623663222c226973737565644174223a313739313030303030303132337d",
+    "claimJson": "{\"v\":1,\"nsid\":\"blue.catbird.labyrinth.getMessages\",\"query\":\"actorDeviceId=0b6f1c2a-7d3e-4f5a-9b8c-1d2e3f4a5b6c&messageIds=Msg~3&messageIds=msg%201%2B%C3%A9&messageIds=msg%3A2%2Fb&threadId=3f2b8c1e-5a4d-4e6f-9b7a-1c2d3e4f5a6b\",\"did\":\"did:plc:alice\\\"/x\",\"deviceId\":\"0b6f1c2a-7d3e-4f5a-9b8c-1d2e3f4a5b6c\",\"issuedAt\":1791000000123}",
+    "publicKeyHex": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+    "readHeader": "eyJ2IjoxLCJuc2lkIjoiYmx1ZS5jYXRiaXJkLmxhYnlyaW50aC5nZXRNZXNzYWdlcyIsInF1ZXJ5IjoiYWN0b3JEZXZpY2VJZD0wYjZmMWMyYS03ZDNlLTRmNWEtOWI4Yy0xZDJlM2Y0YTViNmMmbWVzc2FnZUlkcz1Nc2d-MyZtZXNzYWdlSWRzPW1zZyUyMDElMkIlQzMlQTkmbWVzc2FnZUlkcz1tc2clM0EyJTJGYiZ0aHJlYWRJZD0zZjJiOGMxZS01YTRkLTRlNmYtOWI3YS0xYzJkM2U0ZjVhNmIiLCJkaWQiOiJkaWQ6cGxjOmFsaWNlXCIveCIsImRldmljZUlkIjoiMGI2ZjFjMmEtN2QzZS00ZjVhLTliOGMtMWQyZTNmNGE1YjZjIiwiaXNzdWVkQXQiOjE3OTEwMDAwMDAxMjN9",
+    "readSignatureHeader": "1-Y36HCocX8PH-axSft8j9obLjCsgIcOjnREgZ6JVWNA691qtVZrMqnYR4XOfOx-1TTTpI_FwhErTtWiv0iYCw",
+    "signingInputHex": "434154424952442d4c41425952494e54482d52454144007b2276223a312c226e736964223a22626c75652e636174626972642e6c61627972696e74682e6765744d65737361676573222c227175657279223a226163746f7244657669636549643d30623666316332612d376433652d346635612d396238632d316432653366346135623663266d6573736167654964733d4d73677e33266d6573736167654964733d6d736725323031253242254333254139266d6573736167654964733d6d736725334132253246622674687265616449643d33663262386331652d356134642d346536662d396237612d316332643365346635613662222c22646964223a226469643a706c633a616c6963655c222f78222c226465766963654964223a2230623666316332612d376433652d346635612d396238632d316432653366346135623663222c226973737565644174223a313739313030303030303132337d"
+  }
+}

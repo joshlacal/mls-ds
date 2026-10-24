@@ -1,0 +1,50 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.deleteAttachmentRef",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Delete the caller's attachment reference at this blinded index; when no reference to the blob remains, its object becomes eligible for chat object GC again. Idempotent. ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "deviceKeyPubkey",
+            "blindedIndex"
+          ],
+          "properties": {
+            "deviceKeyPubkey": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "The device whose ORF state maps the index."
+            },
+            "blindedIndex": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "Blinded index."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "OrfStateNotFound"
+        },
+        {
+          "name": "AttachmentsUnavailable"
+        }
+      ]
+    }
+  }
+}

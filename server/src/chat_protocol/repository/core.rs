@@ -865,7 +865,8 @@ impl LockedRevocationConversationManifest {
 
 /// Exact live KeyPackage row locked target-first for a global revocation.
 /// Available rows have no reservation provenance; Reserved rows bind the
-/// owning conversation/request. Both become terminal Revoked with immutable
+/// owning conversation/request, except request-scope held/retired packages,
+/// which bind neither. All become terminal Revoked with immutable
 /// revocation provenance in the batch persistence plan.
 #[derive(Debug)]
 pub(crate) struct LockedRevocationPackageGuard {
@@ -905,10 +906,15 @@ impl LockedRevocationPackageGuard {
             LockedRecoveryPackageStatus::Available => {
                 conversation_id.is_none() && request_id.is_none()
             }
-            LockedRecoveryPackageStatus::Reserved => {
-                conversation_id.is_some_and(uuid_is_canonical_v4)
-                    && request_id.is_some_and(uuid_is_canonical_v4)
-            }
+            // Recovery reservations bind conversation+request; request-scope
+            // held packages bind neither (hydration checks their scope).
+            LockedRecoveryPackageStatus::Reserved => match (conversation_id, request_id) {
+                (Some(conversation_id), Some(request_id)) => {
+                    uuid_is_canonical_v4(conversation_id) && uuid_is_canonical_v4(request_id)
+                }
+                (None, None) => true,
+                _ => false,
+            },
             _ => false,
         };
         if !canonical_transaction_id(&transaction_id)
@@ -1158,6 +1164,7 @@ impl LockedRevocationFanoutGuard {
                         (package.status, package.conversation_id, package.request_id),
                         (LockedRecoveryPackageStatus::Available, None, None)
                             | (LockedRecoveryPackageStatus::Reserved, Some(_), Some(_))
+                            | (LockedRecoveryPackageStatus::Reserved, None, None)
                     )
             })
             || conversations
@@ -2339,6 +2346,7 @@ struct RevocationPackageRow {
     owner_auth_generation: i64,
     not_after: DateTime<Utc>,
     status: String,
+    usage_scope: String,
     conversation_id: Option<Uuid>,
     request_id: Option<Uuid>,
 }
@@ -2361,6 +2369,7 @@ async fn hydrate_locked_revocation_packages(
                kp.owner_auth_generation,
                kp.not_after,
                kp.status,
+               kp.usage_scope,
                r.conversation_id,
                r.recovery_request_id AS request_id
           FROM chat.key_packages kp
@@ -2393,13 +2402,18 @@ async fn hydrate_locked_revocation_packages(
             .wrapper_sha256
             .try_into()
             .map_err(|_| RevocationScopeHydrationError::OutOfDomain)?;
-        let status = match row.status.as_str() {
-            "available" if row.conversation_id.is_none() && row.request_id.is_none() => {
-                LockedRecoveryPackageStatus::Available
-            }
-            "reserved" if row.conversation_id.is_some() && row.request_id.is_some() => {
-                LockedRecoveryPackageStatus::Reserved
-            }
+        let status = match (
+            row.status.as_str(),
+            row.usage_scope.as_str(),
+            row.conversation_id,
+            row.request_id,
+        ) {
+            ("available", _, None, None) => LockedRecoveryPackageStatus::Available,
+            ("reserved", _, Some(_), Some(_)) => LockedRecoveryPackageStatus::Reserved,
+            // Request-scope packages held by a direct-request preparation or
+            // retired by a keys disable/unusable sweep have no recovery
+            // reservation; revocation still retires them (Reserved -> Revoked).
+            ("reserved", "direct-request", None, None) => LockedRecoveryPackageStatus::Reserved,
             _ => return Err(RevocationScopeHydrationError::FanoutMismatch),
         };
         let digest = revocation_package_guard_digest(
@@ -3562,6 +3576,7 @@ async fn hydrate_locked_available_recovery_package_at_coordinate(
           AND kp.owner_key_id = $3
           AND kp.owner_auth_generation = $4
           AND kp.status = 'available'
+          AND kp.usage_scope = 'recovery'
           AND kp.not_before < $5
           AND kp.created_at <= $5
           AND $5 < kp.not_after
@@ -4791,12 +4806,12 @@ pub(crate) async fn load_historical_control_evidence(
     conversation_id: Uuid,
     transition_id: Uuid,
 ) -> Result<PersistedControlAuthority, ControlEvidenceLoadError> {
-    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
         r#"
         SELECT
             e.accepted_payload_bytes,
             e.signed_request_bytes,
-            dk.signing_public_key
+            dk.signing_public_key, e.outer_entry_fingerprint
         FROM chat.entries e
         JOIN chat.device_keys dk
           ON dk.user_did = e.actor_did
@@ -4811,9 +4826,31 @@ pub(crate) async fn load_historical_control_evidence(
     .fetch_optional(&mut **transaction)
     .await?;
 
-    let (public_row_json, raw_signed_wrapper, signing_public_key) =
+    let (public_row_json, raw_signed_wrapper, signing_public_key, stored_fingerprint) =
         row.ok_or(ControlEvidenceLoadError::EntryMissing)?;
 
+    let decoded = super::super::transcript::decode_and_verify_control_entry(
+        &public_row_json,
+        &signing_public_key,
+    )
+    .map_err(|_| ControlEvidenceLoadError::InvalidEvidence)?;
+    if decoded.outer_control_fingerprint().as_slice() != stored_fingerprint {
+        return Err(ControlEvidenceLoadError::InvalidEvidence);
+    }
+    if matches!(
+        decoded.mutation().kind(),
+        SignedMutationKind::DirectRequestPublication | SignedMutationKind::DirectRequestAcceptance
+    ) {
+        verify_direct_request_durable_proof(
+            transaction,
+            conversation_id,
+            transition_id,
+            &public_row_json,
+            &raw_signed_wrapper,
+            &signing_public_key,
+        )
+        .await?;
+    }
     authority
         .hydrate_historical_control_from_durable_bytes(
             public_row_json,
@@ -4821,6 +4858,128 @@ pub(crate) async fn load_historical_control_evidence(
             &signing_public_key,
         )
         .map_err(|_| ControlEvidenceLoadError::InvalidEvidence)
+}
+
+/// Read-time authority for v2 rows includes the dedicated server receipt and
+/// immutable preparation, never a caller-provided verifying key. Historical
+/// keys were pinned from the configured authority DID at startup and retained.
+async fn verify_direct_request_durable_proof(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    transition_id: Uuid,
+    row_bytes: &[u8],
+    signed_bytes: &[u8],
+    actor_key: &[u8],
+) -> Result<(), ControlEvidenceLoadError> {
+    use super::super::direct_request_transcript::{
+        verify_direct_request_acceptance_proof, verify_direct_request_preparation,
+        verify_signed_request, DirectRequestKind,
+    };
+    use serde_json::Value;
+    let invalid = || ControlEvidenceLoadError::InvalidEvidence;
+    let row: Value = serde_json::from_slice(row_bytes).map_err(|_| invalid())?;
+    let publication = row["$type"] == "blue.catbird.chat.defs#directRequestEntry";
+    let verified = verify_signed_request(
+        if publication {
+            DirectRequestKind::Publish
+        } else {
+            DirectRequestKind::Accept
+        },
+        signed_bytes,
+        actor_key,
+    )
+    .map_err(|_| invalid())?;
+    let body = verified.body();
+    let request =
+        Uuid::parse_str(body["requestId"].as_str().ok_or_else(invalid)?).map_err(|_| invalid())?;
+    let mut untagged = row.clone();
+    untagged
+        .as_object_mut()
+        .ok_or_else(invalid)?
+        .remove("$type");
+    if publication {
+        let (prepare_bytes, terminal_bytes, stored_signed, stored_entry): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT a.prepare_response,a.terminal_response,p.signed_publication,p.request_entry FROM chat.direct_request_attempts a JOIN chat.direct_request_publications p USING(request_id) WHERE a.request_id=$1 AND p.conversation_id=$2 AND a.status='published'")
+            .bind(request).bind(conversation_id).fetch_optional(&mut **tx).await?.ok_or_else(invalid)?;
+        if request != transition_id || stored_signed != signed_bytes || stored_entry != row_bytes {
+            return Err(invalid());
+        }
+        let prepare: Value = serde_json::from_slice(&prepare_bytes).map_err(|_| invalid())?;
+        let key = historical_request_receipt_key(
+            tx,
+            prepare["receiptKeyId"].as_str().ok_or_else(invalid)?,
+        )
+        .await?;
+        let prepare =
+            verify_direct_request_preparation(&prepare_bytes, &key).map_err(|_| invalid())?;
+        if !super::super::direct_request_transcript::direct_request_preparation_matches_publication(
+            &prepare, body,
+        ) {
+            return Err(invalid());
+        }
+        let terminal: Value = serde_json::from_slice(&terminal_bytes).map_err(|_| invalid())?;
+        let key = historical_request_receipt_key(
+            tx,
+            terminal["body"]["keyId"].as_str().ok_or_else(invalid)?,
+        )
+        .await?;
+        let terminal = verify_signed_request(DirectRequestKind::Outcome, &terminal_bytes, &key)
+            .map_err(|_| invalid())?;
+        let receipt = &terminal.body()["receipt"];
+        if receipt["$type"] != "blue.catbird.chat.defs#directRequestPublishedReceipt"
+            || receipt["requestId"] != body["requestId"]
+            || receipt["coordinates"] != body["next"]
+            || receipt["firstMessageId"] != body["firstMessageId"]
+            || receipt["requestDigest"].as_str()
+                != Some(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(verified.request_digest())
+                        .as_str(),
+                )
+            || receipt["preparationRequestDigest"] != body["preparationRequestDigest"]
+            || receipt["actorDid"] != body["actorDid"]
+            || receipt["actorDeviceId"] != body["actorDeviceId"]
+            || receipt["actorKeyId"] != body["keyId"]
+            || receipt["authGeneration"] != body["authGeneration"]
+        {
+            return Err(invalid());
+        }
+    } else {
+        let (proof_bytes, publication_bytes, sender_key): (Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT l.acceptance_proof,p.signed_publication,k.signing_public_key FROM chat.direct_request_lifecycle l JOIN chat.direct_request_publications p USING(request_id) JOIN chat.device_keys k ON k.user_did=p.actor_did AND k.device_id=p.actor_device_id AND k.key_id=p.actor_key_id WHERE l.request_id=$1 AND p.conversation_id=$2 AND l.consent IN ('accepted','closed') AND l.accepted_at IS NOT NULL AND l.acceptance_proof IS NOT NULL")
+            .bind(request).bind(conversation_id).fetch_optional(&mut **tx).await?.ok_or_else(invalid)?;
+        let proof: Value = serde_json::from_slice(&proof_bytes).map_err(|_| invalid())?;
+        let key = historical_request_receipt_key(
+            tx,
+            proof["receipt"]["body"]["keyId"]
+                .as_str()
+                .ok_or_else(invalid)?,
+        )
+        .await?;
+        let proof = verify_direct_request_acceptance_proof(&proof_bytes, &key, actor_key)
+            .map_err(|_| invalid())?;
+        let publication =
+            verify_signed_request(DirectRequestKind::Publish, &publication_bytes, &sender_key)
+                .map_err(|_| invalid())?;
+        if proof["entry"] != untagged
+            || body["transitionId"].as_str() != Some(transition_id.to_string().as_str())
+            || body["requestId"] != publication.body()["requestId"]
+            || body["actorDid"] != publication.body()["recipientDid"]
+            || body["prior"]["conversationId"] != publication.body()["next"]["conversationId"]
+            || body["prior"]["generation"] != publication.body()["next"]["generation"]
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+async fn historical_request_receipt_key(
+    tx: &mut Transaction<'_, Postgres>,
+    key_id: &str,
+) -> Result<Vec<u8>, ControlEvidenceLoadError> {
+    sqlx::query_scalar("SELECT public_key FROM chat.direct_request_receipt_keys WHERE key_id=$1")
+        .bind(key_id).fetch_optional(&mut **tx).await?.ok_or(ControlEvidenceLoadError::InvalidEvidence)
 }
 
 // ===========================================================================
@@ -5298,6 +5457,7 @@ pub(crate) async fn load_interval_hydration_rows(
             .map_err(|_| IntervalHydrationError::OutOfDomain)?;
         let generation = interval_u64(generation)?;
         let opening_kind = match opening_kind.as_str() {
+            "directRequest" => OpeningKind::DirectRequest,
             "creation" => OpeningKind::Creation,
             "add" => OpeningKind::Add,
             "reset" => OpeningKind::Reset,
@@ -5330,6 +5490,7 @@ pub(crate) async fn load_interval_hydration_rows(
             (None, None) => None,
             (Some(closing_transition_id), Some(closing_kind)) => {
                 let kind = match closing_kind.as_str() {
+                    "directRequest" => CloseKind::DirectRequest,
                     "remove" => CloseKind::Remove,
                     "replace" => CloseKind::Replace,
                     "reset" => CloseKind::Reset,
@@ -5604,6 +5765,8 @@ pub(crate) fn retained_metadata_head_from_current_evidence<'a>(
         .ok_or(MetadataHydrationError::InvalidProvenance)?
         .kind();
     let kind = match signed_kind {
+        SignedMutationKind::DirectRequestPublication => "directRequestPublication",
+        SignedMutationKind::DirectRequestAcceptance => "directRequestAcceptance",
         SignedMutationKind::Creation => "creation",
         SignedMutationKind::CommitTransition => "commit",
         SignedMutationKind::PolicyTransition => "policy",
@@ -5618,7 +5781,8 @@ pub(crate) fn retained_metadata_head_from_current_evidence<'a>(
     };
     if matches!(
         signed_kind,
-        SignedMutationKind::Creation
+        SignedMutationKind::DirectRequestPublication
+            | SignedMutationKind::Creation
             | SignedMutationKind::CommitTransition
             | SignedMutationKind::MetadataTransition
             | SignedMutationKind::ResetActivation
@@ -5712,14 +5876,24 @@ pub(crate) fn select_retained_metadata_producer(
     }
 
     match head.current_kind {
-        "creation" | "commit" | "metadata" | "leafRecovery" | "leaveCommit" | "resetActivation" => {
+        "directRequestPublication"
+        | "creation"
+        | "commit"
+        | "metadata"
+        | "leafRecovery"
+        | "leaveCommit"
+        | "resetActivation" => {
             if candidate.transition_id != head.current_transition_id
                 || candidate.seq != head.current_seq
             {
                 return Err(MetadataHydrationError::OutOfDomain);
             }
         }
-        "policy" | "acceptConversation" | "leavePolicy" | "closeConversation" => {
+        "directRequestAcceptance"
+        | "policy"
+        | "acceptConversation"
+        | "leavePolicy"
+        | "closeConversation" => {
             if candidate.transition_id == head.current_transition_id
                 || candidate.seq >= head.current_seq
             {
@@ -10097,6 +10271,7 @@ fn graph_digest_interval(digest: &mut Sha256, value: &IntervalHydrationRow) {
     digest.update(value.generation.to_be_bytes());
     graph_digest_transition(digest, &value.opening);
     digest.update([match value.opening_kind {
+        OpeningKind::DirectRequest => 4,
         OpeningKind::Creation => 1,
         OpeningKind::Add => 2,
         OpeningKind::Reset => 3,
@@ -10105,6 +10280,7 @@ fn graph_digest_interval(digest: &mut Sha256, value: &IntervalHydrationRow) {
     graph_digest_option(digest, value.end.as_ref(), |digest, end| {
         graph_digest_transition(digest, &end.evidence);
         digest.update([match end.kind {
+            CloseKind::DirectRequest => 5,
             CloseKind::Remove => 1,
             CloseKind::Replace => 2,
             CloseKind::Reset => 3,
@@ -10598,4 +10774,352 @@ pub(crate) async fn hydrate_locked_conversation_state(
         .map_err(ConversationStateHydrationError::State)?;
     seal_locked_conversation(state, head, graph_digest, snapshot_digest)
         .ok_or(ConversationStateHydrationError::Seal)
+}
+
+#[cfg(test)]
+mod retained_recovery_package_tests {
+    use super::*;
+    fn instant(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+    #[test]
+    fn recovery_retained_terminal_selector_is_closed_over_all_cause_columns() {
+        let requested_at = instant("2030-01-01T00:00:00.000Z");
+        let terminal_at = instant("2030-01-01T00:01:00.000Z");
+        let expires_at = instant("2030-01-01T00:05:00.000Z");
+        let package_not_after = instant("2030-01-02T00:00:00.000Z");
+        let transition_id = Uuid::new_v4();
+        let revocation_id = Uuid::new_v4();
+        let digest = [0x41; 32];
+        let no_terminal = RecoveryReservationTerminal::None;
+        let cancellation_terminal = RecoveryReservationTerminal::Released {
+            transition_id: None,
+            revocation_id: None,
+            request_digest: Some(digest),
+            terminal_at,
+        };
+        let expiry_terminal = RecoveryReservationTerminal::Expiry {
+            terminal_at: expires_at,
+        };
+        let transition_terminal = RecoveryReservationTerminal::Released {
+            transition_id: Some(transition_id),
+            revocation_id: None,
+            request_digest: None,
+            terminal_at,
+        };
+        let revocation_terminal = RecoveryReservationTerminal::Released {
+            transition_id: None,
+            revocation_id: Some(revocation_id),
+            request_digest: None,
+            terminal_at,
+        };
+
+        let open = RecoveryRequestTerminalColumns {
+            status: "open",
+            fulfilling_transition_id: None,
+            terminal_transition_id: None,
+            terminal_revocation_id: None,
+            request_has_any_signed_terminal: false,
+            request_has_complete_signed_terminal: false,
+            terminal_request_digest: None,
+            terminal_at: None,
+            requested_at,
+            expires_at,
+            request_reservation_binding_matches: true,
+            reservation_status: ReservationStatus::Active,
+            reservation_terminal: &no_terminal,
+            package_status: "reserved",
+            package_terminal_transition_id: None,
+            package_terminal_revocation_id: None,
+            package_terminal_at: None,
+            package_not_after,
+        };
+        assert_eq!(
+            select_recovery_request_terminal(open).unwrap(),
+            RecoveryRequestTerminalSelection::Open
+        );
+
+        let cancelled = RecoveryRequestTerminalColumns {
+            status: "cancelled",
+            request_has_any_signed_terminal: true,
+            request_has_complete_signed_terminal: true,
+            terminal_request_digest: Some(&digest),
+            terminal_at: Some(terminal_at),
+            reservation_status: ReservationStatus::Released,
+            reservation_terminal: &cancellation_terminal,
+            package_status: "available",
+            ..open
+        };
+        assert_eq!(
+            select_recovery_request_terminal(cancelled).unwrap(),
+            RecoveryRequestTerminalSelection::Cancelled {
+                terminal_at,
+                terminal_request_digest: digest,
+            }
+        );
+
+        let expired_available = RecoveryRequestTerminalColumns {
+            status: "expired",
+            terminal_at: Some(expires_at),
+            reservation_status: ReservationStatus::Expired,
+            reservation_terminal: &expiry_terminal,
+            package_status: "available",
+            ..open
+        };
+        assert_eq!(
+            select_recovery_request_terminal(expired_available).unwrap(),
+            RecoveryRequestTerminalSelection::Expired {
+                terminal_at: expires_at,
+            }
+        );
+        let expired_package = RecoveryRequestTerminalColumns {
+            package_status: "expired",
+            package_terminal_at: Some(expires_at),
+            package_not_after: expires_at,
+            ..expired_available
+        };
+        assert_eq!(
+            select_recovery_request_terminal(expired_package).unwrap(),
+            RecoveryRequestTerminalSelection::Expired {
+                terminal_at: expires_at,
+            }
+        );
+
+        let transition_superseded = RecoveryRequestTerminalColumns {
+            status: "superseded",
+            terminal_transition_id: Some(transition_id),
+            terminal_at: Some(terminal_at),
+            reservation_status: ReservationStatus::Released,
+            reservation_terminal: &transition_terminal,
+            package_status: "available",
+            ..open
+        };
+        assert_eq!(
+            select_recovery_request_terminal(transition_superseded).unwrap(),
+            RecoveryRequestTerminalSelection::SupersededByTransition {
+                transition_id,
+                terminal_at,
+            }
+        );
+        let revocation_superseded = RecoveryRequestTerminalColumns {
+            terminal_transition_id: None,
+            terminal_revocation_id: Some(revocation_id),
+            reservation_terminal: &revocation_terminal,
+            package_status: "revoked",
+            package_terminal_revocation_id: Some(revocation_id),
+            package_terminal_at: Some(terminal_at),
+            ..transition_superseded
+        };
+        assert_eq!(
+            select_recovery_request_terminal(revocation_superseded).unwrap(),
+            RecoveryRequestTerminalSelection::SupersededByRevocation {
+                revocation_id,
+                terminal_at,
+            }
+        );
+
+        // A released package can be reserved again, then consumed, expired,
+        // or revoked. Its later lifecycle must not rewrite the immutable
+        // terminal cause of an older cancellation or supersession.
+        let later = expires_at + chrono::Duration::seconds(1);
+        for retained in [cancelled, transition_superseded, expired_available] {
+            let expected = select_recovery_request_terminal(retained).unwrap();
+            for (status, transition, revocation, package_terminal_at) in [
+                ("reserved", None, None, None),
+                ("consumed", Some(Uuid::new_v4()), None, Some(later)),
+                ("expired", None, None, Some(package_not_after)),
+                ("revoked", None, Some(Uuid::new_v4()), Some(later)),
+            ] {
+                assert_eq!(
+                    select_recovery_request_terminal(RecoveryRequestTerminalColumns {
+                        package_status: status,
+                        package_terminal_transition_id: transition,
+                        package_terminal_revocation_id: revocation,
+                        package_terminal_at,
+                        ..retained
+                    })
+                    .unwrap(),
+                    expected,
+                    "retained {} with current package {status}",
+                    retained.status,
+                );
+            }
+            for (status, transition, revocation, package_terminal_at) in [
+                ("unknown", None, None, None),
+                ("reserved", Some(Uuid::new_v4()), None, None),
+                ("consumed", None, None, Some(later)),
+                (
+                    "consumed",
+                    Some(Uuid::new_v4()),
+                    Some(Uuid::new_v4()),
+                    Some(later),
+                ),
+                ("consumed", Some(Uuid::new_v4()), None, Some(requested_at)),
+                (
+                    "consumed",
+                    Some(Uuid::new_v4()),
+                    None,
+                    Some(package_not_after),
+                ),
+                ("expired", None, None, Some(later)),
+                ("revoked", None, None, Some(later)),
+                ("revoked", None, Some(Uuid::new_v4()), Some(requested_at)),
+            ] {
+                assert!(
+                    matches!(
+                        select_recovery_request_terminal(RecoveryRequestTerminalColumns {
+                            package_status: status,
+                            package_terminal_transition_id: transition,
+                            package_terminal_revocation_id: revocation,
+                            package_terminal_at,
+                            ..retained
+                        }),
+                        Err(RecoveryHydrationError::TerminalMismatch)
+                    ),
+                    "retained {} must reject invalid current package {status}",
+                    retained.status
+                );
+            }
+        }
+
+        let malformed = [
+            RecoveryRequestTerminalColumns {
+                request_has_complete_signed_terminal: false,
+                ..cancelled
+            },
+            RecoveryRequestTerminalColumns {
+                terminal_request_digest: Some(&[0x42; 32]),
+                ..cancelled
+            },
+            RecoveryRequestTerminalColumns {
+                package_terminal_transition_id: Some(Uuid::new_v4()),
+                ..cancelled
+            },
+            RecoveryRequestTerminalColumns {
+                terminal_at: Some(terminal_at),
+                ..expired_available
+            },
+            RecoveryRequestTerminalColumns {
+                package_terminal_transition_id: Some(Uuid::new_v4()),
+                ..expired_package
+            },
+            RecoveryRequestTerminalColumns {
+                package_terminal_revocation_id: Some(Uuid::new_v4()),
+                ..expired_package
+            },
+            RecoveryRequestTerminalColumns {
+                terminal_revocation_id: Some(Uuid::new_v4()),
+                ..transition_superseded
+            },
+            RecoveryRequestTerminalColumns {
+                package_terminal_at: Some(terminal_at),
+                ..transition_superseded
+            },
+            RecoveryRequestTerminalColumns {
+                package_terminal_revocation_id: Some(Uuid::new_v4()),
+                ..revocation_superseded
+            },
+            RecoveryRequestTerminalColumns {
+                request_reservation_binding_matches: false,
+                ..revocation_superseded
+            },
+        ];
+        for columns in malformed {
+            assert!(matches!(
+                select_recovery_request_terminal(columns),
+                Err(RecoveryHydrationError::TerminalMismatch)
+            ));
+        }
+    }
+}
+
+
+#[cfg(test)]
+impl LockedConversationHeadGuard {
+    pub(crate) fn for_scope_test(
+        transaction_id: &str,
+        conversation_id: [u8; 16],
+        prior_exists: bool,
+        next_entry_seq: u64,
+        durable_row_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            transaction_id: transaction_id.to_owned(),
+            conversation_id: Uuid::from_bytes(conversation_id),
+            prior_coordinate: prior_exists.then(|| {
+                PublicGroupSnapshotCoordinate::new(
+                    conversation_id,
+                    1,
+                    1,
+                    [0; 32],
+                    0,
+                    [0; 32],
+                    [0; 32],
+                    PublicGroupSnapshotLifecycle::Active,
+                )
+            }),
+            next_entry_seq,
+            locked_at: Utc::now(),
+            durable_row_digest,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LockedInvitationQuotaGuard {
+    pub(crate) fn for_scope_test(
+        transaction_id: &str,
+        inviter_did: String,
+        mut new_recipient_dids: Vec<String>,
+        durable_row_digest: [u8; 32],
+    ) -> Self {
+        new_recipient_dids.sort();
+        Self {
+            transaction_id: transaction_id.to_owned(),
+            inviter_did,
+            new_recipient_dids,
+            inviter_recent_24h: 0,
+            recipient_facts: Vec::new(),
+            locked_at: Utc::now(),
+            durable_row_digest,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LockedDirectConversationLookupGuard {
+    pub(crate) fn for_scope_test(
+        transaction_id: &str,
+        did_low: String,
+        did_high: String,
+        outcome: LockedDirectLookupOutcome,
+        durable_row_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            transaction_id: transaction_id.to_owned(),
+            did_low,
+            did_high,
+            locked_at: Utc::now(),
+            outcome,
+            durable_row_digest,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LockedConversationStateGuard {
+    pub(crate) fn for_scope_test(
+        state: ConversationState,
+        head: LockedConversationHeadGuard,
+        locked_graph_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            state,
+            head,
+            locked_graph_digest,
+            locked_snapshot_digest: None,
+        }
+    }
 }

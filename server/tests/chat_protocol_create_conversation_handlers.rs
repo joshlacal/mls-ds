@@ -942,7 +942,17 @@ async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_
         Sha256::digest(&response_bytes).as_slice(),
         "completed replay must carry a canonical response digest"
     );
-    assert_eq!(response_bytes, first_response_bytes);
+    // Merged line: the record stores the generated-DTO bytes and every 200 is
+    // served through the encrypted-requests read presentation, so the stored
+    // record must present to exactly the bytes the client received.
+    assert_eq!(
+        catbird_server::chat_protocol::direct_request_transcript::present_endpoint_output(
+            ENDPOINT,
+            response_bytes,
+        )
+        .expect("present stored response"),
+        first_response_bytes
+    );
 }
 
 #[tokio::test]
@@ -1186,7 +1196,15 @@ async fn submit_transition_policy_add_against_production_router_replays_byte_ide
         Sha256::digest(&response_bytes).as_slice(),
         "completed policy replay must carry a canonical response digest"
     );
-    assert_eq!(response_bytes, first_response_bytes);
+    // See the creation test: stored bytes present to the served bytes.
+    assert_eq!(
+        catbird_server::chat_protocol::direct_request_transcript::present_endpoint_output(
+            "blue.catbird.chat.submitTransition",
+            response_bytes,
+        )
+        .expect("present stored policy response"),
+        first_response_bytes
+    );
 }
 #[tokio::test]
 #[ignore = "requires the dedicated clean-chat gate database"]
@@ -1566,3 +1584,20 @@ async fn submit_transition_negative_corrupted_signature_returns_invalid_signatur
         "corrupted signedRequest must NOT return 500: {body}"
     );
 }
+
+// Encrypted-requests: transcript.rs test modules reference read_projection.
+mod chat_protocol {
+    pub mod read_projection {
+        pub struct DummyCanonical;
+        impl DummyCanonical {
+            pub fn bytes(&self) -> &[u8] { &[] }
+        }
+        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
+            _value: &T,
+            _schema: &str,
+        ) -> Result<DummyCanonical, String> {
+            Ok(DummyCanonical)
+        }
+    }
+}
+

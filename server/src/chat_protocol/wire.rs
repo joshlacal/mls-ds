@@ -4,6 +4,8 @@
 //! a raw inner object. The clean protocol is deliberately closed to MLS 1.0
 //! and the XWing ciphersuite.
 
+pub mod direct_request;
+
 use std::{
     collections::{HashMap, HashSet},
     panic::AssertUnwindSafe,

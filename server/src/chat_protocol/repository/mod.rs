@@ -49,6 +49,19 @@ pub(crate) mod device_directory;
 #[cfg(any(test, feature = "test-support"))]
 pub mod device_directory;
 
+#[allow(dead_code)]
+pub(crate) mod direct_request_preparation;
+
+#[allow(dead_code)]
+pub(crate) mod direct_request_publication;
+
+pub(crate) mod direct_request_push;
+
+#[allow(dead_code)]
+pub mod direct_request_receipts;
+
+pub(crate) mod direct_request_retention;
+
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod entry_read;
 #[cfg(any(test, feature = "test-support"))]
@@ -78,8 +91,10 @@ pub(crate) mod inventory;
 #[cfg(any(test, feature = "test-support"))]
 pub mod inventory;
 
+#[allow(dead_code)]
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod key_packages;
+#[allow(dead_code)]
 #[cfg(any(test, feature = "test-support"))]
 pub mod key_packages;
 
@@ -92,6 +107,8 @@ pub mod leave;
 pub(crate) mod message_delivery;
 #[cfg(any(test, feature = "test-support"))]
 pub mod message_delivery;
+
+pub(crate) mod message_event;
 
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod prelude;
@@ -109,6 +126,7 @@ pub mod recovery;
 pub(crate) mod relationship;
 #[cfg(any(test, feature = "test-support"))]
 pub mod relationship;
+
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod remote_prefix;
 #[cfg(any(test, feature = "test-support"))]
@@ -163,3 +181,47 @@ pub(crate) mod welcome_terminal;
 #[allow(dead_code)]
 #[cfg(any(test, feature = "test-support"))]
 pub mod welcome_terminal;
+
+pub(crate) mod direct_request_lifecycle;
+
+pub(crate) mod push_binding;
+
+#[cfg(test)]
+mod concurrency_tests;
+#[cfg(test)]
+mod rollback_tests;
+#[cfg(test)]
+mod inventory_repository_tests;
+#[cfg(test)]
+#[path = "delivery/read_tests.rs"]
+mod delivery_read_tests;
+#[cfg(test)]
+#[path = "welcome/tests.rs"]
+mod welcome_tests;
+#[cfg(test)]
+#[path = "recovery/tests.rs"]
+mod recovery_tests;
+#[cfg(test)]
+#[path = "ticket/tests.rs"]
+mod ticket_tests;
+#[cfg(test)]
+#[path = "reset/tests.rs"]
+mod reset_repository_tests;
+#[cfg(test)]
+#[path = "reset/wedge_tests.rs"]
+mod reset_wedge_tests;
+#[cfg(test)]
+#[path = "relationship/tests.rs"]
+mod relationship_repository_tests;
+#[cfg(test)]
+#[path = "transition/tests.rs"]
+mod transition_repository_tests;
+#[cfg(test)]
+#[path = "auth/tests.rs"]
+mod auth_repository_tests;
+#[cfg(test)]
+mod inventory_tests;
+#[cfg(test)]
+mod g7_entitlement_tests;
+#[cfg(test)]
+mod conversation_substrate_tests;

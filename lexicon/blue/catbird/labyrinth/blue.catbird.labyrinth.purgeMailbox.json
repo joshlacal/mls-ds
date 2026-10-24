@@ -1,0 +1,31 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.purgeMailbox",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Delete the caller's whole Labyrinth mailbox: devices, epochs, epoch members, virtual devices (recovery bundles), owner batches, every ORF state and attachment reference of the caller, and the caller's chain in the head directory, so the account can enroll again from epoch 0. Peers that pinned an old head see a directory fork on their next read, which is the intended signal of a reset. Thread records the caller sent are kept (redactMessage and deleteAccountData handle those). Mailbox endpoint on the caller's home DS. Idempotent. Requires a bound Labyrinth device (a current, non-virtual device registered by the calling chat device). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "LabyrinthDeviceNotBound"
+        }
+      ]
+    }
+  }
+}

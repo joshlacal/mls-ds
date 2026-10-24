@@ -539,6 +539,9 @@ pub(super) struct DurableRecoveryFulfillmentFixture {
     pub(super) commit: Vec<u8>,
     pub(super) welcome: Vec<u8>,
     pub(super) application_messages: Vec<Vec<u8>>,
+    pub(super) removal_commit: Vec<u8>,
+    pub(super) removal_next: ActivePublicState,
+    pub(super) application_message: Vec<u8>,
 }
 
 struct TwoMemberFulfillmentProducts {
@@ -558,6 +561,9 @@ struct TwoMemberFulfillmentProducts {
     commit: Vec<u8>,
     welcome: Vec<u8>,
     application_messages: Vec<Vec<u8>>,
+    removal_commit: Vec<u8>,
+    removal_next: ActivePublicState,
+    application_message: Vec<u8>,
 }
 
 struct RealAcceptanceEntry {
@@ -1128,6 +1134,7 @@ fn build_two_member_fulfillment_products(
     add_transition_id: Uuid,
     fulfillment_transition_id: Uuid,
     at: DateTime<Utc>,
+    after_policy: bool,
 ) -> Result<TwoMemberFulfillmentProducts, String> {
     let provider = openmls_libcrux_crypto::Provider::new()
         .map_err(|error| format!("create Recovery fulfillment OpenMLS provider: {error:?}"))?;
@@ -1294,11 +1301,44 @@ fn build_two_member_fulfillment_products(
         requester_key_package_wrapper,
         requester_key_package_init_key,
     ) = build_key_package_material(requester, at, &provider, &requester_signer)?;
+    // The renewal proof applies this real policy transition through the signed
+    // facade before using these cryptographic products. Keep the persisted Add
+    // fixture at v2, but bind this Commit to the subsequent policy coordinate.
+    let policy_prior = if after_policy {
+        let c = prior.coordinate();
+        Some(rebind_active_snapshot(
+            &prior,
+            PublicGroupSnapshotCoordinate::new(
+                *c.conversation_id(), c.generation(), c.state_version() + 1,
+                *c.group_id(), c.epoch(), *c.group_context_hash(),
+                *c.confirmation_tag(), PublicGroupSnapshotLifecycle::Active,
+            ),
+        ).map_err(|e| format!("rebind renewal policy coordinate: {e:?}"))?)
+    } else {
+        None
+    };
+    let fulfillment_prior = policy_prior.as_ref().unwrap_or(&prior);
     let fulfillment_aad = recovery_commit_aad(
         conversation_id,
         fulfillment_transition_id,
-        prior.coordinate(),
+        fulfillment_prior.coordinate(),
     )?;
+    requester_group.set_aad(Vec::new());
+    let application_message=requester_group.create_message(&provider,&requester_signer,b"retained application history")
+        .map_err(|e|format!("encrypt real application fixture: {e:?}"))?.tls_serialize_detached()
+        .map_err(|e|format!("encode real application fixture: {e:?}"))?;
+    requester_group.set_aad(fulfillment_aad.clone());
+    let (removal_message, _, removal_info) = requester_group
+        .remove_members(&provider, &requester_signer, &[LeafNodeIndex::new(1)])
+        .map_err(|e|format!("build genuine terminal Remove: {e:?}"))?;
+    let removal_commit=removal_message.tls_serialize_detached().map_err(|e|format!("encode Remove: {e:?}"))?;
+    let removal_context=removal_info.ok_or("missing Remove group info")?.group_context()
+        .tls_serialize_detached().map_err(|e|format!("encode Remove group context: {e:?}"))?;
+    requester_group.merge_pending_commit(&provider).map_err(|e|format!("merge Remove: {e:?}"))?;
+    let removal_coordinate=coordinate_from_merged_group(&requester_group,&removal_context,conversation_id,3 + u64::from(after_policy))?;
+    let removal_next=process_commit(fulfillment_prior,&removal_commit,&fulfillment_aad,removal_coordinate,
+        u64::try_from(at.timestamp()).map_err(|_|"negative Remove time")?,2)
+        .map_err(|e|format!("verify real Remove: {e:?}"))?.into_next();
     fulfiller_group.set_aad(fulfillment_aad.clone());
     // `swap_members` is OpenMLS's inline Remove+Add commit-builder path:
     // it never routes either proposal through the pending proposal store, so
@@ -1337,9 +1377,9 @@ fn build_two_member_fulfillment_products(
         .merge_pending_commit(&fulfiller_provider)
         .map_err(|error| format!("merge Recovery fulfillment Commit: {error:?}"))?;
     let next_coordinate =
-        coordinate_from_merged_group(&fulfiller_group, &next_group_context, conversation_id, 3)?;
+        coordinate_from_merged_group(&fulfiller_group, &next_group_context, conversation_id, 3 + u64::from(after_policy))?;
     let fulfillment_verified = process_commit(
-        &prior,
+        fulfillment_prior,
         &commit,
         &fulfillment_aad,
         next_coordinate,
@@ -1374,6 +1414,9 @@ fn build_two_member_fulfillment_products(
         commit,
         welcome,
         application_messages,
+        removal_commit,
+        removal_next,
+        application_message,
     })
 }
 
@@ -1577,20 +1620,47 @@ pub(super) async fn seed_durable_recovery_fixture_for_identity(
     trusted_instant: &TrustedRequestInstant,
     identity: FixtureIdentity,
 ) -> Result<DurableRecoveryFixture, String> {
+    seed_durable_recovery_fixture_with_pending(pool, trusted_instant, identity, None, false).await
+}
+
+pub(super) async fn seed_durable_recovery_fixture_with_pending(
+    pool: &PgPool,
+    trusted_instant: &TrustedRequestInstant,
+    identity: FixtureIdentity,
+    pending: Option<&FixtureIdentity>,
+    direct: bool,
+) -> Result<DurableRecoveryFixture, String> {
     let conversation_id = Uuid::new_v4();
     let at = trusted_instant.datetime();
     let (group_info, state) = build_genesis_state(&identity, conversation_id, at)?;
     let prior = state.coordinate().clone();
-    let creation = build_real_creation_entry(
-        &identity,
-        conversation_id,
-        &prior,
-        &group_info,
-        trusted_instant.as_str(),
-    )?;
+    let mut creation = match pending {
+        Some(pending) => build_real_creation_entry_with_pending(
+            &identity, pending, conversation_id, &prior, &group_info, trusted_instant.as_str(),
+        )?,
+        None => build_real_creation_entry(
+            &identity, conversation_id, &prior, &group_info, trusted_instant.as_str(),
+        )?,
+    };
+    if direct {
+        let mut wrapper: Value = serde_json::from_slice(&creation.raw_wrapper).map_err(|e| e.to_string())?;
+        wrapper["body"]["conversationKind"] = json!("direct");
+        for participant in wrapper["body"]["manifest"]["participants"].as_array_mut().unwrap() {
+            participant["role"] = json!("admin");
+        }
+        let signed = sign_canonical_wrapper(&identity, wrapper["body"].clone(), SignedMutationKind::Creation)?;
+        creation.raw_wrapper = signed.raw_wrapper;
+        let mut row: Value = serde_json::from_slice(&creation.public_row_json).map_err(|e| e.to_string())?;
+        row["signedRequest"] = serde_json::from_slice(&creation.raw_wrapper).map_err(|e| e.to_string())?;
+        creation.public_row_json = serde_json::to_vec(&row).map_err(|e| e.to_string())?;
+        creation.outer_fingerprint = *decode_and_verify_control_entry(&creation.public_row_json, &identity.signing_public_key())
+            .map_err(|e| format!("verify direct fixture creation: {e:?}"))?.outer_control_fingerprint();
+    }
     let (key_package_ref, key_package_wrapper, init_key) =
         build_available_key_package(&identity, at)?;
     seed_identity(pool, &identity, trusted_instant).await?;
+    if let Some(pending) = pending { seed_identity(pool, pending, trusted_instant).await?; }
+
 
     let verified =
         decode_and_verify_signed_mutation(&creation.raw_wrapper, &identity.signing_public_key())
@@ -1615,9 +1685,11 @@ pub(super) async fn seed_durable_recovery_fixture_for_identity(
         .begin()
         .await
         .map_err(|error| format!("begin durable fixture: {error}"))?;
-    sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at) VALUES($1,'group','active',0,0,2,$2)")
-        .bind(conversation_id).bind(at).execute(&mut *transaction).await
-        .map_err(|error| format!("insert durable fixture conversation: {error}"))?;
+    let pair = pending.map(|other| if identity.did < other.did { (&identity.did, &other.did) } else { (&other.did, &identity.did) });
+    sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at,direct_did_low,direct_did_high) VALUES($1,$3,'active',0,0,2,$2,$4,$5)")
+        .bind(conversation_id).bind(at).bind(if direct { "direct" } else { "group" })
+        .bind(if direct { pair.map(|p| p.0) } else { None }).bind(if direct { pair.map(|p| p.1) } else { None })
+        .execute(&mut *transaction).await.map_err(|error| format!("insert durable fixture conversation: {error}"))?;
     sqlx::query("INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,0,1,$5)")
         .bind(conversation_id).bind(prior.group_id()).bind(&group_info).bind(Sha256::digest(&group_info).to_vec()).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert durable fixture generation: {error}"))?;
@@ -1631,6 +1703,12 @@ pub(super) async fn seed_durable_recovery_fixture_for_identity(
     sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,current_membership,created_at) VALUES($1,$2,$3,'active','admin',$4,$5,$3,$6,true,$5)"#)
         .bind(participant_period_id).bind(conversation_id).bind(&identity.did).bind(creation.transition_id).bind(at).bind(identity.device_id)
         .execute(&mut *transaction).await.map_err(|error| format!("insert durable fixture participant: {error}"))?;
+    if let Some(pending) = pending {
+        sqlx::query("INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,invitation_entry_id,invited_at,current_membership,created_at) VALUES($1,$2,$3,'pending',$4,$5,$6,$7,$8,$5,$9,$6,true,$6)")
+            .bind(Uuid::new_v4()).bind(conversation_id).bind(&pending.did).bind(if direct { "admin" } else { "member" })
+            .bind(creation.transition_id).bind(at).bind(&identity.did).bind(identity.device_id).bind(creation.entry_id)
+            .execute(&mut *transaction).await.map_err(|e| format!("insert pending leave fixture participant: {e}"))?;
+    }
     sqlx::query(r#"INSERT INTO chat.member_devices(leaf_period_id,participant_period_id,conversation_id,generation,user_did,device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,leaf_auth_generation,origin,joined_state_version,joined_transition_id,joined_seq,active,created_at) VALUES($1,$2,$3,0,$4,$5,0,$6,$7,$8,1,'genesis',0,$9,1,true,$10)"#)
         .bind(leaf_period_id).bind(participant_period_id).bind(conversation_id).bind(&identity.did).bind(identity.device_id).bind(&basic_credential).bind(identity.signing_public_key().to_vec()).bind(&identity.key_id).bind(creation.transition_id).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert durable fixture leaf: {error}"))?;
@@ -1648,6 +1726,13 @@ pub(super) async fn seed_durable_recovery_fixture_for_identity(
     sqlx::query(r#"INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)"#)
         .bind(key_package_ref.to_vec()).bind(&key_package_wrapper).bind(Sha256::digest(&key_package_wrapper).to_vec()).bind(init_key).bind(&identity.did).bind(identity.device_id).bind(&identity.key_id).bind(key_package_not_before).bind(key_package_not_after).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert durable fixture KeyPackage: {error}"))?;
+    if let Some(pending) = pending {
+        let (package_ref, wrapper, init_key) = build_available_key_package(pending, at)?;
+        sqlx::query("INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)")
+            .bind(package_ref.to_vec()).bind(&wrapper).bind(Sha256::digest(&wrapper).to_vec()).bind(init_key)
+            .bind(&pending.did).bind(pending.device_id).bind(&pending.key_id).bind(key_package_not_before).bind(key_package_not_after).bind(at)
+            .execute(&mut *transaction).await.map_err(|e| format!("insert accepting fixture package: {e}"))?;
+    }
     transaction
         .commit()
         .await
@@ -1674,6 +1759,20 @@ pub(super) async fn seed_durable_recovery_fulfillment_fixture_for_identities(
     fulfiller: FixtureIdentity,
     fulfillment_transition_id: Uuid,
 ) -> Result<DurableRecoveryFulfillmentFixture, String> {
+    seed_recovery_package_reuse_fixture(
+        pool, trusted_instant, requester, fulfiller, fulfillment_transition_id, false,
+    )
+    .await
+}
+
+pub(super) async fn seed_recovery_package_reuse_fixture(
+    pool: &PgPool,
+    trusted_instant: &TrustedRequestInstant,
+    requester: FixtureIdentity,
+    fulfiller: FixtureIdentity,
+    fulfillment_transition_id: Uuid,
+    after_policy: bool,
+) -> Result<DurableRecoveryFulfillmentFixture, String> {
     if requester.did == fulfiller.did {
         return Err("Recovery fulfillment fixture requires two distinct DIDs".to_owned());
     }
@@ -1687,6 +1786,7 @@ pub(super) async fn seed_durable_recovery_fulfillment_fixture_for_identities(
         add_transition_id,
         fulfillment_transition_id,
         at,
+        after_policy,
     )?;
     let prior = products.prior.coordinate().clone();
     let creation = build_real_creation_entry_with_pending(
@@ -1775,7 +1875,7 @@ pub(super) async fn seed_durable_recovery_fulfillment_fixture_for_identities(
         || products.genesis.coordinate().state_version() != 0
         || products.acceptance.coordinate().state_version() != 1
         || products.prior.coordinate().state_version() != 2
-        || products.next.coordinate().state_version() != 3
+        || products.next.coordinate().state_version() != 3 + u64::from(after_policy)
         || products.genesis.coordinate().epoch() != 0
         || products.acceptance.coordinate().epoch() != 0
         || products.prior.coordinate().epoch() != 1
@@ -1933,6 +2033,9 @@ pub(super) async fn seed_durable_recovery_fulfillment_fixture_for_identities(
         commit: products.commit,
         welcome: products.welcome,
         application_messages: products.application_messages,
+        removal_commit: products.removal_commit,
+        removal_next: products.removal_next,
+        application_message: products.application_message,
     })
 }
 
@@ -2176,6 +2279,143 @@ pub(super) async fn authorize(
     }
 }
 
+pub(super) async fn admit_entry_read(
+    pool: &PgPool, identity: &FixtureIdentity, trusted_instant: &TrustedRequestInstant,
+) -> Result<crate::chat_protocol::dpop::VerifiedReadAdmission, String> {
+    admit_read(pool, identity, "blue.catbird.chat.getEntries", trusted_instant).await
+}
+
+pub(super) async fn admit_read(
+    pool: &PgPool,
+    identity: &FixtureIdentity,
+    endpoint_text: &str,
+    trusted_instant: &TrustedRequestInstant,
+) -> Result<crate::chat_protocol::dpop::VerifiedReadAdmission, String> {
+    let endpoint = ValidatedChatNsid::parse(endpoint_text)
+        .map_err(|error| format!("parse Recovery proof endpoint: {error:?}"))?;
+    let method = endpoint
+        .dpop_method()
+        .map_err(|error| format!("derive Recovery proof endpoint method: {error:?}"))?;
+    let nest_key = fresh_p256(b"nest", identity.device_id)?;
+    let external_base = TrustedExternalBase::parse(EXTERNAL_BASE, &BTreeSet::new())
+        .map_err(|error| format!("parse Recovery proof external base: {error:?}"))?;
+    let chat_instance = CanonicalUuidV4::parse(CHAT_INSTANCE)
+        .map_err(|error| format!("parse Recovery proof chat instance: {error:?}"))?;
+    let trust = TrustedNestVerifier::new(
+        NEST_ISSUER,
+        NEST_AUDIENCE,
+        chat_instance,
+        NEST_KEY_ID,
+        nest_key.verifying_key().to_owned(),
+        external_base,
+    )
+    .map_err(|error| format!("construct Recovery proof Nest trust: {error:?}"))?;
+    let now = trusted_instant.datetime().timestamp();
+    let token = sign_jwt(
+        json!({"alg":"ES256","typ":"JWT","kid":NEST_KEY_ID}),
+        json!({
+            "iss": NEST_ISSUER,
+            "sub": &identity.did,
+            "aud": NEST_AUDIENCE,
+            "lxm": endpoint.as_str(),
+            "iat": now - 1,
+            "exp": now + 60,
+            "jti": Uuid::new_v4().hyphenated().to_string(),
+            "cnf": {"jkt": &identity.proof_jkt},
+            "device_id": identity.device_id.hyphenated().to_string(),
+            "chat_instance": CHAT_INSTANCE,
+        }),
+        &nest_key,
+    )?;
+    let dpop = sign_dpop(
+        &identity.proof_signing_key,
+        &identity.proof_jwk,
+        method.as_str(),
+        trust.external_base().htu(&endpoint),
+        &token,
+        now,
+    )?;
+    let pre_replay = dpop::verify_ordinary_request_auth(
+        &trust,
+        &format!("DPoP {token}"),
+        &dpop,
+        &endpoint,
+        &method,
+        trusted_instant,
+    )
+    .map_err(|error| format!("verify Recovery proof Nest/DPoP request: {error:?}"))?;
+    let authority = crate::chat_protocol::repository::auth::authorize_unsigned_request(pool, pre_replay)
+        .await.map_err(|e| format!("authorize signed read request: {e:?}"))?;
+    crate::chat_protocol::dpop::seal_read_admission(authority)
+        .map_err(|e| format!("seal signed read admission: {e:?}"))
+}
+
+pub(super) async fn admit_lifecycle(
+    pool: &PgPool,
+    identity: &FixtureIdentity,
+    endpoint_text: &str,
+    envelope: &SignedRecoveryEnvelope,
+    trusted_instant: &TrustedRequestInstant,
+) -> Result<crate::chat_protocol::repository::auth::SignedOperationAdmission, String> {
+    let endpoint = ValidatedChatNsid::parse(endpoint_text)
+        .map_err(|error| format!("parse Recovery proof endpoint: {error:?}"))?;
+    let method = endpoint
+        .dpop_method()
+        .map_err(|error| format!("derive Recovery proof endpoint method: {error:?}"))?;
+    let nest_key = fresh_p256(b"nest", identity.device_id)?;
+    let external_base = TrustedExternalBase::parse(EXTERNAL_BASE, &BTreeSet::new())
+        .map_err(|error| format!("parse Recovery proof external base: {error:?}"))?;
+    let chat_instance = CanonicalUuidV4::parse(CHAT_INSTANCE)
+        .map_err(|error| format!("parse Recovery proof chat instance: {error:?}"))?;
+    let trust = TrustedNestVerifier::new(
+        NEST_ISSUER,
+        NEST_AUDIENCE,
+        chat_instance,
+        NEST_KEY_ID,
+        nest_key.verifying_key().to_owned(),
+        external_base,
+    )
+    .map_err(|error| format!("construct Recovery proof Nest trust: {error:?}"))?;
+    let now = trusted_instant.datetime().timestamp();
+    let token = sign_jwt(
+        json!({"alg":"ES256","typ":"JWT","kid":NEST_KEY_ID}),
+        json!({
+            "iss": NEST_ISSUER,
+            "sub": &identity.did,
+            "aud": NEST_AUDIENCE,
+            "lxm": endpoint.as_str(),
+            "iat": now - 1,
+            "exp": now + 60,
+            "jti": Uuid::new_v4().hyphenated().to_string(),
+            "cnf": {"jkt": &identity.proof_jkt},
+            "device_id": identity.device_id.hyphenated().to_string(),
+            "chat_instance": CHAT_INSTANCE,
+        }),
+        &nest_key,
+    )?;
+    let dpop = sign_dpop(
+        &identity.proof_signing_key,
+        &identity.proof_jwk,
+        method.as_str(),
+        trust.external_base().htu(&endpoint),
+        &token,
+        now,
+    )?;
+    let pre_replay = dpop::verify_ordinary_request_auth(
+        &trust,
+        &format!("DPoP {token}"),
+        &dpop,
+        &endpoint,
+        &method,
+        trusted_instant,
+    )
+    .map_err(|error| format!("verify Recovery proof Nest/DPoP request: {error:?}"))?;
+    let canonical = decode_canonical_signed_mutation(&envelope.raw_wrapper)
+        .map_err(|error| format!("decode Recovery proof signed request: {error:?}"))?;
+    crate::chat_protocol::repository::auth::authorize_signed_operation_only(pool, pre_replay, canonical)
+        .await.map_err(|error| format!("admit lifecycle signed operation: {error:?}"))
+}
+
 pub(super) fn leaf_recovery_request(
     identity: &FixtureIdentity,
     request_id: Uuid,
@@ -2285,13 +2525,13 @@ fn signed_recovery_envelope(
     sign_canonical_wrapper(identity, body, kind)
 }
 
-fn sign_canonical_wrapper(
+pub(super) fn sign_canonical_wrapper(
     identity: &FixtureIdentity,
     body: Value,
     expected_kind: SignedMutationKind,
 ) -> Result<SignedRecoveryEnvelope, String> {
-    let operation_id = body["idempotencyKey"]
-        .as_str()
+    let operation_id = body.get("idempotencyKey").or_else(|| body.get("messageId"))
+        .and_then(Value::as_str)
         .ok_or_else(|| "Recovery fixture body is missing idempotencyKey".to_owned())
         .and_then(|value| {
             Uuid::parse_str(value)
@@ -2400,4 +2640,21 @@ fn sign_dpop(
         }),
         key,
     )
+}
+
+/// Fresh signed Creation input without any durable aggregate or authority.
+/// The facade must create and authorize every resulting row itself.
+pub(super) fn creation_envelope(
+    creator: &FixtureIdentity,
+    conversation_id: Uuid,
+    trusted: &TrustedRequestInstant,
+) -> Result<SignedRecoveryEnvelope, String> {
+    let (group_info, state) = build_genesis_state(creator, conversation_id, trusted.datetime())?;
+    let creation = build_real_creation_entry(
+        creator, conversation_id, state.coordinate(), &group_info, trusted.as_str(),
+    )?;
+    let mut wrapper: Value = serde_json::from_slice(&creation.raw_wrapper).map_err(|e| e.to_string())?;
+    wrapper["body"]["signedAt"] = json!(trusted.as_str());
+    wrapper["body"]["idempotencyKey"] = wrapper["body"]["transitionId"].clone();
+    sign_canonical_wrapper(creator, wrapper["body"].clone(), SignedMutationKind::Creation)
 }

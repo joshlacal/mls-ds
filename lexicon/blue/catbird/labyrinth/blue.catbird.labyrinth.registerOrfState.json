@@ -1,0 +1,68 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.registerOrfState",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Create a device's ORF server state: orf_server_init without a parent, else orf_server_evolve(parent state, evolveToken). ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "deviceKeyPubkey"
+          ],
+          "properties": {
+            "deviceKeyPubkey": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "The device (or a one-time-code temporary id)."
+            },
+            "parent": {
+              "type": "ref",
+              "ref": "#parent"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "RecordAlreadyExists"
+        },
+        {
+          "name": "OrfStateNotFound"
+        }
+      ]
+    },
+    "parent": {
+      "type": "object",
+      "required": [
+        "deviceKeyPubkey",
+        "evolveToken"
+      ],
+      "properties": {
+        "deviceKeyPubkey": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32,
+          "description": "Parent device."
+        },
+        "evolveToken": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32,
+          "description": "ORF evolve token."
+        }
+      }
+    }
+  }
+}

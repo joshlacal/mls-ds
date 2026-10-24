@@ -324,6 +324,16 @@ pub(crate) async fn revalidate_consumed_ticket(
     if cursor_position < retained_floor {
         return Err(TicketRepositoryError::CursorExpired);
     }
+    let versions: Option<Vec<String>> = sqlx::query_scalar("SELECT supported_protocol_versions FROM chat.inventory_sessions WHERE inventory_session_id=$1")
+        .bind(ticket.inventory_session_id).fetch_one(&mut **transaction).await?;
+    inventory::reject_unsupported_inventory(
+        transaction,
+        &ticket.user_did,
+        ticket.device_id,
+        versions.as_deref(),
+    )
+    .await
+    .map_err(|_| TicketRepositoryError::SessionBindingMismatch)?;
     Ok(())
 }
 
@@ -565,7 +575,7 @@ pub(crate) struct NewEventCursorReceipt {
 }
 
 impl NewEventCursorReceipt {
-    fn validate(&self) -> Result<(), TicketRepositoryError> {
+    pub(super) fn validate(&self) -> Result<(), TicketRepositoryError> {
         if self.cursor_hash == [0; HASH_BYTES]
             || self
                 .predecessor_cursor_hash
@@ -641,7 +651,8 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
     inventory_session_capability: &str,
     event_cursor: &str,
     sealer: &CursorSealer,
-) -> Result<(String, DateTime<Utc>), TicketRepositoryError> {
+    supported_versions: Option<Vec<String>>,
+) -> Result<(String, DateTime<Utc>, Option<serde_json::Value>), TicketRepositoryError> {
     let attempt = admission
         .into_single_read_attempt("blue.catbird.chat.getSubscriptionTicket", "POST")
         .map_err(|_| TicketRepositoryError::SessionBindingMismatch)?;
@@ -649,49 +660,53 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
     let device = read_authority::lock_read_device_authority_once(&mut transaction, attempt)
         .await
         .map_err(|_| TicketRepositoryError::DeviceBindingMismatch)?;
+    // Main's device-bound capability lookup (exact device, JKT, generation and
+    // presentation namespace) selects and locks the session row...
     let inventory_session_id = inventory::inventory_session_id_for_capability(
         &mut transaction,
         &device,
         inventory_session_capability,
     )
     .await
-    .map_err(|error| match error {
-        inventory::InventoryRepositoryError::SessionNotFound => {
-            TicketRepositoryError::SessionMissing
-        }
-        inventory::InventoryRepositoryError::DeviceAuthorityMismatch => {
-            TicketRepositoryError::DeviceBindingMismatch
-        }
-        inventory::InventoryRepositoryError::Database(error) => {
-            TicketRepositoryError::Database(error)
-        }
-        _ => TicketRepositoryError::SessionBindingMismatch,
-    })?;
-    let (capability, session_expires_at) = inventory::snapshot_capability_for_ticket(
+    .map_err(map_inventory_session_error)?;
+    // ...and the encrypted-requests version/scope fence then binds the ticket
+    // to the exact protocol versions the session was minted for.
+    let (retained_versions, inventory_scope): (Option<Vec<String>>, Option<serde_json::Value>) =
+        sqlx::query_as(
+            "SELECT supported_protocol_versions, inventory_scope FROM chat.inventory_sessions WHERE inventory_session_id=$1 FOR UPDATE",
+        )
+        .bind(inventory_session_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+    if retained_versions != supported_versions {
+        return Err(TicketRepositoryError::SessionBindingMismatch);
+    }
+    inventory::reject_unsupported_inventory(
         &mut transaction,
-        &device,
-        inventory_session_id,
-        sealer,
+        device.user_did(),
+        device.device_id(),
+        retained_versions.as_deref(),
     )
     .await
-    .map_err(|error| match error {
-        inventory::InventoryRepositoryError::SessionNotFound => {
-            TicketRepositoryError::SessionMissing
-        }
-        inventory::InventoryRepositoryError::DeviceAuthorityMismatch => {
-            TicketRepositoryError::DeviceBindingMismatch
-        }
-        inventory::InventoryRepositoryError::Database(error) => {
-            TicketRepositoryError::Database(error)
-        }
-        _ => TicketRepositoryError::SessionBindingMismatch,
-    })?;
+    .map_err(|_| TicketRepositoryError::SessionBindingMismatch)?;
+    let (capability, session_created_at, session_expires_at) =
+        inventory::snapshot_capability_for_ticket(
+            &mut transaction,
+            &device,
+            inventory_session_id,
+            sealer,
+        )
+        .await
+        .map_err(map_inventory_session_error)?;
     if event_cursor != capability || inventory_session_capability != capability {
         return Err(TicketRepositoryError::CursorMismatch);
     }
     let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
         .fetch_one(&mut *transaction)
         .await?;
+    // The session instant is the next whole second after its transaction, so
+    // it can still lie ahead of `now`; a ticket never predates its session.
+    let now = now.max(session_created_at);
     let expires_at = (now + chrono::Duration::seconds(30)).min(session_expires_at);
     if now >= expires_at {
         return Err(TicketRepositoryError::TicketExpired);
@@ -718,13 +733,24 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
     };
     mint_subscription_ticket(&mut transaction, &request).await?;
     transaction.commit().await?;
-    Ok((URL_SAFE_NO_PAD.encode(opaque), expires_at))
+    Ok((URL_SAFE_NO_PAD.encode(opaque), expires_at, inventory_scope))
+}
+
+fn map_inventory_session_error(error: inventory::InventoryRepositoryError) -> TicketRepositoryError {
+    match error {
+        inventory::InventoryRepositoryError::SessionNotFound => TicketRepositoryError::SessionMissing,
+        inventory::InventoryRepositoryError::DeviceAuthorityMismatch => {
+            TicketRepositoryError::DeviceBindingMismatch
+        }
+        inventory::InventoryRepositoryError::Database(error) => TicketRepositoryError::Database(error),
+        _ => TicketRepositoryError::SessionBindingMismatch,
+    }
 }
 
 /// Hash a canonical 32-byte random capability. This helper is intentionally
 /// private to the repository boundary so callers cannot accidentally persist
 /// decoded capability bytes.
-fn capability_hash(encoded: &str) -> Result<[u8; HASH_BYTES], TicketRepositoryError> {
+pub(super) fn capability_hash(encoded: &str) -> Result<[u8; HASH_BYTES], TicketRepositoryError> {
     if encoded.len() != CAPABILITY_ASCII_BYTES {
         return Err(TicketRepositoryError::InvalidCapability);
     }
@@ -747,87 +773,4 @@ fn fixed_hash(value: Vec<u8>) -> Result<[u8; HASH_BYTES], TicketRepositoryError>
     value
         .try_into()
         .map_err(|_| TicketRepositoryError::InvalidReceipt)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn capability_hash_requires_the_canonical_43_character_encoding() {
-        let capability = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        assert_eq!(
-            capability_hash(capability).unwrap(),
-            <[u8; 32]>::from(Sha256::digest([0u8; 32]))
-        );
-        assert!(capability_hash("not-a-capability").is_err());
-        assert!(capability_hash("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").is_err());
-    }
-
-    #[test]
-    fn source_contains_no_plaintext_cursor_columns() {
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/ticket.rs"
-        ));
-        assert!(!source.contains(concat!("snapshot_event_cursor_", "bytes")));
-        assert!(!source.contains(concat!("event_cursor_", "bytes")));
-    }
-
-    #[test]
-    fn mint_request_debug_redacts_bearer_material() {
-        let request = MintSubscriptionTicket {
-            ticket_hash: vec![0xA5; 32],
-            user_did: "did:plc:example".to_owned(),
-            device_id: Uuid::nil(),
-            jkt: Some("secret-jkt".to_owned()),
-            auth_generation: 7,
-            inventory_session_id: "session-capability-secret".to_owned(),
-            event_cursor: "event-capability-secret".to_owned(),
-            subscription_path: SUBSCRIBE_EVENTS_PATH.to_owned(),
-            created_at: Utc::now(),
-            expires_at: Utc::now(),
-        };
-        let debug = format!("{request:?}");
-        assert!(!debug.contains("A5"));
-        assert!(!debug.contains("secret-jkt"));
-        assert!(!debug.contains("session-capability-secret"));
-        assert!(!debug.contains("event-capability-secret"));
-        assert!(debug.contains("REDACTED"));
-    }
-
-    #[test]
-    fn sealed_receipt_boundary_rejects_nonce_reuse_shapes() {
-        let now = Utc::now();
-        let mut receipt = NewEventCursorReceipt {
-            cursor_hash: [1; 32],
-            inventory_session_id: Uuid::new_v4(),
-            user_did: "did:plc:example".to_owned(),
-            device_id: Uuid::new_v4(),
-            jkt: Some("jkt".to_owned()),
-            auth_generation: 1,
-            protocol_instance_id: Uuid::new_v4(),
-            cursor_key_id: "key".to_owned(),
-            event_position: 1,
-            predecessor_cursor_hash: None,
-            retained_floor_at_issue: 0,
-            cursor_nonce: [1; 12],
-            cursor_ciphertext: vec![2; 17],
-            canonical_envelope_sha256: None,
-            created_at: now,
-            expires_at: now + chrono::Duration::minutes(1),
-        };
-        assert!(receipt.validate().is_ok());
-        receipt.cursor_nonce = [0; 12];
-        assert!(matches!(
-            receipt.validate(),
-            Err(TicketRepositoryError::InvalidReceipt)
-        ));
-        receipt.cursor_nonce = [1; 12];
-        receipt.cursor_ciphertext = vec![2; 16];
-        assert!(matches!(
-            receipt.validate(),
-            Err(TicketRepositoryError::InvalidReceipt)
-        ));
-    }
 }

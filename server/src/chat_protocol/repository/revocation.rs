@@ -51,6 +51,8 @@ use catbird_atproto::generated::blue_catbird::chat as chat_dto;
 
 const REVOKE_DEVICE_NSID: &str = "blue.catbird.chat.revokeDevice";
 const G6_REPLAY_POST_STATE_DOMAIN: &[u8] = b"CATBIRD-CHAT-G6-REPLAY-POST-STATE\0";
+/// Discovery→lock→rediscovery attempts before scope drift becomes an error.
+const G6_SCOPE_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Error)]
 pub(crate) enum DeviceRevocationFacadeError {
@@ -451,39 +453,71 @@ async fn prepare_first_device_revocation(
             .mutation()
             .ok_or(DeviceRevocationFacadeError::Integrity)?,
     )?;
-    let (prepared, discovery) = prepare_g6_identity_scope(
-        transaction,
-        &authority,
-        reservation,
-        &input.target_did,
-        input.target_device_id,
-    )
-    .await
-    .map_err(|error| match error {
-        // The admitted actor is already locked and every other audience device
-        // was selected from live rows. The target is the only identity forced
-        // into G6 discovery, so a missing device at this boundary is the
-        // endpoint's declared target-not-found result.
-        LockedG6PreludeError::Prelude(PreludeError::MissingDevice) => {
-            DeviceRevocationFacadeError::TargetMissing
+    // G6 discovers its scope lock-free, then locks it and rediscovers. A
+    // concurrent commit between the two (e.g. a direct-request publication
+    // adding a conversation for the target device) is legitimate, so drift
+    // rewinds to this savepoint — releasing every identity lock and the
+    // uncommitted claim while keeping the operation lock — and rediscovers.
+    let mut reservation = reservation;
+    let mut attempt = 1;
+    let (prepared, locked_device_view, scope) = loop {
+        sqlx::query("SAVEPOINT g6_revocation_scope")
+            .execute(&mut **transaction)
+            .await?;
+        let (prepared, discovery) = prepare_g6_identity_scope(
+            transaction,
+            &authority,
+            reservation,
+            &input.target_did,
+            input.target_device_id,
+        )
+        .await
+        .map_err(|error| match error {
+            // The admitted actor is already locked and every other audience device
+            // was selected from live rows. The target is the only identity forced
+            // into G6 discovery, so a missing device at this boundary is the
+            // endpoint's declared target-not-found result.
+            LockedG6PreludeError::Prelude(PreludeError::MissingDevice) => {
+                DeviceRevocationFacadeError::TargetMissing
+            }
+            error => DeviceRevocationFacadeError::G6Prelude(error),
+        })?;
+        let prepared = prepared.verify_device_revocation_operation(
+            input.operation_id,
+            authority
+                .mutation()
+                .ok_or(DeviceRevocationFacadeError::Integrity)?,
+        )?;
+        let locked_device_view = lock_active_revocation_device_view(
+            transaction,
+            &input.target_did,
+            input.target_device_id,
+            input.target_auth_generation,
+            prepared.scope_authority().trusted_instant(),
+        )
+        .await?;
+        match seal_g6_scope_authority(transaction, prepared.scope_authority(), discovery).await {
+            Ok(scope) => {
+                sqlx::query("RELEASE SAVEPOINT g6_revocation_scope")
+                    .execute(&mut **transaction)
+                    .await?;
+                break (prepared, locked_device_view, scope);
+            }
+            Err(LockedG6PreludeError::DiscoveryDrift) if attempt < G6_SCOPE_ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    "revokeDevice G6 scope changed between discovery and identity locks; retrying"
+                );
+                drop(locked_device_view);
+                sqlx::query("ROLLBACK TO SAVEPOINT g6_revocation_scope")
+                    .execute(&mut **transaction)
+                    .await?;
+                reservation = prepared.into_rewound_reservation(transaction).await?;
+                attempt += 1;
+            }
+            Err(error) => return Err(error.into()),
         }
-        error => DeviceRevocationFacadeError::G6Prelude(error),
-    })?;
-    let prepared = prepared.verify_device_revocation_operation(
-        input.operation_id,
-        authority
-            .mutation()
-            .ok_or(DeviceRevocationFacadeError::Integrity)?,
-    )?;
-    let locked_device_view = lock_active_revocation_device_view(
-        transaction,
-        &input.target_did,
-        input.target_device_id,
-        input.target_auth_generation,
-        prepared.scope_authority().trusted_instant(),
-    )
-    .await?;
-    let scope = seal_g6_scope_authority(transaction, prepared.scope_authority(), discovery).await?;
+    };
     if locked_device_view.transaction_id() != scope.transaction_id() {
         return Err(DeviceRevocationFacadeError::Integrity);
     }
@@ -895,6 +929,8 @@ async fn prepare_device_revocation_replay(
         updated_at: target.updated_at,
         available_package_count: target.available_package_count,
         reserved_package_count: target.reserved_package_count,
+        request_available_package_count: 0,
+        request_reserved_package_count: 0,
         capabilities_json: target.capabilities_json,
     };
     let expected_response_sha256 =

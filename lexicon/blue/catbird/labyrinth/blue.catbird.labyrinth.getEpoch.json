@@ -1,0 +1,50 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.getEpoch",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "One epoch by number. Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "epochNumber"
+        ],
+        "properties": {
+          "epochNumber": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1099511627776,
+            "description": "Epoch number."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "epochId",
+            "record"
+          ],
+          "properties": {
+            "epochId": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "The epochID."
+            },
+            "record": {
+              "type": "unknown",
+              "description": "A blue.catbird.labyrinth.epoch record."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "EpochNotFound"
+        }
+      ]
+    }
+  }
+}

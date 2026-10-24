@@ -1070,15 +1070,15 @@ fn canonical_new_pending_welcomes(
                 .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?,
             "coordinates": coordinate_json(successor)?,
             "status": "pending",
-            "opaqueWelcome": STANDARD.encode(welcome.opaque_welcome()),
-            "sha256": STANDARD.encode(welcome.sha256()),
+            "opaqueWelcome": {"$bytes": STANDARD.encode(welcome.opaque_welcome())},
+            "sha256": {"$bytes": STANDARD.encode(welcome.sha256())},
             "recipientDid": did,
             "recipientDeviceId":
                 Uuid::from_bytes(*welcome.recipient().device_id()).hyphenated().to_string(),
             "provenance": {
                 "recoveryRequestId":
                     Uuid::from_bytes(*welcome.recovery_request_id()).hyphenated().to_string(),
-                "keyPackageRef": STANDARD.encode(welcome.key_package_ref()),
+                "keyPackageRef": {"$bytes": STANDARD.encode(welcome.key_package_ref())},
             },
             "expiresAt": canonical_datetime(expires_at),
         }));
@@ -1570,13 +1570,13 @@ fn replay_welcome_json(
             "transitionSeq": row.entry_seq,
             "coordinates": coordinate_json(successor)?,
             "status": "pending",
-            "opaqueWelcome": STANDARD.encode(&row.wrapper_bytes),
-            "sha256": STANDARD.encode(&row.wrapper_sha256),
+            "opaqueWelcome": {"$bytes": STANDARD.encode(&row.wrapper_bytes)},
+            "sha256": {"$bytes": STANDARD.encode(&row.wrapper_sha256)},
             "recipientDid": row.recipient_did,
             "recipientDeviceId": row.recipient_device_id.hyphenated().to_string(),
             "provenance": {
                 "recoveryRequestId": row.recovery_request_id.hyphenated().to_string(),
-                "keyPackageRef": STANDARD.encode(&row.key_package_ref),
+                "keyPackageRef": {"$bytes": STANDARD.encode(&row.key_package_ref)},
             },
             "expiresAt": canonical_datetime(row.expires_at),
         }));
@@ -1745,4 +1745,26 @@ fn protocol_u64(value: i64) -> Result<u64, SubmitTransitionFacadeError> {
         .ok()
         .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
         .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)
+}
+
+#[cfg(all(
+    feature = "chat-protocol-production-proof",
+    not(feature = "server-bin")
+))]
+pub(crate) async fn discover_control_scope_for_proof(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    add_principals: &[String],
+) -> Result<CanonicalLockScope, String> {
+    discover_submit_transition_identity_scope_for_actor(
+        transaction,
+        conversation_id,
+        actor_did,
+        actor_device_id,
+        add_principals,
+    )
+    .await
+    .map_err(|e| format!("control scope: {e:?}"))
 }

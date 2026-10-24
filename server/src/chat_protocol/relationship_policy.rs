@@ -55,8 +55,11 @@ const MAX_PERSISTED_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const CANONICAL_DID_SET_MAGIC: &[u8; 8] = b"CBDID001";
 const CANONICAL_RELATIONSHIP_EVIDENCE_MAGIC: &[u8; 8] = b"CBREL001";
 const MAX_PINNED_CLIENT_POOL_ENTRIES: usize = MAX_ROSTER_SIZE * 2 + 2;
-const HARDENED_SOURCE_PROFILE_V1: &[u8] =
+pub(crate) const HARDENED_SOURCE_PROFILE_V1: &[u8] =
     b"reqwest-pinned-system-dns/no-proxy/no-redirect/public-only/credential-free/v1";
+#[cfg(feature = "test-support")]
+pub(crate) const TEST_HTTPS_SOURCE_PROFILE_V1: &[u8] =
+    b"test-support/exact-host-loopback/custom-ca/no-proxy/no-redirect/credential-free/v1";
 #[cfg(test)]
 const UNTRUSTED_TEST_SOURCE_PROFILE: &[u8] = b"untrusted-test-source";
 #[cfg(feature = "test-support")]
@@ -65,6 +68,9 @@ const FEDERATION_TEST_SOURCE_PROFILE: &[u8] = b"federation-test-allow-all/v1";
 const GRAPH_PATH: &str = "/xrpc/app.bsky.graph.getRelationships";
 const GET_RECORD_PATH: &str = "/xrpc/com.atproto.repo.getRecord";
 const DECLARATION_COLLECTION: &str = "blue.catbird.chat.declaration";
+/// Delivery-service authority (encrypted-requests) and consent policy (main)
+/// both read the one clean-chat declaration record.
+const CHAT_DECLARATION_COLLECTION: &str = DECLARATION_COLLECTION;
 const DECLARATION_RKEY: &str = "self";
 const RELATIONSHIP_TYPE: &str = "app.bsky.graph.defs#relationship";
 const DECLARATION_TYPE: &str = "blue.catbird.chat.declaration";
@@ -705,6 +711,163 @@ pub trait DnsResolver: Clone + Send + Sync + 'static {
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, TransportError>;
 }
 
+/// The transport used by the shipping relationship authority. Production
+/// builds contain only the hardened public-network variant. A `test-support`
+/// build may install one process-wide, exact-host HTTPS fixture before runtime
+/// construction; its distinct source profile prevents locally collected
+/// evidence from being confused with production-network evidence.
+#[derive(Clone)]
+pub(crate) enum ProductionRelationshipTransport {
+    Public(ReqwestPinnedTransport<SystemDnsResolver>),
+    #[cfg(feature = "test-support")]
+    TestHttps(TestHttpsRelationshipTransport),
+    /// Synthetic allow-all federation transport for the container E2E suite.
+    #[cfg(feature = "test-support")]
+    FederationAllowAll,
+}
+
+#[async_trait]
+impl PublicTransport for ProductionRelationshipTransport {
+    async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
+        match self {
+            Self::Public(transport) => transport.get(request).await,
+            #[cfg(feature = "test-support")]
+            Self::TestHttps(transport) => transport.get(request).await,
+            #[cfg(feature = "test-support")]
+            Self::FederationAllowAll => federation_allow_all_response(&request),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub(crate) struct TestHttpsRelationshipTransport {
+    pub(crate) hosts: Arc<BTreeSet<String>>,
+    pub(crate) port: u16,
+    pub(crate) client: reqwest::Client,
+}
+
+#[cfg(feature = "test-support")]
+static TEST_HTTPS_RELATIONSHIP_TRANSPORT: once_cell::sync::OnceCell<
+    TestHttpsRelationshipTransport,
+> = once_cell::sync::OnceCell::new();
+
+/// Install one CA-validated HTTPS authority for the external-process request
+/// harness. This does not seed relationship evidence or alter the projection
+/// parser. Every DID document, declaration, and graph row is fetched through
+/// the ordinary collector and checked by the ordinary policy rules.
+#[cfg(feature = "test-support")]
+pub(crate) fn install_test_https_relationship_transport(
+    hosts: &[String],
+    port: u16,
+    ca_certificate_pem: &[u8],
+) -> Result<(), String> {
+    let hosts = hosts
+        .iter()
+        .map(|host| host.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if hosts.is_empty()
+        || hosts.len() > HARD_MAX_DNS_ANSWERS
+        || hosts.iter().any(|host| {
+            host.is_empty()
+                || host == "localhost"
+                || host.parse::<IpAddr>().is_ok()
+                || !validate_public_hostname(host)
+        })
+        || port == 0
+    {
+        return Err(
+            "test HTTPS relationship fixture requires bounded explicit public DNS hosts and a port"
+                .into(),
+        );
+    }
+    let certificate = reqwest::Certificate::from_pem(ca_certificate_pem)
+        .map_err(|_| "test HTTPS relationship fixture CA is not a PEM certificate".to_owned())?;
+    let loopback = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(RedirectPolicy::none())
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(certificate);
+    for host in &hosts {
+        client = client.resolve(host, loopback);
+    }
+    let transport = TestHttpsRelationshipTransport {
+        hosts: Arc::new(hosts),
+        port,
+        client: client
+            .build()
+            .map_err(|_| "failed to construct test HTTPS relationship transport".to_owned())?,
+    };
+    TEST_HTTPS_RELATIONSHIP_TRANSPORT
+        .set(transport)
+        .map_err(|_| "test HTTPS relationship transport is already installed".to_owned())
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn installed_test_https_relationship_transport() -> Option<TestHttpsRelationshipTransport>
+{
+    TEST_HTTPS_RELATIONSHIP_TRANSPORT.get().cloned()
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait]
+impl PublicTransport for TestHttpsRelationshipTransport {
+    async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
+        if request.max_body_bytes == 0 || request.max_body_bytes > HARD_MAX_RESPONSE_BYTES {
+            return Err(TransportError::InvalidRequest);
+        }
+        validate_public_request_url(&request.url)?;
+        let host = request
+            .url
+            .host_str()
+            .ok_or(TransportError::UnsafeDestination)?
+            .to_ascii_lowercase();
+        if !self.hosts.contains(&host)
+            || !matches!(request.url.port(), None | Some(443))
+            || request.credentials != PublicCredentials::None
+        {
+            return Err(TransportError::UnsafeDestination);
+        }
+        let mut fixture_url = request.url;
+        fixture_url
+            .set_port(Some(self.port))
+            .map_err(|_| TransportError::UnsafeDestination)?;
+        let response =
+            tokio::time::timeout_at(request.deadline, self.client.get(fixture_url).send())
+                .await
+                .map_err(|_| TransportError::Deadline)?
+                .map_err(|error| {
+                    if error.is_timeout() {
+                        TransportError::Deadline
+                    } else {
+                        TransportError::Network
+                    }
+                })?;
+        if response.status().is_redirection() {
+            return Err(TransportError::Redirect);
+        }
+        let status = response.status().as_u16();
+        let body = collect_bounded(
+            response,
+            ResponseBodyBudget::new(request.max_body_bytes, request.deadline),
+        )
+        .await
+        .map_err(|error| match error {
+            outbound_body::OutboundBodyError::DeclaredTooLarge { .. }
+            | outbound_body::OutboundBodyError::StreamedTooLarge { .. }
+            | outbound_body::OutboundBodyError::LengthOverflow => TransportError::BodyTooLarge,
+            outbound_body::OutboundBodyError::DeadlineExceeded => TransportError::Deadline,
+            outbound_body::OutboundBodyError::ReadFailed(source) if source.is_timeout() => {
+                TransportError::Deadline
+            }
+            outbound_body::OutboundBodyError::ReadFailed(_)
+            | outbound_body::OutboundBodyError::InvalidJson(_) => TransportError::Network,
+        })?;
+        Ok(PublicResponse::new(status, body.to_vec()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemDnsResolver;
 
@@ -1195,18 +1358,7 @@ pub fn parse_declaration_response(
     let value = strict_json(bytes)?;
     let root = object(&value)?;
     if status != 200 {
-        if status != 400 && status != 404 {
-            return Err(AuthorityError::Unavailable);
-        }
-        reject_unknown(root, &["error", "message"])?;
-        if required_string(root, "error")? != "RecordNotFound" {
-            return Err(AuthorityError::Unavailable);
-        }
-        if let Some(message) = root.get("message") {
-            if !message.is_string() {
-                return Err(AuthorityError::Malformed);
-            }
-        }
+        require_record_not_found(status, root)?;
         return Ok(DeclarationRecord {
             incoming: IncomingPolicy::Following,
             group: IncomingPolicy::Following,
@@ -1245,7 +1397,7 @@ pub fn parse_declaration_response(
     )?;
     if required_string(record, "$type")? != DECLARATION_TYPE
         || !validate_bare_did(required_string(record, "deliveryService")?)
-        || required_string(record, "protocolVersion")? != "1"
+        || !matches!(required_string(record, "protocolVersion")?, "1" | "2")
         || DateTime::parse_from_rfc3339(required_string(record, "createdAt")?).is_err()
     {
         return Err(AuthorityError::Malformed);
@@ -1257,6 +1409,77 @@ pub fn parse_declaration_response(
         absent: false,
         cid,
     })
+}
+
+/// A non-200 getRecord response is absence only when it is exactly the
+/// PDS's typed `RecordNotFound`; every other status is unavailability.
+fn require_record_not_found(
+    status: u16,
+    root: &Map<String, Value>,
+) -> Result<(), AuthorityError> {
+    if status != 400 && status != 404 {
+        return Err(AuthorityError::Unavailable);
+    }
+    reject_unknown(root, &["error", "message"])?;
+    if required_string(root, "error")? != "RecordNotFound" {
+        return Err(AuthorityError::Unavailable);
+    }
+    if let Some(message) = root.get("message") {
+        if !message.is_string() {
+            return Err(AuthorityError::Malformed);
+        }
+    }
+    Ok(())
+}
+
+/// Strict `blue.catbird.chat.declaration/self` projection: the recipient's
+/// declared clean-chat delivery service DID, or `None` when no record exists.
+/// Every lexicon-required field must be present and no undeclared field is
+/// accepted; this never loosens the separate `chat.bsky.actor.declaration`
+/// consent parser.
+pub fn parse_chat_declaration_response(
+    recipient: &str,
+    status: u16,
+    bytes: &[u8],
+) -> Result<Option<String>, AuthorityError> {
+    if !validate_bare_did(recipient) {
+        return Err(AuthorityError::Malformed);
+    }
+    let value = strict_json(bytes)?;
+    let root = object(&value)?;
+    if status != 200 {
+        require_record_not_found(status, root)?;
+        return Ok(None);
+    }
+    reject_unknown(root, &["uri", "cid", "value"])?;
+    let expected_uri = format!("at://{recipient}/{CHAT_DECLARATION_COLLECTION}/{DECLARATION_RKEY}");
+    if required_string(root, "uri")? != expected_uri {
+        return Err(AuthorityError::Malformed);
+    }
+    if let Some(cid) = root.get("cid") {
+        if !cid.as_str().is_some_and(valid_cid) {
+            return Err(AuthorityError::Malformed);
+        }
+    }
+    let record = root
+        .get("value")
+        .ok_or(AuthorityError::Malformed)
+        .and_then(object)?;
+    reject_unknown(
+        record,
+        &["$type", "allowIncoming", "deliveryService", "protocolVersion", "createdAt"],
+    )?;
+    if required_string(record, "$type")? != CHAT_DECLARATION_COLLECTION {
+        return Err(AuthorityError::Malformed);
+    }
+    required_string(record, "allowIncoming")?;
+    required_string(record, "protocolVersion")?;
+    required_string(record, "createdAt")?;
+    let delivery_service = required_string(record, "deliveryService")?;
+    if !validate_bare_did(delivery_service) {
+        return Err(AuthorityError::Malformed);
+    }
+    Ok(Some(delivery_service.to_owned()))
 }
 
 fn valid_cid(cid: &str) -> bool {
@@ -1473,6 +1696,9 @@ impl EvidenceKind {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ProjectionOperationScope {
+    DirectRequestPreparation,
+    DirectRequestAcceptance,
+    DirectRequestPushEligibility,
     Creation,
     PendingAdd,
     Acceptance,
@@ -1484,6 +1710,9 @@ pub(crate) enum ProjectionOperationScope {
 impl ProjectionOperationScope {
     pub(crate) const fn as_persisted_str(self) -> &'static str {
         match self {
+            Self::DirectRequestPreparation => "directRequestPreparation",
+            Self::DirectRequestAcceptance => "directRequestAcceptance",
+            Self::DirectRequestPushEligibility => "directRequestPushEligibility",
             Self::Creation => "creation",
             Self::PendingAdd => "pendingAdd",
             Self::Acceptance => "acceptance",
@@ -1495,6 +1724,9 @@ impl ProjectionOperationScope {
 
     pub(crate) fn from_persisted_str(value: &str) -> Result<Self, ProjectionPersistenceError> {
         match value {
+            "directRequestPreparation" => Ok(Self::DirectRequestPreparation),
+            "directRequestAcceptance" => Ok(Self::DirectRequestAcceptance),
+            "directRequestPushEligibility" => Ok(Self::DirectRequestPushEligibility),
             "creation" => Ok(Self::Creation),
             "pendingAdd" => Ok(Self::PendingAdd),
             "acceptance" => Ok(Self::Acceptance),
@@ -1623,13 +1855,16 @@ impl Clone for ProjectionPersistenceAuthority {
         Self(Mutex::new(None))
     }
 }
-
 #[cfg(test)]
 impl PartialEq for ProjectionPersistenceAuthority {
     fn eq(&self, other: &Self) -> bool {
-        let left = self.0.lock().expect("test authority lock");
-        let right = other.0.lock().expect("test authority lock");
-        left.is_some() == right.is_some()
+        let a = self.0.lock().expect("test authority lock");
+        let b = other.0.lock().expect("test authority lock");
+        match (&*a, &*b) {
+            (None, None) => true,
+            (Some(ga), Some(gb)) => ga.projection_revision() == gb.projection_revision(),
+            _ => false,
+        }
     }
 }
 
@@ -2294,7 +2529,7 @@ fn hydrate_declaration_evidence(
             .map_err(|_| ProjectionPersistenceError::Invalid)?,
     );
     let expected_record_request_digest = request_evidence_digest(
-        &declaration_record_url(&resolved_pds_origin, expected_recipient)
+        &declaration_record_url(&resolved_pds_origin, expected_recipient, DECLARATION_COLLECTION)
             .map_err(|_| ProjectionPersistenceError::Invalid)?,
     );
     let absent = match values.record_evidence_kind {
@@ -2791,12 +3026,36 @@ pub trait ProjectionClock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemProjectionClock;
+/// Production projection clock on the PostgreSQL timebase.
+///
+/// Collection timestamps (`started_at`, `completed_at`, `fetched_at`) are later
+/// judged against post-lock `clock_timestamp()` decisions, so they must share
+/// the database clock rather than this process's wall clock. The anchor is a
+/// database sample taken immediately before collection; readings advance it by
+/// this process's monotonic elapsed time. The anchor is sampled on the server
+/// before the reply travels back, so readings lag the database clock by the
+/// round trip and never run ahead of a later database decision.
+#[derive(Debug, Clone, Copy)]
+pub struct DatabaseAnchoredProjectionClock {
+    database_anchor: DateTime<Utc>,
+    local_anchor: std::time::Instant,
+}
 
-impl ProjectionClock for SystemProjectionClock {
+impl DatabaseAnchoredProjectionClock {
+    pub(crate) fn from_database_sample(database_now: DateTime<Utc>) -> Self {
+        Self {
+            database_anchor: database_now,
+            local_anchor: std::time::Instant::now(),
+        }
+    }
+}
+
+impl ProjectionClock for DatabaseAnchoredProjectionClock {
     fn now(&self) -> DateTime<Utc> {
-        Utc::now()
+        let elapsed = TimeDelta::from_std(self.local_anchor.elapsed()).unwrap_or(TimeDelta::MAX);
+        self.database_anchor
+            .checked_add_signed(elapsed)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
     }
 }
 
@@ -2813,28 +3072,10 @@ pub struct RelationshipAuthority<T: PublicTransport> {
 /// transport for the container E2E suite.
 #[cfg(not(feature = "test-support"))]
 pub(crate) type ProductionRelationshipAuthority =
-    RelationshipAuthority<ReqwestPinnedTransport<SystemDnsResolver>>;
+    RelationshipAuthority<ProductionRelationshipTransport>;
 #[cfg(feature = "test-support")]
 pub(crate) type ProductionRelationshipAuthority =
-    RelationshipAuthority<TestSupportRelationshipTransport>;
-
-#[cfg(feature = "test-support")]
-#[derive(Clone)]
-pub(crate) enum TestSupportRelationshipTransport {
-    Production(ReqwestPinnedTransport<SystemDnsResolver>),
-    FederationAllowAll,
-}
-
-#[cfg(feature = "test-support")]
-#[async_trait]
-impl PublicTransport for TestSupportRelationshipTransport {
-    async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
-        match self {
-            Self::Production(transport) => transport.get(request).await,
-            Self::FederationAllowAll => federation_allow_all_response(&request),
-        }
-    }
-}
+    RelationshipAuthority<ProductionRelationshipTransport>;
 
 #[cfg(feature = "test-support")]
 fn federation_allow_all_response(request: &PublicGet) -> Result<PublicResponse, TransportError> {
@@ -2998,13 +3239,14 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
 
     pub(crate) async fn collect_admission_projection(
         &self,
+        clock: &DatabaseAnchoredProjectionClock,
         allocated_revision: AllocatedProjectionRevisionGuard,
         operation_scope: ProjectionOperationScope,
         request: AdmissionRequest,
     ) -> Result<RelationshipProjection, ProjectionRefreshFailure> {
         collect_admission_projection_with_kind(
             self,
-            &SystemProjectionClock,
+            clock,
             allocated_revision,
             operation_scope,
             request,
@@ -3015,13 +3257,14 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
 
     pub(crate) async fn collect_block_projection(
         &self,
+        clock: &DatabaseAnchoredProjectionClock,
         allocated_revision: AllocatedProjectionRevisionGuard,
         operation_scope: ProjectionOperationScope,
         roster: Vec<String>,
     ) -> Result<RelationshipProjection, ProjectionRefreshFailure> {
         collect_block_projection_with_kind(
             self,
-            &SystemProjectionClock,
+            clock,
             allocated_revision,
             operation_scope,
             roster,
@@ -3032,13 +3275,14 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
 
     pub(crate) async fn collect_traffic_projection(
         &self,
+        clock: &DatabaseAnchoredProjectionClock,
         allocated_revision: AllocatedProjectionRevisionGuard,
         actor: String,
         roster: Vec<String>,
     ) -> Result<TrafficProjection, ProjectionRefreshFailure> {
         collect_traffic_projection_with_kind(
             self,
-            &SystemProjectionClock,
+            clock,
             allocated_revision,
             actor,
             roster,
@@ -3092,7 +3336,7 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         }
         let did_digest = sha256(&did_response.body);
         let pds = parse_did_document_service(recipient, &did_response.body)?;
-        let record_url = declaration_record_url(&pds.origin, recipient)?;
+        let record_url = declaration_record_url(&pds.origin, recipient, DECLARATION_COLLECTION)?;
         let record_request_digest = request_evidence_digest(&record_url);
         let record_response = self
             .send_public(PublicGet::new(
@@ -3113,6 +3357,38 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
             record_request_digest,
             record_digest,
         ))
+    }
+
+    /// The recipient's declared clean-chat delivery service, read from its
+    /// public `blue.catbird.chat.declaration/self` through the same pinned,
+    /// rate-limited DID-document → PDS path as the consent declaration.
+    /// `None` means no declaration record exists.
+    pub(crate) async fn recipient_chat_authority(
+        &self,
+        recipient: &str,
+    ) -> Result<Option<String>, AuthorityError> {
+        let deadline = Instant::now() + self.config.total_deadline;
+        let did_response = self
+            .send_public(PublicGet::new(
+                did_document_url(&self.config, recipient)?,
+                deadline,
+                self.config.max_response_bytes,
+            ))
+            .await?;
+        ensure_body_cap(&did_response, self.config.max_response_bytes)?;
+        if did_response.status != 200 {
+            return Err(AuthorityError::Unavailable);
+        }
+        let pds = parse_did_document_service(recipient, &did_response.body)?;
+        let record_response = self
+            .send_public(PublicGet::new(
+                declaration_record_url(&pds.origin, recipient, CHAT_DECLARATION_COLLECTION)?,
+                deadline,
+                self.config.max_response_bytes,
+            ))
+            .await?;
+        ensure_body_cap(&record_response, self.config.max_response_bytes)?;
+        parse_chat_declaration_response(recipient, record_response.status, &record_response.body)
     }
 
     async fn graph(
@@ -3141,17 +3417,15 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
 
 impl ProductionRelationshipAuthority {
     pub(crate) fn from_startup_guard(guard: RelationshipAuthorityStartupGuard) -> Self {
-        let (config, transport) = guard.into_parts();
-        #[cfg(feature = "test-support")]
-        let transport = TestSupportRelationshipTransport::Production(transport);
-        Self::from_parts(config, transport, HARDENED_SOURCE_PROFILE_V1)
+        let (config, transport, source_profile) = guard.into_parts();
+        Self::from_parts(config, transport, source_profile)
     }
 
     #[cfg(feature = "test-support")]
     pub(crate) fn federation_allow_all_for_test() -> Result<Self, RelationshipPolicyConfigError> {
         Ok(Self::from_parts(
             fixed_production_relationship_policy_config()?,
-            TestSupportRelationshipTransport::FederationAllowAll,
+            ProductionRelationshipTransport::FederationAllowAll,
             FEDERATION_TEST_SOURCE_PROFILE,
         ))
     }
@@ -3171,6 +3445,7 @@ fn did_document_url(config: &RelationshipPolicyConfig, did: &str) -> Result<Url,
 fn declaration_record_url(
     pds_origin: &CanonicalOrigin,
     recipient: &str,
+    collection: &str,
 ) -> Result<Url, AuthorityError> {
     if !validate_bare_did(recipient) {
         return Err(AuthorityError::Malformed);
@@ -3178,7 +3453,7 @@ fn declaration_record_url(
     let mut url = pds_origin.append_path(GET_RECORD_PATH)?;
     url.query_pairs_mut()
         .append_pair("repo", recipient)
-        .append_pair("collection", DECLARATION_COLLECTION)
+        .append_pair("collection", collection)
         .append_pair("rkey", DECLARATION_RKEY);
     Ok(url)
 }
@@ -3743,12 +4018,15 @@ fn relationship_operation_scope_matches(
     matches!(
         (operation_scope, scope),
         (
-            ProjectionOperationScope::Creation
+            ProjectionOperationScope::DirectRequestPreparation
+                | ProjectionOperationScope::Creation
                 | ProjectionOperationScope::PendingAdd
                 | ProjectionOperationScope::Acceptance,
             ProjectionScope::Admission(_)
         ) | (
-            ProjectionOperationScope::RecoveryReservation
+            ProjectionOperationScope::DirectRequestAcceptance
+                | ProjectionOperationScope::DirectRequestPushEligibility
+                | ProjectionOperationScope::RecoveryReservation
                 | ProjectionOperationScope::RecoveryFulfillment,
             ProjectionScope::BlockOnly(_)
         )
@@ -4084,6 +4362,9 @@ fn projection_operation_scope_tag(scope: ProjectionOperationScope) -> u8 {
         ProjectionOperationScope::RecoveryReservation => 3,
         ProjectionOperationScope::RecoveryFulfillment => 4,
         ProjectionOperationScope::Traffic => 5,
+        ProjectionOperationScope::DirectRequestPreparation => 6,
+        ProjectionOperationScope::DirectRequestAcceptance => 7,
+        ProjectionOperationScope::DirectRequestPushEligibility => 8,
     }
 }
 
@@ -4922,7 +5203,8 @@ mod projection_integrity_tests {
 
         for (field, value) in [
             ("deliveryService", "not-a-did"),
-            ("protocolVersion", "2"),
+            // "2" is the encrypted-requests profile and is valid after the merge.
+            ("protocolVersion", "3"),
             ("createdAt", "not-a-date"),
         ] {
             let mut invalid: Value = serde_json::from_str(&body).unwrap();
@@ -4940,5 +5222,34 @@ mod projection_integrity_tests {
             parse_declaration_response(actor, 200, &serde_json::to_vec(&legacy).unwrap()).is_err(),
             "accepted the superseded group-only policy field"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod database_anchored_clock_tests {
+    use super::*;
+
+    /// F2: projection collection stamps live on the database timebase. With the
+    /// database clock ten minutes away from this host in either direction, a
+    /// window collected on the anchored clock is fresh at the later post-lock
+    /// database decision, while a window stamped from the host clock (the old
+    /// `SystemProjectionClock`) is refused as future or stale.
+    #[test]
+    fn projection_window_is_fresh_at_a_later_database_decision_despite_host_skew() {
+        for skew in [TimeDelta::minutes(10), TimeDelta::minutes(-10)] {
+            let database_clock = || Utc::now() - skew;
+            let clock = DatabaseAnchoredProjectionClock::from_database_sample(database_clock());
+            let (started, completed) = (clock.now(), clock.now());
+            let host_started = Utc::now();
+            let host_completed = Utc::now();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let decision = database_clock();
+            assert!(fresh_window(started, completed, decision), "anchored, skew {skew}");
+            assert!(
+                !fresh_window(host_started, host_completed, decision),
+                "host clock window must not pass at skew {skew}"
+            );
+        }
     }
 }
