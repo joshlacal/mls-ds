@@ -182,7 +182,7 @@ jobs:
           DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
           TEST_DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
         run: |
-          cargo test --test chat_protocol_signing_domain_vectors --test chat_protocol_route_inventory --features namespace-bluecatbird,server-bin
+          cargo test --test chat_protocol_signing_domain_vectors --test chat_protocol_route_inventory --test federation_fixture_auth_profile --features namespace-bluecatbird,server-bin
 
       - name: Run two-node federation lifecycle
         working-directory: ./e2e-tests
