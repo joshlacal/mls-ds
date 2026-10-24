@@ -63,6 +63,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
 
       - name: Reclaim runner disk for Rust test artifacts
         run: |
@@ -75,9 +77,9 @@ jobs:
       - name: Clone pinned sibling repos
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach 5819783a234eeeb3cab008d8351d3f5e197e109f
+          git -C ../catbird-atproto checkout --detach e7ff2a3bb17f7d668889cae5f34a2d8d6755647c
           git clone --filter=blob:none https://github.com/joshlacal/catbird-mls.git ../catbird-mls
-          git -C ../catbird-mls checkout --detach 5a39327bf24ab4b1b484df2d6289eb07fa616630
+          git -C ../catbird-mls checkout --detach 40c46eaf76066c1a95e055fe61ef510e1c155a30
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2026-03-27)
@@ -92,10 +94,38 @@ jobs:
       - name: Install ripgrep (required by static policy lint scripts)
         run: sudo apt-get install -y ripgrep
 
+      - name: Report full-repository Rust formatting
+        working-directory: ./server
+        run: |
+          if cargo fmt -- --check > "$RUNNER_TEMP/mls-full-rustfmt.log" 2>&1; then
+            echo "Full-repository Rust formatting passed."
+          elif [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            echo "::warning::Full-repository formatting has baseline debt; the PR changed-line gate below remains required. See the rustfmt artifact."
+          else
+            cat "$RUNNER_TEMP/mls-full-rustfmt.log"
+            exit 1
+          fi
+
+      - name: Preserve complete Rust formatting evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: full-repository-rustfmt
+          path: ${{ runner.temp }}/mls-full-rustfmt.log
+
+      - name: Check Rust formatting on changed PR lines
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 server/scripts/check_rustfmt_changed_lines.py --base "$PR_BASE_SHA"
+
+      - name: Verify formatting gate behavior
+        if: github.event_name == 'pull_request'
+        run: python3 server/scripts/test_check_rustfmt_changed_lines.py
+
       - name: Run linting
         working-directory: ./server
         run: |
-          cargo fmt -- --check
           # --all-targets covers tests/benches/examples in addition to
           # --lib --bins. The narrower scope was a chore/ci-cleanup-era
           # transitional shim while pre-existing clippy warnings in test
@@ -269,7 +299,7 @@ jobs:
       - name: Clone pinned catbird-atproto sibling repo
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach 5819783a234eeeb3cab008d8351d3f5e197e109f
+          git -C ../catbird-atproto checkout --detach e7ff2a3bb17f7d668889cae5f34a2d8d6755647c
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2026-03-27)
@@ -354,7 +384,7 @@ jobs:
       - name: Clone pinned catbird-atproto sibling repo
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach 5819783a234eeeb3cab008d8351d3f5e197e109f
+          git -C ../catbird-atproto checkout --detach e7ff2a3bb17f7d668889cae5f34a2d8d6755647c
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
@@ -501,6 +531,9 @@ jobs:
     environment:
       name: production
       url: https://mls.catbird.blue
+    outputs:
+      deployment-attempted: ${{ steps.production-deploy.outputs.attempted }}
+      rollback-needed: ${{ steps.production-deploy.outcome == 'failure' || steps.production-smoke.outcome == 'failure' || steps.traffic-switch.outcome == 'failure' || steps.scale-blue.outcome == 'failure' }}
     
     steps:
       - name: Checkout code
@@ -521,6 +554,7 @@ jobs:
           ./server/scripts/backup/backup-db.sh
 
       - name: Deploy to production (Blue-Green)
+        id: production-deploy
         env:
           KUBE_CONFIG: ${{ secrets.PROD_KUBE_CONFIG }}
           IMAGE_TAG: ${{ needs.build.outputs.image_ref }}
@@ -529,6 +563,7 @@ jobs:
           export KUBECONFIG=/tmp/kubeconfig
           
           # Deploy to green environment
+          echo "attempted=true" >> "$GITHUB_OUTPUT"
           kubectl set image deployment/mls-server-green \
             mls-server="${IMAGE_TAG}" \
             -n production
@@ -537,12 +572,14 @@ jobs:
           kubectl rollout status deployment/mls-server-green -n production --timeout=10m
 
       - name: Run production smoke tests
+        id: production-smoke
         env:
           PROD_GREEN_URL: ${{ secrets.PROD_GREEN_URL }}
         run: |
           ./server/scripts/smoke-test.sh "$PROD_GREEN_URL"
 
       - name: Switch traffic to green
+        id: traffic-switch
         env:
           KUBE_CONFIG: ${{ secrets.PROD_KUBE_CONFIG }}
         run: |
@@ -555,6 +592,7 @@ jobs:
           sleep 300
 
       - name: Scale down blue deployment
+        id: scale-blue
         env:
           KUBE_CONFIG: ${{ secrets.PROD_KUBE_CONFIG }}
         run: |
@@ -571,8 +609,13 @@ jobs:
 
   rollback-production:
     name: Rollback Production
+    needs: [deploy-production]
     runs-on: ubuntu-latest
-    if: failure()
+    # A failed PR check can never enter production rollback. Only an explicitly
+    # dispatched production deployment that reached a cluster mutation and
+    # failed a deployment step is eligible. Policy, backup, and notification
+    # failures alone must never trigger a cluster write.
+    if: failure() && github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production' && needs.deploy-production.result == 'failure' && needs.deploy-production.outputs.deployment-attempted == 'true' && needs.deploy-production.outputs.rollback-needed == 'true'
     environment:
       name: production
     

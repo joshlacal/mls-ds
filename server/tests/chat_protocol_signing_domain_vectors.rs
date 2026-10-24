@@ -1,13 +1,15 @@
 //! Known-answer vectors for the ten active signing domains that no control-entry
 //! case covers.
 //!
-//! `mls_chat_contract_vectors.json` pins fourteen of the twenty-four signing
+//! `mls_chat_contract_vectors.json` originally pins fourteen of twenty-four signing
 //! domains: the thirteen control entries, plus `CATBIRD-CHAT-BLOB-DELETE` from
 //! its one `signedMutator` case. The other ten — `CATBIRD-CHAT-MESSAGE`, the
 //! application-send domain, above all — had no server vector anywhere, so every
 //! client's copy of those domain strings rested on a hand transcription. A
 //! single wrong byte there produces signatures that verify locally and nowhere
 //! else.
+//! Two later direct-request control domains have independent vectors in
+//! `direct_request_vectors.json`; the inventory checks all twenty-six domains.
 //!
 //! # The vectors are server products, not test arithmetic
 //!
@@ -43,26 +45,20 @@
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[allow(dead_code)]
+#[path = "../src/chat_protocol/read_projection.rs"]
+mod read_projection;
+#[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/validation.rs"]
 mod validation;
 
-// Encrypted-requests: transcript.rs test modules reference read_projection.
+// Compile the actual canonical encoder used by transcript.rs's request-view
+// tests. An empty-byte stand-in cannot exercise its round-trip contract.
 mod chat_protocol {
-    pub mod read_projection {
-        pub struct DummyCanonical;
-        impl DummyCanonical {
-            pub fn bytes(&self) -> &[u8] { &[] }
-        }
-        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
-            _value: &T,
-            _schema: &str,
-        ) -> Result<DummyCanonical, String> {
-            Ok(DummyCanonical)
-        }
-    }
+    pub(crate) use crate::read_projection;
+    pub use catbird_server::chat_protocol::direct_request_transcript;
 }
 
 #[path = "common/signing_domain_bodies.rs"]
@@ -93,6 +89,12 @@ const CANONICAL_SOURCE_LEXICON_REVISION: &str = "34e5cc3b23cc30b4a3ea837719614c4
 const CANONICAL_SOURCE_CORPUS_REVISION: &str = "a063ed8f995031fa0cf122bca3f4f82c89f08c90";
 const CANONICAL_SOURCE_LEXICON_SHA256: &str =
     "3d5d867d9b651fc22e119cb6011262740e3308f127efbf87742850ecded6d639";
+// The frozen vectors retain their original provenance. Separately pin the
+// current canonical contract, which also contains the direct-request domains.
+const CURRENT_SOURCE_LEXICON_REVISION: &str = "bfbf4e42d6ae1fae49bac69331573cda32361a41";
+const CURRENT_SOURCE_CORPUS_REVISION: &str = "8672c80ffeb3b9cfbdb6bd98f66efa09b13fe0db";
+const CURRENT_SOURCE_LEXICON_SHA256: &str =
+    "d830abb92430704e52aaf0b47eda435a01be9fd1d5f61d52daf42c2b22a48bcd";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures
@@ -191,6 +193,37 @@ fn existing_contract_fixture_body_names() -> BTreeSet<String> {
             .expect("signed mutator body name")
             .to_owned(),
     );
+    names
+}
+
+fn direct_request_fixture_body_names() -> BTreeSet<String> {
+    use catbird_server::chat_protocol::direct_request_transcript::{
+        direct_request_signing_bytes, DirectRequestKind,
+    };
+
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/direct_request_vectors.json"))
+        .expect("independent direct-request vectors parse");
+    let mut names = BTreeSet::new();
+    for case in fixture["signed"].as_array().expect("signed request cases") {
+        let kind = match case["kind"].as_str() {
+            Some("Publish") => DirectRequestKind::Publish,
+            Some("Accept") => DirectRequestKind::Accept,
+            _ => continue,
+        };
+        let transcript = direct_request_signing_bytes(
+            kind,
+            &serde_json::to_vec(&case["body"]).expect("the frozen body serializes"),
+        )
+        .expect("the production codec accepts the frozen direct-request body");
+        assert_eq!(hex::encode(&transcript), case["transcriptHex"]);
+        assert_eq!(hex::encode(Sha256::digest(&transcript)), case["digestHex"]);
+        assert_eq!(
+            case["body"]["$type"],
+            format!("blue.catbird.chat.defs#{}", kind.body_name())
+        );
+        names.insert(kind.body_name().to_owned());
+    }
+    assert_eq!(names.len(), 2, "both new control domains must be present");
     names
 }
 
@@ -351,8 +384,8 @@ fn generate() -> Value {
         "provenance": {
             "sourceLexicon": CANONICAL_SOURCE_LEXICON_PATH,
             "sourceLexiconMirror": CANONICAL_LEXICON_PATH,
-            "sourceLexiconRevision": CANONICAL_SOURCE_LEXICON_REVISION,
-            "sourceCorpusRevision": CANONICAL_SOURCE_CORPUS_REVISION,
+            "sourceLexiconRevision": CURRENT_SOURCE_LEXICON_REVISION,
+            "sourceCorpusRevision": CURRENT_SOURCE_CORPUS_REVISION,
             "sourceLexiconSha256": canonical_lexicon_sha256()
         },
         "cases": cases,
@@ -367,16 +400,26 @@ fn rendered(document: &Value) -> String {
 
 #[test]
 fn the_ten_active_signing_domain_vectors_are_server_products_and_match_the_fixture() {
-    let document = generate();
-    let text = rendered(&document);
+    let mut document = generate();
 
     if std::env::var_os(REGENERATE_ENV).is_some() {
-        fs::write(fixture_path(), &text).expect("the fixture is writable");
+        assert_eq!(
+            canonical_lexicon_sha256(),
+            CURRENT_SOURCE_LEXICON_SHA256,
+            "review current provenance pins before regenerating a fixture"
+        );
+        fs::write(fixture_path(), rendered(&document)).expect("the fixture is writable");
         return;
     }
 
+    let mut frozen: Value = serde_json::from_str(FIXTURE).expect("the frozen fixture parses");
+    // Compare every original product and non-provenance field unchanged. The
+    // historical fixture and actual current generation have distinct source
+    // metadata, both checked explicitly by the dedicated provenance test.
+    document.as_object_mut().unwrap().remove("provenance");
+    frozen.as_object_mut().unwrap().remove("provenance");
     assert_eq!(
-        text, FIXTURE,
+        document, frozen,
         "the frozen vectors no longer match what the server produces; regenerate with \
          `{REGENERATE_ENV}=1` only after explaining why a signing product moved"
     );
@@ -386,7 +429,8 @@ fn the_ten_active_signing_domain_vectors_are_server_products_and_match_the_fixtu
 fn every_signing_domain_now_has_a_server_vector() {
     // The accounting the vendoring clients rely on: fourteen domains were
     // already pinned by `mls_chat_contract_vectors.json`, these ten are the
-    // remainder, and together they are the whole enum. Keep the expected set
+    // original remainder, and two newer direct-request control domains have
+    // independent vectors. Together they are the whole enum. Keep the expected set
     // explicit so adding an enum arm or silently dropping a fixture fails here.
     let expected = BTreeSet::from([
         "deviceEnrollmentBody",
@@ -413,6 +457,8 @@ fn every_signing_domain_now_has_a_server_vector() {
         "leaveCommitFulfillmentBody",
         "welcomeAcknowledgementBody",
         "welcomeRejectionBody",
+        "directRequestPublicationBody",
+        "directRequestAcceptanceBody",
     ]);
     let enum_kinds: BTreeSet<&'static str> = SignedMutationKind::ALL
         .into_iter()
@@ -425,7 +471,7 @@ fn every_signing_domain_now_has_a_server_vector() {
         .map(|kind| kind.signed_kind().body_name())
         .collect();
     let unpinned = unpinned_body_names();
-    assert_eq!(control.len(), 13);
+    assert_eq!(control.len(), 15);
     assert_eq!(unpinned.len(), 10);
     assert_eq!(
         control.len() + 1 + unpinned.len(),
@@ -462,10 +508,11 @@ fn every_signing_domain_now_has_a_server_vector() {
                 .to_owned(),
         );
     }
+    fixture_kinds.extend(direct_request_fixture_body_names());
     assert_eq!(
         fixture_kinds,
         expected.iter().map(|name| (*name).to_owned()).collect(),
-        "the two server fixtures must cover every SignedMutationKind"
+        "the frozen server and independent request fixtures must cover every SignedMutationKind"
     );
 }
 
@@ -630,8 +677,19 @@ fn frozen_fixture_records_the_canonical_lexicon_provenance() {
     );
     assert_eq!(
         canonical_lexicon_sha256(),
-        CANONICAL_SOURCE_LEXICON_SHA256,
-        "the server mirror must match the canonical PetrelCatbird source"
+        CURRENT_SOURCE_LEXICON_SHA256,
+        "the server mirror must match canonical PetrelCatbird revision {CURRENT_SOURCE_LEXICON_REVISION}"
+    );
+    assert_eq!(
+        generate()["provenance"],
+        json!({
+            "sourceLexicon": CANONICAL_SOURCE_LEXICON_PATH,
+            "sourceLexiconMirror": CANONICAL_LEXICON_PATH,
+            "sourceLexiconRevision": CURRENT_SOURCE_LEXICON_REVISION,
+            "sourceCorpusRevision": CURRENT_SOURCE_CORPUS_REVISION,
+            "sourceLexiconSha256": CURRENT_SOURCE_LEXICON_SHA256
+        }),
+        "new products must record their actual current schema provenance"
     );
 }
 

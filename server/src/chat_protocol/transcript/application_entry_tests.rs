@@ -179,8 +179,10 @@ fn hex_array<const N: usize>(value: &Value) -> [u8; N] {
 }
 
 fn golden() -> Golden {
+    // Exact first vector from the workspace manifest; provenance and its full
+    // source SHA-256 are stored in this repository-local immutable fixture.
     let manifest: Value = serde_json::from_str(include_str!(
-        "../../../../../docs/generated-artifacts/chat-application-v1/manifest.json"
+        "../../../tests/fixtures/chat_application_entry_golden.json"
     ))
     .unwrap();
     let vector = &manifest["vectors"][0];
