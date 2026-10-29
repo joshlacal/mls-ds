@@ -305,6 +305,31 @@ impl SpaceAuthorityQuota {
             ),
         }
     }
+
+    /// Pre-auth calls to one policy endpoint from one client IP per minute.
+    /// It defaults to the per-authority ceiling: an authority sends every
+    /// user's calls from its one egress address, so a smaller bound would
+    /// make the ceiling unreachable and let one user throttle every other.
+    pub fn per_client_ip_from_env() -> u32 {
+        std::env::var("RATE_LIMIT_SPACE_AUTHORITY_IP_PER_MINUTE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| Self::from_env().per_authority)
+    }
+}
+
+/// Request paths of the Space authority policy endpoints.
+const SPACE_AUTHORITY_POLICY_PATHS: [&str; 2] = [
+    "/xrpc/blue.catbird.labyrinth.getSpaceMembership",
+    "/xrpc/blue.catbird.labyrinth.deleteSpaceGeneration",
+];
+
+fn space_authority_policy_path(path: &str) -> Option<&'static str> {
+    SPACE_AUTHORITY_POLICY_PATHS
+        .iter()
+        .copied()
+        .find(|policy_path| *policy_path == path)
 }
 
 /// Quota of the Space authority policy endpoints. One authority DID calls
@@ -340,6 +365,12 @@ impl SpaceAuthorityRateLimiter {
             self.take(format!("{authority}|{endpoint}|{user}"), quota.per_user)?;
         }
         self.take(format!("{authority}|{endpoint}|*"), quota.per_authority)
+    }
+
+    /// Take one pre-auth call to the policy endpoint at `path` from
+    /// `client_ip`. `Err` carries the Retry-After seconds.
+    pub fn check_client(&self, client_ip: &str, path: &str, per_minute: u32) -> Result<(), u64> {
+        self.take(format!("{client_ip}|{path}"), per_minute)
     }
 
     fn take(&self, key: String, per_minute: u32) -> Result<(), u64> {
@@ -469,6 +500,10 @@ pub static FEDERATION_DS_RATE_LIMITER: Lazy<FederationPeerRateLimiter> =
 /// Global limiter of the Space authority policy endpoints.
 pub static SPACE_AUTHORITY_RATE_LIMITER: Lazy<SpaceAuthorityRateLimiter> =
     Lazy::new(SpaceAuthorityRateLimiter::new);
+/// Per-IP pre-auth limiter of the Space authority policy endpoints, which
+/// skip [`IP_LIMITER`]. A separate cache from the post-auth buckets.
+pub static SPACE_AUTHORITY_IP_LIMITER: Lazy<SpaceAuthorityRateLimiter> =
+    Lazy::new(SpaceAuthorityRateLimiter::new);
 
 /// Per-IP rate limiter instance
 pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
@@ -541,14 +576,38 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
         return Ok(next.run(request).await);
     }
 
-    match IP_LIMITER.check(&client_ip) {
+    // A Space authority sends every user's policy calls from its one egress
+    // address, so these routes skip the general per-IP bucket, which one
+    // user's calls could otherwise spend for every other user. Their own
+    // per-IP bucket is sized to the per-authority ceiling and still bounds
+    // unauthenticated calls, which resolve the issuer DID; the
+    // per-(authority, user) quota applies after auth.
+    let (limited, check) = match space_authority_policy_path(request.uri().path()) {
+        Some(path) => (
+            "Space authority policy",
+            SPACE_AUTHORITY_IP_LIMITER.check_client(
+                &client_ip,
+                path,
+                SpaceAuthorityQuota::per_client_ip_from_env(),
+            ),
+        ),
+        None => ("IP", IP_LIMITER.check(&client_ip)),
+    };
+
+    match check {
         Ok(()) => {
-            tracing::debug!("IP pre-auth rate limit passed for {}: {}", client_ip, uri);
+            tracing::debug!(
+                "{} pre-auth rate limit passed for {}: {}",
+                limited,
+                client_ip,
+                uri
+            );
             Ok(next.run(request).await)
         }
         Err(retry_after) => {
             tracing::warn!(
-                "IP pre-auth rate limit exceeded for {}: {} (retry after {} seconds)",
+                "{} pre-auth rate limit exceeded for {}: {} (retry after {} seconds)",
+                limited,
                 client_ip,
                 uri,
                 retry_after
@@ -751,6 +810,126 @@ mod tests {
         assert!(limiter.check(AUTHORITY, DELETION, None, quota).is_ok());
         assert!(limiter.check(AUTHORITY, DELETION, None, quota).is_ok());
         assert!(limiter.check(AUTHORITY, DELETION, None, quota).unwrap_err() >= 1);
+    }
+
+    #[test]
+    fn space_authority_pre_auth_bound_is_keyed_by_client_ip_and_path() {
+        let limiter = SpaceAuthorityRateLimiter::new();
+        let [membership, deletion] = SPACE_AUTHORITY_POLICY_PATHS;
+        assert!(limiter.check_client("192.0.2.1", membership, 2).is_ok());
+        assert!(limiter.check_client("192.0.2.1", membership, 2).is_ok());
+        assert!(
+            limiter
+                .check_client("192.0.2.1", membership, 2)
+                .unwrap_err()
+                >= 1
+        );
+        assert!(limiter.check_client("192.0.2.2", membership, 2).is_ok());
+        assert!(limiter.check_client("192.0.2.1", deletion, 2).is_ok());
+    }
+
+    #[test]
+    fn space_authority_pre_auth_bound_defaults_to_the_ceiling() {
+        assert_eq!(
+            SpaceAuthorityQuota::per_client_ip_from_env(),
+            SpaceAuthorityQuota::from_env().per_authority
+        );
+        assert_eq!(
+            space_authority_policy_path("/xrpc/blue.catbird.labyrinth.getSpaceMembership"),
+            Some("/xrpc/blue.catbird.labyrinth.getSpaceMembership")
+        );
+        assert_eq!(
+            space_authority_policy_path("/xrpc/blue.catbird.labyrinth.listSpaceBatches"),
+            None
+        );
+    }
+
+    /// A router behind [`rate_limit_middleware`] that answers 200 on both
+    /// Space authority policy paths and on one ordinary path.
+    fn limited_router() -> axum::Router {
+        use axum::routing::{get, post};
+        let [membership, deletion] = SPACE_AUTHORITY_POLICY_PATHS;
+        axum::Router::new()
+            .route(membership, get(|| async { StatusCode::OK }))
+            .route(deletion, post(|| async { StatusCode::OK }))
+            .route(
+                "/xrpc/blue.catbird.chat.getEntries",
+                get(|| async { StatusCode::OK }),
+            )
+            .layer(axum::middleware::from_fn(rate_limit_middleware))
+    }
+
+    async fn call_from(router: &axum::Router, ip: [u8; 4], method: &str, path: &str) -> Response {
+        use tower_util::ServiceExt;
+        let mut request = HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((ip, 443))));
+        router.clone().oneshot(request).await.expect("router")
+    }
+
+    // Review of MLSDS-01: an authority sends every user's policy calls from
+    // one address. Through the general per-IP bucket, one user's calls ran
+    // it dry for every other user.
+    #[tokio::test]
+    async fn space_authority_policy_paths_skip_the_general_ip_bucket() {
+        let router = limited_router();
+        let egress = [192, 0, 2, 10];
+        let general = IP_LIMITER.capacity;
+        assert!(SpaceAuthorityQuota::per_client_ip_from_env() > general);
+        let [membership, _] = SPACE_AUTHORITY_POLICY_PATHS;
+        for call in 0..=general {
+            let response = call_from(&router, egress, "GET", membership).await;
+            assert_eq!(response.status(), StatusCode::OK, "call {call}");
+        }
+        // The general bucket of that address is untouched.
+        let response =
+            call_from(&router, egress, "GET", "/xrpc/blue.catbird.chat.getEntries").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // The policy paths keep a pre-auth bound per client IP, because an
+    // unauthenticated call still resolves the issuer DID.
+    #[tokio::test]
+    async fn space_authority_policy_paths_keep_a_pre_auth_ip_bound() {
+        let router = limited_router();
+        let client = [192, 0, 2, 20];
+        let [_, deletion] = SPACE_AUTHORITY_POLICY_PATHS;
+        let bound = SpaceAuthorityQuota::per_client_ip_from_env();
+        for call in 0..bound {
+            let response = call_from(&router, client, "POST", deletion).await;
+            assert_eq!(response.status(), StatusCode::OK, "call {call}");
+        }
+        // The bucket refilled at bound/60 per second during those calls, far
+        // slower than they ran, so it runs dry within a bounded number more.
+        let mut throttled = None;
+        for _ in 0..bound {
+            let response = call_from(&router, client, "POST", deletion).await;
+            if response.status() != StatusCode::OK {
+                throttled = Some(response);
+                break;
+            }
+        }
+        let throttled = throttled.expect("the pre-auth bound never ran dry");
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = throttled.headers()[axum::http::header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(retry_after >= 1);
+        let bytes = axum::body::to_bytes(throttled.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "RateLimitExceeded");
+        // Another address is not throttled.
+        let response = call_from(&router, [192, 0, 2, 21], "POST", deletion).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

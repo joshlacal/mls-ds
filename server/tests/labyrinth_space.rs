@@ -467,41 +467,34 @@ async fn authority_policy_checks_exact_committed_membership_without_user_device_
 /// alone, so every user of the deployment shared one 200/min bucket (and a
 /// burst of 10), and throttling came back as `401 NotAuthorized`. The quota
 /// is per (authority, user), and throttling is `429` with `Retry-After`.
+///
+/// The calls go through the server's per-IP pre-auth limiter, as in the real
+/// router, from one address: the authority sends every user's calls from
+/// its one egress address, so a per-IP bucket the size of one user's quota
+/// would still let that user throttle every other.
 #[tokio::test]
 async fn authority_policy_quota_is_per_user_and_throttles_with_429() {
-    use catbird_server::middleware::rate_limit::SpaceAuthorityQuota;
-    use tower_util::ServiceExt;
+    use catbird_server::middleware::rate_limit::{rate_limit_middleware, SpaceAuthorityQuota};
     let env = Env::new().await;
     let authority = env.account().await;
     let alice = env.account().await;
     let bob = env.account().await;
     let thread = space_thread(&env, &authority, &[&alice, &bob]).await;
     let p = placement(&alice, thread).await;
+    let router = env
+        .router
+        .clone()
+        .layer(axum::middleware::from_fn(rate_limit_middleware));
     let per_user = SpaceAuthorityQuota::from_env().per_user;
     for call in 0..per_user {
-        let reply = policy(&env, &authority, &p, &alice.did).await;
-        assert_eq!(reply.status, 200, "call {call}: {}", reply.json);
+        let response = policy_from_egress(&router, &authority, &p, &alice.did).await;
+        assert_eq!(response.status(), 200, "call {call}");
     }
-    let nsid = "blue.catbird.labyrinth.getSpaceMembership";
-    let q = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("space", p["space"].as_str().unwrap())
-        .append_pair("user", &alice.did)
-        .finish();
     // The bucket refilled at per_user/60 per second during those calls, far
     // slower than they ran, so it runs dry within a bounded number more.
     let mut throttled = None;
     for _ in 0..per_user {
-        let response = env
-            .router
-            .clone()
-            .oneshot(
-                Request::get(format!("/xrpc/{nsid}?{q}"))
-                    .header("authorization", format!("Bearer {}", authority.token(nsid)))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = policy_from_egress(&router, &authority, &p, &alice.did).await;
         if response.status() != 200 {
             throttled = Some(response);
             break;
@@ -519,12 +512,45 @@ async fn authority_policy_quota_is_per_user_and_throttles_with_429() {
         .await
         .unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["error"], "RateLimited");
-    // Another user of the same authority is not throttled.
-    assert_eq!(
-        policy(&env, &authority, &p, &bob.did).await.ok()["user"],
-        bob.did
-    );
+    // The per-user quota, not the per-IP pre-auth limiter (`RateLimitExceeded`).
+    assert_eq!(body["error"], "RateLimited", "{body}");
+    // Another user of the same authority, from the same address, is not
+    // throttled.
+    let response = policy_from_egress(&router, &authority, &p, &bob.did).await;
+    assert_eq!(response.status(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["user"], bob.did);
+}
+
+/// `getSpaceMembership` through `router` from the authority's one egress
+/// address.
+async fn policy_from_egress(
+    router: &axum::Router,
+    authority: &Device,
+    p: &Value,
+    user: &str,
+) -> axum::response::Response {
+    use tower_util::ServiceExt;
+    let egress = std::net::SocketAddr::from(([198, 51, 100, 7], 443));
+    let nsid = "blue.catbird.labyrinth.getSpaceMembership";
+    let q = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("space", p["space"].as_str().unwrap())
+        .append_pair("user", user)
+        .finish();
+    router
+        .clone()
+        .oneshot(
+            Request::get(format!("/xrpc/{nsid}?{q}"))
+                .header("authorization", format!("Bearer {}", authority.token(nsid)))
+                .extension(axum::extract::ConnectInfo(egress))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
 }
 
 // Observe real PostgreSQL lock waits instead of relying on scheduler timing.
