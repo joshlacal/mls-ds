@@ -16,11 +16,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Header name for recovery mode bypass requests
-/// When set to "true", the middleware allows the request through but
-/// the handler MUST verify the client actually needs recovery (0 key packages)
-pub const RECOVERY_MODE_HEADER: &str = "x-mls-recovery-mode";
-
 /// Token bucket rate limiter
 #[derive(Clone)]
 pub struct TokenBucket {
@@ -508,34 +503,6 @@ pub static SPACE_AUTHORITY_IP_LIMITER: Lazy<SpaceAuthorityRateLimiter> =
 /// Per-IP rate limiter instance
 pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
 
-/// Check if an endpoint should use device-based rate limiting
-/// Device-based limits give fresh devices (app reinstall) their own quota
-fn should_use_device_rate_limit(endpoint: &str) -> bool {
-    let endpoint_name = endpoint
-        .trim_start_matches("/xrpc/")
-        .trim_start_matches("blue.catbird.chat.")
-        .trim_start_matches("blue.catbird.mlsDS.");
-
-    endpoint_name.contains("replenishKeyPackages")
-}
-
-/// Check if request is in recovery mode
-/// Recovery mode bypasses rate limits for key package operations
-/// The HANDLER must verify the client genuinely has 0 key packages
-fn is_recovery_mode_request(headers: &HeaderMap, endpoint: &str) -> bool {
-    // Only allow recovery mode for key package endpoints
-    if !should_use_device_rate_limit(endpoint) {
-        return false;
-    }
-
-    // Check for recovery mode header
-    headers
-        .get(RECOVERY_MODE_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 static TRUSTED_PROXY_CIDRS: Lazy<Vec<IpNet>> = Lazy::new(|| {
     std::env::var("TRUSTED_PROXY_CIDRS")
         .ok()
@@ -562,19 +529,8 @@ static TRUSTED_PROXY_CIDRS: Lazy<Vec<IpNet>> = Lazy::new(|| {
 /// Middleware for pre-auth throttling.
 /// Uses only source IP identity (optionally from trusted proxy headers).
 pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
-    let headers = request.headers();
     let uri = request.uri().to_string();
     let client_ip = extract_client_ip(&request);
-
-    // Check for recovery mode bypass (handler MUST verify 0 key packages)
-    if is_recovery_mode_request(headers, &uri) {
-        tracing::debug!(
-            client_ip = %client_ip,
-            endpoint = %uri,
-            "Recovery mode bypass requested (handler must verify true recovery state)"
-        );
-        return Ok(next.run(request).await);
-    }
 
     // A Space authority sends every user's policy calls from its one egress
     // address, so these routes skip the general per-IP bucket, which one
@@ -673,7 +629,7 @@ fn extract_client_ip(request: &Request) -> String {
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::{HeaderMap, HeaderValue, Request as HttpRequest};
+    use axum::http::Request as HttpRequest;
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
@@ -719,28 +675,6 @@ mod tests {
 
         // Different user should have own bucket
         assert!(limiter.check("user2").is_ok());
-    }
-
-    #[test]
-    fn recovery_mode_header_is_case_insensitive_for_key_package_endpoints() {
-        let mut headers = HeaderMap::new();
-        headers.insert(RECOVERY_MODE_HEADER, HeaderValue::from_static("TrUe"));
-
-        assert!(is_recovery_mode_request(
-            &headers,
-            "/xrpc/blue.catbird.chat.replenishKeyPackages"
-        ));
-    }
-
-    #[test]
-    fn recovery_mode_does_not_apply_to_non_recovery_endpoints() {
-        let mut headers = HeaderMap::new();
-        headers.insert(RECOVERY_MODE_HEADER, HeaderValue::from_static("true"));
-
-        assert!(!is_recovery_mode_request(
-            &headers,
-            "/xrpc/blue.catbird.chat.sendMessage"
-        ));
     }
 
     const MEMBERSHIP: &str = "blue.catbird.labyrinth.getSpaceMembership";

@@ -2013,40 +2013,51 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    // The server gives `x-mls-recovery-mode` no meaning: a key-package
+    // request that carries it spends the pre-auth per-IP bucket like any
+    // other request from its address.
     #[tokio::test]
-    async fn recovery_mode_cannot_bypass_ingress_budget_or_poll_body() {
+    async fn recovery_mode_header_is_rate_limited_like_any_other_request() {
         let path = "/xrpc/blue.catbird.chat.replenishKeyPackages";
-        let base_router = Router::new().route(path, post(consume_body));
-        let exhausted_budget = Arc::new(Semaphore::new(1));
-        let _held = exhausted_budget
-            .clone()
-            .try_acquire_owned()
-            .expect("reserve test budget");
         let app = merge_application_routers(
-            base_router,
+            Router::new().route(path, post(consume_body)),
             Router::new(),
             lazy_test_pool(),
-            IngressBodyPolicy::new(exhausted_budget, Duration::from_secs(1)),
+            test_ingress_policy(),
         );
-        let body_was_polled = Arc::new(AtomicBool::new(false));
-        let body_was_polled_by_stream = body_was_polled.clone();
-        let body = Body::from_stream(futures::stream::once(async move {
-            body_was_polled_by_stream.store(true, Ordering::SeqCst);
-            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"{}"))
-        }));
+        // An address no other test uses, so the shared per-IP limiter
+        // starts this test with a full bucket.
+        let client = SocketAddr::from(([198, 51, 100, 73], 443));
+        let call = |recovery_header: bool| {
+            let mut request = Request::post(path);
+            if recovery_header {
+                request = request.header("x-mls-recovery-mode", "true");
+            }
+            let mut request = request.body(Body::from("{}")).expect("request");
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(client));
+            app.clone().oneshot(request)
+        };
 
-        let response = app
-            .oneshot(
-                Request::post(path)
-                    .header(middleware::rate_limit::RECOVERY_MODE_HEADER, "true")
-                    .body(body)
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(!body_was_polled.load(Ordering::SeqCst));
+        // The bucket refills slowly next to these calls, so it runs dry
+        // within a bounded number of them.
+        let mut throttled = None;
+        for _ in 0..10_000 {
+            let response = call(true).await.expect("response");
+            if response.status() != StatusCode::NO_CONTENT {
+                throttled = Some(response.status());
+                break;
+            }
+        }
+        assert_eq!(
+            throttled.expect("requests carrying the header were never limited"),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Those requests spent the bucket that a request without the
+        // header draws on.
+        let response = call(false).await.expect("response");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]
