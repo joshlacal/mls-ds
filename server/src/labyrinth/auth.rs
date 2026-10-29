@@ -160,7 +160,18 @@ fn meter_space_authority_with(
     limiter
         .check(authority, nsid, user, quota)
         .map_err(|retry_after_secs| {
-            authority_auth_failure(nsid, AuthError::RateLimitExceeded { retry_after_secs })
+            // Not an auth failure: the token was verified before metering.
+            tracing::warn!(
+                endpoint = nsid,
+                retry_after_secs,
+                "space authority policy quota spent"
+            );
+            LabyrinthError::new(
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "RateLimited",
+                "rate limited",
+            )
+            .with_retry_after(retry_after_secs)
         })
 }
 
