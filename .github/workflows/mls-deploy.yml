@@ -394,10 +394,13 @@ jobs:
         # Each case mints and drops its own disposable database from the
         # reviewed TEST_DATABASE_URL, so it needs this job's trust-auth
         # service. The harness seeds chat fixtures under
-        # `session_replication_role = replica`, which PostgreSQL lets only a
-        # superuser set. The reviewed URL names no user, so this step alone
-        # connects as the service superuser `anonymous` through PGUSER; the
-        # earlier DB steps still connect as the non-superuser `runner` role.
+        # `session_replication_role = replica`, so it needs a role allowed to
+        # set that parameter: a superuser, or on PostgreSQL 15 and later a
+        # role granted `SET ON PARAMETER session_replication_role`. The
+        # reviewed URL names no user, so this step alone connects as the
+        # service superuser `anonymous` through PGUSER; the earlier DB steps
+        # still connect as the `runner` role, which is not a superuser and
+        # has no such grant.
         # The target requires the test-support feature. It runs after the
         # handler regressions so a failure here does not skip them.
         run: |
