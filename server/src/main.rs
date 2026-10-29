@@ -2060,6 +2060,48 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
+    // The memory budget gate must refuse a body it cannot reserve at once,
+    // and it must run before the body buffer reads anything.
+    #[tokio::test]
+    async fn exhausted_ingress_budget_rejects_post_before_polling_body() {
+        let path = "/xrpc/blue.catbird.chat.replenishKeyPackages";
+        let base_router = Router::new().route(path, post(consume_body));
+        let exhausted_budget = Arc::new(Semaphore::new(1));
+        let _held = exhausted_budget
+            .clone()
+            .try_acquire_owned()
+            .expect("reserve test budget");
+        let app = merge_application_routers(
+            base_router,
+            Router::new(),
+            lazy_test_pool(),
+            IngressBodyPolicy::new(exhausted_budget, Duration::from_secs(1)),
+        );
+        let body_was_polled = Arc::new(AtomicBool::new(false));
+        let body_was_polled_by_stream = body_was_polled.clone();
+        let body = Body::from_stream(futures::stream::once(async move {
+            body_was_polled_by_stream.store(true, Ordering::SeqCst);
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"{}"))
+        }));
+        let mut request = Request::post(path).body(body).expect("request");
+        // An address no other test uses, so the shared per-IP limiter lets
+        // the request reach the budget gate.
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [198, 51, 100, 74],
+                443,
+            ))));
+
+        let response = tokio::time::timeout(Duration::from_secs(1), app.oneshot(request))
+            .await
+            .expect("an exhausted budget must reject without waiting for permits")
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body_was_polled.load(Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn bodyless_methods_bypass_exhausted_budget_and_body_buffering() {
         let exhausted_budget = Arc::new(Semaphore::new(1));
