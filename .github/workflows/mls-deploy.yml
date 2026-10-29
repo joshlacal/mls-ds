@@ -365,21 +365,6 @@ jobs:
             --skip test_out_of_order_commits_prevented \
             --skip test_mixed_operations_no_race_conditions
 
-      - name: Run Labyrinth Space integration tests
-        working-directory: ./server
-        env:
-          DATABASE_URL: postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722
-          TEST_DATABASE_URL: postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722
-          CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: "handlers-and-legacy-apis-sealed"
-          SERVICE_DID: did:web:ci-mls.test
-          RUST_LOG: info
-        # Each case mints and drops its own disposable database from the
-        # reviewed TEST_DATABASE_URL, so it needs this job's trust-auth
-        # service and the CREATEDB `runner` role. The target requires the
-        # test-support feature.
-        run: |
-          cargo test --locked --features test-support --test labyrinth_space
-
       - name: Run authenticated handler regressions
         working-directory: ./server
         env:
@@ -396,6 +381,22 @@ jobs:
           # separate dynamic Swift-producer companion is verified on macOS;
           # frozen Swift serializer products run in the required pure target.
           cargo test --locked --no-default-features --features test-support --test chat_protocol_create_conversation_handlers generated_transition_handlers_preserve_raw_persistence_replay_and_canonical_reads -- --include-ignored --exact --test-threads=1
+
+      - name: Run Labyrinth Space integration tests
+        working-directory: ./server
+        env:
+          DATABASE_URL: postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722
+          TEST_DATABASE_URL: postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722
+          CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: "handlers-and-legacy-apis-sealed"
+          SERVICE_DID: did:web:ci-mls.test
+          RUST_LOG: info
+        # Each case mints and drops its own disposable database from the
+        # reviewed TEST_DATABASE_URL, so it needs this job's trust-auth
+        # service and the CREATEDB `runner` role. The target requires the
+        # test-support feature. It runs after the handler regressions so a
+        # failure here does not skip them.
+        run: |
+          cargo test --locked --features test-support --test labyrinth_space
 
       - name: Preserve generated-transition handler receipts
         if: always()
