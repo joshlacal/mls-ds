@@ -390,11 +390,16 @@ jobs:
           CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: "handlers-and-legacy-apis-sealed"
           SERVICE_DID: did:web:ci-mls.test
           RUST_LOG: info
+          PGUSER: anonymous
         # Each case mints and drops its own disposable database from the
         # reviewed TEST_DATABASE_URL, so it needs this job's trust-auth
-        # service and the CREATEDB `runner` role. The target requires the
-        # test-support feature. It runs after the handler regressions so a
-        # failure here does not skip them.
+        # service. The harness seeds chat fixtures under
+        # `session_replication_role = replica`, which PostgreSQL lets only a
+        # superuser set. The reviewed URL names no user, so this step alone
+        # connects as the service superuser `anonymous` through PGUSER; the
+        # earlier DB steps still connect as the non-superuser `runner` role.
+        # The target requires the test-support feature. It runs after the
+        # handler regressions so a failure here does not skip them.
         run: |
           cargo test --locked --features test-support --test labyrinth_space
 
