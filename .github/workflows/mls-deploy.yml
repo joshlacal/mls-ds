@@ -77,7 +77,7 @@ jobs:
       - name: Clone pinned sibling repos
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach e7ff2a3bb17f7d668889cae5f34a2d8d6755647c
+          git -C ../catbird-atproto checkout --detach d6638bb5237e3d7bf9f6ac34d958fa2d61da2aad
           git clone --filter=blob:none https://github.com/joshlacal/catbird-mls.git ../catbird-mls
           git -C ../catbird-mls checkout --detach 40c46eaf76066c1a95e055fe61ef510e1c155a30
 
@@ -304,7 +304,7 @@ jobs:
       - name: Clone pinned catbird-atproto sibling repo
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach e7ff2a3bb17f7d668889cae5f34a2d8d6755647c
+          git -C ../catbird-atproto checkout --detach d6638bb5237e3d7bf9f6ac34d958fa2d61da2aad
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2026-03-27)
@@ -429,7 +429,7 @@ jobs:
       - name: Clone pinned catbird-atproto sibling repo
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach e7ff2a3bb17f7d668889cae5f34a2d8d6755647c
+          git -C ../catbird-atproto checkout --detach d6638bb5237e3d7bf9f6ac34d958fa2d61da2aad
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
