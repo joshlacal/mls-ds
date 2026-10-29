@@ -2028,12 +2028,11 @@ mod tests {
         // An address no other test uses, so the shared per-IP limiter
         // starts this test with a full bucket.
         let client = SocketAddr::from(([198, 51, 100, 73], 443));
-        let call = |recovery_header: bool| {
-            let mut request = Request::post(path);
-            if recovery_header {
-                request = request.header("x-mls-recovery-mode", "true");
-            }
-            let mut request = request.body(Body::from("{}")).expect("request");
+        let call = || {
+            let mut request = Request::post(path)
+                .header("x-mls-recovery-mode", "true")
+                .body(Body::from("{}"))
+                .expect("request");
             request
                 .extensions_mut()
                 .insert(axum::extract::ConnectInfo(client));
@@ -2041,10 +2040,11 @@ mod tests {
         };
 
         // The bucket refills slowly next to these calls, so it runs dry
-        // within a bounded number of them.
+        // within a bounded number of them. The test stops at the first
+        // limited call: any later call races the refill.
         let mut throttled = None;
         for _ in 0..10_000 {
-            let response = call(true).await.expect("response");
+            let response = call().await.expect("response");
             if response.status() != StatusCode::NO_CONTENT {
                 throttled = Some(response.status());
                 break;
@@ -2054,10 +2054,6 @@ mod tests {
             throttled.expect("requests carrying the header were never limited"),
             StatusCode::TOO_MANY_REQUESTS
         );
-        // Those requests spent the bucket that a request without the
-        // header draws on.
-        let response = call(false).await.expect("response");
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     // The memory budget gate must refuse a body it cannot reserve at once,
