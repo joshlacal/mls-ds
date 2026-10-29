@@ -63,6 +63,16 @@ RATE_LIMIT_REPORT_MEMBER=5
 RATE_LIMIT_DID_DEFAULT=200
 ```
 
+### 3. Space Authority Policy Calls
+
+`blue.catbird.labyrinth.getSpaceMembership` and `deleteSpaceGeneration` are called by one Space authority DID (Swan) on behalf of every user, so they skip the per-DID quotas above. Each `(authority, user)` pair has its own bucket, under a larger per-authority ceiling for each endpoint. `deleteSpaceGeneration` names no user and uses only the ceiling. Throttling returns `429 RateLimited` with `Retry-After`. A failure to resolve the authority's DID document returns `503 DidResolutionFailed`. A rejected token stays `401`.
+
+```bash
+# .env
+RATE_LIMIT_SPACE_AUTHORITY_PER_USER=300     # per authority and user per minute
+RATE_LIMIT_SPACE_AUTHORITY_PER_MINUTE=6000  # per authority and endpoint, all users
+```
+
 ## Technical Details
 
 ### Token Bucket Algorithm

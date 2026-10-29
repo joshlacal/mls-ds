@@ -461,8 +461,12 @@ async fn space_membership(
     const NSID: &str = "blue.catbird.labyrinth.getSpaceMembership";
     let authority = space_authority(pool, rt, headers, NSID).await?;
     let p = Params::parse(query, &["space", "user"])?;
+    let user = p.req("user")?;
+    // A bounded, valid DID before it keys a quota bucket.
+    check_did("user", user)?;
+    auth::meter_space_authority(&authority, NSID, Some(user))?;
     let mut tx = pool.begin().await?;
-    let policy = space::membership(&mut tx, &authority, p.req("space")?, p.req("user")?).await?;
+    let policy = space::membership(&mut tx, &authority, p.req("space")?, user).await?;
     tx.commit().await?;
     to_bytes(&policy)
 }
@@ -480,9 +484,12 @@ async fn space_authority(
             "clean-chat protocol is inactive",
         ));
     }
-    let principal = crate::auth::verify_mls_service_principal(headers, pool, nsid)
-        .await
-        .map_err(|_| LabyrinthError::not_authorized("Space authority service auth failed"))?;
+    // One authority DID calls on behalf of every user, so the per-issuer
+    // quotas are skipped here; each caller meters `(authority, user)`.
+    let principal =
+        crate::auth::verify_mls_service_principal_without_issuer_quota(headers, pool, nsid)
+            .await
+            .map_err(|error| auth::authority_auth_failure(nsid, error))?;
     if principal.exp() - principal.iat() > 60 {
         return Err(LabyrinthError::not_authorized(
             "Space authority policy token lifetime exceeds 60 seconds",
@@ -508,6 +515,7 @@ async fn delete_space_generation_inner(
 ) -> LabyrinthResult<Vec<u8>> {
     const NSID: &str = "blue.catbird.labyrinth.deleteSpaceGeneration";
     let authority = space_authority(pool, rt, headers, NSID).await?;
+    auth::meter_space_authority(&authority, NSID, None)?;
     let input: space::DeleteSpaceGeneration = body(bytes)?;
     let mut tx = pool.begin().await?;
     let result = space::delete_generation(&mut tx, &authority, &input).await?;

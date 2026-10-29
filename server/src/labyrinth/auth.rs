@@ -110,6 +110,60 @@ fn service_auth_failure(nsid: &str, error: AuthError) -> LabyrinthError {
     }
 }
 
+/// The response to a failed Space authority policy call
+/// (`getSpaceMembership`, `deleteSpaceGeneration`). A rejected token stays
+/// `401`. Throttling is `429 RateLimited` with `Retry-After`. An issuer DID
+/// document that cannot be resolved is `503`: the authority cannot fix that
+/// by signing again, only by retrying later.
+pub fn authority_auth_failure(nsid: &str, error: AuthError) -> LabyrinthError {
+    match error {
+        AuthError::DidResolutionFailed(_) => {
+            tracing::warn!(
+                endpoint = nsid,
+                ?error,
+                "space authority DID resolution failed"
+            );
+            LabyrinthError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "DidResolutionFailed",
+                "the authority DID document could not be resolved; retry later",
+            )
+        }
+        other => service_auth_failure(nsid, other),
+    }
+}
+
+/// Take one call from the Space authority policy quota: per `user` (when the
+/// call names one) by `authority`, under a per-authority ceiling.
+pub fn meter_space_authority(
+    authority: &str,
+    nsid: &str,
+    user: Option<&str>,
+) -> LabyrinthResult<()> {
+    use crate::middleware::rate_limit::{SpaceAuthorityQuota, SPACE_AUTHORITY_RATE_LIMITER};
+    meter_space_authority_with(
+        &SPACE_AUTHORITY_RATE_LIMITER,
+        SpaceAuthorityQuota::from_env(),
+        authority,
+        nsid,
+        user,
+    )
+}
+
+fn meter_space_authority_with(
+    limiter: &crate::middleware::rate_limit::SpaceAuthorityRateLimiter,
+    quota: crate::middleware::rate_limit::SpaceAuthorityQuota,
+    authority: &str,
+    nsid: &str,
+    user: Option<&str>,
+) -> LabyrinthResult<()> {
+    limiter
+        .check(authority, nsid, user, quota)
+        .map_err(|retry_after_secs| {
+            authority_auth_failure(nsid, AuthError::RateLimitExceeded { retry_after_secs })
+        })
+}
+
 fn require_cutover(cutover_enabled: bool) -> LabyrinthResult<()> {
     if cutover_enabled {
         Ok(())
@@ -502,5 +556,112 @@ impl RequestTx {
             "IdempotencyConflict",
             format!("operation for {did} completed concurrently; retry to replay it"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::middleware::rate_limit::{SpaceAuthorityQuota, SpaceAuthorityRateLimiter};
+    use axum::http::{header::RETRY_AFTER, StatusCode};
+    use axum::response::IntoResponse;
+
+    const NSID: &str = "blue.catbird.labyrinth.getSpaceMembership";
+
+    /// Swan's membership checker treats 403, 404 and 410 as a definitive
+    /// answer and every other non-200 status as temporarily unavailable.
+    fn swan_reads_as_definitive(status: StatusCode) -> bool {
+        matches!(status.as_u16(), 200 | 403 | 404 | 410)
+    }
+
+    // MLSDS-01: throttling came back as 401 NotAuthorized.
+    #[test]
+    fn authority_throttling_is_429_rate_limited_with_retry_after() {
+        let error = authority_auth_failure(
+            NSID,
+            AuthError::RateLimitExceeded {
+                retry_after_secs: 7,
+            },
+        );
+        assert_eq!(
+            (error.status(), error.name()),
+            (StatusCode::TOO_MANY_REQUESTS, "RateLimited")
+        );
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[RETRY_AFTER], "7");
+    }
+
+    // MLSDS-01: a DID-resolution failure came back as 401 NotAuthorized.
+    #[test]
+    fn authority_did_resolution_failure_is_503() {
+        let error = authority_auth_failure(
+            NSID,
+            AuthError::DidResolutionFailed("DID resolution deadline exceeded".into()),
+        );
+        assert_eq!(
+            (error.status(), error.name()),
+            (StatusCode::SERVICE_UNAVAILABLE, "DidResolutionFailed")
+        );
+        assert!(!swan_reads_as_definitive(error.status()));
+    }
+
+    #[test]
+    fn authority_token_failures_stay_401() {
+        let rejected = [
+            AuthError::MissingAuthHeader,
+            AuthError::InvalidAuthFormat,
+            AuthError::InvalidToken("bad".into()),
+            AuthError::TokenExpired,
+            AuthError::InvalidDid("bad".into()),
+            AuthError::InvalidSignature,
+            AuthError::MissingVerificationMethod,
+            AuthError::UnsupportedKeyType("bad".into()),
+            AuthError::MissingJti,
+            AuthError::ReplayDetected,
+            AuthError::MissingLxm,
+            AuthError::LxmMismatch,
+            AuthError::DeviceAuthorizationDenied,
+        ];
+        for error in rejected {
+            let label = error.to_string();
+            assert_eq!(
+                authority_auth_failure(NSID, error).status(),
+                StatusCode::UNAUTHORIZED,
+                "{label}"
+            );
+        }
+        assert_eq!(
+            authority_auth_failure(NSID, AuthError::Internal("db".into())).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn spent_authority_quota_is_429_rate_limited_for_that_user_only() {
+        let limiter = SpaceAuthorityRateLimiter::new();
+        let quota = SpaceAuthorityQuota {
+            per_user: 2,
+            per_authority: 100,
+        };
+        let authority = "did:web:authority.example.com";
+        let alice = Some("did:plc:alice");
+        for _ in 0..2 {
+            meter_space_authority_with(&limiter, quota, authority, NSID, alice).unwrap();
+        }
+        let error =
+            meter_space_authority_with(&limiter, quota, authority, NSID, alice).unwrap_err();
+        assert_eq!(
+            (error.status(), error.name()),
+            (StatusCode::TOO_MANY_REQUESTS, "RateLimited")
+        );
+        assert!(!swan_reads_as_definitive(error.status()));
+        let retry_after = error.into_response().headers()[RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(retry_after >= 1);
+        meter_space_authority_with(&limiter, quota, authority, NSID, Some("did:plc:bob")).unwrap();
     }
 }

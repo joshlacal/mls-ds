@@ -463,6 +463,70 @@ async fn authority_policy_checks_exact_committed_membership_without_user_device_
         .fails(403, "NotParticipant");
 }
 
+/// MLSDS-01: the authority's policy calls were metered by its issuer DID
+/// alone, so every user of the deployment shared one 200/min bucket (and a
+/// burst of 10), and throttling came back as `401 NotAuthorized`. The quota
+/// is per (authority, user), and throttling is `429` with `Retry-After`.
+#[tokio::test]
+async fn authority_policy_quota_is_per_user_and_throttles_with_429() {
+    use catbird_server::middleware::rate_limit::SpaceAuthorityQuota;
+    use tower_util::ServiceExt;
+    let env = Env::new().await;
+    let authority = env.account().await;
+    let alice = env.account().await;
+    let bob = env.account().await;
+    let thread = space_thread(&env, &authority, &[&alice, &bob]).await;
+    let p = placement(&alice, thread).await;
+    let per_user = SpaceAuthorityQuota::from_env().per_user;
+    for call in 0..per_user {
+        let reply = policy(&env, &authority, &p, &alice.did).await;
+        assert_eq!(reply.status, 200, "call {call}: {}", reply.json);
+    }
+    let nsid = "blue.catbird.labyrinth.getSpaceMembership";
+    let q = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("space", p["space"].as_str().unwrap())
+        .append_pair("user", &alice.did)
+        .finish();
+    // The bucket refilled at per_user/60 per second during those calls, far
+    // slower than they ran, so it runs dry within a bounded number more.
+    let mut throttled = None;
+    for _ in 0..per_user {
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                Request::get(format!("/xrpc/{nsid}?{q}"))
+                    .header("authorization", format!("Bearer {}", authority.token(nsid)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if response.status() != 200 {
+            throttled = Some(response);
+            break;
+        }
+    }
+    let throttled = throttled.expect("the per-user quota never ran dry");
+    assert_eq!(throttled.status(), 429);
+    let retry_after: u64 = throttled.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry_after >= 1);
+    let bytes = axum::body::to_bytes(throttled.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"], "RateLimited");
+    // Another user of the same authority is not throttled.
+    assert_eq!(
+        policy(&env, &authority, &p, &bob.did).await.ok()["user"],
+        bob.did
+    );
+}
+
 // Observe real PostgreSQL lock waits instead of relying on scheduler timing.
 async fn wait_for_blocker(pool: &sqlx::PgPool, blocked: i32, blocker: i32) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {

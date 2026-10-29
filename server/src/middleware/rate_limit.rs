@@ -268,6 +268,101 @@ impl Default for FederationPeerRateLimiter {
     }
 }
 
+/// Per-minute quotas of the Space authority policy endpoints
+/// (`getSpaceMembership`, `deleteSpaceGeneration`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpaceAuthorityQuota {
+    /// Calls for one user by one authority. Applies when the call names a user.
+    pub per_user: u32,
+    /// Calls to one endpoint by one authority, across all users.
+    pub per_authority: u32,
+}
+
+impl Default for SpaceAuthorityQuota {
+    fn default() -> Self {
+        Self {
+            per_user: 300,
+            per_authority: 6000,
+        }
+    }
+}
+
+impl SpaceAuthorityQuota {
+    pub fn from_env() -> Self {
+        let read = |name: &str, default: u32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        };
+        let default = Self::default();
+        Self {
+            per_user: read("RATE_LIMIT_SPACE_AUTHORITY_PER_USER", default.per_user),
+            per_authority: read(
+                "RATE_LIMIT_SPACE_AUTHORITY_PER_MINUTE",
+                default.per_authority,
+            ),
+        }
+    }
+}
+
+/// Quota of the Space authority policy endpoints. One authority DID calls
+/// them for every user of a deployment, so the per-issuer [`DidRateLimiter`]
+/// bucket would make all of those users share one bucket. Here each user has
+/// a bucket per authority, under a larger per-authority ceiling.
+#[derive(Clone)]
+pub struct SpaceAuthorityRateLimiter {
+    buckets: Arc<Cache<String, Arc<Mutex<TokenBucket>>>>,
+}
+
+impl SpaceAuthorityRateLimiter {
+    pub fn new() -> Self {
+        let max_keys = parse_u64_env("RATE_LIMIT_SPACE_AUTHORITY_MAX_KEYS", 300_000);
+        let ttl_seconds = parse_u64_env("RATE_LIMIT_SPACE_AUTHORITY_BUCKET_TTL_SECONDS", 900);
+        Self {
+            buckets: build_bucket_cache(max_keys, ttl_seconds),
+        }
+    }
+
+    /// Take one call to `endpoint` by `authority`, on behalf of `user` when
+    /// the call names one. `Err` carries the Retry-After seconds. The user's
+    /// bucket is checked first, so a throttled user does not spend the
+    /// authority's shared ceiling.
+    pub fn check(
+        &self,
+        authority: &str,
+        endpoint: &str,
+        user: Option<&str>,
+        quota: SpaceAuthorityQuota,
+    ) -> Result<(), u64> {
+        if let Some(user) = user {
+            self.take(format!("{authority}|{endpoint}|{user}"), quota.per_user)?;
+        }
+        self.take(format!("{authority}|{endpoint}|*"), quota.per_authority)
+    }
+
+    fn take(&self, key: String, per_minute: u32) -> Result<(), u64> {
+        let limit = per_minute.max(1);
+        // Include the limit in the key so a quota change does not reuse stale capacity.
+        let bucket = self.buckets.get_with(format!("{key}|{limit}"), || {
+            Arc::new(Mutex::new(TokenBucket::new(limit, limit as f64 / 60.0)))
+        });
+        let mut bucket = bucket.lock();
+        if bucket.try_consume() {
+            Ok(())
+        } else {
+            Err(bucket.retry_after_secs())
+        }
+    }
+}
+
+impl Default for SpaceAuthorityRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Get endpoint-specific quota (limit, window duration)
 fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
     let window = Duration::from_secs(60); // 1 minute window
@@ -371,6 +466,9 @@ pub static DID_RATE_LIMITER: Lazy<DidRateLimiter> = Lazy::new(DidRateLimiter::ne
 /// Global per-source-DS limiter for federation endpoints.
 pub static FEDERATION_DS_RATE_LIMITER: Lazy<FederationPeerRateLimiter> =
     Lazy::new(FederationPeerRateLimiter::new);
+/// Global limiter of the Space authority policy endpoints.
+pub static SPACE_AUTHORITY_RATE_LIMITER: Lazy<SpaceAuthorityRateLimiter> =
+    Lazy::new(SpaceAuthorityRateLimiter::new);
 
 /// Per-IP rate limiter instance
 pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
@@ -584,6 +682,75 @@ mod tests {
             &headers,
             "/xrpc/blue.catbird.chat.sendMessage"
         ));
+    }
+
+    const MEMBERSHIP: &str = "blue.catbird.labyrinth.getSpaceMembership";
+    const DELETION: &str = "blue.catbird.labyrinth.deleteSpaceGeneration";
+    const AUTHORITY: &str = "did:web:authority.example.com";
+
+    // MLSDS-01: two users of one authority each cost 150 policy calls in a
+    // minute. The shared 200/min issuer bucket throttled both (and every
+    // other user); per-user buckets admit both.
+    #[test]
+    fn space_authority_default_quota_admits_two_users_past_the_did_default() {
+        let limiter = SpaceAuthorityRateLimiter::new();
+        let quota = SpaceAuthorityQuota::default();
+        for user in ["did:plc:alice", "did:plc:bob"] {
+            for call in 0..150 {
+                assert!(
+                    limiter
+                        .check(AUTHORITY, MEMBERSHIP, Some(user), quota)
+                        .is_ok(),
+                    "{user} throttled at call {call}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn space_authority_quota_is_keyed_by_authority_and_user() {
+        let limiter = SpaceAuthorityRateLimiter::new();
+        let quota = SpaceAuthorityQuota {
+            per_user: 3,
+            per_authority: 5,
+        };
+        let alice = Some("did:plc:alice");
+        for _ in 0..3 {
+            assert!(limiter.check(AUTHORITY, MEMBERSHIP, alice, quota).is_ok());
+        }
+        let retry_after = limiter
+            .check(AUTHORITY, MEMBERSHIP, alice, quota)
+            .unwrap_err();
+        assert!(retry_after >= 1);
+        // Bob has his own bucket under the same authority.
+        assert!(limiter
+            .check(AUTHORITY, MEMBERSHIP, Some("did:plc:bob"), quota)
+            .is_ok());
+        assert!(limiter
+            .check(AUTHORITY, MEMBERSHIP, Some("did:plc:bob"), quota)
+            .is_ok());
+        // Alice's throttled call did not spend the ceiling, which is now
+        // spent (3 + 2), so it holds for a fresh user too.
+        assert!(limiter
+            .check(AUTHORITY, MEMBERSHIP, Some("did:plc:carol"), quota)
+            .is_err());
+        // Other authorities, and the authority's other endpoint, are separate.
+        assert!(limiter
+            .check("did:web:other.example.com", MEMBERSHIP, alice, quota)
+            .is_ok());
+        assert!(limiter.check(AUTHORITY, DELETION, None, quota).is_ok());
+    }
+
+    #[test]
+    fn space_authority_call_without_user_uses_only_the_ceiling() {
+        let limiter = SpaceAuthorityRateLimiter::new();
+        let quota = SpaceAuthorityQuota {
+            per_user: 1,
+            per_authority: 2,
+        };
+        assert!(limiter.check(AUTHORITY, DELETION, None, quota).is_ok());
+        assert!(limiter.check(AUTHORITY, DELETION, None, quota).is_ok());
+        assert!(limiter.check(AUTHORITY, DELETION, None, quota).unwrap_err() >= 1);
     }
 
     #[test]

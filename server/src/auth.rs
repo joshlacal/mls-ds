@@ -1607,6 +1607,26 @@ pub(crate) async fn verify_mls_service_principal(
     pool: &crate::storage::DbPool,
     endpoint_nsid: &str,
 ) -> Result<VerifiedServicePrincipal, AuthError> {
+    verify_mls_service_principal_with(headers, pool, endpoint_nsid, true).await
+}
+
+/// [`verify_mls_service_principal`] without its per-issuer quotas. Only for a
+/// route that meters the verified principal itself: the Space authority
+/// policy routes, whose single issuer calls on behalf of every user.
+pub(crate) async fn verify_mls_service_principal_without_issuer_quota(
+    headers: &axum::http::HeaderMap,
+    pool: &crate::storage::DbPool,
+    endpoint_nsid: &str,
+) -> Result<VerifiedServicePrincipal, AuthError> {
+    verify_mls_service_principal_with(headers, pool, endpoint_nsid, false).await
+}
+
+async fn verify_mls_service_principal_with(
+    headers: &axum::http::HeaderMap,
+    pool: &crate::storage::DbPool,
+    endpoint_nsid: &str,
+    issuer_quota: bool,
+) -> Result<VerifiedServicePrincipal, AuthError> {
     let authorization = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -1621,13 +1641,15 @@ pub(crate) async fn verify_mls_service_principal(
     let now = Utc::now().timestamp();
     let (issuer, iat) = validate_mls_service_claims(&claims, endpoint_nsid, now)?;
     enforce_standard_with_replay_store(&claims, endpoint_nsid, pool).await?;
-    AUTH_MIDDLEWARE.check_rate_limit(issuer)?;
-    if let Err(retry_after) =
-        crate::middleware::rate_limit::DID_RATE_LIMITER.check_did_limit(issuer, endpoint_nsid)
-    {
-        return Err(AuthError::RateLimitExceeded {
-            retry_after_secs: retry_after,
-        });
+    if issuer_quota {
+        AUTH_MIDDLEWARE.check_rate_limit(issuer)?;
+        if let Err(retry_after) =
+            crate::middleware::rate_limit::DID_RATE_LIMITER.check_did_limit(issuer, endpoint_nsid)
+        {
+            return Err(AuthError::RateLimitExceeded {
+                retry_after_secs: retry_after,
+            });
+        }
     }
 
     Ok(VerifiedServicePrincipal {
