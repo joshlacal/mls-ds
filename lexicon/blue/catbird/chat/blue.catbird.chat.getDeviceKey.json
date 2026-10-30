@@ -1,0 +1,105 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.getDeviceKey",
+  "description": "Return one immutable candidate Ed25519 device key for the exact ownerDid, deviceId and keyId tuple, including retained revoked devices. The authenticated caller must name its own active enrolled actorDeviceId. This lookup asserts neither current nor historical authorization: consumers must verify the key fingerprint, device signature and independently authenticated entry or receipt authority. No target status filtering, enumeration, truncation or authorization flags are provided.",
+  "defs": {
+    "main": {
+      "type": "query",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "actorDeviceId",
+          "ownerDid",
+          "deviceId",
+          "keyId"
+        ],
+        "properties": {
+          "actorDeviceId": {
+            "type": "string",
+            "minLength": 36,
+            "maxLength": 36
+          },
+          "ownerDid": {
+            "type": "string",
+            "format": "did",
+            "minLength": 12,
+            "maxLength": 261
+          },
+          "deviceId": {
+            "type": "string",
+            "minLength": 36,
+            "maxLength": 36
+          },
+          "keyId": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 43
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "ownerDid",
+            "deviceId",
+            "keyId",
+            "signaturePublicKey"
+          ],
+          "properties": {
+            "ownerDid": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#bareDid"
+            },
+            "deviceId": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#deviceId"
+            },
+            "keyId": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#keyId"
+            },
+            "signaturePublicKey": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        },
+        {
+          "name": "DeviceKeyNotFound"
+        }
+      ]
+    }
+  }
+}

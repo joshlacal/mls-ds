@@ -30,13 +30,18 @@ use super::super::relationship_policy::{
     fixed_production_relationship_policy_config,
     hydrate_persisted_fallback_relationship_projection,
     hydrate_persisted_fallback_traffic_projection, AdmissionOperation, AdmissionRequest,
+    DatabaseAnchoredProjectionClock,
     DeclarationRecordEvidenceKind, EvidenceKind, IncomingPolicy, PersistedDeclarationEvidence,
     PersistedGraphRelationshipEvidence, PersistedRelationshipProjection,
-    PersistedTrafficProjection, ProjectionOperationScope, ProjectionScope, PublicTransport,
-    RelationshipAuthority, RelationshipPolicyConfig, RelationshipPolicyConfigError,
-    RelationshipProjection, ReqwestPinnedTransport, SealedRelationshipProjection,
-    SealedTrafficProjection, SystemDnsResolver, TrafficGraphScope, TrafficProjection,
-    TransportError, TransportSecurityProfile,
+    PersistedTrafficProjection, ProductionRelationshipTransport, ProjectionOperationScope,
+    ProjectionScope, PublicTransport, RelationshipAuthority, RelationshipPolicyConfig,
+    RelationshipPolicyConfigError, RelationshipProjection, ReqwestPinnedTransport,
+    SealedRelationshipProjection, SealedTrafficProjection, SystemDnsResolver, TrafficGraphScope,
+    TrafficProjection, TransportError, TransportSecurityProfile, HARDENED_SOURCE_PROFILE_V1,
+};
+#[cfg(feature = "test-support")]
+use super::super::relationship_policy::{
+    installed_test_https_relationship_transport, TEST_HTTPS_SOURCE_PROFILE_V1,
 };
 use super::core::AllocatedProjectionRevisionGuard;
 
@@ -82,7 +87,8 @@ impl From<sqlx::Error> for RelationshipRepositoryError {
 /// configuration and constructed the audited transport internally. Its fields
 pub struct RelationshipAuthorityStartupGuard {
     config: RelationshipPolicyConfig,
-    transport: ReqwestPinnedTransport<SystemDnsResolver>,
+    transport: ProductionRelationshipTransport,
+    source_profile: &'static [u8],
 }
 
 /// Exact durable operation/scope witness for a relationship snapshot load.
@@ -426,9 +432,25 @@ impl TrustedRelationshipDecisionInstant {
 
 /// Capture persistence time after collection. Export rejects observations
 /// before `completed_at`, so capturing this before collection cannot authorize
-/// a projection that finishes later.
-pub(crate) fn observe_relationship_persistence() -> TrustedRelationshipPersistenceInstant {
-    TrustedRelationshipPersistenceInstant(Utc::now())
+/// a projection that finishes later. Read from the same database-anchored
+/// clock that stamped the collection window, because the persisted window is
+/// later judged against post-lock `clock_timestamp()` decisions.
+pub(crate) fn observe_relationship_persistence(
+    clock: &DatabaseAnchoredProjectionClock,
+) -> TrustedRelationshipPersistenceInstant {
+    use super::super::relationship_policy::ProjectionClock as _;
+    TrustedRelationshipPersistenceInstant(clock.now())
+}
+
+/// Anchor a live projection's clock on PostgreSQL immediately before
+/// collection, so collection stamps share the decision clock's timebase.
+pub(crate) async fn anchor_projection_clock<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+) -> Result<DatabaseAnchoredProjectionClock, sqlx::Error> {
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(executor)
+        .await?;
+    Ok(DatabaseAnchoredProjectionClock::from_database_sample(now))
 }
 
 /// Load the production relationship authority. This intentionally accepts no
@@ -439,6 +461,14 @@ pub(crate) fn load_fixed_relationship_authority_startup_guard(
 ) -> Result<RelationshipAuthorityStartupGuard, RelationshipAuthorityStartupError> {
     let config = fixed_production_relationship_policy_config()
         .map_err(RelationshipAuthorityStartupError::InvalidConfiguration)?;
+    #[cfg(feature = "test-support")]
+    if let Some(transport) = installed_test_https_relationship_transport() {
+        return Ok(RelationshipAuthorityStartupGuard {
+            config,
+            transport: ProductionRelationshipTransport::TestHttps(transport),
+            source_profile: TEST_HTTPS_SOURCE_PROFILE_V1,
+        });
+    }
     let transport = ReqwestPinnedTransport::new(SystemDnsResolver, config.max_dns_answers())
         .map_err(RelationshipAuthorityStartupError::InvalidTransport)?;
     if ReqwestPinnedTransport::<SystemDnsResolver>::security_profile()
@@ -452,7 +482,11 @@ pub(crate) fn load_fixed_relationship_authority_startup_guard(
     {
         return Err(RelationshipAuthorityStartupError::InsecureTransportProfile);
     }
-    Ok(RelationshipAuthorityStartupGuard { config, transport })
+    Ok(RelationshipAuthorityStartupGuard {
+        config,
+        transport: ProductionRelationshipTransport::Public(transport),
+        source_profile: HARDENED_SOURCE_PROFILE_V1,
+    })
 }
 
 impl RelationshipAuthorityStartupGuard {
@@ -460,9 +494,10 @@ impl RelationshipAuthorityStartupGuard {
         self,
     ) -> (
         RelationshipPolicyConfig,
-        ReqwestPinnedTransport<SystemDnsResolver>,
+        ProductionRelationshipTransport,
+        &'static [u8],
     ) {
-        (self.config, self.transport)
+        (self.config, self.transport, self.source_profile)
     }
 }
 
@@ -1429,23 +1464,34 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
         _ => {
             let live_allocation = allocate_projection_revision(transaction).await?;
             let fallback_allocation = allocate_projection_revision(transaction).await?;
+            let clock = anchor_projection_clock(&mut **transaction).await?;
             let live = match &scope {
                 ProjectionScope::Admission(req) => authority
-                    .collect_admission_projection(live_allocation, operation_scope, req.clone())
+                    .collect_admission_projection(
+                        &clock,
+                        live_allocation,
+                        operation_scope,
+                        req.clone(),
+                    )
                     .await
                     .map_err(|e| {
                         tracing::error!("collect_admission_projection failed: {:?}", e);
                         RelationshipRepositoryError::InvalidProjection
                     })?,
                 ProjectionScope::BlockOnly(s) => authority
-                    .collect_block_projection(live_allocation, operation_scope, s.members.clone())
+                    .collect_block_projection(
+                        &clock,
+                        live_allocation,
+                        operation_scope,
+                        s.members.clone(),
+                    )
                     .await
                     .map_err(|e| {
                         tracing::error!("collect_block_projection failed: {:?}", e);
                         RelationshipRepositoryError::InvalidProjection
                     })?,
             };
-            let observation = observe_relationship_persistence();
+            let observation = observe_relationship_persistence(&clock);
             let sealed = live
                 .export_persisted_fallback(fallback_allocation, authority, &observation)
                 .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
@@ -1532,8 +1578,10 @@ pub(crate) async fn load_fallback_traffic_projection<T: PublicTransport>(
         _ => {
             let live_allocation = allocate_projection_revision(transaction).await?;
             let fallback_allocation = allocate_projection_revision(transaction).await?;
+            let clock = anchor_projection_clock(&mut **transaction).await?;
             let live = authority
                 .collect_traffic_projection(
+                    &clock,
                     live_allocation,
                     scope.actor.clone(),
                     scope.members.clone(),
@@ -1543,7 +1591,7 @@ pub(crate) async fn load_fallback_traffic_projection<T: PublicTransport>(
                     tracing::error!(?error, "collect_traffic_projection failed");
                     RelationshipRepositoryError::InvalidProjection
                 })?;
-            let observation = observe_relationship_persistence();
+            let observation = observe_relationship_persistence(&clock);
             let sealed = live
                 .export_persisted_fallback(fallback_allocation, authority, &observation)
                 .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
@@ -2440,12 +2488,15 @@ fn relationship_operation_matches_scope(
     matches!(
         (operation, scope),
         (
-            ProjectionOperationScope::Creation
+            ProjectionOperationScope::DirectRequestPreparation
+                | ProjectionOperationScope::Creation
                 | ProjectionOperationScope::PendingAdd
                 | ProjectionOperationScope::Acceptance,
             ProjectionScope::Admission(_)
         ) | (
-            ProjectionOperationScope::RecoveryReservation
+            ProjectionOperationScope::DirectRequestAcceptance
+                | ProjectionOperationScope::DirectRequestPushEligibility
+                | ProjectionOperationScope::RecoveryReservation
                 | ProjectionOperationScope::RecoveryFulfillment,
             ProjectionScope::BlockOnly(_)
         )
@@ -2458,4 +2509,200 @@ fn canonical_transaction_id(value: &str) -> bool {
         && value.as_bytes()[0] != b'0'
         && value.bytes().all(|byte| byte.is_ascii_digit())
         && value.parse::<u64>().is_ok_and(|value| value > 0)
+}
+
+/// Private request-attempt witness comes only from the signed request
+/// compositor after its canonical operation and identity prefix are locked.
+pub(super) async fn verify_direct_request_policy<T: PublicTransport>(
+    transaction: &mut Transaction<'_, Postgres>,
+    witness: &super::direct_request_preparation::DirectRequestPolicyWitness,
+    authority: &RelationshipAuthority<T>,
+    quota_exceeded: bool,
+) -> Result<(), RelationshipRepositoryError> {
+    let (transaction_id, request, actor_digest, read_set_digest) = witness.parts();
+    let scope = ProjectionScope::Admission(request.clone());
+    let make_scope = || {
+        LockedRelationshipFallbackScope::from_locked_read_set(
+            transaction_id.to_owned(),
+            ProjectionOperationScope::DirectRequestPreparation,
+            scope.clone(),
+            actor_digest,
+            read_set_digest,
+        )
+    };
+    let (projection, decision) =
+        load_fallback_relationship_projection(transaction, make_scope()?, authority)
+            .await?
+            .ok_or(RelationshipRepositoryError::InvalidProjection)?;
+    consume_resealed_relationship_projection(
+        &projection,
+        &decision,
+        make_scope()?,
+        &scope,
+        authority,
+        quota_exceeded,
+    )
+    .map_err(|_| RelationshipRepositoryError::InvalidProjection)
+}
+
+/// Recipient acceptance checks current bilateral blocks without reapplying
+/// incoming-request eligibility. The opaque witness carries locked service and
+/// device authority; the peer identity comes only from the immutable request.
+pub(super) async fn verify_direct_request_acceptance_policy<T: PublicTransport>(
+    transaction: &mut Transaction<'_, Postgres>,
+    witness: &super::direct_request_preparation::LockedDirectRequestAcceptance,
+    authority: &RelationshipAuthority<T>,
+) -> Result<(), RelationshipRepositoryError> {
+    witness
+        .require_transaction(transaction)
+        .await
+        .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
+    let signed = witness.signed();
+    let request_id = Uuid::parse_str(
+        signed.body()["requestId"]
+            .as_str()
+            .ok_or(RelationshipRepositoryError::InvalidProjection)?,
+    )
+    .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
+    let (sender,recipient,publication_digest):(String,String,Vec<u8>)=sqlx::query_as("SELECT actor_did,recipient_did,publication_digest FROM chat.direct_request_publications WHERE request_id=$1")
+        .bind(request_id).fetch_one(&mut **transaction).await?;
+    if signed.body()["actorDid"].as_str() != Some(recipient.as_str()) {
+        return Err(RelationshipRepositoryError::InvalidProjection);
+    }
+    let mut roster = vec![sender, recipient];
+    roster.sort();
+    let scope = ProjectionScope::BlockOnly(
+        plan_block_only_graph(&roster)
+            .map_err(|_| RelationshipRepositoryError::InvalidProjection)?
+            .scope,
+    );
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let read_digest =
+        Sha256::digest([publication_digest.as_slice(), request_id.as_bytes()].concat()).into();
+    let make_scope = || {
+        LockedRelationshipFallbackScope::from_locked_read_set(
+            transaction_id.clone(),
+            ProjectionOperationScope::DirectRequestAcceptance,
+            scope.clone(),
+            *signed.request_digest(),
+            read_digest,
+        )
+    };
+    let (projection, decision) =
+        load_fallback_relationship_projection(transaction, make_scope()?, authority)
+            .await?
+            .ok_or(RelationshipRepositoryError::InvalidProjection)?;
+    consume_resealed_relationship_projection(
+        &projection,
+        &decision,
+        make_scope()?,
+        &scope,
+        authority,
+        false,
+    )
+    .map_err(|_| RelationshipRepositoryError::InvalidProjection)
+}
+
+/// Push eligibility never reads a cached/fallback projection. It collects a
+/// fresh bilateral block graph after the caller's complete mutable read set is
+/// locked, persists that exact live evidence, then consumes it under the same
+/// transaction-bound witness. Collection/storage failure remains retryable;
+/// an authenticated current block is a signed negative decision.
+pub(super) async fn verify_direct_request_push_policy<T: PublicTransport>(
+    transaction: &mut Transaction<'_, Postgres>,
+    witness: &super::direct_request_push::LockedDirectRequestPushEligibility,
+    authority: &RelationshipAuthority<T>,
+) -> Result<bool, RelationshipRepositoryError> {
+    let (transaction_id, sender, recipient, actor_digest, read_set_digest) = witness.parts();
+    let mut roster = vec![sender.to_owned(), recipient.to_owned()];
+    roster.sort();
+    roster.dedup();
+    let scope = ProjectionScope::BlockOnly(
+        plan_block_only_graph(&roster)
+            .map_err(|_| RelationshipRepositoryError::InvalidProjection)?
+            .scope,
+    );
+    let make_scope = || {
+        LockedRelationshipFallbackScope::from_locked_read_set(
+            transaction_id.to_owned(),
+            ProjectionOperationScope::DirectRequestPushEligibility,
+            scope.clone(),
+            actor_digest,
+            read_set_digest,
+        )
+    };
+    require_witness_transaction(transaction, transaction_id).await?;
+    let allocation = allocate_projection_revision(transaction).await?;
+    // Collection stamps and the persistence observation share the database
+    // timebase of the post-lock decision below; a host-clock window would let
+    // any host-ahead skew fail `decision >= completed_at`.
+    let clock = anchor_projection_clock(&mut **transaction).await?;
+    let projection = authority
+        .collect_block_projection(
+            &clock,
+            allocation,
+            ProjectionOperationScope::DirectRequestPushEligibility,
+            roster,
+        )
+        .await
+        .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
+    let persistence = observe_relationship_persistence(&clock);
+    let sealed = projection
+        .export_persisted(authority, &persistence)
+        .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
+    persist_relationship_projection(transaction, sealed).await?;
+    let decision = observe_locked_relationship_decision(transaction, make_scope()?).await?;
+    match consume_resealed_relationship_projection(
+        &projection,
+        &decision,
+        make_scope()?,
+        &scope,
+        authority,
+        false,
+    ) {
+        Ok(()) => Ok(true),
+        Err(RelationshipConsumptionError::PolicyDenied) => Ok(false),
+        Err(RelationshipConsumptionError::InvalidWitness) => {
+            Err(RelationshipRepositoryError::InvalidProjection)
+        }
+    }
+}
+
+/// Reuse the production live AppView traffic graph for a coordinator-verified
+/// federated sender while its signed mutation and conversation head are locked.
+pub(crate) async fn verify_federated_send_policy<T: PublicTransport>(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    peer: &str,
+    authenticated_request_digest: [u8; 32],
+    locked_head_digest: [u8; 32],
+    authority: &RelationshipAuthority<T>,
+) -> Result<(), RelationshipConsumptionError> {
+    let roster = vec![actor.to_owned(), peer.to_owned()];
+    let scope = plan_traffic_graph(actor, &roster)
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?
+        .scope;
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    let revision = allocate_projection_revision(tx)
+        .await
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    let clock = anchor_projection_clock(&mut **tx)
+        .await
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    let projection = authority.collect_traffic_projection(
+        &clock, revision, actor.to_owned(), roster,
+    ).await.map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    let observed_at = observe_post_lock_time(tx)
+        .await
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    let decision = TrustedRelationshipDecisionInstant::from_locked_traffic_scope(
+        transaction_id, scope, authenticated_request_digest, locked_head_digest, observed_at,
+    ).ok_or(RelationshipConsumptionError::InvalidWitness)?;
+    consume_traffic_projection(&projection, authority, &decision)
+        .map_err(|_| RelationshipConsumptionError::PolicyDenied)
 }

@@ -75,11 +75,20 @@ pub(crate) async fn visible_events(
                   event.payload_sha256, event.created_at
              FROM chat.event_recipients recipient
              JOIN chat.events event USING (event_position)
+             JOIN chat.inventory_sessions session ON session.inventory_session_id = $7
             WHERE recipient.user_did = $1
               AND recipient.device_id = $2
               AND event.protocol_instance_id = $3
               AND event.event_position > $4
               AND event.event_position <= $5
+              AND (session.supported_protocol_versions IS NULL
+                   OR event.event_kind = 'watermark'
+                   OR EXISTS (SELECT 1 FROM chat.conversations c
+                       WHERE c.conversation_id::text = COALESCE(
+                           convert_from(event.payload_bytes, 'UTF8')::jsonb->>'conversationId',
+                           (SELECT w.conversation_id::text FROM chat.welcome_bundles w
+                            WHERE w.welcome_id = (convert_from(event.payload_bytes, 'UTF8')::jsonb->>'welcomeId')::uuid))
+                         AND c.protocol_version = ANY(session.supported_protocol_versions)))
             ORDER BY event.event_position
             LIMIT $6"#,
     )
@@ -89,6 +98,7 @@ pub(crate) async fn visible_events(
     .bind(after_position)
     .bind(through_position)
     .bind(limit)
+    .bind(ticket.inventory_session_id)
     .fetch_all(&mut **transaction)
     .await?;
 
@@ -263,7 +273,7 @@ pub(crate) async fn materialize_envelope(
             .map_err(|_| TicketRepositoryError::InvalidReceipt)?;
         let cursor = token.encode();
         let cursor_hash = token.lookup_hash();
-        // The envelope hash is filled after constructing the generated union.
+        // The envelope hash is filled after serializing the canonical wire frame.
         (cursor, cursor_hash, [0; 32])
     };
 
@@ -341,6 +351,62 @@ pub(crate) async fn materialize_envelope(
         .await?;
     }
     Ok((message, cursor, cursor_hash))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Serialize;
+
+    /// The encrypted-requests line sealed receipts over this hand-built JSON
+    /// envelope (three-digit UTC millis). Main's generated-DTO receipt input
+    /// must hash to the identical digest, or receipts written by either line
+    /// would fail replay after the merge.
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct EncryptedRequestsLineWireEnvelope<'a> {
+        #[serde(rename = "$type")]
+        kind: &'static str,
+        created_at: &'a str,
+        cursor: &'a str,
+        payload: &'a ProtocolEventPayload<DefaultStr>,
+        previous_cursor: &'a str,
+    }
+
+    #[test]
+    fn receipt_digest_matches_both_merged_producers() {
+        let payload: ProtocolEventPayload<DefaultStr> = serde_json::from_value(serde_json::json!({
+            "$type": "blue.catbird.chat.defs#watermarkEvent",
+            "issuedAt": "2026-09-27T08:31:28.000000Z"
+        }))
+        .unwrap();
+        for timestamp in ["2026-09-27T08:31:28.827456Z", "2026-09-27T08:31:28.827000Z"] {
+            let created_at = DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .with_timezone(&Utc);
+            let message = SubscriptionMessage::EventEnvelope(Box::new(EventEnvelope {
+                created_at: chrono_to_canonical_datetime(created_at),
+                cursor: "successor".into(),
+                payload: payload.clone(),
+                previous_cursor: "predecessor".into(),
+                extra_data: None,
+            }));
+            let main_bytes = serde_json::to_vec(&message).unwrap();
+            let millis = created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let encrypted_line_bytes = serde_json::to_vec(&EncryptedRequestsLineWireEnvelope {
+                kind: "blue.catbird.chat.defs#eventEnvelope",
+                created_at: &millis,
+                cursor: "successor",
+                payload: &payload,
+                previous_cursor: "predecessor",
+            })
+            .unwrap();
+            assert_eq!(main_bytes, encrypted_line_bytes);
+            let main_hash: [u8; 32] = Sha256::digest(&main_bytes).into();
+            let encrypted_line_hash: [u8; 32] = Sha256::digest(&encrypted_line_bytes).into();
+            assert_eq!(main_hash, encrypted_line_hash);
+        }
+    }
 }
 
 fn event_binding(

@@ -1925,7 +1925,7 @@ mod tests {
 
     #[test]
     fn clean_entry_kind_parses_all_fourteen_kinds_and_rejects_shorthand() {
-        assert_eq!(CleanEntryKind::ALL.len(), 14);
+        assert_eq!(CleanEntryKind::ALL.len(), 16);
         for kind in CleanEntryKind::ALL {
             let type_id = kind.type_id();
             assert!(type_id.starts_with("blue.catbird.chat.defs#"));

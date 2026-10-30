@@ -421,6 +421,14 @@ impl EnrollmentOperationReplayAuthority {
 }
 
 impl SignedOperationAdmission {
+    pub(crate) fn subject(&self) -> &str {
+        self.canonical.actor_did().as_str()
+    }
+
+    pub(crate) fn device_id(&self) -> Uuid {
+        Uuid::from_bytes(*self.canonical.actor_device_id().as_bytes())
+    }
+
     pub(super) fn pre_replay(&self) -> &PreReplayCryptographicVerification {
         &self.pre_replay
     }

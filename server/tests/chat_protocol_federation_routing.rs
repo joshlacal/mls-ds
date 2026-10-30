@@ -1722,3 +1722,20 @@ async fn test_replay_counting_failing_resolver_proves_zero_calls() {
         "replay must make ZERO resolver calls (call count strictly unchanged)"
     );
 }
+
+// Encrypted-requests: transcript.rs test modules reference read_projection.
+mod chat_protocol {
+    pub mod read_projection {
+        pub struct DummyCanonical;
+        impl DummyCanonical {
+            pub fn bytes(&self) -> &[u8] { &[] }
+        }
+        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
+            _value: &T,
+            _schema: &str,
+        ) -> Result<DummyCanonical, String> {
+            Ok(DummyCanonical)
+        }
+    }
+}
+

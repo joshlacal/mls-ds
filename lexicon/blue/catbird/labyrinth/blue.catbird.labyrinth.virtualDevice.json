@@ -1,0 +1,113 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.virtualDevice",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A recovery bundle (SPEC \u00a76.2). rkey = hex(vdeviceId). Every encrypted* field is AEAD-sealed under vdeviceDecryptionKey with the paper's AAD strings. Immutable except lastUsedAt (server-stamped); deletable by the owner (remove a recovery method, [CB-39]).",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "vdeviceId",
+          "deviceKeyPubkey",
+          "epochStorageKeyPubkey",
+          "epochStorageKeySig",
+          "encryptedDeviceKeyPriv",
+          "encryptedEpochStorageKeyPriv",
+          "encryptedOrfClientState",
+          "encryptedMailboxRootSalt",
+          "encryptedEpochRootKey",
+          "encryptedEpochNumber",
+          "mechanism",
+          "createdAt"
+        ],
+        "properties": {
+          "vdeviceId": {
+            "type": "bytes",
+            "description": "First 16 bytes of the recovery-code KDF output; equals the rkey.",
+            "minLength": 16,
+            "maxLength": 16
+          },
+          "encryptedDeviceKeyPriv": {
+            "type": "bytes",
+            "description": "Sealed with AAD 'virtual_device:virtual_device_private_key'.",
+            "maxLength": 256
+          },
+          "encryptedEpochStorageKeyPriv": {
+            "type": "bytes",
+            "description": "Sealed with AAD 'virtual_device:epoch_storage_private_key'.",
+            "maxLength": 256
+          },
+          "encryptedOrfClientState": {
+            "type": "bytes",
+            "description": "Sealed with AAD 'virtual_device:ocmf_client_state'.",
+            "maxLength": 256
+          },
+          "encryptedMailboxRootSalt": {
+            "type": "bytes",
+            "description": "Sealed with AAD 'virtual_device:mailbox_root_key'.",
+            "maxLength": 256
+          },
+          "encryptedEpochRootKey": {
+            "type": "bytes",
+            "description": "Sealed with AAD 'virtual_device:epoch_root_key'.",
+            "maxLength": 256
+          },
+          "encryptedEpochNumber": {
+            "type": "bytes",
+            "description": "Sealed base64(decimal(epoch number)) with AAD 'virtual_device:epoch_anon_id'.",
+            "maxLength": 256
+          },
+          "deviceKeyPubkey": {
+            "type": "bytes",
+            "description": "The virtual device's deviceKeyPubkey.",
+            "maxLength": 32,
+            "minLength": 32
+          },
+          "epochStorageKeyPubkey": {
+            "type": "bytes",
+            "description": "The virtual device's epochStorageKeyPubkey.",
+            "maxLength": 32,
+            "minLength": 32
+          },
+          "epochStorageKeySig": {
+            "type": "bytes",
+            "description": "pk_sign(deviceKey, 0x30, epochStorageKeyPubkey).",
+            "maxLength": 64,
+            "minLength": 64
+          },
+          "mechanism": {
+            "type": "string",
+            "description": "Recovery mechanism this bundle backs.",
+            "knownValues": [
+              "code",
+              "passkey",
+              "keychain",
+              "otc"
+            ]
+          },
+          "passkeyWrappedCode": {
+            "type": "bytes",
+            "description": "[CB-13] Recovery code sealed under a WebAuthn PRF-derived key. Present iff passkeyCredentialId is.",
+            "maxLength": 256
+          },
+          "passkeyCredentialId": {
+            "type": "bytes",
+            "description": "WebAuthn credential id for the PRF wrap.",
+            "maxLength": 1024
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          },
+          "lastUsedAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "[CB-39] Last successful restore or keep-alive, stamped by the server from its own clock (clients never write it). Keychain and passkey bundles expire 180 days after max(createdAt, lastUsedAt)."
+          }
+        }
+      }
+    }
+  }
+}

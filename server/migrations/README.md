@@ -339,3 +339,19 @@ Note: sqlx migrations run in transactions, so `CONCURRENTLY` requires special ha
 - [DATABASE_SCHEMA.md](../DATABASE_SCHEMA.md) - Complete schema documentation
 - [DB_USAGE_EXAMPLES.md](../DB_USAGE_EXAMPLES.md) - Usage examples
 - [sqlx documentation](https://docs.rs/sqlx/)
+
+## Generated transition wrapper compatibility
+
+`20261025000001_generated_transition_wrapper_kind.sql` replaces only the exact
+wrapper-kind extractor. The five canonical tagged `submitTransition` variants
+may omit their singleton body tag, as the generated Rust serializer does. A
+present body tag must agree with its exact outer tag. Untagged native wrappers
+keep the explicit body-tag requirement. Original request bytes and all deferred
+claim, transcript, endpoint, digest and signature checks remain unchanged.
+
+The local `chat_protocol_generated_transition_migration` target covers a fresh
+full catalog, an upgraded catalog with an existing native receipt, SQL reapply
+idempotency, malformed authority fields and unchanged unrelated constraints.
+The authenticated generated Rust and Swift policy handler tests cover the full
+cryptographic and persistence path separately. Applied migration files are
+unchanged; production application of this migration is a separate operator gate.

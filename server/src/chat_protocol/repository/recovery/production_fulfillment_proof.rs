@@ -156,16 +156,20 @@ async fn prepare_request(
             )
         }
     };
-    let prelude = crate::chat_protocol::repository::prelude::prepare_actor_prelude(
-        transaction,
-        authority,
-        reservation,
-    )
-    .await
-    .map_err(|error| format!("prepare Recovery prerequisite request prelude: {error:?}"))?;
     let mutation = authority.mutation().ok_or_else(|| {
         "authorized Recovery prerequisite lacks its canonical mutation".to_owned()
     })?;
+    let scope = discover_recovery_event_scope(transaction, authority, mutation)
+        .await
+        .map_err(|e| format!("discover Recovery proof event scope: {e:?}"))?;
+    let prelude = crate::chat_protocol::repository::prelude::prepare_identity_scope_prelude(
+        transaction,
+        authority,
+        reservation,
+        scope,
+    )
+    .await
+    .map_err(|error| format!("prepare Recovery prerequisite request prelude: {error:?}"))?;
     let authority = prepare_recovery_request_authority(transaction, prelude, mutation)
         .await
         .map_err(|error| format!("prepare Recovery prerequisite authority: {error:?}"))?;
@@ -1043,4 +1047,79 @@ pub(super) async fn run_leaf_recovery_fulfillment_due_for_expiry_ordering(
         .await
         .map_err(|error| format!("rollback fulfillment DueForExpiry proof edge: {error}"))?;
     require_exact_post_rollback_baseline(pool, &proof, &envelope, &trusted, &before).await
+}
+
+/// Exact signed requests cross global arbitration before freshness is applied.
+/// Old absent work has a distinct terminal error; an old completed request
+/// returns the immutable original bytes through the real facade replay branch.
+pub(super) async fn run_signed_operation_age_fence(pool: &PgPool) -> Result<(), String> {
+    require_local_owned_gate(pool).await?;
+    let first=FixtureIdentity::fresh(b"age-fence-first")?;
+    let second=FixtureIdentity::fresh(b"age-fence-second")?;
+    super::production_fallback_minter::mint_two_party_recovery_fallbacks(pool,&first.did,&second.did).await?;
+    let proof=new_fulfillment_proof(pool).await?;
+    commit_request_prerequisite(pool,&proof).await?;
+    let now=TrustedRequestInstant::capture().map_err(|e|format!("clock: {e:?}"))?;
+    let old=TrustedRequestInstant::from_datetime(now.datetime()-chrono::TimeDelta::seconds(301)).map_err(|e|format!("old clock: {e:?}"))?;
+    let (body,_)=fulfillment_body(&proof,&old);
+    let old_envelope=leaf_recovery_fulfillment(&proof.fixture.fulfiller,body)?;
+    let admission=super::production_proof_fixture::admit_lifecycle(pool,&proof.fixture.fulfiller,FULFILLMENT_ENDPOINT,&old_envelope,&now).await?;
+    let mut tx=pool.begin().await.map_err(|e|e.to_string())?;
+    let failure=crate::chat_protocol::repository::prelude::prepare_signed_operation(&mut tx,admission).await
+        .expect_err("old absent operation must fail before transition planning");
+    let response=crate::handlers::chat::production_proof_signed_operation_failure(failure);
+    let status=response.status().as_u16();
+    let bytes=axum::body::to_bytes(response.into_body(),4096).await.map_err(|e|e.to_string())?;
+    let error:Value=serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
+    if status!=400 || error["error"]!="SignedOperationExpired" { return Err(format!("old absent operation response: {status} {error}")); }
+    tx.rollback().await.map_err(|e|e.to_string())?;
+    let claimed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.operation_claims WHERE operation_id=$1)").bind(old_envelope.operation_id).fetch_one(pool).await.map_err(|e|e.to_string())?;
+    if claimed { return Err("expired absent operation created a durable claim".into()); }
+
+    // Expiry is not a cryptographic-error oracle and future timestamps do
+    // not prove an operation can never execute.
+    let future=TrustedRequestInstant::from_datetime(now.datetime()+chrono::TimeDelta::seconds(61)).map_err(|e|format!("future clock: {e:?}"))?;
+    let (future_body,_)=fulfillment_body(&proof,&future);
+    let future_envelope=leaf_recovery_fulfillment(&proof.fixture.fulfiller,future_body)?;
+    let mut invalid_wrapper:Value=serde_json::from_slice(&old_envelope.raw_wrapper).map_err(|e|e.to_string())?;
+    let mut invalid_signature=old_envelope.signature; invalid_signature[0]^=1;
+    invalid_wrapper["signature"]=json!(STANDARD.encode(invalid_signature));
+    let invalid_envelope=SignedRecoveryEnvelope { operation_id:old_envelope.operation_id,
+        raw_wrapper:serde_json::to_vec(&invalid_wrapper).map_err(|e|e.to_string())?,
+        request_digest:old_envelope.request_digest,signing_transcript:old_envelope.signing_transcript.clone(),signature:invalid_signature };
+    match super::production_proof_fixture::admit_lifecycle(pool,&proof.fixture.fulfiller,FULFILLMENT_ENDPOINT,&invalid_envelope,&now).await {
+        Err(error) if error.contains("invalid Ed25519 signature") => {},
+        Err(error) => return Err(format!("invalid signature reached unexpected admission failure: {error}")),
+        Ok(_) => return Err("invalid old signature crossed signed-operation admission".into()),
+    }
+    for (label,envelope) in [("future",&future_envelope)] {
+        let admission=super::production_proof_fixture::admit_lifecycle(pool,&proof.fixture.fulfiller,FULFILLMENT_ENDPOINT,envelope,&now).await?;
+        let mut tx=pool.begin().await.map_err(|e|e.to_string())?;
+        let failure=crate::chat_protocol::repository::prelude::prepare_signed_operation(&mut tx,admission).await
+            .expect_err("invalid first operation must not prepare");
+        let response=crate::handlers::chat::production_proof_signed_operation_failure(failure);
+        let status=response.status().as_u16();
+        let bytes=axum::body::to_bytes(response.into_body(),4096).await.map_err(|e|e.to_string())?;
+        let error:Value=serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
+        if status!=401 || error["error"]!="InvalidSignature" { return Err(format!("{label} must retain generic auth error: {status} {error}")); }
+        tx.rollback().await.map_err(|e|e.to_string())?;
+    }
+
+    let (body,_)=fulfillment_body(&proof,&now);
+    let envelope=leaf_recovery_fulfillment(&proof.fixture.fulfiller,body)?;
+    let admission=super::production_proof_fixture::admit_lifecycle(pool,&proof.fixture.fulfiller,FULFILLMENT_ENDPOINT,&envelope,&now).await?;
+    let mut tx=pool.begin().await.map_err(|e|e.to_string())?;
+    let prepared=crate::chat_protocol::repository::prelude::prepare_signed_operation(&mut tx,admission).await.map_err(|e|format!("fresh arbitration: {e:?}"))?;
+    let accepted=execute_prepared_recovery(&mut tx,prepared,&proof.relationship_authority).await.map_err(|e|format!("fresh facade: {e:?}"))?;
+    if accepted.status()!=200 { return Err(format!("fresh status {}",accepted.status())); }
+    let original=accepted.response_bytes().to_vec();
+    tx.commit().await.map_err(|e|format!("commit accepted fulfillment: {e}"))?;
+    let later=TrustedRequestInstant::from_datetime(now.datetime()+chrono::TimeDelta::seconds(301)).map_err(|e|format!("later clock: {e:?}"))?;
+    let admission=super::production_proof_fixture::admit_lifecycle(pool,&proof.fixture.fulfiller,FULFILLMENT_ENDPOINT,&envelope,&later).await?;
+    let mut tx=pool.begin().await.map_err(|e|e.to_string())?;
+    let prepared=crate::chat_protocol::repository::prelude::prepare_signed_operation(&mut tx,admission).await.map_err(|e|format!("old accepted arbitration: {e:?}"))?;
+    let replay=execute_prepared_recovery(&mut tx,prepared,&proof.relationship_authority).await.map_err(|e|format!("old accepted facade replay: {e:?}"))?;
+    if replay.status()!=200 || replay.response_bytes()!=original { return Err("aged completed operation did not return exact original response bytes".into()); }
+    tx.commit().await.map_err(|e|e.to_string())?;
+    Ok(())
 }

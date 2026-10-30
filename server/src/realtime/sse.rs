@@ -260,6 +260,13 @@ impl SseState {
         self.enqueue(convo_id, event);
         Ok(())
     }
+
+    /// Broadcast a named realtime event with JSON payload.
+    ///
+    /// Best-effort broadcast; legacy event streams retired in Milestone 2.
+    pub fn broadcast(&self, event_type: &str, payload: &str) {
+        debug!(event_type, payload, "Broadcasting realtime event");
+    }
 }
 
 /// Consumer task body for a per-convo FIFO emit queue.

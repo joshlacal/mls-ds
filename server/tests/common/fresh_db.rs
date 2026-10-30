@@ -84,6 +84,8 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_fedrouter_",
     // `tests/chat_protocol_federation_outbox_retry.rs`
     "chat_fedoutbox_",
+    // `tests/chat_send_message_routing.rs`
+    "chat_sendrouting_",
     // `tests/chat_protocol_remote_prefix_bootstrap.rs`
     "chat_remoteprefix_",
     "chat_devhandlers_",
@@ -91,8 +93,12 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_authrepo_",
     // `tests/common/fresh_db.rs`
     "chat_freshdb_",
+    // `src/chat_protocol/repository/concurrency_tests.rs`
+    "chat_concurrency_",
     // `tests/db_tests.rs`
     "mlsds_dbtests_",
+    // `tests/labyrinth_*.rs` (via `tests/common/labyrinth_harness.rs`)
+    "labyrinth_srv_",
     // `tests/federation_hostile_peers.rs`
     "mlsds_fedpeers_",
     // `tests/get_key_packages_authz.rs`
@@ -197,6 +203,28 @@ pub fn maintenance_url_from_env() -> Result<String, String> {
     let mut parsed = url::Url::parse(&database_url).map_err(|error| error.to_string())?;
     parsed.set_path("/postgres");
     Ok(parsed.into())
+}
+
+/// Attempts allowed for a fresh-database migration that loses the shared-catalog
+/// write race on `pg_database.catbird`.
+///
+/// See [`FRESH_DB_MIGRATION_LOCK_KEY`] for why no lock closes this: the write is
+/// to a tuple shared by the whole cluster, and both sqlx's migrator lock and
+/// PostgreSQL advisory locks are scoped per database. The losing migration is
+/// fully rolled back (DDL here is transactional, and the `_sqlx_migrations` row
+/// commits inside the same transaction), so re-running the migrator re-applies
+/// from the last committed version. Bounded, so a persistent `XX000` still
+/// surfaces as a failure.
+const FRESH_DB_MIGRATION_ATTEMPTS: usize = 30;
+
+/// True for the transient cluster-catalog conflict worth retrying: SQLSTATE
+/// `XX000`, raised by `simple_heap_update` as "tuple concurrently updated".
+fn is_transient_catalog_conflict(error: &sqlx::migrate::MigrateError) -> bool {
+    matches!(
+        error,
+        sqlx::migrate::MigrateError::Execute(sqlx::Error::Database(database))
+            if database.code().as_deref() == Some("XX000")
+    )
 }
 
 /// A freshly created, uniquely named database plus its reaper.
@@ -335,6 +363,35 @@ impl Drop for DisposableDatabase {
 /// immediately afterwards — the same shape `common::executor_seed` uses. The
 /// returned database is fully migrated, so a later `db::init_db` against its
 /// URL finds nothing to apply.
+/// Advisory-lock key serializing fresh-database migrations *within one
+/// database*, matching
+/// [`crate::common::executor_seed::FRESH_DB_MIGRATION_LOCK_KEY`].
+///
+/// The legacy set's first migration rewrites the shared `pg_database` tuple for
+/// `catbird` with `GRANT ALL PRIVILEGES ON DATABASE catbird TO catbird`. sqlx's
+/// migrator lock is keyed per database name, and PostgreSQL advisory locks are
+/// themselves database-scoped, so two differently named fresh databases do not
+/// exclude each other either way. The mint paths below therefore retry the
+/// transient `XX000` conflict rather than relying on this key alone.
+pub const FRESH_DB_MIGRATION_LOCK_KEY: i64 = 0x6361_7462_6972_6473;
+
+/// Process-wide gate serializing fresh-database creation plus migration.
+///
+/// The cluster-catalog collision described on [`FRESH_DB_MIGRATION_LOCK_KEY`]
+/// only needs two migrators to *overlap*; with one test binary's cases running
+/// on several threads that is the common case, not the exception (the two
+/// `welcome::tests` Part-4 cases raced on every parallel run and never when run
+/// alone). Serializing the create-plus-migrate section inside this process
+/// removes that overlap by construction, leaving the retry above to absorb a
+/// genuinely concurrent sibling *process*.
+static FRESH_DB_CREATION_GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+/// The single shared gate value, initialized on first use.
+fn fresh_db_creation_gate() -> &'static tokio::sync::Mutex<()> {
+    FRESH_DB_CREATION_GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 pub async fn fresh_fully_migrated_db(prefix: &str) -> DisposableDatabase {
     let _migration_guard = acquire_migration_lock().await;
     let database = DisposableDatabase::mint(prefix).await;
@@ -350,9 +407,34 @@ pub async fn fresh_fully_migrated_db(prefix: &str) -> DisposableDatabase {
     .execute(&mut *migration_connection)
     .await
     .expect("authorize operation-claim activation on the migration connection");
-    let migration_result = sqlx::migrate!("./migrations")
-        .run(&mut *migration_connection)
-        .await;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(FRESH_DB_MIGRATION_LOCK_KEY)
+        .execute(&mut *migration_connection)
+        .await
+        .expect("acquire the cluster-wide fresh-DB migration lock");
+    let migration_result = {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let result = sqlx::migrate!("./migrations")
+                .run(&mut *migration_connection)
+                .await;
+            match result {
+                Err(error)
+                    if is_transient_catalog_conflict(&error)
+                        && attempt < FRESH_DB_MIGRATION_ATTEMPTS =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20 * attempt as u64)).await;
+                }
+                other => break other,
+            }
+        }
+    };
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(FRESH_DB_MIGRATION_LOCK_KEY)
+        .execute(&mut *migration_connection)
+        .await
+        .expect("release the cluster-wide fresh-DB migration lock");
     sqlx::query("RESET chat.operation_claim_activation_approved")
         .execute(&mut *migration_connection)
         .await

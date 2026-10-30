@@ -1,0 +1,52 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.listVirtualDevices",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Every recovery bundle. Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "parameters": {
+        "type": "params",
+        "required": [],
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Opaque cursor from the previous page."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Page size (at most 100)."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "items"
+          ],
+          "properties": {
+            "items": {
+              "type": "array",
+              "maxLength": 100,
+              "items": {
+                "type": "unknown",
+                "description": "A blue.catbird.labyrinth.virtualDevice record."
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "Opaque cursor from the previous page."
+            }
+          },
+          "description": "One page of results."
+        }
+      }
+    }
+  }
+}

@@ -24,6 +24,10 @@ RUN mkdir -p server/src codegen/src \
 COPY server server
 COPY codegen codegen
 COPY lexicon lexicon
+# server/Cargo.toml declares the encrypted-request fixture bin at
+# ../e2e-tests/support/encrypted_request_server_fixture.rs; cargo resolves every
+# declared target path even when it is not built.
+COPY e2e-tests e2e-tests
 RUN cargo build --locked --release -p catbird-server
 
 # ---------- federation-builder (test-only builder) ----------

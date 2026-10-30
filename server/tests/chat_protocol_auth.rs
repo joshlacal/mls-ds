@@ -57,18 +57,22 @@ const AUDIENCE: &str = "did:web:chat.catbird.blue";
 
 fn control_endpoint(kind: ControlEntryKind) -> &'static str {
     match kind {
+        ControlEntryKind::DirectRequestPublication | ControlEntryKind::DirectRequestAcceptance => {
+            panic!("v2 history is not a v1 append route")
+        }
         ControlEntryKind::Creation => "blue.catbird.chat.createConversation",
         ControlEntryKind::ParticipantAcceptance => "blue.catbird.chat.acceptConversation",
         ControlEntryKind::ConversationClose => "blue.catbird.chat.closeConversation",
         ControlEntryKind::ResetRequest => "blue.catbird.chat.requestReset",
         ControlEntryKind::ResetActivation => "blue.catbird.chat.activateReset",
-        ControlEntryKind::LeaveRequest => "blue.catbird.chat.requestLeave",
+        ControlEntryKind::LeaveRequest | ControlEntryKind::ZeroLeafLeave => {
+            "blue.catbird.chat.requestLeave"
+        }
         ControlEntryKind::LeaveCancellation => "blue.catbird.chat.cancelLeave",
         ControlEntryKind::Commit
         | ControlEntryKind::Policy
         | ControlEntryKind::Metadata
         | ControlEntryKind::LeafRecoveryFulfillment
-        | ControlEntryKind::ZeroLeafLeave
         | ControlEntryKind::LeaveCommitFulfillment => "blue.catbird.chat.submitTransition",
     }
 }
@@ -338,7 +342,9 @@ fn trusted_origin_and_endpoint_make_htu_without_request_authority_input() {
 #[test]
 fn every_dpop_endpoint_owns_its_exact_http_method_profile() {
     for endpoint in [
+        "blue.catbird.chat.getDeviceKey",
         "blue.catbird.chat.getDevices",
+        "blue.catbird.chat.getDirectRequestOutcome",
         "blue.catbird.chat.getOwnDevices",
         "blue.catbird.chat.getConversations",
         "blue.catbird.chat.getConversationState",

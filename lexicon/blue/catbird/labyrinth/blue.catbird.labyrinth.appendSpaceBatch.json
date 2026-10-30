@@ -1,0 +1,97 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.appendSpaceBatch",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Validate a sender batch under the current device and membership locks, then store only its immutable Space record reference and server ordering. The source record CID, conversation and storage generation must match before stamping. The DS does not retain the sender ciphertext.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "record",
+            "generation",
+            "space",
+            "rkey",
+            "cid"
+          ],
+          "properties": {
+            "record": {
+              "type": "ref",
+              "ref": "blue.catbird.labyrinth.batch"
+            },
+            "generation": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "description": "Immutable UUID identifying this conversation storage lifecycle. A recreated Space requires a new generation."
+            },
+            "space": {
+              "type": "string",
+              "format": "space-ref",
+              "description": "Conversation Space reference, bound to the storage generation."
+            },
+            "rkey": {
+              "type": "string",
+              "format": "record-key",
+              "maxLength": 64
+            },
+            "cid": {
+              "type": "string",
+              "format": "cid"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "rkey",
+            "order"
+          ],
+          "properties": {
+            "rkey": {
+              "type": "string",
+              "format": "record-key",
+              "maxLength": 64,
+              "description": "Immutable source Space record key; deterministic keys may use a 64-character digest."
+            },
+            "order": {
+              "type": "ref",
+              "ref": "blue.catbird.labyrinth.defs#serverOrder"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotParticipant"
+        },
+        {
+          "name": "UnknownMek"
+        },
+        {
+          "name": "MixedMekBatch"
+        },
+        {
+          "name": "SenderKeyMismatch"
+        },
+        {
+          "name": "NotRecipient"
+        },
+        {
+          "name": "StorageGenerationMismatch"
+        },
+        {
+          "name": "StorageNotConfigured"
+        },
+        {
+          "name": "SpaceDeleted"
+        }
+      ]
+    }
+  }
+}

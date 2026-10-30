@@ -50,7 +50,9 @@ async fn three_clients_race_to_bootstrap_one_wins_others_409() {
     let mut carol = client.test_user("race-carol");
     for u in [&mut alice, &mut bob, &mut carol] {
         u.register_device().await.expect("register_device");
-        u.publish_key_packages(3).await.expect("publish_key_packages");
+        u.publish_key_packages(3)
+            .await
+            .expect("publish_key_packages");
     }
 
     let convo = alice
@@ -74,8 +76,7 @@ async fn three_clients_race_to_bootstrap_one_wins_others_409() {
         .await
         .expect("resetGroup call");
     let reset_status = reset_resp.status();
-    let reset_json: serde_json::Value =
-        reset_resp.json().await.expect("resetGroup json");
+    let reset_json: serde_json::Value = reset_resp.json().await.expect("resetGroup json");
     assert_eq!(
         reset_status, 200,
         "admin resetGroup should succeed: body={}",

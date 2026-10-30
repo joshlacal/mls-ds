@@ -1027,6 +1027,7 @@ pub(crate) async fn read_application_attachment(
               FROM chat.blob_bindings AS binding
               JOIN chat.blobs AS b ON b.blob_id = binding.blob_id
              WHERE binding.blob_id = $1
+               AND NOT EXISTS (SELECT 1 FROM chat.direct_request_publications p LEFT JOIN chat.direct_request_lifecycle l USING(request_id) WHERE p.conversation_id=binding.conversation_id AND COALESCE(l.consent,'pending')='pending')
                AND binding.binding_kind = 'application'
                AND EXISTS (
                      SELECT 1
@@ -1136,6 +1137,7 @@ pub(crate) async fn authorize_blob_read<'pool>(
                  FOR SHARE
           ) AS interval ON binding.binding_kind = 'application'
          WHERE b.blob_id = $1
+               AND NOT EXISTS (SELECT 1 FROM chat.direct_request_publications p LEFT JOIN chat.direct_request_lifecycle l USING(request_id) WHERE p.conversation_id=binding.conversation_id AND COALESCE(l.consent,'pending')='pending')
            AND b.status = 'bound'
            AND b.object_store_key IS NOT NULL
            AND b.unbound_expires_at IS NOT NULL

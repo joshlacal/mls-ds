@@ -100,8 +100,7 @@ use crate::chat_protocol::{
         ConversationStateHydrationError, LockedConversationStateGuard,
     },
     state_machine::{
-        AccessInterval, AccessIntervalEnd, ConversationKind, ConversationState, DeviceIdentity,
-        PrincipalId,
+        AccessInterval, AccessIntervalEnd, ConversationState, DeviceIdentity, PrincipalId,
     },
 };
 
@@ -651,8 +650,10 @@ fn classify_current_relationship(
     Err(ReadAuthorityError::NotEntitled)
 }
 
-/// `AccessInterval` exposes its opening transition id as bytes; the schema
-/// CHECK constrains `membership_interval_id = opening_transition_id`.
+/// `AccessInterval` exposes its opening transition id as bytes. For
+/// non-direct-request intervals, `membership_interval_id = opening_transition_id`;
+/// for direct-request intervals they differ, and queries must key by opening
+/// identity `(conversation_id, recipient_did, recipient_device_id, opening_transition_id)`.
 fn interval_id(interval: &AccessInterval) -> Uuid {
     Uuid::from_slice(interval.opening_transition_id())
         .expect("interval opening transition id is a canonical UUID")
@@ -872,6 +873,25 @@ pub(crate) async fn authorize_conversation_state(
                     return Err(e);
                 }
             };
+            let open_membership_interval_id = sqlx::query_scalar::<_, Uuid>(
+                r#"
+                SELECT membership_interval_id
+                  FROM chat.application_intervals
+                 WHERE conversation_id = $1
+                   AND recipient_did = $2
+                   AND recipient_device_id = $3
+                   AND opening_transition_id = $4
+                   AND terminal_seq IS NULL
+                "#,
+            )
+            .bind(conversation_id)
+            .bind(device.user_did())
+            .bind(device.device_id())
+            .bind(open_membership_interval_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| ReadAuthorityError::Storage)?
+            .unwrap_or(open_membership_interval_id);
             CurrentConversationRelationshipWitness::CurrentOpenLeaf {
                 participant_period_id,
                 leaf_period_id,
@@ -1067,24 +1087,25 @@ impl EntryReadAuthority {
 
 /// The exact-device interval rows, in the deterministic
 /// `(start_seq, membership_interval_id)` order the frozen interface requires.
+#[cfg_attr(test, derive(Clone))]
 #[derive(FromRow)]
-struct ExactDeviceIntervalRow {
-    membership_interval_id: Uuid,
-    conversation_id: Uuid,
-    generation: i64,
-    recipient_did: String,
-    recipient_device_id: Uuid,
-    start_seq: i64,
-    opening_transition_id: Uuid,
-    opening_outer_entry_fingerprint: Vec<u8>,
+pub(in crate::chat_protocol) struct ExactDeviceIntervalRow {
+    pub(in crate::chat_protocol) membership_interval_id: Uuid,
+    pub(in crate::chat_protocol) conversation_id: Uuid,
+    pub(in crate::chat_protocol) generation: i64,
+    pub(in crate::chat_protocol) recipient_did: String,
+    pub(in crate::chat_protocol) recipient_device_id: Uuid,
+    pub(in crate::chat_protocol) start_seq: i64,
+    pub(in crate::chat_protocol) opening_transition_id: Uuid,
+    pub(in crate::chat_protocol) opening_outer_entry_fingerprint: Vec<u8>,
     // Read only to mirror the schedule trigger's touching-boundary rule below.
     // Deliberately absent from `interval_row_binding_digest`: the frozen witness
     // bytes must not change, and `generation` already separates a reset touch.
-    opening_kind: String,
-    terminal_seq: Option<i64>,
-    closing_transition_id: Option<Uuid>,
-    closing_outer_entry_fingerprint: Option<Vec<u8>>,
-    closing_kind: Option<String>,
+    pub(in crate::chat_protocol) opening_kind: String,
+    pub(in crate::chat_protocol) terminal_seq: Option<i64>,
+    pub(in crate::chat_protocol) closing_transition_id: Option<Uuid>,
+    pub(in crate::chat_protocol) closing_outer_entry_fingerprint: Option<Vec<u8>>,
+    pub(in crate::chat_protocol) closing_kind: Option<String>,
 }
 
 async fn load_exact_device_interval_rows(
@@ -1189,7 +1210,7 @@ fn interval_row_binding_digest(
 /// replace->add and reset->reset. It is accepted only with the same boundary
 /// evidence the trigger requires, so the reader is exactly as strict as the
 /// writer.
-fn build_ordered_interval_witnesses(
+pub(in crate::chat_protocol) fn build_ordered_interval_witnesses(
     rows: Vec<ExactDeviceIntervalRow>,
     observed_head_seq: u64,
 ) -> Result<Box<[EntryIntervalWitness]>, ReadAuthorityError> {
@@ -1271,7 +1292,9 @@ fn build_ordered_interval_witnesses(
                         // visible through the closed interval's inclusive terminal.
                         let kinds_pair = matches!(
                             (closing_kind.as_str(), row.opening_kind.as_str()),
-                            ("replace", "add") | ("reset", "reset")
+                            ("replace", "add")
+                                | ("reset", "reset")
+                                | ("directRequest", "directRequest")
                         );
                         if !kinds_pair
                             || *closing_transition_id != row.opening_transition_id
@@ -1671,8 +1694,12 @@ pub(in crate::chat_protocol) async fn verify_inventory_fence(
     }
 
     // Temporal bounds: the fence was captured now or in the recent past, and
-    // never in the future or beyond the schema's session expiry horizon.
-    let now = Utc::now();
+    // never in the future or beyond the schema's session expiry horizon. Judged
+    // on the same database clock that stamped `captured_at`.
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| ReadAuthorityError::Storage)?;
     if row.captured_at > now + chrono::Duration::seconds(5)
         || now.signed_duration_since(row.captured_at) > chrono::Duration::minutes(15)
     {
@@ -1792,7 +1819,7 @@ enum InventoryArmDecision {
         closing_outer_entry_fingerprint: Vec<u8>,
     },
     Removal {
-        membership_interval_id: Uuid,
+        opening_transition_id: Uuid,
         terminal_seq: u64,
         closing_transition_id: Uuid,
         closing_outer_entry_fingerprint: Vec<u8>,
@@ -1846,7 +1873,7 @@ fn classify_inventory_arm(
     if let Some(finite) = facts.latest_finite {
         let end = finite.end().ok_or(ReadAuthorityError::Invariant)?;
         return Ok(InventoryArmDecision::Removal {
-            membership_interval_id: interval_id(finite),
+            opening_transition_id: interval_id(finite),
             terminal_seq: end.seq(),
             closing_transition_id: interval_end_transition(end),
             closing_outer_entry_fingerprint: interval_end_fingerprint(end).to_vec(),
@@ -1863,28 +1890,41 @@ fn classify_inventory_arm(
     if participant.is_active() {
         return Ok(InventoryArmDecision::State);
     }
-    if participant.is_pending() && state.kind() == ConversationKind::Group {
+    if participant.is_pending() {
         return Ok(InventoryArmDecision::State);
     }
-    // Direct-pending and unknown statuses yield no item.
+    // Ineligible or unknown participant statuses yield no item.
     Ok(InventoryArmDecision::None)
 }
 
-/// The durable `removed_at` of the exact-device interval that closed the
-/// removal, loaded under the locked head. An absent row after a hydrated
-/// closed interval is an invariant.
+/// The durable `removed_at` and `membership_interval_id` of the exact-device
+/// interval that closed the removal, loaded under the locked head by opening identity.
+/// An absent row after a hydrated closed interval is an invariant.
 async fn interval_removed_at(
     tx: &mut Transaction<'_, Postgres>,
-    membership_interval_id: Uuid,
-) -> Result<DateTime<Utc>, ReadAuthorityError> {
-    let removed_at: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT removed_at FROM chat.application_intervals WHERE membership_interval_id=$1",
+    conversation_id: Uuid,
+    recipient_did: &str,
+    recipient_device_id: Uuid,
+    opening_transition_id: Uuid,
+) -> Result<(Uuid, DateTime<Utc>), ReadAuthorityError> {
+    let row: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+        r#"
+        SELECT membership_interval_id, removed_at
+          FROM chat.application_intervals
+         WHERE conversation_id = $1
+           AND recipient_did = $2
+           AND recipient_device_id = $3
+           AND opening_transition_id = $4
+        "#,
     )
-    .bind(membership_interval_id)
+    .bind(conversation_id)
+    .bind(recipient_did)
+    .bind(recipient_device_id)
+    .bind(opening_transition_id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|_| ReadAuthorityError::Storage)?;
-    removed_at.ok_or(ReadAuthorityError::Invariant)
+    row.ok_or(ReadAuthorityError::Invariant)
 }
 
 /// Lock-free candidate discovery: every conversation the requesting device
@@ -2031,12 +2071,19 @@ pub(crate) async fn inventory_authorities(
                 closing_outer_entry_fingerprint,
             },
             InventoryArmDecision::Removal {
-                membership_interval_id,
+                opening_transition_id,
                 terminal_seq,
                 closing_transition_id,
                 closing_outer_entry_fingerprint,
             } => {
-                let removed_at = interval_removed_at(tx, membership_interval_id).await?;
+                let (membership_interval_id, removed_at) = interval_removed_at(
+                    tx,
+                    conversation_id,
+                    &fence.user_did,
+                    fence.device_id,
+                    opening_transition_id,
+                )
+                .await?;
                 ConversationInventoryArm::Removal {
                     membership_interval_id,
                     terminal_seq,
@@ -2076,4 +2123,24 @@ pub(crate) async fn inventory_authorities(
     // attempt.
     revalidate_fence_after_heads(tx, &fence).await?;
     Ok(authorities.into_boxed_slice())
+}
+
+#[cfg(test)]
+impl LockedReadDeviceAuthority {
+    pub(in crate::chat_protocol) fn for_test(
+        user_did: String,
+        device_id: uuid::Uuid,
+        jkt: Option<String>,
+        auth_generation: u64,
+    ) -> Self {
+        Self {
+            txid: 0,
+            user_did,
+            device_id,
+            jkt,
+            auth_generation,
+            active_key_id: String::new(),
+            device_row_sha256: [0; 32],
+        }
+    }
 }

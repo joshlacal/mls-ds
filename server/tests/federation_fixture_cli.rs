@@ -330,3 +330,135 @@ fn single_visible_test_support_fixture_symbol() {
         "maybe_initialize_chat_fence_for_test must NOT be in library test_support.rs"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Argument-validation cases ported from the encrypted-requests line's
+// federation_fixture_cli suite (dropped when the two lines merged). They are
+// adapted to main's selector CLI surface: one positional selector path, a
+// `usage:` error for wrong arity, `failed to open selector file` for a missing
+// path, and `invalid bootstrap selector` for selector-rule violations (main's
+// selector reports one generic error instead of per-field messages).
+// ---------------------------------------------------------------------------
+
+fn valid_selector() -> serde_json::Value {
+    serde_json::json!({
+        "conversationId": "00112233-4455-4677-8899-aabbccddeeff",
+        "configuredSequencerDid": "did:web:ds1.catbird.blue",
+        "configuredSequencerTerm": 0
+    })
+}
+
+fn assert_rejected_before_database(output: &Output, expected: &str) {
+    assert!(!output.status.success(), "fixture unexpectedly succeeded");
+    let stderr = stderr(output);
+    assert!(
+        stderr.contains(expected),
+        "expected {expected:?}; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to initialize database")
+            && !stderr.contains("failed to load test did fixtures"),
+        "invalid input reached fixture side effects: {stderr}"
+    );
+}
+
+#[test]
+fn app_env_must_be_test_before_file_access() {
+    let output = fixture_command(Some("production"))
+        .arg("/nonexistent/file/path.json")
+        .output()
+        .expect("run federation_fixture");
+    assert_rejected_before_database(&output, "APP_ENV=test");
+    assert!(
+        !stderr(&output).contains("failed to open selector"),
+        "file open must not happen before the APP_ENV check: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn missing_argument_fails() {
+    let output = fixture_command(Some("test"))
+        .output()
+        .expect("run federation_fixture");
+    assert_rejected_before_database(&output, "usage: federation_fixture <path-to-selector-json>");
+}
+
+#[test]
+fn extra_arguments_fail() {
+    let output = fixture_command(Some("test"))
+        .args(["arg1.json", "arg2.json"])
+        .output()
+        .expect("run federation_fixture");
+    assert_rejected_before_database(&output, "usage: federation_fixture <path-to-selector-json>");
+    assert!(
+        !stderr(&output).contains("failed to open selector"),
+        "extra arguments must be refused before any path is opened: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn nonexistent_file_fails() {
+    let output = fixture_command(Some("test"))
+        .arg("/path/that/does/not/exist/fixture.json")
+        .output()
+        .expect("run federation_fixture");
+    assert_rejected_before_database(&output, "failed to open selector file");
+}
+
+#[test]
+fn file_exceeding_4096_bytes_fails() {
+    // Exactly 4096 bytes is within the limit (fails later, on JSON parse);
+    // 4097 bytes trips the overflow check.
+    let at_limit = run_selector_bytes(&vec![b' '; 4096]);
+    assert_rejected_before_database(&at_limit, "failed to parse selector JSON");
+    let over_limit = run_selector_bytes(&vec![b' '; 4097]);
+    assert_rejected_before_database(&over_limit, "exceeds maximum allowed size of 4096 bytes");
+}
+
+#[test]
+fn unknown_fields_rejected_by_deny_unknown_fields() {
+    let mut input = valid_selector();
+    input["unexpectedExtraField"] = serde_json::json!("malicious payload");
+    let output = run_selector_bytes(&serde_json::to_vec(&input).unwrap());
+    assert_rejected_before_database(&output, "unknown field `unexpectedExtraField`");
+}
+
+#[test]
+fn negative_sequencer_term_rejected() {
+    let mut input = valid_selector();
+    input["configuredSequencerTerm"] = serde_json::json!(-1);
+    let output = run_selector_bytes(&serde_json::to_vec(&input).unwrap());
+    assert_rejected_before_database(&output, "invalid bootstrap selector");
+}
+
+#[test]
+fn non_uuid_v4_rejected() {
+    for conversation_id in [
+        // Nil UUID: version 0.
+        "00000000-0000-0000-0000-000000000000",
+        // Well-formed UUIDv7 (version nibble 7).
+        "01890a5d-ac96-774b-bcce-b302099a8057",
+    ] {
+        let mut input = valid_selector();
+        input["conversationId"] = serde_json::json!(conversation_id);
+        let output = run_selector_bytes(&serde_json::to_vec(&input).unwrap());
+        assert_rejected_before_database(&output, "conversationId must be a UUIDv4");
+    }
+}
+
+#[test]
+fn malformed_did_rejected() {
+    for did in [
+        "not-a-valid-did",
+        "did:",
+        "did:web:",
+        "https://ds1.catbird.blue",
+    ] {
+        let mut input = valid_selector();
+        input["configuredSequencerDid"] = serde_json::json!(did);
+        let output = run_selector_bytes(&serde_json::to_vec(&input).unwrap());
+        assert_rejected_before_database(&output, "invalid bootstrap selector");
+    }
+}

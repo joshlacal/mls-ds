@@ -5414,8 +5414,9 @@ fn preflight_device_revocation_batch(
 
 /// Apply the immutable/device-global prefix of a planned revocation batch:
 /// insert the revocation row, revoke the registration once, and revoke every
-/// AVAILABLE package. The caller owns the open transaction and must next
-/// hydrate + apply each conversation in the plan's canonical order.
+/// conversation-less package (available, or request-scope reserved). The
+/// caller owns the open transaction and must next hydrate + apply each
+/// conversation in the plan's canonical order.
 ///
 /// This function never begins, commits, or rolls back a transaction. The
 /// eventual handler owns the idempotency receipt required by the deferred
@@ -5466,10 +5467,20 @@ async fn apply_device_revocation_batch_prefix(
     .await?;
     for binding in plan.revoked_packages() {
         if binding.conversation_id().is_none() {
+            let expected = match binding.expected_status() {
+                PackageStatus::Available => RepoPackageStatus::Available,
+                // Request-scope held/retired package: no conversation owns it.
+                PackageStatus::Reserved => RepoPackageStatus::Reserved,
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "conversation-less revoked package is neither available nor reserved",
+                    ))
+                }
+            };
             transition::cas_key_package_status(
                 transaction,
                 binding.key_package_ref(),
-                RepoPackageStatus::Available,
+                expected,
                 &PackageSuccessor::Revoke {
                     terminal_revocation_id: revocation_id,
                     terminal_at: accepted_at,
@@ -6592,7 +6603,10 @@ async fn apply_leaf_recovery_fulfillment(
                 delivery::close_application_interval(
                     transaction,
                     &ApplicationIntervalClose {
-                        membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                        conversation_id,
+                        recipient_did: device_did(after.recipient())?,
+                        recipient_device_id: device_uuid(after.recipient()),
+                        opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
                         terminal_seq: checked_i64(end.seq())?,
                         closing_state_version: state_version,
                         closing_transition_id: Uuid::from_bytes(*end.transition_id()),
@@ -7224,7 +7238,10 @@ async fn apply_generic_commit(
         delivery::close_application_interval(
             transaction,
             &ApplicationIntervalClose {
-                membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                conversation_id,
+                recipient_did: device_did(after.recipient())?,
+                recipient_device_id: device_uuid(after.recipient()),
+                opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
                 terminal_seq: checked_i64(end.seq())?,
                 closing_state_version: state_version,
                 closing_transition_id: Uuid::from_bytes(*end.transition_id()),
@@ -7673,7 +7690,10 @@ async fn apply_leave_fulfillment(
                 delivery::close_application_interval(
                     transaction,
                     &ApplicationIntervalClose {
-                        membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                        conversation_id,
+                        recipient_did: device_did(after.recipient())?,
+                        recipient_device_id: device_uuid(after.recipient()),
+                        opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
                         terminal_seq: checked_i64(end.seq())?,
                         closing_state_version: state_version,
                         closing_transition_id: Uuid::from_bytes(*end.transition_id()),
@@ -9040,7 +9060,10 @@ async fn apply_close(
         delivery::close_application_interval(
             transaction,
             &ApplicationIntervalClose {
-                membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                conversation_id,
+                recipient_did: device_did(after.recipient())?,
+                recipient_device_id: device_uuid(after.recipient()),
+                opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
                 terminal_seq: checked_i64(end.seq())?,
                 closing_state_version: state_version,
                 closing_transition_id: Uuid::from_bytes(*end.transition_id()),
@@ -9944,7 +9967,10 @@ async fn apply_reset_activation(
                 delivery::close_application_interval(
                     transaction,
                     &ApplicationIntervalClose {
-                        membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                        conversation_id,
+                        recipient_did: device_did(after.recipient())?,
+                        recipient_device_id: device_uuid(after.recipient()),
+                        opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
                         terminal_seq: checked_i64(end.seq())?,
                         closing_state_version: retired_state_version,
                         closing_transition_id: Uuid::from_bytes(*end.transition_id()),
@@ -10572,6 +10598,7 @@ fn closing_leaf_period(
 
 fn repo_interval_close_kind(kind: CloseKind) -> IntervalCloseKind {
     match kind {
+        CloseKind::DirectRequest => IntervalCloseKind::DirectRequest,
         CloseKind::Remove => IntervalCloseKind::Remove,
         CloseKind::Replace => IntervalCloseKind::Replace,
         CloseKind::Reset => IntervalCloseKind::Reset,

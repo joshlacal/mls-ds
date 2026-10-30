@@ -1,0 +1,15 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/did/v1"
+  ],
+  "id": "did:web:alice.test",
+  "verificationMethod": [
+    {
+      "id": "did:web:alice.test#atproto",
+      "type": "Multikey",
+      "controller": "did:web:alice.test",
+      "publicKeyMultibase": "zDnaeeAF2aF1cLmL49XXqEHkaDCxzZQaaATpNp249A6kobiY1"
+    }
+  ],
+  "service": []
+}

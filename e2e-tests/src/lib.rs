@@ -1,6 +1,37 @@
+extern crate self as mls_e2e_tests;
+
 pub mod auth;
 pub mod federation;
 pub mod mls_engine;
+
+/// Guarded local delivery-service facade for real client runtime fixtures.
+///
+/// This feature exports the same HTTPS DID/auth/relationship and external
+/// shipping-router process used by the encrypted-request evidence suite. It
+/// never changes production authentication or receipt trust.
+#[cfg(feature = "local-runtime-fixture")]
+#[path = "../tests/support/encrypted_requests.rs"]
+pub mod local_runtime_fixture;
+
+/// Malicious-but-authentic sender aimed at an externally owned runtime client
+/// behind the local client runtime gateway (reuses the C03 tamper routine).
+#[cfg(feature = "local-runtime-fixture")]
+#[path = "../tests/support/gateway_tampered_request.rs"]
+pub mod gateway_tampered_request;
+
+/// Flip the final byte of the AEAD-protected application ciphertext body. Every
+/// outer framing byte, the canonical wire encoding, the message AAD, the group
+/// id/epoch and every server-side digest stay valid, and the publication is
+/// re-signed after this, so only the recipient's real OpenMLS AEAD can reject it.
+pub fn tamper_introduction_ciphertext(
+    bootstrap: &mut catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestBootstrap,
+) -> anyhow::Result<()> {
+    let raw = &mut bootstrap.initial_ciphertext;
+    anyhow::ensure!(!raw.is_empty(), "prepared introduction ciphertext is empty");
+    let last = raw.len() - 1;
+    raw[last] ^= 1;
+    Ok(())
+}
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -92,11 +123,7 @@ impl TestUser {
     /// Generic XRPC POST helper for tests that need to hit an endpoint
     /// without a dedicated wrapper. Returns the raw [`reqwest::Response`] so
     /// callers can inspect status + body.
-    pub async fn raw_post_xrpc(
-        &self,
-        nsid: &str,
-        body: &Value,
-    ) -> Result<reqwest::Response> {
+    pub async fn raw_post_xrpc(&self, nsid: &str, body: &Value) -> Result<reqwest::Response> {
         let resp = self
             .client
             .inner
@@ -159,7 +186,10 @@ impl TestUser {
             .context("registerDevice request failed")?;
 
         let status = resp.status();
-        let text = resp.text().await.context("registerDevice: failed to read body")?;
+        let text = resp
+            .text()
+            .await
+            .context("registerDevice: failed to read body")?;
         if !status.is_success() {
             anyhow::bail!("registerDevice returned {}: {}", status, text);
         }
@@ -213,7 +243,10 @@ impl TestUser {
             .context("publishKeyPackages request failed")?;
 
         let status = resp.status();
-        let json: Value = resp.json().await.context("publishKeyPackages: invalid JSON")?;
+        let json: Value = resp
+            .json()
+            .await
+            .context("publishKeyPackages: invalid JSON")?;
 
         anyhow::ensure!(
             status.is_success(),
@@ -255,11 +288,13 @@ impl TestUser {
             body["initialMembers"] = json!(members);
         }
         if let Some(w) = welcome {
-            body["welcomeMessage"] =
-                json!(base64::engine::general_purpose::STANDARD.encode(w));
+            body["welcomeMessage"] = json!(base64::engine::general_purpose::STANDARD.encode(w));
         }
 
-        tracing::debug!("createConvo body: {}", serde_json::to_string_pretty(&body).unwrap());
+        tracing::debug!(
+            "createConvo body: {}",
+            serde_json::to_string_pretty(&body).unwrap()
+        );
 
         let resp = self
             .client
@@ -273,14 +308,20 @@ impl TestUser {
             .context("createConvo request failed")?;
 
         let status = resp.status();
-        let text = resp.text().await.context("createConvo: failed to read body")?;
+        let text = resp
+            .text()
+            .await
+            .context("createConvo: failed to read body")?;
         if !status.is_success() {
             anyhow::bail!("createConvo returned {}: {}", status, text);
         }
         let json: Value = serde_json::from_str(&text)
             .with_context(|| format!("createConvo: invalid JSON: {:?}", text))?;
 
-        tracing::debug!("createConvo response: {}", serde_json::to_string_pretty(&json).unwrap());
+        tracing::debug!(
+            "createConvo response: {}",
+            serde_json::to_string_pretty(&json).unwrap()
+        );
 
         // Track the group locally so we can encrypt against it later
         if let Some(gid) = json.get("groupId").and_then(|v| v.as_str()) {
@@ -325,7 +366,10 @@ impl TestUser {
             .context("sendMessage request failed")?;
 
         let status = resp.status();
-        let text = resp.text().await.context("sendMessage: failed to read body")?;
+        let text = resp
+            .text()
+            .await
+            .context("sendMessage: failed to read body")?;
         if !status.is_success() {
             anyhow::bail!("sendMessage returned {}: {}", status, text);
         }
@@ -392,7 +436,10 @@ impl TestUser {
             .context("sendMessage request failed")?;
 
         let status = resp.status();
-        let text = resp.text().await.context("sendMessage: failed to read body")?;
+        let text = resp
+            .text()
+            .await
+            .context("sendMessage: failed to read body")?;
         if !status.is_success() {
             anyhow::bail!("sendMessage returned {}: {}", status, text);
         }
@@ -407,12 +454,9 @@ impl TestUser {
     /// Get messages from a conversation.
     ///
     /// Query params: `convoId`, optional `sinceSeq`, optional `limit`.
-    pub async fn get_messages(
-        &self,
-        convo_id: &str,
-        since_seq: Option<i64>,
-    ) -> Result<Value> {
-        self.get_messages_with_limit(convo_id, since_seq, None).await
+    pub async fn get_messages(&self, convo_id: &str, since_seq: Option<i64>) -> Result<Value> {
+        self.get_messages_with_limit(convo_id, since_seq, None)
+            .await
     }
 
     pub async fn get_messages_with_limit(
@@ -503,7 +547,10 @@ impl TestUser {
             .context("updateCursor request failed")?;
 
         let status = resp.status();
-        let text = resp.text().await.context("updateCursor: failed to read body")?;
+        let text = resp
+            .text()
+            .await
+            .context("updateCursor: failed to read body")?;
 
         anyhow::ensure!(
             status.is_success(),

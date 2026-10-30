@@ -60,7 +60,10 @@ pub(crate) fn require_cutover(
 }
 
 fn capture_instant(endpoint: ChatEndpoint) -> Result<TrustedRequestInstant, ChatFailure> {
-    TrustedRequestInstant::capture().map_err(|_| ChatFailure::invariant(endpoint))
+    TrustedRequestInstant::capture().map_err(|error| {
+        tracing::error!(endpoint = endpoint.nsid(), ?error, "clean-chat trusted instant capture failed");
+        ChatFailure::invariant(endpoint)
+    })
 }
 
 pub(crate) async fn verify_service_principal(
@@ -151,7 +154,10 @@ pub(crate) async fn admit_unsigned_read(
     let authority = auth::authorize_unsigned_request(pool, pre_replay)
         .await
         .map_err(|error| auth_repository_failure(endpoint, error))?;
-    dpop::seal_read_admission(authority).map_err(|_| ChatFailure::invariant(endpoint))
+    dpop::seal_read_admission(authority).map_err(|error| {
+        tracing::error!(endpoint = endpoint.nsid(), ?error, "clean-chat read admission seal failed");
+        ChatFailure::invariant(endpoint)
+    })
 }
 /// Byte-opaque operation-only admission for an ordinary signed procedure.
 /// Global operation arbitration in the caller-owned transaction decides
@@ -251,7 +257,9 @@ pub(crate) fn json_ok(response_bytes: Vec<u8>) -> Response {
 
 /// Render facade-owned canonical JSON bytes at their exact validated status.
 /// Endpoint facades use this for deterministic success and terminal-error
-/// material; handlers must not deserialize and reserialize those bytes.
+/// material; handlers must not deserialize and reserialize those bytes. The one
+/// exception is the read-time lexicon `{"$bytes"}` presentation of a success
+/// output, which never alters the retained bytes.
 pub(crate) fn canonical_json_response(
     endpoint: ChatEndpoint,
     status: i32,
@@ -264,6 +272,7 @@ pub(crate) fn canonical_json_response(
     if response_bytes.is_empty() {
         return Err(ChatFailure::invariant(endpoint));
     }
+    let response_bytes = present_success(endpoint, status, response_bytes)?;
     let mut response = Response::new(axum::body::Body::from(response_bytes));
     *response.status_mut() = status;
     response
@@ -272,19 +281,39 @@ pub(crate) fn canonical_json_response(
     Ok(response)
 }
 
-/// Render a completed idempotency record verbatim (OQ-3): the stored status and
-/// exact stored response bytes, with the endpoint content-type.
-pub(crate) fn replay_response(completed: &CompletedIdempotentResponse) -> Response {
+fn present_success(
+    endpoint: ChatEndpoint,
+    status: StatusCode,
+    response_bytes: Vec<u8>,
+) -> Result<Vec<u8>, ChatFailure> {
+    if status != StatusCode::OK {
+        return Ok(response_bytes);
+    }
+    crate::chat_protocol::direct_request_transcript::present_endpoint_output(
+        endpoint.nsid(),
+        response_bytes,
+    )
+    .map_err(|_| ChatFailure::invariant(endpoint))
+}
+
+/// Render a completed idempotency record (OQ-3): the stored status and stored
+/// response bytes, with the same read-time `{"$bytes"}` presentation as the
+/// first response, so a replay is byte-identical to it.
+pub(crate) fn replay_response(
+    endpoint: ChatEndpoint,
+    completed: &CompletedIdempotentResponse,
+) -> Result<Response, ChatFailure> {
     let status = u16::try_from(completed.status())
         .ok()
         .and_then(|value| StatusCode::from_u16(value).ok())
         .unwrap_or(StatusCode::OK);
-    let mut response = Response::new(axum::body::Body::from(completed.response_bytes().to_vec()));
+    let bytes = present_success(endpoint, status, completed.response_bytes().to_vec())?;
+    let mut response = Response::new(axum::body::Body::from(bytes));
     *response.status_mut() = status;
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    response
+    Ok(response)
 }
 
 /// Map a repository authorization failure to the endpoint's declared wire code
@@ -305,9 +334,19 @@ pub(crate) fn auth_repository_failure(
     use AuthRepositoryError as E;
     use ChatProtocolErrorCode as C;
     let code = match error {
-        E::Database(_) => return ChatFailure::storage(endpoint),
-        E::CorruptIdempotencyRecord | E::InvalidCompletion => {
-            return ChatFailure::invariant(endpoint)
+        E::Database(_) | E::CorruptIdempotencyRecord | E::InvalidCompletion => {
+            // Redacted on the wire; the server log keeps the cause so an
+            // internal 500 is never silent.
+            tracing::error!(
+                endpoint = endpoint.nsid(),
+                error = ?error,
+                "clean-chat authorization repository failure"
+            );
+            return if matches!(error, E::Database(_)) {
+                ChatFailure::storage(endpoint)
+            } else {
+                ChatFailure::invariant(endpoint)
+            };
         }
         E::ReplayDetected => C::NotAuthorized,
         E::DpopBindingMismatch => C::DeviceBindingMismatch,
@@ -335,6 +374,18 @@ pub(crate) fn operation_prelude_failure(
     use PreludeError as E;
 
     match error {
+        // Pending request consent: the endpoint's own declared refusal.
+        // Endpoints declaring neither code still downgrade (lexicon gap).
+        E::DirectRequestConsentRequired => ChatFailure::protocol(
+            endpoint,
+            if endpoint.declares(C::ConversationNotAccepted) {
+                C::ConversationNotAccepted
+            } else if endpoint.declares(C::WelcomeSuperseded) {
+                C::WelcomeSuperseded
+            } else {
+                C::NotParticipant
+            },
+        ),
         E::Database(_) => ChatFailure::storage(endpoint),
         E::Authorization(error) => auth_repository_failure(endpoint, error),
         E::MissingDevice | E::MissingDeviceKey => {
@@ -433,6 +484,74 @@ mod tests {
                 StatusCode::UNAUTHORIZED,
                 "variant {} did not produce 401 Unauthorized",
                 desc
+            );
+        }
+    }
+
+    #[test]
+    fn direct_request_consent_refusal_maps_to_conversation_not_accepted_for_all_endpoints() {
+        use crate::chat_protocol::repository::prelude::PreludeError;
+
+        let endpoints = [
+            ChatEndpoint::SendMessage,
+            ChatEndpoint::PublishTyping,
+            ChatEndpoint::SubmitTransition,
+            ChatEndpoint::RequestReset,
+            ChatEndpoint::ActivateReset,
+            ChatEndpoint::RequestLeave,
+            ChatEndpoint::CancelLeave,
+            ChatEndpoint::CancelLeafRecovery,
+            ChatEndpoint::PrepareBlobUpload,
+            ChatEndpoint::DeleteBlob,
+        ];
+
+        for endpoint in endpoints {
+            assert!(
+                endpoint.declares(ChatProtocolErrorCode::ConversationNotAccepted),
+                "endpoint {} must declare ConversationNotAccepted",
+                endpoint.nsid()
+            );
+            let failure = operation_prelude_failure(
+                endpoint,
+                PreludeError::DirectRequestConsentRequired,
+            );
+            assert_eq!(
+                failure.code(),
+                Some(ChatProtocolErrorCode::ConversationNotAccepted),
+                "endpoint {} did not map DirectRequestConsentRequired to ConversationNotAccepted",
+                endpoint.nsid()
+            );
+            let resp = failure.into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "endpoint {} did not produce 400 Bad Request",
+                endpoint.nsid()
+            );
+        }
+
+        for endpoint in [ChatEndpoint::AcknowledgeWelcome, ChatEndpoint::RejectWelcome] {
+            assert!(
+                endpoint.declares(ChatProtocolErrorCode::WelcomeSuperseded),
+                "endpoint {} must declare WelcomeSuperseded",
+                endpoint.nsid()
+            );
+            let failure = operation_prelude_failure(
+                endpoint,
+                PreludeError::DirectRequestConsentRequired,
+            );
+            assert_eq!(
+                failure.code(),
+                Some(ChatProtocolErrorCode::WelcomeSuperseded),
+                "endpoint {} did not map DirectRequestConsentRequired to WelcomeSuperseded",
+                endpoint.nsid()
+            );
+            let resp = failure.into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "endpoint {} did not produce 400 Bad Request",
+                endpoint.nsid()
             );
         }
     }

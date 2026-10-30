@@ -37,6 +37,9 @@
       },
       "errors": [
         {
+          "name": "ConversationNotAccepted"
+        },
+        {
           "name": "ConversationNotFound"
         },
         {

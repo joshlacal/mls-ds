@@ -4,6 +4,223 @@
 //! without exposing production authority or relaxing crate-private visibility in
 //! production binaries.
 
+// Reuse the genuine signed Creation -> Acceptance -> Add fixture. This module
+// is only compiled for tests/test-support; requests still enter the real router.
+#[allow(dead_code)]
+#[path = "repository/recovery/production_proof_fixture.rs"]
+mod application_routing_fixture;
+
+/// Initial state for the production sendMessage routing regression. No request
+/// admission, operation completion, message entry, or federation job is seeded.
+pub struct ApplicationRoutingFixture {
+    pub conversation_id: uuid::Uuid,
+    pub message_id: uuid::Uuid,
+    pub sender_did: String,
+    pub sender_device_id: uuid::Uuid,
+    pub recipient_did: String,
+    pub signed_request: serde_json::Value,
+}
+
+#[derive(Clone)]
+struct ApplicationRoutingTransport {
+    sender_did: String,
+    recipient_did: String,
+}
+
+#[async_trait::async_trait]
+impl PublicTransport for ApplicationRoutingTransport {
+    async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
+        // External relationship evidence is a deterministic fixture. The real
+        // collector, sealer, persistence writer and send-time consumer still run.
+        // The runtime pair resolver receives no hook and cannot resolve these
+        // unique example.com fixture homes; that is the direct-kind negative control.
+        const FIXTURE_DID_PATH: &str = "/.well-known/did.json"; // did-web-test: fixture match
+        let actor = format!("did:web:{}", request.url.host_str().unwrap_or_default());
+        if (actor == self.sender_did || actor == self.recipient_did)
+            && request.url.path() == FIXTURE_DID_PATH
+        {
+            return Ok(PublicResponse::json(
+                200,
+                serde_json::json!({
+                    "id": actor,
+                    "service": [{
+                        "id": format!("{actor}#atproto_pds"),
+                        "type": "AtprotoPersonalDataServer",
+                        "serviceEndpoint": "https://pds.example.net"
+                    }]
+                }),
+            ));
+        }
+        DeterministicTestTransport.get(request).await
+    }
+}
+
+/// Seed a genuine ready two-leaf group/direct history and a request-bound native
+/// MLS application, plus validated relationship fallback evidence for that pair.
+/// Callers must submit the returned wrapper through the production HTTP router.
+pub async fn seed_application_routing_fixture(
+    pool: &sqlx::PgPool,
+    direct: bool,
+    recipient_service_did: &str,
+) -> Result<ApplicationRoutingFixture, String> {
+    seed_application_routing_fixture_with_sequencer(pool, direct, recipient_service_did, None).await
+}
+
+/// Seed a remote group replica at insertion time, preserving the immutable
+/// routing identity and every normal history/leaf/operation constraint.
+pub async fn seed_remote_group_application_routing_fixture(
+    pool: &sqlx::PgPool,
+    recipient_service_did: &str,
+    sequencer_service_did: &str,
+) -> Result<ApplicationRoutingFixture, String> {
+    seed_application_routing_fixture_with_sequencer(
+        pool,
+        false,
+        recipient_service_did,
+        Some(sequencer_service_did),
+    )
+    .await
+}
+
+async fn seed_application_routing_fixture_with_sequencer(
+    pool: &sqlx::PgPool,
+    direct: bool,
+    recipient_service_did: &str,
+    sequencer_service_did: Option<&str>,
+) -> Result<ApplicationRoutingFixture, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use chrono::SecondsFormat;
+    use ed25519_dalek::Signer as _;
+    use sha2::{Digest as _, Sha256};
+
+    let at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let trusted =
+        super::validation::TrustedRequestInstant::from_datetime(at - chrono::Duration::seconds(2))
+            .map_err(|error| format!("routing fixture instant: {error:?}"))?;
+    let fixture_id = uuid::Uuid::new_v4().simple().to_string();
+    let sender = application_routing_fixture::FixtureIdentity::fresh_for_did(
+        &format!("did:web:sender-{fixture_id}.routing.example.com"),
+        b"send-routing-sender",
+    )?;
+    let recipient = application_routing_fixture::FixtureIdentity::fresh_for_did(
+        &format!("did:web:recipient-{fixture_id}.routing.example.com"),
+        b"send-routing-recipient",
+    )?;
+    let transport = ApplicationRoutingTransport {
+        sender_did: sender.did.clone(),
+        recipient_did: recipient.did.clone(),
+    };
+    let message_id = uuid::Uuid::new_v4();
+    let mut fixture = application_routing_fixture::seed_application_routing_fixture(
+        pool,
+        &trusted,
+        sender,
+        recipient,
+        direct,
+        message_id,
+        recipient_service_did,
+        sequencer_service_did,
+    )
+    .await?;
+    let authority = RelationshipAuthority::new(
+        fixed_production_relationship_policy_config()
+            .map_err(|error| format!("routing relationship policy: {error:?}"))?,
+        transport,
+    );
+    let mut roster = vec![fixture.requester.did.clone(), fixture.fulfiller.did.clone()];
+    roster.sort();
+    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    let live_allocation = allocate_projection_revision(&mut tx)
+        .await
+        .map_err(|error| format!("routing live allocation: {error:?}"))?;
+    let fallback_allocation = allocate_projection_revision(&mut tx)
+        .await
+        .map_err(|error| format!("routing fallback allocation: {error:?}"))?;
+    let clock = anchor_projection_clock(&mut *tx)
+        .await
+        .map_err(|error| format!("routing projection clock: {error}"))?;
+    let live = authority
+        .collect_traffic_projection(
+            &clock,
+            live_allocation,
+            fixture.requester.did.clone(),
+            roster,
+        )
+        .await
+        .map_err(|error| format!("routing traffic collection: {error:?}"))?;
+    let observation = observe_relationship_persistence(&clock);
+    let fallback = live
+        .export_persisted_fallback(fallback_allocation, &authority, &observation)
+        .map_err(|error| format!("routing traffic sealing: {error:?}"))?;
+    persist_traffic_projection(&mut tx, fallback)
+        .await
+        .map_err(|error| format!("routing traffic persistence: {error:?}"))?;
+    tx.commit().await.map_err(|error| error.to_string())?;
+
+    let application = fixture.application_messages.remove(0);
+    let body = serde_json::json!({
+        "$type": "blue.catbird.chat.defs#applicationSendBody",
+        "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0000}",
+        "messageId": message_id,
+        "actorDid": fixture.requester.did,
+        "actorDeviceId": fixture.requester.device_id,
+        "keyId": fixture.requester.key_id,
+        "authGeneration": 1,
+        "prior": application_routing_fixture::coordinate_json(&fixture.prior),
+        "signedAt": chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "blobBindings": [],
+        "aad": application_routing_fixture::application_routing_aad(&fixture.prior, message_id),
+        "applicationMessage": {
+            "framing": "mlsMessage", "contentType": "privateMessageApplication",
+            "bytes": STANDARD.encode(&application),
+            "sha256": STANDARD.encode(Sha256::digest(&application))
+        }
+    });
+    let mut wrapper = serde_json::json!({"body": body, "signature": STANDARD.encode([0_u8; 64])});
+    let unsigned = serde_json::to_vec(&wrapper).map_err(|error| error.to_string())?;
+    let canonical = super::transcript::decode_canonical_signed_mutation(&unsigned)
+        .map_err(|error| format!("routing message transcript: {error:?}"))?;
+    wrapper["signature"] = serde_json::json!(STANDARD.encode(
+        fixture
+            .requester
+            .signing_key
+            .sign(canonical.transcript_bytes())
+            .to_bytes(),
+    ));
+    let signed_bytes = serde_json::to_vec(&wrapper).map_err(|error| error.to_string())?;
+    let verified = super::transcript::decode_and_verify_signed_mutation(
+        &signed_bytes,
+        &fixture.requester.signing_key.verifying_key().to_bytes(),
+    )
+    .map_err(|error| format!("verify routing application signature: {error:?}"))?;
+    let super::transcript::VerifiedMutationProjection::ApplicationSend(projection) =
+        verified.projection()
+    else {
+        return Err("routing fixture did not produce an application projection".to_owned());
+    };
+    let mut expected_aad = b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0".to_vec();
+    expected_aad.extend_from_slice(&projection.aad().canonical_dag_cbor());
+    let native = super::wire::validate_private_application(
+        &application,
+        super::wire::MAX_PRIVATE_MESSAGE_WIRE_BYTES,
+    )
+    .map_err(|error| format!("verify native routing application: {error:?}"))?;
+    if native.aad() != expected_aad {
+        return Err("native MLS AAD differs from the signed request projection".to_owned());
+    }
+    Ok(ApplicationRoutingFixture {
+        conversation_id: fixture.conversation_id,
+        message_id,
+        sender_did: fixture.requester.did,
+        sender_device_id: fixture.requester.device_id,
+        recipient_did: fixture.fulfiller.did,
+        signed_request: wrapper,
+    })
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub use super::relationship_policy::AdmissionOperation;
 #[cfg(any(test, feature = "test-support"))]
@@ -186,15 +403,20 @@ pub async fn seed_deterministic_creation_fallback(
     let fallback_allocation = allocate_projection_revision(&mut fallback_tx)
         .await
         .map_err(|e| format!("allocate fallback revision: {e:?}"))?;
+    // Encrypted-requests: collection and persistence observe the database clock.
+    let clock = anchor_projection_clock(&mut *fallback_tx)
+        .await
+        .map_err(|e| format!("anchor projection clock: {e}"))?;
     let live_rel = rel_authority
         .collect_admission_projection(
+            &clock,
             live_allocation,
             ProjectionOperationScope::Creation,
             admission_req,
         )
         .await
         .map_err(|e| format!("collect admission projection: {e:?}"))?;
-    let observation = observe_relationship_persistence();
+    let observation = observe_relationship_persistence(&clock);
     let sealed_fallback = live_rel
         .export_persisted_fallback(fallback_allocation, &rel_authority, &observation)
         .map_err(|e| format!("seal fallback: {e:?}"))?;
@@ -236,15 +458,20 @@ pub async fn seed_deterministic_pending_add_fallback(
     let fallback_allocation = allocate_projection_revision(&mut fallback_tx)
         .await
         .map_err(|e| format!("allocate fallback revision: {e:?}"))?;
+    // Encrypted-requests: collection and persistence observe the database clock.
+    let clock = anchor_projection_clock(&mut *fallback_tx)
+        .await
+        .map_err(|e| format!("anchor projection clock: {e}"))?;
     let live_rel = rel_authority
         .collect_admission_projection(
+            &clock,
             live_allocation,
             ProjectionOperationScope::PendingAdd,
             admission_req,
         )
         .await
         .map_err(|e| format!("collect admission projection: {e:?}"))?;
-    let observation = observe_relationship_persistence();
+    let observation = observe_relationship_persistence(&clock);
     let sealed_fallback = live_rel
         .export_persisted_fallback(fallback_allocation, &rel_authority, &observation)
         .map_err(|e| format!("seal fallback: {e:?}"))?;
@@ -351,6 +578,13 @@ pub async fn run_federation_fixture() -> Result<(), String> {
 
     let input: FederationFixtureInput = serde_json::from_slice(&buffer)
         .map_err(|e| format!("failed to parse selector JSON: {e}"))?;
+
+    // Conversation ids minted by the server and the e2e harness are UUIDv4; a
+    // nil or other-version id in a selector is a malformed fixture, not a
+    // conversation, so refuse it before any database or network work.
+    if input.conversation_id.get_version_num() != 4 {
+        return Err("invalid bootstrap selector: conversationId must be a UUIDv4".to_string());
+    }
 
     let selector = crate::federation::RemotePrefixBootstrapSelector::new(
         input.conversation_id,

@@ -10,8 +10,22 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use url::Url;
 use zeroize::Zeroizing;
 
+use super::request_push::RequestPushConfig;
 use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
 use crate::chat_protocol::{relationship_policy::ProductionRelationshipAuthority, CursorSealer};
+
+#[cfg(feature = "test-support")]
+pub fn install_test_https_relationship_resolver(
+    hosts: &[String],
+    port: u16,
+    ca_certificate_pem: &[u8],
+) -> Result<(), String> {
+    crate::chat_protocol::relationship_policy::install_test_https_relationship_transport(
+        hosts,
+        port,
+        ca_certificate_pem,
+    )
+}
 use crate::db::DbPool;
 use crate::realtime::{SseState, StreamEvent};
 
@@ -19,6 +33,12 @@ use crate::realtime::{SseState, StreamEvent};
 /// every chat handler as `State<Arc<ChatRuntime>>`.
 pub struct ChatRuntime {
     cutover_enabled: bool,
+    request_producers_enabled: bool,
+    request_receipt_signer: Option<
+        Arc<crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner>,
+    >,
+    request_push: Option<Arc<RequestPushConfig>>,
+    requests_ready: std::sync::atomic::AtomicBool,
     relationship_authority: Arc<ProductionRelationshipAuthority>,
     sse_state: Arc<SseState>,
     cursor_sealer: Option<CursorSealer>,
@@ -33,6 +53,7 @@ impl fmt::Debug for ChatRuntime {
             .debug_struct("ChatRuntime")
             .field("cutover_enabled", &self.cutover_enabled)
             .field("relationship_authority", &"fixed-production-authority")
+            .field("request_push_enabled", &self.request_push.is_some())
             .field("sse_state", &"conversation-filtered")
             .field("cursor_sealer_configured", &self.cursor_sealer.is_some())
             .field(
@@ -104,8 +125,35 @@ impl ChatRuntime {
                     .to_owned(),
             );
         }
+        let request_producers_enabled = env_flag("CHAT_DIRECT_REQUESTS_ENABLED");
+        let request_push_enabled = env_flag("CHAT_REQUEST_PUSH_ENABLED");
+        let request_receipt_signer = if request_producers_enabled
+            || request_push_enabled
+            || std::env::var_os("CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM").is_some()
+        {
+            if !cutover_enabled {
+                return Err("direct requests require chat cutover".into());
+            }
+            let receipt_pem = std::env::var("CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM")
+                .map_err(|_| "missing dedicated request receipt key")?;
+            let service_pem = std::env::var("SIGNING_KEY_PEM")
+                .map_err(|_| "missing service signing key for separation check")?;
+            let document = std::env::var("CHAT_REQUEST_RECEIPT_DID_DOCUMENT_JSON")
+                .map_err(|_| "missing request receipt authority document")?;
+            Some(Arc::new(crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner::configured(&receipt_pem,&service_pem,&document)?))
+        } else {
+            None
+        };
+        if request_push_enabled && !cutover_enabled {
+            return Err("request push requires chat cutover".into());
+        }
+        let request_push = RequestPushConfig::from_env(request_push_enabled)?;
         Ok(Self {
             cutover_enabled,
+            request_producers_enabled,
+            request_receipt_signer,
+            request_push,
+            requests_ready: std::sync::atomic::AtomicBool::new(false),
             relationship_authority,
             sse_state,
             cursor_sealer,
@@ -157,6 +205,24 @@ impl ChatRuntime {
         self.commit_submitter.as_ref()
     }
 
+    /// Test-support-only loopback injection for the real internal route and
+    /// outbox worker. It changes only the fixed peer transport; receipt keys,
+    /// protocol fence, database authority and policy checks remain production.
+    #[cfg(feature = "test-support")]
+    pub fn with_test_request_push_loopback(
+        mut self,
+        event_endpoint: &str,
+        canonical_eligibility_bearer: &str,
+    ) -> Result<Self, String> {
+        let endpoint =
+            Url::parse(event_endpoint).map_err(|_| "test request-push endpoint is invalid")?;
+        self.request_push = Some(RequestPushConfig::loopback_for_test(
+            endpoint,
+            canonical_eligibility_bearer,
+        )?);
+        Ok(self)
+    }
+
     /// The global cutover gate (OQ-2). `pub` so the binary crate can decide, at
     /// startup, whether to spawn the clean-chat background workers at all: while
     /// the gate is off nothing in this tree may touch `chat.*`, and a worker that
@@ -195,13 +261,17 @@ impl ChatRuntime {
             "clean-chat protocol fence cannot be validated without a cursor sealer".to_owned()
         })?;
         let expected_key_id = URL_SAFE_NO_PAD.encode(sealer.key_id());
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|error| format!("failed to acquire connection for clean-chat protocol fence: {error}"))?;
 
         let protocol = sqlx::query_as::<_, (uuid::Uuid, String)>(
             "SELECT p.protocol_instance_id, p.cursor_key_id \
              FROM chat.protocol_instances AS p \
              WHERE p.singleton = TRUE",
         )
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|error| format!("failed to load clean-chat protocol instance fence: {error}"))?
         .ok_or_else(|| "clean-chat protocol instance singleton is missing".to_owned())?;
@@ -219,7 +289,7 @@ impl ChatRuntime {
              WHERE protocol_instance_id = $1)",
         )
         .bind(protocol.0)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|error| format!("failed to load clean-chat event-retention fence: {error}"))?;
         if !retention_exists {
@@ -228,7 +298,65 @@ impl ChatRuntime {
                 protocol.0
             ));
         }
+        if self.request_receipt_signer.is_none() {
+            let schema_present: bool = sqlx::query_scalar(
+                "SELECT to_regclass('chat.direct_request_attempts') IS NOT NULL",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|_| "request rollback schema check")?;
+            if schema_present {
+                let durable: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts)")
+                        .fetch_one(pool)
+                        .await
+                        .map_err(|_| "request rollback authority check")?;
+                if durable {
+                    return Err("durable requests require receipt authority for cancellation, outcome, and consent even when producers are disabled".into());
+                }
+            }
+        }
+        if let Some(signer) = &self.request_receipt_signer {
+            signer.validate_and_retain_keys(pool).await?;
+            self.requests_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         Ok(())
+    }
+
+    pub(crate) fn request_producers_enabled(&self) -> bool {
+        self.request_producers_enabled
+            && self
+                .requests_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn request_receipt_signer(
+        &self,
+    ) -> Option<
+        &crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner,
+    > {
+        self.requests_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then_some(self.request_receipt_signer.as_deref())
+            .flatten()
+    }
+
+    pub fn request_push_enabled(&self) -> bool {
+        self.request_push.is_some()
+            && self
+                .requests_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn request_push_config(&self) -> Option<&Arc<RequestPushConfig>> {
+        self.request_push_enabled()
+            .then_some(self.request_push.as_ref())
+            .flatten()
+    }
+
+    pub fn sse_state(&self) -> &Arc<SseState> {
+        &self.sse_state
     }
 
     pub(crate) async fn subscribe_typing(

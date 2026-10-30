@@ -1,0 +1,39 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.batch",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Sender-encrypted messages for one conversation, stored once per conversation in the sender's repo inside the conversation space ([CB-15], [CB-20]). rkey = TID.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": [
+          "threadId",
+          "items",
+          "createdAt"
+        ],
+        "properties": {
+          "threadId": {
+            "type": "string",
+            "description": "Conversation id.",
+            "maxLength": 256
+          },
+          "items": {
+            "type": "array",
+            "maxLength": 256,
+            "items": {
+              "type": "ref",
+              "ref": "blue.catbird.labyrinth.defs#sealedMessage"
+            },
+            "minLength": 1
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

@@ -16,11 +16,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Header name for recovery mode bypass requests
-/// When set to "true", the middleware allows the request through but
-/// the handler MUST verify the client actually needs recovery (0 key packages)
-pub const RECOVERY_MODE_HEADER: &str = "x-mls-recovery-mode";
-
 /// Token bucket rate limiter
 #[derive(Clone)]
 pub struct TokenBucket {
@@ -268,6 +263,132 @@ impl Default for FederationPeerRateLimiter {
     }
 }
 
+/// Per-minute quotas of the Space authority policy endpoints
+/// (`getSpaceMembership`, `deleteSpaceGeneration`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpaceAuthorityQuota {
+    /// Calls for one user by one authority. Applies when the call names a user.
+    pub per_user: u32,
+    /// Calls to one endpoint by one authority, across all users.
+    pub per_authority: u32,
+}
+
+impl Default for SpaceAuthorityQuota {
+    fn default() -> Self {
+        Self {
+            per_user: 300,
+            per_authority: 6000,
+        }
+    }
+}
+
+impl SpaceAuthorityQuota {
+    pub fn from_env() -> Self {
+        let read = |name: &str, default: u32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        };
+        let default = Self::default();
+        Self {
+            per_user: read("RATE_LIMIT_SPACE_AUTHORITY_PER_USER", default.per_user),
+            per_authority: read(
+                "RATE_LIMIT_SPACE_AUTHORITY_PER_MINUTE",
+                default.per_authority,
+            ),
+        }
+    }
+
+    /// Pre-auth calls to one policy endpoint from one client IP per minute.
+    /// It defaults to the per-authority ceiling: an authority sends every
+    /// user's calls from its one egress address, so a smaller bound would
+    /// make the ceiling unreachable and let one user throttle every other.
+    pub fn per_client_ip_from_env() -> u32 {
+        std::env::var("RATE_LIMIT_SPACE_AUTHORITY_IP_PER_MINUTE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| Self::from_env().per_authority)
+    }
+}
+
+/// Request paths of the Space authority policy endpoints.
+const SPACE_AUTHORITY_POLICY_PATHS: [&str; 2] = [
+    "/xrpc/blue.catbird.labyrinth.getSpaceMembership",
+    "/xrpc/blue.catbird.labyrinth.deleteSpaceGeneration",
+];
+
+fn space_authority_policy_path(path: &str) -> Option<&'static str> {
+    SPACE_AUTHORITY_POLICY_PATHS
+        .iter()
+        .copied()
+        .find(|policy_path| *policy_path == path)
+}
+
+/// Quota of the Space authority policy endpoints. One authority DID calls
+/// them for every user of a deployment, so the per-issuer [`DidRateLimiter`]
+/// bucket would make all of those users share one bucket. Here each user has
+/// a bucket per authority, under a larger per-authority ceiling.
+#[derive(Clone)]
+pub struct SpaceAuthorityRateLimiter {
+    buckets: Arc<Cache<String, Arc<Mutex<TokenBucket>>>>,
+}
+
+impl SpaceAuthorityRateLimiter {
+    pub fn new() -> Self {
+        let max_keys = parse_u64_env("RATE_LIMIT_SPACE_AUTHORITY_MAX_KEYS", 300_000);
+        let ttl_seconds = parse_u64_env("RATE_LIMIT_SPACE_AUTHORITY_BUCKET_TTL_SECONDS", 900);
+        Self {
+            buckets: build_bucket_cache(max_keys, ttl_seconds),
+        }
+    }
+
+    /// Take one call to `endpoint` by `authority`, on behalf of `user` when
+    /// the call names one. `Err` carries the Retry-After seconds. The user's
+    /// bucket is checked first, so a throttled user does not spend the
+    /// authority's shared ceiling.
+    pub fn check(
+        &self,
+        authority: &str,
+        endpoint: &str,
+        user: Option<&str>,
+        quota: SpaceAuthorityQuota,
+    ) -> Result<(), u64> {
+        if let Some(user) = user {
+            self.take(format!("{authority}|{endpoint}|{user}"), quota.per_user)?;
+        }
+        self.take(format!("{authority}|{endpoint}|*"), quota.per_authority)
+    }
+
+    /// Take one pre-auth call to the policy endpoint at `path` from
+    /// `client_ip`. `Err` carries the Retry-After seconds.
+    pub fn check_client(&self, client_ip: &str, path: &str, per_minute: u32) -> Result<(), u64> {
+        self.take(format!("{client_ip}|{path}"), per_minute)
+    }
+
+    fn take(&self, key: String, per_minute: u32) -> Result<(), u64> {
+        let limit = per_minute.max(1);
+        // Include the limit in the key so a quota change does not reuse stale capacity.
+        let bucket = self.buckets.get_with(format!("{key}|{limit}"), || {
+            Arc::new(Mutex::new(TokenBucket::new(limit, limit as f64 / 60.0)))
+        });
+        let mut bucket = bucket.lock();
+        if bucket.try_consume() {
+            Ok(())
+        } else {
+            Err(bucket.retry_after_secs())
+        }
+    }
+}
+
+impl Default for SpaceAuthorityRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Get endpoint-specific quota (limit, window duration)
 fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
     let window = Duration::from_secs(60); // 1 minute window
@@ -371,37 +492,16 @@ pub static DID_RATE_LIMITER: Lazy<DidRateLimiter> = Lazy::new(DidRateLimiter::ne
 /// Global per-source-DS limiter for federation endpoints.
 pub static FEDERATION_DS_RATE_LIMITER: Lazy<FederationPeerRateLimiter> =
     Lazy::new(FederationPeerRateLimiter::new);
+/// Global limiter of the Space authority policy endpoints.
+pub static SPACE_AUTHORITY_RATE_LIMITER: Lazy<SpaceAuthorityRateLimiter> =
+    Lazy::new(SpaceAuthorityRateLimiter::new);
+/// Per-IP pre-auth limiter of the Space authority policy endpoints, which
+/// skip [`IP_LIMITER`]. A separate cache from the post-auth buckets.
+pub static SPACE_AUTHORITY_IP_LIMITER: Lazy<SpaceAuthorityRateLimiter> =
+    Lazy::new(SpaceAuthorityRateLimiter::new);
 
 /// Per-IP rate limiter instance
 pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
-
-/// Check if an endpoint should use device-based rate limiting
-/// Device-based limits give fresh devices (app reinstall) their own quota
-fn should_use_device_rate_limit(endpoint: &str) -> bool {
-    let endpoint_name = endpoint
-        .trim_start_matches("/xrpc/")
-        .trim_start_matches("blue.catbird.chat.")
-        .trim_start_matches("blue.catbird.mlsDS.");
-
-    endpoint_name.contains("replenishKeyPackages")
-}
-
-/// Check if request is in recovery mode
-/// Recovery mode bypasses rate limits for key package operations
-/// The HANDLER must verify the client genuinely has 0 key packages
-fn is_recovery_mode_request(headers: &HeaderMap, endpoint: &str) -> bool {
-    // Only allow recovery mode for key package endpoints
-    if !should_use_device_rate_limit(endpoint) {
-        return false;
-    }
-
-    // Check for recovery mode header
-    headers
-        .get(RECOVERY_MODE_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
 
 static TRUSTED_PROXY_CIDRS: Lazy<Vec<IpNet>> = Lazy::new(|| {
     std::env::var("TRUSTED_PROXY_CIDRS")
@@ -429,28 +529,41 @@ static TRUSTED_PROXY_CIDRS: Lazy<Vec<IpNet>> = Lazy::new(|| {
 /// Middleware for pre-auth throttling.
 /// Uses only source IP identity (optionally from trusted proxy headers).
 pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
-    let headers = request.headers();
     let uri = request.uri().to_string();
     let client_ip = extract_client_ip(&request);
 
-    // Check for recovery mode bypass (handler MUST verify 0 key packages)
-    if is_recovery_mode_request(headers, &uri) {
-        tracing::debug!(
-            client_ip = %client_ip,
-            endpoint = %uri,
-            "Recovery mode bypass requested (handler must verify true recovery state)"
-        );
-        return Ok(next.run(request).await);
-    }
+    // A Space authority sends every user's policy calls from its one egress
+    // address, so these routes skip the general per-IP bucket, which one
+    // user's calls could otherwise spend for every other user. Their own
+    // per-IP bucket is sized to the per-authority ceiling and still bounds
+    // unauthenticated calls, which resolve the issuer DID; the
+    // per-(authority, user) quota applies after auth.
+    let (limited, check) = match space_authority_policy_path(request.uri().path()) {
+        Some(path) => (
+            "Space authority policy",
+            SPACE_AUTHORITY_IP_LIMITER.check_client(
+                &client_ip,
+                path,
+                SpaceAuthorityQuota::per_client_ip_from_env(),
+            ),
+        ),
+        None => ("IP", IP_LIMITER.check(&client_ip)),
+    };
 
-    match IP_LIMITER.check(&client_ip) {
+    match check {
         Ok(()) => {
-            tracing::debug!("IP pre-auth rate limit passed for {}: {}", client_ip, uri);
+            tracing::debug!(
+                "{} pre-auth rate limit passed for {}: {}",
+                limited,
+                client_ip,
+                uri
+            );
             Ok(next.run(request).await)
         }
         Err(retry_after) => {
             tracing::warn!(
-                "IP pre-auth rate limit exceeded for {}: {} (retry after {} seconds)",
+                "{} pre-auth rate limit exceeded for {}: {} (retry after {} seconds)",
+                limited,
                 client_ip,
                 uri,
                 retry_after
@@ -516,7 +629,7 @@ fn extract_client_ip(request: &Request) -> String {
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::{HeaderMap, HeaderValue, Request as HttpRequest};
+    use axum::http::Request as HttpRequest;
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
@@ -564,26 +677,193 @@ mod tests {
         assert!(limiter.check("user2").is_ok());
     }
 
-    #[test]
-    fn recovery_mode_header_is_case_insensitive_for_key_package_endpoints() {
-        let mut headers = HeaderMap::new();
-        headers.insert(RECOVERY_MODE_HEADER, HeaderValue::from_static("TrUe"));
+    const MEMBERSHIP: &str = "blue.catbird.labyrinth.getSpaceMembership";
+    const DELETION: &str = "blue.catbird.labyrinth.deleteSpaceGeneration";
+    const AUTHORITY: &str = "did:web:authority.example.com";
 
-        assert!(is_recovery_mode_request(
-            &headers,
-            "/xrpc/blue.catbird.chat.replenishKeyPackages"
-        ));
+    // MLSDS-01: two users of one authority each cost 150 policy calls in a
+    // minute. The shared 200/min issuer bucket throttled both (and every
+    // other user); per-user buckets admit both.
+    #[test]
+    fn space_authority_default_quota_admits_two_users_past_the_did_default() {
+        let limiter = SpaceAuthorityRateLimiter::new();
+        let quota = SpaceAuthorityQuota::default();
+        for user in ["did:plc:alice", "did:plc:bob"] {
+            for call in 0..150 {
+                assert!(
+                    limiter
+                        .check(AUTHORITY, MEMBERSHIP, Some(user), quota)
+                        .is_ok(),
+                    "{user} throttled at call {call}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn recovery_mode_does_not_apply_to_non_recovery_endpoints() {
-        let mut headers = HeaderMap::new();
-        headers.insert(RECOVERY_MODE_HEADER, HeaderValue::from_static("true"));
+    fn space_authority_quota_is_keyed_by_authority_and_user() {
+        let limiter = SpaceAuthorityRateLimiter::new();
+        let quota = SpaceAuthorityQuota {
+            per_user: 3,
+            per_authority: 5,
+        };
+        let alice = Some("did:plc:alice");
+        for _ in 0..3 {
+            assert!(limiter.check(AUTHORITY, MEMBERSHIP, alice, quota).is_ok());
+        }
+        let retry_after = limiter
+            .check(AUTHORITY, MEMBERSHIP, alice, quota)
+            .unwrap_err();
+        assert!(retry_after >= 1);
+        // Bob has his own bucket under the same authority.
+        assert!(limiter
+            .check(AUTHORITY, MEMBERSHIP, Some("did:plc:bob"), quota)
+            .is_ok());
+        assert!(limiter
+            .check(AUTHORITY, MEMBERSHIP, Some("did:plc:bob"), quota)
+            .is_ok());
+        // Alice's throttled call did not spend the ceiling, which is now
+        // spent (3 + 2), so it holds for a fresh user too.
+        assert!(limiter
+            .check(AUTHORITY, MEMBERSHIP, Some("did:plc:carol"), quota)
+            .is_err());
+        // Other authorities, and the authority's other endpoint, are separate.
+        assert!(limiter
+            .check("did:web:other.example.com", MEMBERSHIP, alice, quota)
+            .is_ok());
+        assert!(limiter.check(AUTHORITY, DELETION, None, quota).is_ok());
+    }
 
-        assert!(!is_recovery_mode_request(
-            &headers,
-            "/xrpc/blue.catbird.chat.sendMessage"
-        ));
+    #[test]
+    fn space_authority_call_without_user_uses_only_the_ceiling() {
+        let limiter = SpaceAuthorityRateLimiter::new();
+        let quota = SpaceAuthorityQuota {
+            per_user: 1,
+            per_authority: 2,
+        };
+        assert!(limiter.check(AUTHORITY, DELETION, None, quota).is_ok());
+        assert!(limiter.check(AUTHORITY, DELETION, None, quota).is_ok());
+        assert!(limiter.check(AUTHORITY, DELETION, None, quota).unwrap_err() >= 1);
+    }
+
+    #[test]
+    fn space_authority_pre_auth_bound_is_keyed_by_client_ip_and_path() {
+        let limiter = SpaceAuthorityRateLimiter::new();
+        let [membership, deletion] = SPACE_AUTHORITY_POLICY_PATHS;
+        assert!(limiter.check_client("192.0.2.1", membership, 2).is_ok());
+        assert!(limiter.check_client("192.0.2.1", membership, 2).is_ok());
+        assert!(
+            limiter
+                .check_client("192.0.2.1", membership, 2)
+                .unwrap_err()
+                >= 1
+        );
+        assert!(limiter.check_client("192.0.2.2", membership, 2).is_ok());
+        assert!(limiter.check_client("192.0.2.1", deletion, 2).is_ok());
+    }
+
+    #[test]
+    fn space_authority_pre_auth_bound_defaults_to_the_ceiling() {
+        assert_eq!(
+            SpaceAuthorityQuota::per_client_ip_from_env(),
+            SpaceAuthorityQuota::from_env().per_authority
+        );
+        assert_eq!(
+            space_authority_policy_path("/xrpc/blue.catbird.labyrinth.getSpaceMembership"),
+            Some("/xrpc/blue.catbird.labyrinth.getSpaceMembership")
+        );
+        assert_eq!(
+            space_authority_policy_path("/xrpc/blue.catbird.labyrinth.listSpaceBatches"),
+            None
+        );
+    }
+
+    /// A router behind [`rate_limit_middleware`] that answers 200 on both
+    /// Space authority policy paths and on one ordinary path.
+    fn limited_router() -> axum::Router {
+        use axum::routing::{get, post};
+        let [membership, deletion] = SPACE_AUTHORITY_POLICY_PATHS;
+        axum::Router::new()
+            .route(membership, get(|| async { StatusCode::OK }))
+            .route(deletion, post(|| async { StatusCode::OK }))
+            .route(
+                "/xrpc/blue.catbird.chat.getEntries",
+                get(|| async { StatusCode::OK }),
+            )
+            .layer(axum::middleware::from_fn(rate_limit_middleware))
+    }
+
+    async fn call_from(router: &axum::Router, ip: [u8; 4], method: &str, path: &str) -> Response {
+        use tower_util::ServiceExt;
+        let mut request = HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((ip, 443))));
+        router.clone().oneshot(request).await.expect("router")
+    }
+
+    // Review of MLSDS-01: an authority sends every user's policy calls from
+    // one address. Through the general per-IP bucket, one user's calls ran
+    // it dry for every other user.
+    #[tokio::test]
+    async fn space_authority_policy_paths_skip_the_general_ip_bucket() {
+        let router = limited_router();
+        let egress = [192, 0, 2, 10];
+        let general = IP_LIMITER.capacity;
+        assert!(SpaceAuthorityQuota::per_client_ip_from_env() > general);
+        let [membership, _] = SPACE_AUTHORITY_POLICY_PATHS;
+        for call in 0..=general {
+            let response = call_from(&router, egress, "GET", membership).await;
+            assert_eq!(response.status(), StatusCode::OK, "call {call}");
+        }
+        // The general bucket of that address is untouched.
+        let response =
+            call_from(&router, egress, "GET", "/xrpc/blue.catbird.chat.getEntries").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // The policy paths keep a pre-auth bound per client IP, because an
+    // unauthenticated call still resolves the issuer DID.
+    #[tokio::test]
+    async fn space_authority_policy_paths_keep_a_pre_auth_ip_bound() {
+        let router = limited_router();
+        let client = [192, 0, 2, 20];
+        let [_, deletion] = SPACE_AUTHORITY_POLICY_PATHS;
+        let bound = SpaceAuthorityQuota::per_client_ip_from_env();
+        for call in 0..bound {
+            let response = call_from(&router, client, "POST", deletion).await;
+            assert_eq!(response.status(), StatusCode::OK, "call {call}");
+        }
+        // The bucket refilled at bound/60 per second during those calls, far
+        // slower than they ran, so it runs dry within a bounded number more.
+        let mut throttled = None;
+        for _ in 0..bound {
+            let response = call_from(&router, client, "POST", deletion).await;
+            if response.status() != StatusCode::OK {
+                throttled = Some(response);
+                break;
+            }
+        }
+        let throttled = throttled.expect("the pre-auth bound never ran dry");
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = throttled.headers()[axum::http::header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(retry_after >= 1);
+        let bytes = axum::body::to_bytes(throttled.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "RateLimitExceeded");
+        // Another address is not throttled.
+        let response = call_from(&router, [192, 0, 2, 21], "POST", deletion).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

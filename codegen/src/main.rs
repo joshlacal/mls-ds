@@ -36,6 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let corpus = LexiconCorpus::load_from_dir(normalized_lexdir.path())?;
     let codegen = CodeGenerator::new(&corpus, "crate::generated");
     codegen.write_to_disk(&args.outdir)?;
+    let patched = patch_schemaless_json_outputs(&args.outdir)?;
+    if patched > 0 {
+        println!("  Gave {patched} schemaless application/json output(s) raw-byte codecs");
+    }
 
     println!("✓ Code generation complete!");
     Ok(())
@@ -54,8 +58,74 @@ fn normalize_lexicon_dirs(
     if normalized > 0 {
         println!("  Normalized {normalized} raw-byte XRPC body schema(s) for Jacquard");
     }
+    let inlined = inline_bytes_alias_refs(tempdir.path())?;
+    if inlined > 0 {
+        println!("  Inlined {inlined} ref(s) to top-level bytes definitions for Jacquard");
+    }
 
     Ok(tempdir)
+}
+
+/// Jacquard attaches its DAG-JSON `{"$bytes":…}` serde helper only to
+/// properties whose own schema is `bytes`; a ref to a top-level `bytes` def
+/// becomes a bare `bytes::Bytes` alias field that neither accepts nor emits
+/// the lexicon JSON byte form. Inline each such ref (keeping the referring
+/// description) so every byte field gets the helper; the alias type itself is
+/// still generated and names the identical Rust type.
+fn inline_bytes_alias_refs(lexicon_dir: &Path) -> Result<usize, Box<dyn std::error::Error>> {
+    let documents = load_preflight_documents(lexicon_dir)?;
+    let aliases: BTreeMap<String, Value> = documents
+        .values()
+        .flat_map(|document| {
+            document.defs.iter().filter_map(|(name, schema)| {
+                (schema.get("type").and_then(Value::as_str) == Some("bytes"))
+                    .then(|| (format!("{}#{name}", document.id), schema.clone()))
+            })
+        })
+        .collect();
+    let mut inlined = 0usize;
+    for document in documents.values() {
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&document.source_path)?)?;
+        let count = inline_bytes_refs(&mut value["defs"], &document.id, &aliases)?;
+        if count > 0 {
+            fs::write(&document.source_path, serde_json::to_string_pretty(&value)?)?;
+            inlined += count;
+        }
+    }
+    Ok(inlined)
+}
+
+fn inline_bytes_refs(
+    value: &mut Value,
+    nsid: &str,
+    aliases: &BTreeMap<String, Value>,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    match value {
+        Value::Object(map) if map.get("type").and_then(Value::as_str) == Some("ref") => {
+            let reference = map.get("ref").and_then(Value::as_str).unwrap_or_default();
+            let target = canonicalize_ref(nsid, reference).map_err(|error| {
+                invalid_union_contract(format!("{nsid} ref {reference}: {error}"))
+            })?;
+            let Some(schema) = aliases.get(&target) else {
+                return Ok(0);
+            };
+            let mut inlined = schema.clone();
+            if let Some(description) = map.get("description") {
+                inlined["description"] = description.clone();
+            }
+            *value = inlined;
+            Ok(1)
+        }
+        Value::Object(map) => map
+            .values_mut()
+            .map(|child| inline_bytes_refs(child, nsid, aliases))
+            .sum(),
+        Value::Array(items) => items
+            .iter_mut()
+            .map(|child| inline_bytes_refs(child, nsid, aliases))
+            .sum(),
+        _ => Ok(0),
+    }
 }
 
 fn validate_strict_union_contracts(lexicon_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -153,6 +223,14 @@ fn load_preflight_documents(
 }
 
 fn collect_json_files(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+    collect_files_with_extension(directory, "json", files)
+}
+
+fn collect_files_with_extension(
+    directory: &Path,
+    wanted: &str,
+    files: &mut Vec<PathBuf>,
+) -> io::Result<()> {
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
 
@@ -160,15 +238,105 @@ fn collect_json_files(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result<
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_json_files(&path, files)?;
+            collect_files_with_extension(&path, wanted, files)?;
         } else if file_type.is_file()
-            && path.extension().and_then(|extension| extension.to_str()) == Some("json")
+            && path.extension().and_then(|extension| extension.to_str()) == Some(wanted)
         {
             files.push(path);
         }
     }
 
     Ok(())
+}
+
+const XRPC_RESP_IMPL: &str = "impl jacquard_common::xrpc::XrpcResp for ";
+const JSON_OUTPUT_ENCODING: &str = "const ENCODING: &'static str = \"application/json\";";
+const OUTPUT_TYPE_DECL: &str = "type Output<S: jacquard_common::BosStr> = ";
+
+/// Jacquard gives an output with no schema a raw `body: Bytes` struct, and
+/// for every encoding except `application/json` it also emits raw
+/// `encode_output`/`decode_output`. For a schemaless `application/json`
+/// output (a byte-for-byte JSON body, like `labyrinthRelay`'s) it keeps the
+/// default JSON codec, which tries to parse the body as `{"body": …}` and
+/// fails. Add the same raw codecs to those responses. Returns how many
+/// responses were patched; a second run patches none.
+fn patch_schemaless_json_outputs(outdir: &Path) -> io::Result<usize> {
+    let mut files = Vec::new();
+    collect_files_with_extension(outdir, "rs", &mut files)?;
+    let mut patched = 0usize;
+    for file in files {
+        let source = fs::read_to_string(&file)?;
+        let (rewritten, count) = patch_schemaless_json_output_source(&source);
+        if count > 0 {
+            fs::write(&file, rewritten)?;
+            patched += count;
+        }
+    }
+    Ok(patched)
+}
+
+fn patch_schemaless_json_output_source(source: &str) -> (String, usize) {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    let mut count = 0usize;
+    while let Some(start) = rest.find(XRPC_RESP_IMPL) {
+        // The impl sits at column 0, so its closing brace is the first
+        // `\n}` after it.
+        let Some(len) = rest[start..].find("\n}") else {
+            break;
+        };
+        let end = start + len;
+        out.push_str(&rest[..end]);
+        if let Some(output) = schemaless_json_output(&rest[start..end]) {
+            out.push_str(&raw_output_codecs(output));
+            count += 1;
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    (out, count)
+}
+
+/// The output struct of an `XrpcResp` impl block whose output is schemaless
+/// `application/json` without its own codecs.
+fn schemaless_json_output(block: &str) -> Option<&str> {
+    if !block.contains(JSON_OUTPUT_ENCODING)
+        || block.contains("fn encode_output")
+        || block.contains("fn decode_output")
+    {
+        return None;
+    }
+    let after = &block[block.find(OUTPUT_TYPE_DECL)? + OUTPUT_TYPE_DECL.len()..];
+    let ty = after[..after.find(';')?].trim();
+    // A schema output is generic (`FooOutput<S>`) and a unit output is `()`.
+    let raw = ty.ends_with("Output") && ty.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    raw.then_some(ty)
+}
+
+/// The codecs Jacquard emits for a raw output (as in `getAttachmentBlob`).
+fn raw_output_codecs(output: &str) -> String {
+    format!(
+        "
+    fn encode_output<S: jacquard_common::BosStr>(
+        output: &Self::Output<S>,
+    ) -> Result<Vec<u8>, jacquard_common::xrpc::EncodeError>
+    where
+        Self::Output<S>: serde::Serialize,
+    {{
+        Ok(output.body.to_vec())
+    }}
+    fn decode_output<'de, S>(
+        body: &'de [u8],
+    ) -> Result<Self::Output<S>, jacquard_common::error::DecodeError>
+    where
+        S: jacquard_common::BosStr + serde::Deserialize<'de>,
+        Self::Output<S>: serde::Deserialize<'de>,
+    {{
+        Ok({output} {{
+            body: jacquard_common::deps::bytes::Bytes::copy_from_slice(body),
+        }})
+    }}"
+    )
 }
 
 fn validate_union_value(
@@ -335,8 +503,20 @@ fn copy_and_normalize_lexicons(
         }
 
         let content = fs::read_to_string(&source_path)?;
+        let value: Value = serde_json::from_str(&content).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "failed to parse JSON file {}: {error}",
+                    source_path.display()
+                ),
+            )
+        })?;
+        if is_unsupported_space_definition(&value) {
+            continue;
+        }
         let (normalized_content, normalized_count) =
-            normalize_lexicon_json(&content).map_err(|error| {
+            normalize_lexicon_value(value).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -346,7 +526,6 @@ fn copy_and_normalize_lexicons(
                 )
             })?;
         normalized += normalized_count;
-
         if let Some(parent) = destination_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -355,12 +534,49 @@ fn copy_and_normalize_lexicons(
 
     Ok(normalized)
 }
+fn is_unsupported_space_definition(value: &Value) -> bool {
+    let Some(defs) = value.get("defs").and_then(Value::as_object) else {
+        return false;
+    };
+    defs.values()
+        .any(|def| def.get("type").and_then(Value::as_str) == Some("space"))
+}
 
-fn normalize_lexicon_json(content: &str) -> Result<(String, usize), serde_json::Error> {
-    let mut value: Value = serde_json::from_str(content)?;
+fn normalize_lexicon_value(mut value: Value) -> Result<(String, usize), serde_json::Error> {
     let normalized_count = normalize_raw_byte_xrpc_bodies(&mut value);
     let normalized_content = serde_json::to_string_pretty(&value)?;
     Ok((normalized_content, normalized_count))
+}
+
+#[allow(dead_code)]
+fn normalize_lexicon_json(content: &str) -> Result<(String, usize), serde_json::Error> {
+    let value: Value = serde_json::from_str(content)?;
+    normalize_lexicon_value(value)
+}
+
+#[allow(dead_code)]
+fn normalize_unsupported_string_formats(value: &mut Value) -> usize {
+    let mut normalized = 0usize;
+    match value {
+        Value::Object(map) => {
+            if let Some(format_val) = map.get("format") {
+                if format_val.as_str() == Some("space-ref") {
+                    map.remove("format");
+                    normalized += 1;
+                }
+            }
+            for child in map.values_mut() {
+                normalized += normalize_unsupported_string_formats(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalized += normalize_unsupported_string_formats(item);
+            }
+        }
+        _ => {}
+    }
+    normalized
 }
 
 fn normalize_raw_byte_xrpc_bodies(value: &mut Value) -> usize {
@@ -420,6 +636,7 @@ mod tests {
     use super::load_preflight_documents;
     use super::normalize_lexicon_dirs;
     use super::normalize_raw_byte_xrpc_bodies;
+    use super::patch_schemaless_json_outputs;
     use super::validate_strict_union_contracts;
     use jacquard_lexicon::codegen::CodeGenerator;
     use jacquard_lexicon::corpus::LexiconCorpus;
@@ -536,6 +753,30 @@ mod tests {
             lexicon["defs"]["main"]["output"]["schema"]["type"],
             "object"
         );
+    }
+    #[test]
+    fn test_jacquard_corpus_with_space_type() {
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let lexicon = json!({
+            "lexicon": 1,
+            "id": "blue.catbird.circle",
+            "defs": {
+                "main": {
+                    "type": "space",
+                    "key": "tid",
+                    "name": "Catbird Circle",
+                    "description": "An author-owned private posting audience",
+                    "collections": [
+                        "blue.catbird.circle.metadata",
+                        "app.bsky.feed.post",
+                        "app.bsky.feed.like"
+                    ]
+                }
+            }
+        });
+        write_lexicon_at(fixture.path(), "circle.json", &lexicon);
+        let err = LexiconCorpus::load_from_dir(fixture.path()).unwrap_err();
+        println!("load_from_dir error: {:?}", err);
     }
 
     #[test]
@@ -937,5 +1178,88 @@ mod tests {
         assert!(generated.contains(&format!("rename = \"{FIXTURE_ID}#first\"")));
         assert!(generated.contains(&format!("rename = \"{FIXTURE_ID}#second\"")));
         assert!(!generated.contains("open_union"));
+    }
+
+    #[test]
+    fn bytes_alias_refs_get_the_dag_json_bytes_helper() {
+        let lexicon = fixture_with_defs(json!({
+            "digest": { "type": "bytes", "minLength": 32, "maxLength": 32 },
+            "main": {
+                "type": "object",
+                "required": ["local"],
+                "properties": {
+                    "local": { "type": "ref", "ref": "#digest", "description": "kept" },
+                    "absolute": { "type": "ref", "ref": format!("{FIXTURE_ID}#digest") }
+                }
+            }
+        }));
+        let fixture = write_fixture(&lexicon);
+        let normalized =
+            normalize_lexicon_dirs(&[fixture.path().to_path_buf()]).expect("normalize fixture");
+        let corpus = LexiconCorpus::load_from_dir(normalized.path()).expect("load fixture corpus");
+        let output = tempfile::tempdir().expect("generated output tempdir");
+        CodeGenerator::new(&corpus, "crate::generated")
+            .write_to_disk(output.path())
+            .expect("generate fixture corpus");
+        let generated =
+            fs::read_to_string(output.path().join("blue_catbird/chat/union_fixture.rs"))
+                .expect("read generated fixture module");
+        let compact: String = generated.split_whitespace().collect();
+        assert!(compact.contains(
+            "#[serde(default,with=\"jacquard_common::opt_serde_bytes_helper\")]pubabsolute:"
+        ));
+        assert!(compact.contains("#[serde(with=\"jacquard_common::serde_bytes_helper\")]publocal:"));
+        assert!(generated.contains("kept"));
+    }
+
+    fn procedure_fixture(output: Value) -> Value {
+        json!({
+            "lexicon": 1,
+            "id": FIXTURE_ID,
+            "defs": {
+                "main": {
+                    "type": "procedure",
+                    "input": { "encoding": "application/json", "schema": object_definition() },
+                    "output": output
+                }
+            }
+        })
+    }
+
+    fn generate_and_patch(lexicon: &Value) -> (String, usize, usize) {
+        let fixture = write_fixture(lexicon);
+        let corpus = LexiconCorpus::load_from_dir(fixture.path()).expect("load fixture corpus");
+        let output = tempfile::tempdir().expect("generated output tempdir");
+        CodeGenerator::new(&corpus, "crate::generated")
+            .write_to_disk(output.path())
+            .expect("generate fixture corpus");
+        let first = patch_schemaless_json_outputs(output.path()).expect("patch outputs");
+        let second = patch_schemaless_json_outputs(output.path()).expect("patch outputs again");
+        let generated =
+            fs::read_to_string(output.path().join("blue_catbird/chat/union_fixture.rs"))
+                .expect("read generated fixture module");
+        (generated, first, second)
+    }
+
+    #[test]
+    fn schemaless_json_outputs_get_raw_byte_codecs() {
+        let (generated, first, second) = generate_and_patch(&procedure_fixture(
+            json!({ "encoding": "application/json", "description": "byte for byte" }),
+        ));
+        assert_eq!((first, second), (1, 0));
+        let compact: String = generated.split_whitespace().collect();
+        assert!(compact.contains("Ok(output.body.to_vec())"));
+        assert!(compact.contains(
+            "Ok(UnionFixtureOutput{body:jacquard_common::deps::bytes::Bytes::copy_from_slice(body),})"
+        ));
+    }
+
+    #[test]
+    fn schema_json_outputs_keep_the_json_codec() {
+        let (generated, first, _) = generate_and_patch(&procedure_fixture(
+            json!({ "encoding": "application/json", "schema": object_definition() }),
+        ));
+        assert_eq!(first, 0);
+        assert!(!generated.contains("fn decode_output"));
     }
 }

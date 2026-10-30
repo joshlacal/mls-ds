@@ -1,0 +1,63 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.appendBatch",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Append a sender batch. Every item must carry the caller's own chat key and the same mekId, naming a MEK in the conversation the caller wrote or received (Y4). Thread endpoint on the conversation's sequencer DS; threadId is the chat conversation id ([CB-2]). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "record"
+          ],
+          "properties": {
+            "record": {
+              "type": "unknown",
+              "description": "A blue.catbird.labyrinth.batch record."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "rkey",
+            "order"
+          ],
+          "properties": {
+            "rkey": {
+              "type": "string",
+              "maxLength": 13,
+              "description": "TID."
+            },
+            "order": {
+              "type": "ref",
+              "ref": "blue.catbird.labyrinth.defs#serverOrder"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotParticipant"
+        },
+        {
+          "name": "UnknownMek"
+        },
+        {
+          "name": "MixedMekBatch"
+        },
+        {
+          "name": "SenderKeyMismatch"
+        },
+        {
+          "name": "NotRecipient"
+        }
+      ]
+    }
+  }
+}

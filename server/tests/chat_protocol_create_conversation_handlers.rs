@@ -24,7 +24,11 @@ mod transcript;
 #[path = "../src/chat_protocol/validation.rs"]
 mod validation;
 
-use std::sync::Arc;
+#[allow(dead_code)]
+#[path = "common/generated_transition_requests.rs"]
+mod generated_transition_requests;
+
+use std::{fs, path::Path, process::Command, sync::Arc};
 
 use axum::{
     body::Body,
@@ -942,7 +946,495 @@ async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_
         Sha256::digest(&response_bytes).as_slice(),
         "completed replay must carry a canonical response digest"
     );
-    assert_eq!(response_bytes, first_response_bytes);
+    // Merged line: the record stores the generated-DTO bytes and every 200 is
+    // served through the encrypted-requests read presentation, so the stored
+    // record must present to exactly the bytes the client received.
+    assert_eq!(
+        catbird_server::chat_protocol::direct_request_transcript::present_endpoint_output(
+            ENDPOINT,
+            response_bytes,
+        )
+        .expect("present stored response"),
+        first_response_bytes
+    );
+}
+
+#[derive(Clone, Copy)]
+enum GeneratedTransitionOrigin {
+    Rust,
+    Swift,
+}
+
+impl GeneratedTransitionOrigin {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Swift => "swift",
+        }
+    }
+}
+
+fn run_swift_transition_producer(args: &[&str], log_path: &Path) {
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/generated_transitions/reproduce.py"
+        ))
+        .args(args)
+        .output()
+        .expect("run required actual generated Swift producer");
+    let mut log = output.stdout;
+    log.extend_from_slice(&output.stderr);
+    fs::write(log_path, &log).expect("retain Swift producer output");
+    assert!(
+        output.status.success(),
+        "actual generated Swift producer failed; {}: {}",
+        log_path.display(),
+        String::from_utf8_lossy(&log)
+    );
+}
+
+async fn signed_pending_add_for_generated_handler(
+    pool: &DbPool,
+    fixture: &CreationTestFixture,
+    trusted_at: DateTime<Utc>,
+) -> (Uuid, Value) {
+    let transition_id = Uuid::new_v4();
+    let invitee = random_did();
+    sqlx::query("INSERT INTO chat.principals (user_did, created_at) VALUES ($1, $2)")
+        .bind(&invitee)
+        .bind(trusted_at)
+        .execute(pool)
+        .await
+        .expect("seed generated-handler invitee");
+    let mut roster = vec![fixture.actor_did.clone(), invitee.clone()];
+    roster.sort();
+    catbird_server::chat_protocol::test_support::seed_deterministic_pending_add_fallback(
+        pool,
+        &fixture.actor_did,
+        roster,
+        vec![invitee.clone()],
+    )
+    .await
+    .expect("seed pending-add relationship fallback");
+    let prior = json!({
+        "conversationId": fixture.cid.to_string(),
+        "generation": 0,
+        "stateVersion": 0,
+        "groupId": STANDARD.encode(fixture.group_id),
+        "epoch": 0,
+        "groupContextHash": STANDARD.encode(fixture.group_context_hash),
+        "confirmationTag": STANDARD.encode(fixture.confirmation_tag),
+        "lifecycle": "active",
+    });
+    let mut next = prior.clone();
+    next["stateVersion"] = json!(1);
+    let body = json!({
+        "$type": "blue.catbird.chat.defs#policyTransitionBody",
+        "signatureDomain": "CATBIRD-CHAT-POLICY\u{0000}",
+        "transitionId": transition_id.to_string(),
+        "actorDid": fixture.actor_did,
+        "actorDeviceId": fixture.actor_device_id.to_string(),
+        "keyId": fixture.actor_key_id,
+        "authGeneration": 1,
+        "prior": prior,
+        "next": next,
+        "participantChanges": [{
+            "$type": "blue.catbird.chat.defs#addParticipant",
+            "userDid": invitee,
+            "status": "pending",
+            "role": "member",
+            "invitationProvenance": {
+                "invitedByDid": fixture.actor_did,
+                "invitedByDeviceId": fixture.actor_device_id.to_string(),
+                "invitationTransitionId": transition_id.to_string(),
+            },
+        }],
+        "idempotencyKey": transition_id.to_string(),
+        "signedAt": (trusted_at - chrono::Duration::milliseconds(500))
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+    let mut wrapper = json!({"body": body, "signature": STANDARD.encode([0_u8; 64])});
+    let canonical = decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper).unwrap())
+        .expect("canonical policy signing input");
+    wrapper["signature"] = json!(STANDARD.encode(
+        fixture
+            .actor_ed25519_signing_key
+            .sign(canonical.transcript_bytes())
+            .to_bytes()
+    ));
+    (transition_id, wrapper)
+}
+
+async fn generated_handler_business_snapshot(
+    pool: &DbPool,
+    fixture: &CreationTestFixture,
+) -> Value {
+    // BYTEA stays hex in to_jsonb(row); never cast a signed payload to PG JSON,
+    // whose parser rejects the signature domain's escaped NUL.
+    sqlx::query_scalar(
+        "SELECT jsonb_build_object(\
+         'conversation', (SELECT to_jsonb(c) FROM chat.conversations c WHERE conversation_id=$1), \
+         'participants', (SELECT jsonb_agg(to_jsonb(p) ORDER BY user_did) FROM chat.participants p WHERE conversation_id=$1), \
+         'entries', (SELECT jsonb_agg(to_jsonb(e) ORDER BY seq) FROM chat.entries e WHERE conversation_id=$1), \
+         'transitions', (SELECT jsonb_agg(to_jsonb(t) ORDER BY transition_id) FROM chat.transitions t WHERE conversation_id=$1), \
+         'receipts', (SELECT jsonb_agg(to_jsonb(i) ORDER BY endpoint_nsid, operation_id) FROM chat.idempotency_records i WHERE principal_did=$2), \
+         'claims', (SELECT jsonb_agg(to_jsonb(o) ORDER BY operation_id) FROM chat.operation_claims o WHERE principal_did=$2))",
+    )
+    .bind(fixture.cid)
+    .bind(&fixture.actor_did)
+    .fetch_one(pool)
+    .await
+    .expect("snapshot generated-handler durable business state")
+}
+
+async fn exercise_generated_transition_handler(origin: GeneratedTransitionOrigin) {
+    use catbird_server::chat_protocol::transcript::{
+        decode_and_verify_control_entry, rebind_persisted_control_entry,
+    };
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    const SUBMIT: &str = "blue.catbird.chat.submitTransition";
+    let artifacts = std::env::var_os("CATBIRD_GENERATED_TRANSITION_ARTIFACT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../artifacts"))
+        .join(format!(
+            "generated-{}-handler-{}",
+            origin.name(),
+            Uuid::new_v4()
+        ));
+    fs::create_dir_all(&artifacts).expect("create retained handler artifacts");
+    println!(
+        "Generated {} handler artifacts: {}",
+        origin.name(),
+        artifacts.display()
+    );
+    let (pool, _disposable) =
+        common::fresh_db::fresh_clean_protocol_db("chat_convhandlers_", 4).await;
+    let trusted_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            .fetch_one(&pool)
+            .await
+            .expect("sample fixture timestamp");
+    let fixture = build_test_creation_fixture(trusted_at);
+    let dpop_key = random_p256();
+    let dpop_jwk = public_jwk(&dpop_key);
+    let dpop_jkt = jwk_thumbprint(&dpop_jwk);
+    seed_device_for_creation(
+        &pool,
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &fixture.actor_key_id,
+        &fixture.actor_ed25519_public_key,
+        &dpop_key,
+        &dpop_jkt,
+    )
+    .await;
+    let router = router_with(pool.clone(), true).await;
+    let (status, creation) = send_raw(
+        router.clone(),
+        build_authenticated_request(
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            &dpop_key,
+            &dpop_jwk,
+            &dpop_jkt,
+            json!({"signedRequest": fixture.signed_request_json}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "creation: {}",
+        String::from_utf8_lossy(&creation)
+    );
+    let (transition_id, canonical_wrapper) =
+        signed_pending_add_for_generated_handler(&pool, &fixture, trusted_at).await;
+    let canonical_path = artifacts.join("canonical-wrapper.json");
+    fs::write(
+        &canonical_path,
+        serde_json::to_vec(&canonical_wrapper).unwrap(),
+    )
+    .unwrap();
+    let request_bytes = match origin {
+        GeneratedTransitionOrigin::Rust => generated_transition_requests::generated_request(
+            &canonical_wrapper["body"],
+            &STANDARD
+                .decode(canonical_wrapper["signature"].as_str().unwrap())
+                .unwrap(),
+        ),
+        GeneratedTransitionOrigin::Swift => {
+            run_swift_transition_producer(
+                &[
+                    "--encode-wrapper",
+                    "policy",
+                    canonical_path.to_str().unwrap(),
+                    artifacts.to_str().unwrap(),
+                ],
+                &artifacts.join("swift-encode.log"),
+            );
+            fs::read(artifacts.join("swift-policy.request.json"))
+                .expect("actual Swift request bytes")
+        }
+    };
+    fs::write(artifacts.join("submitted.request.json"), &request_bytes).unwrap();
+    #[derive(serde::Deserialize)]
+    struct RawEnvelope {
+        #[serde(rename = "signedRequest")]
+        signed_request: Box<serde_json::value::RawValue>,
+    }
+    let envelope: RawEnvelope = serde_json::from_slice(&request_bytes).unwrap();
+    let raw_wrapper = envelope.signed_request.get().as_bytes();
+    let wire_value: Value = serde_json::from_slice(&request_bytes).unwrap();
+    assert_eq!(
+        wire_value["signedRequest"]["$type"],
+        "blue.catbird.chat.defs#signedPolicyTransition"
+    );
+    if matches!(origin, GeneratedTransitionOrigin::Rust) {
+        assert!(
+            wire_value["signedRequest"]["body"].get("$type").is_none(),
+            "fresh Rust structs must not inherit a body tag through extra_data"
+        );
+    }
+    let request = |bytes: &[u8]| {
+        let mut request = build_authenticated_post_for_endpoint(
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            &dpop_key,
+            &dpop_jwk,
+            &dpop_jkt,
+            SUBMIT,
+            Value::Null,
+        );
+        // DPoP binds method/URL/token, not body. Preserve generated bytes exactly.
+        *request.body_mut() = Body::from(bytes.to_vec());
+        request
+    };
+
+    let before_invalid = generated_handler_business_snapshot(&pool, &fixture).await;
+    let mut invalid = wire_value.clone();
+    invalid["signedRequest"]["$type"] = json!("blue.catbird.chat.defs#signedMetadataTransition");
+    let invalid_bytes = serde_json::to_vec(&invalid).unwrap();
+    let (invalid_status, invalid_response) =
+        send_raw(router.clone(), request(&invalid_bytes)).await;
+    fs::write(artifacts.join("invalid-response.json"), &invalid_response).unwrap();
+    assert_eq!(
+        invalid_status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&invalid_response)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&invalid_response).unwrap()["error"],
+        "InvalidRequest"
+    );
+    assert_eq!(before_invalid, generated_handler_business_snapshot(&pool, &fixture).await,
+        "wrong generated discriminator must not mutate conversation, participants, entries, transitions, receipts or claims");
+
+    let (status, first_response) = send_raw(router.clone(), request(&request_bytes)).await;
+    fs::write(artifacts.join("submit-response.json"), &first_response).unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "generated {} submission: {}",
+        origin.name(),
+        String::from_utf8_lossy(&first_response)
+    );
+    let output: catbird_atproto::blue_catbird::chat::submit_transition::SubmitTransitionOutput =
+        serde_json::from_slice(&first_response)
+            .expect("generated Rust decodes actual submit response");
+    assert_eq!(output.coordinates.state_version, 1);
+    let first_value: Value = serde_json::from_slice(&first_response).unwrap();
+    let before_replay = generated_handler_business_snapshot(&pool, &fixture).await;
+    let (replay_status, replay_response) = send_raw(router.clone(), request(&request_bytes)).await;
+    fs::write(artifacts.join("replay-response.json"), &replay_response).unwrap();
+    assert_eq!(
+        replay_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&replay_response)
+    );
+    assert_eq!(
+        first_response, replay_response,
+        "exact request replay must return exact HTTP body bytes"
+    );
+    assert_eq!(
+        before_replay,
+        generated_handler_business_snapshot(&pool, &fixture).await
+    );
+
+    let legacy_request = serde_json::to_vec(&json!({"signedRequest": canonical_wrapper})).unwrap();
+    assert_ne!(legacy_request, request_bytes);
+    let (conflict_status, conflict_response) =
+        send_raw(router.clone(), request(&legacy_request)).await;
+    fs::write(
+        artifacts.join("alternate-response.json"),
+        &conflict_response,
+    )
+    .unwrap();
+    assert_eq!(
+        conflict_status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&conflict_response)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&conflict_response).unwrap()["error"],
+        "IdempotencyConflict"
+    );
+    assert_eq!(
+        before_replay,
+        generated_handler_business_snapshot(&pool, &fixture).await,
+        "semantically equal alternate bytes must not replace the accepted representation"
+    );
+
+    let (transition_raw, entry_raw, receipt_raw, durable, durable_hash, fingerprint):
+        (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT t.signed_request_bytes, e.signed_request_bytes, i.accepted_request_bytes, \
+         e.accepted_payload_bytes, e.accepted_payload_sha256, e.outer_entry_fingerprint \
+         FROM chat.transitions t JOIN chat.entries e \
+           ON e.conversation_id=t.conversation_id AND e.transition_id=t.transition_id AND e.seq=t.entry_seq \
+         JOIN chat.idempotency_records i ON i.principal_did=t.actor_did \
+           AND i.endpoint_nsid=$1 AND i.operation_id=t.transition_id WHERE t.transition_id=$2",
+    ).bind(SUBMIT).bind(transition_id).fetch_one(&pool).await.expect("read accepted generated policy rows");
+    assert_eq!(transition_raw, raw_wrapper);
+    assert_eq!(entry_raw, raw_wrapper);
+    assert_eq!(receipt_raw, raw_wrapper);
+    assert_ne!(
+        durable, raw_wrapper,
+        "accepted payload is the complete durable control row"
+    );
+    assert_eq!(durable_hash.as_slice(), Sha256::digest(&durable).as_slice());
+    assert_ne!(
+        durable_hash.as_slice(),
+        Sha256::digest(raw_wrapper).as_slice()
+    );
+    fs::write(artifacts.join("durable-control-row.json"), &durable).unwrap();
+    fs::write(artifacts.join("retained-signed-wrapper.json"), &entry_raw).unwrap();
+    let verified = decode_and_verify_control_entry(&durable, &fixture.actor_ed25519_public_key)
+        .expect("production authority verifier accepts full durable row");
+    assert_eq!(verified.outer_control_fingerprint().as_slice(), fingerprint);
+    let rebound =
+        rebind_persisted_control_entry(verified, &entry_raw, &fixture.actor_ed25519_public_key)
+            .expect("historical rebinding preserves original generated wrapper");
+    assert_eq!(
+        rebound.mutation().accepted_wrapper_bytes(),
+        Some(raw_wrapper)
+    );
+
+    let (read_status, read_response) = send_raw(
+        router.clone(),
+        build_authenticated_get_request(
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            &dpop_key,
+            &dpop_jwk,
+            &dpop_jkt,
+            "blue.catbird.chat.getEntries",
+            &format!(
+                "actorDeviceId={}&conversationId={}&afterSeq=0&limit=100",
+                fixture.actor_device_id, fixture.cid
+            ),
+        ),
+    )
+    .await;
+    fs::write(artifacts.join("get-entries-response.json"), &read_response).unwrap();
+    assert_eq!(
+        read_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&read_response)
+    );
+    let read_output: catbird_atproto::blue_catbird::chat::get_entries::GetEntriesOutput =
+        serde_json::from_slice(&read_response)
+            .expect("generated Rust decodes actual getEntries response");
+    assert_eq!(read_output.entries.len(), 2);
+    assert!(!read_output.has_more);
+    let read_value: Value = serde_json::from_slice(&read_response).unwrap();
+    let policy_entry = read_value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["signedRequest"]["body"]["transitionId"] == transition_id.to_string())
+        .expect("getEntries returned the generated policy transition");
+    assert_eq!(
+        policy_entry, &first_value["entry"],
+        "ACK and canonical read expose the same complete entry"
+    );
+    let read_verified = decode_and_verify_control_entry(
+        &serde_json::to_vec(policy_entry).unwrap(),
+        &fixture.actor_ed25519_public_key,
+    )
+    .expect("production authority verifier accepts actual canonical read entry");
+    assert_eq!(
+        read_verified.outer_control_fingerprint(),
+        rebound.outer_control_fingerprint()
+    );
+    assert_eq!(
+        read_verified.mutation().request_digest(),
+        rebound.mutation().request_digest()
+    );
+    let (state_status, state_response) = send_raw(
+        router,
+        build_authenticated_get_request(
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            &dpop_key,
+            &dpop_jwk,
+            &dpop_jkt,
+            "blue.catbird.chat.getConversationState",
+            &format!(
+                "actorDeviceId={}&conversationId={}",
+                fixture.actor_device_id, fixture.cid
+            ),
+        ),
+    )
+    .await;
+    fs::write(artifacts.join("get-state-response.json"), &state_response).unwrap();
+    assert_eq!(
+        state_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&state_response)
+    );
+    let state_output: catbird_atproto::blue_catbird::chat::get_conversation_state::GetConversationStateOutput =
+        serde_json::from_slice(&state_response)
+            .expect("generated Rust decodes actual getConversationState response");
+    assert_eq!(state_output.state.coordinates, output.coordinates);
+    assert_eq!(state_output.state.snapshot_seq, 2);
+    if matches!(origin, GeneratedTransitionOrigin::Swift) {
+        for (kind, file) in [
+            ("submitTransition", "submit-response.json"),
+            ("getEntries", "get-entries-response.json"),
+            ("getConversationState", "get-state-response.json"),
+        ] {
+            run_swift_transition_producer(
+                &[
+                    "--decode-response",
+                    kind,
+                    artifacts.join(file).to_str().unwrap(),
+                ],
+                &artifacts.join(format!("swift-decode-{kind}.log")),
+            );
+        }
+    }
+    println!("Generated {}: accepted, exact replay, alternate conflict, no-mutation invalid tag, exact raw persistence, full-row digest, canonical getEntries/state and historical rebind verified", origin.name());
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL and activation; required by the Linux compatibility gate"]
+async fn generated_transition_handlers_preserve_raw_persistence_replay_and_canonical_reads() {
+    exercise_generated_transition_handler(GeneratedTransitionOrigin::Rust).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL, activation and actual pinned Swift SDK producer on macOS"]
+async fn generated_swift_transition_handlers_preserve_raw_persistence_replay_and_canonical_reads() {
+    exercise_generated_transition_handler(GeneratedTransitionOrigin::Swift).await;
 }
 
 #[tokio::test]
@@ -1186,7 +1678,15 @@ async fn submit_transition_policy_add_against_production_router_replays_byte_ide
         Sha256::digest(&response_bytes).as_slice(),
         "completed policy replay must carry a canonical response digest"
     );
-    assert_eq!(response_bytes, first_response_bytes);
+    // See the creation test: stored bytes present to the served bytes.
+    assert_eq!(
+        catbird_server::chat_protocol::direct_request_transcript::present_endpoint_output(
+            "blue.catbird.chat.submitTransition",
+            response_bytes,
+        )
+        .expect("present stored policy response"),
+        first_response_bytes
+    );
 }
 #[tokio::test]
 #[ignore = "requires the dedicated clean-chat gate database"]
@@ -1565,4 +2065,22 @@ async fn submit_transition_negative_corrupted_signature_returns_invalid_signatur
         StatusCode::INTERNAL_SERVER_ERROR,
         "corrupted signedRequest must NOT return 500: {body}"
     );
+}
+
+// Encrypted-requests: transcript.rs test modules reference read_projection.
+mod chat_protocol {
+    pub mod read_projection {
+        pub struct DummyCanonical;
+        impl DummyCanonical {
+            pub fn bytes(&self) -> &[u8] {
+                &[]
+            }
+        }
+        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
+            _value: &T,
+            _schema: &str,
+        ) -> Result<DummyCanonical, String> {
+            Ok(DummyCanonical)
+        }
+    }
 }

@@ -1,7 +1,7 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.chat.acceptConversation",
-  "description": "Accepts one exact pending invitation from the target participant's active registered device. Under the conversation mutation lock it verifies immutable invitation provenance, consent and every-pair block policy, changes only pending to active at prior stateVersion plus one, and atomically creates one add-kind target-device-signed recovery request with a request-bound KeyPackage reservation. A different current leaf later fulfills the one-device Add Commit and Welcome.",
+  "description": "Accepts one exact pending invitation from the target participant's active registered device. Under the conversation mutation lock it verifies immutable invitation provenance, consent and every-pair block policy, changes only pending to active at prior stateVersion plus one, and atomically creates one add-kind target-device-signed recovery request with a request-bound KeyPackage reservation. A different current leaf later fulfills the one-device Add Commit and Welcome. Wire protocol 2 directRequestAcceptance is policy-only and never reserves or adds a leaf; accepted devices recover separately. Version 1 keeps its mandatory recovery semantics.",
   "defs": {
     "main": {
       "type": "procedure",
@@ -9,15 +9,18 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": [
-            "signedRequest"
-          ],
+          "required": [],
           "properties": {
             "signedRequest": {
               "type": "ref",
               "ref": "blue.catbird.chat.defs#signedParticipantAcceptance"
+            },
+            "directRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedDirectRequestAcceptance"
             }
-          }
+          },
+          "description": "Exactly one field is required at runtime; missing, both and unknown fields are rejected before effects. Existing v1 signedRequest bytes remain unchanged."
         }
       },
       "output": {
@@ -25,9 +28,7 @@
         "schema": {
           "type": "object",
           "required": [
-            "coordinates",
-            "entry",
-            "recovery"
+            "coordinates"
           ],
           "properties": {
             "coordinates": {
@@ -41,6 +42,10 @@
             "recovery": {
               "type": "ref",
               "ref": "blue.catbird.chat.defs#leafRecoveryView"
+            },
+            "acceptanceProof": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#directRequestAcceptanceProof"
             }
           }
         }
@@ -117,6 +122,10 @@
         },
         {
           "name": "RateLimited"
+        },
+        {
+          "name": "CapacityUnavailable",
+          "description": "The bounded encrypted request lifecycle reserve cannot accommodate this operation. No first-execution effects are committed; retry the same signed operation after capacity is available."
         }
       ]
     }

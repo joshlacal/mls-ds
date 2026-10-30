@@ -64,6 +64,9 @@
           "name": "ConversationLeafLimitReached"
         },
         {
+          "name": "ConversationNotAccepted"
+        },
+        {
           "name": "ConversationNotFound"
         },
         {

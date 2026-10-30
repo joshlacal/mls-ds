@@ -1,0 +1,54 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.getAttachmentRef",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Whether an attachment reference exists at this blinded index (decision J4: the server keeps no readable conversation, message or blob linkage to return). ORF endpoint ([CB-17]): states are per device of the caller DID; the server never reveals one. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "deviceKeyPubkey",
+          "blindedIndex"
+        ],
+        "properties": {
+          "deviceKeyPubkey": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "description": "deviceKeyPubkey of the device (lowercase hex)."
+          },
+          "blindedIndex": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "description": "blinded index (lowercase hex)."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "createdAt"
+          ],
+          "properties": {
+            "createdAt": {
+              "type": "string",
+              "format": "datetime"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "OrfStateNotFound"
+        },
+        {
+          "name": "NotFound"
+        }
+      ]
+    }
+  }
+}

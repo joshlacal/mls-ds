@@ -1,0 +1,78 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.listThreads",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Lookup by thread: every conversation in which the caller wrote a MEK or is a MEK recipient, including conversations it has left ([CB-22]), ascending by conversation id. The caller's home DS merges its own conversations with those of every remote sequencer of a conversation the caller takes or took part in (labyrinthRelay listThreads); the remote sequencers are asked in parallel with a per-sequencer deadline and response cap, and a sequencer that cannot answer is named in incomplete instead of failing the call (its conversations are then missing from this page). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Opaque cursor from the previous page."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Page size (at most 100)."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "items"
+          ],
+          "properties": {
+            "items": {
+              "type": "array",
+              "maxLength": 100,
+              "items": {
+                "type": "ref",
+                "ref": "#threadView"
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "Opaque cursor from the previous page."
+            },
+            "incomplete": {
+              "type": "array",
+              "maxLength": 1024,
+              "items": {
+                "type": "string",
+                "format": "did"
+              },
+              "description": "Remote sequencer DSes whose conversations could not be listed this time; absent when the page is complete. Retry later for a complete list."
+            }
+          },
+          "description": "One page of results."
+        }
+      },
+      "errors": [
+        {
+          "name": "RelayUnavailable"
+        }
+      ]
+    },
+    "threadView": {
+      "type": "object",
+      "required": [
+        "threadId"
+      ],
+      "properties": {
+        "threadId": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Thread id."
+        }
+      }
+    }
+  }
+}

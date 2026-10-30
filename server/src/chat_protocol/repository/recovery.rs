@@ -587,6 +587,7 @@ pub(crate) const LOCK_AVAILABLE_RECOVERY_PACKAGE_SQL: &str = r#"
       AND kp.owner_key_id = $3
       AND kp.owner_auth_generation = $4
       AND kp.status = 'available'
+      AND kp.usage_scope = 'recovery'
       AND kp.terminal_transition_id IS NULL
       AND kp.terminal_revocation_id IS NULL
       AND kp.terminal_at IS NULL
@@ -685,7 +686,7 @@ pub(crate) const LOCK_RECOVERY_PACKAGE_SQL: &str = r#"
         kp.terminal_at,
         kp.created_at
     FROM chat.key_packages kp
-    WHERE kp.key_package_ref = $1
+    WHERE kp.key_package_ref = $1 AND kp.usage_scope = 'recovery'
     FOR UPDATE OF kp
 "#;
 
@@ -2140,10 +2141,10 @@ fn response_coordinate(
         "conversationId": conversation_id.hyphenated().to_string(),
         "generation": generation,
         "stateVersion": state_version,
-        "groupId": STANDARD.encode(group_id),
+        "groupId": { "$bytes": STANDARD.encode(group_id) },
         "epoch": epoch,
-        "groupContextHash": STANDARD.encode(group_context_hash),
-        "confirmationTag": STANDARD.encode(confirmation_tag),
+        "groupContextHash": { "$bytes": STANDARD.encode(group_context_hash) },
+        "confirmationTag": { "$bytes": STANDARD.encode(confirmation_tag) },
         "lifecycle": "active",
     }))
 }
@@ -2151,24 +2152,11 @@ fn response_coordinate(
 fn response_coordinate_from_snapshot(
     coordinate: &super::super::snapshot::PublicGroupSnapshotCoordinate,
 ) -> Result<JsonValue, RecoveryRepositoryError> {
-    let generation = i64::try_from(coordinate.generation())
-        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
-    let state_version = i64::try_from(coordinate.state_version())
-        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
-    let epoch = i64::try_from(coordinate.epoch())
-        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
     if coordinate.lifecycle() != super::super::snapshot::PublicGroupSnapshotLifecycle::Active {
         return Err(RecoveryRepositoryError::InvalidDurableRow);
     }
-    response_coordinate(
-        Uuid::from_bytes(*coordinate.conversation_id()),
-        generation,
-        state_version,
-        coordinate.group_id(),
-        epoch,
-        coordinate.group_context_hash(),
-        coordinate.confirmation_tag(),
-    )
+    super::coordinate::canonical_coordinate_json(coordinate)
+        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)
 }
 
 fn canonical_datetime(value: DateTime<Utc>) -> String {
@@ -2351,14 +2339,14 @@ fn fulfillment_response_bytes(
             "transitionSeq": welcome.transition_seq(),
             "coordinates": response_coordinate_from_snapshot(successor)?,
             "status": "pending",
-            "opaqueWelcome": STANDARD.encode(welcome.opaque_welcome()),
-            "sha256": STANDARD.encode(welcome.sha256()),
+            "opaqueWelcome": { "$bytes": STANDARD.encode(welcome.opaque_welcome()) },
+            "sha256": { "$bytes": STANDARD.encode(welcome.sha256()) },
             "recipientDid": recipient_did,
             "recipientDeviceId":
                 Uuid::from_bytes(*welcome.recipient().device_id()).hyphenated().to_string(),
             "provenance": {
                 "recoveryRequestId": witness.request.recovery_request_id.hyphenated().to_string(),
-                "keyPackageRef": STANDARD.encode(welcome.key_package_ref()),
+                "keyPackageRef": { "$bytes": STANDARD.encode(welcome.key_package_ref()) },
             },
             "expiresAt": canonical_datetime(expires_at),
         }],
@@ -3084,6 +3072,86 @@ pub mod production_composition_proof {
         include!("recovery/production_fulfillment_proof.rs");
     }
 
+    mod production_inventory_lock_proof {
+        include!("recovery/production_inventory_lock_proof.rs");
+    }
+
+    pub async fn run_inventory_lock_order(pool: &PgPool) -> Result<(), String> {
+        production_inventory_lock_proof::run_inventory_lock_order(pool).await
+    }
+
+    mod production_recovery_inventory_proof {
+        include!("recovery/production_recovery_inventory_proof.rs");
+    }
+
+    pub async fn run_request_inventory_concurrency(pool: &PgPool) -> Result<(), String> {
+        production_recovery_inventory_proof::run_request_inventory_concurrency(pool).await
+    }
+
+    mod production_package_reuse_proof {
+        include!("recovery/production_package_reuse_proof.rs");
+    }
+
+    pub async fn run_superseded_recovery_package_reuse(pool: &PgPool) -> Result<(), String> {
+        production_package_reuse_proof::run_package_reuse(pool, true).await
+    }
+
+    pub async fn run_cancelled_recovery_package_reuse(pool: &PgPool) -> Result<(), String> {
+        production_package_reuse_proof::run_package_reuse(pool, false).await
+    }
+
+    mod production_creation_scope_proof {
+        include!("recovery/production_creation_scope_proof.rs");
+    }
+
+    mod production_control_scope_proof {
+        include!("recovery/production_control_scope_proof.rs");
+    }
+
+    pub async fn run_control_prospective_scope_and_drift(pool: &PgPool) -> Result<(), String> {
+        production_control_scope_proof::run_control_prospective_scope_and_drift(pool).await
+    }
+
+    pub async fn run_control_pending_welcome_scope(pool: &PgPool) -> Result<(), String> {
+        production_control_scope_proof::run_control_pending_welcome_scope(pool).await
+    }
+
+    pub async fn run_control_close_historical_scope(pool: &PgPool) -> Result<(), String> {
+        production_control_scope_proof::run_control_close_historical_scope(pool).await
+    }
+
+    pub async fn run_creation_with_enrolled_sibling(pool: &PgPool) -> Result<(), String> {
+        production_creation_scope_proof::run_creation_with_enrolled_sibling(pool).await
+    }
+
+    mod production_leave_proof {
+        include!("recovery/production_leave_proof.rs");
+    }
+
+    mod production_concurrent_send_proof {
+        include!("recovery/production_concurrent_send_proof.rs");
+    }
+
+    pub async fn run_concurrent_signed_sends(pool: &PgPool) -> Result<(), String> {
+        production_concurrent_send_proof::run_concurrent_signed_sends(pool).await
+    }
+
+    pub async fn run_unlocked_send_audience_rejected(pool: &PgPool) -> Result<(), String> {
+        production_concurrent_send_proof::run_unlocked_send_audience_rejected(pool).await
+    }
+
+    pub async fn run_leafless_direct_close_with_open_recovery(pool: &PgPool) -> Result<(), String> {
+        production_leave_proof::run_leafless_lifecycle_with_open_recovery(pool, true, false).await
+    }
+
+    pub async fn run_zero_leaf_leave_with_open_recovery(pool: &PgPool) -> Result<(), String> {
+        production_leave_proof::run_leafless_lifecycle_with_open_recovery(pool, false, false).await
+    }
+
+    pub async fn run_acceptance_with_open_recovery(pool: &PgPool) -> Result<(), String> {
+        production_leave_proof::run_leafless_lifecycle_with_open_recovery(pool, false, true).await
+    }
+
     mod production_fallback_minter {
         include!("recovery/production_fallback_minter.rs");
     }
@@ -3156,6 +3224,15 @@ pub mod production_composition_proof {
         pool: &PgPool,
     ) -> Result<(), String> {
         production_client_proof::run_leaf_recovery_cancellation_due_for_expiry_ordering(pool).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_removed_device_terminal_entry_read(pool: &PgPool) -> Result<(), String> {
+        production_leave_proof::run_removed_device_terminal_entry_read(pool).await
+    }
+
+    pub async fn run_signed_operation_age_fence(pool: &PgPool) -> Result<(), String> {
+        production_fulfillment_proof::run_signed_operation_age_fence(pool).await
     }
 
     #[doc(hidden)]
@@ -5156,13 +5233,13 @@ async fn lock_recovery_fulfillment_replay_graph(
                 &row.confirmation_tag,
             )?,
             "status": "pending",
-            "opaqueWelcome": STANDARD.encode(&row.welcome_wrapper_bytes),
-            "sha256": STANDARD.encode(&row.welcome_wrapper_sha256),
+            "opaqueWelcome": { "$bytes": STANDARD.encode(&row.welcome_wrapper_bytes) },
+            "sha256": { "$bytes": STANDARD.encode(&row.welcome_wrapper_sha256) },
             "recipientDid": row.recipient_did,
             "recipientDeviceId": row.recipient_device_id.hyphenated().to_string(),
             "provenance": {
                 "recoveryRequestId": row.recovery_request_id.hyphenated().to_string(),
-                "keyPackageRef": STANDARD.encode(&row.delivery_key_package_ref),
+                "keyPackageRef": { "$bytes": STANDARD.encode(&row.delivery_key_package_ref) },
             },
             "expiresAt": canonical_datetime(row.delivery_expires_at),
         }],

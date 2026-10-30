@@ -9,14 +9,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use super::service_auth_fixture;
 use crate::TestClient;
 use anyhow::{Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
-use chrono::Utc;
-use p256::ecdsa::{
-    signature::Signer, signature::Verifier, Signature as P256Signature, SigningKey, VerifyingKey,
-};
+use p256::ecdsa::{signature::Verifier, Signature as P256Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey;
 use serde::Deserialize;
 use serde_json::json;
@@ -25,7 +21,6 @@ use uuid::Uuid;
 
 pub const DS1_DEFAULT_SERVICE_DID: &str = "did:web:ds1.catbird.blue";
 pub const DS2_DEFAULT_SERVICE_DID: &str = "did:web:ds2.catbird.blue";
-pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
 
 pub const DIGEST_ALLOWED_TABLES: &[&str] = &[
     "chat.conversations",
@@ -201,32 +196,14 @@ impl TwoNodeCluster {
         custom_jti: Option<&str>,
         lifetime_secs: i64,
     ) -> String {
-        let now = Utc::now().timestamp();
-        let jti = custom_jti
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let header = json!({
-            "alg": "ES256",
-            "typ": "JWT",
-            "kid": format!("{issuer}#atproto")
-        });
-        let claims = json!({
-            "iss": issuer,
-            "sub": issuer,
-            "aud": audience,
-            "lxm": endpoint_nsid,
-            "iat": now,
-            "exp": now + lifetime_secs,
-            "jti": jti
-        });
-
-        let h_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
-        let c_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
-        let signing_input = format!("{h_b64}.{c_b64}");
-        let signature: P256Signature = key.sign(signing_input.as_bytes());
-        let sig_bytes = signature.to_bytes();
-        let s_b64 = URL_SAFE_NO_PAD.encode(sig_bytes);
-        format!("{signing_input}.{s_b64}")
+        service_auth_fixture::mint_jwt_with_lifetime(
+            issuer,
+            key,
+            audience,
+            endpoint_nsid,
+            custom_jti,
+            lifetime_secs,
+        )
     }
 
     /// Mint an ES256 service JWT with default 120s lifetime.
@@ -241,16 +218,15 @@ impl TwoNodeCluster {
         self.mint_jwt_with_lifetime(issuer, key, audience, endpoint_nsid, custom_jti, 120)
     }
 
-    /// Mint a short-lived ES256 service JWT (<=60s) targeting the MLS AppView service.
-    pub fn mint_chat_jwt(&self, issuer: &str, key: &SigningKey, endpoint_nsid: &str) -> String {
-        self.mint_jwt_with_lifetime(
-            issuer,
-            key,
-            MLS_APPVIEW_SERVICE_REF,
-            endpoint_nsid,
-            None,
-            50,
-        )
+    /// Mint a short-lived ES256 JWT targeting the destination node's MLS AppView service.
+    pub fn mint_chat_jwt(
+        &self,
+        issuer: &str,
+        key: &SigningKey,
+        destination_service_did: &str,
+        endpoint_nsid: &str,
+    ) -> String {
+        service_auth_fixture::mint_chat_jwt(issuer, key, destination_service_did, endpoint_nsid)
     }
 
     /// Verify an ES256 signature against DS1 verifying key.

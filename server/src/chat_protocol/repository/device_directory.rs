@@ -83,6 +83,8 @@ pub(crate) struct DeviceDirectoryView {
     pub(crate) updated_at: DateTime<Utc>,
     pub(crate) available_package_count: i64,
     pub(crate) reserved_package_count: i64,
+    pub(crate) request_available_package_count: i64,
+    pub(crate) request_reserved_package_count: i64,
     pub(crate) capabilities_json: String,
 }
 
@@ -121,6 +123,8 @@ impl LockedRevocationDeviceView {
             .active
             .available_package_count
             .checked_add(self.active.reserved_package_count)
+            .and_then(|value| value.checked_add(self.active.request_available_package_count))
+            .and_then(|value| value.checked_add(self.active.request_reserved_package_count))
             .and_then(|value| usize::try_from(value).ok())
             .ok_or(RevocationDeviceViewError::Projection)?;
         let expected_digest = revocation_device_view_digest(
@@ -150,6 +154,8 @@ impl LockedRevocationDeviceView {
             updated_at: accepted_at,
             available_package_count: 0,
             reserved_package_count: 0,
+            request_available_package_count: 0,
+            request_reserved_package_count: 0,
             capabilities_json: self.active.capabilities_json,
         })
     }
@@ -172,6 +178,8 @@ struct ActiveRevocationDeviceViewRow {
     key_revocation_id: Option<Uuid>,
     available_package_count: i64,
     reserved_package_count: i64,
+    request_available_package_count: i64,
+    request_reserved_package_count: i64,
     capabilities_json: String,
 }
 
@@ -189,12 +197,14 @@ const SELECT_DEVICE_VIEW: &str = r#"
               FROM chat.key_packages kp
              WHERE kp.owner_did = device.user_did
                AND kp.owner_device_id = device.device_id
-               AND kp.status = 'available') AS available_package_count,
+               AND kp.usage_scope = 'recovery' AND kp.status = 'available') AS available_package_count,
            (SELECT count(*)
               FROM chat.key_packages kp
              WHERE kp.owner_did = device.user_did
                AND kp.owner_device_id = device.device_id
-               AND kp.status = 'reserved') AS reserved_package_count
+               AND kp.usage_scope = 'recovery' AND kp.status = 'reserved') AS reserved_package_count,
+           (SELECT count(*) FROM chat.key_packages kp WHERE kp.owner_did=device.user_did AND kp.owner_device_id=device.device_id AND kp.usage_scope='direct-request' AND kp.status='available') AS request_available_package_count,
+           (SELECT count(*) FROM chat.key_packages kp WHERE kp.owner_did=device.user_did AND kp.owner_device_id=device.device_id AND kp.usage_scope='direct-request' AND kp.status='reserved') AS request_reserved_package_count
       FROM chat.devices device
       JOIN chat.device_keys device_key
         ON device_key.user_did = device.user_did
@@ -330,12 +340,14 @@ pub(crate) async fn lock_active_revocation_device_view(
                   FROM chat.key_packages kp
                  WHERE kp.owner_did=device.user_did
                    AND kp.owner_device_id=device.device_id
-                   AND kp.status='available') AS available_package_count,
+                   AND kp.usage_scope='recovery' AND kp.status='available') AS available_package_count,
                (SELECT count(*)
                   FROM chat.key_packages kp
                  WHERE kp.owner_did=device.user_did
                    AND kp.owner_device_id=device.device_id
-                   AND kp.status='reserved') AS reserved_package_count
+                   AND kp.usage_scope='recovery' AND kp.status='reserved') AS reserved_package_count,
+               (SELECT count(*) FROM chat.key_packages kp WHERE kp.owner_did=device.user_did AND kp.owner_device_id=device.device_id AND kp.usage_scope='direct-request' AND kp.status='available') AS request_available_package_count,
+               (SELECT count(*) FROM chat.key_packages kp WHERE kp.owner_did=device.user_did AND kp.owner_device_id=device.device_id AND kp.usage_scope='direct-request' AND kp.status='reserved') AS request_reserved_package_count
           FROM chat.devices device
           JOIN chat.device_keys device_key
             ON device_key.user_did=device.user_did
@@ -400,6 +412,8 @@ fn validate_active_revocation_device_view_row(
         || locked_at.timestamp_subsec_nanos() % 1_000_000 != 0
         || row.available_package_count < 0
         || row.reserved_package_count < 0
+        || row.request_available_package_count < 0
+        || row.request_reserved_package_count < 0
     {
         return Err(RevocationDeviceViewError::Projection);
     }
@@ -435,6 +449,8 @@ fn validate_active_revocation_device_view_row(
         updated_at: row.updated_at,
         available_package_count: row.available_package_count,
         reserved_package_count: row.reserved_package_count,
+        request_available_package_count: row.request_available_package_count,
+        request_reserved_package_count: row.request_reserved_package_count,
         capabilities_json: row.capabilities_json,
     })
 }
@@ -483,6 +499,8 @@ fn revocation_device_view_digest(
     digest.update(view.updated_at.timestamp_micros().to_be_bytes());
     digest.update(view.available_package_count.to_be_bytes());
     digest.update(view.reserved_package_count.to_be_bytes());
+    digest.update(view.request_available_package_count.to_be_bytes());
+    digest.update(view.request_reserved_package_count.to_be_bytes());
     digest.update(locked_at.timestamp_millis().to_be_bytes());
     digest.finalize().into()
 }
@@ -503,6 +521,8 @@ mod revocation_tests {
             updated_at: DateTime::from_timestamp_millis(1_700_000_001_000).unwrap(),
             available_package_count: 2,
             reserved_package_count: 1,
+            request_available_package_count: 0,
+            request_reserved_package_count: 0,
             capabilities_json: "{\"mlsProtocolVersion\":\"1.0\"}".to_owned(),
         }
     }
@@ -541,6 +561,8 @@ mod revocation_tests {
             key_revocation_id: None,
             available_package_count: view.available_package_count,
             reserved_package_count: view.reserved_package_count,
+            request_available_package_count: view.request_available_package_count,
+            request_reserved_package_count: view.request_reserved_package_count,
             capabilities_json: view.capabilities_json,
         }
     }
@@ -622,4 +644,73 @@ mod revocation_tests {
             Err(RevocationDeviceViewError::Projection)
         ));
     }
+}
+
+/// Exact-device replenishment hint. The caller must already hold and verify
+/// the own-device snapshot requester; this is never peer/public directory data.
+#[derive(sqlx::FromRow)]
+pub(crate) struct DirectRequestPoolHint {
+    pub(crate) enabled: bool,
+    pub(crate) revision: i64,
+    pub(crate) usable_count: i64,
+    pub(crate) reserved_count: i64,
+    pub(crate) as_of: DateTime<Utc>,
+    pub(crate) usable_until: DateTime<Utc>,
+}
+pub(crate) async fn read_direct_request_pool_hint(
+    tx: &mut Transaction<'_, Postgres>,
+    did: &str,
+    device: Uuid,
+    key_id: &str,
+    generation: i64,
+) -> Result<Option<DirectRequestPoolHint>, DeviceDirectoryError> {
+    let present: bool =
+        sqlx::query_scalar("SELECT to_regclass('chat.direct_request_capabilities') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if !present {
+        return Ok(None);
+    }
+    // A single statement timestamp and exact capability/key/generation binding
+    // make both counts describe one hint horizon. Final prepare is authoritative.
+    Ok(sqlx::query_as(r#"
+      WITH instant AS (SELECT date_trunc('milliseconds',clock_timestamp()) AS at)
+      SELECT (c.enabled AND c.auth_generation=d.auth_generation AND c.owner_key_id=k.key_id
+        AND d.status='active' AND k.revoked_at IS NULL) AS enabled,c.revision,
+        count(p.key_package_ref) FILTER(WHERE p.status='available' AND NOT EXISTS(
+          SELECT 1 FROM chat.direct_request_selected_devices s WHERE s.key_package_ref=p.key_package_ref)
+          AND NOT EXISTS(SELECT 1 FROM chat.direct_request_retired_packages r WHERE r.key_package_ref=p.key_package_ref)) AS usable_count,
+        count(p.key_package_ref) FILTER(WHERE p.status='reserved') AS reserved_count,
+        instant.at AS as_of,instant.at+INTERVAL '605400 seconds' AS usable_until
+      FROM instant CROSS JOIN chat.direct_request_capabilities c
+      JOIN chat.devices d ON d.user_did=c.owner_did AND d.device_id=c.owner_device_id
+      JOIN chat.device_keys k ON k.user_did=d.user_did AND k.device_id=d.device_id
+      LEFT JOIN chat.key_packages p ON c.enabled AND d.status='active' AND k.revoked_at IS NULL
+        AND c.auth_generation=d.auth_generation AND c.owner_key_id=k.key_id
+        AND p.owner_did=c.owner_did AND p.owner_device_id=c.owner_device_id
+        AND p.owner_key_id=c.owner_key_id AND p.owner_auth_generation=c.auth_generation
+        AND p.usage_scope='direct-request' AND p.status IN('available','reserved')
+        AND p.not_before<=instant.at AND p.not_after>=instant.at+INTERVAL '605400 seconds'
+        AND NOT EXISTS (SELECT 1 FROM chat.direct_request_remote_leases l WHERE l.key_package_ref=p.key_package_ref AND l.status = 'active' AND l.expires_at > clock_timestamp())
+        AND EXISTS(SELECT 1 FROM chat.direct_request_grants g WHERE g.key_package_ref=p.key_package_ref
+          AND g.owner_did=p.owner_did AND g.owner_device_id=p.owner_device_id AND g.owner_key_id=p.owner_key_id
+          AND g.auth_generation=p.owner_auth_generation AND g.revoked_at IS NULL
+          AND g.purpose='direct-request-bootstrap' AND g.protocol_version='2' AND g.profile='encryptedIntroduction1'
+          AND g.expires_at>=instant.at+INTERVAL '605400 seconds')
+      WHERE c.owner_did=$1 AND c.owner_device_id=$2 AND k.key_id=$3 AND d.auth_generation=$4
+      GROUP BY c.enabled,c.revision,c.auth_generation,c.owner_key_id,d.auth_generation,d.status,k.key_id,k.revoked_at,instant.at
+    "#).bind(did).bind(device).bind(key_id).bind(generation).fetch_optional(&mut **tx).await?)
+}
+
+/// Exact immutable candidate material, including revoked historical devices.
+/// Caller must already hold verified requester read admission; these bytes
+/// alone confer no current or historical authorization.
+pub(super) async fn read_immutable_candidate_key(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: &str,
+    device: Uuid,
+    key_id: &str,
+) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    sqlx::query_scalar("SELECT signing_public_key FROM chat.device_keys WHERE user_did=$1 AND device_id=$2 AND key_id=$3")
+        .bind(owner).bind(device).bind(key_id).fetch_optional(&mut **tx).await
 }

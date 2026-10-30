@@ -1199,6 +1199,7 @@ impl IntervalOpeningKind {
 /// `application_intervals_close_kind_check` exactly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IntervalCloseKind {
+    DirectRequest,
     Remove,
     Replace,
     Reset,
@@ -1208,6 +1209,7 @@ pub(crate) enum IntervalCloseKind {
 impl IntervalCloseKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::DirectRequest => "directRequest",
             Self::Remove => "remove",
             Self::Replace => "replace",
             Self::Reset => "reset",
@@ -1298,7 +1300,10 @@ pub(crate) async fn insert_application_interval(
 /// `terminal_seq > start_seq` and a 32-byte `closing_outer_entry_fingerprint`.
 #[derive(Clone, Debug)]
 pub(crate) struct ApplicationIntervalClose {
-    pub(crate) membership_interval_id: Uuid,
+    pub(crate) conversation_id: Uuid,
+    pub(crate) recipient_did: String,
+    pub(crate) recipient_device_id: Uuid,
+    pub(crate) opening_transition_id: Uuid,
     pub(crate) terminal_seq: i64,
     pub(crate) closing_state_version: i64,
     pub(crate) closing_transition_id: Uuid,
@@ -1310,8 +1315,10 @@ pub(crate) struct ApplicationIntervalClose {
 
 /// Compare-and-set an open application interval to finite, writing all seven
 /// closing columns at once. Matches only a still-open interval (`terminal_seq IS
-/// NULL`); a second close, a wrong id, or a drifted (already-closed) row matches
-/// nothing and is a typed conflict. A closed interval is terminal — the
+/// NULL`) identified by its unique opening identity `(conversation_id,
+/// recipient_did, recipient_device_id, opening_transition_id)`; a second
+/// close, a wrong id, or a drifted (already-closed) row matches nothing and is
+/// a typed conflict. A closed interval is terminal — the
 /// `application_intervals_lifecycle_monotonic` trigger also rejects any rewrite of
 /// a finite row, and the `application_intervals_identity_immutable` trigger allows
 /// only these seven closing columns to change.
@@ -1322,18 +1329,24 @@ pub(crate) async fn close_application_interval(
     let result = sqlx::query(
         r#"
         UPDATE chat.application_intervals
-           SET terminal_seq = $2,
-               closing_state_version = $3,
-               closing_transition_id = $4,
-               closing_outer_entry_fingerprint = $5,
-               closing_kind = $6,
-               closing_leaf_period_id = $7,
-               removed_at = $8
-         WHERE membership_interval_id = $1
+           SET terminal_seq = $5,
+               closing_state_version = $6,
+               closing_transition_id = $7,
+               closing_outer_entry_fingerprint = $8,
+               closing_kind = $9,
+               closing_leaf_period_id = $10,
+               removed_at = $11
+         WHERE conversation_id = $1
+           AND recipient_did = $2
+           AND recipient_device_id = $3
+           AND opening_transition_id = $4
            AND terminal_seq IS NULL
         "#,
     )
-    .bind(close.membership_interval_id)
+    .bind(close.conversation_id)
+    .bind(&close.recipient_did)
+    .bind(close.recipient_device_id)
+    .bind(close.opening_transition_id)
     .bind(close.terminal_seq)
     .bind(close.closing_state_version)
     .bind(close.closing_transition_id)
@@ -2480,6 +2493,12 @@ pub(crate) async fn get_entries_with_terminal_control_interval(
               FROM chat.entries AS entry
              WHERE entry.conversation_id = $1
                AND entry.seq > $2
+               AND (NOT EXISTS (
+                    SELECT 1 FROM chat.direct_request_publications p
+                    LEFT JOIN chat.direct_request_lifecycle l USING(request_id)
+                    WHERE p.conversation_id=entry.conversation_id AND COALESCE(l.consent,'pending')='pending'
+               ) OR entry.entry_kind='blue.catbird.chat.defs#directRequestEntry')
+
                AND ($7::bigint IS NULL OR (
                    entry.entry_kind <> $5 AND entry.seq >= $7 AND entry.seq <= $8
                ))

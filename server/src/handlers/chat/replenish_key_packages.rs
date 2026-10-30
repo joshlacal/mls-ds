@@ -71,7 +71,7 @@ async fn replenish(
                 .commit()
                 .await
                 .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-            return Ok(context::replay_response(&response));
+            return context::replay_response(ENDPOINT, &response);
         }
         PreparedReplenishmentOperation::First(prepared) => prepared,
     };

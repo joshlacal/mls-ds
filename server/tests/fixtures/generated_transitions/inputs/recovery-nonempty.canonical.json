@@ -1,0 +1,114 @@
+{
+  "body": {
+    "$type": "blue.catbird.chat.defs#leafRecoveryFulfillmentBody",
+    "aad": {
+      "conversationId": "ERERERERQRGREREREREREQ==",
+      "generation": 0,
+      "prior": {
+        "confirmationTag": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+        "conversationId": "ERERERERQRGREREREREREQ==",
+        "epoch": 0,
+        "generation": 0,
+        "groupContextHash": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+        "groupId": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+        "lifecycle": "active",
+        "stateVersion": 0
+      },
+      "protocolVersion": "1",
+      "transitionId": "WlpaWlpaWlpaWlpaWlpaWg=="
+    },
+    "actorDeviceId": "72727272-7272-4272-b272-727272727272",
+    "actorDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+    "authGeneration": 1,
+    "commit": {
+      "bytes": "WlpaWlpaWlo=",
+      "contentType": "publicMessageCommit",
+      "framing": "mlsMessage",
+      "sha256": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo="
+    },
+    "idempotencyKey": "00000000-0000-4000-8000-000000000040",
+    "keyId": "odV3NQqVns2SFGDg7Ym9FMHYhYMCi7cbcIiIXaW1UQU",
+    "manifest": {
+      "leafChanges": [
+        {
+          "$type": "blue.catbird.chat.defs#addLeafByRecovery",
+          "deviceId": "73737373-7373-4373-b373-737373737373",
+          "keyPackageRef": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=",
+          "recoveryRequestId": "00000000-0000-4000-8000-000000000038",
+          "userDid": "did:plc:bobfixtureaaaaaaaaaaaaaa"
+        }
+      ],
+      "leafRecoveryRequestId": "00000000-0000-4000-8000-000000000038",
+      "participantChanges": [],
+      "welcomeBundle": {
+        "contentType": "welcome",
+        "deliveries": [
+          {
+            "provenance": {
+              "keyPackageRef": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=",
+              "recoveryRequestId": "00000000-0000-4000-8000-000000000038"
+            },
+            "recipientDeviceId": "73737373-7373-4373-b373-737373737373",
+            "recipientDid": "did:plc:bobfixtureaaaaaaaaaaaaaa"
+          }
+        ],
+        "framing": "mlsMessage",
+        "opaqueWelcome": "YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJi",
+        "sha256": "FpY+eM7zluoyLGM4qMgBrg0R8hVuZMwa+CcwbzajRP4=",
+        "welcomeId": "74747474-7474-4474-b474-747474747474"
+      }
+    },
+    "metadataSnapshot": {
+      "authorProof": {
+        "authGenerationAtOrigin": 1,
+        "authorDeviceId": "00000000-0000-4000-8000-00000000003e",
+        "authorDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+        "authorKeyId": "YL8HxIiq0Y_aM53wfk-8R7TwC-cXEZNvGNBNNSrQGJA",
+        "deviceStatusAtOrigin": "active",
+        "originSeq": 1,
+        "originTransitionId": "00000000-0000-4000-8000-00000000003f",
+        "roleAtOrigin": "admin",
+        "signaturePublicKey": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo="
+      },
+      "ciphertext": "WlpaWlpaWlpaWlpaWlpaWg==",
+      "ciphertextSha256": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "ciphertextSize": 16,
+      "coordinate": {
+        "confirmationTag": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+        "conversationId": "ERERERERQRGREREREREREQ==",
+        "epoch": 0,
+        "generation": 0,
+        "groupContextHash": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+        "groupId": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo="
+      },
+      "metadataVersion": 1,
+      "nonce": "WlpaWlpaWlpaWlpa",
+      "originTransitionId": "00000000-0000-4000-8000-00000000003d"
+    },
+    "next": {
+      "confirmationTag": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "conversationId": "11111111-1111-4111-9111-111111111111",
+      "epoch": 0,
+      "generation": 0,
+      "groupContextHash": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "groupId": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "lifecycle": "active",
+      "stateVersion": 0
+    },
+    "prior": {
+      "confirmationTag": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "conversationId": "11111111-1111-4111-9111-111111111111",
+      "epoch": 0,
+      "generation": 0,
+      "groupContextHash": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "groupId": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "lifecycle": "active",
+      "stateVersion": 0
+    },
+    "recoveryRequestId": "00000000-0000-4000-8000-000000000038",
+    "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-FULFILL\u0000",
+    "signedAt": "2026-07-22T12:34:55.000Z",
+    "transitionId": "00000000-0000-4000-8000-000000000039"
+  },
+  "signature": "M4pmY+soYWSCYtReT9h+bv1RfpsnVQlZk0OQP2ypyjg06vMsc3F0eczgIMY0OdmMb934nNKxbybUyR1nMdd1BQ=="
+}

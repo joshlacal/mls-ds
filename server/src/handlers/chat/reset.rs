@@ -76,7 +76,7 @@ async fn handle(
         .map_err(|error| reset_failure(endpoint, error))?;
 
     let response = match outcome {
-        ResetTransactionOutcome::Replay(completed) => context::replay_response(&completed),
+        ResetTransactionOutcome::Replay(completed) => context::replay_response(endpoint, &completed)?,
         ResetTransactionOutcome::First(applied) => {
             let event_position = applied.event_position();
             let (_, completion, response) = applied.into_parts();
@@ -111,9 +111,6 @@ fn reset_failure(endpoint: ChatEndpoint, error: ResetFacadeError) -> ChatFailure
     use ResetRepositoryError as R;
     use StateMachineError as S;
 
-    // Invariant failures are never exposed to clients; keep the cause
-    // in the server log so a 500 here is diagnosable.
-    let detail = format!("{error:?}");
     match error {
         E::Database(_) => ChatFailure::storage(endpoint),
         E::Prelude(error) => prelude_failure(endpoint, error),
@@ -155,14 +152,16 @@ fn reset_failure(endpoint: ChatEndpoint, error: ResetFacadeError) -> ChatFailure
         {
             ChatFailure::protocol(endpoint, C::ResetRequestStale)
         }
-        E::MissingMutation
+        error @ (E::MissingMutation
         | E::UnsupportedMutation
         | E::InvalidCanonicalMaterial
         | E::Repository(_)
         | E::StateMachine(_)
         | E::ExecutionContext(_)
-        | E::Executor(_) => {
-            tracing::error!(endpoint = endpoint.nsid(), error = %detail, "reset handler invariant failure");
+        | E::Executor(_)) => {
+            // Never exposed to the caller; the concrete variant is the only
+            // evidence an operator has for an unmapped (endpoint, cause) pair.
+            tracing::error!(endpoint = endpoint.nsid(), variant = ?error, "reset handler invariant failure");
             ChatFailure::invariant(endpoint)
         }
     }

@@ -1,0 +1,20 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.deleteSpaceGeneration",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Internal authority callback that permanently deletes exactly one conversation Space generation. Requires the exact authority service JWT, DS audience, exact lxm, unique jti and a lifetime of at most 60 seconds. The authority must persist pending deletion and stop credential issuance before calling; only after success may it acknowledge deletion and durably notify registered repositories. Repeating the same exact generation with a fresh JWT is idempotent. No rebind or undelete exists.",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["space", "generation"], "properties": {
+        "space": {"type": "string", "format": "space-ref"},
+        "generation": {"type": "string", "minLength": 36, "maxLength": 36}
+      }}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["space", "generation", "deleted"], "properties": {
+        "space": {"type": "string", "format": "space-ref"},
+        "generation": {"type": "string", "minLength": 36, "maxLength": 36},
+        "deleted": {"type": "boolean", "const": true}
+      }}},
+      "errors": [{"name": "NotAuthorized"}, {"name": "StorageGenerationMismatch"}, {"name": "StorageNotConfigured"}]
+    }
+  }
+}

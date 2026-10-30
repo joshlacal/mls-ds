@@ -1,0 +1,61 @@
+{
+  "encoding": "JSONEncoder.encode(actual generated Input), sortedKeys and withoutEscapingSlashes; no post-encoding JSON rewrite",
+  "outputFilesSHA256": {
+    "swift-commit.request.json": "2d65bd1eb698331c70056bf959afb645daa29f74debbdd80eb949054e799c17a",
+    "swift-commit.wrapper.json": "86f2b211652a04fc813da643d7d9a4e4408cfae43c8bc72fc17d0e452eed36d3",
+    "swift-fixtures.json": "7661f1dae79d99be798c38a0273fb9a6e7c019de6cc89d866aecf456a6f29767",
+    "swift-leave.request.json": "d37ae945d6c831da1d1a67fd955b0855487d1b6a51ea207222c81fb4c77a2c4f",
+    "swift-leave.wrapper.json": "c83296cd5c96f1672aeb8e92ae19d64496c9f8b25bfb3ea495bd80eb71661aa9",
+    "swift-metadata.request.json": "65625a3d710b57acec6c336391f060444b31cb67334add4c9589def1e251d38c",
+    "swift-metadata.wrapper.json": "d31090fcc0c40663279fefdb3e06a1f1495ccfd5f52fe54bea43414d6b39349e",
+    "swift-policy.request.json": "803b3d5db56db2eed772808bc895abcc0206df6043a37120eab7638cf535b259",
+    "swift-policy.wrapper.json": "525928a53bc44577d3503aca966990bdb8a32331ebe713d5ce4d139a38d2f221",
+    "swift-recovery-nonempty.request.json": "ccb804934c6b19b9b7ae8bf57273b6307ce592ac6c8542f8387ceb28d0545227",
+    "swift-recovery-nonempty.wrapper.json": "0941a6fec2daa38d2798ffeace9d37d82c9ddef199e8e88c3ac5c8d4b27fb941",
+    "swift-recovery.request.json": "05ff4d4e0feee7effb06a74f9e0d981731706d3fa3e1d4516b85468328061a8a",
+    "swift-recovery.wrapper.json": "34417deed7070f699053a995651effd5d340679e43ca85f29fb450c7287c2db8"
+  },
+  "producer": "SwiftProducer/Sources/GeneratedTransitionProducer/main.swift",
+  "producerFilesSHA256": {
+    "SwiftProducer/Package.resolved": "9c8eb1c1962e8722c311c8d56bb6ab7efc66026fec5be3fe236e988cb4471ee2",
+    "SwiftProducer/Package.swift": "373419496787d2e09d0e34344a99129495caaea8edff2d859eba8d4c9ba51a74",
+    "SwiftProducer/Sources/GeneratedTransitionProducer/main.swift": "a4d822f3c22f257181f7b9a3968282161d2bd15addb64aa4bfcefc8826a77200",
+    "reproduce.py": "e3ecd71f4e9c1ba848382a2e940652c6714809dad93018b21990af0e90e22287"
+  },
+  "purpose": "Actual generated Swift serializer fixtures; signing values copied from independent server vectors",
+  "qualification": "DTO encoding and typed roundtrip only; production decoder, crypto, handler, DB and MLS validity are tested separately",
+  "regenerateCommand": "python3 server/tests/fixtures/generated_transitions/reproduce.py --write",
+  "reproduceCommand": "python3 server/tests/fixtures/generated_transitions/reproduce.py --check",
+  "resolvedSDKs": {
+    "Petrel": {
+      "edges": 2,
+      "kind": "local",
+      "workspaceRelativePath": "Petrel"
+    },
+    "PetrelCatbird": {
+      "edges": 1,
+      "kind": "local",
+      "workspaceRelativePath": "PetrelCatbird"
+    }
+  },
+  "schemaVersion": 1,
+  "sourceFilesSHA256": {
+    "Petrel/Sources/Petrel/Core/Utils/ATProtoTypes.swift": "c7c03e7a2e62ee5bcd928e4aeaec57aedbef64504b0e0f1005c66aeedc8f7b41",
+    "PetrelCatbird/Sources/PetrelCatbird/Generated/Lexicons/Blue/Catbird/BlueCatbirdChatDefs.swift": "245bf0d03b036cedd84e15f62bbe1f98fda0fa9e36c017c505518d330c3e466d",
+    "PetrelCatbird/Sources/PetrelCatbird/Generated/Lexicons/Blue/Catbird/BlueCatbirdChatSubmitTransition.swift": "7efd89c77c3ce6b0d23dd0c4296228ddcc03f89333eace0ffb644db40f289f7f",
+    "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json": "d830abb92430704e52aaf0b47eda435a01be9fd1d5f61d52daf42c2b22a48bcd",
+    "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.submitTransition.json": "92be39e46322ca6d60ca2a2ea5183b83ccf16aabca1e1001d6e3faf28594e449",
+    "mls-ds/lexicon/blue/catbird/chat/blue.catbird.chat.defs.json": "d830abb92430704e52aaf0b47eda435a01be9fd1d5f61d52daf42c2b22a48bcd",
+    "mls-ds/server/tests/fixtures/mls_chat_contract_vectors.json": "4bfaf0966facdf574fa0411fa245f06288de2badac5ffeb8ec2b076ba7b58d4e",
+    "mls-ds/server/tests/fixtures/mls_chat_control_fingerprint_source.json": "f33406a5d99dba3b604da108c4df2e53d70531b9fa0be14b21e2db94ba07b311"
+  },
+  "sourceRevisions": {
+    "Petrel": "e115236537041a900ec971be05185a70cca73e8a",
+    "PetrelCatbird": "8672c80ffeb3b9cfbdb6bd98f66efa09b13fe0db"
+  },
+  "supplementalInputsSHA256": {
+    "inputs/recovery-nonempty.canonical.json": "7fefb2f74c84f05c02638ead49b3017a7fc43efe5ac05eff5e5a6b2d7622208b",
+    "inputs/recovery-nonempty.expected.json": "7125cf25876138109624fcb980befa0ed69060a8d1ed0fbb0d65a35a38aead77"
+  },
+  "swiftToolchain": "Apple Swift version 6.4 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)\nTarget: arm64-apple-macosx27.0.0"
+}

@@ -1,0 +1,73 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.getThreadStorage",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Resolve the authenticated current chat device's conversation-history placement. A Space placement requires the returned immutable generation and Space reference on every subsequent operation. This endpoint does not grant Spaces or MLS device authorization.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "threadId",
+          "actorDeviceId"
+        ],
+        "properties": {
+          "threadId": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "actorDeviceId": {
+            "type": "string",
+            "minLength": 36,
+            "maxLength": 36,
+            "description": "Current chat device UUID."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "placement",
+            "generation"
+          ],
+          "properties": {
+            "placement": {
+              "type": "string",
+              "knownValues": [
+                "mlsds",
+                "space"
+              ]
+            },
+            "generation": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "description": "Immutable UUID identifying this conversation storage lifecycle. A recreated Space requires a new generation."
+            },
+            "space": {
+              "type": "string",
+              "format": "space-ref",
+              "description": "Required when placement is space; absent for mlsds."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotParticipant"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "StorageNotConfigured"
+        },
+        {
+          "name": "SpaceDeleted"
+        }
+      ]
+    }
+  }
+}

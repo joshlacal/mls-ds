@@ -1,0 +1,53 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.publishEpochHead",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Re-publish the head of an epoch the caller's mailbox already holds. Heads enter the directory only through createEpoch, atomically; this endpoint can neither introduce an epoch nor claim the next number. The caller must hold a bound Labyrinth device, the epoch must exist with exactly this epochPublic, and its attestation must be by the calling chat device's own key. Identical bytes succeed again. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "epoch"
+          ],
+          "properties": {
+            "epoch": {
+              "type": "ref",
+              "ref": "blue.catbird.labyrinth.defs#epochPublic"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidEpochChain"
+        },
+        {
+          "name": "EpochHeadConflict"
+        },
+        {
+          "name": "AttestationNotCurrent"
+        },
+        {
+          "name": "EpochNotFound"
+        },
+        {
+          "name": "AttestationNotCaller"
+        },
+        {
+          "name": "LabyrinthDeviceNotBound"
+        }
+      ]
+    }
+  }
+}

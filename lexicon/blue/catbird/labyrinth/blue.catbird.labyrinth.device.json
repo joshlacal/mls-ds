@@ -1,0 +1,71 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.device",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A device enrolled in the mailbox (SPEC \u00a74), physical or virtual. Personal mailbox space. rkey = hex(deviceKeyPubkey). Immutable except that revokedAt is set once on revocation.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "deviceKeyPubkey",
+          "epochStorageKeyPubkey",
+          "epochStorageKeySig",
+          "virtual",
+          "createdAt"
+        ],
+        "properties": {
+          "deviceKeyPubkey": {
+            "type": "bytes",
+            "description": "XEdDSA device key (X25519 form).",
+            "maxLength": 32,
+            "minLength": 32
+          },
+          "epochStorageKeyPubkey": {
+            "type": "bytes",
+            "description": "Labyrinth HPKE encryption key.",
+            "maxLength": 32,
+            "minLength": 32
+          },
+          "epochStorageKeySig": {
+            "type": "bytes",
+            "description": "pk_sign(deviceKey, 0x30, epochStorageKeyPubkey).",
+            "maxLength": 64,
+            "minLength": 64
+          },
+          "epochStorageAuthKeyPubkey": {
+            "type": "bytes",
+            "description": "Labyrinth HPKE auth key; absent for virtual devices.",
+            "maxLength": 32,
+            "minLength": 32
+          },
+          "epochStorageAuthKeySig": {
+            "type": "bytes",
+            "description": "pk_sign(deviceKey, 0x31, epochStorageAuthKeyPubkey).",
+            "maxLength": 64,
+            "minLength": 64
+          },
+          "virtual": {
+            "type": "boolean",
+            "description": "True for a recovery (virtual) device, which has no epochStorageAuthKey."
+          },
+          "chatBinding": {
+            "type": "ref",
+            "ref": "blue.catbird.labyrinth.defs#transportAttestation",
+            "description": "[CB-36] Ed25519(chat key, \"catbird.labyrinth.device_binding:\" || did || \":\" || deviceKeyPubkey) by the chat device that enrolled this physical device. Absent for virtual devices; a physical device without a valid binding to a current chat device is dropped at the next rotation."
+          },
+          "revokedAt": {
+            "type": "string",
+            "description": "Set once when the device is revoked; the revoking device opens a new epoch that excludes it ([CB-11]).",
+            "format": "datetime"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

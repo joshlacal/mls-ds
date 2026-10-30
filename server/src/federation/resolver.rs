@@ -1,12 +1,16 @@
 use sqlx::PgPool;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 #[cfg(any(test, feature = "test-support"))]
 use std::pin::Pin;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
+use std::net::SocketAddr;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::OnceLock;
 use std::sync::LazyLock;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use super::errors::{FederationError, ResolutionFailureKind};
@@ -360,7 +364,8 @@ pub fn validate_declaration_record_value(
         });
     }
 
-    // 2. protocolVersion == "1"
+    // 2. protocolVersion is "1", or "2" for actors whose delivery service
+    // also serves encrypted direct requests (merged encrypted-requests line).
     let protocol_version = value
         .get("protocolVersion")
         .and_then(|v| v.as_str())
@@ -370,7 +375,7 @@ pub fn validate_declaration_record_value(
                 "Declaration record missing protocolVersion".to_string(),
             ),
         })?;
-    if protocol_version != "1" {
+    if !matches!(protocol_version, "1" | "2") {
         return Err(FederationError::ResolutionFailed {
             did: String::new(),
             kind: ResolutionFailureKind::InvalidDeclaration(format!(
@@ -518,6 +523,31 @@ impl DsResolver {
     pub fn with_user_did_resolver_hook(mut self, hook: UserDidResolverFn) -> Self {
         self.user_did_resolver = Some(hook);
         self
+    }
+
+    /// Encrypted-requests constructor shape: only an optional default DS
+    /// endpoint is supplied; its DID comes from `DEFAULT_DS_DID` or is derived
+    /// from the endpoint exactly as [`Self::with_defaults`] does.
+    pub fn with_default_endpoint(
+        pool: PgPool,
+        http: reqwest::Client,
+        self_did: String,
+        self_endpoint: String,
+        default_ds_endpoint: Option<String>,
+        cache_ttl_secs: u64,
+    ) -> Self {
+        let default_ds_did = std::env::var("DEFAULT_DS_DID")
+            .ok()
+            .filter(|_| default_ds_endpoint.is_some());
+        Self::with_defaults(
+            pool,
+            http,
+            self_did,
+            self_endpoint,
+            default_ds_did,
+            default_ds_endpoint,
+            cache_ttl_secs,
+        )
     }
 
     pub fn with_defaults(
@@ -1489,6 +1519,240 @@ impl DsResolver {
         Ok(deleted)
     }
 
+    /// Resolve and verify a coordinator's direct-request receipt public key.
+    ///
+    /// Fetch the coordinator's DID document and verify the exact receipt
+    /// method. Foreign keys must not enter the local issuer's immutable
+    /// `chat.direct_request_receipt_keys` history.
+    pub async fn resolve_coordinator_receipt_key(
+        &self,
+        _pool: &PgPool,
+        authority_did: &str,
+        key_id: &str,
+    ) -> Result<Vec<u8>, FederationError> {
+        let doc = self.fetch_did_document(authority_did).await?;
+        let methods = doc["verificationMethod"]
+            .as_array()
+            .ok_or(FederationError::InvalidProof)?;
+
+        for method in methods {
+            if method["id"].as_str().unwrap_or_default() != key_id {
+                continue;
+            }
+            if method["controller"].as_str() != Some(authority_did)
+                || method["type"].as_str() != Some("Multikey")
+            {
+                return Err(FederationError::InvalidProof);
+            }
+            let key_multibase = method["publicKeyMultibase"]
+                .as_str()
+                .ok_or(FederationError::InvalidProof)?;
+            let (_, key) =
+                multibase::decode(key_multibase).map_err(|_| FederationError::InvalidProof)?;
+            if key.len() != 35 || key[..2] != [0x80, 0x24] {
+                return Err(FederationError::InvalidProof);
+            }
+            let p256_key = key[2..].to_vec();
+            let calculated_id = crate::chat_protocol::direct_request_transcript::direct_request_receipt_key_id_for_authority(
+                authority_did,
+                &p256_key,
+            )
+            .map_err(|_| FederationError::InvalidProof)?;
+            if calculated_id != key_id {
+                return Err(FederationError::InvalidProof);
+            }
+            return Ok(p256_key);
+        }
+
+        Err(FederationError::NotFound(format!(
+            "receipt key {key_id} not found in DID doc for {authority_did}"
+        )))
+    }
+
+    /// Resolve the authoritative Delivery Service for a user from their live
+    /// `blue.catbird.chat.declaration/self` record (encrypted direct requests,
+    /// C33). Unlike [`Self::resolve`], this never consults the cache, the DID
+    /// document `#atproto_mls` entry, the legacy profile or a default DS: an
+    /// absent declaration fails closed with `Unsupported`.
+    pub async fn resolve_authoritative_ds(
+        &self,
+        user_did: &str,
+    ) -> Result<DsEndpoint, FederationError> {
+        let canonical_user = canonical_did(user_did).to_string();
+        if self.is_self(&canonical_user) {
+            return Ok(DsEndpoint {
+                did: self.self_did.clone(),
+                endpoint: self.self_endpoint.clone(),
+                supported_cipher_suites: None,
+                federation_capabilities: Some(super::local_federation_capabilities()),
+            });
+        }
+
+        let pds_endpoint = match self.resolve_did_to_pds(&canonical_user).await {
+            Ok(pds) => pds,
+            Err(e) => {
+                debug!(
+                    did = %crate::crypto::redact_for_log(&canonical_user),
+                    error = %e,
+                    "Failed to resolve PDS for chat declaration"
+                );
+                return Err(FederationError::Unsupported(format!(
+                    "Failed to resolve PDS endpoint from DID document: {e}"
+                )));
+            }
+        };
+
+        let record_url = declaration_record_url(&pds_endpoint, &canonical_user);
+        let destination = self.resolve_endpoint_destination(&record_url).await?;
+        let deadline = checked_outbound_deadline(&canonical_user, Duration::from_secs(10))?;
+        let resp = send_hardened_resolution_request(
+            &destination,
+            deadline,
+            &canonical_user,
+            "Chat declaration HTTP error",
+        )
+        .await?;
+
+        let invalid = |reason: String| FederationError::ResolutionFailed {
+            did: canonical_user.clone(),
+            kind: ResolutionFailureKind::InvalidDeclaration(reason),
+        };
+        let status = resp.status();
+        let authority_did = if status.is_success() {
+            let body_val: serde_json::Value = decode_resolution_json(
+                resp,
+                PROFILE_OR_DEVICE_MAX_BYTES,
+                deadline,
+                &canonical_user,
+                "Invalid chat declaration JSON",
+            )
+            .await?;
+            let root = body_val
+                .as_object()
+                .ok_or_else(|| invalid("Chat declaration response is not a JSON object".into()))?;
+            let expected_uri =
+                format!("at://{canonical_user}/{DECLARATION_COLLECTION}/{DECLARATION_RKEY}");
+            let uri = root
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| invalid("Missing uri in chat declaration response".into()))?;
+            if uri != expected_uri {
+                return Err(invalid(format!(
+                    "Chat declaration URI mismatch: expected {expected_uri}, got {uri}"
+                )));
+            }
+            let value = root
+                .get("value")
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| invalid("Missing value record in chat declaration response".into()))?;
+            let record_type = value.get("$type").and_then(|v| v.as_str()).unwrap_or("");
+            if record_type != DECLARATION_COLLECTION {
+                return Err(invalid(format!(
+                    "Unexpected $type in chat declaration: {record_type}"
+                )));
+            }
+            let protocol_version = value.get("protocolVersion").and_then(|v| v.as_str());
+            if !matches!(protocol_version, Some("1" | "2")) {
+                return Err(FederationError::Unsupported(format!(
+                    "Unsupported protocolVersion in chat declaration for {canonical_user}: {protocol_version:?}"
+                )));
+            }
+            let delivery_service = value
+                .get("deliveryService")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| invalid("Missing deliveryService in chat declaration".into()))?;
+            if !crate::chat_protocol::is_bare_did(delivery_service) {
+                return Err(invalid(format!(
+                    "Invalid deliveryService DID in chat declaration: {delivery_service}"
+                )));
+            }
+            delivery_service.to_string()
+        } else if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::BAD_REQUEST
+        {
+            let err_val: Option<serde_json::Value> = decode_resolution_json(
+                resp,
+                PROFILE_OR_DEVICE_MAX_BYTES,
+                deadline,
+                &canonical_user,
+                "Error response decode",
+            )
+            .await
+            .ok();
+            let is_not_found = err_val
+                .as_ref()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()))
+                .map(|e| e == "RecordNotFound" || e == "CouldNotLocateRecord")
+                .unwrap_or(status == reqwest::StatusCode::NOT_FOUND);
+            if is_not_found {
+                debug!(
+                    did = %crate::crypto::redact_for_log(&canonical_user),
+                    "Chat declaration record absent on PDS; failing closed with unsupported authority"
+                );
+                return Err(FederationError::Unsupported(format!(
+                    "Chat declaration record absent for {canonical_user}"
+                )));
+            }
+            return Err(FederationError::ResolutionFailed {
+                did: canonical_user.clone(),
+                kind: ResolutionFailureKind::HttpStatus {
+                    status: status.as_u16(),
+                    message: format!("Chat declaration PDS returned error: {err_val:?}"),
+                },
+            });
+        } else {
+            return Err(FederationError::ResolutionFailed {
+                did: canonical_user.clone(),
+                kind: ResolutionFailureKind::HttpStatus {
+                    status: status.as_u16(),
+                    message: format!("Chat declaration PDS returned status {status}"),
+                },
+            });
+        };
+
+        let authority_endpoint = self.resolve_authority_ds_endpoint(&authority_did).await?;
+        // Peer admission governs outbound federation, not this authority's own accounts.
+        if canonical_did(&authority_endpoint.did) != canonical_did(&self.self_did) {
+            super::peer_policy::enforce_outbound_peer_policy(&self.pool, &authority_endpoint.did)
+                .await?;
+        }
+        Ok(authority_endpoint)
+    }
+
+    /// Map a delivery-service authority DID to the exact HTTPS endpoint its DID
+    /// document declares as `#atproto_mls` / `AtprotoMLSDeliveryService`.
+    /// Strict: no configured-default or did:web derivation fallback.
+    pub async fn resolve_authority_ds_endpoint(
+        &self,
+        authority_did: &str,
+    ) -> Result<DsEndpoint, FederationError> {
+        let canonical_auth_did = canonical_did(authority_did).to_string();
+        if self.is_self(&canonical_auth_did) {
+            return Ok(DsEndpoint {
+                did: self.self_did.clone(),
+                endpoint: self.self_endpoint.clone(),
+                supported_cipher_suites: None,
+                federation_capabilities: Some(super::local_federation_capabilities()),
+            });
+        }
+        let doc = self.fetch_did_document(&canonical_auth_did).await?;
+        let endpoint_str = extract_service(&doc, "atproto_mls", Some("AtprotoMLSDeliveryService"))
+            .ok_or_else(|| FederationError::ResolutionFailed {
+                did: canonical_auth_did.clone(),
+                kind: ResolutionFailureKind::ServiceMissing(
+                    "No AtprotoMLSDeliveryService service entry in authority DID document"
+                        .to_string(),
+                ),
+            })?;
+        self.validate_remote_url(endpoint_str).await?;
+        Ok(DsEndpoint {
+            did: canonical_auth_did,
+            endpoint: endpoint_str.to_string(),
+            supported_cipher_suites: None,
+            federation_capabilities: None,
+        })
+    }
+
     async fn validate_remote_url(&self, url_str: &str) -> Result<(), FederationError> {
         self.resolve_endpoint_destination(url_str).await.map(|_| ())
     }
@@ -1514,7 +1778,7 @@ async fn send_resolution_request(
     did: &str,
     context: &str,
 ) -> Result<reqwest::Response, FederationError> {
-    tokio::time::timeout_at(deadline, request.send())
+    let response = tokio::time::timeout_at(deadline, request.send())
         .await
         .map_err(|_| FederationError::ResolutionFailed {
             did: did.to_string(),
@@ -1542,7 +1806,19 @@ async fn send_resolution_request(
             } else {
                 FederationError::Http(error)
             }
-        })
+        })?;
+
+    if response.status().is_redirection() {
+        return Err(FederationError::ResolutionFailed {
+            did: did.to_string(),
+            kind: ResolutionFailureKind::RedirectRejected(format!(
+                "{context}: redirect rejected (status {})",
+                response.status()
+            )),
+        });
+    }
+
+    Ok(response)
 }
 
 async fn decode_resolution_json<T: serde::de::DeserializeOwned>(
@@ -1868,7 +2144,10 @@ pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
 }
 
 fn allow_insecure_http() -> bool {
-    std::env::var("FEDERATION_ALLOW_INSECURE_HTTP")
+    // Compile-time gate from the encrypted-requests line: a production build
+    // cannot be talked into plaintext federation by environment alone.
+    cfg!(any(test, feature = "test-support"))
+        && std::env::var("FEDERATION_ALLOW_INSECURE_HTTP")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
@@ -1899,6 +2178,69 @@ fn host_is_allowlisted(host: &str, allowlist: &[String]) -> bool {
     allowlist
         .iter()
         .any(|allowed| host_lc == *allowed || host_lc.ends_with(&format!(".{allowed}")))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone)]
+struct TestFixtureHosts {
+    hosts: Vec<String>,
+    port: u16,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static TEST_FIXTURE_HOSTS: OnceLock<TestFixtureHosts> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_test_fixture_host_resolver(hosts: &[String], port: u16) -> Result<(), String> {
+    TEST_FIXTURE_HOSTS
+        .set(TestFixtureHosts {
+            hosts: hosts.iter().map(|h| h.to_ascii_lowercase()).collect(),
+            port,
+        })
+        .map_err(|_| "test fixture host resolver already installed".to_string())
+}
+
+/// True only in test/test-support builds for an explicitly installed fixture
+/// host (HTTPS DID fixture, relationship transport, `REQUEST_FIXTURE_DID_HOSTS`)
+/// or for loopback HTTP when insecure HTTP was explicitly enabled.
+pub(crate) fn is_explicit_debug_fixture(host: &str, port: u16, is_http: bool) -> bool {
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let _ = (host, port, is_http);
+        false
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let host_lc = host.to_ascii_lowercase();
+        if crate::auth::is_test_fixture_host(host) {
+            return true;
+        }
+        if let Some(fixture) = TEST_FIXTURE_HOSTS.get() {
+            if fixture.port == port && fixture.hosts.iter().any(|h| h.eq_ignore_ascii_case(&host_lc)) {
+                return true;
+            }
+        }
+        if let Ok(fixture_hosts_raw) = std::env::var("REQUEST_FIXTURE_DID_HOSTS") {
+            let fixture_port = std::env::var("REQUEST_FIXTURE_DID_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(443);
+            if port == fixture_port
+                && fixture_hosts_raw
+                    .split(',')
+                    .any(|allowed| allowed.trim().eq_ignore_ascii_case(&host_lc))
+            {
+                return true;
+            }
+        }
+        is_http
+            && allow_insecure_http()
+            && (host_lc == "localhost"
+                || host_lc == "127.0.0.1"
+                || host_lc == "::1"
+                || host_lc == "[::1]"
+                || host_lc.ends_with(".localhost"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1992,11 +2334,15 @@ pub(crate) fn validate_endpoint_url_with_custom_policy(
 
     if let Some(host) = parsed.host_str() {
         let host_lc = host.to_ascii_lowercase();
+        let port = parsed
+            .port_or_known_default()
+            .unwrap_or(if parsed.scheme() == "http" { 80 } else { 443 });
+        let is_fixture = is_explicit_debug_fixture(host, port, parsed.scheme() == "http");
 
         // 1. Hostname allowlist check if configured
         let effective_allowlist = allowlist.or_else(|| FEDERATION_HOST_ALLOWLIST.as_deref());
         if let Some(allowed) = effective_allowlist {
-            if !host_is_allowlisted(host, allowed) {
+            if !host_is_allowlisted(host, allowed) && !is_fixture {
                 return Err(FederationError::ResolutionFailed {
                     did: String::new(),
                     kind: ResolutionFailureKind::AllowlistBlocked(format!(
@@ -2008,7 +2354,7 @@ pub(crate) fn validate_endpoint_url_with_custom_policy(
 
         let blocked = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
         if blocked.contains(&host_lc.as_str()) || host_lc.ends_with(".localhost") {
-            if !(is_app_env_test && allow_http) {
+            if !(is_app_env_test && allow_http) && !is_fixture {
                 return Err(FederationError::ResolutionFailed {
                     did: String::new(),
                     kind: ResolutionFailureKind::SsrfBlocked(format!(
@@ -2025,7 +2371,7 @@ pub(crate) fn validate_endpoint_url_with_custom_policy(
             _ => host.parse::<std::net::IpAddr>().ok(),
         };
         if let Some(ip) = typed_ip {
-            if is_private_ip(&ip) && !(is_app_env_test && allow_http) {
+            if is_private_ip(&ip) && !(is_app_env_test && allow_http) && !is_fixture {
                 return Err(FederationError::ResolutionFailed {
                     did: String::new(),
                     kind: ResolutionFailureKind::SsrfBlocked(format!(
@@ -2081,11 +2427,12 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
     let port = parsed
         .port_or_known_default()
         .unwrap_or(if parsed.scheme() == "http" { 80 } else { 443 });
+    let is_fixture = is_explicit_debug_fixture(&host, port, parsed.scheme() == "http");
 
     // Hostname allowlist check
     let effective_allowlist = allowlist.or_else(|| FEDERATION_HOST_ALLOWLIST.as_deref());
     if let Some(allowed) = effective_allowlist {
-        if !host_is_allowlisted(&host, allowed) {
+        if !host_is_allowlisted(&host, allowed) && !is_fixture {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
                 kind: ResolutionFailureKind::AllowlistBlocked(format!(
@@ -2095,8 +2442,13 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
         }
     }
 
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if is_private_ip(&ip) && !(is_app_env_test && allow_http) {
+    let typed_ip: Option<std::net::IpAddr> = match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => Some(std::net::IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => Some(std::net::IpAddr::V6(v6)),
+        _ => host.parse::<std::net::IpAddr>().ok(),
+    };
+    if let Some(ip) = typed_ip {
+        if is_private_ip(&ip) && !(is_app_env_test && allow_http) && !is_fixture {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
                 kind: ResolutionFailureKind::SsrfBlocked(format!("Blocked non-global IP: {ip}")),
@@ -2107,6 +2459,20 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
             url: parsed,
             host,
             addrs: vec![sock_addr],
+        });
+    }
+
+    // Named fixture hosts (custom-CA HTTPS DID fixtures) are served on loopback.
+    #[cfg(any(test, feature = "test-support"))]
+    if is_fixture {
+        let loopback = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        );
+        return Ok(ValidatedRemoteDestination {
+            url: parsed,
+            host,
+            addrs: vec![loopback],
         });
     }
 
@@ -2149,7 +2515,7 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
 
     // Reject mixed/private: ALL addresses must be public
     for addr in &addrs {
-        if is_private_ip(&addr.ip()) && !(is_app_env_test && allow_http) {
+        if is_private_ip(&addr.ip()) && !(is_app_env_test && allow_http) && !is_fixture {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
                 kind: ResolutionFailureKind::SsrfBlocked(format!(
@@ -2181,18 +2547,41 @@ pub(crate) async fn send_hardened_resolution_request(
     did: &str,
     context: &str,
 ) -> Result<reqwest::Response, FederationError> {
-    let client = reqwest::Client::builder()
-        .user_agent("catbird-mls-ds/1.0")
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(&destination.host, &destination.addrs)
-        .build()
+    let port = destination
+        .url
+        .port_or_known_default()
+        .unwrap_or(if destination.url.scheme() == "http" { 80 } else { 443 });
+    let client = if is_explicit_debug_fixture(
+        &destination.host,
+        port,
+        destination.url.scheme() == "http",
+    ) {
+        build_pinned_client(
+            &destination.host,
+            &destination.addrs,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
         .map_err(|e| FederationError::ResolutionFailed {
             did: did.to_string(),
             kind: ResolutionFailureKind::InvalidConfiguration(format!(
-                "{context}: client build failed: {e}"
+                "{context}: fixture client build failed: {e}"
             )),
-        })?;
+        })?
+    } else {
+        reqwest::Client::builder()
+            .user_agent("catbird-mls-ds/1.0")
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&destination.host, &destination.addrs)
+            .build()
+            .map_err(|e| FederationError::ResolutionFailed {
+                did: did.to_string(),
+                kind: ResolutionFailureKind::InvalidConfiguration(format!(
+                    "{context}: client build failed: {e}"
+                )),
+            })?
+    };
 
     let resp = tokio::time::timeout_at(deadline, client.get(destination.url.clone()).send())
         .await
@@ -2235,6 +2624,139 @@ pub(crate) async fn send_hardened_resolution_request(
     }
 
     Ok(resp)
+}
+
+/// Validate `url` and resolve it to the socket addresses a client MUST be
+/// pinned to (DNS-rebinding closure). Thin adapter over
+/// [`validate_and_resolve_destination`] for the encrypted-requests callers.
+pub(crate) async fn resolve_and_pin_destination(
+    url: &url::Url,
+) -> Result<(String, Vec<SocketAddr>), FederationError> {
+    let destination = validate_and_resolve_destination(url.as_str(), None).await?;
+    Ok((destination.host, destination.addrs))
+}
+
+type PinnedClientKey = (String, Vec<SocketAddr>, Duration, Duration);
+
+static PINNED_CLIENT_POOL: LazyLock<Mutex<BTreeMap<PinnedClientKey, reqwest::Client>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+pub(crate) async fn get_or_build_pinned_client(
+    host: &str,
+    addrs: &[SocketAddr],
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<reqwest::Client, FederationError> {
+    let key = (
+        host.to_string(),
+        addrs.to_vec(),
+        connect_timeout,
+        request_timeout,
+    );
+    let mut pool = PINNED_CLIENT_POOL.lock().await;
+    if let Some(client) = pool.get(&key) {
+        return Ok(client.clone());
+    }
+    let client = build_pinned_client(host, addrs, connect_timeout, request_timeout)?;
+    if pool.len() < 256 {
+        pool.insert(key, client.clone());
+    }
+    Ok(client)
+}
+
+pub(crate) fn build_pinned_client(
+    host: &str,
+    addrs: &[SocketAddr],
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<reqwest::Client, FederationError> {
+    #[cfg(feature = "test-support")]
+    if let Some(transport) =
+        crate::chat_protocol::relationship_policy::installed_test_https_relationship_transport()
+    {
+        return Ok(transport.client);
+    }
+    #[cfg(feature = "test-support")]
+    if let Some(client) = crate::auth::test_fixture_http_client() {
+        return Ok(client);
+    }
+
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(10)
+        .user_agent("catbird-mls-ds/1.0");
+    if !addrs.is_empty() {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    if let Ok(ca_path) = std::env::var("REQUEST_FIXTURE_DID_CA_PEM") {
+        if let Ok(ca_bytes) = std::fs::read(&ca_path) {
+            if let Ok(cert) = reqwest::Certificate::from_pem(&ca_bytes) {
+                builder = builder
+                    .tls_built_in_root_certs(false)
+                    .add_root_certificate(cert);
+            }
+        }
+    }
+
+    builder
+        .build()
+        .map_err(|e| FederationError::ResolutionFailed {
+            did: String::new(),
+            kind: ResolutionFailureKind::InvalidConfiguration(format!(
+                "Failed to build pinned HTTP client for {host}: {e}"
+            )),
+        })
+}
+
+/// HTTP client for canonical relay resolution: redirects disabled, honoring
+/// installed HTTPS test fixtures in test-support builds only.
+pub fn build_resolver_http_client() -> reqwest::Client {
+    #[cfg(feature = "test-support")]
+    if let Some(transport) =
+        crate::chat_protocol::relationship_policy::installed_test_https_relationship_transport()
+    {
+        return transport.client;
+    }
+    #[cfg(feature = "test-support")]
+    if let Some(client) = crate::auth::test_fixture_http_client() {
+        return client;
+    }
+
+    #[allow(unused_mut)]
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(10)
+        .user_agent("catbird-mls-ds/1.0");
+
+    #[cfg(any(test, feature = "test-support"))]
+    if let (Ok(hosts), Ok(port_str), Ok(ca_path)) = (
+        std::env::var("REQUEST_FIXTURE_DID_HOSTS"),
+        std::env::var("REQUEST_FIXTURE_DID_PORT"),
+        std::env::var("REQUEST_FIXTURE_DID_CA_PEM"),
+    ) {
+        if let (Ok(port), Ok(ca_pem)) = (port_str.parse::<u16>(), std::fs::read(&ca_path)) {
+            if let Ok(cert) = reqwest::Certificate::from_pem(&ca_pem) {
+                let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                builder = builder
+                    .tls_built_in_root_certs(false)
+                    .add_root_certificate(cert);
+                for host in hosts.split(',').map(str::trim).filter(|h| !h.is_empty()) {
+                    builder = builder.resolve(host, loopback);
+                }
+            }
+        }
+    }
+
+    builder
+        .build()
+        .expect("failed to build federation resolver HTTP client")
 }
 
 #[cfg(test)]
@@ -3782,10 +4304,12 @@ mod tests {
         });
         assert!(validate_declaration_record_value(wrong_type.as_object().unwrap()).is_err());
 
-        // 5. Unsupported protocolVersion ("2")
+        // 5. Unsupported protocolVersion. The merged line accepts "1" and "2"
+        // (encrypted-requests publishes v2 declarations), so "3" is the
+        // first unsupported value.
         let wrong_version = serde_json::json!({
             "$type": "blue.catbird.chat.declaration",
-            "protocolVersion": "2",
+            "protocolVersion": "3",
             "allowIncoming": "all",
             "deliveryService": "did:web:chat.catbird.blue",
             "createdAt": "2026-08-24T12:00:00Z"
@@ -4234,5 +4758,174 @@ mod tests {
         let _ = sqlx::query(&format!("DROP SCHEMA {schema_name} CASCADE;"))
             .execute(&mut *conn)
             .await;
+    }
+
+    // -- ported from the encrypted-requests line --
+
+    #[tokio::test]
+    async fn destination_pin_preserves_public_ipv6_and_rejects_mapped_private_ipv4() {
+        // Other tests in this binary leave APP_ENV=test + insecure HTTP set;
+        // this SSRF check must run under the production policy.
+        std::env::remove_var("FEDERATION_ALLOW_INSECURE_HTTP");
+        std::env::remove_var("APP_ENV");
+        let public = url::Url::parse("https://[2606:4700::1111]/").unwrap();
+        let (host, addrs) = resolve_and_pin_destination(&public).await.unwrap();
+        assert_eq!(host, "[2606:4700::1111]");
+        assert_eq!(addrs, vec!["[2606:4700::1111]:443".parse().unwrap()]);
+
+        let mapped = url::Url::parse("https://[::ffff:127.0.0.1]/").unwrap();
+        assert!(resolve_and_pin_destination(&mapped).await.is_err());
+    }
+
+    async fn redirecting_server(location: &'static str, status_line: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test request");
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn send_resolution_request_rejects_307_and_308_redirects_to_private_targets() {
+        for (status_line, location, code) in [
+            ("307 Temporary Redirect", "http://169.254.169.254/latest/meta-data/", "307"),
+            ("308 Permanent Redirect", "http://10.0.0.1:8080/sensitive", "308"),
+        ] {
+            let address = redirecting_server(location, status_line).await;
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let error = send_resolution_request(
+                client.get(format!("http://{address}/")),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                "did:plc:test",
+                "test context",
+            )
+            .await
+            .expect_err("redirect must be rejected");
+            assert!(error.to_string().contains("redirect rejected"));
+            assert!(error.to_string().contains(code));
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_http_client_does_not_follow_redirects() {
+        let address = redirecting_server("http://127.0.0.1:9/private", "307 Temporary Redirect").await;
+        let error = send_resolution_request(
+            build_resolver_http_client().get(format!("http://{address}/")),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            "did:web:request-fixture",
+            "test redirect",
+        )
+        .await
+        .expect_err("redirect must be rejected");
+        assert!(error.to_string().contains("redirect rejected"));
+    }
+
+    #[tokio::test]
+    async fn resolve_and_pin_destination_rejects_private_ips_fail_closed() {
+        // Other tests in this binary leave APP_ENV=test + insecure HTTP set;
+        // this SSRF check must run under the production policy.
+        std::env::remove_var("FEDERATION_ALLOW_INSECURE_HTTP");
+        std::env::remove_var("APP_ENV");
+        for target in [
+            "https://10.0.0.1/",
+            "https://172.16.0.1/",
+            "https://172.31.255.254/",
+            "https://192.168.1.1/",
+            "https://169.254.169.254/",
+            "https://100.64.0.1/",
+            "https://192.0.2.1/",
+            "https://198.51.100.1/",
+            "https://203.0.113.1/",
+            "https://[fc00::1]/",
+            "https://[fe80::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://[::ffff:10.0.0.1]/",
+            "https://[::ffff:169.254.169.254]/",
+        ] {
+            let parsed = url::Url::parse(target).unwrap();
+            let result = resolve_and_pin_destination(&parsed).await;
+            assert!(result.is_err(), "expected error for private target {target}, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_is_private_ip_coverage() {
+        for private in [
+            "127.0.0.1", "127.255.255.255", "::1", "10.0.0.1", "10.255.255.254", "172.16.0.1",
+            "172.31.255.254", "192.168.0.1", "192.168.255.254", "169.254.169.254", "fe80::1",
+            "100.64.0.1", "100.127.255.254", "192.0.2.1", "198.51.100.1", "203.0.113.1",
+            "fc00::1", "fd12:3456:789a::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(is_private_ip(&private.parse::<IpAddr>().unwrap()), "{private}");
+        }
+        for public in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
+            assert!(!is_private_ip(&public.parse::<IpAddr>().unwrap()), "{public}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_ds_self_resolves_without_network() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/nonexistent_resolver_test")
+            .expect("lazy pool");
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:ds1.test".to_string(),
+            "https://ds1.test".to_string(),
+            None,
+            3600,
+        );
+        let endpoint = resolver
+            .resolve_authoritative_ds("did:web:ds1.test")
+            .await
+            .expect("self authoritative resolution succeeds");
+        assert_eq!(endpoint.did, "did:web:ds1.test");
+        assert_eq!(endpoint.endpoint, "https://ds1.test");
+        assert!(endpoint.federation_capabilities.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_ds_never_trusts_generic_cache() {
+        let (pool, _db) = setup_cache_test_pool().await;
+        let resolver = DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            "did:web:ds1.test".to_string(),
+            "https://ds1.test".to_string(),
+            None,
+            3600,
+        );
+        let user_did = format!("did:key:{}", Uuid::new_v4().as_simple());
+        resolver
+            .cache_endpoint(&DsEndpoint {
+                did: user_did.clone(),
+                endpoint: "https://attacker.evil.com".to_string(),
+                supported_cipher_suites: None,
+                federation_capabilities: None,
+            })
+            .await
+            .expect("cache insert");
+        match resolver.resolve_authoritative_ds(&user_did).await {
+            Ok(ep) => panic!("authoritative resolution must not return cached row: {ep:?}"),
+            Err(e) => assert!(matches!(
+                e,
+                FederationError::Unsupported(_) | FederationError::ResolutionFailed { .. }
+            )),
+        }
     }
 }

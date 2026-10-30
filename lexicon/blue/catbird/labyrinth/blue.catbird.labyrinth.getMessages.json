@@ -1,0 +1,104 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.getMessages",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Direct lookup by message id: the batches of one thread holding an item whose messageId is one of messageIds, in server seq order, filtered to those sealed under a MEK the caller wrote or received (the same per-MEK authorization as listBatches). A batch is returned whole; redacted items appear as stored (empty signedEncMessage plus redaction). Ids reused by several authors ([CB-31]) match every author's batch. Thread endpoint on the conversation's sequencer DS. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "threadId",
+          "messageIds"
+        ],
+        "properties": {
+          "threadId": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Conversation id."
+          },
+          "messageIds": {
+            "type": "array",
+            "minLength": 1,
+            "maxLength": 100,
+            "items": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "Message ids to look up (1 to 100)."
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Opaque cursor from the previous page."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Page size (at most 100)."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "items"
+          ],
+          "properties": {
+            "items": {
+              "type": "array",
+              "maxLength": 100,
+              "items": {
+                "type": "ref",
+                "ref": "#authoredView"
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "Opaque cursor from the previous page."
+            }
+          },
+          "description": "One page of results."
+        }
+      },
+      "errors": [
+        {
+          "name": "NotRecipient"
+        }
+      ]
+    },
+    "authoredView": {
+      "type": "object",
+      "required": [
+        "author",
+        "rkey",
+        "record",
+        "order"
+      ],
+      "properties": {
+        "author": {
+          "type": "string",
+          "format": "did",
+          "description": "Author DID."
+        },
+        "rkey": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Record key."
+        },
+        "record": {
+          "type": "unknown",
+          "description": "The record."
+        },
+        "order": {
+          "type": "ref",
+          "ref": "blue.catbird.labyrinth.defs#serverOrder"
+        }
+      }
+    }
+  }
+}

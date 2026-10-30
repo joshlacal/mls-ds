@@ -26,6 +26,14 @@ const ENDPOINT: ChatEndpoint = ChatEndpoint::UpdatePushToken;
 #[derive(Deserialize)]
 struct UpdatePushTokenBody {
     token: Option<String>,
+    #[serde(default, deserialize_with = "present_registration")]
+    registration: Option<catbird_atproto::blue_catbird::chat::SignedPushRegistration>,
+}
+
+fn present_registration<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<catbird_atproto::blue_catbird::chat::SignedPushRegistration>, D::Error> {
+    catbird_atproto::blue_catbird::chat::SignedPushRegistration::deserialize(deserializer).map(Some)
 }
 
 pub(super) async fn handle(
@@ -51,11 +59,53 @@ async fn update_push_token(
     let principal = context::verify_service_principal(pool, ENDPOINT, headers).await?;
 
     let parsed: UpdatePushTokenBody = if body.is_empty() {
-        UpdatePushTokenBody { token: None }
+        UpdatePushTokenBody {
+            token: None,
+            registration: None,
+        }
     } else {
         serde_json::from_slice(body)
             .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?
     };
+
+    if let Some(registration) = parsed.registration {
+        for name in ["x-catbird-chat-device-id", "x-catbird-device-id"] {
+            let values: Vec<_> = headers.get_all(name).iter().collect();
+            if values.len() > 1
+                || values.first().is_some_and(|value| {
+                    value.to_str().ok() != Some(registration.body.actor_device_id.as_str())
+                })
+            {
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::InvalidRequest,
+                ));
+            }
+        }
+        let (view, binding) = crate::chat_protocol::repository::push_binding::register(
+            pool,
+            principal.did(),
+            registration,
+            parsed.token.as_deref(),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::chat_protocol::repository::push_binding::PushBindingError::Protocol(code) => {
+                ChatFailure::protocol(ENDPOINT, code)
+            }
+            crate::chat_protocol::repository::push_binding::PushBindingError::Database(_) => {
+                ChatFailure::storage(ENDPOINT)
+            }
+            crate::chat_protocol::repository::push_binding::PushBindingError::Invariant => {
+                ChatFailure::invariant(ENDPOINT)
+            }
+        })?;
+        let bytes = serde_json::to_vec(
+            &json!({"device":device_view_from_directory(&view),"pushBinding":binding}),
+        )
+        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+        return Ok(context::json_ok(bytes));
+    }
 
     if let Some(tok) = &parsed.token {
         if tok.is_empty()
@@ -118,6 +168,21 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn present_null_or_malformed_registration_never_uses_legacy_clear() {
+        for payload in [
+            r#"{"registration":null}"#,
+            r#"{"registration":{}}"#,
+            r#"{"registration":false}"#,
+        ] {
+            assert!(serde_json::from_str::<UpdatePushTokenBody>(payload).is_err());
+        }
+        assert!(serde_json::from_str::<UpdatePushTokenBody>("{}")
+            .unwrap()
+            .registration
+            .is_none());
     }
 
     #[test]

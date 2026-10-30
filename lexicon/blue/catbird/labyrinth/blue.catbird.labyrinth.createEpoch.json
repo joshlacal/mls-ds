@@ -1,0 +1,77 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.createEpoch",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Atomically create an epoch and its initial members, and record its head in the epoch-head directory. The head must recompute, its selfSig (XEdDSA by signingPubkey) must verify, it must be attested by the calling chat device's own key, and a later epoch's prevSig must verify under the previous epoch's signingPubkey. The epoch number is the race guard between devices ([CB-9]). Mailbox endpoint: the caller is a chat device of the mailbox owner; every call reads or writes the caller DID's own mailbox. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "epoch",
+            "members"
+          ],
+          "properties": {
+            "epoch": {
+              "type": "unknown",
+              "description": "A blue.catbird.labyrinth.epoch record."
+            },
+            "members": {
+              "type": "array",
+              "maxLength": 256,
+              "items": {
+                "type": "unknown",
+                "description": "A blue.catbird.labyrinth.epochMember record."
+              }
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "epochId",
+            "epochNumber"
+          ],
+          "properties": {
+            "epochId": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "Backend-assigned epochID."
+            },
+            "epochNumber": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1099511627776,
+              "description": "The epoch's number."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "RecordAlreadyExists"
+        },
+        {
+          "name": "InvalidEpochChain"
+        },
+        {
+          "name": "AttestationNotCurrent"
+        },
+        {
+          "name": "LabyrinthDeviceNotBound"
+        },
+        {
+          "name": "MemberDeviceNotRegistered"
+        },
+        {
+          "name": "AttestationNotCaller"
+        }
+      ]
+    }
+  }
+}

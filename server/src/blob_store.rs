@@ -348,6 +348,19 @@ impl BlobStore {
         Ok(())
     }
 
+    /// Read the stored object at `object_store_key` as the repository
+    /// committed it (route-test objects included). Callers verify size and
+    /// digest against their own commitment.
+    pub async fn get_committed(&self, object_store_key: &str) -> Result<Vec<u8>, BlobStoreError> {
+        if let Some(objects) = &self.route_test_objects {
+            return objects
+                .get(object_store_key)
+                .map(|object| object.data.clone())
+                .ok_or(BlobStoreError::NotFound);
+        }
+        self.get(object_store_key).await
+    }
+
     #[instrument(skip(self))]
     pub async fn get(&self, blob_id: &str) -> Result<Vec<u8>, BlobStoreError> {
         let resp = self

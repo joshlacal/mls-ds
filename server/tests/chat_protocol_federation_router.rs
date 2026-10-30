@@ -12987,3 +12987,20 @@ async fn test_reconciliation_mismatched_accepted_payload_sha256_overlap_fails_be
     )
     .await;
 }
+
+// Encrypted-requests: transcript.rs test modules reference read_projection.
+mod chat_protocol {
+    pub mod read_projection {
+        pub struct DummyCanonical;
+        impl DummyCanonical {
+            pub fn bytes(&self) -> &[u8] { &[] }
+        }
+        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
+            _value: &T,
+            _schema: &str,
+        ) -> Result<DummyCanonical, String> {
+            Ok(DummyCanonical)
+        }
+    }
+}
+
