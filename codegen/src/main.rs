@@ -40,6 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if patched > 0 {
         println!("  Gave {patched} schemaless application/json output(s) raw-byte codecs");
     }
+    let renamed = disambiguate_union_variants(&args.outdir)?;
+    if renamed > 0 {
+        println!("  Renamed {renamed} colliding union variant(s) by their NSID");
+    }
 
     println!("✓ Code generation complete!");
     Ok(())
@@ -339,6 +343,188 @@ fn raw_output_codecs(output: &str) -> String {
     )
 }
 
+const SERDE_RENAME_PREFIX: &str = "#[serde(rename = \"";
+
+/// Jacquard names a union variant that refers to another lexicon's `main`
+/// definition after the last NSID segment, and only disambiguates collisions
+/// for refs outside the current two-segment namespace. A union inside
+/// `com.atproto` whose arms are `com.atproto.personalspace.policy`,
+/// `com.atproto.memberspace.policy` and `com.atproto.managedspace.policy`
+/// therefore gets three variants named `Policy`, which does not compile.
+/// Prefix each colliding variant with the NSID segment before the one Jacquard
+/// used (`PersonalspacePolicy`, ...). The serde tag, and so the wire format,
+/// is unchanged. Returns how many variants were renamed; a second run renames
+/// none.
+fn disambiguate_union_variants(outdir: &Path) -> io::Result<usize> {
+    let mut files = Vec::new();
+    collect_files_with_extension(outdir, "rs", &mut files)?;
+    let mut renamed = 0usize;
+    for file in files {
+        let source = fs::read_to_string(&file)?;
+        let (rewritten, count) = disambiguate_union_variant_source(&source).map_err(|reason| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {reason}", file.display()),
+            )
+        })?;
+        if count > 0 {
+            fs::write(&file, rewritten)?;
+            renamed += count;
+        }
+    }
+    Ok(renamed)
+}
+
+struct TaggedVariant {
+    tag: String,
+    ident: String,
+    ident_start: usize,
+}
+
+fn disambiguate_union_variant_source(source: &str) -> Result<(String, usize), String> {
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut search = 0usize;
+    while let Some(found) = source[search..].find("pub enum ") {
+        let name_start = search + found + "pub enum ".len();
+        let name_len = source[name_start..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(source.len() - name_start);
+        let enum_name = &source[name_start..name_start + name_len];
+        let Some(open) = source[name_start..].find('{').map(|i| name_start + i) else {
+            break;
+        };
+        let close =
+            matching_brace(source, open).ok_or_else(|| format!("unterminated enum {enum_name}"))?;
+        let variants = tagged_variants(source, open, close);
+        search = close;
+
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for variant in &variants {
+            *counts.entry(variant.ident.as_str()).or_default() += 1;
+        }
+        if counts.values().all(|count| *count == 1) {
+            continue;
+        }
+
+        let mut final_names: HashSet<String> = HashSet::new();
+        let mut planned = Vec::new();
+        for variant in &variants {
+            let name = if counts[variant.ident.as_str()] > 1 {
+                let nsid = variant.tag.split('#').next().unwrap_or_default();
+                let segments: Vec<&str> = nsid.split('.').collect();
+                if segments.len() < 2 {
+                    return Err(format!(
+                        "cannot disambiguate {enum_name}::{} for tag {:?}",
+                        variant.ident, variant.tag
+                    ));
+                }
+                let qualifier = pascal_case(segments[segments.len() - 2]);
+                planned.push((
+                    variant.ident_start,
+                    variant.ident.clone(),
+                    qualifier.clone(),
+                ));
+                format!("{qualifier}{}", variant.ident)
+            } else {
+                variant.ident.clone()
+            };
+            if !final_names.insert(name.clone()) {
+                return Err(format!(
+                    "union variant {enum_name}::{name} still collides after disambiguation"
+                ));
+            }
+        }
+        for ident in counts
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(ident, _)| ident)
+        {
+            let path = format!("{enum_name}::{ident}");
+            if source.contains(&path) {
+                return Err(format!(
+                    "ambiguous variant reference {path} in generated code"
+                ));
+            }
+        }
+        for (start, ident, qualifier) in planned {
+            replacements.push((start, start + ident.len(), format!("{qualifier}{ident}")));
+        }
+    }
+
+    if replacements.is_empty() {
+        return Ok((source.to_string(), 0));
+    }
+    let count = replacements.len();
+    let mut out = String::with_capacity(source.len() + count * 16);
+    let mut cursor = 0usize;
+    for (start, end, replacement) in replacements {
+        out.push_str(&source[cursor..start]);
+        out.push_str(&replacement);
+        cursor = end;
+    }
+    out.push_str(&source[cursor..]);
+    Ok((out, count))
+}
+
+fn matching_brace(source: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, c) in source[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `#[serde(rename = "tag")] Ident(` variants between `open` and `close`.
+fn tagged_variants(source: &str, open: usize, close: usize) -> Vec<TaggedVariant> {
+    let mut variants = Vec::new();
+    let mut cursor = open;
+    while let Some(found) = source[cursor..close].find(SERDE_RENAME_PREFIX) {
+        let tag_start = cursor + found + SERDE_RENAME_PREFIX.len();
+        let Some(tag_len) = source[tag_start..close].find('"') else {
+            break;
+        };
+        let tag = &source[tag_start..tag_start + tag_len];
+        let after_attr = tag_start + tag_len;
+        cursor = after_attr;
+        let Some(attr_end) = source[after_attr..close].find(")]") else {
+            break;
+        };
+        let rest = &source[after_attr + attr_end + 2..close];
+        let ident_start = after_attr + attr_end + 2 + (rest.len() - rest.trim_start().len());
+        let ident_len = source[ident_start..close]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(0);
+        let ident = &source[ident_start..ident_start + ident_len];
+        if ident.is_empty() || !source[ident_start + ident_len..close].starts_with('(') {
+            continue;
+        }
+        variants.push(TaggedVariant {
+            tag: tag.to_string(),
+            ident: ident.to_string(),
+            ident_start,
+        });
+        cursor = ident_start + ident_len;
+    }
+    variants
+}
+
+fn pascal_case(segment: &str) -> String {
+    let mut chars = segment.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 fn validate_union_value(
     value: &Value,
     current_document: &PreflightDocument,
@@ -633,6 +819,7 @@ fn normalize_raw_byte_body_schema(body: &mut serde_json::Map<String, Value>) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::disambiguate_union_variants;
     use super::load_preflight_documents;
     use super::normalize_lexicon_dirs;
     use super::normalize_raw_byte_xrpc_bodies;
@@ -1261,5 +1448,55 @@ mod tests {
         ));
         assert_eq!(first, 0);
         assert!(!generated.contains("fn decode_output"));
+    }
+
+    #[test]
+    fn colliding_main_union_arms_get_nsid_qualified_variants() {
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        for (relative, id) in [
+            ("first.json", "blue.catbird.alpha.policy"),
+            ("second.json", "blue.catbird.beta.policy"),
+        ] {
+            write_lexicon_at(
+                fixture.path(),
+                relative,
+                &json!({ "lexicon": 1, "id": id, "defs": { "main": object_definition() } }),
+            );
+        }
+        write_lexicon_at(
+            fixture.path(),
+            "holder.json",
+            &json!({
+                "lexicon": 1,
+                "id": "blue.catbird.holder",
+                "defs": { "main": {
+                    "type": "object",
+                    "required": ["policy"],
+                    "properties": { "policy": {
+                        "type": "union",
+                        "refs": ["blue.catbird.alpha.policy", "blue.catbird.beta.policy"]
+                    } }
+                } }
+            }),
+        );
+        let corpus = LexiconCorpus::load_from_dir(fixture.path()).expect("load fixture corpus");
+        let output = tempfile::tempdir().expect("generated output tempdir");
+        CodeGenerator::new(&corpus, "crate::generated")
+            .write_to_disk(output.path())
+            .expect("generate fixture corpus");
+        let path = output.path().join("blue_catbird/holder.rs");
+        let before = fs::read_to_string(&path).expect("read generated holder");
+        let compact: String = before.split_whitespace().collect();
+        assert_eq!(compact.matches("Policy(Box<").count(), 2, "{before}");
+
+        let first = disambiguate_union_variants(output.path()).expect("rename variants");
+        let second = disambiguate_union_variants(output.path()).expect("rename again");
+        assert_eq!((first, second), (2, 0));
+        let after: String = fs::read_to_string(&path)
+            .expect("read patched holder")
+            .split_whitespace()
+            .collect();
+        assert!(after.contains("#[serde(rename=\"blue.catbird.alpha.policy\")]AlphaPolicy(Box<"));
+        assert!(after.contains("#[serde(rename=\"blue.catbird.beta.policy\")]BetaPolicy(Box<"));
     }
 }
