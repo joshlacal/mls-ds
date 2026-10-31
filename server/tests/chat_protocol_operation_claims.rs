@@ -309,7 +309,6 @@ fn completeness_activation_drains_writers_and_preserves_only_bounded_legacy_orph
         relative_writer_paths,
         [
             Path::new("src/chat_protocol/repository/auth.rs").to_path_buf(),
-            Path::new("src/chat_protocol/repository/blobs.rs").to_path_buf(),
             Path::new("src/chat_protocol/repository/prelude.rs").to_path_buf(),
         ]
         .into_iter()
@@ -327,30 +326,11 @@ fn completeness_activation_drains_writers_and_preserves_only_bounded_legacy_orph
         .collect::<BTreeSet<_>>();
     assert_eq!(
         claim_writer_paths,
-        [
-            Path::new("src/chat_protocol/repository/blobs.rs").to_path_buf(),
-            Path::new("src/chat_protocol/repository/prelude.rs").to_path_buf(),
-        ]
-        .into_iter()
-        .collect(),
-        "only the shared prelude and cfg(test) compatibility fixture may insert claims"
+        [Path::new("src/chat_protocol/repository/prelude.rs").to_path_buf()]
+            .into_iter()
+            .collect(),
+        "only the shared prelude may insert claims"
     );
-    let blob_source =
-        std::fs::read_to_string(source_root.join("chat_protocol/repository/blobs.rs"))
-            .expect("read blob repository");
-    let blob_test_module = blob_source
-        .find("#[cfg(test)]\nmod tests")
-        .expect("blob compatibility writers must remain in a cfg(test) module");
-    for writer in [
-        "INSERT INTO chat.operation_claims",
-        "INSERT INTO chat.idempotency_records",
-    ] {
-        assert!(
-            !blob_source[..blob_test_module].contains(writer)
-                && blob_source[blob_test_module..].contains(writer),
-            "blob compatibility writer must remain test-only: {writer}"
-        );
-    }
 
     let auth_source = std::fs::read_to_string(source_root.join("chat_protocol/repository/auth.rs"))
         .expect("read authentication repository");

@@ -31,7 +31,6 @@ use tower_util::ServiceExt;
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
-    blob_store: catbird_server::blob_store::BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -43,12 +42,6 @@ impl FromRef<TestState> for DbPool {
 impl FromRef<TestState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestState) -> Self {
         state.runtime.clone()
-    }
-}
-
-impl FromRef<TestState> for catbird_server::blob_store::BlobStore {
-    fn from_ref(state: &TestState) -> Self {
-        state.blob_store.clone()
     }
 }
 
@@ -89,11 +82,7 @@ fn router() -> Router {
         .max_connections(1)
         .connect_lazy("postgres://127.0.0.1/param_validation_test")
         .expect("lazy pool");
-    chat_router::<TestState>().with_state(TestState {
-        pool,
-        runtime,
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
-    })
+    chat_router::<TestState>().with_state(TestState { pool, runtime })
 }
 
 async fn get_uri(uri: &str) -> (StatusCode, Value) {
@@ -583,137 +572,31 @@ async fn get_conversation_state_rejects_bogus_key() {
 }
 
 // =========================================================================
-// 8. getBlob
+// 8. Retired server-hosted blob endpoints return 404 NotFound (Clean-Slate G6)
 // =========================================================================
 
 #[tokio::test]
-async fn get_blob_accepts_full_lexicon_params() {
-    let (status, body) = get_uri(&format!(
-        "/xrpc/blue.catbird.chat.getBlob?actorDeviceId={VALID_DEVICE_ID}&blobId={VALID_BLOB_ID}"
-    ))
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "NotAuthorized");
-}
-
-#[tokio::test]
-async fn get_blob_rejects_missing_actor_device_id() {
-    let (status, body) = get_uri(&format!(
-        "/xrpc/blue.catbird.chat.getBlob?blobId={VALID_BLOB_ID}"
-    ))
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "InvalidRequest");
-}
-
-#[tokio::test]
-async fn get_blob_rejects_missing_blob_id() {
-    let (status, body) = get_uri(&format!(
-        "/xrpc/blue.catbird.chat.getBlob?actorDeviceId={VALID_DEVICE_ID}"
-    ))
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "InvalidRequest");
-}
-
-#[tokio::test]
-async fn get_blob_rejects_bogus_key() {
-    let (status, body) = get_uri(&format!(
-        "/xrpc/blue.catbird.chat.getBlob?actorDeviceId={VALID_DEVICE_ID}&blobId={VALID_BLOB_ID}&other=123"
-    ))
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "InvalidRequest");
-}
-
-// =========================================================================
-// 9. getBlobUsage
-// =========================================================================
-
-#[tokio::test]
-async fn get_blob_usage_accepts_full_lexicon_params() {
-    let (status, body) = get_uri(&format!(
-        "/xrpc/blue.catbird.chat.getBlobUsage?actorDeviceId={VALID_DEVICE_ID}"
-    ))
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "NotAuthorized");
-}
-
-#[tokio::test]
-async fn get_blob_usage_rejects_missing_actor_device_id() {
-    let (status, body) = get_uri("/xrpc/blue.catbird.chat.getBlobUsage").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "InvalidRequest");
-}
-
-#[tokio::test]
-async fn get_blob_usage_rejects_bogus_key() {
-    let (status, body) = get_uri(&format!(
-        "/xrpc/blue.catbird.chat.getBlobUsage?actorDeviceId={VALID_DEVICE_ID}&extra=1"
-    ))
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "InvalidRequest");
-}
-
-// =========================================================================
-// 10. uploadBlob
-// =========================================================================
-
-#[tokio::test]
-async fn upload_blob_accepts_full_lexicon_params() {
+async fn retired_blob_endpoints_return_404_not_found() {
+    for uri in [
+        format!(
+            "/xrpc/blue.catbird.chat.getBlob?actorDeviceId={VALID_DEVICE_ID}&blobId={VALID_BLOB_ID}"
+        ),
+        format!("/xrpc/blue.catbird.chat.getBlobUsage?actorDeviceId={VALID_DEVICE_ID}"),
+    ] {
+        let (status, _) = get_uri(&uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "URI {uri} must 404");
+    }
     let ticket = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let (status, body) = post_uri(
-        &format!(
+    for uri in [
+        format!(
             "/xrpc/blue.catbird.chat.uploadBlob?actorDeviceId={VALID_DEVICE_ID}&uploadTicket={ticket}"
         ),
-        Some("application/octet-stream"),
-        vec![0x42; 10],
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "NotAuthorized");
-}
-
-#[tokio::test]
-async fn upload_blob_rejects_missing_actor_device_id() {
-    let ticket = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let (status, body) = post_uri(
-        &format!("/xrpc/blue.catbird.chat.uploadBlob?uploadTicket={ticket}"),
-        Some("application/octet-stream"),
-        vec![0x42; 10],
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "InvalidRequest");
-}
-
-#[tokio::test]
-async fn upload_blob_rejects_missing_upload_ticket() {
-    let (status, body) = post_uri(
-        &format!("/xrpc/blue.catbird.chat.uploadBlob?actorDeviceId={VALID_DEVICE_ID}"),
-        Some("application/octet-stream"),
-        vec![0x42; 10],
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "InvalidRequest");
-}
-
-#[tokio::test]
-async fn upload_blob_rejects_bogus_key() {
-    let ticket = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let (status, body) = post_uri(
-        &format!(
-            "/xrpc/blue.catbird.chat.uploadBlob?actorDeviceId={VALID_DEVICE_ID}&uploadTicket={ticket}&bogus=1"
-        ),
-        Some("application/octet-stream"),
-        vec![0x42; 10],
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "InvalidRequest");
+        "/xrpc/blue.catbird.chat.prepareBlobUpload".to_string(),
+        "/xrpc/blue.catbird.chat.deleteBlob".to_string(),
+    ] {
+        let (status, _) = post_uri(&uri, Some("application/octet-stream"), vec![0x42; 10]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "URI {uri} must 404");
+    }
 }
 
 // =========================================================================

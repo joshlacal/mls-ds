@@ -35,8 +35,8 @@
           },
           "encryptedEntropy": {
             "type": "bytes",
-            "description": "labyrinth_hpke(epochStorageKey, openerAuth, distPsk, 'epoch__'||seq, entropy); present for devices that carried over when the epoch opened.",
-            "maxLength": 128
+            "description": "hawk_encrypt_auth(epochStorageKey, openerAuth, distPsk, 'epoch__'||seq, entropy) (1,169 bytes, I16); present for devices that carried over when the epoch opened.",
+            "maxLength": 1200
           },
           "createdAt": {
             "type": "string",

@@ -31,6 +31,10 @@
             "entry": {
               "type": "ref",
               "ref": "blue.catbird.chat.defs#applicationEntry"
+            },
+            "sequencerReceipt": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#sequencerReceipt"
             }
           }
         }

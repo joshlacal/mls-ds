@@ -597,10 +597,10 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
         };
         sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,direct_did_low,direct_did_high,created_at,protocol_version) VALUES($1,'direct','active',0,1,2,$2,$3,$4,'2')")
             .bind(convo).bind(low).bind(high).bind(now).execute(&mut **tx).await?;
-        crate::labyrinth::repo::space::initialize_from_environment(&mut **tx, convo, false).await?;
     }
     sqlx::query("INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,$2,$3,'active',$4,$5,1,$6,$7)")
         .bind(convo).bind(generation).bind(next.group_id().as_slice()).bind(&genesis_info).bind(binary(&a["genesisGroupInfo"]["sha256"])?).bind(seq).bind(now).execute(&mut **tx).await?;
+    super::transition::register_conversation_space_if_migrated(&mut **tx, convo, generation, now).await?;
     sqlx::query("INSERT INTO chat.generation_states(conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,lifecycle,state_kind,producing_transition_id,public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,leaf_count,created_at) VALUES($1,$2,1,$3,1,$4,$5,'active','directRequestPublication',$6,$7,$8,$9,$10,$11,$12)")
         .bind(convo).bind(generation).bind(next.group_id().as_slice()).bind(next.group_context_hash().as_slice()).bind(next.confirmation_tag().as_slice()).bind(request).bind(final_state.snapshot()).bind(final_state.snapshot_sha256().as_slice()).bind(tree.bytes()).bind(tree.sha256().as_slice()).bind(final_state.binding().tree_summary().leaves().len() as i64).bind(now).execute(&mut **tx).await?;
     let metadata_id = Uuid::new_v4();

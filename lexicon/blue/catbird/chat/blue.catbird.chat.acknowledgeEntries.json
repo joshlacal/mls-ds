@@ -1,0 +1,121 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.acknowledgeEntries",
+  "description": "Device-signed post-commit acknowledgment of delivered entries up to upToSeq by an active leaf device. Once all active non-dormant leaf devices acknowledge an applicationMessageEntry, mls-ds prunes accepted_payload_bytes to NULL while preserving seq contiguity and all MLS control entries.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "conversationId",
+            "generation",
+            "actorDeviceId",
+            "keyId",
+            "authGeneration",
+            "upToSeq",
+            "signedAt",
+            "signature"
+          ],
+          "properties": {
+            "conversationId": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#operationId"
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "actorDeviceId": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#deviceId"
+            },
+            "keyId": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#keyId"
+            },
+            "authGeneration": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "upToSeq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "signedAt": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#canonicalDatetime"
+            },
+            "signature": {
+              "type": "bytes",
+              "minLength": 64,
+              "maxLength": 64
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "acknowledgedSeq",
+            "prunedCount"
+          ],
+          "properties": {
+            "acknowledgedSeq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "prunedCount": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "ConversationNotFound"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "DeviceNotLeaf"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        }
+      ]
+    }
+  }
+}

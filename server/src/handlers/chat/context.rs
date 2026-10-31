@@ -154,10 +154,7 @@ pub(crate) async fn admit_unsigned_read(
     let authority = auth::authorize_unsigned_request(pool, pre_replay)
         .await
         .map_err(|error| auth_repository_failure(endpoint, error))?;
-    dpop::seal_read_admission(authority).map_err(|error| {
-        tracing::error!(endpoint = endpoint.nsid(), ?error, "clean-chat read admission seal failed");
-        ChatFailure::invariant(endpoint)
-    })
+    dpop::seal_read_admission(authority).map_err(|_| ChatFailure::invariant(endpoint))
 }
 /// Byte-opaque operation-only admission for an ordinary signed procedure.
 /// Global operation arbitration in the caller-owned transaction decides
@@ -501,8 +498,6 @@ mod tests {
             ChatEndpoint::RequestLeave,
             ChatEndpoint::CancelLeave,
             ChatEndpoint::CancelLeafRecovery,
-            ChatEndpoint::PrepareBlobUpload,
-            ChatEndpoint::DeleteBlob,
         ];
 
         for endpoint in endpoints {

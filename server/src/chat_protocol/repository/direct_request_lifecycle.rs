@@ -73,15 +73,7 @@ pub(crate) async fn enforce_ordinary_mutation(
     };
     let id = match conversation_id(&body) {
         Some(id) => Some(id),
-        None if mutation.kind() == SignedMutationKind::BlobDeletion => match body.get("blobId") {
-            Some(CanonicalValueRef::Uuid(id)) => {
-                sqlx::query_scalar("SELECT conversation_id FROM chat.blob_bindings WHERE blob_id=$1")
-                    .bind(Uuid::from_bytes(*id.as_bytes()))
-                    .fetch_optional(&mut **tx)
-                    .await?
-            }
-            _ => return Err(PreludeError::DirectRequestConsentRequired),
-        },
+        None if mutation.kind() == SignedMutationKind::BlobDeletion => None,
         None if mutation.kind() == SignedMutationKind::LeafRecoveryCancellation => {
             match body.get("recoveryRequestId") {
                 Some(CanonicalValueRef::Uuid(id)) => sqlx::query_scalar("SELECT conversation_id FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1")

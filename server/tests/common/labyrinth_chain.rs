@@ -61,15 +61,34 @@ pub fn epoch_public(
     prev: Option<Link>,
     prev_signer: Option<[u8; 32]>,
 ) -> (Value, Link) {
-    let did = &attester.did;
-    let auth = [n as u8 ^ 0x21; 32];
-    let enc = vec![n as u8 ^ 0x42; 1216];
+    epoch_public_for_key(
+        &attester.did,
+        &attester.chat_key,
+        n,
+        signing_seed,
+        prev,
+        prev_signer,
+    )
+}
+
+pub fn epoch_public_for_key(
+    did: &str,
+    chat_key: &ed25519_dalek::SigningKey,
+    n: u64,
+    signing_seed: [u8; 32],
+    prev: Option<Link>,
+    prev_signer: Option<[u8; 32]>,
+) -> (Value, Link) {
+    let auth = [n as u8 ^ signing_seed[0] ^ 0x21; 32];
+    let enc = vec![n as u8 ^ signing_seed[0] ^ 0x42; 1216];
     let signing = xpub(signing_seed);
+    let members_hash = [n as u8 ^ signing_seed[0] ^ 0x55; 32];
     let head = compute_epoch_head(
         n,
         &auth,
         &enc,
         &signing,
+        &members_hash,
         prev.as_ref().map(|p| &p.head),
         did,
     );
@@ -81,16 +100,18 @@ pub fn epoch_public(
         ]
         .concat(),
     );
+    let chat_pub = chat_key.verifying_key().to_bytes();
     let mut v = serde_json::json!({
         "epochNumber": n,
         "authPubkey": b(&auth),
         "encryptionPubkey": b(&enc),
         "signingPubkey": b(&signing),
+        "membersHash": b(&members_hash),
         "epochHead": b(&head),
         "selfSig": b(&self_sig),
         "attestation": {
-            "transportPubkey": b(&attester.chat_pub()),
-            "sig": b(&attester.chat_key.sign(&attestation_message(did, &head)).to_bytes()),
+            "transportPubkey": b(&chat_pub),
+            "sig": b(&chat_key.sign(&attestation_message(did, &head)).to_bytes()),
         },
     });
     if let Some(p) = prev {

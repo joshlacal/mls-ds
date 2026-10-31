@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use super::{blobs, delivery, prelude::ScopeBoundBusinessAuthority};
+use super::{delivery, prelude::ScopeBoundBusinessAuthority};
 use crate::chat_protocol::{
     relationship_policy::{PublicTransport, RelationshipAuthority},
     state_machine::HydrationAuthority,
@@ -384,22 +384,11 @@ fn validate_application_message(
     Ok(())
 }
 
-struct PendingAttachment {
-    blob_id: Uuid,
-    ciphertext_sha256: Vec<u8>,
-    ciphertext_size: i64,
-    uploaded_at: DateTime<Utc>,
-    unbound_expires_at: DateTime<Utc>,
-    plaintext_size: i64,
-}
-
-async fn validate_artifacts(
-    tx: &mut Transaction<'_, Postgres>,
+fn validate_artifacts(
     projection: &transcript::ApplicationSendProjection<'_>,
     coordinate: Coordinate,
     message_id: Uuid,
-    scope: &ScopeBoundBusinessAuthority,
-) -> Result<Option<PendingAttachment>, MessageDeliveryError> {
+) -> Result<(), MessageDeliveryError> {
     let aad = projection.aad();
     let aad_conversation = match aad.get("conversationId") {
         Some(CanonicalValueRef::Bytes(v)) if v.len() == 16 => {
@@ -446,43 +435,10 @@ async fn validate_artifacts(
     {
         return Err(MessageDeliveryError::InvalidApplicationMessage);
     }
-    let bindings = projection.blob_bindings();
-    if bindings.len() > 1 {
-        return Err(MessageDeliveryError::InvalidApplicationMessage);
-    }
-    let Some(CanonicalValueRef::Object(binding)) = bindings.get(0) else {
-        return Ok(None);
-    };
-    let blob_id = uuid(binding.get("blobId"))?;
-    let hash = match binding.get("ciphertextSha256") {
-        Some(CanonicalValueRef::Bytes(v)) if v.len() == 32 => v.to_vec(),
-        _ => return Err(MessageDeliveryError::InvalidApplicationMessage),
-    };
-    let size = integer(binding.get("ciphertextSize"))?;
-    if !(17..=blobs::MAX_CIPHERTEXT_BYTES).contains(&size)
-        || !matches!(
-            binding.get("purpose"),
-            Some(CanonicalValueRef::Text("attachment"))
-        )
-    {
-        return Err(MessageDeliveryError::InvalidApplicationMessage);
-    }
-    let row = sqlx::query("SELECT ciphertext_sha256, ciphertext_size, plaintext_size, uploaded_at, unbound_expires_at FROM chat.blobs WHERE blob_id=$1 AND owner_did=$2 AND owner_device_id=$3 AND purpose='attachment' AND status='completedUnbound' FOR UPDATE")
-        .bind(blob_id).bind(scope.actor_did()).bind(scope.actor_device_id()).fetch_optional(&mut **tx).await?.ok_or(MessageDeliveryError::BlobNotFound)?;
-    let stored_hash: Vec<u8> = row.try_get("ciphertext_sha256")?;
-    let stored_size: i64 = row.try_get("ciphertext_size")?;
-    let expires: DateTime<Utc> = row.try_get("unbound_expires_at")?;
-    if stored_hash != hash || stored_size != size || expires <= scope.trusted_instant() {
+    if !projection.blob_bindings().is_empty() {
         return Err(MessageDeliveryError::BlobNotFound);
     }
-    Ok(Some(PendingAttachment {
-        blob_id,
-        ciphertext_sha256: hash,
-        ciphertext_size: size,
-        uploaded_at: row.try_get("uploaded_at")?,
-        unbound_expires_at: expires,
-        plaintext_size: row.try_get("plaintext_size")?,
-    }))
+    Ok(())
 }
 
 fn verified_mutation(
@@ -524,7 +480,7 @@ pub(crate) async fn send<T: PublicTransport>(
     require_relationship_policy(tx, scope, head.coordinate, relationship_authority).await?;
     let message_id = Uuid::from_bytes(*projection.message_id().as_bytes());
     validate_application_message(&projection)?;
-    let attachment = validate_artifacts(tx, &projection, expected, message_id, &scope).await?;
+    validate_artifacts(&projection, expected, message_id)?;
     let entry_id = CanonicalUuidV4::parse(&Uuid::new_v4().to_string())
         .map_err(|_| MessageDeliveryError::Invariant)?;
     let conversation_id = CanonicalUuidV4::parse(&expected.conversation_id.to_string())
@@ -625,46 +581,6 @@ pub(crate) async fn send<T: PublicTransport>(
                 tracing::error!(?e, "failed to enqueue clean federation message jobs");
                 MessageDeliveryError::Invariant
             })?;
-    }
-    if let Some(attachment) = attachment {
-        let descriptor_bytes = projection.application_message().canonical_dag_cbor();
-        let aad_bytes = projection.aad().canonical_dag_cbor();
-        let descriptor_sha256: [u8; 32] = Sha256::digest(&descriptor_bytes).into();
-        let aad_sha256: [u8; 32] = Sha256::digest(&aad_bytes).into();
-        blobs::bind_application_blob(
-            tx,
-            &blobs::NewBlobBinding {
-                blob_id: attachment.blob_id,
-                binding_kind: blobs::BindingKind::Application,
-                conversation_id: expected.conversation_id,
-                entry_seq: Some(i64::try_from(seq).map_err(|_| MessageDeliveryError::Invariant)?),
-                message_id: Some(message_id),
-                metadata_origin_transition_id: None,
-                metadata_version: None,
-                owner_did: scope.actor_did().to_owned(),
-                owner_device_id: scope.actor_device_id(),
-                descriptor_bytes,
-                descriptor_sha256: descriptor_sha256.to_vec(),
-                aad_bytes,
-                aad_sha256: aad_sha256.to_vec(),
-                ciphertext_sha256: attachment.ciphertext_sha256,
-                plaintext_size: attachment.plaintext_size,
-                ciphertext_size: attachment.ciphertext_size,
-                purpose: blobs::BlobPurpose::Attachment,
-                bound_at: scope.trusted_instant(),
-                uploaded_at: attachment.uploaded_at,
-                unbound_expires_at: attachment.unbound_expires_at,
-            },
-        )
-        .await
-        .map_err(|error| match error {
-            blobs::BlobRepositoryError::Database(error) => MessageDeliveryError::Database(error),
-            blobs::BlobRepositoryError::BindingConflict
-            | blobs::BlobRepositoryError::CompareAndSetConflict => {
-                MessageDeliveryError::BlobBindingConflict
-            }
-            _ => MessageDeliveryError::Invariant,
-        })?;
     }
     let event_position = delivery::append_message_available_event(
         tx,

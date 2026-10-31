@@ -859,7 +859,7 @@ fn exactly_two_writers_clear_a_pending_reset_row_and_revocation_is_one() {
     let reset = include_str!("../reset.rs");
     let transition = include_str!("../transition.rs");
     let sweep = include_str!("../expiry_sweep.rs");
-    let executor = include_str!("../../state_machine/executor.rs");
+    let executor = concat!(include_str!("../../state_machine/executor.rs"), include_str!("../../state_machine/executor/commit_leave_ops.rs"), include_str!("../../state_machine/executor/creation_ops.rs"), include_str!("../../state_machine/executor/dispatch.rs"), include_str!("../../state_machine/executor/event_chain.rs"), include_str!("../../state_machine/executor/federation_ops.rs"), include_str!("../../state_machine/executor/fulfillment_ops.rs"), include_str!("../../state_machine/executor/lifecycle_ops.rs"), include_str!("../../state_machine/executor/preflight.rs"), include_str!("../../state_machine/executor/prior_bound_ops.rs"), include_str!("../../state_machine/executor/pruning.rs"), include_str!("../../state_machine/executor/read_ops.rs"), include_str!("../../state_machine/executor/recovery_ops.rs"), include_str!("../../state_machine/executor/reset_accept_ops.rs"), include_str!("../../state_machine/executor/welcome_ops.rs"), include_str!("../../state_machine/executor/write_ops.rs"));
 
     // Positive controls: each source really is the file it claims to be, so a
     // path that stops resolving cannot masquerade as a clean absence.

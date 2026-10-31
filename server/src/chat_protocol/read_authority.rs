@@ -115,9 +115,6 @@ pub(crate) enum OrdinaryReadEndpoint {
     GetEntries,
     GetPendingWelcomes,
     GetLeafRecoveryInbox,
-    GetBlob,
-    GetBlobUsage,
-    UploadBlob,
     GetSubscriptionTicket,
     SubscribeEvents,
     PublishTyping,
@@ -130,9 +127,6 @@ impl OrdinaryReadEndpoint {
             Self::GetEntries => "blue.catbird.chat.getEntries",
             Self::GetPendingWelcomes => "blue.catbird.chat.getPendingWelcomes",
             Self::GetLeafRecoveryInbox => "blue.catbird.chat.getLeafRecoveryInbox",
-            Self::GetBlob => "blue.catbird.chat.getBlob",
-            Self::GetBlobUsage => "blue.catbird.chat.getBlobUsage",
-            Self::UploadBlob => "blue.catbird.chat.uploadBlob",
             Self::GetSubscriptionTicket => "blue.catbird.chat.getSubscriptionTicket",
             Self::SubscribeEvents => "blue.catbird.chat.subscribeEvents",
             Self::PublishTyping => "blue.catbird.chat.publishTyping",
@@ -141,7 +135,7 @@ impl OrdinaryReadEndpoint {
 
     pub(crate) const fn canonical_method(self) -> &'static str {
         match self {
-            Self::GetSubscriptionTicket | Self::PublishTyping | Self::UploadBlob => "POST",
+            Self::GetSubscriptionTicket | Self::PublishTyping => "POST",
             _ => "GET",
         }
     }

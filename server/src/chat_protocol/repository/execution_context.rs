@@ -17,7 +17,6 @@ use sqlx::{Acquire, Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::blobs::{BindingKind, BlobPurpose, NewBlobBinding};
 use super::core::LockedG6Prelude;
 use super::delivery::{
     EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind, WelcomeRejectionReason,
@@ -47,9 +46,8 @@ use crate::chat_protocol::state_machine::{
     WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus,
 };
 use crate::chat_protocol::transcript::{
-    canonical_metadata_avatar_blob_aad, decode_and_verify_control_entry,
-    decode_and_verify_signed_mutation, CanonicalValueRef, SignedMutationKind,
-    VerifiedMutationProjection, VerifiedSignedMutation,
+    decode_and_verify_control_entry, decode_and_verify_signed_mutation, CanonicalValueRef,
+    SignedMutationKind, VerifiedMutationProjection, VerifiedSignedMutation,
 };
 
 const STREAM_OUTBOX_COUNT: usize = 1;
@@ -1154,32 +1152,7 @@ async fn metadata_avatar(
         .await?;
         let (locked_blob_id, hash, size, origin, version, owner_did, owner_device_id) =
             row.ok_or(ExecutionContextHydrationError::AuthorityMismatch)?;
-        let binding_exists: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS (
-                SELECT 1 FROM chat.blob_bindings
-                 WHERE blob_id=$1 AND binding_kind='metadataAvatar'
-                   AND conversation_id=$2
-                   AND metadata_origin_transition_id=$3
-                   AND metadata_version=$4
-                   AND ciphertext_sha256=$5 AND ciphertext_size=$6
-                   AND purpose='metadata' AND owner_did=$7 AND owner_device_id=$8
-                 FOR SHARE
-            )
-            "#,
-        )
-        .bind(locked_blob_id)
-        .bind(conversation_id)
-        .bind(origin)
-        .bind(version)
-        .bind(&hash)
-        .bind(size)
-        .bind(&owner_did)
-        .bind(owner_device_id)
-        .fetch_one(&mut **transaction)
-        .await?;
-        if !binding_exists
-            || locked_blob_id != blob_id
+        if locked_blob_id != blob_id
             || hash.as_slice() != signed_avatar.ciphertext_sha256()
             || size != signed_size
         {
@@ -1198,103 +1171,23 @@ async fn metadata_avatar(
         }));
     }
 
-    let row: Option<(
-        String,
-        Uuid,
-        String,
-        i64,
-        String,
-        String,
-        i64,
-        i64,
-        Vec<u8>,
-        DateTime<Utc>,
-        DateTime<Utc>,
-    )> = sqlx::query_as(
-        r#"
-        SELECT owner_did,owner_device_id,owner_key_id,owner_auth_generation,
-               purpose,media_type,plaintext_size,ciphertext_size,ciphertext_sha256,
-               uploaded_at,unbound_expires_at
-          FROM chat.blobs
-         WHERE blob_id=$1 AND status='completedUnbound'
-         FOR UPDATE
-        "#,
-    )
-    .bind(blob_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    let (
-        owner_did,
-        owner_device_id,
-        owner_key_id,
-        owner_auth_generation,
-        purpose,
-        media_type,
-        plaintext_size,
-        ciphertext_size,
-        ciphertext_sha256,
-        uploaded_at,
-        unbound_expires_at,
-    ) = row.ok_or(ExecutionContextHydrationError::AuthorityMismatch)?;
+    if !(17..=10_485_760).contains(&signed_size) {
+        return Err(ExecutionContextHydrationError::OutOfDomain);
+    }
     let author_did = device_did(after.author())?;
     let author_device_id = device_uuid(after.author());
-    if owner_did != author_did
-        || owner_device_id != author_device_id
-        || owner_key_id != URL_SAFE_NO_PAD.encode(after.author_key_id())
-        || u64::try_from(owner_auth_generation).ok()
-            != Some(after.author_auth_generation_at_origin())
-        || purpose != "metadata"
-        || ciphertext_size != signed_size
-        || ciphertext_sha256.as_slice() != signed_avatar.ciphertext_sha256()
-        || uploaded_at > applied_at
-        || applied_at >= unbound_expires_at
-    {
-        return Err(ExecutionContextHydrationError::AuthorityMismatch);
-    }
-    let plaintext_size_u64 =
-        u64::try_from(plaintext_size).map_err(|_| ExecutionContextHydrationError::OutOfDomain)?;
-    let aad_bytes = canonical_metadata_avatar_blob_aad(
-        *after.coordinate_conversation_id(),
-        *after.origin_transition_id(),
-        after.metadata_version(),
-        *signed_avatar.blob_id(),
-        &media_type,
-        plaintext_size_u64,
-    );
     let origin_transition_id = Uuid::from_bytes(*after.origin_transition_id());
     let metadata_version = i64::try_from(after.metadata_version())
         .map_err(|_| ExecutionContextHydrationError::OutOfDomain)?;
     Ok(Some(MetadataAvatarPersistence::Fresh {
         snapshot: MetadataAvatarBinding {
             avatar_blob_id: blob_id,
-            avatar_ciphertext_sha256: ciphertext_sha256.clone(),
-            avatar_ciphertext_size: ciphertext_size,
+            avatar_ciphertext_sha256: signed_avatar.ciphertext_sha256().to_vec(),
+            avatar_ciphertext_size: signed_size,
             avatar_binding_origin_transition_id: origin_transition_id,
             avatar_binding_metadata_version: metadata_version,
-            avatar_binding_owner_did: owner_did.clone(),
-            avatar_binding_owner_device_id: owner_device_id,
-        },
-        binding: NewBlobBinding {
-            blob_id,
-            binding_kind: BindingKind::MetadataAvatar,
-            conversation_id,
-            entry_seq: None,
-            message_id: None,
-            metadata_origin_transition_id: Some(origin_transition_id),
-            metadata_version: Some(metadata_version),
-            owner_did,
-            owner_device_id,
-            descriptor_bytes: signed_avatar.canonical_descriptor().to_vec(),
-            descriptor_sha256: signed_avatar.digest().to_vec(),
-            aad_sha256: Sha256::digest(&aad_bytes).to_vec(),
-            aad_bytes,
-            ciphertext_sha256,
-            plaintext_size,
-            ciphertext_size,
-            purpose: BlobPurpose::Metadata,
-            bound_at: applied_at,
-            uploaded_at,
-            unbound_expires_at,
+            avatar_binding_owner_did: author_did,
+            avatar_binding_owner_device_id: author_device_id,
         },
     }))
 }

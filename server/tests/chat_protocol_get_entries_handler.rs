@@ -21,7 +21,6 @@ use tower_util::ServiceExt;
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
-    blob_store: catbird_server::blob_store::BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -33,12 +32,6 @@ impl FromRef<TestState> for DbPool {
 impl FromRef<TestState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestState) -> Self {
         state.runtime.clone()
-    }
-}
-
-impl FromRef<TestState> for catbird_server::blob_store::BlobStore {
-    fn from_ref(state: &TestState) -> Self {
-        state.blob_store.clone()
     }
 }
 
@@ -79,11 +72,7 @@ fn router() -> Router {
         .max_connections(1)
         .connect_lazy("postgres://127.0.0.1/clean_chat_get_entries")
         .expect("lazy pool");
-    chat_router::<TestState>().with_state(TestState {
-        pool,
-        runtime,
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
-    })
+    chat_router::<TestState>().with_state(TestState { pool, runtime })
 }
 
 #[tokio::test]

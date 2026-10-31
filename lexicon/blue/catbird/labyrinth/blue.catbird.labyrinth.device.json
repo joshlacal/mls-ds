@@ -24,13 +24,13 @@
           },
           "epochStorageKeyPubkey": {
             "type": "bytes",
-            "description": "Labyrinth HPKE encryption key.",
-            "maxLength": 32,
-            "minLength": 32
+            "description": "Hawk encryption public key: X25519(32) || ML-KEM-768 ek(1184) (1,216 bytes, I16).",
+            "maxLength": 1216,
+            "minLength": 1216
           },
           "epochStorageKeySig": {
             "type": "bytes",
-            "description": "pk_sign(deviceKey, 0x30, epochStorageKeyPubkey).",
+            "description": "pk_sign(deviceKey, 0x32, epochStorageKeyPubkey) (100% PQ domain tag 0x32, I16).",
             "maxLength": 64,
             "minLength": 64
           },

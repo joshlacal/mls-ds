@@ -9,7 +9,6 @@ use base64::{
     Engine as _,
 };
 use catbird_server::{
-    blob_store::BlobStore,
     handlers::chat::{chat_router, ChatRuntime},
     realtime::SseState,
     storage::DbPool,
@@ -30,7 +29,6 @@ pub const NEST_KEY_ID: &str = "http-acceptance";
 pub struct TestState {
     pub pool: DbPool,
     pub runtime: Arc<ChatRuntime>,
-    pub blob_store: BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -41,11 +39,6 @@ impl FromRef<TestState> for DbPool {
 impl FromRef<TestState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestState) -> Self {
         state.runtime.clone()
-    }
-}
-impl FromRef<TestState> for BlobStore {
-    fn from_ref(state: &TestState) -> Self {
-        state.blob_store.clone()
     }
 }
 
@@ -237,7 +230,7 @@ pub async fn ensure_fence(pool: &DbPool) {
 
 /// Build the route harness with the pre-cutover fence held by default.
 pub async fn router(pool: DbPool) -> Router {
-    build_router(pool, false, None).await
+    build_router(pool, false).await
 }
 
 /// The named authenticated acceptance cases exercise routes gated behind the
@@ -245,21 +238,10 @@ pub async fn router(pool: DbPool) -> Router {
 /// the process-level value is restored to the explicit pre-cutover value
 /// immediately afterward.
 pub async fn router_for_authenticated_acceptance(pool: DbPool) -> Router {
-    build_router(pool, true, None).await
+    build_router(pool, true).await
 }
 
-pub async fn router_for_authenticated_acceptance_with_blob_store(
-    pool: DbPool,
-    blob_store: BlobStore,
-) -> Router {
-    build_router(pool, true, Some(blob_store)).await
-}
-
-async fn build_router(
-    pool: DbPool,
-    cutover_enabled: bool,
-    blob_store: Option<BlobStore>,
-) -> Router {
+async fn build_router(pool: DbPool, cutover_enabled: bool) -> Router {
     let key_id: String = sqlx::query_scalar(
         "SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE",
     )
@@ -317,11 +299,7 @@ async fn build_router(
     );
     let runtime = Arc::new(ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("runtime"));
     std::env::set_var("CHAT_CUTOVER_ENABLED", "0");
-    chat_router::<TestState>().with_state(TestState {
-        pool,
-        runtime,
-        blob_store: blob_store.unwrap_or_else(BlobStore::for_route_tests),
-    })
+    chat_router::<TestState>().with_state(TestState { pool, runtime })
 }
 
 pub fn unsigned_request(device: &Device, nsid: &str, method: &str, query: &str) -> Request<Body> {

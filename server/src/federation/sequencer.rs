@@ -75,47 +75,29 @@ impl Sequencer {
     }
 
     /// Check if this DS is the sequencer for a conversation.
-    /// `sequencer_ds` NULL means we are the sequencer (backward compat).
+    /// Local sequencer has `is_remote = FALSE` (`sequencer_ds IS NULL`).
     pub async fn is_sequencer_for(&self, convo_id: &str) -> Result<bool, sqlx::Error> {
-        let row = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT sequencer_ds FROM conversations WHERE id = $1",
+        let Ok(convo_uuid) = uuid::Uuid::parse_str(convo_id) else {
+            return Ok(false);
+        };
+        let row = sqlx::query_as::<_, (bool, Option<String>)>(
+            "SELECT is_remote, sequencer_ds FROM chat.conversations WHERE conversation_id = $1",
         )
-        .bind(convo_id)
+        .bind(convo_uuid)
         .fetch_optional(&self.pool)
         .await?;
 
         let is_sequencer = match row {
-            Some(Some(ds)) => canonical_did(&ds) == canonical_did(&self.self_did),
-            Some(None) => true,
+            Some((false, _)) => true,
+            Some((true, Some(ds))) => canonical_did(&ds) == canonical_did(&self.self_did),
+            Some((true, None)) => false,
             None => false,
         };
 
         Ok(is_sequencer)
     }
 
-    /// Submit a commit for sequencing via CAS on `current_epoch`.
-    ///
-    /// MIMI-inspired safety invariants for sequencing:
-    /// - `sequencer_term` is the lease term for the active sequencer and must
-    ///   match exactly for the commit to be accepted.
-    /// - `current_epoch` advances by exactly one per accepted commit.
-    /// - `(convo_id, current_epoch, sequencer_term)` CAS guarantees a single
-    ///   writer per term and fences out stale sequencers during failover.
-    ///
-    /// `commit_ciphertext` is the raw commit data used to produce a receipt
-    /// when a `ReceiptSigner` is configured.
-    ///
-    /// TASK #36: the CAS now runs on the caller's `&mut Transaction`. All three
-    /// CAS predicates (`convo_id`, `current_epoch`, `sequencer_term`) evaluate
-    /// on the same connection and same tx as the caller's subsequent
-    /// `commits` + `messages` inserts. A crash or rollback after the CAS
-    /// advance but before the caller's commit now atomically undoes the epoch
-    /// advance — no orphan epochs from the federation path.
-    ///
-    /// Callers must `tx.commit()` themselves after this returns
-    /// `CommitResult::Accepted`. Returning `Conflict` or `TermStale` does NOT
-    /// release the tx; caller decides whether to roll back (typical) or
-    /// continue with compensating state in the same tx.
+    /// Submit a commit for sequencing via CAS on `current_generation` and `sequencer_term`.
     pub async fn submit_commit(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -134,16 +116,20 @@ impl Sequencer {
             });
         }
 
-        // CAS: atomically advance the epoch only if it still matches.
-        // Runs on the caller's tx (task #36) so epoch advance + caller's
-        // commit-row + message-row inserts are one atomic unit.
+        let Ok(convo_uuid) = uuid::Uuid::parse_str(convo_id) else {
+            return Ok(CommitResult::Conflict {
+                current_epoch: -1,
+                reason: "Conversation not found".to_string(),
+            });
+        };
+
         let result = sqlx::query(
-            "UPDATE conversations SET current_epoch = $2, updated_at = NOW() \
-        WHERE id = $1 AND current_epoch = $3 AND sequencer_term = $4",
+            "UPDATE chat.conversations SET current_generation = $2 \
+             WHERE conversation_id = $1 AND current_generation = $3 AND sequencer_term = $4 AND NOT is_remote",
         )
-        .bind(convo_id)
-        .bind(proposed_epoch)
-        .bind(current_epoch)
+        .bind(convo_uuid)
+        .bind(i64::from(proposed_epoch))
+        .bind(i64::from(current_epoch))
         .bind(sequencer_term as i64)
         .execute(&mut **tx)
         .await?;
@@ -159,21 +145,15 @@ impl Sequencer {
             });
         }
 
-        // Either epoch moved or term moved — fetch current values on the
-        // same tx so we see the same snapshot the CAS just lost against.
-        // (Reading on &self.pool would race: a different concurrent commit
-        // could have advanced again between our CAS and the read.)
-        let current = sqlx::query_as::<_, (Option<i32>, Option<i64>)>(
-            "SELECT current_epoch, sequencer_term FROM conversations WHERE id = $1",
+        let current = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT current_generation, sequencer_term FROM chat.conversations WHERE conversation_id = $1",
         )
-        .bind(convo_id)
+        .bind(convo_uuid)
         .fetch_optional(&mut **tx)
         .await?;
 
         match current {
-            Some((Some(_actual_epoch), Some(actual_term)))
-                if actual_term.max(0) as u64 != sequencer_term =>
-            {
+            Some((_actual_epoch, actual_term)) if actual_term.max(0) as u64 != sequencer_term => {
                 let current_term = actual_term.max(0) as u64;
                 warn!(
                     convo_id,
@@ -188,34 +168,38 @@ impl Sequencer {
                     ),
                 })
             }
-            Some((Some(actual), _)) => {
+            Some((actual, _)) => {
+                let actual_i32 = i32::try_from(actual).unwrap_or(i32::MAX);
                 warn!(
                     convo_id,
                     proposed_epoch,
-                    actual_epoch = actual,
+                    actual_epoch = actual_i32,
                     "Commit conflict detected"
                 );
                 Ok(CommitResult::Conflict {
-                    current_epoch: actual,
-                    reason: format!("Epoch already advanced to {actual}"),
+                    current_epoch: actual_i32,
+                    reason: format!("Epoch already advanced to {actual_i32}"),
                 })
             }
-            _ => Ok(CommitResult::Conflict {
+            None => Ok(CommitResult::Conflict {
                 current_epoch: -1,
                 reason: "Conversation not found".to_string(),
             }),
         }
     }
 
-    /// Get the current epoch for a conversation.
+    /// Get the current generation/epoch for a conversation.
     pub async fn get_epoch(&self, convo_id: &str) -> Result<Option<i32>, sqlx::Error> {
-        sqlx::query_scalar::<_, Option<i32>>(
-            "SELECT current_epoch FROM conversations WHERE id = $1",
+        let Ok(convo_uuid) = uuid::Uuid::parse_str(convo_id) else {
+            return Ok(None);
+        };
+        sqlx::query_scalar::<_, i64>(
+            "SELECT current_generation FROM chat.conversations WHERE conversation_id = $1",
         )
-        .bind(convo_id)
+        .bind(convo_uuid)
         .fetch_optional(&self.pool)
         .await
-        .map(|opt| opt.flatten())
+        .map(|opt| opt.and_then(|v| i32::try_from(v).ok()))
     }
 
     pub fn self_did(&self) -> &str {

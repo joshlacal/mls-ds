@@ -351,8 +351,6 @@ fn every_dpop_endpoint_owns_its_exact_http_method_profile() {
         "blue.catbird.chat.getEntries",
         "blue.catbird.chat.getPendingWelcomes",
         "blue.catbird.chat.getLeafRecoveryInbox",
-        "blue.catbird.chat.getBlob",
-        "blue.catbird.chat.getBlobUsage",
     ] {
         assert_eq!(
             ValidatedChatNsid::parse(endpoint)
@@ -381,9 +379,6 @@ fn every_dpop_endpoint_owns_its_exact_http_method_profile() {
         "blue.catbird.chat.activateReset",
         "blue.catbird.chat.requestLeave",
         "blue.catbird.chat.cancelLeave",
-        "blue.catbird.chat.prepareBlobUpload",
-        "blue.catbird.chat.uploadBlob",
-        "blue.catbird.chat.deleteBlob",
         "blue.catbird.chat.getSubscriptionTicket",
     ] {
         assert_eq!(
@@ -394,6 +389,15 @@ fn every_dpop_endpoint_owns_its_exact_http_method_profile() {
                 .as_str(),
             "POST"
         );
+    }
+    for retired in [
+        "blue.catbird.chat.prepareBlobUpload",
+        "blue.catbird.chat.uploadBlob",
+        "blue.catbird.chat.deleteBlob",
+        "blue.catbird.chat.getBlob",
+        "blue.catbird.chat.getBlobUsage",
+    ] {
+        assert!(ValidatedChatNsid::parse(retired).is_err());
     }
     assert!(
         ValidatedChatNsid::parse("blue.catbird.chat.subscribeEvents")
@@ -506,6 +510,16 @@ fn closed_contract_decoder_matches_frozen_vector_and_rejects_raw_ambiguity() {
 #[test]
 fn all_frozen_signed_mutation_contracts_have_owned_type_and_domain() {
     let expected = [
+        (
+            SignedMutationKind::DirectRequestPublication,
+            "directRequestPublicationBody",
+            "CATBIRD-DIRECT-REQUEST-PUBLISH\0",
+        ),
+        (
+            SignedMutationKind::DirectRequestAcceptance,
+            "directRequestAcceptanceBody",
+            "CATBIRD-DIRECT-REQUEST-ACCEPT\0",
+        ),
         (
             SignedMutationKind::DeviceEnrollment,
             "deviceEnrollmentBody",
@@ -843,7 +857,9 @@ fn all_thirteen_control_fingerprint_variants_are_closed_and_match_the_frozen_cor
         .as_array()
         .unwrap();
     assert_eq!(cases.len(), 13);
-    assert_eq!(ControlEntryKind::ALL.len(), 13);
+    assert_eq!(ControlEntryKind::ALL.len(), 15);
+    assert!(ControlEntryKind::ALL.contains(&ControlEntryKind::DirectRequestPublication));
+    assert!(ControlEntryKind::ALL.contains(&ControlEntryKind::DirectRequestAcceptance));
     let mut corpus_issues = Vec::new();
     for case in cases {
         let projection = json!({
@@ -1352,7 +1368,7 @@ fn ordinary_nest_token_and_dpop_proof_verify_as_one_bound_request() {
     for (field, replacement) in [
         ("iss", json!("did:web:other.example.net")),
         ("aud", json!("did:web:other.example.net")),
-        ("lxm", json!("blue.catbird.chat.getBlob")),
+        ("lxm", json!("blue.catbird.chat.getDevices")),
         (
             "chat_instance",
             json!("11111111-1111-4111-9111-111111111111"),

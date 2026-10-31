@@ -120,6 +120,7 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     // directly. A leak here names the *prefix*, not one of its eleven
     // consuming targets; they are enumerated at [`SHARED_LEGACY_DB_PREFIX`].
     "mlsds_shared_",
+    "clean_slate_",
 ];
 
 /// Prefix used by [`crate::common::setup_test_db`], the shared legacy fixture

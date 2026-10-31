@@ -1,30 +1,12 @@
-//! HTTP layer of the Labyrinth backend (`blue.catbird.labyrinth.*`, design
-//! labyrinth `docs/MLSDS_BACKEND.md` §2–§3; domain code in
-//! `crate::labyrinth`).
+//! HTTP layer of the clean-slate Labyrinth directory (`blue.catbird.labyrinth.*`).
 //!
-//! All 37 XRPC endpoints of the lexicons are registered by
-//! [`labyrinth_router`]. Every one requires the clean-chat cutover gate and a
-//! standard service-auth JWT whose `lxm` is the endpoint NSID; queries name
-//! the calling device with `actorDeviceId`, procedures with a signed
-//! `labyrinthWriteBody` (see `crate::labyrinth::auth`). `main.rs` merges the
-//! router only when `LABYRINTH_ENABLED` is set.
-//!
-//! Federation: thread operations on a conversation sequenced by another DS
-//! are forwarded there through the server-to-server `labyrinthRelay`
-//! procedure (design §3, Y3; `crate::labyrinth::relay`), which this router
-//! also serves for peers.
+//! Only the 6 zero-content directory and account-lifecycle endpoints remain on `mls-ds`:
+//! - Procedures (3): `publishEpochHead`, `purgeMailbox`, `deleteAccountData`
+//! - Queries (3): `getEpochHead`, `getChatDeviceKeys`, `getMemberDevices`
 
 mod directory;
-mod lookup;
-mod mailbox;
-mod orf;
-pub mod outbox;
 mod params;
-mod relay;
-pub mod relay_client;
-mod relay_jobs;
 mod retention;
-mod thread;
 
 use std::sync::Arc;
 
@@ -36,7 +18,6 @@ use axum::{
     Router,
 };
 
-use crate::blob_store::BlobStore;
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::error::LabyrinthResult;
 use crate::storage::DbPool;
@@ -45,62 +26,17 @@ use crate::storage::DbPool;
 pub const NSID_PREFIX: &str = "blue.catbird.labyrinth.";
 
 const KIB: usize = 1024;
-/// Body limits (design §4 "Size limits").
-const LIMIT_RECORD_STREAM: usize = 1024 * KIB;
-const LIMIT_CREATE_EPOCH: usize = 512 * KIB;
 const LIMIT_DEFAULT: usize = 64 * KIB;
-/// A relayed write carries a `LIMIT_RECORD_STREAM` payload base64-encoded.
-const LIMIT_RELAY: usize = 2048 * KIB;
 
-/// The procedures, with their body limits.
+/// Active procedures and their body limits.
 pub const PROCEDURES: &[(&str, usize)] = &[
-    ("createDevice", LIMIT_DEFAULT),
-    ("markDeviceRevoked", LIMIT_DEFAULT),
-    ("createEpoch", LIMIT_CREATE_EPOCH),
-    ("createEpochMember", LIMIT_DEFAULT),
-    ("createVirtualDevice", LIMIT_DEFAULT),
-    ("appendOwnerBatch", LIMIT_RECORD_STREAM),
-    ("createMek", LIMIT_RECORD_STREAM),
-    ("appendBatch", LIMIT_RECORD_STREAM),
-    ("appendSpaceBatch", LIMIT_RECORD_STREAM),
-    ("deleteSpaceGeneration", LIMIT_DEFAULT),
     ("publishEpochHead", LIMIT_DEFAULT),
-    ("registerOrfState", LIMIT_DEFAULT),
-    ("deleteOrfState", LIMIT_DEFAULT),
-    ("putAttachmentRef", LIMIT_DEFAULT),
-    ("deleteAttachmentRef", LIMIT_DEFAULT),
-    ("redactMessage", LIMIT_DEFAULT),
     ("purgeMailbox", LIMIT_DEFAULT),
     ("deleteAccountData", LIMIT_DEFAULT),
-    ("deleteVirtualDevice", LIMIT_DEFAULT),
-    ("touchVirtualDevice", LIMIT_DEFAULT),
-    ("labyrinthRelay", LIMIT_RELAY),
 ];
 
-/// The queries.
-pub const QUERIES: &[&str] = &[
-    "getDevice",
-    "listDevices",
-    "getEpoch",
-    "listEpochs",
-    "listEpochMembers",
-    "getVirtualDevice",
-    "listVirtualDevices",
-    "listOwnerBatches",
-    "findMeks",
-    "listBatches",
-    "getThreadStorage",
-    "getSpaceMembership",
-    "listSpaceBatches",
-    "getMessages",
-    "listThreads",
-    "listOwnerThreads",
-    "getEpochHead",
-    "getChatDeviceKeys",
-    "getMemberDevices",
-    "getAttachmentRef",
-    "getAttachmentBlob",
-];
+/// Active queries.
+pub const QUERIES: &[&str] = &["getEpochHead", "getChatDeviceKeys", "getMemberDevices"];
 
 fn path(name: &str) -> String {
     format!("/xrpc/{NSID_PREFIX}{name}")
@@ -122,108 +58,22 @@ fn respond(result: LabyrinthResult<Vec<u8>>) -> Response {
     }
 }
 
-/// Build the `blue.catbird.labyrinth.*` router. Generic over the
-/// application state like `chat_router`.
+/// Build the `blue.catbird.labyrinth.*` router.
 pub fn labyrinth_router<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
     DbPool: FromRef<S>,
     Arc<ChatRuntime>: FromRef<S>,
-    BlobStore: FromRef<S>,
-    Arc<crate::federation::DsResolver>: FromRef<S>,
-    Arc<crate::federation::outbound::OutboundClient>: FromRef<S>,
-    Option<Arc<crate::federation::ServiceAuthClient>>: FromRef<S>,
 {
-    let limit = |name: &str| {
-        PROCEDURES
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, l)| *l)
-            .expect("registered procedure")
-    };
     Router::new()
-        .route(&path("createDevice"), post(mailbox::create_device))
         .route(
-            &path("markDeviceRevoked"),
-            post(mailbox::mark_device_revoked),
-        )
-        .route(&path("getDevice"), get(mailbox::get_device))
-        .route(&path("listDevices"), get(mailbox::list_devices))
-        .route(
-            &path("createEpoch"),
-            post(mailbox::create_epoch).layer(DefaultBodyLimit::max(limit("createEpoch"))),
-        )
-        .route(&path("getEpoch"), get(mailbox::get_epoch))
-        .route(&path("listEpochs"), get(mailbox::list_epochs))
-        .route(
-            &path("createEpochMember"),
-            post(mailbox::create_epoch_member),
-        )
-        .route(&path("listEpochMembers"), get(mailbox::list_epoch_members))
-        .route(
-            &path("createVirtualDevice"),
-            post(mailbox::create_virtual_device),
-        )
-        .route(&path("getVirtualDevice"), get(mailbox::get_virtual_device))
-        .route(
-            &path("listVirtualDevices"),
-            get(mailbox::list_virtual_devices),
-        )
-        .route(
-            &path("appendOwnerBatch"),
-            post(mailbox::append_owner_batch)
-                .layer(DefaultBodyLimit::max(limit("appendOwnerBatch"))),
-        )
-        .route(&path("listOwnerBatches"), get(mailbox::list_owner_batches))
-        .route(
-            &path("createMek"),
-            post(thread::create_mek).layer(DefaultBodyLimit::max(limit("createMek"))),
-        )
-        .route(&path("findMeks"), get(thread::find_meks))
-        .route(
-            &path("appendBatch"),
-            post(thread::append_batch).layer(DefaultBodyLimit::max(limit("appendBatch"))),
-        )
-        .route(&path("listBatches"), get(thread::list_batches))
-        .route(&path("getThreadStorage"), get(thread::get_thread_storage))
-        .route(
-            &path("getSpaceMembership"),
-            get(thread::get_space_membership),
-        )
-        .route(&path("listSpaceBatches"), get(thread::list_space_batches))
-        .route(
-            &path("deleteSpaceGeneration"),
-            post(thread::delete_space_generation),
-        )
-        .route(
-            &path("appendSpaceBatch"),
-            post(thread::append_space_batch)
-                .layer(DefaultBodyLimit::max(limit("appendSpaceBatch"))),
-        )
-        .route(&path("getMessages"), get(lookup::get_messages))
-        .route(&path("listThreads"), get(lookup::list_threads))
-        .route(&path("listOwnerThreads"), get(lookup::list_owner_threads))
-        .route(&path("redactMessage"), post(thread::redact_message))
-        .route(
-            &path("labyrinthRelay"),
-            post(relay::labyrinth_relay).layer(DefaultBodyLimit::max(limit("labyrinthRelay"))),
+            &path("publishEpochHead"),
+            post(directory::publish_epoch_head),
         )
         .route(&path("purgeMailbox"), post(retention::purge_mailbox))
         .route(
             &path("deleteAccountData"),
             post(retention::delete_account_data),
-        )
-        .route(
-            &path("deleteVirtualDevice"),
-            post(retention::delete_virtual_device),
-        )
-        .route(
-            &path("touchVirtualDevice"),
-            post(retention::touch_virtual_device),
-        )
-        .route(
-            &path("publishEpochHead"),
-            post(directory::publish_epoch_head),
         )
         .route(&path("getEpochHead"), get(directory::get_epoch_head))
         .route(
@@ -234,15 +84,6 @@ where
             &path("getMemberDevices"),
             get(directory::get_member_devices),
         )
-        .route(&path("registerOrfState"), post(orf::register_orf_state))
-        .route(&path("deleteOrfState"), post(orf::delete_orf_state))
-        .route(&path("putAttachmentRef"), post(orf::put_attachment_ref))
-        .route(
-            &path("deleteAttachmentRef"),
-            post(orf::delete_attachment_ref),
-        )
-        .route(&path("getAttachmentRef"), get(orf::get_attachment_ref))
-        .route(&path("getAttachmentBlob"), get(orf::get_attachment_blob))
         .layer(DefaultBodyLimit::max(LIMIT_DEFAULT))
 }
 
@@ -276,6 +117,6 @@ mod tests {
             assert!(served.insert(((*name).to_owned(), "query".to_owned())));
         }
         assert_eq!(served, lexicon);
-        assert_eq!(served.len(), 42);
+        assert_eq!(served.len(), 6);
     }
 }

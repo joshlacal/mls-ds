@@ -1,0 +1,39 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.conversationPolicy",
+  "defs": {
+    "main": {
+      "type": "object",
+      "description": "Space policy governing a conversation Space hosted by the sequencing mls-ds authority. Active MLS conversation participants receive short-lived read credentials; active, left, and removed writers appear in listRepos until they delete their Space records.",
+      "required": [
+        "conversationId",
+        "generation",
+        "sequencerDid"
+      ],
+      "properties": {
+        "conversationId": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "description": "Canonical lowercase hyphenated UUIDv4 conversation identifier."
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Conversation generation counter."
+        },
+        "sequencerDid": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the sequencing mls-ds Space authority."
+        },
+        "publishPolicy": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the policy is also mirrored as a com.atproto.space.policy record."
+        }
+      }
+    }
+  }
+}

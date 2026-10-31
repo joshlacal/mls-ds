@@ -10,6 +10,7 @@
         "authPubkey",
         "encryptionPubkey",
         "signingPubkey",
+        "membersHash",
         "epochHead",
         "selfSig",
         "attestation"
@@ -39,6 +40,12 @@
           "maxLength": 32,
           "minLength": 32
         },
+        "membersHash": {
+          "type": "bytes",
+          "description": "[Gate 3] SHA-256 over canonical sorted active epoch member deviceKeyPubkeys bound into epochHead.",
+          "maxLength": 32,
+          "minLength": 32
+        },
         "previousEpochHead": {
           "type": "bytes",
           "description": "Head of epoch N-1; absent for epoch 0.",
@@ -47,7 +54,7 @@
         },
         "epochHead": {
           "type": "bytes",
-          "description": "sha256 epoch head (SPEC \u00a75.3).",
+          "description": "sha256 epoch head (SPEC \u00a75.3, Gate 3 membersHash bound).",
           "maxLength": 32,
           "minLength": 32
         },
@@ -91,9 +98,92 @@
         }
       }
     },
+    "sequencerReceipt": {
+      "type": "object",
+      "description": "[I13] Sequencer receipt signed by {sequencerDid}#mls-receipt-1 binding Labyrinth history items to live MLS applicationAad.archiveCommitment.",
+      "required": [
+        "conversationId",
+        "generation",
+        "groupId",
+        "epoch",
+        "entryId",
+        "seq",
+        "senderDid",
+        "senderDeviceId",
+        "archiveCommitment",
+        "issuedAtMs",
+        "sequencerDid",
+        "kid",
+        "signature"
+      ],
+      "properties": {
+        "conversationId": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "groupId": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "entryId": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "senderDid": {
+          "type": "string",
+          "format": "did"
+        },
+        "senderDeviceId": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36
+        },
+        "archiveCommitment": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32
+        },
+        "issuedAtMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sequencerDid": {
+          "type": "string",
+          "format": "did"
+        },
+        "kid": {
+          "type": "string",
+          "maxLength": 320
+        },
+        "signature": {
+          "type": "bytes",
+          "minLength": 64,
+          "maxLength": 64
+        }
+      }
+    },
     "sealedMessage": {
       "type": "object",
-      "description": "One v1.1 sender-encrypted message (SPEC \u00a77.2). A redacted item ([CB-38]) keeps messageId, timestamp, mekId and senderTransportPubkey, carries redaction, and has an empty signedEncMessage.",
+      "description": "One v1.1 sender-encrypted message (SPEC \u00a77.2, I13). frameNonce lives strictly inside MEK-encrypted signedEncMessage so archiveCommitment remains hiding. A redacted item ([CB-38]) keeps messageId, timestamp, mekId and senderTransportPubkey, carries redaction, and has an empty signedEncMessage.",
       "required": [
         "messageId",
         "timestamp",
@@ -106,6 +196,12 @@
           "type": "string",
           "description": "Chat message id.",
           "maxLength": 128
+        },
+        "seq": {
+          "type": "integer",
+          "description": "Sequenced MLS entry seq from sequencerReceipt (I13).",
+          "minimum": 1,
+          "maximum": 9007199254740991
         },
         "timestamp": {
           "type": "integer",
@@ -126,9 +222,13 @@
         },
         "signedEncMessage": {
           "type": "bytes",
-          "description": "Ed25519 sig(64) || suite-tagged AEAD ciphertext of the padded frame; empty once redacted.",
+          "description": "Ed25519 sig(64) || suite-tagged AEAD ciphertext of the padded (frameNonce || canonicalPayloadBytes) frame; empty once redacted.",
           "maxLength": 262144,
           "minLength": 0
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         },
         "redaction": {
           "type": "ref",
@@ -139,7 +239,7 @@
     },
     "ownerMessage": {
       "type": "object",
-      "description": "One owner-encrypted message or delete-for-me tombstone (SPEC \u00a77.1, [CB-37], [CB-38]).",
+      "description": "One owner-encrypted message or delete-for-me tombstone (SPEC \u00a77.1, [CB-37], [CB-38], I13). frameNonce lives strictly inside owner-encrypted ciphertext.",
       "required": [
         "threadId",
         "messageId",
@@ -158,6 +258,12 @@
           "type": "string",
           "description": "Message id.",
           "maxLength": 128
+        },
+        "seq": {
+          "type": "integer",
+          "description": "Sequenced MLS entry seq when archived from a live conversation.",
+          "minimum": 1,
+          "maximum": 9007199254740991
         },
         "timestamp": {
           "type": "integer",
@@ -178,8 +284,12 @@
         },
         "encrypted": {
           "type": "bytes",
-          "description": "Suite-tagged AEAD ciphertext of the padded frame.",
+          "description": "Suite-tagged AEAD ciphertext of the padded frame (carrying frameNonce inside ciphertext when sequencerReceipt is present).",
           "maxLength": 262144
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         }
       }
     },

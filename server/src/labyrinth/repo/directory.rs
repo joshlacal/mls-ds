@@ -1,5 +1,4 @@
-//! The verifying head directory and the MLS device views
-//! (`MailboxDirectory`, design §1a, §2 "Directory").
+//! The verifying `EpochPublic` head directory and MLS device views (`Gate 6`, `L-F01`).
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
@@ -10,6 +9,9 @@ use crate::labyrinth::auth::Caller;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
 use crate::labyrinth::heads::{check_chain_link, verify_epoch_public, verify_prev_sig};
 use crate::labyrinth::wire::records::EpochPublic;
+
+/// Maximum `chain` length returned by `getEpochHead` (`lexicon/blue.catbird.labyrinth.getEpochHead.json`).
+const MAX_CHAIN_HEADERS: i64 = 1024;
 
 /// The key id of `did`'s *current* chat device key `key`, if any.
 pub async fn current_chat_key_id(
@@ -52,14 +54,13 @@ pub(crate) fn parse_stored(text: &str) -> LabyrinthResult<EpochPublic> {
     })
 }
 
-/// Accept `epoch` into the caller DID's head chain (design §1a checks 1-6,
-/// tightened by the second security review). The head recomputes, its
-/// `selfSig` verifies, it is attested by the **calling** chat device's own
-/// key (not merely any current key of the DID), and it extends the stored
-/// latest head by one with a `prevSig` by that head's signing key.
-/// Re-sending an identical head succeeds; a different head under a taken
-/// number is `EpochHeadConflict`. Only `createEpoch` (inside its
-/// transaction, after the binding check) and [`republish_head`] call this.
+/// Accept `epoch` into the caller DID's head chain (`Gate 3`, `Gate 6`, `L-F01`).
+///
+/// Recomputes `epochHead` (with `membersHash`), verifies XEdDSA `selfSig` and the calling
+/// chat device's Ed25519 attestation, enforces the monotonic `labyrinth.epoch_head_floors`
+/// rollback floor, and verifies `prevSig` under the previous epoch's signing key.
+/// Re-sending an identical head is idempotent; a different head at the same epoch number
+/// returns `409 EpochHeadConflict`.
 pub async fn record_head(
     conn: &mut PgConnection,
     caller: &Caller,
@@ -139,42 +140,23 @@ pub async fn record_head(
     Ok(())
 }
 
-/// `publishEpochHead` for an account whose mailbox is on this DS: re-publish
-/// the head of an epoch the caller's mailbox already holds. Such an
-/// account's heads enter the directory only through `createEpoch`
-/// (atomically, behind the Labyrinth device binding); this endpoint can
-/// neither introduce an epoch nor squat the next number. The epoch must
-/// exist in `labyrinth.epochs` with exactly this `public`, and the caller
-/// must be the chat device that attested it.
-pub async fn republish_head(
-    conn: &mut PgConnection,
-    caller: &Caller,
-    epoch: &EpochPublic,
-    at: DateTime<Utc>,
-) -> LabyrinthResult<()> {
-    let stored: Option<String> = sqlx::query_scalar(
-        "SELECT (record->'public')::text FROM labyrinth.epochs \
-          WHERE owner_did = $1 AND epoch_number = $2",
-    )
-    .bind(&caller.did)
-    .bind(epoch.epoch_number as i64)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let stored = stored.ok_or_else(|| LabyrinthError::not_found("EpochNotFound"))?;
-    if &parse_stored(&stored)? != epoch {
-        return Err(head_conflict());
-    }
-    record_head(conn, caller, epoch, at).await
+/// Verified `getEpochHead` response payload (`Gate 6` + `L-F01`).
+pub struct EpochHeadLookup {
+    pub epoch: serde_json::Value,
+    pub chain: Vec<serde_json::Value>,
+    pub floor_seq: u64,
+    pub received_at: DateTime<Utc>,
 }
 
-/// `getEpochHead`: the record and when it was received; `None` for latest.
+/// `getEpochHead`: returns the target `epoch`, contiguous verified `chain` from
+/// `floorSeq..=epoch.epochNumber` (up to 1,024 headers), `floorSeq`, and `receivedAt`.
 pub async fn get_head(
     conn: &mut PgConnection,
     did: &str,
     n: Option<u64>,
-) -> LabyrinthResult<Option<(serde_json::Value, DateTime<Utc>)>> {
-    let row: Option<(String, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT epoch_public::text, received_at FROM labyrinth.epoch_heads \
+) -> LabyrinthResult<Option<EpochHeadLookup>> {
+    let row: Option<(i64, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT epoch_number, epoch_public::text, received_at FROM labyrinth.epoch_heads \
           WHERE did = $1 AND ($2::bigint IS NULL OR epoch_number = $2) \
           ORDER BY epoch_number DESC LIMIT 1",
     )
@@ -182,8 +164,38 @@ pub async fn get_head(
     .bind(n.map(|n| n as i64))
     .fetch_optional(&mut *conn)
     .await?;
-    row.map(|(text, at)| Ok((super::stored_json(&text)?, at)))
-        .transpose()
+    let Some((target_seq, text, received_at)) = row else {
+        return Ok(None);
+    };
+    let epoch = super::stored_json(&text)?;
+
+    let mut chain_rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT epoch_number, epoch_public::text FROM labyrinth.epoch_heads \
+          WHERE did = $1 AND epoch_number <= $2 \
+          ORDER BY epoch_number DESC LIMIT $3",
+    )
+    .bind(did)
+    .bind(target_seq)
+    .bind(MAX_CHAIN_HEADERS)
+    .fetch_all(&mut *conn)
+    .await?;
+    chain_rows.reverse();
+
+    let floor_seq = chain_rows
+        .first()
+        .map(|(seq, _)| u64::try_from(*seq).unwrap_or(0))
+        .unwrap_or(target_seq.max(0) as u64);
+    let mut chain = Vec::with_capacity(chain_rows.len());
+    for (_, item_text) in chain_rows {
+        chain.push(super::stored_json(&item_text)?);
+    }
+
+    Ok(Some(EpochHeadLookup {
+        epoch,
+        chain,
+        floor_seq,
+        received_at,
+    }))
 }
 
 /// One `getChatDeviceKeys` item.
@@ -195,7 +207,7 @@ pub struct ChatKeyRow {
 }
 
 /// Every chat device key of `did`, revoked ones included (with the time).
-/// The cursor is the last keyId.
+/// The cursor is the last `keyId`.
 pub async fn chat_device_keys(
     conn: &mut PgConnection,
     did: &str,
@@ -231,7 +243,7 @@ pub async fn chat_device_keys(
     Ok((items, cursor))
 }
 
-/// Whether `did` ever was a participant of the conversation.
+/// Whether `did` has an accepted participant period (`active`, `left`, or `removed`) in `conversation_id`.
 pub async fn ever_participant(
     conn: &mut PgConnection,
     conversation_id: Uuid,
@@ -239,7 +251,8 @@ pub async fn ever_participant(
 ) -> LabyrinthResult<bool> {
     Ok(sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM chat.participants \
-                        WHERE conversation_id = $1 AND user_did = $2 AND status = 'active')",
+                        WHERE conversation_id = $1 AND user_did = $2 \
+                          AND status IN ('active', 'left', 'removed'))",
     )
     .bind(conversation_id)
     .bind(did)
@@ -256,7 +269,7 @@ pub struct MemberDeviceRow {
 }
 
 /// `did`'s device leaves in the conversation with the chat seqs that added
-/// and removed each. Only a past or present participant may read a
+/// and removed each. Only a past or present accepted participant may read a
 /// conversation's leaf view; anyone else sees `ConversationNotFound`.
 pub async fn member_devices(
     conn: &mut PgConnection,

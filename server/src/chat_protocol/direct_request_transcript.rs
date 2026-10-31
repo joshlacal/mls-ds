@@ -1260,14 +1260,17 @@ fn endpoint_output_schema(nsid: &str) -> Option<&'static Value> {
     SCHEMAS
         .get_or_init(|| {
             endpoint_lexicons![
-                "acceptConversation", "activateReset", "cancelDirectRequestPreparation",
+                "acceptConversation", "acknowledgeEntries", "acknowledgeWelcome",
+                "activateReset", "authFull", "cancelDirectRequestPreparation",
                 "cancelLeafRecovery", "cancelLeave", "closeConversation", "createConversation",
                 "enrollDevice", "getConversationState", "getConversations", "getDeviceKey",
-                "getDirectRequestOutcome", "getEntries", "getLeafRecoveryInbox", "getOwnDevices",
-                "getPendingWelcomes", "getSubscriptionTicket", "prepareBlobUpload",
-                "prepareDirectRequest", "publishDirectRequest", "replenishKeyPackages",
+                "getDevices", "getDirectRequestOutcome", "getEntries", "getLeafRecoveryInbox",
+                "getOwnDevices", "getPendingWelcomes", "getSubscriptionTicket",
+                "prepareDirectRequest", "publishDirectRequest", "publishDirectRequestKeys",
+                "publishTyping", "registerPushGateway", "rejectWelcome",
+                "relaySpaceCredential", "relaySpaceRead", "replenishKeyPackages",
                 "requestLeafRecovery", "requestLeave", "requestReset", "revokeDevice",
-                "sendMessage", "submitTransition", "updatePushToken", "uploadBlob",
+                "sendMessage", "submitTransition", "subscribeEvents",
             ]
             .into_iter()
             .map(|(nsid, raw)| {

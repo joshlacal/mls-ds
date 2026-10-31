@@ -1085,9 +1085,12 @@ impl OutboundQueue {
                             self.auth_middleware.resolve_did(&ack.receiver_ds_did).await
                         {
                             if let Some(verifying_key) = crate::auth::extract_p256_key(&did_doc) {
-                                if ack.verify(&verifying_key) {
-                                    let _ =
-                                        crate::db::store_delivery_ack(&self.pool, ack, true).await;
+                                if !ack.verify(&verifying_key) {
+                                    warn!(
+                                        queue_id = %item.id,
+                                        receiver_ds = %ack.receiver_ds_did,
+                                        "Delivery ACK signature invalid"
+                                    );
                                 }
                             }
                         }

@@ -1,0 +1,17 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.conversation",
+  "defs": {
+    "main": {
+      "type": "space",
+      "key": "any",
+      "name": "Catbird chat history",
+      "description": "Sender-written post-quantum encrypted MLS conversation history, MEKs, and attachment manifests",
+      "collections": [
+        "blue.catbird.labyrinth.batch",
+        "blue.catbird.labyrinth.mek",
+        "blue.catbird.labyrinth.attachmentManifest"
+      ]
+    }
+  }
+}

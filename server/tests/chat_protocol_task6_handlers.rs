@@ -36,7 +36,6 @@ const TASK6_ENDPOINTS: &[&str] = &[
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
-    blob_store: catbird_server::blob_store::BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -48,12 +47,6 @@ impl FromRef<TestState> for DbPool {
 impl FromRef<TestState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestState) -> Self {
         state.runtime.clone()
-    }
-}
-
-impl FromRef<TestState> for catbird_server::blob_store::BlobStore {
-    fn from_ref(state: &TestState) -> Self {
-        state.blob_store.clone()
     }
 }
 
@@ -107,7 +100,6 @@ fn router(cutover_enabled: bool) -> Router {
     chat_router::<TestState>().with_state(TestState {
         pool: lazy_pool(),
         runtime: runtime(cutover_enabled),
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     })
 }
 

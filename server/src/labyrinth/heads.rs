@@ -1,29 +1,21 @@
-//! Epoch-head checks mls-ds performs itself (design §1a, Y1).
-//!
-//! The labyrinth crate is private, so mls-ds re-implements the small pieces
-//! it needs: the sha256 epoch-head recomputation of SPEC §5.3 (with the
-//! account DID in place of Meta's fbid, [CB-1]), the [CB-18] Ed25519
-//! attestation by a chat device key, and (second security review) the
-//! XEdDSA `selfSig` here and the `prevSig` chain link in
-//! `repo::directory::record_head` (`super::xeddsa`).
+//! Epoch-head verification delegated to `labyrinth_protocol::epoch_chain` (`Gate 3`, `Gate 6`).
 
-use ed25519_dalek::{Signature, VerifyingKey};
-use sha2::{Digest, Sha256};
+use labyrinth_protocol::epoch_chain::{
+    compute_epoch_head as protocol_compute_epoch_head, ed25519_verify_strict, xeddsa_verify,
+};
+use labyrinth_protocol::transcripts::{
+    EPOCH_ATTEST_PREFIX, EPOCH_PREV_SIG_PREFIX, EPOCH_SELF_SIG_PREFIX,
+};
 
 use super::error::{LabyrinthError, LabyrinthResult};
 use super::wire::records::EpochPublic;
-use super::xeddsa;
-
-const ATTEST_PREFIX: &str = "catbird.labyrinth.epoch_head_attest:";
-/// SPEC §5.3 `self_sig` / `prev_sig` prefixes (unstructured, no use-case byte).
-const SELF_SIG_PREFIX: &[u8] = b"minos.unstructured_signature.epoch_self:";
-const PREV_SIG_PREFIX: &[u8] = b"minos.unstructured_signature.epoch_prev:";
 
 /// The parsed fixed-size parts of an `epochPublic` the server checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadParts {
     pub epoch_number: u64,
     pub head: [u8; 32],
+    pub members_hash: [u8; 32],
     pub previous_head: Option<[u8; 32]>,
     pub attestation_key: [u8; 32],
     /// The epoch's XEdDSA signing key (X25519 u-coordinate).
@@ -31,55 +23,47 @@ pub struct HeadParts {
     pub prev_sig: Option<[u8; 64]>,
 }
 
-fn sha256(data: &[u8]) -> [u8; 32] {
-    Sha256::digest(data).into()
-}
-
-/// `get_epoch_head` (SPEC §5.3; paper p.22–23) with `user_did`.
+/// `get_epoch_head` (`SPEC §5.3` + `Gate 3` `membersHash` binding) with `user_did`.
 pub fn compute_epoch_head(
     epoch_number: u64,
-    auth_pubkey: &[u8],
+    auth_pubkey: &[u8; 32],
     encryption_pubkey: &[u8],
-    signing_pubkey: &[u8],
+    signing_pubkey: &[u8; 32],
+    members_hash: &[u8; 32],
     previous_head: Option<&[u8; 32]>,
     did: &str,
 ) -> [u8; 32] {
-    let prev = previous_head.map_or_else(|| "null".to_owned(), hex::encode);
-    let epoch_hash = sha256(
-        format!(
-            "epoch_public_data:auth_pubkey={};encryption_pubkey={};epoch_number={epoch_number};\
-             previous_epoch_head={prev};signing_pubkey={};user_did={did}",
-            hex::encode(auth_pubkey),
-            hex::encode(encryption_pubkey),
-            hex::encode(signing_pubkey),
-        )
-        .as_bytes(),
-    );
-    sha256(
-        format!(
-            "epoch_head:epoch_hash={};epoch_number={epoch_number};previous_epoch_head={prev}",
-            hex::encode(epoch_hash)
-        )
-        .as_bytes(),
+    protocol_compute_epoch_head(
+        epoch_number,
+        auth_pubkey,
+        encryption_pubkey,
+        signing_pubkey,
+        members_hash,
+        previous_head,
+        did,
     )
 }
 
-/// The [CB-18] attestation message.
+/// The `[CB-18]` attestation message.
 pub fn attestation_message(did: &str, head: &[u8; 32]) -> Vec<u8> {
-    [format!("{ATTEST_PREFIX}{did}:").as_bytes(), head.as_slice()].concat()
+    [
+        format!("{EPOCH_ATTEST_PREFIX}{did}:").as_bytes(),
+        head.as_slice(),
+    ]
+    .concat()
 }
 
 fn bad_sig(what: &str) -> LabyrinthError {
     LabyrinthError::invalid(format!("{what} does not verify"))
 }
 
-/// Checks 3 and 4 of design §1a: the head recomputes from the public keys,
-/// the attestation is a valid Ed25519 signature over it, and `selfSig` is a
-/// valid XEdDSA signature by the epoch's own signing key. Also enforces
-/// the genesis shape (epoch 0 has no predecessor and no `prevSig`; later
-/// epochs have both). Returns the parts the chain checks need.
+/// Verify `EpochPublic` recomputation, `membersHash` binding, Ed25519 attestation,
+/// and XEdDSA `selfSig` via `labyrinth_protocol::epoch_chain`.
 pub fn verify_epoch_public(did: &str, epoch: &EpochPublic) -> LabyrinthResult<HeadParts> {
     epoch.validate()?;
+    let auth_pubkey = epoch.auth_pubkey.array::<32>("authPubkey")?;
+    let signing_key = epoch.signing_pubkey.array::<32>("signingPubkey")?;
+    let members_hash = epoch.members_hash.array::<32>("membersHash")?;
     let previous_head = epoch
         .previous_epoch_head
         .as_ref()
@@ -98,9 +82,10 @@ pub fn verify_epoch_public(did: &str, epoch: &EpochPublic) -> LabyrinthResult<He
     let head = epoch.epoch_head.array::<32>("epochHead")?;
     let expected = compute_epoch_head(
         epoch.epoch_number,
-        &epoch.auth_pubkey.0,
+        &auth_pubkey,
         &epoch.encryption_pubkey.0,
-        &epoch.signing_pubkey.0,
+        &signing_key,
+        &members_hash,
         previous_head.as_ref(),
         did,
     );
@@ -114,18 +99,17 @@ pub fn verify_epoch_public(did: &str, epoch: &EpochPublic) -> LabyrinthResult<He
         .transport_pubkey
         .array::<32>("attestation.transportPubkey")?;
     let sig = epoch.attestation.sig.array::<64>("attestation.sig")?;
-    let key = VerifyingKey::from_bytes(&attestation_key)
-        .map_err(|_| LabyrinthError::invalid("attestation key is not an Ed25519 point"))?;
-    key.verify_strict(
-        &attestation_message(did, &head),
-        &Signature::from_bytes(&sig),
-    )
-    .map_err(|_| LabyrinthError::invalid("attestation signature does not verify"))?;
-    let signing_key = epoch.signing_pubkey.array::<32>("signingPubkey")?;
+    ed25519_verify_strict(&attestation_key, &attestation_message(did, &head), &sig)
+        .map_err(|_| LabyrinthError::invalid("attestation signature does not verify"))?;
+
     let self_sig = epoch.self_sig.array::<64>("selfSig")?;
-    if !xeddsa::verify(&signing_key, &[SELF_SIG_PREFIX, &head].concat(), &self_sig) {
-        return Err(bad_sig("selfSig"));
-    }
+    xeddsa_verify(
+        &signing_key,
+        &[EPOCH_SELF_SIG_PREFIX, head.as_slice()].concat(),
+        &self_sig,
+    )
+    .map_err(|_| bad_sig("selfSig"))?;
+
     let prev_sig = epoch
         .prev_sig
         .as_ref()
@@ -134,6 +118,7 @@ pub fn verify_epoch_public(did: &str, epoch: &EpochPublic) -> LabyrinthResult<He
     Ok(HeadParts {
         epoch_number: epoch.epoch_number,
         head,
+        members_hash,
         previous_head,
         attestation_key,
         signing_key,
@@ -141,16 +126,16 @@ pub fn verify_epoch_public(did: &str, epoch: &EpochPublic) -> LabyrinthResult<He
     })
 }
 
-/// SPEC §5.3 `prev_sig`: epoch n's head signed by epoch n-1's signing key.
-/// Genesis carries none (enforced by [`verify_epoch_public`]).
+/// SPEC §5.3 `prev_sig`: epoch `n`'s head signed by epoch `n - 1`'s signing key.
 pub fn verify_prev_sig(parts: &HeadParts, previous_signing_key: &[u8; 32]) -> LabyrinthResult<()> {
     match &parts.prev_sig {
         Some(sig)
-            if xeddsa::verify(
+            if xeddsa_verify(
                 previous_signing_key,
-                &[PREV_SIG_PREFIX, &parts.head].concat(),
+                &[EPOCH_PREV_SIG_PREFIX, parts.head.as_slice()].concat(),
                 sig,
-            ) =>
+            )
+            .is_ok() =>
         {
             Ok(())
         }
@@ -158,10 +143,7 @@ pub fn verify_prev_sig(parts: &HeadParts, previous_signing_key: &[u8; 32]) -> La
     }
 }
 
-/// Check 1 and 2 of design §1a against the stored latest head (and any
-/// post-purge high-water floor) of the DID: genesis only on an unanchored
-/// chain, `floor + 1` (with no predecessor) when restarting after a purge,
-/// otherwise `latest + 1` linking to the latest head.
+/// Check genesis / post-purge `floor + 1` restart / contiguous `latest + 1` extension.
 pub fn check_chain_link(
     parts: &HeadParts,
     latest: Option<(u64, [u8; 32])>,
@@ -198,6 +180,7 @@ mod tests {
         let parts = |n, prev| HeadParts {
             epoch_number: n,
             head: [9; 32],
+            members_hash: [5; 32],
             previous_head: prev,
             attestation_key: [0; 32],
             signing_key: [0; 32],

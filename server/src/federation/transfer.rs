@@ -93,55 +93,51 @@ impl SequencerTransfer {
         convo_id: &str,
         new_sequencer_did: &str,
     ) -> Result<TransferResult, TransferError> {
-        let current = sqlx::query_as::<_, (Option<String>, Option<i64>)>(
-            "SELECT sequencer_ds, sequencer_term FROM conversations WHERE id = $1",
+        let convo_uuid = uuid::Uuid::parse_str(convo_id)
+            .map_err(|_| TransferError::ConversationNotFound(convo_id.to_string()))?;
+        let current = sqlx::query_as::<_, (bool, Option<String>, i64)>(
+            "SELECT is_remote, sequencer_ds, sequencer_term FROM chat.conversations WHERE conversation_id = $1",
         )
-        .bind(convo_id)
+        .bind(convo_uuid)
         .fetch_optional(&self.pool)
         .await
         .map_err(TransferError::Database)?;
 
-        match current.as_ref() {
+        let (was_remote, observed_sequencer, current_term_i64) = match current {
             None => return Err(TransferError::ConversationNotFound(convo_id.to_string())),
-            Some((Some(ds), _)) if canonical_did(ds) != canonical_did(&self.self_did) => {
+            Some((true, Some(ds), _)) if canonical_did(&ds) != canonical_did(&self.self_did) => {
                 return Err(TransferError::NotCurrentSequencer {
                     convo_id: convo_id.to_string(),
-                    current_sequencer: ds.clone(),
+                    current_sequencer: ds,
                 });
             }
-            _ => {} // NULL or our DID — we are the sequencer
-        }
-        let current_term = current
-            .as_ref()
-            .and_then(|(_, term)| *term)
-            .unwrap_or(0)
-            .max(0) as u64;
+            Some(row) => row,
+        };
+        let current_term = current_term_i64.max(0) as u64;
         let new_sequencer_term = current_term + 1;
+        let canonical_new = canonical_did(new_sequencer_did).to_string();
+        let (next_is_remote, next_sequencer_ds): (bool, Option<String>) =
+            if canonical_new == canonical_did(&self.self_did) {
+                (false, None)
+            } else {
+                (true, Some(canonical_new.clone()))
+            };
 
-        // N30: CAS-fence the handoff against the observed `(owner, term)` so a
-        // concurrent transfer/failover between our read above and this UPDATE
-        // cannot be silently overwritten. Mirrors `accept_transfer`'s fence:
-        // term equality + NULL-safe, fragment-stripped owner match, with
-        // RETURNING as the post-CAS source of truth.
-        let observed_sequencer = current
-            .as_ref()
-            .and_then(|(ds, _)| ds.as_deref())
-            .map(canonical_did);
         let updated: Option<i64> = sqlx::query_scalar(
-            "UPDATE conversations \
-             SET sequencer_ds = $2, sequencer_term = $3, updated_at = NOW() \
-             WHERE id = $1 \
-               AND COALESCE(sequencer_term, 0) = $4 \
-               AND ( \
-                    ($5::text IS NULL AND sequencer_ds IS NULL) \
-                 OR split_part(sequencer_ds, '#', 1) = $5 \
-               ) \
+            "UPDATE chat.conversations \
+             SET is_remote = $2, sequencer_ds = $3, sequencer_term = $4 \
+             WHERE conversation_id = $1 \
+               AND sequencer_term = $5 \
+               AND is_remote = $6 \
+               AND sequencer_ds IS NOT DISTINCT FROM $7 \
              RETURNING sequencer_term",
         )
-        .bind(convo_id)
-        .bind(new_sequencer_did)
+        .bind(convo_uuid)
+        .bind(next_is_remote)
+        .bind(next_sequencer_ds)
         .bind(new_sequencer_term as i64)
         .bind(current_term as i64)
+        .bind(was_remote)
         .bind(observed_sequencer)
         .fetch_optional(&self.pool)
         .await
@@ -168,7 +164,7 @@ impl SequencerTransfer {
 
         Ok(TransferResult::Transferred {
             convo_id: convo_id.to_string(),
-            new_sequencer_did: new_sequencer_did.to_string(),
+            new_sequencer_did: canonical_new,
             new_sequencer_term: new_term_raw.max(0) as u64,
         })
     }
@@ -180,18 +176,20 @@ impl SequencerTransfer {
         from_sequencer_did: &str,
         new_sequencer_term: u64,
     ) -> Result<TransferResult, TransferError> {
-        let row = sqlx::query_as::<_, (Option<String>, Option<i32>, Option<i64>)>(
-            "SELECT sequencer_ds, current_epoch, sequencer_term FROM conversations \
-       WHERE id = $1",
+        let convo_uuid = uuid::Uuid::parse_str(convo_id)
+            .map_err(|_| TransferError::ConversationNotFound(convo_id.to_string()))?;
+        let row = sqlx::query_as::<_, (bool, Option<String>, i64, i64)>(
+            "SELECT is_remote, sequencer_ds, current_generation, sequencer_term \
+             FROM chat.conversations WHERE conversation_id = $1",
         )
-        .bind(convo_id)
+        .bind(convo_uuid)
         .fetch_optional(&self.pool)
         .await
         .map_err(TransferError::Database)?;
 
         match row {
             None => Err(TransferError::ConversationNotFound(convo_id.to_string())),
-            Some((seq_ds, _epoch, current_term_raw)) => {
+            Some((was_remote, seq_ds, _epoch, current_term_raw)) => {
                 if let Some(ref ds) = seq_ds {
                     if canonical_did(ds) != canonical_did(from_sequencer_did) {
                         warn!(
@@ -206,7 +204,7 @@ impl SequencerTransfer {
                         });
                     }
                 }
-                let current_term = current_term_raw.unwrap_or(0).max(0) as u64;
+                let current_term = current_term_raw.max(0) as u64;
                 if new_sequencer_term <= current_term {
                     return Err(TransferError::TermStale {
                         convo_id: convo_id.to_string(),
@@ -226,28 +224,25 @@ impl SequencerTransfer {
                     });
                 }
 
-                let observed_sequencer = seq_ds.as_deref().map(canonical_did);
-                let updated: Option<(i32, i64)> = sqlx::query_as(
-                    "UPDATE conversations \
-                     SET sequencer_ds = $2, sequencer_term = $3, updated_at = NOW() \
-                     WHERE id = $1 \
-                       AND COALESCE(sequencer_term, 0) = $4 \
-                       AND ( \
-                            ($5::text IS NULL AND sequencer_ds IS NULL) \
-                         OR split_part(sequencer_ds, '#', 1) = $5 \
-                       ) \
-                     RETURNING current_epoch, sequencer_term",
+                let updated: Option<(i64, i64)> = sqlx::query_as(
+                    "UPDATE chat.conversations \
+                     SET is_remote = FALSE, sequencer_ds = NULL, sequencer_term = $2 \
+                     WHERE conversation_id = $1 \
+                       AND sequencer_term = $3 \
+                       AND is_remote = $4 \
+                       AND sequencer_ds IS NOT DISTINCT FROM $5 \
+                     RETURNING current_generation, sequencer_term",
                 )
-                .bind(convo_id)
-                .bind(&self.self_did)
+                .bind(convo_uuid)
                 .bind(new_sequencer_term as i64)
                 .bind(current_term as i64)
-                .bind(observed_sequencer)
+                .bind(was_remote)
+                .bind(seq_ds)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(TransferError::Database)?;
 
-                let Some((new_epoch, new_term_raw)) = updated else {
+                let Some((new_epoch_i64, new_term_raw)) = updated else {
                     return Err(TransferError::NotCurrentSequencer {
                         convo_id: convo_id.to_string(),
                         current_sequencer: "unknown (changed during transfer)".to_string(),
@@ -263,7 +258,7 @@ impl SequencerTransfer {
 
                 Ok(TransferResult::Accepted {
                     convo_id: convo_id.to_string(),
-                    new_epoch,
+                    new_epoch: i32::try_from(new_epoch_i64).unwrap_or(i32::MAX),
                     new_sequencer_term: new_term_raw.max(0) as u64,
                 })
             }
@@ -271,56 +266,43 @@ impl SequencerTransfer {
     }
 
     /// Forcefully assume the sequencer role for a conversation.
-    ///
-    /// Used during client-requested failover when the current sequencer
-    /// is unreachable. Unlike `accept_transfer`, this does NOT require
-    /// authorisation from the current sequencer, but does require:
-    /// 1. Authorization: this DS must have active members in the conversation
-    /// 2. CAS: the current sequencer must match `expected_sequencer` to prevent split-brain
-    /// 3. Lease staleness: local lease observation must be stale enough before takeover
-    ///
-    /// MIMI-inspired failover invariant: takeover fences old writers by
-    /// incrementing both `current_epoch` and `sequencer_term` in one CAS step.
     pub async fn assume_sequencer_role(
         &self,
         convo_id: &str,
         expected_sequencer: &str,
     ) -> Result<TransferResult, TransferError> {
-        // 1. Verify conversation exists and get current state
-        let row = sqlx::query_as::<_, (Option<String>, Option<i32>, Option<i64>, DateTime<Utc>)>(
-            "SELECT sequencer_ds, current_epoch, sequencer_term, updated_at FROM conversations WHERE id = $1",
+        let convo_uuid = uuid::Uuid::parse_str(convo_id)
+            .map_err(|_| TransferError::ConversationNotFound(convo_id.to_string()))?;
+        let row = sqlx::query_as::<_, (bool, Option<String>, i64, i64, DateTime<Utc>)>(
+            "SELECT c.is_remote, c.sequencer_ds, c.current_generation, c.sequencer_term, \
+                    COALESCE((SELECT MAX(s.updated_at) FROM federation_sync_state s WHERE s.convo_id = $2), c.created_at) \
+               FROM chat.conversations c WHERE c.conversation_id = $1",
         )
+        .bind(convo_uuid)
         .bind(convo_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(TransferError::Database)?;
 
-        let expected_term = row
-            .as_ref()
-            .and_then(|(_, _, term, _)| *term)
-            .unwrap_or(0)
-            .max(0) as u64;
+        let Some((was_remote, seq_ds, current_epoch_i64, current_term_raw, lease_observed_at)) = row
+        else {
+            return Err(TransferError::ConversationNotFound(convo_id.to_string()));
+        };
 
-        match row.as_ref() {
-            None => return Err(TransferError::ConversationNotFound(convo_id.to_string())),
-            Some((Some(ds), current_epoch, current_term_raw, _))
-                if canonical_did(ds) == canonical_did(&self.self_did) =>
-            {
-                return Ok(TransferResult::Accepted {
-                    convo_id: convo_id.to_string(),
-                    new_epoch: current_epoch.as_ref().copied().unwrap_or(0),
-                    new_sequencer_term: current_term_raw.as_ref().copied().unwrap_or(0).max(0)
-                        as u64,
-                });
-            }
-            _ => {}
+        if !was_remote
+            || seq_ds
+                .as_deref()
+                .is_some_and(|ds| canonical_did(ds) == canonical_did(&self.self_did))
+        {
+            return Ok(TransferResult::Accepted {
+                convo_id: convo_id.to_string(),
+                new_epoch: i32::try_from(current_epoch_i64).unwrap_or(0),
+                new_sequencer_term: current_term_raw.max(0) as u64,
+            });
         }
 
+        let expected_term = current_term_raw.max(0) as u64;
         let now = Utc::now();
-        let lease_observed_at = row
-            .as_ref()
-            .map(|(_, _, _, updated_at)| *updated_at)
-            .expect("conversation existence checked above");
         let observed_age_secs = observed_lease_age_secs(&lease_observed_at, now);
         if !self
             .failover_policy
@@ -333,12 +315,18 @@ impl SequencerTransfer {
             });
         }
 
-        // 2. Authorization: verify this DS has active members in the conversation
+        let canonical_self = canonical_did(&self.self_did).to_string();
         let has_members: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND left_at IS NULL AND COALESCE(split_part(ds_did, '#', 1), $2) = $2)",
+            "SELECT EXISTS( \
+               SELECT 1 FROM chat.participants \
+               WHERE conversation_id = $1 \
+                 AND current_membership = TRUE \
+                 AND status = 'active' \
+                 AND COALESCE(ds_did, $2) = $2 \
+             )",
         )
-        .bind(convo_id)
-        .bind(&self.self_did)
+        .bind(convo_uuid)
+        .bind(&canonical_self)
         .fetch_one(&self.pool)
         .await
         .map_err(TransferError::Database)?;
@@ -350,35 +338,27 @@ impl SequencerTransfer {
             });
         }
 
-        // 3. CAS: only take over if the sequencer is still who we expect.
-        //
-        // `current_epoch` MUST NOT advance here. Bumping it without also
-        // writing a commit row (to `messages` and `commits`) orphans the MLS
-        // epoch: clients learn about the advance via SSE/GroupInfo but cannot
-        // fetch a commit to catch their local MLS state up to it. Fencing is
-        // handled by `sequencer_term` alone — the CAS below already rejects
-        // concurrent takeovers. Epoch advances must only ever originate from
-        // an actual MLS commit landing in `submit_commit` / `commit_group_change`.
-        let updated: Option<(i32, i64)> = sqlx::query_as(
-            "UPDATE conversations \
-             SET sequencer_ds = $2, sequencer_term = sequencer_term + 1, updated_at = NOW() \
-             WHERE id = $1 AND (sequencer_ds = $3 OR sequencer_ds IS NULL) AND sequencer_term = $4 \
-             RETURNING current_epoch, sequencer_term",
+        let canonical_expected = canonical_did(expected_sequencer);
+        let updated: Option<(i64, i64)> = sqlx::query_as(
+            "UPDATE chat.conversations \
+             SET is_remote = FALSE, sequencer_ds = NULL, sequencer_term = sequencer_term + 1 \
+             WHERE conversation_id = $1 AND is_remote = TRUE AND sequencer_ds = $2 AND sequencer_term = $3 \
+             RETURNING current_generation, sequencer_term",
         )
-        .bind(convo_id)
-        .bind(&self.self_did)
-        .bind(expected_sequencer)
+        .bind(convo_uuid)
+        .bind(canonical_expected)
         .bind(expected_term as i64)
         .fetch_optional(&self.pool)
         .await
         .map_err(TransferError::Database)?;
 
-        let Some((new_epoch, new_term_raw)) = updated else {
+        let Some((new_epoch_i64, new_term_raw)) = updated else {
             return Err(TransferError::NotCurrentSequencer {
                 convo_id: convo_id.to_string(),
                 current_sequencer: "unknown (changed during failover)".to_string(),
             });
         };
+        let new_epoch = i32::try_from(new_epoch_i64).unwrap_or(i32::MAX);
         let new_sequencer_term = new_term_raw.max(0) as u64;
 
         warn!(
@@ -397,20 +377,22 @@ impl SequencerTransfer {
         })
     }
 
-    /// Pick a new sequencer from the conversation's members.
-    /// Prefers the oldest admin, falling back to the oldest member.
+    /// Pick a new sequencer from the conversation's active participants.
     pub async fn pick_new_sequencer(
         &self,
         convo_id: &str,
     ) -> Result<Option<String>, TransferError> {
+        let convo_uuid = uuid::Uuid::parse_str(convo_id)
+            .map_err(|_| TransferError::ConversationNotFound(convo_id.to_string()))?;
+        let canonical_self = canonical_did(&self.self_did).to_string();
         let new_ds = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT COALESCE(split_part(ds_did, '#', 1), $2) FROM members \
-       WHERE convo_id = $1 \
-       ORDER BY is_admin DESC, joined_at ASC \
-       LIMIT 1",
+            "SELECT COALESCE(ds_did, $2) FROM chat.participants \
+             WHERE conversation_id = $1 AND current_membership = TRUE AND status = 'active' \
+             ORDER BY (role = 'admin') DESC, created_at ASC \
+             LIMIT 1",
         )
-        .bind(convo_id)
-        .bind(&self.self_did)
+        .bind(convo_uuid)
+        .bind(&canonical_self)
         .fetch_optional(&self.pool)
         .await
         .map_err(TransferError::Database)?;

@@ -1,0 +1,106 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.relaySpaceRead",
+  "description": "Stateless zero-persistence home-mls-ds relay (3A) forwarding client-signed RFC 9421 Space read requests (listRepos, getSpace, listRecords, getRecord, listRepoOps, getLatestCommit, getRepo, getBlob) to a remote Space host or writer PDS, returning raw bytes and preserving the Atproto-Space-Mac header.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "actorDeviceId",
+            "targetDid",
+            "nsid",
+            "credential",
+            "spaceAudience",
+            "signatureInput",
+            "signature"
+          ],
+          "properties": {
+            "actorDeviceId": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#deviceId"
+            },
+            "targetDid": {
+              "type": "string",
+              "format": "did",
+              "description": "DID whose #atproto_pds or #atproto_mls endpoint serves the requested com.atproto.space.* read endpoint."
+            },
+            "nsid": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "Read-only com.atproto.space.* NSID (listRepos, getSpace, listRecords, getRecord, listRepoOps, getLatestCommit, getRepo, getBlob)."
+            },
+            "query": {
+              "type": "string",
+              "maxLength": 4096,
+              "description": "Raw URL-encoded query string without leading '?'."
+            },
+            "credential": {
+              "type": "string",
+              "maxLength": 16384,
+              "description": "Space credential JWT forwarded in Authorization / Atproto-Space-Credential."
+            },
+            "spaceAudience": {
+              "type": "string",
+              "maxLength": 512,
+              "description": "Atproto-Space-Audience header value."
+            },
+            "wantMac": {
+              "type": "string",
+              "maxLength": 512,
+              "description": "Optional Atproto-Space-Want-Mac (#atproto_kem did:key share)."
+            },
+            "signatureInput": {
+              "type": "string",
+              "maxLength": 2048,
+              "description": "RFC 9421 Signature-Input header covering ('authorization' 'atproto-space-audience')."
+            },
+            "signature": {
+              "type": "string",
+              "maxLength": 2048,
+              "description": "RFC 9421 Signature header produced by the client's ephemeral PoP key."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/octet-stream"
+      },
+      "errors": [
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "InvalidNsid"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidTargetEndpoint"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "UpstreamError"
+        }
+      ]
+    }
+  }
+}

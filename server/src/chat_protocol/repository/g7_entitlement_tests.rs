@@ -605,7 +605,6 @@ mod chat_protocol {
             GetEntries,
             GetPendingWelcomes,
             GetLeafRecoveryInbox,
-            GetBlob,
             GetSubscriptionTicket,
             SubscribeEvents,
             PublishTyping,
@@ -624,7 +623,6 @@ mod chat_protocol {
                     Self::GetLeafRecoveryInbox => {
                         super::read_authority::OrdinaryReadEndpoint::GetLeafRecoveryInbox
                     }
-                    Self::GetBlob => super::read_authority::OrdinaryReadEndpoint::GetBlob,
                     Self::GetSubscriptionTicket => {
                         super::read_authority::OrdinaryReadEndpoint::GetSubscriptionTicket
                     }
@@ -1744,7 +1742,7 @@ fn production_hydrator_retains_the_direct_locked_aggregate_path() {
 #[test]
 fn locked_aggregate_has_no_unchecked_or_shipping_test_hydration_constructor() {
     let core = include_str!("core.rs");
-    let state_machine = include_str!("../state_machine.rs");
+    let state_machine = concat!(include_str!("../state_machine.rs"), include_str!("../state_machine/commands.rs"), include_str!("../state_machine/creation.rs"), include_str!("../state_machine/direct_requests.rs"), include_str!("../state_machine/effects.rs"), include_str!("../state_machine/evidence.rs"), include_str!("../state_machine/historical.rs"), include_str!("../state_machine/hydration_entries.rs"), include_str!("../state_machine/hydration_requests.rs"), include_str!("../state_machine/hydration_rows.rs"), include_str!("../state_machine/invariants.rs"), include_str!("../state_machine/lifecycle.rs"), include_str!("../state_machine/membership_rules.rs"), include_str!("../state_machine/messages.rs"), include_str!("../state_machine/metadata.rs"), include_str!("../state_machine/planned_transition.rs"), include_str!("../state_machine/planners.rs"), include_str!("../state_machine/recovery.rs"), include_str!("../state_machine/recovery_encoder.rs"), include_str!("../state_machine/recovery_fingerprint.rs"), include_str!("../state_machine/registration.rs"), include_str!("../state_machine/state_graph.rs"), include_str!("../state_machine/transitions.rs"), include_str!("../state_machine/types.rs"), include_str!("../state_machine/work_validation.rs"));
     let public_state = include_str!("../public_state.rs");
     let module_root = include_str!("../mod.rs");
     for (name, source) in [

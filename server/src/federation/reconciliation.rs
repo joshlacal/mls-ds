@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -306,41 +306,6 @@ async fn run_once(
         }
     }
 
-    // 2. Reconcile legacy conversations from conversations (public schema)
-    let legacy_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, split_part(sequencer_ds, '#', 1) \
-         FROM conversations \
-         WHERE is_remote = TRUE AND sequencer_ds IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("failed to list legacy remote conversations: {e}"))?;
-
-    for (convo_id, sequencer_ds_raw) in legacy_rows {
-        let sequencer_ds = canonical_did(&sequencer_ds_raw).to_string();
-        if canonical_did(&sequencer_ds) == canonical_did(self_did) {
-            continue;
-        }
-        if let Err(e) = reconcile_conversation_internal(
-            pool,
-            resolver,
-            outbound,
-            auth_sign,
-            &convo_id,
-            &sequencer_ds,
-            false,
-        )
-        .await
-        {
-            warn!(
-                convo_id = %crate::crypto::redact_for_log(&convo_id),
-                sequencer_ds = %crate::crypto::redact_for_log(&sequencer_ds),
-                error = %e,
-                "Failed to reconcile legacy conversation"
-            );
-        }
-    }
-
     Ok(())
 }
 
@@ -364,56 +329,45 @@ pub async fn reconcile_conversation(
     convo_id: &str,
     sequencer_ds: &str,
 ) -> Result<(), String> {
-    if let Ok(convo_uuid) = uuid::Uuid::parse_str(convo_id) {
-        peer_policy::enforce_outbound_peer_policy(pool, sequencer_ds)
-            .await
-            .map_err(|e| format!("peer policy denied outbound reconciliation: {e}"))?;
-        let endpoint = resolver
-            .resolve_ds_did(sequencer_ds)
-            .await
-            .map_err(|e| format!("resolve sequencer endpoint failed: {e}"))?;
-        let destination = resolver
-            .resolve_ds_destination(sequencer_ds)
-            .await
-            .map_err(|e| format!("resolve sequencer destination failed: {e}"))?;
-        let discovery_payload = fetch_discovery_payload(&destination).await;
-        if !super::target_supports_capability(
-            CAPABILITY_RECONCILIATION_V1,
+    let convo_uuid = uuid::Uuid::parse_str(convo_id)
+        .map_err(|_| format!("invalid conversation UUID: {convo_id}"))?;
+    peer_policy::enforce_outbound_peer_policy(pool, sequencer_ds)
+        .await
+        .map_err(|e| format!("peer policy denied outbound reconciliation: {e}"))?;
+    let endpoint = resolver
+        .resolve_ds_did(sequencer_ds)
+        .await
+        .map_err(|e| format!("resolve sequencer endpoint failed: {e}"))?;
+    let destination = resolver
+        .resolve_ds_destination(sequencer_ds)
+        .await
+        .map_err(|e| format!("resolve sequencer destination failed: {e}"))?;
+    let discovery_payload = fetch_discovery_payload(&destination).await;
+    if !super::target_supports_capability(
+        CAPABILITY_RECONCILIATION_V1,
+        endpoint.federation_capabilities.as_deref(),
+        discovery_payload.as_ref(),
+    ) {
+        let known_caps = super::known_target_capabilities(
             endpoint.federation_capabilities.as_deref(),
             discovery_payload.as_ref(),
-        ) {
-            let known_caps = super::known_target_capabilities(
-                endpoint.federation_capabilities.as_deref(),
-                discovery_payload.as_ref(),
-            )
-            .unwrap_or_default();
-            return Err(format!(
-                "target DS missing required capability '{CAPABILITY_RECONCILIATION_V1}' (did={}, advertised={:?})",
-                crate::crypto::redact_for_log(sequencer_ds),
-                known_caps
-            ));
-        }
-        reconcile_clean_conversation(
-            pool,
-            convo_uuid,
-            sequencer_ds,
-            &destination,
-            outbound,
-            auth_sign,
         )
-        .await
-    } else {
-        reconcile_conversation_internal(
-            pool,
-            resolver,
-            outbound,
-            auth_sign,
-            convo_id,
-            sequencer_ds,
-            false,
-        )
-        .await
+        .unwrap_or_default();
+        return Err(format!(
+            "target DS missing required capability '{CAPABILITY_RECONCILIATION_V1}' (did={}, advertised={:?})",
+            crate::crypto::redact_for_log(sequencer_ds),
+            known_caps
+        ));
     }
+    reconcile_clean_conversation(
+        pool,
+        convo_uuid,
+        sequencer_ds,
+        &destination,
+        outbound,
+        auth_sign,
+    )
+    .await
 }
 pub(crate) async fn query_remote_digest(
     outbound: &OutboundClient,
@@ -634,15 +588,16 @@ async fn reconcile_clean_conversation(
             return Err(format!("events page convo_id mismatch"));
         }
 
-        if page.from_seq_exclusive != cursor {
+        let after_seq = cursor;
+        if page.from_seq_exclusive != after_seq {
             return Err(format!("events page from_seq_exclusive mismatch"));
         }
 
-        if page.to_seq_inclusive > remote_digest.last_seq || page.to_seq_inclusive <= cursor {
+        if page.to_seq_inclusive > remote_digest.last_seq || page.to_seq_inclusive <= after_seq {
             return Err(format!("events page to_seq_inclusive out of bounds"));
         }
 
-        let overlap_start = cursor;
+        let overlap_start = after_seq;
         let overlap_end = std::cmp::min(page.to_seq_inclusive, local_snapshot.last_seq);
         let local_chunk_map: std::collections::BTreeMap<
             i64,
@@ -651,8 +606,9 @@ async fn reconcile_clean_conversation(
             let local_chunk: Vec<crate::handlers::ds::get_convo_digest::CleanDigestRow> =
                 sqlx::query_as(
                     "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
-                            entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
-                            signed_request_bytes, outer_entry_fingerprint, received_at \
+                            entry_id, entry_kind, COALESCE(accepted_payload_bytes, ''::bytea) AS accepted_payload_bytes, \
+                            accepted_payload_sha256, COALESCE(signed_request_bytes, ''::bytea) AS signed_request_bytes, \
+                            outer_entry_fingerprint, received_at \
                      FROM chat.entries WHERE conversation_id = $1 AND seq > $2 AND seq <= $3 ORDER BY seq ASC",
                 )
                 .bind(convo_uuid)
@@ -949,143 +905,6 @@ async fn reconcile_clean_conversation(
     }
 }
 
-async fn reconcile_conversation_internal(
-    pool: &PgPool,
-    resolver: &DsResolver,
-    outbound: &OutboundClient,
-    auth_sign: &(dyn Fn(&str, &str) -> Result<String, String> + Send + Sync),
-    convo_id: &str,
-    sequencer_ds: &str,
-    is_clean: bool,
-) -> Result<(), String> {
-    peer_policy::enforce_outbound_peer_policy(pool, sequencer_ds)
-        .await
-        .map_err(|e| format!("peer policy denied outbound reconciliation: {e}"))?;
-    let endpoint = resolver
-        .resolve_ds_did(sequencer_ds)
-        .await
-        .map_err(|e| format!("resolve sequencer endpoint failed: {e}"))?;
-    let destination = resolver
-        .resolve_ds_destination(sequencer_ds)
-        .await
-        .map_err(|e| format!("resolve sequencer destination failed: {e}"))?;
-    let discovery_payload = fetch_discovery_payload(&destination).await;
-    if !super::target_supports_capability(
-        CAPABILITY_RECONCILIATION_V1,
-        endpoint.federation_capabilities.as_deref(),
-        discovery_payload.as_ref(),
-    ) {
-        let known_caps = super::known_target_capabilities(
-            endpoint.federation_capabilities.as_deref(),
-            discovery_payload.as_ref(),
-        )
-        .unwrap_or_default();
-        return Err(format!(
-            "target DS missing required capability '{CAPABILITY_RECONCILIATION_V1}' (did={}, advertised={:?})",
-            crate::crypto::redact_for_log(sequencer_ds),
-            known_caps
-        ));
-    }
-
-    let digest_token = auth_sign(sequencer_ds, DIGEST_NSID)
-        .map_err(|e| format!("failed to sign digest request: {e}"))?;
-    let remote_digest =
-        query_remote_digest(outbound, &destination, &digest_token, convo_id).await?;
-    let mut local_state = local_legacy_digest_state(pool, convo_id)
-        .await
-        .map_err(|e| format!("local legacy digest failed: {e}"))?;
-    let drifted = local_state.digest_sha256 != remote_digest.digest_sha256
-        || local_state.last_seq != remote_digest.last_seq
-        || local_state.event_count != remote_digest.event_count;
-
-    if drifted {
-        metrics::counter!("federation_reconciliation_drift_total", 1, "convo_id" => convo_id.to_string());
-        debug!(
-            convo_id = %crate::crypto::redact_for_log(convo_id),
-            local_last_seq = local_state.last_seq,
-            remote_last_seq = remote_digest.last_seq,
-            "Reconciliation drift detected; fetching missing events"
-        );
-
-        let mut after_seq = local_state.last_seq;
-        loop {
-            let events_token = auth_sign(sequencer_ds, EVENTS_NSID)
-                .map_err(|e| format!("failed to sign events request: {e}"))?;
-            let page = query_remote_events(
-                outbound,
-                &destination,
-                &events_token,
-                convo_id,
-                after_seq,
-                EVENTS_PAGE_LIMIT,
-            )
-            .await?;
-            if page.events.is_empty() {
-                break;
-            }
-            if page.to_seq_inclusive <= after_seq {
-                return Err(format!(
-                    "events page did not advance reconciliation cursor (after_seq={after_seq}, to_seq_inclusive={})",
-                    page.to_seq_inclusive
-                ));
-            }
-            apply_remote_events(pool, convo_id, &page.events)
-                .await
-                .map_err(|e| format!("apply legacy events failed: {e}"))?;
-            after_seq = page.to_seq_inclusive;
-            if page.events.len() < EVENTS_PAGE_LIMIT as usize {
-                break;
-            }
-        }
-
-        sqlx::query(
-            "UPDATE conversations \
-             SET current_epoch = GREATEST(current_epoch, $2), \
-                 sequencer_term = GREATEST(COALESCE(sequencer_term, 0), $3), \
-                 sequencer_ds = $4 \
-             WHERE id = $1",
-        )
-        .bind(convo_id)
-        .bind(remote_digest.epoch)
-        .bind(remote_digest.sequencer_term)
-        .bind(canonical_did(&remote_digest.sequencer_ds_did))
-        .execute(pool)
-        .await
-        .map_err(|e| format!("failed to update conversation state after reconciliation: {e}"))?;
-
-        local_state = local_legacy_digest_state(pool, convo_id)
-            .await
-            .map_err(|e| format!("local legacy digest after reconcile failed: {e}"))?;
-    }
-
-    let drift_increment = if drifted { 1_i64 } else { 0_i64 };
-    sqlx::query(
-        "INSERT INTO federation_sync_state \
-            (convo_id, sequencer_ds_did, sequencer_term, last_seq, last_epoch, last_digest, last_reconciled_at, drift_count, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, NOW()) \
-         ON CONFLICT (convo_id, sequencer_ds_did) DO UPDATE SET \
-            sequencer_term = EXCLUDED.sequencer_term, \
-            last_seq = EXCLUDED.last_seq, \
-            last_epoch = EXCLUDED.last_epoch, \
-            last_digest = EXCLUDED.last_digest, \
-            last_reconciled_at = NOW(), \
-            drift_count = federation_sync_state.drift_count + EXCLUDED.drift_count, \
-            updated_at = NOW()",
-    )
-    .bind(convo_id)
-    .bind(canonical_did(&remote_digest.sequencer_ds_did))
-    .bind(remote_digest.sequencer_term)
-    .bind(local_state.last_seq)
-    .bind(local_state.last_epoch)
-    .bind(&local_state.digest_sha256)
-    .bind(drift_increment)
-    .execute(pool)
-    .await
-    .map_err(|e| format!("failed to update federation_sync_state: {e}"))?;
-
-    Ok(())
-}
-
 pub(crate) async fn fetch_discovery_payload(
     destination: &ValidatedRemoteDestination,
 ) -> Option<serde_json::Value> {
@@ -1122,50 +941,6 @@ async fn fetch_discovery_payload_with_timeout(
     )
     .await
     .ok()
-}
-
-async fn apply_remote_events(
-    pool: &PgPool,
-    convo_id: &str,
-    events: &[RemoteEvent],
-) -> Result<(), sqlx::Error> {
-    for event in events {
-        let wire_epoch = if event.message_type == "commit" {
-            crate::crypto::commit_inspect::inspect_commit_shape(&event.ciphertext)
-                .ok()
-                .map(|shape| shape.epoch as i64)
-        } else {
-            None
-        };
-
-        sqlx::query(
-            "INSERT INTO messages \
-                (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq, ciphertext, padded_size, created_at, msg_id) \
-             VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10) \
-             ON CONFLICT (id) DO UPDATE SET \
-                message_type = EXCLUDED.message_type, \
-                epoch = EXCLUDED.epoch, \
-                wire_epoch = EXCLUDED.wire_epoch, \
-                seq = EXCLUDED.seq, \
-                ciphertext = EXCLUDED.ciphertext, \
-                padded_size = EXCLUDED.padded_size, \
-                created_at = EXCLUDED.created_at, \
-                msg_id = EXCLUDED.msg_id",
-        )
-        .bind(&event.msg_id)
-        .bind(convo_id)
-        .bind(&event.message_type)
-        .bind(event.epoch)
-        .bind(wire_epoch)
-        .bind(event.seq)
-        .bind(&event.ciphertext)
-        .bind(event.padded_size)
-        .bind(event.created_at)
-        .bind(&event.msg_id)
-        .execute(pool)
-        .await?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1540,9 +1315,9 @@ async fn local_clean_digest_state(
        CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
        entry_id, \
        entry_kind, \
-       accepted_payload_bytes, \
+       COALESCE(accepted_payload_bytes, ''::bytea) AS accepted_payload_bytes, \
        accepted_payload_sha256, \
-       signed_request_bytes, \
+       COALESCE(signed_request_bytes, ''::bytea) AS signed_request_bytes, \
        outer_entry_fingerprint, \
        received_at \
      FROM chat.entries \
@@ -1584,9 +1359,9 @@ pub(crate) async fn local_clean_digest_state_tx(
        CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
        entry_id, \
        entry_kind, \
-       accepted_payload_bytes, \
+       COALESCE(accepted_payload_bytes, ''::bytea) AS accepted_payload_bytes, \
        accepted_payload_sha256, \
-       signed_request_bytes, \
+       COALESCE(signed_request_bytes, ''::bytea) AS signed_request_bytes, \
        outer_entry_fingerprint, \
        received_at \
      FROM chat.entries \
@@ -1615,64 +1390,6 @@ pub(crate) async fn local_clean_digest_state_tx(
         event_count,
         digest_sha256: hasher.finalize(),
     })
-}
-
-async fn local_legacy_digest_state(
-    pool: &PgPool,
-    convo_id: &str,
-) -> Result<LocalDigestState, sqlx::Error> {
-    let stats = sqlx::query(
-        "SELECT \
-           CAST(COALESCE(MAX(seq), 0) AS BIGINT) AS last_seq, \
-           CAST(COALESCE(MAX(epoch), 0) AS BIGINT) AS last_epoch, \
-           CAST(COUNT(*) AS BIGINT) AS event_count \
-         FROM messages WHERE convo_id = $1",
-    )
-    .bind(convo_id)
-    .fetch_one(pool)
-    .await?;
-    let last_seq: i64 = stats.try_get("last_seq")?;
-    let last_epoch: i64 = stats.try_get("last_epoch")?;
-    let event_count: i64 = stats.try_get("event_count")?;
-
-    let rows: Vec<crate::handlers::ds::get_convo_digest::LegacyDigestRow> =
-        sqlx::query_as::<_, crate::handlers::ds::get_convo_digest::LegacyDigestRow>(
-            "SELECT \
-           CAST(seq AS BIGINT) AS seq, \
-           CAST(epoch AS BIGINT) AS epoch, \
-           COALESCE(msg_id, id) AS msg_id, \
-           message_type, \
-           ciphertext, \
-           CAST(COALESCE(padded_size, 0) AS BIGINT) AS padded_size, \
-           created_at \
-         FROM messages \
-         WHERE convo_id = $1 \
-         ORDER BY seq ASC",
-        )
-        .bind(convo_id)
-        .fetch_all(pool)
-        .await?;
-
-    let digest_sha256 = crate::handlers::ds::get_convo_digest::compute_legacy_convo_digest(&rows);
-
-    Ok(LocalDigestState {
-        last_seq,
-        last_epoch,
-        event_count,
-        digest_sha256,
-    })
-}
-
-#[allow(dead_code)]
-async fn local_digest_state(
-    pool: &PgPool,
-    convo_id: &str,
-) -> Result<LocalDigestState, sqlx::Error> {
-    local_legacy_digest_state(pool, convo_id).await
-}
-fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update((bytes.len() as u32).to_be_bytes());
-    hasher.update(bytes);
 }
 
 #[cfg(test)]
@@ -1901,7 +1618,7 @@ mod tests {
             .find("async fn fetch_discovery_payload_with_timeout")
             .unwrap();
         let discovery_end = source[discovery_start..]
-            .find("\nasync fn apply_remote_events")
+            .find("\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub(crate) enum ApplicationImportMode")
             .unwrap();
         let discovery = &source[discovery_start..discovery_start + discovery_end];
         for log_macro in ["debug!(", "info!(", "warn!(", "error!("] {

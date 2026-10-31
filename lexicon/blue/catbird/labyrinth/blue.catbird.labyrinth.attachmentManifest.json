@@ -1,0 +1,48 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.attachmentManifest",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Ciphertext-only attachment manifest written into a conversation Space or personal mailbox Space BEFORE sending an MLS message referencing the blob (Gate 5). Committing this record with a standard ATProto blob ref promotes the uploaded encrypted blob from .staged to .space on the writer's PDS so com.atproto.sync.getBlob returns 404 while Space credential holders can read com.atproto.space.getBlob.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "blob",
+          "sha256",
+          "ciphertextSize",
+          "createdAt"
+        ],
+        "properties": {
+          "blob": {
+            "type": "blob",
+            "maxSize": 134217728,
+            "description": "Opaque AES-256-GCM encrypted attachment blob reference."
+          },
+          "sha256": {
+            "type": "bytes",
+            "minLength": 32,
+            "maxLength": 32,
+            "description": "Raw SHA-256 digest of the encrypted blob bytes."
+          },
+          "ciphertextSize": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 134217728,
+            "description": "Exact byte length of the encrypted blob."
+          },
+          "mimeTypeHint": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Optional non-sensitive category hint (default application/octet-stream)."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

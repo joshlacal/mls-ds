@@ -71,7 +71,6 @@ const EXTERNAL_BASE: &str = "https://chat.example.net";
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
-    blob_store: catbird_server::blob_store::BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -83,12 +82,6 @@ impl FromRef<TestState> for DbPool {
 impl FromRef<TestState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestState) -> Arc<ChatRuntime> {
         state.runtime.clone()
-    }
-}
-
-impl FromRef<TestState> for catbird_server::blob_store::BlobStore {
-    fn from_ref(state: &TestState) -> catbird_server::blob_store::BlobStore {
-        state.blob_store.clone()
     }
 }
 
@@ -148,7 +141,6 @@ fn router_with(pool: DbPool, cutover_enabled: bool) -> Router {
     chat_router::<TestState>().with_state(TestState {
         pool,
         runtime: runtime(cutover_enabled),
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     })
 }
 

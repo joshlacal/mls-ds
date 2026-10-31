@@ -1,5 +1,5 @@
-//! Labyrinth backend: admission and the verifying head directory
-//! (labyrinth `docs/MLSDS_BACKEND.md` §1a, §2 "Directory", §3).
+//! Clean-slate Labyrinth backend: admission, verifying `EpochPublic` head directory,
+//! and chat device-key / member-device views (`G6`, `I14`, `2A`, `L-F01`, `L-F10`).
 //!
 //! Requires `TEST_DATABASE_URL` naming the local clean-chat gate database
 //! (only its cluster is used: every test mints a private database) and
@@ -13,7 +13,7 @@ mod harness;
 #[path = "common/labyrinth_chain.rs"]
 mod chain;
 
-use axum::{body::Body, http::Request};
+use axum::{body::Body, http::Request, http::StatusCode};
 use ed25519_dalek::{Signer as _, SigningKey};
 use harness::*;
 use serde_json::{json, Value};
@@ -25,7 +25,7 @@ fn publish(epoch: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Admission (design §3)
+// Admission
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -35,8 +35,8 @@ async fn admission_requires_cutover_service_auth_and_a_current_device() {
 
     // No token.
     let request = Request::get(format!(
-        "/xrpc/{PREFIX}listDevices?actorDeviceId={}",
-        alice.device_id
+        "/xrpc/{PREFIX}getChatDeviceKeys?actorDeviceId={}&did={}",
+        alice.device_id, alice.did
     ))
     .body(Body::empty())
     .unwrap();
@@ -44,20 +44,20 @@ async fn admission_requires_cutover_service_auth_and_a_current_device() {
 
     // A token minted for another NSID (lxm mismatch).
     let request = Request::get(format!(
-        "/xrpc/{PREFIX}listDevices?actorDeviceId={}",
-        alice.device_id
+        "/xrpc/{PREFIX}getChatDeviceKeys?actorDeviceId={}&did={}",
+        alice.device_id, alice.did
     ))
     .header(
         "authorization",
-        format!("Bearer {}", alice.token(&format!("{PREFIX}listEpochs"))),
+        format!("Bearer {}", alice.token(&format!("{PREFIX}getEpochHead"))),
     )
     .body(Body::empty())
     .unwrap();
     send(&env.router, request).await.fails(401, "NotAuthorized");
 
     // Missing actorDeviceId is a malformed request.
-    let nsid = format!("{PREFIX}listDevices");
-    let request = Request::get(format!("/xrpc/{nsid}"))
+    let nsid = format!("{PREFIX}getChatDeviceKeys");
+    let request = Request::get(format!("/xrpc/{nsid}?did={}", alice.did))
         .header("authorization", format!("Bearer {}", alice.token(&nsid)))
         .body(Body::empty())
         .unwrap();
@@ -69,29 +69,29 @@ async fn admission_requires_cutover_service_auth_and_a_current_device() {
     let mut stranger = alice.clone();
     stranger.device_id = uuid::Uuid::new_v4();
     stranger
-        .query("listDevices", &[])
+        .query("getChatDeviceKeys", &[("did", alice.did.clone())])
         .await
         .fails(401, "NotAuthorized");
 
     // The real device works, then stops working once revoked.
-    alice.query("listDevices", &[]).await.ok();
+    alice
+        .query("getChatDeviceKeys", &[("did", alice.did.clone())])
+        .await
+        .ok();
     env.revoke(&alice).await;
     alice
-        .query("listDevices", &[])
+        .query("getChatDeviceKeys", &[("did", alice.did.clone())])
         .await
         .fails(401, "DeviceRevoked");
     alice
-        .call(
-            "createDevice",
-            &json!({ "record": alice.device_record([1; 32]) }),
-        )
+        .call("purgeMailbox", &json!({}))
         .await
         .fails(401, "DeviceRevoked");
 
     // Without the chat cutover gate nothing is served.
-    let gated = Env::with(false, None).await;
+    let gated = Env::with(false).await;
     let bob = gated.account().await;
-    bob.query("listDevices", &[])
+    bob.query("getChatDeviceKeys", &[("did", bob.did.clone())])
         .await
         .fails(400, "CutoverRequired");
 }
@@ -121,11 +121,11 @@ async fn reads_require_a_device_signed_claim_over_the_exact_query() {
     let env = Env::new().await;
     let alice = env.account().await;
     let alice2 = env.device_for(&alice.did, random_seed()).await;
-    let nsid = format!("{PREFIX}listDevices");
-    let q = format!("actorDeviceId={}", alice.device_id);
+    let nsid = format!("{PREFIX}getChatDeviceKeys");
+    let q = format!("actorDeviceId={}&did={}", alice.device_id, alice.did);
     let ok = |device: &Device, query: &str| Some(device.read_headers(&nsid, query));
 
-    send(&env.router, get_with(&alice, "listDevices", &q, None))
+    send(&env.router, get_with(&alice, "getChatDeviceKeys", &q, None))
         .await
         .fails(400, "InvalidRequest");
     // Signed by another key (an impostor holding the account JWT).
@@ -133,7 +133,7 @@ async fn reads_require_a_device_signed_claim_over_the_exact_query() {
     impostor.chat_key = SigningKey::from_bytes(&random_seed());
     send(
         &env.router,
-        get_with(&alice, "listDevices", &q, ok(&impostor, &q)),
+        get_with(&alice, "getChatDeviceKeys", &q, ok(&impostor, &q)),
     )
     .await
     .fails(401, "InvalidSignature");
@@ -141,7 +141,7 @@ async fn reads_require_a_device_signed_claim_over_the_exact_query() {
     // carries its own deviceId, not actorDeviceId.
     send(
         &env.router,
-        get_with(&alice, "listDevices", &q, ok(&alice2, &q)),
+        get_with(&alice, "getChatDeviceKeys", &q, ok(&alice2, &q)),
     )
     .await
     .fails(400, "InvalidRequest");
@@ -149,17 +149,20 @@ async fn reads_require_a_device_signed_claim_over_the_exact_query() {
     let tampered = format!("{q}&limit=1");
     send(
         &env.router,
-        get_with(&alice, "listDevices", &tampered, ok(&alice, &q)),
+        get_with(&alice, "getChatDeviceKeys", &tampered, ok(&alice, &q)),
     )
     .await
     .fails(400, "InvalidRequest");
-    let other_nsid = Some(alice.read_headers(&format!("{PREFIX}listEpochs"), &q));
-    send(&env.router, get_with(&alice, "listDevices", &q, other_nsid))
-        .await
-        .fails(400, "InvalidRequest");
+    let other_nsid = Some(alice.read_headers(&format!("{PREFIX}getEpochHead"), &q));
+    send(
+        &env.router,
+        get_with(&alice, "getChatDeviceKeys", &q, other_nsid),
+    )
+    .await
+    .fails(400, "InvalidRequest");
     let stale = chrono::Utc::now().timestamp_millis() - 301_000;
     let old = Some(alice.read_headers_at(&nsid, &q, stale));
-    send(&env.router, get_with(&alice, "listDevices", &q, old))
+    send(&env.router, get_with(&alice, "getChatDeviceKeys", &q, old))
         .await
         .fails(400, "InvalidRequest");
     // Parameter order and encoding do not matter; the canonical form does.
@@ -169,7 +172,7 @@ async fn reads_require_a_device_signed_claim_over_the_exact_query() {
         &env.router,
         get_with(
             &alice,
-            "listDevices",
+            "getChatDeviceKeys",
             &reordered,
             ok(&alice, &canonical_twin),
         ),
@@ -178,78 +181,49 @@ async fn reads_require_a_device_signed_claim_over_the_exact_query() {
     .ok();
     send(
         &env.router,
-        get_with(&alice, "listDevices", &q, ok(&alice, &q)),
+        get_with(&alice, "getChatDeviceKeys", &q, ok(&alice, &q)),
     )
     .await
     .ok();
 }
 
-/// getVirtualDevice stamps `lastUsedAt` only on a valid device-signed read.
 #[tokio::test]
-async fn bundle_use_is_recorded_only_for_device_signed_reads() {
+async fn retired_mailbox_virtual_device_and_orf_endpoints_return_404() {
     let env = Env::new().await;
     let alice = env.account().await;
-    // Owner-archive and bundle writes need a bound Labyrinth device.
-    alice.enroll([0xE0; 32]).await;
-    alice
-        .call(
-            "createVirtualDevice",
-            &json!({ "record": vdevice_record([0x51; 16], [0x52; 32]) }),
-        )
-        .await
-        .ok();
-    let last_used = || async {
-        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
-            "SELECT last_used_at FROM labyrinth.virtual_devices WHERE owner_did = $1",
-        )
-        .bind(&alice.did)
-        .fetch_one(&env.pool)
-        .await
-        .unwrap()
-    };
-    let nsid = format!("{PREFIX}getVirtualDevice");
-    let q = format!(
-        "actorDeviceId={}&vdeviceId={}",
-        alice.device_id,
-        hex::encode([0x51; 16])
-    );
-    let mut impostor = alice.clone();
-    impostor.chat_key = SigningKey::from_bytes(&random_seed());
-    let forged = Some(impostor.read_headers(&nsid, &q));
-    send(
-        &env.router,
-        get_with(&alice, "getVirtualDevice", &q, forged),
-    )
-    .await
-    .fails(401, "InvalidSignature");
-    send(&env.router, get_with(&alice, "getVirtualDevice", &q, None))
-        .await
-        .fails(400, "InvalidRequest");
-    assert!(last_used().await.is_none(), "refused reads record no use");
-    let genuine = Some(alice.read_headers(&nsid, &q));
-    send(
-        &env.router,
-        get_with(&alice, "getVirtualDevice", &q, genuine),
-    )
-    .await
-    .ok();
-    assert!(last_used().await.is_none(), "getVirtualDevice is read-only");
-    alice
-        .call(
-            "touchVirtualDevice",
-            &json!({ "vdeviceId": b(&[0x51; 16]) }),
-        )
-        .await
-        .ok();
-    assert!(last_used().await.is_some());
+    for query_name in ["listDevices", "listEpochs", "getVirtualDevice", "listVirtualDevices"] {
+        let reply = alice.query(query_name, &[]).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::NOT_FOUND,
+            "{query_name} must be unmounted (404)"
+        );
+    }
+    for proc_name in [
+        "createDevice",
+        "createEpoch",
+        "createVirtualDevice",
+        "touchVirtualDevice",
+        "deleteVirtualDevice",
+        "registerOrfState",
+        "deleteOrfState",
+    ] {
+        let reply = alice.call(proc_name, &json!({})).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::NOT_FOUND,
+            "{proc_name} must be unmounted (404)"
+        );
+    }
 }
 
 #[tokio::test]
 async fn writes_require_a_valid_signed_write_body() {
     let env = Env::new().await;
     let alice = env.account().await;
-    let nsid = format!("{PREFIX}createDevice");
-    let input = serde_json::to_vec(&json!({ "record": alice.device_record([1; 32]) })).unwrap();
+    let (genesis, _) = chain::epoch_public(&alice, 0, [1; 32], None, None);
+    let nsid = format!("{PREFIX}publishEpochHead");
+    let input = serde_json::to_vec(&publish(&genesis)).unwrap();
     let op = *uuid::Uuid::new_v4().as_bytes();
 
     let post = |write: String, sig: String, body: Vec<u8>| {
@@ -279,7 +253,7 @@ async fn writes_require_a_valid_signed_write_body() {
         .fails(400, "InvalidRequest");
 
     // Write body bound to another endpoint.
-    let (write, sig) = alice.write_headers(&format!("{PREFIX}createEpoch"), &input, op);
+    let (write, sig) = alice.write_headers(&format!("{PREFIX}purgeMailbox"), &input, op);
     send(&env.router, post(write, sig, input.clone()))
         .await
         .fails(400, "InvalidRequest");
@@ -300,21 +274,13 @@ async fn writes_require_a_valid_signed_write_body() {
 }
 
 // ---------------------------------------------------------------------------
-// Head chain acceptance (design §1a; second security review finding 1)
+// Head chain acceptance
 // ---------------------------------------------------------------------------
 
-/// `createEpoch` input opening `public` with Labyrinth device `opened_by`.
-fn open_epoch(public: &Value, opened_by: [u8; 32]) -> Value {
-    json!({ "epoch": epoch_record(public, opened_by), "members": [] })
-}
-
-/// The vector DID's two chat devices, each holding a bound Labyrinth device
-/// (d0: 0xD0, d1: 0xD1). Epochs 0-1 are attested by d0, epoch 2 by d1.
+/// The vector DID's two chat devices (epochs 0-1 are attested by d0, epoch 2 by d1).
 async fn vector_devices(env: &Env, v: &Vectors) -> (Device, Device) {
     let d0 = env.device_for(&v.did, v.seeds[0]).await;
     let d1 = env.device_for(&v.did, v.seeds[1]).await;
-    d0.enroll([0xD0; 32]).await;
-    d1.enroll([0xD1; 32]).await;
     (d0, d1)
 }
 
@@ -330,11 +296,9 @@ async fn head_chain_accepts_crate_vectors_in_order_and_serves_them() {
         .await
         .fails(404, "EpochNotFound");
     for epoch in &v.chain[..2] {
-        d0.call("createEpoch", &open_epoch(epoch, [0xD0; 32]))
-            .await
-            .ok();
+        d0.call("publishEpochHead", &publish(epoch)).await.ok();
     }
-    d1.call("createEpoch", &open_epoch(&v.chain[2], [0xD1; 32]))
+    d1.call("publishEpochHead", &publish(&v.chain[2]))
         .await
         .ok();
     // Re-publishing an existing epoch's head is accepted (identical bytes).
@@ -370,40 +334,39 @@ async fn head_chain_rejects_gaps_non_genesis_starts_and_forks() {
     let (d0, d1) = vector_devices(&env, &v).await;
 
     // Not genesis on an empty chain.
-    d0.call("createEpoch", &open_epoch(&v.chain[1], [0xD0; 32]))
+    d0.call("publishEpochHead", &publish(&v.chain[1]))
         .await
         .fails(400, "InvalidEpochChain");
-    d0.call("createEpoch", &open_epoch(&v.chain[0], [0xD0; 32]))
+    d0.call("publishEpochHead", &publish(&v.chain[0]))
         .await
         .ok();
     // Skips epoch 1.
-    d1.call("createEpoch", &open_epoch(&v.chain[2], [0xD1; 32]))
+    d1.call("publishEpochHead", &publish(&v.chain[2]))
         .await
         .fails(400, "InvalidEpochChain");
-    d0.call("createEpoch", &open_epoch(&v.chain[1], [0xD0; 32]))
+    d0.call("publishEpochHead", &publish(&v.chain[1]))
         .await
         .ok();
-    // A different epoch 1 (same predecessor) is a fork: the [CB-9] race
-    // guard on createEpoch, a conflict on publishEpochHead.
-    d0.call("createEpoch", &open_epoch(&v.fork, [0xD0; 32]))
-        .await
-        .fails(409, "RecordAlreadyExists");
+    // A different epoch 1 (same predecessor) is a fork -> 409 EpochHeadConflict.
     d0.call("publishEpochHead", &publish(&v.fork))
         .await
         .fails(409, "EpochHeadConflict");
 }
 
 /// Re-attest `epoch` after replacing its predecessor link, recomputing the
-/// head as the server does. Its `selfSig` no longer verifies (the vector's
-/// signing key is the crate's), which is exactly what the server checks.
+/// head as the server does. Its `selfSig` no longer verifies.
 fn relinked(did: &str, epoch: &Value, previous: [u8; 32], seed: [u8; 32]) -> Value {
     let mut e = epoch.clone();
     let n = e["epochNumber"].as_u64().unwrap();
+    let auth: [u8; 32] = unb(&e["authPubkey"]).try_into().unwrap();
+    let signing: [u8; 32] = unb(&e["signingPubkey"]).try_into().unwrap();
+    let members_hash: [u8; 32] = unb(&e["membersHash"]).try_into().unwrap();
     let head = compute_epoch_head(
         n,
-        &unb(&e["authPubkey"]),
+        &auth,
         &unb(&e["encryptionPubkey"]),
-        &unb(&e["signingPubkey"]),
+        &signing,
+        &members_hash,
         Some(&previous),
         did,
     );
@@ -419,38 +382,36 @@ async fn head_chain_requires_a_recomputable_self_signed_attested_head() {
     let env = Env::new().await;
     let v = vectors();
     let (d0, _d1) = vector_devices(&env, &v).await;
-    d0.call("createEpoch", &open_epoch(&v.chain[0], [0xD0; 32]))
+    d0.call("publishEpochHead", &publish(&v.chain[0]))
         .await
         .ok();
-    let create = |e: &Value| open_epoch(e, [0xD0; 32]);
 
     // Re-headed onto another predecessor: selfSig no longer verifies.
     let wrong_link = relinked(&v.did, &v.chain[1], [0xAB; 32], v.seeds[0]);
-    d0.call("createEpoch", &create(&wrong_link))
+    d0.call("publishEpochHead", &publish(&wrong_link))
         .await
         .fails(400, "InvalidRequest");
     // A head that does not recompute from its keys.
     let mut tampered = v.chain[1].clone();
     tampered["authPubkey"] = b(&[0x5A; 32]);
-    d0.call("createEpoch", &create(&tampered))
+    d0.call("publishEpochHead", &publish(&tampered))
         .await
         .fails(400, "InvalidRequest");
     // A forged attestation or self signature.
     let mut forged = v.chain[1].clone();
     forged["attestation"]["sig"] = b(&[0x11; 64]);
-    d0.call("createEpoch", &create(&forged))
+    d0.call("publishEpochHead", &publish(&forged))
         .await
         .fails(400, "InvalidRequest");
     let mut forged = v.chain[1].clone();
     forged["selfSig"] = v.chain[0]["selfSig"].clone();
-    d0.call("createEpoch", &create(&forged))
+    d0.call("publishEpochHead", &publish(&forged))
         .await
         .fails(400, "InvalidRequest");
     // A head for another DID (the caller's own DID is always the subject).
     let other = env.account().await;
-    other.enroll([0x0B; 32]).await;
     other
-        .call("createEpoch", &open_epoch(&v.chain[0], [0x0B; 32]))
+        .call("publishEpochHead", &publish(&v.chain[0]))
         .await
         .fails(400, "InvalidRequest");
 }
@@ -459,24 +420,20 @@ async fn head_chain_requires_a_recomputable_self_signed_attested_head() {
 async fn prev_sig_must_be_signed_by_the_previous_epochs_key() {
     let env = Env::new().await;
     let alice = env.account().await;
-    alice.enroll([0xA0; 32]).await;
     let (genesis, g) = chain::epoch_public(&alice, 0, [1; 32], None, None);
     alice
-        .call("createEpoch", &open_epoch(&genesis, [0xA0; 32]))
+        .call("publishEpochHead", &publish(&genesis))
         .await
         .ok();
     // Correct head, self signature and attestation, but prevSig by a key
     // that is not epoch 0's.
     let (bad, _) = chain::epoch_public(&alice, 1, [2; 32], Some(g), Some([9; 32]));
     alice
-        .call("createEpoch", &open_epoch(&bad, [0xA0; 32]))
+        .call("publishEpochHead", &publish(&bad))
         .await
         .fails(400, "InvalidRequest");
     let (good, _) = chain::epoch_public(&alice, 1, [2; 32], Some(g), None);
-    alice
-        .call("createEpoch", &open_epoch(&good, [0xA0; 32]))
-        .await
-        .ok();
+    alice.call("publishEpochHead", &publish(&good)).await.ok();
 }
 
 #[tokio::test]
@@ -485,13 +442,10 @@ async fn head_attestation_must_be_the_callers_own_chat_key() {
     let v = vectors();
     let (d0, d1) = vector_devices(&env, &v).await;
     for epoch in &v.chain[..2] {
-        d0.call("createEpoch", &open_epoch(epoch, [0xD0; 32]))
-            .await
-            .ok();
+        d0.call("publishEpochHead", &publish(epoch)).await.ok();
     }
-    // Epoch 2 is attested by d1's key: d0 can neither open nor publish it,
-    // although d1's key is a current chat key of the DID.
-    d0.call("createEpoch", &open_epoch(&v.chain[2], [0xD0; 32]))
+    // Epoch 2 is attested by d1's key: d0 cannot publish it.
+    d0.call("publishEpochHead", &publish(&v.chain[2]))
         .await
         .fails(400, "AttestationNotCaller");
     // d1 cannot re-publish d0's epoch either.
@@ -500,79 +454,13 @@ async fn head_attestation_must_be_the_callers_own_chat_key() {
         .fails(400, "AttestationNotCaller");
     // Once d1 is revoked it cannot act at all.
     env.revoke(&d1).await;
-    d1.call("createEpoch", &open_epoch(&v.chain[2], [0xD1; 32]))
+    d1.call("publishEpochHead", &publish(&v.chain[2]))
         .await
         .fails(401, "DeviceRevoked");
 }
 
-/// Finding 1 repro: before the fix an unbound chat device of the DID could
-/// publish a self-attested head n+1 through publishEpochHead and squat the
-/// number, wedging every later rotation.
 #[tokio::test]
-async fn unbound_device_cannot_squat_the_next_head_and_rotation_proceeds() {
-    let env = Env::new().await;
-    let alice = env.account().await;
-    alice.enroll([0xA0; 32]).await;
-    let (genesis, g) = chain::epoch_public(&alice, 0, [1; 32], None, None);
-    alice
-        .call("createEpoch", &open_epoch(&genesis, [0xA0; 32]))
-        .await
-        .ok();
-
-    // A second chat device of the same DID with no Labyrinth device builds
-    // a fully valid epoch 1 (it cannot sign prevSig without epoch 0's key,
-    // so give it that key too: the attack must fail on authority alone).
-    let rogue = env.device_for(&alice.did, random_seed()).await;
-    let (squat, _) = chain::epoch_public(&rogue, 1, [6; 32], Some(g), None);
-    rogue
-        .call("publishEpochHead", &publish(&squat))
-        .await
-        .fails(403, "LabyrinthDeviceNotBound");
-    // Bound, but the epoch is not in its mailbox: publishEpochHead never
-    // introduces a head.
-    rogue.enroll([0x7E; 32]).await;
-    rogue
-        .call("publishEpochHead", &publish(&squat))
-        .await
-        .fails(404, "EpochNotFound");
-    // The rogue's own bound device may open its own epoch only with its own
-    // attestation; alice's attestation is refused for it.
-    let (alices_next, _) = chain::epoch_public(&alice, 1, [2; 32], Some(g), None);
-    rogue
-        .call("createEpoch", &open_epoch(&alices_next, [0x7E; 32]))
-        .await
-        .fails(400, "AttestationNotCaller");
-    let heads: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM labyrinth.epoch_heads WHERE did = $1")
-            .bind(&alice.did)
-            .fetch_one(&env.pool)
-            .await
-            .unwrap();
-    assert_eq!(heads, 1, "nothing was squatted");
-
-    // The real rotation succeeds, and its head can be re-published.
-    alice
-        .call("createEpoch", &open_epoch(&alices_next, [0xA0; 32]))
-        .await
-        .ok();
-    alice
-        .call("publishEpochHead", &publish(&alices_next))
-        .await
-        .ok();
-    let latest = alice
-        .query("getEpochHead", &[("did", alice.did.clone())])
-        .await;
-    assert_eq!(latest.ok()["epoch"], alices_next);
-}
-
-/// An account whose mailbox lives in its own PDS Space keeps no mailbox
-/// here. Its chat devices publish heads straight into the chain, under the
-/// same checks as `createEpoch`: genesis first, contiguous numbers, a valid
-/// `prevSig`, an attestation by the calling device, no second head for a
-/// number. The account can then also drop its ORF states without a bound
-/// device. Once it keeps a mailbox here, the binding rules apply again.
-#[tokio::test]
-async fn a_space_hosted_account_publishes_heads_without_a_mailbox_here() {
+async fn a_space_hosted_account_publishes_heads_and_rejects_cross_device_forgeries() {
     let env = Env::new().await;
     let alice = env.account().await;
     let (genesis, g) = chain::epoch_public(&alice, 0, [1; 32], None, None);
@@ -602,69 +490,33 @@ async fn a_space_hosted_account_publishes_heads_without_a_mailbox_here() {
         .fails(409, "EpochHeadConflict");
 
     // Another chat device of the DID cannot publish a head attested by
-    // alice's key.
+    // alice's key, nor publish without epoch 1's signing key (`prevSig`).
     let other = env.device_for(&alice.did, random_seed()).await;
     let (two, _) = chain::epoch_public(&alice, 2, [4; 32], Some(l1), None);
     other
         .call("publishEpochHead", &publish(&two))
         .await
         .fails(400, "AttestationNotCaller");
+    let (rogue_two, _) = chain::epoch_public(&other, 2, [5; 32], Some(l1), Some([8; 32]));
+    other
+        .call("publishEpochHead", &publish(&rogue_two))
+        .await
+        .fails(400, "InvalidRequest");
+
     alice.call("publishEpochHead", &publish(&two)).await.ok();
     let latest = other
         .query("getEpochHead", &[("did", alice.did.clone())])
         .await;
     assert_eq!(latest.ok()["epoch"], two);
-    let mailboxes: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM labyrinth.mailboxes WHERE owner_did = $1")
-            .bind(&alice.did)
-            .fetch_one(&env.pool)
-            .await
-            .unwrap();
-    assert_eq!(mailboxes, 0, "the heads created no mailbox");
-
-    // Revocation drops an ORF state with no bound device.
-    let key = [0xA5; 32];
-    alice
-        .call("registerOrfState", &json!({ "deviceKeyPubkey": b(&key) }))
-        .await
-        .ok();
-    other
-        .call("deleteOrfState", &json!({ "deviceKeyPubkey": b(&key) }))
-        .await
-        .ok();
-
-    // An mls-ds mailbox for the same DID cannot fork the published chain:
-    // its genesis head differs from the recorded one (the [CB-9] race
-    // guard, which createEpoch reports as RecordAlreadyExists).
-    alice.enroll([0xA0; 32]).await;
-    let (other_genesis, _) = chain::epoch_public(&alice, 0, [7; 32], None, None);
-    alice
-        .call("createEpoch", &open_epoch(&other_genesis, [0xA0; 32]))
-        .await
-        .fails(409, "RecordAlreadyExists");
-    // With a mailbox here, an unbound device is refused again.
-    other
-        .call("publishEpochHead", &publish(&two))
-        .await
-        .fails(403, "LabyrinthDeviceNotBound");
 }
 
-/// Such an account deletes what this DS holds for it (head chain, ORF
-/// states, authored items) from any of its chat devices.
 #[tokio::test]
-async fn a_space_hosted_account_deletes_its_data_without_a_bound_device() {
+async fn a_space_hosted_account_deletes_its_data_and_advances_floor() {
     let env = Env::new().await;
     let alice = env.account().await;
     let (genesis, _) = chain::epoch_public(&alice, 0, [1; 32], None, None);
     alice
         .call("publishEpochHead", &publish(&genesis))
-        .await
-        .ok();
-    alice
-        .call(
-            "registerOrfState",
-            &json!({ "deviceKeyPubkey": b(&[0xA5; 32]) }),
-        )
         .await
         .ok();
 
@@ -674,13 +526,6 @@ async fn a_space_hosted_account_deletes_its_data_without_a_bound_device() {
         .query("getEpochHead", &[("did", alice.did.clone())])
         .await
         .fails(404, "EpochNotFound");
-    let states: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM labyrinth.orf_states WHERE owner_did = $1")
-            .bind(&alice.did)
-            .fetch_one(&env.pool)
-            .await
-            .unwrap();
-    assert_eq!(states, 0);
     // Epoch 0 cannot be reused after purge; restarting at floor + 1 succeeds.
     alice
         .call("publishEpochHead", &publish(&genesis))

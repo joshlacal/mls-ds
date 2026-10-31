@@ -30,7 +30,6 @@ use sha2::{Digest, Sha256};
 use tower_util::ServiceExt;
 
 use crate::{
-    blob_store::BlobStore,
     chat_protocol::{
         dpop::{
             verify_enrollment_request_auth, verify_ordinary_request_auth, TrustedNestVerifier,
@@ -1060,7 +1059,6 @@ fn challenge_2_enrollment_claims_auth_time_window_validation() {
 struct RouteTestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
-    blob_store: BlobStore,
 }
 
 impl FromRef<RouteTestState> for DbPool {
@@ -1072,12 +1070,6 @@ impl FromRef<RouteTestState> for DbPool {
 impl FromRef<RouteTestState> for Arc<ChatRuntime> {
     fn from_ref(state: &RouteTestState) -> Self {
         state.runtime.clone()
-    }
-}
-
-impl FromRef<RouteTestState> for BlobStore {
-    fn from_ref(state: &RouteTestState) -> Self {
-        state.blob_store.clone()
     }
 }
 
@@ -1125,16 +1117,13 @@ fn test_router(cutover_enabled: bool) -> Router {
     chat_router::<RouteTestState>().with_state(RouteTestState {
         pool,
         runtime: test_runtime(cutover_enabled),
-        blob_store: BlobStore::for_route_tests(),
     })
 }
 
 fn is_get_endpoint(endpoint: ChatEndpoint) -> bool {
     matches!(
         endpoint,
-        ChatEndpoint::GetBlob
-            | ChatEndpoint::GetBlobUsage
-            | ChatEndpoint::GetConversationState
+        ChatEndpoint::GetConversationState
             | ChatEndpoint::GetConversations
             | ChatEndpoint::GetDeviceKey
             | ChatEndpoint::GetDevices
@@ -1151,8 +1140,8 @@ fn is_get_endpoint(endpoint: ChatEndpoint) -> bool {
 async fn challenge_4_all_32_endpoints_cutover_disabled_rejection() {
     assert_eq!(
         ChatEndpoint::ALL.len(),
-        38,
-        "Must contain exactly 38 endpoints"
+        36,
+        "Must contain exactly 36 endpoints"
     );
 
     for endpoint in ChatEndpoint::ALL {

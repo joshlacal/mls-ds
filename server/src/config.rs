@@ -202,16 +202,18 @@ pub fn classify_device_auth_endpoint(nsid: &str) -> Option<DeviceAuthEndpointCla
         "blue.catbird.chat.replenishKeyPackages" => Bootstrap,
 
         // Read
-        "blue.catbird.chat.getBlob"
-        | "blue.catbird.chat.getBlobUsage"
-        | "blue.catbird.chat.getConversationState"
+        "blue.catbird.chat.getConversationState"
         | "blue.catbird.chat.getConversations"
+        | "blue.catbird.chat.getDeviceKey"
         | "blue.catbird.chat.getDevices"
+        | "blue.catbird.chat.getDirectRequestOutcome"
         | "blue.catbird.chat.getEntries"
         | "blue.catbird.chat.getLeafRecoveryInbox"
         | "blue.catbird.chat.getOwnDevices"
         | "blue.catbird.chat.getPendingWelcomes"
         | "blue.catbird.chat.getSubscriptionTicket"
+        | "blue.catbird.chat.relaySpaceCredential"
+        | "blue.catbird.chat.relaySpaceRead"
         | "blue.catbird.chat.subscribeEvents" => Read,
 
         // Canary
@@ -219,14 +221,18 @@ pub fn classify_device_auth_endpoint(nsid: &str) -> Option<DeviceAuthEndpointCla
 
         // Mutation
         "blue.catbird.chat.acceptConversation"
+        | "blue.catbird.chat.acknowledgeEntries"
         | "blue.catbird.chat.acknowledgeWelcome"
         | "blue.catbird.chat.activateReset"
+        | "blue.catbird.chat.cancelDirectRequestPreparation"
         | "blue.catbird.chat.cancelLeafRecovery"
         | "blue.catbird.chat.cancelLeave"
         | "blue.catbird.chat.closeConversation"
         | "blue.catbird.chat.createConversation"
-        | "blue.catbird.chat.deleteBlob"
-        | "blue.catbird.chat.prepareBlobUpload"
+        | "blue.catbird.chat.prepareDirectRequest"
+        | "blue.catbird.chat.publishDirectRequest"
+        | "blue.catbird.chat.publishDirectRequestKeys"
+        | "blue.catbird.chat.registerPushGateway"
         | "blue.catbird.chat.rejectWelcome"
         | "blue.catbird.chat.reportRecoveryFailure"
         | "blue.catbird.chat.requestLeafRecovery"
@@ -234,9 +240,7 @@ pub fn classify_device_auth_endpoint(nsid: &str) -> Option<DeviceAuthEndpointCla
         | "blue.catbird.chat.requestReset"
         | "blue.catbird.chat.revokeDevice"
         | "blue.catbird.chat.sendMessage"
-        | "blue.catbird.chat.submitTransition"
-        | "blue.catbird.chat.updatePushToken"
-        | "blue.catbird.chat.uploadBlob" => Mutation,
+        | "blue.catbird.chat.submitTransition" => Mutation,
         _ => return None,
     })
 }

@@ -1,13 +1,4 @@
-//! Directory endpoints (`MailboxDirectory`). Reads: any authenticated chat
-//! device. `publishEpochHead`: for an account whose mailbox is on this DS,
-//! only a chat device holding a bound Labyrinth device, and only to
-//! re-publish an epoch its mailbox already holds. For an account whose
-//! mailbox lives in its PDS Space (no mailbox here), the head itself is the
-//! only thing this DS can check: it must recompute, be attested by the
-//! calling chat device and extend the stored chain by one with a valid
-//! `prevSig` ([`repo::record_head`]). A chat device of such an account can
-//! therefore take the next number; the client's PDS × mls-ds cross-check
-//! reports that as a directory fork.
+//! Directory endpoints (`publishEpochHead`, `getEpochHead`, `getChatDeviceKeys`, `getMemberDevices`).
 
 use std::sync::Arc;
 
@@ -24,9 +15,7 @@ use super::respond;
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth::begin_read;
 use crate::labyrinth::error::LabyrinthError;
-use crate::labyrinth::repo::binding;
-use crate::labyrinth::repo::directory as repo;
-use crate::labyrinth::repo::thread::parse_thread_id;
+use crate::labyrinth::repo::{directory as repo, parse_thread_id};
 use crate::labyrinth::wire::bytes::{check_did, Bytes as AtBytes, MAX_EPOCH_NUMBER};
 use crate::labyrinth::wire::io::{body, datetime, to_bytes, Page, PublishHeadIn, Received};
 use crate::labyrinth::wire::records::EpochPublic;
@@ -48,12 +37,7 @@ pub async fn publish_epoch_head(
             let epoch = Received::<EpochPublic>::parse(&input.epoch, "epoch")?;
             let mut w = begin_write!(&pool, adm);
             let caller = w.caller.clone();
-            if binding::hosts_mailbox(&mut w.tx, &caller.did).await? {
-                binding::require_bound(&mut w.tx, &caller, None).await?;
-                repo::republish_head(&mut w.tx, &caller, &epoch.value, w.instant).await?;
-            } else {
-                repo::record_head(&mut w.tx, &caller, &epoch.value, w.instant).await?;
-            }
+            repo::record_head(&mut w.tx, &caller, &epoch.value, w.instant).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,
@@ -81,11 +65,16 @@ pub async fn get_epoch_head(
             check_did("did", &did)?;
             let n = p.int("epochNumber", MAX_EPOCH_NUMBER)?;
             let mut r = begin_read(&pool, adm).await?;
-            let (epoch, received_at) = repo::get_head(&mut r.tx, &did, n)
+            let lookup = repo::get_head(&mut r.tx, &did, n)
                 .await?
                 .ok_or_else(|| LabyrinthError::not_found("EpochNotFound"))?;
             r.finish_read().await?;
-            to_bytes(&json!({ "epoch": epoch, "receivedAt": datetime(received_at) }))
+            to_bytes(&json!({
+                "epoch": lookup.epoch,
+                "chain": lookup.chain,
+                "floorSeq": lookup.floor_seq,
+                "receivedAt": datetime(lookup.received_at),
+            }))
         }
         .await,
     )

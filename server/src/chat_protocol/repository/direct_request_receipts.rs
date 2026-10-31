@@ -523,10 +523,15 @@ mod tests {
             "keyId": signer.key_id(),
             "receipt": {
                 "$type": "blue.catbird.chat.defs#directRequestCancelledReceipt",
-                "requestId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
-                "actorDid": "did:plc:sender11111111111111111",
-                "actorDeviceId": "018f3f6a-7b2c-4d91-8a5e-0f123456789b",
-                "cancelledAt": "2026-09-19T00:00:00Z"
+                "requestId": "12345678-1234-4234-8234-123456789abc",
+                "requestDigest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "recordedAt": "2026-09-19T12:00:00.000Z",
+                "preparationRequestDigest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "actorDid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                "actorDeviceId": "12345678-1234-4234-8234-123456789abc",
+                "actorKeyId": "Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU",
+                "authGeneration": 1,
+                "requestKind": "cancel"
             }
         });
         let sealed = signer.seal_outcome(body.clone()).unwrap();

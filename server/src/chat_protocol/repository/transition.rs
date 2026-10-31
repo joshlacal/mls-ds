@@ -2837,12 +2837,6 @@ pub(crate) async fn insert_conversation_head(
     .bind(head.sequencer_term)
     .execute(&mut **transaction)
     .await?;
-    crate::labyrinth::repo::space::initialize_from_environment(
-        &mut **transaction,
-        head.conversation_id,
-        head.is_remote,
-    )
-    .await?;
     Ok(())
 }
 
@@ -2987,6 +2981,65 @@ pub(crate) async fn insert_generation(
     .bind(generation.activated_seq)
     .bind(generation.activated_at)
     .execute(&mut **transaction)
+    .await?;
+    register_conversation_space_if_migrated(
+        &mut **transaction,
+        generation.conversation_id,
+        generation.generation,
+        generation.activated_at,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Register the Option A conversation Space (`at://{authorityDid}/space/blue.catbird.labyrinth.conversation/{conversationId}-{generation}`)
+/// in `chat.conversation_spaces` when the clean-slate migration is present.
+pub(crate) async fn register_conversation_space_if_migrated(
+    conn: &mut sqlx::PgConnection,
+    conversation_id: Uuid,
+    generation: i64,
+    created_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let table_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('chat.conversation_spaces') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !table_exists {
+        return Ok(());
+    }
+    let row: Option<(bool, Option<String>)> = sqlx::query_as(
+        "SELECT is_remote, sequencer_ds FROM chat.conversations WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((is_remote, sequencer_ds)) = row else {
+        return Ok(());
+    };
+    let authority_did = if is_remote {
+        let Some(ds) = sequencer_ds else {
+            return Ok(());
+        };
+        crate::identity::canonical_did(&ds).to_owned()
+    } else {
+        crate::identity::service_did_base_opt()
+            .unwrap_or_else(|| "did:web:localhost".to_owned())
+    };
+    let space_uri = format!(
+        "at://{authority_did}/space/blue.catbird.labyrinth.conversation/{conversation_id}-{generation}"
+    );
+    sqlx::query(
+        "INSERT INTO chat.conversation_spaces \
+            (conversation_id, generation, space_uri, authority_did, created_at) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (conversation_id, generation) DO NOTHING",
+    )
+    .bind(conversation_id)
+    .bind(generation)
+    .bind(&space_uri)
+    .bind(&authority_did)
+    .bind(created_at)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }

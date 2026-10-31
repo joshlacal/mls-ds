@@ -466,7 +466,6 @@ pub(crate) async fn compare_exact_application_entry(
     transaction: &mut Transaction<'_, Postgres>,
     send: &ApplicationSend,
     expected_seq: u64,
-    blob_binding: Option<&super::blobs::NewBlobBinding>,
 ) -> Result<bool, DeliveryRepositoryError> {
     let message_id = send
         .entry
@@ -477,9 +476,9 @@ pub(crate) async fn compare_exact_application_entry(
     let entry_row: Option<(
         Uuid,
         String,
+        Option<Vec<u8>>,
         Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
+        Option<Vec<u8>>,
         Vec<u8>,
         Vec<u8>,
         Vec<u8>,
@@ -528,11 +527,19 @@ pub(crate) async fn compare_exact_application_entry(
         return Ok(false);
     };
 
+    let payload_matches = match (accepted_payload_bytes.as_deref(), signed_request_bytes.as_deref()) {
+        (Some(stored_payload), Some(stored_signed)) => {
+            stored_payload == send.entry.accepted_payload_bytes.as_slice()
+                && stored_signed == send.entry.signed_request_bytes.as_slice()
+        }
+        (None, None) => entry_kind == APPLICATION_ENTRY_KIND,
+        _ => false,
+    };
+
     if entry_id != send.entry.entry_id
         || entry_kind != send.entry.entry_kind
-        || accepted_payload_bytes != send.entry.accepted_payload_bytes
+        || !payload_matches
         || accepted_payload_sha256 != send.entry.accepted_payload_sha256
-        || signed_request_bytes != send.entry.signed_request_bytes
         || request_digest != send.entry.request_digest
         || signature != send.entry.signature
         || outer_entry_fingerprint != send.entry.outer_entry_fingerprint
@@ -548,7 +555,7 @@ pub(crate) async fn compare_exact_application_entry(
         return Ok(false);
     }
 
-    let send_row: Option<(String, Option<i64>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    let send_row: Option<(String, Option<i64>, Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as(
         r#"
         SELECT status, accepted_entry_seq, signing_transcript_bytes, outcome_bytes
           FROM chat.message_sends
@@ -565,58 +572,17 @@ pub(crate) async fn compare_exact_application_entry(
         return Ok(false);
     };
 
-    if status != "accepted"
-        || accepted_entry_seq != Some(seq_i64)
-        || signing_transcript_bytes != send.signing_transcript_bytes
-        || outcome_bytes != send.outcome_bytes
-    {
+    let send_payload_matches = match (signing_transcript_bytes.as_deref(), outcome_bytes.as_deref()) {
+        (Some(stored_transcript), Some(stored_outcome)) => {
+            stored_transcript == send.signing_transcript_bytes.as_slice()
+                && stored_outcome == send.outcome_bytes.as_slice()
+        }
+        (None, None) => true,
+        _ => false,
+    };
+
+    if status != "accepted" || accepted_entry_seq != Some(seq_i64) || !send_payload_matches {
         return Ok(false);
-    }
-
-    if let Some(b) = blob_binding {
-        let binding_row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, String)> = sqlx::query_as(
-            r#"
-            SELECT bb.descriptor_bytes, bb.aad_bytes, bb.ciphertext_sha256, bl.status
-              FROM chat.blob_bindings bb
-              JOIN chat.blobs bl ON bl.blob_id = bb.blob_id
-             WHERE bb.conversation_id = $1 AND bb.entry_seq = $2 AND bb.message_id = $3 AND bb.blob_id = $4
-            "#,
-        )
-        .bind(send.entry.conversation_id)
-        .bind(seq_i64)
-        .bind(message_id)
-        .bind(b.blob_id)
-        .fetch_optional(&mut **transaction)
-        .await?;
-
-        let Some((stored_desc, stored_aad, stored_hash, blob_status)) = binding_row else {
-            return Ok(false);
-        };
-
-        if stored_desc != b.descriptor_bytes
-            || stored_aad != b.aad_bytes
-            || stored_hash != b.ciphertext_sha256
-            || blob_status != "bound"
-        {
-            return Ok(false);
-        }
-    } else {
-        let has_binding: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS(
-                SELECT 1 FROM chat.blob_bindings
-                 WHERE conversation_id = $1 AND entry_seq = $2
-            )
-            "#,
-        )
-        .bind(send.entry.conversation_id)
-        .bind(seq_i64)
-        .fetch_one(&mut **transaction)
-        .await?;
-
-        if has_binding {
-            return Ok(false);
-        }
     }
 
     Ok(true)

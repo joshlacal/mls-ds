@@ -18,7 +18,6 @@ use base64::{
     Engine,
 };
 use catbird_server::{
-    blob_store::BlobStore,
     chat_protocol::error::ChatEndpoint,
     config::classify_device_auth_endpoint,
     handlers::chat::{chat_router, ChatRuntime},
@@ -34,7 +33,6 @@ use tower_util::ServiceExt;
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
-    blob_store: BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -46,12 +44,6 @@ impl FromRef<TestState> for DbPool {
 impl FromRef<TestState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestState) -> Self {
         state.runtime.clone()
-    }
-}
-
-impl FromRef<TestState> for BlobStore {
-    fn from_ref(state: &TestState) -> Self {
-        state.blob_store.clone()
     }
 }
 
@@ -91,7 +83,6 @@ fn test_router() -> Router {
     chat_router::<TestState>().with_state(TestState {
         pool,
         runtime: test_runtime(),
-        blob_store: BlobStore::for_route_tests(),
     })
 }
 
@@ -126,6 +117,11 @@ const LEGACY_ENDPOINTS: &[&str] = &[
     "blue.catbird.mlsChat.unmuteConvo",
     "blue.catbird.mlsChat.updateConvo",
     "blue.catbird.mlsChat.reportConvo",
+    "blue.catbird.chat.prepareBlobUpload",
+    "blue.catbird.chat.uploadBlob",
+    "blue.catbird.chat.deleteBlob",
+    "blue.catbird.chat.getBlob",
+    "blue.catbird.chat.getBlobUsage",
 ];
 
 #[tokio::test]
@@ -161,7 +157,7 @@ fn legacy_mlschat_endpoints_fail_closed_in_device_auth_classification() {
 }
 
 #[test]
-fn all_32_clean_chat_endpoints_are_classified_in_device_auth() {
+fn all_clean_chat_endpoints_are_classified_in_device_auth() {
     for endpoint in ChatEndpoint::ALL {
         let classification = classify_device_auth_endpoint(endpoint.nsid());
         assert!(
@@ -177,6 +173,8 @@ fn legacy_handlers_and_types_files_do_not_exist() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let legacy_paths = [
         manifest_dir.join("src/handlers/mls_chat"),
+        manifest_dir.join("src/actors"),
+        manifest_dir.join("src/blob_store.rs"),
         manifest_dir.join("src/lexicon_types.rs"),
         manifest_dir.join("src/error_responses.rs"),
         manifest_dir.join("src/realtime/websocket.rs.deprecated"),

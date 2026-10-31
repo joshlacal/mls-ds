@@ -68,7 +68,73 @@ impl ExpectedGroupInfoSigner {
     }
 }
 
-use crate::{auth::device_auth::VerifiedDeviceRequest, models::ResolvedMlsContext};
+/// Resolved MLS conversation context bound during GroupInfo transition verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedMlsContext {
+    pub conversation_id: String,
+    pub crypto_session_id: String,
+    pub mls_group_id: String,
+    pub reset_generation: i64,
+    pub state: String,
+    pub authoritative_epoch: i64,
+    pub confirmation_tag: Option<Vec<u8>>,
+    pub group_info: Option<Vec<u8>>,
+    pub group_info_epoch: Option<i64>,
+    pub sequencer_did: String,
+    pub sequencer_term: i64,
+    pub receipt: Option<Vec<u8>>,
+}
+
+/// Verified device-authenticated request metadata bound during GroupInfo verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedDeviceRequest {
+    user_did: String,
+    device_id: String,
+    dpop_jkt: String,
+    auth_generation: i64,
+}
+
+impl VerifiedDeviceRequest {
+    pub fn new(
+        user_did: impl Into<String>,
+        device_id: impl Into<String>,
+        dpop_jkt: impl Into<String>,
+        auth_generation: i64,
+    ) -> Self {
+        Self {
+            user_did: user_did.into(),
+            device_id: device_id.into(),
+            dpop_jkt: dpop_jkt.into(),
+            auth_generation,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_for_policy_test(
+        user_did: &str,
+        device_id: &str,
+        dpop_jkt: &str,
+        auth_generation: i64,
+    ) -> Self {
+        Self::new(user_did, device_id, dpop_jkt, auth_generation)
+    }
+
+    pub fn user_did(&self) -> &str {
+        &self.user_did
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    pub fn dpop_jkt(&self) -> &str {
+        &self.dpop_jkt
+    }
+
+    pub fn auth_generation(&self) -> i64 {
+        self.auth_generation
+    }
+}
 
 /// Device signer authority returned only after an exact active-registry lookup.
 ///
@@ -343,11 +409,18 @@ pub async fn resolve_registry_verified_device_signer(
     device: &VerifiedDeviceRequest,
 ) -> Result<RegistryVerifiedDeviceSigner, GroupInfoVerificationError> {
     let encoded_signature_key: Option<String> = sqlx::query_scalar(
-        "SELECT signature_public_key FROM devices
-         WHERE user_did = $1 AND device_id = $2 AND dpop_jkt = $3
-           AND auth_generation = $4 AND active AND auth_bound_at IS NOT NULL
-           AND signature_public_key IS NOT NULL
-         FOR SHARE",
+        "SELECT encode(dk.signing_public_key, 'hex')
+           FROM chat.devices d
+           JOIN chat.device_keys dk
+             ON dk.user_did = d.user_did
+            AND dk.device_id = d.device_id
+          WHERE d.user_did = $1
+            AND d.device_id::text = $2
+            AND d.dpop_jkt = $3
+            AND d.auth_generation = $4
+            AND d.status = 'active'
+            AND dk.revoked_at IS NULL
+          FOR SHARE OF d",
     )
     .bind(device.user_did())
     .bind(device.device_id())
@@ -596,11 +669,10 @@ pub(crate) mod context_binding_tests {
     use openmls_basic_credential::SignatureKeyPair;
     use openmls_traits::OpenMlsProvider;
 
-    use crate::{auth::device_auth::VerifiedDeviceRequest, models::ResolvedMlsContext};
-
     use super::{
         authority_from_registry_key, verify_group_info_for_transition, GroupInfoVerificationError,
-        GroupInfoVerifierLimits, RegistryVerifiedDeviceSigner,
+        GroupInfoVerifierLimits, RegistryVerifiedDeviceSigner, ResolvedMlsContext,
+        VerifiedDeviceRequest,
     };
 
     const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;

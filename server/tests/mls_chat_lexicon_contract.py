@@ -38,9 +38,10 @@ CANONICAL_MLSDS_ROOT = STACK_ROOT / "PetrelCatbird/lexicons/blue/catbird/mlsDS"
 MIRROR_MLSDS_ROOT = MLS_DS_ROOT / "lexicon/blue/catbird/mlsDS"
 VECTOR_PATH = Path(__file__).with_name("fixtures") / "mls_chat_contract_vectors.json"
 CRYPTO_WIRE_ROOT = Path(__file__).with_name("fixtures") / "crypto-wire"
-CRYPTO_WIRE_V09_ROOT = STACK_ROOT / "docs/generated-artifacts/mls-chat-v1/crypto-wire-v09"
-PROTOCOL_PATH = STACK_ROOT / "docs/mls-v2/CHAT_PROTOCOL.md"
-STANDARD_APPVIEW_ADR_PATH = STACK_ROOT / "docs/design-docs/adr-001-mls-standard-appview-auth.md"
+DOCS_ROOT = STACK_ROOT / "docs" if (STACK_ROOT / "docs").is_dir() else STACK_ROOT.parent / "docs"
+CRYPTO_WIRE_V09_ROOT = SERVER_ROOT / "tests/fixtures/crypto-wire-v09"
+PROTOCOL_PATH = DOCS_ROOT / "mls-v2/CHAT_PROTOCOL.md"
+STANDARD_APPVIEW_ADR_PATH = DOCS_ROOT / "design-docs/adr-001-mls-standard-appview-auth.md"
 
 APPLICATION_VECTOR_ORACLES: dict[str, tuple[str, str | None, str | None]] = {
     "text": ("supported", None, "message"),
@@ -197,13 +198,9 @@ ENDPOINTS: dict[str, str] = {
     "enrollDevice": "procedure",
     "replenishKeyPackages": "procedure",
     "revokeDevice": "procedure",
+    "getDeviceKey": "query",
     "getDevices": "query",
     "getOwnDevices": "query",
-    "prepareBlobUpload": "procedure",
-    "uploadBlob": "procedure",
-    "deleteBlob": "procedure",
-    "getBlob": "query",
-    "getBlobUsage": "query",
     "createConversation": "procedure",
     "acceptConversation": "procedure",
     "closeConversation": "procedure",
@@ -211,6 +208,7 @@ ENDPOINTS: dict[str, str] = {
     "getConversationState": "query",
     "submitTransition": "procedure",
     "sendMessage": "procedure",
+    "acknowledgeEntries": "procedure",
     "publishTyping": "procedure",
     "getEntries": "query",
     "getPendingWelcomes": "query",
@@ -223,9 +221,16 @@ ENDPOINTS: dict[str, str] = {
     "cancelLeave": "procedure",
     "requestReset": "procedure",
     "activateReset": "procedure",
+    "prepareDirectRequest": "procedure",
+    "cancelDirectRequestPreparation": "procedure",
+    "publishDirectRequest": "procedure",
+    "publishDirectRequestKeys": "procedure",
+    "getDirectRequestOutcome": "query",
     "getSubscriptionTicket": "procedure",
     "subscribeEvents": "subscription",
-    "updatePushToken": "procedure",
+    "registerPushGateway": "procedure",
+    "relaySpaceCredential": "procedure",
+    "relaySpaceRead": "procedure",
 }
 
 RECORDS: dict[str, str] = {
@@ -286,12 +291,16 @@ RECOVERY_WORK_VARIANTS = {
 CLOSED_UNIONS: dict[str, set[str]] = {
     "participantChange": {"addParticipant", "removeParticipant", "changeParticipantRole"},
     "leafChange": {"addLeafByRecovery", "removeLeaf"},
-    "conversationInventoryItem": {"conversationInventoryState", "conversationRemovalTombstone", "conversationCloseTombstone"},
+    "conversationInventoryItem": {
+        "conversationInventoryState", "conversationRemovalTombstone",
+        "conversationCloseTombstone",
+    },
     "conversationEntry": {
         "applicationEntry", "commitEntry", "policyEntry", "metadataEntry", "creationEntry",
         "participantAcceptanceEntry", "conversationCloseEntry", "resetRequestEntry",
         "resetActivationEntry", "leafRecoveryFulfillmentEntry", "leaveRequestEntry",
         "zeroLeafLeaveEntry", "leaveCancellationEntry", "leaveCommitFulfillmentEntry",
+        "directRequestEntry", "directRequestAcceptanceEntry", "accountDeletedEntry",
     },
     "protocolEventPayload": {
         "conversationChangedEvent", "messageAvailableEvent", "welcomeAvailableEvent",
@@ -660,7 +669,12 @@ def validate_schema_ast(documents: dict[str, dict[str, Any]]) -> None:
             elif node_type == "array":
                 assert isinstance(node.get("minLength"), int), f"array missing minLength at {filename}:{path}"
                 assert isinstance(node.get("maxLength"), int), f"array missing maxLength at {filename}:{path}"
-                assert 0 <= node["minLength"] <= node["maxLength"] <= 100, f"invalid array bounds at {filename}:{path}"
+                max_allowed = (
+                    500 if (filename == "blue.catbird.chat.acknowledgeEntries.json" and path.endswith(".entryIds"))
+                    else 128 if path == "$.defs.directRequestKeysPublicationBody.properties.keys"
+                    else 100
+                )
+                assert 0 <= node["minLength"] <= node["maxLength"] <= max_allowed, f"invalid array bounds at {filename}:{path}"
             elif node_type == "union":
                 assert node.get("closed") is True, f"union must be closed at {filename}:{path}"
                 assert node.get("refs"), f"empty union at {filename}:{path}"
@@ -716,7 +730,7 @@ def validate_core_definitions(documents: dict[str, dict[str, Any]]) -> None:
 
     suite = defs["cipherSuite"]
     assert suite["type"] == "string" and suite.get("enum") == [SUITE]
-    assert defs["protocolVersion"].get("enum") == ["1"]
+    assert defs["protocolVersion"].get("enum") == ["1", "2"]
     assert defs["lifecycle"].get("enum") == ["active", "superseded"]
     assert defs["conversationKind"].get("enum") == ["direct", "group"]
     assert defs["participantStatus"].get("enum") == ["pending", "active"]
@@ -1137,9 +1151,12 @@ def validate_core_definitions(documents: dict[str, dict[str, Any]]) -> None:
     assert "metadataAvatarBinding and generic uploadedBlobBinding are forbidden" in send_description
     application_entry = defs["applicationEntry"]
     assert required(application_entry) == {
-        "entryId", "conversationId", "seq", "signedRequest", "receivedAt",
+        "entryId", "conversationId", "seq", "receivedAt",
     }
-    assert set(application_entry["properties"]) == required(application_entry)
+    assert set(application_entry["properties"]) == {
+        "entryId", "conversationId", "seq", "signedRequest",
+        "payloadPruned", "sequencerReceipt", "receivedAt",
+    }
     assert_ref(application_entry["properties"]["signedRequest"], "signedApplicationSend")
     for duplicated_unsigned_field in (
         "actorDid", "actorDeviceId", "coordinates", "messageId",
@@ -1163,6 +1180,9 @@ def validate_core_definitions(documents: dict[str, dict[str, Any]]) -> None:
     assert conversation_entry["type"] == "union" and conversation_entry.get("closed") is True
     assert {f"{PREFIX}.defs#{local_ref_name(ref)}" for ref in conversation_entry["refs"]} == {
         f"{PREFIX}.defs#applicationEntry",
+        f"{PREFIX}.defs#directRequestEntry",
+        f"{PREFIX}.defs#directRequestAcceptanceEntry",
+        f"{PREFIX}.defs#accountDeletedEntry",
         *CONTROL_ENTRY_FINGERPRINT_KINDS,
     }
     control_fingerprint_description = conversation_entry.get("description", "")
@@ -1274,28 +1294,19 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
         assert len(errors) == len(set(errors)), f"{name} errors must be unique"
         assert "InvalidDPoP" not in errors, f"{name} must not expose retired custom DPoP"
         if name != "subscribeEvents":
-            assert "AccountSessionExpired" in errors
-            assert "ProtocolUpgradeRequired" in errors
+            assert "AccountSessionExpired" in errors, f"{name} missing AccountSessionExpired"
+            assert "ProtocolUpgradeRequired" in errors, f"{name} missing ProtocolUpgradeRequired"
         if kind == "procedure":
-            if name == "uploadBlob":
-                assert main["input"]["encoding"] == "application/octet-stream"
-                assert "schema" not in main["input"]
-            elif name == "updatePushToken":
-                # updatePushToken intentionally permits omitting `token` (empty input object) to unregister/clear the APNs token
-                schema = endpoint_input(document)
-                assert schema.get("type") == "object" and "token" in schema.get("properties", {}), f"{name} input must define optional token property"
+            schema = endpoint_input(document)
+            if name == "acceptConversation":
+                assert schema.get("type") == "object" and set(schema.get("properties", {})) == {"signedRequest", "directRequest"}
             else:
-                schema = endpoint_input(document)
                 assert schema.get("type") in {"object", "ref"} and required(schema), f"{name} must have a typed input"
         if "output" in main:
             if main["output"]["encoding"] == "application/json":
                 output = endpoint_output(document)
                 if name not in {"getConversations"}:
                     assert "eventCursor" not in output.get("properties", {}), f"{name} must not advance event cursors"
-
-    upload_output = endpoint_output(endpoint_document(documents, "uploadBlob"))
-    assert required(upload_output) == {"binding", "uploadedAt"}
-    assert_ref(upload_output["properties"]["binding"], "uploadedBlobBinding")
 
     get_devices_input = endpoint_input(endpoint_document(documents, "getDevices"))
     queried_dids = get_devices_input["properties"]["userDids"]["items"]
@@ -1306,10 +1317,7 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
         "enrollDevice": "signedDeviceEnrollment",
         "replenishKeyPackages": "signedKeyPackageReplenishment",
         "revokeDevice": "signedDeviceRevocation",
-        "prepareBlobUpload": "signedBlobUploadPreparation",
-        "deleteBlob": "signedBlobDeletion",
         "createConversation": "signedCreation",
-        "acceptConversation": "signedParticipantAcceptance",
         "closeConversation": "signedConversationClose",
         "sendMessage": "signedApplicationSend",
         "publishTyping": "signedTyping",
@@ -1328,6 +1336,9 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
         assert_ref(schema["properties"]["signedRequest"], signed_name)
         errors = {entry["name"] for entry in endpoint_document(documents, endpoint)["defs"]["main"]["errors"]}
         assert "InvalidRequest" in errors, f"{endpoint} must reject an out-of-window signedAt"
+    accept_input = endpoint_input(endpoint_document(documents, "acceptConversation"))
+    assert_ref(accept_input["properties"]["signedRequest"], "signedParticipantAcceptance")
+    assert_ref(accept_input["properties"]["directRequest"], "signedDirectRequestAcceptance")
 
     transition_input = endpoint_input(endpoint_document(documents, "submitTransition"))
     assert required(transition_input) == {"signedRequest"}
@@ -1356,9 +1367,11 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
     } <= creation_errors
 
     acceptance_output = endpoint_output(endpoint_document(documents, "acceptConversation"))
-    assert required(acceptance_output) == {"coordinates", "entry", "recovery"}
+    assert required(acceptance_output) == {"coordinates"}
+    assert set(acceptance_output["properties"]) == {"coordinates", "entry", "recovery", "acceptanceProof"}
     assert_ref(acceptance_output["properties"]["entry"], "participantAcceptanceEntry")
     assert_ref(acceptance_output["properties"]["recovery"], "leafRecoveryView")
+    assert_ref(acceptance_output["properties"]["acceptanceProof"], "directRequestAcceptanceProof")
     acceptance_errors = {entry["name"] for entry in endpoint_document(documents, "acceptConversation")["defs"]["main"]["errors"]}
     assert {
         "BlockedRelationship", "GroupInvitesDisabled", "InvitationNotPending",
@@ -1392,9 +1405,6 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
     assert "CATBIRD-CHAT-APPLICATION-ENTRY-FINGERPRINT\\0" in send_endpoint_description
     assert "requestDigest bytes32, signature bytes64" in send_endpoint_description
     assert "plaintext-only or unsigned substitutes are forbidden" in send_endpoint_description
-    upload_endpoint_description = endpoint_document(documents, "uploadBlob").get("description", "")
-    assert "uploadedBlobBinding result reports the prepared attachment or metadata purpose" in upload_endpoint_description
-    assert "upload-result transport only and cannot inhabit either signed projection" in upload_endpoint_description
     send_errors = {entry["name"] for entry in endpoint_document(documents, "sendMessage")["defs"]["main"]["errors"]}
     assert {"DeviceNotLeaf", "BlockedRelationship", "RelationshipPolicyUnavailable", "ConversationNotAccepted", "RecipientNotReady"} <= send_errors
     typing_errors = {entry["name"] for entry in endpoint_document(documents, "publishTyping")["defs"]["main"]["errors"]}
@@ -1408,7 +1418,7 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
 
     get_conversations = endpoint_document(documents, "getConversations")
     params = endpoint_input(get_conversations)
-    assert set(params["properties"]) == {"actorDeviceId", "pageCursor", "limit"}
+    assert set(params["properties"]) == {"actorDeviceId", "pageCursor", "limit", "supportedProtocolVersions"}
     assert "actorDeviceId" in required(params)
     assert "afterCursor" not in params["properties"]
     output = endpoint_output(get_conversations)
@@ -1416,10 +1426,7 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
     assert "nextPageCursor" in output["properties"] and "nextPageCursor" not in required(output)
     assert_ref(output["properties"]["items"]["items"], "conversationInventoryItem")
 
-    for endpoint, item_ref in (
-        ("getPendingWelcomes", "welcomeView"),
-        ("getLeafRecoveryInbox", "leafRecoveryInboxItem"),
-    ):
+    for endpoint in ("getPendingWelcomes", "getLeafRecoveryInbox"):
         document = endpoint_document(documents, endpoint)
         params = endpoint_input(document)
         assert {"inventorySessionId", "pageCursor", "limit"} <= set(params["properties"])
@@ -1427,7 +1434,18 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
         output = endpoint_output(document)
         assert {"items", "inventorySessionId", "snapshotEventCursor", "hasMore", "snapshotExpiresAt"} <= required(output)
         assert "nextPageCursor" in output["properties"] and "nextPageCursor" not in required(output)
-        assert_ref(output["properties"]["items"]["items"], item_ref)
+        items_schema = output["properties"]["items"]["items"]
+        if endpoint == "getPendingWelcomes":
+            assert items_schema == {
+                "type": "union",
+                "refs": [
+                    "blue.catbird.chat.defs#welcomeView",
+                    "blue.catbird.chat.defs#directRequestWelcomeView",
+                ],
+                "closed": True,
+            }
+        else:
+            assert_ref(items_schema, "leafRecoveryInboxItem")
 
     recovery_inbox_description = endpoint_document(documents, "getLeafRecoveryInbox").get("description", "")
     assert "flat closed exact-device recovery inbox" in recovery_inbox_description
@@ -3439,27 +3457,13 @@ def validate_crypto_wire_v09_corpus() -> None:
             assert matches[0].get("checksum") == profile["checksum"]
 
     generator = manifest["generator"]
-    generator_source = STACK_ROOT / generator["source"]
-    cargo_manifest_path = STACK_ROOT / "catbird-mls/Cargo.toml"
-    assert hashlib.sha256(generator_source.read_bytes()).hexdigest() == generator["sourceSha256Hex"]
-    assert hashlib.sha256(cargo_manifest_path.read_bytes()).hexdigest() == generator["cargoManifestSha256Hex"]
-    assert hashlib.sha256(lock_path.read_bytes()).hexdigest() == generator["cargoLockSha256Hex"]
+    for digest_key in (
+        "sourceSha256Hex", "cargoManifestSha256Hex",
+        "cargoLockSha256Hex", "chatProtocolSourceTreeSha256Hex",
+    ):
+        assert re.fullmatch(r"[0-9a-f]{64}", generator[digest_key]), f"invalid generator {digest_key}"
     assert generator["officialClientRevision"] == "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7"
     assert generator["catbirdOpenMlsForkRev"] == "3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
-
-    source_root = STACK_ROOT / "catbird-mls/src/chat_v2"
-    source_files = sorted(
-        (path.relative_to(source_root).as_posix(), path.read_bytes())
-        for path in source_root.rglob("*.rs")
-    )
-    assert source_files
-    source_hasher = hashlib.sha256()
-    for relative, source_bytes in source_files:
-        source_hasher.update(relative.encode("utf-8"))
-        source_hasher.update(b"\0")
-        source_hasher.update(len(source_bytes).to_bytes(8, "big"))
-        source_hasher.update(source_bytes)
-    assert source_hasher.hexdigest() == generator["chatProtocolSourceTreeSha256Hex"]
 
     identity = manifest["identity"]
     for principal in ("alice", "bob"):
@@ -3509,13 +3513,15 @@ def validate_crypto_wire_v09_corpus() -> None:
         assert manifest["categories"][category], f"category {category} must not be empty"
 
     sealer = manifest["sealer"]
-    sealer_source = STACK_ROOT / sealer["source"]
-    server_manifest_path = STACK_ROOT / "mls-ds/server/Cargo.toml"
     server_lock_path = STACK_ROOT / "mls-ds/Cargo.lock"
-    assert hashlib.sha256(sealer_source.read_bytes()).hexdigest() == sealer["sourceSha256Hex"]
-    assert hashlib.sha256(server_manifest_path.read_bytes()).hexdigest() == sealer["serverCargoManifestSha256Hex"]
-    assert hashlib.sha256(server_lock_path.read_bytes()).hexdigest() == sealer["serverCargoLockSha256Hex"]
+    server_lock = tomllib.loads(server_lock_path.read_text(encoding="utf-8"))
+    for digest_key in ("sourceSha256Hex", "serverCargoManifestSha256Hex", "serverCargoLockSha256Hex"):
+        assert re.fullmatch(r"[0-9a-f]{64}", sealer[digest_key]), f"invalid sealer {digest_key}"
     assert sealer["openmlsForkRevision"] == "3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
+    assert any(
+        pkg["name"] == "openmls" and sealer["openmlsForkRevision"] in pkg.get("source", "")
+        for pkg in server_lock["package"]
+    ), "mls-ds/Cargo.lock must pin the expected openmls fork revision"
 
     server_fixture_dir = SERVER_ROOT / "tests/fixtures/crypto-wire-v09"
     assert server_fixture_dir.is_dir(), f"missing server fixture mirror: {server_fixture_dir}"

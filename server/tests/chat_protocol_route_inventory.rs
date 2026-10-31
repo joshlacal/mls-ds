@@ -18,7 +18,6 @@ use base64::{
     Engine,
 };
 use catbird_server::{
-    blob_store::BlobStore,
     chat_protocol::error::ChatEndpoint,
     handlers::chat::{chat_router, ChatRuntime},
     realtime::SseState,
@@ -32,7 +31,6 @@ use tower_util::ServiceExt;
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
-    blob_store: BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -44,12 +42,6 @@ impl FromRef<TestState> for DbPool {
 impl FromRef<TestState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestState) -> Self {
         state.runtime.clone()
-    }
-}
-
-impl FromRef<TestState> for BlobStore {
-    fn from_ref(state: &TestState) -> Self {
-        state.blob_store.clone()
     }
 }
 
@@ -90,7 +82,6 @@ fn router() -> Router {
     chat_router::<TestState>().with_state(TestState {
         pool,
         runtime: runtime(),
-        blob_store: BlobStore::for_route_tests(),
     })
 }
 
@@ -105,19 +96,13 @@ fn live_router() -> Router {
         ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("live clean-chat runtime"),
     );
     std::env::remove_var("CHAT_CUTOVER_ENABLED");
-    chat_router::<TestState>().with_state(TestState {
-        pool,
-        runtime,
-        blob_store: BlobStore::for_route_tests(),
-    })
+    chat_router::<TestState>().with_state(TestState { pool, runtime })
 }
 
 fn is_get(endpoint: ChatEndpoint) -> bool {
     matches!(
         endpoint,
-        ChatEndpoint::GetBlob
-            | ChatEndpoint::GetBlobUsage
-            | ChatEndpoint::GetConversationState
+        ChatEndpoint::GetConversationState
             | ChatEndpoint::GetConversations
             | ChatEndpoint::GetDeviceKey
             | ChatEndpoint::GetDevices

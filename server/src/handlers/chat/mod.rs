@@ -1,11 +1,4 @@
 //! Clean-cutover chat HTTP handler layer (`blue.catbird.chat.*`).
-//!
-//! This is the v2 handler tree, isolated from the superseded
-//! `handlers/mls_chat/` namespace. It exposes the certified
-//! `chat_protocol` repository/executor spine over XRPC. All 32 chat routes are
-//! registered up front by [`chat_router`]. Device lifecycle plus the sealed
-//! Reset, G6, Welcome, and Recovery mutation compositors have real routes;
-//! every remaining endpoint stays on the shared cutover-gated stub.
 
 use std::sync::Arc;
 
@@ -16,13 +9,11 @@ use axum::{
     Router,
 };
 
-use crate::blob_store::BlobStore;
 use crate::chat_protocol::error::ChatEndpoint;
 use crate::chat_protocol::validation::ValidatedChatNsid;
 use crate::storage::DbPool;
 
 mod accept_conversation;
-mod blob_routes;
 mod context;
 mod conversation_state;
 mod create_conversation;
@@ -50,15 +41,10 @@ mod send_message;
 mod submit_transition;
 mod subscribe_events;
 mod subscription;
-mod update_push_token;
 mod welcome;
 
 pub use errors::ChatFailure;
-#[cfg(any(test, feature = "test-support"))]
-pub use expiry_worker::reclaim_due_blob_objects_recording;
-pub use expiry_worker::{
-    run_chat_expiry_sweeper, run_chat_expiry_sweeper_with_blob_store, ChatExpirySweepConfig,
-};
+pub use expiry_worker::{run_chat_expiry_sweeper, ChatExpirySweepConfig};
 #[cfg(feature = "test-support")]
 pub use runtime::install_test_https_relationship_resolver;
 pub use runtime::ChatRuntime;
@@ -75,18 +61,12 @@ pub(crate) async fn admit_signed_operation_for_test(
     context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await
 }
 
-/// Build the isolated `blue.catbird.chat.*` router. Generic over the
-/// application state so it can be assembled in the binary crate where
-/// `AppState` lives, as long as that state can hand out a [`DbPool`] and the
-/// shared [`ChatRuntime`]. Every one of the 32 chat NSIDs is registered so
-/// routing and per-route body limits are exercised from the first slice; slices
-/// fill in real handler bodies over time.
+/// Build the isolated `blue.catbird.chat.*` router.
 pub fn chat_router<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
     DbPool: FromRef<S>,
     Arc<ChatRuntime>: FromRef<S>,
-    BlobStore: FromRef<S>,
 {
     let mut router = Router::new();
     for &endpoint in ChatEndpoint::ALL {
@@ -132,11 +112,6 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::GetLeafRecoveryInbox
             | ChatEndpoint::GetSubscriptionTicket
             | ChatEndpoint::SubscribeEvents
-            | ChatEndpoint::GetBlob
-            | ChatEndpoint::GetBlobUsage
-            | ChatEndpoint::PrepareBlobUpload
-            | ChatEndpoint::UploadBlob
-            | ChatEndpoint::DeleteBlob
             | ChatEndpoint::GetConversationState
             | ChatEndpoint::RequestReset
             | ChatEndpoint::ActivateReset
@@ -147,7 +122,6 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::CancelLeafRecovery
             | ChatEndpoint::SubmitTransition
             | ChatEndpoint::GetEntries
-            | ChatEndpoint::UpdatePushToken
     )
 }
 
@@ -157,9 +131,8 @@ where
     S: Clone + Send + Sync + 'static,
     DbPool: FromRef<S>,
     Arc<ChatRuntime>: FromRef<S>,
-    BlobStore: FromRef<S>,
 {
-    let router = Router::new()
+    Router::new()
         .route(
             &xrpc_path(ChatEndpoint::PublishDirectRequestKeys),
             post(direct_requests::publish_keys).layer(DefaultBodyLimit::max(16_777_216)),
@@ -289,34 +262,10 @@ where
             get(subscribe_events::handle),
         )
         .route(
-            &xrpc_path(ChatEndpoint::GetBlobUsage),
-            get(blob_routes::get_blob_usage),
-        )
-        .route(
-            &xrpc_path(ChatEndpoint::PrepareBlobUpload),
-            post(blob_routes::prepare_blob_upload),
-        )
-        .route(
-            &xrpc_path(ChatEndpoint::UploadBlob),
-            post(blob_routes::upload_blob).layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
-        )
-        .route(
-            &xrpc_path(ChatEndpoint::DeleteBlob),
-            post(blob_routes::delete_blob),
-        )
-        .route(
-            &xrpc_path(ChatEndpoint::UpdatePushToken),
-            post(update_push_token::handle),
-        )
-        .route(
             "/internal/chat/request-push-eligibility",
             post(request_push::eligibility).layer(DefaultBodyLimit::max(
                 crate::chat_protocol::request_push::MAX_INTERNAL_BODY_BYTES,
             )),
-        )
-        .route(
-            &xrpc_path(ChatEndpoint::GetBlob),
-            get(blob_routes::get_blob),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.reserveRecipientBootstrap",
@@ -366,17 +315,13 @@ where
         .route(
             "/xrpc/blue.catbird.mlsDS.getDirectRequestOutcome",
             get(crate::handlers::ds::direct_requests::get_direct_request_outcome),
-        );
-    router
+        )
 }
+
 fn xrpc_path(endpoint: ChatEndpoint) -> String {
     format!("/xrpc/{}", endpoint.nsid())
 }
 
-/// Whether the endpoint is served over HTTP GET. Sourced from the authoritative
-/// `ValidatedChatNsid::dpop_method` classification; `subscribeEvents` (which has
-/// no DPoP method because it is a ticket-only WebSocket upgrade) is served over
-/// GET.
 fn uses_http_get(endpoint: ChatEndpoint) -> bool {
     match ValidatedChatNsid::parse(endpoint.nsid()) {
         Ok(nsid) => match nsid.dpop_method() {
@@ -387,14 +332,6 @@ fn uses_http_get(endpoint: ChatEndpoint) -> bool {
     }
 }
 
-/// The shared not-implemented stub for every route without a real handler yet.
-///
-/// It is cutover-gated: while the clean protocol is not active (the default,
-/// operative state) it returns the declared `CutoverRequired` code — a valid
-/// wire outcome for every one of the 32 endpoints. Once cutover is enabled, a
-/// still-unimplemented route is an internal invariant violation (HTTP 500, no
-/// protocol code, no invented vocabulary). This is how `revokeDevice` and the
-/// H2–H7 routes stub without ever inventing a "not implemented" code.
 fn not_implemented(endpoint: ChatEndpoint, runtime: &ChatRuntime) -> Response {
     match context::require_cutover(runtime, endpoint) {
         Err(failure) => failure.into_response(),
@@ -409,16 +346,11 @@ mod tests {
         ChatProtocolErrorCode, EndpointProtocolError, ErrorExposure,
     };
 
-    /// Exhaustiveness property (build-time gate, ruling OQ-11 + risk R1): for
-    /// every `(endpoint, code)` pair the failure mapper admits the code only
-    /// when the Lexicon declares it, and downgrades every undeclared pair to an
-    /// internal invariant violation — never a vocabulary leak.
     #[test]
     fn failure_mapper_never_emits_undeclared_code() {
         for &endpoint in ChatEndpoint::ALL {
             for &code in ChatProtocolErrorCode::ALL {
                 let declared = endpoint.declares(code);
-                // The guarded constructor must agree with the Lexicon.
                 assert_eq!(
                     EndpointProtocolError::new(endpoint, code).is_ok(),
                     declared,
@@ -455,13 +387,11 @@ mod tests {
         }
     }
 
-    /// Every chat endpoint must map to a registrable route method.
     #[test]
     fn every_endpoint_has_a_route_method() {
         for &endpoint in ChatEndpoint::ALL {
             let path = xrpc_path(endpoint);
             assert!(path.starts_with("/xrpc/blue.catbird.chat."));
-            // Exercises the GET/POST classification without panicking.
             let _ = uses_http_get(endpoint);
         }
     }

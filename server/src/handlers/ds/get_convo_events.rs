@@ -63,17 +63,6 @@ pub struct GetConvoEventsOutput {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct LegacyEventRow {
-    seq: i64,
-    epoch: i64,
-    msg_id: Option<String>,
-    message_type: String,
-    ciphertext: Vec<u8>,
-    padded_size: i64,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, sqlx::FromRow)]
 struct CleanEventRow {
     seq: i64,
     epoch: i64,
@@ -86,6 +75,7 @@ struct CleanEventRow {
     outer_entry_fingerprint: Vec<u8>,
     received_at: DateTime<Utc>,
 }
+
 /// GET /xrpc/blue.catbird.mlsDS.getConvoEvents
 #[tracing::instrument(skip(pool, auth_user, query))]
 pub async fn get_convo_events(
@@ -102,103 +92,60 @@ pub async fn get_convo_events(
         let from_seq = query.after_seq.unwrap_or(0).max(0);
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
-        let events = if state.is_clean {
-            let convo_uuid = uuid::Uuid::parse_str(&query.convo_id).map_err(|_| {
-                FederationError::ConversationNotFound {
-                    convo_id: query.convo_id.clone(),
-                }
-            })?;
+        let convo_uuid = uuid::Uuid::parse_str(&query.convo_id).map_err(|_| {
+            FederationError::ConversationNotFound {
+                convo_id: query.convo_id.clone(),
+            }
+        })?;
 
-            let rows: Vec<CleanEventRow> = sqlx::query_as::<_, CleanEventRow>(
-                "SELECT \
-                   CAST(seq AS BIGINT) AS seq, \
-                   CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
-                   entry_id, \
-                   message_id, \
-                   entry_kind, \
-                   accepted_payload_bytes, \
-                   accepted_payload_sha256, \
-                   signed_request_bytes, \
-                   outer_entry_fingerprint, \
-                   received_at \
-                 FROM chat.entries \
-                 WHERE conversation_id = $1 AND seq > $2 \
-                 ORDER BY seq ASC \
-                 LIMIT $3",
-            )
-            .bind(convo_uuid)
-            .bind(from_seq)
-            .bind(limit)
-            .fetch_all(&pool)
-            .await
-            .map_err(FederationError::Database)?;
+        let rows: Vec<CleanEventRow> = sqlx::query_as::<_, CleanEventRow>(
+            "SELECT \
+               CAST(seq AS BIGINT) AS seq, \
+               CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+               entry_id, \
+               message_id, \
+               entry_kind, \
+               COALESCE(accepted_payload_bytes, ''::bytea) AS accepted_payload_bytes, \
+               accepted_payload_sha256, \
+               COALESCE(signed_request_bytes, ''::bytea) AS signed_request_bytes, \
+               outer_entry_fingerprint, \
+               received_at \
+             FROM chat.entries \
+             WHERE conversation_id = $1 AND seq > $2 \
+             ORDER BY seq ASC \
+             LIMIT $3",
+        )
+        .bind(convo_uuid)
+        .bind(from_seq)
+        .bind(limit)
+        .fetch_all(&pool)
+        .await
+        .map_err(FederationError::Database)?;
 
-            let events: Vec<ConvoEventEntry> = rows
-                .into_iter()
-                .map(|row| {
-                    let msg_id = row
-                        .message_id
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|| row.entry_id.to_string());
-                    let padded_size = row.accepted_payload_bytes.len() as i64;
-                    ConvoEventEntry {
-                        seq: row.seq,
-                        epoch: row.epoch,
-                        msg_id,
-                        message_type: row.entry_kind.clone(),
-                        ciphertext: row.accepted_payload_bytes,
-                        padded_size,
-                        created_at: row.received_at,
-                        entry_id: Some(row.entry_id.to_string()),
-                        entry_kind: Some(row.entry_kind),
-                        accepted_payload_sha256: Some(row.accepted_payload_sha256),
-                        signed_request: Some(row.signed_request_bytes),
-                        outer_fingerprint: Some(row.outer_entry_fingerprint),
-                    }
-                })
-                .collect();
-            events
-        } else {
-            let rows: Vec<LegacyEventRow> = sqlx::query_as::<_, LegacyEventRow>(
-                "SELECT \
-                   CAST(seq AS BIGINT) AS seq, \
-                   CAST(epoch AS BIGINT) AS epoch, \
-                   COALESCE(msg_id, id) AS msg_id, \
-                   message_type, \
-                   ciphertext, \
-                   CAST(COALESCE(padded_size, 0) AS BIGINT) AS padded_size, \
-                   created_at \
-                 FROM messages \
-                 WHERE convo_id = $1 AND seq > $2 \
-                 ORDER BY seq ASC \
-                 LIMIT $3",
-            )
-            .bind(&query.convo_id)
-            .bind(from_seq)
-            .bind(limit)
-            .fetch_all(&pool)
-            .await
-            .map_err(FederationError::Database)?;
-
-            let events: Vec<ConvoEventEntry> = rows
-                .into_iter()
-                .map(|row| ConvoEventEntry {
+        let events: Vec<ConvoEventEntry> = rows
+            .into_iter()
+            .map(|row| {
+                let msg_id = row
+                    .message_id
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| row.entry_id.to_string());
+                let padded_size = row.accepted_payload_bytes.len() as i64;
+                ConvoEventEntry {
                     seq: row.seq,
                     epoch: row.epoch,
-                    msg_id: row.msg_id.unwrap_or_default(),
-                    message_type: row.message_type,
-                    ciphertext: row.ciphertext,
-                    padded_size: row.padded_size,
-                    created_at: row.created_at,
-                    entry_id: None,
-                    entry_kind: None,
-                    accepted_payload_sha256: None,
-                    signed_request: None,
-                    outer_fingerprint: None,
-                })
-                .collect();
-            events
-        };
+                    msg_id,
+                    message_type: row.entry_kind.clone(),
+                    ciphertext: row.accepted_payload_bytes,
+                    padded_size,
+                    created_at: row.received_at,
+                    entry_id: Some(row.entry_id.to_string()),
+                    entry_kind: Some(row.entry_kind),
+                    accepted_payload_sha256: Some(row.accepted_payload_sha256),
+                    signed_request: Some(row.signed_request_bytes),
+                    outer_fingerprint: Some(row.outer_entry_fingerprint),
+                }
+            })
+            .collect();
         let to_seq_inclusive = events.last().map(|event| event.seq).unwrap_or(from_seq);
         Ok(Json(GetConvoEventsOutput {
             convo_id: state.convo_id,

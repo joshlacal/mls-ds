@@ -105,7 +105,6 @@ const ENDPOINT: &str = "blue.catbird.chat.createConversation";
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
-    blob_store: catbird_server::blob_store::BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -117,12 +116,6 @@ impl FromRef<TestState> for DbPool {
 impl FromRef<TestState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestState) -> Arc<ChatRuntime> {
         state.runtime.clone()
-    }
-}
-
-impl FromRef<TestState> for catbird_server::blob_store::BlobStore {
-    fn from_ref(state: &TestState) -> catbird_server::blob_store::BlobStore {
-        state.blob_store.clone()
     }
 }
 
@@ -221,11 +214,7 @@ async fn runtime(pool: &DbPool, cutover_enabled: bool) -> Arc<ChatRuntime> {
 }
 async fn router_with(pool: DbPool, cutover_enabled: bool) -> Router {
     let rt = runtime(&pool, cutover_enabled).await;
-    chat_router::<TestState>().with_state(TestState {
-        pool,
-        runtime: rt,
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
-    })
+    chat_router::<TestState>().with_state(TestState { pool, runtime: rt })
 }
 
 fn xrpc(nsid: &str) -> String {
@@ -1040,7 +1029,6 @@ async fn test_allowlisted_remote_ds_did_persisted_end_to_end() {
     let router = chat_router::<TestState>().with_state(TestState {
         pool: pool.clone(),
         runtime: rt.clone(),
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     });
 
     let payload = json!({
@@ -1338,7 +1326,6 @@ async fn test_resolver_failure_or_untrusted_peer_causes_zero_writes() {
     let router = chat_router::<TestState>().with_state(TestState {
         pool: pool.clone(),
         runtime: rt,
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     });
 
     let payload = json!({
@@ -1667,7 +1654,6 @@ async fn test_replay_counting_failing_resolver_proves_zero_calls() {
     let router = chat_router::<TestState>().with_state(TestState {
         pool: pool.clone(),
         runtime: rt.clone(),
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     });
 
     let payload = json!({

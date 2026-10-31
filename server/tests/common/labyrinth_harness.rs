@@ -1,22 +1,13 @@
-//! Shared harness of the Labyrinth backend suites (`tests/labyrinth_*.rs`).
+//! Shared harness of the clean-slate Labyrinth backend suites (`tests/labyrinth_*.rs`).
 //!
 //! Every test owns a fresh, fully migrated database (`labyrinth_srv_`
 //! prefix) and drives the real `labyrinth_router` over HTTP with real
 //! standard service-auth JWTs (ES256, DID document cached through the
-//! test-support hook) and real signed `labyrinthWriteBody` headers.
-//!
-//! Chat fixtures (principals, devices, keys, conversations, participants,
-//! leaves, blobs) are seeded with plain SQL. Conversation-shaped rows are
-//! written with `session_replication_role = replica`, which suspends the
-//! chat schema's FK and deferred-invariant triggers for that one seeding
-//! transaction only (CHECK constraints still apply). That needs a superuser
-//! test role, which the local disposable cluster has. Labyrinth rows are
-//! never seeded this way: they always go through the handlers.
+//! test-support hook) and real signed `labyrinthWriteBody` / read-claim headers.
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Once};
 
 use axum::{body::Body, extract::FromRef, http::Request, http::StatusCode, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -30,26 +21,21 @@ use sqlx::PgPool;
 use tower_util::ServiceExt;
 use uuid::Uuid;
 
-use catbird_server::blob_store::BlobStore;
 use catbird_server::federation::outbound::OutboundClient;
 use catbird_server::federation::resolver::ValidatedRemoteDestination;
 use catbird_server::federation::{DsResolver, ServiceAuthClient};
 use catbird_server::handlers::chat::ChatRuntime;
 use catbird_server::handlers::labyrinth::labyrinth_router;
-use catbird_server::handlers::labyrinth::relay_client::RelayClient;
 use catbird_server::storage::DbPool;
 
 use crate::common::fresh_db::{fresh_fully_migrated_db, DisposableDatabase};
 
 pub const PREFIX: &str = "blue.catbird.labyrinth.";
-/// The DS redaction signing seed every test process configures.
-pub const REDACTION_SEED: [u8; 32] = [0x5E; 32];
 
 #[derive(Clone)]
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
-    blob_store: BlobStore,
     resolver: Arc<DsResolver>,
     outbound: Arc<OutboundClient>,
     service_auth: Option<Arc<ServiceAuthClient>>,
@@ -71,8 +57,7 @@ impl FromRef<TestState> for Option<Arc<ServiceAuthClient>> {
     }
 }
 
-/// This DS's federation identity in a two-DS relay test: its DID, its
-/// service-auth key, and where its one peer (the sequencer) listens.
+/// This DS's federation identity in a two-DS test.
 pub struct Federation {
     pub self_did: String,
     pub key: P256Key,
@@ -89,11 +74,6 @@ impl FromRef<TestState> for Arc<ChatRuntime> {
         state.runtime.clone()
     }
 }
-impl FromRef<TestState> for BlobStore {
-    fn from_ref(state: &TestState) -> BlobStore {
-        state.blob_store.clone()
-    }
-}
 
 fn ensure_runtime_env() {
     static ENV: Once = Once::new();
@@ -102,14 +82,6 @@ fn ensure_runtime_env() {
         std::env::set_var(
             "CHAT_CURSOR_SEALING_SECRET",
             URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
-        );
-        std::env::set_var(
-            "LABYRINTH_REDACTION_SIGNING_KEY",
-            URL_SAFE_NO_PAD.encode(REDACTION_SEED),
-        );
-        std::env::set_var(
-            "LABYRINTH_ATTACHMENT_DIGEST_KEY",
-            URL_SAFE_NO_PAD.encode([0x3C_u8; 32]),
         );
         std::env::set_var(
             "CHAT_SUBSCRIPTION_ENDPOINT",
@@ -142,49 +114,26 @@ pub fn runtime(cutover: bool) -> Arc<ChatRuntime> {
 pub struct Env {
     pub pool: PgPool,
     pub router: Router,
-    /// This DS's federation client (federated envs), for draining the
-    /// Labyrinth relay outbox.
-    pub relay: Option<RelayClient>,
     _db: DisposableDatabase,
-}
-
-/// A stored attachment object served by the route-test blob store.
-pub struct TestObject {
-    pub key: String,
-    pub data: Vec<u8>,
 }
 
 impl Env {
     pub async fn new() -> Self {
-        Self::with(true, None).await
+        Self::with(true).await
     }
 
-    pub async fn with(cutover: bool, object: Option<&TestObject>) -> Self {
-        Self::build(cutover, object, None).await
+    pub async fn with(cutover: bool) -> Self {
+        Self::build(cutover, None).await
     }
 
     /// An env with a federation identity (see [`Federation`]).
-    pub async fn federated(federation: Federation, object: Option<&TestObject>) -> Self {
-        Self::build(true, object, Some(federation)).await
+    pub async fn federated(federation: Federation) -> Self {
+        Self::build(true, Some(federation)).await
     }
 
-    async fn build(
-        cutover: bool,
-        object: Option<&TestObject>,
-        federation: Option<Federation>,
-    ) -> Self {
+    async fn build(cutover: bool, federation: Option<Federation>) -> Self {
         let db = fresh_fully_migrated_db("labyrinth_srv_").await;
         let pool = db.connect(8).await;
-        let blob_store = match object {
-            None => BlobStore::for_route_tests(),
-            Some(o) => BlobStore::for_route_tests_with_object(
-                o.key.clone(),
-                o.data.clone(),
-                Sha256::digest(&o.data).into(),
-                String::new(),
-                "image/png".to_owned(),
-            ),
-        };
         let self_did = federation
             .as_ref()
             .map(|f| f.self_did.clone())
@@ -192,7 +141,7 @@ impl Env {
         let mut resolver = DsResolver::new(
             pool.clone(),
             reqwest::Client::new(),
-            self_did.clone(),
+            self_did,
             "https://labyrinth-test.invalid".to_owned(),
             None,
             3600,
@@ -218,13 +167,9 @@ impl Env {
         });
         let resolver = Arc::new(resolver);
         let outbound = Arc::new(OutboundClient::new(2, 10));
-        let relay = service_auth
-            .clone()
-            .map(|sa| RelayClient::new(resolver.clone(), outbound.clone(), sa));
         let router = labyrinth_router::<TestState>().with_state(TestState {
             pool: pool.clone(),
             runtime: runtime(cutover),
-            blob_store,
             resolver,
             outbound,
             service_auth,
@@ -232,17 +177,8 @@ impl Env {
         Self {
             pool,
             router,
-            relay,
             _db: db,
         }
-    }
-
-    /// Deliver every due relay-outbox job once.
-    pub async fn drain_outbox(&self) -> catbird_server::handlers::labyrinth::outbox::Drained {
-        let client = self.relay.as_ref().expect("a federated env");
-        catbird_server::handlers::labyrinth::outbox::drain_once(&self.pool, client, 100)
-            .await
-            .expect("outbox pass")
     }
 
     pub async fn now(&self) -> DateTime<Utc> {
@@ -260,7 +196,6 @@ impl Env {
     /// Another active chat device of `did`, with chat key `seed`.
     pub async fn device_for(&self, did: &str, seed: [u8; 32]) -> Device {
         let chat_key = EdKey::from_bytes(&seed);
-        remember_transport_seed(chat_key.verifying_key().to_bytes(), seed);
         let device = Device {
             did: did.to_owned(),
             device_id: Uuid::new_v4(),
@@ -327,7 +262,7 @@ impl Env {
         device.cache_did_document().await;
     }
 
-    /// Serve this env's router on loopback (a peer DS for relay tests).
+    /// Serve this env's router on loopback.
     pub async fn serve(&self) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -401,8 +336,7 @@ pub async fn seed_conversation_with_id(
     seed_conversation_with_storage(env, conversation_id, leaves, next_entry_seq, None).await
 }
 
-/// Fixture creator runs the production immutable storage initializer in the
-/// same transaction as the new conversation; no mutable placement override.
+/// Seed a conversation and its Space placement in `chat.conversation_spaces`.
 pub async fn seed_conversation_with_storage(
     env: &Env,
     conversation_id: Uuid,
@@ -424,9 +358,23 @@ pub async fn seed_conversation_with_storage(
     .execute(&mut *tx)
     .await
     .expect("conversation");
-    catbird_server::labyrinth::repo::space::initialize(&mut tx, conversation_id, authority)
-        .await
-        .unwrap();
+    let authority_did = authority
+        .map(str::to_owned)
+        .unwrap_or_else(catbird_server::identity::service_did);
+    let space_uri = format!(
+        "at://{authority_did}/space/blue.catbird.labyrinth.conversation/{conversation_id}-1"
+    );
+    sqlx::query(
+        "INSERT INTO chat.conversation_spaces(conversation_id, generation, space_uri, authority_did, created_at) \
+         VALUES ($1, 1, $2, $3, $4)",
+    )
+    .bind(conversation_id)
+    .bind(&space_uri)
+    .bind(&authority_did)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .expect("conversation space");
     insert_members(&mut tx, conversation_id, leaves, now, 0).await;
     tx.commit().await.unwrap();
     conversation_id
@@ -583,99 +531,6 @@ pub async fn make_remote(env: &Env, conversation_id: Uuid) {
     tx.commit().await.unwrap();
 }
 
-/// An uploaded attachment blob owned by `owner`, stored at `object.key`.
-pub async fn seed_attachment_blob(env: &Env, owner: &Device, object: &TestObject) -> Uuid {
-    let blob_id = Uuid::new_v4();
-    let now = env.now().await;
-    let mut tx = env.pool.begin().await.unwrap();
-    replica(&mut tx).await;
-    let size = object.data.len() as i64;
-    sqlx::query(
-        "INSERT INTO chat.blobs(blob_id, owner_did, owner_device_id, owner_key_id, \
-           owner_auth_generation, purpose, media_type, plaintext_size, ciphertext_size, \
-           ciphertext_sha256, object_store_key, status, prepared_at, upload_expires_at, \
-           uploaded_at, unbound_expires_at) \
-         VALUES ($1, $2, $3, chat.ed25519_key_id($4), 1, 'attachment', 'image/png', $5, $6, $7, \
-           $8, 'completedUnbound', $9, $9 + INTERVAL '5 minutes', $9, $9 + INTERVAL '1 hour')",
-    )
-    .bind(blob_id)
-    .bind(&owner.did)
-    .bind(owner.device_id)
-    .bind(owner.chat_pub().as_slice())
-    .bind(size - 16)
-    .bind(size)
-    .bind(Sha256::digest(&object.data).to_vec())
-    .bind(&object.key)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .expect("blob");
-    tx.commit().await.unwrap();
-    blob_id
-}
-
-/// A bound attachment blob of `conversation`: uploaded by `owner`, stored at
-/// `object.key`, bound to chat message `message_id` at entry `entry_seq`.
-pub async fn seed_bound_attachment(
-    env: &Env,
-    owner: &Device,
-    conversation: Uuid,
-    object: &TestObject,
-    entry_seq: i64,
-) -> (Uuid, Uuid) {
-    let (blob_id, message_id) = (Uuid::new_v4(), Uuid::new_v4());
-    let now = env.now().await;
-    let size = object.data.len() as i64;
-    let hash = Sha256::digest(&object.data).to_vec();
-    let mut tx = env.pool.begin().await.unwrap();
-    replica(&mut tx).await;
-    sqlx::query(
-        "INSERT INTO chat.blobs(blob_id, owner_did, owner_device_id, owner_key_id, \
-           owner_auth_generation, purpose, media_type, plaintext_size, ciphertext_size, \
-           ciphertext_sha256, object_store_key, status, prepared_at, upload_expires_at, \
-           uploaded_at, unbound_expires_at, bound_at) \
-         VALUES ($1, $2, $3, chat.ed25519_key_id($4), 1, 'attachment', 'image/png', $5, $6, $7, \
-           $8, 'bound', $9, $9 + INTERVAL '5 minutes', $9, $9 + INTERVAL '1 hour', \
-           $9 + INTERVAL '1 second')",
-    )
-    .bind(blob_id)
-    .bind(&owner.did)
-    .bind(owner.device_id)
-    .bind(owner.chat_pub().as_slice())
-    .bind(size - 16)
-    .bind(size)
-    .bind(&hash)
-    .bind(&object.key)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .expect("bound blob");
-    sqlx::query(
-        "INSERT INTO chat.blob_bindings(blob_id, binding_kind, conversation_id, entry_seq, \
-           message_id, owner_did, owner_device_id, descriptor_bytes, descriptor_sha256, \
-           aad_bytes, aad_sha256, ciphertext_sha256, plaintext_size, ciphertext_size, purpose, \
-           bound_at, uploaded_at, unbound_expires_at) \
-         VALUES ($1, 'application', $2, $3, $4, $5, $6, '\\x01', digest('\\x01'::bytea, 'sha256'), \
-           '\\x02', digest('\\x02'::bytea, 'sha256'), $7, $8, $9, 'attachment', \
-           $10 + INTERVAL '1 second', $10, $10 + INTERVAL '1 hour')",
-    )
-    .bind(blob_id)
-    .bind(conversation)
-    .bind(entry_seq)
-    .bind(message_id)
-    .bind(&owner.did)
-    .bind(owner.device_id)
-    .bind(&hash)
-    .bind(size - 16)
-    .bind(size)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .expect("blob binding");
-    tx.commit().await.unwrap();
-    (blob_id, message_id)
-}
-
 /// An application interval of `device` in `conversation` from `start_seq`,
 /// closed at `terminal_seq` when given.
 pub async fn grant_interval(
@@ -719,32 +574,6 @@ pub async fn grant_interval(
     .execute(&mut *tx)
     .await
     .expect("application interval");
-    tx.commit().await.unwrap();
-}
-
-/// Rewrite a chat blob's lifecycle columns below the API (`expired` with
-/// its object kept, or `reclaimed` by object GC).
-pub async fn force_blob_state(env: &Env, blob_id: Uuid, state: &str) {
-    let mut tx = env.pool.begin().await.unwrap();
-    replica(&mut tx).await;
-    let sql = match state {
-        "expired" => {
-            "UPDATE chat.blobs SET status = 'expired', bound_at = NULL, \
-               expired_at = unbound_expires_at WHERE blob_id = $1"
-        }
-        "reclaimed" => {
-            "UPDATE chat.blobs SET status = 'expired', bound_at = NULL, \
-               expired_at = unbound_expires_at, object_store_key = NULL, \
-               object_gc_status = 'reclaimed', object_gc_after = unbound_expires_at, \
-               object_deleted_at = unbound_expires_at WHERE blob_id = $1"
-        }
-        other => panic!("unknown blob state {other}"),
-    };
-    sqlx::query(sql)
-        .bind(blob_id)
-        .execute(&mut *tx)
-        .await
-        .expect("blob state");
     tx.commit().await.unwrap();
 }
 
@@ -829,38 +658,6 @@ impl Device {
         format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
     }
 
-    /// The `[CB-36]` chatBinding of Labyrinth device `key` by this chat
-    /// device.
-    pub fn chat_binding(&self, key: [u8; 32]) -> Value {
-        let message = [
-            format!("catbird.labyrinth.device_binding:{}:", self.did).as_bytes(),
-            key.as_slice(),
-        ]
-        .concat();
-        json!({
-            "transportPubkey": b(&self.chat_pub()),
-            "sig": b(&self.chat_key.sign(&message).to_bytes()),
-        })
-    }
-
-    /// A physical Labyrinth `device` record for `key`, bound to this chat
-    /// device.
-    pub fn device_record(&self, key: [u8; 32]) -> Value {
-        let mut record = unbound_device_record(key);
-        record["chatBinding"] = self.chat_binding(key);
-        record
-    }
-
-    /// Register Labyrinth device `key` bound to this chat device.
-    pub async fn enroll(&self, key: [u8; 32]) {
-        self.call(
-            "createDevice",
-            &json!({ "record": self.device_record(key) }),
-        )
-        .await
-        .ok();
-    }
-
     /// `GET` a Labyrinth query as this device.
     pub async fn query(&self, name: &str, params: &[(&str, String)]) -> Reply {
         let nsid = format!("{PREFIX}{name}");
@@ -880,7 +677,7 @@ impl Device {
         send(&self.router, request).await
     }
 
-    /// The device-signed read headers for `query` on `nsid` (finding 3).
+    /// The device-signed read headers for `query` on `nsid`.
     pub fn read_headers(&self, nsid: &str, query: &str) -> (String, String) {
         self.read_headers_at(nsid, query, Utc::now().timestamp_millis())
     }
@@ -998,8 +795,7 @@ pub async fn cache_did_key(did: &str, key: &P256Key) {
     catbird_server::auth::cache_test_did_document(document).await;
 }
 
-/// Record `ds` as `device`'s home DS in the conversation (the sequencer's
-/// view of a remote participant).
+/// Record `ds` as `device`'s home DS in the conversation.
 pub async fn set_home_ds(env: &Env, conversation_id: Uuid, device: &Device, ds: &str) {
     let mut tx = env.pool.begin().await.unwrap();
     replica(&mut tx).await;
@@ -1080,9 +876,7 @@ pub fn b(bytes: &[u8]) -> Value {
 }
 
 /// The epochPublic golden vectors exported from the labyrinth crate
-/// (`tests/fixtures/labyrinth_epoch_heads.json`, generator in the lane's
-/// `vectorgen/`): a three-epoch chain of one DID (epochs 0–1 attested by
-/// transport seed 0, epoch 2 by seed 1) and a fork of epoch 1.
+/// (`tests/fixtures/labyrinth_epoch_heads.json`).
 pub struct Vectors {
     pub did: String,
     pub seeds: [[u8; 32]; 2],
@@ -1114,219 +908,4 @@ pub fn unb(value: &Value) -> Vec<u8> {
         .decode(text)
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(text))
         .unwrap()
-}
-
-/// A physical Labyrinth `device` record for key `key` without a
-/// `chatBinding` (refused by `createDevice`; see [`Device::device_record`]).
-pub fn unbound_device_record(key: [u8; 32]) -> Value {
-    json!({
-        "$type": "blue.catbird.labyrinth.device",
-        "deviceKeyPubkey": b(&key),
-        "epochStorageKeyPubkey": b(&[7; 32]),
-        "epochStorageKeySig": b(&[8; 64]),
-        "epochStorageAuthKeyPubkey": b(&[9; 32]),
-        "epochStorageAuthKeySig": b(&[10; 64]),
-        "virtual": false,
-        "createdAt": "2026-10-04T12:00:00.000Z",
-    })
-}
-
-/// A virtual (recovery) Labyrinth `device` record for key `key`.
-pub fn virtual_device_record(key: [u8; 32]) -> Value {
-    json!({
-        "$type": "blue.catbird.labyrinth.device",
-        "deviceKeyPubkey": b(&key),
-        "epochStorageKeyPubkey": b(&[7; 32]),
-        "epochStorageKeySig": b(&[8; 64]),
-        "virtual": true,
-        "createdAt": "2026-10-04T12:00:00.000Z",
-    })
-}
-
-/// An `epoch` record carrying `public`.
-pub fn epoch_record(public: &Value, opened_by: [u8; 32]) -> Value {
-    json!({
-        "$type": "blue.catbird.labyrinth.epoch",
-        "public": public,
-        "openedBy": b(&opened_by),
-        "createdAt": "2026-10-04T12:00:00.000Z",
-    })
-}
-
-/// An `epochMember` record.
-pub fn member_record(epoch_number: u64, key: [u8; 32]) -> Value {
-    json!({
-        "$type": "blue.catbird.labyrinth.epochMember",
-        "epochNumber": epoch_number,
-        "deviceKeyPubkey": b(&key),
-        "deviceMac": b(&[3; 32]),
-        "createdAt": "2026-10-04T12:00:00.000Z",
-    })
-}
-
-/// A `virtualDevice` record.
-pub fn vdevice_record(id: [u8; 16], key: [u8; 32]) -> Value {
-    json!({
-        "$type": "blue.catbird.labyrinth.virtualDevice",
-        "vdeviceId": b(&id),
-        "encryptedDeviceKeyPriv": b(&[1; 48]),
-        "encryptedEpochStorageKeyPriv": b(&[2; 48]),
-        "encryptedOrfClientState": b(&[3; 48]),
-        "encryptedMailboxRootSalt": b(&[4; 48]),
-        "encryptedEpochRootKey": b(&[5; 48]),
-        "encryptedEpochNumber": b(&[6; 24]),
-        "deviceKeyPubkey": b(&key),
-        "epochStorageKeyPubkey": b(&[7; 32]),
-        "epochStorageKeySig": b(&[8; 64]),
-        "mechanism": "code",
-        "createdAt": "2026-10-04T12:00:00.000Z",
-    })
-}
-
-/// An `ownerBatch` record with items at `timestamps`.
-pub fn owner_batch_record(thread_id: &str, timestamps: &[u64]) -> Value {
-    let items: Vec<Value> = timestamps
-        .iter()
-        .enumerate()
-        .map(|(i, ts)| {
-            json!({
-                "threadId": thread_id,
-                "messageId": format!("m{i}-{ts}"),
-                "timestamp": ts,
-                "epochNumber": 0,
-                "version": 3,
-                "encrypted": b(&[0xEE; 40]),
-            })
-        })
-        .collect();
-    json!({
-        "$type": "blue.catbird.labyrinth.ownerBatch",
-        "threadId": thread_id,
-        "items": items,
-        "createdAt": "2026-10-04T12:00:00.000Z",
-    })
-}
-
-fn transport_seeds() -> &'static Mutex<HashMap<[u8; 32], [u8; 32]>> {
-    static SEEDS: OnceLock<Mutex<HashMap<[u8; 32], [u8; 32]>>> = OnceLock::new();
-    SEEDS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn remember_transport_seed(pubkey: [u8; 32], seed: [u8; 32]) {
-    transport_seeds().lock().unwrap().insert(pubkey, seed);
-}
-
-fn transport_key_for(pubkey: [u8; 32]) -> Option<EdKey> {
-    transport_seeds()
-        .lock()
-        .unwrap()
-        .get(&pubkey)
-        .map(EdKey::from_bytes)
-}
-
-/// A `mek` record from a transport sender (`sender`'s chat key) addressed to
-/// `recipients`.
-pub fn transport_mek(
-    thread: Uuid,
-    mek_id: [u8; 12],
-    sender: [u8; 32],
-    recipients: &[&str],
-) -> Value {
-    let ephemeral_auth_pubkey = [0x21; 32];
-    let msg = format!(
-        "minos.structured_signature.mek_distribution.ephemeral_auth:k={};mek_id={}",
-        hex::encode(ephemeral_auth_pubkey),
-        hex::encode(mek_id),
-    );
-    let sig = transport_key_for(sender)
-        .map(|k| k.sign(msg.as_bytes()).to_bytes())
-        .unwrap_or([0x22; 64]);
-    mek_with_sender(
-        thread,
-        mek_id,
-        json!({
-            "$type": "blue.catbird.labyrinth.mek#transportSender",
-            "transportPubkey": b(&sender),
-            "ephemeralAuthPubkey": b(&ephemeral_auth_pubkey),
-            "sig": b(&sig),
-        }),
-        recipients,
-    )
-}
-
-/// A `mek` record from a Labyrinth sender (`did`, epoch `public`).
-pub fn labyrinth_mek(
-    thread: Uuid,
-    mek_id: [u8; 12],
-    did: &str,
-    public: &Value,
-    recipients: &[&str],
-) -> Value {
-    mek_with_sender(
-        thread,
-        mek_id,
-        json!({
-            "$type": "blue.catbird.labyrinth.mek#labyrinthSender",
-            "did": did,
-            "senderEpochHead": public["epochHead"],
-            "senderEpoch": public,
-        }),
-        recipients,
-    )
-}
-
-fn mek_with_sender(thread: Uuid, mek_id: [u8; 12], sender: Value, recipients: &[&str]) -> Value {
-    let mut heads_hex: Vec<String> = (0..recipients.len())
-        .map(|_| hex::encode([0x31u8; 32]))
-        .collect();
-    heads_hex.sort();
-    let mut hasher = Sha256::new();
-    hasher.update(b"mek_recipient_list:");
-    for h in &heads_hex {
-        hasher.update(h.as_bytes());
-    }
-    let roster_hash: [u8; 32] = hasher.finalize().into();
-    let recipients: Vec<Value> = recipients
-        .iter()
-        .map(|did| {
-            json!({
-                "did": did,
-                "recipientEpochHead": b(&[0x31; 32]),
-                "ciphertext": b(&[0x41; 120]),
-            })
-        })
-        .collect();
-    json!({
-        "$type": "blue.catbird.labyrinth.mek",
-        "threadId": thread.to_string(),
-        "mekId": b(&mek_id),
-        "rosterHash": b(&roster_hash),
-        "sender": sender,
-        "recipients": recipients,
-        "createdAt": "2026-10-04T12:00:00.000Z",
-    })
-}
-
-/// A `batch` record: one sealed message per `(mekId, timestamp)`, sent by
-/// chat key `sender`.
-pub fn batch_record(thread: Uuid, sender: [u8; 32], items: &[([u8; 12], u64)]) -> Value {
-    let items: Vec<Value> = items
-        .iter()
-        .enumerate()
-        .map(|(i, (mek_id, ts))| {
-            json!({
-                "messageId": format!("msg-{i}-{ts}"),
-                "timestamp": ts,
-                "mekId": b(mek_id),
-                "senderTransportPubkey": b(&sender),
-                "signedEncMessage": b(&[0x61; 96]),
-            })
-        })
-        .collect();
-    json!({
-        "$type": "blue.catbird.labyrinth.batch",
-        "threadId": thread.to_string(),
-        "items": items,
-        "createdAt": "2026-10-04T12:00:00.000Z",
-    })
 }

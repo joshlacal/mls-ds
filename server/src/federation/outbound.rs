@@ -81,6 +81,7 @@ impl OutboundClient {
                 request_timeout: Duration::from_secs(request_timeout_secs),
             };
         }
+        #[cfg_attr(not(any(test, feature = "test-support")), allow(unused_mut))]
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .timeout(Duration::from_secs(request_timeout_secs))

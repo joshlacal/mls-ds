@@ -17,7 +17,6 @@ use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use super::blobs::{self, BindingKind, BlobPurpose, NewBlobBinding};
 use super::delivery::{
     append_exact_application_entry, append_message_available_event,
     compare_exact_application_entry, AppendEntry, ApplicationSend, DeliveryRepositoryError,
@@ -1467,106 +1466,10 @@ pub async fn deliver_message_replication(
         })?
         .with_timezone(&Utc);
 
-    let bindings = projection.blob_bindings();
-    if bindings.len() > 1 {
+    if !projection.blob_bindings().is_empty() {
         return Err(FederationError::InvalidEnvelope {
-            reason: "at most one blob binding is allowed".to_string(),
-        });
-    }
-
-    let mut pending_blob: Option<NewBlobBinding> = None;
-    if let Some(CanonicalValueRef::Object(binding)) = bindings.get(0) {
-        let blob_id_val = match binding.get("blobId") {
-            Some(CanonicalValueRef::Uuid(u)) => Uuid::from_bytes(*u.as_bytes()),
-            _ => {
-                return Err(FederationError::InvalidEnvelope {
-                    reason: "invalid blobId in binding".to_string(),
-                })
-            }
-        };
-        let hash_val = match binding.get("ciphertextSha256") {
-            Some(CanonicalValueRef::Bytes(v)) if v.len() == 32 => v.to_vec(),
-            _ => {
-                return Err(FederationError::InvalidEnvelope {
-                    reason: "invalid ciphertextSha256 in binding".to_string(),
-                })
-            }
-        };
-        let size_val = match binding.get("ciphertextSize") {
-            Some(CanonicalValueRef::Integer(s)) => s as i64,
-            _ => {
-                return Err(FederationError::InvalidEnvelope {
-                    reason: "invalid ciphertextSize in binding".to_string(),
-                })
-            }
-        };
-        if !(17..=blobs::MAX_CIPHERTEXT_BYTES).contains(&size_val)
-            || !matches!(
-                binding.get("purpose"),
-                Some(CanonicalValueRef::Text("attachment"))
-            )
-        {
-            return Err(FederationError::InvalidEnvelope {
-                reason: "invalid blob binding purpose or size".to_string(),
-            });
-        }
-
-        let blob_row: Option<(Vec<u8>, i64, i64, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
-            r#"
-            SELECT ciphertext_sha256, ciphertext_size, plaintext_size, uploaded_at, unbound_expires_at
-              FROM chat.blobs
-             WHERE blob_id = $1 AND owner_did = $2 AND owner_device_id = $3
-               AND purpose = 'attachment' AND status = 'completedUnbound'
-             FOR UPDATE
-            "#,
-        )
-        .bind(blob_id_val)
-        .bind(actor_did)
-        .bind(actor_device_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(FederationError::Database)?;
-
-        let Some((stored_hash, stored_size, plaintext_size, uploaded_at, expires_at)) = blob_row
-        else {
-            return Err(FederationError::MailboxNotProvisioned {
-                reason: "attachment blob not found or not completedUnbound on destination DS"
-                    .to_string(),
-            });
-        };
-
-        if stored_hash != hash_val || stored_size != size_val || expires_at <= received_at_dt {
-            return Err(FederationError::DeliveryConflict {
-                reason: "attachment blob digest/size mismatch or expired".to_string(),
-            });
-        }
-
-        let descriptor_bytes = projection.application_message().canonical_dag_cbor();
-        let aad_bytes = projection.aad().canonical_dag_cbor();
-        let descriptor_sha256: [u8; 32] = Sha256::digest(&descriptor_bytes).into();
-        let aad_sha256: [u8; 32] = Sha256::digest(&aad_bytes).into();
-
-        pending_blob = Some(NewBlobBinding {
-            blob_id: blob_id_val,
-            binding_kind: BindingKind::Application,
-            conversation_id: header.conversation_id,
-            entry_seq: Some(locator.seq as i64),
-            message_id: Some(message_id),
-            metadata_origin_transition_id: None,
-            metadata_version: None,
-            owner_did: actor_did.to_string(),
-            owner_device_id: actor_device_id,
-            descriptor_bytes,
-            descriptor_sha256: descriptor_sha256.to_vec(),
-            aad_bytes,
-            aad_sha256: aad_sha256.to_vec(),
-            ciphertext_sha256: hash_val,
-            plaintext_size,
-            ciphertext_size: size_val,
-            purpose: BlobPurpose::Attachment,
-            bound_at: received_at_dt,
-            uploaded_at,
-            unbound_expires_at: expires_at,
+            reason: "server-hosted blob bindings are retired; attachments live in Spaces"
+                .to_string(),
         });
     }
 
@@ -1632,12 +1535,11 @@ pub async fn deliver_message_replication(
     let mut event_position = None;
 
     if seq_exists {
-        let is_exact =
-            compare_exact_application_entry(tx, &send, locator.seq, pending_blob.as_ref())
-                .await
-                .map_err(|e| FederationError::SequenceConflict {
-                    reason: format!("exact compare failed: {e:?}"),
-                })?;
+        let is_exact = compare_exact_application_entry(tx, &send, locator.seq)
+            .await
+            .map_err(|e| FederationError::SequenceConflict {
+                reason: format!("exact compare failed: {e:?}"),
+            })?;
         if !is_exact {
             return Err(FederationError::SequenceConflict {
                 reason: format!(
@@ -1732,13 +1634,6 @@ pub async fn deliver_message_replication(
                 reason: format!("append_exact_application_entry failed: {e:?}"),
             })?;
 
-        if let Some(ref blob_binding) = pending_blob {
-            blobs::bind_application_blob(tx, blob_binding)
-                .await
-                .map_err(|e| FederationError::DeliveryConflict {
-                    reason: format!("blob binding failed: {e:?}"),
-                })?;
-        }
         event_position = Some(
             append_message_available_event(
                 tx,

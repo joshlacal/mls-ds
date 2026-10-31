@@ -1,22 +1,32 @@
 use std::fs;
+use std::path::Path;
 
-const STATE_MACHINE_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/src/chat_protocol/state_machine.rs"
-);
-
-// The executor module moved to its own file post-C2-seal; the guard scans the
-// same source text, now split across two files.
-const STATE_MACHINE_EXECUTOR_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/src/chat_protocol/state_machine/executor.rs"
-);
+fn append_non_test_rs_files(dir: &Path, out: &mut String) {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .expect("read module dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| {
+            path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+                && !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("test"))
+        })
+        .collect();
+    entries.sort();
+    for path in entries {
+        out.push_str(&fs::read_to_string(&path).expect("read submodule source"));
+    }
+}
 
 fn state_machine_source() -> String {
-    let mut source = fs::read_to_string(STATE_MACHINE_PATH).expect("read state-machine source");
-    source.push_str(
-        &fs::read_to_string(STATE_MACHINE_EXECUTOR_PATH)
-            .expect("read state-machine executor source"),
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut source = fs::read_to_string(manifest_dir.join("src/chat_protocol/state_machine.rs"))
+        .expect("read state-machine source");
+    append_non_test_rs_files(&manifest_dir.join("src/chat_protocol/state_machine"), &mut source);
+    append_non_test_rs_files(
+        &manifest_dir.join("src/chat_protocol/state_machine/executor"),
+        &mut source,
     );
     source
 }
@@ -60,7 +70,7 @@ fn task6_metadata_preflight_rebinds_all_sealed_authority_families() {
         "MetadataAvatarPersistence::Reuse",
         "MetadataAvatarPersistence::Fresh",
         "metadata fresh avatar lock/binding authority drifted",
-        "bind_metadata_avatar_blob",
+        "write_metadata_update_snapshot",
         "terminal_is_exact_due_expiry",
         "metadata primary event/audience/spine shape drifted",
         "run_metadata_semantic_proof",

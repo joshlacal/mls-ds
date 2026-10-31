@@ -17,7 +17,6 @@ use base64::{
     Engine,
 };
 use catbird_server::{
-    blob_store::BlobStore,
     handlers::chat::{chat_router, ChatRuntime},
     realtime::SseState,
     storage::DbPool,
@@ -30,7 +29,6 @@ use tower_util::ServiceExt;
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
-    blob_store: BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -42,12 +40,6 @@ impl FromRef<TestState> for DbPool {
 impl FromRef<TestState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestState) -> Self {
         state.runtime.clone()
-    }
-}
-
-impl FromRef<TestState> for BlobStore {
-    fn from_ref(state: &TestState) -> Self {
-        state.blob_store.clone()
     }
 }
 
@@ -92,7 +84,6 @@ fn router(cutover_enabled: bool) -> Router {
     chat_router::<TestState>().with_state(TestState {
         pool,
         runtime: runtime(cutover_enabled),
-        blob_store: BlobStore::for_route_tests(),
     })
 }
 

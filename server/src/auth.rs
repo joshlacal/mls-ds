@@ -40,10 +40,6 @@ fn audience_matches_expected(claimed: &str, expected: &str) -> bool {
     claimed == expected || (expected.contains('#') && claimed == canonical_did(expected))
 }
 
-// ADR-016 remains endpoint-opt-in during observe/enroll rollout. Keeping the
-// foundation under auth prevents it from becoming implicit transition policy.
-#[path = "auth_device.rs"]
-pub mod device_auth;
 
 /// Authentication errors
 #[derive(Debug, Error)]
@@ -1929,9 +1925,6 @@ where
 
         // Verify JWT and extract claims
         let claims = middleware.verify_jwt(token).await?;
-        let request_target =
-            device_auth::VerifiedRequestTarget::from_request_parts(&parts.method, &parts.uri);
-        parts.extensions.insert(request_target.clone());
 
         // Enforce lxm/jti + shared replay store across all authenticated XRPC endpoints.
         let endpoint = parts.uri.path();
@@ -1974,32 +1967,7 @@ where
             effective_user_did: user_did.clone(),
             delegated_gateway,
         };
-        parts.extensions.insert(verified_bearer.clone());
-
-        // Startup installs the validated rollout mode exactly once. Keeping
-        // this writer commit inert until that coordinator-owned integration
-        // lands prevents tests and intermediate builds from reading mutable
-        // process environment on every request.
-        if let (Some(endpoint_nsid), Some(mode)) = (
-            endpoint_nsid_from_path(endpoint),
-            crate::middleware::device_auth::installed_device_auth_mode(),
-        ) {
-            if endpoint_nsid.starts_with("blue.catbird.chat.") {
-                let pool = crate::storage::DbPool::from_ref(state);
-                crate::middleware::device_auth::enforce_device_auth_policy(
-                    mode,
-                    endpoint_nsid,
-                    &parts.headers,
-                    &mut parts.extensions,
-                    &pool,
-                    &verified_bearer,
-                    &request_target,
-                    Utc::now(),
-                )
-                .await
-                .map_err(|_| AuthError::DeviceAuthorizationDenied)?;
-            }
-        }
+        parts.extensions.insert(verified_bearer);
 
         debug!(
             "Authenticated request from DID: {} (issuer: {})",
@@ -2011,157 +1979,6 @@ where
             did: user_did,
             claims,
         })
-    }
-}
-
-// =============================================================================
-// Admin Authorization Helpers
-// =============================================================================
-
-/// Check if a user is an admin of a conversation
-///
-/// # Errors
-/// Returns an error if:
-/// - Database query fails
-/// - User is not a member of the conversation
-/// - User is not an admin
-pub async fn verify_is_admin(
-    pool: &crate::storage::DbPool,
-    convo_id: &str,
-    user_did: &str,
-) -> Result<(), StatusCode> {
-    // In multi-device mode, user_did from JWT is base DID but members.member_did is device DID
-    // Check both member_did and user_did columns to support both modes
-    let is_admin: Option<bool> = sqlx::query_scalar(
-        "SELECT is_admin FROM members
-         WHERE convo_id = $1 AND (member_did = $2 OR user_did = $2) AND left_at IS NULL
-         LIMIT 1",
-    )
-    .bind(convo_id)
-    .bind(user_did)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to check admin status: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    match is_admin {
-        Some(true) => Ok(()),
-        Some(false) => {
-            tracing::warn!("User is not an admin of conversation");
-            Err(StatusCode::FORBIDDEN)
-        }
-        None => {
-            // Return FORBIDDEN (not NOT_FOUND) for non-members to avoid information disclosure
-            // and for proper handling through ATProto PDS proxy
-            tracing::warn!("User is not a member of conversation");
-            Err(StatusCode::FORBIDDEN)
-        }
-    }
-}
-
-/// Check if a user is a member of a conversation
-///
-/// Handles both single-device (legacy) and multi-device modes:
-/// - In multi-device mode, user_did from JWT is base DID but members.member_did is device DID
-/// - Checks both member_did and user_did columns to support both modes
-///
-/// # Errors
-/// Returns an error if:
-/// - Database query fails
-/// - User is not a member of the conversation
-pub async fn verify_is_member(
-    pool: &crate::storage::DbPool,
-    convo_id: &str,
-    user_did: &str,
-) -> Result<(), StatusCode> {
-    let is_member: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM members
-            WHERE convo_id = $1 AND (member_did = $2 OR user_did = $2) AND left_at IS NULL
-        )",
-    )
-    .bind(convo_id)
-    .bind(user_did)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to check membership: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    if is_member {
-        Ok(())
-    } else {
-        // Return FORBIDDEN (not NOT_FOUND) for non-members to avoid information disclosure
-        // and for proper handling through ATProto PDS proxy
-        tracing::warn!("User is not a member of conversation");
-        Err(StatusCode::FORBIDDEN)
-    }
-}
-
-/// Count admins in a conversation
-///
-/// # Errors
-/// Returns an error if database query fails
-pub async fn count_admins(
-    pool: &crate::storage::DbPool,
-    convo_id: &str,
-) -> Result<i64, StatusCode> {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM members
-         WHERE convo_id = $1 AND is_admin = true AND left_at IS NULL",
-    )
-    .bind(convo_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to count admins: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
-}
-
-/// Check if a user is a moderator (or admin) of a conversation
-///
-/// Admins have moderator privileges, so this returns true for both admins and moderators.
-///
-/// # Errors
-/// Returns an error if:
-/// - Database query fails
-/// - User is not a member or doesn't have moderator/admin privileges
-pub async fn verify_is_moderator_or_admin(
-    pool: &crate::storage::DbPool,
-    convo_id: &str,
-    user_did: &str,
-) -> Result<(), StatusCode> {
-    let result: Option<(bool, bool)> = sqlx::query_as(
-        "SELECT is_admin, COALESCE(is_moderator, false)
-         FROM members
-         WHERE convo_id = $1 AND (member_did = $2 OR user_did = $2) AND left_at IS NULL
-         LIMIT 1",
-    )
-    .bind(convo_id)
-    .bind(user_did)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to check moderator status: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    match result {
-        Some((is_admin, is_moderator)) if is_admin || is_moderator => Ok(()),
-        Some(_) => {
-            tracing::warn!("User is not a moderator or admin of conversation");
-            Err(StatusCode::FORBIDDEN)
-        }
-        None => {
-            // Return FORBIDDEN (not NOT_FOUND) for non-members to avoid information disclosure
-            // and for proper handling through ATProto PDS proxy
-            tracing::warn!("User is not a member of conversation");
-            Err(StatusCode::FORBIDDEN)
-        }
     }
 }
 

@@ -91,10 +91,10 @@ const CANONICAL_SOURCE_LEXICON_SHA256: &str =
     "3d5d867d9b651fc22e119cb6011262740e3308f127efbf87742850ecded6d639";
 // The frozen vectors retain their original provenance. Separately pin the
 // current canonical contract, which also contains the direct-request domains.
-const CURRENT_SOURCE_LEXICON_REVISION: &str = "bfbf4e42d6ae1fae49bac69331573cda32361a41";
-const CURRENT_SOURCE_CORPUS_REVISION: &str = "8672c80ffeb3b9cfbdb6bd98f66efa09b13fe0db";
+const CURRENT_SOURCE_LEXICON_REVISION: &str = "f102084efb5c7d9ae22d40995eb6ea7b87d74b72";
+const CURRENT_SOURCE_CORPUS_REVISION: &str = "f102084efb5c7d9ae22d40995eb6ea7b87d74b72";
 const CURRENT_SOURCE_LEXICON_SHA256: &str =
-    "d830abb92430704e52aaf0b47eda435a01be9fd1d5f61d52daf42c2b22a48bcd";
+    "a2e783d38ababcb5e7572c0b4b95d7db9a8d50427a2aeca28db279bfaca0da5d";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures

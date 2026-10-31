@@ -37,6 +37,21 @@
               "type": "ref",
               "ref": "blue.catbird.labyrinth.defs#epochPublic"
             },
+            "chain": {
+              "type": "array",
+              "description": "[Gate 6] Contiguous verified hash-chained EpochPublic headers from floorSeq..=epoch.epochNumber proving directory consistency.",
+              "maxLength": 1024,
+              "items": {
+                "type": "ref",
+                "ref": "blue.catbird.labyrinth.defs#epochPublic"
+              }
+            },
+            "floorSeq": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1099511627776,
+              "description": "Lowest epochNumber retained in the directory hash chain."
+            },
             "receivedAt": {
               "type": "string",
               "format": "datetime",

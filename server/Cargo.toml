@@ -58,7 +58,9 @@ cid = "0.11"
 jsonwebtoken = "9"
 
 # Jacquard (ATProto types)
-catbird-atproto = { path = "../../catbird-atproto" }
+catbird-atproto = { path = "../../catbird-atproto", features = ["namespace-atproto-space", "namespace-bluecatbird"] }
+atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
+labyrinth-protocol = { path = "../../labyrinth/labyrinth-protocol" }
 jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
 jacquard-axum = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
 jacquard-derive = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
@@ -71,24 +73,12 @@ bytes = "1"
 # HTTP client (for DID resolution)
 reqwest = { version = "0.12", features = ["json"] }
 
-# S3-compatible blob storage (SeaweedFS)
-# Disable default features to avoid pulling legacy rustls 0.21 (vulnerable
-# rustls-webpki 0.101.7 path). default-https-client still provides modern
-# rustls 0.23 + aws-lc-rs via aws-smithy-runtime's default-https-client feature.
-# Do not enable the legacy `rustls` compatibility feature: it selects Hyper
-# 0.14/h2 0.3. `default-https-client` is the supported aws-lc TLS connector.
-aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio", "sso"] }
-
 # Caching and rate limiting
 moka = { version = "0.12", features = ["future", "sync"] }
 governor = "0.6"
 
 # Async primitives
 parking_lot = "0.12"
-
-# Actor system
-ractor = "0.12"
 dashmap = "6.0"
 
 # Utilities
@@ -101,9 +91,6 @@ thiserror = "1"
 dotenvy = "0.15"
 once_cell = "1.19"
 ipnet = "2.10"
-
-# Push notifications
-a2 = "0.10"
 
 # Metrics
 metrics = "0.21"
@@ -120,16 +107,10 @@ lazy_static = "1.4"
 [dev-dependencies]
 tempfile = "3"
 tower-util = { package = "tower", version = "0.5", features = ["util"] }
- 
 
 [[bin]]
 name = "catbird-server"
 path = "src/main.rs"
-required-features = ["server-bin"]
-
-[[bin]]
-name = "deadletter_recover"
-path = "src/bin/deadletter_recover.rs"
 required-features = ["server-bin"]
 
 [[bin]]
@@ -147,6 +128,10 @@ name = "seal_mls_chat_crypto_wire_v09"
 path = "examples/seal_mls_chat_crypto_wire_v09.rs"
 
 [[test]]
+name = "clean_slate_data_line_scan"
+path = "tests/clean_slate_data_line_scan.rs"
+
+[[test]]
 name = "chat_protocol_production_cfg"
 path = "tests/chat_protocol_production_cfg.rs"
 required-features = ["chat-protocol-production-proof"]
@@ -157,28 +142,13 @@ path = "tests/chat_protocol_create_conversation_regression.rs"
 required-features = ["test-support"]
 
 [[test]]
-name = "chat_protocol_blobs"
-path = "tests/chat_protocol_blobs.rs"
-required-features = ["test-support"]
-
-[[test]]
 name = "chat_protocol_device_handlers"
 path = "tests/chat_protocol_device_handlers.rs"
 required-features = ["test-support"]
 
 [[test]]
-name = "chat_protocol_s3_lifecycle"
-path = "tests/chat_protocol_s3_lifecycle.rs"
-required-features = ["test-support"]
-
-[[test]]
 name = "chat_protocol_wire"
 path = "tests/chat_protocol_wire.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "federation_hostile_peers"
-path = "tests/federation_hostile_peers.rs"
 required-features = ["test-support"]
 
 [[test]]
@@ -230,43 +200,8 @@ path = "tests/labyrinth_directory.rs"
 required-features = ["test-support"]
 
 [[test]]
-name = "labyrinth_mailbox"
-path = "tests/labyrinth_mailbox.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "labyrinth_thread"
-path = "tests/labyrinth_thread.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "labyrinth_crate_trace"
-path = "tests/labyrinth_crate_trace.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "labyrinth_attachments"
-path = "tests/labyrinth_attachments.rs"
-required-features = ["test-support"]
-
-[[test]]
 name = "labyrinth_retention"
 path = "tests/labyrinth_retention.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "labyrinth_blob_gc_pin"
-path = "tests/labyrinth_blob_gc_pin.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "labyrinth_relay"
-path = "tests/labyrinth_relay.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "labyrinth_device_binding"
-path = "tests/labyrinth_device_binding.rs"
 required-features = ["test-support"]
 
 [features]
@@ -276,13 +211,3 @@ server-bin = []
 chat-protocol-production-proof = []
 subscription-production-proof = []
 test-support = []
-
-[[test]]
-name = "labyrinth_space"
-path = "tests/labyrinth_space.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "conversation_storage_smoke_fixture"
-path = "tests/conversation_storage_smoke_fixture.rs"
-required-features = ["test-support"]

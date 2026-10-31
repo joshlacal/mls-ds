@@ -75,7 +75,6 @@ struct TestDsState {
     pool: DbPool,
     ack_signer: Option<Arc<AckSigner>>,
     runtime: Arc<ChatRuntime>,
-    blob_store: catbird_server::blob_store::BlobStore,
 }
 
 impl FromRef<TestDsState> for DbPool {
@@ -93,12 +92,6 @@ impl FromRef<TestDsState> for Option<Arc<AckSigner>> {
 impl FromRef<TestDsState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestDsState) -> Arc<ChatRuntime> {
         state.runtime.clone()
-    }
-}
-
-impl FromRef<TestDsState> for catbird_server::blob_store::BlobStore {
-    fn from_ref(state: &TestDsState) -> catbird_server::blob_store::BlobStore {
-        state.blob_store.clone()
     }
 }
 
@@ -432,7 +425,6 @@ impl TestHarness {
             pool: pool.clone(),
             ack_signer: Some(ack_signer.clone()),
             runtime,
-            blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
         };
         let router = build_federation_router(state);
 
@@ -4153,7 +4145,7 @@ async fn test_deliver_message_router_authenticated_positive_replay_and_idempoten
 }
 
 // =============================================================================
-// Test 3: deliverMessage with Attachment Blob Binding
+// Test 3: deliverMessage Rejects Legacy Server-Blob Bindings & Accepts Zero-Blob
 // =============================================================================
 
 #[tokio::test]
@@ -4184,54 +4176,6 @@ async fn test_deliver_message_router_with_attachment_binding() {
 
     let blob_id = Uuid::new_v4();
     let blob_hash = vec![0x44u8; 32];
-
-    // Seed completedUnbound blob + ticket inside a single transaction to satisfy deferred constraint triggers
-    let mut tx = harness.pool.begin().await.unwrap();
-    sqlx::query(
-        r#"
-        INSERT INTO chat.blobs (
-            blob_id, owner_did, owner_device_id, owner_key_id, owner_auth_generation,
-            purpose, media_type, plaintext_size, ciphertext_size, ciphertext_sha256,
-            object_store_key, status, prepared_at, uploaded_at, upload_expires_at, unbound_expires_at
-        ) VALUES (
-            $1, $2, $3, $4, 1,
-            'attachment', 'image/png', 32, 48, $5,
-            'mock-key', 'completedUnbound',
-            $6 - INTERVAL '2 minutes', $6 - INTERVAL '1 minute',
-            $6 + INTERVAL '3 minutes', $6 + INTERVAL '59 minutes'
-        )
-        "#,
-    )
-    .bind(blob_id)
-    .bind(&actor.did)
-    .bind(actor.device_id)
-    .bind(&actor.key_id)
-    .bind(&blob_hash)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        r#"
-        INSERT INTO chat.blob_upload_tickets (
-            ticket_hash, blob_id, owner_did, owner_device_id,
-            created_at, expires_at, consumed_at
-        ) VALUES (
-            digest(decode('feed', 'hex'), 'sha256'), $1, $2, $3,
-            $4 - INTERVAL '2 minutes', $4 + INTERVAL '3 minutes', $4 - INTERVAL '1 minute'
-        )
-        "#,
-    )
-    .bind(blob_id)
-    .bind(&actor.did)
-    .bind(actor.device_id)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-
-    tx.commit().await.unwrap();
 
     let attachments = vec![json!({
         "blobId": blob_id.to_string(),
@@ -4329,31 +4273,84 @@ async fn test_deliver_message_router_with_attachment_binding() {
         .await;
     assert_eq!(
         status,
-        StatusCode::OK,
-        "deliverMessage with attachment must succeed: {body:?}"
+        StatusCode::BAD_REQUEST,
+        "deliverMessage with legacy server blobBindings must be rejected under G6: {body:?}"
     );
 
-    // Verify blob binding transitioned to bound
-    let blob_status: String =
-        sqlx::query_scalar("SELECT status FROM chat.blobs WHERE blob_id = $1")
-            .bind(blob_id)
-            .fetch_one(&harness.pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        blob_status, "bound",
-        "blob must be bound after deliverMessage"
-    );
-
-    let binding_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM chat.blob_bindings WHERE blob_id = $1 AND conversation_id = $2 AND entry_seq = 2)",
+    // Zero-blob delivery on the same conversation succeeds cleanly.
+    let clean_msg_id = Uuid::new_v4();
+    let clean_entry_id = Uuid::new_v4();
+    let (_, clean_signed_req_bytes) =
+        make_message_body(convo_id, clean_msg_id, &actor, &group_id, vec![], now);
+    let clean_mutation = decode_and_verify_signed_mutation(
+        &clean_signed_req_bytes,
+        actor.public_key.as_slice(),
     )
-    .bind(blob_id)
-    .bind(convo_id)
-    .fetch_one(&harness.pool)
-    .await
     .unwrap();
-    assert!(binding_exists, "blob binding record must exist in DB");
+    let clean_built = build_verified_application_entry(
+        clean_mutation,
+        CanonicalUuidV4::parse(&clean_entry_id.to_string()).unwrap(),
+        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+        2,
+        &received_at,
+    )
+    .unwrap();
+    let clean_entry_bytes = clean_built.canonical_entry_bytes().to_vec();
+    let clean_sha256 = *clean_built.accepted_payload_sha256();
+    let clean_outer_fp = *clean_built.outer_application_fingerprint();
+    let clean_delivery_id = Uuid::new_v4();
+    let clean_locator = ValidatedEntryLocator {
+        entry_id: clean_entry_id,
+        seq: 2,
+        accepted_payload_sha256: clean_sha256,
+        outer_entry_fingerprint: clean_outer_fp,
+    };
+    let mut clean_header = ValidatedEnvelopeHeader {
+        delivery_id: clean_delivery_id,
+        ..header_model
+    };
+    let clean_digest = compute_message_envelope_digest(
+        &clean_header,
+        &recipient.did,
+        &clean_locator,
+        &clean_entry_bytes,
+        &clean_signed_req_bytes,
+    )
+    .unwrap();
+    clean_header.payload_sha256 = clean_digest;
+    let clean_body = json!({
+        "header": make_envelope_header_json(
+            clean_delivery_id,
+            convo_id,
+            &harness.sequencer_ds_did,
+            LOCAL_DS_DID,
+            &harness.sequencer_ds_did,
+            1,
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            &clean_digest,
+        ),
+        "entryLocator": make_entry_locator_json(clean_entry_id, 2, &clean_sha256, &clean_outer_fp),
+        "recipientDid": recipient.did,
+        "entryBytes": { "$bytes": STANDARD.encode(&clean_entry_bytes) },
+        "signedRequestBytes": { "$bytes": STANDARD.encode(&clean_signed_req_bytes) },
+    });
+    let clean_jwt = harness.mint_jwt_for(
+        &harness.sequencer_ds_did,
+        &harness.sequencer_ds_key,
+        DELIVER_MESSAGE_NSID,
+    );
+    let (ok_status, ok_body, _) = harness
+        .send_json(
+            "/xrpc/blue.catbird.mlsDS.deliverMessage",
+            Some(&clean_jwt),
+            &clean_body,
+        )
+        .await;
+    assert_eq!(
+        ok_status,
+        StatusCode::OK,
+        "deliverMessage with empty blobBindings must succeed: {ok_body:?}"
+    );
 }
 
 // =============================================================================
@@ -6432,7 +6429,6 @@ async fn test_remote_commit_rejected_order_leaves_mailbox_state_byte_for_byte_un
         pool: harness.pool.clone(),
         ack_signer: Some(harness.ack_signer.clone()),
         runtime,
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     };
     let custom_router = build_federation_router(test_state);
 
@@ -6603,7 +6599,6 @@ async fn test_remote_commit_rejected_403_returns_not_authorized_and_leaves_mailb
         pool: harness.pool.clone(),
         ack_signer: Some(harness.ack_signer.clone()),
         runtime,
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     };
     let custom_router = build_federation_router(test_state);
 
@@ -6784,7 +6779,6 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
         pool: seq_pool.clone(),
         ack_signer: Some(seq_ack_signer.clone()),
         runtime: seq_runtime.clone(),
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     };
     let seq_router = build_federation_router(seq_test_state);
 
@@ -6931,7 +6925,6 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
         pool: harness.pool.clone(),
         ack_signer: Some(harness.ack_signer.clone()),
         runtime,
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     };
     let custom_router = build_federation_router(test_state);
 
@@ -7093,7 +7086,6 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
         pool: seq_pool.clone(),
         ack_signer: Some(seq_ack_signer.clone()),
         runtime: seq_runtime.clone(),
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     };
     let seq_router = build_federation_router(seq_test_state);
 
@@ -7232,7 +7224,6 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
         pool: harness.pool.clone(),
         ack_signer: Some(harness.ack_signer.clone()),
         runtime,
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     };
     let custom_router = build_federation_router(test_state);
 
@@ -7394,7 +7385,6 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
         pool: seq_pool.clone(),
         ack_signer: Some(seq_ack_signer.clone()),
         runtime: seq_runtime.clone(),
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     };
     let seq_router = build_federation_router(seq_test_state);
 
@@ -7533,7 +7523,6 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
         pool: harness.pool.clone(),
         ack_signer: Some(harness.ack_signer.clone()),
         runtime,
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     };
     let custom_router = build_federation_router(test_state);
 
@@ -7695,7 +7684,6 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         pool: seq_pool.clone(),
         ack_signer: Some(seq_ack_signer.clone()),
         runtime: seq_runtime.clone(),
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     };
     let seq_router = build_federation_router(seq_test_state);
     let call_counts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -7856,7 +7844,6 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         pool: harness.pool.clone(),
         ack_signer: Some(harness.ack_signer.clone()),
         runtime,
-        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     };
     let custom_router = build_federation_router(test_state);
 

@@ -38,13 +38,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Import from library crate instead of re-declaring modules
 use catbird_server::{
-    actors, auth, blob_store, config, crypto, db, federation, handlers, health, metrics,
-    middleware, models, realtime, workers,
+    auth, config, db, federation, handlers, health, jobs, metrics, middleware, realtime, workers,
 };
 
-// These modules are only in main.rs (not in lib.rs)
-mod device_utils;
-mod jobs;
 mod xrpc_proxy;
 
 // Composite state for Axum 0.7
@@ -52,13 +48,6 @@ mod xrpc_proxy;
 struct AppState {
     db_pool: PgPool,
     sse_state: Arc<realtime::SseState>,
-    actor_registry: Arc<actors::ActorRegistry>,
-    /// Phase 2 (B5) — config for the inline 409-burst trigger that bypasses
-    /// the periodic sweep's poll latency. Wrapped in Arc so the handler can
-    /// extract it via `State<Arc<InlineTriggerConfig>>` without cloning the
-    /// struct on every request.
-    inline_trigger_cfg: Arc<config::InlineTriggerConfig>,
-    notification_service: Option<Arc<catbird_server::notifications::NotificationService>>,
     // Federation
     federation_config: federation::FederationConfig,
     resolver: Arc<federation::DsResolver>,
@@ -67,14 +56,8 @@ struct AppState {
     outbound_queue: Arc<federation::queue::OutboundQueue>,
     sequencer: Arc<federation::Sequencer>,
     sequencer_transfer: Arc<federation::SequencerTransfer>,
-    federated_backend: Arc<federation::FederatedBackend>,
-    upstream_manager: Option<Arc<federation::UpstreamManager>>,
     ack_signer: Option<Arc<federation::AckSigner>>,
     device_client: Arc<federation::DeviceRecordClient>,
-    blob_store: blob_store::BlobStore,
-    // Clean-cutover chat (`blue.catbird.chat.*`) shared runtime: cutover gate +
-    // trusted Nest verifier. Extracted by chat handlers via
-    // `State<Arc<ChatRuntime>>` through `#[derive(FromRef)]`.
     chat_runtime: Arc<catbird_server::handlers::chat::ChatRuntime>,
 }
 
@@ -244,7 +227,6 @@ async fn init_federation_test_chat_fence(pool: &sqlx::PgPool) -> Result<(), Stri
     );
     Ok(())
 }
-const BLOB_UPLOAD_BODY_LIMIT_BYTES: usize = 11 * 1024 * 1024;
 // MLS JSON encodes `bytes` fields as base64. A valid 10 MiB ciphertext or
 // GroupInfo therefore needs nearly 13.34 MiB on the wire before the small JSON
 // envelope is counted. Keep the ordinary 4 MiB default, but preserve the
@@ -266,9 +248,8 @@ const BYTES_PER_INGRESS_PERMIT: usize = 1024 * 1024;
 const DEFAULT_REQUEST_BODY_READ_TIMEOUT_MS: u64 = 15_000;
 const MAX_REQUEST_BODY_READ_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS: u64 = 120_000;
-const DEFAULT_BLOB_UPLOAD_TOTAL_TIMEOUT_MS: u64 = 300_000;
+const DEFAULT_LARGE_BODY_TOTAL_TIMEOUT_MS: u64 = 300_000;
 const MAX_REQUEST_BODY_TOTAL_TIMEOUT_MS: u64 = 600_000;
-const BLOB_UPLOAD_PATH: &str = "/xrpc/blue.catbird.chat.uploadBlob";
 static INGRESS_BODY_BUDGET: Lazy<Arc<Semaphore>> =
     Lazy::new(|| Arc::new(Semaphore::new(INGRESS_BODY_BUDGET_MIB)));
 
@@ -277,7 +258,7 @@ struct IngressBodyPolicy {
     budget: Arc<Semaphore>,
     read_idle_timeout: Duration,
     read_total_timeout: Duration,
-    blob_upload_total_timeout: Duration,
+    large_body_total_timeout: Duration,
 }
 
 impl IngressBodyPolicy {
@@ -286,7 +267,7 @@ impl IngressBodyPolicy {
             budget,
             read_idle_timeout,
             read_total_timeout: Duration::from_millis(DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS),
-            blob_upload_total_timeout: Duration::from_millis(DEFAULT_BLOB_UPLOAD_TOTAL_TIMEOUT_MS),
+            large_body_total_timeout: Duration::from_millis(DEFAULT_LARGE_BODY_TOTAL_TIMEOUT_MS),
         }
     }
 
@@ -300,7 +281,7 @@ impl IngressBodyPolicy {
             budget,
             read_idle_timeout,
             read_total_timeout,
-            blob_upload_total_timeout: read_total_timeout,
+            large_body_total_timeout: read_total_timeout,
         }
     }
 
@@ -316,25 +297,23 @@ impl IngressBodyPolicy {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| (1..=MAX_REQUEST_BODY_TOTAL_TIMEOUT_MS).contains(value))
             .unwrap_or(DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS);
-        let blob_total_timeout_ms = std::env::var("BLOB_UPLOAD_READ_TOTAL_TIMEOUT_MS")
+        let large_total_timeout_ms = std::env::var("LARGE_BODY_READ_TOTAL_TIMEOUT_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| (1..=MAX_REQUEST_BODY_TOTAL_TIMEOUT_MS).contains(value))
-            .unwrap_or(DEFAULT_BLOB_UPLOAD_TOTAL_TIMEOUT_MS);
+            .unwrap_or(DEFAULT_LARGE_BODY_TOTAL_TIMEOUT_MS);
 
         Self {
             budget: INGRESS_BODY_BUDGET.clone(),
             read_idle_timeout: Duration::from_millis(timeout_ms),
             read_total_timeout: Duration::from_millis(total_timeout_ms),
-            blob_upload_total_timeout: Duration::from_millis(blob_total_timeout_ms),
+            large_body_total_timeout: Duration::from_millis(large_total_timeout_ms),
         }
     }
 
     fn total_timeout(&self, path: &str) -> Duration {
-        // Large base64 MLS envelopes need the same slow-client allowance as a
-        // raw blob upload. The idle timeout still rejects stalled senders.
         if request_body_limit(path) > DEFAULT_REQUEST_BODY_LIMIT_BYTES {
-            self.blob_upload_total_timeout
+            self.large_body_total_timeout
         } else {
             self.read_total_timeout
         }
@@ -343,7 +322,6 @@ impl IngressBodyPolicy {
 
 fn request_body_limit(path: &str) -> usize {
     match path {
-        BLOB_UPLOAD_PATH => BLOB_UPLOAD_BODY_LIMIT_BYTES,
         "/xrpc/blue.catbird.chat.enrollDevice" | "/xrpc/blue.catbird.chat.replenishKeyPackages" => {
             CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES
         }
@@ -358,7 +336,6 @@ fn request_body_limit(path: &str) -> usize {
         | "/xrpc/blue.catbird.mlsDS.deliverDirectRequest"
         | "/xrpc/blue.catbird.mlsDS.relaySendMessage"
         | "/xrpc/blue.catbird.mlsDS.deliverMessageEntry" => SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
-        "/xrpc/blue.catbird.labyrinth.labyrinthRelay" => 2 * 1024 * 1024,
         p if p.starts_with("/xrpc/blue.catbird.labyrinth.") => 1_572_864,
         _ => DEFAULT_REQUEST_BODY_LIMIT_BYTES,
     }
@@ -628,23 +605,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Parse and install the closed device-auth rollout mode once at startup.
-    // Invalid values fail before external dependencies or the listener are
-    // initialized, and request handling never re-reads mutable environment.
-    let device_auth_mode = config::DeviceAuthMode::from_env()?;
-    middleware::device_auth::install_device_auth_mode(device_auth_mode)?;
-    tracing::info!(?device_auth_mode, "Device-auth rollout mode installed");
-
     // Load offline test DID document fixtures if configured (strictly gated to APP_ENV=test)
     #[cfg(feature = "test-support")]
     if let Err(e) = auth::load_test_did_fixtures_from_env().await {
         panic!("Failed to load test DID document fixtures: {e}");
     }
 
-    // Parse the listener host before initializing external dependencies so a
-    // malformed or non-IP SERVER_HOST fails startup rather than falling back
-    // to an unexpectedly broad bind. Production APP_ENV safety checks above
-    // remain authoritative and run first.
     let server_bind = config::ServerBindConfig::from_env()?;
 
     // Initialize metrics
@@ -654,7 +620,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize database
     let db_pool = db::init_db_default().await?;
-
     tracing::info!("Database initialized");
 
     // Initialize SSE state for realtime events
@@ -665,125 +630,17 @@ async fn main() -> anyhow::Result<()> {
     let sse_state = Arc::new(realtime::SseState::new(sse_buffer_size));
     tracing::info!("SSE state initialized with buffer size {}", sse_buffer_size);
 
-    // Spawn compaction worker - Temporarily disabled - requires new DB schema
-    // let compaction_pool = db_pool.clone();
-    // let compaction_config = jobs::CompactionConfig::default();
-    // tokio::spawn(async move {
-    //     jobs::run_compaction_worker(compaction_pool, compaction_config).await;
-    // });
-    // tracing::info!("Compaction worker started");
-
-    // Initialize notification service
-    let notification_service = Some(Arc::new(
-        catbird_server::notifications::NotificationService::new(),
-    ));
-    tracing::info!("Notification service initialized");
-
-    // Initialize actor registry
-    let actor_registry = Arc::new(actors::ActorRegistry::new(
-        db_pool.clone(),
-        sse_state.clone(),
-        notification_service.clone(),
-    ));
-    tracing::info!("Actor registry initialized");
-
-    // Phase 2 (Stage 4) — server-side sweep that auto-resets operationally
-    // dead conversations even when no client is online to vote (Path B).
-    // Cooldown + circuit-breaker gates are enforced both in the sweep query
-    // and inside the actor's `TriggerSystemReset` handler (defense in depth).
-    {
-        let sweep_cfg = config::SweepConfig::from_env();
-        let sweep_pool = db_pool.clone();
-        let sweep_registry = actor_registry.clone();
-        tokio::spawn(async move {
-            jobs::auto_detect_failed_groups::run_failed_group_sweep(
-                sweep_pool,
-                sweep_registry,
-                sweep_cfg,
-            )
-            .await;
-        });
-        tracing::info!("spawned auto_detect_failed_groups sweep worker");
-    }
-
-    // Phase 2 (B5) — inline trigger config, read once at startup. Stored on
-    // AppState so handlers can extract it via Axum `State<Arc<InlineTriggerConfig>>`
-    // without re-reading the env on every request.
-    let inline_trigger_cfg = Arc::new(config::InlineTriggerConfig::from_env());
-    tracing::info!(
-        min_409_threshold = inline_trigger_cfg.min_409_threshold,
-        reset_cooldown_secs = inline_trigger_cfg.reset_cooldown_secs,
-        min_groupinfo_404_threshold = inline_trigger_cfg.min_groupinfo_404_threshold,
-        "inline-trigger config loaded (Phase 2 B5 + B10)"
-    );
-
-    // Spawn idempotency cache cleanup worker
-    let cleanup_pool = db_pool.clone();
-    tokio::spawn(async move {
-        let mut interval_timer = interval(Duration::from_secs(3600)); // Every hour
-        loop {
-            interval_timer.tick().await;
-            if let Err(e) = middleware::idempotency::cleanup_expired_entries(&cleanup_pool).await {
-                tracing::error!("Failed to cleanup idempotency cache: {}", e);
-            } else {
-                tracing::debug!("Idempotency cache cleanup completed");
-            }
-        }
-    });
-    tracing::info!("Idempotency cache cleanup worker started");
-
-    // Spawn data compaction worker (messages, events, welcome messages)
-    let compaction_pool = db_pool.clone();
-    tokio::spawn(async move {
-        jobs::run_data_compaction_worker(compaction_pool).await;
-    });
-    tracing::info!("Data compaction worker started");
-
-    // Spawn key package cleanup worker
-    let key_package_pool = db_pool.clone();
-    tokio::spawn(async move {
-        jobs::run_key_package_cleanup_worker(key_package_pool).await;
-    });
-    tracing::info!("Key package cleanup worker started");
-
-    // Spawn delivery ACKs cleanup worker
-    let acks_cleanup_pool = db_pool.clone();
-    tokio::spawn(async move {
-        jobs::run_delivery_acks_cleanup_worker(acks_cleanup_pool).await;
-    });
-    tracing::info!("Delivery ACKs cleanup worker started");
-
-    // Phase 2.5 §7 R3 — backstop reminder worker for stuck reset_requested
-    // sessions. Re-broadcasts `crypto_session_reset_requested` at 1h/6h/24h
-    // when no client has activated; emits an admin-alert log on exhaustion.
-    let reset_reminder_pool = db_pool.clone();
-    let reset_reminder_sse = sse_state.clone();
-    tokio::spawn(async move {
-        jobs::run_reset_reminder_worker(reset_reminder_pool, reset_reminder_sse).await;
-    });
-    tracing::info!("Reset-reminder worker started (Phase 2.5 §7 R3)");
-
-    // Phase 3 — durable outbox workers. Drain rows that the chokepoint
-    // wrote in the same Postgres tx as `delivery_events`, surviving a
-    // SIGKILL between commit and broadcast send.
     let federation_outbox_pool = db_pool.clone();
     tokio::spawn(async move {
         workers::run_federation_outbox_worker(federation_outbox_pool).await;
     });
-    tracing::info!("Federation outbox worker started (Phase 3)");
-
-    let notification_outbox_pool = db_pool.clone();
-    tokio::spawn(async move {
-        workers::run_notification_outbox_worker(notification_outbox_pool).await;
-    });
-    tracing::info!("Notification outbox worker started (Phase 3)");
+    tracing::info!("Federation outbox worker started");
 
     // Spawn rate limiter cleanup worker (clean up stale buckets every 5 minutes)
     tokio::spawn(async move {
-        let mut interval_timer = interval(Duration::from_secs(300)); // Every 5 minutes
+        let mut interval_timer = interval(Duration::from_secs(300));
         loop {
             interval_timer.tick().await;
-            // Cleanup buckets not accessed in the last 10 minutes
             let max_age = Duration::from_secs(600);
             middleware::rate_limit::DID_RATE_LIMITER
                 .cleanup_old_buckets(max_age)
@@ -802,7 +659,7 @@ async fn main() -> anyhow::Result<()> {
     // Cleanup shared JTI replay store entries
     let replay_cleanup_pool = db_pool.clone();
     tokio::spawn(async move {
-        let mut interval_timer = interval(Duration::from_secs(300)); // Every 5 minutes
+        let mut interval_timer = interval(Duration::from_secs(300));
         loop {
             interval_timer.tick().await;
             match auth::cleanup_expired_jti_nonces(&replay_cleanup_pool).await {
@@ -812,25 +669,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     tracing::info!("Shared JTI cleanup worker started");
-
-    // Cleanup expired device-auth DPoP replays and enrollment challenges.
-    // Enrollment deliberately bypasses the generic idempotency cache, so its
-    // one-time replay material has an independent bounded-retention worker.
-    let device_auth_cleanup_pool = db_pool.clone();
-    tokio::spawn(async move {
-        let mut interval_timer = interval(Duration::from_secs(300)); // Every 5 minutes
-        loop {
-            interval_timer.tick().await;
-            match auth::device_auth::cleanup_expired_auth_material(&device_auth_cleanup_pool).await
-            {
-                Ok(rows) => tracing::debug!(rows, "Device-auth replay cleanup completed"),
-                Err(e) => tracing::warn!(error = %e, "Device-auth replay cleanup failed"),
-            }
-        }
-    });
-    tracing::info!("Device-auth replay cleanup worker started");
-
-    // Create composite app state
 
     // ── Federation setup ──────────────────────────────────────────────
     let fed_config = federation::FederationConfig::from_env();
@@ -899,7 +737,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Build AckSigner from the same ES256 PEM key (only available with ES256, not shared secret)
     let ack_signer = fed_config.signing_key_pem.as_ref().and_then(|key_pem| {
         match federation::AckSigner::from_pem(key_pem, fed_config.self_did.clone()) {
             Ok(signer) => {
@@ -943,9 +780,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Receipt issuance has its own key and fixed DID verification method.
-    // Issue mode fails startup closed; SIGNING_KEY_PEM is comparison-only and
-    // is never used as a receipt-signing fallback.
     let receipt_signer = federation::configured_receipt_signer(
         fed_config.receipt_issuance_mode.as_deref(),
         fed_config.receipt_signing_key_pem.as_deref(),
@@ -985,67 +819,15 @@ async fn main() -> anyhow::Result<()> {
         fed_config.self_did.clone(),
     ));
 
-    let federated_backend = Arc::new(federation::FederatedBackend::new(
-        db_pool.clone(),
-        fed_config.self_did.clone(),
-        fed_config.enabled,
-    ));
-
     tracing::info!("Federation components initialized");
 
-    // Device record client for fetching MLS device records from users' PDSes
     let device_client = Arc::new(federation::DeviceRecordClient::new(
         http_client.clone(),
         resolver.clone(),
     ));
 
-    // Initialize blob store (S3-compatible storage for encrypted image blobs)
-    let blob_store = blob_store::BlobStore::new().await;
-    tracing::info!("Blob store initialized");
-
-    // Blob cleanup worker — TTL expiration, S3 purge, orphan metadata cleanup
-    tokio::spawn(jobs::run_blob_cleanup_worker(
-        db_pool.clone(),
-        blob_store.clone(),
-    ));
-    tracing::info!("Blob cleanup worker started");
-
-    // Shared shutdown token for federation workers
     let shutdown_token = tokio_util::sync::CancellationToken::new();
 
-    // ── UpstreamManager (WS proxy for remote sequencer conversations) ──
-    let ws_proxy_enabled = std::env::var("FEDERATION_WS_PROXY")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-
-    let upstream_manager = if fed_config.enabled && ws_proxy_enabled {
-        if let Some(ref auth) = service_auth {
-            let manager = federation::UpstreamManager::new(
-                db_pool.clone(),
-                resolver.clone(),
-                auth.clone(),
-                fed_config.self_did.clone(),
-                fed_config.self_endpoint.clone(),
-                shutdown_token.child_token(),
-                sse_buffer_size,
-            );
-            tracing::info!("UpstreamManager initialized (WS proxy enabled)");
-            Some(Arc::new(manager))
-        } else {
-            tracing::warn!(
-                "FEDERATION_WS_PROXY enabled but no service auth; UpstreamManager not created"
-            );
-            None
-        }
-    } else {
-        None
-    };
-
-    // Clean-cutover chat runtime. The fixed relationship authority is mandatory
-    // in every mode and construction failure aborts startup. Pre-cutover this
-    // needs no Nest configuration; once CHAT_CUTOVER_ENABLED is set the verifier
-    // config becomes mandatory and its absence fails startup loudly rather than
-    // silently 500-ing requests.
     let chat_runtime = Arc::new(
         catbird_server::handlers::chat::ChatRuntime::from_env_with_federation(
             sse_state.clone(),
@@ -1058,8 +840,6 @@ async fn main() -> anyhow::Result<()> {
         }),
     );
 
-    // Phase 2 test infrastructure initializer: when running in test environment with test-support,
-    // initialize or exact-compare the protocol fence singleton before validating it.
     #[cfg(feature = "test-support")]
     if truthy_env_var("FEDERATION_TEST_INITIALIZE_CHAT_FENCE") {
         init_federation_test_chat_fence(&db_pool)
@@ -1075,15 +855,6 @@ async fn main() -> anyhow::Result<()> {
         panic!("FEDERATION_TEST_INITIALIZE_CHAT_FENCE is not supported without the test-support feature");
     }
 
-    // Clean-chat expiry sweeper. Overdue OPEN leaf-recovery requests and overdue
-    // PENDING Welcome deliveries hold reserved key packages and block their
-    // owner's re-request; nothing clears them on a quiet conversation. This is
-    // the only clean-chat background worker, and it is gated on the SAME cutover
-    // flag as every chat route: while `CHAT_CUTOVER_ENABLED` is off the task is
-    // never spawned, so no timer exists and nothing ever reads `chat.*`. (The
-    // worker re-checks the flag itself, so a future caller that spawns it
-    // unconditionally still performs zero chat access — unlike the device-auth
-    // cleanup worker above, which is unconditional and is its own known problem.)
     if chat_runtime.cutover_enabled() {
         #[cfg(feature = "test-support")]
         {
@@ -1108,16 +879,21 @@ async fn main() -> anyhow::Result<()> {
             });
         let chat_expiry_pool = db_pool.clone();
         let chat_expiry_runtime = chat_runtime.clone();
-        let chat_expiry_blob_store = blob_store.clone();
         tokio::spawn(async move {
-            catbird_server::handlers::chat::run_chat_expiry_sweeper_with_blob_store(
+            catbird_server::handlers::chat::run_chat_expiry_sweeper(
                 chat_expiry_pool,
                 chat_expiry_runtime,
-                chat_expiry_blob_store,
             )
             .await;
         });
         tracing::info!("Clean-chat expiry sweeper worker started (cutover enabled)");
+
+        let dormant_pool = db_pool.clone();
+        tokio::spawn(async move {
+            jobs::run_mark_inactive_devices_worker(dormant_pool).await;
+        });
+        tracing::info!("Mark inactive devices worker started (60-day dormancy)");
+
         if chat_runtime.request_push_enabled() {
             let request_push_pool = db_pool.clone();
             let request_push_runtime = chat_runtime.clone();
@@ -1143,9 +919,6 @@ async fn main() -> anyhow::Result<()> {
     let app_state = AppState {
         db_pool: db_pool.clone(),
         sse_state,
-        actor_registry,
-        inline_trigger_cfg,
-        notification_service,
         federation_config: fed_config.clone(),
         resolver,
         service_auth: service_auth.clone(),
@@ -1153,15 +926,11 @@ async fn main() -> anyhow::Result<()> {
         outbound_queue: outbound_queue.clone(),
         sequencer,
         sequencer_transfer,
-        federated_backend,
-        upstream_manager: upstream_manager.clone(),
         ack_signer,
         device_client,
-        blob_store: blob_store.clone(),
         chat_runtime,
     };
 
-    // Start federation queue worker (only when federation is enabled)
     if fed_config.enabled {
         if let Some(ref auth) = service_auth {
             let queue_clone = outbound_queue.clone();
@@ -1215,8 +984,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Build application router
-    // Only expose metrics when explicitly enabled
     let metrics_router = if matches!(
         std::env::var("ENABLE_METRICS").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
@@ -1229,7 +996,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let base_router = Router::new()
-        // Health check endpoints
         .route("/health", get(health::health))
         .route("/health/live", get(health::liveness))
         .route("/health/ready", get(health::readiness))
@@ -1237,8 +1003,6 @@ async fn main() -> anyhow::Result<()> {
         .merge(metrics_router)
         .with_state(app_state.clone());
 
-    // ⚠️ SECURITY: Developer-only direct XRPC proxy - NEVER enable in production
-    // This is gated with #[cfg(debug_assertions)] to prevent accidental production use
     #[cfg(debug_assertions)]
     let base_router = {
         let mut base_router = base_router;
@@ -1261,7 +1025,6 @@ async fn main() -> anyhow::Result<()> {
         base_router
     };
 
-    // Refuse to start if proxy is requested in release mode
     #[cfg(not(debug_assertions))]
     if std::env::var("ENABLE_DIRECT_XRPC_PROXY").is_ok() {
         panic!(
@@ -1271,7 +1034,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // DS-to-DS federation routes (mlsDS namespace)
     let ds_router = Router::new()
         .route(
             "/xrpc/blue.catbird.mlsDS.deliverMessage",
@@ -1331,39 +1093,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(app_state.clone());
 
-    // Clean-cutover chat router (`blue.catbird.chat.*`), isolated from the
-    // superseded mlsChat namespace. Merged into base so it inherits the shared
-    // idempotency/body-budget/content-type/logging middleware stack.
     let chat_router =
         catbird_server::handlers::chat::chat_router::<AppState>().with_state(app_state.clone());
     let base_router = base_router.merge(chat_router);
 
-    // Labyrinth encrypted-history backend (`blue.catbird.labyrinth.*`),
-    // opt-in until its rollout is approved. It also requires the chat
-    // cutover gate per request.
     let base_router = if truthy_env_var("LABYRINTH_ENABLED") {
-        tracing::info!("Labyrinth backend enabled (blue.catbird.labyrinth.*)");
-        // Retention pass: idle keychain/passkey recovery bundles (J2) and
-        // old idempotency records.
+        tracing::info!("Labyrinth recovery/epoch-head directory enabled (blue.catbird.labyrinth.*)");
         tokio::spawn(catbird_server::labyrinth::repo::retention::gc_worker(
             db_pool.clone(),
             std::time::Duration::from_secs(3600),
         ));
-        // Durable DS-to-DS jobs: remote account purges and redaction
-        // announcements (review 2, findings 4 and 5).
-        if let Some(service_auth) = app_state.service_auth.clone() {
-            use catbird_server::handlers::labyrinth::{outbox, relay_client::RelayClient};
-            let client = RelayClient::new(
-                app_state.resolver.clone(),
-                app_state.outbound.clone(),
-                service_auth,
-            );
-            tokio::spawn(outbox::worker(
-                db_pool.clone(),
-                client,
-                std::time::Duration::from_secs(15),
-            ));
-        }
         base_router.merge(
             catbird_server::handlers::labyrinth::labyrinth_router::<AppState>()
                 .with_state(app_state.clone()),
@@ -1384,7 +1123,6 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    let upstream_for_shutdown = upstream_manager;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -1408,9 +1146,6 @@ async fn main() -> anyhow::Result<()> {
         }
 
         shutdown_token.cancel();
-        if let Some(ref mgr) = upstream_for_shutdown {
-            mgr.shutdown().await;
-        }
     })
     .await?;
 
@@ -1703,12 +1438,12 @@ mod tests {
             budget: Arc::new(Semaphore::new(INGRESS_BODY_BUDGET_MIB)),
             read_idle_timeout: Duration::from_secs(1),
             read_total_timeout: Duration::from_secs(2),
-            blob_upload_total_timeout: Duration::from_secs(3),
+            large_body_total_timeout: Duration::from_secs(3),
         };
 
         assert_eq!(policy.total_timeout("/ordinary"), Duration::from_secs(2));
         for path in [
-            BLOB_UPLOAD_PATH,
+            "/xrpc/blue.catbird.chat.publishDirectRequest",
             "/xrpc/blue.catbird.mlsDS.deliverMessage",
             "/xrpc/blue.catbird.chat.enrollDevice",
         ] {
@@ -1942,9 +1677,10 @@ mod tests {
 
     #[tokio::test]
     async fn route_specific_upload_limit_reaches_idempotency_above_default() {
+        let path = "/xrpc/blue.catbird.chat.publishDirectRequest";
         let base_router = Router::new().route(
-            BLOB_UPLOAD_PATH,
-            post(consume_body).layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
+            path,
+            post(consume_body).layer(DefaultBodyLimit::max(CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES)),
         );
         let app = merge_application_routers(
             base_router,
@@ -1955,7 +1691,7 @@ mod tests {
 
         let response = app
             .oneshot(
-                Request::post(BLOB_UPLOAD_PATH)
+                Request::post(path)
                     .body(Body::from(vec![0_u8; 4 * 1024 * 1024 + 1]))
                     .expect("request"),
             )
@@ -2323,25 +2059,21 @@ mod tests {
     #[tokio::test]
     async fn lf10_labyrinth_routes_enforce_tightened_ingress_body_limits() {
         assert_eq!(
-            request_body_limit("/xrpc/blue.catbird.labyrinth.labyrinthRelay"),
-            2 * 1024 * 1024
-        );
-        assert_eq!(
-            request_body_limit("/xrpc/blue.catbird.labyrinth.appendBatch"),
+            request_body_limit("/xrpc/blue.catbird.labyrinth.publishEpochHead"),
             1_572_864
         );
         assert_eq!(
-            request_body_limit("/xrpc/blue.catbird.labyrinth.createEpoch"),
+            request_body_limit("/xrpc/blue.catbird.labyrinth.purgeMailbox"),
             1_572_864
         );
 
         let base_router = Router::new()
             .route(
-                "/xrpc/blue.catbird.labyrinth.appendBatch",
+                "/xrpc/blue.catbird.labyrinth.publishEpochHead",
                 post(consume_body),
             )
             .route(
-                "/xrpc/blue.catbird.labyrinth.labyrinthRelay",
+                "/xrpc/blue.catbird.labyrinth.purgeMailbox",
                 post(consume_body),
             );
         let app = merge_application_routers(
@@ -2351,36 +2083,25 @@ mod tests {
             test_ingress_policy(),
         );
 
-        let too_large_labyrinth = app
+        let within_limit = app
             .clone()
             .oneshot(
-                Request::post("/xrpc/blue.catbird.labyrinth.appendBatch")
+                Request::post("/xrpc/blue.catbird.labyrinth.publishEpochHead")
+                    .body(Body::from(vec![b'x'; 1_572_864]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(within_limit.status(), StatusCode::NO_CONTENT);
+
+        let too_large_labyrinth = app
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.labyrinth.purgeMailbox")
                     .body(Body::from(vec![b'x'; 1_572_864 + 1]))
                     .expect("request"),
             )
             .await
             .expect("response");
         assert_eq!(too_large_labyrinth.status(), StatusCode::PAYLOAD_TOO_LARGE);
-
-        let relay_within_2m = app
-            .clone()
-            .oneshot(
-                Request::post("/xrpc/blue.catbird.labyrinth.labyrinthRelay")
-                    .body(Body::from(vec![b'x'; 1_800_000]))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(relay_within_2m.status(), StatusCode::NO_CONTENT);
-
-        let relay_over_2m = app
-            .oneshot(
-                Request::post("/xrpc/blue.catbird.labyrinth.labyrinthRelay")
-                    .body(Body::from(vec![b'x'; 2 * 1024 * 1024 + 1]))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(relay_over_2m.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

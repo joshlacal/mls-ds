@@ -4,8 +4,8 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "Sender-encrypted messages for one conversation, stored once per conversation in the sender's repo inside the conversation space ([CB-15], [CB-20]). rkey = TID.",
-      "key": "tid",
+      "description": "Sender-encrypted messages for one conversation, stored once per conversation in the sender's repo inside the conversation space ([CB-15], [CB-20]). rkey = '<16-hex-first-seq>-<tid>' so listRecords(reverse=true) sorts strictly by MLS seq.",
+      "key": "any",
       "record": {
         "type": "object",
         "required": [

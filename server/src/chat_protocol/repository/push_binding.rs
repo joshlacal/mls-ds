@@ -347,13 +347,18 @@ mod tests {
         .unwrap();
         let mut body: PushRegistrationBody =
             serde_json::from_value(fixture["body"].clone()).unwrap();
-        let key = SigningKey::from_bytes(&std::array::from_fn(|i| i as u8));
         let device = Uuid::new_v4();
         let registration = Uuid::new_v4();
+        let mut seed = [0u8; 32];
+        seed[..16].copy_from_slice(device.as_bytes());
+        seed[16..].copy_from_slice(registration.as_bytes());
+        let key = SigningKey::from_bytes(&seed);
+        let key_id_str = URL_SAFE_NO_PAD.encode(Sha256::digest(key.verifying_key().to_bytes()));
         let did = format!("did:web:push-lock-{}.example.org", device.simple());
         body.actor_did = did.parse().unwrap();
         body.actor_device_id = device.to_string().into();
         body.registration_id = registration.to_string().into();
+        body.key_id = key_id_str.into();
         body.auth_generation = 1;
         let mut setup = pool.begin().await.unwrap();
         sqlx::query(

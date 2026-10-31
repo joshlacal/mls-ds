@@ -10,13 +10,6 @@ pub(crate) mod auth;
 #[cfg(any(test, feature = "test-support"))]
 pub mod auth;
 
-#[allow(dead_code)]
-#[cfg(not(any(test, feature = "test-support")))]
-pub(crate) mod blobs;
-#[allow(dead_code)]
-#[cfg(any(test, feature = "test-support"))]
-pub mod blobs;
-
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod conversation;
 #[cfg(any(test, feature = "test-support"))]

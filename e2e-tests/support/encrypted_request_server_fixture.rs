@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use axum::{extract::FromRef, Router};
 use catbird_server::{
     auth::install_test_https_did_resolver,
-    blob_store::BlobStore,
     federation::{outbound::OutboundClient, DsResolver, ServiceAuthClient},
     handlers::chat::{chat_router, install_test_https_relationship_resolver, ChatRuntime},
     handlers::labyrinth::labyrinth_router,
@@ -56,7 +55,6 @@ fn is_dedicated_database_url(url: &str) -> bool {
 struct FixtureState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
-    blob_store: BlobStore,
     /// Federation handles the Labyrinth router needs (`LABYRINTH_ENABLED`).
     /// Fixture conversations are all local, so no peer is ever contacted.
     resolver: Arc<DsResolver>,
@@ -72,12 +70,6 @@ impl FromRef<FixtureState> for DbPool {
 impl FromRef<FixtureState> for Arc<ChatRuntime> {
     fn from_ref(state: &FixtureState) -> Self {
         state.runtime.clone()
-    }
-}
-
-impl FromRef<FixtureState> for BlobStore {
-    fn from_ref(state: &FixtureState) -> Self {
-        state.blob_store.clone()
     }
 }
 
@@ -297,7 +289,6 @@ async fn main() -> Result<()> {
     let app: Router = router.with_state(FixtureState {
         pool,
         runtime,
-        blob_store: BlobStore::for_route_tests(),
         resolver,
         outbound: Arc::new(OutboundClient::new(10, 30)),
     });

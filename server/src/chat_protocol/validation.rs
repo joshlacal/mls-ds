@@ -555,7 +555,7 @@ fn origin_hostname_is_valid(host: &str) -> bool {
     })
 }
 
-const CHAT_ENDPOINTS: [&str; 38] = [
+const CHAT_ENDPOINTS: [&str; 36] = [
     "blue.catbird.chat.publishDirectRequestKeys",
     "blue.catbird.chat.prepareDirectRequest",
     "blue.catbird.chat.getDirectRequestOutcome",
@@ -574,6 +574,7 @@ const CHAT_ENDPOINTS: [&str; 38] = [
     "blue.catbird.chat.getConversationState",
     "blue.catbird.chat.submitTransition",
     "blue.catbird.chat.sendMessage",
+    "blue.catbird.chat.acknowledgeEntries",
     "blue.catbird.chat.getEntries",
     "blue.catbird.chat.publishTyping",
     "blue.catbird.chat.getPendingWelcomes",
@@ -586,14 +587,11 @@ const CHAT_ENDPOINTS: [&str; 38] = [
     "blue.catbird.chat.activateReset",
     "blue.catbird.chat.requestLeave",
     "blue.catbird.chat.cancelLeave",
-    "blue.catbird.chat.prepareBlobUpload",
-    "blue.catbird.chat.uploadBlob",
-    "blue.catbird.chat.deleteBlob",
-    "blue.catbird.chat.getBlob",
-    "blue.catbird.chat.getBlobUsage",
     "blue.catbird.chat.getSubscriptionTicket",
     "blue.catbird.chat.subscribeEvents",
-    "blue.catbird.chat.updatePushToken",
+    "blue.catbird.chat.registerPushGateway",
+    "blue.catbird.chat.relaySpaceCredential",
+    "blue.catbird.chat.relaySpaceRead",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -623,9 +621,7 @@ impl ValidatedChatNsid {
             | "blue.catbird.chat.getConversationState"
             | "blue.catbird.chat.getEntries"
             | "blue.catbird.chat.getPendingWelcomes"
-            | "blue.catbird.chat.getLeafRecoveryInbox"
-            | "blue.catbird.chat.getBlob"
-            | "blue.catbird.chat.getBlobUsage" => Ok(CanonicalHttpMethod("GET")),
+            | "blue.catbird.chat.getLeafRecoveryInbox" => Ok(CanonicalHttpMethod("GET")),
             "blue.catbird.chat.subscribeEvents" => Err(AuthPrimitiveError::invalid(
                 "subscription tickets do not use DPoP request authentication",
             )),

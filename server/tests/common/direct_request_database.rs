@@ -31,55 +31,31 @@ pub async fn setup() -> PgPool {
     use sha2::Digest as _;
     assert_eq!(format!("{:x}", sha2::Sha384::digest(send_message.as_bytes())),
         "ae9cc21dd145c3608a57e1f96654b67d53709dba17e3f347758aa8b93830c725d380230751d83f85c497132b8669a30e");
-    migrations.push(Migration::new(
-        20260816000001,
-        Cow::Borrowed("enable send message operation claims"),
-        MigrationType::Simple,
-        Cow::Borrowed(send_message),
-    ));
+    assert!(migrations.iter().any(|m| m.version == 20260816000001));
 
-    // Existing service-auth ledger omitted from the original fourteen-file
-    // test baseline. Keep that baseline immutable and pin this dependency.
     let service_auth =
         include_str!("../../migrations/20260820000001_chat_service_auth_admissions.sql");
     assert_eq!(format!("{:x}", sha2::Sha384::digest(service_auth.as_bytes())),
         "2e8cb6bf47498402e56ba5c2fc753114c1d46e0767c98aa243c47993eb4f51a84de89469a8ae9af6bfac751ddadd18ac");
-    migrations.push(Migration::new(
-        20260820000001,
-        Cow::Borrowed("chat service auth admissions"),
-        MigrationType::Simple,
-        Cow::Borrowed(service_auth),
-    ));
+    assert!(migrations.iter().any(|m| m.version == 20260820000001));
+
     let legacy_dpop =
         include_str!("../../migrations/20260820000002_chat_nullable_legacy_dpop_jkt.sql");
     assert_eq!(format!("{:x}", sha2::Sha384::digest(legacy_dpop.as_bytes())),
         "d1914c731e0fbf81f5b0a9bf9cd77c12f2943fd940c36b9a351b1156b5ca09b55f2b4b44c6810012b4377f6ac283955d");
-    migrations.push(Migration::new(
-        20260820000002,
-        Cow::Borrowed("chat nullable legacy dpop jkt"),
-        MigrationType::Simple,
-        Cow::Borrowed(legacy_dpop),
-    ));
+    assert!(migrations.iter().any(|m| m.version == 20260820000002));
+
     let inventory_gc =
         include_str!("../../migrations/20260821000001_fix_expired_inventory_session_gc.sql");
     assert_eq!(format!("{:x}", sha2::Sha384::digest(inventory_gc.as_bytes())),
         "42790274fbeb43bce44aa9638d23328223042933af03e6453a0c8c3640b9bcf236d0bc0b8cd76e1e5d846be7c6bfc78a");
-    migrations.push(Migration::new(
-        20260821000001,
-        Cow::Borrowed("fix expired inventory session gc"),
-        MigrationType::Simple,
-        Cow::Borrowed(inventory_gc),
-    ));
+    assert!(migrations.iter().any(|m| m.version == 20260821000001));
+
     let performance_indices =
         include_str!("../../migrations/20260824000001_chat_performance_indices.sql");
     assert_eq!(format!("{:x}", sha2::Sha384::digest(performance_indices.as_bytes())),
         "e5f3f169724d2afc84043d80057bf9e494fbc9ad617ced0feaebb469d1be68788e7c19e19a67fb36296b85ee803139e0");
-    migrations.push(Migration::new(
-        20260824000001,
-        Cow::Borrowed("chat performance indices"),
-        MigrationType::Simple,
-        Cow::Borrowed(performance_indices),
-    ));
+    assert!(migrations.iter().any(|m| m.version == 20260824000001));
     let pending_inventory =
         include_str!("../../migrations/20260907000001_chat_direct_pending_inventory.sql");
     assert_eq!(format!("{:x}",sha2::Sha384::digest(pending_inventory.as_bytes())),
@@ -299,7 +275,7 @@ pub async fn setup() -> PgPool {
         include_str!("../../migrations/20260919000025_federated_inventory_conversation_items.sql");
     assert_eq!(
         format!("{:x}", sha2::Sha384::digest(federated_conversation_items.as_bytes())),
-        "b0b0b5dd997f6c5594a6f6c4520d8b6e80a13d9355c29254ee911616a7bb49f81ffa18fdea9edb6d9a5c40bd32445ee8"
+        "c8cd858bc6805485334ad90e96673123b215591282f9625c55e2315a624430f77460fdda0e444a61abffe45433f0a9b1"
     );
     migrations.push(Migration::new(
         20260919000025,
@@ -313,18 +289,22 @@ pub async fn setup() -> PgPool {
         locking: true,
     };
     let mut connection = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(hashtext('direct_request_database_setup'))")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
     sqlx::query("SET chat.operation_claim_activation_approved='handlers-and-legacy-apis-sealed'")
         .execute(&mut *connection)
         .await
         .unwrap();
-    migrator
-        .run_direct(&mut *connection)
-        .await
-        .expect("apply reviewed additive migration on guarded local DB");
-    sqlx::query("RESET chat.operation_claim_activation_approved")
+    let migrate_result = migrator.run_direct(&mut *connection).await;
+    let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
         .execute(&mut *connection)
-        .await
-        .unwrap();
+        .await;
+    let _ = sqlx::query("SELECT pg_advisory_unlock(hashtext('direct_request_database_setup'))")
+        .execute(&mut *connection)
+        .await;
+    migrate_result.expect("apply reviewed additive migration on guarded local DB");
     drop(connection);
     let inventory_gc_contract: (bool, bool) = sqlx::query_as(
         "SELECT position('device_inventory_items' in immutable.prosrc)>0 AND position('session_replication_role' in immutable.prosrc)=0, count(gc.oid)=2 AND bool_and(position('session_replication_role' in gc.prosrc)=0) FROM pg_proc immutable JOIN pg_namespace immutable_ns ON immutable_ns.oid=immutable.pronamespace LEFT JOIN pg_proc gc ON gc.pronamespace=immutable.pronamespace AND gc.proname IN ('gc_expired_inventory_sessions','gc_expired_device_inventory_sessions') WHERE immutable_ns.nspname='chat' AND immutable.proname='enforce_immutable_identity' GROUP BY immutable.prosrc",

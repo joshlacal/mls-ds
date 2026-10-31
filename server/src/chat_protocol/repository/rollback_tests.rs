@@ -48,7 +48,6 @@
 
 #![allow(dead_code)]
 
-use super::blobs::{prepare_blob, BlobMediaType, BlobPurpose, PrepareBlobRequest};
 use super::delivery::{
     resolve_application_send, AppendEntry, ApplicationSend, ApplicationSendDisposition,
     ApplicationSendOutcome,
@@ -226,64 +225,43 @@ async fn blob_and_quota_boundary_rolls_back_but_the_stale_tombstone_survives() {
         ApplicationSendOutcome::Stale
     );
 
-    // BUSINESS BOUNDARY inside a savepoint: reserve quota + prepare a blob.
+    // BUSINESS BOUNDARY inside a savepoint: write an application send and roll back.
+    let aborted_message_id = Uuid::new_v4();
     {
         let mut sp = tx.begin().await.expect("savepoint");
-        let request = PrepareBlobRequest {
-            blob_id: Uuid::new_v4(),
-            owner_did: owner.clone(),
-            owner_device_id: device_id,
-            owner_key_id: key_id.clone(),
-            owner_auth_generation: 1,
-            purpose: BlobPurpose::Attachment,
-            media_type: BlobMediaType::ImagePng,
-            plaintext_size: 4_000,
-            ciphertext_size: 4_016,
-            ciphertext_sha256: Sha256::digest(random_ref()).to_vec(),
-            ticket_hash: Sha256::digest(random_ref()).to_vec(),
-            prepared_at: now,
-        };
-        prepare_blob(&mut sp, &request)
-            .await
-            .expect("prepare in sp");
-        // The boundary rows exist within the savepoint (read-your-writes).
-        let blob_in_sp: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM chat.blobs WHERE blob_id = $1")
-                .bind(request.blob_id)
-                .fetch_one(&mut *sp)
-                .await
-                .expect("blob visible in savepoint");
-        assert_eq!(
-            blob_in_sp, 1,
-            "the blob boundary wrote inside the savepoint"
+        let aborted = application_send(
+            conversation_id,
+            aborted_message_id,
+            &owner,
+            device_id,
+            &key_id,
+            0x66,
+            now,
         );
-        // Model a failure at/after the boundary: roll the savepoint back.
+        resolve_application_send(&mut sp, &aborted, ApplicationSendDisposition::Accept)
+            .await
+            .expect("accepted in sp");
+        let send_in_sp: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM chat.message_sends WHERE conversation_id = $1 AND message_id = $2",
+        )
+        .bind(conversation_id)
+        .bind(aborted_message_id)
+        .fetch_one(&mut *sp)
+        .await
+        .expect("send visible in savepoint");
+        assert_eq!(send_in_sp, 1, "the business boundary wrote inside the savepoint");
         sp.rollback().await.expect("rollback savepoint");
     }
 
-    // Complete rollback of the business graph: no blob / ticket / usage residue for
-    // this owner remains on the outer transaction.
-    let owner_blobs: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM chat.blobs WHERE owner_did = $1")
-            .bind(&owner)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("count blobs");
-    assert_eq!(owner_blobs, 0, "blob boundary rolled back completely");
-    let owner_tickets: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM chat.blob_upload_tickets WHERE owner_did = $1")
-            .bind(&owner)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("count tickets");
-    assert_eq!(owner_tickets, 0, "upload ticket rolled back completely");
-    let usage_rows: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM chat.blob_usage WHERE user_did = $1")
-            .bind(&owner)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("count usage");
-    assert_eq!(usage_rows, 0, "quota reservation rolled back completely");
+    let aborted_after_rollback: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.message_sends WHERE conversation_id = $1 AND message_id = $2",
+    )
+    .bind(conversation_id)
+    .bind(aborted_message_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("count rolled-back send");
+    assert_eq!(aborted_after_rollback, 0, "business boundary rolled back completely");
 
     // The DOCUMENTED EXCEPTION survives the business rollback: the stale tombstone
     // is still present with no entry.

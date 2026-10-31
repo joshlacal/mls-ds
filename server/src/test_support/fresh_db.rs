@@ -40,6 +40,7 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_creation_",
     "chat_blobs_",
     "src_legacy_",
+    "clean_slate_",
 ];
 
 /// Advisory lock key on `/postgres` used across all full catalog migration runs.

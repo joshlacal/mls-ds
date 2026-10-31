@@ -36,18 +36,6 @@ pub(crate) struct ConvoAuthState {
     pub sequencer_ds_did: String,
     pub sequencer_term: i64,
     pub epoch: i64,
-    pub is_clean: bool,
-}
-
-#[derive(Debug, FromRow)]
-pub(crate) struct LegacyDigestRow {
-    pub seq: i64,
-    pub epoch: i64,
-    pub msg_id: Option<String>,
-    pub message_type: String,
-    pub ciphertext: Vec<u8>,
-    pub padded_size: i64,
-    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -68,107 +56,47 @@ pub(crate) async fn authorize_convo_read(
     convo_id: &str,
     requester_ds: &str,
 ) -> Result<ConvoAuthState, FederationError> {
-    // N31: fail-loudly service identity — no hardcoded fallback DID.
     let self_did = crate::identity::service_did_base();
+    let convo_uuid =
+        uuid::Uuid::parse_str(convo_id).map_err(|_| FederationError::ConversationNotFound {
+            convo_id: convo_id.to_string(),
+        })?;
 
-    // 1. Check clean chat.conversations first if convo_id is a valid UUID
-    if let Ok(convo_uuid) = uuid::Uuid::parse_str(convo_id) {
-        let clean_row = sqlx::query_as::<_, (bool, Option<String>, i64, i64, bool)>(
-            "SELECT \
-               c.is_remote, \
-               c.sequencer_ds, \
-               c.sequencer_term, \
-               COALESCE((SELECT MAX(generation) FROM chat.generations g WHERE g.conversation_id = c.conversation_id), 0) AS epoch, \
-               EXISTS( \
-                 SELECT 1 FROM chat.participants p \
-                 WHERE p.conversation_id = c.conversation_id \
-                   AND p.current_membership = TRUE \
-                   AND COALESCE(p.ds_did, $2) = $3 \
-               ) AS caller_is_member_ds \
-             FROM chat.conversations c \
-             WHERE c.conversation_id = $1",
-        )
-        .bind(convo_uuid)
-        .bind(&self_did)
-        .bind(requester_ds)
-        .fetch_optional(pool)
-        .await
-        .map_err(FederationError::Database)?;
-
-        if let Some((is_remote, sequencer_ds, sequencer_term, epoch, caller_is_member_ds)) =
-            clean_row
-        {
-            let sequencer_ds_did = if is_remote {
-                canonical_did(&sequencer_ds.unwrap_or_else(|| self_did.clone())).to_string()
-            } else {
-                canonical_did(&self_did).to_string()
-            };
-
-            if requester_ds != sequencer_ds_did && !caller_is_member_ds {
-                return Err(FederationError::AuthFailed {
-                    reason: format!(
-                        "DS {} is not authorized to read reconciliation state for {}",
-                        requester_ds, convo_id
-                    ),
-                });
-            }
-
-            let is_quarantined: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM federation_sync_state
-                    WHERE convo_id = $1 AND status = 'quarantined'
-                )",
-            )
-            .bind(convo_id)
-            .fetch_one(pool)
-            .await
-            .map_err(FederationError::Database)?;
-
-            if is_quarantined {
-                return Err(FederationError::DeliveryConflict {
-                    reason: format!("conversation {} is quarantined", convo_id),
-                });
-            }
-
-            return Ok(ConvoAuthState {
-                convo_id: convo_id.to_string(),
-                sequencer_ds_did,
-                sequencer_term,
-                epoch,
-                is_clean: true,
-            });
-        }
-    }
-
-    // 2. Legacy fallback to conversations (public schema)
-    let row = sqlx::query_as::<_, (Option<String>, Option<i64>, Option<i64>, bool)>(
+    let clean_row = sqlx::query_as::<_, (bool, Option<String>, i64, i64, bool)>(
         "SELECT \
+           c.is_remote, \
            c.sequencer_ds, \
-           CAST(COALESCE(c.sequencer_term, 0) AS BIGINT), \
-           CAST(COALESCE(c.current_epoch, 0) AS BIGINT), \
+           c.sequencer_term, \
+           COALESCE((SELECT MAX(generation) FROM chat.generations g WHERE g.conversation_id = c.conversation_id), 0) AS epoch, \
            EXISTS( \
-             SELECT 1 FROM members m \
-             WHERE m.convo_id = c.id \
-               AND m.left_at IS NULL \
-               AND COALESCE(split_part(m.ds_did, '#', 1), $2) = $3 \
+             SELECT 1 FROM chat.participants p \
+             WHERE p.conversation_id = c.conversation_id \
+               AND p.current_membership = TRUE \
+               AND COALESCE(p.ds_did, $2) = $3 \
            ) AS caller_is_member_ds \
-         FROM conversations c \
-         WHERE c.id = $1",
+         FROM chat.conversations c \
+         WHERE c.conversation_id = $1",
     )
-    .bind(convo_id)
+    .bind(convo_uuid)
     .bind(&self_did)
     .bind(requester_ds)
     .fetch_optional(pool)
     .await
     .map_err(FederationError::Database)?;
 
-    let Some((sequencer_ds, sequencer_term, epoch, caller_is_member_ds)) = row else {
+    let Some((is_remote, sequencer_ds, sequencer_term, epoch, caller_is_member_ds)) = clean_row
+    else {
         return Err(FederationError::ConversationNotFound {
             convo_id: convo_id.to_string(),
         });
     };
 
-    let sequencer_ds_did = canonical_did(&sequencer_ds.unwrap_or(self_did)).to_string();
+    let sequencer_ds_did = if is_remote {
+        canonical_did(&sequencer_ds.unwrap_or_else(|| self_did.clone())).to_string()
+    } else {
+        canonical_did(&self_did).to_string()
+    };
+
     if requester_ds != sequencer_ds_did && !caller_is_member_ds {
         return Err(FederationError::AuthFailed {
             reason: format!(
@@ -178,12 +106,28 @@ pub(crate) async fn authorize_convo_read(
         });
     }
 
+    let is_quarantined: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM federation_sync_state
+            WHERE convo_id = $1 AND status = 'quarantined'
+        )",
+    )
+    .bind(convo_id)
+    .fetch_one(pool)
+    .await
+    .map_err(FederationError::Database)?;
+
+    if is_quarantined {
+        return Err(FederationError::DeliveryConflict {
+            reason: format!("conversation {} is quarantined", convo_id),
+        });
+    }
+
     Ok(ConvoAuthState {
         convo_id: convo_id.to_string(),
         sequencer_ds_did,
-        sequencer_term: sequencer_term.unwrap_or(0),
-        epoch: epoch.unwrap_or(0),
-        is_clean: false,
+        sequencer_term,
+        epoch,
     })
 }
 
@@ -200,79 +144,44 @@ pub async fn get_convo_digest(
 
     let result: Result<Json<GetConvoDigestOutput>, FederationError> = async {
         let state = authorize_convo_read(&pool, &query.convo_id, &requester_ds).await?;
-
-        let (last_seq, event_count, digest_sha256) = if state.is_clean {
-            let convo_uuid = uuid::Uuid::parse_str(&query.convo_id).map_err(|_| {
-                FederationError::ConversationNotFound {
-                    convo_id: query.convo_id.clone(),
-                }
-            })?;
-
-            let (last_seq, event_count): (i64, i64) = sqlx::query_as(
-                "SELECT CAST(COALESCE(MAX(seq), 0) AS BIGINT), CAST(COUNT(*) AS BIGINT) \
-                 FROM chat.entries WHERE conversation_id = $1",
-            )
-            .bind(convo_uuid)
-            .fetch_one(&pool)
-            .await
-            .map_err(FederationError::Database)?;
-
-            let mut stream = sqlx::query_as::<_, CleanDigestRow>(
-                "SELECT \
-                   CAST(seq AS BIGINT) AS seq, \
-                   CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
-                   entry_id, \
-                   entry_kind, \
-                   accepted_payload_bytes, \
-                   accepted_payload_sha256, \
-                   signed_request_bytes, \
-                   outer_entry_fingerprint, \
-                   received_at \
-                 FROM chat.entries \
-                 WHERE conversation_id = $1 \
-                 ORDER BY seq ASC",
-            )
-            .bind(convo_uuid)
-            .fetch(&pool);
-
-            let mut hasher = CleanConvoDigestHasher::new();
-            while let Some(row) = stream.try_next().await.map_err(FederationError::Database)? {
-                hasher.update_row(&row);
+        let convo_uuid = uuid::Uuid::parse_str(&query.convo_id).map_err(|_| {
+            FederationError::ConversationNotFound {
+                convo_id: query.convo_id.clone(),
             }
-            (last_seq, event_count, hasher.finalize())
-        } else {
-            let (last_seq, event_count): (i64, i64) = sqlx::query_as(
-                "SELECT CAST(COALESCE(MAX(seq), 0) AS BIGINT), CAST(COUNT(*) AS BIGINT) \
-                 FROM messages WHERE convo_id = $1",
-            )
-            .bind(&query.convo_id)
-            .fetch_one(&pool)
-            .await
-            .map_err(FederationError::Database)?;
+        })?;
 
-            let mut stream = sqlx::query_as::<_, LegacyDigestRow>(
-                "SELECT \
-                   CAST(seq AS BIGINT) AS seq, \
-                   CAST(epoch AS BIGINT) AS epoch, \
-                   COALESCE(msg_id, id) AS msg_id, \
-                   message_type, \
-                   ciphertext, \
-                   CAST(COALESCE(padded_size, 0) AS BIGINT) AS padded_size, \
-                   created_at \
-                 FROM messages \
-                 WHERE convo_id = $1 \
-                 ORDER BY seq ASC",
-            )
-            .bind(&query.convo_id)
-            .fetch(&pool);
+        let (last_seq, event_count): (i64, i64) = sqlx::query_as(
+            "SELECT CAST(COALESCE(MAX(seq), 0) AS BIGINT), CAST(COUNT(*) AS BIGINT) \
+             FROM chat.entries WHERE conversation_id = $1",
+        )
+        .bind(convo_uuid)
+        .fetch_one(&pool)
+        .await
+        .map_err(FederationError::Database)?;
 
-            let mut hasher = LegacyConvoDigestHasher::new();
-            while let Some(row) = stream.try_next().await.map_err(FederationError::Database)? {
-                hasher.update_row(&row);
-            }
-            (last_seq, event_count, hasher.finalize())
-        };
+        let mut stream = sqlx::query_as::<_, CleanDigestRow>(
+            "SELECT \
+               CAST(seq AS BIGINT) AS seq, \
+               CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+               entry_id, \
+               entry_kind, \
+               COALESCE(accepted_payload_bytes, ''::bytea) AS accepted_payload_bytes, \
+               accepted_payload_sha256, \
+               COALESCE(signed_request_bytes, ''::bytea) AS signed_request_bytes, \
+               outer_entry_fingerprint, \
+               received_at \
+             FROM chat.entries \
+             WHERE conversation_id = $1 \
+             ORDER BY seq ASC",
+        )
+        .bind(convo_uuid)
+        .fetch(&pool);
 
+        let mut hasher = CleanConvoDigestHasher::new();
+        while let Some(row) = stream.try_next().await.map_err(FederationError::Database)? {
+            hasher.update_row(&row);
+        }
+        let digest_sha256 = hasher.finalize();
         let generated_at = Utc::now();
 
         Ok(Json(GetConvoDigestOutput {
@@ -352,42 +261,6 @@ pub fn compute_clean_convo_digest(rows: &[CleanDigestRow]) -> String {
     hasher.finalize()
 }
 
-pub(crate) struct LegacyConvoDigestHasher {
-    hasher: Sha256,
-}
-
-impl LegacyConvoDigestHasher {
-    pub(crate) fn new() -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(b"CATBIRD-CONVO-DIGEST-V1:");
-        Self { hasher }
-    }
-
-    pub(crate) fn update_row(&mut self, row: &LegacyDigestRow) {
-        self.hasher.update(row.seq.to_be_bytes());
-        self.hasher.update(row.epoch.to_be_bytes());
-        let msg_id = row.msg_id.as_deref().unwrap_or_default();
-        hash_len_prefixed(&mut self.hasher, msg_id.as_bytes());
-        hash_len_prefixed(&mut self.hasher, row.message_type.as_bytes());
-        hash_len_prefixed(&mut self.hasher, &row.ciphertext);
-        self.hasher.update(row.padded_size.to_be_bytes());
-        self.hasher
-            .update(row.created_at.timestamp_millis().to_be_bytes());
-    }
-
-    pub(crate) fn finalize(self) -> String {
-        hex::encode(self.hasher.finalize())
-    }
-}
-
-pub(crate) fn compute_legacy_convo_digest(rows: &[LegacyDigestRow]) -> String {
-    let mut hasher = LegacyConvoDigestHasher::new();
-    for row in rows {
-        hasher.update_row(row);
-    }
-    hasher.finalize()
-}
-
 fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u32).to_be_bytes());
     hasher.update(bytes);
@@ -402,10 +275,6 @@ mod tests {
         assert_eq!(
             CleanConvoDigestHasher::new().finalize(),
             compute_clean_convo_digest(&[])
-        );
-        assert_eq!(
-            LegacyConvoDigestHasher::new().finalize(),
-            compute_legacy_convo_digest(&[])
         );
 
         let now = Utc::now();
@@ -440,35 +309,6 @@ mod tests {
         assert_eq!(
             clean_stream_hasher.finalize(),
             compute_clean_convo_digest(&clean_rows)
-        );
-
-        let legacy_rows = vec![
-            LegacyDigestRow {
-                seq: 1,
-                epoch: 0,
-                msg_id: Some("msg-1".to_string()),
-                message_type: "app".to_string(),
-                ciphertext: vec![0xde, 0xad, 0xbe, 0xef],
-                padded_size: 512,
-                created_at: now,
-            },
-            LegacyDigestRow {
-                seq: 2,
-                epoch: 1,
-                msg_id: None,
-                message_type: "commit".to_string(),
-                ciphertext: vec![0x01, 0x02],
-                padded_size: 1024,
-                created_at: now,
-            },
-        ];
-        let mut legacy_stream_hasher = LegacyConvoDigestHasher::new();
-        for row in &legacy_rows {
-            legacy_stream_hasher.update_row(row);
-        }
-        assert_eq!(
-            legacy_stream_hasher.finalize(),
-            compute_legacy_convo_digest(&legacy_rows)
         );
     }
 }
