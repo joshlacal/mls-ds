@@ -61,6 +61,11 @@ pub async fn create_device(
     at: DateTime<Utc>,
 ) -> LabyrinthResult<String> {
     rec.value.validate()?;
+    if rec.value.revoked_at.is_some() {
+        return Err(LabyrinthError::invalid(
+            "new device record must not carry revokedAt",
+        ));
+    }
     binding::verify_chat_binding(caller, &rec.value)?;
     let owner = caller.did.as_str();
     let key = rec.value.device_key_pubkey.array::<32>("deviceKeyPubkey")?;
@@ -69,8 +74,36 @@ pub async fn create_device(
     // Otherwise any chat device could create the mailbox row of an account
     // whose mailbox lives in its PDS Space.
     let is_virtual = rec.value.r#virtual;
+    binding::lock_mailbox(conn, owner).await?;
     if is_virtual {
         binding::require_bound(conn, caller, None).await?;
+    } else {
+        let hosted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM labyrinth.mailboxes WHERE owner_did = $1)",
+        )
+        .bind(owner)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !hosted {
+            super::advisory_lock(conn, &format!("labyrinth.epoch_heads:{owner}")).await?;
+            let latest_head: Option<String> = sqlx::query_scalar(
+                "SELECT epoch_public::text FROM labyrinth.epoch_heads \
+                  WHERE did = $1 ORDER BY epoch_number DESC LIMIT 1",
+            )
+            .bind(owner)
+            .fetch_optional(&mut *conn)
+            .await?;
+            if let Some(text) = latest_head {
+                let latest = directory::parse_stored(&text)?;
+                if latest.attestation.transport_pubkey.0 != caller.signing_key {
+                    return Err(LabyrinthError::new(
+                        axum::http::StatusCode::CONFLICT,
+                        "MailboxAlreadyAnchored",
+                        "account already anchored in the head directory by another chat key",
+                    ));
+                }
+            }
+        }
     }
     charge(
         conn,
@@ -338,7 +371,12 @@ pub async fn create_epoch_member(
     m.value.validate()?;
     let owner = caller.did.as_str();
     binding::require_bound(conn, caller, None).await?;
-    binding::require_registered(conn, owner, &[m.value.device_key_pubkey.0.clone()]).await?;
+    binding::require_registered(
+        conn,
+        owner,
+        std::slice::from_ref(&m.value.device_key_pubkey.0),
+    )
+    .await?;
     if !epoch_exists(conn, owner, m.value.epoch_number).await? {
         return Err(LabyrinthError::not_found("EpochNotFound"));
     }
@@ -469,6 +507,11 @@ pub async fn create_virtual_device(
         return Err(LabyrinthError::already_exists());
     }
     if let Some(m) = member {
+        if m.value.device_key_pubkey != rec.value.device_key_pubkey {
+            return Err(LabyrinthError::invalid(
+                "member.deviceKeyPubkey must match record.deviceKeyPubkey",
+            ));
+        }
         create_epoch_member(conn, caller, m, at).await?;
     }
     if let Some(parent) = orf_parent {
@@ -483,28 +526,24 @@ const VDEVICE_JSON: &str = "(CASE WHEN last_used_at IS NULL THEN record \
        to_jsonb(to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))) \
      END)::text";
 
-/// `getVirtualDevice`; reading a bundle also records it as used (J2).
+const VDEVICE_LIVE_PREDICATE: &str = "NOT (record->>'mechanism' IN ('keychain', 'passkey') \
+          AND COALESCE(last_used_at, created_at) <= $AT - INTERVAL '180 days')";
+
+/// `getVirtualDevice`; strictly read-only (`touchVirtualDevice` stamps use).
 pub async fn get_virtual_device(
     conn: &mut PgConnection,
     owner: &str,
     id: &[u8; 16],
     at: DateTime<Utc>,
 ) -> LabyrinthResult<Option<serde_json::Value>> {
-    sqlx::query(
-        "UPDATE labyrinth.virtual_devices SET last_used_at = $3 \
-          WHERE owner_did = $1 AND vdevice_id = $2",
-    )
-    .bind(owner)
-    .bind(id.as_slice())
-    .bind(at)
-    .execute(&mut *conn)
-    .await?;
     let text: Option<String> = sqlx::query_scalar(&format!(
         "SELECT {VDEVICE_JSON} FROM labyrinth.virtual_devices \
-          WHERE owner_did = $1 AND vdevice_id = $2"
+          WHERE owner_did = $1 AND vdevice_id = $2 AND {}",
+        VDEVICE_LIVE_PREDICATE.replace("$AT", "$3")
     ))
     .bind(owner)
     .bind(id.as_slice())
+    .bind(at)
     .fetch_optional(&mut *conn)
     .await?;
     text.as_deref().map(stored_json).transpose()
@@ -514,14 +553,18 @@ pub async fn list_virtual_devices(
     conn: &mut PgConnection,
     owner: &str,
     page: &PageReq,
+    at: DateTime<Utc>,
 ) -> LabyrinthResult<(Vec<serde_json::Value>, Option<String>)> {
     let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(&format!(
         "SELECT vdevice_id, {VDEVICE_JSON} FROM labyrinth.virtual_devices \
-              WHERE owner_did = $1 AND vdevice_id > $2 ORDER BY vdevice_id LIMIT $3"
+          WHERE owner_did = $1 AND vdevice_id > $2 AND {} \
+          ORDER BY vdevice_id LIMIT $3",
+        VDEVICE_LIVE_PREDICATE.replace("$AT", "$4")
     ))
     .bind(owner)
     .bind(hex_cursor(page)?)
     .bind(page.limit() + 1)
+    .bind(at)
     .fetch_all(&mut *conn)
     .await?;
     keyed_page(rows, page.limit())

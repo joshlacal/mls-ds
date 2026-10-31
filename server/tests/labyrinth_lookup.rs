@@ -456,3 +456,81 @@ async fn list_owner_batches_pages_newest_first_and_by_receive_window() {
     .await;
     assert_eq!(seqs(&both), vec![1, 2]);
 }
+
+/// L-F10: non-participants querying `listBatches`, `getMessages`, or `findMeks`
+/// receive empty results without leaking Space placement (`StorageGenerationMismatch`),
+/// Space deletion (`SpaceDeleted`), or missing storage (`StorageNotConfigured`).
+#[tokio::test]
+async fn lf10_non_participant_reads_return_empty_without_storage_or_deletion_oracle() {
+    let env = Env::new().await;
+    let authority = env.account().await;
+    let alice = env.account().await;
+    let outsider = env.account().await;
+
+    let space_thread = seed_conversation_with_storage(
+        &env,
+        Uuid::new_v4(),
+        &[leaf(&alice, 1)],
+        2,
+        Some(&authority.did),
+    )
+    .await;
+    let deleted_space = seed_conversation_with_storage(
+        &env,
+        Uuid::new_v4(),
+        &[leaf(&alice, 1)],
+        2,
+        Some(&authority.did),
+    )
+    .await;
+    let gen: Uuid = sqlx::query_scalar(
+        "SELECT generation FROM labyrinth.thread_storage WHERE conversation_id = $1",
+    )
+    .bind(deleted_space)
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    let mut tx = env.pool.begin().await.unwrap();
+    catbird_server::labyrinth::repo::space::mark_deleted(
+        &mut tx,
+        deleted_space,
+        gen,
+        env.now().await,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    for target in [space_thread, deleted_space, Uuid::new_v4()] {
+        let batches = outsider
+            .query("listBatches", &[("threadId", target.to_string())])
+            .await;
+        assert!(
+            items(&batches).is_empty(),
+            "listBatches leaked {target}: {}",
+            batches.json
+        );
+
+        let msgs = get_messages(&outsider, target, &["m1"], &[]).await;
+        assert!(
+            items(&msgs).is_empty(),
+            "getMessages leaked {target}: {}",
+            msgs.json
+        );
+
+        let meks = outsider
+            .query(
+                "findMeks",
+                &[
+                    ("threadId", target.to_string()),
+                    ("mekId", hex::encode(MEK1)),
+                ],
+            )
+            .await;
+        assert!(
+            items(&meks).is_empty(),
+            "findMeks leaked {target}: {}",
+            meks.json
+        );
+    }
+}

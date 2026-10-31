@@ -8,6 +8,9 @@ mod common;
 #[path = "common/labyrinth_harness.rs"]
 mod harness;
 
+#[path = "common/labyrinth_chain.rs"]
+mod chain;
+
 use catbird_server::labyrinth::repo::retention::run_gc;
 use chrono::Duration;
 use ed25519_dalek::Signer as _;
@@ -165,7 +168,7 @@ async fn unsend_redacts_only_the_authors_items_and_keeps_their_order() {
             assert_eq!(item, old, "{author}'s m2 is untouched");
         }
     }
-    // Usage follows the stored bytes exactly.
+    // Usage never increases when a tombstone outweighs a short ciphertext.
     let stored: i64 = sqlx::query_scalar(
         "SELECT (SELECT coalesce(sum(record_bytes), 0) FROM labyrinth.batches WHERE author_did = $1) \
               + (SELECT coalesce(sum(record_bytes), 0) FROM labyrinth.meks WHERE author_did = $1)",
@@ -174,8 +177,8 @@ async fn unsend_redacts_only_the_authors_items_and_keeps_their_order() {
     .fetch_one(&env.pool)
     .await
     .unwrap();
-    assert_eq!(usage(&env, &alice.did).await, stored);
-    assert_ne!(usage(&env, &alice.did).await, usage_before);
+    assert_eq!(usage(&env, &alice.did).await, usage_before);
+    assert!(usage(&env, &alice.did).await <= stored);
 
     // Ordinary SQL still cannot delete or rewrite thread rows.
     assert!(sqlx::query("DELETE FROM labyrinth.batches")
@@ -339,11 +342,18 @@ async fn purge_mailbox_resets_the_account_and_nothing_else() {
     d0.query("getEpochHead", &[("did", v.did.clone())])
         .await
         .fails(404, "EpochNotFound");
-    // The account enrolls again from epoch 0.
+    // The account enrolls again; epoch 0 is blocked by the floor, epoch 1 restarts.
     d0.enroll([0xD0; 32]).await;
     d0.call(
         "createEpoch",
         &json!({ "epoch": epoch_record(&v.chain[0], [0xD0; 32]), "members": [] }),
+    )
+    .await
+    .fails(400, "InvalidEpochChain");
+    let (restarted, _) = chain::epoch_public(&d0, 1, [9; 32], None, None);
+    d0.call(
+        "createEpoch",
+        &json!({ "epoch": epoch_record(&restarted, [0xD0; 32]), "members": [] }),
     )
     .await
     .ok();
@@ -370,7 +380,9 @@ async fn delete_account_data_purges_signs_redactions_and_keeps_operations() {
     let (alice, bob, thread) = chat(&env).await;
     alice.enroll([0xA0; 32]).await;
     let owner_batch = json!({ "record": owner_batch_record("t", &[1]) });
-    let before = alice.call_op("appendOwnerBatch", &owner_batch, [0x0B; 16]).await;
+    let before = alice
+        .call_op("appendOwnerBatch", &owner_batch, [0x0B; 16])
+        .await;
     before.ok();
 
     alice.call("deleteAccountData", &json!({})).await.ok();
@@ -385,9 +397,14 @@ async fn delete_account_data_purges_signs_redactions_and_keeps_operations() {
     // pre-deletion write answers from its record and writes nothing.
     let ops = count(&env, "operations", "owner_did", &alice.did).await;
     assert!(ops >= 5, "operations kept: {ops}");
-    let replay = alice.call_op("appendOwnerBatch", &owner_batch, [0x0B; 16]).await;
+    let replay = alice
+        .call_op("appendOwnerBatch", &owner_batch, [0x0B; 16])
+        .await;
     assert_eq!(replay.bytes, before.bytes);
-    assert_eq!(count(&env, "owner_batches", "owner_did", &alice.did).await, 0);
+    assert_eq!(
+        count(&env, "owner_batches", "owner_did", &alice.did).await,
+        0
+    );
     // The MEK stays: bob's batch is sealed under it.
     assert_eq!(count(&env, "meks", "author_did", &alice.did).await, 1);
     // Finding 7: each account-deletion redaction names this DS and the
@@ -411,7 +428,10 @@ async fn delete_account_data_purges_signs_redactions_and_keeps_operations() {
             );
             let sig: [u8; 64] = unb(&r["sig"]).try_into().unwrap();
             ds_key
-                .verify_strict(message.as_bytes(), &ed25519_dalek::Signature::from_bytes(&sig))
+                .verify_strict(
+                    message.as_bytes(),
+                    &ed25519_dalek::Signature::from_bytes(&sig),
+                )
                 .expect("DS redaction signature verifies");
             seen += 1;
         } else {
@@ -434,16 +454,19 @@ async fn delete_account_data_purges_signs_redactions_and_keeps_operations() {
         .fails(403, "LabyrinthDeviceNotBound");
     carol.call("deleteAccountData", &json!({})).await.ok();
     assert_eq!(count(&env, "devices", "owner_did", &carol.did).await, 0);
-    let queued: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT op, status, request->>'actorDid' FROM labyrinth.relay_outbox",
-    )
-    .fetch_all(&env.pool)
-    .await
-    .unwrap();
+    let queued: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT op, status, request->>'actorDid' FROM labyrinth.relay_outbox")
+            .fetch_all(&env.pool)
+            .await
+            .unwrap();
     assert_eq!(queued.len(), 1);
     assert_eq!(
         queued[0],
-        ("purgeAuthor".to_owned(), "pending".to_owned(), carol.did.clone())
+        (
+            "purgeAuthor".to_owned(),
+            "pending".to_owned(),
+            carol.did.clone()
+        )
     );
 }
 
@@ -481,10 +504,7 @@ async fn recovery_bundles_record_use_expire_when_idle_and_can_be_deleted() {
     let got = alice
         .query("getVirtualDevice", &[("vdeviceId", hex::encode([1u8; 16]))])
         .await;
-    assert!(got.ok()["record"]["lastUsedAt"]
-        .as_str()
-        .unwrap()
-        .ends_with('Z'));
+    assert!(got.ok()["record"].get("lastUsedAt").is_none());
     alice
         .call("touchVirtualDevice", &json!({ "vdeviceId": b(&[4; 16]) }))
         .await
@@ -565,4 +585,163 @@ async fn recovery_bundles_record_use_expire_when_idle_and_can_be_deleted() {
     .await
     .unwrap();
     assert_eq!(left, vec!["code".to_owned()]);
+}
+
+#[tokio::test]
+async fn lf02_redact_message_requires_participant_and_author_before_recording() {
+    let env = Env::new().await;
+    let (_alice, bob, thread) = chat(&env).await;
+    let stranger = env.account().await;
+
+    // Non-participant cannot call redactMessage.
+    stranger
+        .call("redactMessage", &redact(&stranger, thread, "m1"))
+        .await
+        .fails(403, "NotParticipant");
+
+    // Non-author participant calling redactMessage on someone else's or nonexistent
+    // message must NOT pollute redacted_messages or enqueue relay_outbox jobs.
+    let total_redacted_rows = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM labyrinth.redacted_messages")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap()
+    };
+    let before_rows = total_redacted_rows().await;
+    let r = bob
+        .call("redactMessage", &redact(&bob, thread, "nonexistent-msg"))
+        .await;
+    assert_eq!(r.ok()["redacted"], 0);
+    assert_eq!(
+        total_redacted_rows().await,
+        before_rows,
+        "non-author/nonexistent redactMessage must not insert into redacted_messages"
+    );
+}
+
+#[tokio::test]
+async fn lf05_virtual_device_get_is_readonly_expiry_filters_at_180d_and_touch_requires_bound() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    let unbound = env.device_for(&alice.did, random_seed()).await;
+    alice.enroll([0xA7; 32]).await;
+
+    for (id, mechanism) in [(1u8, "keychain"), (2, "passkey"), (3, "code")] {
+        alice
+            .call("createVirtualDevice", &vdevice(id, mechanism))
+            .await
+            .ok();
+    }
+
+    // 1. GET must be read-only (never stamps lastUsedAt).
+    let got = alice
+        .query("getVirtualDevice", &[("vdeviceId", hex::encode([1u8; 16]))])
+        .await;
+    assert!(
+        got.ok()["record"].get("lastUsedAt").is_none(),
+        "getVirtualDevice must not mutate last_used_at"
+    );
+
+    // 2. Unbound chat device cannot call touchVirtualDevice.
+    unbound
+        .call("touchVirtualDevice", &json!({ "vdeviceId": b(&[1; 16]) }))
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+
+    // 3. Backdate created_at past 180 days: keychain & passkey expire immediately on
+    //    get/list/touch even before background GC runs, while code never expires.
+    let mut tx = env.pool.begin().await.unwrap();
+    sqlx::query("SELECT labyrinth.open_retention_scope()")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE labyrinth.virtual_devices SET created_at = $2 WHERE owner_did = $1")
+        .bind(&alice.did)
+        .bind(env.now().await - Duration::days(181))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    alice
+        .query("getVirtualDevice", &[("vdeviceId", hex::encode([1u8; 16]))])
+        .await
+        .fails(404, "VirtualDeviceNotFound");
+    alice
+        .query("getVirtualDevice", &[("vdeviceId", hex::encode([2u8; 16]))])
+        .await
+        .fails(404, "VirtualDeviceNotFound");
+    alice
+        .call("touchVirtualDevice", &json!({ "vdeviceId": b(&[1; 16]) }))
+        .await
+        .fails(404, "VirtualDeviceNotFound");
+    alice
+        .query("getVirtualDevice", &[("vdeviceId", hex::encode([3u8; 16]))])
+        .await
+        .ok();
+    let listed = alice.query("listVirtualDevices", &[]).await;
+    let items = listed.ok()["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["mechanism"], "code");
+}
+
+#[tokio::test]
+async fn lf07_redaction_never_charges_positive_tombstone_growth_and_drop_vdevice_revokes_device() {
+    let env = Env::new().await;
+    let (alice, _bob, thread) = chat(&env).await;
+    alice.enroll([0xA0; 32]).await;
+
+    // Pin alice right at the 1 GiB author_usage ceiling: redacting a tiny 96-byte
+    // message (whose signed tombstone JSON is larger than the 96-byte ciphertext)
+    // must still succeed without violating author_usage_bytes_quota!
+    sqlx::query("UPDATE labyrinth.author_usage SET bytes_used = 1073741824 WHERE author_did = $1")
+        .bind(&alice.did)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let res = alice
+        .call("redactMessage", &redact(&alice, thread, "m1"))
+        .await;
+    assert_eq!(res.ok()["redacted"], 1);
+    assert_eq!(usage(&env, &alice.did).await, 1_073_741_824);
+
+    // Dropping a virtual device must also mark its labyrinth.devices row revoked_at.
+    let vkey = [0x7E; 32];
+    alice
+        .call(
+            "createDevice",
+            &json!({ "record": virtual_device_record(vkey) }),
+        )
+        .await
+        .ok();
+    alice
+        .call(
+            "createVirtualDevice",
+            &json!({ "record": vdevice_record([0x7F; 16], vkey) }),
+        )
+        .await
+        .ok();
+    alice
+        .call(
+            "deleteVirtualDevice",
+            &json!({ "vdeviceId": b(&[0x7F; 16]) }),
+        )
+        .await
+        .ok();
+    let revoked_at: Option<String> = sqlx::query_scalar(
+        "SELECT revoked_at FROM labyrinth.devices WHERE owner_did = $1 AND device_key = $2",
+    )
+    .bind(&alice.did)
+    .bind(vkey.as_slice())
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert!(
+        revoked_at.is_some(),
+        "drop_virtual_device must stamp revoked_at on labyrinth.devices"
+    );
 }

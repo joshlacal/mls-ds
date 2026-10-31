@@ -15,7 +15,8 @@
 
 #![allow(dead_code)]
 
-use std::sync::{Arc, Once};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use axum::{body::Body, extract::FromRef, http::Request, http::StatusCode, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -114,6 +115,9 @@ fn ensure_runtime_env() {
             "CHAT_SUBSCRIPTION_ENDPOINT",
             "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
         );
+        if std::env::var_os("SERVICE_DID").is_none() {
+            std::env::set_var("SERVICE_DID", "did:web:chat.catbird.blue");
+        }
     });
 }
 
@@ -255,10 +259,12 @@ impl Env {
 
     /// Another active chat device of `did`, with chat key `seed`.
     pub async fn device_for(&self, did: &str, seed: [u8; 32]) -> Device {
+        let chat_key = EdKey::from_bytes(&seed);
+        remember_transport_seed(chat_key.verifying_key().to_bytes(), seed);
         let device = Device {
             did: did.to_owned(),
             device_id: Uuid::new_v4(),
-            chat_key: EdKey::from_bytes(&seed),
+            chat_key,
             jwt_key: jwt_key_for(did),
             router: self.router.clone(),
         };
@@ -1201,6 +1207,23 @@ pub fn owner_batch_record(thread_id: &str, timestamps: &[u64]) -> Value {
     })
 }
 
+fn transport_seeds() -> &'static Mutex<HashMap<[u8; 32], [u8; 32]>> {
+    static SEEDS: OnceLock<Mutex<HashMap<[u8; 32], [u8; 32]>>> = OnceLock::new();
+    SEEDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_transport_seed(pubkey: [u8; 32], seed: [u8; 32]) {
+    transport_seeds().lock().unwrap().insert(pubkey, seed);
+}
+
+fn transport_key_for(pubkey: [u8; 32]) -> Option<EdKey> {
+    transport_seeds()
+        .lock()
+        .unwrap()
+        .get(&pubkey)
+        .map(EdKey::from_bytes)
+}
+
 /// A `mek` record from a transport sender (`sender`'s chat key) addressed to
 /// `recipients`.
 pub fn transport_mek(
@@ -1209,14 +1232,23 @@ pub fn transport_mek(
     sender: [u8; 32],
     recipients: &[&str],
 ) -> Value {
+    let ephemeral_auth_pubkey = [0x21; 32];
+    let msg = format!(
+        "minos.structured_signature.mek_distribution.ephemeral_auth:k={};mek_id={}",
+        hex::encode(ephemeral_auth_pubkey),
+        hex::encode(mek_id),
+    );
+    let sig = transport_key_for(sender)
+        .map(|k| k.sign(msg.as_bytes()).to_bytes())
+        .unwrap_or([0x22; 64]);
     mek_with_sender(
         thread,
         mek_id,
         json!({
             "$type": "blue.catbird.labyrinth.mek#transportSender",
             "transportPubkey": b(&sender),
-            "ephemeralAuthPubkey": b(&[0x21; 32]),
-            "sig": b(&[0x22; 64]),
+            "ephemeralAuthPubkey": b(&ephemeral_auth_pubkey),
+            "sig": b(&sig),
         }),
         recipients,
     )
@@ -1244,6 +1276,16 @@ pub fn labyrinth_mek(
 }
 
 fn mek_with_sender(thread: Uuid, mek_id: [u8; 12], sender: Value, recipients: &[&str]) -> Value {
+    let mut heads_hex: Vec<String> = (0..recipients.len())
+        .map(|_| hex::encode([0x31u8; 32]))
+        .collect();
+    heads_hex.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"mek_recipient_list:");
+    for h in &heads_hex {
+        hasher.update(h.as_bytes());
+    }
+    let roster_hash: [u8; 32] = hasher.finalize().into();
     let recipients: Vec<Value> = recipients
         .iter()
         .map(|did| {
@@ -1258,7 +1300,7 @@ fn mek_with_sender(thread: Uuid, mek_id: [u8; 12], sender: Value, recipients: &[
         "$type": "blue.catbird.labyrinth.mek",
         "threadId": thread.to_string(),
         "mekId": b(&mek_id),
-        "rosterHash": b(&[0x51; 32]),
+        "rosterHash": b(&roster_hash),
         "sender": sender,
         "recipients": recipients,
         "createdAt": "2026-10-04T12:00:00.000Z",

@@ -53,9 +53,12 @@ fn compare(path: &str, got: &Value, want: &Value, diffs: &mut Vec<String>) {
                 let p = format!("{path}/{k}");
                 match (g.get(k), w.get(k)) {
                     (Some(gv), Some(wv)) => {
+                        let server_redaction =
+                            path.ends_with("/redaction") && !w.contains_key("transportPubkey");
                         let volatile = VOLATILE.contains(&k.as_str())
                             || (k == "createdAt" && chat_key_view)
-                            || (k == "rkey" && is_tid(gv) && is_tid(wv));
+                            || (k == "rkey" && is_tid(gv) && is_tid(wv))
+                            || (server_redaction && matches!(k.as_str(), "by" | "sig"));
                         if volatile {
                             if !same_type(gv, wv) {
                                 diffs.push(format!("{p}: type {gv} vs {wv}"));

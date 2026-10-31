@@ -503,6 +503,20 @@ pub static SPACE_AUTHORITY_IP_LIMITER: Lazy<SpaceAuthorityRateLimiter> =
 /// Per-IP rate limiter instance
 pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
 
+fn default_trusted_proxy_cidrs() -> Vec<IpNet> {
+    [
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "::1/128",
+        "fc00::/7",
+    ]
+    .into_iter()
+    .map(|cidr| cidr.parse::<IpNet>().expect("static trusted proxy CIDR"))
+    .collect()
+}
+
 static TRUSTED_PROXY_CIDRS: Lazy<Vec<IpNet>> = Lazy::new(|| {
     std::env::var("TRUSTED_PROXY_CIDRS")
         .ok()
@@ -523,7 +537,7 @@ static TRUSTED_PROXY_CIDRS: Lazy<Vec<IpNet>> = Lazy::new(|| {
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_else(default_trusted_proxy_cidrs)
 });
 
 /// Middleware for pre-auth throttling.
@@ -596,6 +610,23 @@ fn parse_ip_from_header(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
         .and_then(|value| value.parse::<IpAddr>().ok())
 }
 
+fn parse_xff_rightmost_untrusted(headers: &HeaderMap, trusted_cidrs: &[IpNet]) -> Option<IpAddr> {
+    let values: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    for raw in values.into_iter().rev() {
+        for hop in raw.rsplit(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let ip = hop.parse::<IpAddr>().ok()?;
+            if !is_trusted_proxy(ip, trusted_cidrs) {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
 fn is_trusted_proxy(ip: IpAddr, trusted_cidrs: &[IpNet]) -> bool {
     !trusted_cidrs.is_empty() && trusted_cidrs.iter().any(|cidr| cidr.contains(&ip))
 }
@@ -609,7 +640,7 @@ fn extract_client_ip_with_trusted(request: &Request, trusted_cidrs: &[IpNet]) ->
     if let Some(source_ip) = peer_ip {
         if is_trusted_proxy(source_ip, trusted_cidrs) {
             if let Some(ip) = parse_ip_from_header(request.headers(), "cf-connecting-ip")
-                .or_else(|| parse_ip_from_header(request.headers(), "x-forwarded-for"))
+                .or_else(|| parse_xff_rightmost_untrusted(request.headers(), trusted_cidrs))
                 .or_else(|| parse_ip_from_header(request.headers(), "x-real-ip"))
             {
                 return ip.to_string();
@@ -912,5 +943,47 @@ mod tests {
             extract_client_ip_with_trusted(&request, &trusted),
             "198.51.100.20"
         );
+    }
+
+    #[test]
+    fn mf10_xff_extracts_rightmost_untrusted_ip_and_defaults_trust_local_proxies() {
+        let mut request = HttpRequest::builder()
+            .uri("/xrpc/blue.catbird.chat.getEntries")
+            .header("x-forwarded-for", "1.2.3.4, 198.51.100.7, 10.0.0.2")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            443,
+        )));
+
+        let trusted = vec![
+            "127.0.0.0/8".parse::<IpNet>().unwrap(),
+            "10.0.0.0/8".parse::<IpNet>().unwrap(),
+        ];
+        assert_eq!(
+            extract_client_ip_with_trusted(&request, &trusted),
+            "198.51.100.7",
+            "must select rightmost non-trusted XFF hop, ignoring spoofed leftmost entry"
+        );
+
+        // Default TRUSTED_PROXY_CIDRS (when env var is unset) trusts loopback/private proxies
+        // while still ignoring headers from public untrusted peers.
+        if std::env::var("TRUSTED_PROXY_CIDRS").is_err() {
+            assert_eq!(extract_client_ip(&request), "198.51.100.7");
+
+            let mut direct_public = HttpRequest::builder()
+                .uri("/xrpc/blue.catbird.chat.getEntries")
+                .header("x-forwarded-for", "1.2.3.4")
+                .body(Body::empty())
+                .expect("request");
+            direct_public
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+                    443,
+                )));
+            assert_eq!(extract_client_ip(&direct_public), "198.51.100.20");
+        }
     }
 }

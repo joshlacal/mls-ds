@@ -45,7 +45,7 @@ fn head_conflict() -> LabyrinthError {
     )
 }
 
-fn parse_stored(text: &str) -> LabyrinthResult<EpochPublic> {
+pub(crate) fn parse_stored(text: &str) -> LabyrinthResult<EpochPublic> {
     serde_json::from_str(text).map_err(|error| {
         tracing::error!(?error, "stored epoch head does not parse");
         LabyrinthError::internal()
@@ -106,7 +106,16 @@ pub async fn record_head(
             Ok((n as u64, head, signing))
         })
         .transpose()?;
-    check_chain_link(&parts, latest.map(|(n, head, _)| (n, head)))?;
+    let floor: Option<i64> = sqlx::query_scalar(
+        "SELECT max_epoch_number FROM labyrinth.epoch_head_floors WHERE did = $1",
+    )
+    .bind(did)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let floor = floor
+        .map(|f| u64::try_from(f).map_err(|_| LabyrinthError::internal()))
+        .transpose()?;
+    check_chain_link(&parts, latest.map(|(n, head, _)| (n, head)), floor)?;
     if let Some((_, _, previous_signing_key)) = latest {
         verify_prev_sig(&parts, &previous_signing_key)?;
     }
@@ -230,7 +239,7 @@ pub async fn ever_participant(
 ) -> LabyrinthResult<bool> {
     Ok(sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM chat.participants \
-                        WHERE conversation_id = $1 AND user_did = $2)",
+                        WHERE conversation_id = $1 AND user_did = $2 AND status = 'active')",
     )
     .bind(conversation_id)
     .bind(did)
@@ -274,7 +283,7 @@ pub async fn member_devices(
     .await?;
     let more = rows.len() as i64 > page.limit();
     rows.truncate(page.limit() as usize);
-    let cursor = more.then(|| (offset + page.limit()).to_string());
+    let cursor = more.then(|| offset.saturating_add(page.limit()).to_string());
     let items = rows
         .into_iter()
         .map(

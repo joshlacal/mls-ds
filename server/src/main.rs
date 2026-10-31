@@ -358,6 +358,8 @@ fn request_body_limit(path: &str) -> usize {
         | "/xrpc/blue.catbird.mlsDS.deliverDirectRequest"
         | "/xrpc/blue.catbird.mlsDS.relaySendMessage"
         | "/xrpc/blue.catbird.mlsDS.deliverMessageEntry" => SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
+        "/xrpc/blue.catbird.labyrinth.labyrinthRelay" => 2 * 1024 * 1024,
+        p if p.starts_with("/xrpc/blue.catbird.labyrinth.") => 1_572_864,
         _ => DEFAULT_REQUEST_BODY_LIMIT_BYTES,
     }
 }
@@ -567,7 +569,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         enforce_lxm = %std::env::var("ENFORCE_LXM").unwrap_or_else(|_| "true".to_string()),
         enforce_jti = %std::env::var("ENFORCE_JTI").unwrap_or_else(|_| "true".to_string()),
-        jti_ttl_seconds = %std::env::var("JTI_TTL_SECONDS").unwrap_or_else(|_| "120".to_string()),
+        jti_ttl_seconds = %std::env::var("JTI_TTL_SECONDS").unwrap_or_else(|_| "360".to_string()),
         "Authentication configuration loaded"
     );
 
@@ -2316,5 +2318,69 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn lf10_labyrinth_routes_enforce_tightened_ingress_body_limits() {
+        assert_eq!(
+            request_body_limit("/xrpc/blue.catbird.labyrinth.labyrinthRelay"),
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            request_body_limit("/xrpc/blue.catbird.labyrinth.appendBatch"),
+            1_572_864
+        );
+        assert_eq!(
+            request_body_limit("/xrpc/blue.catbird.labyrinth.createEpoch"),
+            1_572_864
+        );
+
+        let base_router = Router::new()
+            .route(
+                "/xrpc/blue.catbird.labyrinth.appendBatch",
+                post(consume_body),
+            )
+            .route(
+                "/xrpc/blue.catbird.labyrinth.labyrinthRelay",
+                post(consume_body),
+            );
+        let app = merge_application_routers(
+            base_router,
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+
+        let too_large_labyrinth = app
+            .clone()
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.labyrinth.appendBatch")
+                    .body(Body::from(vec![b'x'; 1_572_864 + 1]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(too_large_labyrinth.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let relay_within_2m = app
+            .clone()
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.labyrinth.labyrinthRelay")
+                    .body(Body::from(vec![b'x'; 1_800_000]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(relay_within_2m.status(), StatusCode::NO_CONTENT);
+
+        let relay_over_2m = app
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.labyrinth.labyrinthRelay")
+                    .body(Body::from(vec![b'x'; 2 * 1024 * 1024 + 1]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(relay_over_2m.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

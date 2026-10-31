@@ -15613,6 +15613,14 @@ fn plan_commit_inner(
         {
             return Err(StateMachineError::InvalidCommitEffects);
         }
+        if leaf.device.principal() != command.actor.principal() {
+            let actor = prior
+                .participant(command.actor.principal())
+                .ok_or(StateMachineError::NotParticipant)?;
+            if actor.status != ParticipantStatus::Active || actor.role != ParticipantRole::Admin {
+                return Err(StateMachineError::AdminRequired);
+            }
+        }
     }
 
     let mut state = prior.clone();
@@ -18916,30 +18924,30 @@ fn require_commit_body(
             let c_commit_sha = commit.verified_commit_sha256() == Some(commit_sha256);
             let c_aad_sha = commit.verified_aad_sha256() == Some(aad_digest);
             let c_meta = commit_metadata_matches(prior_state, metadata, next);
-            tracing::error!("LeafRecoveryFulfillment check: prior={}, next={}, req={}, commit_sha={}, aad_sha={}, meta={}", c_prior, c_next, c_req, c_commit_sha, c_aad_sha, c_meta);
+            tracing::debug!("LeafRecoveryFulfillment check: prior={}, next={}, req={}, commit_sha={}, aad_sha={}, meta={}", c_prior, c_next, c_req, c_commit_sha, c_aad_sha, c_meta);
             if !c_prior {
-                tracing::error!(
+                tracing::debug!(
                     "prior mismatch: signed_prior={:?} != prior={:?}",
                     signed_prior,
                     prior
                 );
             }
             if !c_next {
-                tracing::error!(
+                tracing::debug!(
                     "next mismatch: signed_next={:?} != next={:?}",
                     signed_next,
                     next
                 );
             }
             if !c_commit_sha {
-                tracing::error!(
+                tracing::debug!(
                     "commit_sha mismatch: verified={:?} != signed={:?}",
                     commit.verified_commit_sha256(),
                     commit_sha256
                 );
             }
             if !c_aad_sha {
-                tracing::error!(
+                tracing::debug!(
                     "aad_sha mismatch: verified={:?} != signed={:?}",
                     commit.verified_aad_sha256(),
                     aad_digest
@@ -18986,7 +18994,7 @@ fn commit_metadata_matches(
     next_coordinate: &PublicGroupSnapshotCoordinate,
 ) -> bool {
     let Some(prior_metadata) = prior.metadata.as_ref() else {
-        tracing::error!("commit_metadata_matches: prior.metadata is None");
+        tracing::debug!("commit_metadata_matches: prior.metadata is None");
         return false;
     };
     let c_coord = metadata_coordinate_matches(next_metadata, next_coordinate);
@@ -18996,12 +19004,12 @@ fn commit_metadata_matches(
     let c_auth = next_metadata.author_proof == prior_metadata.author_proof;
     let c_avatar = next_metadata.avatar_binding == prior_metadata.avatar_binding;
     let c_nonce = next_metadata.nonce != prior_metadata.nonce;
-    tracing::error!(
+    tracing::debug!(
         "commit_metadata_matches: next_len={}, prior_len={}",
         next_metadata.ciphertext.len(),
         prior_metadata.ciphertext.len()
     );
-    tracing::error!(
+    tracing::debug!(
         "commit_metadata_matches: coord={}, ver={}, ot={}, len={}, auth={}, avatar={}, nonce={}",
         c_coord,
         c_ver,
@@ -19012,14 +19020,14 @@ fn commit_metadata_matches(
         c_nonce
     );
     if !c_coord {
-        tracing::error!(
+        tracing::debug!(
             "metadata coordinate mismatch: next_metadata={:?} != next_coord={:?}",
             next_metadata.coordinate,
             next_coordinate
         );
     }
     if !c_auth {
-        tracing::error!(
+        tracing::debug!(
             "author_proof mismatch: next={:?} != prior={:?}",
             next_metadata.author_proof,
             prior_metadata.author_proof
@@ -19131,7 +19139,7 @@ fn require_commit_manifest(
             let c_w_wire = signed_welcome.opaque_welcome == welcome.wire_bytes();
             let c_w_sha =
                 signed_welcome.sha256 == <[u8; 32]>::from(Sha256::digest(welcome.wire_bytes()));
-            tracing::error!("InvalidWelcomeMapping checks: pc={}, adds_len={}, adds_tgt={}, adds_req={}, adds_kp={}, m_req={}, w_id={}, w_rcp={}, w_req={}, w_kp={}, w_wire={}, w_sha={}", c_pc, c_adds_len, c_adds_tgt, c_adds_req, c_adds_kp, c_m_req, c_w_id, c_w_rcp, c_w_req, c_w_kp, c_w_wire, c_w_sha);
+            tracing::debug!("InvalidWelcomeMapping checks: pc={}, adds_len={}, adds_tgt={}, adds_req={}, adds_kp={}, m_req={}, w_id={}, w_rcp={}, w_req={}, w_kp={}, w_wire={}, w_sha={}", c_pc, c_adds_len, c_adds_tgt, c_adds_req, c_adds_kp, c_m_req, c_w_id, c_w_rcp, c_w_req, c_w_kp, c_w_wire, c_w_sha);
             if !c_pc
                 || !c_adds_len
                 || !c_adds_tgt
@@ -21488,7 +21496,12 @@ impl ParticipantRecord {
             role: ParticipantRole::Member,
             role_producer: None,
             invitation: inviter.map(|inviter| InvitationProvenance {
-                transition: TransitionEvidence::new(1, *uuid::Uuid::from_u128(0x01234567_89ab_4cde_8f01_23456789abcd).as_bytes(), [0; 32]).unwrap(),
+                transition: TransitionEvidence::new(
+                    1,
+                    *uuid::Uuid::from_u128(0x01234567_89ab_4cde_8f01_23456789abcd).as_bytes(),
+                    [0; 32],
+                )
+                .unwrap(),
                 inviter,
             }),
             acceptance: None,
@@ -21516,7 +21529,12 @@ impl ConversationState {
         Self {
             kind,
             coordinate,
-            producer: TransitionEvidence::new(1, *uuid::Uuid::from_u128(0x01234567_89ab_4cde_8f01_23456789abcd).as_bytes(), [0; 32]).unwrap(),
+            producer: TransitionEvidence::new(
+                1,
+                *uuid::Uuid::from_u128(0x01234567_89ab_4cde_8f01_23456789abcd).as_bytes(),
+                [0; 32],
+            )
+            .unwrap(),
             public_state: None,
             metadata: None,
             metadata_producer: None,

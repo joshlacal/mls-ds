@@ -355,7 +355,7 @@ pub async fn list_virtual_devices(
             let page = p.page()?;
             let mut r = begin_read(&pool, adm).await?;
             let (items, cursor) =
-                repo::list_virtual_devices(&mut r.tx, &r.caller.did, &page).await?;
+                repo::list_virtual_devices(&mut r.tx, &r.caller.did, &page, r.instant).await?;
             r.finish_read().await?;
             page_bytes(items, cursor)
         }

@@ -79,6 +79,9 @@ pub async fn member_home_dses(
     .bind(conversation)
     .fetch_all(&mut *conn)
     .await?;
+    if all.is_empty() {
+        return Ok(Vec::new());
+    }
     let me = crate::identity::service_did();
     Ok(all
         .into_iter()
@@ -126,21 +129,26 @@ pub async fn announce_redaction(
 
 /// Claim up to `limit` due jobs (lease them for a while).
 pub async fn claim_due(pool: &DbPool, now: DateTime<Utc>, limit: i64) -> LabyrinthResult<Vec<Job>> {
-    let rows: Vec<(i64, String, sqlx::types::Json<RelayRequest>, i32, DateTime<Utc>)> =
-        sqlx::query_as(
-            "UPDATE labyrinth.relay_outbox o \
+    let rows: Vec<(
+        i64,
+        String,
+        sqlx::types::Json<RelayRequest>,
+        i32,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
+        "UPDATE labyrinth.relay_outbox o \
                 SET attempts = o.attempts + 1, next_attempt_at = $2, updated_at = $1 \
               WHERE o.job_id IN ( \
                     SELECT job_id FROM labyrinth.relay_outbox \
                      WHERE status = 'pending' AND next_attempt_at <= $1 \
                      ORDER BY next_attempt_at LIMIT $3 FOR UPDATE SKIP LOCKED) \
              RETURNING o.job_id, o.target_ds, o.request, o.attempts, o.created_at",
-        )
-        .bind(now)
-        .bind(now + Duration::seconds(LEASE_SECONDS))
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+    )
+    .bind(now)
+    .bind(now + Duration::seconds(LEASE_SECONDS))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .into_iter()
         .map(|(job_id, target_ds, request, attempts, created_at)| Job {
@@ -177,8 +185,8 @@ pub async fn fail(
 ) -> LabyrinthResult<()> {
     let expired = now - job.created_at > Duration::days(JOB_MAX_AGE_DAYS);
     let dead = permanent || expired;
-    let backoff = Duration::seconds(30 * (1i64 << job.attempts.clamp(0, 10)))
-        .min(Duration::hours(6));
+    let backoff =
+        Duration::seconds(30 * (1i64 << job.attempts.clamp(0, 10))).min(Duration::hours(6));
     if dead {
         tracing::error!(job = job.job_id, target = %job.target_ds, op = %job.request.op,
                         error, "labyrinth relay job abandoned");

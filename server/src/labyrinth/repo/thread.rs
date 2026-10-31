@@ -74,28 +74,6 @@ pub(crate) async fn lock_local_conversation(
     }
 }
 
-pub(crate) async fn require_active_leaf(
-    conn: &mut PgConnection,
-    conversation_id: Uuid,
-    caller: &Caller,
-) -> LabyrinthResult<()> {
-    let active: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM chat.member_devices \
-                        WHERE conversation_id = $1 AND user_did = $2 \
-                          AND device_id = $3 AND active)",
-    )
-    .bind(conversation_id)
-    .bind(&caller.did)
-    .bind(caller.device_id)
-    .fetch_one(&mut *conn)
-    .await?;
-    if active {
-        Ok(())
-    } else {
-        Err(not_participant())
-    }
-}
-
 /// The next per-conversation Labyrinth seq (from 1); the counter row lock
 /// serializes stamping within a conversation until commit.
 pub(crate) async fn next_seq(
@@ -131,7 +109,7 @@ pub(crate) async fn charge_author(
     Ok(())
 }
 
-/// Every recipient DID must be a current participant.
+/// Every recipient DID must be an accepted current participant.
 async fn check_recipients(
     conn: &mut PgConnection,
     conversation_id: Uuid,
@@ -140,7 +118,8 @@ async fn check_recipients(
     let list: Vec<String> = dids.iter().cloned().collect();
     let found: i64 = sqlx::query_scalar(
         "SELECT count(DISTINCT user_did) FROM chat.participants \
-          WHERE conversation_id = $1 AND current_membership AND user_did = ANY($2)",
+          WHERE conversation_id = $1 AND current_membership AND status = 'active' \
+            AND user_did = ANY($2)",
     )
     .bind(conversation_id)
     .bind(&list)
@@ -168,8 +147,8 @@ pub async fn create_mek(
     mek.validate()?;
     let conversation_id = parse_thread_id(&mek.thread_id)?;
     let chat_seq = lock_local_conversation(conn, conversation_id).await?;
-    require_active_leaf(conn, conversation_id, caller).await?;
     super::space::validate_mek_writer(conn, caller, conversation_id, chat_seq).await?;
+    super::space::exact_leaf(conn, caller, conversation_id, chat_seq).await?;
     let (kind, attestation_key_id) = match &mek.sender {
         MekSender::Labyrinth(s) => {
             if s.did != caller.did {
@@ -266,6 +245,9 @@ pub async fn find_meks(
     mek_id: &[u8; 12],
     page: &PageReq,
 ) -> LabyrinthResult<(Vec<AuthoredRow>, Option<String>)> {
+    if !directory::ever_participant(conn, conversation_id, reader).await? {
+        return Ok((Vec::new(), None));
+    }
     super::space::require_not_deleted(conn, conversation_id).await?;
     let sql = format!(
         "SELECT m.seq, m.author_did, m.record::text, m.chat_seq, m.received_at \
@@ -307,11 +289,15 @@ pub async fn append_batch(
     rec: &Received<Batch>,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<(String, ServerOrder)> {
+    if rec.bytes > 1_048_576 {
+        return Err(LabyrinthError::invalid("batch record exceeds 1 MiB"));
+    }
     let batch = &rec.value;
     batch.validate()?;
     let conversation_id = parse_thread_id(&batch.thread_id)?;
     let chat_seq = lock_local_conversation(conn, conversation_id).await?;
-    require_active_leaf(conn, conversation_id, caller).await?;
+    let (joined, chat_generation) =
+        super::space::exact_leaf(conn, caller, conversation_id, chat_seq).await?;
     super::space::require_legacy(conn, conversation_id).await?;
     let mek_id = &batch.items[0].mek_id;
     if batch.items.iter().any(|i| &i.mek_id != mek_id) {
@@ -335,17 +321,17 @@ pub async fn append_batch(
     // One MEK per id and conversation (finding 8): its author is part of
     // the batch's identity, so readability joins on (mekId, author).
     let sql = format!(
-        "SELECT m.author_did, {} FROM labyrinth.meks m \
+        "SELECT m.author_did, m.chat_seq, m.chat_generation, {} FROM labyrinth.meks m \
           WHERE m.conversation_id = $1 AND m.mek_id = $2",
         mek_readable("$3")
     );
-    let mek: Option<(String, bool)> = sqlx::query_as(&sql)
+    let mek: Option<(String, i64, Option<i64>, bool)> = sqlx::query_as(&sql)
         .bind(conversation_id)
         .bind(&mek_id.0)
         .bind(&caller.did)
         .fetch_optional(&mut *conn)
         .await?;
-    let Some((mek_author, usable)) = mek else {
+    let Some((mek_author, mek_seq, mek_generation, usable)) = mek else {
         return Err(named(400, "UnknownMek", "no such MEK in the conversation"));
     };
     if !usable {
@@ -353,6 +339,13 @@ pub async fn append_batch(
             403,
             "NotRecipient",
             "the caller can neither author nor open this MEK",
+        ));
+    }
+    if mek_generation != Some(chat_generation) || mek_seq < joined || mek_seq > chat_seq {
+        return Err(named(
+            400,
+            "UnknownMek",
+            "MEK lies outside the current leaf generation and sequence bounds",
         ));
     }
     charge_author(conn, &caller.did, rec.bytes).await?;
@@ -447,6 +440,9 @@ pub async fn list_batches(
     range: TimeRange,
     page: &PageReq,
 ) -> LabyrinthResult<(Vec<AuthoredRow>, Option<String>)> {
+    if !directory::ever_participant(conn, conversation_id, reader).await? {
+        return Ok((Vec::new(), None));
+    }
     super::space::require_legacy(conn, conversation_id).await?;
     let sql = format!(
         "SELECT {BATCH_COLUMNS} FROM labyrinth.batches b \

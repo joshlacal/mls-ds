@@ -18,8 +18,8 @@ use super::respond;
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth;
 use crate::labyrinth::relay::{RelayOp, RelayRequest};
-use crate::labyrinth::repo::outbox;
 use crate::labyrinth::repo::binding;
+use crate::labyrinth::repo::outbox;
 use crate::labyrinth::repo::retention as repo;
 use crate::labyrinth::wire::bytes::Bytes as AtBytes;
 use crate::labyrinth::wire::io::{body, to_bytes};
@@ -93,8 +93,9 @@ pub async fn touch_virtual_device(
             let input: VirtualDeviceIdIn = body(&bytes)?;
             let id = input.vdevice_id.array::<16>("vdeviceId")?;
             let mut w = begin_write!(&pool, adm);
-            let (did, at) = (w.caller.did.clone(), w.instant);
-            repo::touch_virtual_device(&mut w.tx, &did, &id, at).await?;
+            let (caller, at) = (w.caller.clone(), w.instant);
+            binding::require_bound(&mut w.tx, &caller, None).await?;
+            repo::touch_virtual_device(&mut w.tx, &caller.did, &id, at).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
         .await,

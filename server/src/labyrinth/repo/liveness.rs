@@ -126,6 +126,19 @@ pub async fn check(
             own_copy: own,
         }));
     }
+    if own {
+        let locally_redacted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM labyrinth.batch_items \
+                            WHERE conversation_id = $1 AND author_did = $2 \
+                              AND message_id = $3 AND redacted_at IS NOT NULL)",
+        )
+        .bind(conversation)
+        .bind(author)
+        .bind(message_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        return Ok(Liveness::Known(!locally_redacted));
+    }
     let (live, redacted) = sender_state(conn, reader, conversation, message_id, author).await?;
     Ok(Liveness::Known(decide(live, redacted, own)))
 }

@@ -294,10 +294,8 @@ async fn virtual_devices_register_member_and_orf_state_atomically() {
             &[("vdeviceId", hex::encode([0xAAu8; 16]))],
         )
         .await;
-    // The server projects its lastUsedAt stamp (J2) into the record.
-    let mut record = got.ok()["record"].clone();
-    assert!(record["lastUsedAt"].as_str().unwrap().ends_with('Z'));
-    record.as_object_mut().unwrap().remove("lastUsedAt");
+    // getVirtualDevice is strictly read-only; lastUsedAt is absent until touched.
+    let record = got.ok()["record"].clone();
     assert_eq!(record, vdevice_record([0xAA; 16], [0xBB; 32]));
     // The evolved ORF state exists: registering it again conflicts.
     d0.call(
@@ -510,4 +508,168 @@ async fn stored_rows_are_immutable() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn lf01_space_anchored_account_rejects_unattested_physical_device_squat() {
+    let env = Env::new().await;
+    let v = vectors();
+    let d0 = env.device_for(&v.did, v.seeds[0]).await;
+    let d1 = env.device_for(&v.did, v.seeds[1]).await;
+
+    // Anchor epoch 0 in epoch_heads as a PDS-Space account (no mailbox row on DS).
+    d0.call("publishEpochHead", &json!({ "epoch": v.chain[0] }))
+        .await
+        .ok();
+
+    // Sibling chat device d1 did not attest the latest epoch_heads row, so it
+    // must not squat a DS-hosted mailbox via createDevice(virtual: false).
+    d1.call(
+        "createDevice",
+        &json!({ "record": d1.device_record([0xD1; 32]) }),
+    )
+    .await
+    .fails(409, "MailboxAlreadyAnchored");
+    let mailboxes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM labyrinth.mailboxes WHERE owner_did = $1")
+            .bind(&v.did)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(mailboxes, 0);
+
+    // The exact attesting chat key of the latest epoch_heads row CAN enroll.
+    d0.call(
+        "createDevice",
+        &json!({ "record": d0.device_record([0xD0; 32]) }),
+    )
+    .await
+    .ok();
+}
+
+#[tokio::test]
+async fn lf04_owner_batch_accepts_v5_and_rejects_v1() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    alice.enroll([0xE0; 32]).await;
+
+    for ok_ver in [0u64, 2, 3, 4, 5] {
+        let mut batch = owner_batch_record("thread-v", &[100 + ok_ver]);
+        batch["items"][0]["version"] = json!(ok_ver);
+        alice
+            .call("appendOwnerBatch", &json!({ "record": batch }))
+            .await
+            .ok();
+    }
+
+    for bad_ver in [1u64, 6] {
+        let mut batch = owner_batch_record("thread-v", &[200 + bad_ver]);
+        batch["items"][0]["version"] = json!(bad_ver);
+        alice
+            .call("appendOwnerBatch", &json!({ "record": batch }))
+            .await
+            .fails(400, "InvalidRequest");
+    }
+}
+
+#[tokio::test]
+async fn lf06_concurrent_identical_writes_replay_and_cross_device_replay_conflicts() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    let sibling = env.device_for(&alice.did, random_seed()).await;
+    alice.enroll([0xE0; 32]).await;
+
+    let op = [0x66; 16];
+    let body = json!({ "record": owner_batch_record("thread-conc", &[500]) });
+    let (r1, r2, r3, r4) = tokio::join!(
+        alice.call_op("appendOwnerBatch", &body, op),
+        alice.call_op("appendOwnerBatch", &body, op),
+        alice.call_op("appendOwnerBatch", &body, op),
+        alice.call_op("appendOwnerBatch", &body, op),
+    );
+    let expected = r1.ok().clone();
+    assert_eq!(r2.ok(), &expected);
+    assert_eq!(r3.ok(), &expected);
+    assert_eq!(r4.ok(), &expected);
+
+    // A sibling device replaying the same operation_id + payload must be rejected.
+    sibling
+        .call_op("appendOwnerBatch", &body, op)
+        .await
+        .fails(409, "IdempotencyConflict");
+}
+
+#[tokio::test]
+async fn lf08_device_and_virtual_device_enforce_revoked_auth_keys_and_member_key_match() {
+    let env = Env::new().await;
+    let v = vectors();
+    let d0 = env.device_for(&v.did, v.seeds[0]).await;
+    d0.enroll([0xD0; 32]).await;
+    d0.call(
+        "createEpoch",
+        &json!({ "epoch": epoch_record(&v.chain[0], [0xD0; 32]), "members": [] }),
+    )
+    .await
+    .ok();
+
+    // 1. Pre-revoked device on createDevice is rejected.
+    let mut pre_revoked = d0.device_record([0xD1; 32]);
+    pre_revoked["revokedAt"] = json!("2026-10-04T12:00:00.000Z");
+    d0.call("createDevice", &json!({ "record": pre_revoked }))
+        .await
+        .fails(400, "InvalidRequest");
+
+    // 2. Physical device missing epochStorageAuthKeyPubkey/Sig (or half-present) is rejected.
+    let mut phys_no_auth = d0.device_record([0xD2; 32]);
+    phys_no_auth
+        .as_object_mut()
+        .unwrap()
+        .remove("epochStorageAuthKeyPubkey");
+    phys_no_auth
+        .as_object_mut()
+        .unwrap()
+        .remove("epochStorageAuthKeySig");
+    d0.call("createDevice", &json!({ "record": phys_no_auth }))
+        .await
+        .fails(400, "InvalidRequest");
+
+    let mut phys_half_auth = d0.device_record([0xD3; 32]);
+    phys_half_auth
+        .as_object_mut()
+        .unwrap()
+        .remove("epochStorageAuthKeySig");
+    d0.call("createDevice", &json!({ "record": phys_half_auth }))
+        .await
+        .fails(400, "InvalidRequest");
+
+    // 3. Virtual device carrying epochStorageAuthKeyPubkey/Sig is rejected.
+    let mut virt_with_auth = virtual_device_record([0xD4; 32]);
+    virt_with_auth["epochStorageAuthKeyPubkey"] = b(&[9; 32]);
+    virt_with_auth["epochStorageAuthKeySig"] = b(&[10; 64]);
+    d0.call("createDevice", &json!({ "record": virt_with_auth }))
+        .await
+        .fails(400, "InvalidRequest");
+
+    // 4. createVirtualDevice with mismatched member.deviceKeyPubkey is rejected.
+    d0.call(
+        "createDevice",
+        &json!({ "record": virtual_device_record([0xB1; 32]) }),
+    )
+    .await
+    .ok();
+    d0.call(
+        "createDevice",
+        &json!({ "record": virtual_device_record([0xB2; 32]) }),
+    )
+    .await
+    .ok();
+    d0.call(
+        "createVirtualDevice",
+        &json!({
+            "record": vdevice_record([0xAA; 16], [0xB1; 32]),
+            "member": member_record(0, [0xB2; 32]),
+        }),
+    )
+    .await
+    .fails(400, "InvalidRequest");
 }

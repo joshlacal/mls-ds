@@ -4780,7 +4780,9 @@ fn d2_receipt_sql_and_response_shapes_are_source_pinned() {
 // HTTP-level authenticated acceptance (server/cutover Task 1).
 // ===========================================================================
 
+#[cfg(feature = "test-support")]
 use common::http_acceptance as http;
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_drift() {
     let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
@@ -4847,6 +4849,7 @@ async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_dr
     assert_eq!(body["error"], "DeviceNotRegistered");
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn http_inventory_rejects_exact_device_when_session_auth_generation_is_stale() {
     let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
@@ -4938,6 +4941,7 @@ async fn http_inventory_rejects_exact_device_when_session_auth_generation_is_sta
     );
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn http_inventory_bootstrap_round_trip_emitter_to_all_consumers_end_to_end() {
     let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;

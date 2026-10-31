@@ -13,8 +13,8 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::attachments;
-use crate::labyrinth::ds_sign;
 use crate::labyrinth::auth::Caller;
+use crate::labyrinth::ds_sign;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
 use crate::labyrinth::wire::bytes::{check_str, Bytes};
 use crate::storage::DbPool;
@@ -62,6 +62,12 @@ pub async fn redact_message(
     check_str("messageId", message_id, 128)?;
     let conversation = super::thread::parse_thread_id(thread_id)?;
     super::thread::lock_local_conversation(conn, conversation).await?;
+    if !super::directory::ever_participant(conn, conversation, &caller.did).await? {
+        return Err(LabyrinthError::forbidden(
+            "NotParticipant",
+            "caller has no accepted conversation membership",
+        ));
+    }
     let key: [u8; 32] = redaction
         .transport_pubkey
         .array("redaction.transportPubkey")?;
@@ -91,9 +97,24 @@ pub async fn redact_message(
         at,
     )
     .await?;
-    let ids = [message_id.to_owned()];
-    attachments::invalidate_messages(conn, thread_id, &caller.did, &ids, at).await?;
-    super::outbox::announce_redaction(conn, conversation, &caller.did, &ids, at).await?;
+    let authored_here: bool = if redacted > 0 {
+        true
+    } else {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM labyrinth.batch_items \
+                            WHERE conversation_id = $1 AND author_did = $2 AND message_id = $3)",
+        )
+        .bind(conversation)
+        .bind(&caller.did)
+        .bind(message_id)
+        .fetch_one(&mut *conn)
+        .await?
+    };
+    if authored_here {
+        let ids = [message_id.to_owned()];
+        attachments::invalidate_messages(conn, thread_id, &caller.did, &ids, at).await?;
+        super::outbox::announce_redaction(conn, conversation, &caller.did, &ids, at).await?;
+    }
     Ok(redacted)
 }
 
@@ -157,7 +178,15 @@ pub async fn redact_author(
         let thread_id = conversation.to_string();
         for message in &messages {
             let marker = ds_sign::marker(author, &thread_id, message, at);
-            total += redact(conn, conversation, author, Some(&[message.clone()]), marker, at).await?;
+            total += redact(
+                conn,
+                conversation,
+                author,
+                Some(std::slice::from_ref(message)),
+                marker,
+                at,
+            )
+            .await?;
         }
         attachments::invalidate_messages(conn, &thread_id, author, &messages, at).await?;
         super::outbox::announce_redaction(conn, conversation, author, &messages, at).await?;
@@ -168,6 +197,7 @@ pub async fn redact_author(
 /// `purgeMailbox`: the caller's mailbox, ORF states, attachment references
 /// and head-directory chain.
 pub async fn purge_mailbox(conn: &mut PgConnection, did: &str) -> LabyrinthResult<()> {
+    super::advisory_lock(conn, &format!("labyrinth.epoch_heads:{did}")).await?;
     attachments::delete_owned(conn, did).await?;
     sqlx::query("SELECT labyrinth.purge_mailbox($1)")
         .bind(did)
@@ -241,7 +271,7 @@ pub async fn delete_virtual_device(
     }
 }
 
-/// `touchVirtualDevice` (and every `getVirtualDevice`): stamp last use.
+/// `touchVirtualDevice`: stamp last use on a non-expired bundle.
 pub async fn touch_virtual_device(
     conn: &mut PgConnection,
     owner: &str,
@@ -250,7 +280,9 @@ pub async fn touch_virtual_device(
 ) -> LabyrinthResult<()> {
     let touched = sqlx::query(
         "UPDATE labyrinth.virtual_devices SET last_used_at = $3 \
-          WHERE owner_did = $1 AND vdevice_id = $2",
+          WHERE owner_did = $1 AND vdevice_id = $2 \
+            AND NOT (record->>'mechanism' IN ('keychain', 'passkey') \
+                     AND COALESCE(last_used_at, created_at) <= $3 - INTERVAL '180 days')",
     )
     .bind(owner)
     .bind(id.as_slice())

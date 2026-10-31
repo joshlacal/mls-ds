@@ -33,6 +33,9 @@ pub async fn get_messages(
     message_ids: &[String],
     page: &PageReq,
 ) -> LabyrinthResult<(Vec<AuthoredRow>, Option<String>)> {
+    if !super::directory::ever_participant(conn, conversation_id, reader).await? {
+        return Ok((Vec::new(), None));
+    }
     super::space::require_legacy(conn, conversation_id).await?;
     let sql = format!(
         "SELECT {BATCH_COLUMNS} FROM labyrinth.batches b \

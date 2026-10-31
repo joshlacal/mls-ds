@@ -491,7 +491,15 @@ pub async fn begin_write(pool: &DbPool, admission: Admission) -> LabyrinthResult
         .ok_or_else(LabyrinthError::internal)?;
     let mut tx = pool.begin().await?;
     let caller = load_current_device(&mut tx, &admission.did, admission.device_id, true).await?;
-    if let Some(response) = completed_operation(&mut tx, &caller.did, &write).await? {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "labyrinth.operations:{}:{}",
+            caller.did,
+            hex::encode(write.operation_id)
+        ))
+        .execute(&mut *tx)
+        .await?;
+    if let Some(response) = completed_operation(&mut tx, &caller, &write).await? {
         return Ok(Begun::Replay(response));
     }
     Ok(Begun::Fresh(Box::new(RequestTx {
@@ -504,21 +512,24 @@ pub async fn begin_write(pool: &DbPool, admission: Admission) -> LabyrinthResult
 
 async fn completed_operation(
     conn: &mut PgConnection,
-    did: &str,
+    caller: &Caller,
     write: &WriteBody,
 ) -> LabyrinthResult<Option<Vec<u8>>> {
-    let row: Option<(String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-        "SELECT endpoint_nsid, payload_sha256, response FROM labyrinth.operations \
+    let row: Option<(String, Vec<u8>, Uuid, Vec<u8>)> = sqlx::query_as(
+        "SELECT endpoint_nsid, payload_sha256, actor_device_id, response \
+           FROM labyrinth.operations \
           WHERE owner_did = $1 AND operation_id = $2",
     )
-    .bind(did)
+    .bind(&caller.did)
     .bind(write.operation_id.as_slice())
     .fetch_optional(&mut *conn)
     .await?;
     match row {
         None => Ok(None),
-        Some((nsid, digest, response))
-            if nsid == write.endpoint_nsid && digest == write.payload_sha256 =>
+        Some((nsid, digest, actor_device_id, response))
+            if nsid == write.endpoint_nsid
+                && digest == write.payload_sha256
+                && actor_device_id == caller.device_id =>
         {
             Ok(Some(response))
         }

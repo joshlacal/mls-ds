@@ -1,5 +1,6 @@
 use axum::{extract::State, Json};
 use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
@@ -216,7 +217,7 @@ pub async fn get_convo_digest(
             .await
             .map_err(FederationError::Database)?;
 
-            let rows: Vec<CleanDigestRow> = sqlx::query_as::<_, CleanDigestRow>(
+            let mut stream = sqlx::query_as::<_, CleanDigestRow>(
                 "SELECT \
                    CAST(seq AS BIGINT) AS seq, \
                    CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
@@ -232,12 +233,13 @@ pub async fn get_convo_digest(
                  ORDER BY seq ASC",
             )
             .bind(convo_uuid)
-            .fetch_all(&pool)
-            .await
-            .map_err(FederationError::Database)?;
+            .fetch(&pool);
 
-            let digest = compute_clean_convo_digest(&rows);
-            (last_seq, event_count, digest)
+            let mut hasher = CleanConvoDigestHasher::new();
+            while let Some(row) = stream.try_next().await.map_err(FederationError::Database)? {
+                hasher.update_row(&row);
+            }
+            (last_seq, event_count, hasher.finalize())
         } else {
             let (last_seq, event_count): (i64, i64) = sqlx::query_as(
                 "SELECT CAST(COALESCE(MAX(seq), 0) AS BIGINT), CAST(COUNT(*) AS BIGINT) \
@@ -248,7 +250,7 @@ pub async fn get_convo_digest(
             .await
             .map_err(FederationError::Database)?;
 
-            let rows: Vec<LegacyDigestRow> = sqlx::query_as::<_, LegacyDigestRow>(
+            let mut stream = sqlx::query_as::<_, LegacyDigestRow>(
                 "SELECT \
                    CAST(seq AS BIGINT) AS seq, \
                    CAST(epoch AS BIGINT) AS epoch, \
@@ -262,12 +264,13 @@ pub async fn get_convo_digest(
                  ORDER BY seq ASC",
             )
             .bind(&query.convo_id)
-            .fetch_all(&pool)
-            .await
-            .map_err(FederationError::Database)?;
+            .fetch(&pool);
 
-            let digest = compute_legacy_convo_digest(&rows);
-            (last_seq, event_count, digest)
+            let mut hasher = LegacyConvoDigestHasher::new();
+            while let Some(row) = stream.try_next().await.map_err(FederationError::Database)? {
+                hasher.update_row(&row);
+            }
+            (last_seq, event_count, hasher.finalize())
         };
 
         let generated_at = Utc::now();
@@ -349,23 +352,123 @@ pub fn compute_clean_convo_digest(rows: &[CleanDigestRow]) -> String {
     hasher.finalize()
 }
 
-pub(crate) fn compute_legacy_convo_digest(rows: &[LegacyDigestRow]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"CATBIRD-CONVO-DIGEST-V1:");
-    for row in rows {
-        hasher.update(row.seq.to_be_bytes());
-        hasher.update(row.epoch.to_be_bytes());
-        let msg_id = row.msg_id.as_deref().unwrap_or_default();
-        hash_len_prefixed(&mut hasher, msg_id.as_bytes());
-        hash_len_prefixed(&mut hasher, row.message_type.as_bytes());
-        hash_len_prefixed(&mut hasher, &row.ciphertext);
-        hasher.update(row.padded_size.to_be_bytes());
-        hasher.update(row.created_at.timestamp_millis().to_be_bytes());
+pub(crate) struct LegacyConvoDigestHasher {
+    hasher: Sha256,
+}
+
+impl LegacyConvoDigestHasher {
+    pub(crate) fn new() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"CATBIRD-CONVO-DIGEST-V1:");
+        Self { hasher }
     }
-    hex::encode(hasher.finalize())
+
+    pub(crate) fn update_row(&mut self, row: &LegacyDigestRow) {
+        self.hasher.update(row.seq.to_be_bytes());
+        self.hasher.update(row.epoch.to_be_bytes());
+        let msg_id = row.msg_id.as_deref().unwrap_or_default();
+        hash_len_prefixed(&mut self.hasher, msg_id.as_bytes());
+        hash_len_prefixed(&mut self.hasher, row.message_type.as_bytes());
+        hash_len_prefixed(&mut self.hasher, &row.ciphertext);
+        self.hasher.update(row.padded_size.to_be_bytes());
+        self.hasher
+            .update(row.created_at.timestamp_millis().to_be_bytes());
+    }
+
+    pub(crate) fn finalize(self) -> String {
+        hex::encode(self.hasher.finalize())
+    }
+}
+
+pub(crate) fn compute_legacy_convo_digest(rows: &[LegacyDigestRow]) -> String {
+    let mut hasher = LegacyConvoDigestHasher::new();
+    for row in rows {
+        hasher.update_row(row);
+    }
+    hasher.finalize()
 }
 
 fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u32).to_be_bytes());
     hasher.update(bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mf09_streaming_digest_hashers_match_batch_digests() {
+        assert_eq!(
+            CleanConvoDigestHasher::new().finalize(),
+            compute_clean_convo_digest(&[])
+        );
+        assert_eq!(
+            LegacyConvoDigestHasher::new().finalize(),
+            compute_legacy_convo_digest(&[])
+        );
+
+        let now = Utc::now();
+        let clean_rows = vec![
+            CleanDigestRow {
+                seq: 1,
+                epoch: 0,
+                entry_id: uuid::Uuid::from_bytes([0x11; 16]),
+                entry_kind: "blue.catbird.chat.defs#applicationEntry".to_string(),
+                accepted_payload_bytes: vec![1, 2, 3, 4],
+                accepted_payload_sha256: vec![0xaa; 32],
+                signed_request_bytes: vec![5, 6, 7],
+                outer_entry_fingerprint: vec![0xbb; 32],
+                received_at: now,
+            },
+            CleanDigestRow {
+                seq: 2,
+                epoch: 1,
+                entry_id: uuid::Uuid::from_bytes([0x22; 16]),
+                entry_kind: "blue.catbird.chat.defs#commitEntry".to_string(),
+                accepted_payload_bytes: vec![8, 9],
+                accepted_payload_sha256: vec![0xcc; 32],
+                signed_request_bytes: vec![10],
+                outer_entry_fingerprint: vec![0xdd; 32],
+                received_at: now,
+            },
+        ];
+        let mut clean_stream_hasher = CleanConvoDigestHasher::new();
+        for row in &clean_rows {
+            clean_stream_hasher.update_row(row);
+        }
+        assert_eq!(
+            clean_stream_hasher.finalize(),
+            compute_clean_convo_digest(&clean_rows)
+        );
+
+        let legacy_rows = vec![
+            LegacyDigestRow {
+                seq: 1,
+                epoch: 0,
+                msg_id: Some("msg-1".to_string()),
+                message_type: "app".to_string(),
+                ciphertext: vec![0xde, 0xad, 0xbe, 0xef],
+                padded_size: 512,
+                created_at: now,
+            },
+            LegacyDigestRow {
+                seq: 2,
+                epoch: 1,
+                msg_id: None,
+                message_type: "commit".to_string(),
+                ciphertext: vec![0x01, 0x02],
+                padded_size: 1024,
+                created_at: now,
+            },
+        ];
+        let mut legacy_stream_hasher = LegacyConvoDigestHasher::new();
+        for row in &legacy_rows {
+            legacy_stream_hasher.update_row(row);
+        }
+        assert_eq!(
+            legacy_stream_hasher.finalize(),
+            compute_legacy_convo_digest(&legacy_rows)
+        );
+    }
 }

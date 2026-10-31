@@ -564,19 +564,34 @@ impl AuthMiddleware {
             "Parsed JWT claims"
         );
 
-        // Expiration
+        // Expiration & lifetime bounds
+        const MAX_SERVICE_JWT_LIFETIME_SECS: i64 = 300;
+        const MAX_SERVICE_JWT_FUTURE_SKEW_SECS: i64 = 60;
         let now = Utc::now().timestamp();
         if claims.exp < now {
             return Err(AuthError::TokenExpired);
+        }
+        if claims.exp.saturating_sub(now) > MAX_SERVICE_JWT_LIFETIME_SECS {
+            return Err(AuthError::InvalidToken(format!(
+                "JWT lifetime exceeds maximum ({MAX_SERVICE_JWT_LIFETIME_SECS}s)"
+            )));
+        }
+        if let Some(iat) = claims.iat {
+            if iat > now + MAX_SERVICE_JWT_FUTURE_SKEW_SECS {
+                return Err(AuthError::InvalidToken("JWT iat is in the future".into()));
+            }
+            if claims.exp < iat {
+                return Err(AuthError::InvalidToken("JWT exp precedes iat".into()));
+            }
         }
 
         // Audience enforcement
         if let Some(expected) = expected_aud {
             if !audience_matches_expected(&claims.aud, expected) {
                 tracing::warn!("JWT audience mismatch with expected audience {expected}");
-                return Err(AuthError::InvalidToken(
-                    format!("aud does not match {expected}").into(),
-                ));
+                return Err(AuthError::InvalidToken(format!(
+                    "aud does not match {expected}"
+                )));
             }
         } else if let Some(service_did) = self.configured_service_did() {
             tracing::debug!("Validating JWT audience against configured SERVICE_DID");
@@ -835,10 +850,33 @@ impl AuthMiddleware {
         self.did_cache.insert(doc.id.clone(), cached).await;
     }
 
+    fn build_pinned_did_http_client(
+        &self,
+        host: &str,
+        resolved_addrs: &[std::net::SocketAddr],
+    ) -> Result<reqwest::Client, AuthError> {
+        let mut builder = reqwest::Client::builder()
+            .timeout(self.did_resolution_timeout)
+            .redirect(reqwest::redirect::Policy::none());
+        if host.parse::<std::net::IpAddr>().is_err() {
+            builder = builder.resolve_to_addrs(host, resolved_addrs);
+        }
+        builder.build().map_err(|e| {
+            AuthError::DidResolutionFailed(format!("failed to build pinned HTTP client: {e}"))
+        })
+    }
+
     /// Resolve did:plc DID via PLC directory
     async fn resolve_plc_did(&self, did: &str) -> Result<DidDocument, AuthError> {
-        let _plc_id = did
+        let plc_id = did
             .strip_prefix("did:plc:")
+            .filter(|id| {
+                id.len() == 24
+                    && id
+                        .as_bytes()
+                        .iter()
+                        .all(|&b| matches!(b, b'a'..=b'z' | b'2'..=b'7'))
+            })
             .ok_or_else(|| AuthError::InvalidDid(format!("Invalid PLC DID: {}", did)))?;
         let plc_host = "plc.directory";
         if let Some(allowlist) = &self.did_host_allowlist {
@@ -848,15 +886,30 @@ impl AuthMiddleware {
                 ));
             }
         }
-        validate_resolved_host_is_public(plc_host, 443).await?;
-        let url = format!("https://plc.directory/{}", did);
+        #[cfg(feature = "test-support")]
+        let is_exact_test_fixture = self.test_https_fixture.as_ref().is_some_and(|fixture| {
+            fixture
+                .hosts
+                .iter()
+                .any(|allowed| plc_host.eq_ignore_ascii_case(allowed))
+        });
+        #[cfg(not(feature = "test-support"))]
+        let is_exact_test_fixture = false;
+
+        let client = if is_exact_test_fixture {
+            self.http_client.clone()
+        } else {
+            let resolved_addrs = validate_resolved_host_is_public(plc_host, 443).await?;
+            self.build_pinned_did_http_client(plc_host, &resolved_addrs)?
+        };
+        let url = format!("https://plc.directory/did:plc:{plc_id}");
 
         tracing::debug!(
             did = %crate::crypto::redact_for_log(did),
             "Resolving DID document via PLC directory"
         );
 
-        self.send_and_decode_did_document(self.http_client.get(&url), |status| {
+        self.send_and_decode_did_document(client.get(&url), |status| {
             tracing::error!(
                 status = status.as_u16(),
                 "Failed to resolve DID from PLC directory"
@@ -870,9 +923,17 @@ impl AuthMiddleware {
     async fn resolve_web_did(&self, did: &str) -> Result<DidDocument, AuthError> {
         let url = did_web_document_url(did)
             .ok_or_else(|| AuthError::InvalidDid(format!("Invalid WEB DID: {}", did)))?;
+        #[cfg_attr(not(feature = "test-support"), allow(unused_mut))]
         let mut parsed = url::Url::parse(&url).map_err(|e| {
             AuthError::DidResolutionFailed(format!("Invalid did:web URL for {}: {}", did, e))
         })?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(AuthError::InvalidDid(format!("Invalid WEB DID: {}", did)));
+        }
         // A test-support resolver connects a standards-shaped did:web identity
         // to its injected ephemeral HTTPS port.  The logical DID remains
         // `did:web:localhost:<path>` (and therefore passes the production bare
@@ -919,11 +980,14 @@ impl AuthMiddleware {
                 ));
             }
         }
-        if !is_exact_test_fixture {
-            validate_resolved_host_is_public(host, port).await?;
-        }
+        let client = if is_exact_test_fixture {
+            self.http_client.clone()
+        } else {
+            let resolved_addrs = validate_resolved_host_is_public(host, port).await?;
+            self.build_pinned_did_http_client(host, &resolved_addrs)?
+        };
 
-        self.send_and_decode_did_document(self.http_client.get(parsed.as_str()), |status| {
+        self.send_and_decode_did_document(client.get(parsed.as_str()), |status| {
             format!("Web server returned status {status}")
         })
         .await
@@ -1095,6 +1159,8 @@ pub fn extract_p256_key(did_doc: &DidDocument) -> Option<p256::ecdsa::VerifyingK
 // lxm/jti enforcement helpers
 // -----------------------------------------------------------------------------
 
+const DEFAULT_JTI_TTL_SECS: u64 = 360;
+
 static JTI_CACHE: Lazy<moka::sync::Cache<String, ()>> = Lazy::new(|| {
     use std::time::Duration;
     moka::sync::Cache::builder()
@@ -1102,7 +1168,7 @@ static JTI_CACHE: Lazy<moka::sync::Cache<String, ()>> = Lazy::new(|| {
             std::env::var("JTI_TTL_SECONDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(120),
+                .unwrap_or(DEFAULT_JTI_TTL_SECS),
         ))
         .max_capacity(100_000)
         .build()
@@ -1160,14 +1226,20 @@ pub fn is_test_fixture_host(host: &str) -> bool {
         }
     }
     #[cfg(feature = "test-support")]
-    if let Some(transport) = crate::chat_protocol::relationship_policy::installed_test_https_relationship_transport() {
+    if let Some(transport) =
+        crate::chat_protocol::relationship_policy::installed_test_https_relationship_transport()
+    {
         if transport.hosts.iter().any(|h| *h == host_lc) {
             return true;
         }
     }
     #[cfg(feature = "test-support")]
     if let Ok(hosts) = std::env::var("REQUEST_FIXTURE_DID_HOSTS") {
-        if hosts.split(',').map(|h| h.trim().to_ascii_lowercase()).any(|h| h == host_lc) {
+        if hosts
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .any(|h| h == host_lc)
+        {
             return true;
         }
     }
@@ -1303,16 +1375,27 @@ fn host_is_allowlisted(host: &str, allowlist: &[String]) -> bool {
         .any(|allowed| host_lc == *allowed || host_lc.ends_with(&format!(".{allowed}")))
 }
 
+fn ipv4_is_disallowed(v4: &std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    let is_cgnat = octets[0] == 100 && (octets[1] & 0b1100_0000) == 64;
+    let is_benchmark = octets[0] == 198 && (octets[1] == 18 || octets[1] == 19);
+    v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || is_cgnat
+        || is_benchmark
+}
+
 fn ip_is_disallowed(ip: &std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_multicast()
-                || v4.is_unspecified()
-        }
+        std::net::IpAddr::V4(v4) => ipv4_is_disallowed(v4),
         std::net::IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return ipv4_is_disallowed(&mapped_v4);
+            }
             v6.is_unique_local()
                 || v6.is_loopback()
                 || v6.is_unspecified()
@@ -1383,37 +1466,40 @@ fn is_disallowed_host(host: &str) -> bool {
     }
 }
 
-async fn validate_resolved_host_is_public(host: &str, port: u16) -> Result<(), AuthError> {
+async fn validate_resolved_host_is_public(
+    host: &str,
+    port: u16,
+) -> Result<Vec<std::net::SocketAddr>, AuthError> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         if ip_is_disallowed(&ip) {
             return Err(AuthError::DidResolutionFailed(format!(
                 "host resolved to blocked IP: {ip}"
             )));
         }
-        return Ok(());
+        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
     }
 
     let addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|e| AuthError::DidResolutionFailed(format!("DNS resolution failed: {e}")))?;
 
-    let mut saw_any = false;
+    let mut resolved = Vec::new();
     for addr in addrs {
-        saw_any = true;
         if ip_is_disallowed(&addr.ip()) {
             return Err(AuthError::DidResolutionFailed(format!(
                 "host resolved to blocked IP: {}",
                 addr.ip()
             )));
         }
+        resolved.push(addr);
     }
 
-    if !saw_any {
+    if resolved.is_empty() {
         return Err(AuthError::DidResolutionFailed(
             "host resolved to zero addresses".to_string(),
         ));
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// Enforce optional lxm and jti-claim presence.
@@ -1441,7 +1527,7 @@ impl AuthEnforcementPolicy {
             jti_ttl_seconds: std::env::var("JTI_TTL_SECONDS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(120),
+                .unwrap_or(DEFAULT_JTI_TTL_SECS),
         }
     }
 
@@ -1450,7 +1536,7 @@ impl AuthEnforcementPolicy {
         Self {
             enforce_lxm: true,
             enforce_jti: true,
-            jti_ttl_seconds: 120,
+            jti_ttl_seconds: DEFAULT_JTI_TTL_SECS,
         }
     }
 }
@@ -2465,7 +2551,7 @@ mod tests {
         AtProtoClaims {
             iss: iss.to_string(),
             aud: "did:web:mls.example.com".to_string(),
-            exp: i64::MAX,
+            exp: Utc::now().timestamp() + 60,
             iat: None,
             sub: sub.map(str::to_string),
             lxm: Some("blue.catbird.chat.getConversations".to_string()),
@@ -3308,6 +3394,8 @@ mod tests {
 
     #[test]
     fn standard_service_claim_profile_is_exact() {
+        let _guard = super::federation_fixture_tests::TEST_ENV_LOCK.blocking_lock();
+        std::env::remove_var("SERVICE_DID");
         let now = 2_000_000_000;
         let endpoint = "blue.catbird.chat.getOwnDevices";
         let valid = standard_claims(now);
@@ -3383,11 +3471,22 @@ mod federation_fixture_tests {
     use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
     use tokio::sync::Mutex;
 
-    static TEST_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    pub(super) static TEST_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    struct EnvVarCleanup(&'static [&'static str]);
+
+    impl Drop for EnvVarCleanup {
+        fn drop(&mut self) {
+            for key in self.0 {
+                std::env::remove_var(key);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_offline_did_fixtures_loaded_and_verified() {
         let _guard = TEST_ENV_LOCK.lock().await;
+        let _cleanup = EnvVarCleanup(&["APP_ENV", "TEST_DID_DOCUMENT_PATHS"]);
 
         let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -3472,17 +3571,25 @@ mod federation_fixture_tests {
     #[should_panic(expected = "Offline DID fixtures are forbidden outside test mode")]
     async fn test_offline_did_fixtures_aborts_outside_test_mode() {
         let _guard = TEST_ENV_LOCK.lock().await;
+        let _cleanup = EnvVarCleanup(&["APP_ENV", "TEST_DID_DOCUMENT_PATHS"]);
         std::env::set_var("APP_ENV", "production");
         std::env::set_var("TEST_DID_DOCUMENT_PATHS", "/nonexistent/path.json");
 
         let res = load_test_did_fixtures_from_env().await;
-        std::env::remove_var("TEST_DID_DOCUMENT_PATHS");
         let _ = res;
     }
 
     #[tokio::test]
     async fn test_federation_config_loads_key_from_file_and_health_check_payload() {
         let _guard = TEST_ENV_LOCK.lock().await;
+        let _cleanup = EnvVarCleanup(&[
+            "APP_ENV",
+            "SERVICE_DID",
+            "FEDERATION_ENABLED",
+            "FEDERATION_MODE",
+            "SIGNING_KEY_FILE",
+            "FEDERATION_CAPABILITIES",
+        ]);
 
         let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -3528,11 +3635,193 @@ mod federation_fixture_tests {
     #[should_panic(expected = "could not be read")]
     async fn test_unreadable_signing_key_file_panics_in_every_environment() {
         let _guard = TEST_ENV_LOCK.lock().await;
+        let _cleanup = EnvVarCleanup(&["SERVICE_DID", "SIGNING_KEY_FILE"]);
         std::env::set_var("SERVICE_DID", "did:web:ds1.catbird.blue");
         std::env::set_var("SIGNING_KEY_FILE", "/nonexistent/path/to/signing_key.pem");
         let res = crate::federation::FederationConfig::from_env();
-        std::env::remove_var("SIGNING_KEY_FILE");
         let _ = res;
+    }
+
+    #[test]
+    fn mf02_ip_is_disallowed_blocks_ipv4_mapped_ipv6_cgnat_benchmark_and_broadcast() {
+        for blocked in [
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "::ffff:10.0.0.1",
+            "::ffff:100.64.0.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "198.18.0.1",
+            "198.19.255.254",
+            "255.255.255.255",
+        ] {
+            let ip: std::net::IpAddr = blocked.parse().unwrap();
+            assert!(
+                ip_is_disallowed(&ip),
+                "expected {blocked} to be disallowed for outbound DID SSRF guard"
+            );
+        }
+
+        for allowed in [
+            "::ffff:8.8.8.8",
+            "8.8.8.8",
+            "100.63.255.255",
+            "100.128.0.1",
+            "198.17.255.255",
+            "198.20.0.1",
+        ] {
+            let ip: std::net::IpAddr = allowed.parse().unwrap();
+            assert!(
+                !ip_is_disallowed(&ip),
+                "expected public IP {allowed} to remain allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mf02_did_plc_and_did_web_reject_malformed_identifiers_before_network() {
+        let middleware = AuthMiddleware::with_config(300, 100, 60);
+        for bad_plc in [
+            "did:plc:../admin",
+            "did:plc:short",
+            "did:plc:UPPERCASE234567890123456",
+            "did:plc:0189invalidbase32chars00",
+            "did:plc:abcdefghijklmnopqrstuvwx/extra",
+        ] {
+            let err = middleware
+                .resolve_plc_did(bad_plc)
+                .await
+                .expect_err("malformed did:plc must fail closed before network");
+            assert!(
+                matches!(err, AuthError::InvalidDid(_)),
+                "expected InvalidDid for {bad_plc}, got {err:?}"
+            );
+        }
+
+        for bad_web in [
+            "did:web:user%40evil.com",
+            "did:web:evil.com%2F..%2Fadmin",
+            "did:web:evil.com:..:secret",
+            "did:web:evil.com%3Fquery",
+        ] {
+            let err = middleware
+                .resolve_web_did(bad_web)
+                .await
+                .expect_err("malformed did:web must fail closed before network");
+            assert!(
+                matches!(err, AuthError::InvalidDid(_)),
+                "expected InvalidDid for {bad_web}, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mf03_jwt_enforces_max_lifetime_iat_bounds_and_360s_jti_ttl() {
+        use k256::ecdsa::{signature::Signer, Signature};
+
+        assert_eq!(
+            AuthEnforcementPolicy::strict_for_test().jti_ttl_seconds,
+            360
+        );
+
+        let issuer = "did:plc:es256k-mf03-fixture";
+        let mut scalar = [0_u8; 32];
+        scalar[31] = 7;
+        let signing_key = k256::ecdsa::SigningKey::from_slice(&scalar).unwrap();
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let doc = DidDocument {
+            id: issuer.into(),
+            verification_method: vec![VerificationMethod {
+                id: "#atproto".into(),
+                key_type: "EcdsaSecp256k1VerificationKey2019".into(),
+                controller: issuer.into(),
+                public_key_multibase: Some(multibase::encode(
+                    multibase::Base::Base58Btc,
+                    point.as_bytes(),
+                )),
+                public_key_jwk: None,
+            }],
+            service: None,
+        };
+
+        let middleware = AuthMiddleware::with_config(300, 100, 60)
+            .with_test_service_did("did:web:mls.example.com");
+        middleware
+            .did_cache
+            .insert(
+                issuer.to_string(),
+                CachedDidDoc {
+                    doc,
+                    cached_at: Utc::now(),
+                },
+            )
+            .await;
+
+        let sign_claims = |claims_val: serde_json::Value| -> String {
+            let header = URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&json!({"alg": "ES256K", "typ": "JWT", "kid": "#atproto"}))
+                    .unwrap(),
+            );
+            let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims_val).unwrap());
+            let signing_input = format!("{header}.{payload}");
+            let sig: Signature = signing_key.sign(signing_input.as_bytes());
+            format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+        };
+
+        let now = Utc::now().timestamp();
+
+        // 1. Excessive lifetime (exp - now > 300s) rejected.
+        let long_lived = sign_claims(json!({
+            "iss": issuer,
+            "aud": "did:web:mls.example.com",
+            "iat": now,
+            "exp": now + 301,
+            "jti": "jti-long"
+        }));
+        assert!(matches!(
+            middleware.verify_jwt(&long_lived).await,
+            Err(AuthError::InvalidToken(_))
+        ));
+
+        // 2. Future iat (> now + 60s) rejected.
+        let future_iat = sign_claims(json!({
+            "iss": issuer,
+            "aud": "did:web:mls.example.com",
+            "iat": now + 61,
+            "exp": now + 120,
+            "jti": "jti-future-iat"
+        }));
+        assert!(matches!(
+            middleware.verify_jwt(&future_iat).await,
+            Err(AuthError::InvalidToken(_))
+        ));
+
+        // 3. exp < iat rejected.
+        let inverted_bounds = sign_claims(json!({
+            "iss": issuer,
+            "aud": "did:web:mls.example.com",
+            "iat": now + 30,
+            "exp": now + 10,
+            "jti": "jti-inverted"
+        }));
+        assert!(matches!(
+            middleware.verify_jwt(&inverted_bounds).await,
+            Err(AuthError::InvalidToken(_))
+        ));
+
+        // 4. Valid bounded JWT (exp - now <= 300, valid iat) succeeds.
+        let valid_bounded = sign_claims(json!({
+            "iss": issuer,
+            "aud": "did:web:mls.example.com",
+            "iat": now,
+            "exp": now + 300,
+            "jti": "jti-ok"
+        }));
+        let verified = middleware
+            .verify_jwt(&valid_bounded)
+            .await
+            .expect("valid bounded JWT must verify");
+        assert_eq!(verified.iss, issuer);
     }
 }
 

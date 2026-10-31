@@ -233,6 +233,14 @@ async fn bundle_use_is_recorded_only_for_device_signed_reads() {
     )
     .await
     .ok();
+    assert!(last_used().await.is_none(), "getVirtualDevice is read-only");
+    alice
+        .call(
+            "touchVirtualDevice",
+            &json!({ "vdeviceId": b(&[0x51; 16]) }),
+        )
+        .await
+        .ok();
     assert!(last_used().await.is_some());
 }
 
@@ -673,9 +681,14 @@ async fn a_space_hosted_account_deletes_its_data_without_a_bound_device() {
             .await
             .unwrap();
     assert_eq!(states, 0);
-    // The account can start a new chain.
+    // Epoch 0 cannot be reused after purge; restarting at floor + 1 succeeds.
     alice
         .call("publishEpochHead", &publish(&genesis))
+        .await
+        .fails(400, "InvalidEpochChain");
+    let (restarted, _) = chain::epoch_public(&alice, 1, [9; 32], None, None);
+    alice
+        .call("publishEpochHead", &publish(&restarted))
         .await
         .ok();
 }
@@ -782,4 +795,70 @@ async fn member_devices_serve_join_and_removal_seqs_to_participants_only() {
         )
         .await
         .fails(404, "ConversationNotFound");
+}
+
+#[tokio::test]
+async fn lf01_purge_preserves_epoch_head_high_water_floor() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    let (e0, link0) = chain::epoch_public(&alice, 0, [0x11; 32], None, None);
+    let (e1, _) = chain::epoch_public(&alice, 1, [0x22; 32], Some(link0), None);
+    alice.call("publishEpochHead", &publish(&e0)).await.ok();
+    alice.call("publishEpochHead", &publish(&e1)).await.ok();
+
+    alice.call("purgeMailbox", &json!({})).await.ok();
+    alice
+        .query("getEpochHead", &[("did", alice.did.clone())])
+        .await
+        .fails(404, "EpochNotFound");
+
+    // Re-anchoring at or below prior_max (1), or skipping past prior_max + 1, must fail.
+    let (re0, _) = chain::epoch_public(&alice, 0, [0x33; 32], None, None);
+    alice
+        .call("publishEpochHead", &publish(&re0))
+        .await
+        .fails(400, "InvalidEpochChain");
+    let (re1, _) = chain::epoch_public(&alice, 1, [0x44; 32], None, None);
+    alice
+        .call("publishEpochHead", &publish(&re1))
+        .await
+        .fails(400, "InvalidEpochChain");
+    let (skip3, _) = chain::epoch_public(&alice, 3, [0x55; 32], None, None);
+    alice
+        .call("publishEpochHead", &publish(&skip3))
+        .await
+        .fails(400, "InvalidEpochChain");
+
+    // Post-purge restart at prior_max + 1 (2) succeeds and extends normally to 3.
+    let (re2, link2) = chain::epoch_public(&alice, 2, [0x66; 32], None, None);
+    alice.call("publishEpochHead", &publish(&re2)).await.ok();
+    let (e3, _) = chain::epoch_public(&alice, 3, [0x77; 32], Some(link2), None);
+    alice.call("publishEpochHead", &publish(&e3)).await.ok();
+}
+
+#[tokio::test]
+async fn lf10_member_devices_cursor_near_i64_max_does_not_overflow() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    let conversation = seed_conversation(
+        &env,
+        &[Leaf {
+            device: &alice,
+            joined_seq: 1,
+            removed_seq: None,
+        }],
+        2,
+    )
+    .await;
+    let reply = alice
+        .query(
+            "getMemberDevices",
+            &[
+                ("threadId", conversation.to_string()),
+                ("did", alice.did.clone()),
+                ("cursor", i64::MAX.to_string()),
+            ],
+        )
+        .await;
+    assert_eq!(reply.ok()["items"], json!([]));
 }

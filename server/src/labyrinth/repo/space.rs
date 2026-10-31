@@ -145,6 +145,18 @@ async fn require_supported(conn: &mut PgConnection, conversation: Uuid) -> Labyr
     Ok(())
 }
 
+async fn require_supported_read(
+    conn: &mut PgConnection,
+    conversation: Uuid,
+) -> LabyrinthResult<()> {
+    let unsupported: bool = sqlx::query_scalar("SELECT c.is_remote OR EXISTS (SELECT 1 FROM chat.participants p WHERE p.conversation_id=c.conversation_id AND p.current_membership AND (p.status <> 'active' OR p.ds_did IS NOT NULL)) FROM chat.conversations c WHERE c.conversation_id=$1")
+        .bind(conversation).fetch_one(conn).await?;
+    if unsupported {
+        return Err(unconfigured("Space history requires a local conversation with accepted local participants; federation and pending-request Space authorization are unavailable"));
+    }
+    Ok(())
+}
+
 pub async fn get_storage(
     conn: &mut PgConnection,
     reader: &str,
@@ -161,7 +173,7 @@ pub async fn get_storage(
     }
     let p = placement(conn, conversation).await?;
     if p.placement == "space" {
-        require_supported(conn, conversation).await?;
+        require_supported_read(conn, conversation).await?;
     }
     Ok(p)
 }
@@ -190,14 +202,14 @@ pub(crate) async fn validate_mek_writer(
     Ok(())
 }
 
-async fn exact_leaf(
+pub(crate) async fn exact_leaf(
     conn: &mut PgConnection,
     caller: &Caller,
     conversation: Uuid,
     chat_seq: i64,
 ) -> LabyrinthResult<(i64, i64)> {
     // The conversation row lock linearizes against MLS removal and reset.
-    let leaf: Option<(i64, i64)> = sqlx::query_as("SELECT d.joined_seq, d.generation FROM chat.member_devices d JOIN chat.conversations c USING(conversation_id) JOIN chat.participants p USING(participant_period_id) WHERE d.conversation_id=$1 AND d.user_did=$2 AND d.device_id=$3 AND d.leaf_key_id=$4 AND d.leaf_signature_key=$5 AND d.active AND d.removed_seq IS NULL AND d.generation=c.current_generation AND d.joined_seq <= $6 AND p.current_membership AND p.status='active'")
+    let leaf: Option<(i64, i64)> = sqlx::query_as("SELECT d.joined_seq, d.generation FROM chat.member_devices d JOIN chat.conversations c USING(conversation_id) JOIN chat.participants p USING(participant_period_id) WHERE d.conversation_id=$1 AND d.user_did=$2 AND d.device_id=$3 AND d.leaf_key_id=$4 AND d.leaf_signature_key=$5 AND d.active AND d.removed_seq IS NULL AND d.generation=c.current_generation AND d.joined_seq <= $6 AND p.current_membership AND p.status='active' AND c.lifecycle='active'")
         .bind(conversation).bind(&caller.did).bind(caller.device_id).bind(&caller.key_id).bind(caller.signing_key.as_slice()).bind(chat_seq).fetch_optional(&mut *conn).await?;
     leaf.ok_or_else(|| {
         LabyrinthError::forbidden(

@@ -537,3 +537,226 @@ async fn thread_records_count_against_the_author_quota() {
         .await
         .fails(400, "QuotaExceeded");
 }
+
+#[tokio::test]
+async fn lf03_legacy_mek_and_batch_enforce_active_lifecycle_accepted_recipients_and_current_gen_bounds(
+) {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    let pending = env.account().await;
+    let thread = seed_conversation(
+        &env,
+        &[
+            Leaf {
+                device: &alice,
+                joined_seq: 5,
+                removed_seq: None,
+            },
+            Leaf {
+                device: &pending,
+                joined_seq: 5,
+                removed_seq: None,
+            },
+        ],
+        10,
+    )
+    .await;
+
+    // Mark `pending` as an unaccepted direct-request participant (`status = 'pending'`).
+    let mut tx = env.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chat.participants \
+            SET status = 'pending', \
+                invitation_transition_id = $3, \
+                invitation_entry_id = $4, \
+                invited_at = now(), \
+                acceptance_transition_id = NULL, \
+                acceptance_entry_id = NULL, \
+                accepted_at = NULL \
+          WHERE conversation_id = $1 AND user_did = $2",
+    )
+    .bind(thread)
+    .bind(&pending.did)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // Pending participant cannot write MEKs or be addressed in MEKs.
+    pending
+        .call(
+            "createMek",
+            &record(transport_mek(
+                thread,
+                MEK1,
+                pending.chat_pub(),
+                &[&alice.did],
+            )),
+        )
+        .await
+        .fails(403, "NotParticipant");
+    alice
+        .call(
+            "createMek",
+            &record(transport_mek(
+                thread,
+                MEK1,
+                alice.chat_pub(),
+                &[&alice.did, &pending.did],
+            )),
+        )
+        .await
+        .fails(400, "RecipientNotParticipant");
+
+    // Valid MEK for alice alone succeeds while active.
+    alice
+        .call(
+            "createMek",
+            &record(transport_mek(thread, MEK1, alice.chat_pub(), &[&alice.did])),
+        )
+        .await
+        .ok();
+
+    // Pre-join MEK (`chat_seq = 2 < alice.joined_seq = 5`) must be rejected by appendBatch.
+    let mut tx = env.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE labyrinth.meks SET chat_seq = 2 WHERE conversation_id = $1 AND mek_id = $2",
+    )
+    .bind(thread)
+    .bind(MEK1.as_slice())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    alice
+        .call(
+            "appendBatch",
+            &record(batch_record(thread, alice.chat_pub(), &[(MEK1, 100)])),
+        )
+        .await
+        .fails(400, "UnknownMek");
+
+    // Restore chat_seq = 6, then mark MEK as stale generation 0 (`current_generation = 1`).
+    let mut tx = env.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE labyrinth.meks SET chat_seq = 6, chat_generation = 0 WHERE conversation_id = $1 AND mek_id = $2")
+        .bind(thread)
+        .bind(MEK1.as_slice())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    alice
+        .call(
+            "appendBatch",
+            &record(batch_record(thread, alice.chat_pub(), &[(MEK1, 101)])),
+        )
+        .await
+        .fails(400, "UnknownMek");
+
+    // Restore current generation, then close the conversation: both createMek and appendBatch fail.
+    let mut tx = env.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE labyrinth.meks SET chat_generation = 1 WHERE conversation_id = $1 AND mek_id = $2",
+    )
+    .bind(thread)
+    .bind(MEK1.as_slice())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE chat.conversations \
+            SET lifecycle = 'superseded', \
+                close_transition_id = $2, \
+                close_generation = 1, \
+                close_state_version = 1, \
+                close_seq = 9, \
+                closed_at = now() \
+          WHERE conversation_id = $1",
+    )
+    .bind(thread)
+    .bind(Uuid::new_v4())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    alice
+        .call(
+            "createMek",
+            &record(transport_mek(thread, MEK2, alice.chat_pub(), &[&alice.did])),
+        )
+        .await
+        .fails(403, "NotParticipant");
+    alice
+        .call(
+            "appendBatch",
+            &record(batch_record(thread, alice.chat_pub(), &[(MEK1, 102)])),
+        )
+        .await
+        .fails(403, "NotParticipant");
+}
+
+#[tokio::test]
+async fn lf08_mek_validates_transport_sig_unique_recipients_and_roster_hash() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    let bob = env.account().await;
+    let thread = seed_conversation(
+        &env,
+        &[
+            Leaf {
+                device: &alice,
+                joined_seq: 1,
+                removed_seq: None,
+            },
+            Leaf {
+                device: &bob,
+                joined_seq: 1,
+                removed_seq: None,
+            },
+        ],
+        5,
+    )
+    .await;
+
+    // 1. Forged transportSender.sig is rejected.
+    let mut bad_sig = transport_mek(thread, MEK1, alice.chat_pub(), &[&alice.did, &bob.did]);
+    bad_sig["sender"]["sig"] = b(&[0x99; 64]);
+    alice
+        .call("createMek", &record(bad_sig))
+        .await
+        .fails(400, "InvalidRequest");
+
+    // 2. Duplicate recipient DID is rejected.
+    let dup = transport_mek(thread, MEK1, alice.chat_pub(), &[&alice.did, &alice.did]);
+    alice
+        .call("createMek", &record(dup))
+        .await
+        .fails(400, "InvalidRequest");
+
+    // 3. Tampered rosterHash is rejected.
+    let mut bad_roster = transport_mek(thread, MEK1, alice.chat_pub(), &[&alice.did, &bob.did]);
+    bad_roster["rosterHash"] = b(&[0xAA; 32]);
+    alice
+        .call("createMek", &record(bad_roster))
+        .await
+        .fails(400, "InvalidRequest");
+}

@@ -1,5 +1,5 @@
-use super::state_machine::*;
 use super::state_machine::hydrate_conversation_state as hydrate_graph;
+use super::state_machine::*;
 use crate::chat_protocol;
 use crate::chat_protocol::{
     public_state::{
@@ -3170,4 +3170,180 @@ fn acceptance_replay_binds_recovery_to_transition_successor_coordinate() {
         3,
         9
     ));
+}
+
+#[test]
+fn mf01_group_commit_removing_other_principal_requires_admin() {
+    use chat_protocol::snapshot::{PublicGroupSnapshotBinding, PublicGroupSnapshotLeaf};
+
+    let manifest = corpus_manifest();
+    let group = added_group();
+    let alice_leaf = group.leaf(&alice(&manifest)).expect("Alice leaf");
+    let bob_leaf = group.leaf(&bob(&manifest)).expect("Bob leaf");
+    let current = group.coordinate();
+    let next_coord = PublicGroupSnapshotCoordinate::new(
+        *current.conversation_id(),
+        current.generation(),
+        current.state_version() + 1,
+        *current.group_id(),
+        current.epoch() + 1,
+        [0xe1; 32],
+        [0xe2; 32],
+        PublicGroupSnapshotLifecycle::Active,
+    );
+
+    // 1. Non-admin Member (Bob) attempting to evict another participant's (Alice's) leaf in a Group must fail with AdminRequired.
+    let bob_removes_alice =
+        chat_protocol::public_state::VerifiedCommitPublicState::for_test_remove(
+            group.public_state(),
+            next_coord,
+            bob_leaf.leaf_index(),
+            &[alice_leaf.leaf_index()],
+        )
+        .expect("valid MLS remove shape");
+    assert_eq!(
+        plan_commit(
+            &group,
+            CommitCommand {
+                actor: bob(&manifest),
+                transition: evidence(4, 0x91),
+                commit: bob_removes_alice,
+            },
+        ),
+        Err(StateMachineError::AdminRequired)
+    );
+
+    // 2. Non-admin Member (Bob) removing their OWN sibling device leaf in a Group remains allowed.
+    let bob_sibling =
+        DeviceIdentity::new(bob(&manifest).principal().clone(), uuid_v4_bytes(0x92)).unwrap();
+    let bob_sibling_cred = format!(
+        "{}#{}",
+        manifest.identity.bob.actor_did,
+        Uuid::from_bytes(*bob_sibling.device_id()).hyphenated()
+    )
+    .into_bytes();
+    let mut rows = ConversationStateHydration::for_test_from_state(group.clone());
+    let sample_encryption_key = rows.leaves[0].encryption_key.clone();
+    rows.leaves.push(LeafHydrationRow {
+        device: bob_sibling.clone(),
+        leaf_index: 2,
+        basic_credential: bob_sibling_cred,
+        signature_key: vec![0x55; 32],
+        encryption_key: sample_encryption_key,
+        key_package_ref: Some([0x93; 32]),
+    });
+    rows.intervals.push(IntervalHydrationRow {
+        recipient: bob_sibling.clone(),
+        generation: current.generation(),
+        opening: evidence(ADD_SEQ, 0x33),
+        opening_kind: OpeningKind::Add,
+        opening_context: *current,
+        end: None,
+    });
+    rows.intervals.sort_by(|a, b| {
+        a.recipient
+            .cmp(&b.recipient)
+            .then_with(|| a.opening.seq().cmp(&b.opening.seq()))
+    });
+    let snapshot_bytes = vec![0xca, 0xfe, 0xba, 0xbe];
+    let tree = PublicGroupSnapshotTreeSummary::new(
+        [0x77; 32],
+        rows.leaves
+            .iter()
+            .map(|l| {
+                PublicGroupSnapshotLeaf::new(
+                    l.leaf_index,
+                    l.basic_credential.clone(),
+                    l.signature_key.clone(),
+                    l.encryption_key.clone(),
+                )
+            })
+            .collect(),
+    );
+    let binding = PublicGroupSnapshotBinding::new(
+        *current.conversation_id(),
+        current.generation(),
+        current.state_version(),
+        *current.group_id(),
+        current.epoch(),
+        *current.group_context_hash(),
+        *current.confirmation_tag(),
+        current.lifecycle(),
+        Sha256::digest(&snapshot_bytes).into(),
+        tree,
+    );
+    rows.public_state = Some(
+        chat_protocol::public_state::ActivePublicState::for_test_from_persisted_binding(
+            snapshot_bytes,
+            binding,
+        )
+        .unwrap(),
+    );
+    let group_with_bob_sibling =
+        hydrate_rows(*current.conversation_id(), rows).expect("hydrate 3-leaf group");
+    let self_cleanup_commit =
+        chat_protocol::public_state::VerifiedCommitPublicState::for_test_remove(
+            group_with_bob_sibling.public_state(),
+            next_coord,
+            bob_leaf.leaf_index(),
+            &[2],
+        )
+        .expect("valid own-sibling remove shape");
+    let after_self_cleanup = plan_commit(
+        &group_with_bob_sibling,
+        CommitCommand {
+            actor: bob(&manifest),
+            transition: evidence(4, 0x94),
+            commit: self_cleanup_commit,
+        },
+    )
+    .expect("non-admin member may remove own sibling device leaf")
+    .into_state();
+    assert!(after_self_cleanup.leaf(&bob_sibling).is_none());
+    assert!(after_self_cleanup.leaf(&bob(&manifest)).is_some());
+
+    // 3. Admin (Alice) removing Bob's leaf in a Group succeeds, and Direct conversation peer leaf removal remains allowed.
+    let admin_removed = plan_commit(
+        &group,
+        CommitCommand {
+            actor: alice(&manifest),
+            transition: evidence(4, 0x95),
+            commit: verified_remove_bob_commit(&group),
+        },
+    )
+    .expect("group admin may remove another participant's leaf")
+    .into_state();
+    assert!(admin_removed.leaf(&bob(&manifest)).is_none());
+
+    let direct = added_direct();
+    let direct_current = direct.coordinate();
+    let direct_next = PublicGroupSnapshotCoordinate::new(
+        *direct_current.conversation_id(),
+        direct_current.generation(),
+        direct_current.state_version() + 1,
+        *direct_current.group_id(),
+        direct_current.epoch() + 1,
+        [0xe3; 32],
+        [0xe4; 32],
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    let direct_alice_leaf = direct.leaf(&alice(&manifest)).unwrap();
+    let direct_bob_leaf = direct.leaf(&bob(&manifest)).unwrap();
+    let direct_bob_removes_alice =
+        chat_protocol::public_state::VerifiedCommitPublicState::for_test_remove(
+            direct.public_state(),
+            direct_next,
+            direct_bob_leaf.leaf_index(),
+            &[direct_alice_leaf.leaf_index()],
+        )
+        .unwrap();
+    plan_commit(
+        &direct,
+        CommitCommand {
+            actor: bob(&manifest),
+            transition: evidence(4, 0x96),
+            commit: direct_bob_removes_alice,
+        },
+    )
+    .expect("direct peer retains mutual admin authority");
 }

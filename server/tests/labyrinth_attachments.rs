@@ -542,3 +542,192 @@ async fn another_authors_message_lives_only_through_its_sender_copy() {
         .await
         .fails(410, "MessageRedacted");
 }
+
+/// L-F07: `labyrinth.sender_message_state` must require `ever_participant` and
+/// leaf-interval coverage (`d.joined_seq <= b.chat_seq < d.removed_seq`), so an
+/// outsider addressed in `mek_recipients` or a removed member for a post-removal
+/// batch never sees `live = true`.
+#[tokio::test]
+async fn lf07_sender_message_state_requires_participant_and_leaf_coverage() {
+    let env = Env::new().await;
+    let alice = env.account().await;
+    let bob = env.account().await;
+    let outsider = env.account().await;
+
+    let thread = seed_conversation(&env, &leaves(&[&alice, &bob]), 3).await;
+    // Alice removes Bob at MLS transition seq = 3 (`removed_seq = 3`, `next_entry_seq = 4`),
+    // then appends a batch (which receives `chat_seq = 3`, i.e., post-removal).
+    remove_member(&env, thread, &bob, 3).await;
+    set_next_entry_seq(&env, thread, 4).await;
+
+    // Seed a MEK row + post-removal batch directly via SQL only if handler blocks
+    // non-participants, or check what happens when Alice addresses herself, then inspect
+    // `sender_message_state` when `mek_recipients` contains `bob` and `outsider` (simulating
+    // a pre-hardening MEK or pre-removal MEK reused after Bob's removal!).
+    // Specifically: Bob WAS an accepted participant before seq 3, so Alice could address
+    // MEK to `[alice, bob]` BEFORE removing Bob! Let's test that exact real attack!
+    let thread2 = seed_conversation(&env, &leaves(&[&alice, &bob]), 3).await;
+    alice
+        .call(
+            "createMek",
+            &json!({ "record": transport_mek(thread2, MEK, alice.chat_pub(), &[&alice.did, &bob.did]) }),
+        )
+        .await
+        .ok();
+    // Now Bob is removed at seq = 3 (`removed_seq = 3`, `next_entry_seq = 4`), and Alice sends
+    // a post-removal message (`chat_seq = 3`) reusing that pre-removal MEK!
+    remove_member(&env, thread2, &bob, 3).await;
+    set_next_entry_seq(&env, thread2, 4).await;
+    let post_removal_msg = "msg-post-removal";
+    let batch = json!({
+        "$type": "blue.catbird.labyrinth.batch",
+        "threadId": thread2.to_string(),
+        "items": [{
+            "messageId": post_removal_msg,
+            "timestamp": 2000,
+            "mekId": b(&MEK),
+            "senderTransportPubkey": b(&alice.chat_pub()),
+            "signedEncMessage": b(&[0x61; 96]),
+        }],
+        "createdAt": "2026-10-04T12:00:00.000Z",
+    });
+    alice
+        .call("appendBatch", &json!({ "record": batch }))
+        .await
+        .ok();
+
+    let mut conn = env.pool.acquire().await.unwrap();
+    let (bob_live, _) = catbird_server::labyrinth::repo::liveness::sender_state(
+        &mut conn,
+        &bob.did,
+        thread2,
+        post_removal_msg,
+        &alice.did,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !bob_live,
+        "removed member must not see post-removal batch (chat_seq == removed_seq) as live"
+    );
+
+    // Also insert a synthetic `mek_recipients` row for `outsider` (as from a pre-L-F03 row)
+    // and verify SQL `sender_message_state` itself enforces `ever_participant` + `leaf_covered`.
+    sqlx::query(
+        "INSERT INTO labyrinth.mek_recipients (conversation_id, mek_id, author_did, recipient_did) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(thread2)
+    .bind(MEK.as_slice())
+    .bind(&alice.did)
+    .bind(&outsider.did)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    let (outsider_live, _) = catbird_server::labyrinth::repo::liveness::sender_state(
+        &mut conn,
+        &outsider.did,
+        thread2,
+        post_removal_msg,
+        &alice.did,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !outsider_live,
+        "non-participant in mek_recipients must not see message as live"
+    );
+}
+
+/// L-F09: hosted accounts enforce `require_bound_if_hosted` on `putAttachmentRef`,
+/// `deleteAttachmentRef`, `getAttachmentRef`, and `getAttachmentBlob`, and an active
+/// physical device cannot overwrite or delete another active physical sibling's ORF state.
+#[tokio::test]
+async fn lf09_hosted_attachment_and_orf_endpoints_enforce_device_and_sibling_binding() {
+    let object = object();
+    let env = Env::with(true, Some(&object)).await;
+    let alice_d1 = env.account().await;
+    let alice_d2 = env.device_for(&alice_d1.did, [0xD2; 32]).await;
+    let alice_unbound = env.device_for(&alice_d1.did, [0xD3; 32]).await;
+    let bob = env.account().await;
+
+    let d1_key = [0xA1; 32];
+    let d2_key = [0xA2; 32];
+    alice_d1.enroll(d1_key).await;
+    alice_d2.enroll(d2_key).await;
+
+    // Physical device d1 registers its own ORF state; active sibling d2 cannot
+    // overwrite/evolve or delete d1's active physical ORF state!
+    register(&alice_d1, d1_key).await;
+    alice_d2
+        .call(
+            "registerOrfState",
+            &json!({
+                "deviceKeyPubkey": b(&[0xA9; 32]),
+                "parent": {
+                    "deviceKeyPubkey": b(&d1_key),
+                    "evolveToken": b(&Scalar::from(5u64).to_bytes()),
+                }
+            }),
+        )
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+    alice_d2
+        .call("deleteOrfState", &json!({ "deviceKeyPubkey": b(&d1_key) }))
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+    // Nor can d2 register an ORF state AT d2_key? Wait: d2 CAN register d2_key,
+    // whereas d1 CANNOT register d2_key before d2 does!
+    alice_d1
+        .call(
+            "registerOrfState",
+            &json!({ "deviceKeyPubkey": b(&d2_key) }),
+        )
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+
+    // Seed an attachment on a conversation containing alice_d1, alice_unbound, and bob.
+    let thread = seed_conversation(&env, &leaves(&[&alice_d1, &alice_unbound, &bob]), 10).await;
+    grant_interval(&env, thread, &alice_d1, 1, None).await;
+    grant_interval(&env, thread, &alice_unbound, 1, None).await;
+    let (blob, message) = seed_bound_attachment(&env, &bob, thread, &object, 5).await;
+    let message = message.to_string();
+    send_message(&bob, thread, &message, &[&alice_d1.did, &bob.did]).await;
+
+    let client = Client {
+        device_key: d1_key,
+        c: Scalar::from(19u64),
+    };
+
+    // Unbound chat device on a hosted account is rejected on all 4 attachment endpoints.
+    alice_unbound
+        .call("putAttachmentRef", &client.put("1", blob, thread, &message))
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+
+    // Bound device d1 stores the ref cleanly.
+    alice_d1
+        .call("putAttachmentRef", &client.put("1", blob, thread, &message))
+        .await
+        .ok();
+
+    alice_unbound
+        .query("getAttachmentRef", &client.get("1", thread, &message)[..2])
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+    alice_unbound
+        .query("getAttachmentBlob", &client.get("1", thread, &message))
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+    alice_unbound
+        .call(
+            "deleteAttachmentRef",
+            &json!({
+                "deviceKeyPubkey": b(&client.device_key),
+                "blindedIndex": b(&blind(client.c, b"idx-1")),
+            }),
+        )
+        .await
+        .fails(403, "LabyrinthDeviceNotBound");
+}

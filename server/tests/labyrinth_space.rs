@@ -838,3 +838,125 @@ fn batch_cid_matches_independent_cbor_vector() {
         batch
     );
 }
+
+/// L-F09: closed/superseded local Space conversations still permit historical
+/// `getThreadStorage` and `listSpaceBatches` reads (while still blocking writes),
+/// and deleting a Space generation does not break `getAttachmentBlob` for the
+/// author's own unredacted owner-archive copy.
+#[tokio::test]
+async fn lf09_closed_conversation_allows_space_reads_and_deleted_space_preserves_own_archive_blob()
+{
+    use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
+    use sha2::{Digest, Sha512};
+
+    let object = TestObject {
+        key: "bafy-lf09-space-own-archive".to_owned(),
+        data: vec![0x7C; 48],
+    };
+    let env = Env::with(true, Some(&object)).await;
+    let authority = env.account().await;
+    let alice = env.account().await;
+    let d_key = [0xE0; 32];
+    alice.enroll(d_key).await;
+
+    let thread = space_thread(&env, &authority, &[&alice]).await;
+    let p = placement(&alice, thread).await;
+    create_mek(&alice, thread, &[&alice]).await;
+    let batch = input(thread, &alice, &p, 42);
+    alice.call("appendSpaceBatch", &batch).await.ok();
+
+    // Seed an attachment authored by Alice, register ORF + attachment ref, and archive
+    // the message in Alice's own owner archive BEFORE Space deletion.
+    grant_interval(&env, thread, &alice, 1, None).await;
+    let (blob, msg_uuid) = seed_bound_attachment(&env, &alice, thread, &object, 2).await;
+    let msg_id = msg_uuid.to_string();
+    alice
+        .call("registerOrfState", &json!({ "deviceKeyPubkey": b(&d_key) }))
+        .await
+        .ok();
+    let c = Scalar::from(13u64);
+    let blind = |x: &[u8]| -> [u8; 32] {
+        let h: [u8; 64] = Sha512::digest(x).into();
+        (RistrettoPoint::from_uniform_bytes(&h) * c)
+            .compress()
+            .to_bytes()
+    };
+    alice
+        .call(
+            "putAttachmentRef",
+            &json!({
+                "deviceKeyPubkey": b(&d_key),
+                "blindedIndex": b(&blind(b"idx-own")),
+                "blindedTokenSalt": b(&blind(b"tok-own")),
+                "blobId": blob.to_string(),
+                "threadId": thread.to_string(),
+                "messageId": msg_id,
+            }),
+        )
+        .await
+        .ok();
+    let mut archive = owner_batch_record(&thread.to_string(), &[1000]);
+    archive["items"][0]["messageId"] = json!(msg_id);
+    alice
+        .call("appendOwnerBatch", &json!({ "record": archive }))
+        .await
+        .ok();
+
+    // Supersede/close the local conversation: historical Space reads succeed, writes still fail.
+    let mut tx = env.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chat.conversations \
+            SET lifecycle = 'superseded', \
+                close_transition_id = $2, \
+                close_generation = 1, \
+                close_state_version = 1, \
+                close_seq = 2, \
+                closed_at = now() \
+          WHERE conversation_id = $1",
+    )
+    .bind(thread)
+    .bind(Uuid::new_v4())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let closed_p = alice
+        .query("getThreadStorage", &[("threadId", thread.to_string())])
+        .await;
+    assert_eq!(closed_p.ok()["placement"], "space");
+    let closed_list = list(&alice, thread, &p).await;
+    assert_eq!(closed_list.ok()["items"].as_array().unwrap().len(), 1);
+    alice
+        .call("appendSpaceBatch", &input(thread, &alice, &p, 43))
+        .await
+        .fails(503, "StorageNotConfigured");
+
+    // Delete the Space generation: Space reads now return 410 SpaceDeleted,
+    // while Alice's own unredacted owner-archive attachment blob remains readable!
+    let generation = p["generation"].as_str().unwrap();
+    delete_space(&env, &authority, &p, generation).await.ok();
+    alice
+        .query("getThreadStorage", &[("threadId", thread.to_string())])
+        .await
+        .fails(410, "SpaceDeleted");
+
+    let blob_reply = alice
+        .query(
+            "getAttachmentBlob",
+            &[
+                ("deviceKeyPubkey", hex::encode(d_key)),
+                ("blindedIndex", hex::encode(blind(b"idx-own"))),
+                ("blindedTokenSalt", hex::encode(blind(b"tok-own"))),
+                ("threadId", thread.to_string()),
+                ("messageId", msg_id.clone()),
+            ],
+        )
+        .await;
+    assert_eq!(blob_reply.status.as_u16(), 200, "{}", blob_reply.json);
+    assert_eq!(blob_reply.bytes, object.data);
+}

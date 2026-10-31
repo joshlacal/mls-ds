@@ -106,6 +106,37 @@ fn self_endpoint_from_env_values(
     })
 }
 
+fn valid_did_web_host_port(host_port: &str) -> bool {
+    if host_port.is_empty()
+        || host_port.bytes().any(|b| {
+            b.is_ascii_whitespace()
+                || b.is_ascii_control()
+                || matches!(b, b'@' | b'/' | b'\\' | b'?' | b'#')
+        })
+    {
+        return false;
+    }
+    url::Url::parse(&format!("https://{host_port}"))
+        .ok()
+        .is_some_and(|u| {
+            u.username().is_empty()
+                && u.password().is_none()
+                && u.host_str().is_some()
+                && u.path() == "/"
+                && u.query().is_none()
+                && u.fragment().is_none()
+        })
+}
+
+fn valid_did_web_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment
+            .bytes()
+            .any(|b| b.is_ascii_control() || matches!(b, b'/' | b'\\' | b'?' | b'#' | b'@'))
+}
+
 /// Parse a `did:web` into `(host_port, path_segments)`.
 ///
 /// Handles encoded host ports such as `did:web:example.com%3A8443`.
@@ -113,7 +144,7 @@ pub fn parse_did_web(did: &str) -> Option<(String, Vec<String>)> {
     let method_specific = canonical_did(did).strip_prefix("did:web:")?;
     let mut parts = method_specific.split(':');
     let host_port = urlencoding::decode(parts.next()?.trim()).ok()?.into_owned();
-    if host_port.is_empty() {
+    if !valid_did_web_host_port(&host_port) {
         return None;
     }
     let path = parts
@@ -122,6 +153,7 @@ pub fn parse_did_web(did: &str) -> Option<(String, Vec<String>)> {
             urlencoding::decode(segment.trim())
                 .ok()
                 .map(|s| s.into_owned())
+                .filter(|s| valid_did_web_segment(s))
         })
         .collect::<Option<Vec<String>>>()?;
     Some((host_port, path))
@@ -282,6 +314,35 @@ mod tests {
         assert_eq!(
             did_web_service_endpoint("did:web:example.com%3A8443:mls"),
             Some("https://example.com:8443/mls".to_string())
+        );
+    }
+
+    #[test]
+    fn mf02_parse_did_web_rejects_userinfo_slashes_dot_segments_and_query_or_fragment_injection() {
+        for malicious in [
+            "did:web:user%40evil.com",
+            "did:web:evil.com%2F..%2Fadmin",
+            "did:web:evil.com%5Cadmin",
+            "did:web:evil.com%3Ffoo%3Dbar",
+            "did:web:evil.com%23frag",
+            "did:web:evil.com:..:secret",
+            "did:web:evil.com:.:secret",
+            "did:web:evil.com:foo%2Fbar",
+            "did:web:evil.com:foo%5Cbar",
+            "did:web:evil.com:foo%3Fbar",
+        ] {
+            assert!(
+                parse_did_web(malicious).is_none(),
+                "expected malicious did:web {malicious} to be rejected"
+            );
+            assert!(did_web_document_url(malicious).is_none());
+        }
+        assert_eq!(
+            parse_did_web("did:web:example.com%3A8443:user:alice"),
+            Some((
+                "example.com:8443".to_string(),
+                vec!["user".to_string(), "alice".to_string()],
+            ))
         );
     }
 }

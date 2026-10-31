@@ -22,8 +22,8 @@ use crate::labyrinth::auth::begin_read;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
 use crate::labyrinth::relay::RelayOp;
 use crate::labyrinth::repo::attachments::{self, Blinded, MessageRef};
-use crate::labyrinth::repo::liveness;
 use crate::labyrinth::repo::binding;
+use crate::labyrinth::repo::liveness;
 use crate::labyrinth::repo::orf as repo;
 use crate::labyrinth::wire::bytes::hex_array;
 use crate::labyrinth::wire::io::{
@@ -63,6 +63,10 @@ pub async fn register_orf_state(
             // account has no device rows here and registers unbound, within
             // the per-account cap.
             binding::require_bound_if_hosted(&mut w.tx, &caller).await?;
+            binding::require_physical_target_bound(&mut w.tx, &caller, &key).await?;
+            if let Some((parent_key, _)) = &parent {
+                binding::require_physical_target_bound(&mut w.tx, &caller, parent_key).await?;
+            }
             repo::register(&mut w.tx, &caller.did, &key, parent, w.instant).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
@@ -87,6 +91,7 @@ pub async fn delete_orf_state(
             // device here; registration needs none either, so any current
             // chat device of the DID may drop one of its states (revocation).
             binding::require_bound_if_hosted(&mut w.tx, &caller).await?;
+            binding::require_physical_target_bound(&mut w.tx, &caller, &key).await?;
             repo::delete(&mut w.tx, &caller.did, &key).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
@@ -115,6 +120,7 @@ pub async fn put_attachment_ref(
             };
             let mut w = begin_write!(&pool, adm);
             let caller = w.caller.clone();
+            binding::require_bound_if_hosted(&mut w.tx, &caller).await?;
             attachments::put(
                 &mut w.tx,
                 &caller,
@@ -144,6 +150,7 @@ pub async fn delete_attachment_ref(
             let index = input.blinded_index.array::<32>("blindedIndex")?;
             let mut w = begin_write!(&pool, adm);
             let caller = w.caller.clone();
+            binding::require_bound_if_hosted(&mut w.tx, &caller).await?;
             attachments::delete(&mut w.tx, &caller, &key, index).await?;
             w.finish_write(to_bytes(&json!({}))?).await
         }
@@ -178,6 +185,7 @@ pub async fn get_attachment_ref(
             let (key, index) = key_and_index(&p)?;
             let mut r = begin_read(&pool, adm).await?;
             let caller = r.caller.clone();
+            binding::require_bound_if_hosted(&mut r.tx, &caller).await?;
             let at = attachments::created_at(&mut r.tx, &caller, &key, index).await?;
             r.finish_read().await?;
             to_bytes(&json!({ "createdAt": datetime(at) }))
@@ -225,6 +233,7 @@ pub async fn get_attachment_blob(
         };
         let mut r = begin_read(&pool, adm.clone()).await?;
         let caller = r.caller.clone();
+        binding::require_bound_if_hosted(&mut r.tx, &caller).await?;
         let object = attachments::authorize(&mut r.tx, &caller, &blinded, &msg).await?;
         r.finish_read().await?;
         if let Some(check) = &object.pending_remote {

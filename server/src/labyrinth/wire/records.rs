@@ -5,7 +5,11 @@
 //! lexicon's length and range limits, so whatever the server stores is
 //! something the labyrinth crate's equally strict reader accepts back.
 
+use std::collections::BTreeSet;
+
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::bytes::{check_datetime, check_did, check_epoch_number, check_str, check_type, Bytes};
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
@@ -98,6 +102,13 @@ impl Device {
             .check("epochStorageKeyPubkey", 32, 32)?;
         self.epoch_storage_key_sig
             .check("epochStorageKeySig", 64, 64)?;
+        if self.epoch_storage_auth_key_pubkey.is_some() != !self.r#virtual
+            || self.epoch_storage_auth_key_sig.is_some() != !self.r#virtual
+        {
+            return Err(LabyrinthError::invalid(
+                "physical devices require epochStorageAuthKeyPubkey/Sig and virtual devices forbid them",
+            ));
+        }
         if let Some(b) = &self.epoch_storage_auth_key_pubkey {
             b.check("epochStorageAuthKeyPubkey", 32, 32)?;
         }
@@ -266,8 +277,8 @@ impl OwnerBatch {
             check_str("items.messageId", &item.message_id, 128)?;
             check_timestamp(item.timestamp)?;
             check_epoch_number("items.epochNumber", item.epoch_number)?;
-            if item.version > 4 {
-                return Err(LabyrinthError::invalid("items.version must be 0..=4"));
+            if !matches!(item.version, 0 | 2..=5) {
+                return Err(LabyrinthError::invalid("items.version must be 0 or 2..=5"));
             }
             item.encrypted.check("items.encrypted", 0, 262_144)?;
         }
@@ -350,20 +361,49 @@ impl Mek {
                 }
             }
             MekSender::Transport(s) => {
-                s.transport_pubkey.check("sender.transportPubkey", 32, 32)?;
-                s.ephemeral_auth_pubkey
-                    .check("sender.ephemeralAuthPubkey", 32, 32)?;
-                s.sig.check("sender.sig", 64, 64)?;
+                let pubkey = s.transport_pubkey.array::<32>("sender.transportPubkey")?;
+                let eph = s
+                    .ephemeral_auth_pubkey
+                    .array::<32>("sender.ephemeralAuthPubkey")?;
+                let sig = s.sig.array::<64>("sender.sig")?;
+                let vk = VerifyingKey::from_bytes(&pubkey).map_err(|_| {
+                    LabyrinthError::invalid("sender.transportPubkey is not an Ed25519 point")
+                })?;
+                let signed = format!(
+                    "minos.structured_signature.mek_distribution.ephemeral_auth:k={};mek_id={}",
+                    hex::encode(eph),
+                    hex::encode(&self.mek_id.0),
+                );
+                vk.verify_strict(signed.as_bytes(), &Signature::from_bytes(&sig))
+                    .map_err(|_| LabyrinthError::invalid("sender.sig does not verify"))?;
             }
         }
         if self.recipients.len() > 512 {
             return Err(LabyrinthError::invalid("at most 512 recipients"));
         }
+        let mut seen_dids = BTreeSet::new();
+        let mut heads_hex = Vec::with_capacity(self.recipients.len());
         for r in &self.recipients {
             check_did("recipients.did", &r.did)?;
+            if !seen_dids.insert(r.did.as_str()) {
+                return Err(LabyrinthError::invalid("duplicate recipient DID"));
+            }
             r.recipient_epoch_head
                 .check("recipients.recipientEpochHead", 32, 32)?;
             r.ciphertext.check("recipients.ciphertext", 0, 1200)?;
+            heads_hex.push(hex::encode(&r.recipient_epoch_head.0));
+        }
+        heads_hex.sort();
+        let mut hasher = Sha256::new();
+        hasher.update(b"mek_recipient_list:");
+        for h in &heads_hex {
+            hasher.update(h.as_bytes());
+        }
+        let expected_roster_hash: [u8; 32] = hasher.finalize().into();
+        if self.roster_hash.0.as_slice() != expected_roster_hash.as_slice() {
+            return Err(LabyrinthError::invalid(
+                "rosterHash does not match recipients",
+            ));
         }
         check_datetime("createdAt", &self.created_at)
     }

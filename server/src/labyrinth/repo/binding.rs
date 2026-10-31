@@ -122,6 +122,33 @@ pub async fn require_bound(
     }
 }
 
+/// If `target_key` names an active physical Labyrinth device of `caller.did`
+/// whose bound chat device is still active, require `caller` to be that exact
+/// bound chat device (preventing one active physical sibling from mutating or
+/// deleting another's ORF state).
+pub async fn require_physical_target_bound(
+    conn: &mut PgConnection,
+    caller: &Caller,
+    target_key: &[u8; 32],
+) -> LabyrinthResult<()> {
+    let active_physical: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM labyrinth.devices ld \
+               JOIN chat.devices cd ON cd.user_did = ld.owner_did AND cd.device_id = ld.chat_device_id \
+              WHERE ld.owner_did = $1 AND ld.device_key = $2 \
+                AND ld.revoked_at IS NULL AND NOT ld.is_virtual \
+                AND cd.status = 'active')",
+    )
+    .bind(&caller.did)
+    .bind(target_key.as_slice())
+    .fetch_one(&mut *conn)
+    .await?;
+    if active_physical {
+        require_bound(conn, caller, Some(target_key)).await?;
+    }
+    Ok(())
+}
+
 /// Every key must be a current (non-revoked) Labyrinth device of `owner`.
 pub async fn require_registered(
     conn: &mut PgConnection,

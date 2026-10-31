@@ -85,10 +85,14 @@ pub fn verify_epoch_public(did: &str, epoch: &EpochPublic) -> LabyrinthResult<He
         .as_ref()
         .map(|h| h.array::<32>("previousEpochHead"))
         .transpose()?;
-    let genesis = epoch.epoch_number == 0;
-    if genesis != previous_head.is_none() || genesis != epoch.prev_sig.is_none() {
+    let valid_link_shape = if epoch.epoch_number == 0 {
+        previous_head.is_none() && epoch.prev_sig.is_none()
+    } else {
+        previous_head.is_none() == epoch.prev_sig.is_none()
+    };
+    if !valid_link_shape {
         return Err(LabyrinthError::invalid(
-            "epoch 0 has no previousEpochHead/prevSig and every later epoch has both",
+            "epoch 0 has no previousEpochHead/prevSig and later epochs carry both or neither",
         ));
     }
     let head = epoch.epoch_head.array::<32>("epochHead")?;
@@ -154,13 +158,23 @@ pub fn verify_prev_sig(parts: &HeadParts, previous_signing_key: &[u8; 32]) -> La
     }
 }
 
-/// Check 1 and 2 of design §1a against the stored latest head of the DID:
-/// genesis only on an empty chain, otherwise exactly latest + 1 linking to
-/// the latest head.
-pub fn check_chain_link(parts: &HeadParts, latest: Option<(u64, [u8; 32])>) -> LabyrinthResult<()> {
-    let ok = match latest {
-        None => parts.epoch_number == 0,
-        Some((n, head)) => {
+/// Check 1 and 2 of design §1a against the stored latest head (and any
+/// post-purge high-water floor) of the DID: genesis only on an unanchored
+/// chain, `floor + 1` (with no predecessor) when restarting after a purge,
+/// otherwise `latest + 1` linking to the latest head.
+pub fn check_chain_link(
+    parts: &HeadParts,
+    latest: Option<(u64, [u8; 32])>,
+    floor: Option<u64>,
+) -> LabyrinthResult<()> {
+    let ok = match (latest, floor) {
+        (None, None) => parts.epoch_number == 0 && parts.previous_head.is_none(),
+        (None, Some(prior_max)) => {
+            prior_max.checked_add(1) == Some(parts.epoch_number)
+                && parts.previous_head.is_none()
+                && parts.prev_sig.is_none()
+        }
+        (Some((n, head)), _) => {
             n.checked_add(1) == Some(parts.epoch_number) && parts.previous_head == Some(head)
         }
     };
@@ -170,7 +184,7 @@ pub fn check_chain_link(parts: &HeadParts, latest: Option<(u64, [u8; 32])>) -> L
         Err(LabyrinthError::new(
             axum::http::StatusCode::BAD_REQUEST,
             "InvalidEpochChain",
-            "epoch head must be genesis or extend the latest head by one",
+            "epoch head must be genesis, restart at floor + 1, or extend the latest head by one",
         ))
     }
 }
@@ -187,13 +201,19 @@ mod tests {
             previous_head: prev,
             attestation_key: [0; 32],
             signing_key: [0; 32],
-            prev_sig: None,
+            prev_sig: prev.map(|_| [7; 64]),
         };
-        assert!(check_chain_link(&parts(0, None), None).is_ok());
-        assert!(check_chain_link(&parts(1, Some([1; 32])), None).is_err());
-        assert!(check_chain_link(&parts(1, Some([1; 32])), Some((0, [1; 32]))).is_ok());
-        assert!(check_chain_link(&parts(1, Some([2; 32])), Some((0, [1; 32]))).is_err());
-        assert!(check_chain_link(&parts(2, Some([1; 32])), Some((0, [1; 32]))).is_err());
-        assert!(check_chain_link(&parts(0, None), Some((0, [1; 32]))).is_err());
+        assert!(check_chain_link(&parts(0, None), None, None).is_ok());
+        assert!(check_chain_link(&parts(1, Some([1; 32])), None, None).is_err());
+        assert!(check_chain_link(&parts(1, Some([1; 32])), Some((0, [1; 32])), None).is_ok());
+        assert!(check_chain_link(&parts(1, Some([2; 32])), Some((0, [1; 32])), None).is_err());
+        assert!(check_chain_link(&parts(2, Some([1; 32])), Some((0, [1; 32])), None).is_err());
+        assert!(check_chain_link(&parts(0, None), Some((0, [1; 32])), None).is_err());
+        // Post-purge floor enforcement:
+        assert!(check_chain_link(&parts(0, None), None, Some(1)).is_err());
+        assert!(check_chain_link(&parts(1, None), None, Some(1)).is_err());
+        assert!(check_chain_link(&parts(2, Some([1; 32])), None, Some(1)).is_err());
+        assert!(check_chain_link(&parts(3, None), None, Some(1)).is_err());
+        assert!(check_chain_link(&parts(2, None), None, Some(1)).is_ok());
     }
 }

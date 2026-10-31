@@ -374,13 +374,13 @@ async fn persisted_replay_is_issuer_and_jti_scoped_across_endpoints() {
                 issuer_did: GATEWAY_DID.to_string(),
                 jti: jti.to_string(),
                 endpoint_nsid: ENDPOINT.to_string(),
-                ttl_seconds: 120,
+                ttl_seconds: 360,
             },
             FixtureReplayAttempt {
                 issuer_did: GATEWAY_DID.to_string(),
                 jti: jti.to_string(),
                 endpoint_nsid: OTHER_ENDPOINT.to_string(),
-                ttl_seconds: 120,
+                ttl_seconds: 360,
             },
         ]
     );
