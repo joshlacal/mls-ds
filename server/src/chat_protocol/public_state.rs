@@ -1148,21 +1148,61 @@ pub(crate) fn process_commit(
     now_unix_seconds: u64,
     max_members: usize,
 ) -> Result<VerifiedCommitPublicState, PublicStateError> {
+    process_commit_inner(
+        prior,
+        commit_bytes,
+        expected_aad,
+        expected_next_coordinate,
+        now_unix_seconds,
+        max_members,
+        false,
+    )
+}
+
+pub(crate) fn process_direct_request_commit(
+    prior: &ActivePublicState,
+    commit_bytes: &[u8],
+    expected_aad: &[u8],
+    expected_next_coordinate: PublicGroupSnapshotCoordinate,
+    now_unix_seconds: u64,
+    max_members: usize,
+) -> Result<VerifiedCommitPublicState, PublicStateError> {
+    process_commit_inner(
+        prior,
+        commit_bytes,
+        expected_aad,
+        expected_next_coordinate,
+        now_unix_seconds,
+        max_members,
+        true,
+    )
+}
+
+fn process_commit_inner(
+    prior: &ActivePublicState,
+    commit_bytes: &[u8],
+    expected_aad: &[u8],
+    expected_next_coordinate: PublicGroupSnapshotCoordinate,
+    now_unix_seconds: u64,
+    max_members: usize,
+    direct_request_scope: bool,
+) -> Result<VerifiedCommitPublicState, PublicStateError> {
     let restored = decode_public_group_snapshot(&prior.snapshot, &prior.binding)
         .map_err(map_snapshot_error)?;
     let commit =
         validate_public_commit(commit_bytes, commit_bytes.len().max(1)).map_err(map_wire_error)?;
-    let processed = process_public_commit(
-        &restored,
-        commit,
-        PublicCommitValidationPolicy {
-            expected_aad,
-            trusted_prior_binding: &prior.binding,
-            expected_next_coordinate: &expected_next_coordinate,
-            now_unix_seconds,
-            max_members,
-        },
-    )
+    let policy = PublicCommitValidationPolicy {
+        expected_aad,
+        trusted_prior_binding: &prior.binding,
+        expected_next_coordinate: &expected_next_coordinate,
+        now_unix_seconds,
+        max_members,
+    };
+    let processed = if direct_request_scope {
+        crate::chat_protocol::wire::process_direct_request_public_commit(&restored, commit, policy)
+    } else {
+        process_public_commit(&restored, commit, policy)
+    }
     .map_err(map_wire_error)?;
 
     let next = load_active_snapshot_from_verified_binding(

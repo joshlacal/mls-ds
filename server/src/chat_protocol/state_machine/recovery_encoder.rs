@@ -499,6 +499,9 @@ pub(in crate::chat_protocol::state_machine) fn plan_reset_request_inner(
     if !participant.is_active() {
         return Err(StateMachineError::NotMember);
     }
+    if prior.kind == ConversationKind::Group && participant.role != ParticipantRole::Admin {
+        return Err(StateMachineError::AdminRequired);
+    }
     if prior
         .reset_requests
         .iter()

@@ -236,8 +236,8 @@ pub(crate) fn verify_bootstrap(
     };
     let aad = transcript::direct_request_commit_aad(&context_hash)
         .map_err(|_| BootstrapError::Binding)?;
-    let commit =
-        public_state::process_commit(&initial, &add, &aad, next, now, 40).map_err(state_error)?;
+    let commit = public_state::process_direct_request_commit(&initial, &add, &aad, next, now, 40)
+        .map_err(state_error)?;
     if !commit.removes().is_empty() || commit.adds().len() != selected.len() {
         return Err(BootstrapError::Binding);
     }

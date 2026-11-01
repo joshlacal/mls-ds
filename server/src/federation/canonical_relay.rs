@@ -150,7 +150,12 @@ pub async fn check_pair_owner_fence(
               AND a.request_id <> $3 \
               AND ( \
                   (a.status = 'prepared' AND a.lease_expires_at > clock_timestamp()) \
-                  OR a.status IN ('published', 'existing-direct') \
+                  OR (a.status IN ('published', 'existing-direct') \
+                      AND NOT EXISTS ( \
+                          SELECT 1 FROM chat.direct_request_lifecycle l \
+                          WHERE l.request_id = a.request_id \
+                            AND l.consent IN ('expired', 'rejected', 'closed') \
+                      )) \
               ) \
             UNION ALL \
             SELECT \
@@ -183,26 +188,41 @@ pub async fn check_pair_owner_fence(
               AND status IN ('pending', 'accepted') \
             UNION ALL \
             SELECT \
-                coordinator_did, \
+                r.coordinator_did, \
                 'remote_leases'::text AS source_table, \
-                status, \
-                leased_at AS created_at \
-            FROM chat.direct_request_remote_leases \
-            WHERE ((sender_did = $1 AND recipient_did = $2) OR (sender_did = $2 AND recipient_did = $1)) \
-              AND request_id <> $3 \
+                r.status, \
+                r.leased_at AS created_at \
+            FROM chat.direct_request_remote_leases r \
+            WHERE ((r.sender_did = $1 AND r.recipient_did = $2) OR (r.sender_did = $2 AND r.recipient_did = $1)) \
+              AND r.request_id <> $3 \
               AND ( \
-                  (status = 'active' AND expires_at > clock_timestamp()) \
-                  OR status = 'finalized' \
+                  (r.status = 'active' AND r.expires_at > clock_timestamp()) \
+                  OR (r.status = 'finalized' \
+                      AND NOT EXISTS ( \
+                          SELECT 1 FROM chat.direct_request_transport_inbox t \
+                          WHERE t.request_id = r.request_id \
+                            AND t.status IN ('expired', 'rejected', 'closed') \
+                      )) \
               ) \
             UNION ALL \
             SELECT \
-                coordinator_did, \
+                o.coordinator_did, \
                 'outbound_routes'::text AS source_table, \
                 'routed'::text AS status, \
-                created_at \
-            FROM chat.direct_request_outbound_routes \
-            WHERE ((actor_did = $1 AND recipient_did = $2) OR (actor_did = $2 AND recipient_did = $1)) \
-              AND request_id <> $3 \
+                o.created_at \
+            FROM chat.direct_request_outbound_routes o \
+            WHERE ((o.actor_did = $1 AND o.recipient_did = $2) OR (o.actor_did = $2 AND o.recipient_did = $1)) \
+              AND o.request_id <> $3 \
+              AND NOT EXISTS ( \
+                  SELECT 1 FROM chat.direct_request_lifecycle l \
+                  WHERE l.request_id = o.request_id \
+                    AND l.consent IN ('expired', 'rejected', 'closed') \
+              ) \
+              AND NOT EXISTS ( \
+                  SELECT 1 FROM chat.direct_request_transport_inbox t \
+                  WHERE t.request_id = o.request_id \
+                    AND t.status IN ('expired', 'rejected', 'closed') \
+              ) \
         ) AS pair_records \
         WHERE (source_table = 'attempts' AND status = 'prepared') \
            OR ($4::text IS NOT NULL AND split_part(coalesce(coordinator_did, $5), '#', 1) <> split_part($4, '#', 1)) \
@@ -878,7 +898,7 @@ pub async fn stage_remote_recipient_devices(
             .map_err(|_| FederationError::InvalidRequest("invalid device UUID".into()))?;
         let credential = crate::chat_protocol::validation::basic_credential_identity(&bare_did, &canon_device_id);
 
-        let valid_pkg = crate::chat_protocol::wire::validate_key_package(
+        let valid_pkg = crate::chat_protocol::wire::validate_direct_request_key_package(
             &wrapper,
             crate::chat_protocol::wire::KeyPackageValidationPolicy {
                 expected_basic_credential: &credential,
@@ -1634,7 +1654,6 @@ pub async fn ingest_remote_direct_request_delivery(
     }
 
     let now = Utc::now();
-    let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
 
     // 1. Determine full_welcome bytes and sha256 (fail closed)
     let full_welcome = if let Some(b64) = &input.full_welcome_bytes {
@@ -1671,7 +1690,7 @@ pub async fn ingest_remote_direct_request_delivery(
         return Err(FederationError::InvalidRequest("importUntil is in the past".into()));
     }
 
-    // 2. Independently verify trusted coordinator DID doc receipt signature
+    // 2. Independently verify trusted coordinator DID doc receipt signature (M-F04: before tx)
     let http = super::resolver::build_resolver_http_client();
     let resolver = DsResolver::with_default_endpoint(
         pool.clone(),
@@ -1712,13 +1731,15 @@ pub async fn ingest_remote_direct_request_delivery(
     )
     .map_err(|e| FederationError::InvalidRequest(format!("coordinator receipt signature verification failed: {e:?}")))?;
 
-    // 3. Verify actor signature: live PDS or commit-time proof
+    // 3. Verify actor signature: live PDS or commit-time proof (M-F04: HTTP before tx)
     let authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await.unwrap_or_default();
     let matching_key = authorized_keys.iter().find(|k| {
         URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == key_id
             || STANDARD.encode(k) == key_id
             || crate::chat_protocol::validation::ed25519_key_id(k).map(|id| id.as_str() == key_id).unwrap_or(false)
     }).cloned();
+
+    let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let matching_key = match matching_key {
         Some(k) => k,
@@ -2399,14 +2420,141 @@ pub async fn coordinator_prepare_direct_request(
     };
     let pair_lock_key = format!("chat-direct-request-pair:{p1}:{p2}");
 
+    // M-F04: Validate and PDS-authorize senderDeviceKey BEFORE opening PostgreSQL transaction
+    let verified_sender_key = if !coord.is_sender_home {
+        let sender_key = match input.get("senderDeviceKey") {
+            Some(k) => k,
+            None => {
+                return Err(FederationError::InvalidRequest("missing senderDeviceKey from sender home DS".into()));
+            }
+        };
+        let device_id_str = match sender_key["deviceId"].as_str() {
+            Some(s) => s,
+            None => {
+                return Err(FederationError::InvalidRequest("missing senderDeviceKey.deviceId".into()));
+            }
+        };
+        let key_id = match sender_key["keyId"].as_str() {
+            Some(k) => k.to_string(),
+            None => {
+                return Err(FederationError::InvalidRequest("missing senderDeviceKey.keyId".into()));
+            }
+        };
+        let auth_gen = match sender_key["authGeneration"].as_i64() {
+            Some(g) => g,
+            None => {
+                return Err(FederationError::InvalidRequest("missing senderDeviceKey.authGeneration".into()));
+            }
+        };
+        let pub_key_b64 = match sender_key["signingPublicKey"].as_str() {
+            Some(p) => p,
+            None => {
+                return Err(FederationError::InvalidRequest("missing senderDeviceKey.signingPublicKey".into()));
+            }
+        };
+        let device_id = match Uuid::parse_str(device_id_str) {
+            Ok(d) => d,
+            Err(_) => {
+                return Err(FederationError::InvalidRequest("invalid senderDeviceKey.deviceId".into()));
+            }
+        };
+        let pub_key = match STANDARD.decode(pub_key_b64) {
+            Ok(k) => k,
+            Err(_) => {
+                return Err(FederationError::InvalidRequest("invalid senderDeviceKey.signingPublicKey base64".into()));
+            }
+        };
+
+        if signed_req["body"]["actorDeviceId"].as_str() != Some(device_id_str)
+            || signed_req["body"]["keyId"].as_str() != Some(key_id.as_str())
+            || signed_req["body"]["authGeneration"].as_i64() != Some(auth_gen)
+        {
+            return Err(FederationError::InvalidRequest("signedRequest fields do not match senderDeviceKey".into()));
+        }
+        let http = super::resolver::build_resolver_http_client();
+        let resolver = DsResolver::with_default_endpoint(
+            pool.clone(),
+            http,
+            crate::identity::service_did(),
+            crate::identity::self_endpoint(),
+            std::env::var("DEFAULT_DS_ENDPOINT").ok(),
+            3600,
+        );
+        let authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await?;
+        if !authorized_keys.contains(&pub_key) {
+            return Err(FederationError::Forbidden(format!(
+                "sender key {key_id} is not authorized by actor {actor_did}'s PDS"
+            )));
+        }
+        let signed_bytes = serde_json::to_vec(signed_req).map_err(FederationError::Json)?;
+        if let Err(e) = crate::chat_protocol::direct_request_transcript::verify_signed_request(
+            crate::chat_protocol::direct_request_transcript::DirectRequestKind::Prepare,
+            &signed_bytes,
+            &pub_key,
+        ) {
+            return Err(FederationError::InvalidRequest(format!("prepare signature verification failed against senderDeviceKey: {e:?}")));
+        }
+        let calculated_key_id = match crate::chat_protocol::validation::ed25519_key_id(&pub_key) {
+            Ok(k) => k,
+            Err(e) => {
+                return Err(FederationError::InvalidRequest(format!("invalid ed25519 public key: {e:?}")));
+            }
+        };
+        if calculated_key_id.as_str() != key_id {
+            return Err(FederationError::InvalidRequest("senderDeviceKey keyId does not match public key thumbprint".into()));
+        }
+        Some((device_id, key_id, auth_gen, pub_key))
+    } else {
+        None
+    };
+
+    // Quick pre-check before remote reservation HTTP so replays/conflicts do not unnecessarily reserve
+    let has_existing_attempt: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)"
+    )
+    .bind(request_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| FederationError::Storage(e.to_string()))?;
+
+    let reserved_remote_devices = if !has_existing_attempt && !coord.is_recipient_home {
+        Some(
+            reserve_remote_recipient_bootstrap(
+                pool,
+                &coord.recipient_home.endpoint,
+                &coord.recipient_home.did,
+                request_id,
+                actor_did,
+                recipient_did,
+                Some(signed_req.clone()),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
 
     // Acquire transaction advisory lock for the unordered participant pair
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+    if let Err(e) = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(&pair_lock_key)
         .execute(&mut *tx)
         .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
+    {
+        drop(tx);
+        if reserved_remote_devices.is_some() {
+            let _ = release_remote_recipient_bootstrap(
+                pool,
+                &coord.recipient_home.endpoint,
+                &coord.recipient_home.did,
+                request_id,
+                recipient_did,
+            )
+            .await;
+        }
+        return Err(FederationError::Storage(e.to_string()));
+    }
 
     if let Some(conflict) = check_pair_owner_fence(
         &mut tx,
@@ -2424,6 +2572,17 @@ pub async fn coordinator_prepare_direct_request(
                 "Direct request already in progress for this pair".to_string()
             }
         };
+        drop(tx);
+        if reserved_remote_devices.is_some() {
+            let _ = release_remote_recipient_bootstrap(
+                pool,
+                &coord.recipient_home.endpoint,
+                &coord.recipient_home.did,
+                request_id,
+                recipient_did,
+            )
+            .await;
+        }
         return Err(FederationError::RemoteError {
             status: 409,
             body: format!("{{\"error\":\"PreparationConflict\",\"message\":\"{msg}\"}}"),
@@ -2464,7 +2623,8 @@ pub async fn coordinator_prepare_direct_request(
             }
             _ => return Err(FederationError::Invariant("invalid retained preparation outcome".into())),
         };
-        if rejected && !coord.is_recipient_home {
+        tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+        if (rejected || reserved_remote_devices.is_some()) && !coord.is_recipient_home {
             release_remote_recipient_bootstrap(
                 pool,
                 &coord.recipient_home.endpoint,
@@ -2473,104 +2633,10 @@ pub async fn coordinator_prepare_direct_request(
                 recipient_did,
             ).await?;
         }
-        tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
         return Ok(json!({"outcome": outcome}));
     }
 
-    if !coord.is_sender_home {
-        let sender_key = match input.get("senderDeviceKey") {
-            Some(k) => k,
-            None => {
-                return Err(FederationError::InvalidRequest("missing senderDeviceKey from sender home DS".into()));
-            }
-        };
-        let device_id_str = match sender_key["deviceId"].as_str() {
-            Some(s) => s,
-            None => {
-                return Err(FederationError::InvalidRequest("missing senderDeviceKey.deviceId".into()));
-            }
-        };
-        let key_id = match sender_key["keyId"].as_str() {
-            Some(k) => k,
-            None => {
-                return Err(FederationError::InvalidRequest("missing senderDeviceKey.keyId".into()));
-            }
-        };
-        let auth_gen = match sender_key["authGeneration"].as_i64() {
-            Some(g) => g,
-            None => {
-                return Err(FederationError::InvalidRequest("missing senderDeviceKey.authGeneration".into()));
-            }
-        };
-        let pub_key_b64 = match sender_key["signingPublicKey"].as_str() {
-            Some(p) => p,
-            None => {
-                return Err(FederationError::InvalidRequest("missing senderDeviceKey.signingPublicKey".into()));
-            }
-        };
-        let device_id = match Uuid::parse_str(device_id_str) {
-            Ok(d) => d,
-            Err(_) => {
-                return Err(FederationError::InvalidRequest("invalid senderDeviceKey.deviceId".into()));
-            }
-        };
-        let pub_key = match STANDARD.decode(pub_key_b64) {
-            Ok(k) => k,
-            Err(_) => {
-                return Err(FederationError::InvalidRequest("invalid senderDeviceKey.signingPublicKey base64".into()));
-            }
-        };
-
-        // Bind signedRequest fields to senderDeviceKey
-        if signed_req["body"]["actorDeviceId"].as_str() != Some(device_id_str)
-            || signed_req["body"]["keyId"].as_str() != Some(key_id)
-            || signed_req["body"]["authGeneration"].as_i64() != Some(auth_gen)
-        {
-            return Err(FederationError::InvalidRequest("signedRequest fields do not match senderDeviceKey".into()));
-        }
-        // Independently authorize senderDeviceKey against the actor's PDS
-        let http = super::resolver::build_resolver_http_client();
-        let resolver = DsResolver::with_default_endpoint(
-            pool.clone(),
-            http,
-            crate::identity::service_did(),
-            crate::identity::self_endpoint(),
-            std::env::var("DEFAULT_DS_ENDPOINT").ok(),
-            3600,
-        );
-        let authorized_keys = match resolver.resolve_authorized_device_keys(actor_did).await {
-            Ok(keys) => keys,
-            Err(e) => {
-                return Err(e);
-            }
-        };
-        if !authorized_keys.contains(&pub_key) {
-            return Err(FederationError::Forbidden(format!(
-                "sender key {key_id} is not authorized by actor {actor_did}'s PDS"
-            )));
-        }
-
-        // Verify signed prepare request against sender's signing key
-        let signed_bytes = serde_json::to_vec(signed_req).map_err(FederationError::Json)?;
-        if let Err(e) = crate::chat_protocol::direct_request_transcript::verify_signed_request(
-            crate::chat_protocol::direct_request_transcript::DirectRequestKind::Prepare,
-            &signed_bytes,
-            &pub_key,
-        ) {
-            return Err(FederationError::InvalidRequest(format!("prepare signature verification failed against senderDeviceKey: {e:?}")));
-        }
-
-        // Verify sender key ID matches thumbprint
-        let calculated_key_id = match crate::chat_protocol::validation::ed25519_key_id(&pub_key) {
-            Ok(k) => k,
-            Err(e) => {
-                return Err(FederationError::InvalidRequest(format!("invalid ed25519 public key: {e:?}")));
-            }
-        };
-        if calculated_key_id.as_str() != key_id {
-            return Err(FederationError::InvalidRequest("senderDeviceKey keyId does not match public key thumbprint".into()));
-        }
-
+    if let Some((device_id, ref key_id, auth_gen, ref pub_key)) = verified_sender_key {
         let existing_device: Option<(String, i64)> = sqlx::query_as(
             "SELECT status, auth_generation FROM chat.devices WHERE user_did = $1 AND device_id = $2"
         )
@@ -2582,9 +2648,29 @@ pub async fn coordinator_prepare_direct_request(
 
         if let Some((status, gen)) = existing_device {
             if status != "active" {
+                drop(tx);
+                if reserved_remote_devices.is_some() {
+                    let _ = release_remote_recipient_bootstrap(
+                        pool,
+                        &coord.recipient_home.endpoint,
+                        &coord.recipient_home.did,
+                        request_id,
+                        recipient_did,
+                    ).await;
+                }
                 return Err(FederationError::Forbidden("sender device is not active".into()));
             }
             if auth_gen < gen {
+                drop(tx);
+                if reserved_remote_devices.is_some() {
+                    let _ = release_remote_recipient_bootstrap(
+                        pool,
+                        &coord.recipient_home.endpoint,
+                        &coord.recipient_home.did,
+                        request_id,
+                        recipient_did,
+                    ).await;
+                }
                 return Err(FederationError::InvalidRequest("sender device auth_generation rollback".into()));
             }
         }
@@ -2594,13 +2680,23 @@ pub async fn coordinator_prepare_direct_request(
         )
         .bind(actor_did)
         .bind(device_id)
-        .bind(key_id)
+        .bind(key_id.as_str())
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;
 
         if let Some(existing_pk) = existing_key {
-            if existing_pk != pub_key {
+            if &existing_pk != pub_key {
+                drop(tx);
+                if reserved_remote_devices.is_some() {
+                    let _ = release_remote_recipient_bootstrap(
+                        pool,
+                        &coord.recipient_home.endpoint,
+                        &coord.recipient_home.did,
+                        request_id,
+                        recipient_did,
+                    ).await;
+                }
                 return Err(FederationError::InvalidRequest("sender signing key mismatch with existing coordinator key".into()));
             }
         }
@@ -2637,8 +2733,8 @@ pub async fn coordinator_prepare_direct_request(
         )
         .bind(actor_did)
         .bind(device_id)
-        .bind(key_id)
-        .bind(&pub_key)
+        .bind(key_id.as_str())
+        .bind(pub_key)
         .bind(auth_gen)
         .bind(now)
         .execute(&mut *tx)
@@ -2658,18 +2754,9 @@ pub async fn coordinator_prepare_direct_request(
 
     let signed_bytes = serde_json::to_vec(signed_req)
         .map_err(FederationError::Json)?;
-    if !coord.is_recipient_home {
-        let remote_devices = reserve_remote_recipient_bootstrap(
-            pool,
-            &coord.recipient_home.endpoint,
-            &coord.recipient_home.did,
-            request_id,
-            actor_did,
-            recipient_did,
-            Some(signed_req.clone()),
-        )
-        .await?;
-        if let Err(e) = stage_remote_recipient_devices(pool, &mut tx, request_id, &remote_devices, now).await {
+    if let Some(ref remote_devices) = reserved_remote_devices {
+        if let Err(e) = stage_remote_recipient_devices(pool, &mut tx, request_id, remote_devices, now).await {
+            drop(tx);
             release_remote_recipient_bootstrap(
                 pool,
                 &coord.recipient_home.endpoint,
@@ -2692,7 +2779,8 @@ pub async fn coordinator_prepare_direct_request(
     .await {
         Ok(r) => r,
         Err(e) => {
-            if !coord.is_recipient_home {
+            drop(tx);
+            if reserved_remote_devices.is_some() {
                 release_remote_recipient_bootstrap(
                     pool,
                     &coord.recipient_home.endpoint,
@@ -2708,18 +2796,9 @@ pub async fn coordinator_prepare_direct_request(
             });
         }
     };
-    if !coord.is_recipient_home
+    let should_release_remote = reserved_remote_devices.is_some()
         && !matches!(&result,
-            crate::chat_protocol::repository::direct_request_preparation::DirectRequestResult::Prepared(_))
-    {
-        release_remote_recipient_bootstrap(
-            pool,
-            &coord.recipient_home.endpoint,
-            &coord.recipient_home.did,
-            request_id,
-            recipient_did,
-        ).await?;
-    }
+            crate::chat_protocol::repository::direct_request_preparation::DirectRequestResult::Prepared(_));
 
     let output_val = match result {
         crate::chat_protocol::repository::direct_request_preparation::DirectRequestResult::Keys(bytes) => {
@@ -2740,6 +2819,15 @@ pub async fn coordinator_prepare_direct_request(
     };
 
     tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    if should_release_remote {
+        release_remote_recipient_bootstrap(
+            pool,
+            &coord.recipient_home.endpoint,
+            &coord.recipient_home.did,
+            request_id,
+            recipient_did,
+        ).await?;
+    }
     Ok(json!({ "outcome": output_val }))
 }
 
@@ -2786,6 +2874,36 @@ pub async fn coordinator_publish_direct_request(
         .map_err(|_| FederationError::Invariant("trusted instant".into()))?
         .datetime();
 
+    // M-F04 + C33-AUTH-002: Resolve actor and recipient PDS device keys BEFORE opening PostgreSQL transaction
+    let http = super::resolver::build_resolver_http_client();
+    let resolver = DsResolver::with_default_endpoint(
+        pool.clone(),
+        http,
+        crate::identity::service_did(),
+        crate::identity::self_endpoint(),
+        std::env::var("DEFAULT_DS_ENDPOINT").ok(),
+        3600,
+    );
+    let actor_authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await?;
+    let actor_key_id = signed_req.pointer("/body/keyId").and_then(|v| v.as_str()).unwrap_or_default();
+    let actor_key_authorized = actor_authorized_keys.iter().any(|k| {
+        URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == actor_key_id
+            || STANDARD.encode(k) == actor_key_id
+            || crate::chat_protocol::validation::ed25519_key_id(k).map(|id| id.as_str() == actor_key_id).unwrap_or(false)
+    });
+    if !actor_key_authorized {
+        return Err(FederationError::Forbidden(format!(
+            "actor {actor_did} key {actor_key_id} is not authorized by PDS at publication commit"
+        )));
+    }
+
+    let recipient_authorized_keys = resolver.resolve_authorized_device_keys(recipient_did).await?;
+    if recipient_authorized_keys.is_empty() {
+        return Err(FederationError::Forbidden(format!(
+            "recipient {recipient_did} authorizes no MLS device keys on PDS at publication commit"
+        )));
+    }
+
     let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let request_id = Uuid::parse_str(signed_req["body"]["requestId"].as_str().unwrap_or_default())
@@ -2826,37 +2944,6 @@ pub async fn coordinator_publish_direct_request(
             status: 409,
             body: format!("{{\"error\":\"PreparationConflict\",\"message\":\"{msg}\"}}"),
         });
-    }
-
-
-    // C33-AUTH-002: Revalidate actor and every selected recipient key against fresh PDS snapshot at commit boundary
-    let http = super::resolver::build_resolver_http_client();
-    let resolver = DsResolver::with_default_endpoint(
-        pool.clone(),
-        http,
-        crate::identity::service_did(),
-        crate::identity::self_endpoint(),
-        std::env::var("DEFAULT_DS_ENDPOINT").ok(),
-        3600,
-    );
-    let actor_authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await?;
-    let actor_key_id = signed_req.pointer("/body/keyId").and_then(|v| v.as_str()).unwrap_or_default();
-    let actor_key_authorized = actor_authorized_keys.iter().any(|k| {
-        URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == actor_key_id
-            || STANDARD.encode(k) == actor_key_id
-            || crate::chat_protocol::validation::ed25519_key_id(k).map(|id| id.as_str() == actor_key_id).unwrap_or(false)
-    });
-    if !actor_key_authorized {
-        return Err(FederationError::Forbidden(format!(
-            "actor {actor_did} key {actor_key_id} is not authorized by PDS at publication commit"
-        )));
-    }
-
-    let recipient_authorized_keys = resolver.resolve_authorized_device_keys(recipient_did).await?;
-    if recipient_authorized_keys.is_empty() {
-        return Err(FederationError::Forbidden(format!(
-            "recipient {recipient_did} authorizes no MLS device keys on PDS at publication commit"
-        )));
     }
 
     let selected_recipient_keys: Vec<Vec<u8>> = sqlx::query_scalar(

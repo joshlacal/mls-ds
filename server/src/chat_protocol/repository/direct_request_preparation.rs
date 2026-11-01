@@ -262,7 +262,7 @@ mod signed_admission {
                 return invalid();
             }
             let wrapper = bytes_field(&key["keyPackage"], "bytes")?;
-            let valid = crate::chat_protocol::wire::validate_key_package(
+            let valid = crate::chat_protocol::wire::validate_direct_request_key_package(
                 &wrapper,
                 crate::chat_protocol::wire::KeyPackageValidationPolicy {
                     expected_basic_credential: &credential,

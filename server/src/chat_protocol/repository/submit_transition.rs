@@ -299,6 +299,135 @@ pub(crate) struct ParsedSubmitTransition {
     pub(crate) add_principals: Vec<String>,
 }
 
+#[derive(Debug)]
+pub(crate) enum RemoteCommitPreflightOutcome {
+    Disabled,
+    NotRemoteOrDeferred,
+    Verified(crate::federation::commit_submitter::VerifiedSubmitCommit),
+}
+
+/// M-F04: Perform outbound S2S `submitCommit` BEFORE opening the business PostgreSQL transaction.
+/// For local conversations this executes one single PK read on `pool` and returns immediately.
+pub(crate) async fn preflight_remote_commit(
+    pool: &sqlx::PgPool,
+    admission: &super::auth::SignedOperationAdmission,
+    routing: Option<&crate::chat_protocol::federation_routing::ParticipantRoutingIntent>,
+    commit_submitter: Option<&crate::federation::commit_submitter::RemoteCommitSubmitter>,
+) -> Result<RemoteCommitPreflightOutcome, SubmitTransitionFacadeError> {
+    let kind = admission.mutation_kind();
+    if !matches!(
+        kind,
+        SignedMutationKind::CommitTransition
+            | SignedMutationKind::PolicyTransition
+            | SignedMutationKind::MetadataTransition
+            | SignedMutationKind::LeaveCommitFulfillment
+    ) {
+        return Ok(RemoteCommitPreflightOutcome::NotRemoteOrDeferred);
+    }
+    let Some(submitter) = commit_submitter else {
+        return Ok(RemoteCommitPreflightOutcome::Disabled);
+    };
+    let Some(accepted_request) = admission.canonical().accepted_wrapper_bytes() else {
+        return Ok(RemoteCommitPreflightOutcome::NotRemoteOrDeferred);
+    };
+    let Ok(admitted) =
+        decode_and_verify_signed_mutation(accepted_request, admission.signing_public_key())
+    else {
+        return Ok(RemoteCommitPreflightOutcome::NotRemoteOrDeferred);
+    };
+    let Ok(parsed) = parse_submit_transition(&admitted) else {
+        return Ok(RemoteCommitPreflightOutcome::NotRemoteOrDeferred);
+    };
+    if let Some(r) = routing {
+        if !parsed.add_principals.is_empty() && r.recheck_added_dids(&parsed.add_principals).is_err()
+        {
+            return Ok(RemoteCommitPreflightOutcome::NotRemoteOrDeferred);
+        }
+    }
+
+    let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
+    let convo_row: Option<(bool, Option<String>, i64, i64, i64, i64, bool)> = sqlx::query_as(
+        "SELECT c.is_remote, c.sequencer_ds, c.sequencer_term, c.next_entry_seq, \
+                c.current_generation, c.current_state_version, \
+                EXISTS( \
+                    SELECT 1 FROM chat.participants p \
+                     WHERE p.conversation_id = c.conversation_id \
+                       AND p.user_did = $2 \
+                       AND p.status = 'active' \
+                ) \
+           FROM chat.conversations c \
+          WHERE c.conversation_id = $1 AND c.lifecycle = 'active'",
+    )
+    .bind(conversation_id)
+    .bind(admission.subject())
+    .fetch_optional(pool)
+    .await
+    .map_err(SubmitTransitionFacadeError::Database)?;
+
+    let Some((
+        true,
+        Some(sequencer_ds),
+        sequencer_term,
+        next_entry_seq,
+        current_generation,
+        current_state_version,
+        true,
+    )) = convo_row
+    else {
+        return Ok(RemoteCommitPreflightOutcome::NotRemoteOrDeferred);
+    };
+
+    if parsed.prior.lifecycle() != PublicGroupSnapshotLifecycle::Active
+        || current_generation < 0
+        || current_state_version < 0
+        || next_entry_seq < 1
+        || current_generation as u64 != parsed.prior.generation()
+        || current_state_version as u64 != parsed.prior.state_version()
+    {
+        return Ok(RemoteCommitPreflightOutcome::NotRemoteOrDeferred);
+    }
+
+    let expected_seq = protocol_u64(next_entry_seq)?;
+    let expected_entry_id = parsed.transition_id;
+    let effective_instant = TrustedRequestInstant::from_canonical(admitted.signed_at().clone());
+    let kind = control_kind(admitted.kind())?;
+    let entry = build_verified_control_entry(
+        admitted,
+        admission.pre_replay().endpoint(),
+        canonical_uuid_v4(parsed.transition_id)?,
+        canonical_uuid_v4(conversation_id)?,
+        expected_seq,
+        &effective_instant,
+        CanonicalControlServerFields::empty(kind)?,
+    )?;
+    let outer_entry_fingerprint = *entry.outer_control_fingerprint();
+    let products = CanonicalControlEntryProducts::mint(&entry)?;
+    let accepted_payload_sha256: [u8; 32] = Sha256::digest(products.durable_json()).into();
+
+    let envelope = crate::chat_protocol::repository::federation::build_federated_commit_envelope(
+        conversation_id,
+        parsed.transition_id,
+        &sequencer_ds,
+        accepted_request,
+        sequencer_term as u64,
+        effective_instant.as_canonical(),
+    )?;
+
+    let verified = submitter
+        .submit(
+            pool,
+            &sequencer_ds,
+            sequencer_term as u64,
+            &envelope,
+            expected_entry_id,
+            expected_seq,
+            accepted_payload_sha256,
+            outer_entry_fingerprint,
+        )
+        .await?;
+    Ok(RemoteCommitPreflightOutcome::Verified(verified))
+}
+
 /// Consume one globally arbitrated signed `submitTransition` operation.
 ///
 /// Recovery fulfillment is intentionally absent: its stronger request,
@@ -309,7 +438,7 @@ pub(crate) async fn execute_prepared_submit_transition<T: PublicTransport>(
     prepared: PreparedSignedOperation,
     relationship_authority: &RelationshipAuthority<T>,
     routing: Option<crate::chat_protocol::federation_routing::ParticipantRoutingIntent>,
-    commit_submitter: Option<&crate::federation::commit_submitter::RemoteCommitSubmitter>,
+    remote_commit: RemoteCommitPreflightOutcome,
 ) -> Result<SubmitTransitionTransactionOutcome, SubmitTransitionFacadeError> {
     match prepared.into_state() {
         PreparedSignedOperationState::First {
@@ -322,7 +451,7 @@ pub(crate) async fn execute_prepared_submit_transition<T: PublicTransport>(
                 reservation,
                 relationship_authority,
                 routing,
-                commit_submitter,
+                remote_commit,
             )
             .await
         }
@@ -354,7 +483,7 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     reservation: OperationReservationGuard,
     relationship_authority: &RelationshipAuthority<T>,
     routing: Option<crate::chat_protocol::federation_routing::ParticipantRoutingIntent>,
-    commit_submitter: Option<&crate::federation::commit_submitter::RemoteCommitSubmitter>,
+    remote_commit: RemoteCommitPreflightOutcome,
 ) -> Result<SubmitTransitionTransactionOutcome, SubmitTransitionFacadeError> {
     let admitted = authority
         .mutation()
@@ -432,9 +561,7 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         &effective_instant,
         CanonicalControlServerFields::empty(control_kind(admitted.kind())?)?,
     )?;
-    let outer_entry_fingerprint = *entry.outer_control_fingerprint();
     let products = CanonicalControlEntryProducts::mint(&entry)?;
-    let accepted_payload_sha256: [u8; 32] = Sha256::digest(products.durable_json()).into();
     let planned = match admitted.kind() {
         SignedMutationKind::CommitTransition => {
             hydration.plan_commit_entry(&aggregate, entry, &registration, terminal_packages)?
@@ -507,47 +634,27 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     }
 
     if let Some((true, Some(sequencer_ds), sequencer_term)) = convo_row {
-        let submitter = commit_submitter.ok_or_else(|| {
-            SubmitTransitionFacadeError::Federation(
-                crate::federation::FederationError::ConfigError {
-                    reason: "Remote commit submitter is not configured for federated conversation"
-                        .to_string(),
-                },
-            )
-        })?;
-
-        let accepted_request = admitted
-            .accepted_wrapper_bytes()
-            .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+        let verified = match remote_commit {
+            RemoteCommitPreflightOutcome::Disabled => {
+                return Err(SubmitTransitionFacadeError::Federation(
+                    crate::federation::FederationError::ConfigError {
+                        reason:
+                            "Remote commit submitter is not configured for federated conversation"
+                                .to_string(),
+                    },
+                ));
+            }
+            RemoteCommitPreflightOutcome::NotRemoteOrDeferred => {
+                return Err(SubmitTransitionFacadeError::CandidateScopeDrift);
+            }
+            RemoteCommitPreflightOutcome::Verified(verified) => verified,
+        };
         let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
-        let transition_id = parsed.transition_id;
-
-        let envelope =
-            crate::chat_protocol::repository::federation::build_federated_commit_envelope(
-                conversation_id,
-                transition_id,
-                &sequencer_ds,
-                accepted_request,
-                sequencer_term as u64,
-                effective_instant.as_canonical(),
-            )?;
-
-        // ponytail: the remote call holds the conversation lock; split admission into a durable
-        // pending state only if measured federation latency makes this a throughput bottleneck.
-        let verified = submitter
-            .submit(
-                transaction,
-                &sequencer_ds,
-                sequencer_term as u64,
-                &envelope,
-                expected_entry_id,
-                expected_seq,
-                accepted_payload_sha256,
-                outer_entry_fingerprint,
-            )
-            .await?;
-
-        if verified.submit_transition_response_bytes.as_slice() != local_response.as_bytes() {
+        if verified.output.receipt.conversation_id != conversation_id.to_string()
+            || !crate::identity::dids_equivalent(&verified.output.receipt.sequencer_did, &sequencer_ds)
+            || verified.output.receipt.sequencer_term != sequencer_term
+            || verified.submit_transition_response_bytes.as_slice() != local_response.as_bytes()
+        {
             return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
         }
         let succ = plan

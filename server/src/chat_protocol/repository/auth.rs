@@ -437,6 +437,14 @@ impl SignedOperationAdmission {
         &self.canonical
     }
 
+    pub(crate) fn mutation_kind(&self) -> super::super::transcript::SignedMutationKind {
+        self.canonical.kind()
+    }
+
+    pub(super) fn signing_public_key(&self) -> &[u8] {
+        &self.signing_public_key
+    }
+
     pub(super) fn operation_id(&self) -> Result<Uuid, AuthRepositoryError> {
         operation_id_from_canonical(&self.canonical)
     }

@@ -179,6 +179,8 @@ pub(crate) mod direct_request_lifecycle;
 
 pub(crate) mod push_binding;
 
+pub(crate) mod transport_welcome;
+
 #[cfg(test)]
 mod concurrency_tests;
 #[cfg(test)]

@@ -102,6 +102,7 @@ async fn handle(
         .commit()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
+    runtime.notify_events();
     Ok(response)
 }
 
@@ -140,6 +141,9 @@ fn reset_failure(endpoint: ChatEndpoint, error: ResetFacadeError) -> ChatFailure
             ChatFailure::protocol(endpoint, C::CoordinateOverflow)
         }
         E::StateMachine(S::NotMember) => ChatFailure::protocol(endpoint, C::NotMember),
+        E::StateMachine(S::AdminRequired) if endpoint == ChatEndpoint::RequestReset => {
+            ChatFailure::protocol(endpoint, C::NotAuthorized)
+        }
         E::StateMachine(S::AdminRequired) => ChatFailure::protocol(endpoint, C::AdminRequired),
         E::StateMachine(S::ResetAlreadyPending) if endpoint == ChatEndpoint::RequestReset => {
             ChatFailure::protocol(endpoint, C::ResetAlreadyPending)

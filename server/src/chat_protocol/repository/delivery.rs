@@ -2273,6 +2273,86 @@ pub(crate) const APPLICATION_ENTRY_KIND: &str = "blue.catbird.chat.defs#applicat
 /// forbids from re-appearing as duplicated projection fields. The outer
 /// fingerprint is carried alongside (not inside) the projection so a caller can
 /// assert the recomputed projection fingerprint equals the frozen column.
+/// Attach an immutable `I13` `sequencer_receipt_bytes` JSON payload to an
+/// accepted `applicationEntry` row inside the sequencing transaction.
+pub(crate) async fn set_entry_sequencer_receipt(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    seq: u64,
+    receipt_bytes: &[u8],
+) -> Result<(), DeliveryRepositoryError> {
+    let seq_i64 = i64::try_from(seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
+    sqlx::query(
+        r#"
+        UPDATE chat.entries
+           SET sequencer_receipt_bytes = $3
+         WHERE conversation_id = $1
+           AND seq = $2
+           AND entry_kind = $4
+           AND sequencer_receipt_bytes IS NULL
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(seq_i64)
+    .bind(receipt_bytes)
+    .bind(APPLICATION_ENTRY_KIND)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+/// Lock-step prune of an `applicationEntry` ciphertext and its matching
+/// accepted `chat.message_sends` payload inside one transaction (`G6`, `I14`).
+/// Preserves `seq`, `accepted_payload_sha256`, `request_digest`, `signature`,
+/// `outer_entry_fingerprint`, and `sequencer_receipt_bytes`.
+pub(crate) async fn prune_application_entry_payload(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    seq: i64,
+    pruned_at: DateTime<Utc>,
+) -> Result<bool, DeliveryRepositoryError> {
+    let entry_res = sqlx::query(
+        r#"
+        UPDATE chat.entries
+           SET accepted_payload_bytes = NULL,
+               signed_request_bytes = NULL,
+               payload_pruned_at = $3
+         WHERE conversation_id = $1
+           AND seq = $2
+           AND entry_kind = $4
+           AND payload_pruned_at IS NULL
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(seq)
+    .bind(pruned_at)
+    .bind(APPLICATION_ENTRY_KIND)
+    .execute(&mut **transaction)
+    .await?;
+    if entry_res.rows_affected() == 0 {
+        return Ok(false);
+    }
+    sqlx::query(
+        r#"
+        UPDATE chat.message_sends
+           SET signed_request_bytes = NULL,
+               signing_transcript_bytes = NULL,
+               outcome_bytes = NULL,
+               payload_pruned_at = $3
+         WHERE conversation_id = $1
+           AND accepted_entry_seq = $2
+           AND status = 'accepted'
+           AND payload_pruned_at IS NULL
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(seq)
+    .bind(pruned_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(true)
+}
+
 #[derive(Clone, Debug, sqlx::FromRow)]
 #[allow(dead_code)]
 pub(crate) struct DeliveredEntryRow {
@@ -2280,11 +2360,15 @@ pub(crate) struct DeliveredEntryRow {
     pub(crate) seq: i64,
     pub(crate) entry_id: Uuid,
     pub(crate) entry_kind: String,
-    pub(crate) signed_request_bytes: Vec<u8>,
+    pub(crate) signed_request_bytes: Option<Vec<u8>>,
     pub(crate) request_digest: Vec<u8>,
     pub(crate) signature: Vec<u8>,
     pub(crate) server_fields_bytes: Vec<u8>,
     pub(crate) outer_entry_fingerprint: Vec<u8>,
+    #[sqlx(default)]
+    pub(crate) payload_pruned_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    pub(crate) sequencer_receipt_bytes: Option<Vec<u8>>,
     pub(crate) received_at: DateTime<Utc>,
 }
 
@@ -2345,7 +2429,7 @@ impl DeliveredEntryRow {
             entry_id: self.entry_id,
             conversation_id: self.conversation_id,
             seq: u64::try_from(self.seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?,
-            signed_request_bytes: self.signed_request_bytes.clone(),
+            signed_request_bytes: self.signed_request_bytes.clone().unwrap_or_default(),
             received_at: self.received_at,
         })
     }
@@ -2445,14 +2529,29 @@ pub(crate) async fn get_entries_with_terminal_control_interval(
         .checked_add(1)
         .ok_or(DeliveryRepositoryError::SequenceOverflow)?;
 
-    let mut rows: Vec<DeliveredEntryRow> = sqlx::query_as(
+    let has_clean_slate_entry_cols: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+              FROM pg_attribute a
+              JOIN pg_class c ON c.oid = a.attrelid
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'chat'
+               AND c.relname = 'entries'
+               AND a.attname = 'payload_pruned_at'
+               AND a.attnum > 0
+               AND NOT a.attisdropped
+        )
+        "#,
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+
+    let sql = if has_clean_slate_entry_cols {
         // DRIFT GUARD: the application-interval EXISTS predicate below
         // (`entry.seq >= interval.start_seq AND (interval.terminal_seq IS NULL OR
         // entry.seq <= interval.terminal_seq)`) is the canonical per-device
-        // application-visibility rule. `repository/blobs.rs::read_application_attachment`
-        // carries a byte-identical copy for blob custody and a matching
-        // cross-reference comment; change both sites together so entry-log and
-        // blob visibility never diverge.
+        // application-visibility rule.
         r#"
         WITH visible AS (
             SELECT entry.seq
@@ -2501,23 +2600,82 @@ pub(crate) async fn get_entries_with_terminal_control_interval(
         SELECT entry.conversation_id, entry.seq, entry.entry_id, entry.entry_kind,
                entry.signed_request_bytes, entry.request_digest, entry.signature,
                entry.server_fields_bytes, entry.outer_entry_fingerprint,
+               entry.payload_pruned_at, entry.sequencer_receipt_bytes,
                entry.received_at
           FROM chat.entries AS entry
           JOIN visible ON visible.seq = entry.seq
          WHERE entry.conversation_id = $1
          ORDER BY entry.seq
-        "#,
-    )
-    .bind(conversation_id)
-    .bind(after_seq_i64)
-    .bind(caller_did)
-    .bind(caller_device_id)
-    .bind(APPLICATION_ENTRY_KIND)
-    .bind(fetch)
-    .bind(control_start)
-    .bind(control_end)
-    .fetch_all(&mut **transaction)
-    .await?;
+        "#
+    } else {
+        r#"
+        WITH visible AS (
+            SELECT entry.seq
+              FROM chat.entries AS entry
+             WHERE entry.conversation_id = $1
+               AND entry.seq > $2
+               AND (NOT EXISTS (
+                    SELECT 1 FROM chat.direct_request_publications p
+                    LEFT JOIN chat.direct_request_lifecycle l USING(request_id)
+                    WHERE p.conversation_id=entry.conversation_id AND COALESCE(l.consent,'pending')='pending'
+               ) OR entry.entry_kind='blue.catbird.chat.defs#directRequestEntry')
+
+               AND ($7::bigint IS NULL OR (
+                   entry.entry_kind <> $5 AND entry.seq >= $7 AND entry.seq <= $8
+               ))
+               AND (
+                 (
+                   entry.entry_kind = $5
+                   AND EXISTS (
+                     SELECT 1
+                       FROM chat.application_intervals AS interval
+                      WHERE interval.conversation_id = entry.conversation_id
+                        AND interval.recipient_did = $3
+                        AND interval.recipient_device_id = $4
+                        AND entry.seq >= interval.start_seq
+                        AND (interval.terminal_seq IS NULL
+                             OR entry.seq <= interval.terminal_seq)
+                   )
+                 )
+                 OR
+                 (
+                   entry.entry_kind <> $5
+                   AND EXISTS (
+                     SELECT 1
+                       FROM chat.entry_recipients AS recipient
+                      WHERE recipient.conversation_id = entry.conversation_id
+                        AND recipient.seq = entry.seq
+                        AND recipient.user_did = $3
+                        AND recipient.device_id = $4
+                   )
+                 )
+               )
+             ORDER BY entry.seq
+             LIMIT $6
+        )
+        SELECT entry.conversation_id, entry.seq, entry.entry_id, entry.entry_kind,
+               entry.signed_request_bytes, entry.request_digest, entry.signature,
+               entry.server_fields_bytes, entry.outer_entry_fingerprint,
+               NULL::timestamptz AS payload_pruned_at, NULL::bytea AS sequencer_receipt_bytes,
+               entry.received_at
+          FROM chat.entries AS entry
+          JOIN visible ON visible.seq = entry.seq
+         WHERE entry.conversation_id = $1
+         ORDER BY entry.seq
+        "#
+    };
+
+    let mut rows: Vec<DeliveredEntryRow> = sqlx::query_as(sql)
+        .bind(conversation_id)
+        .bind(after_seq_i64)
+        .bind(caller_did)
+        .bind(caller_device_id)
+        .bind(APPLICATION_ENTRY_KIND)
+        .bind(fetch)
+        .bind(control_start)
+        .bind(control_end)
+        .fetch_all(&mut **transaction)
+        .await?;
 
     let limit_usize =
         usize::try_from(limit).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;

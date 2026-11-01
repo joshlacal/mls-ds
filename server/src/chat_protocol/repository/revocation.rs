@@ -268,6 +268,34 @@ impl AppliedDeviceRevocationMutation {
         if !self.response.validates_device(self.material.device()) {
             return Err(DeviceRevocationFacadeError::Integrity);
         }
+        let target_did = self.scope.actor_did().to_owned();
+        let target_device_id = self.material.device().device_id;
+        let has_push_gw: bool =
+            sqlx::query_scalar("SELECT to_regclass('chat.push_gateway_bindings') IS NOT NULL")
+                .fetch_one(&mut **transaction)
+                .await?;
+        if has_push_gw {
+            sqlx::query(
+                "DELETE FROM chat.push_gateway_bindings WHERE user_did = $1 AND device_id = $2",
+            )
+            .bind(&target_did)
+            .bind(target_device_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        let has_req_push: bool =
+            sqlx::query_scalar("SELECT to_regclass('chat.request_push_bindings') IS NOT NULL")
+                .fetch_one(&mut **transaction)
+                .await?;
+        if has_req_push {
+            sqlx::query(
+                "DELETE FROM chat.request_push_bindings WHERE user_did = $1 AND device_id = $2",
+            )
+            .bind(&target_did)
+            .bind(target_device_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
         complete_operation(
             transaction,
             &self.authority,
@@ -279,6 +307,8 @@ impl AppliedDeviceRevocationMutation {
         )
         .await?;
         Ok(CompletedDeviceRevocationMutation {
+            target_did,
+            target_device_id,
             material: self.material,
             status: self.response.status,
             response_bytes: self.response.body,
@@ -289,12 +319,18 @@ impl AppliedDeviceRevocationMutation {
 /// Facade-owned result after the exact canonical bytes have been durably
 /// recorded. Handlers may transmit these bytes but cannot influence them.
 pub(crate) struct CompletedDeviceRevocationMutation {
+    target_did: String,
+    target_device_id: Uuid,
     material: DeviceRevocationMaterial,
     status: i32,
     response_bytes: Vec<u8>,
 }
 
 impl CompletedDeviceRevocationMutation {
+    pub(crate) fn revoked_target(&self) -> (&str, Uuid) {
+        (&self.target_did, self.target_device_id)
+    }
+
     pub(crate) fn material(&self) -> &DeviceRevocationMaterial {
         &self.material
     }

@@ -121,6 +121,16 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     // consuming targets; they are enumerated at [`SHARED_LEGACY_DB_PREFIX`].
     "mlsds_shared_",
     "clean_slate_",
+    "chat_pruning_",
+    "chat_dormant_",
+    "chat_acct_del_",
+    "chat_c33_exp_",
+    "chat_space_roster_",
+    "chat_gate8_auth_",
+    "chat_gate8_f03_",
+    "chat_space_host_",
+    "chat_push_gw_",
+    "chat_fed_relay_",
 ];
 
 /// Prefix used by [`crate::common::setup_test_db`], the shared legacy fixture

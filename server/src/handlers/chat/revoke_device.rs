@@ -55,6 +55,7 @@ async fn revoke(
         .await
         .map_err(revocation_failure)?;
 
+    let mut revoked_ws_target = None;
     let response = match outcome {
         DeviceRevocationTransactionOutcome::Replay(replay) => {
             context::replay_response(ENDPOINT, replay.response())?
@@ -70,6 +71,8 @@ async fn revoke(
                 .complete(&mut transaction)
                 .await
                 .map_err(revocation_failure)?;
+            let (did, device_id) = completed.revoked_target();
+            revoked_ws_target = Some((did.to_owned(), device_id));
             let status = completed.status();
             context::canonical_json_response(ENDPOINT, status, completed.into_response_bytes())?
         }
@@ -79,6 +82,10 @@ async fn revoke(
         .commit()
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+    if let Some((did, device_id)) = revoked_ws_target {
+        runtime.disconnect_device_ws(&did, device_id);
+        runtime.notify_events();
+    }
     Ok(response)
 }
 

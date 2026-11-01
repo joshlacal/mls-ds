@@ -573,6 +573,7 @@ struct TwoMemberFixtureOptions<'a> {
     after_policy: bool,
     direct: bool,
     application_message_id: Option<Uuid>,
+    archive_commitment: Option<[u8; 32]>,
     recipient_service_did: Option<&'a str>,
     sequencer_service_did: Option<&'a str>,
 }
@@ -1033,6 +1034,16 @@ fn recovery_commit_aad(
     Ok(aad)
 }
 
+mod opt_bytes_slice {
+    use serde::Serializer;
+    pub fn serialize<S: Serializer>(v: &Option<&[u8]>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(bytes) => serde_bytes::serialize(bytes, s),
+            None => s.serialize_none(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApplicationRoutingAad<'a> {
@@ -1042,18 +1053,22 @@ struct ApplicationRoutingAad<'a> {
     generation: u64,
     #[serde(with = "serde_bytes")]
     message_id: &'a [u8],
+    #[serde(skip_serializing_if = "Option::is_none", with = "opt_bytes_slice")]
+    archive_commitment: Option<&'a [u8]>,
     prior: RecoveryCommitPriorAad<'a>,
 }
 
 fn application_routing_aad_bytes(
     prior: &PublicGroupSnapshotCoordinate,
     message_id: Uuid,
+    archive_commitment: Option<&[u8; 32]>,
 ) -> Result<Vec<u8>, String> {
     let canonical = serde_ipld_dagcbor::to_vec(&ApplicationRoutingAad {
         protocol_version: "1",
         conversation_id: prior.conversation_id(),
         generation: prior.generation(),
         message_id: message_id.as_bytes(),
+        archive_commitment: archive_commitment.map(|c| c.as_slice()),
         prior: RecoveryCommitPriorAad {
             conversation_id: prior.conversation_id(),
             generation: prior.generation(),
@@ -1075,15 +1090,27 @@ pub(super) fn application_routing_aad(
     prior: &PublicGroupSnapshotCoordinate,
     message_id: Uuid,
 ) -> Value {
+    application_routing_aad_with_commitment(prior, message_id, None)
+}
+
+pub(super) fn application_routing_aad_with_commitment(
+    prior: &PublicGroupSnapshotCoordinate,
+    message_id: Uuid,
+    archive_commitment: Option<&[u8; 32]>,
+) -> Value {
     let mut aad_prior = coordinate_json(prior);
     aad_prior["conversationId"] = json!(STANDARD.encode(prior.conversation_id()));
-    json!({
+    let mut obj = json!({
         "protocolVersion": "1",
         "conversationId": STANDARD.encode(prior.conversation_id()),
         "generation": prior.generation(),
         "messageId": STANDARD.encode(message_id.as_bytes()),
         "prior": aad_prior,
-    })
+    });
+    if let Some(commitment) = archive_commitment {
+        obj["archiveCommitment"] = json!(STANDARD.encode(commitment));
+    }
+    obj
 }
 
 fn public_state_from_group_info(
@@ -1372,7 +1399,11 @@ fn build_two_member_fulfillment_products(
     .enumerate()
     {
         let aad = match (index, options.application_message_id) {
-            (0, Some(message_id)) => application_routing_aad_bytes(prior.coordinate(), message_id)?,
+            (0, Some(message_id)) => application_routing_aad_bytes(
+                prior.coordinate(),
+                message_id,
+                options.archive_commitment.as_ref(),
+            )?,
             _ => Vec::new(),
         };
         requester_group.set_aad(aad);
@@ -1786,6 +1817,14 @@ pub(super) async fn seed_durable_recovery_fixture_with_pending(
     sqlx::query("INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,0,1,$5)")
         .bind(conversation_id).bind(prior.group_id()).bind(&group_info).bind(Sha256::digest(&group_info).to_vec()).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert durable fixture generation: {error}"))?;
+    crate::chat_protocol::repository::transition::register_conversation_space_if_migrated(
+        &mut *transaction,
+        conversation_id,
+        0,
+        at,
+    )
+    .await
+    .map_err(|error| format!("register durable fixture space: {error}"))?;
     sqlx::query(r#"INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,next_generation,next_state_version,metadata_snapshot_id,entry_seq,accepted_at) VALUES($1,$2,'creation',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,0,0,$11,1,$12)"#)
         .bind(creation.transition_id).bind(conversation_id).bind(&identity.did).bind(identity.device_id).bind(&identity.key_id)
         .bind(&creation.raw_wrapper).bind(verified.canonical_projection()).bind(verified.transcript_bytes()).bind(verified.request_digest().to_vec()).bind(verified.signature().to_vec()).bind(metadata_snapshot_id).bind(at)
@@ -1892,6 +1931,31 @@ pub(super) async fn seed_application_routing_fixture(
     recipient_service_did: &str,
     sequencer_service_did: Option<&str>,
 ) -> Result<DurableRecoveryFulfillmentFixture, String> {
+    seed_application_routing_fixture_with_commitment(
+        pool,
+        trusted_instant,
+        requester,
+        fulfiller,
+        direct,
+        message_id,
+        None,
+        recipient_service_did,
+        sequencer_service_did,
+    )
+    .await
+}
+
+pub(super) async fn seed_application_routing_fixture_with_commitment(
+    pool: &PgPool,
+    trusted_instant: &TrustedRequestInstant,
+    requester: FixtureIdentity,
+    fulfiller: FixtureIdentity,
+    direct: bool,
+    message_id: Uuid,
+    archive_commitment: Option<[u8; 32]>,
+    recipient_service_did: &str,
+    sequencer_service_did: Option<&str>,
+) -> Result<DurableRecoveryFulfillmentFixture, String> {
     seed_two_member_fixture(
         pool,
         trusted_instant,
@@ -1901,6 +1965,7 @@ pub(super) async fn seed_application_routing_fixture(
         TwoMemberFixtureOptions {
             direct,
             application_message_id: Some(message_id),
+            archive_commitment,
             recipient_service_did: Some(recipient_service_did),
             sequencer_service_did,
             ..TwoMemberFixtureOptions::default()
@@ -2067,6 +2132,14 @@ async fn seed_two_member_fixture(
     sqlx::query("INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,2,1,$5)")
         .bind(conversation_id).bind(products.genesis.coordinate().group_id()).bind(&products.genesis_group_info).bind(Sha256::digest(&products.genesis_group_info).to_vec()).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert singleton Recovery generation: {error}"))?;
+    crate::chat_protocol::repository::transition::register_conversation_space_if_migrated(
+        &mut *transaction,
+        conversation_id,
+        0,
+        at,
+    )
+    .await
+    .map_err(|error| format!("register two-member fixture space: {error}"))?;
     sqlx::query(r#"INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,next_generation,next_state_version,metadata_snapshot_id,entry_seq,accepted_at) VALUES($1,$2,'creation',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,0,0,$11,1,$12)"#)
         .bind(creation.transition_id).bind(conversation_id).bind(&requester.did).bind(requester.device_id).bind(&requester.key_id)
         .bind(&creation.raw_wrapper).bind(creation_verified.canonical_projection()).bind(creation_verified.transcript_bytes()).bind(creation_verified.request_digest().to_vec()).bind(creation_verified.signature().to_vec()).bind(creation_metadata_snapshot_id).bind(at)
@@ -2816,4 +2889,184 @@ pub(super) fn creation_envelope(
     wrapper["body"]["signedAt"] = json!(trusted.as_str());
     wrapper["body"]["idempotencyKey"] = wrapper["body"]["transitionId"].clone();
     sign_canonical_wrapper(creator, wrapper["body"].clone(), SignedMutationKind::Creation)
+}
+
+#[allow(clippy::type_complexity)]
+pub(super) fn build_c33_two_leaf_artifacts(
+    actor: &FixtureIdentity,
+    recipient: &FixtureIdentity,
+    conversation_id: Uuid,
+    request_id: Uuid,
+    at: DateTime<Utc>,
+) -> Result<
+    (
+        Vec<u8>,
+        ActivePublicState,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        [u8; 32],
+        Vec<u8>,
+        Vec<u8>,
+    ),
+    String,
+> {
+    let provider = openmls_libcrux_crypto::Provider::new()
+        .map_err(|e| format!("c33 actor provider: {e:?}"))?;
+    let recipient_provider = openmls_libcrux_crypto::Provider::new()
+        .map_err(|e| format!("c33 recipient provider: {e:?}"))?;
+    let actor_signer = SignatureKeyPair::from_raw(
+        XWING_CIPHERSUITE.signature_algorithm(),
+        actor.signing_key.to_bytes().to_vec(),
+        actor.signing_public_key().to_vec(),
+    );
+    actor_signer
+        .store(provider.storage())
+        .map_err(|e| format!("store c33 actor signer: {e:?}"))?;
+    let recipient_signer = SignatureKeyPair::from_raw(
+        XWING_CIPHERSUITE.signature_algorithm(),
+        recipient.signing_key.to_bytes().to_vec(),
+        recipient.signing_public_key().to_vec(),
+    );
+    recipient_signer
+        .store(recipient_provider.storage())
+        .map_err(|e| format!("store c33 recipient signer: {e:?}"))?;
+
+    let genesis_lifetime = Lifetime::init(
+        u64::try_from((at - chrono::Duration::minutes(5)).timestamp())
+            .map_err(|_| "negative c33 lifetime".to_owned())?,
+        u64::try_from((at + chrono::Duration::days(8)).timestamp())
+            .map_err(|_| "negative c33 lifetime".to_owned())?,
+    );
+    let kp_lifetime = Lifetime::init(
+        u64::try_from((at - chrono::Duration::minutes(5)).timestamp())
+            .map_err(|_| "negative c33 kp lifetime".to_owned())?,
+        u64::try_from((at + chrono::Duration::days(36)).timestamp())
+            .map_err(|_| "negative c33 kp lifetime".to_owned())?,
+    );
+    let config = MlsGroupCreateConfig::builder()
+        .ciphersuite(XWING_CIPHERSUITE)
+        .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .use_ratchet_tree_extension(true)
+        .capabilities(exact_mls_capabilities())
+        .lifetime(genesis_lifetime)
+        .build();
+    let group_id: [u8; 32] = Sha256::digest(
+        [
+            b"CATBIRD-C33-EXPIRED-FIXTURE-GENESIS\0".as_ref(),
+            conversation_id.as_bytes(),
+        ]
+        .concat(),
+    )
+    .into();
+    let actor_cred = format!("{}#{}", actor.did, actor.device_id).into_bytes();
+    let mut actor_group = MlsGroup::new_with_group_id(
+        &provider,
+        &actor_signer,
+        &config,
+        GroupId::from_slice(&group_id),
+        CredentialWithKey {
+            credential: BasicCredential::new(actor_cred).into(),
+            signature_key: actor.signing_public_key().to_vec().into(),
+        },
+    )
+    .map_err(|e| format!("create c33 group: {e:?}"))?;
+    let genesis_group_info = actor_group
+        .export_group_info(provider.crypto(), &actor_signer, true)
+        .map_err(|e| format!("export c33 genesis info: {e:?}"))?
+        .tls_serialize_detached()
+        .map_err(|e| format!("serialize c33 genesis info: {e:?}"))?;
+    let genesis = public_state_from_group_info(&genesis_group_info, actor, conversation_id, 0, 0, at)?;
+
+    let recipient_cred = format!("{}#{}", recipient.did, recipient.device_id).into_bytes();
+    let package = KeyPackage::builder()
+        .key_package_lifetime(kp_lifetime)
+        .leaf_node_capabilities(exact_mls_capabilities())
+        .build(
+            XWING_CIPHERSUITE,
+            &recipient_provider,
+            &recipient_signer,
+            CredentialWithKey {
+                credential: BasicCredential::new(recipient_cred.clone()).into(),
+                signature_key: recipient.signing_public_key().to_vec().into(),
+            },
+        )
+        .map_err(|e| format!("build c33 keypackage: {e:?}"))?
+        .key_package()
+        .clone();
+    let kp_wrapper = MlsMessageOut::from(package.clone())
+        .tls_serialize_detached()
+        .map_err(|e| format!("serialize c33 keypackage: {e:?}"))?;
+    let validated_kp = crate::chat_protocol::wire::validate_direct_request_key_package(
+        &kp_wrapper,
+        KeyPackageValidationPolicy {
+            expected_basic_credential: &recipient_cred,
+            expected_signature_key: &recipient.signing_public_key(),
+            now_unix_seconds: u64::try_from(at.timestamp())
+                .map_err(|_| "negative c33 clock".to_owned())?,
+            max_bytes: MAX_KEY_PACKAGE_WIRE_BYTES,
+        },
+    )
+    .map_err(|e| format!("validate c33 keypackage: {e:?}"))?;
+    let kp_ref = *validated_kp.key_package_ref();
+    let kp_init_key = validated_kp.init_key().to_vec();
+
+    let add_aad = recovery_commit_aad(conversation_id, request_id, genesis.coordinate())?;
+    actor_group.set_aad(add_aad.clone());
+    let (add_commit, add_welcome, add_group_info) = actor_group
+        .add_members(&provider, &actor_signer, &[package])
+        .map_err(|e| format!("c33 add_members: {e:?}"))?;
+    let add_commit_bytes = add_commit
+        .tls_serialize_detached()
+        .map_err(|e| format!("c33 commit serialize: {e:?}"))?;
+    let welcome_bytes = add_welcome
+        .tls_serialize_detached()
+        .map_err(|e| format!("c33 welcome serialize: {e:?}"))?;
+    actor_group
+        .merge_pending_commit(&provider)
+        .map_err(|e| format!("c33 merge commit: {e:?}"))?;
+    let add_group_info = add_group_info.ok_or_else(|| "c33 missing group_info".to_owned())?;
+    let final_group_info = MlsMessageOut::from(add_group_info.clone())
+        .tls_serialize_detached()
+        .map_err(|e| format!("c33 final_group_info serialize: {e:?}"))?;
+    let add_group_context = add_group_info
+        .group_context()
+        .tls_serialize_detached()
+        .map_err(|e| format!("c33 group_context serialize: {e:?}"))?;
+    let final_coord = coordinate_from_merged_group(&actor_group, &add_group_context, conversation_id, 1)?;
+    let final_state = crate::chat_protocol::public_state::process_direct_request_commit(
+        &genesis,
+        &add_commit_bytes,
+        &add_aad,
+        final_coord,
+        u64::try_from(at.timestamp()).map_err(|_| "negative c33 clock".to_owned())?,
+        2,
+    )
+    .map_err(|e| format!("c33 process_commit: {e:?}"))?
+    .into_next();
+    let (tree_bytes, tree_sha256) =
+        encode_public_tree_summary(final_state.binding().tree_summary())
+            .map_err(|e| format!("c33 encode tree: {e:?}"))?
+            .into_parts();
+    actor_group.set_aad(Vec::new());
+    let initial_ct = actor_group
+        .create_message(&provider, &actor_signer, b"hello c33")
+        .map_err(|e| format!("c33 initial_ct: {e:?}"))?
+        .tls_serialize_detached()
+        .map_err(|e| format!("c33 initial_ct serialize: {e:?}"))?;
+
+    Ok((
+        genesis_group_info,
+        final_state,
+        tree_bytes,
+        tree_sha256.to_vec(),
+        final_group_info,
+        welcome_bytes,
+        initial_ct,
+        kp_ref,
+        kp_wrapper,
+        kp_init_key,
+    ))
 }

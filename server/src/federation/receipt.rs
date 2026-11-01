@@ -72,21 +72,38 @@ pub fn validate_receipt_did_document(
     expected_receipt_key: &VerifyingKey,
     service_auth_key: Option<&VerifyingKey>,
 ) -> Result<(), ReceiptDidDocumentError> {
-    let document: serde_json::Value =
-        serde_json::from_str(document).map_err(|_| ReceiptDidDocumentError::MalformedDocument)?;
     let method_owner = RECEIPT_VERIFICATION_METHOD
         .split_once('#')
         .map(|(did, _)| did)
         .expect("fixed receipt verification method contains a fragment");
+    validate_receipt_did_document_for_service(
+        document,
+        method_owner,
+        expected_receipt_key,
+        service_auth_key,
+    )
+}
+
+/// Validate `{service_did}#mls-receipt-1` in a resolved DID document for any `did:web` or `did:plc` `service_did`.
+pub fn validate_receipt_did_document_for_service(
+    document: &str,
+    service_did: &str,
+    expected_receipt_key: &VerifyingKey,
+    service_auth_key: Option<&VerifyingKey>,
+) -> Result<(), ReceiptDidDocumentError> {
+    let document: serde_json::Value =
+        serde_json::from_str(document).map_err(|_| ReceiptDidDocumentError::MalformedDocument)?;
+    let method_owner = crate::identity::canonical_did(service_did);
     if document.get("id").and_then(serde_json::Value::as_str) != Some(method_owner) {
         return Err(ReceiptDidDocumentError::DocumentOwnerMismatch);
     }
+    let expected_method_id = format!("{method_owner}#mls-receipt-1");
     let methods = document
         .get("verificationMethod")
         .and_then(serde_json::Value::as_array)
         .ok_or(ReceiptDidDocumentError::MissingReceiptMethod)?;
     let mut matching_methods = methods.iter().filter(|method| {
-        method.get("id").and_then(serde_json::Value::as_str) == Some(RECEIPT_VERIFICATION_METHOD)
+        method.get("id").and_then(serde_json::Value::as_str) == Some(expected_method_id.as_str())
     });
     let method = matching_methods
         .next()
@@ -142,13 +159,12 @@ pub fn configured_receipt_signer(
         return Err(ReceiptConfigError::InvalidIssuanceMode);
     }
 
-    if receipt_verification_method != Some(RECEIPT_VERIFICATION_METHOD) {
+    let Some((method_owner, "mls-receipt-1")) = receipt_verification_method
+        .and_then(|v| v.split_once('#'))
+        .filter(|(did, _)| !did.is_empty() && (did.starts_with("did:web:") || did.starts_with("did:plc:")))
+    else {
         return Err(ReceiptConfigError::UnexpectedVerificationMethod);
-    }
-    let method_owner = RECEIPT_VERIFICATION_METHOD
-        .split_once('#')
-        .map(|(did, _)| did)
-        .expect("fixed receipt verification method contains a fragment");
+    };
     if crate::identity::canonical_did(service_did) != method_owner {
         return Err(ReceiptConfigError::VerificationMethodOwnerMismatch);
     }
@@ -167,8 +183,9 @@ pub fn configured_receipt_signer(
 
     let published_did_document =
         published_did_document.ok_or(ReceiptConfigError::MissingPublishedDidDocument)?;
-    validate_receipt_did_document(
+    validate_receipt_did_document_for_service(
         published_did_document,
+        method_owner,
         receipt_key.verifying_key(),
         Some(service_key.verifying_key()),
     )?;
@@ -177,6 +194,91 @@ pub fn configured_receipt_signer(
         receipt_key,
         service_did.to_string(),
     )))
+}
+
+/// Clean-slate `I13` ES256 sequencer receipt signer (`{sequencer_did}#mls-receipt-1`,
+/// `labyrinth_protocol::receipt::sign_sequencer_receipt`).
+#[derive(Debug, Clone)]
+pub struct I13ReceiptSigner {
+    signing_key: SigningKey,
+    sequencer_did: String,
+    key_id: String,
+}
+
+impl I13ReceiptSigner {
+    pub fn new(signing_key: SigningKey, sequencer_did: String) -> Self {
+        let base = crate::identity::canonical_did(&sequencer_did).to_string();
+        let key_id = labyrinth_protocol::receipt::expected_receipt_key_id(&base);
+        Self {
+            signing_key,
+            sequencer_did: base,
+            key_id,
+        }
+    }
+
+    pub fn sequencer_did(&self) -> &str {
+        &self.sequencer_did
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn verifying_key(&self) -> VerifyingKey {
+        *self.signing_key.verifying_key()
+    }
+
+    /// Sign an `I13` `SequencerReceiptPayload` binding `archive_commitment` to the sequenced entry.
+    pub fn sign_application_receipt(
+        &self,
+        conversation_id: &str,
+        group_id: &[u8],
+        epoch: u64,
+        sender_did: &str,
+        sender_device_id: &str,
+        entry_id: &str,
+        archive_commitment: &[u8; 32],
+        seq: u64,
+        issued_at_ms: i64,
+    ) -> Result<labyrinth_protocol::receipt::SignedSequencerReceipt, labyrinth_protocol::ProtocolError> {
+        let payload = labyrinth_protocol::receipt::SequencerReceiptPayload {
+            sequencer_did: self.sequencer_did.clone(),
+            conversation_id: conversation_id.to_string(),
+            group_id: group_id.to_vec(),
+            epoch,
+            sender_device_did_url: format!("{sender_did}#{sender_device_id}"),
+            entry_id: entry_id.to_string(),
+            archive_commitment: *archive_commitment,
+            seq,
+            issued_at_ms,
+        };
+        labyrinth_protocol::receipt::sign_sequencer_receipt(&self.signing_key, &self.key_id, &payload)
+    }
+
+    /// Project a `SignedSequencerReceipt` + `generation` into the canonical `blue.catbird.chat.defs#sequencerReceipt` JSON object (bare base64 for internal storage; `present_endpoint_output` / `encode_canonical_generated_chat_json_v1` wrap `$bytes` on wire).
+    pub fn receipt_wire_json(
+        signed: &labyrinth_protocol::receipt::SignedSequencerReceipt,
+        generation: u64,
+        sender_did: &str,
+        sender_device_id: &str,
+    ) -> serde_json::Value {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        serde_json::json!({
+            "conversationId": signed.payload.conversation_id,
+            "generation": generation,
+            "groupId": STANDARD.encode(&signed.payload.group_id),
+            "epoch": signed.payload.epoch,
+            "entryId": signed.payload.entry_id,
+            "seq": signed.payload.seq,
+            "senderDid": sender_did,
+            "senderDeviceId": sender_device_id,
+            "archiveCommitment": STANDARD.encode(signed.payload.archive_commitment),
+            "issuedAtMs": signed.payload.issued_at_ms,
+            "sequencerDid": signed.payload.sequencer_did,
+            "kid": signed.key_id,
+            "signature": STANDARD.encode(signed.signature),
+        })
+    }
 }
 
 /// A signed receipt proving the sequencer accepted and ordered a commit.

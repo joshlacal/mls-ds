@@ -116,6 +116,7 @@ pub(crate) mod public_state;
 #[cfg(any(test, feature = "test-support"))]
 pub mod public_state;
 
+pub mod read_auth;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod read_authority;
 #[cfg(any(test, feature = "test-support"))]

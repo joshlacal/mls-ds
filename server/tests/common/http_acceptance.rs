@@ -230,7 +230,7 @@ pub async fn ensure_fence(pool: &DbPool) {
 
 /// Build the route harness with the pre-cutover fence held by default.
 pub async fn router(pool: DbPool) -> Router {
-    build_router(pool, false).await
+    build_router_with_options(pool, false, None, false).await
 }
 
 /// The named authenticated acceptance cases exercise routes gated behind the
@@ -238,10 +238,26 @@ pub async fn router(pool: DbPool) -> Router {
 /// the process-level value is restored to the explicit pre-cutover value
 /// immediately afterward.
 pub async fn router_for_authenticated_acceptance(pool: DbPool) -> Router {
-    build_router(pool, true).await
+    build_router_with_options(pool, true, None, false).await
 }
 
-async fn build_router(pool: DbPool, cutover_enabled: bool) -> Router {
+pub async fn router_for_authenticated_acceptance_with_i13(
+    pool: DbPool,
+    i13_signer: catbird_server::federation::receipt::I13ReceiptSigner,
+) -> Router {
+    build_router_with_options(pool, true, Some(i13_signer), false).await
+}
+
+pub async fn router_for_authenticated_acceptance_strict_reads(pool: DbPool) -> Router {
+    build_router_with_options(pool, true, None, true).await
+}
+
+async fn build_router_with_options(
+    pool: DbPool,
+    cutover_enabled: bool,
+    i13_signer: Option<catbird_server::federation::receipt::I13ReceiptSigner>,
+    require_signed_reads: bool,
+) -> Router {
     let key_id: String = sqlx::query_scalar(
         "SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE",
     )
@@ -297,9 +313,20 @@ async fn build_router(pool: DbPool, cutover_enabled: bool) -> Router {
         "CHAT_CUTOVER_ENABLED",
         if cutover_enabled { "1" } else { "0" },
     );
-    let runtime = Arc::new(ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("runtime"));
+    let mut runtime = ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("runtime");
+    if let Some(i13) = i13_signer {
+        runtime = runtime.with_i13_receipt_signer(i13);
+    }
+    if require_signed_reads {
+        runtime = runtime.with_require_signed_reads(true);
+    }
+    let runtime = Arc::new(runtime);
     std::env::set_var("CHAT_CUTOVER_ENABLED", "0");
     chat_router::<TestState>().with_state(TestState { pool, runtime })
+}
+
+fn current_audience() -> String {
+    format!("{}#atproto_mls", catbird_server::identity::service_did_base())
 }
 
 pub fn unsigned_request(device: &Device, nsid: &str, method: &str, query: &str) -> Request<Body> {
@@ -328,9 +355,10 @@ pub fn unsigned_request_as(
     _proof_jwk: &Value,
 ) -> Request<Body> {
     let now = chrono::Utc::now().timestamp();
+    let aud = current_audience();
     let token = sign_jwt(
         serde_json::json!({"alg":"ES256","typ":"JWT","kid":format!("{subject}#atproto")}),
-        serde_json::json!({"iss":subject,"aud":AUDIENCE,"lxm":nsid,"iat":now,"exp":now+60,"jti":Uuid::new_v4().to_string()}),
+        serde_json::json!({"iss":subject,"aud":aud,"lxm":nsid,"iat":now,"exp":now+60,"jti":Uuid::new_v4().to_string()}),
         &device.signing,
     );
     Request::builder()
@@ -341,11 +369,21 @@ pub fn unsigned_request_as(
         .expect("request")
 }
 
+pub fn unsigned_get_request(device: &Device, nsid: &str, raw_query: &str) -> Request<Body> {
+    let suffix = if raw_query.is_empty() || raw_query.starts_with('?') {
+        raw_query.to_string()
+    } else {
+        format!("?{raw_query}")
+    };
+    unsigned_request(device, nsid, "GET", &suffix)
+}
+
 pub fn unsigned_json_request(device: &Device, nsid: &str, body: Vec<u8>) -> Request<Body> {
     let now = chrono::Utc::now().timestamp();
+    let aud = current_audience();
     let token = sign_jwt(
         serde_json::json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto", device.did)}),
-        serde_json::json!({"iss":device.did,"aud":AUDIENCE,"lxm":nsid,"iat":now,"exp":now+60,"jti":Uuid::new_v4().to_string()}),
+        serde_json::json!({"iss":device.did,"aud":aud,"lxm":nsid,"iat":now,"exp":now+60,"jti":Uuid::new_v4().to_string()}),
         &device.signing,
     );
     Request::builder()

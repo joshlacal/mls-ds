@@ -221,6 +221,865 @@ async fn seed_application_routing_fixture_with_sequencer(
     })
 }
 
+/// Extended clean-slate two-member fixture exposing both devices' Ed25519 seeds/key IDs
+/// and optional `I13` `archiveCommitment` binding in `applicationSendBody.aad`.
+pub struct CleanSlateApplicationFixture {
+    pub conversation_id: uuid::Uuid,
+    pub message_id: uuid::Uuid,
+    pub sender_did: String,
+    pub sender_device_id: uuid::Uuid,
+    pub sender_key_id: String,
+    pub sender_ed25519_seed: [u8; 32],
+    pub recipient_did: String,
+    pub recipient_device_id: uuid::Uuid,
+    pub recipient_key_id: String,
+    pub recipient_ed25519_seed: [u8; 32],
+    pub signed_request: serde_json::Value,
+}
+
+pub async fn seed_clean_slate_application_fixture(
+    pool: &sqlx::PgPool,
+    direct: bool,
+    recipient_service_did: &str,
+    archive_commitment: Option<[u8; 32]>,
+) -> Result<CleanSlateApplicationFixture, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use chrono::SecondsFormat;
+    use ed25519_dalek::Signer as _;
+    use sha2::{Digest as _, Sha256};
+
+    let at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let trusted =
+        super::validation::TrustedRequestInstant::from_datetime(at - chrono::Duration::seconds(2))
+            .map_err(|error| format!("clean-slate fixture instant: {error:?}"))?;
+    let fixture_id = uuid::Uuid::new_v4().simple().to_string();
+    let sender = application_routing_fixture::FixtureIdentity::fresh_for_did(
+        &format!("did:web:sender-{fixture_id}.routing.example.com"),
+        b"clean-slate-sender",
+    )?;
+    let recipient = application_routing_fixture::FixtureIdentity::fresh_for_did(
+        &format!("did:web:recipient-{fixture_id}.routing.example.com"),
+        b"clean-slate-recipient",
+    )?;
+    let transport = ApplicationRoutingTransport {
+        sender_did: sender.did.clone(),
+        recipient_did: recipient.did.clone(),
+    };
+    let message_id = uuid::Uuid::new_v4();
+    let mut fixture =
+        application_routing_fixture::seed_application_routing_fixture_with_commitment(
+            pool,
+            &trusted,
+            sender,
+            recipient,
+            direct,
+            message_id,
+            archive_commitment,
+            recipient_service_did,
+            None,
+        )
+        .await?;
+    let authority = RelationshipAuthority::new(
+        fixed_production_relationship_policy_config()
+            .map_err(|error| format!("clean-slate relationship policy: {error:?}"))?,
+        transport,
+    );
+    let mut roster = vec![fixture.requester.did.clone(), fixture.fulfiller.did.clone()];
+    roster.sort();
+    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    let live_allocation = allocate_projection_revision(&mut tx)
+        .await
+        .map_err(|error| format!("clean-slate live allocation: {error:?}"))?;
+    let fallback_allocation = allocate_projection_revision(&mut tx)
+        .await
+        .map_err(|error| format!("clean-slate fallback allocation: {error:?}"))?;
+    let clock = anchor_projection_clock(&mut *tx)
+        .await
+        .map_err(|error| format!("clean-slate projection clock: {error}"))?;
+    let live = authority
+        .collect_traffic_projection(
+            &clock,
+            live_allocation,
+            fixture.requester.did.clone(),
+            roster,
+        )
+        .await
+        .map_err(|error| format!("clean-slate traffic collection: {error:?}"))?;
+    let observation = observe_relationship_persistence(&clock);
+    let fallback = live
+        .export_persisted_fallback(fallback_allocation, &authority, &observation)
+        .map_err(|error| format!("clean-slate traffic sealing: {error:?}"))?;
+    persist_traffic_projection(&mut tx, fallback)
+        .await
+        .map_err(|error| format!("clean-slate traffic persistence: {error:?}"))?;
+    tx.commit().await.map_err(|error| error.to_string())?;
+
+    let application = fixture.application_messages.remove(0);
+    let body = serde_json::json!({
+        "$type": "blue.catbird.chat.defs#applicationSendBody",
+        "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0000}",
+        "messageId": message_id,
+        "actorDid": fixture.requester.did,
+        "actorDeviceId": fixture.requester.device_id,
+        "keyId": fixture.requester.key_id,
+        "authGeneration": 1,
+        "prior": application_routing_fixture::coordinate_json(&fixture.prior),
+        "signedAt": chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "blobBindings": [],
+        "aad": application_routing_fixture::application_routing_aad_with_commitment(
+            &fixture.prior,
+            message_id,
+            archive_commitment.as_ref(),
+        ),
+        "applicationMessage": {
+            "framing": "mlsMessage",
+            "contentType": "privateMessageApplication",
+            "bytes": STANDARD.encode(&application),
+            "sha256": STANDARD.encode(Sha256::digest(&application)),
+        }
+    });
+    let wrapper = sign_mutation_json_for_test(&body, &fixture.requester.signing_key)?;
+    let signed_bytes = serde_json::to_vec(&wrapper).map_err(|error| error.to_string())?;
+    let verified = super::transcript::decode_and_verify_signed_mutation(
+        &signed_bytes,
+        &fixture.requester.signing_key.verifying_key().to_bytes(),
+    )
+    .map_err(|error| format!("verify clean-slate application signature: {error:?}"))?;
+    let super::transcript::VerifiedMutationProjection::ApplicationSend(projection) =
+        verified.projection()
+    else {
+        return Err("clean-slate fixture did not produce an application projection".to_owned());
+    };
+    let mut expected_aad = b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0".to_vec();
+    expected_aad.extend_from_slice(&projection.aad().canonical_dag_cbor());
+    let native = super::wire::validate_private_application(
+        &application,
+        super::wire::MAX_PRIVATE_MESSAGE_WIRE_BYTES,
+    )
+    .map_err(|error| format!("verify native clean-slate application: {error:?}"))?;
+    if native.aad() != expected_aad {
+        return Err("native MLS AAD differs from the clean-slate signed request projection".to_owned());
+    }
+
+    Ok(CleanSlateApplicationFixture {
+        conversation_id: fixture.conversation_id,
+        message_id,
+        sender_did: fixture.requester.did,
+        sender_device_id: fixture.requester.device_id,
+        sender_key_id: fixture.requester.key_id,
+        sender_ed25519_seed: fixture.requester.signing_key.to_bytes(),
+        recipient_did: fixture.fulfiller.did,
+        recipient_device_id: fixture.fulfiller.device_id,
+        recipient_key_id: fixture.fulfiller.key_id,
+        recipient_ed25519_seed: fixture.fulfiller.signing_key.to_bytes(),
+        signed_request: wrapper,
+    })
+}
+
+/// Sign any canonical `blue.catbird.chat.defs#*Body` JSON object with an Ed25519 device key.
+pub fn sign_mutation_json_for_test(
+    body: &serde_json::Value,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<serde_json::Value, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use ed25519_dalek::Signer as _;
+
+    let mut wrapper = serde_json::json!({
+        "body": body,
+        "signature": STANDARD.encode([0_u8; 64]),
+    });
+    let unsigned = serde_json::to_vec(&wrapper).map_err(|e| e.to_string())?;
+    let canonical = super::transcript::decode_canonical_signed_mutation(&unsigned)
+        .map_err(|e| format!("decode canonical signed mutation: {e:?}"))?;
+    let sig = signing_key.sign(canonical.transcript_bytes());
+    wrapper["signature"] = serde_json::json!(STANDARD.encode(sig.to_bytes()));
+    Ok(wrapper)
+}
+
+/// Seeded overdue `C33` published direct request (`created_at <= now - 31 days`) satisfying all
+/// PostgreSQL deferred publication, state-output, key-package, and lifecycle-reserve triggers.
+pub struct CleanSlateExpiredDirectRequestFixture {
+    pub request_id: uuid::Uuid,
+    pub conversation_id: uuid::Uuid,
+    pub actor_did: String,
+    pub recipient_did: String,
+}
+
+pub async fn seed_clean_slate_expired_direct_request_fixture(
+    pool: &sqlx::PgPool,
+    signer: &super::repository::direct_request_receipts::DirectRequestReceiptSigner,
+) -> Result<CleanSlateExpiredDirectRequestFixture, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use chrono::{Duration, SecondsFormat};
+    use sha2::{Digest as _, Sha256};
+    use uuid::Uuid;
+
+    signer.validate_and_retain_keys(pool).await?;
+
+    let now_db: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let created_at = now_db - Duration::days(31);
+    let prepared_at = created_at - Duration::seconds(10);
+    let lease_expires_at = prepared_at + Duration::seconds(60);
+    let import_until = created_at + Duration::days(30);
+    let kp_not_before = created_at - Duration::minutes(5);
+    let kp_not_after = created_at + Duration::days(36);
+
+    let trusted_past = super::validation::TrustedRequestInstant::from_datetime(prepared_at)
+        .map_err(|e| format!("trusted instant: {e:?}"))?;
+    let actor = application_routing_fixture::FixtureIdentity::fresh(b"c33-expired-actor")?;
+    let recipient = application_routing_fixture::FixtureIdentity::fresh(b"c33-expired-recipient")?;
+    application_routing_fixture::seed_identity(pool, &actor, &trusted_past).await?;
+    application_routing_fixture::seed_identity(pool, &recipient, &trusted_past).await?;
+
+    let request_id = Uuid::new_v4();
+    let conversation_id = Uuid::new_v4();
+    let first_message_id = Uuid::new_v4();
+    let entry_id = Uuid::new_v4();
+    let metadata_snapshot_id = Uuid::new_v4();
+    let grant_id = Uuid::new_v4();
+    let actor_participant_id = Uuid::new_v4();
+    let recipient_participant_id = Uuid::new_v4();
+    let actor_leaf_id = Uuid::new_v4();
+    let recipient_leaf_id = Uuid::new_v4();
+
+    let (genesis_info, final_state, tree_bytes, tree_sha256, final_info, welcome_bytes, initial_ct, kp_ref, kp_wrapper, kp_init_key) =
+        application_routing_fixture::build_c33_two_leaf_artifacts(
+            &actor,
+            &recipient,
+            conversation_id,
+            request_id,
+            created_at,
+        )?;
+
+    let context_hash = [0x31_u8; 32];
+    let prepare_digest = [0x32_u8; 32];
+    let preparation_digest = [0x33_u8; 32];
+    let grant_digest = [0x34_u8; 32];
+    let metadata_nonce = [0x52_u8; 12];
+    let metadata_ciphertext = [0x5A_u8; 16];
+    let metadata_json_obj = serde_json::json!({
+        "metadataVersion": 1,
+        "nonce": STANDARD.encode(metadata_nonce),
+        "ciphertext": STANDARD.encode(metadata_ciphertext),
+    });
+    let metadata_bytes = serde_json::to_vec(&metadata_json_obj).map_err(|e| e.to_string())?;
+
+    let pub_body = serde_json::json!({
+        "requestId": request_id.to_string(),
+        "conversationId": conversation_id.to_string(),
+        "firstMessageId": first_message_id.to_string(),
+        "actorDid": actor.did,
+        "recipientDid": recipient.did,
+        "actorDeviceId": actor.device_id.to_string(),
+        "keyId": actor.key_id,
+        "authGeneration": 1_i64,
+        "contextHash": STANDARD.encode(context_hash),
+        "preparationDigest": STANDARD.encode(preparation_digest),
+        "importUntil": import_until.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "artifacts": {
+            "finalGroupInfo": {
+                "bytes": STANDARD.encode(&final_info),
+            },
+            "welcome": {
+                "opaqueWelcome": STANDARD.encode(&welcome_bytes),
+            },
+            "initialCiphertext": STANDARD.encode(&initial_ct),
+            "metadataSnapshot": metadata_json_obj,
+        },
+    });
+    let signed_pub_val = serde_json::json!({
+        "body": pub_body,
+        "signature": STANDARD.encode([0x77_u8; 64]),
+    });
+    let signed_publication = serde_json::to_vec(&signed_pub_val).map_err(|e| e.to_string())?;
+    let unsigned_body_bytes = serde_json::to_vec(&signed_pub_val["body"]).map_err(|e| e.to_string())?;
+    let publication_digest: [u8; 32] = Sha256::digest(&unsigned_body_bytes).into();
+    let request_entry_val = serde_json::json!({
+        "$type": "blue.catbird.chat.defs#directRequestEntry",
+        "entryId": entry_id.to_string(),
+        "conversationId": conversation_id.to_string(),
+        "seq": 1_i64,
+        "signedRequest": signed_pub_val,
+        "receivedAt": created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+    let request_entry = serde_json::to_vec(&request_entry_val).map_err(|e| e.to_string())?;
+    let request_entry_sha256: [u8; 32] = Sha256::digest(&request_entry).into();
+    let outer_fp: [u8; 32] = Sha256::digest(&request_entry).into();
+    let terminal_response = b"{\"status\":\"published\"}".to_vec();
+    let terminal_response_sha256: [u8; 32] = Sha256::digest(&terminal_response).into();
+    let provenance_bytes = b"{\"grant\":\"ok\"}".to_vec();
+    let provenance_sha256: [u8; 32] = Sha256::digest(&provenance_bytes).into();
+    let server_fields = serde_json::to_vec(&serde_json::json!({
+        "entryId": entry_id.to_string(),
+        "conversationId": conversation_id.to_string(),
+        "seq": 1_i64,
+        "receivedAt": created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+    }))
+    .map_err(|e| e.to_string())?;
+
+    let (low_did, high_did) = if actor.did < recipient.did {
+        (&actor.did, &recipient.did)
+    } else {
+        (&recipient.did, &actor.did)
+    };
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "INSERT INTO chat.key_packages( \
+             key_package_ref, wrapper_bytes, wrapper_sha256, init_key, \
+             owner_did, owner_device_id, owner_key_id, owner_auth_generation, \
+             not_before, not_after, status, terminal_transition_id, terminal_at, \
+             created_at, usage_scope \
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'consumed',$10,$11,$12,'direct-request')",
+    )
+    .bind(kp_ref.as_slice())
+    .bind(&kp_wrapper)
+    .bind(Sha256::digest(&kp_wrapper).as_slice())
+    .bind(&kp_init_key)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(kp_not_before)
+    .bind(kp_not_after)
+    .bind(request_id)
+    .bind(created_at)
+    .bind(prepared_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 key_package: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.direct_request_grants( \
+             grant_id, revision, owner_did, owner_device_id, owner_key_id, auth_generation, \
+             capability_revision, key_package_ref, usage_scope, purpose, protocol_version, \
+             profile, signed_grant, grant_digest, expires_at, created_at \
+         ) VALUES ($1,1,$2,$3,$4,1,1,$5,'direct-request','direct-request-bootstrap','2','xwing',$6,$7,$8,$9)",
+    )
+    .bind(grant_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(kp_ref.as_slice())
+    .bind(b"{\"grant\":true}".as_slice())
+    .bind(grant_digest.as_slice())
+    .bind(kp_not_after)
+    .bind(prepared_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 grant: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.direct_request_attempts( \
+             request_id, actor_did, actor_device_id, actor_key_id, actor_auth_generation, \
+             recipient_did, prepare_digest, status, prepare_response, selected_digest, \
+             prepared_at, lease_expires_at, terminal_at, terminal_response, \
+             terminal_response_sha256, publication_digest, reserved_bytes, created_at \
+         ) VALUES ($1,$2,$3,$4,1,$5,$6,'published',$7,$8,$9,$10,$11,$12,$13,$14,16000000,$9)",
+    )
+    .bind(request_id)
+    .bind(&actor.did)
+    .bind(actor.device_id)
+    .bind(&actor.key_id)
+    .bind(&recipient.did)
+    .bind(prepare_digest.as_slice())
+    .bind(b"{\"prepared\":true}".as_slice())
+    .bind(preparation_digest.as_slice())
+    .bind(prepared_at)
+    .bind(lease_expires_at)
+    .bind(created_at)
+    .bind(&terminal_response)
+    .bind(terminal_response_sha256.as_slice())
+    .bind(publication_digest.as_slice())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 attempt: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.direct_request_retained_charges( \
+             request_id, charged_bytes, model_version, recorded_at \
+         ) VALUES ($1, 16000000, 1, $2)",
+    )
+    .bind(request_id)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 retained_charge: {e}"))?;
+
+    sqlx::query(
+        "UPDATE chat.direct_request_budget SET retained_bytes = retained_bytes + 16000000 WHERE singleton",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("update c33 budget: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.direct_request_selected_devices( \
+             request_id, owner_did, owner_device_id, owner_key_id, auth_generation, \
+             grant_id, grant_digest, capability_revision, key_package_ref \
+         ) VALUES ($1,$2,$3,$4,1,$5,$6,1,$7)",
+    )
+    .bind(request_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(grant_id)
+    .bind(grant_digest.as_slice())
+    .bind(kp_ref.as_slice())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 selected_device: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.conversations( \
+             conversation_id, kind, lifecycle, current_generation, current_state_version, \
+             next_entry_seq, direct_did_low, direct_did_high, created_at, protocol_version \
+         ) VALUES ($1,'direct','active',0,1,2,$2,$3,$4,'2')",
+    )
+    .bind(conversation_id)
+    .bind(low_did)
+    .bind(high_did)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 conversation: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.generations( \
+             conversation_id, generation, group_id, lifecycle, genesis_group_info_bytes, \
+             genesis_group_info_sha256, current_state_version, activated_seq, activated_at \
+         ) VALUES ($1,0,$2,'active',$3,$4,1,1,$5)",
+    )
+    .bind(conversation_id)
+    .bind(final_state.coordinate().group_id().as_slice())
+    .bind(&genesis_info)
+    .bind(Sha256::digest(&genesis_info).as_slice())
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 generation: {e}"))?;
+
+    super::repository::transition::register_conversation_space_if_migrated(
+        &mut *tx,
+        conversation_id,
+        0,
+        created_at,
+    )
+    .await
+    .map_err(|e| format!("register c33 space: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.generation_states( \
+             conversation_id, generation, state_version, group_id, epoch, group_context_hash, \
+             confirmation_tag, lifecycle, state_kind, producing_transition_id, \
+             public_snapshot_bytes, snapshot_sha256, tree_summary_bytes, tree_summary_sha256, \
+             leaf_count, created_at \
+         ) VALUES ($1,0,1,$2,1,$3,$4,'active','directRequestPublication',$5,$6,$7,$8,$9,2,$10)",
+    )
+    .bind(conversation_id)
+    .bind(final_state.coordinate().group_id().as_slice())
+    .bind(final_state.coordinate().group_context_hash().as_slice())
+    .bind(final_state.coordinate().confirmation_tag().as_slice())
+    .bind(request_id)
+    .bind(final_state.snapshot())
+    .bind(final_state.snapshot_sha256().as_slice())
+    .bind(&tree_bytes)
+    .bind(&tree_sha256)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 generation_state: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.transitions( \
+             transition_id, conversation_id, kind, actor_did, actor_device_id, actor_key_id, \
+             actor_auth_generation, actor_role, actor_device_status, signed_request_bytes, \
+             unsigned_projection_bytes, signing_transcript_bytes, request_digest, signature, \
+             next_generation, next_state_version, metadata_snapshot_id, entry_seq, accepted_at \
+         ) VALUES ($1,$2,'directRequestPublication',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,0,1,$11,1,$12)",
+    )
+    .bind(request_id)
+    .bind(conversation_id)
+    .bind(&actor.did)
+    .bind(actor.device_id)
+    .bind(&actor.key_id)
+    .bind(&signed_publication)
+    .bind(&unsigned_body_bytes)
+    .bind(&unsigned_body_bytes)
+    .bind(publication_digest.as_slice())
+    .bind([0x77_u8; 64].as_slice())
+    .bind(metadata_snapshot_id)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 transition: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.entries( \
+             conversation_id, seq, entry_id, entry_kind, accepted_payload_bytes, \
+             accepted_payload_sha256, signed_request_bytes, request_digest, signature, \
+             server_fields_bytes, outer_entry_fingerprint, actor_did, actor_device_id, \
+             actor_key_id, actor_auth_generation, generation, state_version, transition_id, received_at \
+         ) VALUES ($1,1,$2,'blue.catbird.chat.defs#directRequestEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,1,$13,$14)",
+    )
+    .bind(conversation_id)
+    .bind(entry_id)
+    .bind(&request_entry)
+    .bind(request_entry_sha256.as_slice())
+    .bind(&signed_publication)
+    .bind(publication_digest.as_slice())
+    .bind([0x77_u8; 64].as_slice())
+    .bind(&server_fields)
+    .bind(outer_fp.as_slice())
+    .bind(&actor.did)
+    .bind(actor.device_id)
+    .bind(&actor.key_id)
+    .bind(request_id)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 entry: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.metadata_snapshots( \
+             metadata_snapshot_id, conversation_id, generation, state_version, group_id, epoch, \
+             group_context_hash, confirmation_tag, producing_transition_id, origin_transition_id, \
+             metadata_version, nonce, ciphertext, ciphertext_sha256, ciphertext_size, \
+             author_did, author_device_id, author_key_id, author_public_key, \
+             author_auth_generation, author_origin_seq, author_role, author_device_status, created_at \
+         ) VALUES ($1,$2,0,1,$3,1,$4,$5,$6,$6,1,$7,$8,$9,16,$10,$11,$12,$13,1,1,'admin','active',$14)",
+    )
+    .bind(metadata_snapshot_id)
+    .bind(conversation_id)
+    .bind(final_state.coordinate().group_id().as_slice())
+    .bind(final_state.coordinate().group_context_hash().as_slice())
+    .bind(final_state.coordinate().confirmation_tag().as_slice())
+    .bind(request_id)
+    .bind(metadata_nonce.as_slice())
+    .bind(metadata_ciphertext.as_slice())
+    .bind(Sha256::digest(metadata_ciphertext).as_slice())
+    .bind(&actor.did)
+    .bind(actor.device_id)
+    .bind(&actor.key_id)
+    .bind(actor.signing_public_key().as_slice())
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 metadata: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.participants( \
+             participant_period_id, conversation_id, user_did, status, role, role_transition_id, \
+             role_changed_at, created_by_did, created_by_device_id, current_membership, created_at \
+         ) VALUES ($1,$2,$3,'active','admin',$4,$5,$3,$6,true,$5)",
+    )
+    .bind(actor_participant_id)
+    .bind(conversation_id)
+    .bind(&actor.did)
+    .bind(request_id)
+    .bind(created_at)
+    .bind(actor.device_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 actor participant: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.participants( \
+             participant_period_id, conversation_id, user_did, status, role, role_transition_id, \
+             role_changed_at, created_by_did, created_by_device_id, invitation_transition_id, \
+             invitation_entry_id, invited_at, current_membership, created_at \
+         ) VALUES ($1,$2,$3,'pending','admin',$4,$5,$6,$7,$4,$8,$5,true,$5)",
+    )
+    .bind(recipient_participant_id)
+    .bind(conversation_id)
+    .bind(&recipient.did)
+    .bind(request_id)
+    .bind(created_at)
+    .bind(&actor.did)
+    .bind(actor.device_id)
+    .bind(entry_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 recipient participant: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.direct_request_publications( \
+             request_id, conversation_id, generation, state_version, first_message_id, \
+             actor_did, actor_device_id, actor_key_id, recipient_did, context_hash, \
+             preparation_digest, publication_digest, signed_publication, request_entry, \
+             request_entry_sha256, final_group_info, final_group_info_sha256, full_welcome, \
+             full_welcome_sha256, initial_ciphertext, initial_ciphertext_sha256, \
+             metadata_snapshot, metadata_snapshot_sha256, import_until, created_at, actor_auth_generation \
+         ) VALUES ($1,$2,0,1,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,1)",
+    )
+    .bind(request_id)
+    .bind(conversation_id)
+    .bind(first_message_id)
+    .bind(&actor.did)
+    .bind(actor.device_id)
+    .bind(&actor.key_id)
+    .bind(&recipient.did)
+    .bind(context_hash.as_slice())
+    .bind(preparation_digest.as_slice())
+    .bind(publication_digest.as_slice())
+    .bind(&signed_publication)
+    .bind(&request_entry)
+    .bind(request_entry_sha256.as_slice())
+    .bind(&final_info)
+    .bind(Sha256::digest(&final_info).as_slice())
+    .bind(&welcome_bytes)
+    .bind(Sha256::digest(&welcome_bytes).as_slice())
+    .bind(&initial_ct)
+    .bind(Sha256::digest(&initial_ct).as_slice())
+    .bind(&metadata_bytes)
+    .bind(Sha256::digest(&metadata_bytes).as_slice())
+    .bind(import_until)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 publication: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.direct_request_lifecycle_reserves( \
+             request_id, decision_bytes, welcome_bytes_per_delivery, delivery_count \
+         ) VALUES ($1, 8388608, 524288, 1)",
+    )
+    .bind(request_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 lifecycle_reserve: {e}"))?;
+
+    let leaves = final_state.binding().tree_summary().leaves();
+    let actor_leaf = leaves
+        .iter()
+        .find(|l| l.basic_credential() == format!("{}#{}", actor.did, actor.device_id).as_bytes())
+        .ok_or_else(|| "missing actor leaf in c33 final_state".to_owned())?;
+    let recipient_leaf = leaves
+        .iter()
+        .find(|l| {
+            l.basic_credential()
+                == format!("{}#{}", recipient.did, recipient.device_id).as_bytes()
+        })
+        .ok_or_else(|| "missing recipient leaf in c33 final_state".to_owned())?;
+
+    sqlx::query(
+        "INSERT INTO chat.member_devices( \
+             leaf_period_id, participant_period_id, conversation_id, generation, user_did, \
+             device_id, leaf_index, basic_credential, leaf_signature_key, leaf_key_id, \
+             leaf_auth_generation, origin, join_key_package_ref, joined_state_version, \
+             joined_transition_id, joined_seq, active, created_at \
+         ) VALUES ($1,$2,$3,0,$4,$5,$6,$7,$8,$9,1,'genesis',NULL,1,$10,1,true,$11)",
+    )
+    .bind(actor_leaf_id)
+    .bind(actor_participant_id)
+    .bind(conversation_id)
+    .bind(&actor.did)
+    .bind(actor.device_id)
+    .bind(actor_leaf.leaf_index() as i64)
+    .bind(actor_leaf.basic_credential())
+    .bind(actor_leaf.signature_key())
+    .bind(&actor.key_id)
+    .bind(request_id)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 actor member_device: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.member_devices( \
+             leaf_period_id, participant_period_id, conversation_id, generation, user_did, \
+             device_id, leaf_index, basic_credential, leaf_signature_key, leaf_key_id, \
+             leaf_auth_generation, origin, join_key_package_ref, joined_state_version, \
+             joined_transition_id, joined_seq, active, created_at \
+         ) VALUES ($1,$2,$3,0,$4,$5,$6,$7,$8,$9,1,'keyPackage',$10,1,$11,1,true,$12)",
+    )
+    .bind(recipient_leaf_id)
+    .bind(recipient_participant_id)
+    .bind(conversation_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(recipient_leaf.leaf_index() as i64)
+    .bind(recipient_leaf.basic_credential())
+    .bind(recipient_leaf.signature_key())
+    .bind(&recipient.key_id)
+    .bind(kp_ref.as_slice())
+    .bind(request_id)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 recipient member_device: {e}"))?;
+
+    for (did, dev_id, leaf_id) in [
+        (&actor.did, actor.device_id, actor_leaf_id),
+        (&recipient.did, recipient.device_id, recipient_leaf_id),
+    ] {
+        sqlx::query(
+            "INSERT INTO chat.entry_recipients(conversation_id, seq, user_did, device_id, entitlement_kind) \
+             VALUES ($1,1,$2,$3,'control')",
+        )
+        .bind(conversation_id)
+        .bind(did)
+        .bind(dev_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert c33 entry_recipient: {e}"))?;
+
+        sqlx::query(
+            "INSERT INTO chat.application_intervals( \
+                 membership_interval_id, conversation_id, generation, recipient_did, \
+                 recipient_device_id, start_seq, opening_kind, opening_transition_id, \
+                 opening_outer_entry_fingerprint, opening_state_version, opening_group_id, \
+                 opening_epoch, opening_group_context_hash, opening_confirmation_tag, \
+                 opening_leaf_period_id, created_at \
+             ) VALUES ($1,$2,0,$3,$4,1,'directRequest',$5,$6,1,$7,1,$8,$9,$10,$11)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(conversation_id)
+        .bind(did)
+        .bind(dev_id)
+        .bind(request_id)
+        .bind(outer_fp.as_slice())
+        .bind(final_state.coordinate().group_id().as_slice())
+        .bind(final_state.coordinate().group_context_hash().as_slice())
+        .bind(final_state.coordinate().confirmation_tag().as_slice())
+        .bind(leaf_id)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert c33 application_interval: {e}"))?;
+    }
+
+    sqlx::query(
+        "INSERT INTO chat.direct_request_device_deliveries( \
+             request_id, owner_did, owner_device_id, owner_key_id, auth_generation, \
+             key_package_ref, grant_id, grant_revision, grant_digest, leaf_index, \
+             import_until, provenance, provenance_sha256 \
+         ) VALUES ($1,$2,$3,$4,1,$5,$6,1,$7,$8,$9,$10,$11)",
+    )
+    .bind(request_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(kp_ref.as_slice())
+    .bind(grant_id)
+    .bind(grant_digest.as_slice())
+    .bind(recipient_leaf.leaf_index() as i64)
+    .bind(import_until)
+    .bind(&provenance_bytes)
+    .bind(provenance_sha256.as_slice())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 device_delivery: {e}"))?;
+
+    let event_id = Uuid::new_v4();
+    let event_bytes = serde_json::to_vec(&serde_json::json!({
+        "$type": "blue.catbird.chat.defs#conversationChangedEvent",
+        "conversationId": conversation_id.to_string(),
+    }))
+    .unwrap();
+    let event_position: i64 = sqlx::query_scalar(
+        "INSERT INTO chat.events(event_id, event_kind, payload_bytes, payload_sha256, created_at, protocol_instance_id) \
+         SELECT $1, 'conversationChanged', $2, $3, $4, protocol_instance_id \
+           FROM chat.protocol_instances \
+         RETURNING event_position",
+    )
+    .bind(event_id)
+    .bind(&event_bytes)
+    .bind(Sha256::digest(&event_bytes).as_slice())
+    .bind(created_at)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 event: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.event_recipients(event_position, user_did, device_id, entitlement_kind, audience_predecessor_position) \
+         SELECT $1, r.user_did, r.device_id, 'leaf', \
+                (SELECT max(previous.event_position) FROM chat.event_recipients previous WHERE previous.user_did = r.user_did AND previous.device_id = r.device_id) \
+           FROM chat.entry_recipients r \
+          WHERE r.conversation_id = $2 AND r.seq = 1 \
+          ORDER BY r.user_did, r.device_id",
+    )
+    .bind(event_position)
+    .bind(conversation_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 event_recipients: {e}"))?;
+
+    let stream_outbox = Uuid::new_v4();
+    let notification_outbox = Uuid::new_v4();
+    for (outbox_id, kind) in [
+        (stream_outbox, "stream"),
+        (notification_outbox, "notification"),
+    ] {
+        sqlx::query(
+            "INSERT INTO chat.outbox(outbox_id, event_position, work_kind, status, next_attempt_at, created_at) \
+             VALUES ($1, $2, $3, 'pending', $4, $4)",
+        )
+        .bind(outbox_id)
+        .bind(event_position)
+        .bind(kind)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert c33 outbox: {e}"))?;
+    }
+
+    sqlx::query(
+        "INSERT INTO chat.direct_request_push_events( \
+             event_id, request_id, event_position, outbox_id, conversation_id, first_message_id, \
+             sender_did, recipient_did, payload_digest, created_at \
+         ) VALUES ( \
+             $1, $2, $3, $4, $5, $6, $7, $8, \
+             chat.direct_request_push_payload_digest($1, $2, $5, $6, $7, $8, ARRAY[$9::uuid]), \
+             $10 \
+         )",
+    )
+    .bind(event_id)
+    .bind(request_id)
+    .bind(event_position)
+    .bind(notification_outbox)
+    .bind(conversation_id)
+    .bind(first_message_id)
+    .bind(&actor.did)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 push_event: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.direct_request_push_event_recipients( \
+             event_id, request_id, recipient_did, recipient_device_id \
+         ) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(event_id)
+    .bind(request_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert c33 push_event_recipient: {e}"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("commit c33 expired publication fixture: {e}"))?;
+
+    Ok(CleanSlateExpiredDirectRequestFixture {
+        request_id,
+        conversation_id,
+        actor_did: actor.did,
+        recipient_did: recipient.did,
+    })
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub use super::relationship_policy::AdmissionOperation;
 #[cfg(any(test, feature = "test-support"))]

@@ -116,7 +116,11 @@ pub fn verify_final_group_info(
                     validate_clean_leaf_shape(&leaf)?;
                     match leaf.payload.source {
                         WireLeafNodeSource::KeyPackage(lifetime) => {
-                            validate_clean_lifetime(lifetime, policy.now_unix_seconds)?;
+                            validate_clean_lifetime_with_max(
+                                lifetime,
+                                policy.now_unix_seconds,
+                                MAX_DIRECT_REQUEST_KEY_PACKAGE_LIFETIME_SECONDS,
+                            )?;
                             earliest = earliest.min(lifetime.not_after);
                         }
                         WireLeafNodeSource::Commit(_) if index == 0 => (),

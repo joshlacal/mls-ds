@@ -204,6 +204,21 @@ name = "labyrinth_retention"
 path = "tests/labyrinth_retention.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "entry_payload_pruning_and_contiguity"
+path = "tests/entry_payload_pruning_and_contiguity.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "c33_expiry_and_space_roster"
+path = "tests/c33_expiry_and_space_roster.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "gate8_security_suite"
+path = "tests/gate8_security_suite.rs"
+required-features = ["test-support"]
+
 [features]
 default = ["namespace-bluecatbird", "server-bin"]
 namespace-bluecatbird = []

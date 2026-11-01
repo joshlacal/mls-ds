@@ -90,6 +90,20 @@ async fn submit(
         None
     };
 
+    let remote_commit = if completed_preflight {
+        submit_transition::RemoteCommitPreflightOutcome::NotRemoteOrDeferred
+    } else {
+        let preflight_kind = admission.mutation_kind();
+        submit_transition::preflight_remote_commit(
+            pool,
+            &admission,
+            routing_intent.as_ref(),
+            runtime.commit_submitter().map(|s| s.as_ref()),
+        )
+        .await
+        .map_err(|error| submit_failure(preflight_kind, error))?
+    };
+
     let mut transaction = pool
         .begin()
         .await
@@ -114,7 +128,7 @@ async fn submit(
                 prepared,
                 runtime.relationship_authority().as_ref(),
                 routing_intent,
-                runtime.commit_submitter().map(|s| s.as_ref()),
+                remote_commit,
             )
             .await
             .map_err(|error| submit_failure(mutation_kind, error))?;
@@ -138,6 +152,7 @@ async fn submit(
         tracing::error!(?error, "submitTransition outer transaction commit failed");
         ChatFailure::storage(ENDPOINT)
     })?;
+    runtime.notify_events();
     Ok(response)
 }
 

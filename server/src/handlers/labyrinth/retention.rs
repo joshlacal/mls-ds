@@ -52,8 +52,12 @@ pub async fn delete_account_data(
             let EmptyIn {} = body(&bytes)?;
             let mut w = begin_write!(&pool, adm);
             let (caller, at) = (w.caller.clone(), w.instant);
-            repo::purge_account(&mut w.tx, &caller.did, at).await?;
-            w.finish_write(to_bytes(&json!({}))?).await
+            let sequenced = repo::purge_account(&mut w.tx, &caller.did, at).await?;
+            let resp = w.finish_write(to_bytes(&json!({}))?).await?;
+            if sequenced > 0 {
+                rt.notify_events();
+            }
+            Ok(resp)
         }
         .await,
     )

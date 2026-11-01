@@ -56,8 +56,11 @@ pub const MAX_WELCOME_RECIPIENTS: usize = 100;
 /// Clean-protocol packages must remain usable for at least ten minutes.
 pub const MIN_KEY_PACKAGE_REMAINING_SECONDS: u64 = 10 * 60;
 /// Clean-protocol package validity spans at most 30 days plus one hour of
-/// allowed clock skew.
+/// allowed clock skew for ordinary recovery packages.
 pub const MAX_KEY_PACKAGE_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60 + 60 * 60;
+/// Direct-request (`C33`, Spec §6.5) packages outlive the 30-day consent window
+/// (`not_after >= 35d`), bounded at 45 days plus one hour of clock skew.
+pub const MAX_DIRECT_REQUEST_KEY_PACKAGE_LIFETIME_SECONDS: u64 = 45 * 24 * 60 * 60 + 60 * 60;
 
 /// Convert one sealed trusted server timestamp from canonical milliseconds to
 /// the Unix-second instant used for MLS lifetime validation.
@@ -747,6 +750,14 @@ fn validate_clean_lifetime(
     lifetime: WireLifetime,
     now_unix_seconds: u64,
 ) -> Result<(), WireValidationError> {
+    validate_clean_lifetime_with_max(lifetime, now_unix_seconds, MAX_KEY_PACKAGE_LIFETIME_SECONDS)
+}
+
+pub(crate) fn validate_clean_lifetime_with_max(
+    lifetime: WireLifetime,
+    now_unix_seconds: u64,
+    max_lifetime_seconds: u64,
+) -> Result<(), WireValidationError> {
     if !(lifetime.not_before < now_unix_seconds && now_unix_seconds < lifetime.not_after) {
         return Err(WireValidationError::InvalidLifetime {
             now: now_unix_seconds,
@@ -757,7 +768,7 @@ fn validate_clean_lifetime(
     if lifetime.not_after - now_unix_seconds < MIN_KEY_PACKAGE_REMAINING_SECONDS {
         return Err(WireValidationError::InsufficientRemainingLifetime);
     }
-    if lifetime.not_after.saturating_sub(lifetime.not_before) > MAX_KEY_PACKAGE_LIFETIME_SECONDS {
+    if lifetime.not_after.saturating_sub(lifetime.not_before) > max_lifetime_seconds {
         return Err(WireValidationError::LifetimeTooLong);
     }
     Ok(())
@@ -767,11 +778,19 @@ fn validate_clean_leaf_profile(
     leaf: &WireLeafNode,
     now_unix_seconds: u64,
 ) -> Result<WireLifetime, WireValidationError> {
+    validate_clean_leaf_profile_with_max(leaf, now_unix_seconds, MAX_KEY_PACKAGE_LIFETIME_SECONDS)
+}
+
+fn validate_clean_leaf_profile_with_max(
+    leaf: &WireLeafNode,
+    now_unix_seconds: u64,
+    max_lifetime_seconds: u64,
+) -> Result<WireLifetime, WireValidationError> {
     let lifetime = match &leaf.payload.source {
         WireLeafNodeSource::KeyPackage(lifetime) => *lifetime,
         _ => return Err(WireValidationError::UnsupportedLeafSource),
     };
-    validate_clean_lifetime(lifetime, now_unix_seconds)?;
+    validate_clean_lifetime_with_max(lifetime, now_unix_seconds, max_lifetime_seconds)?;
 
     validate_clean_leaf_shape(leaf)?;
     Ok(lifetime)
@@ -884,6 +903,27 @@ pub fn validate_key_package(
     bytes: &[u8],
     policy: KeyPackageValidationPolicy<'_>,
 ) -> Result<ValidatedKeyPackage, WireValidationError> {
+    validate_key_package_with_max(bytes, policy, MAX_KEY_PACKAGE_LIFETIME_SECONDS)
+}
+
+/// Validate one exact wire-format-5 `MLSMessage` carrying a `C33` direct-request
+/// KeyPackage (`not_after >= 35d`, bounded by `MAX_DIRECT_REQUEST_KEY_PACKAGE_LIFETIME_SECONDS`).
+pub fn validate_direct_request_key_package(
+    bytes: &[u8],
+    policy: KeyPackageValidationPolicy<'_>,
+) -> Result<ValidatedKeyPackage, WireValidationError> {
+    validate_key_package_with_max(
+        bytes,
+        policy,
+        MAX_DIRECT_REQUEST_KEY_PACKAGE_LIFETIME_SECONDS,
+    )
+}
+
+fn validate_key_package_with_max(
+    bytes: &[u8],
+    policy: KeyPackageValidationPolicy<'_>,
+    max_lifetime_seconds: u64,
+) -> Result<ValidatedKeyPackage, WireValidationError> {
     let message = preflight_exact_message(
         bytes,
         WireFormat::KeyPackage,
@@ -930,7 +970,8 @@ pub fn validate_key_package(
         return Err(WireValidationError::WrongSignatureKey);
     }
 
-    let lifetime = validate_clean_leaf_profile(leaf, policy.now_unix_seconds)?;
+    let lifetime =
+        validate_clean_leaf_profile_with_max(leaf, policy.now_unix_seconds, max_lifetime_seconds)?;
     if !key_package.payload.extensions.is_empty() {
         return Err(WireValidationError::UnsupportedExtensions);
     }
@@ -1230,6 +1271,30 @@ pub fn process_public_commit(
     commit: ValidatedPublicCommit,
     policy: PublicCommitValidationPolicy<'_>,
 ) -> Result<ProcessedPublicCommit, WireValidationError> {
+    process_public_commit_with_max(prior_state, commit, policy, MAX_KEY_PACKAGE_LIFETIME_SECONDS)
+}
+
+/// Process a `C33` direct-request bootstrap Add Commit allowing `direct-request`
+/// KeyPackages (`not_after >= 35d`, up to `MAX_DIRECT_REQUEST_KEY_PACKAGE_LIFETIME_SECONDS`).
+pub fn process_direct_request_public_commit(
+    prior_state: &PublicGroupState,
+    commit: ValidatedPublicCommit,
+    policy: PublicCommitValidationPolicy<'_>,
+) -> Result<ProcessedPublicCommit, WireValidationError> {
+    process_public_commit_with_max(
+        prior_state,
+        commit,
+        policy,
+        MAX_DIRECT_REQUEST_KEY_PACKAGE_LIFETIME_SECONDS,
+    )
+}
+
+fn process_public_commit_with_max(
+    prior_state: &PublicGroupState,
+    commit: ValidatedPublicCommit,
+    policy: PublicCommitValidationPolicy<'_>,
+    max_lifetime_seconds: u64,
+) -> Result<ProcessedPublicCommit, WireValidationError> {
     if policy.max_members == 0 {
         return Err(WireValidationError::InvalidLimit);
     }
@@ -1328,7 +1393,7 @@ pub fn process_public_commit(
                 let signature_key = leaf.signature_key().as_slice().to_vec();
                 let wrapped = canonical_wrapped(WireFormat::KeyPackage, key_package)
                     .map_err(|_| WireValidationError::InvalidCommitAdd)?;
-                let validated = validate_key_package(
+                let validated = validate_key_package_with_max(
                     &wrapped,
                     KeyPackageValidationPolicy {
                         expected_basic_credential: &basic_credential,
@@ -1336,6 +1401,7 @@ pub fn process_public_commit(
                         now_unix_seconds: policy.now_unix_seconds,
                         max_bytes: MAX_KEY_PACKAGE_WIRE_BYTES,
                     },
+                    max_lifetime_seconds,
                 )
                 .map_err(|_| WireValidationError::InvalidCommitAdd)?;
                 pending_adds.push(PendingCommitAdd {

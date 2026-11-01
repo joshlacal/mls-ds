@@ -29,6 +29,56 @@ pub fn install_test_https_relationship_resolver(
 use crate::db::DbPool;
 use crate::realtime::{SseState, StreamEvent};
 
+pub const MAX_WS_PER_DEVICE: usize = 4;
+pub const MAX_WS_PER_DID: usize = 16;
+pub const MAX_WS_GLOBAL: usize = 8_192;
+
+#[derive(Default)]
+struct WsRegistryState {
+    total: usize,
+    per_did: std::collections::HashMap<String, usize>,
+    per_device: std::collections::HashMap<(String, uuid::Uuid), Vec<(u64, tokio::sync::watch::Sender<bool>)>>,
+    next_conn_id: u64,
+}
+
+/// RAII guard for an active `subscribeEvents` WebSocket connection (`M-F05`, `M-F08`).
+pub struct WsSlotGuard {
+    registry: Arc<std::sync::Mutex<WsRegistryState>>,
+    did: String,
+    device_id: uuid::Uuid,
+    conn_id: u64,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl WsSlotGuard {
+    pub async fn cancelled(&mut self) {
+        if *self.cancel_rx.borrow() {
+            return;
+        }
+        let _ = self.cancel_rx.changed().await;
+    }
+}
+
+impl Drop for WsSlotGuard {
+    fn drop(&mut self) {
+        let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        guard.total = guard.total.saturating_sub(1);
+        if let Some(count) = guard.per_did.get_mut(&self.did) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                guard.per_did.remove(&self.did);
+            }
+        }
+        let key = (self.did.clone(), self.device_id);
+        if let Some(entries) = guard.per_device.get_mut(&key) {
+            entries.retain(|(id, _)| *id != self.conn_id);
+            if entries.is_empty() {
+                guard.per_device.remove(&key);
+            }
+        }
+    }
+}
+
 /// Shared, immutable clean-chat runtime, stored in `AppState` and extracted by
 /// every chat handler as `State<Arc<ChatRuntime>>`.
 pub struct ChatRuntime {
@@ -37,6 +87,10 @@ pub struct ChatRuntime {
     request_receipt_signer: Option<
         Arc<crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner>,
     >,
+    i13_receipt_signer: Option<Arc<crate::federation::receipt::I13ReceiptSigner>>,
+    require_signed_reads: bool,
+    ws_registry: Arc<std::sync::Mutex<WsRegistryState>>,
+    events_notify: Arc<tokio::sync::Notify>,
     request_push: Option<Arc<RequestPushConfig>>,
     requests_ready: std::sync::atomic::AtomicBool,
     relationship_authority: Arc<ProductionRelationshipAuthority>,
@@ -54,6 +108,8 @@ impl fmt::Debug for ChatRuntime {
             .field("cutover_enabled", &self.cutover_enabled)
             .field("relationship_authority", &"fixed-production-authority")
             .field("request_push_enabled", &self.request_push.is_some())
+            .field("i13_receipt_signer_configured", &self.i13_receipt_signer.is_some())
+            .field("require_signed_reads", &self.require_signed_reads)
             .field("sse_state", &"conversation-filtered")
             .field("cursor_sealer_configured", &self.cursor_sealer.is_some())
             .field(
@@ -148,10 +204,16 @@ impl ChatRuntime {
             return Err("request push requires chat cutover".into());
         }
         let request_push = RequestPushConfig::from_env(request_push_enabled)?;
+        let require_signed_reads = env_flag("CHAT_REQUIRE_SIGNED_READS");
+        let i13_receipt_signer = build_i13_receipt_signer_from_env()?;
         Ok(Self {
             cutover_enabled,
             request_producers_enabled,
             request_receipt_signer,
+            i13_receipt_signer,
+            require_signed_reads,
+            ws_registry: Arc::new(std::sync::Mutex::new(WsRegistryState::default())),
+            events_notify: Arc::new(tokio::sync::Notify::new()),
             request_push,
             requests_ready: std::sync::atomic::AtomicBool::new(false),
             relationship_authority,
@@ -391,6 +453,97 @@ impl ChatRuntime {
             },
         );
     }
+
+    pub fn with_i13_receipt_signer(
+        mut self,
+        signer: crate::federation::receipt::I13ReceiptSigner,
+    ) -> Self {
+        self.i13_receipt_signer = Some(Arc::new(signer));
+        self
+    }
+
+    pub fn i13_receipt_signer(&self) -> Option<&crate::federation::receipt::I13ReceiptSigner> {
+        self.i13_receipt_signer.as_deref()
+    }
+
+    pub fn with_require_signed_reads(mut self, required: bool) -> Self {
+        self.require_signed_reads = required;
+        self
+    }
+
+    pub fn require_signed_reads(&self) -> bool {
+        self.require_signed_reads
+    }
+
+    /// Acquire a bounded WebSocket slot (`<= 4` per device, `<= 16` per DID,
+    /// `<= 8192` global) or fail closed for `RateLimited` (`M-F05`).
+    pub fn acquire_ws_slot(&self, did: &str, device_id: uuid::Uuid) -> Result<WsSlotGuard, ()> {
+        let mut guard = self.ws_registry.lock().unwrap_or_else(|e| e.into_inner());
+        let did_count = guard.per_did.get(did).copied().unwrap_or(0);
+        let key = (did.to_owned(), device_id);
+        let dev_count = guard.per_device.get(&key).map(Vec::len).unwrap_or(0);
+        if guard.total >= MAX_WS_GLOBAL || did_count >= MAX_WS_PER_DID || dev_count >= MAX_WS_PER_DEVICE {
+            return Err(());
+        }
+        guard.total += 1;
+        *guard.per_did.entry(did.to_owned()).or_insert(0) += 1;
+        guard.next_conn_id += 1;
+        let conn_id = guard.next_conn_id;
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        guard.per_device.entry(key).or_default().push((conn_id, cancel_tx));
+        Ok(WsSlotGuard {
+            registry: Arc::clone(&self.ws_registry),
+            did: did.to_owned(),
+            device_id,
+            conn_id,
+            cancel_rx,
+        })
+    }
+
+    /// Evict all active WebSocket connections for `(did, device_id)` (`M-F08`).
+    pub fn disconnect_device_ws(&self, did: &str, device_id: uuid::Uuid) -> usize {
+        let guard = self.ws_registry.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entries) = guard.per_device.get(&(did.to_owned(), device_id)) else {
+            return 0;
+        };
+        for (_, tx) in entries {
+            let _ = tx.send(true);
+        }
+        entries.len()
+    }
+
+    /// Wake all `subscribeEvents` loops immediately after durable event commits (`M-F05`).
+    pub fn notify_events(&self) {
+        self.events_notify.notify_waiters();
+    }
+
+    /// Wait for either `notify_events()` or `timeout` fallback (`M-F05`).
+    pub async fn wait_for_events_or_timeout(&self, timeout_dur: std::time::Duration) -> bool {
+        tokio::time::timeout(timeout_dur, self.events_notify.notified())
+            .await
+            .is_ok()
+    }
+}
+
+fn build_i13_receipt_signer_from_env(
+) -> Result<Option<Arc<crate::federation::receipt::I13ReceiptSigner>>, String> {
+    use p256::pkcs8::DecodePrivateKey as _;
+    let Ok(pem) = std::env::var("RECEIPT_SIGNING_KEY_PEM") else {
+        return Ok(None);
+    };
+    if pem.trim().is_empty() {
+        return Ok(None);
+    }
+    let Some(service_did) = crate::identity::service_did_base_opt() else {
+        return Ok(None);
+    };
+    let secret = p256::SecretKey::from_pkcs8_pem(pem.trim())
+        .map_err(|_| "RECEIPT_SIGNING_KEY_PEM is not valid P-256 PKCS#8 PEM".to_owned())?;
+    let signing_key = p256::ecdsa::SigningKey::from(secret);
+    Ok(Some(Arc::new(crate::federation::receipt::I13ReceiptSigner::new(
+        signing_key,
+        service_did,
+    ))))
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::{
 };
 use jacquard_common::DefaultStr;
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Transaction};
+use sqlx::PgPool;
 
 use super::envelope::{verify_receipt, SUBMIT_COMMIT_NSID};
 use super::errors::FederationError;
@@ -46,9 +46,10 @@ impl RemoteCommitSubmitter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        pool: &PgPool,
         sequencer_ds_did: &str,
         sequencer_term: u64,
         envelope: &SubmitCommit<DefaultStr>,
@@ -62,7 +63,7 @@ impl RemoteCommitSubmitter {
             .resolve_ds_destination_uncached(sequencer_ds_did)
             .await?;
 
-        peer_policy::enforce_outbound_peer_policy_tx(transaction, sequencer_ds_did).await?;
+        peer_policy::enforce_outbound_peer_policy(pool, sequencer_ds_did).await?;
 
         let auth_token = self
             .service_auth

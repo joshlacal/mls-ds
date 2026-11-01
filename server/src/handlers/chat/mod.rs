@@ -14,6 +14,7 @@ use crate::chat_protocol::validation::ValidatedChatNsid;
 use crate::storage::DbPool;
 
 mod accept_conversation;
+mod acknowledge_entries;
 mod context;
 mod conversation_state;
 mod create_conversation;
@@ -83,7 +84,25 @@ where
             router.route(&path, post(handler))
         };
     }
-    router.merge(implemented_routes::<S>())
+    router
+        .merge(implemented_routes::<S>())
+        .layer(axum::middleware::from_fn(attach_canonical_query_header))
+}
+
+async fn attach_canonical_query_header(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    req.headers_mut()
+        .remove(crate::chat_protocol::read_auth::INTERNAL_CANONICAL_QUERY_HEADER);
+    let canonical = crate::chat_protocol::read_auth::canonical_query(req.uri().query());
+    if let Ok(value) = axum::http::HeaderValue::from_str(&canonical) {
+        req.headers_mut().insert(
+            crate::chat_protocol::read_auth::INTERNAL_CANONICAL_QUERY_HEADER,
+            value,
+        );
+    }
+    next.run(req).await
 }
 
 /// Whether `endpoint` has a real handler in this slice.
@@ -107,6 +126,7 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::PublishTyping
             | ChatEndpoint::CreateConversation
             | ChatEndpoint::AcceptConversation
+            | ChatEndpoint::AcknowledgeEntries
             | ChatEndpoint::GetConversations
             | ChatEndpoint::GetPendingWelcomes
             | ChatEndpoint::GetLeafRecoveryInbox
@@ -175,7 +195,7 @@ where
         )
         .route(
             &xrpc_path(ChatEndpoint::CreateConversation),
-            post(create_conversation::handle),
+            post(create_conversation::handle).layer(DefaultBodyLimit::max(15_728_640)),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetConversationState),
@@ -211,11 +231,15 @@ where
         )
         .route(
             &xrpc_path(ChatEndpoint::SubmitTransition),
-            post(submit_transition::handle),
+            post(submit_transition::handle).layer(DefaultBodyLimit::max(15_728_640)),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetEntries),
             get(get_entries::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::AcknowledgeEntries),
+            post(acknowledge_entries::handle).layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             &xrpc_path(ChatEndpoint::RequestLeave),
@@ -231,7 +255,7 @@ where
         )
         .route(
             &xrpc_path(ChatEndpoint::SendMessage),
-            post(send_message::handle),
+            post(send_message::handle).layer(DefaultBodyLimit::max(15_728_640)),
         )
         .route(
             &xrpc_path(ChatEndpoint::PublishTyping),
@@ -305,12 +329,12 @@ where
         .route(
             "/xrpc/blue.catbird.mlsDS.relaySendMessage",
             post(crate::handlers::ds::direct_requests::relay_send_message)
-                .layer(DefaultBodyLimit::max(16_777_216)),
+                .layer(DefaultBodyLimit::max(15_728_640)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.deliverMessageEntry",
             post(crate::handlers::ds::direct_requests::deliver_message_entry)
-                .layer(DefaultBodyLimit::max(16_777_216)),
+                .layer(DefaultBodyLimit::max(15_728_640)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.getDirectRequestOutcome",

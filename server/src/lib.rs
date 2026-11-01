@@ -96,7 +96,40 @@ pub use catbird_atproto::builder_types;
 // sqlx conversion helpers for jacquard-common types
 pub mod sqlx_jacquard;
 
+/// Default HTTP body limit for ordinary XRPC routes (`4 MiB`).
+pub const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+/// KeyPackage batch body limit (`12 MiB`) for `enrollDevice` and `replenishKeyPackages`.
+pub const CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES: usize = 12 * 1024 * 1024;
+/// Symmetric single-MLS-artifact body limit (`15 MiB`) across client and S2S routes (`M-F11`).
+pub const SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES: usize = 15 * 1024 * 1024;
+/// Symmetric direct-request bootstrap/keys body limit (`16 MiB`) across client and S2S routes (`M-F11`).
+pub const CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Authoritative per-route HTTP body limit shared symmetrically across client and S2S surfaces (`M-F11`).
+pub fn request_body_limit(path: &str) -> usize {
+    match path {
+        "/xrpc/blue.catbird.chat.enrollDevice" | "/xrpc/blue.catbird.chat.replenishKeyPackages" => {
+            CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES
+        }
+        "/xrpc/blue.catbird.chat.publishDirectRequest"
+        | "/xrpc/blue.catbird.chat.publishDirectRequestKeys"
+        | "/xrpc/blue.catbird.mlsDS.publishDirectRequest"
+        | "/xrpc/blue.catbird.mlsDS.deliverDirectRequest" => CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES,
+        "/xrpc/blue.catbird.chat.createConversation"
+        | "/xrpc/blue.catbird.chat.submitTransition"
+        | "/xrpc/blue.catbird.chat.sendMessage"
+        | "/xrpc/blue.catbird.mlsDS.deliverMessage"
+        | "/xrpc/blue.catbird.mlsDS.deliverWelcome"
+        | "/xrpc/blue.catbird.mlsDS.submitCommit"
+        | "/xrpc/blue.catbird.mlsDS.relaySendMessage"
+        | "/xrpc/blue.catbird.mlsDS.deliverMessageEntry"
+        | "/xrpc/blue.catbird.mlsDS.relayGroupMutation" => SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
+        p if p.starts_with("/xrpc/blue.catbird.labyrinth.") => 1_572_864,
+        _ => DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+    }
+}
 
 #[cfg(all(test, feature = "test-support"))]
 #[path = "../tests/common/chat_protocol_heartbeat_transport.rs"]
 mod heartbeat_transport_tests;
+

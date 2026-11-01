@@ -394,7 +394,7 @@ pub async fn expire_due_published_requests(
             "$type": "blue.catbird.chat.defs#directRequestReceiptBody",
             "signatureDomain": "CATBIRD-DIRECT-REQUEST-OUTCOME\0",
             "protocolVersion": "2",
-            "authorityDid": super::direct_request_receipts::REQUEST_RECEIPT_AUTHORITY,
+            "authorityDid": signer.authority_did(),
             "keyId": signer.key_id(),
             "receipt": {
                 "$type": "blue.catbird.chat.defs#directRequestExpiredReceipt",
@@ -451,10 +451,110 @@ pub async fn expire_due_published_requests(
         .execute(&mut *tx)
         .await?;
 
+        sqlx::query(
+            "UPDATE chat.generations \
+                SET lifecycle = 'superseded', \
+                    superseded_seq = (SELECT next_entry_seq - 1 FROM chat.conversations WHERE conversation_id = $1), \
+                    superseded_at = $2 \
+              WHERE conversation_id = $1 \
+                AND lifecycle = 'active'",
+        )
+        .bind(conversation_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE chat.conversations \
+                SET lifecycle = 'superseded' \
+              WHERE conversation_id = $1 \
+                AND kind = 'direct' \
+                AND protocol_version = '2' \
+                AND lifecycle = 'active'",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE chat.direct_request_transport_inbox \
+                SET status = 'expired', updated_at = $2 \
+              WHERE request_id = $1 \
+                AND status = 'pending'",
+        )
+        .bind(id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         count += 1;
     }
     Ok(count)
+}
+
+/// Deterministic test entrypoint for sweeping overdue published `C33` direct requests.
+pub async fn sweep_expired_published_direct_requests_for_test(
+    pool: &PgPool,
+    signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
+) -> Result<usize, ExpirySweepError> {
+    expire_due_published_requests(pool, signer, 100).await
+}
+
+/// Mark active devices with `last_active_at <= now - 60 days` as dormant so abandoned
+/// devices cannot stall ACK-based ciphertext pruning (`I14`, `G6`).
+pub async fn mark_inactive_devices(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> Result<u64, ExpirySweepError> {
+    let result = sqlx::query(
+        "UPDATE chat.devices \
+            SET dormant_at = $1 \
+          WHERE status = 'active' \
+            AND dormant_at IS NULL \
+            AND last_active_at <= $1 - INTERVAL '60 days'",
+    )
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Hard 30-day ceiling sweep: prune any unpruned `applicationEntry` ciphertext older
+/// than 30 days while keeping contiguous `seq` skeletons and `sequencer_receipt_bytes`.
+pub async fn prune_expired_application_payloads(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> Result<u64, ExpirySweepError> {
+    let cutoff = now - chrono::Duration::days(30);
+    let targets: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT conversation_id, seq \
+           FROM chat.entries \
+          WHERE entry_kind = 'blue.catbird.chat.defs#applicationEntry' \
+            AND payload_pruned_at IS NULL \
+            AND received_at <= $1 \
+          ORDER BY received_at ASC, conversation_id ASC, seq ASC \
+          LIMIT 256",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+
+    let mut pruned = 0_u64;
+    for (conversation_id, seq) in targets {
+        let mut tx = pool.begin().await?;
+        let did_prune =
+            super::delivery::prune_application_entry_payload(&mut tx, conversation_id, seq, now)
+                .await
+                .map_err(|e| ExpirySweepError::DirectRequest(format!("prune 30d payload: {e:?}")))?;
+        if did_prune {
+            tx.commit().await?;
+            pruned += 1;
+        } else {
+            tx.rollback().await?;
+        }
+    }
+    Ok(pruned)
 }
 
 /// Prune heavy artifacts of requests terminal (closed or expired) for >14 days

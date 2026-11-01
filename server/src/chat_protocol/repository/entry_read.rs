@@ -121,10 +121,45 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
         "blue.catbird.chat.defs#directRequestEntry"
             | "blue.catbird.chat.defs#directRequestAcceptanceEntry"
     );
-    let mut entry = if row.entry_kind == delivery::APPLICATION_ENTRY_KIND || is_direct_request_entry
-    {
-        let signed_request: Value = serde_json::from_slice(&row.signed_request_bytes)
-            .map_err(|_| EntryReadFacadeError::Invariant)?;
+    let mut entry = if row.entry_kind == delivery::APPLICATION_ENTRY_KIND {
+        let mut obj = if row.payload_pruned_at.is_some() || row.signed_request_bytes.is_none() {
+            json!({
+                "$type": row.entry_kind,
+                "conversationId": row.conversation_id.hyphenated().to_string(),
+                "entryId": row.entry_id.hyphenated().to_string(),
+                "payloadPruned": true,
+                "receivedAt": row.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "seq": row.seq,
+            })
+        } else {
+            let signed_bytes = row
+                .signed_request_bytes
+                .as_deref()
+                .ok_or(EntryReadFacadeError::Invariant)?;
+            let signed_request: Value =
+                serde_json::from_slice(signed_bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
+            json!({
+                "$type": row.entry_kind,
+                "conversationId": row.conversation_id.hyphenated().to_string(),
+                "entryId": row.entry_id.hyphenated().to_string(),
+                "receivedAt": row.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "seq": row.seq,
+                "signedRequest": signed_request,
+            })
+        };
+        if let Some(rcpt_bytes) = &row.sequencer_receipt_bytes {
+            let rcpt: Value =
+                serde_json::from_slice(rcpt_bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
+            obj["sequencerReceipt"] = rcpt;
+        }
+        obj
+    } else if is_direct_request_entry {
+        let signed_bytes = row
+            .signed_request_bytes
+            .as_deref()
+            .ok_or(EntryReadFacadeError::Invariant)?;
+        let signed_request: Value =
+            serde_json::from_slice(signed_bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
         json!({
             "$type": row.entry_kind,
             "conversationId": row.conversation_id.hyphenated().to_string(),
@@ -133,14 +168,44 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
             "seq": row.seq,
             "signedRequest": signed_request,
         })
+    } else if row.entry_kind == "blue.catbird.chat.defs#accountDeletedEntry" {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AccountDeletedFields {
+            deleted_did: String,
+            sequencer_did: String,
+            #[serde(default, with = "serde_bytes")]
+            signature: Option<Vec<u8>>,
+        }
+        let fields: AccountDeletedFields =
+            serde_ipld_dagcbor::from_slice(&row.server_fields_bytes)
+                .map_err(|_| EntryReadFacadeError::Invariant)?;
+        let mut obj = json!({
+            "$type": row.entry_kind,
+            "conversationId": row.conversation_id.hyphenated().to_string(),
+            "deletedDid": fields.deleted_did,
+            "entryId": row.entry_id.hyphenated().to_string(),
+            "receivedAt": row.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            "seq": row.seq,
+            "sequencerDid": fields.sequencer_did,
+        });
+        if let Some(sig) = fields.signature {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            obj["signature"] = json!(STANDARD.encode(sig));
+        }
+        obj
     } else {
+        let signed_bytes = row
+            .signed_request_bytes
+            .as_deref()
+            .ok_or(EntryReadFacadeError::Invariant)?;
         let bytes = crate::chat_protocol::transcript::persisted_control_entry_response_json(
             &row.entry_kind,
             &row.entry_id.hyphenated().to_string(),
             &row.conversation_id.hyphenated().to_string(),
             u64::try_from(row.seq).map_err(|_| EntryReadFacadeError::Invariant)?,
             &row.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-            &row.signed_request_bytes,
+            signed_bytes,
             &row.server_fields_bytes,
         )
         .map_err(|_| EntryReadFacadeError::Invariant)?;
@@ -229,11 +294,13 @@ mod tests {
             seq: 2,
             entry_id,
             entry_kind: "blue.catbird.chat.defs#leaveCancellationEntry".to_string(),
-            signed_request_bytes,
+            signed_request_bytes: Some(signed_request_bytes),
             request_digest: Sha256::digest(canonical.transcript_bytes()).to_vec(),
             signature: signature.to_vec(),
             server_fields_bytes: vec![0xA0],
             outer_entry_fingerprint: vec![0x11; 32],
+            payload_pruned_at: None,
+            sequencer_receipt_bytes: None,
             received_at: "2026-08-20T12:00:01.000Z".parse().unwrap(),
         };
 
@@ -316,11 +383,13 @@ mod tests {
             seq: 2,
             entry_id: Uuid::parse_str("51515151-5151-4151-9151-515151515151").unwrap(),
             entry_kind: delivery::APPLICATION_ENTRY_KIND.to_owned(),
-            signed_request_bytes: serde_json::to_vec(&signed_request).unwrap(),
+            signed_request_bytes: Some(serde_json::to_vec(&signed_request).unwrap()),
             request_digest: vec![0x11; 32],
             signature: vec![0x22; 64],
             server_fields_bytes: vec![0xA0],
             outer_entry_fingerprint: vec![0x33; 32],
+            payload_pruned_at: None,
+            sequencer_receipt_bytes: None,
             received_at: "2026-07-22T12:34:56.000Z".parse().unwrap(),
         };
 

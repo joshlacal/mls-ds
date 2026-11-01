@@ -171,8 +171,23 @@ pub fn did_web_service_endpoint(did: &str) -> Option<String> {
     Some(format!("https://{host_port}/{}", path.join("/")))
 }
 
+pub mod did_doc;
+
 /// Canonical root DID document path shared by URL resolution and serving.
 pub const DID_WEB_WELL_KNOWN_PATH: &str = "/.well-known/did.json";
+
+/// Build the HTTP route path at which a `did:web` serves its DID document, or `None` for non-`did:web` (`did:plc`).
+///
+/// - `did:web:example.com` -> `Some("/.well-known/did.json")`
+/// - `did:web:example.com:chat:ds1` -> `Some("/chat/ds1/did.json")`
+/// - `did:plc:...` -> `None`
+pub fn did_web_document_path(did: &str) -> Option<String> {
+    let (_host_port, path) = parse_did_web(did)?;
+    if path.is_empty() {
+        return Some(DID_WEB_WELL_KNOWN_PATH.to_string());
+    }
+    Some(format!("/{}/did.json", path.join("/")))
+}
 
 /// Build DID document URL from `did:web` per method rules.
 ///

@@ -261,11 +261,12 @@ async fn send(
         }
         PreparedChatAdmission::First(first) => {
             let (authority, scope, completion) = first.into_execution_parts();
-            let (response_bytes, event_position) = message_delivery::send(
+            let (response_bytes, event_position) = message_delivery::send_with_receipt_signer(
                 &mut tx,
                 &authority,
                 &scope,
                 runtime.relationship_authority().as_ref(),
+                runtime.i13_receipt_signer(),
             )
             .await
             .map_err(|e| {
@@ -290,6 +291,7 @@ async fn send(
                 tracing::error!("tx.commit error: {:?}", e);
                 ChatFailure::storage(ENDPOINT)
             })?;
+            runtime.notify_events();
             deliver_message_entry_to_remote_peers(pool, authority.subject().as_str(), &response_bytes).await?;
 
             context::canonical_json_response(ENDPOINT, 200, response_bytes)

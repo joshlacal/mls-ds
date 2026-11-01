@@ -147,6 +147,27 @@ pub(crate) async fn admit_unsigned_read(
 ) -> Result<VerifiedReadAdmission, ChatFailure> {
     require_cutover(runtime, endpoint)?;
     let principal = verify_service_principal(pool, endpoint, headers).await?;
+    if (method.as_str() == "GET" && runtime.require_signed_reads())
+        || crate::chat_protocol::read_auth::has_any_read_auth_header(headers)
+    {
+        crate::chat_protocol::read_auth::verify_chat_read_headers(
+            pool,
+            endpoint,
+            principal.did(),
+            actor_device_id,
+            headers,
+        )
+        .await?;
+    } else if let Ok(device_uuid) = uuid::Uuid::parse_str(actor_device_id) {
+        let _ = sqlx::query(
+            "UPDATE chat.devices SET last_active_at = clock_timestamp() \
+             WHERE user_did = $1 AND device_id = $2 AND status = 'active'",
+        )
+        .bind(principal.did())
+        .bind(device_uuid)
+        .execute(pool)
+        .await;
+    }
     let instant = capture_instant(endpoint)?;
     let pre_replay =
         dpop::standard_service_auth_evidence(principal, actor_device_id, method, instant, None)

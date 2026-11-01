@@ -1130,3 +1130,20 @@ BEGIN
     RETURN TRUE;
 END;
 $$;
+
+-- =============================================================================
+-- 7. Scope-aware `key_packages_lifetime_check` for Spec §6.5 `C33` (>= 35d)
+-- =============================================================================
+-- `recovery` KeyPackages preserve the strict 2,595,600s (30d + 1h) ceiling,
+-- while `direct-request` KeyPackages allow up to 3,891,600s (45d + 1h) so
+-- clients can mint `not_after >= 35d` past the 30-day C33 request consent window.
+ALTER TABLE chat.key_packages DROP CONSTRAINT IF EXISTS key_packages_lifetime_check;
+ALTER TABLE chat.key_packages ADD CONSTRAINT key_packages_lifetime_check CHECK (
+    not_before < created_at AND created_at < not_after
+    AND not_after >= created_at + INTERVAL '600 seconds'
+    AND (
+        (usage_scope = 'recovery' AND not_after <= not_before + INTERVAL '2595600 seconds')
+        OR (usage_scope = 'direct-request' AND not_after <= not_before + INTERVAL '3891600 seconds')
+    )
+);
+

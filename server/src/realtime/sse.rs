@@ -142,6 +142,17 @@ impl SseState {
     pub fn broadcast(&self, event_type: &str, payload: &str) {
         debug!(event_type, payload, "Broadcasting realtime event");
     }
+
+    /// Prune conversation broadcast channels that currently have zero active
+    /// receivers and no in-flight emit-queue consumer (`M-F05`).
+    pub async fn prune_idle_channels(&self) -> usize {
+        let mut channels = self.channels.write().await;
+        let before = channels.len();
+        channels.retain(|convo_id, sender| {
+            sender.receiver_count() > 0 || self.emit_queue.contains_key(convo_id)
+        });
+        before.saturating_sub(channels.len())
+    }
 }
 
 async fn consume_emit_queue(

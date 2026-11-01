@@ -38,7 +38,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Import from library crate instead of re-declaring modules
 use catbird_server::{
-    auth, config, db, federation, handlers, health, jobs, metrics, middleware, realtime, workers,
+    auth, config, db, federation, handlers, health, jobs, metrics, middleware, realtime,
+    request_body_limit, workers, CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES,
+    DEFAULT_REQUEST_BODY_LIMIT_BYTES,
 };
 
 mod xrpc_proxy;
@@ -68,9 +70,16 @@ where
     let Some(document) = document else {
         return Router::new();
     };
+    let route_path = match document.get("id").and_then(|v| v.as_str()) {
+        Some(did) => match catbird_server::identity::did_web_document_path(did) {
+            Some(path) => path,
+            None => return Router::new(),
+        },
+        None => catbird_server::identity::DID_WEB_WELL_KNOWN_PATH.to_owned(),
+    };
     let document = Arc::new(document);
     Router::new().route(
-        catbird_server::identity::DID_WEB_WELL_KNOWN_PATH,
+        &route_path,
         get(move || {
             let document = document.clone();
             async move { axum::Json((*document).clone()).into_response() }
@@ -101,8 +110,6 @@ fn is_production_environment() -> bool {
         None => !cfg!(debug_assertions),
     }
 }
-
-const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
 #[cfg(feature = "test-support")]
 async fn init_federation_test_chat_fence(pool: &sqlx::PgPool) -> Result<(), String> {
@@ -231,18 +238,6 @@ async fn init_federation_test_chat_fence(pool: &sqlx::PgPool) -> Result<(), Stri
 // GroupInfo therefore needs nearly 13.34 MiB on the wire before the small JSON
 // envelope is counted. Keep the ordinary 4 MiB default, but preserve the
 // existing MLS contracts on routes that carry one or more large artifacts.
-const SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES: usize = 15 * 1024 * 1024;
-// Clean-chat enroll/replenish carry up to 100 KeyPackages
-// (`blue.catbird.chat.defs#keyPackageArtifact.bytes` maxLength 65536 ×
-// `keyPackages` maxLength 100), which base64-expand (4/3) to ~8.4 MiB of JSON
-// plus the signed-request envelope; 12 MiB gives headroom without truncating a
-// valid maximal batch (OQ-10).
-const CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES: usize = 12 * 1024 * 1024;
-// T16 request-specific publish tier: the signed publication and the request
-// key batch carry their own 16 MiB wire budget (the same value as their route
-// `DefaultBodyLimit`), never widening the 4 MiB default. Nest mirrors this
-// exact table in `services/xrpc_ingress.rs` so it refuses before forwarding.
-const CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const INGRESS_BODY_BUDGET_MIB: usize = 64;
 const BYTES_PER_INGRESS_PERMIT: usize = 1024 * 1024;
 const DEFAULT_REQUEST_BODY_READ_TIMEOUT_MS: u64 = 15_000;
@@ -317,27 +312,6 @@ impl IngressBodyPolicy {
         } else {
             self.read_total_timeout
         }
-    }
-}
-
-fn request_body_limit(path: &str) -> usize {
-    match path {
-        "/xrpc/blue.catbird.chat.enrollDevice" | "/xrpc/blue.catbird.chat.replenishKeyPackages" => {
-            CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES
-        }
-        "/xrpc/blue.catbird.chat.publishDirectRequest"
-        | "/xrpc/blue.catbird.chat.publishDirectRequestKeys" => {
-            CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES
-        }
-        "/xrpc/blue.catbird.mlsDS.deliverMessage"
-        | "/xrpc/blue.catbird.mlsDS.deliverWelcome"
-        | "/xrpc/blue.catbird.mlsDS.submitCommit"
-        | "/xrpc/blue.catbird.mlsDS.publishDirectRequest"
-        | "/xrpc/blue.catbird.mlsDS.deliverDirectRequest"
-        | "/xrpc/blue.catbird.mlsDS.relaySendMessage"
-        | "/xrpc/blue.catbird.mlsDS.deliverMessageEntry" => SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
-        p if p.starts_with("/xrpc/blue.catbird.labyrinth.") => 1_572_864,
-        _ => DEFAULT_REQUEST_BODY_LIMIT_BYTES,
     }
 }
 
@@ -490,9 +464,9 @@ fn merge_application_routers(
             middleware::idempotency::idempotency_middleware,
         ))
         // The path-aware outer buffer enforces the narrower effective limit.
-        // Configure the extractor ceiling to the largest valid route (15 MiB for DS single artifact)
+        // Configure the extractor ceiling to the largest valid route (16 MiB for direct request)
         // so it cannot re-reject a body already accepted by that policy.
-        .layer(DefaultBodyLimit::max(SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES))
+        .layer(DefaultBodyLimit::max(CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             ingress_body_policy.clone(),
             buffer_limited_request_body,

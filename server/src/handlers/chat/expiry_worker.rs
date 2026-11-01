@@ -137,6 +137,25 @@ pub async fn run_chat_expiry_sweeper(pool: DbPool, runtime: Arc<ChatRuntime>) {
             Ok(_) => {}
             Err(error) => tracing::warn!(%error, "terminal direct request artifact pruning failed"),
         }
+        let now = chrono::Utc::now();
+        match crate::chat_protocol::repository::expiry_sweep::mark_inactive_devices(&pool, now).await
+        {
+            Ok(marked) if marked > 0 => tracing::info!(marked, "marked 60d inactive devices dormant"),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "device dormancy sweep failed"),
+        }
+        match crate::chat_protocol::repository::expiry_sweep::prune_expired_application_payloads(
+            &pool, now,
+        )
+        .await
+        {
+            Ok(pruned) if pruned > 0 => {
+                tracing::info!(pruned, "pruned 30d expired application payloads")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "30d application payload pruning failed"),
+        }
+        let _ = runtime.sse_state().prune_idle_channels().await;
         if counts.had_errors() {
             tracing::warn!(
                 recovery_due = counts.recovery_due,

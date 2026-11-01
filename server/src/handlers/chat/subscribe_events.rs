@@ -89,11 +89,26 @@ pub(super) async fn handle(
         Err(failure) => return failure.into_response(),
     };
     match authorize(&pool, &runtime, &parsed).await {
-        Ok((ticket, replay_through)) => ws
-            .on_upgrade(move |socket| {
-                stream(socket, pool, runtime, ticket, parsed.cursor, replay_through)
-            })
-            .into_response(),
+        Ok((ticket, replay_through)) => {
+            let Ok(ws_guard) = runtime.acquire_ws_slot(&ticket.user_did, ticket.device_id) else {
+                return ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::RateLimited)
+                    .into_response();
+            };
+            ws.max_message_size(65_536)
+                .max_frame_size(65_536)
+                .on_upgrade(move |socket| {
+                    stream(
+                        socket,
+                        pool,
+                        runtime,
+                        ticket,
+                        parsed.cursor,
+                        replay_through,
+                        ws_guard,
+                    )
+                })
+                .into_response()
+        }
         Err(failure) => failure.into_response(),
     }
 }
@@ -228,6 +243,7 @@ async fn stream(
     ticket: ConsumedTicket,
     initial_cursor: String,
     replay_through: i64,
+    mut ws_guard: super::runtime::WsSlotGuard,
 ) {
     let Some(sealer) = runtime.cursor_sealer() else {
         return;
@@ -319,6 +335,10 @@ async fn stream(
         }
 
         tokio::select! {
+            _ = ws_guard.cancelled() => {
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            },
             _ = heartbeat.tick() => {
                 if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
                     return;
@@ -331,7 +351,7 @@ async fn stream(
                 }
                 _ => {}
             },
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            _ = runtime.wait_for_events_or_timeout(Duration::from_secs(15)) => {}
         }
     }
 }

@@ -388,7 +388,7 @@ fn validate_artifacts(
     projection: &transcript::ApplicationSendProjection<'_>,
     coordinate: Coordinate,
     message_id: Uuid,
-) -> Result<(), MessageDeliveryError> {
+) -> Result<Option<[u8; 32]>, MessageDeliveryError> {
     let aad = projection.aad();
     let aad_conversation = match aad.get("conversationId") {
         Some(CanonicalValueRef::Bytes(v)) if v.len() == 16 => {
@@ -435,10 +435,17 @@ fn validate_artifacts(
     {
         return Err(MessageDeliveryError::InvalidApplicationMessage);
     }
+    let archive_commitment = match aad.get("archiveCommitment") {
+        None => None,
+        Some(CanonicalValueRef::Bytes(v)) if v.len() == 32 => {
+            Some(v.try_into().expect("32-byte archiveCommitment"))
+        }
+        Some(_) => return Err(MessageDeliveryError::InvalidApplicationMessage),
+    };
     if !projection.blob_bindings().is_empty() {
         return Err(MessageDeliveryError::BlobNotFound);
     }
-    Ok(())
+    Ok(archive_commitment)
 }
 
 fn verified_mutation(
@@ -456,11 +463,22 @@ fn verified_mutation(
         .map_err(|_| MessageDeliveryError::InvalidApplicationMessage)
 }
 
+#[allow(dead_code)]
 pub(crate) async fn send<T: PublicTransport>(
     tx: &mut Transaction<'_, Postgres>,
     authority: &crate::chat_protocol::dpop::VerifiedChatDeviceRequest,
     scope: &ScopeBoundBusinessAuthority,
     relationship_authority: &RelationshipAuthority<T>,
+) -> Result<(Vec<u8>, Option<i64>), MessageDeliveryError> {
+    send_with_receipt_signer(tx, authority, scope, relationship_authority, None).await
+}
+
+pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
+    tx: &mut Transaction<'_, Postgres>,
+    authority: &crate::chat_protocol::dpop::VerifiedChatDeviceRequest,
+    scope: &ScopeBoundBusinessAuthority,
+    relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&crate::federation::receipt::I13ReceiptSigner>,
 ) -> Result<(Vec<u8>, Option<i64>), MessageDeliveryError> {
     let mutation = verified_mutation(&authority, &scope)?;
     let projection = match mutation.projection() {
@@ -480,7 +498,7 @@ pub(crate) async fn send<T: PublicTransport>(
     require_relationship_policy(tx, scope, head.coordinate, relationship_authority).await?;
     let message_id = Uuid::from_bytes(*projection.message_id().as_bytes());
     validate_application_message(&projection)?;
-    validate_artifacts(&projection, expected, message_id)?;
+    let archive_commitment = validate_artifacts(&projection, expected, message_id)?;
     let entry_id = CanonicalUuidV4::parse(&Uuid::new_v4().to_string())
         .map_err(|_| MessageDeliveryError::Invariant)?;
     let conversation_id = CanonicalUuidV4::parse(&expected.conversation_id.to_string())
@@ -502,7 +520,50 @@ pub(crate) async fn send<T: PublicTransport>(
             .ok_or(MessageDeliveryError::Invariant)?,
     )
     .map_err(|_| MessageDeliveryError::Invariant)?;
-    let response = json!({"entry": {"entryId": entry_id_text, "conversationId": conversation_id_text, "seq": head.next_seq, "signedRequest": signed_request, "receivedAt": authority.trusted_instant().as_str()}});
+    let i13_receipt_json = match (archive_commitment, i13_signer) {
+        (Some(commitment), Some(signer)) => {
+            let epoch_u64 =
+                u64::try_from(expected.epoch).map_err(|_| MessageDeliveryError::Invariant)?;
+            let generation_u64 =
+                u64::try_from(expected.generation).map_err(|_| MessageDeliveryError::Invariant)?;
+            let sender_device_text = scope.actor_device_id().to_string();
+            let signed_receipt = signer
+                .sign_application_receipt(
+                    &conversation_id_text,
+                    &head.coordinate.group_id,
+                    epoch_u64,
+                    scope.actor_did(),
+                    &sender_device_text,
+                    &entry_id_text,
+                    &commitment,
+                    head.next_seq,
+                    scope.trusted_instant().timestamp_millis(),
+                )
+                .map_err(|_| MessageDeliveryError::Invariant)?;
+            Some(crate::federation::receipt::I13ReceiptSigner::receipt_wire_json(
+                &signed_receipt,
+                generation_u64,
+                scope.actor_did(),
+                &sender_device_text,
+            ))
+        }
+        _ => None,
+    };
+    let mut entry_obj = json!({
+        "entryId": entry_id_text,
+        "conversationId": conversation_id_text,
+        "seq": head.next_seq,
+        "signedRequest": signed_request,
+        "receivedAt": authority.trusted_instant().as_str()
+    });
+    let mut response = json!({ "entry": entry_obj });
+    if let Some(rcpt) = &i13_receipt_json {
+        entry_obj["sequencerReceipt"] = rcpt.clone();
+        response = json!({
+            "entry": entry_obj,
+            "sequencerReceipt": rcpt.clone(),
+        });
+    }
     let response_bytes = serde_json::to_vec(&response).map_err(|e| {
         tracing::error!("response serde error: {:?}", e);
         MessageDeliveryError::Invariant
@@ -566,6 +627,15 @@ pub(crate) async fn send<T: PublicTransport>(
     };
     if seq != head.next_seq {
         return Err(MessageDeliveryError::Invariant);
+    }
+    if let Some(rcpt) = &i13_receipt_json {
+        let rcpt_bytes = serde_json::to_vec(rcpt).map_err(|_| MessageDeliveryError::Invariant)?;
+        delivery::set_entry_sequencer_receipt(tx, expected.conversation_id, seq, &rcpt_bytes)
+            .await
+            .map_err(|e| match e {
+                delivery::DeliveryRepositoryError::Database(e) => MessageDeliveryError::Database(e),
+                _ => MessageDeliveryError::Invariant,
+            })?;
     }
     if !head.is_remote {
         let _ =
