@@ -39,7 +39,8 @@ use catbird_mls::{
         get_conversations::GetConversationsOutput, get_pending_welcomes::GetPendingWelcomesOutput,
     },
     chat_v2::transcript::{
-        decode_strict_json, direct_request::{self as protocol, DirectRequestKind},
+        decode_strict_json,
+        direct_request::{self as protocol, DirectRequestKind},
         project_signed_body, SignedMutationKind, SigningTranscript,
     },
     metadata::GroupMetadataV1,
@@ -49,8 +50,8 @@ use catbird_mls::{
     },
 };
 use encrypted_requests::{
-    canonical_future, canonical_now, connect_guarded_request_database, request_database_url,
-    request_database_snapshot, reviewed_request_migrations, route_to_dedicated_database,
+    canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
+    request_database_url, reviewed_request_migrations, route_to_dedicated_database,
     seed_service_device, signed_mls_request, validate_request_test_database_url, HttpsDidFixture,
     ServiceIdentity, ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
 };
@@ -79,7 +80,10 @@ fn launcher() -> PathBuf {
 
 impl FaketimeCluster {
     fn start(clock_file: &str) -> anyhow::Result<Self> {
-        let lib = Command::new("python3").arg(launcher()).arg("lib").output()?;
+        let lib = Command::new("python3")
+            .arg(launcher())
+            .arg("lib")
+            .output()?;
         anyhow::ensure!(lib.status.success(), "serialized libfaketime unavailable");
         let lib = String::from_utf8(lib.stdout)?.trim().to_owned();
         anyhow::ensure!(
@@ -88,13 +92,22 @@ impl FaketimeCluster {
         );
         let run = &Uuid::new_v4().simple().to_string()[..12];
         let dir = std::env::temp_dir().join(format!("c22-faketime-{run}"));
-        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
         let db = format!("catbird_direct_requests_faketime_c22_{run}");
         let out = Command::new("python3")
             .arg(launcher())
             .args(["start", "--dir"])
             .arg(&dir)
-            .args(["--port", &port.to_string(), "--db", &db, "--clock-file", clock_file])
+            .args([
+                "--port",
+                &port.to_string(),
+                "--db",
+                &db,
+                "--clock-file",
+                clock_file,
+            ])
             .output()
             .context("launch faketime cluster")?;
         anyhow::ensure!(
@@ -139,7 +152,16 @@ impl Drop for FaketimeCluster {
 
 fn db_query(sql: &str) -> anyhow::Result<String> {
     let out = Command::new("psql")
-        .args(["-X", "-v", "ON_ERROR_STOP=1", "-At", "-d", request_database_url(), "-c", sql])
+        .args([
+            "-X",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-At",
+            "-d",
+            request_database_url(),
+            "-c",
+            sql,
+        ])
         .output()?;
     anyhow::ensure!(
         out.status.success(),
@@ -190,7 +212,12 @@ async fn acknowledge(
         "idempotencyKey": Uuid::new_v4().to_string(),
         "signedAt": signed_at
     });
-    let signed = sign_mutation(engine, identity, SignedMutationKind::WelcomeAcknowledgement, body)?;
+    let signed = sign_mutation(
+        engine,
+        identity,
+        SignedMutationKind::WelcomeAcknowledgement,
+        body,
+    )?;
     let (status, bytes) = service
         .post(
             &f.client,
@@ -200,8 +227,12 @@ async fn acknowledge(
             true,
         )
         .await?;
-    let value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("acknowledgeWelcome body: {}", String::from_utf8_lossy(&bytes)))?;
+    let value = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "acknowledgeWelcome body: {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })?;
     Ok((status, value))
 }
 
@@ -211,7 +242,9 @@ async fn get_json(
     nsid: &str,
     params: &[(String, String)],
 ) -> anyhow::Result<Value> {
-    let (status, bytes) = service.get(&f.client, &f.server.base_url, nsid, params).await?;
+    let (status, bytes) = service
+        .get(&f.client, &f.server.base_url, nsid, params)
+        .await?;
     anyhow::ensure!(
         status == reqwest::StatusCode::OK,
         "{nsid} failed {status}: {}",
@@ -250,15 +283,16 @@ async fn pending_welcomes(
 }
 
 fn conversation_listed(conversations: &Value, conversation_id: Uuid) -> bool {
-    conversations.to_string().contains(&conversation_id.to_string())
+    conversations
+        .to_string()
+        .contains(&conversation_id.to_string())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn c22_expired_unimported_device_is_unavailable_while_imported_sibling_and_history_remain(
 ) -> anyhow::Result<()> {
-    let clock_file = std::env::var("FAKETIME_TIMESTAMP_FILE").context(
-        "C22 must run with the whole process under libfaketime; see the module docs",
-    )?;
+    let clock_file = std::env::var("FAKETIME_TIMESTAMP_FILE")
+        .context("C22 must run with the whole process under libfaketime; see the module docs")?;
     anyhow::ensure!(
         std::env::var("DYLD_INSERT_LIBRARIES").is_ok_and(|lib| lib.contains("libfaketime")),
         "C22 test process is not running under libfaketime"
@@ -282,9 +316,16 @@ async fn c22_expired_unimported_device_is_unavailable_while_imported_sibling_and
     let (_, bob_items) = pending_welcomes(&f, &f.bob).await?;
     let (_, sibling_items) = pending_welcomes(&f, &sibling.service).await?;
     assert_eq!(bob_items.len(), 1, "addressed device offered its Welcome");
-    assert_eq!(sibling_items.len(), 1, "sibling offered its Welcome before expiry");
+    assert_eq!(
+        sibling_items.len(),
+        1,
+        "sibling offered its Welcome before expiry"
+    );
     assert_eq!(sibling_items[0]["status"], "pending");
-    assert_eq!(sibling_items[0]["recipientDeviceId"], sibling.service.device_id.to_string());
+    assert_eq!(
+        sibling_items[0]["recipientDeviceId"],
+        sibling.service.device_id.to_string()
+    );
 
     // Device 1 imports within the deadline, decrypts the preview, and ACKs.
     f.bob_engine.process_direct_request(&f.welcome_input)?;
@@ -296,23 +337,39 @@ async fn c22_expired_unimported_device_is_unavailable_while_imported_sibling_and
     assert_eq!(text, "Real encrypted first contact");
     let (ack_status, ack) =
         acknowledge(&f, &f.bob, &f.bob_engine, &bob_identity, canonical_now()).await?;
-    assert_eq!(ack_status, reqwest::StatusCode::OK, "imported device ACK: {ack}");
+    assert_eq!(
+        ack_status,
+        reqwest::StatusCode::OK,
+        "imported device ACK: {ack}"
+    );
 
     // Advance every clock one hour past the immutable deadline.
     let before = chrono::Utc::now();
     let skew = (import_until.with_timezone(&chrono::Utc) - before).num_seconds() + 3600;
-    anyhow::ensure!(skew > 7 * 86_400, "deadline must be at least seven days out, got {skew}s");
+    anyhow::ensure!(
+        skew > 7 * 86_400,
+        "deadline must be at least seven days out, got {skew}s"
+    );
     cluster.advance_seconds(skew)?;
     let client_now = chrono::Utc::now();
     let advanced = chrono::DateTime::parse_from_rfc3339(&db_now()?)?;
-    assert!(client_now > import_until, "client clock {client_now} must pass {import_until}");
-    assert!(advanced > import_until, "cluster clock {advanced} must pass {import_until}");
+    assert!(
+        client_now > import_until,
+        "client clock {client_now} must pass {import_until}"
+    );
+    assert!(
+        advanced > import_until,
+        "cluster clock {advanced} must pass {import_until}"
+    );
     println!("C22 all clocks advanced by {skew}s: client {client_now}, database {advanced}");
 
     // Expired unimported device: no longer offered, and its import claim gets
     // the typed terminal error from the real expiry branch.
     let (_, sibling_items) = pending_welcomes(&f, &sibling.service).await?;
-    assert!(sibling_items.is_empty(), "expired Welcome must not be offered: {sibling_items:?}");
+    assert!(
+        sibling_items.is_empty(),
+        "expired Welcome must not be offered: {sibling_items:?}"
+    );
     let (status, expired) = acknowledge(
         &f,
         &sibling.service,
@@ -321,8 +378,14 @@ async fn c22_expired_unimported_device_is_unavailable_while_imported_sibling_and
         canonical_now(),
     )
     .await?;
-    assert!(status.is_client_error(), "expired ACK must fail: {status} {expired}");
-    assert_eq!(expired["error"], "WelcomeExpired", "typed expiry: {expired}");
+    assert!(
+        status.is_client_error(),
+        "expired ACK must fail: {status} {expired}"
+    );
+    assert_eq!(
+        expired["error"], "WelcomeExpired",
+        "typed expiry: {expired}"
+    );
     let mut sibling_input = f.welcome_input.clone();
     sibling_input.local_identity = sibling.identity.as_bytes().to_vec();
     sibling_input.local_package_ref = sibling.package_ref.clone();
@@ -349,13 +412,21 @@ async fn c22_expired_unimported_device_is_unavailable_while_imported_sibling_and
     assert_eq!(expired_view.crypto, RequestCrypto::Unavailable);
     assert_eq!(
         expired_view.preview,
-        Some(RequestPreview::Unavailable { code: "ImportExpired".into() })
+        Some(RequestPreview::Unavailable {
+            code: "ImportExpired".into()
+        })
     );
     assert!(!expired_view.capabilities.can_preview && !expired_view.capabilities.can_send);
     sibling_client.shutdown().await;
-    assert!(sibling.engine.epoch(&group).is_err(), "expired device has no group state");
     assert!(
-        sibling.engine.decrypt_direct_request(&sibling_input).is_err(),
+        sibling.engine.epoch(&group).is_err(),
+        "expired device has no group state"
+    );
+    assert!(
+        sibling
+            .engine
+            .decrypt_direct_request(&sibling_input)
+            .is_err(),
         "expired unimported device cannot read the introduction"
     );
 
@@ -382,12 +453,21 @@ async fn c22_expired_unimported_device_is_unavailable_while_imported_sibling_and
     // native context after expiry and still reads the preview, both natively
     // and through the app-facing projection.
     let bob = f.bob.clone();
-    let (client, base_url, conversation) =
-        (f.client.clone(), f.server.base_url.clone(), f.conversation_id);
+    let (client, base_url, conversation) = (
+        f.client.clone(),
+        f.server.base_url.clone(),
+        f.conversation_id,
+    );
     let (reopened, input, server) = f_bob_reopen(f)?;
     let again = reopened.decrypt_direct_request(&input)?;
-    assert_eq!(again, preview, "imported preview survives expiry and store reopen");
-    assert!(reopened.epoch(&group).is_ok(), "imported device keeps its group");
+    assert_eq!(
+        again, preview,
+        "imported preview survives expiry and store reopen"
+    );
+    assert!(
+        reopened.epoch(&group).is_ok(),
+        "imported device keeps its group"
+    );
     let bob_client = live_orchestrator::live_orchestrator(
         reopened.context(),
         &bob,
@@ -396,7 +476,9 @@ async fn c22_expired_unimported_device_is_unavailable_while_imported_sibling_and
         receipt_document,
     )
     .await?;
-    let retained_view = bob_client.refresh_request_preview(&conversation.to_string()).await?;
+    let retained_view = bob_client
+        .refresh_request_preview(&conversation.to_string())
+        .await?;
     println!("C22 imported device view after expiry: {retained_view:?}");
     assert_eq!(retained_view.crypto, RequestCrypto::Ready);
     assert_eq!(

@@ -74,7 +74,15 @@ const MAINTENANCE_URL: &str = "postgresql://127.0.0.1:5432/postgres";
 
 fn maintenance(sql: &str) -> Result<()> {
     let output = Command::new("psql")
-        .args([MAINTENANCE_URL, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            MAINTENANCE_URL,
+            "-X",
+            "-q",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()?;
     anyhow::ensure!(
         output.status.success(),
@@ -241,10 +249,7 @@ fn start_reader_server(
         )
         .env("CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM", receipt_pem)
         .env("SIGNING_KEY_PEM", service_pem)
-        .env(
-            "CHAT_REQUEST_RECEIPT_DID_DOCUMENT_JSON",
-            receipt_document,
-        )
+        .env("CHAT_REQUEST_RECEIPT_DID_DOCUMENT_JSON", receipt_document)
         .env("RUST_LOG", "warn")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -558,7 +563,9 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         replayed_val["outcome"]["$type"],
         "blue.catbird.chat.defs#signedDirectRequestReceipt"
     );
-    println!("C34: New creations verified refused with typed CutoverRequired, exact replay preserved.");
+    println!(
+        "C34: New creations verified refused with typed CutoverRequired, exact replay preserved."
+    );
 
     // 3b. Read histories back through reader (publication, preview, acceptance)
     println!("C34: Reading histories back through retained compatible reader...");
@@ -605,7 +612,10 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         "directRequestState",
         false,
     )?;
-    assert_eq!(r2_request["contextHash"], STANDARD.encode(req2_context_hash));
+    assert_eq!(
+        r2_request["contextHash"],
+        STANDARD.encode(req2_context_hash)
+    );
 
     // Read preview/pending conversation state for Request 2 (outgoingPending for Alice)
     let (r2_alice_status, r2_alice_bytes) = fixture2
@@ -829,8 +839,12 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
 
     // Probe direct-request route on running baseline: must be 404 / route absence
     let probe_client = reqwest::Client::builder().build()?;
-    let probe_url = format!("http://127.0.0.1:{skip_port}/xrpc/blue.catbird.chat.prepareDirectRequest");
-    let probe_resp = probe_client.post(&probe_url).send().await
+    let probe_url =
+        format!("http://127.0.0.1:{skip_port}/xrpc/blue.catbird.chat.prepareDirectRequest");
+    let probe_resp = probe_client
+        .post(&probe_url)
+        .send()
+        .await
         .context("probe baseline server route")?;
     assert_eq!(
         probe_resp.status(),

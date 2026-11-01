@@ -388,7 +388,7 @@ impl TestUser {
             .copied()
             .unwrap_or_else(|| {
                 // Round up to next multiple of 8192
-                ((payload.len() + 8191) / 8192) * 8192
+                payload.len().div_ceil(8192) * 8192
             });
         let mut buf = vec![0u8; target];
         buf[..payload.len()].copy_from_slice(payload);
@@ -570,7 +570,7 @@ impl TestUser {
 
 /// Compute latency statistics from a collection of durations.
 /// Returns a formatted string with count, avg, p50, p99, and total.
-pub fn latency_stats(durations: &mut Vec<std::time::Duration>) -> String {
+pub fn latency_stats(durations: &mut [std::time::Duration]) -> String {
     durations.sort();
     let n = durations.len();
     if n == 0 {

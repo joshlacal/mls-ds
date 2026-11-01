@@ -20,17 +20,19 @@
 //!   DYLD_FORCE_FLAT_NAMESPACE=1 FAKETIME_TIMESTAMP_FILE=$CLOCK FAKETIME_NO_CACHE=1 \
 //!   FAKETIME_DONT_FAKE_MONOTONIC=1 <test-binary> --nocapture --test-threads=1
 #![allow(dead_code, unused_imports)]
+#[path = "support/c12_c13.rs"]
+mod c12_c13;
 #[path = "support/encrypted_requests.rs"]
 mod encrypted_requests;
 #[path = "support/staged_direct_request.rs"]
 mod staged_direct_request;
-#[path = "support/c12_c13.rs"]
-mod c12_c13;
 
 use anyhow::Context as _;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use c12_c13::*;
-use encrypted_requests::{request_database_url, route_to_dedicated_database, ShippingServerFixture};
+use encrypted_requests::{
+    request_database_url, route_to_dedicated_database, ShippingServerFixture,
+};
 use serde_json::{json, Value};
 use staged_direct_request::{stage_request, StagedRequest};
 use std::{path::PathBuf, process::Command};
@@ -52,13 +54,22 @@ impl FaketimeCluster {
     fn start(clock_file: &str) -> anyhow::Result<Self> {
         let run = &Uuid::new_v4().simple().to_string()[..12];
         let dir = std::env::temp_dir().join(format!("c13-faketime-{run}"));
-        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
         let db = format!("catbird_direct_requests_faketime_c13_{run}");
         let out = Command::new("python3")
             .arg(launcher())
             .args(["start", "--dir"])
             .arg(&dir)
-            .args(["--port", &port.to_string(), "--db", &db, "--clock-file", clock_file])
+            .args([
+                "--port",
+                &port.to_string(),
+                "--db",
+                &db,
+                "--clock-file",
+                clock_file,
+            ])
             .output()
             .context("launch faketime cluster")?;
         anyhow::ensure!(
@@ -113,10 +124,16 @@ fn durable_graph(s: &StagedRequest) -> anyhow::Result<String> {
 
 fn assert_expired_receipt(s: &StagedRequest, response: &Value) -> anyhow::Result<()> {
     let receipt = verified_receipt(s, response)?;
-    assert_eq!(receipt["$type"], "blue.catbird.chat.defs#directRequestExpiredReceipt", "{receipt}");
+    assert_eq!(
+        receipt["$type"], "blue.catbird.chat.defs#directRequestExpiredReceipt",
+        "{receipt}"
+    );
     assert_eq!(receipt["requestKind"], "expiry");
     assert_eq!(receipt["requestId"], s.request_id.to_string());
-    assert_eq!(receipt["preparationRequestDigest"], STANDARD.encode(s.preparation_request_digest));
+    assert_eq!(
+        receipt["preparationRequestDigest"],
+        STANDARD.encode(s.preparation_request_digest)
+    );
     assert_eq!(receipt["actorDid"], s.alice.did);
     Ok(())
 }
@@ -130,7 +147,8 @@ fn set_env(key: &str, value: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn c13_expiry_claims_signed_proof_under_lock_and_c12_preparation_timeout() -> anyhow::Result<()> {
+async fn c13_expiry_claims_signed_proof_under_lock_and_c12_preparation_timeout(
+) -> anyhow::Result<()> {
     let clock_file = std::env::var("FAKETIME_TIMESTAMP_FILE")
         .context("C13 must run with the whole process under libfaketime; see the module docs")?;
     anyhow::ensure!(
@@ -157,12 +175,21 @@ async fn c13_expiry_claims_signed_proof_under_lock_and_c12_preparation_timeout()
     // unknown id stays unknown and creates nothing.
     let (status, live) = outcome(&claimed, claimed.request_id).await?;
     assert_eq!(status, OK, "{live}");
-    assert_eq!(live["outcome"]["$type"], "blue.catbird.chat.defs#directRequestPreparedOutcome");
-    println!("C13 lease of {}: {}", claimed.request_id, live["outcome"]["preparation"]["leaseExpiresAt"]);
+    assert_eq!(
+        live["outcome"]["$type"],
+        "blue.catbird.chat.defs#directRequestPreparedOutcome"
+    );
+    println!(
+        "C13 lease of {}: {}",
+        claimed.request_id, live["outcome"]["preparation"]["leaseExpiresAt"]
+    );
     let unknown = Uuid::new_v4();
     let (status, absent) = outcome(&claimed, unknown).await?;
     assert_eq!(status, OK, "{absent}");
-    assert_eq!(absent["outcome"]["$type"], "blue.catbird.chat.defs#directRequestUnknownOutcome");
+    assert_eq!(
+        absent["outcome"]["$type"],
+        "blue.catbird.chat.defs#directRequestUnknownOutcome"
+    );
 
     // Every clock moves past the 300-second lease.
     cluster.advance_seconds(400)?;
@@ -181,9 +208,14 @@ async fn c13_expiry_claims_signed_proof_under_lock_and_c12_preparation_timeout()
     );
     let (status, still_absent) = outcome(&claimed, unknown).await?;
     assert_eq!(status, OK);
-    assert_eq!(still_absent["outcome"]["$type"], "blue.catbird.chat.defs#directRequestUnknownOutcome");
     assert_eq!(
-        db_query(&format!("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{unknown}'"))?,
+        still_absent["outcome"]["$type"],
+        "blue.catbird.chat.defs#directRequestUnknownOutcome"
+    );
+    assert_eq!(
+        db_query(&format!(
+            "SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{unknown}'"
+        ))?,
         "0",
         "absence never becomes an abandonment record"
     );
@@ -193,12 +225,18 @@ async fn c13_expiry_claims_signed_proof_under_lock_and_c12_preparation_timeout()
     let (status, late) = post(&timed_out, PUBLISH_NSID, &fresh_publication(&timed_out)?).await?;
     assert_eq!(status, OK, "{late}");
     let refusal = verified_receipt(&timed_out, &late)?;
-    assert_eq!(refusal["$type"], "blue.catbird.chat.defs#directRequestRejectedReceipt", "{refusal}");
+    assert_eq!(
+        refusal["$type"], "blue.catbird.chat.defs#directRequestRejectedReceipt",
+        "{refusal}"
+    );
     assert_eq!(refusal["code"], "PreparationExpired");
     assert_eq!(refusal["requestKind"], "publish");
     let (status, late_replay) = post(&timed_out, PUBLISH_NSID, &timed_out.publication).await?;
     assert_eq!(status, OK, "{late_replay}");
-    assert_eq!(late_replay["outcome"], late["outcome"], "original publish bytes get the same refusal");
+    assert_eq!(
+        late_replay["outcome"], late["outcome"],
+        "original publish bytes get the same refusal"
+    );
     let (timeout_status, timeout_body) = stored_terminal(timed_out.request_id)?;
     println!("C12 preparation timeout stored status: {timeout_status}");
     assert_eq!(timeout_body, Some(untyped_outcome(&late)?));
@@ -220,7 +258,11 @@ async fn c13_expiry_claims_signed_proof_under_lock_and_c12_preparation_timeout()
     barrier.wait_for_waiters(1).await?;
     let second = spawn_post(&claimed, PUBLISH_NSID, claimed.publication.clone());
     let queued = barrier.wait_for_waiters(2).await?;
-    assert_eq!(stored_terminal(claimed.request_id)?, ("prepared".to_owned(), None), "no claim without the lock");
+    assert_eq!(
+        stored_terminal(claimed.request_id)?,
+        ("prepared".to_owned(), None),
+        "no claim without the lock"
+    );
     println!("C13 claim: {queued} RPC sessions queued behind the operation lock");
     barrier.release()?;
     let (first_status, first_claim) = first.await??;
@@ -228,13 +270,19 @@ async fn c13_expiry_claims_signed_proof_under_lock_and_c12_preparation_timeout()
     assert_eq!(first_status, OK, "{first_claim}");
     assert_eq!(second_status, OK, "{second_claim}");
     assert_expired_receipt(&claimed, &first_claim)?;
-    assert_eq!(second_claim["outcome"], first_claim["outcome"], "concurrent claim sees the same proof");
+    assert_eq!(
+        second_claim["outcome"], first_claim["outcome"],
+        "concurrent claim sees the same proof"
+    );
     assert_eq!(
         stored_terminal(claimed.request_id)?,
         ("expired".to_owned(), Some(untyped_outcome(&first_claim)?))
     );
     let (_, again) = outcome(&claimed, claimed.request_id).await?;
-    assert_eq!(again["outcome"], first_claim["outcome"], "the expired proof is definitive");
+    assert_eq!(
+        again["outcome"], first_claim["outcome"],
+        "the expired proof is definitive"
+    );
     assert_eq!(
         db_query(&format!(
             "SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{}'",
@@ -255,18 +303,31 @@ async fn c13_expiry_claims_signed_proof_under_lock_and_c12_preparation_timeout()
     );
     let (status, replay) = post(&replayed, PUBLISH_NSID, &replayed.publication).await?;
     assert_eq!(status, OK, "{replay}");
-    assert_eq!(replay["outcome"], published["outcome"], "completed replay after lease expiry");
+    assert_eq!(
+        replay["outcome"], published["outcome"],
+        "completed replay after lease expiry"
+    );
     let (status, replay_outcome) = outcome(&replayed, replayed.request_id).await?;
     assert_eq!(status, OK);
     assert_eq!(replay_outcome["outcome"], published["outcome"]);
-    assert_eq!(durable_graph(&replayed)?, graph_before, "replay leaves the durable graph unchanged");
+    assert_eq!(
+        durable_graph(&replayed)?,
+        graph_before,
+        "replay leaves the durable graph unchanged"
+    );
 
     // Production background expiry: the sweeper claims the last unclaimed
     // expired request without any client RPC for it.
     set_env("REQUEST_FIXTURE_EXPIRY_SWEEP", "1");
     set_env("CHAT_EXPIRY_SWEEP_INTERVAL_SECS", "1");
-    set_env("REQUEST_SERVER_RUST_LOG", "warn,catbird_server::handlers::chat::expiry_worker=info");
-    assert_eq!(stored_terminal(swept.request_id)?, ("prepared".to_owned(), None));
+    set_env(
+        "REQUEST_SERVER_RUST_LOG",
+        "warn,catbird_server::handlers::chat::expiry_worker=info",
+    );
+    assert_eq!(
+        stored_terminal(swept.request_id)?,
+        ("prepared".to_owned(), None)
+    );
     let sweeper = ShippingServerFixture::start(&swept._https)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let stored = loop {
@@ -275,10 +336,17 @@ async fn c13_expiry_claims_signed_proof_under_lock_and_c12_preparation_timeout()
             assert_eq!(status, "expired");
             break body.context("expired row carries its proof")?;
         }
-        anyhow::ensure!(std::time::Instant::now() < deadline, "sweeper never expired {}", swept.request_id);
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "sweeper never expired {}",
+            swept.request_id
+        );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     };
-    println!("C13 sweeper expired {} without a client claim", swept.request_id);
+    println!(
+        "C13 sweeper expired {} without a client claim",
+        swept.request_id
+    );
     let (status, swept_outcome) = outcome(&swept, swept.request_id).await?;
     assert_eq!(status, OK, "{swept_outcome}");
     assert_expired_receipt(&swept, &swept_outcome)?;

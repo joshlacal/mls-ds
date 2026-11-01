@@ -32,20 +32,15 @@ use catbird_mls::orchestrator::{
 };
 use catbird_mls::{DirectRequestInput, MLSContext, MLSError};
 use encrypted_requests::{
-    canonical_future, canonical_now, connect_guarded_request_database,
-    request_database_url, reviewed_request_migrations, route_to_dedicated_database,
-    seed_service_device, signed_mls_request, HttpsDidFixture, ServiceIdentity,
-    ShippingServerFixture,
+    canonical_future, canonical_now, connect_guarded_request_database, request_database_url,
+    reviewed_request_migrations, route_to_dedicated_database, seed_service_device,
+    signed_mls_request, HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
 };
 use live_orchestrator::{mock_credentials::MockCredentials, mock_storage::MockStorage};
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{
-    path::Path,
-    process::Command,
-    sync::Arc,
-};
+use std::{path::Path, process::Command, sync::Arc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -64,7 +59,15 @@ const MAINTENANCE_URL: &str = "postgresql://127.0.0.1:5432/postgres";
 
 fn maintenance(sql: &str) -> anyhow::Result<()> {
     let output = Command::new("psql")
-        .args([MAINTENANCE_URL, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            MAINTENANCE_URL,
+            "-X",
+            "-q",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()?;
     anyhow::ensure!(
         output.status.success(),
@@ -89,7 +92,17 @@ impl Drop for DedicatedDatabase {
 
 fn psql(sql: &str) -> anyhow::Result<String> {
     let output = Command::new("psql")
-        .args([request_database_url(), "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            request_database_url(),
+            "-X",
+            "-A",
+            "-t",
+            "-q",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()?;
     anyhow::ensure!(
         output.status.success(),
@@ -193,7 +206,15 @@ impl Account {
         let public = engine.identity_public_key(&identity)?;
         seed_service_device(&svc, &public)?;
         let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&public));
-        Ok(Self { svc, engine, identity, public, key_id, package, package_ref })
+        Ok(Self {
+            svc,
+            engine,
+            identity,
+            public,
+            key_id,
+            package,
+            package_ref,
+        })
     }
     fn did(&self) -> &str {
         &self.svc.did
@@ -215,15 +236,28 @@ async fn rig(identities: &[&ServiceIdentity]) -> anyhow::Result<Rig> {
         .collect::<Vec<_>>();
     let https = HttpsDidFixture::start(HttpsDidFixture::reserve_port()?, &documents)?;
     let server = ShippingServerFixture::start(&https)?;
-    Ok(Rig { https, server, client: reqwest::Client::builder().build()? })
+    Ok(Rig {
+        https,
+        server,
+        client: reqwest::Client::builder().build()?,
+    })
 }
 
 fn identity(label: &str, run: &str) -> ServiceIdentity {
-    ServiceIdentity::new(format!("did:web:{label}-{run}.request-fixture.catbird.blue"))
+    ServiceIdentity::new(format!(
+        "did:web:{label}-{run}.request-fixture.catbird.blue"
+    ))
 }
 
-async fn post(rig: &Rig, who: &ServiceIdentity, nsid: &str, body: &Value) -> anyhow::Result<(reqwest::StatusCode, Value)> {
-    let (status, bytes) = who.post(&rig.client, &rig.server.base_url, nsid, body, true).await?;
+async fn post(
+    rig: &Rig,
+    who: &ServiceIdentity,
+    nsid: &str,
+    body: &Value,
+) -> anyhow::Result<(reqwest::StatusCode, Value)> {
+    let (status, bytes) = who
+        .post(&rig.client, &rig.server.base_url, nsid, body, true)
+        .await?;
     let value = serde_json::from_slice(&bytes)
         .with_context(|| format!("{nsid} {status}: {}", String::from_utf8_lossy(&bytes)))?;
     Ok((status, value))
@@ -262,9 +296,17 @@ async fn publish_keys(rig: &Rig, a: &Account) -> anyhow::Result<()> {
             "idempotencyKey":Uuid::new_v4().to_string(),"signedAt":canonical_now()
         }),
     )?;
-    let (status, body) =
-        post(rig, &a.svc, "blue.catbird.chat.publishDirectRequestKeys", &json!({"signedRequest":keys})).await?;
-    anyhow::ensure!(status == reqwest::StatusCode::OK, "publish keys {status}: {body}");
+    let (status, body) = post(
+        rig,
+        &a.svc,
+        "blue.catbird.chat.publishDirectRequestKeys",
+        &json!({"signedRequest":keys}),
+    )
+    .await?;
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "publish keys {status}: {body}"
+    );
     Ok(())
 }
 
@@ -300,9 +342,20 @@ async fn prepare(rig: &Rig, alice: &Account, recipient: &str) -> anyhow::Result<
         &alice.public,
     )?
     .request_digest();
-    let (status, response) =
-        post(rig, &alice.svc, "blue.catbird.chat.prepareDirectRequest", &json!({"signedRequest":prepare})).await?;
-    Ok(Prep { request_id, conversation_id, prepare_digest, status, response })
+    let (status, response) = post(
+        rig,
+        &alice.svc,
+        "blue.catbird.chat.prepareDirectRequest",
+        &json!({"signedRequest":prepare}),
+    )
+    .await?;
+    Ok(Prep {
+        request_id,
+        conversation_id,
+        prepare_digest,
+        status,
+        response,
+    })
 }
 
 async fn cancel(rig: &Rig, alice: &Account, recipient: &str, prep: &Prep) -> anyhow::Result<()> {
@@ -314,7 +367,12 @@ async fn cancel(rig: &Rig, alice: &Account, recipient: &str, prep: &Prep) -> any
         "recipientDid":recipient,"preparationRequestDigest":STANDARD.encode(prep.prepare_digest),
         "idempotencyKey":Uuid::new_v4().to_string(),"signedAt":canonical_now()
     });
-    let signed = signed_mls_request(&alice.engine, &alice.identity, DirectRequestKind::Cancel, body)?;
+    let signed = signed_mls_request(
+        &alice.engine,
+        &alice.identity,
+        DirectRequestKind::Cancel,
+        body,
+    )?;
     let (status, response) = post(
         rig,
         &alice.svc,
@@ -322,7 +380,10 @@ async fn cancel(rig: &Rig, alice: &Account, recipient: &str, prep: &Prep) -> any
         &json!({"signedRequest":signed}),
     )
     .await?;
-    anyhow::ensure!(status == reqwest::StatusCode::OK, "cancel {status}: {response}");
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "cancel {status}: {response}"
+    );
     Ok(())
 }
 
@@ -333,9 +394,15 @@ fn receipt(response: &Value, key: &[u8]) -> anyhow::Result<(String, Option<Strin
         "expected signed receipt, got {response}"
     );
     let mut signed = response["outcome"].clone();
-    signed.as_object_mut().context("receipt object")?.remove("$type");
-    let verified =
-        protocol::verify_received_signed_request(DirectRequestKind::Outcome, &serde_json::to_vec(&signed)?, key)?;
+    signed
+        .as_object_mut()
+        .context("receipt object")?
+        .remove("$type");
+    let verified = protocol::verify_received_signed_request(
+        DirectRequestKind::Outcome,
+        &serde_json::to_vec(&signed)?,
+        key,
+    )?;
     let proof = verified.body()["receipt"].clone();
     Ok((
         proof["$type"]
@@ -360,29 +427,57 @@ fn receipt(response: &Value, key: &[u8]) -> anyhow::Result<(String, Option<Strin
 /// and an undeclared recipient without keys keeps `RecipientKeysUnavailable`.
 async fn router_refuses_foreign_recipient_before_any_lease() -> anyhow::Result<()> {
     let run = Uuid::new_v4().simple().to_string();
-    let (alice_id, bob_id, carol_id) = (identity("alice", &run), identity("bob", &run), identity("carol", &run));
+    let (alice_id, bob_id, carol_id) = (
+        identity("alice", &run),
+        identity("bob", &run),
+        identity("carol", &run),
+    );
     let rig = rig(&[&alice_id, &bob_id, &carol_id]).await?;
     let alice = Account::new(alice_id, "c33-alice")?;
     let bob = Account::new(bob_id, "c33-bob")?;
     let carol = Account::new(carol_id, "c33-carol")?;
     publish_keys(&rig, &bob).await?;
-    assert_eq!(available_request_packages(bob.did())?, 1, "bob has a usable request package");
+    assert_eq!(
+        available_request_packages(bob.did())?,
+        1,
+        "bob has a usable request package"
+    );
 
     // Foreign-homed recipient (sender's authority canonical).
     declare_chat_authority(&rig.https.root, bob.did(), FOREIGN_AUTHORITY)?;
     let refused = prepare(&rig, &alice, bob.did()).await?;
-    assert_eq!(refused.status, reqwest::StatusCode::OK, "{}", refused.response);
+    assert_eq!(
+        refused.status,
+        reqwest::StatusCode::OK,
+        "{}",
+        refused.response
+    );
     let (kind, code, proof) = receipt(&refused.response, &rig.server.receipt_public_key)?;
     println!("C33 foreign-recipient receipt: {proof}");
     assert_eq!(kind, "directRequestRejectedReceipt");
-    assert_eq!(code.as_deref(), Some("RecipientAuthorityUnsupported"), "typed unsupported capability");
+    assert_eq!(
+        code.as_deref(),
+        Some("RecipientAuthorityUnsupported"),
+        "typed unsupported capability"
+    );
     assert_eq!(proof["requestKind"], "prepare");
     assert_eq!(proof["requestId"], refused.request_id.to_string());
     let footprint = attempt_footprint(refused.request_id, refused.conversation_id)?;
     println!("C33 refused attempt footprint: {footprint}");
-    assert_eq!(footprint, "rejected|0|0|0|0|0|0", "terminal refusal, no lease/selection/publication");
-    assert_eq!(available_request_packages(bob.did())?, 1, "no recipient package consumed or reserved");
-    assert_eq!(pair_footprint(alice.did(), bob.did())?, "0|0|0|0", "no request/Welcome/conversation rows");
+    assert_eq!(
+        footprint, "rejected|0|0|0|0|0|0",
+        "terminal refusal, no lease/selection/publication"
+    );
+    assert_eq!(
+        available_request_packages(bob.did())?,
+        1,
+        "no recipient package consumed or reserved"
+    );
+    assert_eq!(
+        pair_footprint(alice.did(), bob.did())?,
+        "0|0|0|0",
+        "no request/Welcome/conversation rows"
+    );
 
     // Exact replay of the same signed prepare returns the same terminal receipt.
     // (Idempotent terminal state; the refusal is not re-evaluated into a lease.)
@@ -397,14 +492,21 @@ async fn router_refuses_foreign_recipient_before_any_lease() -> anyhow::Result<(
     declare_chat_authority(&rig.https.root, bob.did(), CANONICAL_AUTHORITY)?;
     let prepared = prepare(&rig, &alice, bob.did()).await?;
     assert_eq!(
-        prepared.response["outcome"]["$type"], "blue.catbird.chat.defs#directRequestPreparedOutcome",
+        prepared.response["outcome"]["$type"],
+        "blue.catbird.chat.defs#directRequestPreparedOutcome",
         "canonical-homed recipient must be preparable: {}",
         prepared.response
     );
-    assert_eq!(attempt_footprint(prepared.request_id, prepared.conversation_id)?, "prepared|1|1|0|0|0|0");
+    assert_eq!(
+        attempt_footprint(prepared.request_id, prepared.conversation_id)?,
+        "prepared|1|1|0|0|0|0"
+    );
     cancel(&rig, &alice, bob.did(), &prepared).await?;
     let released = attempt_footprint(prepared.request_id, prepared.conversation_id)?;
-    assert!(released.starts_with("cancelled|"), "control lease released by signed cancel: {released}");
+    assert!(
+        released.starts_with("cancelled|"),
+        "control lease released by signed cancel: {released}"
+    );
 
     // Control 2: a recipient with no chat declaration at all (fixture answers
     // the typed RecordNotFound) and no request keys keeps the pre-existing
@@ -420,7 +522,10 @@ async fn router_refuses_foreign_recipient_before_any_lease() -> anyhow::Result<(
     let malformed = prepare(&rig, &alice, bob.did()).await?;
     let (_, malformed_code, _) = receipt(&malformed.response, &rig.server.receipt_public_key)?;
     assert_eq!(malformed_code.as_deref(), Some("RequestPolicyDenied"));
-    assert_eq!(attempt_footprint(malformed.request_id, malformed.conversation_id)?, "rejected|0|0|0|0|0|0");
+    assert_eq!(
+        attempt_footprint(malformed.request_id, malformed.conversation_id)?,
+        "rejected|0|0|0|0|0|0"
+    );
     Ok(())
 }
 
@@ -446,7 +551,12 @@ fn outside(method: &str) -> OrchestratorError {
 type ApiResult<T> = catbird_mls::orchestrator::Result<T>;
 
 impl RecordingLiveApi {
-    async fn forward(&self, method: reqwest::Method, path: &str, body: Option<&[u8]>) -> ApiResult<(u16, Vec<u8>)> {
+    async fn forward(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> ApiResult<(u16, Vec<u8>)> {
         self.paths.lock().await.push(path.to_owned());
         let (path, query) = match path.split_once('?') {
             Some((path, query)) => (path, Some(query)),
@@ -472,14 +582,23 @@ impl MLSAPIClient for RecordingLiveApi {
     async fn current_did(&self) -> Option<String> {
         Some(self.service.did.clone())
     }
-    async fn submit_prepared_request(&self, request: PreparedRequest) -> ApiResult<GatewayResponse> {
+    async fn submit_prepared_request(
+        &self,
+        request: PreparedRequest,
+    ) -> ApiResult<GatewayResponse> {
         let method = match request.method.as_str() {
             "GET" => reqwest::Method::GET,
             "POST" => reqwest::Method::POST,
             other => return Err(OrchestratorError::Api(format!("method {other}"))),
         };
-        let (status, body) = self.forward(method, &request.path, request.body.as_deref()).await?;
-        Ok(GatewayResponse { status, content_type: Some("application/json".into()), body })
+        let (status, body) = self
+            .forward(method, &request.path, request.body.as_deref())
+            .await?;
+        Ok(GatewayResponse {
+            status,
+            content_type: Some("application/json".into()),
+            body,
+        })
     }
     async fn get_conversations(
         &self,
@@ -491,11 +610,21 @@ impl MLSAPIClient for RecordingLiveApi {
             self.service.device_id
         );
         let (status, body) = self.forward(reqwest::Method::GET, &path, None).await?;
-        let value: Value = serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        if status != 200 || value["items"].as_array().is_none_or(|items| !items.is_empty()) {
-            return Err(OrchestratorError::Api(format!("C33 expects an empty live inventory: {status} {value}")));
+        let value: Value =
+            serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        if status != 200
+            || value["items"]
+                .as_array()
+                .is_none_or(|items| !items.is_empty())
+        {
+            return Err(OrchestratorError::Api(format!(
+                "C33 expects an empty live inventory: {status} {value}"
+            )));
         }
-        Ok(catbird_mls::orchestrator::ConversationListPage { conversations: Vec::new(), cursor: None })
+        Ok(catbird_mls::orchestrator::ConversationListPage {
+            conversations: Vec::new(),
+            cursor: None,
+        })
     }
     async fn get_messages(
         &self,
@@ -505,7 +634,10 @@ impl MLSAPIClient for RecordingLiveApi {
         _message_type: Option<&str>,
         _from_epoch: Option<u32>,
         _to_epoch: Option<u32>,
-    ) -> ApiResult<(Vec<catbird_mls::orchestrator::IncomingEnvelope>, Option<String>)> {
+    ) -> ApiResult<(
+        Vec<catbird_mls::orchestrator::IncomingEnvelope>,
+        Option<String>,
+    )> {
         Err(outside("get_messages"))
     }
     async fn get_key_packages(
@@ -525,7 +657,10 @@ impl MLSAPIClient for RecordingLiveApi {
     ) -> ApiResult<catbird_mls::orchestrator::KeyPackageSyncResult> {
         Err(outside("sync_key_packages"))
     }
-    async fn list_devices(&self, _actor_device_id: &str) -> ApiResult<Vec<catbird_mls::orchestrator::DeviceInfo>> {
+    async fn list_devices(
+        &self,
+        _actor_device_id: &str,
+    ) -> ApiResult<Vec<catbird_mls::orchestrator::DeviceInfo>> {
         Err(outside("list_devices"))
     }
     async fn get_group_info(&self, _convo_id: &str) -> ApiResult<Vec<u8>> {
@@ -549,7 +684,9 @@ async fn orchestrator_foreign_recipient_typed_unsupported_draft_retained() -> an
     let paths = Arc::new(Mutex::new(Vec::new()));
     let credentials = MockCredentials::new();
     credentials.set_request_authority_document(rig.server.receipt_document.clone());
-    credentials.store_device_uuid(alice.did(), &alice.svc.device_id.to_string()).await?;
+    credentials
+        .store_device_uuid(alice.did(), &alice.svc.device_id.to_string())
+        .await?;
     credentials.store_mls_did(alice.did(), alice.did()).await?;
     let context: Arc<MLSContext> = alice.engine.context();
     let orchestrator = MLSOrchestrator::new(
@@ -595,19 +732,41 @@ async fn orchestrator_foreign_recipient_typed_unsupported_draft_retained() -> an
         let result = orchestrator.start_direct_request(draft.clone()).await;
         println!("C33 orchestrator attempt {attempt}: {result:?}");
         match &result {
-            Err(OrchestratorError::Mls(MLSError::OperationNotSupported { reason: got })) => assert_eq!(got, reason),
-            other => panic!("attempt {attempt}: expected typed OperationNotSupported, got {other:?}"),
+            Err(OrchestratorError::Mls(MLSError::OperationNotSupported { reason: got })) => {
+                assert_eq!(got, reason)
+            }
+            other => {
+                panic!("attempt {attempt}: expected typed OperationNotSupported, got {other:?}")
+            }
         }
         assert_eq!(draft, &snapshot, "caller draft unchanged");
         // Draft retained: the intent survives with its signed terminal receipt.
-        let raw = context.read_direct_request_intent(&draft_id)?.expect("draft intent retained");
+        let raw = context
+            .read_direct_request_intent(&draft_id)?
+            .expect("draft intent retained");
         let intent: Value = serde_json::from_slice(&raw)?;
         assert_eq!(intent["input"]["text"], draft.text, "retained draft text");
-        assert!(intent["terminal_response"].is_array(), "signed terminal receipt retained with draft");
-        assert_eq!(intent["previous_attempts"].as_array().map(Vec::len), Some(previous));
-        assert!(context.list_direct_request_journal()?.is_empty(), "no bootstrap journal (no lease)");
-        assert!(context.list_direct_request_projections()?.is_empty(), "no request projection");
-        assert_eq!(prepares_sent(&paths.lock().await), prepares, "attempt {attempt} wire prepares");
+        assert!(
+            intent["terminal_response"].is_array(),
+            "signed terminal receipt retained with draft"
+        );
+        assert_eq!(
+            intent["previous_attempts"].as_array().map(Vec::len),
+            Some(previous)
+        );
+        assert!(
+            context.list_direct_request_journal()?.is_empty(),
+            "no bootstrap journal (no lease)"
+        );
+        assert!(
+            context.list_direct_request_projections()?.is_empty(),
+            "no request projection"
+        );
+        assert_eq!(
+            prepares_sent(&paths.lock().await),
+            prepares,
+            "attempt {attempt} wire prepares"
+        );
     }
 
     // Server: every attempt by Alice to Bob is a terminal rejection with the
@@ -626,22 +785,37 @@ async fn orchestrator_foreign_recipient_typed_unsupported_draft_retained() -> an
          AND convert_from(terminal_response,'UTF8') LIKE '%\"code\":\"RecipientAuthorityUnsupported\"%'",
         alice.did(), bob.did()
     ))?;
-    assert_eq!(typed, 2, "both server attempts hold the typed signed refusal");
-    assert_eq!(available_request_packages(bob.did())?, 1, "no recipient package consumed");
+    assert_eq!(
+        typed, 2,
+        "both server attempts hold the typed signed refusal"
+    );
+    assert_eq!(
+        available_request_packages(bob.did())?,
+        1,
+        "no recipient package consumed"
+    );
     assert_eq!(pair_footprint(alice.did(), bob.did())?, "0|0|0|0");
 
     // No legacy fallback: only the canonical inventory read and the two
     // prepare submissions reached the wire.
     let sent = paths.lock().await.clone();
     println!("C33 orchestrator wire paths: {sent:?}");
-    assert_eq!(prepares_sent(&sent), 2, "one prepare per immutable attempt: {sent:?}");
+    assert_eq!(
+        prepares_sent(&sent),
+        2,
+        "one prepare per immutable attempt: {sent:?}"
+    );
     for path in &sent {
         assert!(
             path == "/xrpc/blue.catbird.chat.prepareDirectRequest"
                 || path.starts_with("/xrpc/blue.catbird.chat.getConversations?"),
             "unexpected wire request (legacy fallback?): {path}"
         );
-        assert!(!path.contains("mlsDS.") && !path.contains("deliverMessage") && !path.contains("deliverWelcome"));
+        assert!(
+            !path.contains("mlsDS.")
+                && !path.contains("deliverMessage")
+                && !path.contains("deliverWelcome")
+        );
     }
     orchestrator.shutdown().await;
     Ok(())
@@ -651,7 +825,10 @@ async fn orchestrator_foreign_recipient_typed_unsupported_draft_retained() -> an
 /// (harness routing is fixed per process), dropped at the end.
 #[tokio::test(flavor = "multi_thread")]
 async fn c33_live_recipient_homed_on_foreign_authority() -> anyhow::Result<()> {
-    let name = format!("catbird_direct_requests_fault_{}", &Uuid::new_v4().simple().to_string()[..16]);
+    let name = format!(
+        "catbird_direct_requests_fault_{}",
+        &Uuid::new_v4().simple().to_string()[..16]
+    );
     maintenance(&format!("CREATE DATABASE {name}"))?;
     let _dedicated = DedicatedDatabase(name.clone());
     route_to_dedicated_database(&format!("postgresql://127.0.0.1:5432/{name}"))?;

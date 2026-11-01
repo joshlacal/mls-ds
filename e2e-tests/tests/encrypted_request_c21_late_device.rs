@@ -28,7 +28,8 @@ use catbird_mls::{
         get_conversations::GetConversationsOutput, get_pending_welcomes::GetPendingWelcomesOutput,
     },
     chat_v2::transcript::{
-        decode_strict_json, direct_request::{self as protocol, DirectRequestKind},
+        decode_strict_json,
+        direct_request::{self as protocol, DirectRequestKind},
         project_signed_body, SignedMutationKind, SigningTranscript,
     },
     metadata::GroupMetadataV1,
@@ -39,10 +40,10 @@ use catbird_mls::{
     RequestConsent, RequestCrypto, RequestPreview,
 };
 use encrypted_requests::{
-    canonical_future, canonical_now, connect_guarded_request_database,
-    request_database_snapshot, reviewed_request_migrations, seed_service_device,
-    signed_mls_request, validate_request_test_database_url, HttpsDidFixture, ServiceIdentity,
-    ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
+    canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
+    reviewed_request_migrations, seed_service_device, signed_mls_request,
+    validate_request_test_database_url, HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
+    REQUEST_TEST_DATABASE_URL,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -66,7 +67,13 @@ async fn directory_key(
     let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(engine.identity_public_key(&identity)?));
     let (status, body) = f
         .alice
-        .get_device_key(&f.client, &f.server.base_url, &owner.did, owner.device_id, &key_id)
+        .get_device_key(
+            &f.client,
+            &f.server.base_url,
+            &owner.did,
+            owner.device_id,
+            &key_id,
+        )
         .await?;
     anyhow::ensure!(status == reqwest::StatusCode::OK, "getDeviceKey {status}");
     let key: Value = serde_json::from_slice(&body)?;
@@ -178,9 +185,17 @@ async fn request_welcomes(
         ("supportedProtocolVersions".to_owned(), "2".to_owned()),
     ];
     let (status, body) = service
-        .get(&f.client, &f.server.base_url, "blue.catbird.chat.getConversations", &params)
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getConversations",
+            &params,
+        )
         .await?;
-    anyhow::ensure!(status == reqwest::StatusCode::OK, "getConversations {status}");
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "getConversations {status}"
+    );
     let conversations: Value = serde_json::from_slice(&body)?;
     params.push((
         "inventorySessionId".to_owned(),
@@ -190,9 +205,17 @@ async fn request_welcomes(
             .to_owned(),
     ));
     let (status, body) = service
-        .get(&f.client, &f.server.base_url, "blue.catbird.chat.getPendingWelcomes", &params)
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getPendingWelcomes",
+            &params,
+        )
         .await?;
-    anyhow::ensure!(status == reqwest::StatusCode::OK, "getPendingWelcomes {status}");
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "getPendingWelcomes {status}"
+    );
     let welcomes: Value = serde_json::from_slice(&body)?;
     Ok(welcomes["items"]
         .as_array()
@@ -228,15 +251,23 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
     let f = live_direct_request::publish_request(false).await?;
     let conversation = f.conversation_id.to_string();
     let group = group_id(&f)?;
-    let _ = f.bob_engine.context().set_epoch_secret_storage(Box::new(MemoryEpochStore::default()));
+    let _ = f
+        .bob_engine
+        .context()
+        .set_epoch_secret_storage(Box::new(MemoryEpochStore::default()));
     if let Some(alice) = &f.alice_engine {
-        let _ = alice.context().set_epoch_secret_storage(Box::new(MemoryEpochStore::default()));
+        let _ = alice
+            .context()
+            .set_epoch_secret_storage(Box::new(MemoryEpochStore::default()));
     }
 
     // A new device of the recipient enrolls only after publication committed.
     let late = live_direct_request::siblings::enroll(&f.bob, &f.client, &f.server.base_url).await?;
     assert_ne!(late.service.device_id, f.bob.device_id);
-    let _ = late.engine.context().set_epoch_secret_storage(Box::new(MemoryEpochStore::default()));
+    let _ = late
+        .engine
+        .context()
+        .set_epoch_secret_storage(Box::new(MemoryEpochStore::default()));
 
     // Account consent through the real signed acceptance.
     live_direct_request::accept_existing_fixture(&f).await?;
@@ -247,7 +278,9 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
         request_welcomes(&f, &late.service).await?.is_empty(),
         "late device must not be offered the request Welcome"
     );
-    let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(late.engine.identity_public_key(&late.identity)?));
+    let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(
+        late.engine.identity_public_key(&late.identity)?,
+    ));
     let claim = sign_mutation(
         &late.engine,
         &late.identity,
@@ -277,10 +310,19 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
         )
         .await?;
     let refusal: Value = serde_json::from_slice(&body)?;
-    assert!(status.is_client_error(), "late claim must fail: {status} {refusal}");
-    assert_eq!(refusal["error"], "WelcomeNotFound", "typed refusal: {refusal}");
+    assert!(
+        status.is_client_error(),
+        "late claim must fail: {status} {refusal}"
+    );
+    assert_eq!(
+        refusal["error"], "WelcomeNotFound",
+        "typed refusal: {refusal}"
+    );
     let late_input = input_for(&f, &late.identity, &late.package_ref);
-    assert!(late.engine.epoch(&group).is_err(), "no group keys by acceptance");
+    assert!(
+        late.engine.epoch(&group).is_err(),
+        "no group keys by acceptance"
+    );
     assert!(
         late.engine.decrypt_direct_request(&late_input).is_err(),
         "no intro readable by acceptance"
@@ -301,25 +343,38 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
     assert_eq!(late_view.crypto, RequestCrypto::Unavailable);
     assert_eq!(
         late_view.preview,
-        Some(RequestPreview::Unavailable { code: "DeviceNotAddressed".into() })
+        Some(RequestPreview::Unavailable {
+            code: "DeviceNotAddressed".into()
+        })
     );
-    assert!(!late_view.capabilities.can_preview, "no preview without keys");
+    assert!(
+        !late_view.capabilities.can_preview,
+        "no preview without keys"
+    );
     assert!(!late_view.capabilities.can_send, "no false send readiness");
     late_client.shutdown().await;
-    assert!(late.engine.epoch(&group).is_err(), "projection refresh imported nothing");
+    assert!(
+        late.engine.epoch(&group).is_err(),
+        "projection refresh imported nothing"
+    );
 
     // 3. Reinstalled addressed device: the native store is wiped, while the
     //    device UUID and full signing identity survive in the keychain and
     //    are re-imported (as `devices.rs` does after a reinstall). The fresh
     //    store holds none of the request's KeyPackage secrets.
     let bob_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
-    let surviving_identity = f.bob_engine.context().export_identity_key(bob_identity.clone())?;
+    let surviving_identity = f
+        .bob_engine
+        .context()
+        .export_identity_key(bob_identity.clone())?;
     let reinstalled = MlsEngine::new("c21-bob-reinstalled")?;
     reinstalled
         .context()
         .import_identity_key(bob_identity.clone(), surviving_identity)?;
     assert!(reinstalled.epoch(&group).is_err());
-    let _ = reinstalled.context().set_epoch_secret_storage(Box::new(MemoryEpochStore::default()));
+    let _ = reinstalled
+        .context()
+        .set_epoch_secret_storage(Box::new(MemoryEpochStore::default()));
     let reinstalled_client = live_orchestrator::live_orchestrator(
         reinstalled.context(),
         &f.bob,
@@ -328,21 +383,32 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
         receipt_document.clone(),
     )
     .await?;
-    let reinstalled_view = reinstalled_client.refresh_request_preview(&conversation).await?;
+    let reinstalled_view = reinstalled_client
+        .refresh_request_preview(&conversation)
+        .await?;
     println!("C21 reinstalled device view: {reinstalled_view:?}");
     assert_eq!(reinstalled_view.crypto, RequestCrypto::Unavailable);
     // Key loss surfaces through the core's existing import-failure code.
     assert_eq!(
         reinstalled_view.preview,
-        Some(RequestPreview::Unavailable { code: "InvalidBootstrap".into() }),
+        Some(RequestPreview::Unavailable {
+            code: "InvalidBootstrap".into()
+        }),
         "fresh store cannot show the introduction"
     );
     assert!(!reinstalled_view.capabilities.can_preview && !reinstalled_view.capabilities.can_send);
     reinstalled_client.shutdown().await;
-    assert!(reinstalled.epoch(&group).is_err(), "fresh store gained no group keys");
+    assert!(
+        reinstalled.epoch(&group).is_err(),
+        "fresh store gained no group keys"
+    );
     assert!(
         reinstalled
-            .decrypt_direct_request(&input_for(&f, &bob_identity, &f.welcome_input.local_package_ref))
+            .decrypt_direct_request(&input_for(
+                &f,
+                &bob_identity,
+                &f.welcome_input.local_package_ref
+            ))
             .is_err(),
         "fresh store cannot decrypt the introduction"
     );
@@ -358,7 +424,11 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
         (f.bob.did.as_str(), vec![bob_key, late_key]),
     ];
     let introductions_before = entry_kinds(&conversation)?;
-    assert_eq!(recovery_rows(&conversation)?, json!([]), "no recovery work yet");
+    assert_eq!(
+        recovery_rows(&conversation)?,
+        json!([]),
+        "no recovery work yet"
+    );
 
     // 4a. The late device's own core publishes a recovery-scope KeyPackage
     //     (signed replenishKeyPackages) and, finding no Welcome, signs
@@ -401,7 +471,10 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
     );
     let pending = late_recovery.join_or_rejoin(&conversation).await;
     println!("C21 late device join_or_rejoin before fulfillment: {pending:?}");
-    assert!(pending.is_err(), "no membership before a current leaf fulfills");
+    assert!(
+        pending.is_err(),
+        "no membership before a current leaf fulfills"
+    );
     assert_eq!(
         recovery_rows(&conversation)?,
         json!([{"device": late.service.device_id.to_string(), "kind": "add",
@@ -420,7 +493,10 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
         json!(["recovery"]),
         "the recovery reservation binds a recovery-scope package"
     );
-    assert!(late.engine.epoch(&group).is_err(), "request alone grants no keys");
+    assert!(
+        late.engine.epoch(&group).is_err(),
+        "request alone grants no keys"
+    );
 
     // 4b. A current leaf fulfills it. The addressed recipient device imports
     //    its own Welcome through the core projection, then runs the core
@@ -434,15 +510,26 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
     )
     .await?;
     let bob_view = bob_leaf.refresh_request_preview(&conversation).await?;
-    assert_eq!(bob_view.crypto, RequestCrypto::Ready, "addressed device holds a leaf");
+    assert_eq!(
+        bob_view.crypto,
+        RequestCrypto::Ready,
+        "addressed device holds a leaf"
+    );
     let request_epoch = f.bob_engine.epoch(&group)?;
     let fulfilled = bob_leaf.fulfill_leaf_recovery(&conversation).await?;
-    println!("C21 fulfillment entry type: {}", fulfilled["entry"]["$type"]);
+    println!(
+        "C21 fulfillment entry type: {}",
+        fulfilled["entry"]["$type"]
+    );
     assert_eq!(
         fulfilled["entry"]["$type"],
         "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry"
     );
-    assert_eq!(f.bob_engine.epoch(&group)?, request_epoch + 1, "fulfiller merged its Add");
+    assert_eq!(
+        f.bob_engine.epoch(&group)?,
+        request_epoch + 1,
+        "fulfiller merged its Add"
+    );
     assert_eq!(
         recovery_rows(&conversation)?[0]["status"],
         "fulfilled",
@@ -451,7 +538,11 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
 
     // 4c. The late device joins at the successor epoch through its core.
     let joined_epoch = late_recovery.join_or_rejoin(&conversation).await?;
-    assert_eq!(joined_epoch, request_epoch + 1, "membership starts at the successor epoch");
+    assert_eq!(
+        joined_epoch,
+        request_epoch + 1,
+        "membership starts at the successor epoch"
+    );
     assert_eq!(late.engine.epoch(&group)?, request_epoch + 1);
     let (successor_ciphertext, _) = f.bob_engine.encrypt(&group, b"after recovery")?;
     assert_eq!(
@@ -502,14 +593,21 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
     let items = entries_val["entries"].as_array().context("entries array")?;
     println!(
         "C21 recovered device visible entries: {:?}",
-        items.iter().map(|e| (&e["seq"], &e["$type"])).collect::<Vec<_>>()
+        items
+            .iter()
+            .map(|e| (&e["seq"], &e["$type"]))
+            .collect::<Vec<_>>()
     );
     assert!(
-        items.iter().all(|e| e["$type"] != "blue.catbird.chat.defs#directRequestEntry"),
+        items
+            .iter()
+            .all(|e| e["$type"] != "blue.catbird.chat.defs#directRequestEntry"),
         "recovered device history must contain no directRequestEntry: {items:?}"
     );
     assert!(
-        items.iter().any(|e| e["$type"] == "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry"),
+        items
+            .iter()
+            .any(|e| e["$type"] == "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry"),
         "recovered device history must include its fulfillment: {items:?}"
     );
     let mut expected_kinds = introductions_before.clone();
@@ -519,7 +617,10 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
         expected_kinds,
         "recovery added exactly one fulfillment entry and no introduction"
     );
-    assert_eq!(introductions_before["blue.catbird.chat.defs#directRequestEntry"], 1);
+    assert_eq!(
+        introductions_before["blue.catbird.chat.defs#directRequestEntry"],
+        1
+    );
     late_recovery.shutdown().await;
     bob_leaf.shutdown().await;
 

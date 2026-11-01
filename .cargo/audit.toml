@@ -1,0 +1,26 @@
+# Risk-accepted upstream-pinned advisories for `mls-ds` (tracked in `docs/DECISIONS.md`).
+# Patchable semver advisories (`ctutils >=0.4.4`, `crossbeam-epoch >=0.9.20`, `h2 >=0.4.16`,
+# `rustls 0.23.46`, `rustls-webpki 0.103.16`) were upgraded directly in `Cargo.lock`.
+[advisories]
+ignore = [
+    # OpenMLS 0.9.0-rc.3 / jacquard 0.13 transitive pin on `elliptic-curve 0.13` -> `crypto-bigint 0.5.5`.
+    "RUSTSEC-2026-0387",
+    # OpenMLS 0.9.0-rc.3 `openmls_libcrux_crypto 0.4.0-rc.3` pins `libcrux-hmac-drbg 0.0.1` and `libcrux-kem 0.0.9`.
+    "RUSTSEC-2026-0329",
+    "RUSTSEC-2026-0330",
+    "RUSTSEC-2026-0331",
+    # `sqlx 0.7.4` proc-macro workspace pulls unused `sqlx-mysql` -> `rsa 0.9.10` (PostgreSQL only at runtime).
+    "RUSTSEC-2023-0071",
+    # `sqlx 0.7.4` binary protocol cast advisory; upgrading to `sqlx 0.8` requires full query-macro & driver migration.
+    "RUSTSEC-2024-0363",
+    # `sqlx 0.7.4` (`rustls 0.21.12`) and `tokio-tungstenite 0.21` (`rustls 0.22.4`) transitive pins;
+    # primary outbound HTTP/S2S client stack uses `rustls 0.23.46` + `rustls-webpki 0.103.16`.
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0349",
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0382",
+    "RUSTSEC-2026-0381",
+]

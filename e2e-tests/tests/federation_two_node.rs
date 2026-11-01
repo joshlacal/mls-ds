@@ -13,9 +13,7 @@ use catbird_mls::chat_v2::transcript::strict_json::decode_strict_json;
 use catbird_mls::chat_v2::transcript::{
     project_signed_body, SignedMutationKind, SigningTranscript,
 };
-use catbird_mls::orchestrator::{
-    canonical_application_aad_bytes, canonical_commit_aad_bytes,
-};
+use catbird_mls::orchestrator::{canonical_application_aad_bytes, canonical_commit_aad_bytes};
 use chrono::{DateTime, SecondsFormat, Utc};
 use mls_e2e_tests::federation::{boot_two_node_cluster, TwoNodeCluster, DIGEST_ALLOWED_TABLES};
 use mls_e2e_tests::mls_engine::MlsEngine;
@@ -31,7 +29,6 @@ const RECEIPT_SIGNING_DOMAIN: &[u8] = b"CATBIRD-CLEAN-FEDERATION-RECEIPT-V1\0";
 const DELIVER_MESSAGE_NSID: &str = "blue.catbird.mlsDS.deliverMessage";
 const DELIVER_WELCOME_NSID: &str = "blue.catbird.mlsDS.deliverWelcome";
 const SUBMIT_COMMIT_NSID: &str = "blue.catbird.mlsDS.submitCommit";
-
 
 struct TestIdentity {
     did: String,
@@ -264,7 +261,6 @@ fn application_aad(
         )
     })
 }
-
 
 fn make_creation_body_with_invitee(
     convo_id: Uuid,
@@ -1037,26 +1033,14 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     let alice_device_id = Uuid::parse_str("70707070-7070-4070-b070-707070707070")?;
     let bob_device_id = Uuid::parse_str("80808080-8080-4080-b080-808080808080")?;
 
-    let alice = TestIdentity::with_fixed_identity(
-        "alice",
-        ALICE_DID,
-        alice_device_id,
-        alice_p256,
-    );
-    let bob = TestIdentity::with_fixed_identity(
-        "bob",
-        BOB_DID,
-        bob_device_id,
-        bob_p256,
-    );
+    let alice = TestIdentity::with_fixed_identity("alice", ALICE_DID, alice_device_id, alice_p256);
+    let bob = TestIdentity::with_fixed_identity("bob", BOB_DID, bob_device_id, bob_p256);
     let alice_credential = alice.credential_identity();
     let bob_credential = bob.credential_identity();
 
-
     // Step 2: Generate real OpenMLS key packages
     tracing::info!("Step 2: Generating OpenMLS key packages...");
-    let (alice_kp_bytes, alice_kp_ref_vec) =
-        alice.engine.create_key_package(&alice_credential)?;
+    let (alice_kp_bytes, alice_kp_ref_vec) = alice.engine.create_key_package(&alice_credential)?;
     let (bob_kp_bytes, bob_kp_ref_vec) = bob.engine.create_key_package(&bob_credential)?;
     let mut bob_kp_ref = [0u8; 32];
     bob_kp_ref.copy_from_slice(&bob_kp_ref_vec);
@@ -1068,12 +1052,8 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
 
     // Step 3: Enroll Alice on DS1
     tracing::info!("Step 3: Enrolling Alice on DS1 via enrollDevice...");
-    let (alice_enroll_wrapper, _) = make_device_enrollment_body(
-        &alice,
-        vec![alice_kp_val.clone()],
-        Uuid::new_v4(),
-        now,
-    );
+    let (alice_enroll_wrapper, _) =
+        make_device_enrollment_body(&alice, vec![alice_kp_val.clone()], Uuid::new_v4(), now);
     let alice_enroll_jwt = alice.mint_chat_jwt(
         &cluster,
         &cluster.ds1_service_did,
@@ -1144,7 +1124,10 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         &alice_enroll_wrapper_ds2,
     )
     .await?;
-    tracing::info!(?alice_enroll_res_ds2, "Alice authority material enrolled on DS2");
+    tracing::info!(
+        ?alice_enroll_res_ds2,
+        "Alice authority material enrolled on DS2"
+    );
 
     // Step 6: Create conversation on DS1
     tracing::info!("Step 6: Creating conversation on DS1 as Alice...");
@@ -1246,11 +1229,10 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     );
     let fulfill_aad = canonical_commit_aad_bytes(&fulfill_aad)
         .map_err(|error| anyhow::anyhow!("canonical recovery Commit AAD: {error}"))?;
-    let (commit_data, welcome_data, sv2_gch, sv2_ctag) = alice.engine.add_members_with_aad(
-        &group_id,
-        vec![bob_kp_bytes.clone()],
-        &fulfill_aad,
-    )?;
+    let (commit_data, welcome_data, sv2_gch, sv2_ctag) =
+        alice
+            .engine
+            .add_members_with_aad(&group_id, vec![bob_kp_bytes.clone()], &fulfill_aad)?;
     let sv2_gch: [u8; 32] = sv2_gch.try_into().map_err(|bytes: Vec<u8>| {
         anyhow::anyhow!("expected 32-byte GroupContext hash, got {}", bytes.len())
     })?;
@@ -1341,21 +1323,12 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
 
     let msg1_id = Uuid::new_v4();
     let msg1_text = b"Hello Bob from Alice after remote-prefix bootstrap!";
-    let msg1_aad = application_aad(
-        convo_id,
-        msg1_id,
-        &group_id,
-        2,
-        1,
-        &sv2_gch,
-        &sv2_ctag,
-    );
+    let msg1_aad = application_aad(convo_id, msg1_id, &group_id, 2, 1, &sv2_gch, &sv2_ctag);
     let msg1_aad = canonical_application_aad_bytes(&msg1_aad)
         .map_err(|error| anyhow::anyhow!("canonical message AAD: {error}"))?;
-    let (msg1_ciphertext, _) =
-        alice
-            .engine
-            .encrypt_with_aad(&group_id, msg1_text, &msg1_aad)?;
+    let (msg1_ciphertext, _) = alice
+        .engine
+        .encrypt_with_aad(&group_id, msg1_text, &msg1_aad)?;
 
     let (msg1_wrapper, _) = make_message_body(
         convo_id,
@@ -1572,10 +1545,9 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     );
     let msg2_aad = canonical_application_aad_bytes(&msg2_aad)
         .map_err(|error| anyhow::anyhow!("canonical message AAD: {error}"))?;
-    let (msg2_ciphertext, _) =
-        alice
-            .engine
-            .encrypt_with_aad(&group_id, msg2_text, &msg2_aad)?;
+    let (msg2_ciphertext, _) = alice
+        .engine
+        .encrypt_with_aad(&group_id, msg2_text, &msg2_aad)?;
     let (msg2_wrapper, _) = make_message_body(
         convo_id,
         msg2_id,

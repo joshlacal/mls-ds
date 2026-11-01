@@ -123,6 +123,11 @@ name = "encrypted_request_server_fixture"
 path = "../e2e-tests/support/encrypted_request_server_fixture.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "clean_slate_federation_fixture"
+path = "../e2e-tests/support/clean_slate_federation_fixture.rs"
+required-features = ["test-support"]
+
 [[example]]
 name = "seal_mls_chat_crypto_wire_v09"
 path = "examples/seal_mls_chat_crypto_wire_v09.rs"

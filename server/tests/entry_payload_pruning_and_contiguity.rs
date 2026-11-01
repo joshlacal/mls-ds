@@ -224,7 +224,11 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
         ),
     )
     .await;
-    assert_eq!(send_status, StatusCode::OK, "sendMessage failed: {send_body}");
+    assert_eq!(
+        send_status,
+        StatusCode::OK,
+        "sendMessage failed: {send_body}"
+    );
     let app_seq = send_body["entry"]["seq"].as_i64().expect("entry seq");
     let entry_id_str = send_body["entry"]["entryId"].as_str().expect("entryId");
     let receipt_json = send_body
@@ -234,9 +238,13 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
     assert_eq!(receipt_json["sequencerDid"], self_did);
     assert_eq!(receipt_json["seq"], app_seq);
     assert_eq!(receipt_json["kid"], format!("{self_did}#mls-receipt-1"));
-    let sig_b64 = receipt_json["signature"]["$bytes"].as_str().expect("sig $bytes");
+    let sig_b64 = receipt_json["signature"]["$bytes"]
+        .as_str()
+        .expect("sig $bytes");
     let sig_raw: [u8; 64] = STANDARD.decode(sig_b64).unwrap().try_into().unwrap();
-    let group_id_b64 = receipt_json["groupId"]["$bytes"].as_str().expect("groupId $bytes");
+    let group_id_b64 = receipt_json["groupId"]["$bytes"]
+        .as_str()
+        .expect("groupId $bytes");
     let group_id_raw = STANDARD.decode(group_id_b64).unwrap();
     let issued_at_ms = receipt_json["issuedAtMs"].as_i64().expect("issuedAtMs");
     let epoch = fixture.signed_request["body"]["prior"]["epoch"]
@@ -280,7 +288,11 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
         ),
     )
     .await;
-    assert_eq!(ack1_status, StatusCode::OK, "sender ack failed: {ack1_body}");
+    assert_eq!(
+        ack1_status,
+        StatusCode::OK,
+        "sender ack failed: {ack1_body}"
+    );
     assert_eq!(ack1_body["acknowledgedSeq"], app_seq);
     assert_eq!(ack1_body["prunedCount"], 0);
 
@@ -292,7 +304,10 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(!pruned_after_one, "must not prune before all active devices ack");
+    assert!(
+        !pruned_after_one,
+        "must not prune before all active devices ack"
+    );
 
     // 3. Recipient ACKs -> all active devices have acked -> payload_pruned_at set, bytes NULL
     let recipient_ed = EdSigningKey::from_bytes(&fixture.recipient_ed25519_seed);
@@ -314,7 +329,11 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
         ),
     )
     .await;
-    assert_eq!(ack2_status, StatusCode::OK, "recipient ack failed: {ack2_body}");
+    assert_eq!(
+        ack2_status,
+        StatusCode::OK,
+        "recipient ack failed: {ack2_body}"
+    );
     assert_eq!(ack2_body["acknowledgedSeq"], app_seq);
     assert_eq!(ack2_body["prunedCount"], 1);
 
@@ -327,8 +346,14 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(row.0.is_none(), "accepted_payload_bytes must be NULL after pruning");
-    assert!(row.1.is_none(), "signed_request_bytes must be NULL after pruning");
+    assert!(
+        row.0.is_none(),
+        "accepted_payload_bytes must be NULL after pruning"
+    );
+    assert!(
+        row.1.is_none(),
+        "signed_request_bytes must be NULL after pruning"
+    );
     assert!(row.2, "payload_pruned_at must be set");
 
     // 4. getEntries still returns contiguous seqs with payloadPruned: true + verifiable sequencerReceipt!
@@ -344,11 +369,19 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
         ),
     )
     .await;
-    assert_eq!(entries_status, StatusCode::OK, "getEntries after prune: {entries_body}");
+    assert_eq!(
+        entries_status,
+        StatusCode::OK,
+        "getEntries after prune: {entries_body}"
+    );
     let entries = entries_body["entries"].as_array().expect("entries array");
     let seqs: Vec<i64> = entries.iter().map(|e| e["seq"].as_i64().unwrap()).collect();
     for (idx, s) in seqs.iter().enumerate() {
-        assert_eq!(*s, (idx + 1) as i64, "seq contiguity must hold after payload pruning");
+        assert_eq!(
+            *s,
+            (idx + 1) as i64,
+            "seq contiguity must hold after payload pruning"
+        );
     }
     let pruned_entry = entries
         .iter()
@@ -368,9 +401,10 @@ async fn dormant_60d_devices_and_30d_ceiling_prune_without_stalling_active_conve
     let pool = db.connect(4).await;
     http::ensure_fence(&pool).await;
 
-    let fixture = seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
-        .await
-        .expect("fixture");
+    let fixture =
+        seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
+            .await
+            .expect("fixture");
 
     let sender_p256 = http::random_p256();
     let sender_jwk = http::public_jwk(&sender_p256);
@@ -436,7 +470,10 @@ async fn dormant_60d_devices_and_30d_ceiling_prune_without_stalling_active_conve
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(is_pruned, "dormant device must not hold up ACK-based pruning");
+    assert!(
+        is_pruned,
+        "dormant device must not hold up ACK-based pruning"
+    );
 
     // Also verify 30-day hard ceiling sweep on unacked applicationEntry rows:
     let pruned_30d = prune_expired_application_payloads(&pool, Utc::now() + Duration::days(31))
@@ -454,9 +491,10 @@ async fn delete_account_data_sequences_account_deleted_entry_in_active_conversat
     let pool = db.connect(4).await;
     http::ensure_fence(&pool).await;
 
-    let fixture = seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
-        .await
-        .expect("fixture");
+    let fixture =
+        seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
+            .await
+            .expect("fixture");
 
     let recipient_p256 = http::random_p256();
     let recipient_jwk = http::public_jwk(&recipient_p256);
@@ -481,14 +519,18 @@ async fn delete_account_data_sequences_account_deleted_entry_in_active_conversat
     http::cache_device_did(&sender_dev).await;
 
     // Invoke deleteAccountData for sender_did via labyrinth retention repo
-    let deleted_seqs = catbird_server::labyrinth::repo::retention::delete_account_data_with_conversations(
-        &pool,
-        &fixture.sender_did,
-        Utc::now(),
-    )
-    .await
-    .expect("delete_account_data_with_conversations");
-    assert_eq!(deleted_seqs, 1, "one active conversation must receive accountDeletedEntry");
+    let deleted_seqs =
+        catbird_server::labyrinth::repo::retention::delete_account_data_with_conversations(
+            &pool,
+            &fixture.sender_did,
+            Utc::now(),
+        )
+        .await
+        .expect("delete_account_data_with_conversations");
+    assert_eq!(
+        deleted_seqs, 1,
+        "one active conversation must receive accountDeletedEntry"
+    );
 
     let chat_router = http::router_for_authenticated_acceptance(pool.clone()).await;
     let (status, body) = http::send(
@@ -503,7 +545,11 @@ async fn delete_account_data_sequences_account_deleted_entry_in_active_conversat
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "recipient getEntries after peer deleteAccountData: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "recipient getEntries after peer deleteAccountData: {body}"
+    );
     let entries = body["entries"].as_array().expect("entries");
     let acct_del = entries
         .iter()

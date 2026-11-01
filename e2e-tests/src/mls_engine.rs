@@ -378,6 +378,7 @@ impl MlsEngine {
             .map_err(|e| anyhow::anyhow!("self_update_with_aad: {e}"))
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn add_members_with_aad(
         &self,
         group_id: &[u8],
@@ -421,11 +422,7 @@ impl MlsEngine {
     ) -> Result<(Vec<u8>, u32)> {
         let result = self
             .ctx
-            .encrypt_message_with_aad_for_test(
-                group_id.to_vec(),
-                plaintext.to_vec(),
-                aad.to_vec(),
-            )
+            .encrypt_message_with_aad_for_test(group_id.to_vec(), plaintext.to_vec(), aad.to_vec())
             .map_err(|e| anyhow::anyhow!("encrypt_message_with_aad: {e}"))?;
         Ok((result.ciphertext, result.padded_size))
     }

@@ -21,6 +21,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use catbird_mls::orchestrator::canonical_transport;
 use catbird_mls::{
     chat_v2::transcript::direct_request::{self as protocol, DirectRequestKind},
     metadata::GroupMetadataV1,
@@ -28,10 +29,9 @@ use catbird_mls::{
 };
 use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, request_database_url,
-    route_to_dedicated_database, seed_service_device, signed_mls_request, HttpsDidFixture, ServiceIdentity,
-    ShippingServerFixture,
+    route_to_dedicated_database, seed_service_device, signed_mls_request, HttpsDidFixture,
+    ServiceIdentity, ShippingServerFixture,
 };
-use catbird_mls::orchestrator::canonical_transport;
 use live_orchestrator::{mock_credentials::MockCredentials, mock_storage::MockStorage};
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -42,7 +42,16 @@ use uuid::Uuid;
 /// Read-only query against the routed guarded database.
 fn db(sql: &str) -> anyhow::Result<String> {
     let out = std::process::Command::new("psql")
-        .args(["-X", "-v", "ON_ERROR_STOP=1", "-At", "-d", request_database_url(), "-c", sql])
+        .args([
+            "-X",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-At",
+            "-d",
+            request_database_url(),
+            "-c",
+            sql,
+        ])
         .output()?;
     anyhow::ensure!(
         out.status.success(),
@@ -91,7 +100,15 @@ const MAINTENANCE_URL: &str = "postgresql://127.0.0.1:5432/postgres";
 
 fn maintenance(sql: &str) -> anyhow::Result<()> {
     let output = std::process::Command::new("psql")
-        .args([MAINTENANCE_URL, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            MAINTENANCE_URL,
+            "-X",
+            "-q",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()?;
     anyhow::ensure!(
         output.status.success(),
@@ -123,7 +140,10 @@ async fn dedicated_database() -> anyhow::Result<DedicatedDatabase> {
     anyhow::ensure!(request_database_url().ends_with(&name));
     let authority = connect_guarded_request_database(5).await?;
     anyhow::ensure!(authority.database == name);
-    println!("dedicated database {name} ({} request migrations)", authority.additive_migrations);
+    println!(
+        "dedicated database {name} ({} request migrations)",
+        authority.additive_migrations
+    );
     Ok(guard)
 }
 
@@ -146,9 +166,8 @@ struct Fixture {
 async fn fixture() -> anyhow::Result<Fixture> {
     let _authority = connect_guarded_request_database(5).await?;
     let run = Uuid::new_v4().simple().to_string()[..16].to_owned();
-    let alice_id = ServiceIdentity::new(format!(
-        "did:web:alice-{run}.request-fixture.catbird.blue"
-    ));
+    let alice_id =
+        ServiceIdentity::new(format!("did:web:alice-{run}.request-fixture.catbird.blue"));
     let bob_id = ServiceIdentity::new(format!("did:web:bob-{run}.request-fixture.catbird.blue"));
     let https = HttpsDidFixture::start(
         HttpsDidFixture::reserve_port()?,
@@ -230,9 +249,11 @@ async fn publish_bob_keys(f: &Fixture, count: usize) -> anyhow::Result<()> {
                 "signedAt":canonical_now()
             }),
         )?;
-        keys.push(json!({"keyPackage":{"framing":"mlsMessage","contentType":"keyPackage",
+        keys.push(
+            json!({"keyPackage":{"framing":"mlsMessage","contentType":"keyPackage",
             "bytes":STANDARD.encode(&package),"sha256":STANDARD.encode(Sha256::digest(&package)),
-            "keyPackageRef":STANDARD.encode(&package_ref)},"grant":grant}));
+            "keyPackageRef":STANDARD.encode(&package_ref)},"grant":grant}),
+        );
     }
     let operation = Uuid::new_v4();
     let keys = signed_mls_request(
@@ -346,7 +367,10 @@ impl catbird_mls::orchestrator::api_client::MLSAPIClient for CapableHostApi {
         }
         let path = request.path.clone();
         let response = self.submit_prepared_request(request).await?;
-        self.inventory_log.lock().await.push((path, response.status));
+        self.inventory_log
+            .lock()
+            .await
+            .push((path, response.status));
         if response.status != 200 {
             return Err(api_error(format!(
                 "getConversations {}: {}",
@@ -354,8 +378,8 @@ impl catbird_mls::orchestrator::api_client::MLSAPIClient for CapableHostApi {
                 String::from_utf8_lossy(&response.body)
             )));
         }
-        let page =
-            canonical_transport::decode_conversations_inventory(&response.body).map_err(api_error)?;
+        let page = canonical_transport::decode_conversations_inventory(&response.body)
+            .map_err(api_error)?;
         let mut conversations = Vec::new();
         for item in page.items {
             // Tombstones carry no state; only live states become views.
@@ -393,7 +417,10 @@ impl catbird_mls::orchestrator::api_client::MLSAPIClient for CapableHostApi {
         _: Option<&str>,
         _: Option<u32>,
         _: Option<u32>,
-    ) -> ApiResult<(Vec<catbird_mls::orchestrator::IncomingEnvelope>, Option<String>)> {
+    ) -> ApiResult<(
+        Vec<catbird_mls::orchestrator::IncomingEnvelope>,
+        Option<String>,
+    )> {
         Err(api_error("get_messages is outside the C23 request path"))
     }
 
@@ -402,11 +429,15 @@ impl catbird_mls::orchestrator::api_client::MLSAPIClient for CapableHostApi {
         _: &str,
         _: &[String],
     ) -> ApiResult<Vec<catbird_mls::orchestrator::KeyPackageRef>> {
-        Err(api_error("get_key_packages is outside the C23 request path"))
+        Err(api_error(
+            "get_key_packages is outside the C23 request path",
+        ))
     }
 
     async fn get_key_package_stats(&self) -> ApiResult<catbird_mls::orchestrator::KeyPackageStats> {
-        Err(api_error("get_key_package_stats is outside the C23 request path"))
+        Err(api_error(
+            "get_key_package_stats is outside the C23 request path",
+        ))
     }
 
     async fn sync_key_packages(
@@ -414,7 +445,9 @@ impl catbird_mls::orchestrator::api_client::MLSAPIClient for CapableHostApi {
         _: &[String],
         _: &str,
     ) -> ApiResult<catbird_mls::orchestrator::KeyPackageSyncResult> {
-        Err(api_error("sync_key_packages is outside the C23 request path"))
+        Err(api_error(
+            "sync_key_packages is outside the C23 request path",
+        ))
     }
 
     async fn list_devices(&self, _: &str) -> ApiResult<Vec<catbird_mls::orchestrator::DeviceInfo>> {
@@ -437,14 +470,20 @@ async fn capable_orchestrator(
     f: &Fixture,
     party: &Party,
     v1_only: bool,
-) -> anyhow::Result<(CapableOrchestrator, MockStorage, Arc<tokio::sync::Mutex<Vec<(String, u16)>>>)> {
+) -> anyhow::Result<(
+    CapableOrchestrator,
+    MockStorage,
+    Arc<tokio::sync::Mutex<Vec<(String, u16)>>>,
+)> {
     use catbird_mls::orchestrator::CredentialStore as _;
     let credentials = MockCredentials::new();
     credentials.set_request_authority_document(f.server.receipt_document.clone());
     credentials
         .store_device_uuid(&party.id.did, &party.id.device_id.to_string())
         .await?;
-    credentials.store_mls_did(&party.id.did, &party.id.did).await?;
+    credentials
+        .store_mls_did(&party.id.did, &party.id.did)
+        .await?;
     let storage = MockStorage::new();
     let inventory_log = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let orchestrator = catbird_mls::orchestrator::MLSOrchestrator::new(
@@ -522,31 +561,50 @@ async fn c23_real_client_upgrades_legacy_pending_direct() -> anyhow::Result<()> 
     else {
         anyhow::bail!("legacy upgrade did not publish: {outcome:?}");
     };
-    assert_eq!(conversation_id, cid.to_string(), "upgrade must keep the conversation id");
+    assert_eq!(
+        conversation_id,
+        cid.to_string(),
+        "upgrade must keep the conversation id"
+    );
     let after = legacy_rows(cid)?;
-    assert_eq!(before, after, "v1 creation authority must be byte-exact after upgrade");
+    assert_eq!(
+        before, after,
+        "v1 creation authority must be byte-exact after upgrade"
+    );
     let upgraded = head(cid)?;
     println!("upgraded head {upgraded}");
     assert_eq!(upgraded["protocolVersion"], "2");
     assert_eq!(upgraded["generation"], 1);
     assert_eq!(upgraded["requests"], 1);
-    assert_ne!(upgraded["groupId"], legacy_head["groupId"], "successor needs fresh crypto");
+    assert_ne!(
+        upgraded["groupId"], legacy_head["groupId"],
+        "successor needs fresh crypto"
+    );
     let request = db_json(&format!(
         "SELECT json_build_object('seq',e.seq,'kind',e.entry_kind,'createdAt',e.received_at,\
          'legacyCreatedAt',(SELECT received_at FROM chat.entries WHERE conversation_id='{cid}' AND seq=1))\
          FROM chat.entries e WHERE e.conversation_id='{cid}' AND e.seq>1 ORDER BY e.seq LIMIT 1"
     ))?;
     println!("introduction entry {request} request {request_id}");
-    assert_eq!(request["seq"], legacy_head["nextSeq"], "introduction takes the next legacy seq");
-    let intro_at = chrono::DateTime::parse_from_rfc3339(request["createdAt"].as_str().context("createdAt")?)?;
+    assert_eq!(
+        request["seq"], legacy_head["nextSeq"],
+        "introduction takes the next legacy seq"
+    );
+    let intro_at =
+        chrono::DateTime::parse_from_rfc3339(request["createdAt"].as_str().context("createdAt")?)?;
     assert!(
         intro_at >= upgrade_started - chrono::Duration::seconds(1),
         "introduction must not be backdated to legacy creation"
     );
     let legacy_at = chrono::DateTime::parse_from_rfc3339(
-        request["legacyCreatedAt"].as_str().context("legacyCreatedAt")?,
+        request["legacyCreatedAt"]
+            .as_str()
+            .context("legacyCreatedAt")?,
     )?;
-    assert!(intro_at > legacy_at, "introduction follows the legacy creation entry");
+    assert!(
+        intro_at > legacy_at,
+        "introduction follows the legacy creation entry"
+    );
     alice.shutdown().await;
     Ok(())
 }
@@ -695,7 +753,11 @@ async fn prepare_upgrade(
         )?);
     }
     let decode = |device: &Value, field: &str| -> anyhow::Result<Vec<u8>> {
-        Ok(STANDARD.decode(device["keyPackage"][field].as_str().context("package field")?)?)
+        Ok(STANDARD.decode(
+            device["keyPackage"][field]
+                .as_str()
+                .context("package field")?,
+        )?)
     };
     let prior_generation = origin["exactPrior"]["generation"]
         .as_u64()
@@ -707,30 +769,35 @@ async fn prepare_upgrade(
         "actorKeyId":alice.key_id,"recipientDid":f.bob.id.did,
         "preparationDigest":preparation["preparationDigest"]
     });
-    let journal = alice.engine.prepare_direct_request(&DirectRequestBootstrapInput {
-        draft_id: Uuid::new_v4().to_string(),
-        context_json: serde_json::to_vec(&context)?,
-        group_id: rand::random::<[u8; 32]>().to_vec(),
-        generation: prior_generation + 1,
-        state_version: 1,
-        key_packages: selected.iter().map(|d| decode(d, "bytes")).collect::<anyhow::Result<_>>()?,
-        expected_package_refs: selected
-            .iter()
-            .map(|d| decode(d, "keyPackageRef"))
-            .collect::<anyhow::Result<_>>()?,
-        authority_import_until: import_until,
-        preparation_request_digest: *verified_prepare.request_digest(),
-        receipt_authority_key: f.server.receipt_public_key.clone(),
-        text: "Upgraded legacy introduction".into(),
-        invitation: None,
-        metadata: GroupMetadataV1 {
-            version: 1,
-            title: String::new(),
-            description: String::new(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-        },
-    })?;
+    let journal = alice
+        .engine
+        .prepare_direct_request(&DirectRequestBootstrapInput {
+            draft_id: Uuid::new_v4().to_string(),
+            context_json: serde_json::to_vec(&context)?,
+            group_id: rand::random::<[u8; 32]>().to_vec(),
+            generation: prior_generation + 1,
+            state_version: 1,
+            key_packages: selected
+                .iter()
+                .map(|d| decode(d, "bytes"))
+                .collect::<anyhow::Result<_>>()?,
+            expected_package_refs: selected
+                .iter()
+                .map(|d| decode(d, "keyPackageRef"))
+                .collect::<anyhow::Result<_>>()?,
+            authority_import_until: import_until,
+            preparation_request_digest: *verified_prepare.request_digest(),
+            receipt_authority_key: f.server.receipt_public_key.clone(),
+            text: "Upgraded legacy introduction".into(),
+            invitation: None,
+            metadata: GroupMetadataV1 {
+                version: 1,
+                title: String::new(),
+                description: String::new(),
+                avatar_blob_locator: None,
+                avatar_content_type: None,
+            },
+        })?;
     let b = &journal.bootstrap;
     let mut body = prepare["body"].clone();
     body["$type"] = json!("blue.catbird.chat.defs#directRequestPublicationBody");
@@ -777,8 +844,12 @@ async fn prepare_upgrade(
                 "originSeq":origin_seq,"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"}
         }
     });
-    let publication =
-        signed_mls_request(&alice.engine, &alice.identity, DirectRequestKind::Publish, body)?;
+    let publication = signed_mls_request(
+        &alice.engine,
+        &alice.identity,
+        DirectRequestKind::Publish,
+        body,
+    )?;
     Ok(PreparedUpgrade {
         request_id,
         publication,
@@ -787,7 +858,11 @@ async fn prepare_upgrade(
 }
 
 /// Verified signed publication receipt (`body.receipt`) from a publish response.
-fn publication_receipt(f: &Fixture, status: reqwest::StatusCode, bytes: &[u8]) -> anyhow::Result<Value> {
+fn publication_receipt(
+    f: &Fixture,
+    status: reqwest::StatusCode,
+    bytes: &[u8],
+) -> anyhow::Result<Value> {
     anyhow::ensure!(
         status == reqwest::StatusCode::OK,
         "publish {status}: {}",
@@ -795,7 +870,10 @@ fn publication_receipt(f: &Fixture, status: reqwest::StatusCode, bytes: &[u8]) -
     );
     let response: Value = serde_json::from_slice(bytes)?;
     let mut outcome = response["outcome"].clone();
-    outcome.as_object_mut().context("outcome object")?.remove("$type");
+    outcome
+        .as_object_mut()
+        .context("outcome object")?
+        .remove("$type");
     let verified = protocol::verify_received_signed_request(
         DirectRequestKind::Outcome,
         &serde_json::to_vec(&outcome)?,
@@ -882,16 +960,19 @@ async fn release(f: &Fixture, cid: Uuid, upgrade: &PreparedUpgrade) -> anyhow::R
 async fn replenish(f: &Fixture, party: &Party) -> anyhow::Result<()> {
     let (package, package_ref) = party.engine.create_key_package(&party.identity)?;
     let op = Uuid::new_v4();
-    let signed = signed_ordinary(party, json!({
-        "$type":"blue.catbird.chat.defs#keyPackageReplenishmentBody",
-        "signatureDomain":"CATBIRD-CHAT-DEVICE-REPLENISH\0","actorDid":party.id.did,
-        "actorDeviceId":party.id.device_id.to_string(),"keyId":party.key_id,"authGeneration":1,
-        "signaturePublicKey":STANDARD.encode(&party.public),
-        "keyPackages":[{"framing":"mlsMessage","contentType":"keyPackage",
-            "bytes":STANDARD.encode(&package),"sha256":STANDARD.encode(Sha256::digest(&package)),
-            "keyPackageRef":STANDARD.encode(&package_ref)}],
-        "idempotencyKey":op.to_string(),"signedAt":canonical_now()
-    }))?;
+    let signed = signed_ordinary(
+        party,
+        json!({
+            "$type":"blue.catbird.chat.defs#keyPackageReplenishmentBody",
+            "signatureDomain":"CATBIRD-CHAT-DEVICE-REPLENISH\0","actorDid":party.id.did,
+            "actorDeviceId":party.id.device_id.to_string(),"keyId":party.key_id,"authGeneration":1,
+            "signaturePublicKey":STANDARD.encode(&party.public),
+            "keyPackages":[{"framing":"mlsMessage","contentType":"keyPackage",
+                "bytes":STANDARD.encode(&package),"sha256":STANDARD.encode(Sha256::digest(&package)),
+                "keyPackageRef":STANDARD.encode(&package_ref)}],
+            "idempotencyKey":op.to_string(),"signedAt":canonical_now()
+        }),
+    )?;
     let (status, bytes) = post_raw(
         f,
         party,
@@ -930,23 +1011,46 @@ async fn legacy_fixture() -> anyhow::Result<Legacy> {
     assert_eq!(head["lifecycle"], "active");
     assert_eq!(head["pending"], 1);
     let next_seq = head["nextSeq"].as_i64().context("nextSeq")?;
-    Ok(Legacy { f, cid, state, origin, rows, head, next_seq })
+    Ok(Legacy {
+        f,
+        cid,
+        state,
+        origin,
+        rows,
+        head,
+        next_seq,
+    })
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn c23_server_gate_upgrades_real_legacy_pending_direct() -> anyhow::Result<()> {
     let _db = dedicated_database().await?;
-    let Legacy { f, cid, state, origin, rows: before, head: legacy_head, next_seq } =
-        legacy_fixture().await?;
+    let Legacy {
+        f,
+        cid,
+        state,
+        origin,
+        rows: before,
+        head: legacy_head,
+        next_seq,
+    } = legacy_fixture().await?;
     println!("legacy head {legacy_head}");
 
     // A backdated originSeq and a drifted exact prior are refused, writing nothing.
-    let receipt = publish(&f, &prepare_upgrade(&f, cid, origin.clone(), next_seq - 1).await?).await?;
+    let receipt = publish(
+        &f,
+        &prepare_upgrade(&f, cid, origin.clone(), next_seq - 1).await?,
+    )
+    .await?;
     println!("backdated originSeq receipt {receipt}");
     assert_eq!(receipt_kind(&receipt), (REJECTED, "InvalidBootstrap"));
     let mut drifted = origin.clone();
-    drifted["exactPrior"]["stateVersion"] =
-        json!(state["coordinates"]["stateVersion"].as_u64().context("sv")? + 1);
+    drifted["exactPrior"]["stateVersion"] = json!(
+        state["coordinates"]["stateVersion"]
+            .as_u64()
+            .context("sv")?
+            + 1
+    );
     let receipt = publish(&f, &prepare_upgrade(&f, cid, drifted, next_seq).await?).await?;
     println!("drifted exactPrior receipt {receipt}");
     assert_eq!(receipt_kind(&receipt), (REJECTED, "StaleLegacyPrior"));
@@ -957,10 +1061,18 @@ async fn c23_server_gate_upgrades_real_legacy_pending_direct() -> anyhow::Result
     let receipt = publish(&f, &upgrade).await?;
     println!("upgrade receipt {receipt}");
     assert_eq!(receipt_kind(&receipt).0, PUBLISHED);
-    assert_eq!(receipt["conversationId"], cid.to_string(), "same conversation id");
+    assert_eq!(
+        receipt["conversationId"],
+        cid.to_string(),
+        "same conversation id"
+    );
     assert_eq!(receipt["coordinates"], upgrade.next);
 
-    assert_eq!(legacy_rows(cid)?, before, "v1 signed creation authority byte-exact");
+    assert_eq!(
+        legacy_rows(cid)?,
+        before,
+        "v1 signed creation authority byte-exact"
+    );
     let upgraded = head(cid)?;
     println!("upgraded head {upgraded}");
     assert_eq!(upgraded["protocolVersion"], "2");
@@ -969,10 +1081,15 @@ async fn c23_server_gate_upgrades_real_legacy_pending_direct() -> anyhow::Result
     assert_eq!(upgraded["stateVersion"], 1);
     assert_eq!(upgraded["epoch"], 1);
     assert_eq!(upgraded["requests"], 1);
-    assert_ne!(upgraded["groupId"], legacy_head["groupId"], "fresh successor crypto generation");
+    assert_ne!(
+        upgraded["groupId"], legacy_head["groupId"],
+        "fresh successor crypto generation"
+    );
     assert_eq!(
         upgraded["groupId"],
-        json!(hex::encode(STANDARD.decode(upgrade.next["groupId"].as_str().context("groupId")?)?))
+        json!(hex::encode(STANDARD.decode(
+            upgrade.next["groupId"].as_str().context("groupId")?
+        )?))
     );
     let states = db_json(&format!(
         "SELECT jsonb_agg(jsonb_build_object('g',generation,'sv',state_version,'kind',state_kind,'group',encode(group_id,'hex')) ORDER BY generation,state_version) \
@@ -982,7 +1099,10 @@ async fn c23_server_gate_upgrades_real_legacy_pending_direct() -> anyhow::Result
     let retirement = &states[1];
     assert_eq!(retirement["g"], 0);
     assert_eq!(retirement["sv"], 1);
-    assert_eq!(retirement["kind"], "directRequestRetirement", "prior generation retired, not rewritten");
+    assert_eq!(
+        retirement["kind"], "directRequestRetirement",
+        "prior generation retired, not rewritten"
+    );
     assert_eq!(retirement["group"], legacy_head["groupId"]);
     assert_eq!(states[2]["g"], 1);
     assert_eq!(states[2]["group"], upgraded["groupId"]);
@@ -992,7 +1112,11 @@ async fn c23_server_gate_upgrades_real_legacy_pending_direct() -> anyhow::Result
          WHERE conversation_id='{cid}' AND seq>1 ORDER BY seq LIMIT 1"
     ))?;
     println!("introduction entry {intro}");
-    assert_eq!(intro["seq"].as_i64(), Some(next_seq), "introduction takes the next legacy seq");
+    assert_eq!(
+        intro["seq"].as_i64(),
+        Some(next_seq),
+        "introduction takes the next legacy seq"
+    );
     let intro_at =
         chrono::DateTime::parse_from_rfc3339(intro["createdAt"].as_str().context("createdAt")?)?;
     assert!(
@@ -1001,18 +1125,29 @@ async fn c23_server_gate_upgrades_real_legacy_pending_direct() -> anyhow::Result
     );
     let legacy_at =
         chrono::DateTime::parse_from_rfc3339(intro["legacyAt"].as_str().context("legacyAt")?)?;
-    assert!(intro_at > legacy_at, "introduction not backdated to legacy creation");
+    assert!(
+        intro_at > legacy_at,
+        "introduction not backdated to legacy creation"
+    );
 
     // Replaying the now-stale legacy head after the upgrade never publishes.
     match prepare_upgrade(&f, cid, origin, next_seq).await {
         Ok(late) => {
             let receipt = publish(&f, &late).await?;
             println!("post-upgrade stale head receipt {receipt}");
-            assert_ne!(receipt_kind(&receipt).0, PUBLISHED, "stale head must never publish");
+            assert_ne!(
+                receipt_kind(&receipt).0,
+                PUBLISHED,
+                "stale head must never publish"
+            );
         }
         Err(error) => println!("post-upgrade stale head refused at prepare: {error:#}"),
     }
-    assert_eq!(head(cid)?, upgraded, "no silent overwrite of the upgraded head");
+    assert_eq!(
+        head(cid)?,
+        upgraded,
+        "no silent overwrite of the upgraded head"
+    );
     release(&f, cid, &upgrade).await?;
     Ok(())
 }
@@ -1026,10 +1161,7 @@ enum RaceLeg {
 }
 
 /// Build the competing signed mutation against the same legacy head.
-async fn competing(
-    l: &Legacy,
-    leg: RaceLeg,
-) -> anyhow::Result<(&'static str, Value)> {
+async fn competing(l: &Legacy, leg: RaceLeg) -> anyhow::Result<(&'static str, Value)> {
     let f = &l.f;
     let prior = l.state["coordinates"].clone();
     let transition = Uuid::new_v4();
@@ -1079,7 +1211,10 @@ async fn competing(
                 Err(error) => format!("{error:#}"),
             };
             println!("second concurrent upgrade preparation refused: {refused}");
-            anyhow::ensure!(refused.contains("no live preparation"), "unexpected refusal {refused}");
+            anyhow::ensure!(
+                refused.contains("no live preparation"),
+                "unexpected refusal {refused}"
+            );
             // The race is then the same signed publication delivered twice at once.
             ("blue.catbird.chat.publishDirectRequest", Value::Null)
         }
@@ -1112,7 +1247,13 @@ async fn race(leg: RaceLeg, label: &str) -> anyhow::Result<&'static str> {
     let (upgrade_result, competitor_result) = tokio::join!(
         async {
             barrier.wait().await;
-            post_raw(f, &f.alice, "blue.catbird.chat.publishDirectRequest", &publish_envelope).await
+            post_raw(
+                f,
+                &f.alice,
+                "blue.catbird.chat.publishDirectRequest",
+                &publish_envelope,
+            )
+            .await
         },
         async {
             barrier.wait().await;
@@ -1124,17 +1265,29 @@ async fn race(leg: RaceLeg, label: &str) -> anyhow::Result<&'static str> {
     let (c_status, c_bytes) = competitor_result?;
     let after = head(cid)?;
     println!("[{label}] upgrade receipt {upgrade_receipt}");
-    println!("[{label}] competitor {nsid} {c_status}: {}", String::from_utf8_lossy(&c_bytes));
+    println!(
+        "[{label}] competitor {nsid} {c_status}: {}",
+        String::from_utf8_lossy(&c_bytes)
+    );
     println!("[{label}] head {after}");
-    assert_eq!(legacy_rows(cid)?, l.rows, "[{label}] v1 authority byte-exact");
+    assert_eq!(
+        legacy_rows(cid)?,
+        l.rows,
+        "[{label}] v1 authority byte-exact"
+    );
     if matches!(leg, RaceLeg::SecondUpgrade) {
         let duplicate = publication_receipt(f, c_status, &c_bytes)?;
         assert_eq!(receipt_kind(&upgrade_receipt).0, PUBLISHED, "[{label}]");
-        assert_eq!(duplicate, upgrade_receipt, "[{label}] concurrent duplicate returns the one recorded outcome");
+        assert_eq!(
+            duplicate, upgrade_receipt,
+            "[{label}] concurrent duplicate returns the one recorded outcome"
+        );
         assert_eq!(after["protocolVersion"], "2", "[{label}]");
         assert_eq!(after["generation"], 1, "[{label}]");
         assert_eq!(after["requests"], 1, "[{label}] exactly one publication");
-        let entries = db(&format!("SELECT count(*) FROM chat.entries WHERE conversation_id='{cid}' AND seq>1"))?;
+        let entries = db(&format!(
+            "SELECT count(*) FROM chat.entries WHERE conversation_id='{cid}' AND seq>1"
+        ))?;
         assert_eq!(entries, "1", "[{label}] exactly one introduction entry");
         release(f, cid, &upgrade).await?;
         println!("[{label}] winner singlePublication");
@@ -1149,22 +1302,42 @@ async fn race(leg: RaceLeg, label: &str) -> anyhow::Result<&'static str> {
         "[{label}] exactly one authoritative winner (upgrade {upgrade_won}, competitor {competitor_won})"
     );
     if !upgrade_won {
-        assert_eq!(receipt_kind(&upgrade_receipt), (REJECTED, "StaleLegacyPrior"), "[{label}]");
+        assert_eq!(
+            receipt_kind(&upgrade_receipt),
+            (REJECTED, "StaleLegacyPrior"),
+            "[{label}]"
+        );
     }
     // A losing competitor must be refused with a typed, declared protocol
     // code for its endpoint — never an untyped 500.
     if upgrade_won {
         let allowed: &[&str] = match leg {
-            RaceLeg::Accept => &["StaleCoordinates", "NotParticipant", "InvitationNotPending", "ConversationNotAccepted"],
-            RaceLeg::Close => &["StaleCoordinates", "NotParticipant", "ConversationNotAccepted"],
+            RaceLeg::Accept => &[
+                "StaleCoordinates",
+                "NotParticipant",
+                "InvitationNotPending",
+                "ConversationNotAccepted",
+            ],
+            RaceLeg::Close => &[
+                "StaleCoordinates",
+                "NotParticipant",
+                "ConversationNotAccepted",
+            ],
             RaceLeg::Reset => &["StaleCoordinates", "NotMember", "ConversationNotAccepted"],
             RaceLeg::SecondUpgrade => unreachable!("handled above"),
         };
         let body: Value = serde_json::from_slice(&c_bytes).unwrap_or(Value::Null);
         let code = body["error"].as_str().unwrap_or_default().to_owned();
         println!("[{label}] loser {nsid} typed code {c_status} {code}");
-        assert_eq!(c_status, reqwest::StatusCode::BAD_REQUEST, "[{label}] loser must be a typed 400, got {c_status} {code}");
-        assert!(allowed.contains(&code.as_str()), "[{label}] loser code {code} not a declared stale/non-pending code {allowed:?}");
+        assert_eq!(
+            c_status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "[{label}] loser must be a typed 400, got {c_status} {code}"
+        );
+        assert!(
+            allowed.contains(&code.as_str()),
+            "[{label}] loser code {code} not a declared stale/non-pending code {allowed:?}"
+        );
     }
     let winner = match (leg, upgrade_won) {
         (_, true) => {
@@ -1172,7 +1345,10 @@ async fn race(leg: RaceLeg, label: &str) -> anyhow::Result<&'static str> {
             assert_eq!(after["lifecycle"], "active", "[{label}]");
             assert_eq!(after["generation"], 1, "[{label}]");
             assert_eq!(after["requests"], 1, "[{label}]");
-            assert_eq!(after["pending"], 1, "[{label}] recipient still pending the request");
+            assert_eq!(
+                after["pending"], 1,
+                "[{label}] recipient still pending the request"
+            );
             assert_eq!(pending_resets(cid)?, "0", "[{label}]");
             release(f, cid, &upgrade).await?;
             "upgrade"
@@ -1251,8 +1427,16 @@ fn run_retained_old_client(
     // Build first so fixture JWTs are minted immediately before the run.
     let build = std::process::Command::new("cargo")
         .args([
-            "test", "--locked", "--manifest-path", &manifest, "--features", "echo-bot",
-            "--test", "c24_retained_old_client", "--no-run", "--message-format=json",
+            "test",
+            "--locked",
+            "--manifest-path",
+            &manifest,
+            "--features",
+            "echo-bot",
+            "--test",
+            "c24_retained_old_client",
+            "--no-run",
+            "--message-format=json",
         ])
         .env("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
         .output()?;
@@ -1276,7 +1460,11 @@ fn run_retained_old_client(
         .collect::<Vec<_>>()
         .join(",");
     let output = std::process::Command::new(&executable)
-        .args(["--exact", "c24_retained_old_client_reconciler", "--nocapture"])
+        .args([
+            "--exact",
+            "c24_retained_old_client_reconciler",
+            "--nocapture",
+        ])
         .env("C24_BASE_URL", &f.server.base_url)
         .env("C24_DID", &party.id.did)
         .env("C24_DEVICE_ID", party.id.device_id.to_string())
@@ -1289,7 +1477,10 @@ fn run_retained_old_client(
         String::from_utf8_lossy(&output.stderr)
     );
     let text = format!("retained old client executable {executable}\n{text}");
-    anyhow::ensure!(output.status.success(), "retained old client run failed:\n{text}");
+    anyhow::ensure!(
+        output.status.success(),
+        "retained old client run failed:\n{text}"
+    );
     let line = text
         .lines()
         .find_map(|l| l.strip_prefix("C24_OLD_RESULT "))
@@ -1310,7 +1501,12 @@ async fn inventory(
     );
     let (status, bytes) = who
         .id
-        .get(&f.client, &f.server.base_url, "blue.catbird.chat.getConversations", &query)
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getConversations",
+            &query,
+        )
         .await?;
     Ok((status, serde_json::from_slice(&bytes)?))
 }
@@ -1336,7 +1532,11 @@ async fn c24_retained_old_client_and_capable_scoped_reader() -> anyhow::Result<(
     let next_seq = head(cid)?["nextSeq"].as_i64().context("nextSeq")?;
     let upgrade = prepare_upgrade(&f, cid, legacy_origin_for(&f, &state)?, next_seq).await?;
     let receipt = publish(&f, &upgrade).await?;
-    assert_eq!(receipt_kind(&receipt).0, PUBLISHED, "Alice now participates in a v2 conversation");
+    assert_eq!(
+        receipt_kind(&receipt).0,
+        PUBLISHED,
+        "Alice now participates in a v2 conversation"
+    );
     assert_eq!(head(cid)?["protocolVersion"], "2");
 
     // Server side of the three reads, recorded as evidence.
@@ -1347,18 +1547,27 @@ async fn c24_retained_old_client_and_capable_scoped_reader() -> anyhow::Result<(
     let (scoped_status, scoped) = inventory(&f, &f.alice, &["1"]).await?;
     println!("v1-scoped inventory {scoped_status}: {scoped}");
     assert_eq!(scoped_status, reqwest::StatusCode::OK);
-    assert!(!listed(&scoped, cid), "v1-scoped inventory omits the v2 conversation");
+    assert!(
+        !listed(&scoped, cid),
+        "v1-scoped inventory omits the v2 conversation"
+    );
     let (full_status, full) = inventory(&f, &f.alice, &["1", "2"]).await?;
     println!("v1+v2 inventory {full_status}: {full}");
     assert_eq!(full_status, reqwest::StatusCode::OK);
-    assert!(listed(&full, cid), "fully capable inventory lists the v2 conversation");
+    assert!(
+        listed(&full, cid),
+        "fully capable inventory lists the v2 conversation"
+    );
 
     // Retained old client: baseline orchestrator reconciler, unscoped read.
     let local = vec![cid.to_string(), Uuid::new_v4().to_string()];
     let (old, old_log) = run_retained_old_client(&f, &f.alice, &local)?;
     println!("retained old client result {old}");
     println!("retained old client log begin\n{old_log}\nretained old client log end");
-    assert_eq!(old["syncOk"], false, "old reconciler never gets a successful partial inventory");
+    assert_eq!(
+        old["syncOk"], false,
+        "old reconciler never gets a successful partial inventory"
+    );
     assert_eq!(old["errorStatus"], 400);
     assert!(
         old["errorBody"]
@@ -1371,10 +1580,16 @@ async fn c24_retained_old_client_and_capable_scoped_reader() -> anyhow::Result<(
     for exchange in exchanges {
         let path = exchange["path"].as_str().context("path")?;
         assert!(path.starts_with("/xrpc/blue.catbird.chat.getConversations?"));
-        assert!(!path.contains("supportedProtocolVersions"), "baseline read is unscoped");
+        assert!(
+            !path.contains("supportedProtocolVersions"),
+            "baseline read is unscoped"
+        );
         assert_eq!(exchange["status"], 400);
     }
-    assert_eq!(old["localHistoryUnchanged"], true, "no local history deleted");
+    assert_eq!(
+        old["localHistoryUnchanged"], true,
+        "no local history deleted"
+    );
     assert_eq!(
         old["localAfter"]["conversations"].as_array().map(Vec::len),
         Some(local.len())
@@ -1405,8 +1620,13 @@ async fn c24_retained_old_client_and_capable_scoped_reader() -> anyhow::Result<(
         match reader.sync_with_server(true).await {
             Ok(()) => break,
             Err(error) if attempts < 8 && error.to_string().contains("getConversations 500") => {
-                println!("capable reader sync attempt {attempts} hit shared-fence contention: {error}");
-                assert_eq!(ids(&store.list_conversations(&f.alice.id.did).await?), before);
+                println!(
+                    "capable reader sync attempt {attempts} hit shared-fence contention: {error}"
+                );
+                assert_eq!(
+                    ids(&store.list_conversations(&f.alice.id.did).await?),
+                    before
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Err(error) => return Err(error).context("capable scoped reader sync"),
@@ -1421,7 +1641,10 @@ async fn c24_retained_old_client_and_capable_scoped_reader() -> anyhow::Result<(
     assert!(!last_path.contains("supportedProtocolVersions=2"));
     let after = ids(&store.list_conversations(&f.alice.id.did).await?);
     println!("capable reader local before {before:?} after {after:?}");
-    assert_eq!(before, after, "omitted record preserved by the capable scoped reader");
+    assert_eq!(
+        before, after,
+        "omitted record preserved by the capable scoped reader"
+    );
     reader.shutdown().await;
     release(&f, cid, &upgrade).await?;
     Ok(())
@@ -1448,7 +1671,15 @@ impl RowBarrier {
             "controlled races must run on a dedicated database"
         );
         let mut child = std::process::Command::new("psql")
-            .args([request_database_url(), "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
+            .args([
+                request_database_url(),
+                "-X",
+                "-A",
+                "-t",
+                "-q",
+                "-v",
+                "ON_ERROR_STOP=1",
+            ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -1461,7 +1692,8 @@ impl RowBarrier {
              \\echo BARRIER-HELD"
         )?;
         stdin.flush()?;
-        let mut lines = std::io::BufReader::new(child.stdout.take().context("barrier stdout")?).lines();
+        let mut lines =
+            std::io::BufReader::new(child.stdout.take().context("barrier stdout")?).lines();
         let pid: i64 = lines.next().context("barrier pid")??.trim().parse()?;
         for line in lines.by_ref() {
             if line?.trim() == "BARRIER-HELD" {
@@ -1489,7 +1721,10 @@ impl RowBarrier {
             if n >= at_least {
                 return Ok(n);
             }
-            anyhow::ensure!(std::time::Instant::now() < deadline, "only {n}/{at_least} sessions queued");
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "only {n}/{at_least} sessions queued"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
@@ -1545,11 +1780,26 @@ async fn controlled(leg: RaceLeg, order: Order, label: &str) -> anyhow::Result<S
     let publish_envelope = json!({"signedRequest":upgrade.publication});
     let upgrade_first = matches!(order, Order::UpgradeFirst);
     let barrier = RowBarrier::hold_conversation(cid)?;
-    let spawn_upgrade = || spawn_post(f, &f.alice, "blue.catbird.chat.publishDirectRequest", publish_envelope.clone());
+    let spawn_upgrade = || {
+        spawn_post(
+            f,
+            &f.alice,
+            "blue.catbird.chat.publishDirectRequest",
+            publish_envelope.clone(),
+        )
+    };
     let spawn_competitor = || spawn_post(f, competitor, nsid, envelope.clone());
-    let first = if upgrade_first { spawn_upgrade() } else { spawn_competitor() };
+    let first = if upgrade_first {
+        spawn_upgrade()
+    } else {
+        spawn_competitor()
+    };
     let queued_first = barrier.wait_for_waiters(1).await?;
-    let second = if upgrade_first { spawn_competitor() } else { spawn_upgrade() };
+    let second = if upgrade_first {
+        spawn_competitor()
+    } else {
+        spawn_upgrade()
+    };
     let queued_both = barrier.wait_for_waiters(2).await?;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     barrier.release()?;
@@ -1568,10 +1818,18 @@ async fn controlled(leg: RaceLeg, order: Order, label: &str) -> anyhow::Result<S
         receipt_kind(&receipt),
         c_body["error"].as_str().unwrap_or("ok")
     );
-    assert_eq!(legacy_rows(cid)?, l.rows, "[{label}] v1 authority byte-exact");
+    assert_eq!(
+        legacy_rows(cid)?,
+        l.rows,
+        "[{label}] v1 authority byte-exact"
+    );
     let outcome = match order {
         Order::UpgradeFirst => {
-            assert_eq!(receipt_kind(&receipt).0, PUBLISHED, "[{label}] upgrade queued first must publish");
+            assert_eq!(
+                receipt_kind(&receipt).0,
+                PUBLISHED,
+                "[{label}] upgrade queued first must publish"
+            );
             assert_eq!(after["protocolVersion"], "2", "[{label}]");
             assert_eq!(after["generation"], 1, "[{label}]");
             assert_eq!(after["lifecycle"], "active", "[{label}]");
@@ -1588,8 +1846,17 @@ async fn controlled(leg: RaceLeg, order: Order, label: &str) -> anyhow::Result<S
             format!("upgrade; loser {}", expected_loser_code(leg))
         }
         Order::CompetitorFirst => {
-            assert_eq!(c_status, reqwest::StatusCode::OK, "[{label}] competitor queued first must win: {}", String::from_utf8_lossy(&c_bytes));
-            assert_eq!(receipt_kind(&receipt), (REJECTED, "StaleLegacyPrior"), "[{label}]");
+            assert_eq!(
+                c_status,
+                reqwest::StatusCode::OK,
+                "[{label}] competitor queued first must win: {}",
+                String::from_utf8_lossy(&c_bytes)
+            );
+            assert_eq!(
+                receipt_kind(&receipt),
+                (REJECTED, "StaleLegacyPrior"),
+                "[{label}]"
+            );
             assert_eq!(after["protocolVersion"], "1", "[{label}]");
             assert_eq!(after["requests"], 0, "[{label}]");
             match leg {

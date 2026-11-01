@@ -106,10 +106,7 @@ async fn delete_account_data_purges_heads_and_preserves_idempotency_operations()
         .call_op("publishEpochHead", &publish(&genesis), op_id)
         .await;
     before.ok();
-    alice
-        .call("publishEpochHead", &publish(&epoch1))
-        .await
-        .ok();
+    alice.call("publishEpochHead", &publish(&epoch1)).await.ok();
 
     alice.call("deleteAccountData", &json!({})).await.ok();
     assert_eq!(count(&env, "epoch_heads", "did", &alice.did).await, 0);

@@ -92,7 +92,8 @@ impl GatewaySender<'_> {
     ) -> Result<PublishedTamperedRequest> {
         let identity = self.identity();
         let public = self.engine.identity_public_key(&identity)?;
-        let key_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&public));
+        let key_id =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&public));
         let request_id = Uuid::new_v4();
         let first_message_id = Uuid::new_v4();
         let conversation_id = Uuid::new_v4();
@@ -119,9 +120,16 @@ impl GatewaySender<'_> {
             }),
         )?;
         let (status, body) = self
-            .post("blue.catbird.chat.prepareDirectRequest", &json!({"signedRequest":prepare}))
+            .post(
+                "blue.catbird.chat.prepareDirectRequest",
+                &json!({"signedRequest":prepare}),
+            )
             .await?;
-        ensure!(status == reqwest::StatusCode::OK, "prepare failed {status}: {}", String::from_utf8_lossy(&body));
+        ensure!(
+            status == reqwest::StatusCode::OK,
+            "prepare failed {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
         let response: Value = serde_json::from_slice(&body)?;
         let preparation = response
             .pointer("/outcome/preparation")
@@ -131,12 +139,16 @@ impl GatewaySender<'_> {
         let document = self.receipt_document().await?;
         let receipt_key = protocol::resolve_direct_request_receipt_key(
             &document,
-            preparation["receiptKeyId"].as_str().context("receiptKeyId")?,
+            preparation["receiptKeyId"]
+                .as_str()
+                .context("receiptKeyId")?,
         )?;
         // Continue with the verified value: reads present `{"$bytes"}`, and only
         // the verifier's normalized projection may feed the strict signer.
-        let preparation =
-            protocol::verify_direct_request_preparation(&serde_json::to_vec(&preparation)?, &receipt_key)?;
+        let preparation = protocol::verify_direct_request_preparation(
+            &serde_json::to_vec(&preparation)?,
+            &receipt_key,
+        )?;
         let verified_prepare = protocol::verify_signed_request(
             DirectRequestKind::Prepare,
             &serde_json::to_vec(&prepare)?,
@@ -146,26 +158,39 @@ impl GatewaySender<'_> {
             .as_array()
             .context("preparation selectedDevices")?
             .clone();
-        ensure!(!selected.is_empty(), "preparation selected no recipient device");
+        ensure!(
+            !selected.is_empty(),
+            "preparation selected no recipient device"
+        );
         let minimum_import_until = chrono::DateTime::parse_from_rfc3339(
-            preparation["minimumImportUntil"].as_str().context("minimumImportUntil")?,
+            preparation["minimumImportUntil"]
+                .as_str()
+                .context("minimumImportUntil")?,
         )?
         .timestamp();
         let mut authority_import_until = i64::MAX;
         for device in &selected {
-            ensure!(device["actorDid"] == recipient_did, "preparation selected a foreign device");
+            ensure!(
+                device["actorDid"] == recipient_did,
+                "preparation selected a foreign device"
+            );
             let grant = protocol::verify_signed_request(
                 DirectRequestKind::Grant,
                 &serde_json::to_vec(&device["grant"])?,
                 recipient_public_key,
             )?;
             let expires = chrono::DateTime::parse_from_rfc3339(
-                grant.body()["expiresAt"].as_str().context("grant expiresAt")?,
+                grant.body()["expiresAt"]
+                    .as_str()
+                    .context("grant expiresAt")?,
             )?
             .timestamp();
             authority_import_until = authority_import_until.min(expires);
         }
-        ensure!(authority_import_until >= minimum_import_until, "grant expires before import floor");
+        ensure!(
+            authority_import_until >= minimum_import_until,
+            "grant expires before import floor"
+        );
         let context = json!({
             "protocolVersion":"2",
             "requestId":request_id.to_string(),
@@ -178,33 +203,35 @@ impl GatewaySender<'_> {
             "recipientDid":recipient_did,
             "preparationDigest":preparation["preparationDigest"]
         });
-        let mut journal = self.engine.prepare_direct_request(&DirectRequestBootstrapInput {
-            draft_id: Uuid::new_v4().to_string(),
-            context_json: serde_json::to_vec(&context)?,
-            group_id: rand::random::<[u8; 32]>().to_vec(),
-            generation: 0,
-            state_version: 1,
-            key_packages: selected
-                .iter()
-                .map(|d| bytes_field(&d["keyPackage"]["bytes"]))
-                .collect::<Result<Vec<_>>>()?,
-            expected_package_refs: selected
-                .iter()
-                .map(|d| bytes_field(&d["keyPackage"]["keyPackageRef"]))
-                .collect::<Result<Vec<_>>>()?,
-            authority_import_until: u64::try_from(authority_import_until)?,
-            preparation_request_digest: *verified_prepare.request_digest(),
-            receipt_authority_key: receipt_key.clone(),
-            text: "Unverifiable introduction the recipient must never surface".into(),
-            invitation: None,
-            metadata: GroupMetadataV1 {
-                version: 1,
-                title: String::new(),
-                description: String::new(),
-                avatar_blob_locator: None,
-                avatar_content_type: None,
-            },
-        })?;
+        let mut journal = self
+            .engine
+            .prepare_direct_request(&DirectRequestBootstrapInput {
+                draft_id: Uuid::new_v4().to_string(),
+                context_json: serde_json::to_vec(&context)?,
+                group_id: rand::random::<[u8; 32]>().to_vec(),
+                generation: 0,
+                state_version: 1,
+                key_packages: selected
+                    .iter()
+                    .map(|d| bytes_field(&d["keyPackage"]["bytes"]))
+                    .collect::<Result<Vec<_>>>()?,
+                expected_package_refs: selected
+                    .iter()
+                    .map(|d| bytes_field(&d["keyPackage"]["keyPackageRef"]))
+                    .collect::<Result<Vec<_>>>()?,
+                authority_import_until: u64::try_from(authority_import_until)?,
+                preparation_request_digest: *verified_prepare.request_digest(),
+                receipt_authority_key: receipt_key.clone(),
+                text: "Unverifiable introduction the recipient must never surface".into(),
+                invitation: None,
+                metadata: GroupMetadataV1 {
+                    version: 1,
+                    title: String::new(),
+                    description: String::new(),
+                    avatar_blob_locator: None,
+                    avatar_content_type: None,
+                },
+            })?;
         tamper_introduction_ciphertext(&mut journal.bootstrap)?;
         let bootstrap = &journal.bootstrap;
         let mut publish_body = prepare["body"].clone();
@@ -212,12 +239,16 @@ impl GatewaySender<'_> {
         publish_body["signatureDomain"] = json!("CATBIRD-DIRECT-REQUEST-PUBLISH\0");
         publish_body["signedAt"] = json!(canonical_now());
         publish_body["preparationDigest"] = preparation["preparationDigest"].clone();
-        publish_body["preparationRequestDigest"] = json!(STANDARD.encode(verified_prepare.request_digest()));
+        publish_body["preparationRequestDigest"] =
+            json!(STANDARD.encode(verified_prepare.request_digest()));
         publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
         publish_body["next"] = bootstrap.coordinates.clone();
-        publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
-            .context("import timestamp")?
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
+            bootstrap.import_until as i64,
+            0
+        )
+        .context("import timestamp")?
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
         let artifact = |data: &[u8], content_type: &str| {
             json!({"framing":"mlsMessage","contentType":content_type,
                    "bytes":STANDARD.encode(data),"sha256":STANDARD.encode(Sha256::digest(data))})
@@ -261,14 +292,29 @@ impl GatewaySender<'_> {
                 "ciphertextSize":bootstrap.metadata_ciphertext.len(),"authorProof":author
             }
         });
-        let publication = signed_mls_request(self.engine, &identity, DirectRequestKind::Publish, publish_body)?;
+        let publication = signed_mls_request(
+            self.engine,
+            &identity,
+            DirectRequestKind::Publish,
+            publish_body,
+        )?;
         let (status, body) = self
-            .post("blue.catbird.chat.publishDirectRequest", &json!({"signedRequest":publication}))
+            .post(
+                "blue.catbird.chat.publishDirectRequest",
+                &json!({"signedRequest":publication}),
+            )
             .await?;
-        ensure!(status == reqwest::StatusCode::OK, "publish failed {status}: {}", String::from_utf8_lossy(&body));
+        ensure!(
+            status == reqwest::StatusCode::OK,
+            "publish failed {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
         let published: Value = serde_json::from_slice(&body)?;
         let mut receipt = published["outcome"].clone();
-        receipt.as_object_mut().context("published outcome object")?.remove("$type");
+        receipt
+            .as_object_mut()
+            .context("published outcome object")?
+            .remove("$type");
         let verified_receipt = protocol::verify_received_signed_request(
             DirectRequestKind::Outcome,
             &serde_json::to_vec(&receipt)?,

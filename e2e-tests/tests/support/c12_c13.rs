@@ -32,7 +32,16 @@ pub const CLOSE_NSID: &str = "blue.catbird.chat.closeConversation";
 
 pub fn db_query(sql: &str) -> anyhow::Result<String> {
     let out = Command::new("psql")
-        .args(["-X", "-v", "ON_ERROR_STOP=1", "-At", "-d", request_database_url(), "-c", sql])
+        .args([
+            "-X",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-At",
+            "-d",
+            request_database_url(),
+            "-c",
+            sql,
+        ])
         .output()?;
     anyhow::ensure!(
         out.status.success(),
@@ -59,7 +68,11 @@ fn sign_bytes(s: &StagedRequest, transcript: Vec<u8>) -> anyhow::Result<Vec<u8>>
 }
 
 /// Direct-request signed wrapper, verified against the sender's public key.
-pub fn sign_direct(s: &StagedRequest, kind: DirectRequestKind, body: Value) -> anyhow::Result<Value> {
+pub fn sign_direct(
+    s: &StagedRequest,
+    kind: DirectRequestKind,
+    body: Value,
+) -> anyhow::Result<Value> {
     let transcript = protocol::direct_request_signing_bytes(kind, &serde_json::to_vec(&body)?)?;
     let wrapper = json!({"body":body,"signature":STANDARD.encode(sign_bytes(s, transcript)?)});
     protocol::verify_signed_request(kind, &serde_json::to_vec(&wrapper)?, &s.alice_public)?;
@@ -67,12 +80,23 @@ pub fn sign_direct(s: &StagedRequest, kind: DirectRequestKind, body: Value) -> a
 }
 
 /// Request digest of a signed direct-request wrapper (as the server derives it).
-pub fn request_digest(kind: DirectRequestKind, signed: &Value, public: &[u8]) -> anyhow::Result<[u8; 32]> {
-    Ok(*protocol::verify_signed_request(kind, &serde_json::to_vec(signed)?, public)?.request_digest())
+pub fn request_digest(
+    kind: DirectRequestKind,
+    signed: &Value,
+    public: &[u8],
+) -> anyhow::Result<[u8; 32]> {
+    Ok(
+        *protocol::verify_signed_request(kind, &serde_json::to_vec(signed)?, public)?
+            .request_digest(),
+    )
 }
 
 /// Fresh signed cancellation of `request_id` bound to `prepare_digest`.
-pub fn signed_cancel(s: &StagedRequest, request_id: Uuid, prepare_digest: &[u8]) -> anyhow::Result<Value> {
+pub fn signed_cancel(
+    s: &StagedRequest,
+    request_id: Uuid,
+    prepare_digest: &[u8],
+) -> anyhow::Result<Value> {
     sign_direct(
         s,
         DirectRequestKind::Cancel,
@@ -94,10 +118,20 @@ pub fn fresh_publication(s: &StagedRequest) -> anyhow::Result<Value> {
     sign_direct(s, DirectRequestKind::Publish, body)
 }
 
-pub async fn post(s: &StagedRequest, nsid: &str, signed: &Value) -> anyhow::Result<(reqwest::StatusCode, Value)> {
+pub async fn post(
+    s: &StagedRequest,
+    nsid: &str,
+    signed: &Value,
+) -> anyhow::Result<(reqwest::StatusCode, Value)> {
     let (status, bytes) = s
         .alice
-        .post(&s.client, &s.server.base_url, nsid, &json!({"signedRequest":signed}), true)
+        .post(
+            &s.client,
+            &s.server.base_url,
+            nsid,
+            &json!({"signedRequest":signed}),
+            true,
+        )
         .await?;
     let value = serde_json::from_slice(&bytes)
         .with_context(|| format!("{nsid} body: {}", String::from_utf8_lossy(&bytes)))?;
@@ -112,10 +146,18 @@ pub fn normalized_outcome(value: Value) -> anyhow::Result<Value> {
     Ok(value)
 }
 
-pub async fn outcome(s: &StagedRequest, request_id: Uuid) -> anyhow::Result<(reqwest::StatusCode, Value)> {
+pub async fn outcome(
+    s: &StagedRequest,
+    request_id: Uuid,
+) -> anyhow::Result<(reqwest::StatusCode, Value)> {
     let (status, bytes) = s
         .alice
-        .get(&s.client, &s.server.base_url, OUTCOME_NSID, &[("requestId".into(), request_id.to_string())])
+        .get(
+            &s.client,
+            &s.server.base_url,
+            OUTCOME_NSID,
+            &[("requestId".into(), request_id.to_string())],
+        )
         .await?;
     let value = serde_json::from_slice(&bytes)
         .with_context(|| format!("outcome body: {}", String::from_utf8_lossy(&bytes)))?;
@@ -139,7 +181,12 @@ pub fn spawn_outcome(s: &StagedRequest, request_id: Uuid) -> Pending {
     let (alice, client, base) = (s.alice.clone(), s.client.clone(), s.server.base_url.clone());
     tokio::spawn(async move {
         let (status, bytes) = alice
-            .get(&client, &base, OUTCOME_NSID, &[("requestId".into(), request_id.to_string())])
+            .get(
+                &client,
+                &base,
+                OUTCOME_NSID,
+                &[("requestId".into(), request_id.to_string())],
+            )
             .await?;
         Ok((status, normalized_outcome(serde_json::from_slice(&bytes)?)?))
     })
@@ -153,7 +200,10 @@ pub fn verified_receipt(s: &StagedRequest, response: &Value) -> anyhow::Result<V
         "expected a signed receipt, got {response}"
     );
     let mut signed = response["outcome"].clone();
-    signed.as_object_mut().context("receipt object")?.remove("$type");
+    signed
+        .as_object_mut()
+        .context("receipt object")?
+        .remove("$type");
     let verified = protocol::verify_received_signed_request(
         DirectRequestKind::Outcome,
         &serde_json::to_vec(&signed)?,
@@ -168,27 +218,33 @@ pub fn stored_terminal(request_id: Uuid) -> anyhow::Result<(String, Option<Value
         "SELECT status||'|'||coalesce(convert_from(terminal_response,'UTF8'),'') \
          FROM chat.direct_request_attempts WHERE request_id='{request_id}'"
     ))?;
-    let (status, body) = row.split_once('|').with_context(|| format!("no attempt row for {request_id}"))?;
-    let body = (!body.is_empty()).then(|| serde_json::from_str(body)).transpose()?;
+    let (status, body) = row
+        .split_once('|')
+        .with_context(|| format!("no attempt row for {request_id}"))?;
+    let body = (!body.is_empty())
+        .then(|| serde_json::from_str(body))
+        .transpose()?;
     Ok((status.to_owned(), body))
 }
 
 /// The response outcome without its `$type` (= the stored signed receipt).
 pub fn untyped_outcome(response: &Value) -> anyhow::Result<Value> {
     let mut value = response["outcome"].clone();
-    value.as_object_mut().context("outcome object")?.remove("$type");
+    value
+        .as_object_mut()
+        .context("outcome object")?
+        .remove("$type");
     let raw = serde_json::to_vec(&value)?;
-    let normalized = protocol::normalize_read_presentation(
-        &raw,
-        "signedDirectRequestReceipt",
-        false,
-    )?;
+    let normalized =
+        protocol::normalize_read_presentation(&raw, "signedDirectRequestReceipt", false)?;
     Ok(normalized)
 }
 
 /// Real signed `closeConversation` by the staged sender, retiring the
 /// published request's `next` coordinates. Returns (status, body, transitionId).
-pub async fn close_published(s: &StagedRequest) -> anyhow::Result<(reqwest::StatusCode, Value, Uuid)> {
+pub async fn close_published(
+    s: &StagedRequest,
+) -> anyhow::Result<(reqwest::StatusCode, Value, Uuid)> {
     let prior = s.publication["body"]["next"].clone();
     let mut retired = prior.clone();
     retired["stateVersion"] = json!(prior["stateVersion"].as_u64().context("stateVersion")? + 1);
@@ -220,7 +276,16 @@ pub struct OperationBarrier {
 impl OperationBarrier {
     pub fn hold(request_id: Uuid) -> anyhow::Result<Self> {
         let mut child = Command::new("psql")
-            .args(["-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-d", request_database_url()])
+            .args([
+                "-X",
+                "-A",
+                "-t",
+                "-q",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-d",
+                request_database_url(),
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

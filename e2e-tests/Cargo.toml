@@ -49,6 +49,16 @@ url = { version = "2", optional = true }
 [dev-dependencies]
 openmls_traits = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
 openmls_basic_credential = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["draft-ietf-mls-pq-ciphersuites"] }
+atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
+labyrinth = { path = "../../labyrinth" }
+labyrinth-protocol = { path = "../../labyrinth/labyrinth-protocol" }
+bird-daemon = { path = "../../BIRDaemon" }
+tempfile = "3"
+url = "2"
+axum = "0.8"
+aes-gcm = "0.10"
+hmac = "0.12"
+urlencoding = "2"
 
 [[example]]
 name = "client_runtime_gateway"

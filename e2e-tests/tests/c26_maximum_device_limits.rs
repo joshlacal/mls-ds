@@ -65,7 +65,15 @@ const MAINTENANCE_URL: &str = "postgresql://127.0.0.1:5432/postgres";
 
 fn maintenance(sql: &str) -> Result<()> {
     let output = Command::new("psql")
-        .args([MAINTENANCE_URL, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            MAINTENANCE_URL,
+            "-X",
+            "-q",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()?;
     anyhow::ensure!(
         output.status.success(),
@@ -128,7 +136,16 @@ fn publication_rows(request_id: Uuid, conversation_id: Uuid, dids: [&str; 2]) ->
         dids[0], dids[1], dids[0]
     );
     let output = Command::new("psql")
-        .args([request_database_url(), "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", &sql])
+        .args([
+            request_database_url(),
+            "-X",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            &sql,
+        ])
         .output()?;
     anyhow::ensure!(
         output.status.success(),
@@ -227,7 +244,10 @@ struct PairedNest {
 impl PairedNest {
     /// One fresh, single-use service token for the next proxied request.
     fn arm(&self, alice: &ServiceIdentity, nsid: &str) -> Result<()> {
-        std::fs::write(&self.token_path, alice.scoped_jwt_with_jti(nsid, Uuid::new_v4()))?;
+        std::fs::write(
+            &self.token_path,
+            alice.scoped_jwt_with_jti(nsid, Uuid::new_v4()),
+        )?;
         Ok(())
     }
 
@@ -571,10 +591,17 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
     outside["recipientDid"] = json!(bob.did);
     outside["recipientDeviceId"] = json!(Uuid::new_v4().to_string());
     deliveries.push(outside);
-    anyhow::ensure!(deliveries.len() == 40, "max-plus-one must carry 40 deliveries");
-    let refusal =
-        signed_mls_request(&alice_engine, &alice_identity, DirectRequestKind::Publish, body.clone())
-            .expect_err("core transcript must refuse a 41-leaf publication");
+    anyhow::ensure!(
+        deliveries.len() == 40,
+        "max-plus-one must carry 40 deliveries"
+    );
+    let refusal = signed_mls_request(
+        &alice_engine,
+        &alice_identity,
+        DirectRequestKind::Publish,
+        body.clone(),
+    )
+    .expect_err("core transcript must refuse a 41-leaf publication");
     anyhow::ensure!(
         refusal.to_string().contains("array length bound"),
         "expected the core 39-delivery bound, got: {refusal}"
@@ -589,8 +616,12 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
             true,
         )
         .await?;
-    let error: Value = serde_json::from_slice(&response)
-        .with_context(|| format!("untyped refusal {status}: {}", String::from_utf8_lossy(&response)))?;
+    let error: Value = serde_json::from_slice(&response).with_context(|| {
+        format!(
+            "untyped refusal {status}: {}",
+            String::from_utf8_lossy(&response)
+        )
+    })?;
     println!("41st leaf (40 deliveries) direct to DS -> {status} {error}");
     anyhow::ensure!(
         status == reqwest::StatusCode::UNAUTHORIZED && error["error"] == "InvalidSignature",
@@ -665,7 +696,10 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
         result_path,
         child,
     };
-    anyhow::ensure!(nest.forwarding_attempts()? == 0, "Nest forwarded before use");
+    anyhow::ensure!(
+        nest.forwarding_attempts()? == 0,
+        "Nest forwarded before use"
+    );
 
     // 6. Exact maximum: the real 40-leaf bundle through Nest into DS.
     nest.arm(&alice, PUBLISH)?;
@@ -675,7 +709,10 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
         "40-leaf publication through Nest failed {status}: {}",
         String::from_utf8_lossy(&response)
     );
-    anyhow::ensure!(nest.forwarding_attempts()? == 1, "publication was not forwarded once");
+    anyhow::ensure!(
+        nest.forwarding_attempts()? == 1,
+        "publication was not forwarded once"
+    );
     let published: Value = serde_json::from_slice(&response)?;
     let mut receipt = published["outcome"].clone();
     receipt
@@ -799,7 +836,11 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
         "probe preparation must select Carol's device: {probe_selected:?}"
     );
     let probe_rows = |label: &str| -> Result<Value> {
-        let rows = publication_rows(probe.request_id, probe.conversation_id, [&alice.did, &carol.did])?;
+        let rows = publication_rows(
+            probe.request_id,
+            probe.conversation_id,
+            [&alice.did, &carol.did],
+        )?;
         println!("{label} probe rows {rows}");
         Ok(rows)
     };
@@ -812,11 +853,21 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
         .find(|d| d["recipientDid"] == carol.did)
         .context("Carol delivery")?;
     carol_delivery["recipientDeviceId"] = json!(Uuid::new_v4().to_string());
-    let outside =
-        signed_mls_request(&alice_engine, &alice_identity, DirectRequestKind::Publish, body)?;
+    let outside = signed_mls_request(
+        &alice_engine,
+        &alice_identity,
+        DirectRequestKind::Publish,
+        body,
+    )?;
     let outside_envelope = json!({"signedRequest":outside});
     let (status, response) = alice
-        .post(&client, &ds_server.base_url, PUBLISH, &outside_envelope, true)
+        .post(
+            &client,
+            &ds_server.base_url,
+            PUBLISH,
+            &outside_envelope,
+            true,
+        )
         .await?;
     anyhow::ensure!(
         status == reqwest::StatusCode::OK,
@@ -850,11 +901,18 @@ async fn c26_maximum_device_bundle_through_ds_and_nest() -> Result<()> {
         );
     }
     anyhow::ensure!(
-        after["packages"]["direct-request:consumed"] == before["packages"]["direct-request:consumed"],
+        after["packages"]["direct-request:consumed"]
+            == before["packages"]["direct-request:consumed"],
         "refused publication consumed a request package: {before} -> {after}"
     );
     let (replay_status, replay) = alice
-        .post(&client, &ds_server.base_url, PUBLISH, &outside_envelope, true)
+        .post(
+            &client,
+            &ds_server.base_url,
+            PUBLISH,
+            &outside_envelope,
+            true,
+        )
         .await?;
     anyhow::ensure!(
         replay_status == reqwest::StatusCode::OK && replay == response,

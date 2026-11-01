@@ -87,7 +87,10 @@ async fn catalog_enforces_clean_slate_spaces_only_data_line() {
             .fetch_one(&pool)
             .await
             .expect("check required clean-slate operational table");
-        assert!(exists, "required operational table {required_table} missing");
+        assert!(
+            exists,
+            "required operational table {required_table} missing"
+        );
     }
 
     let labyrinth_tables: Vec<String> = sqlx::query_scalar(
@@ -96,11 +99,10 @@ async fn catalog_enforces_clean_slate_spaces_only_data_line() {
     .fetch_all(&pool)
     .await
     .expect("list labyrinth tables");
-    let expected_labyrinth: BTreeSet<String> =
-        ["epoch_head_floors", "epoch_heads", "operations"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+    let expected_labyrinth: BTreeSet<String> = ["epoch_head_floors", "epoch_heads", "operations"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     let actual_labyrinth: BTreeSet<String> = labyrinth_tables.into_iter().collect();
     assert_eq!(
         actual_labyrinth, expected_labyrinth,

@@ -21,9 +21,9 @@ use catbird_mls::{
 };
 use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
-    reviewed_baseline, reviewed_request_migrations, seed_service_device, signed_mls_request,
-    validate_request_test_database_url, DeterministicFaultTransport, FaultBoundary,
-    HttpsDidFixture, RequestRig, ServiceIdentity, ShippingServerFixture, request_database_url,
+    request_database_url, reviewed_baseline, reviewed_request_migrations, seed_service_device,
+    signed_mls_request, validate_request_test_database_url, DeterministicFaultTransport,
+    FaultBoundary, HttpsDidFixture, RequestRig, ServiceIdentity, ShippingServerFixture,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -85,7 +85,13 @@ fn keys_snapshot_for_did(did: &str) -> anyhow::Result<Vec<u8>> {
     let result = std::process::Command::new("psql")
         .args([
             request_database_url(),
-            "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", &sql,
+            "-X",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            &sql,
         ])
         .output()?;
     anyhow::ensure!(
@@ -180,7 +186,8 @@ async fn prepare_field_mutations_fail_before_graph_effects() -> anyhow::Result<(
         "idempotencyKey":grant_id.to_string(),
         "signedAt":canonical_now()
     });
-    let signed_grant = signed_mls_request(&bob_engine, &bob_identity, DirectRequestKind::Grant, grant)?;
+    let signed_grant =
+        signed_mls_request(&bob_engine, &bob_identity, DirectRequestKind::Grant, grant)?;
     let keys_operation = Uuid::new_v4();
     let keys_body = json!({
         "$type":"blue.catbird.chat.defs#directRequestKeysPublicationBody",
@@ -205,9 +212,25 @@ async fn prepare_field_mutations_fail_before_graph_effects() -> anyhow::Result<(
         "idempotencyKey":keys_operation.to_string(),
         "signedAt":canonical_now()
     });
-    let signed_keys = signed_mls_request(&bob_engine, &bob_identity, DirectRequestKind::Keys, keys_body)?;
-    let (k_status, _) = bob.post(&client, &server.base_url, "blue.catbird.chat.publishDirectRequestKeys", &json!({"signedRequest":signed_keys}), true).await?;
-    anyhow::ensure!(k_status.is_success(), "failed to publish Bob's keys: {k_status}");
+    let signed_keys = signed_mls_request(
+        &bob_engine,
+        &bob_identity,
+        DirectRequestKind::Keys,
+        keys_body,
+    )?;
+    let (k_status, _) = bob
+        .post(
+            &client,
+            &server.base_url,
+            "blue.catbird.chat.publishDirectRequestKeys",
+            &json!({"signedRequest":signed_keys}),
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        k_status.is_success(),
+        "failed to publish Bob's keys: {k_status}"
+    );
 
     let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
     let request_id = Uuid::new_v4();
@@ -233,7 +256,12 @@ async fn prepare_field_mutations_fail_before_graph_effects() -> anyhow::Result<(
         "idempotencyKey":request_id.to_string(),
         "signedAt":canonical_now()
     });
-    let prepare_envelope = signed_mls_request(&alice_engine, &alice_identity, DirectRequestKind::Prepare, prepare_body)?;
+    let prepare_envelope = signed_mls_request(
+        &alice_engine,
+        &alice_identity,
+        DirectRequestKind::Prepare,
+        prepare_body,
+    )?;
 
     let control_bytes = protocol::direct_request_signing_bytes(
         DirectRequestKind::Prepare,
@@ -274,7 +302,10 @@ async fn prepare_field_mutations_fail_before_graph_effects() -> anyhow::Result<(
             &serde_json::to_vec(&altered["body"])?,
         );
         if let Ok(changed) = changed_res {
-            anyhow::ensure!(control_bytes != changed, "canonical transcript omitted {path}");
+            anyhow::ensure!(
+                control_bytes != changed,
+                "canonical transcript omitted {path}"
+            );
         }
 
         let (status, raw): (reqwest::StatusCode, Vec<u8>) = alice
@@ -299,7 +330,10 @@ async fn prepare_field_mutations_fail_before_graph_effects() -> anyhow::Result<(
             "InvalidSignature"
         };
         anyhow::ensure!(
-            status.is_client_error() && (response["error"] == expected || response["error"] == "InvalidSignature" || response["error"] == "PreparationConflict"),
+            status.is_client_error()
+                && (response["error"] == expected
+                    || response["error"] == "InvalidSignature"
+                    || response["error"] == "PreparationConflict"),
             "prepare {path} expected client error ({expected}), received {status}: {response}"
         );
         anyhow::ensure!(
@@ -356,7 +390,12 @@ async fn cancel_field_mutations_fail_before_graph_effects() -> anyhow::Result<()
         "idempotencyKey":request_id.to_string(),
         "signedAt":canonical_now()
     });
-    let cancel_envelope = signed_mls_request(&alice_engine, &alice_identity, DirectRequestKind::Cancel, cancel_body)?;
+    let cancel_envelope = signed_mls_request(
+        &alice_engine,
+        &alice_identity,
+        DirectRequestKind::Cancel,
+        cancel_body,
+    )?;
 
     let control_bytes = protocol::direct_request_signing_bytes(
         DirectRequestKind::Cancel,
@@ -388,7 +427,10 @@ async fn cancel_field_mutations_fail_before_graph_effects() -> anyhow::Result<()
             &serde_json::to_vec(&altered["body"])?,
         );
         if let Ok(changed) = changed_res {
-            anyhow::ensure!(control_bytes != changed, "canonical transcript omitted {path}");
+            anyhow::ensure!(
+                control_bytes != changed,
+                "canonical transcript omitted {path}"
+            );
         }
 
         let (status, raw): (reqwest::StatusCode, Vec<u8>) = alice
@@ -407,7 +449,8 @@ async fn cancel_field_mutations_fail_before_graph_effects() -> anyhow::Result<()
             "InvalidSignature"
         };
         anyhow::ensure!(
-            status.is_client_error() && (response["error"] == expected || response["error"] == "InvalidSignature"),
+            status.is_client_error()
+                && (response["error"] == expected || response["error"] == "InvalidSignature"),
             "cancel {path} expected client error ({expected}), received {status}: {response}"
         );
         anyhow::ensure!(
@@ -461,7 +504,12 @@ async fn accept_field_mutations_fail_before_graph_effects() -> anyhow::Result<()
         "idempotencyKey":transition_id.to_string(),
         "signedAt":canonical_now()
     });
-    let accept_envelope = signed_mls_request(bob_engine, &bob_identity, DirectRequestKind::Accept, acceptance_body)?;
+    let accept_envelope = signed_mls_request(
+        bob_engine,
+        &bob_identity,
+        DirectRequestKind::Accept,
+        acceptance_body,
+    )?;
 
     let control_bytes = protocol::direct_request_signing_bytes(
         DirectRequestKind::Accept,
@@ -503,7 +551,10 @@ async fn accept_field_mutations_fail_before_graph_effects() -> anyhow::Result<()
             &serde_json::to_vec(&altered["body"])?,
         );
         if let Ok(changed) = changed_res {
-            anyhow::ensure!(control_bytes != changed, "canonical transcript omitted {path}");
+            anyhow::ensure!(
+                control_bytes != changed,
+                "canonical transcript omitted {path}"
+            );
         }
 
         let (status, raw): (reqwest::StatusCode, Vec<u8>) = f
@@ -523,7 +574,10 @@ async fn accept_field_mutations_fail_before_graph_effects() -> anyhow::Result<()
             "InvalidSignature"
         };
         anyhow::ensure!(
-            status.is_client_error() && (response["error"] == expected || response["error"] == "InvalidSignature" || response["error"] == "InvalidRequest"),
+            status.is_client_error()
+                && (response["error"] == expected
+                    || response["error"] == "InvalidSignature"
+                    || response["error"] == "InvalidRequest"),
             "accept {path} expected client error ({expected}), received {status}: {response}"
         );
         anyhow::ensure!(
@@ -542,12 +596,7 @@ async fn grant_field_mutations_fail_before_keys_publication() -> anyhow::Result<
     let did_port = HttpsDidFixture::reserve_port()?;
     let run = Uuid::new_v4().simple().to_string();
     let bob = ServiceIdentity::new(format!("did:web:bob-{run}.request-fixture.catbird.blue"));
-    let https = HttpsDidFixture::start(
-        did_port,
-        &[
-            (bob.did.clone(), bob.did_document()),
-        ],
-    )?;
+    let https = HttpsDidFixture::start(did_port, &[(bob.did.clone(), bob.did_document())])?;
 
     let bob_engine = MlsEngine::new("c03-grant-bob")?;
     let bob_identity = format!("{}#{}", bob.did, bob.device_id);
@@ -578,7 +627,12 @@ async fn grant_field_mutations_fail_before_keys_publication() -> anyhow::Result<
         "idempotencyKey":grant_id.to_string(),
         "signedAt":canonical_now()
     });
-    let signed_grant = signed_mls_request(&bob_engine, &bob_identity, DirectRequestKind::Grant, grant_body)?;
+    let signed_grant = signed_mls_request(
+        &bob_engine,
+        &bob_identity,
+        DirectRequestKind::Grant,
+        grant_body,
+    )?;
 
     let control_bytes = protocol::direct_request_signing_bytes(
         DirectRequestKind::Grant,
@@ -613,7 +667,10 @@ async fn grant_field_mutations_fail_before_keys_publication() -> anyhow::Result<
             DirectRequestKind::Grant,
             &serde_json::to_vec(&altered_grant["body"])?,
         )?;
-        anyhow::ensure!(control_bytes != changed, "canonical transcript omitted {path}");
+        anyhow::ensure!(
+            control_bytes != changed,
+            "canonical transcript omitted {path}"
+        );
 
         let keys_operation = Uuid::new_v4();
         let keys_body = json!({
@@ -639,14 +696,21 @@ async fn grant_field_mutations_fail_before_keys_publication() -> anyhow::Result<
             "idempotencyKey":keys_operation.to_string(),
             "signedAt":canonical_now()
         });
-        let signed_keys = signed_mls_request(&bob_engine, &bob_identity, DirectRequestKind::Keys, keys_body)?;
-        let (status, raw): (reqwest::StatusCode, Vec<u8>) = bob.post(
-            &client,
-            &server.base_url,
-            "blue.catbird.chat.publishDirectRequestKeys",
-            &json!({"signedRequest":signed_keys}),
-            true,
-        ).await?;
+        let signed_keys = signed_mls_request(
+            &bob_engine,
+            &bob_identity,
+            DirectRequestKind::Keys,
+            keys_body,
+        )?;
+        let (status, raw): (reqwest::StatusCode, Vec<u8>) = bob
+            .post(
+                &client,
+                &server.base_url,
+                "blue.catbird.chat.publishDirectRequestKeys",
+                &json!({"signedRequest":signed_keys}),
+                true,
+            )
+            .await?;
         let response: Value = serde_json::from_slice(&raw)?;
         anyhow::ensure!(
             status.is_client_error(),
@@ -686,14 +750,21 @@ async fn grant_field_mutations_fail_before_keys_publication() -> anyhow::Result<
         "idempotencyKey":control_op.to_string(),
         "signedAt":canonical_now()
     });
-    let control_signed = signed_mls_request(&bob_engine, &bob_identity, DirectRequestKind::Keys, control_keys_body)?;
-    let (control_status, _): (reqwest::StatusCode, Vec<u8>) = bob.post(
-        &client,
-        &server.base_url,
-        "blue.catbird.chat.publishDirectRequestKeys",
-        &json!({"signedRequest":control_signed}),
-        true,
-    ).await?;
+    let control_signed = signed_mls_request(
+        &bob_engine,
+        &bob_identity,
+        DirectRequestKind::Keys,
+        control_keys_body,
+    )?;
+    let (control_status, _): (reqwest::StatusCode, Vec<u8>) = bob
+        .post(
+            &client,
+            &server.base_url,
+            "blue.catbird.chat.publishDirectRequestKeys",
+            &json!({"signedRequest":control_signed}),
+            true,
+        )
+        .await?;
     anyhow::ensure!(
         control_status.is_success(),
         "positive control: unmutated grant at revision 1 must succeed, got {control_status}"
@@ -717,32 +788,48 @@ async fn ciphertext_and_aad_mutations_fail_at_recipient_before_acceptance() -> a
     // process_message / AEAD unwrap must reject it.
     let tampered = live_direct_request::publish_request_with_unverifiable_introduction().await?;
     let initial_graph = durable_graph_for_req(
-        &tampered.alice.did, tampered.request_id, tampered.conversation_id,
+        &tampered.alice.did,
+        tampered.request_id,
+        tampered.conversation_id,
     )?;
 
     // Import the Welcome so native MLS store is ready (Welcome itself is authentic)
-    tampered.bob_engine.process_direct_request(&tampered.welcome_input)?;
+    tampered
+        .bob_engine
+        .process_direct_request(&tampered.welcome_input)?;
 
     // Decrypt must reach the AEAD and return Unavailable{InvalidIntroduction}
-    let tampered_result = tampered.bob_engine.decrypt_direct_request(&tampered.welcome_input)?;
+    let tampered_result = tampered
+        .bob_engine
+        .decrypt_direct_request(&tampered.welcome_input)?;
     assert_eq!(
         tampered_result,
-        DirectRequestIntroductionResult::Unavailable { code: "InvalidIntroduction".into() },
+        DirectRequestIntroductionResult::Unavailable {
+            code: "InvalidIntroduction".into()
+        },
         "tampered ciphertext must be rejected by the real AEAD, not a pre-check"
     );
     println!("C03 Tampered ciphertext reached AEAD and was rejected: InvalidIntroduction");
 
     // Graph unchanged after AEAD rejection
     anyhow::ensure!(
-        durable_graph_for_req(&tampered.alice.did, tampered.request_id, tampered.conversation_id)? == initial_graph,
+        durable_graph_for_req(
+            &tampered.alice.did,
+            tampered.request_id,
+            tampered.conversation_id
+        )? == initial_graph,
         "AEAD rejection leaked graph changes"
     );
 
     // --- Part 2: context_hash mismatch is caught before AEAD ---
     let authentic = live_direct_request::publish_request(false).await?;
-    authentic.bob_engine.process_direct_request(&authentic.welcome_input)?;
+    authentic
+        .bob_engine
+        .process_direct_request(&authentic.welcome_input)?;
     let auth_graph = durable_graph_for_req(
-        &authentic.alice.did, authentic.request_id, authentic.conversation_id,
+        &authentic.alice.did,
+        authentic.request_id,
+        authentic.conversation_id,
     )?;
 
     let mut wrong_ctx = authentic.welcome_input.clone();
@@ -756,14 +843,22 @@ async fn ciphertext_and_aad_mutations_fail_at_recipient_before_acceptance() -> a
     println!("C03 Recipient rejected mutated context_hash: {err_msg}");
 
     anyhow::ensure!(
-        durable_graph_for_req(&authentic.alice.did, authentic.request_id, authentic.conversation_id)? == auth_graph,
+        durable_graph_for_req(
+            &authentic.alice.did,
+            authentic.request_id,
+            authentic.conversation_id
+        )? == auth_graph,
         "context_hash rejection leaked graph changes"
     );
 
     // --- Part 3: positive control — authentic introduction decrypts successfully ---
     let control = live_direct_request::publish_request(false).await?;
-    control.bob_engine.process_direct_request(&control.welcome_input)?;
-    let control_result = control.bob_engine.decrypt_direct_request(&control.welcome_input)?;
+    control
+        .bob_engine
+        .process_direct_request(&control.welcome_input)?;
+    let control_result = control
+        .bob_engine
+        .decrypt_direct_request(&control.welcome_input)?;
     match &control_result {
         DirectRequestIntroductionResult::Ready { plaintext } => {
             let text = String::from_utf8_lossy(plaintext);

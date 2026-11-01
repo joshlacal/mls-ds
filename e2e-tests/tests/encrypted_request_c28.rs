@@ -16,10 +16,10 @@
 
 #[path = "support/encrypted_requests.rs"]
 mod encrypted_requests;
-#[path = "support/live_orchestrator.rs"]
-mod live_orchestrator;
 #[path = "../../../catbird-mls/tests/epoch_secret_test_support.rs"]
 mod epoch_secret_test_support;
+#[path = "support/live_orchestrator.rs"]
+mod live_orchestrator;
 
 use anyhow::Context as _;
 use base64::{
@@ -52,9 +52,22 @@ use uuid::Uuid;
 /// Read-only projection of the guarded database.
 fn psql(sql: &str) -> anyhow::Result<String> {
     let out = std::process::Command::new("psql")
-        .args([request_database_url(), "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            request_database_url(),
+            "-X",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()?;
-    anyhow::ensure!(out.status.success(), "psql: {}", String::from_utf8_lossy(&out.stderr));
+    anyhow::ensure!(
+        out.status.success(),
+        "psql: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     Ok(String::from_utf8(out.stdout)?.trim().to_owned())
 }
 
@@ -172,11 +185,13 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
                 .await?;
             anyhow::ensure!(status == reqwest::StatusCode::OK, "getDeviceKey {status}");
             let served: Value = serde_json::from_slice(&body)?;
-            anyhow::Ok(STANDARD.decode(
-                served["signaturePublicKey"]["$bytes"]
-                    .as_str()
-                    .context("signaturePublicKey")?,
-            )?)
+            anyhow::Ok(
+                STANDARD.decode(
+                    served["signaturePublicKey"]["$bytes"]
+                        .as_str()
+                        .context("signaturePublicKey")?,
+                )?,
+            )
         }
     };
     let credentials = MockCredentials::new();
@@ -311,11 +326,7 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
         "preparationDigest": snapshot["preparationDigest"],
     });
     let decode_pkg = |d: &Value, k: &str| -> anyhow::Result<Vec<u8>> {
-        Ok(STANDARD.decode(
-            d["keyPackage"][k]
-                .as_str()
-                .context("package field")?,
-        )?)
+        Ok(STANDARD.decode(d["keyPackage"][k].as_str().context("package field")?)?)
     };
     let journal = alice_engine.prepare_direct_request(&DirectRequestBootstrapInput {
         draft_id: Uuid::new_v4().to_string(),
@@ -451,7 +462,10 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
     let lost_res = transport
         .post_json(
             &fault_client,
-            &format!("{}/xrpc/blue.catbird.chat.publishDirectRequest", server.base_url),
+            &format!(
+                "{}/xrpc/blue.catbird.chat.publishDirectRequest",
+                server.base_url
+            ),
             &body_val,
         )
         .await;
@@ -462,7 +476,10 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
     );
     assert_eq!(
         transport.trace(),
-        &[FaultBoundary::BeforeRequest, FaultBoundary::AfterRequestBeforeResponse]
+        &[
+            FaultBoundary::BeforeRequest,
+            FaultBoundary::AfterRequestBeforeResponse
+        ]
     );
 
     // 8. Server check after lost response:

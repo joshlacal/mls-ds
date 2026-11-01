@@ -43,13 +43,10 @@ pub async fn publish_request_variant(
 /// the same real prepare/publish router path, the same real Welcome.
 pub async fn publish_request_with_unverifiable_introduction(
 ) -> anyhow::Result<PublishedRequestFixture> {
-    Ok(
-        publish_request_variant_configured(false, false, true)
-            .await?
-            .0,
-    )
+    Ok(publish_request_variant_configured(false, false, true)
+        .await?
+        .0)
 }
-
 
 async fn publish_request_variant_configured(
     import_recipient: bool,
@@ -86,22 +83,28 @@ async fn publish_request_variant_configured(
         let name = identity.did.replace(':', "%3A");
         let declarations = https.root.join("_policy/catbirdDeclaration");
         std::fs::create_dir_all(&declarations)?;
-        std::fs::write(declarations.join(&name), serde_json::to_vec(&json!({
-            "$type": "blue.catbird.chat.declaration",
-            "protocolVersion": "1",
-            "allowIncoming": "all",
-            "deliveryService": "did:web:chat.catbird.blue",
-            "createdAt": canonical_now()
-        }))?)?;
+        std::fs::write(
+            declarations.join(&name),
+            serde_json::to_vec(&json!({
+                "$type": "blue.catbird.chat.declaration",
+                "protocolVersion": "1",
+                "allowIncoming": "all",
+                "deliveryService": "did:web:chat.catbird.blue",
+                "createdAt": canonical_now()
+            }))?,
+        )?;
         let devices = https.root.join("_policy/deviceKeys");
         std::fs::create_dir_all(&devices)?;
-        std::fs::write(devices.join(name), serde_json::to_vec(&json!({
-            "records": [{"value": {
-                "algorithm": "ed25519",
-                "mlsSignaturePublicKey": {"$bytes": STANDARD.encode(public_key)},
-                "createdAt": canonical_now()
-            }}]
-        }))?)?;
+        std::fs::write(
+            devices.join(name),
+            serde_json::to_vec(&json!({
+                "records": [{"value": {
+                    "algorithm": "ed25519",
+                    "mlsSignaturePublicKey": {"$bytes": STANDARD.encode(public_key)},
+                    "createdAt": canonical_now()
+                }}]
+            }))?,
+        )?;
     }
     seed_service_device(&alice, &alice_public)?;
     seed_service_device(&bob, &bob_public)?;
@@ -330,7 +333,10 @@ async fn publish_request_variant_configured(
         .cloned()
         .with_context(|| format!("prepare returned no live preparation: {response}"))?;
     let preparation_bytes = serde_json::to_vec(&preparation)?;
-    let preparation = protocol::verify_direct_request_preparation(&preparation_bytes, &server.receipt_public_key)?;
+    let preparation = protocol::verify_direct_request_preparation(
+        &preparation_bytes,
+        &server.receipt_public_key,
+    )?;
     let verified_prepare = protocol::verify_signed_request(
         DirectRequestKind::Prepare,
         &serde_json::to_vec(&prepare)?,
@@ -600,13 +606,26 @@ async fn publish_request_variant_configured(
         use catbird_mls::orchestrator::{RequestCapabilities, RequestConsent, RequestCrypto};
         let state_query = &[("conversationId".into(), conversation_id.to_string())];
         let (before_status, before_bytes) = bob
-            .get(&client, &server.base_url, "blue.catbird.chat.getConversationState", state_query)
+            .get(
+                &client,
+                &server.base_url,
+                "blue.catbird.chat.getConversationState",
+                state_query,
+            )
             .await?;
-        anyhow::ensure!(before_status == reqwest::StatusCode::OK, "pending state before import: {before_status}");
+        anyhow::ensure!(
+            before_status == reqwest::StatusCode::OK,
+            "pending state before import: {before_status}"
+        );
         let before: Value = serde_json::from_slice(&before_bytes)?;
-        assert_eq!(before["state"]["directRequest"]["consent"], "incomingPending");
+        assert_eq!(
+            before["state"]["directRequest"]["consent"],
+            "incomingPending"
+        );
         let before_capabilities = RequestCapabilities::derive(
-            RequestConsent::IncomingPending, RequestCrypto::WelcomeAvailable, false,
+            RequestConsent::IncomingPending,
+            RequestCrypto::WelcomeAvailable,
+            false,
         );
         bob_engine.process_direct_request(&welcome_input)?;
         let decrypted = bob_engine.decrypt_direct_request(&welcome_input)?;
@@ -616,15 +635,31 @@ async fn publish_request_variant_configured(
         let introduction = protocol::decode_direct_request_introduction(&plaintext)?;
         assert_eq!(introduction["text"], "Real encrypted first contact");
         let (after_status, after_bytes) = bob
-            .get(&client, &server.base_url, "blue.catbird.chat.getConversationState", state_query)
+            .get(
+                &client,
+                &server.base_url,
+                "blue.catbird.chat.getConversationState",
+                state_query,
+            )
             .await?;
-        anyhow::ensure!(after_status == reqwest::StatusCode::OK, "pending state after import: {after_status}");
-        let after: Value = serde_json::from_slice(&after_bytes)?;
-        assert_eq!(before["state"], after["state"], "local preview must not change server consent");
-        let after_capabilities = RequestCapabilities::derive(
-            RequestConsent::IncomingPending, RequestCrypto::Ready, true,
+        anyhow::ensure!(
+            after_status == reqwest::StatusCode::OK,
+            "pending state after import: {after_status}"
         );
-        assert!(after_capabilities.can_preview, "decrypted introduction must be previewable");
+        let after: Value = serde_json::from_slice(&after_bytes)?;
+        assert_eq!(
+            before["state"], after["state"],
+            "local preview must not change server consent"
+        );
+        let after_capabilities = RequestCapabilities::derive(
+            RequestConsent::IncomingPending,
+            RequestCrypto::Ready,
+            true,
+        );
+        assert!(
+            after_capabilities.can_preview,
+            "decrypted introduction must be previewable"
+        );
         for capabilities in [before_capabilities, after_capabilities] {
             assert!(!capabilities.can_send && !capabilities.can_emit_receipts && !capabilities.can_administer,
                 "pending consent must gate ordinary send, receipts and administration even after preview");
@@ -721,7 +756,10 @@ pub(crate) fn graph(conversation: Uuid) -> anyhow::Result<Value> {
     Ok(serde_json::from_slice(&result.stdout)?)
 }
 
-pub async fn accept_reply_offline(accept_before_import: bool, future_signed_at: bool) -> anyhow::Result<()> {
+pub async fn accept_reply_offline(
+    accept_before_import: bool,
+    future_signed_at: bool,
+) -> anyhow::Result<()> {
     use catbird_mls::chat_v2::transcript::{decode_strict_json, VerifiedApplicationEntry};
     use catbird_mls::orchestrator::{canonical_application_aad_bytes, MLSMessagePayload};
     // Both scenarios start with an unimported recipient. The sender must be
@@ -943,26 +981,39 @@ pub async fn accept_reply_offline(accept_before_import: bool, future_signed_at: 
     assert_eq!(proof["entry"]["signedRequest"], acceptance);
     if future_signed_at {
         let signed_at = chrono::DateTime::parse_from_rfc3339(
-            acceptance["body"]["signedAt"].as_str().context("acceptance signedAt")?
+            acceptance["body"]["signedAt"]
+                .as_str()
+                .context("acceptance signedAt")?,
         )?;
         let received_at = chrono::DateTime::parse_from_rfc3339(
-            proof["entry"]["receivedAt"].as_str().context("acceptance receivedAt")?
+            proof["entry"]["receivedAt"]
+                .as_str()
+                .context("acceptance receivedAt")?,
         )?;
-        anyhow::ensure!(signed_at > received_at, "fixture failed to exercise accepted future-signed clock skew");
+        anyhow::ensure!(
+            signed_at > received_at,
+            "fixture failed to exercise accepted future-signed clock skew"
+        );
     }
-    let (accepted_state_status, accepted_state_bytes) = f.bob.get(
-        &f.client,
-        &f.server.base_url,
-        "blue.catbird.chat.getConversationState",
-        &[("conversationId".into(), f.conversation_id.to_string())],
-    ).await?;
+    let (accepted_state_status, accepted_state_bytes) = f
+        .bob
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getConversationState",
+            &[("conversationId".into(), f.conversation_id.to_string())],
+        )
+        .await?;
     anyhow::ensure!(
         accepted_state_status == reqwest::StatusCode::OK,
         "accepted recipient state read failed {accepted_state_status}: {}",
         String::from_utf8_lossy(&accepted_state_bytes)
     );
     let accepted_state: Value = serde_json::from_slice(&accepted_state_bytes)?;
-    assert_eq!(accepted_state["state"]["directRequest"]["consent"], "accepted");
+    assert_eq!(
+        accepted_state["state"]["directRequest"]["consent"],
+        "accepted"
+    );
     let replay = checked_post(
         &f,
         &f.bob,
@@ -1159,15 +1210,33 @@ pub async fn accept_reply_offline_with_followup() -> anyhow::Result<Uuid> {
     use catbird_mls::chat_v2::transcript::{decode_strict_json, VerifiedApplicationEntry};
     use catbird_mls::orchestrator::{canonical_application_aad_bytes, MLSMessagePayload};
     let mut f = publish_request(false).await?;
-    let (pending_status, pending_bytes) = f.bob.get(&f.client, &f.server.base_url, "blue.catbird.chat.getConversationState", &[("conversationId".into(), f.conversation_id.to_string())]).await?;
-    anyhow::ensure!(pending_status == reqwest::StatusCode::OK, "pending state failed");
+    let (pending_status, pending_bytes) = f
+        .bob
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getConversationState",
+            &[("conversationId".into(), f.conversation_id.to_string())],
+        )
+        .await?;
+    anyhow::ensure!(
+        pending_status == reqwest::StatusCode::OK,
+        "pending state failed"
+    );
     let pending: Value = serde_json::from_slice(&pending_bytes)?;
-    assert_eq!(pending["state"]["directRequest"]["consent"], "incomingPending");
+    assert_eq!(
+        pending["state"]["directRequest"]["consent"],
+        "incomingPending"
+    );
     let prior = f.welcome_input.bootstrap.coordinates.clone();
     let group = STANDARD.decode(prior["groupId"].as_str().context("group ID")?)?;
     let epoch = prior["epoch"].as_u64().context("epoch")?;
     let alice_engine = f.alice_engine.take().context("sender native store")?;
-    alice_engine.confirm_request_publication(&f.request_id.to_string(), &serde_json::to_vec(&f.receipt)?, &f.server.receipt_public_key)?;
+    alice_engine.confirm_request_publication(
+        &f.request_id.to_string(),
+        &serde_json::to_vec(&f.receipt)?,
+        &f.server.receipt_public_key,
+    )?;
     let offline_sender = alice_engine.close_for_offline()?;
     f.bob_engine.process_direct_request(&f.welcome_input)?;
     let bob_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
@@ -1175,27 +1244,47 @@ pub async fn accept_reply_offline_with_followup() -> anyhow::Result<Uuid> {
     let transition = Uuid::new_v4();
     let mut next = prior.clone();
     next["stateVersion"] = json!(prior["stateVersion"].as_u64().context("state version")? + 1);
-    let acceptance = signed_mls_request(&f.bob_engine, &bob_identity, DirectRequestKind::Accept, json!({
-        "$type":"blue.catbird.chat.defs#directRequestAcceptanceBody", "signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPT\0", "protocolVersion":"2",
-        "actorDid":f.bob.did, "actorDeviceId":f.bob.device_id.to_string(), "keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)), "authGeneration":1,
-        "requestId":f.request_id.to_string(), "transitionId":transition.to_string(), "prior":prior, "next":next,
-        "invitationProvenance":{"invitationTransitionId":f.request_id.to_string(),"invitedByDid":f.alice.did,"invitedByDeviceId":f.alice.device_id.to_string()},
-        "idempotencyKey":transition.to_string(),"signedAt":canonical_now()
-    }))?;
+    let acceptance = signed_mls_request(
+        &f.bob_engine,
+        &bob_identity,
+        DirectRequestKind::Accept,
+        json!({
+            "$type":"blue.catbird.chat.defs#directRequestAcceptanceBody", "signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPT\0", "protocolVersion":"2",
+            "actorDid":f.bob.did, "actorDeviceId":f.bob.device_id.to_string(), "keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)), "authGeneration":1,
+            "requestId":f.request_id.to_string(), "transitionId":transition.to_string(), "prior":prior, "next":next,
+            "invitationProvenance":{"invitationTransitionId":f.request_id.to_string(),"invitedByDid":f.alice.did,"invitedByDeviceId":f.alice.device_id.to_string()},
+            "idempotencyKey":transition.to_string(),"signedAt":canonical_now()
+        }),
+    )?;
     let envelope = json!({"directRequest":acceptance});
-    let _ = checked_post(&f, &f.bob, "blue.catbird.chat.acceptConversation", &envelope).await?;
+    let _ = checked_post(
+        &f,
+        &f.bob,
+        "blue.catbird.chat.acceptConversation",
+        &envelope,
+    )
+    .await?;
     let message = Uuid::new_v4();
     let mut aad_prior = next.clone();
     aad_prior["conversationId"] = json!(STANDARD.encode(f.conversation_id.as_bytes()));
     let aad = json!({"protocolVersion":"1","conversationId":STANDARD.encode(f.conversation_id.as_bytes()),"generation":next["generation"],"messageId":STANDARD.encode(message.as_bytes()),"prior":aad_prior});
     let text = "Reply while the original sender is offline";
     let content = MLSMessagePayload::text(text).encode()?;
-    let ciphertext = f.bob_engine.encrypt_canonical(&group, &content, canonical_application_aad_bytes(&aad)?, epoch)?;
-    let application = signed_ordinary(&f.bob_engine, &bob_identity, json!({
-        "$type":"blue.catbird.chat.defs#applicationSendBody","signatureDomain":"CATBIRD-CHAT-MESSAGE\0","messageId":message.to_string(),
-        "actorDid":f.bob.did,"actorDeviceId":f.bob.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"authGeneration":1,
-        "prior":next,"aad":aad,"applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication","bytes":STANDARD.encode(&ciphertext),"sha256":STANDARD.encode(Sha256::digest(&ciphertext))},"blobBindings":[],"signedAt":canonical_now()
-    }))?;
+    let ciphertext = f.bob_engine.encrypt_canonical(
+        &group,
+        &content,
+        canonical_application_aad_bytes(&aad)?,
+        epoch,
+    )?;
+    let application = signed_ordinary(
+        &f.bob_engine,
+        &bob_identity,
+        json!({
+            "$type":"blue.catbird.chat.defs#applicationSendBody","signatureDomain":"CATBIRD-CHAT-MESSAGE\0","messageId":message.to_string(),
+            "actorDid":f.bob.did,"actorDeviceId":f.bob.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"authGeneration":1,
+            "prior":next,"aad":aad,"applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication","bytes":STANDARD.encode(&ciphertext),"sha256":STANDARD.encode(Sha256::digest(&ciphertext))},"blobBindings":[],"signedAt":canonical_now()
+        }),
+    )?;
     let send_envelope = json!({"signedRequest":application});
     let _ = checked_post(&f, &f.bob, "blue.catbird.chat.sendMessage", &send_envelope).await?;
     let sender = offline_sender.reopen()?;
@@ -1205,16 +1294,31 @@ pub async fn accept_reply_offline_with_followup() -> anyhow::Result<Uuid> {
     let aad2 = json!({"protocolVersion":"1","conversationId":STANDARD.encode(f.conversation_id.as_bytes()),"generation":next["generation"],"messageId":STANDARD.encode(message2.as_bytes()),"prior":aad_prior2});
     let text2 = "Follow-up reply after restart";
     let content2 = MLSMessagePayload::text(text2).encode()?;
-    let ciphertext2 = sender.encrypt_canonical(&group, &content2, canonical_application_aad_bytes(&aad2)?, epoch)?;
+    let ciphertext2 = sender.encrypt_canonical(
+        &group,
+        &content2,
+        canonical_application_aad_bytes(&aad2)?,
+        epoch,
+    )?;
     let alice_identity = format!("{}#{}", f.alice.did, f.alice.device_id);
     let alice_public = sender.identity_public_key(&alice_identity)?;
-    let application2 = signed_ordinary(&sender, &alice_identity, json!({
-        "$type":"blue.catbird.chat.defs#applicationSendBody","signatureDomain":"CATBIRD-CHAT-MESSAGE\0","messageId":message2.to_string(),
-        "actorDid":f.alice.did,"actorDeviceId":f.alice.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public)),"authGeneration":1,
-        "prior":next,"aad":aad2,"applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication","bytes":STANDARD.encode(&ciphertext2), "sha256":STANDARD.encode(Sha256::digest(&ciphertext2))},"blobBindings":[],"signedAt":canonical_now()
-    }))?;
+    let application2 = signed_ordinary(
+        &sender,
+        &alice_identity,
+        json!({
+            "$type":"blue.catbird.chat.defs#applicationSendBody","signatureDomain":"CATBIRD-CHAT-MESSAGE\0","messageId":message2.to_string(),
+            "actorDid":f.alice.did,"actorDeviceId":f.alice.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public)),"authGeneration":1,
+            "prior":next,"aad":aad2,"applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication","bytes":STANDARD.encode(&ciphertext2), "sha256":STANDARD.encode(Sha256::digest(&ciphertext2))},"blobBindings":[],"signedAt":canonical_now()
+        }),
+    )?;
     let send_envelope2 = json!({"signedRequest":application2});
-    let sent_bytes2 = checked_post(&f, &f.alice, "blue.catbird.chat.sendMessage", &send_envelope2).await?;
+    let sent_bytes2 = checked_post(
+        &f,
+        &f.alice,
+        "blue.catbird.chat.sendMessage",
+        &send_envelope2,
+    )
+    .await?;
     let sent2: Value = serde_json::from_slice(&sent_bytes2)?;
     assert_eq!(sent2["entry"]["seq"], 4);
     Ok(f.conversation_id)
@@ -1229,9 +1333,10 @@ async fn assert_generated_accepted_reads(
     entries_bytes: &[u8],
 ) -> anyhow::Result<()> {
     use catbird_mls::atproto::generated::blue_catbird::chat::{
-        get_conversation_state::GetConversationStateOutput, get_conversations::GetConversationsOutput,
-        get_direct_request_outcome::GetDirectRequestOutcomeOutput,
-        ConversationEntry, ConversationInventoryItem, DirectRequestOutcome, DirectRequestStateConsent,
+        get_conversation_state::GetConversationStateOutput,
+        get_conversations::GetConversationsOutput,
+        get_direct_request_outcome::GetDirectRequestOutcomeOutput, ConversationEntry,
+        ConversationInventoryItem, DirectRequestOutcome, DirectRequestStateConsent,
     };
     let context_hash = STANDARD.decode(
         f.publication["body"]["contextHash"]
@@ -1262,7 +1367,11 @@ async fn assert_generated_accepted_reads(
     assert_eq!(
         typed_introduction.signed_request.signature.as_ref(),
         STANDARD
-            .decode(f.publication["signature"].as_str().context("publication signature")?)?
+            .decode(
+                f.publication["signature"]
+                    .as_str()
+                    .context("publication signature")?
+            )?
             .as_slice()
     );
     assert!(page
@@ -1328,8 +1437,14 @@ async fn assert_generated_accepted_reads(
             _ => None,
         })
         .context("typed inventory request")?;
-    assert_eq!(inventory_request.consent, DirectRequestStateConsent::Accepted);
-    assert_eq!(inventory_request.context_hash.as_ref(), context_hash.as_slice());
+    assert_eq!(
+        inventory_request.consent,
+        DirectRequestStateConsent::Accepted
+    );
+    assert_eq!(
+        inventory_request.context_hash.as_ref(),
+        context_hash.as_slice()
+    );
 
     let (status, outcome_bytes) = f
         .alice

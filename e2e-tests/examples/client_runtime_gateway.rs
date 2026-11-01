@@ -30,7 +30,10 @@ use std::{
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use uuid::Uuid;
@@ -144,7 +147,15 @@ impl Drop for DedicatedDatabase {
 
 fn psql_maintenance(sql: &str) -> Result<()> {
     let output = Command::new("psql")
-        .args([MAINTENANCE_URL, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            MAINTENANCE_URL,
+            "-X",
+            "-q",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()?;
     ensure!(
         output.status.success(),
@@ -168,7 +179,17 @@ fn psql_on(db_url: &str, sql: &str) -> Result<()> {
 
 fn psql_value(db_url: &str, sql: &str) -> Result<String> {
     let output = Command::new("psql")
-        .args([db_url, "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            db_url,
+            "-X",
+            "-q",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()?;
     ensure!(
         output.status.success(),
@@ -212,7 +233,11 @@ fn bootstrap_federation_tables(db_url: &str) -> Result<()> {
 }
 
 fn prepare_dedicated_federation_database(db_url: &str) -> Result<()> {
-    if psql_value(db_url, "SELECT to_regclass('chat.direct_request_remote_leases') IS NULL")? == "t" {
+    if psql_value(
+        db_url,
+        "SELECT to_regclass('chat.direct_request_remote_leases') IS NULL",
+    )? == "t"
+    {
         psql_on(
             db_url,
             include_str!("../../server/migrations/20260919000022_federated_transport_inbox.sql"),
@@ -225,7 +250,9 @@ fn prepare_dedicated_federation_database(db_url: &str) -> Result<()> {
     {
         psql_on(
             db_url,
-            include_str!("../../server/migrations/20260919000023_expired_federated_lease_release.sql"),
+            include_str!(
+                "../../server/migrations/20260919000023_expired_federated_lease_release.sql"
+            ),
         )?;
     }
     psql_on(
@@ -234,14 +261,17 @@ fn prepare_dedicated_federation_database(db_url: &str) -> Result<()> {
     )?;
     psql_on(
         db_url,
-        include_str!("../../server/migrations/20260919000025_federated_inventory_conversation_items.sql"),
+        include_str!(
+            "../../server/migrations/20260919000025_federated_inventory_conversation_items.sql"
+        ),
     )?;
     bootstrap_federation_tables(db_url)?;
     psql_on(db_url, "TRUNCATE chat.direct_request_receipt_keys")?;
     let cursor_key_id = psql_value(
         db_url,
         "SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE",
-    ).unwrap_or_default();
+    )
+    .unwrap_or_default();
     if cursor_key_id.is_empty() {
         let key = URL_SAFE_NO_PAD.encode([0xC1_u8; 32]);
         psql_on(
@@ -324,11 +354,7 @@ fn sync_device_key_policy(root: &Path, did: &str, key: &[u8]) {
     );
 }
 
-fn ds_did_document(
-    did: &str,
-    server_url: &str,
-    seed_byte: u8,
-) -> Result<(Value, Vec<u8>, String)> {
+fn ds_did_document(did: &str, server_url: &str, seed_byte: u8) -> Result<(Value, Vec<u8>, String)> {
     let receipt_key = SigningKey::from_bytes((&[seed_byte; 32]).into())?;
     let service_key = SigningKey::from_bytes((&[seed_byte + 1; 32]).into())?;
     let receipt_point = receipt_key.verifying_key().to_encoded_point(true);
@@ -418,7 +444,11 @@ fn resolve_server_fixture_binary(require_env_sha: bool) -> Result<(PathBuf, Stri
                 );
             }
         })?;
-    ensure!(binary.is_file(), "server fixture binary not found at {:?}", binary);
+    ensure!(
+        binary.is_file(),
+        "server fixture binary not found at {:?}",
+        binary
+    );
     let bytes = std::fs::read(&binary)?;
     let actual_sha = hex::encode(Sha256::digest(&bytes));
     let expected_sha_env = std::env::var("REQUEST_SERVER_FIXTURE_SHA256")
@@ -459,7 +489,10 @@ fn spawn_server_fixture(
         db_url,
         "SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE",
     )?;
-    ensure!(!cursor_key_id.is_empty(), "fixture database lacks protocol identity");
+    ensure!(
+        !cursor_key_id.is_empty(),
+        "fixture database lacks protocol identity"
+    );
 
     let mut command = Command::new(binary);
     command
@@ -473,11 +506,17 @@ fn spawn_server_fixture(
         .env("DID_RESOLUTION_HOST_ALLOWLIST", https.hosts.join(","))
         .env("CHAT_CUTOVER_ENABLED", "1")
         .env("CHAT_DIRECT_REQUESTS_ENABLED", "1")
-        .env("CHAT_SUBSCRIPTION_ENDPOINT", "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents")
+        .env(
+            "CHAT_SUBSCRIPTION_ENDPOINT",
+            "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents",
+        )
         .env("FEDERATION_ALLOW_INSECURE_HTTP", "true")
         .env("FEDERATION_MODE", "open_intelligent")
         .env("CHAT_CURSOR_KEY_ID", &cursor_key_id)
-        .env("CHAT_CURSOR_SEALING_SECRET", URL_SAFE_NO_PAD.encode([0xA5_u8; 32]))
+        .env(
+            "CHAT_CURSOR_SEALING_SECRET",
+            URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
+        )
         .env(
             "CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM",
             receipt_key.to_pkcs8_pem(LineEnding::LF)?.as_str(),
@@ -502,7 +541,10 @@ fn spawn_server_fixture(
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let ready: Value = serde_json::from_str(&line)?;
-    let base_url = ready["baseUrl"].as_str().context("missing baseUrl")?.to_owned();
+    let base_url = ready["baseUrl"]
+        .as_str()
+        .context("missing baseUrl")?
+        .to_owned();
     ensure!(
         base_url == self_endpoint,
         "server fixture bound to {base_url} but expected {self_endpoint}"
@@ -701,7 +743,11 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
     if path.starts_with("/xrpc/") {
         eprintln!(
             "fixture-xrpc-path-only {:?}",
-            if path.len() <= 256 { path.as_str() } else { "<overlong>" }
+            if path.len() <= 256 {
+                path.as_str()
+            } else {
+                "<overlong>"
+            }
         );
     }
     let method = request.method().clone();
@@ -730,10 +776,9 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
     if path == "/xrpc/com.atproto.repo.listRecords" && method == Method::GET {
         let owned_actor = public_actor.or_else(|| {
             let session = actor_for_session(proxy, &request)?;
-            proxy
-                .actors
-                .iter()
-                .find(|a| a.identity.did == session.identity.did && q.get("repo") == Some(&a.identity.did))
+            proxy.actors.iter().find(|a| {
+                a.identity.did == session.identity.did && q.get("repo") == Some(&a.identity.did)
+            })
         });
         let Some(a) = owned_actor else {
             return error(StatusCode::FORBIDDEN, "InvalidRepo");
@@ -771,9 +816,12 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
         }
         if q.get("collection").map(String::as_str) == Some("blue.catbird.chat.declaration") {
             let authority = if proxy.two_authority_federation {
-                if q.get("repo").map(String::as_str) == Some(proxy.actors[0].identity.did.as_str()) {
+                if q.get("repo").map(String::as_str) == Some(proxy.actors[0].identity.did.as_str())
+                {
                     &proxy.ds1_did
-                } else if q.get("repo").map(String::as_str) == Some(proxy.actors[1].identity.did.as_str()) {
+                } else if q.get("repo").map(String::as_str)
+                    == Some(proxy.actors[1].identity.did.as_str())
+                {
                     &proxy.ds2_did
                 } else {
                     &proxy.ds1_did
@@ -806,7 +854,11 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
         }
         let actor_did = &q["actor"];
         let other_did = &q["others"];
-        let actor = proxy.actors.iter().find(|a| &a.identity.did == actor_did).unwrap();
+        let actor = proxy
+            .actors
+            .iter()
+            .find(|a| &a.identity.did == actor_did)
+            .unwrap();
         let blocking_uri = actor.blocks.lock().unwrap().values().find_map(|r| {
             if r["value"]["subject"] == *other_did {
                 r["uri"].as_str().map(str::to_owned)
@@ -911,7 +963,10 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
     }
     if matches!(
         path.as_str(),
-        "/fixture/enroll" | "/xrpc/com.atproto.repo.putRecord" | "/xrpc/com.atproto.repo.createRecord" | "/xrpc/com.atproto.repo.deleteRecord"
+        "/fixture/enroll"
+            | "/xrpc/com.atproto.repo.putRecord"
+            | "/xrpc/com.atproto.repo.createRecord"
+            | "/xrpc/com.atproto.repo.deleteRecord"
     ) && catbird_mls::chat_v2::transcript::decode_strict_json(&bytes).is_err()
     {
         return error(StatusCode::BAD_REQUEST, "InvalidJson");
@@ -923,7 +978,8 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
             return error(StatusCode::BAD_REQUEST, "InvalidJson");
         };
         let known = |did: &Value| {
-            did.as_str().is_some_and(|d| proxy.actors.iter().any(|a| a.identity.did == d))
+            did.as_str()
+                .is_some_and(|d| proxy.actors.iter().any(|a| a.identity.did == d))
         };
         let subject = v["record"]["subject"].as_str().unwrap_or("");
         eprintln!(
@@ -952,10 +1008,7 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
             "value": v["record"],
         });
         actor.blocks.lock().unwrap().insert(rkey, record);
-        return response(
-            StatusCode::OK,
-            json!({"uri": uri, "cid": CID}),
-        );
+        return response(StatusCode::OK, json!({"uri": uri, "cid": CID}));
     }
     if path == "/xrpc/com.atproto.repo.deleteRecord" && method == Method::POST {
         let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
@@ -1132,10 +1185,17 @@ async fn serve_inner(proxy: &Proxy, request: Request) -> Response {
                 && status == reqwest::StatusCode::OK
                 && serde_json::from_slice::<Value>(&body)
                     .ok()
-                    .is_some_and(|v| v["outcome"]["body"]["receipt"]["code"] == "RecipientAuthorityUnsupported")
-                && proxy.withhold_first_foreign_prepare_response.swap(false, Ordering::SeqCst)
+                    .is_some_and(|v| {
+                        v["outcome"]["body"]["receipt"]["code"] == "RecipientAuthorityUnsupported"
+                    })
+                && proxy
+                    .withhold_first_foreign_prepare_response
+                    .swap(false, Ordering::SeqCst)
             {
-                return error(StatusCode::SERVICE_UNAVAILABLE, "FixtureWithheldSignedRefusal");
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "FixtureWithheldSignedRefusal",
+                );
             }
             Response::builder()
                 .status(status.as_u16())
@@ -1252,8 +1312,12 @@ async fn main() -> Result<()> {
                 .or_insert_with(|| json!({"id":format!("did:web:{h}")}));
         }
         let proxy = Arc::new(Proxy {
-            foreign_recipient_did: config.foreign_bob_authority.then(|| actors[1].identity.did.clone()),
-            withhold_first_foreign_prepare_response: AtomicBool::new(config.withhold_first_foreign_prepare_response),
+            foreign_recipient_did: config
+                .foreign_bob_authority
+                .then(|| actors[1].identity.did.clone()),
+            withhold_first_foreign_prepare_response: AtomicBool::new(
+                config.withhold_first_foreign_prepare_response,
+            ),
             actors,
             documents: Mutex::new(documents),
             service: Mutex::new(None),
@@ -1505,14 +1569,12 @@ async fn main() -> Result<()> {
     let ds1_receipt_doc_bytes = serde_json::to_vec(&ds1_doc)?;
     let ds2_receipt_doc_bytes = serde_json::to_vec(&ds2_doc)?;
 
-    let alice_identity = ServiceIdentity::new(format!(
-        "did:web:alice-{run}.request-fixture.catbird.blue"
-    ))
-    .with_audience(&ds1_did);
-    let bob_identity = ServiceIdentity::new(format!(
-        "did:web:bob-{run}.request-fixture.catbird.blue"
-    ))
-    .with_audience(&ds2_did);
+    let alice_identity =
+        ServiceIdentity::new(format!("did:web:alice-{run}.request-fixture.catbird.blue"))
+            .with_audience(&ds1_did);
+    let bob_identity =
+        ServiceIdentity::new(format!("did:web:bob-{run}.request-fixture.catbird.blue"))
+            .with_audience(&ds2_did);
 
     let alice_actor = Arc::new(Actor {
         identity: alice_identity,
@@ -1924,9 +1986,20 @@ mod tests {
             withhold_first_foreign_prepare_response: true,
             two_authority_federation: false,
         };
-        assert!(validate_config(&loss).is_err(), "never withhold a canonical recipient response");
-        assert!(validate_config(&Config { foreign_bob_authority: true, ..loss.clone() }).is_ok());
-        assert!(validate_config(&Config { two_authority_federation: true, ..loss }).is_err());
+        assert!(
+            validate_config(&loss).is_err(),
+            "never withhold a canonical recipient response"
+        );
+        assert!(validate_config(&Config {
+            foreign_bob_authority: true,
+            ..loss.clone()
+        })
+        .is_ok());
+        assert!(validate_config(&Config {
+            two_authority_federation: true,
+            ..loss
+        })
+        .is_err());
         for seconds in [0, 3601] {
             assert!(validate_config(&Config {
                 output_dir: c.output_dir.clone(),
@@ -2051,22 +2124,34 @@ mod tests {
     }
     #[tokio::test]
     async fn foreign_bob_declaration_requires_explicit_fixture_option() {
-        let actors: Vec<_> = ["alice", "bob"].into_iter().map(|label| {
-            Arc::new(Actor {
-                identity: ServiceIdentity::new(format!("did:web:{label}.request-fixture.catbird.blue")),
-                session: "opaque".into(),
-                records: Mutex::new(BTreeMap::new()),
-                blocks: Mutex::new(BTreeMap::new()),
-                seeded: Mutex::new(None),
+        let actors: Vec<_> = ["alice", "bob"]
+            .into_iter()
+            .map(|label| {
+                Arc::new(Actor {
+                    identity: ServiceIdentity::new(format!(
+                        "did:web:{label}.request-fixture.catbird.blue"
+                    )),
+                    session: "opaque".into(),
+                    records: Mutex::new(BTreeMap::new()),
+                    blocks: Mutex::new(BTreeMap::new()),
+                    seeded: Mutex::new(None),
+                })
             })
-        }).collect();
+            .collect();
         let bob = actors[1].identity.did.clone();
         for foreign in [false, true] {
             let proxy = Arc::new(Proxy {
-                documents: Mutex::new(actors.iter().map(|actor| (
-                    actor.identity.did.trim_start_matches("did:web:").to_owned(),
-                    json!({"id": actor.identity.did}),
-                )).collect()),
+                documents: Mutex::new(
+                    actors
+                        .iter()
+                        .map(|actor| {
+                            (
+                                actor.identity.did.trim_start_matches("did:web:").to_owned(),
+                                json!({"id": actor.identity.did}),
+                            )
+                        })
+                        .collect(),
+                ),
                 foreign_recipient_did: foreign.then(|| bob.clone()),
                 withhold_first_foreign_prepare_response: AtomicBool::new(false),
                 actors: actors.clone(),
@@ -2134,8 +2219,14 @@ mod tests {
             actors: actors.clone(),
             service: Mutex::new(Some("http://127.0.0.1:9001".into())),
             actor_services: BTreeMap::from([
-                (actors[0].identity.did.clone(), "http://127.0.0.1:9001".into()),
-                (actors[1].identity.did.clone(), "http://127.0.0.1:9002".into()),
+                (
+                    actors[0].identity.did.clone(),
+                    "http://127.0.0.1:9001".into(),
+                ),
+                (
+                    actors[1].identity.did.clone(),
+                    "http://127.0.0.1:9002".into(),
+                ),
             ]),
             actor_db_urls: BTreeMap::new(),
             two_authority_federation: true,

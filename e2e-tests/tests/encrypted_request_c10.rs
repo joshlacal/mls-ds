@@ -40,7 +40,18 @@ const MAX_WRITES: usize = 400;
 
 async fn psql_on(url: &str, sql: &str) -> anyhow::Result<String> {
     let output = tokio::process::Command::new("psql")
-        .args([url, "-X", "-A", "-t", "-F", "\t", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            url,
+            "-X",
+            "-A",
+            "-t",
+            "-F",
+            "\t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()
         .await?;
     anyhow::ensure!(
@@ -107,7 +118,11 @@ SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'c10_fault_%';
 
 /// Committed state visible to an independent connection. Every component must
 /// stay zero (and the package reserved, the attempt prepared) until commit.
-async fn observed_partial_state(request: Uuid, conversation: Uuid, package_hex: &str) -> anyhow::Result<Value> {
+async fn observed_partial_state(
+    request: Uuid,
+    conversation: Uuid,
+    package_hex: &str,
+) -> anyhow::Result<Value> {
     let row = psql(&format!(
         "SELECT jsonb_build_object(\
           'conversation',(SELECT count(*) FROM chat.conversations WHERE conversation_id='{conversation}'),\
@@ -145,7 +160,10 @@ fn assert_no_partial_state(state: &Value, when: &str) {
         "events",
         "lifecycleReserve",
     ] {
-        assert_eq!(state[key], 0, "{when}: observer saw {key} before commit: {state}");
+        assert_eq!(
+            state[key], 0,
+            "{when}: observer saw {key} before commit: {state}"
+        );
     }
     assert_eq!(state["packageStatus"], "reserved", "{when}: {state}");
     assert_eq!(state["attemptStatus"], "prepared", "{when}: {state}");
@@ -164,8 +182,16 @@ async fn c10_every_publication_write_fault_leaves_no_partial_state_and_retry_com
     assert!(request_database_url().ends_with(&name));
 
     let f = staged::stage_request("c10").await?;
-    let triggers: i64 = psql(FAULT_SQL).await?.lines().last().context("trigger count")?.parse()?;
-    assert!(triggers > 40, "fault trigger must cover every chat table, got {triggers}");
+    let triggers: i64 = psql(FAULT_SQL)
+        .await?
+        .lines()
+        .last()
+        .context("trigger count")?
+        .parse()?;
+    assert!(
+        triggers > 40,
+        "fault trigger must cover every chat table, got {triggers}"
+    );
     let request = f.request_id;
     let conversation = f.conversation_id;
     let package_hex = hex::encode(&f.bob_package_ref);
@@ -194,7 +220,8 @@ async fn c10_every_publication_write_fault_leaves_no_partial_state_and_retry_com
                 )
                 .await?;
                 if !sleeping.is_empty() {
-                    let during = observed_partial_state(request, conversation, &package_hex).await?;
+                    let during =
+                        observed_partial_state(request, conversation, &package_hex).await?;
                     let still = psql(&format!(
                         "SELECT count(*) FROM pg_stat_activity WHERE pid={} AND wait_event='PgSleep'",
                         sleeping.split('\t').next().unwrap_or("0")
@@ -203,7 +230,12 @@ async fn c10_every_publication_write_fault_leaves_no_partial_state_and_retry_com
                     return anyhow::Ok(Some((sleeping, during, still == "1")));
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                if psql(&format!("SELECT status FROM chat.direct_request_attempts WHERE request_id='{request}'")).await? == "published" {
+                if psql(&format!(
+                    "SELECT status FROM chat.direct_request_attempts WHERE request_id='{request}'"
+                ))
+                .await?
+                    == "published"
+                {
                     return Ok(None);
                 }
             }
@@ -229,7 +261,10 @@ async fn c10_every_publication_write_fault_leaves_no_partial_state_and_retry_com
                 let pid = fields.next().unwrap_or_default().to_owned();
                 let xid = fields.next().unwrap_or_default().to_owned();
                 let query = fields.next().unwrap_or_default().to_owned();
-                assert!(!xid.is_empty(), "write {target}: faulted backend holds a transaction id");
+                assert!(
+                    !xid.is_empty(),
+                    "write {target}: faulted backend holds a transaction id"
+                );
                 println!("C10 boundary write={target} status={status} pid={pid} xid={xid} statement={query}");
                 boundaries.push(json!({"write":target,"status":status.as_u16(),"statement":query}));
             }
@@ -284,7 +319,10 @@ async fn c10_every_publication_write_fault_leaves_no_partial_state_and_retry_com
     ] {
         assert!(all.contains(table), "no injected boundary wrote {table}");
     }
-    let ordered: Vec<usize> = boundaries.iter().map(|b| b["write"].as_u64().unwrap() as usize).collect();
+    let ordered: Vec<usize> = boundaries
+        .iter()
+        .map(|b| b["write"].as_u64().unwrap() as usize)
+        .collect();
     assert_eq!(ordered, (1..=boundaries.len()).collect::<Vec<_>>());
 
     // Committed exactly once, complete.
@@ -311,8 +349,14 @@ async fn c10_every_publication_write_fault_leaves_no_partial_state_and_retry_com
     let sender = f.sender.as_ref().context("sender")?;
     let journal = staged::journal(sender, request)?;
     assert_eq!(journal.phase, DirectRequestJournalPhase::OutcomeUnknown);
-    assert_eq!(journal.publish_request.as_deref(), Some(f.exact_publication.as_slice()));
-    assert_eq!(ciphertext, hex::encode(&journal.bootstrap.initial_ciphertext));
+    assert_eq!(
+        journal.publish_request.as_deref(),
+        Some(f.exact_publication.as_slice())
+    );
+    assert_eq!(
+        ciphertext,
+        hex::encode(&journal.bootstrap.initial_ciphertext)
+    );
     let resolved = sender
         .confirm_published_bootstrap(
             &request.to_string(),
@@ -320,7 +364,10 @@ async fn c10_every_publication_write_fault_leaves_no_partial_state_and_retry_com
             &f.server.receipt_public_key,
         )
         .map_err(|error| anyhow::anyhow!("confirm: {error}"))?;
-    assert_eq!(resolved.phase, DirectRequestJournalPhase::PublishedAwaitingProjection);
+    assert_eq!(
+        resolved.phase,
+        DirectRequestJournalPhase::PublishedAwaitingProjection
+    );
 
     let welcome = f.welcome_input(journal.bootstrap.clone(), &receipt)?;
     f.bob_engine.process_direct_request(&welcome)?;

@@ -32,17 +32,14 @@ use catbird_mls::{
     },
     DirectRequestOutcome,
 };
-use live_orchestrator::{
-    mock_credentials::MockCredentials,
-    mock_storage::MockStorage,
-};
-use std::sync::Arc;
 use encrypted_requests::{
     canonical_now, request_database_snapshot, request_database_url, signed_mls_request,
     DeterministicFaultTransport, FaultBoundary,
 };
+use live_orchestrator::{mock_credentials::MockCredentials, mock_storage::MockStorage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::{io::BufRead as _, path::PathBuf, process::Stdio, time::Duration};
 use uuid::Uuid;
 
@@ -52,7 +49,16 @@ const RESULT_PREFIX: &str = "C11_CHILD_RESULT ";
 
 fn psql(sql: &str) -> anyhow::Result<String> {
     let output = std::process::Command::new("psql")
-        .args([request_database_url(), "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            request_database_url(),
+            "-X",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()?;
     anyhow::ensure!(
         output.status.success(),
@@ -98,7 +104,10 @@ fn spawn_child(role: &str, envs: &[(&str, String)]) -> anyhow::Result<std::proce
 fn child_result(output: &[u8]) -> anyhow::Result<Value> {
     let line = String::from_utf8_lossy(output)
         .lines()
-        .find_map(|line| line.split_once(RESULT_PREFIX).map(|(_, json)| json.to_owned()))
+        .find_map(|line| {
+            line.split_once(RESULT_PREFIX)
+                .map(|(_, json)| json.to_owned())
+        })
         .context("child printed no result line")?;
     Ok(serde_json::from_str(&line)?)
 }
@@ -140,12 +149,13 @@ impl MLSAPIClient for ResolverApiClient {
         let method = match request.method.as_str() {
             "GET" => reqwest::Method::GET,
             "POST" => reqwest::Method::POST,
-            other => return Err(OrchestratorError::Api(format!("unsupported method {other}"))),
+            other => {
+                return Err(OrchestratorError::Api(format!(
+                    "unsupported method {other}"
+                )))
+            }
         };
-        let mut req = self
-            .client
-            .request(method, &url)
-            .bearer_auth(&self.bearer);
+        let mut req = self.client.request(method, &url).bearer_auth(&self.bearer);
         if let Some(body) = request.body {
             req = req
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -173,7 +183,9 @@ impl MLSAPIClient for ResolverApiClient {
         _limit: u32,
         _cursor: Option<&str>,
     ) -> Result<catbird_mls::orchestrator::ConversationListPage, OrchestratorError> {
-        Err(OrchestratorError::Api("get_conversations outside projection".into()))
+        Err(OrchestratorError::Api(
+            "get_conversations outside projection".into(),
+        ))
     }
 
     async fn get_messages(
@@ -184,8 +196,16 @@ impl MLSAPIClient for ResolverApiClient {
         _message_type: Option<&str>,
         _from_epoch: Option<u32>,
         _to_epoch: Option<u32>,
-    ) -> Result<(Vec<catbird_mls::orchestrator::IncomingEnvelope>, Option<String>), OrchestratorError> {
-        Err(OrchestratorError::Api("get_messages outside projection".into()))
+    ) -> Result<
+        (
+            Vec<catbird_mls::orchestrator::IncomingEnvelope>,
+            Option<String>,
+        ),
+        OrchestratorError,
+    > {
+        Err(OrchestratorError::Api(
+            "get_messages outside projection".into(),
+        ))
     }
 
     async fn get_key_packages(
@@ -193,11 +213,17 @@ impl MLSAPIClient for ResolverApiClient {
         _actor_device_id: &str,
         _dids: &[String],
     ) -> Result<Vec<catbird_mls::orchestrator::KeyPackageRef>, OrchestratorError> {
-        Err(OrchestratorError::Api("get_key_packages outside projection".into()))
+        Err(OrchestratorError::Api(
+            "get_key_packages outside projection".into(),
+        ))
     }
 
-    async fn get_key_package_stats(&self) -> Result<catbird_mls::orchestrator::KeyPackageStats, OrchestratorError> {
-        Err(OrchestratorError::Api("get_key_package_stats outside projection".into()))
+    async fn get_key_package_stats(
+        &self,
+    ) -> Result<catbird_mls::orchestrator::KeyPackageStats, OrchestratorError> {
+        Err(OrchestratorError::Api(
+            "get_key_package_stats outside projection".into(),
+        ))
     }
 
     async fn sync_key_packages(
@@ -205,18 +231,24 @@ impl MLSAPIClient for ResolverApiClient {
         _local_hashes: &[String],
         _device_id: &str,
     ) -> Result<catbird_mls::orchestrator::KeyPackageSyncResult, OrchestratorError> {
-        Err(OrchestratorError::Api("sync_key_packages outside projection".into()))
+        Err(OrchestratorError::Api(
+            "sync_key_packages outside projection".into(),
+        ))
     }
 
     async fn list_devices(
         &self,
         _actor_device_id: &str,
     ) -> Result<Vec<catbird_mls::orchestrator::DeviceInfo>, OrchestratorError> {
-        Err(OrchestratorError::Api("list_devices outside projection".into()))
+        Err(OrchestratorError::Api(
+            "list_devices outside projection".into(),
+        ))
     }
 
     async fn get_group_info(&self, _convo_id: &str) -> Result<Vec<u8>, OrchestratorError> {
-        Err(OrchestratorError::Api("get_group_info outside projection".into()))
+        Err(OrchestratorError::Api(
+            "get_group_info outside projection".into(),
+        ))
     }
 }
 
@@ -385,15 +417,23 @@ async fn c11_committed_publication_lost_response_resolves_after_process_restart(
     let request = f.request_id;
     let sender = f.sender.take().context("sender store")?;
     let staged_journal = staged::journal(&sender, request)?;
-    assert_eq!(staged_journal.phase, DirectRequestJournalPhase::OutcomeUnknown);
-    assert_eq!(staged_journal.publish_request.as_deref(), Some(f.exact_publication.as_slice()));
+    assert_eq!(
+        staged_journal.phase,
+        DirectRequestJournalPhase::OutcomeUnknown
+    );
+    assert_eq!(
+        staged_journal.publish_request.as_deref(),
+        Some(f.exact_publication.as_slice())
+    );
     let package_status_sql = format!(
         "SELECT status FROM chat.key_packages WHERE key_package_ref=decode('{}','hex')",
         hex::encode(&f.bob_package_ref)
     );
     assert_eq!(psql(&package_status_sql)?, "reserved");
     assert_eq!(
-        count(&format!("SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{request}'"))?,
+        count(&format!(
+            "SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{request}'"
+        ))?,
         0
     );
 
@@ -408,11 +448,16 @@ async fn c11_committed_publication_lost_response_resolves_after_process_restart(
     );
     assert_eq!(
         transport.trace(),
-        &[FaultBoundary::BeforeRequest, FaultBoundary::AfterRequestBeforeResponse]
+        &[
+            FaultBoundary::BeforeRequest,
+            FaultBoundary::AfterRequestBeforeResponse
+        ]
     );
     let committed_graph = server_graph(request, f.conversation_id)?;
     assert_eq!(
-        count(&format!("SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{request}'"))?,
+        count(&format!(
+            "SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{request}'"
+        ))?,
         1,
         "server must have committed the publication whose response was lost"
     );
@@ -455,14 +500,13 @@ async fn c11_committed_publication_lost_response_resolves_after_process_restart(
     std::fs::remove_file(&ready).ok();
     {
         use std::os::unix::process::ExitStatusExt as _;
-        assert_eq!(holder_status.signal(), Some(9), "holder must die by SIGKILL");
+        assert_eq!(
+            holder_status.signal(),
+            Some(9),
+            "holder must die by SIGKILL"
+        );
     }
-    let holder_result = child_result(
-        holder_line
-            .await?
-            .context("holder result line")?
-            .as_bytes(),
-    )?;
+    let holder_result = child_result(holder_line.await?.context("holder result line")?.as_bytes())?;
     assert_eq!(holder_result["pid"], holder_pid);
     assert_eq!(holder_result["phase"], "OutcomeUnknown");
     assert_ne!(holder_pid, std::process::id());
@@ -475,12 +519,16 @@ async fn c11_committed_publication_lost_response_resolves_after_process_restart(
         ("C11_BASE_URL", f.server.base_url.clone()),
         (
             "C11_BEARER",
-            f.alice.scoped_jwt_with_jti(staged::PUBLISH_NSID, Uuid::new_v4()),
+            f.alice
+                .scoped_jwt_with_jti(staged::PUBLISH_NSID, Uuid::new_v4()),
         ),
         ("C11_ACTOR_DID", f.alice.did.clone()),
         ("C11_ACTOR_DEVICE", f.alice.device_id.to_string()),
         ("C11_DRAFT_ID", f.draft_id.clone()),
-        ("C11_AUTHORITY_KEY", hex::encode(&f.server.receipt_public_key)),
+        (
+            "C11_AUTHORITY_KEY",
+            hex::encode(&f.server.receipt_public_key),
+        ),
         ("C11_AUTHORITY_DOC", hex::encode(&f.server.receipt_document)),
     ];
     let resolver = spawn_child("resolver", &resolver_envs)?;
@@ -490,8 +538,14 @@ async fn c11_committed_publication_lost_response_resolves_after_process_restart(
     assert_ne!(resolved["pid"], holder_pid);
     assert_ne!(resolved["pid"], std::process::id());
     assert_eq!(resolved["phaseBefore"], "OutcomeUnknown");
-    assert_eq!(resolved["phaseAfter"], "RequestSent", "projected exactly once");
-    assert_eq!(resolved["hostConversations"], 1, "exactly one host conversation");
+    assert_eq!(
+        resolved["phaseAfter"], "RequestSent",
+        "projected exactly once"
+    );
+    assert_eq!(
+        resolved["hostConversations"], 1,
+        "exactly one host conversation"
+    );
     assert_eq!(resolved["projections"], 1, "exactly one projection");
     assert_eq!(resolved["journalRows"], 1);
 
@@ -504,12 +558,16 @@ async fn c11_committed_publication_lost_response_resolves_after_process_restart(
             ("C11_BASE_URL", f.server.base_url.clone()),
             (
                 "C11_BEARER",
-                f.alice.scoped_jwt_with_jti(staged::PUBLISH_NSID, Uuid::new_v4()),
+                f.alice
+                    .scoped_jwt_with_jti(staged::PUBLISH_NSID, Uuid::new_v4()),
             ),
             ("C11_ACTOR_DID", f.alice.did.clone()),
             ("C11_ACTOR_DEVICE", f.alice.device_id.to_string()),
             ("C11_DRAFT_ID", f.draft_id.clone()),
-            ("C11_AUTHORITY_KEY", hex::encode(&f.server.receipt_public_key)),
+            (
+                "C11_AUTHORITY_KEY",
+                hex::encode(&f.server.receipt_public_key),
+            ),
             ("C11_AUTHORITY_DOC", hex::encode(&f.server.receipt_document)),
         ],
     )?;
@@ -529,7 +587,10 @@ async fn c11_committed_publication_lost_response_resolves_after_process_restart(
     let persisted_proj = sender_reopened
         .read_direct_request_projection(&f.conversation_id.to_string())?
         .context("persisted projection must exist on disk")?;
-    assert!(!persisted_proj.is_empty(), "persisted projection bytes must be present");
+    assert!(
+        !persisted_proj.is_empty(),
+        "persisted projection bytes must be present"
+    );
     assert_eq!(
         sender_reopened.list_direct_request_projections()?.len(),
         1,
@@ -568,9 +629,8 @@ async fn c11_committed_publication_lost_response_resolves_after_process_restart(
         hex::encode(&durable.bootstrap.welcome),
         "server Welcome must be the durable journal Welcome"
     );
-    let server_signed: Value = serde_json::from_slice(
-        &STANDARD.decode(fields.collect::<String>().replace('\n', ""))?,
-    )?;
+    let server_signed: Value =
+        serde_json::from_slice(&STANDARD.decode(fields.collect::<String>().replace('\n', ""))?)?;
     assert_eq!(server_signed, durable_wrapper["signedRequest"]);
 
     // 5. Exactly-once server effects; resolution did not mutate the server.
@@ -582,13 +642,19 @@ async fn c11_committed_publication_lost_response_resolves_after_process_restart(
         "exactly one key package consumed"
     );
     assert_eq!(
-        count(&format!("SELECT count(*) FROM chat.direct_request_push_events WHERE request_id='{request}'"))?,
+        count(&format!(
+            "SELECT count(*) FROM chat.direct_request_push_events WHERE request_id='{request}'"
+        ))?,
         1,
         "exactly one notification event"
     );
     let snapshot = request_database_snapshot(request)?;
     assert_eq!(
-        (snapshot.request_rows, snapshot.message_rows, snapshot.welcome_rows),
+        (
+            snapshot.request_rows,
+            snapshot.message_rows,
+            snapshot.welcome_rows
+        ),
         (1, 1, 1)
     );
 

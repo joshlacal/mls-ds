@@ -66,7 +66,15 @@ impl Drop for DedicatedDatabase {
 
 fn psql_maintenance(sql: &str) -> anyhow::Result<()> {
     let output = Command::new("psql")
-        .args([MAINTENANCE_URL, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            MAINTENANCE_URL,
+            "-X",
+            "-q",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()?;
     anyhow::ensure!(
         output.status.success(),
@@ -90,7 +98,17 @@ fn psql_on(db_url: &str, sql: &str) -> anyhow::Result<()> {
 
 fn psql_value(db_url: &str, sql: &str) -> anyhow::Result<String> {
     let output = Command::new("psql")
-        .args([db_url, "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .args([
+            db_url,
+            "-X",
+            "-q",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
         .output()?;
     anyhow::ensure!(
         output.status.success(),
@@ -171,7 +189,11 @@ fn declare_chat_authority(root: &Path, did: &str, delivery_service: &str) -> any
     Ok(())
 }
 fn publish_pds_device_key(root: &Path, party: &FederatedParty) -> anyhow::Result<()> {
-    anyhow::ensure!(party.public.len() == 32, "native MLS signer is {} bytes; PDS fixture expects Ed25519", party.public.len());
+    anyhow::ensure!(
+        party.public.len() == 32,
+        "native MLS signer is {} bytes; PDS fixture expects Ed25519",
+        party.public.len()
+    );
     let dir = root.join("_policy").join("deviceKeys");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
@@ -188,7 +210,6 @@ fn publish_pds_device_key(root: &Path, party: &FederatedParty) -> anyhow::Result
     )?;
     Ok(())
 }
-
 
 fn ds_did_document(
     did: &str,
@@ -271,16 +292,28 @@ impl FederatedAuthorityServer {
     ) -> anyhow::Result<Self> {
         let db_url = format!("postgresql://127.0.0.1:5432/{db_name}");
         let db = create_database_clone("catbird_direct_requests_test_20260919", db_name)?;
-        if psql_value(&db_url, "SELECT to_regclass('chat.direct_request_remote_leases') IS NULL")? == "t" {
+        if psql_value(
+            &db_url,
+            "SELECT to_regclass('chat.direct_request_remote_leases') IS NULL",
+        )? == "t"
+        {
             psql_on(
                 &db_url,
-                include_str!("../../server/migrations/20260919000022_federated_transport_inbox.sql"),
+                include_str!(
+                    "../../server/migrations/20260919000022_federated_transport_inbox.sql"
+                ),
             )?;
         }
-        if psql_value(&db_url, "SELECT to_regclass('chat.direct_request_outbound_routes_actor_recent') IS NULL")? == "t" {
+        if psql_value(
+            &db_url,
+            "SELECT to_regclass('chat.direct_request_outbound_routes_actor_recent') IS NULL",
+        )? == "t"
+        {
             psql_on(
                 &db_url,
-                include_str!("../../server/migrations/20260919000023_expired_federated_lease_release.sql"),
+                include_str!(
+                    "../../server/migrations/20260919000023_expired_federated_lease_release.sql"
+                ),
             )?;
         }
         psql_on(
@@ -289,7 +322,9 @@ impl FederatedAuthorityServer {
         )?;
         psql_on(
             &db_url,
-            include_str!("../../server/migrations/20260919000025_federated_inventory_conversation_items.sql"),
+            include_str!(
+                "../../server/migrations/20260919000025_federated_inventory_conversation_items.sql"
+            ),
         )?;
         bootstrap_federation_tables(&db_url)?;
         // Each private clone is a new authority; discard the base fixture's unrelated receipt history.
@@ -308,7 +343,10 @@ impl FederatedAuthorityServer {
             &db_url,
             "SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE",
         )?;
-        anyhow::ensure!(!cursor_key_id.is_empty(), "fixture clone lacks protocol identity");
+        anyhow::ensure!(
+            !cursor_key_id.is_empty(),
+            "fixture clone lacks protocol identity"
+        );
 
         let binary = std::env::var("REQUEST_SERVER_FIXTURE_BINARY")
             .map(std::path::PathBuf::from)
@@ -331,18 +369,28 @@ impl FederatedAuthorityServer {
             .env("DID_RESOLUTION_HOST_ALLOWLIST", https.hosts.join(","))
             .env("CHAT_CUTOVER_ENABLED", "1")
             .env("CHAT_DIRECT_REQUESTS_ENABLED", "1")
-            .env("CHAT_SUBSCRIPTION_ENDPOINT", "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents")
+            .env(
+                "CHAT_SUBSCRIPTION_ENDPOINT",
+                "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents",
+            )
             .env("FEDERATION_ALLOW_INSECURE_HTTP", "true")
             .env("FEDERATION_MODE", "open_intelligent")
             .env("CHAT_CURSOR_KEY_ID", &cursor_key_id)
-            .env("CHAT_CURSOR_SEALING_SECRET", URL_SAFE_NO_PAD.encode([0xA5_u8; 32]))
+            .env(
+                "CHAT_CURSOR_SEALING_SECRET",
+                URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
+            )
             .env(
                 "CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM",
-                receipt_key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?.as_str(),
+                receipt_key
+                    .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
+                    .as_str(),
             )
             .env(
                 "SIGNING_KEY_PEM",
-                service_key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?.as_str(),
+                service_key
+                    .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
+                    .as_str(),
             )
             .env(
                 "CHAT_REQUEST_RECEIPT_DID_DOCUMENT_JSON",
@@ -360,7 +408,10 @@ impl FederatedAuthorityServer {
         let mut line = String::new();
         std::io::BufRead::read_line(&mut reader, &mut line)?;
         let ready: Value = serde_json::from_str(&line)?;
-        let base_url = ready["baseUrl"].as_str().context("missing baseUrl")?.to_owned();
+        let base_url = ready["baseUrl"]
+            .as_str()
+            .context("missing baseUrl")?
+            .to_owned();
         anyhow::ensure!(
             base_url == self_endpoint,
             "server fixture bound to {base_url} but expected {self_endpoint}"
@@ -413,18 +464,28 @@ impl FederatedAuthorityServer {
             .env("DID_RESOLUTION_HOST_ALLOWLIST", https.hosts.join(","))
             .env("CHAT_CUTOVER_ENABLED", "1")
             .env("CHAT_DIRECT_REQUESTS_ENABLED", "1")
-            .env("CHAT_SUBSCRIPTION_ENDPOINT", "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents")
+            .env(
+                "CHAT_SUBSCRIPTION_ENDPOINT",
+                "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents",
+            )
             .env("FEDERATION_ALLOW_INSECURE_HTTP", "true")
             .env("FEDERATION_MODE", "open_intelligent")
             .env("CHAT_CURSOR_KEY_ID", &cursor_key_id)
-            .env("CHAT_CURSOR_SEALING_SECRET", URL_SAFE_NO_PAD.encode([0xA5_u8; 32]))
+            .env(
+                "CHAT_CURSOR_SEALING_SECRET",
+                URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
+            )
             .env(
                 "CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM",
-                receipt_key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?.as_str(),
+                receipt_key
+                    .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
+                    .as_str(),
             )
             .env(
                 "SIGNING_KEY_PEM",
-                service_key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?.as_str(),
+                service_key
+                    .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
+                    .as_str(),
             )
             .env(
                 "CHAT_REQUEST_RECEIPT_DID_DOCUMENT_JSON",
@@ -445,7 +506,10 @@ impl FederatedAuthorityServer {
         let mut line = String::new();
         std::io::BufRead::read_line(&mut reader, &mut line)?;
         let ready: Value = serde_json::from_str(&line)?;
-        let base_url = ready["baseUrl"].as_str().context("missing baseUrl")?.to_owned();
+        let base_url = ready["baseUrl"]
+            .as_str()
+            .context("missing baseUrl")?
+            .to_owned();
         anyhow::ensure!(
             base_url == self_endpoint,
             "restarted server fixture bound to {base_url} but expected {self_endpoint}"
@@ -608,7 +672,10 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         "C33 requires the exact guarded local synthetic template"
     );
     anyhow::ensure!(
-        psql_value(template, "SELECT to_regclass('chat.protocol_instances') IS NOT NULL")? == "t",
+        psql_value(
+            template,
+            "SELECT to_regclass('chat.protocol_instances') IS NOT NULL"
+        )? == "t",
         "guarded synthetic template has no chat schema"
     );
 
@@ -619,12 +686,26 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     let ds1_did = format!("did:web:ds1-{run}.catbird.blue");
     let ds2_did = format!("did:web:ds2-{run}.catbird.blue");
 
-    let alice = FederatedParty::new(format!("did:web:alice-{run}.catbird.blue"), "c33-alice",
-        if reverse { &ds2_did } else { &ds1_did })?;
-    let bob = FederatedParty::new(format!("did:web:bob-{run}.catbird.blue"), "c33-bob",
-        if reverse { &ds1_did } else { &ds2_did })?;
-    let charlie = FederatedParty::new(format!("did:web:charlie-{run}.catbird.blue"), "c33-charlie", &ds1_did)?;
-    let dana = FederatedParty::new(format!("did:web:dana-{run}.catbird.blue"), "c33-dana", &ds2_did)?;
+    let alice = FederatedParty::new(
+        format!("did:web:alice-{run}.catbird.blue"),
+        "c33-alice",
+        if reverse { &ds2_did } else { &ds1_did },
+    )?;
+    let bob = FederatedParty::new(
+        format!("did:web:bob-{run}.catbird.blue"),
+        "c33-bob",
+        if reverse { &ds1_did } else { &ds2_did },
+    )?;
+    let charlie = FederatedParty::new(
+        format!("did:web:charlie-{run}.catbird.blue"),
+        "c33-charlie",
+        &ds1_did,
+    )?;
+    let dana = FederatedParty::new(
+        format!("did:web:dana-{run}.catbird.blue"),
+        "c33-dana",
+        &ds2_did,
+    )?;
 
     // Pre-reserve loopback ports before starting HttpsDidFixture and servers
     let port_a = reserve_loopback_port()?;
@@ -653,27 +734,63 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         &[
             (ds1_did.clone(), ds1_doc),
             (ds2_did.clone(), ds2_doc),
-            (alice.svc.did.clone(), home_document(&alice, if reverse { &server_b_url } else { &server_a_url })?),
-            (bob.svc.did.clone(), home_document(&bob, if reverse { &server_a_url } else { &server_b_url })?),
-            (charlie.svc.did.clone(), home_document(&charlie, &server_a_url)?),
+            (
+                alice.svc.did.clone(),
+                home_document(
+                    &alice,
+                    if reverse {
+                        &server_b_url
+                    } else {
+                        &server_a_url
+                    },
+                )?,
+            ),
+            (
+                bob.svc.did.clone(),
+                home_document(
+                    &bob,
+                    if reverse {
+                        &server_a_url
+                    } else {
+                        &server_b_url
+                    },
+                )?,
+            ),
+            (
+                charlie.svc.did.clone(),
+                home_document(&charlie, &server_a_url)?,
+            ),
             (dana.svc.did.clone(), home_document(&dana, &server_b_url)?),
         ],
     )?;
 
     // Each orientation has the same deterministic coordinator, but a different sender home.
-    declare_chat_authority(&https.root, &alice.svc.did, if reverse { &ds2_did } else { &ds1_did })?;
-    declare_chat_authority(&https.root, &bob.svc.did, if reverse { &ds1_did } else { &ds2_did })?;
+    declare_chat_authority(
+        &https.root,
+        &alice.svc.did,
+        if reverse { &ds2_did } else { &ds1_did },
+    )?;
+    declare_chat_authority(
+        &https.root,
+        &bob.svc.did,
+        if reverse { &ds1_did } else { &ds2_did },
+    )?;
     declare_chat_authority(&https.root, &charlie.svc.did, &ds1_did)?;
     declare_chat_authority(&https.root, &dana.svc.did, &ds2_did)?;
     for party in [&alice, &bob, &charlie, &dana] {
         publish_pds_device_key(&https.root, party)?;
     }
 
-
     let client = reqwest::Client::builder().build()?;
 
-    let db1_name = format!("catbird_direct_requests_fault_{}", &Uuid::new_v4().simple().to_string()[..16]);
-    let db2_name = format!("catbird_direct_requests_fault_{}", &Uuid::new_v4().simple().to_string()[..16]);
+    let db1_name = format!(
+        "catbird_direct_requests_fault_{}",
+        &Uuid::new_v4().simple().to_string()[..16]
+    );
+    let db2_name = format!(
+        "catbird_direct_requests_fault_{}",
+        &Uuid::new_v4().simple().to_string()[..16]
+    );
 
     // 2. Launch two independent server processes with independent databases on reserved ports
     let server_a = FederatedAuthorityServer::start(&ds1_did, port_a, &db1_name, &https, 61)?;
@@ -699,9 +816,16 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         &server_b.database_url,
         &format!("INSERT INTO federation_peers(ds_did, status) VALUES('{ds1_did}', 'allow') ON CONFLICT DO NOTHING;"),
     )?;
-    let alice_home = if reverse { server_b.base_url.clone() } else { server_a.base_url.clone() };
-    let bob_home = if reverse { server_a.base_url.clone() } else { server_b.base_url.clone() };
-
+    let alice_home = if reverse {
+        server_b.base_url.clone()
+    } else {
+        server_a.base_url.clone()
+    };
+    let bob_home = if reverse {
+        server_a.base_url.clone()
+    } else {
+        server_b.base_url.clone()
+    };
 
     // -------------------------------------------------------------------------
     // Step 1: Pre-provision Bob's direct request key on his independent home DS.
@@ -763,26 +887,41 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         unauthorized_body["firstMessageId"] = json!(Uuid::new_v4().to_string());
         unauthorized_body["conversationId"] = json!(Uuid::new_v4().to_string());
         let unauthorized_signed = signed_mls_request(
-            &alice.engine, &alice.identity, DirectRequestKind::Prepare, unauthorized_body,
+            &alice.engine,
+            &alice.identity,
+            DirectRequestKind::Prepare,
+            unauthorized_body,
         )?;
-        let pds_record = https.root.join("_policy").join("deviceKeys").join(quote(&bob.svc.did));
+        let pds_record = https
+            .root
+            .join("_policy")
+            .join("deviceKeys")
+            .join(quote(&bob.svc.did));
         let authorized = std::fs::read(&pds_record)?;
         std::fs::write(&pds_record, b"{\"records\":[]}")?;
-        let (status, bytes) = alice.svc.post(
-            &client, &alice_home, "blue.catbird.chat.prepareDirectRequest",
-            &json!({ "signedRequest": unauthorized_signed }), true,
-        ).await?;
+        let (status, bytes) = alice
+            .svc
+            .post(
+                &client,
+                &alice_home,
+                "blue.catbird.chat.prepareDirectRequest",
+                &json!({ "signedRequest": unauthorized_signed }),
+                true,
+            )
+            .await?;
         std::fs::write(&pds_record, authorized)?;
-        anyhow::ensure!(status == StatusCode::BAD_REQUEST
-            && serde_json::from_slice::<Value>(&bytes)?["error"] == "RecipientKeysUnavailable",
-            "PDS-unauthorized recipient key accepted: {status} {}", String::from_utf8_lossy(&bytes));
+        anyhow::ensure!(
+            status == StatusCode::BAD_REQUEST
+                && serde_json::from_slice::<Value>(&bytes)?["error"] == "RecipientKeysUnavailable",
+            "PDS-unauthorized recipient key accepted: {status} {}",
+            String::from_utf8_lossy(&bytes)
+        );
         assert_eq!(psql_count(&server_a.database_url,
             &format!("SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{unauthorized_request_id}'"))?, 0);
         assert_eq!(psql_count(&server_b.database_url,
             &format!("SELECT count(*) FROM chat.direct_request_remote_leases WHERE request_id='{unauthorized_request_id}' AND status='active'"))?, 0,
             "failed recipient authorization left an active peer package reservation");
     }
-
 
     // Alice calls her own DS; the coordinator is always DS-A.
     let (prep_status, prep_bytes) = alice
@@ -808,7 +947,9 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         .context("missing preparation outcome")?;
     // Use the verified, normalized snapshot: HTTP bytes wrappers are not signing-body bytes.
     let preparation = protocol::verify_direct_request_preparation_for_authority(
-        &server_a.did, &serde_json::to_vec(raw_preparation)?, &server_a.receipt_public_key
+        &server_a.did,
+        &serde_json::to_vec(raw_preparation)?,
+        &server_a.receipt_public_key,
     )?;
 
     let selected = preparation["selectedDevices"]
@@ -822,21 +963,33 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     // -------------------------------------------------------------------------
     // Bob may have opened inventory before Alice publishes; the later S2S
     // delivery must not replay that empty, receipt-bound snapshot.
-    let (before_status, before_bytes) = bob.svc.get(
-        &client,
-        &bob_home,
-        "blue.catbird.chat.getConversations",
-        &[
-            ("supportedProtocolVersions".into(), "1".into()),
-            ("supportedProtocolVersions".into(), "2".into()),
-        ],
-    ).await?;
-    anyhow::ensure!(before_status == StatusCode::OK, "prepublication inventory failed");
+    let (before_status, before_bytes) = bob
+        .svc
+        .get(
+            &client,
+            &bob_home,
+            "blue.catbird.chat.getConversations",
+            &[
+                ("supportedProtocolVersions".into(), "1".into()),
+                ("supportedProtocolVersions".into(), "2".into()),
+            ],
+        )
+        .await?;
+    anyhow::ensure!(
+        before_status == StatusCode::OK,
+        "prepublication inventory failed"
+    );
     let before_inventory: Value = serde_json::from_slice(&before_bytes)?;
-    let before_session = before_inventory["inventorySessionId"].as_str()
-        .context("missing prepublication session")?.to_owned();
-    anyhow::ensure!(before_inventory["items"].as_array().is_some_and(Vec::is_empty),
-        "Bob must have no conversation before publication");
+    let before_session = before_inventory["inventorySessionId"]
+        .as_str()
+        .context("missing prepublication session")?
+        .to_owned();
+    anyhow::ensure!(
+        before_inventory["items"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "Bob must have no conversation before publication"
+    );
 
     // Step 3: Publish Encrypted Introduction on Server A
     // -------------------------------------------------------------------------
@@ -859,47 +1012,49 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         &alice.public,
     )?;
 
-    let journal = alice.engine.prepare_direct_request(&DirectRequestBootstrapInput {
-        draft_id: Uuid::new_v4().to_string(),
-        context_json: serde_json::to_vec(&context_val)?,
-        group_id: rand::random::<[u8; 32]>().to_vec(),
-        generation: 0,
-        state_version: 1,
-        key_packages: selected
-            .iter()
-            .map(|device| {
-                Ok(STANDARD.decode(
-                    device["keyPackage"]["bytes"]["$bytes"]
-                        .as_str()
-                        .or_else(|| device["keyPackage"]["bytes"].as_str())
-                        .context("selected package bytes")?,
-                )?)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?,
-        expected_package_refs: selected
-            .iter()
-            .map(|device| {
-                Ok(STANDARD.decode(
-                    device["keyPackage"]["keyPackageRef"]["$bytes"]
-                        .as_str()
-                        .or_else(|| device["keyPackage"]["keyPackageRef"].as_str())
-                        .context("selected package ref")?,
-                )?)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?,
-        authority_import_until: 4_000_000_000,
-        preparation_request_digest: *verified_prepare.request_digest(),
-        receipt_authority_key: server_a.receipt_public_key.clone(),
-        text: "Hello from Alice over Catbird MLS Federation".into(),
-        invitation: None,
-        metadata: GroupMetadataV1 {
-            version: 1,
-            title: String::new(),
-            description: String::new(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-        },
-    })?;
+    let journal = alice
+        .engine
+        .prepare_direct_request(&DirectRequestBootstrapInput {
+            draft_id: Uuid::new_v4().to_string(),
+            context_json: serde_json::to_vec(&context_val)?,
+            group_id: rand::random::<[u8; 32]>().to_vec(),
+            generation: 0,
+            state_version: 1,
+            key_packages: selected
+                .iter()
+                .map(|device| {
+                    Ok(STANDARD.decode(
+                        device["keyPackage"]["bytes"]["$bytes"]
+                            .as_str()
+                            .or_else(|| device["keyPackage"]["bytes"].as_str())
+                            .context("selected package bytes")?,
+                    )?)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            expected_package_refs: selected
+                .iter()
+                .map(|device| {
+                    Ok(STANDARD.decode(
+                        device["keyPackage"]["keyPackageRef"]["$bytes"]
+                            .as_str()
+                            .or_else(|| device["keyPackage"]["keyPackageRef"].as_str())
+                            .context("selected package ref")?,
+                    )?)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            authority_import_until: 4_000_000_000,
+            preparation_request_digest: *verified_prepare.request_digest(),
+            receipt_authority_key: server_a.receipt_public_key.clone(),
+            text: "Hello from Alice over Catbird MLS Federation".into(),
+            invitation: None,
+            metadata: GroupMetadataV1 {
+                version: 1,
+                title: String::new(),
+                description: String::new(),
+                avatar_blob_locator: None,
+                avatar_content_type: None,
+            },
+        })?;
 
     let bootstrap = &journal.bootstrap;
     let mut publish_body = prepare_signed["body"].clone();
@@ -911,11 +1066,12 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         json!(STANDARD.encode(verified_prepare.request_digest()));
     publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
     publish_body["next"] = bootstrap.coordinates.clone();
-    publish_body["importUntil"] = json!(
-        chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
-            .context("MLS final-tree import deadline")?
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-    );
+    publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
+        bootstrap.import_until as i64,
+        0
+    )
+    .context("MLS final-tree import deadline")?
+    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
 
     let artifact = |data: &[u8], content_type: &str| {
         json!({
@@ -987,8 +1143,9 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         DirectRequestKind::Publish,
         publish_body,
     )?;
-    alice.engine.persist_request_publication(&journal.request_id, &serde_json::to_vec(&publish_signed)?)?;
-
+    alice
+        .engine
+        .persist_request_publication(&journal.request_id, &serde_json::to_vec(&publish_signed)?)?;
 
     // In the sender-coordinator orientation, commit while the recipient authority is offline.
     // A lost HTTP response must not turn the durable publication into a second request.
@@ -1001,22 +1158,42 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::AUTHORIZATION,
-        format!("Bearer {}", alice.svc.scoped_jwt_with_jti(
-            "blue.catbird.chat.publishDirectRequest", Uuid::new_v4()
-        )).parse()?,
+        format!(
+            "Bearer {}",
+            alice
+                .svc
+                .scoped_jwt_with_jti("blue.catbird.chat.publishDirectRequest", Uuid::new_v4())
+        )
+        .parse()?,
     );
-    let fault_client = reqwest::Client::builder().default_headers(headers).build()?;
-    let lost = transport.post_json(
-        &fault_client,
-        &format!("{alice_home}/xrpc/blue.catbird.chat.publishDirectRequest"),
-        &json!({ "signedRequest": publish_signed }),
-    ).await.expect_err("publication response must be lost after server commits");
-    anyhow::ensure!(lost.to_string().contains("AfterRequestBeforeResponse"),
-        "unexpected transport failure: {lost:#}");
-    assert_eq!(transport.trace(),
-        &[FaultBoundary::BeforeRequest, FaultBoundary::AfterRequestBeforeResponse]);
-    let first_commit_count = psql_value(&server_a.database_url,
-        &format!("SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{request_id}'"))?;
+    let fault_client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()?;
+    let lost = transport
+        .post_json(
+            &fault_client,
+            &format!("{alice_home}/xrpc/blue.catbird.chat.publishDirectRequest"),
+            &json!({ "signedRequest": publish_signed }),
+        )
+        .await
+        .expect_err("publication response must be lost after server commits");
+    anyhow::ensure!(
+        lost.to_string().contains("AfterRequestBeforeResponse"),
+        "unexpected transport failure: {lost:#}"
+    );
+    assert_eq!(
+        transport.trace(),
+        &[
+            FaultBoundary::BeforeRequest,
+            FaultBoundary::AfterRequestBeforeResponse
+        ]
+    );
+    let first_commit_count = psql_value(
+        &server_a.database_url,
+        &format!(
+            "SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{request_id}'"
+        ),
+    )?;
     if !reverse {
         assert_eq!(psql_count(&server_b.database_url,
             &format!("SELECT count(*) FROM chat.direct_request_transport_inbox WHERE request_id='{request_id}'"))?, 0,
@@ -1038,7 +1215,10 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
                 break;
             }
         }
-        anyhow::ensure!(retry_after_limit, "C33 queued introduction stopped retrying after five peer failures");
+        anyhow::ensure!(
+            retry_after_limit,
+            "C33 queued introduction stopped retrying after five peer failures"
+        );
         server_b.restart(port_b, &https, 71)?;
         psql_on(
             &server_a.database_url,
@@ -1065,32 +1245,49 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
             "outbound queue worker failed to auto-replay delivery to recovered peer before client retry"
         );
     }
-    let (pub_status, pub_bytes) = alice.svc.post(
-        &client, &alice_home, "blue.catbird.chat.publishDirectRequest",
-        &json!({ "signedRequest": publish_signed }), true
-    ).await?;
+    let (pub_status, pub_bytes) = alice
+        .svc
+        .post(
+            &client,
+            &alice_home,
+            "blue.catbird.chat.publishDirectRequest",
+            &json!({ "signedRequest": publish_signed }),
+            true,
+        )
+        .await?;
     anyhow::ensure!(pub_status == StatusCode::OK,
         "publishDirectRequest replay failed {pub_status} (first committed={first_commit_count}): {}",
         String::from_utf8_lossy(&pub_bytes));
-    anyhow::ensure!(first_commit_count == "1",
+    anyhow::ensure!(
+        first_commit_count == "1",
         "publication not committed after lost client response; signed outcome: {}",
-        String::from_utf8_lossy(&pub_bytes));
+        String::from_utf8_lossy(&pub_bytes)
+    );
     let pub_resp: Value = serde_json::from_slice(&pub_bytes)?;
-    let first_published_receipt = pub_resp.pointer("/outcome")
-        .context("missing committed publication receipt")?.clone();
+    let first_published_receipt = pub_resp
+        .pointer("/outcome")
+        .context("missing committed publication receipt")?
+        .clone();
     if reverse {
-        let (status, bytes) = alice.svc.get(
-            &client, &alice_home, "blue.catbird.chat.getDirectRequestOutcome",
-            &[
-                ("requestId".into(), request_id.to_string()),
-            ],
-        ).await?;
-        anyhow::ensure!(status == StatusCode::OK,
+        let (status, bytes) = alice
+            .svc
+            .get(
+                &client,
+                &alice_home,
+                "blue.catbird.chat.getDirectRequestOutcome",
+                &[("requestId".into(), request_id.to_string())],
+            )
+            .await?;
+        anyhow::ensure!(
+            status == StatusCode::OK,
             "remote sender-home outcome reconciliation failed {status}: {}",
-            String::from_utf8_lossy(&bytes));
+            String::from_utf8_lossy(&bytes)
+        );
         let recovered: Value = serde_json::from_slice(&bytes)?;
-        assert_eq!(recovered["outcome"], first_published_receipt,
-            "sender-home outcome must be the authoritative coordinator receipt after lost response");
+        assert_eq!(
+            recovered["outcome"], first_published_receipt,
+            "sender-home outcome must be the authoritative coordinator receipt after lost response"
+        );
     }
     alice.engine.confirm_request_publication(
         &journal.request_id,
@@ -1134,19 +1331,27 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     // -------------------------------------------------------------------------
     // Step 5: Bob imports the actual Welcome through his own DS.
     // -------------------------------------------------------------------------
-    let (inventory_status, inventory_bytes) = bob.svc.get(
-        &client,
-        &bob_home,
-        "blue.catbird.chat.getConversations",
-        &[
-            ("supportedProtocolVersions".into(), "1".into()),
-            ("supportedProtocolVersions".into(), "2".into()),
-        ],
-    ).await?;
-    anyhow::ensure!(inventory_status == StatusCode::OK,
-        "recipient inventory failed {inventory_status}: {}", String::from_utf8_lossy(&inventory_bytes));
+    let (inventory_status, inventory_bytes) = bob
+        .svc
+        .get(
+            &client,
+            &bob_home,
+            "blue.catbird.chat.getConversations",
+            &[
+                ("supportedProtocolVersions".into(), "1".into()),
+                ("supportedProtocolVersions".into(), "2".into()),
+            ],
+        )
+        .await?;
+    anyhow::ensure!(
+        inventory_status == StatusCode::OK,
+        "recipient inventory failed {inventory_status}: {}",
+        String::from_utf8_lossy(&inventory_bytes)
+    );
     let inventory: Value = serde_json::from_slice(&inventory_bytes)?;
-    let inventory_session = inventory["inventorySessionId"].as_str().context("missing recipient inventory session")?;
+    let inventory_session = inventory["inventorySessionId"]
+        .as_str()
+        .context("missing recipient inventory session")?;
     anyhow::ensure!(
         inventory_session != before_session,
         "recipient home replayed its prepublication empty inventory session"
@@ -1159,7 +1364,8 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         .find(|item| {
             item.pointer("/state/coordinates/conversationId")
                 .or_else(|| item.pointer("/conversationId"))
-                .and_then(|v| v.as_str()) == Some(conversation_id.to_string().as_str())
+                .and_then(|v| v.as_str())
+                == Some(conversation_id.to_string().as_str())
         })
         .context("Bob did not receive remote direct request conversation in getConversations")?;
     let conv_consent = conv_item
@@ -1235,7 +1441,6 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         String::from_utf8_lossy(&wrong_user_bytes)
     );
 
-
     let (welcomes_status, welcomes_bytes) = bob
         .svc
         .get(
@@ -1268,24 +1473,37 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         .context("Bob did not receive pending Welcome on Server B")?;
 
     let delivered_welcome = STANDARD.decode(
-        welcome_item["opaqueWelcome"]["$bytes"].as_str()
+        welcome_item["opaqueWelcome"]["$bytes"]
+            .as_str()
             .or_else(|| welcome_item["opaqueWelcome"].as_str())
-            .context("recipient home did not deliver encrypted Welcome bytes")?
+            .context("recipient home did not deliver encrypted Welcome bytes")?,
     )?;
-    anyhow::ensure!(!delivered_welcome.is_empty(), "empty recipient-home Welcome");
-    let (entry_status, entry_bytes) = bob.svc.get(
-        &client, &bob_home, "blue.catbird.chat.getEntries",
-        &[
-            ("conversationId".into(), conversation_id.to_string()),
-            ("afterSeq".into(), "0".into()),
-            ("limit".into(), "10".into()),
-        ],
-    ).await?;
-    anyhow::ensure!(entry_status == StatusCode::OK,
+    anyhow::ensure!(
+        !delivered_welcome.is_empty(),
+        "empty recipient-home Welcome"
+    );
+    let (entry_status, entry_bytes) = bob
+        .svc
+        .get(
+            &client,
+            &bob_home,
+            "blue.catbird.chat.getEntries",
+            &[
+                ("conversationId".into(), conversation_id.to_string()),
+                ("afterSeq".into(), "0".into()),
+                ("limit".into(), "10".into()),
+            ],
+        )
+        .await?;
+    anyhow::ensure!(
+        entry_status == StatusCode::OK,
         "Bob did not receive signed introduction {entry_status}: {}",
-        String::from_utf8_lossy(&entry_bytes));
+        String::from_utf8_lossy(&entry_bytes)
+    );
     let entry_page: Value = serde_json::from_slice(&entry_bytes)?;
-    let introduction_entry = entry_page["entries"].as_array().context("Bob entries missing")?
+    let introduction_entry = entry_page["entries"]
+        .as_array()
+        .context("Bob entries missing")?
         .iter()
         .find(|entry| entry["seq"] == 1)
         .context("signed introduction absent from recipient home")?;
@@ -1294,36 +1512,57 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         "recipient entry must not carry a field absent from the signed directRequestEntry lexicon"
     );
     let remote_publication = introduction_entry["signedRequest"].clone();
-    let (status, bytes) = bob.svc.get(
-        &client, &bob_home, "blue.catbird.chat.getDirectRequestOutcome",
-        &[("requestId".into(), request_id.to_string())],
-    ).await?;
-    anyhow::ensure!(status == StatusCode::OK,
+    let (status, bytes) = bob
+        .svc
+        .get(
+            &client,
+            &bob_home,
+            "blue.catbird.chat.getDirectRequestOutcome",
+            &[("requestId".into(), request_id.to_string())],
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
         "recipient home did not return publication outcome {status}: {}",
-        String::from_utf8_lossy(&bytes));
+        String::from_utf8_lossy(&bytes)
+    );
     let remote_receipt = serde_json::from_slice::<Value>(&bytes)?["outcome"].clone();
-    anyhow::ensure!(remote_publication.is_object() && remote_receipt.is_object(),
-        "recipient home omitted signed publication or coordinator receipt: {introduction_entry}");
+    anyhow::ensure!(
+        remote_publication.is_object() && remote_receipt.is_object(),
+        "recipient home omitted signed publication or coordinator receipt: {introduction_entry}"
+    );
     anyhow::ensure!(
         introduction_entry["receivedAt"] == remote_receipt["body"]["receipt"]["recordedAt"],
         "recipient entry timestamp must bind to the coordinator's signed publication receipt"
     );
     let verified_publication = protocol::verify_received_signed_request_for_authority(
-        &server_a.did, DirectRequestKind::Publish,
-        &serde_json::to_vec(&remote_publication)?, &alice.public
-    ).context("recipient-sourced signed publication verification")?;
+        &server_a.did,
+        DirectRequestKind::Publish,
+        &serde_json::to_vec(&remote_publication)?,
+        &alice.public,
+    )
+    .context("recipient-sourced signed publication verification")?;
     let verified_receipt = protocol::verify_received_signed_request_for_authority(
-        &server_a.did, DirectRequestKind::Outcome,
-        &serde_json::to_vec(&remote_receipt)?, &server_a.receipt_public_key
-    ).context("recipient-sourced coordinator receipt verification")?;
-    anyhow::ensure!(verified_publication.body()["requestId"] == request_id.to_string()
-        && verified_receipt.body()["receipt"]["requestId"] == request_id.to_string(),
-        "recipient did not receive independently verified introduction and receipt");
+        &server_a.did,
+        DirectRequestKind::Outcome,
+        &serde_json::to_vec(&remote_receipt)?,
+        &server_a.receipt_public_key,
+    )
+    .context("recipient-sourced coordinator receipt verification")?;
+    anyhow::ensure!(
+        verified_publication.body()["requestId"] == request_id.to_string()
+            && verified_receipt.body()["receipt"]["requestId"] == request_id.to_string(),
+        "recipient did not receive independently verified introduction and receipt"
+    );
     let publication = verified_publication.body();
     let artifacts = &publication["artifacts"];
     let wire_bytes = |value: &Value| -> anyhow::Result<Vec<u8>> {
-        Ok(STANDARD.decode(value.as_str().or_else(|| value["$bytes"].as_str())
-            .context("missing delivered byte field")?)?)
+        Ok(STANDARD.decode(
+            value
+                .as_str()
+                .or_else(|| value["$bytes"].as_str())
+                .context("missing delivered byte field")?,
+        )?)
     };
     let recipient_context = json!({
         "protocolVersion": "2",
@@ -1339,14 +1578,21 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     });
     let delivered_bootstrap = DirectRequestBootstrap {
         context_json: serde_json::to_vec(&recipient_context)?,
-        context_hash: wire_bytes(&publication["contextHash"])?.try_into()
+        context_hash: wire_bytes(&publication["contextHash"])?
+            .try_into()
             .map_err(|_| anyhow::anyhow!("invalid delivered context hash"))?,
         coordinates: publication["next"].clone(),
         import_until: chrono::DateTime::parse_from_rfc3339(
-            publication["importUntil"].as_str().context("missing import deadline")?
-        )?.timestamp().try_into()?,
-        expected_package_refs: artifacts["welcome"]["deliveries"].as_array()
-            .context("missing signed deliveries")?.iter()
+            publication["importUntil"]
+                .as_str()
+                .context("missing import deadline")?,
+        )?
+        .timestamp()
+        .try_into()?,
+        expected_package_refs: artifacts["welcome"]["deliveries"]
+            .as_array()
+            .context("missing signed deliveries")?
+            .iter()
             .map(|delivery| wire_bytes(&delivery["provenance"]["keyPackageRef"]))
             .collect::<anyhow::Result<Vec<_>>>()?,
         genesis_group_info: wire_bytes(&artifacts["genesisGroupInfo"]["bytes"])?,
@@ -1367,7 +1613,8 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         receipt_authority_did: server_a.did.clone(),
         receipt_authority_key: server_a.receipt_public_key.clone(),
         preparation_request_digest: wire_bytes(&publication["preparationRequestDigest"])?
-            .try_into().map_err(|_| anyhow::anyhow!("invalid preparation digest"))?,
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid preparation digest"))?,
     };
 
     bob.engine.process_direct_request(&welcome_input)?;
@@ -1377,8 +1624,7 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     };
     let introduction = protocol::decode_direct_request_introduction(&plaintext)?;
     assert_eq!(
-        introduction["text"],
-        "Hello from Alice over Catbird MLS Federation",
+        introduction["text"], "Hello from Alice over Catbird MLS Federation",
         "Bob successfully decrypted Alice's encrypted introduction on Server B"
     );
 
@@ -1450,30 +1696,41 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         request_id.to_string(),
         "acceptance proof binds to the exact request ID"
     );
-    let (replay_status, replay_bytes) = bob.svc.post(
-        &client, &bob_home, "blue.catbird.chat.acceptConversation",
-        &json!({ "directRequest": accept_replay }), true,
-    ).await?;
-    anyhow::ensure!(replay_status == StatusCode::OK
-        && serde_json::from_slice::<Value>(&replay_bytes)? == accept_resp,
+    let (replay_status, replay_bytes) = bob
+        .svc
+        .post(
+            &client,
+            &bob_home,
+            "blue.catbird.chat.acceptConversation",
+            &json!({ "directRequest": accept_replay }),
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        replay_status == StatusCode::OK
+            && serde_json::from_slice::<Value>(&replay_bytes)? == accept_resp,
         "lost acceptance response did not replay the verified outcome: {replay_status}: {}",
-        String::from_utf8_lossy(&replay_bytes));
+        String::from_utf8_lossy(&replay_bytes)
+    );
     assert_eq!(psql_count(
         &server_a.database_url,
         &format!("SELECT count(*) FROM chat.entries WHERE conversation_id='{conversation_id}' AND seq=2"),
     )?, 1, "acceptance response replay duplicated the canonical transition");
     // Parent invariant check: recipient home getEntries seq=2 normalized directRequestAcceptanceEntry
     // hash must equal accept_resp.acceptanceProof.entry canonical entry hash
-    let (accept_entry_status, accept_entry_bytes) = bob.svc.get(
-        &client,
-        &bob_home,
-        "blue.catbird.chat.getEntries",
-        &[
-            ("conversationId".into(), conversation_id.to_string()),
-            ("afterSeq".into(), "1".into()),
-            ("limit".into(), "10".into()),
-        ],
-    ).await?;
+    let (accept_entry_status, accept_entry_bytes) = bob
+        .svc
+        .get(
+            &client,
+            &bob_home,
+            "blue.catbird.chat.getEntries",
+            &[
+                ("conversationId".into(), conversation_id.to_string()),
+                ("afterSeq".into(), "1".into()),
+                ("limit".into(), "10".into()),
+            ],
+        )
+        .await?;
     anyhow::ensure!(
         accept_entry_status == StatusCode::OK,
         "recipient home getEntries seq=2 failed {accept_entry_status}: {}",
@@ -1489,48 +1746,74 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     let proof_entry = accept_resp
         .pointer("/acceptanceProof/entry")
         .context("missing acceptanceProof.entry in accept response")?;
-    anyhow::ensure!(fetched_accept_entry.get("acceptanceProof").is_none(),
-        "recipient acceptance entry must not embed a proof outside its lexicon");
+    anyhow::ensure!(
+        fetched_accept_entry.get("acceptanceProof").is_none(),
+        "recipient acceptance entry must not embed a proof outside its lexicon"
+    );
     let mut proof_entry = proof_entry.clone();
-    proof_entry.as_object_mut().context("acceptance proof entry object")?.remove("$type");
+    proof_entry
+        .as_object_mut()
+        .context("acceptance proof entry object")?
+        .remove("$type");
     let proof_entry = protocol::normalize_read_presentation(
-        &serde_json::to_vec(&proof_entry)?, "directRequestAcceptanceEntry", false)?;
+        &serde_json::to_vec(&proof_entry)?,
+        "directRequestAcceptanceEntry",
+        false,
+    )?;
     let mut fetched_entry = protocol::normalize_read_presentation(
-        &serde_json::to_vec(fetched_accept_entry)?, "directRequestAcceptanceEntry", true)?;
-    fetched_entry.as_object_mut().context("recipient acceptance entry object")?.remove("$type");
-    let proof_entry_hash = protocol::direct_request_acceptance_entry_hash(
-        &serde_json::to_vec(&proof_entry)?)?;
-    let fetched_entry_hash = protocol::direct_request_acceptance_entry_hash(
-        &serde_json::to_vec(&fetched_entry)?)?;
+        &serde_json::to_vec(fetched_accept_entry)?,
+        "directRequestAcceptanceEntry",
+        true,
+    )?;
+    fetched_entry
+        .as_object_mut()
+        .context("recipient acceptance entry object")?
+        .remove("$type");
+    let proof_entry_hash =
+        protocol::direct_request_acceptance_entry_hash(&serde_json::to_vec(&proof_entry)?)?;
+    let fetched_entry_hash =
+        protocol::direct_request_acceptance_entry_hash(&serde_json::to_vec(&fetched_entry)?)?;
     assert_eq!(
         fetched_entry_hash, proof_entry_hash,
         "recipient home getEntries seq=2 normalized directRequestAcceptanceEntry hash must equal accept_resp.acceptanceProof.entry canonical entry hash"
     );
-    let (accepted_status, accepted_bytes) = bob.svc.get(
-        &client,
-        &bob_home,
-        "blue.catbird.chat.getConversations",
-        &[
-            ("supportedProtocolVersions".into(), "1".into()),
-            ("supportedProtocolVersions".into(), "2".into()),
-        ],
-    ).await?;
-    anyhow::ensure!(accepted_status == StatusCode::OK,
-        "accepted recipient inventory failed {accepted_status}: {}", String::from_utf8_lossy(&accepted_bytes));
+    let (accepted_status, accepted_bytes) = bob
+        .svc
+        .get(
+            &client,
+            &bob_home,
+            "blue.catbird.chat.getConversations",
+            &[
+                ("supportedProtocolVersions".into(), "1".into()),
+                ("supportedProtocolVersions".into(), "2".into()),
+            ],
+        )
+        .await?;
+    anyhow::ensure!(
+        accepted_status == StatusCode::OK,
+        "accepted recipient inventory failed {accepted_status}: {}",
+        String::from_utf8_lossy(&accepted_bytes)
+    );
     let accepted_inventory: Value = serde_json::from_slice(&accepted_bytes)?;
-    let accepted_item = accepted_inventory["items"].as_array()
-        .and_then(|items| items.iter().find(|item|
-            item.pointer("/state/coordinates/conversationId")
-                .or_else(|| item.pointer("/conversationId"))
-                .and_then(Value::as_str) == Some(conversation_id.to_string().as_str())))
+    let accepted_item = accepted_inventory["items"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.pointer("/state/coordinates/conversationId")
+                    .or_else(|| item.pointer("/conversationId"))
+                    .and_then(Value::as_str)
+                    == Some(conversation_id.to_string().as_str())
+            })
+        })
         .context("accepted remote conversation disappeared from recipient inventory")?;
     anyhow::ensure!(
-        accepted_item.pointer("/state/directRequest/consent")
+        accepted_item
+            .pointer("/state/directRequest/consent")
             .or_else(|| accepted_item.pointer("/directRequest/consent"))
-            .and_then(Value::as_str) == Some("accepted"),
+            .and_then(Value::as_str)
+            == Some("accepted"),
         "recipient inventory did not project accepted remote consent"
     );
-
 
     // -------------------------------------------------------------------------
     // Step 7: Bi-Directional Reply with Real MLS Encryption & Decryption
@@ -1540,10 +1823,26 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         .or_else(|| bootstrap.coordinates["groupId"]["$bytes"].as_str())
         .context("missing groupId in coordinates")?;
     let group_id_bytes = STANDARD.decode(group_id_str)?;
-    let epoch = bootstrap.coordinates["epoch"].as_u64().context("missing MLS epoch")?;
+    let epoch = bootstrap.coordinates["epoch"]
+        .as_u64()
+        .context("missing MLS epoch")?;
     for (sender, sender_home, recipient, recipient_home, seq, text) in [
-        (&bob, &bob_home, &alice, &alice_home, 3, "Bob's encrypted reply"),
-        (&alice, &alice_home, &bob, &bob_home, 4, "Alice's encrypted reply"),
+        (
+            &bob,
+            &bob_home,
+            &alice,
+            &alice_home,
+            3,
+            "Bob's encrypted reply",
+        ),
+        (
+            &alice,
+            &alice_home,
+            &bob,
+            &bob_home,
+            4,
+            "Alice's encrypted reply",
+        ),
     ] {
         let message_id = Uuid::new_v4();
         let mut aad_prior = accept_body["next"].clone();
@@ -1583,73 +1882,120 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         });
         let signed = signed_ordinary(&sender.engine, &sender.identity, body.clone())?;
         let retry_signed = signed.clone();
-        let (status, response_bytes) = sender.svc.post(
-            &client, sender_home, "blue.catbird.chat.sendMessage",
-            &json!({ "signedRequest": signed }), true
-        ).await?;
-        anyhow::ensure!(status == StatusCode::OK,
+        let (status, response_bytes) = sender
+            .svc
+            .post(
+                &client,
+                sender_home,
+                "blue.catbird.chat.sendMessage",
+                &json!({ "signedRequest": signed }),
+                true,
+            )
+            .await?;
+        anyhow::ensure!(
+            status == StatusCode::OK,
             "sendMessage from {} failed {status}: {}",
-            sender.svc.did, String::from_utf8_lossy(&response_bytes));
+            sender.svc.did,
+            String::from_utf8_lossy(&response_bytes)
+        );
         let response: Value = serde_json::from_slice(&response_bytes)?;
         assert_eq!(response["entry"]["seq"], seq);
         anyhow::ensure!(response["entry"].as_object().is_some_and(|entry|
             entry.len() == 5 && !entry.contains_key("$type")),
             "XRPC sendMessage response must expose the five-field client entry, not the internally tagged S2S delivery entry");
         if seq == 3 {
-            let (retry_status, retry_bytes) = sender.svc.post(
-                &client, sender_home, "blue.catbird.chat.sendMessage",
-                &json!({ "signedRequest": retry_signed }), true,
-            ).await?;
-            anyhow::ensure!(retry_status == StatusCode::OK
-                && serde_json::from_slice::<Value>(&retry_bytes)? == response,
-                "remote exact send retry must replay the same five-field accepted entry");
+            let (retry_status, retry_bytes) = sender
+                .svc
+                .post(
+                    &client,
+                    sender_home,
+                    "blue.catbird.chat.sendMessage",
+                    &json!({ "signedRequest": retry_signed }),
+                    true,
+                )
+                .await?;
+            anyhow::ensure!(
+                retry_status == StatusCode::OK
+                    && serde_json::from_slice::<Value>(&retry_bytes)? == response,
+                "remote exact send retry must replay the same five-field accepted entry"
+            );
             let mut changed = body;
             changed["signedAt"] = json!(canonical_now());
             let changed_signed = signed_ordinary(&sender.engine, &sender.identity, changed)?;
-            let (conflict, error_bytes) = sender.svc.post(
-                &client, sender_home, "blue.catbird.chat.sendMessage",
-                &json!({ "signedRequest": changed_signed }), true,
-            ).await?;
-            assert_eq!(conflict, StatusCode::BAD_REQUEST,
-                "same message ID with different signed request was falsely acknowledged");
-            assert_eq!(serde_json::from_slice::<Value>(&error_bytes)?["error"], "IdempotencyConflict");
+            let (conflict, error_bytes) = sender
+                .svc
+                .post(
+                    &client,
+                    sender_home,
+                    "blue.catbird.chat.sendMessage",
+                    &json!({ "signedRequest": changed_signed }),
+                    true,
+                )
+                .await?;
+            assert_eq!(
+                conflict,
+                StatusCode::BAD_REQUEST,
+                "same message ID with different signed request was falsely acknowledged"
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&error_bytes)?["error"],
+                "IdempotencyConflict"
+            );
         }
 
-        let (status, bytes) = recipient.svc.get(
-            &client, recipient_home, "blue.catbird.chat.getEntries",
-            &[
-                ("conversationId".into(), conversation_id.to_string()),
-                ("afterSeq".into(), (seq - 1).to_string()),
-                ("limit".into(), "10".into()),
-            ],
-        ).await?;
-        anyhow::ensure!(status == StatusCode::OK,
+        let (status, bytes) = recipient
+            .svc
+            .get(
+                &client,
+                recipient_home,
+                "blue.catbird.chat.getEntries",
+                &[
+                    ("conversationId".into(), conversation_id.to_string()),
+                    ("afterSeq".into(), (seq - 1).to_string()),
+                    ("limit".into(), "10".into()),
+                ],
+            )
+            .await?;
+        anyhow::ensure!(
+            status == StatusCode::OK,
             "recipient {} getEntries failed {status}: {}",
-            recipient.svc.did, String::from_utf8_lossy(&bytes));
+            recipient.svc.did,
+            String::from_utf8_lossy(&bytes)
+        );
         let page: Value = serde_json::from_slice(&bytes)?;
-        let entry = page["entries"].as_array().context("entries missing")?
+        let entry = page["entries"]
+            .as_array()
+            .context("entries missing")?
             .iter()
-            .find(|e| e["$type"] == "blue.catbird.chat.defs#applicationEntry"
-                && e["seq"] == seq)
-            .with_context(|| format!("recipient {} did not serve encrypted reply seq {seq}: {page}", recipient.svc.did))?;
-        let fetched_b64 = entry.pointer("/signedRequest/body/applicationMessage/bytes")
+            .find(|e| e["$type"] == "blue.catbird.chat.defs#applicationEntry" && e["seq"] == seq)
+            .with_context(|| {
+                format!(
+                    "recipient {} did not serve encrypted reply seq {seq}: {page}",
+                    recipient.svc.did
+                )
+            })?;
+        let fetched_b64 = entry
+            .pointer("/signedRequest/body/applicationMessage/bytes")
             .and_then(|v| v.as_str().or_else(|| v["$bytes"].as_str()))
             .context("missing ciphertext in fetched reply entry")?;
-        anyhow::ensure!(STANDARD.decode(fetched_b64)? == ciphertext,
-            "recipient home delivered ciphertext other than the signed application message");
-        let authenticated = recipient.engine.decrypt_authenticated(
-            &group_id_bytes, &STANDARD.decode(fetched_b64)?
-        )?;
+        anyhow::ensure!(
+            STANDARD.decode(fetched_b64)? == ciphertext,
+            "recipient home delivered ciphertext other than the signed application message"
+        );
+        let authenticated = recipient
+            .engine
+            .decrypt_authenticated(&group_id_bytes, &STANDARD.decode(fetched_b64)?)?;
         let decoded = MLSMessagePayload::decode(&authenticated.plaintext)?;
-        assert_eq!(decoded.display_text(), text, "peer could not decrypt shipped MLS reply");
+        assert_eq!(
+            decoded.display_text(),
+            text,
+            "peer could not decrypt shipped MLS reply"
+        );
     }
 
     // -------------------------------------------------------------------------
     // Step 8: simultaneous first-send attempts for a fresh pair, one per home DS.
-    for (party, home) in [
-        (&charlie, &server_a.base_url),
-        (&dana, &server_b.base_url),
-    ] {
+    for (party, home) in [(&charlie, &server_a.base_url), (&dana, &server_b.base_url)] {
         let (status, response) = party
             .svc
             .post(
@@ -1694,8 +2040,14 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     let dana_request = race_prepare(&dana, &charlie)?;
     let dana_replay = dana_request.clone();
     let charlie_request = race_prepare(&charlie, &dana)?;
-    let dana_request_id = dana_replay["body"]["requestId"].as_str().context("Dana request ID")?.to_owned();
-    let charlie_request_id = charlie_request["body"]["requestId"].as_str().context("Charlie request ID")?.to_owned();
+    let dana_request_id = dana_replay["body"]["requestId"]
+        .as_str()
+        .context("Dana request ID")?
+        .to_owned();
+    let charlie_request_id = charlie_request["body"]["requestId"]
+        .as_str()
+        .context("Charlie request ID")?
+        .to_owned();
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let dana_task = {
         let gate = barrier.clone();
@@ -1739,7 +2091,10 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         if status == StatusCode::BAD_REQUEST && value["error"] == "PreparationConflict" {
             return Ok(false);
         }
-        anyhow::ensure!(status == StatusCode::OK, "first-send race failed {status}: {value}");
+        anyhow::ensure!(
+            status == StatusCode::OK,
+            "first-send race failed {status}: {value}"
+        );
         if value.pointer("/outcome/preparation").is_some() {
             return Ok(true);
         }
@@ -1775,10 +2130,16 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     assert_eq!(psql_count(&server_b.database_url, &pair_attempts)?, 0);
     // Sender-home routes are bounded even when the coordinator rejects the
     // attempt; a retained request ID remains replayable at the limit.
-    assert_eq!(psql_count(
-        &server_b.database_url,
-        &format!("SELECT count(*) FROM chat.direct_request_outbound_routes WHERE actor_did='{}'", dana.svc.did),
-    )?, 1);
+    assert_eq!(
+        psql_count(
+            &server_b.database_url,
+            &format!(
+                "SELECT count(*) FROM chat.direct_request_outbound_routes WHERE actor_did='{}'",
+                dana.svc.did
+            ),
+        )?,
+        1
+    );
     psql_on(
         &server_b.database_url,
         &format!(
@@ -1788,28 +2149,46 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
             dana.svc.did, dana.svc.device_id, charlie.svc.did, server_a.did,
         ),
     )?;
-    let (cap_status, cap_bytes) = dana.svc.post(
-        &client, &server_b.base_url, "blue.catbird.chat.prepareDirectRequest",
-        &json!({ "signedRequest": race_prepare(&dana, &charlie)? }), true,
-    ).await?;
+    let (cap_status, cap_bytes) = dana
+        .svc
+        .post(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.prepareDirectRequest",
+            &json!({ "signedRequest": race_prepare(&dana, &charlie)? }),
+            true,
+        )
+        .await?;
     assert_eq!(cap_status, StatusCode::BAD_REQUEST);
-    assert_eq!(serde_json::from_slice::<Value>(&cap_bytes)?["error"], "CapacityUnavailable");
-    let (_, replay_bytes) = dana.svc.post(
-        &client, &server_b.base_url, "blue.catbird.chat.prepareDirectRequest",
-        &json!({ "signedRequest": dana_replay }), true,
-    ).await?;
-    assert_ne!(serde_json::from_slice::<Value>(&replay_bytes)?["error"], "CapacityUnavailable");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&cap_bytes)?["error"],
+        "CapacityUnavailable"
+    );
+    let (_, replay_bytes) = dana
+        .svc
+        .post(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.prepareDirectRequest",
+            &json!({ "signedRequest": dana_replay }),
+            true,
+        )
+        .await?;
+    assert_ne!(
+        serde_json::from_slice::<Value>(&replay_bytes)?["error"],
+        "CapacityUnavailable"
+    );
 
     // -------------------------------------------------------------------------
     // Step 9: Zero Legacy Fallback and Exact Canonical DB Graph Assertion
     // -------------------------------------------------------------------------
-    for (node, database_url) in [
-        ("A", &server_a.database_url),
-        ("B", &server_b.database_url),
-    ] {
+    for (node, database_url) in [("A", &server_a.database_url), ("B", &server_b.database_url)] {
         for table in ["messages", "welcome_messages", "pending_welcomes"] {
             assert_eq!(
-                psql_value(database_url, &format!("SELECT to_regclass('public.{table}') IS NULL"))?,
+                psql_value(
+                    database_url,
+                    &format!("SELECT to_regclass('public.{table}') IS NULL")
+                )?,
                 "t",
                 "Server {node} must not use a legacy {table} table"
             );
@@ -1835,7 +2214,9 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         assert_eq!(
             psql_count(
                 database_url,
-                &format!("SELECT count(*) FROM chat.entries WHERE conversation_id = '{conversation_id}'")
+                &format!(
+                    "SELECT count(*) FROM chat.entries WHERE conversation_id = '{conversation_id}'"
+                )
             )?,
             expected_entries,
             "only the coordinator sequences introduction, acceptance, and both encrypted replies"
@@ -1992,7 +2373,10 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         "C33 requires the exact guarded local synthetic template"
     );
     anyhow::ensure!(
-        psql_value(template, "SELECT to_regclass('chat.protocol_instances') IS NOT NULL")? == "t",
+        psql_value(
+            template,
+            "SELECT to_regclass('chat.protocol_instances') IS NOT NULL"
+        )? == "t",
         "guarded synthetic template has no chat schema"
     );
 
@@ -2005,8 +2389,16 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     // Ensure ds1 < ds2 so ds1 (Server A) is the deterministic coordinator min(ds1, ds2)
     anyhow::ensure!(ds1_did < ds2_did, "ds1_did must sort before ds2_did");
 
-    let alice = FederatedParty::new(format!("did:web:alice-{run}.catbird.blue"), "c33-simul-alice", &ds1_did)?;
-    let bob = FederatedParty::new(format!("did:web:bob-{run}.catbird.blue"), "c33-simul-bob-1", &ds2_did)?;
+    let alice = FederatedParty::new(
+        format!("did:web:alice-{run}.catbird.blue"),
+        "c33-simul-alice",
+        &ds1_did,
+    )?;
+    let bob = FederatedParty::new(
+        format!("did:web:bob-{run}.catbird.blue"),
+        "c33-simul-bob-1",
+        &ds2_did,
+    )?;
 
     let port_a = reserve_loopback_port()?;
     let port_b = reserve_loopback_port()?;
@@ -2062,24 +2454,38 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
 
     // Publish direct request keys on home servers:
     // Alice on Server A:
-    let (a_key_status, a_key_bytes) = alice.svc.post(
-        &client,
-        &server_a.base_url,
-        "blue.catbird.chat.publishDirectRequestKeys",
-        &alice.key_entry()?,
-        true,
-    ).await?;
-    anyhow::ensure!(a_key_status == StatusCode::OK, "Alice key publish failed: {a_key_status}: {}", String::from_utf8_lossy(&a_key_bytes));
+    let (a_key_status, a_key_bytes) = alice
+        .svc
+        .post(
+            &client,
+            &server_a.base_url,
+            "blue.catbird.chat.publishDirectRequestKeys",
+            &alice.key_entry()?,
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        a_key_status == StatusCode::OK,
+        "Alice key publish failed: {a_key_status}: {}",
+        String::from_utf8_lossy(&a_key_bytes)
+    );
 
     // Bob Device 1 on Server B:
-    let (b_key_status, b_key_bytes) = bob.svc.post(
-        &client,
-        &server_b.base_url,
-        "blue.catbird.chat.publishDirectRequestKeys",
-        &bob.key_entry()?,
-        true,
-    ).await?;
-    anyhow::ensure!(b_key_status == StatusCode::OK, "Bob Dev 1 key publish failed: {b_key_status}: {}", String::from_utf8_lossy(&b_key_bytes));
+    let (b_key_status, b_key_bytes) = bob
+        .svc
+        .post(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.publishDirectRequestKeys",
+            &bob.key_entry()?,
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        b_key_status == StatusCode::OK,
+        "Bob Dev 1 key publish failed: {b_key_status}: {}",
+        String::from_utf8_lossy(&b_key_bytes)
+    );
     // Bob Device 2 does NOT publish keys; it remains an unaddressed sibling device.
 
     // -------------------------------------------------------------------------
@@ -2153,8 +2559,14 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         let signed = alice_prepare_signed.clone();
         tokio::spawn(async move {
             gate.wait().await;
-            svc.post(&client, &home, "blue.catbird.chat.prepareDirectRequest",
-                &json!({ "signedRequest": signed }), true).await
+            svc.post(
+                &client,
+                &home,
+                "blue.catbird.chat.prepareDirectRequest",
+                &json!({ "signedRequest": signed }),
+                true,
+            )
+            .await
         })
     };
     let bob_task = {
@@ -2166,8 +2578,14 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         tokio::spawn(async move {
             gate.wait().await;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            svc.post(&client, &home, "blue.catbird.chat.prepareDirectRequest",
-                &json!({ "signedRequest": signed }), true).await
+            svc.post(
+                &client,
+                &home,
+                "blue.catbird.chat.prepareDirectRequest",
+                &json!({ "signedRequest": signed }),
+                true,
+            )
+            .await
         })
     };
 
@@ -2197,12 +2615,21 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         1,
         "contended opposite-direction first sends must converge on exactly one preparation"
     );
-    anyhow::ensure!(alice_prepared, "fault-injection continuation requires Alice on DS-A to win this staggered race");
+    anyhow::ensure!(
+        alice_prepared,
+        "fault-injection continuation requires Alice on DS-A to win this staggered race"
+    );
 
     // The losing preparation must not retain an active remote lease.
-    let (winner_is_alice, winner_req_id, winner_convo_id, winner_first_msg_id, winner_prep_bytes, winner_prep_body) =
-        if alice_prepared {
-            assert_eq!(
+    let (
+        winner_is_alice,
+        winner_req_id,
+        winner_convo_id,
+        winner_first_msg_id,
+        winner_prep_bytes,
+        winner_prep_body,
+    ) = if alice_prepared {
+        assert_eq!(
                 psql_count(
                     &server_a.database_url,
                     &format!("SELECT count(*) FROM chat.direct_request_remote_leases WHERE request_id='{bob_req_id}' AND status='active'")
@@ -2210,9 +2637,16 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
                 0,
                 "losing Bob preparation must not retain an active remote lease"
             );
-            (true, alice_req_id, alice_convo_id, alice_first_msg_id, alice_prep_bytes, alice_prepare_body)
-        } else {
-            assert_eq!(
+        (
+            true,
+            alice_req_id,
+            alice_convo_id,
+            alice_first_msg_id,
+            alice_prep_bytes,
+            alice_prepare_body,
+        )
+    } else {
+        assert_eq!(
                 psql_count(
                     &server_b.database_url,
                     &format!("SELECT count(*) FROM chat.direct_request_remote_leases WHERE request_id='{alice_req_id}' AND status='active'")
@@ -2220,8 +2654,15 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
                 0,
                 "losing Alice preparation must not retain an active remote lease"
             );
-            (false, bob_req_id, bob_convo_id, bob_first_msg_id, bob_prep_bytes, bob_prepare_body)
-        };
+        (
+            false,
+            bob_req_id,
+            bob_convo_id,
+            bob_first_msg_id,
+            bob_prep_bytes,
+            bob_prepare_body,
+        )
+    };
 
     // -------------------------------------------------------------------------
     // Phase 2: Winner First Send with Lost-Peer and Lost-Client-Response Retry
@@ -2233,12 +2674,21 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     };
 
     let prep_resp: Value = serde_json::from_slice(&winner_prep_bytes)?;
-    let raw_preparation = prep_resp.pointer("/outcome/preparation").context("winner preparation")?;
+    let raw_preparation = prep_resp
+        .pointer("/outcome/preparation")
+        .context("winner preparation")?;
     let preparation = protocol::verify_direct_request_preparation_for_authority(
-        &server_a.did, &serde_json::to_vec(raw_preparation)?, &server_a.receipt_public_key
+        &server_a.did,
+        &serde_json::to_vec(raw_preparation)?,
+        &server_a.receipt_public_key,
     )?;
-    let selected = preparation["selectedDevices"].as_array().context("selected devices")?;
-    anyhow::ensure!(selected.len() == 1, "preparation must select exactly one recipient device");
+    let selected = preparation["selectedDevices"]
+        .as_array()
+        .context("selected devices")?;
+    anyhow::ensure!(
+        selected.len() == 1,
+        "preparation must select exactly one recipient device"
+    );
     anyhow::ensure!(
         selected[0]["actorDeviceId"] == recipient_party.svc.device_id.to_string(),
         "selected device must match recipient's primary device (Device 1), never sibling Device 2"
@@ -2259,51 +2709,57 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
 
     let verified_prepare = protocol::verify_signed_request(
         DirectRequestKind::Prepare,
-        &serde_json::to_vec(if winner_is_alice { &alice_prepare_signed } else { &bob_prepare_signed })?,
+        &serde_json::to_vec(if winner_is_alice {
+            &alice_prepare_signed
+        } else {
+            &bob_prepare_signed
+        })?,
         &winner_party.public,
     )?;
 
-    let journal = winner_party.engine.prepare_direct_request(&DirectRequestBootstrapInput {
-        draft_id: Uuid::new_v4().to_string(),
-        context_json: serde_json::to_vec(&context_val)?,
-        group_id: rand::random::<[u8; 32]>().to_vec(),
-        generation: 0,
-        state_version: 1,
-        key_packages: selected
-            .iter()
-            .map(|device| {
-                Ok(STANDARD.decode(
-                    device["keyPackage"]["bytes"]["$bytes"]
-                        .as_str()
-                        .or_else(|| device["keyPackage"]["bytes"].as_str())
-                        .context("selected package bytes")?,
-                )?)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?,
-        expected_package_refs: selected
-            .iter()
-            .map(|device| {
-                Ok(STANDARD.decode(
-                    device["keyPackage"]["keyPackageRef"]["$bytes"]
-                        .as_str()
-                        .or_else(|| device["keyPackage"]["keyPackageRef"].as_str())
-                        .context("selected package ref")?,
-                )?)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?,
-        authority_import_until: 4_000_000_000,
-        preparation_request_digest: *verified_prepare.request_digest(),
-        receipt_authority_key: server_a.receipt_public_key.clone(),
-        text: "Converged authoritative direct request".into(),
-        invitation: None,
-        metadata: GroupMetadataV1 {
-            version: 1,
-            title: String::new(),
-            description: String::new(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-        },
-    })?;
+    let journal = winner_party
+        .engine
+        .prepare_direct_request(&DirectRequestBootstrapInput {
+            draft_id: Uuid::new_v4().to_string(),
+            context_json: serde_json::to_vec(&context_val)?,
+            group_id: rand::random::<[u8; 32]>().to_vec(),
+            generation: 0,
+            state_version: 1,
+            key_packages: selected
+                .iter()
+                .map(|device| {
+                    Ok(STANDARD.decode(
+                        device["keyPackage"]["bytes"]["$bytes"]
+                            .as_str()
+                            .or_else(|| device["keyPackage"]["bytes"].as_str())
+                            .context("selected package bytes")?,
+                    )?)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            expected_package_refs: selected
+                .iter()
+                .map(|device| {
+                    Ok(STANDARD.decode(
+                        device["keyPackage"]["keyPackageRef"]["$bytes"]
+                            .as_str()
+                            .or_else(|| device["keyPackage"]["keyPackageRef"].as_str())
+                            .context("selected package ref")?,
+                    )?)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            authority_import_until: 4_000_000_000,
+            preparation_request_digest: *verified_prepare.request_digest(),
+            receipt_authority_key: server_a.receipt_public_key.clone(),
+            text: "Converged authoritative direct request".into(),
+            invitation: None,
+            metadata: GroupMetadataV1 {
+                version: 1,
+                title: String::new(),
+                description: String::new(),
+                avatar_blob_locator: None,
+                avatar_content_type: None,
+            },
+        })?;
 
     let bootstrap = &journal.bootstrap;
     let mut publish_body = winner_prep_body.clone();
@@ -2311,14 +2767,16 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     publish_body["signatureDomain"] = json!("CATBIRD-DIRECT-REQUEST-PUBLISH\0");
     publish_body["signedAt"] = json!(canonical_now());
     publish_body["preparationDigest"] = preparation["preparationDigest"].clone();
-    publish_body["preparationRequestDigest"] = json!(STANDARD.encode(verified_prepare.request_digest()));
+    publish_body["preparationRequestDigest"] =
+        json!(STANDARD.encode(verified_prepare.request_digest()));
     publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
     publish_body["next"] = bootstrap.coordinates.clone();
-    publish_body["importUntil"] = json!(
-        chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
-            .context("MLS final-tree import deadline")?
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-    );
+    publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
+        bootstrap.import_until as i64,
+        0
+    )
+    .context("MLS final-tree import deadline")?
+    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
 
     let artifact = |data: &[u8], content_type: &str| {
         json!({
@@ -2390,7 +2848,9 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         DirectRequestKind::Publish,
         publish_body,
     )?;
-    winner_party.engine.persist_request_publication(&journal.request_id, &serde_json::to_vec(&publish_signed)?)?;
+    winner_party
+        .engine
+        .persist_request_publication(&journal.request_id, &serde_json::to_vec(&publish_signed)?)?;
 
     // Simulate lost peer: recipient server is killed before publication commits
     server_b._child.0.kill()?;
@@ -2402,16 +2862,25 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::AUTHORIZATION,
-        format!("Bearer {}", winner_party.svc.scoped_jwt_with_jti(
-            "blue.catbird.chat.publishDirectRequest", Uuid::new_v4()
-        )).parse()?,
+        format!(
+            "Bearer {}",
+            winner_party
+                .svc
+                .scoped_jwt_with_jti("blue.catbird.chat.publishDirectRequest", Uuid::new_v4())
+        )
+        .parse()?,
     );
-    let fault_client = reqwest::Client::builder().default_headers(headers).build()?;
-    let lost = transport.post_json(
-        &fault_client,
-        &format!("{winner_home}/xrpc/blue.catbird.chat.publishDirectRequest"),
-        &json!({ "signedRequest": publish_signed }),
-    ).await.expect_err("publication response must be lost after server commits");
+    let fault_client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()?;
+    let lost = transport
+        .post_json(
+            &fault_client,
+            &format!("{winner_home}/xrpc/blue.catbird.chat.publishDirectRequest"),
+            &json!({ "signedRequest": publish_signed }),
+        )
+        .await
+        .expect_err("publication response must be lost after server commits");
     anyhow::ensure!(
         lost.to_string().contains("AfterRequestBeforeResponse"),
         "unexpected transport failure: {lost:#}"
@@ -2462,25 +2931,40 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
             break;
         }
     }
-    anyhow::ensure!(auto_delivered, "outbound queue delivery to recovered Server B timed out");
+    anyhow::ensure!(
+        auto_delivered,
+        "outbound queue delivery to recovered Server B timed out"
+    );
 
     // Idempotent publication replay from winner returns identical published outcome
-    let (replay_status, replay_bytes) = winner_party.svc.post(
-        &client,
-        &winner_home,
-        "blue.catbird.chat.publishDirectRequest",
-        &json!({ "signedRequest": publish_signed }),
-        true,
-    ).await?;
-    anyhow::ensure!(replay_status == StatusCode::OK, "idempotent publication retry failed: {replay_status}");
+    let (replay_status, replay_bytes) = winner_party
+        .svc
+        .post(
+            &client,
+            &winner_home,
+            "blue.catbird.chat.publishDirectRequest",
+            &json!({ "signedRequest": publish_signed }),
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        replay_status == StatusCode::OK,
+        "idempotent publication retry failed: {replay_status}"
+    );
     let replay_resp: Value = serde_json::from_slice(&replay_bytes)?;
-    let published_receipt = replay_resp.pointer("/outcome").context("published outcome receipt")?.clone();
+    let published_receipt = replay_resp
+        .pointer("/outcome")
+        .context("published outcome receipt")?
+        .clone();
 
-    winner_party.engine.confirm_request_publication(
-        &journal.request_id,
-        &serde_json::to_vec(&published_receipt)?,
-        &server_a.receipt_public_key,
-    ).context("sender native published receipt confirmation")?;
+    winner_party
+        .engine
+        .confirm_request_publication(
+            &journal.request_id,
+            &serde_json::to_vec(&published_receipt)?,
+            &server_a.receipt_public_key,
+        )
+        .context("sender native published receipt confirmation")?;
 
     // -------------------------------------------------------------------------
     // Phase 3: Preserving Single Welcome / Single Package Invariants
@@ -2497,7 +2981,9 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     assert_eq!(
         psql_count(
             &server_a.database_url,
-            &format!("SELECT count(*) FROM chat.conversations WHERE conversation_id='{winner_convo_id}'")
+            &format!(
+                "SELECT count(*) FROM chat.conversations WHERE conversation_id='{winner_convo_id}'"
+            )
         )?,
         1,
         "coordinator must contain exactly one conversation for the winning request"
@@ -2534,104 +3020,148 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     assert_eq!(
         psql_count(
             &server_b.database_url,
-            &format!("SELECT count(*) FROM chat.key_packages WHERE owner_did='{}' AND status='consumed'", bob.svc.did)
+            &format!(
+                "SELECT count(*) FROM chat.key_packages WHERE owner_did='{}' AND status='consumed'",
+                bob.svc.did
+            )
         )?,
         1,
         "retry and peer recovery must preserve single consumed key package, no package draining"
     );
 
     // Bob Device 1 (addressed primary device):
-    let (inv_status, inv_bytes) = bob.svc.get(
-        &client,
-        &server_b.base_url,
-        "blue.catbird.chat.getConversations",
-        &[
-            ("supportedProtocolVersions".into(), "1".into()),
-            ("supportedProtocolVersions".into(), "2".into()),
-        ],
-    ).await?;
+    let (inv_status, inv_bytes) = bob
+        .svc
+        .get(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.getConversations",
+            &[
+                ("supportedProtocolVersions".into(), "1".into()),
+                ("supportedProtocolVersions".into(), "2".into()),
+            ],
+        )
+        .await?;
     assert_eq!(inv_status, StatusCode::OK);
     let inventory: Value = serde_json::from_slice(&inv_bytes)?;
-    let inventory_session = inventory["inventorySessionId"].as_str().context("missing recipient inventory session")?;
+    let inventory_session = inventory["inventorySessionId"]
+        .as_str()
+        .context("missing recipient inventory session")?;
 
-    let (welcomes_status, welcomes_bytes) = bob.svc.get(
-        &client,
-        &server_b.base_url,
-        "blue.catbird.chat.getPendingWelcomes",
-        &[
-            ("inventorySessionId".into(), inventory_session.into()),
-            ("limit".into(), "10".into()),
-            ("supportedProtocolVersions".into(), "1".into()),
-            ("supportedProtocolVersions".into(), "2".into()),
-        ],
-    ).await?;
+    let (welcomes_status, welcomes_bytes) = bob
+        .svc
+        .get(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.getPendingWelcomes",
+            &[
+                ("inventorySessionId".into(), inventory_session.into()),
+                ("limit".into(), "10".into()),
+                ("supportedProtocolVersions".into(), "1".into()),
+                ("supportedProtocolVersions".into(), "2".into()),
+            ],
+        )
+        .await?;
     assert_eq!(welcomes_status, StatusCode::OK);
     let welcomes_resp: Value = serde_json::from_slice(&welcomes_bytes)?;
-    let welcome_item = welcomes_resp["items"].as_array().context("items")?
+    let welcome_item = welcomes_resp["items"]
+        .as_array()
+        .context("items")?
         .iter()
         .find(|item| item["welcomeId"] == winner_req_id.to_string())
         .context("Bob Dev 1 must receive pending Welcome on Server B")?;
 
     let delivered_welcome = STANDARD.decode(
-        welcome_item["opaqueWelcome"]["$bytes"].as_str()
+        welcome_item["opaqueWelcome"]["$bytes"]
+            .as_str()
             .or_else(|| welcome_item["opaqueWelcome"].as_str())
-            .context("missing delivered welcome bytes")?
+            .context("missing delivered welcome bytes")?,
     )?;
-    assert!(!delivered_welcome.is_empty(), "delivered welcome must not be empty");
+    assert!(
+        !delivered_welcome.is_empty(),
+        "delivered welcome must not be empty"
+    );
 
-    let (entry_status, entry_bytes) = bob.svc.get(
-        &client,
-        &server_b.base_url,
-        "blue.catbird.chat.getEntries",
-        &[
-            ("conversationId".into(), winner_convo_id.to_string()),
-            ("afterSeq".into(), "0".into()),
-            ("limit".into(), "10".into()),
-        ],
-    ).await?;
+    let (entry_status, entry_bytes) = bob
+        .svc
+        .get(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.getEntries",
+            &[
+                ("conversationId".into(), winner_convo_id.to_string()),
+                ("afterSeq".into(), "0".into()),
+                ("limit".into(), "10".into()),
+            ],
+        )
+        .await?;
     assert_eq!(entry_status, StatusCode::OK);
     let entry_page: Value = serde_json::from_slice(&entry_bytes)?;
-    let introduction_entry = entry_page["entries"].as_array().context("Bob entries")?
+    let introduction_entry = entry_page["entries"]
+        .as_array()
+        .context("Bob entries")?
         .iter()
         .find(|entry| entry["seq"] == 1)
         .context("signed introduction entry seq 1 must be present for Bob Dev 1")?;
 
     let remote_publication = introduction_entry["signedRequest"].clone();
-    let (outcome_status, outcome_bytes) = bob.svc.get(
-        &client,
-        &server_b.base_url,
-        "blue.catbird.chat.getDirectRequestOutcome",
-        &[("requestId".into(), winner_req_id.to_string())],
-    ).await?;
+    let (outcome_status, outcome_bytes) = bob
+        .svc
+        .get(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.getDirectRequestOutcome",
+            &[("requestId".into(), winner_req_id.to_string())],
+        )
+        .await?;
     assert_eq!(outcome_status, StatusCode::OK);
     let remote_receipt = serde_json::from_slice::<Value>(&outcome_bytes)?["outcome"].clone();
 
     let wire_bytes = |value: &Value| -> anyhow::Result<Vec<u8>> {
         Ok(STANDARD.decode(
-            value.as_str().or_else(|| value["$bytes"].as_str())
+            value
+                .as_str()
+                .or_else(|| value["$bytes"].as_str())
                 .context("missing delivered byte field")?,
         )?)
     };
 
     let delivered_bootstrap = DirectRequestBootstrap {
         context_json: serde_json::to_vec(&context_val)?,
-        context_hash: wire_bytes(&remote_publication["body"]["contextHash"])?.try_into()
+        context_hash: wire_bytes(&remote_publication["body"]["contextHash"])?
+            .try_into()
             .map_err(|_| anyhow::anyhow!("invalid delivered context hash"))?,
         coordinates: bootstrap.coordinates.clone(),
         import_until: chrono::DateTime::parse_from_rfc3339(
-            remote_publication["body"]["importUntil"].as_str().context("missing import deadline")?
-        )?.timestamp().try_into()?,
+            remote_publication["body"]["importUntil"]
+                .as_str()
+                .context("missing import deadline")?,
+        )?
+        .timestamp()
+        .try_into()?,
         expected_package_refs: remote_publication["body"]["artifacts"]["welcome"]["deliveries"]
-            .as_array().context("deliveries")?.iter()
+            .as_array()
+            .context("deliveries")?
+            .iter()
             .map(|delivery| wire_bytes(&delivery["provenance"]["keyPackageRef"]))
             .collect::<anyhow::Result<Vec<_>>>()?,
-        genesis_group_info: wire_bytes(&remote_publication["body"]["artifacts"]["genesisGroupInfo"]["bytes"])?,
+        genesis_group_info: wire_bytes(
+            &remote_publication["body"]["artifacts"]["genesisGroupInfo"]["bytes"],
+        )?,
         add_commit: wire_bytes(&remote_publication["body"]["artifacts"]["addCommit"]["bytes"])?,
-        final_group_info: wire_bytes(&remote_publication["body"]["artifacts"]["finalGroupInfo"]["bytes"])?,
+        final_group_info: wire_bytes(
+            &remote_publication["body"]["artifacts"]["finalGroupInfo"]["bytes"],
+        )?,
         welcome: delivered_welcome,
-        metadata_nonce: wire_bytes(&remote_publication["body"]["artifacts"]["metadataSnapshot"]["nonce"])?,
-        metadata_ciphertext: wire_bytes(&remote_publication["body"]["artifacts"]["metadataSnapshot"]["ciphertext"])?,
-        initial_ciphertext: wire_bytes(&remote_publication["body"]["artifacts"]["initialCiphertext"])?,
+        metadata_nonce: wire_bytes(
+            &remote_publication["body"]["artifacts"]["metadataSnapshot"]["nonce"],
+        )?,
+        metadata_ciphertext: wire_bytes(
+            &remote_publication["body"]["artifacts"]["metadataSnapshot"]["ciphertext"],
+        )?,
+        initial_ciphertext: wire_bytes(
+            &remote_publication["body"]["artifacts"]["initialCiphertext"],
+        )?,
     };
 
     let welcome_input = DirectRequestWelcomeInput {
@@ -2643,19 +3173,27 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         published_receipt: serde_json::to_vec(&remote_receipt)?,
         receipt_authority_did: server_a.did.clone(),
         receipt_authority_key: server_a.receipt_public_key.clone(),
-        preparation_request_digest: wire_bytes(&remote_publication["body"]["preparationRequestDigest"])?
-            .try_into().map_err(|_| anyhow::anyhow!("invalid preparation digest"))?,
+        preparation_request_digest: wire_bytes(
+            &remote_publication["body"]["preparationRequestDigest"],
+        )?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid preparation digest"))?,
     };
 
-    bob.engine.process_direct_request(&welcome_input).context("recipient native Welcome import")?;
-    let decrypted = bob.engine.decrypt_direct_request(&welcome_input).context("recipient native introduction decrypt")?;
+    bob.engine
+        .process_direct_request(&welcome_input)
+        .context("recipient native Welcome import")?;
+    let decrypted = bob
+        .engine
+        .decrypt_direct_request(&welcome_input)
+        .context("recipient native introduction decrypt")?;
     let DirectRequestIntroductionResult::Ready { plaintext } = decrypted else {
         anyhow::bail!("Bob introduction decryption failed: not ready");
     };
-    let introduction = protocol::decode_direct_request_introduction(&plaintext).context("recipient canonical introduction decode")?;
+    let introduction = protocol::decode_direct_request_introduction(&plaintext)
+        .context("recipient canonical introduction decode")?;
     assert_eq!(
-        introduction["text"],
-        "Converged authoritative direct request",
+        introduction["text"], "Converged authoritative direct request",
         "Bob successfully decrypted winner's introduction on Server B"
     );
 
@@ -2700,28 +3238,38 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         accept_body.clone(),
     )?;
 
-    let (accept_status, accept_bytes) = bob.svc.post(
-        &client,
-        &server_b.base_url,
-        "blue.catbird.chat.acceptConversation",
-        &json!({ "directRequest": accept_signed }),
-        true,
-    ).await?;
-    anyhow::ensure!(accept_status == StatusCode::OK, "acceptConversation failed: {accept_status}: {}", String::from_utf8_lossy(&accept_bytes));
+    let (accept_status, accept_bytes) = bob
+        .svc
+        .post(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.acceptConversation",
+            &json!({ "directRequest": accept_signed }),
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        accept_status == StatusCode::OK,
+        "acceptConversation failed: {accept_status}: {}",
+        String::from_utf8_lossy(&accept_bytes)
+    );
     let accept_resp: Value = serde_json::from_slice(&accept_bytes)?;
 
     // Parent invariant check: recipient home getEntries seq=2 normalized directRequestAcceptanceEntry
     // hash must equal accept_resp.acceptanceProof.entry canonical entry hash
-    let (accept_entry_status, accept_entry_bytes) = bob.svc.get(
-        &client,
-        &server_b.base_url,
-        "blue.catbird.chat.getEntries",
-        &[
-            ("conversationId".into(), winner_convo_id.to_string()),
-            ("afterSeq".into(), "1".into()),
-            ("limit".into(), "10".into()),
-        ],
-    ).await?;
+    let (accept_entry_status, accept_entry_bytes) = bob
+        .svc
+        .get(
+            &client,
+            &server_b.base_url,
+            "blue.catbird.chat.getEntries",
+            &[
+                ("conversationId".into(), winner_convo_id.to_string()),
+                ("afterSeq".into(), "1".into()),
+                ("limit".into(), "10".into()),
+            ],
+        )
+        .await?;
     anyhow::ensure!(
         accept_entry_status == StatusCode::OK,
         "recipient home getEntries seq=2 failed {accept_entry_status}: {}",
@@ -2737,19 +3285,33 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     let proof_entry = accept_resp
         .pointer("/acceptanceProof/entry")
         .context("missing acceptanceProof.entry in accept response")?;
-    anyhow::ensure!(fetched_accept_entry.get("acceptanceProof").is_none(),
-        "recipient acceptance entry must not embed a proof outside its lexicon");
+    anyhow::ensure!(
+        fetched_accept_entry.get("acceptanceProof").is_none(),
+        "recipient acceptance entry must not embed a proof outside its lexicon"
+    );
     let mut proof_entry = proof_entry.clone();
-    proof_entry.as_object_mut().context("acceptance proof entry object")?.remove("$type");
+    proof_entry
+        .as_object_mut()
+        .context("acceptance proof entry object")?
+        .remove("$type");
     let proof_entry = protocol::normalize_read_presentation(
-        &serde_json::to_vec(&proof_entry)?, "directRequestAcceptanceEntry", false)?;
+        &serde_json::to_vec(&proof_entry)?,
+        "directRequestAcceptanceEntry",
+        false,
+    )?;
     let mut fetched_entry = protocol::normalize_read_presentation(
-        &serde_json::to_vec(fetched_accept_entry)?, "directRequestAcceptanceEntry", true)?;
-    fetched_entry.as_object_mut().context("recipient acceptance entry object")?.remove("$type");
-    let proof_entry_hash = protocol::direct_request_acceptance_entry_hash(
-        &serde_json::to_vec(&proof_entry)?)?;
-    let fetched_entry_hash = protocol::direct_request_acceptance_entry_hash(
-        &serde_json::to_vec(&fetched_entry)?)?;
+        &serde_json::to_vec(fetched_accept_entry)?,
+        "directRequestAcceptanceEntry",
+        true,
+    )?;
+    fetched_entry
+        .as_object_mut()
+        .context("recipient acceptance entry object")?
+        .remove("$type");
+    let proof_entry_hash =
+        protocol::direct_request_acceptance_entry_hash(&serde_json::to_vec(&proof_entry)?)?;
+    let fetched_entry_hash =
+        protocol::direct_request_acceptance_entry_hash(&serde_json::to_vec(&fetched_entry)?)?;
     assert_eq!(
         fetched_entry_hash, proof_entry_hash,
         "recipient home getEntries seq=2 normalized directRequestAcceptanceEntry hash must equal accept_resp.acceptanceProof.entry canonical entry hash"
@@ -2760,12 +3322,28 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         .or_else(|| bootstrap.coordinates["groupId"]["$bytes"].as_str())
         .context("missing groupId in coordinates")?;
     let group_id_bytes = STANDARD.decode(group_id_str)?;
-    let epoch = bootstrap.coordinates["epoch"].as_u64().context("missing MLS epoch")?;
+    let epoch = bootstrap.coordinates["epoch"]
+        .as_u64()
+        .context("missing MLS epoch")?;
 
     // Bi-directional replies: Bob replies (seq 3), then Alice replies (seq 4)
     for (sender, sender_home, recipient, recipient_home, seq, text) in [
-        (&bob, &server_b.base_url, &alice, &server_a.base_url, 3, "Bob's converged reply"),
-        (&alice, &server_a.base_url, &bob, &server_b.base_url, 4, "Alice's converged reply"),
+        (
+            &bob,
+            &server_b.base_url,
+            &alice,
+            &server_a.base_url,
+            3,
+            "Bob's converged reply",
+        ),
+        (
+            &alice,
+            &server_a.base_url,
+            &bob,
+            &server_b.base_url,
+            4,
+            "Alice's converged reply",
+        ),
     ] {
         let message_id = Uuid::new_v4();
         let mut aad_prior = accept_body["next"].clone();
@@ -2804,34 +3382,59 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
             "signedAt": canonical_now()
         });
         let signed = signed_ordinary(&sender.engine, &sender.identity, body)?;
-        let (send_status, send_bytes) = sender.svc.post(
-            &client, sender_home, "blue.catbird.chat.sendMessage",
-            &json!({ "signedRequest": signed }), true
-        ).await?;
-        anyhow::ensure!(send_status == StatusCode::OK, "sendMessage failed {send_status}: {}", String::from_utf8_lossy(&send_bytes));
+        let (send_status, send_bytes) = sender
+            .svc
+            .post(
+                &client,
+                sender_home,
+                "blue.catbird.chat.sendMessage",
+                &json!({ "signedRequest": signed }),
+                true,
+            )
+            .await?;
+        anyhow::ensure!(
+            send_status == StatusCode::OK,
+            "sendMessage failed {send_status}: {}",
+            String::from_utf8_lossy(&send_bytes)
+        );
 
-        let (rec_status, rec_bytes) = recipient.svc.get(
-            &client, recipient_home, "blue.catbird.chat.getEntries",
-            &[
-                ("conversationId".into(), winner_convo_id.to_string()),
-                ("afterSeq".into(), (seq - 1).to_string()),
-                ("limit".into(), "10".into()),
-            ],
-        ).await?;
-        anyhow::ensure!(rec_status == StatusCode::OK, "getEntries for reply failed: {rec_status}");
+        let (rec_status, rec_bytes) = recipient
+            .svc
+            .get(
+                &client,
+                recipient_home,
+                "blue.catbird.chat.getEntries",
+                &[
+                    ("conversationId".into(), winner_convo_id.to_string()),
+                    ("afterSeq".into(), (seq - 1).to_string()),
+                    ("limit".into(), "10".into()),
+                ],
+            )
+            .await?;
+        anyhow::ensure!(
+            rec_status == StatusCode::OK,
+            "getEntries for reply failed: {rec_status}"
+        );
         let page: Value = serde_json::from_slice(&rec_bytes)?;
-        let entry = page["entries"].as_array().context("entries")?
+        let entry = page["entries"]
+            .as_array()
+            .context("entries")?
             .iter()
             .find(|e| e["seq"] == seq)
             .context("missing reply entry")?;
-        let fetched_b64 = entry.pointer("/signedRequest/body/applicationMessage/bytes")
+        let fetched_b64 = entry
+            .pointer("/signedRequest/body/applicationMessage/bytes")
             .and_then(|v| v.as_str().or_else(|| v["$bytes"].as_str()))
             .context("missing ciphertext")?;
-        let authenticated = recipient.engine.decrypt_authenticated(
-            &group_id_bytes, &STANDARD.decode(fetched_b64)?
-        )?;
+        let authenticated = recipient
+            .engine
+            .decrypt_authenticated(&group_id_bytes, &STANDARD.decode(fetched_b64)?)?;
         let decoded = MLSMessagePayload::decode(&authenticated.plaintext)?;
-        assert_eq!(decoded.display_text(), text, "peer successfully decrypted converged MLS reply");
+        assert_eq!(
+            decoded.display_text(),
+            text,
+            "peer successfully decrypted converged MLS reply"
+        );
     }
 
     Ok(())

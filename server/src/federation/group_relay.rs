@@ -81,12 +81,23 @@ impl GroupRelayState {
         s2s_secret: &[u8],
         i13_receipt_signer: Option<Arc<I13ReceiptSigner>>,
     ) -> Self {
+        Self::for_test_with_push(pool, self_did, s2s_secret, i13_receipt_signer, None)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test_with_push(
+        pool: DbPool,
+        self_did: String,
+        s2s_secret: &[u8],
+        i13_receipt_signer: Option<Arc<I13ReceiptSigner>>,
+        push_gateway_client: Option<Arc<PushGatewayClient>>,
+    ) -> Self {
         Self {
             pool,
             self_did: crate::identity::canonical_did(&self_did).to_string(),
             s2s_shared_secret: Some(Arc::new(s2s_secret.to_vec())),
             i13_receipt_signer,
-            push_gateway_client: None,
+            push_gateway_client,
         }
     }
 }
@@ -680,6 +691,20 @@ async fn sequence_relayed_group_application_send(
                 )
             })?;
 
+    let receipt_commitment: [u8; 32] = match projection.aad().get("archiveCommitment") {
+        None => msg_sha256,
+        Some(crate::chat_protocol::transcript::CanonicalValueRef::Bytes(v)) if v.len() == 32 => {
+            v.try_into().expect("32-byte archiveCommitment")
+        }
+        Some(_) => {
+            return Err(s2s_err(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "archiveCommitment must be 32 bytes",
+            ));
+        }
+    };
+
     let entry_product = crate::chat_protocol::transcript::build_verified_application_entry(
         verified,
         canon_entry_id,
@@ -712,7 +737,7 @@ async fn sequence_relayed_group_application_send(
                 actor_did,
                 &actor_device_id.to_string(),
                 &entry_id_str,
-                &msg_sha256,
+                &receipt_commitment,
                 next_seq as u64,
                 trusted_now.timestamp_millis(),
             )

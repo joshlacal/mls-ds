@@ -31,10 +31,9 @@ use catbird_mls::{
     },
 };
 use encrypted_requests::{
-    canonical_future, canonical_now, connect_guarded_request_database,
-    request_database_snapshot, reviewed_request_migrations, seed_service_device,
-    signed_mls_request, validate_request_test_database_url, HttpsDidFixture, ServiceIdentity,
-    request_database_url, ShippingServerFixture,
+    canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
+    request_database_url, reviewed_request_migrations, seed_service_device, signed_mls_request,
+    validate_request_test_database_url, HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
 };
 
 #[path = "support/live_direct_request.rs"]
@@ -101,10 +100,7 @@ fn request_rows(request_id: Uuid, conversation_id: Uuid) -> anyhow::Result<Reque
                 (SELECT count(*) FROM chat.conversations WHERE conversation_id='{conversation_id}'), \
                 (SELECT count(*) FROM chat.entries WHERE transition_id='{request_id}')"
     ))?;
-    let f: Vec<i64> = row
-        .split('|')
-        .map(str::parse)
-        .collect::<Result<_, _>>()?;
+    let f: Vec<i64> = row.split('|').map(str::parse).collect::<Result<_, _>>()?;
     anyhow::ensure!(f.len() == 5, "unexpected row projection {row}");
     Ok(RequestRows {
         published_attempts: f[0],
@@ -162,7 +158,12 @@ fn set_policy(root: &Path, parts: &[&str], value: &Value) -> anyhow::Result<()> 
 /// Direct admission orients the only graph request as actor=recipient,
 /// others=[inviter] (`plan_admission_graph` with the inviter as sink), so every
 /// block direction is expressed on that one appview row.
-fn set_recipient_view(root: &Path, recipient: &str, inviter: &str, row: Value) -> anyhow::Result<()> {
+fn set_recipient_view(
+    root: &Path,
+    recipient: &str,
+    inviter: &str,
+    row: Value,
+) -> anyhow::Result<()> {
     set_policy(root, &["relationship", recipient, inviter], &row)
 }
 
@@ -216,7 +217,9 @@ impl Account {
 }
 
 fn identity(label: &str, run: &str) -> ServiceIdentity {
-    ServiceIdentity::new(format!("did:web:{label}-{run}.request-fixture.catbird.blue"))
+    ServiceIdentity::new(format!(
+        "did:web:{label}-{run}.request-fixture.catbird.blue"
+    ))
 }
 
 struct Rig {
@@ -303,7 +306,10 @@ async fn publish_keys(rig: &Rig, a: &Account) -> anyhow::Result<()> {
         &keys_envelope(a, 1, true)?,
     )
     .await?;
-    anyhow::ensure!(status == reqwest::StatusCode::OK, "publish keys {status}: {body}");
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "publish keys {status}: {body}"
+    );
     Ok(())
 }
 
@@ -389,7 +395,10 @@ fn build_publication(
     alice: &Account,
     recipient: &str,
     prep: &Prep,
-) -> anyhow::Result<(Value, catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestBootstrap)> {
+) -> anyhow::Result<(
+    Value,
+    catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestBootstrap,
+)> {
     let preparation = prep.preparation()?;
     let preparation = protocol::verify_direct_request_preparation(
         &serde_json::to_vec(preparation)?,
@@ -425,33 +434,35 @@ fn build_publication(
         "actorKeyId":alice.key_id,"recipientDid":recipient,
         "preparationDigest":preparation["preparationDigest"]
     });
-    let journal = alice.engine.prepare_direct_request(&DirectRequestBootstrapInput {
-        draft_id: Uuid::new_v4().to_string(),
-        context_json: serde_json::to_vec(&context)?,
-        group_id: rand::random::<[u8; 32]>().to_vec(),
-        generation: 0,
-        state_version: 1,
-        key_packages: selected
-            .iter()
-            .map(|d| decode(d, "bytes"))
-            .collect::<anyhow::Result<_>>()?,
-        expected_package_refs: selected
-            .iter()
-            .map(|d| decode(d, "keyPackageRef"))
-            .collect::<anyhow::Result<_>>()?,
-        authority_import_until,
-        preparation_request_digest: prep.prepare_digest,
-        receipt_authority_key: rig.server.receipt_public_key.clone(),
-        text: "C08/C09 encrypted first contact".into(),
-        invitation: None,
-        metadata: GroupMetadataV1 {
-            version: 1,
-            title: String::new(),
-            description: String::new(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-        },
-    })?;
+    let journal = alice
+        .engine
+        .prepare_direct_request(&DirectRequestBootstrapInput {
+            draft_id: Uuid::new_v4().to_string(),
+            context_json: serde_json::to_vec(&context)?,
+            group_id: rand::random::<[u8; 32]>().to_vec(),
+            generation: 0,
+            state_version: 1,
+            key_packages: selected
+                .iter()
+                .map(|d| decode(d, "bytes"))
+                .collect::<anyhow::Result<_>>()?,
+            expected_package_refs: selected
+                .iter()
+                .map(|d| decode(d, "keyPackageRef"))
+                .collect::<anyhow::Result<_>>()?,
+            authority_import_until,
+            preparation_request_digest: prep.prepare_digest,
+            receipt_authority_key: rig.server.receipt_public_key.clone(),
+            text: "C08/C09 encrypted first contact".into(),
+            invitation: None,
+            metadata: GroupMetadataV1 {
+                version: 1,
+                title: String::new(),
+                description: String::new(),
+                avatar_blob_locator: None,
+                avatar_content_type: None,
+            },
+        })?;
     let bootstrap = journal.bootstrap.clone();
     let mut body = prep.prepare["body"].clone();
     body["$type"] = json!("blue.catbird.chat.defs#directRequestPublicationBody");
@@ -461,9 +472,11 @@ fn build_publication(
     body["preparationRequestDigest"] = json!(STANDARD.encode(prep.prepare_digest));
     body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
     body["next"] = bootstrap.coordinates.clone();
-    body["importUntil"] = json!(chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
-        .context("import timestamp")?
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    body["importUntil"] = json!(
+        chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
+            .context("import timestamp")?
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    );
     let artifact = |data: &[u8], content_type: &str| {
         json!({"framing":"mlsMessage","contentType":content_type,
             "bytes":STANDARD.encode(data),"sha256":STANDARD.encode(Sha256::digest(data))})
@@ -507,8 +520,12 @@ fn build_publication(
             "ciphertextSize":bootstrap.metadata_ciphertext.len(),"authorProof":author
         }
     });
-    let publication =
-        signed_mls_request(&alice.engine, &alice.identity, DirectRequestKind::Publish, body)?;
+    let publication = signed_mls_request(
+        &alice.engine,
+        &alice.identity,
+        DirectRequestKind::Publish,
+        body,
+    )?;
     Ok((json!({"signedRequest":publication}), bootstrap))
 }
 
@@ -556,7 +573,10 @@ async fn release_by_accept(
         )
         .await?;
         if status == reqwest::StatusCode::OK {
-            println!("RELEASE request {} accepted by {}", prep.request_id, svc.device_id);
+            println!(
+                "RELEASE request {} accepted by {}",
+                prep.request_id, svc.device_id
+            );
             return Ok(());
         }
         println!("RELEASE retry after accept {status}: {body}");
@@ -677,13 +697,24 @@ impl Barrier {
 
     fn hold_rows(locks: &str) -> anyhow::Result<Self> {
         let mut child = Command::new("psql")
-            .args([request_database_url(), "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
+            .args([
+                request_database_url(),
+                "-X",
+                "-A",
+                "-t",
+                "-q",
+                "-v",
+                "ON_ERROR_STOP=1",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
         let mut stdin = child.stdin.take().context("barrier stdin")?;
-        writeln!(stdin, "BEGIN;\nSELECT pg_backend_pid();\n{locks}\n\\echo BARRIER-HELD")?;
+        writeln!(
+            stdin,
+            "BEGIN;\nSELECT pg_backend_pid();\n{locks}\n\\echo BARRIER-HELD"
+        )?;
         stdin.flush()?;
         let mut lines = BufReader::new(child.stdout.take().context("barrier stdout")?).lines();
         let pid: i64 = lines.next().context("barrier pid")??.trim().parse()?;
@@ -760,9 +791,11 @@ async fn race(
     );
     barrier.release()?;
     let decode = |(status, bytes): (reqwest::StatusCode, Vec<u8>)| -> anyhow::Result<_> {
-        Ok((status, serde_json::from_slice::<Value>(&bytes).with_context(|| {
-            format!("{status}: {}", String::from_utf8_lossy(&bytes))
-        })?))
+        Ok((
+            status,
+            serde_json::from_slice::<Value>(&bytes)
+                .with_context(|| format!("{status}: {}", String::from_utf8_lossy(&bytes)))?,
+        ))
     };
     Ok(RaceResult {
         first: decode(a.await??)?,
@@ -808,23 +841,43 @@ async fn c08_live_block_and_preference_denials_use_real_projection() -> anyhow::
         unreachable!()
     };
     // alice blocks bob: bob's view of alice is blockedBy.
-    set_recipient_view(root, direct_actor.did(), a,
-        json!({"blockedBy":record_uri(a, "app.bsky.graph.block")}))?;
+    set_recipient_view(
+        root,
+        direct_actor.did(),
+        a,
+        json!({"blockedBy":record_uri(a, "app.bsky.graph.block")}),
+    )?;
     // bob blocks alice.
-    set_recipient_view(root, direct_recipient.did(), a,
-        json!({"blocking":record_uri(direct_recipient.did(), "app.bsky.graph.block")}))?;
+    set_recipient_view(
+        root,
+        direct_recipient.did(),
+        a,
+        json!({"blocking":record_uri(direct_recipient.did(), "app.bsky.graph.block")}),
+    )?;
     // alice blocks bob through a moderation list.
-    set_recipient_view(root, list_actor.did(), a,
-        json!({"blockedByList":record_uri(a, "app.bsky.graph.list")}))?;
+    set_recipient_view(
+        root,
+        list_actor.did(),
+        a,
+        json!({"blockedByList":record_uri(a, "app.bsky.graph.list")}),
+    )?;
     // bob blocks alice through a moderation list.
-    set_recipient_view(root, list_recipient.did(), a,
-        json!({"blockingByList":record_uri(list_recipient.did(), "app.bsky.graph.list")}))?;
+    set_recipient_view(
+        root,
+        list_recipient.did(),
+        a,
+        json!({"blockingByList":record_uri(list_recipient.did(), "app.bsky.graph.list")}),
+    )?;
     set_incoming(root, none.did(), "none")?;
     set_incoming(root, following.did(), "following")?;
     // Control: identical path, recipient requires following and does follow alice.
     set_incoming(root, control.did(), "following")?;
-    set_recipient_view(root, control.did(), a,
-        json!({"following":record_uri(control.did(), "app.bsky.graph.follow")}))?;
+    set_recipient_view(
+        root,
+        control.did(),
+        a,
+        json!({"following":record_uri(control.did(), "app.bsky.graph.follow")}),
+    )?;
 
     for (bob, scenario) in bobs[..6].iter().zip(labels) {
         let prep = prepare(&rig, &alice, bob.did()).await?;
@@ -838,7 +891,10 @@ async fn c08_live_block_and_preference_denials_use_real_projection() -> anyhow::
             ))? == 0,
             "{scenario}: no device reservation after policy denial"
         );
-        anyhow::ensure!(request_rows(prep.request_id, prep.conversation_id)? == NO_ROWS, "{scenario}");
+        anyhow::ensure!(
+            request_rows(prep.request_id, prep.conversation_id)? == NO_ROWS,
+            "{scenario}"
+        );
         println!("C08 {scenario}: prepare -> RequestPolicyDenied, attempt rejected, zero reservation/publication rows");
     }
 
@@ -858,12 +914,26 @@ async fn c08_live_block_and_preference_denials_use_real_projection() -> anyhow::
         "admitted control did not persist its relationship projection"
     );
     let (publication, bootstrap) = build_publication(&rig, &alice, control.did(), &prep)?;
-    let (status, response) =
-        post(&rig, &alice.svc, "blue.catbird.chat.publishDirectRequest", &publication).await?;
+    let (status, response) = post(
+        &rig,
+        &alice.svc,
+        "blue.catbird.chat.publishDirectRequest",
+        &publication,
+    )
+    .await?;
     anyhow::ensure!(status == reqwest::StatusCode::OK, "{status}: {response}");
     anyhow::ensure!(receipt(&rig, &response)?.0 == "directRequestPublishedReceipt");
-    println!("C08 control (following + followed): prepare admitted, projection persisted, published");
-    release_by_accept(&rig, (&control.engine, &control.identity, &control.svc), &alice, &prep, &bootstrap).await?;
+    println!(
+        "C08 control (following + followed): prepare admitted, projection persisted, published"
+    );
+    release_by_accept(
+        &rig,
+        (&control.engine, &control.identity, &control.svc),
+        &alice,
+        &prep,
+        &bootstrap,
+    )
+    .await?;
     Ok(())
 }
 
@@ -886,15 +956,24 @@ async fn c08_live_publish_time_policy_recheck_denies_after_preparation() -> anyh
         pending.push((bob, prep, publication));
     }
     // Policy changes after reservation, before publication.
-    set_recipient_view(&rig.https.root, blocked.did(), alice.did(),
-        json!({"blocking":record_uri(blocked.did(), "app.bsky.graph.block")}))?;
+    set_recipient_view(
+        &rig.https.root,
+        blocked.did(),
+        alice.did(),
+        json!({"blocking":record_uri(blocked.did(), "app.bsky.graph.block")}),
+    )?;
     set_incoming(&rig.https.root, disabled.did(), "none")?;
     // The admission projection is reused for 60s (`load_fallback_relationship_projection`);
     // publish after it ages out so the recheck collects the changed evidence.
     tokio::time::sleep(Duration::from_secs(62)).await;
     for (bob, prep, publication) in &pending {
-        let (status, response) =
-            post(&rig, &alice.svc, "blue.catbird.chat.publishDirectRequest", publication).await?;
+        let (status, response) = post(
+            &rig,
+            &alice.svc,
+            "blue.catbird.chat.publishDirectRequest",
+            publication,
+        )
+        .await?;
         expect_rejected(&rig, status, &response, "RequestPolicyDenied")
             .with_context(|| bob.did().to_owned())?;
         anyhow::ensure!(attempt_status(prep.request_id)? == "rejected");
@@ -930,8 +1009,16 @@ async fn grant_disable_race(mutation_first: bool) -> anyhow::Result<()> {
         "blue.catbird.chat.publishDirectRequestKeys",
         keys_envelope(&bob, 2, false)?,
     );
-    let publish = (&alice.svc, "blue.catbird.chat.publishDirectRequest", publication);
-    let label = if mutation_first { "grant-disable-first" } else { "publish-first/grant-disable" };
+    let publish = (
+        &alice.svc,
+        "blue.catbird.chat.publishDirectRequest",
+        publication,
+    );
+    let label = if mutation_first {
+        "grant-disable-first"
+    } else {
+        "publish-first/grant-disable"
+    };
     let result = if mutation_first {
         race(&rig, Barrier::hold(bob.did())?, disable, publish, label).await?
     } else {
@@ -945,7 +1032,14 @@ async fn grant_disable_race(mutation_first: bool) -> anyhow::Result<()> {
     let published = publish_result.0 == reqwest::StatusCode::OK
         && receipt(&rig, &publish_result.1)?.0 == "directRequestPublishedReceipt";
     if published {
-        release_by_accept(&rig, (&bob.engine, &bob.identity, &bob.svc), &alice, &prep, &bootstrap).await?;
+        release_by_accept(
+            &rig,
+            (&bob.engine, &bob.identity, &bob.svc),
+            &alice,
+            &prep,
+            &bootstrap,
+        )
+        .await?;
     }
     anyhow::ensure!(
         disable_result.0 == reqwest::StatusCode::OK && disable_result.1["enabled"] == false,
@@ -957,16 +1051,32 @@ async fn grant_disable_race(mutation_first: bool) -> anyhow::Result<()> {
         "SELECT count(*) FROM chat.direct_request_grants WHERE owner_did='{}' AND revoked_at IS NOT NULL",
         bob.did()
     ))?;
-    anyhow::ensure!(grant_revoked == 1, "grant disable must revoke the selected grant");
+    anyhow::ensure!(
+        grant_revoked == 1,
+        "grant disable must revoke the selected grant"
+    );
     let rows = request_rows(prep.request_id, prep.conversation_id)?;
     if mutation_first {
-        expect_rejected(&rig, publish_result.0, &publish_result.1, "PreparationRevoked")?;
+        expect_rejected(
+            &rig,
+            publish_result.0,
+            &publish_result.1,
+            "PreparationRevoked",
+        )?;
         anyhow::ensure!(rows == NO_ROWS, "{rows:?}");
-        println!("C08 {label}: disable committed first; publish -> PreparationRevoked; rows {rows:?}");
+        println!(
+            "C08 {label}: disable committed first; publish -> PreparationRevoked; rows {rows:?}"
+        );
     } else {
-        anyhow::ensure!(publish_result.0 == reqwest::StatusCode::OK, "{}", publish_result.1);
+        anyhow::ensure!(
+            publish_result.0 == reqwest::StatusCode::OK,
+            "{}",
+            publish_result.1
+        );
         anyhow::ensure!(receipt(&rig, &publish_result.1)?.0 == "directRequestPublishedReceipt");
-        anyhow::ensure!(rows.publications == 1 && rows.deliveries == 1 && rows.published_attempts == 1);
+        anyhow::ensure!(
+            rows.publications == 1 && rows.deliveries == 1 && rows.published_attempts == 1
+        );
         // The published delivery is bound to the grant that was live when the
         // publication committed; the disable was serialized after it.
         let authorized = count(&format!(
@@ -976,7 +1086,10 @@ async fn grant_disable_race(mutation_first: bool) -> anyhow::Result<()> {
              WHERE d.request_id='{}' AND g.revoked_at > p.created_at",
             prep.request_id
         ))?;
-        anyhow::ensure!(authorized == 1, "published delivery references a grant revoked before publication");
+        anyhow::ensure!(
+            authorized == 1,
+            "published delivery references a grant revoked before publication"
+        );
         println!("C08 {label}: publish committed first with live grant; disable serialized after; rows {rows:?}");
     }
     Ok(())
@@ -1004,7 +1117,10 @@ async fn device_revoke_race(mutation_first: bool) -> anyhow::Result<()> {
     let prep = prepare(&rig, &alice, bob.did()).await?;
     anyhow::ensure!(
         prep.selected_device_ids()?
-            == BTreeSet::from([bob.svc.device_id.to_string(), sibling.service.device_id.to_string()])
+            == BTreeSet::from([
+                bob.svc.device_id.to_string(),
+                sibling.service.device_id.to_string()
+            ])
     );
     let (publication, bootstrap) = build_publication(&rig, &alice, bob.did(), &prep)?;
     let revoke = (
@@ -1012,8 +1128,16 @@ async fn device_revoke_race(mutation_first: bool) -> anyhow::Result<()> {
         "blue.catbird.chat.revokeDevice",
         revoke_envelope(&sibling, bob.svc.device_id)?,
     );
-    let publish = (&alice.svc, "blue.catbird.chat.publishDirectRequest", publication);
-    let label = if mutation_first { "revoke-first" } else { "publish-first/revoke" };
+    let publish = (
+        &alice.svc,
+        "blue.catbird.chat.publishDirectRequest",
+        publication,
+    );
+    let label = if mutation_first {
+        "revoke-first"
+    } else {
+        "publish-first/revoke"
+    };
     // Principal-only barrier: both transactions queue on their first identity
     // lock, the revocation only after its lock-free G6 scope discovery. Queue
     // order is therefore commit order, and in publish-first the revocation's
@@ -1068,7 +1192,12 @@ async fn device_revoke_race(mutation_first: bool) -> anyhow::Result<()> {
     anyhow::ensure!(revoked == "revoked,true", "target not revoked: {revoked}");
     let rows = request_rows(prep.request_id, prep.conversation_id)?;
     if mutation_first {
-        expect_rejected(&rig, publish_result.0, &publish_result.1, "PreparationRevoked")?;
+        expect_rejected(
+            &rig,
+            publish_result.0,
+            &publish_result.1,
+            "PreparationRevoked",
+        )?;
         anyhow::ensure!(rows == NO_ROWS, "{rows:?}");
         // The preparation-held (Reserved, no recovery reservation) request
         // package is retired by the revocation itself (F25).
@@ -1115,7 +1244,10 @@ fn request_packages_revoked(did: &str, device: Uuid) -> anyhow::Result<String> {
           WHERE p.owner_did='{did}' AND p.owner_device_id='{device}' AND p.usage_scope='direct-request'"
     ))?;
     let (total, revoked) = packages.split_once(',').context("package projection")?;
-    anyhow::ensure!(total != "0" && total == revoked, "request packages not all revoked: {packages}");
+    anyhow::ensure!(
+        total != "0" && total == revoked,
+        "request packages not all revoked: {packages}"
+    );
     Ok(packages)
 }
 
@@ -1137,7 +1269,10 @@ async fn c08_live_revoke_device_with_retired_request_packages() -> anyhow::Resul
         &keys_envelope(&bob, 2, false)?,
     )
     .await?;
-    anyhow::ensure!(status == reqwest::StatusCode::OK && body["enabled"] == false, "disable {status}: {body}");
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK && body["enabled"] == false,
+        "disable {status}: {body}"
+    );
     let retired = count(&format!(
         "SELECT count(*) FROM chat.key_packages WHERE owner_did='{}' AND owner_device_id='{}' \
          AND usage_scope='direct-request' AND status='reserved'",
@@ -1152,7 +1287,10 @@ async fn c08_live_revoke_device_with_retired_request_packages() -> anyhow::Resul
         &revoke_envelope(&sibling, bob.svc.device_id)?,
     )
     .await?;
-    anyhow::ensure!(status == reqwest::StatusCode::OK, "revokeDevice {status}: {body}");
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "revokeDevice {status}: {body}"
+    );
     let packages = request_packages_revoked(bob.did(), bob.svc.device_id)?;
     println!("C08 retired-packages revoke: {retired} retired request packages; revoke 200; total,revoked-by-revocation={packages}");
     Ok(())
@@ -1184,7 +1322,10 @@ async fn c09_live_snapshot_includes_every_deliverable_device_and_ignores_unrelat
         alice_sibling.service.device_id.to_string(),
     ]);
     let selected = prep.selected_device_ids()?;
-    anyhow::ensure!(selected == expected, "snapshot {selected:?} != deliverable {expected:?}");
+    anyhow::ensure!(
+        selected == expected,
+        "snapshot {selected:?} != deliverable {expected:?}"
+    );
     let reserved: BTreeSet<String> = psql(&format!(
         "SELECT string_agg(owner_device_id::text, ',') FROM chat.direct_request_selected_devices WHERE request_id='{}'",
         prep.request_id
@@ -1200,8 +1341,13 @@ async fn c09_live_snapshot_includes_every_deliverable_device_and_ignores_unrelat
     let late = siblings::enroll(&bob.svc, &rig.client, &rig.server.base_url).await?;
     publish_keys(&rig, &carol).await?;
     let (publication, bootstrap) = build_publication(&rig, &alice, bob.did(), &prep)?;
-    let (status, response) =
-        post(&rig, &alice.svc, "blue.catbird.chat.publishDirectRequest", &publication).await?;
+    let (status, response) = post(
+        &rig,
+        &alice.svc,
+        "blue.catbird.chat.publishDirectRequest",
+        &publication,
+    )
+    .await?;
     anyhow::ensure!(status == reqwest::StatusCode::OK, "{status}: {response}");
     anyhow::ensure!(receipt(&rig, &response)?.0 == "directRequestPublishedReceipt");
     let delivered: BTreeSet<String> = psql(&format!(
@@ -1217,12 +1363,23 @@ async fn c09_live_snapshot_includes_every_deliverable_device_and_ignores_unrelat
 
     // Every included device imports the one Welcome and reads the introduction.
     let mut published = response["outcome"].clone();
-    published.as_object_mut().context("outcome")?.remove("$type");
+    published
+        .as_object_mut()
+        .context("outcome")?
+        .remove("$type");
     let publication_request = serde_json::to_vec(&publication["signedRequest"])?;
     for (engine, identity, package_ref) in [
         (&bob.engine, bob.identity.clone(), bob.package_ref.clone()),
-        (&bob_sibling.engine, bob_sibling.identity.clone(), bob_sibling.package_ref.clone()),
-        (&alice_sibling.engine, alice_sibling.identity.clone(), alice_sibling.package_ref.clone()),
+        (
+            &bob_sibling.engine,
+            bob_sibling.identity.clone(),
+            bob_sibling.package_ref.clone(),
+        ),
+        (
+            &alice_sibling.engine,
+            alice_sibling.identity.clone(),
+            alice_sibling.package_ref.clone(),
+        ),
     ] {
         let input = DirectRequestWelcomeInput {
             bootstrap: bootstrap.clone(),
@@ -1246,7 +1403,14 @@ async fn c09_live_snapshot_includes_every_deliverable_device_and_ignores_unrelat
                 == "C08/C09 encrypted first contact"
         );
     }
-    release_by_accept(&rig, (&bob.engine, &bob.identity, &bob.svc), &alice, &prep, &bootstrap).await?;
+    release_by_accept(
+        &rig,
+        (&bob.engine, &bob.identity, &bob.svc),
+        &alice,
+        &prep,
+        &bootstrap,
+    )
+    .await?;
     println!("C09 unrelated enrollment: late recipient device + unrelated account enrolled after snapshot; publish succeeded with exactly the snapshot (3 deliveries), late device excluded; all 3 included devices imported and decrypted");
     Ok(())
 }
@@ -1270,9 +1434,17 @@ async fn c09_live_no_eligible_recipient_emits_no_invitation() -> anyhow::Result<
     )
     .await?;
     anyhow::ensure!(status == reqwest::StatusCode::OK, "{body}");
-    for (bob, scenario) in [(&keyless, "never published keys"), (&disabled, "request keys disabled")] {
+    for (bob, scenario) in [
+        (&keyless, "never published keys"),
+        (&disabled, "request keys disabled"),
+    ] {
         let prep = prepare(&rig, &alice, bob.did()).await?;
-        expect_rejected(&rig, prep.status, &prep.response, "RecipientKeysUnavailable")?;
+        expect_rejected(
+            &rig,
+            prep.status,
+            &prep.response,
+            "RecipientKeysUnavailable",
+        )?;
         anyhow::ensure!(attempt_status(prep.request_id)? == "rejected");
         anyhow::ensure!(request_rows(prep.request_id, prep.conversation_id)? == NO_ROWS);
         anyhow::ensure!(
@@ -1294,4 +1466,3 @@ async fn c09_live_no_eligible_recipient_emits_no_invitation() -> anyhow::Result<
     }
     Ok(())
 }
-

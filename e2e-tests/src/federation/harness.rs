@@ -519,7 +519,6 @@ impl TwoNodeCluster {
             return Err(error);
         }
 
-
         // 2. docker compose exec -T ds2 /usr/local/bin/federation_fixture <container-path>
         let exec_output = Command::new("docker")
             .args([

@@ -22,10 +22,10 @@ use catbird_mls::{
 };
 use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, push_auth_snapshot,
-    request_database_snapshot, reviewed_baseline, reviewed_request_migrations, seed_service_device,
-    signed_mls_request, validate_request_test_database_url, DeterministicFaultTransport,
-    FaultBoundary, HttpsDidFixture, PushFixtureConfig, RequestRig, ServiceIdentity,
-    ShippingServerFixture, request_database_url,
+    request_database_snapshot, request_database_url, reviewed_baseline,
+    reviewed_request_migrations, seed_service_device, signed_mls_request,
+    validate_request_test_database_url, DeterministicFaultTransport, FaultBoundary,
+    HttpsDidFixture, PushFixtureConfig, RequestRig, ServiceIdentity, ShippingServerFixture,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -109,21 +109,29 @@ async fn run_c32_paired(scenario: &str) -> anyhow::Result<()> {
                 "enabled":true,"signedAt":canonical_now()
             }))?;
         let fcm_transcript = catbird_mls::atproto::push_registration::transcript(&fcm_body)?;
-        let fcm_sig = fixture.bob_engine.sign_identity(&bob_identity, fcm_transcript)?;
+        let fcm_sig = fixture
+            .bob_engine
+            .sign_identity(&bob_identity, fcm_transcript)?;
         let fcm_registration = catbird_mls::atproto::blue_catbird::chat::SignedPushRegistration {
             body: fcm_body.clone(),
             signature: fcm_sig.into(),
             extra_data: None,
         };
         let fcm_req = json!({"token":synthetic_fcm_token,"registration":fcm_registration});
-        let (fcm_status, fcm_bytes) = fixture.bob.post(
-            &fixture.client,
-            &fixture.server.base_url,
-            "blue.catbird.chat.updatePushToken",
-            &fcm_req,
-            true,
-        ).await?;
-        anyhow::ensure!(fcm_status == reqwest::StatusCode::OK, "fcm registration failed {fcm_status}");
+        let (fcm_status, fcm_bytes) = fixture
+            .bob
+            .post(
+                &fixture.client,
+                &fixture.server.base_url,
+                "blue.catbird.chat.updatePushToken",
+                &fcm_req,
+                true,
+            )
+            .await?;
+        anyhow::ensure!(
+            fcm_status == reqwest::StatusCode::OK,
+            "fcm registration failed {fcm_status}"
+        );
         let fcm_ack: Value = serde_json::from_slice(&fcm_bytes)?;
         (fcm_req, fcm_ack)
     } else {
@@ -131,7 +139,10 @@ async fn run_c32_paired(scenario: &str) -> anyhow::Result<()> {
             // Transition consent to non-pending before push dispatch
             live_direct_request::accept_existing_fixture(&fixture).await?;
         }
-        (fixture.push_registration_request.clone(), fixture.push_registration_ack.clone())
+        (
+            fixture.push_registration_request.clone(),
+            fixture.push_registration_ack.clone(),
+        )
     };
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let ds_port = listener.local_addr()?.port();

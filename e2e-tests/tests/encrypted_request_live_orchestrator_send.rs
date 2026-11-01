@@ -8,10 +8,10 @@
 
 #[path = "support/encrypted_requests.rs"]
 mod encrypted_requests;
-#[path = "support/live_orchestrator.rs"]
-mod live_orchestrator;
 #[path = "../../../catbird-mls/tests/epoch_secret_test_support.rs"]
 mod epoch_secret_test_support;
+#[path = "support/live_orchestrator.rs"]
+mod live_orchestrator;
 
 use anyhow::Context as _;
 use catbird_mls::atproto::generated::blue_catbird::chat::{
@@ -32,12 +32,17 @@ use serde_json::Value;
 use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request() -> anyhow::Result<()> {
+async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request(
+) -> anyhow::Result<()> {
     let authority = connect_guarded_request_database(5).await?;
     anyhow::ensure!(authority.additive_migrations == reviewed_request_migrations().len());
     let run = Uuid::new_v4().simple().to_string();
-    let alice = ServiceIdentity::new(format!("did:web:f37-alice-{run}.request-fixture.catbird.blue"));
-    let bob = ServiceIdentity::new(format!("did:web:f37-bob-{run}.request-fixture.catbird.blue"));
+    let alice = ServiceIdentity::new(format!(
+        "did:web:f37-alice-{run}.request-fixture.catbird.blue"
+    ));
+    let bob = ServiceIdentity::new(format!(
+        "did:web:f37-bob-{run}.request-fixture.catbird.blue"
+    ));
     let https = HttpsDidFixture::start(
         HttpsDidFixture::reserve_port()?,
         &[
@@ -71,19 +76,27 @@ async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request
         async move {
             use base64::Engine as _;
             use sha2::Digest as _;
-            let key_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(&key));
+            let key_id =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(&key));
             let (status, body) = alice
                 .get_device_key(&client, &base, &owner.did, owner.device_id, &key_id)
                 .await?;
             anyhow::ensure!(status == reqwest::StatusCode::OK, "getDeviceKey {status}");
             let served: Value = serde_json::from_slice(&body)?;
-            anyhow::Ok(base64::engine::general_purpose::STANDARD.decode(
-                served["signaturePublicKey"]["$bytes"].as_str().context("signaturePublicKey")?,
-            )?)
+            anyhow::Ok(
+                base64::engine::general_purpose::STANDARD.decode(
+                    served["signaturePublicKey"]["$bytes"]
+                        .as_str()
+                        .context("signaturePublicKey")?,
+                )?,
+            )
         }
     };
     let credentials = MockCredentials::new();
-    credentials.set_authorized_device_keys(&alice.did, vec![directory_key(&alice, public.clone()).await?]);
+    credentials.set_authorized_device_keys(
+        &alice.did,
+        vec![directory_key(&alice, public.clone()).await?],
+    );
     credentials.set_authorized_device_keys(
         &bob.did,
         vec![directory_key(&bob, bob_engine.identity_public_key(&bob_identity)?).await?],
@@ -138,14 +151,16 @@ async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request
         .await
         .context("live leaf recovery fulfilment")?;
     assert_eq!(
-        fulfilled["entry"]["$type"],
-        "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry",
+        fulfilled["entry"]["$type"], "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry",
         "{fulfilled}"
     );
     // The success response carries Bob's pending Welcome view, presented.
     let welcomes = fulfilled["welcomes"].as_array().context("welcomes")?;
     assert_eq!(welcomes.len(), 1, "{fulfilled}");
-    assert!(welcomes[0]["opaqueWelcome"]["$bytes"].is_string(), "{fulfilled}");
+    assert!(
+        welcomes[0]["opaqueWelcome"]["$bytes"].is_string(),
+        "{fulfilled}"
+    );
 
     // F41 replay regression: re-submitting the exact fulfillment mutation request
     // returns 200 and decodes into SubmitTransitionOutput with presented $bytes.
@@ -194,7 +209,10 @@ async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request
         .await
         .context("live send_message through encrypt_and_send_message_prepared")?;
     assert_eq!(sent.conversation_id, cid);
-    println!("F37 live send accepted: conversation={cid} message={}", sent.id);
+    println!(
+        "F37 live send accepted: conversation={cid} message={}",
+        sent.id
+    );
     assert_eq!(sent.sender_did, alice.did);
 
     // The router presented the echoed signed request with lexicon bytes.
@@ -210,7 +228,11 @@ async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request
             ],
         )
         .await?;
-    anyhow::ensure!(status == reqwest::StatusCode::OK, "getEntries {status}: {}", String::from_utf8_lossy(&body));
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "getEntries {status}: {}",
+        String::from_utf8_lossy(&body)
+    );
     let raw: Value = serde_json::from_slice(&body)?;
     let application = raw["entries"]
         .as_array()
@@ -219,21 +241,30 @@ async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request
         .find(|entry| entry["$type"] == "blue.catbird.chat.defs#applicationEntry")
         .context("application entry")?;
     let aad = &application["signedRequest"]["body"]["aad"];
-    assert!(aad["conversationId"]["$bytes"].is_string(), "presented identifierBytes: {aad}");
-    assert!(aad["messageId"]["$bytes"].is_string(), "presented identifierBytes: {aad}");
-    let page: GetEntriesOutput = serde_json::from_slice(&body)
-        .context("getEntries does not decode into generated types")?;
+    assert!(
+        aad["conversationId"]["$bytes"].is_string(),
+        "presented identifierBytes: {aad}"
+    );
+    assert!(
+        aad["messageId"]["$bytes"].is_string(),
+        "presented identifierBytes: {aad}"
+    );
+    let page: GetEntriesOutput =
+        serde_json::from_slice(&body).context("getEntries does not decode into generated types")?;
     assert!(page
         .entries
         .iter()
         .any(|entry| matches!(entry, ConversationEntry::ApplicationEntry(_))));
 
     // The canonical host entry mapping decodes the same presented page.
-    let (envelopes, _) = live_orchestrator::LiveApiClient::for_test(&alice, &client, &server.base_url)
-        .get_messages(&cid, None, 100, None, None, None)
-        .await?;
+    let (envelopes, _) =
+        live_orchestrator::LiveApiClient::for_test(&alice, &client, &server.base_url)
+            .get_messages(&cid, None, 100, None, None, None)
+            .await?;
     assert!(
-        envelopes.iter().any(|envelope| !envelope.ciphertext.is_empty()),
+        envelopes
+            .iter()
+            .any(|envelope| !envelope.ciphertext.is_empty()),
         "application entry maps to an MLS envelope"
     );
 
@@ -267,8 +298,14 @@ async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request
         nsid: &str,
     ) -> anyhow::Result<T> {
         let responses = api.responses(nsid);
-        let (status, body) = responses.last().with_context(|| format!("no {nsid} exchange"))?;
-        anyhow::ensure!(*status == 200, "{nsid} {status}: {}", String::from_utf8_lossy(body));
+        let (status, body) = responses
+            .last()
+            .with_context(|| format!("no {nsid} exchange"))?;
+        anyhow::ensure!(
+            *status == 200,
+            "{nsid} {status}: {}",
+            String::from_utf8_lossy(body)
+        );
         serde_json::from_slice(body)
             .with_context(|| format!("{nsid} success body does not decode into generated types"))
     }
@@ -278,8 +315,10 @@ async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request
     let _: RequestResetOutput = typed(api, "blue.catbird.chat.requestReset")?;
     let _: ActivateResetOutput = typed(api, "blue.catbird.chat.activateReset")?;
     let _: GetSubscriptionTicketOutput = typed(api, "blue.catbird.chat.getSubscriptionTicket")?;
-    let _: AcceptConversationOutput =
-        typed(bob_orchestrator.api_client(), "blue.catbird.chat.acceptConversation")?;
+    let _: AcceptConversationOutput = typed(
+        bob_orchestrator.api_client(),
+        "blue.catbird.chat.acceptConversation",
+    )?;
     println!("F37 live typed success: createConversation submitTransition sendMessage acceptConversation requestReset activateReset getSubscriptionTicket");
 
     orchestrator.shutdown().await;

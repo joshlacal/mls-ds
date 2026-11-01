@@ -1714,7 +1714,9 @@ mod chat_protocol {
     pub mod read_projection {
         pub struct DummyCanonical;
         impl DummyCanonical {
-            pub fn bytes(&self) -> &[u8] { &[] }
+            pub fn bytes(&self) -> &[u8] {
+                &[]
+            }
         }
         pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
             _value: &T,
@@ -1724,4 +1726,3 @@ mod chat_protocol {
         }
     }
 }
-

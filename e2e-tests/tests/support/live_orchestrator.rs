@@ -165,7 +165,9 @@ impl LiveApiClient {
 }
 
 fn outside_projection(method: &str) -> OrchestratorError {
-    OrchestratorError::Api(format!("{method} is outside the direct-request projection path"))
+    OrchestratorError::Api(format!(
+        "{method} is outside the direct-request projection path"
+    ))
 }
 
 type ApiResult<T> = catbird_mls::orchestrator::Result<T>;
@@ -180,7 +182,10 @@ impl MLSAPIClient for LiveApiClient {
         Some(self.service.did.clone())
     }
 
-    async fn submit_prepared_request(&self, request: PreparedRequest) -> ApiResult<GatewayResponse> {
+    async fn submit_prepared_request(
+        &self,
+        request: PreparedRequest,
+    ) -> ApiResult<GatewayResponse> {
         let (path, query) = match request.path.split_once('?') {
             Some((path, query)) => (path, Some(query)),
             None => (request.path.as_str(), None),
@@ -205,10 +210,12 @@ impl MLSAPIClient for LiveApiClient {
             )
             .await
             .map_err(|error| OrchestratorError::Api(format!("{error:#}")))?;
-        self.exchanges
-            .lock()
-            .unwrap()
-            .push((nsid.to_owned(), request.body.clone(), status.as_u16(), body.clone()));
+        self.exchanges.lock().unwrap().push((
+            nsid.to_owned(),
+            request.body.clone(),
+            status.as_u16(),
+            body.clone(),
+        ));
         Ok(GatewayResponse {
             status: status.as_u16(),
             content_type: Some("application/json".into()),
@@ -234,10 +241,12 @@ impl MLSAPIClient for LiveApiClient {
             Ok(response) => (response.status, response.body.clone()),
             Err(error) => (0, error.to_string().into_bytes()),
         };
-        self.exchanges
-            .lock()
-            .unwrap()
-            .push((request.nsid.clone(), request.body.clone(), status, body));
+        self.exchanges.lock().unwrap().push((
+            request.nsid.clone(),
+            request.body.clone(),
+            status,
+            body,
+        ));
         result
     }
 
@@ -273,8 +282,7 @@ impl MLSAPIClient for LiveApiClient {
             });
         }
         let invalid = |what: &str| OrchestratorError::Serialization(format!("inventory {what}"));
-        let page: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|_| invalid("JSON"))?;
+        let page: serde_json::Value = serde_json::from_slice(&body).map_err(|_| invalid("JSON"))?;
         let mut conversations = Vec::new();
         for item in page["items"].as_array().into_iter().flatten() {
             if item["$type"] != "blue.catbird.chat.defs#conversationInventoryState" {
@@ -289,17 +297,20 @@ impl MLSAPIClient for LiveApiClient {
             let group = base64::engine::general_purpose::STANDARD
                 .decode(group)
                 .map_err(|_| invalid("groupId"))?;
-            let canonical = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
-                &serde_json::to_vec(state).map_err(|_| invalid("state"))?,
-            )
-            .map_err(|error| invalid(&error.to_string()))?;
+            let canonical =
+                catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+                    &serde_json::to_vec(state).map_err(|_| invalid("state"))?,
+                )
+                .map_err(|error| invalid(&error.to_string()))?;
             conversations.push(ConversationView {
                 group_id: hex::encode(group),
                 conversation_id: coordinates["conversationId"]
                     .as_str()
                     .ok_or_else(|| invalid("conversationId"))?
                     .to_owned(),
-                epoch: coordinates["epoch"].as_u64().ok_or_else(|| invalid("epoch"))?,
+                epoch: coordinates["epoch"]
+                    .as_u64()
+                    .ok_or_else(|| invalid("epoch"))?,
                 members: state["participants"]
                     .as_array()
                     .into_iter()
@@ -338,7 +349,10 @@ impl MLSAPIClient for LiveApiClient {
         _message_type: Option<&str>,
         _from_epoch: Option<u32>,
         _to_epoch: Option<u32>,
-    ) -> ApiResult<(Vec<catbird_mls::orchestrator::IncomingEnvelope>, Option<String>)> {
+    ) -> ApiResult<(
+        Vec<catbird_mls::orchestrator::IncomingEnvelope>,
+        Option<String>,
+    )> {
         let after = cursor.unwrap_or("0");
         let query = format!(
             "actorDeviceId={}&conversationId={convo_id}&afterSeq={after}&limit={}",
@@ -419,7 +433,8 @@ impl MLSAPIClient for LiveApiClient {
     }
 }
 
-pub type LiveOrchestrator = MLSOrchestrator<MockStorage, LiveApiClient, MockCredentials, MLSContext>;
+pub type LiveOrchestrator =
+    MLSOrchestrator<MockStorage, LiveApiClient, MockCredentials, MLSContext>;
 
 /// An initialized orchestrator for `service`'s exact device over `context`,
 /// trusting the fixture's published receipt authority document.
@@ -460,7 +475,9 @@ pub async fn live_orchestrator_with_key_packages(
     credentials
         .store_device_uuid(&service.did, &service.device_id.to_string())
         .await?;
-    credentials.store_mls_did(&service.did, &service.did).await?;
+    credentials
+        .store_mls_did(&service.did, &service.did)
+        .await?;
     let orchestrator = MLSOrchestrator::new(
         context,
         Arc::new(MockStorage::new()),

@@ -24,10 +24,9 @@ use catbird_mls::{
     },
 };
 use encrypted_requests::{
-    canonical_future, canonical_now, connect_guarded_request_database,
-    request_database_snapshot, reviewed_request_migrations, seed_service_device,
-    signed_mls_request, validate_request_test_database_url, HttpsDidFixture,
-    ServiceIdentity, ShippingServerFixture, request_database_url,
+    canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
+    request_database_url, reviewed_request_migrations, seed_service_device, signed_mls_request,
+    validate_request_test_database_url, HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
 };
 
 #[path = "support/live_direct_request.rs"]
@@ -86,7 +85,9 @@ async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> any
     let run = Uuid::new_v4().simple().to_string();
     let alice = ServiceIdentity::new(format!("did:web:alice-{run}.request-fixture.catbird.blue"));
     let bob = ServiceIdentity::new(format!("did:web:bob-{run}.request-fixture.catbird.blue"));
-    let charlie = ServiceIdentity::new(format!("did:web:charlie-{run}.request-fixture.catbird.blue"));
+    let charlie = ServiceIdentity::new(format!(
+        "did:web:charlie-{run}.request-fixture.catbird.blue"
+    ));
     let https = HttpsDidFixture::start(
         did_port,
         &[
@@ -357,15 +358,25 @@ async fn c07_live_router_recovery_pool_isolated_from_request_exhaustion() -> any
         "idempotencyKey": Uuid::new_v4().to_string(),
         "signedAt": canonical_now(),
     });
-    let cancel = signed_mls_request(&alice_engine, &alice_identity, DirectRequestKind::Cancel, cancel_body)?;
-    let (cancel_status, _) = alice.post(
-        &client,
-        &server.base_url,
-        "blue.catbird.chat.cancelDirectRequestPreparation",
-        &json!({"signedRequest": cancel}),
-        true,
-    ).await?;
-    anyhow::ensure!(cancel_status == reqwest::StatusCode::OK, "cancel preparation: {cancel_status}");
+    let cancel = signed_mls_request(
+        &alice_engine,
+        &alice_identity,
+        DirectRequestKind::Cancel,
+        cancel_body,
+    )?;
+    let (cancel_status, _) = alice
+        .post(
+            &client,
+            &server.base_url,
+            "blue.catbird.chat.cancelDirectRequestPreparation",
+            &json!({"signedRequest": cancel}),
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        cancel_status == reqwest::StatusCode::OK,
+        "cancel preparation: {cancel_status}"
+    );
 
     Ok(())
 }

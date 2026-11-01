@@ -48,14 +48,11 @@ use catbird_mls::{
     },
 };
 use encrypted_requests::{
-    canonical_future, canonical_now, connect_guarded_request_database,
-    request_database_snapshot, request_database_url, reviewed_request_migrations,
-    seed_service_device, signed_mls_request, validate_request_test_database_url,
-    HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
+    canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
+    request_database_url, reviewed_request_migrations, seed_service_device, signed_mls_request,
+    validate_request_test_database_url, HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
 };
-use live_direct_request::{
-    publish_request_variant, PublishedRequestFixture,
-};
+use live_direct_request::{publish_request_variant, PublishedRequestFixture};
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -66,15 +63,27 @@ struct MemoryEpochStore(tokio::sync::Mutex<std::collections::HashMap<(String, u6
 
 #[async_trait::async_trait]
 impl catbird_mls::EpochSecretStorage for MemoryEpochStore {
-    async fn store_epoch_secret(&self, conversation_id: String, epoch: u64, secret_data: Vec<u8>) -> bool {
-        self.0.lock().await.insert((conversation_id, epoch), secret_data);
+    async fn store_epoch_secret(
+        &self,
+        conversation_id: String,
+        epoch: u64,
+        secret_data: Vec<u8>,
+    ) -> bool {
+        self.0
+            .lock()
+            .await
+            .insert((conversation_id, epoch), secret_data);
         true
     }
     async fn get_epoch_secret(&self, conversation_id: String, epoch: u64) -> Option<Vec<u8>> {
         self.0.lock().await.get(&(conversation_id, epoch)).cloned()
     }
     async fn delete_epoch_secret(&self, conversation_id: String, epoch: u64) -> bool {
-        self.0.lock().await.remove(&(conversation_id, epoch)).is_some()
+        self.0
+            .lock()
+            .await
+            .remove(&(conversation_id, epoch))
+            .is_some()
     }
     async fn delete_epochs_before(&self, conversation_id: String, cutoff_epoch: u64) -> u32 {
         let mut store = self.0.lock().await;
@@ -126,7 +135,13 @@ fn graph(conversation: Uuid) -> anyhow::Result<Value> {
     let result = std::process::Command::new("psql")
         .args([
             request_database_url(),
-            "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", &sql,
+            "-X",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            &sql,
         ])
         .output()
         .context("psql graph query failed")?;
@@ -157,7 +172,10 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
     let sibling = sibling.context("second selected recipient device (iPad)")?;
 
     assert_eq!(f.bob.did, sibling.service.did, "same account DID");
-    assert_ne!(f.bob.device_id, sibling.service.device_id, "distinct device IDs");
+    assert_ne!(
+        f.bob.device_id, sibling.service.device_id,
+        "distinct device IDs"
+    );
 
     let bob_iphone_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
     let bob_ipad_identity = sibling.identity.clone();
@@ -178,7 +196,10 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
     // 4. Verify database state at publication: 1 message, 2 welcomes, 0 plaintext
     let snapshot = request_database_snapshot(f.request_id)?;
     assert_eq!(snapshot.message_rows, 1, "exactly one intro message");
-    assert_eq!(snapshot.welcome_rows, 2, "two welcome rows for the two recipient devices");
+    assert_eq!(
+        snapshot.welcome_rows, 2,
+        "two welcome rows for the two recipient devices"
+    );
     assert_eq!(snapshot.plaintext_matches, 0, "zero plaintext leaks");
 
     // 5. Pre-acceptance preview on BOTH recipient devices
@@ -186,7 +207,10 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
     f.bob_engine.process_direct_request(&f.welcome_input)?;
     assert_eq!(f.bob_engine.epoch(&group)?, epoch);
     let iphone_intro = f.bob_engine.decrypt_direct_request(&f.welcome_input)?;
-    let DirectRequestIntroductionResult::Ready { plaintext: iphone_pt } = &iphone_intro else {
+    let DirectRequestIntroductionResult::Ready {
+        plaintext: iphone_pt,
+    } = &iphone_intro
+    else {
         anyhow::bail!("Bob-iPhone intro not ready");
     };
     let iphone_intro_text = protocol::decode_direct_request_introduction(iphone_pt)?["text"]
@@ -211,7 +235,10 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
         .context("text")?
         .to_string();
     assert_eq!(ipad_intro_text, "Real encrypted first contact");
-    assert_eq!(iphone_intro_text, ipad_intro_text, "both devices see identical intro");
+    assert_eq!(
+        iphone_intro_text, ipad_intro_text,
+        "both devices see identical intro"
+    );
 
     // 6. Pre-acceptance restriction: ordinary send before consent fails with ConversationNotAccepted
     let bob_public = f.bob_engine.identity_public_key(&bob_iphone_identity)?;
@@ -257,7 +284,8 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
             "signedAt": canonical_now()
         }),
     )?;
-    let (premature_status, premature_bytes) = f.bob
+    let (premature_status, premature_bytes) = f
+        .bob
         .post(
             &f.client,
             &f.server.base_url,
@@ -310,7 +338,8 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
         }),
     )?;
     let acceptance_envelope = json!({"directRequest": acceptance_signed});
-    let (acc_status, acc_bytes) = sibling.service
+    let (acc_status, acc_bytes) = sibling
+        .service
         .post(
             &f.client,
             &f.server.base_url,
@@ -328,7 +357,8 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
     assert!(accepted_result.get("acceptanceProof").is_some());
 
     // 8. Acceptance propagation: Bob-iPhone observes consent: accepted without extra Add/reset
-    let (state_status, state_raw) = f.bob
+    let (state_status, state_raw) = f
+        .bob
         .get(
             &f.client,
             &f.server.base_url,
@@ -344,9 +374,18 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
     );
 
     let graph_after = graph(f.conversation_id)?;
-    assert_eq!(graph_after["epoch"], graph_before["epoch"], "no epoch advancement on accept");
-    assert_eq!(graph_after["generation"], graph_before["generation"], "no crypto reset");
-    assert_eq!(graph_after["acceptanceClaims"], 1, "exactly one acceptance claim");
+    assert_eq!(
+        graph_after["epoch"], graph_before["epoch"],
+        "no epoch advancement on accept"
+    );
+    assert_eq!(
+        graph_after["generation"], graph_before["generation"],
+        "no crypto reset"
+    );
+    assert_eq!(
+        graph_after["acceptanceClaims"], 1,
+        "exactly one acceptance claim"
+    );
 
     // 9. Bob-iPhone sends ordinary encrypted reply
     let reply1_id = Uuid::new_v4();
@@ -392,7 +431,8 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
             "signedAt": canonical_now()
         }),
     )?;
-    let (send1_status, send1_bytes) = f.bob
+    let (send1_status, send1_bytes) = f
+        .bob
         .post(
             &f.client,
             &f.server.base_url,
@@ -471,7 +511,8 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
             "signedAt": canonical_now()
         }),
     )?;
-    let (send2_status, send2_bytes) = sibling.service
+    let (send2_status, send2_bytes) = sibling
+        .service
         .post(
             &f.client,
             &f.server.base_url,
@@ -558,7 +599,8 @@ async fn ipados_ios_second_device_every_row_branches() -> anyhow::Result<()> {
         "signedAt": canonical_now()
     });
     let close_signed = signed_ordinary(&f.bob_engine, &bob_identity, close_body)?;
-    let (close_status, close_bytes) = f.bob
+    let (close_status, close_bytes) = f
+        .bob
         .post(
             &f.client,
             &f.server.base_url,
@@ -580,14 +622,25 @@ async fn ipados_ios_second_device_every_row_branches() -> anyhow::Result<()> {
     let output = std::process::Command::new("psql")
         .args([
             request_database_url(),
-            "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", &consent_sql,
+            "-X",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            &consent_sql,
         ])
         .output()?;
     anyhow::ensure!(output.status.success(), "consent query failed");
     let consent_state = String::from_utf8(output.stdout)?;
-    assert_eq!(consent_state.trim(), "closed", "lifecycle consent must be closed");
+    assert_eq!(
+        consent_state.trim(),
+        "closed",
+        "lifecycle consent must be closed"
+    );
     // Idempotent duplicate close replay succeeds
-    let (replay_status, _) = f.bob
+    let (replay_status, _) = f
+        .bob
         .post(
             &f.client,
             &f.server.base_url,
@@ -596,7 +649,11 @@ async fn ipados_ios_second_device_every_row_branches() -> anyhow::Result<()> {
             true,
         )
         .await?;
-    assert_eq!(replay_status, reqwest::StatusCode::OK, "duplicate close replay succeeds");
+    assert_eq!(
+        replay_status,
+        reqwest::StatusCode::OK,
+        "duplicate close replay succeeds"
+    );
 
     println!("ipados_ios_second_device: decline/block monotonicity verified");
     Ok(())
@@ -678,7 +735,8 @@ async fn ipados_ios_second_device_device_added_after_acceptance() -> anyhow::Res
             "signedAt": canonical_now()
         }),
     )?;
-    let (acc_status, acc_bytes) = sibling.service
+    let (acc_status, acc_bytes) = sibling
+        .service
         .post(
             &f.client,
             &f.server.base_url,
@@ -687,27 +745,39 @@ async fn ipados_ios_second_device_device_added_after_acceptance() -> anyhow::Res
             true,
         )
         .await?;
-    anyhow::ensure!(acc_status == reqwest::StatusCode::OK, "accept failed {acc_status}: {}", String::from_utf8_lossy(&acc_bytes));
+    anyhow::ensure!(
+        acc_status == reqwest::StatusCode::OK,
+        "accept failed {acc_status}: {}",
+        String::from_utf8_lossy(&acc_bytes)
+    );
 
     // 5. Post-acceptance device addition: Bob enrolls a THIRD device AFTER acceptance
-    let late_device = live_direct_request::siblings::enroll(&f.bob, &f.client, &f.server.base_url).await?;
+    let late_device =
+        live_direct_request::siblings::enroll(&f.bob, &f.client, &f.server.base_url).await?;
     assert_ne!(late_device.service.device_id, f.bob.device_id);
     assert_ne!(late_device.service.device_id, sibling.service.device_id);
     assert_eq!(late_device.service.did, f.bob.did);
-    late_device.engine.context().set_epoch_secret_storage(Box::new(MemoryEpochStore::default()))?;
+    late_device
+        .engine
+        .context()
+        .set_epoch_secret_storage(Box::new(MemoryEpochStore::default()))?;
 
     // 6. Active member (Bob-iPhone) adds the late device to the active group
     //    With F26 fixed on mainline core, metadata reseal on request-born groups succeeds
-    let (late_kp_data, _) = late_device.engine.create_key_package(&late_device.identity)?;
-    let (commit_data, welcome_data) = f.bob_engine.add_members(
-        &group,
-        vec![late_kp_data],
-    )?;
-    assert!(!welcome_data.is_empty(), "welcome generated for late device");
+    let (late_kp_data, _) = late_device
+        .engine
+        .create_key_package(&late_device.identity)?;
+    let (commit_data, welcome_data) = f.bob_engine.add_members(&group, vec![late_kp_data])?;
+    assert!(
+        !welcome_data.is_empty(),
+        "welcome generated for late device"
+    );
     assert!(!commit_data.is_empty(), "commit generated for add");
 
     // 7. Late device joins via Welcome at successor epoch 2
-    let joined_group = late_device.engine.process_welcome(&welcome_data, &late_device.identity)?;
+    let joined_group = late_device
+        .engine
+        .process_welcome(&welcome_data, &late_device.identity)?;
     assert_eq!(joined_group, group);
     let late_epoch = late_device.engine.epoch(&group)?;
     assert_eq!(late_epoch, 2, "late device joins at successor epoch 2");

@@ -100,7 +100,11 @@ pub fn journal(ctx: &MLSContext, request_id: Uuid) -> anyhow::Result<DirectReque
         .into_iter()
         .filter(|row| row.request_id == request_id.to_string())
         .collect::<Vec<_>>();
-    anyhow::ensure!(rows.len() == 1, "expected one journal row, found {}", rows.len());
+    anyhow::ensure!(
+        rows.len() == 1,
+        "expected one journal row, found {}",
+        rows.len()
+    );
     Ok(rows.into_iter().next().unwrap())
 }
 
@@ -288,7 +292,10 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
         .as_array()
         .context("preparation selectedDevices")?
         .clone();
-    anyhow::ensure!(selected.len() == 1, "expected one selected recipient device");
+    anyhow::ensure!(
+        selected.len() == 1,
+        "expected one selected recipient device"
+    );
     let grant = protocol::verify_signed_request(
         DirectRequestKind::Grant,
         &serde_json::to_vec(&selected[0]["grant"])?,
@@ -296,7 +303,9 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
     )?;
     let authority_import_until = u64::try_from(
         chrono::DateTime::parse_from_rfc3339(
-            grant.body()["expiresAt"].as_str().context("grant expiresAt")?,
+            grant.body()["expiresAt"]
+                .as_str()
+                .context("grant expiresAt")?,
         )?
         .timestamp(),
     )?;
@@ -350,12 +359,11 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
     body["preparationRequestDigest"] = json!(STANDARD.encode(verified_prepare.request_digest()));
     body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
     body["next"] = bootstrap.coordinates.clone();
-    body["importUntil"] = json!(chrono::DateTime::from_timestamp(
-        bootstrap.import_until as i64,
-        0
-    )
-    .context("import timestamp")?
-    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    body["importUntil"] = json!(
+        chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
+            .context("import timestamp")?
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    );
     let artifact = |data: &[u8], content_type: &str| {
         json!({"framing":"mlsMessage","contentType":content_type,
             "bytes":STANDARD.encode(data),"sha256":STANDARD.encode(Sha256::digest(data))})

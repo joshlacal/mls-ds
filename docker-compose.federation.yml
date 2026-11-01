@@ -1,7 +1,7 @@
-version: "3.9"
-
 # Catbird MLS Delivery Service — 2-DS Clean-Slate Federation & Spaces Topology
 # Exercises:
+# - Two independent DS authorities (`ds-a` as `did:web`, `ds-b` as `did:plc`)
+# - `Swan` Spaces PDS + `bluesky-social/atproto#5187` reference Spaces PDS containers
 # - Option A Conversation Space Authority & Space Host (`com.atproto.space.*` on `ds-a` & `ds-b`)
 # - `D1` Cross-Server Group Mutation Relay (`relayGroupMutation` / `deliverGroupEntry`)
 # - `3A` Stateless Home-`mls-ds` Space Relays (`relaySpaceCredential` / `relaySpaceRead`)
@@ -42,11 +42,20 @@ services:
       context: ../Swan
       dockerfile: Dockerfile
     environment:
-      PDS_HOSTNAME: swan.federation.local
+      PDS_HOSTNAME: swan.federation.catbird.blue
       PDS_PORT: "2583"
       PDS_SPACES_ENABLED: "true"
     ports:
       - "2583:2583"
+
+  atproto-spaces-pds:
+    image: "${ATPROTO_SPACES_PDS_IMAGE:-ghcr.io/bluesky-social/pds:spaces-5187}"
+    environment:
+      PDS_HOSTNAME: spaces-ref.federation.catbird.blue
+      PDS_PORT: "2584"
+      PDS_SPACES_ENABLED: "true"
+    ports:
+      - "2584:2584"
 
   ds-a:
     build:
@@ -60,19 +69,19 @@ services:
       SERVER_HOST: 0.0.0.0
       SERVER_PORT: "3001"
       DATABASE_URL: postgresql://catbird:catbird_dev_password@postgres-a:5432/mls_ds_a
-      SERVICE_DID: did:web:ds-a.federation.local
-      SELF_ENDPOINT: https://ds-a.federation.local
+      SERVICE_DID: "${DS_A_SERVICE_DID:-did:web:ds-a.federation.catbird.blue}"
+      SELF_ENDPOINT: "${DS_A_SELF_ENDPOINT:-https://ds-a.federation.catbird.blue}"
       CHAT_CUTOVER_ENABLED: "true"
       CHAT_REQUIRE_SIGNED_READS: "true"
       LABYRINTH_ENABLED: "true"
       FEDERATION_ENABLED: "true"
       FEDERATION_MODE: open_intelligent
-      CHAT_SUBSCRIPTION_ENDPOINT: wss://ds-a.federation.local/xrpc/blue.catbird.chat.subscribeEvents
-      SIGNING_KEY_PEM: ${DS_A_SIGNING_KEY_PEM}
-      SPACE_HOST_SIGNING_KEY_PEM: ${DS_A_SIGNING_KEY_PEM}
-      RECEIPT_SIGNING_KEY_PEM: ${DS_A_RECEIPT_SIGNING_KEY_PEM}
-      CHAT_CURSOR_KEY_ID: ${DS_A_CURSOR_KEY_ID}
-      CHAT_CURSOR_SEALING_SECRET: ${DS_A_CURSOR_SEALING_SECRET}
+      CHAT_SUBSCRIPTION_ENDPOINT: wss://ds-a.federation.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents
+      SIGNING_KEY_PEM: "${DS_A_SIGNING_KEY_PEM:-dev-placeholder-ds-a-signing-key}"
+      SPACE_HOST_SIGNING_KEY_PEM: "${DS_A_SIGNING_KEY_PEM:-dev-placeholder-ds-a-signing-key}"
+      RECEIPT_SIGNING_KEY_PEM: "${DS_A_RECEIPT_SIGNING_KEY_PEM:-dev-placeholder-ds-a-receipt-key}"
+      CHAT_CURSOR_KEY_ID: "${DS_A_CURSOR_KEY_ID:-ERERERERERERERERERERERERERERERERERERERERERE}"
+      CHAT_CURSOR_SEALING_SECRET: "${DS_A_CURSOR_SEALING_SECRET:-IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI}"
     ports:
       - "3001:3001"
 
@@ -88,18 +97,18 @@ services:
       SERVER_HOST: 0.0.0.0
       SERVER_PORT: "3002"
       DATABASE_URL: postgresql://catbird:catbird_dev_password@postgres-b:5432/mls_ds_b
-      SERVICE_DID: did:web:ds-b.federation.local
-      SELF_ENDPOINT: https://ds-b.federation.local
+      SERVICE_DID: "${DS_B_SERVICE_DID:-did:plc:dsbfederationlocal24char}"
+      SELF_ENDPOINT: "${DS_B_SELF_ENDPOINT:-https://ds-b.federation.catbird.blue}"
       CHAT_CUTOVER_ENABLED: "true"
       CHAT_REQUIRE_SIGNED_READS: "true"
       LABYRINTH_ENABLED: "true"
       FEDERATION_ENABLED: "true"
       FEDERATION_MODE: open_intelligent
-      CHAT_SUBSCRIPTION_ENDPOINT: wss://ds-b.federation.local/xrpc/blue.catbird.chat.subscribeEvents
-      SIGNING_KEY_PEM: ${DS_B_SIGNING_KEY_PEM}
-      SPACE_HOST_SIGNING_KEY_PEM: ${DS_B_SIGNING_KEY_PEM}
-      RECEIPT_SIGNING_KEY_PEM: ${DS_B_RECEIPT_SIGNING_KEY_PEM}
-      CHAT_CURSOR_KEY_ID: ${DS_B_CURSOR_KEY_ID}
-      CHAT_CURSOR_SEALING_SECRET: ${DS_B_CURSOR_SEALING_SECRET}
+      CHAT_SUBSCRIPTION_ENDPOINT: wss://ds-b.federation.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents
+      SIGNING_KEY_PEM: "${DS_B_SIGNING_KEY_PEM:-dev-placeholder-ds-b-signing-key}"
+      SPACE_HOST_SIGNING_KEY_PEM: "${DS_B_SIGNING_KEY_PEM:-dev-placeholder-ds-b-signing-key}"
+      RECEIPT_SIGNING_KEY_PEM: "${DS_B_RECEIPT_SIGNING_KEY_PEM:-dev-placeholder-ds-b-receipt-key}"
+      CHAT_CURSOR_KEY_ID: "${DS_B_CURSOR_KEY_ID:-ERERERERERERERERERERERERERERERERERERERERERE}"
+      CHAT_CURSOR_SEALING_SECRET: "${DS_B_CURSOR_SEALING_SECRET:-IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI}"
     ports:
       - "3002:3002"

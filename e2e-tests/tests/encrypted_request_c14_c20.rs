@@ -12,7 +12,8 @@ use base64::{
 };
 use catbird_mls::{
     chat_v2::transcript::{
-        decode_strict_json, direct_request::{self as protocol, DirectRequestKind},
+        decode_strict_json,
+        direct_request::{self as protocol, DirectRequestKind},
         project_signed_body, SignedMutationKind, SigningTranscript,
     },
     metadata::GroupMetadataV1,
@@ -26,11 +27,11 @@ use catbird_mls::{
     },
 };
 use encrypted_requests::{
-    canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
-    request_database_url, reviewed_baseline, reviewed_request_migrations, seed_service_device,
-    signed_mls_request, validate_request_test_database_url, DeterministicFaultTransport,
-    FaultBoundary, HttpsDidFixture, RequestRig, ServiceIdentity, ShippingServerFixture,
-    dedicated_request_database_name,
+    canonical_future, canonical_now, connect_guarded_request_database,
+    dedicated_request_database_name, request_database_snapshot, request_database_url,
+    reviewed_baseline, reviewed_request_migrations, seed_service_device, signed_mls_request,
+    validate_request_test_database_url, DeterministicFaultTransport, FaultBoundary,
+    HttpsDidFixture, RequestRig, ServiceIdentity, ShippingServerFixture,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -109,7 +110,6 @@ fn signed_ordinary(engine: &MlsEngine, identity: &str, body: Value) -> anyhow::R
     sign_mutation(engine, identity, kind, body)
 }
 
-
 fn quote(part: &str) -> String {
     part.bytes()
         .map(|b| {
@@ -135,7 +135,12 @@ fn set_policy(root: &Path, parts: &[&str], value: &Value) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn set_recipient_view(root: &Path, recipient: &str, inviter: &str, row: Value) -> anyhow::Result<()> {
+fn set_recipient_view(
+    root: &Path,
+    recipient: &str,
+    inviter: &str,
+    row: Value,
+) -> anyhow::Result<()> {
     set_policy(root, &["relationship", recipient, inviter], &row)
 }
 
@@ -147,22 +152,41 @@ fn record_uri(owner: &str, collection: &str) -> String {
 /// `edit` and `callSignal` have no payload variant, so they use a text carrier.
 fn control_payloads() -> Vec<(&'static str, MLSMessagePayload)> {
     let target = Uuid::new_v4().to_string();
-    let control = |message_type: MLSMessageType, delivery_ack: Option<MLSDeliveryAckPayload>| MLSMessagePayload {
-        version: 1,
-        message_type,
-        text: None,
-        embed: None,
-        reaction: None,
-        delivery_ack,
-        recovery_request: None,
+    let control = |message_type: MLSMessageType, delivery_ack: Option<MLSDeliveryAckPayload>| {
+        MLSMessagePayload {
+            version: 1,
+            message_type,
+            text: None,
+            embed: None,
+            reaction: None,
+            delivery_ack,
+            recovery_request: None,
+        }
     };
     vec![
-        ("reaction", MLSMessagePayload::reaction(&target, "👍", ReactionAction::Add)),
+        (
+            "reaction",
+            MLSMessagePayload::reaction(&target, "👍", ReactionAction::Add),
+        ),
         ("readReceipt", control(MLSMessageType::ReadReceipt, None)),
-        ("deliveryReceipt", control(MLSMessageType::DeliveryAck, Some(MLSDeliveryAckPayload { message_id: target.clone() }))),
+        (
+            "deliveryReceipt",
+            control(
+                MLSMessageType::DeliveryAck,
+                Some(MLSDeliveryAckPayload {
+                    message_id: target.clone(),
+                }),
+            ),
+        ),
         ("inBandTyping", control(MLSMessageType::Typing, None)),
-        ("edit(textCarrier)", MLSMessagePayload::text("Edit replacement text")),
-        ("callSignal(textCarrier)", MLSMessagePayload::text("Call invite audio session")),
+        (
+            "edit(textCarrier)",
+            MLSMessagePayload::text("Edit replacement text"),
+        ),
+        (
+            "callSignal(textCarrier)",
+            MLSMessagePayload::text("Call invite audio session"),
+        ),
     ]
 }
 
@@ -172,7 +196,10 @@ fn close_envelope(
     prior: Option<Value>,
 ) -> anyhow::Result<(Value, Uuid)> {
     let (who, engine) = if actor_alice {
-        (&f.alice, f.alice_engine.as_ref().context("Alice engine for close")?)
+        (
+            &f.alice,
+            f.alice_engine.as_ref().context("Alice engine for close")?,
+        )
     } else {
         (&f.bob, &f.bob_engine)
     };
@@ -200,7 +227,12 @@ fn close_envelope(
         "idempotencyKey": transition_id.to_string(),
         "signedAt": canonical_now()
     });
-    let signed = sign_mutation(engine, &identity, SignedMutationKind::ConversationClose, body)?;
+    let signed = sign_mutation(
+        engine,
+        &identity,
+        SignedMutationKind::ConversationClose,
+        body,
+    )?;
     Ok((json!({"signedRequest": signed}), transition_id))
 }
 
@@ -220,13 +252,16 @@ async fn release_by_close_from(
         return Ok(());
     }
     let (envelope, _) = close_envelope(f, true, prior)?;
-    let (status, bytes) = f.alice.post(
-        &f.client,
-        &f.server.base_url,
-        "blue.catbird.chat.closeConversation",
-        &envelope,
-        true,
-    ).await?;
+    let (status, bytes) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.closeConversation",
+            &envelope,
+            true,
+        )
+        .await?;
     anyhow::ensure!(
         status == reqwest::StatusCode::OK,
         "release_by_close failed: {status}: {}",
@@ -237,18 +272,25 @@ async fn release_by_close_from(
 
 /// Every event row addressed to the sender (the source of her subscribeEvents
 /// stream) plus her direct-request push fan-out rows.
-fn alice_event_audience(f: &live_direct_request::PublishedRequestFixture) -> anyhow::Result<String> {
+fn alice_event_audience(
+    f: &live_direct_request::PublishedRequestFixture,
+) -> anyhow::Result<String> {
     let a = &f.alice.did;
-    psql_cmd(&format!(r#"SELECT jsonb_build_object(
+    psql_cmd(&format!(
+        r#"SELECT jsonb_build_object(
       'events',(SELECT jsonb_agg(jsonb_build_object('position',er.event_position,'kind',e.event_kind,'device',er.device_id,'entitlement',er.entitlement_kind) ORDER BY er.event_position,er.device_id)
                 FROM chat.event_recipients er JOIN chat.events e USING(event_position) WHERE er.user_did='{a}'),
       'push',(SELECT count(*) FROM chat.direct_request_push_event_recipients WHERE recipient_did='{a}')
-    )::text"#))
+    )::text"#
+    ))
 }
 
-fn durable_comprehensive(f: &live_direct_request::PublishedRequestFixture) -> anyhow::Result<String> {
+fn durable_comprehensive(
+    f: &live_direct_request::PublishedRequestFixture,
+) -> anyhow::Result<String> {
     let (r, c, a, b) = (f.request_id, f.conversation_id, &f.alice.did, &f.bob.did);
-    psql_cmd(&format!(r#"SELECT jsonb_build_object(
+    psql_cmd(&format!(
+        r#"SELECT jsonb_build_object(
       'conversation',(SELECT to_jsonb(x) FROM chat.conversations x WHERE conversation_id='{c}'),
       'attempt',(SELECT to_jsonb(a) FROM chat.direct_request_attempts a WHERE request_id='{r}'),
       'publication',(SELECT to_jsonb(p) FROM chat.direct_request_publications p WHERE request_id='{r}'),
@@ -262,7 +304,8 @@ fn durable_comprehensive(f: &live_direct_request::PublishedRequestFixture) -> an
       'blobBindings',(SELECT count(*) FROM chat.blob_bindings WHERE conversation_id='{c}'),
       'resets',(SELECT count(*) FROM chat.reset_requests WHERE conversation_id='{c}'),
       'recoveries',(SELECT count(*) FROM chat.leaf_recovery_requests WHERE conversation_id='{c}')
-    )::text"#))
+    )::text"#
+    ))
 }
 
 struct Barrier {
@@ -282,10 +325,23 @@ impl Barrier {
             dedicated_request_database_name(request_database_url()).is_some(),
             "barrier races must run on a dedicated catbird_direct_requests_fault_<hex> database"
         );
-        let dids = dids.iter().map(|d| format!("'{d}'")).collect::<Vec<_>>().join(",");
-        let budget = "SELECT singleton FROM chat.direct_request_budget WHERE singleton FOR UPDATE;\n";
+        let dids = dids
+            .iter()
+            .map(|d| format!("'{d}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let budget =
+            "SELECT singleton FROM chat.direct_request_budget WHERE singleton FOR UPDATE;\n";
         let mut child = Command::new("psql")
-            .args([request_database_url(), "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
+            .args([
+                request_database_url(),
+                "-X",
+                "-A",
+                "-t",
+                "-q",
+                "-v",
+                "ON_ERROR_STOP=1",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -321,7 +377,15 @@ impl Barrier {
             "barrier races must run on a dedicated catbird_direct_requests_fault_<hex> database"
         );
         let mut child = Command::new("psql")
-            .args([request_database_url(), "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
+            .args([
+                request_database_url(),
+                "-X",
+                "-A",
+                "-t",
+                "-q",
+                "-v",
+                "ON_ERROR_STOP=1",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -365,7 +429,10 @@ impl Barrier {
             if n >= at_least {
                 return Ok(n);
             }
-            anyhow::ensure!(Instant::now() < deadline, "only {n}/{at_least} sessions queued behind barrier");
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "only {n}/{at_least} sessions queued behind barrier"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -431,52 +498,73 @@ async fn publish_direct_keys(
     let (package, package_ref) = engine.create_key_package(&identity)?;
     let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&engine.identity_public_key(&identity)?));
     let grant_id = Uuid::new_v4();
-    let signed_grant = signed_mls_request(engine, &identity, DirectRequestKind::Grant, json!({
-        "$type": "blue.catbird.chat.defs#directRequestGrantBody",
-        "signatureDomain": "CATBIRD-DIRECT-REQUEST-GRANT\0",
-        "protocolVersion": "2",
-        "actorDid": who.did,
-        "actorDeviceId": who.device_id.to_string(),
-        "keyId": key_id,
-        "authGeneration": 1,
-        "grantId": grant_id.to_string(),
-        "grantRevision": 1,
-        "purpose": "direct-request-bootstrap",
-        "profile": "encryptedIntroduction1",
-        "keyPackageRef": STANDARD.encode(&package_ref),
-        "keyPackageSha256": STANDARD.encode(Sha256::digest(&package)),
-        "expiresAt": canonical_future(29),
-        "idempotencyKey": grant_id.to_string(),
-        "signedAt": canonical_now()
-    }))?;
+    let signed_grant = signed_mls_request(
+        engine,
+        &identity,
+        DirectRequestKind::Grant,
+        json!({
+            "$type": "blue.catbird.chat.defs#directRequestGrantBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-GRANT\0",
+            "protocolVersion": "2",
+            "actorDid": who.did,
+            "actorDeviceId": who.device_id.to_string(),
+            "keyId": key_id,
+            "authGeneration": 1,
+            "grantId": grant_id.to_string(),
+            "grantRevision": 1,
+            "purpose": "direct-request-bootstrap",
+            "profile": "encryptedIntroduction1",
+            "keyPackageRef": STANDARD.encode(&package_ref),
+            "keyPackageSha256": STANDARD.encode(Sha256::digest(&package)),
+            "expiresAt": canonical_future(29),
+            "idempotencyKey": grant_id.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
     let keys_op = Uuid::new_v4();
-    let keys = signed_mls_request(engine, &identity, DirectRequestKind::Keys, json!({
-        "$type": "blue.catbird.chat.defs#directRequestKeysPublicationBody",
-        "signatureDomain": "CATBIRD-DIRECT-REQUEST-KEYS\0",
-        "protocolVersion": "2",
-        "actorDid": who.did,
-        "actorDeviceId": who.device_id.to_string(),
-        "keyId": key_id,
-        "authGeneration": 1,
-        "revision": revision,
-        "enabled": true,
-        "keys": [{
-            "keyPackage": {
-                "framing": "mlsMessage",
-                "contentType": "keyPackage",
-                "bytes": STANDARD.encode(&package),
-                "sha256": STANDARD.encode(Sha256::digest(&package)),
-                "keyPackageRef": STANDARD.encode(&package_ref)
-            },
-            "grant": signed_grant
-        }],
-        "idempotencyKey": keys_op.to_string(),
-        "signedAt": canonical_now()
-    }))?;
+    let keys = signed_mls_request(
+        engine,
+        &identity,
+        DirectRequestKind::Keys,
+        json!({
+            "$type": "blue.catbird.chat.defs#directRequestKeysPublicationBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-KEYS\0",
+            "protocolVersion": "2",
+            "actorDid": who.did,
+            "actorDeviceId": who.device_id.to_string(),
+            "keyId": key_id,
+            "authGeneration": 1,
+            "revision": revision,
+            "enabled": true,
+            "keys": [{
+                "keyPackage": {
+                    "framing": "mlsMessage",
+                    "contentType": "keyPackage",
+                    "bytes": STANDARD.encode(&package),
+                    "sha256": STANDARD.encode(Sha256::digest(&package)),
+                    "keyPackageRef": STANDARD.encode(&package_ref)
+                },
+                "grant": signed_grant
+            }],
+            "idempotencyKey": keys_op.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
     let (status, body) = who
-        .post(&f.client, &f.server.base_url, "blue.catbird.chat.publishDirectRequestKeys", &json!({"signedRequest": keys}), true)
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.publishDirectRequestKeys",
+            &json!({"signedRequest": keys}),
+            true,
+        )
         .await?;
-    anyhow::ensure!(status == reqwest::StatusCode::OK, "{} keys publication failed {status}: {}", who.did, String::from_utf8_lossy(&body));
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "{} keys publication failed {status}: {}",
+        who.did,
+        String::from_utf8_lossy(&body)
+    );
     Ok(())
 }
 
@@ -496,30 +584,50 @@ async fn prepare_direct_publication(
     let request_id = Uuid::new_v4();
     let first_msg_id = Uuid::new_v4();
     let candidate = Uuid::new_v4();
-    let prepare = signed_mls_request(engine, &identity, DirectRequestKind::Prepare, json!({
-        "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
-        "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\0",
-        "protocolVersion": "2",
-        "actorDid": sender.did,
-        "actorDeviceId": sender.device_id.to_string(),
-        "keyId": key_id,
-        "authGeneration": 1,
-        "requestId": request_id.to_string(),
-        "firstMessageId": first_msg_id.to_string(),
-        "conversationId": candidate.to_string(),
-        "recipientDid": recipient_did,
-        "origin": {"$type": "blue.catbird.chat.defs#freshDirectOrigin"},
-        "profile": "encryptedIntroduction1",
-        "idempotencyKey": request_id.to_string(),
-        "signedAt": canonical_now()
-    }))?;
+    let prepare = signed_mls_request(
+        engine,
+        &identity,
+        DirectRequestKind::Prepare,
+        json!({
+            "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\0",
+            "protocolVersion": "2",
+            "actorDid": sender.did,
+            "actorDeviceId": sender.device_id.to_string(),
+            "keyId": key_id,
+            "authGeneration": 1,
+            "requestId": request_id.to_string(),
+            "firstMessageId": first_msg_id.to_string(),
+            "conversationId": candidate.to_string(),
+            "recipientDid": recipient_did,
+            "origin": {"$type": "blue.catbird.chat.defs#freshDirectOrigin"},
+            "profile": "encryptedIntroduction1",
+            "idempotencyKey": request_id.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
     let (prepare_status, prepare_body) = sender
-        .post(&f.client, &f.server.base_url, "blue.catbird.chat.prepareDirectRequest", &json!({"signedRequest": prepare}), true)
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.prepareDirectRequest",
+            &json!({"signedRequest": prepare}),
+            true,
+        )
         .await?;
-    anyhow::ensure!(prepare_status == reqwest::StatusCode::OK, "{} prepare failed {prepare_status}: {}", sender.did, String::from_utf8_lossy(&prepare_body));
+    anyhow::ensure!(
+        prepare_status == reqwest::StatusCode::OK,
+        "{} prepare failed {prepare_status}: {}",
+        sender.did,
+        String::from_utf8_lossy(&prepare_body)
+    );
     let prep_resp: Value = serde_json::from_slice(&prepare_body)?;
     let prep_snapshot = protocol::verify_direct_request_preparation(
-        &serde_json::to_vec(prep_resp.pointer("/outcome/preparation").context("preparation snapshot")?)?,
+        &serde_json::to_vec(
+            prep_resp
+                .pointer("/outcome/preparation")
+                .context("preparation snapshot")?,
+        )?,
         &f.server.receipt_public_key,
     )?;
 
@@ -535,26 +643,41 @@ async fn prepare_direct_publication(
         "recipientDid": recipient_did,
         "preparationDigest": prep_snapshot["preparationDigest"]
     });
-    let selected = prep_snapshot["selectedDevices"].as_array().context("selectedDevices")?;
+    let selected = prep_snapshot["selectedDevices"]
+        .as_array()
+        .context("selectedDevices")?;
     // Same derivation as the shared fixture: the import authority is the earliest
     // selected grant expiry, which must cover the server's preparation floor.
     let minimum_import_until = chrono::DateTime::parse_from_rfc3339(
-        prep_snapshot["minimumImportUntil"].as_str().context("minimumImportUntil")?,
+        prep_snapshot["minimumImportUntil"]
+            .as_str()
+            .context("minimumImportUntil")?,
     )?
     .timestamp();
     let authority_import_until = selected
         .iter()
         .map(|dev| {
-            Ok(chrono::DateTime::parse_from_rfc3339(dev["grant"]["body"]["expiresAt"].as_str().context("grant expiresAt")?)?
-                .timestamp())
+            Ok(chrono::DateTime::parse_from_rfc3339(
+                dev["grant"]["body"]["expiresAt"]
+                    .as_str()
+                    .context("grant expiresAt")?,
+            )?
+            .timestamp())
         })
         .collect::<anyhow::Result<Vec<i64>>>()?
         .into_iter()
         .min()
         .context("no selected devices")?;
-    anyhow::ensure!(authority_import_until >= minimum_import_until, "selected grant expires before preparation import floor");
+    anyhow::ensure!(
+        authority_import_until >= minimum_import_until,
+        "selected grant expires before preparation import floor"
+    );
     let authority_import_until = u64::try_from(authority_import_until)?;
-    let verified_prepare = protocol::verify_signed_request(DirectRequestKind::Prepare, &serde_json::to_vec(&prepare)?, &public)?;
+    let verified_prepare = protocol::verify_signed_request(
+        DirectRequestKind::Prepare,
+        &serde_json::to_vec(&prepare)?,
+        &public,
+    )?;
     let journal = engine.prepare_direct_request(&DirectRequestBootstrapInput {
         draft_id: Uuid::new_v4().to_string(),
         context_json: serde_json::to_vec(&context)?,
@@ -563,11 +686,19 @@ async fn prepare_direct_publication(
         state_version: 1,
         key_packages: selected
             .iter()
-            .map(|dev| Ok(STANDARD.decode(dev["keyPackage"]["bytes"].as_str().context("pkg bytes")?)?))
+            .map(|dev| {
+                Ok(STANDARD.decode(dev["keyPackage"]["bytes"].as_str().context("pkg bytes")?)?)
+            })
             .collect::<anyhow::Result<Vec<_>>>()?,
         expected_package_refs: selected
             .iter()
-            .map(|dev| Ok(STANDARD.decode(dev["keyPackage"]["keyPackageRef"].as_str().context("pkg ref")?)?))
+            .map(|dev| {
+                Ok(STANDARD.decode(
+                    dev["keyPackage"]["keyPackageRef"]
+                        .as_str()
+                        .context("pkg ref")?,
+                )?)
+            })
             .collect::<anyhow::Result<Vec<_>>>()?,
         authority_import_until,
         preparation_request_digest: *verified_prepare.request_digest(),
@@ -591,9 +722,11 @@ async fn prepare_direct_publication(
     body["preparationRequestDigest"] = json!(STANDARD.encode(verified_prepare.request_digest()));
     body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
     body["next"] = bootstrap.coordinates.clone();
-    body["importUntil"] = json!(chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
-        .context("import timestamp")?
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    body["importUntil"] = json!(
+        chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
+            .context("import timestamp")?
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    );
     let artifact = |data: &[u8], content_type: &str| {
         json!({
             "framing": "mlsMessage", "contentType": content_type,
@@ -654,7 +787,8 @@ async fn prepare_direct_publication(
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-async fn c14_crossed_starts_yield_single_direct_and_existing_direct_receipt() -> anyhow::Result<()> {
+async fn c14_crossed_starts_yield_single_direct_and_existing_direct_receipt() -> anyhow::Result<()>
+{
     // Alice prepares and publishes a direct request to Bob (A -> B).
     let f = live_direct_request::publish_request(false).await?;
 
@@ -669,14 +803,23 @@ async fn c14_crossed_starts_yield_single_direct_and_existing_direct_receipt() ->
         "SELECT count(*) FROM chat.conversations WHERE kind='direct' AND lifecycle='active' AND direct_did_low='{did_low}' AND direct_did_high='{did_high}'"
     ))?
     .parse()?;
-    assert_eq!(count_before, 1, "Expected exactly one active direct conversation after Alice's publication");
+    assert_eq!(
+        count_before, 1,
+        "Expected exactly one active direct conversation after Alice's publication"
+    );
 
     // Alice publishes direct request keys so Bob can address Alice for B -> A,
     // then Bob prepares and publishes the crossed B -> A request.
     let alice_engine = f.alice_engine.as_ref().context("Alice engine")?;
     publish_direct_keys(&f, &f.alice, alice_engine, 1).await?;
-    let (bob_publish, _bob_request_id, bob_candidate_convo_id) =
-        prepare_direct_publication(&f, &f.bob, &f.bob_engine, &f.alice.did, "Bob's candidate introduction").await?;
+    let (bob_publish, _bob_request_id, bob_candidate_convo_id) = prepare_direct_publication(
+        &f,
+        &f.bob,
+        &f.bob_engine,
+        &f.alice.did,
+        "Bob's candidate introduction",
+    )
+    .await?;
     let (publish_status, publish_response) = f
         .bob
         .post(
@@ -695,7 +838,10 @@ async fn c14_crossed_starts_yield_single_direct_and_existing_direct_receipt() ->
 
     let pub_resp: Value = serde_json::from_slice(&publish_response)?;
     let outcome = &pub_resp["outcome"];
-    assert_eq!(outcome["$type"], "blue.catbird.chat.defs#signedDirectRequestReceipt");
+    assert_eq!(
+        outcome["$type"],
+        "blue.catbird.chat.defs#signedDirectRequestReceipt"
+    );
 
     let receipt = &outcome["body"]["receipt"];
     assert_eq!(
@@ -717,7 +863,10 @@ async fn c14_crossed_starts_yield_single_direct_and_existing_direct_receipt() ->
         "SELECT count(*) FROM chat.conversations WHERE kind='direct' AND lifecycle='active' AND direct_did_low='{did_low}' AND direct_did_high='{did_high}'"
     ))?
     .parse()?;
-    assert_eq!(count_after, 1, "Guarded database must retain exactly one direct conversation for the pair");
+    assert_eq!(
+        count_after, 1,
+        "Guarded database must retain exactly one direct conversation for the pair"
+    );
 
     // The losing candidate's proposed conversation was NOT created
     let candidate_exists = psql_cmd(&format!(
@@ -725,7 +874,10 @@ async fn c14_crossed_starts_yield_single_direct_and_existing_direct_receipt() ->
     ))?
     .trim()
         == "t";
-    assert!(!candidate_exists, "Losing candidate conversation ID must not exist in database");
+    assert!(
+        !candidate_exists,
+        "Losing candidate conversation ID must not exist in database"
+    );
     release_by_close(&f).await?;
 
     Ok(())
@@ -741,51 +893,133 @@ async fn c14_concurrent_crossed_publications_barrier_one_direct() -> anyhow::Res
     publish_direct_keys(&f, &f.bob, &f.bob_engine, 2).await?;
 
     // Both sides prepare real candidates (A -> B and B -> A) before either publishes.
-    let (a_pub, a_req, a_convo) = prepare_direct_publication(&f, &f.alice, alice_engine, &f.bob.did, "Alice crossed start").await?;
-    let (b_pub, b_req, b_convo) = prepare_direct_publication(&f, &f.bob, &f.bob_engine, &f.alice.did, "Bob crossed start").await?;
+    let (a_pub, a_req, a_convo) = prepare_direct_publication(
+        &f,
+        &f.alice,
+        alice_engine,
+        &f.bob.did,
+        "Alice crossed start",
+    )
+    .await?;
+    let (b_pub, b_req, b_convo) =
+        prepare_direct_publication(&f, &f.bob, &f.bob_engine, &f.alice.did, "Bob crossed start")
+            .await?;
 
     // Both publications queue behind a barrier holding the request budget and
     // both principals' locks, then are released together.
     let barrier = Barrier::hold(&[&f.alice.did, &f.bob.did])?;
     let a_future = {
-        let (who, client, base, env) = (f.alice.clone(), f.client.clone(), f.server.base_url.clone(), json!({"signedRequest": a_pub.clone()}));
-        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.publishDirectRequest", &env, true).await })
+        let (who, client, base, env) = (
+            f.alice.clone(),
+            f.client.clone(),
+            f.server.base_url.clone(),
+            json!({"signedRequest": a_pub.clone()}),
+        );
+        tokio::spawn(async move {
+            who.post(
+                &client,
+                &base,
+                "blue.catbird.chat.publishDirectRequest",
+                &env,
+                true,
+            )
+            .await
+        })
     };
     let b_future = {
-        let (who, client, base, env) = (f.bob.clone(), f.client.clone(), f.server.base_url.clone(), json!({"signedRequest": b_pub.clone()}));
-        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.publishDirectRequest", &env, true).await })
+        let (who, client, base, env) = (
+            f.bob.clone(),
+            f.client.clone(),
+            f.server.base_url.clone(),
+            json!({"signedRequest": b_pub.clone()}),
+        );
+        tokio::spawn(async move {
+            who.post(
+                &client,
+                &base,
+                "blue.catbird.chat.publishDirectRequest",
+                &env,
+                true,
+            )
+            .await
+        })
     };
     let queued = barrier.wait_for_waiters(2).await?;
     barrier.release()?;
     let (a_status, a_bytes) = a_future.await??;
     let (b_status, b_bytes) = b_future.await??;
-    anyhow::ensure!(a_status == reqwest::StatusCode::OK, "Alice publish {a_status}: {}", String::from_utf8_lossy(&a_bytes));
-    anyhow::ensure!(b_status == reqwest::StatusCode::OK, "Bob publish {b_status}: {}", String::from_utf8_lossy(&b_bytes));
-    let a_receipt = serde_json::from_slice::<Value>(&a_bytes)?["outcome"]["body"]["receipt"].clone();
-    let b_receipt = serde_json::from_slice::<Value>(&b_bytes)?["outcome"]["body"]["receipt"].clone();
+    anyhow::ensure!(
+        a_status == reqwest::StatusCode::OK,
+        "Alice publish {a_status}: {}",
+        String::from_utf8_lossy(&a_bytes)
+    );
+    anyhow::ensure!(
+        b_status == reqwest::StatusCode::OK,
+        "Bob publish {b_status}: {}",
+        String::from_utf8_lossy(&b_bytes)
+    );
+    let a_receipt =
+        serde_json::from_slice::<Value>(&a_bytes)?["outcome"]["body"]["receipt"].clone();
+    let b_receipt =
+        serde_json::from_slice::<Value>(&b_bytes)?["outcome"]["body"]["receipt"].clone();
     const PUBLISHED: &str = "blue.catbird.chat.defs#directRequestPublishedReceipt";
     const EXISTING: &str = "blue.catbird.chat.defs#directRequestExistingDirectReceipt";
     let alice_won = a_receipt["$type"] == PUBLISHED;
     let (winner_convo, loser_convo, loser_req, loser_receipt, winner_pub) = if alice_won {
-        assert_eq!(b_receipt["$type"], EXISTING, "loser must get existing-direct receipt: {b_receipt}");
+        assert_eq!(
+            b_receipt["$type"], EXISTING,
+            "loser must get existing-direct receipt: {b_receipt}"
+        );
         (a_convo, b_convo, b_req, &b_receipt, &a_pub)
     } else {
-        assert_eq!(b_receipt["$type"], PUBLISHED, "exactly one publication must win: {a_receipt} / {b_receipt}");
-        assert_eq!(a_receipt["$type"], EXISTING, "loser must get existing-direct receipt: {a_receipt}");
+        assert_eq!(
+            b_receipt["$type"], PUBLISHED,
+            "exactly one publication must win: {a_receipt} / {b_receipt}"
+        );
+        assert_eq!(
+            a_receipt["$type"], EXISTING,
+            "loser must get existing-direct receipt: {a_receipt}"
+        );
         (b_convo, a_convo, a_req, &a_receipt, &b_pub)
     };
-    eprintln!("C14 concurrent crossed start: queued={queued} winner={}", if alice_won { "alice" } else { "bob" });
-    assert_eq!(loser_receipt["conversationId"], winner_convo.to_string(), "loser receipt names the winner");
-    assert_eq!(loser_receipt["requiresAcceptance"], true, "loser is pending recipient; nothing silently accepted");
+    eprintln!(
+        "C14 concurrent crossed start: queued={queued} winner={}",
+        if alice_won { "alice" } else { "bob" }
+    );
+    assert_eq!(
+        loser_receipt["conversationId"],
+        winner_convo.to_string(),
+        "loser receipt names the winner"
+    );
+    assert_eq!(
+        loser_receipt["requiresAcceptance"], true,
+        "loser is pending recipient; nothing silently accepted"
+    );
 
-    let (did_low, did_high) = if f.alice.did < f.bob.did { (&f.alice.did, &f.bob.did) } else { (&f.bob.did, &f.alice.did) };
+    let (did_low, did_high) = if f.alice.did < f.bob.did {
+        (&f.alice.did, &f.bob.did)
+    } else {
+        (&f.bob.did, &f.alice.did)
+    };
     assert_eq!(
         psql_cmd(&format!("SELECT count(*) FROM chat.conversations WHERE kind='direct' AND lifecycle='active' AND direct_did_low='{did_low}' AND direct_did_high='{did_high}'"))?,
         "1",
         "exactly one active direct for the pair"
     );
-    assert_eq!(psql_cmd(&format!("SELECT count(*) FROM chat.conversations WHERE conversation_id='{loser_convo}'"))?, "0", "loser candidate not created");
-    assert_eq!(psql_cmd(&format!("SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{loser_req}'"))?, "0", "loser ciphertext not transplanted");
+    assert_eq!(
+        psql_cmd(&format!(
+            "SELECT count(*) FROM chat.conversations WHERE conversation_id='{loser_convo}'"
+        ))?,
+        "0",
+        "loser candidate not created"
+    );
+    assert_eq!(
+        psql_cmd(&format!(
+            "SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{loser_req}'"
+        ))?,
+        "0",
+        "loser ciphertext not transplanted"
+    );
     assert_eq!(
         psql_cmd(&format!("SELECT count(*) FROM chat.transitions WHERE conversation_id='{winner_convo}' AND kind='directRequestAcceptance'"))?,
         "0",
@@ -795,8 +1029,20 @@ async fn c14_concurrent_crossed_publications_barrier_one_direct() -> anyhow::Res
     // Release capacity: close the winner through the real signed RPC.
     let (close_env, _) = close_envelope(&f, alice_won, Some(winner_pub["body"]["next"].clone()))?;
     let who = if alice_won { &f.alice } else { &f.bob };
-    let (close_status, close_bytes) = who.post(&f.client, &f.server.base_url, "blue.catbird.chat.closeConversation", &close_env, true).await?;
-    anyhow::ensure!(close_status == reqwest::StatusCode::OK, "winner close {close_status}: {}", String::from_utf8_lossy(&close_bytes));
+    let (close_status, close_bytes) = who
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.closeConversation",
+            &close_env,
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        close_status == reqwest::StatusCode::OK,
+        "winner close {close_status}: {}",
+        String::from_utf8_lossy(&close_bytes)
+    );
     Ok(())
 }
 
@@ -829,19 +1075,33 @@ async fn c15_exact_replay_success_and_attribute_collisions() -> anyhow::Result<(
             true,
         )
         .await?;
-    anyhow::ensure!(replay_status == reqwest::StatusCode::OK, "Exact replay failed: {replay_status}");
+    anyhow::ensure!(
+        replay_status == reqwest::StatusCode::OK,
+        "Exact replay failed: {replay_status}"
+    );
     let replay_resp: Value = serde_json::from_slice(&replay_bytes)?;
     let mut replayed_receipt = replay_resp["outcome"].clone();
-    replayed_receipt.as_object_mut().context("outcome obj")?.remove("$type");
-    assert_eq!(replayed_receipt, f.receipt, "Replayed receipt must equal original committed proof");
-    assert_eq!(durable_graph(&f)?, before, "Exact replay must not alter durable graph");
+    replayed_receipt
+        .as_object_mut()
+        .context("outcome obj")?
+        .remove("$type");
+    assert_eq!(
+        replayed_receipt, f.receipt,
+        "Replayed receipt must equal original committed proof"
+    );
+    assert_eq!(
+        durable_graph(&f)?,
+        before,
+        "Exact replay must not alter durable graph"
+    );
 
     // 2. Collisions: re-sign changed fields under the original operation ID
     for field in ["ciphertext", "digest", "firstMessageId"] {
         let mut body = f.publication["body"].clone();
         match field {
             "ciphertext" => {
-                let mut b = STANDARD.decode(body["artifacts"]["initialCiphertext"].as_str().unwrap())?;
+                let mut b =
+                    STANDARD.decode(body["artifacts"]["initialCiphertext"].as_str().unwrap())?;
                 b[0] ^= 1;
                 body["artifacts"]["initialCiphertext"] = json!(STANDARD.encode(b));
             }
@@ -863,10 +1123,20 @@ async fn c15_exact_replay_success_and_attribute_collisions() -> anyhow::Result<(
                 true,
             )
             .await?;
-        anyhow::ensure!(status.is_client_error(), "{field} collision must return 4xx error, got {status}");
+        anyhow::ensure!(
+            status.is_client_error(),
+            "{field} collision must return 4xx error, got {status}"
+        );
         let err: Value = serde_json::from_slice(&resp_bytes)?;
-        assert_eq!(err["error"], "PreparationConflict", "Expected PreparationConflict for {field}");
-        assert_eq!(durable_graph(&f)?, before, "{field} collision must not alter durable database graph");
+        assert_eq!(
+            err["error"], "PreparationConflict",
+            "Expected PreparationConflict for {field}"
+        );
+        assert_eq!(
+            durable_graph(&f)?,
+            before,
+            "{field} collision must not alter durable database graph"
+        );
     }
 
     // 3. Bit-flipped signature returns InvalidSignature
@@ -884,10 +1154,18 @@ async fn c15_exact_replay_success_and_attribute_collisions() -> anyhow::Result<(
             true,
         )
         .await?;
-    assert_eq!(sig_status, reqwest::StatusCode::UNAUTHORIZED, "Bad signature must return 401");
+    assert_eq!(
+        sig_status,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "Bad signature must return 401"
+    );
     let err: Value = serde_json::from_slice(&sig_bytes)?;
     assert_eq!(err["error"], "InvalidSignature");
-    assert_eq!(durable_graph(&f)?, before, "Invalid signature attempt must not alter durable graph");
+    assert_eq!(
+        durable_graph(&f)?,
+        before,
+        "Invalid signature attempt must not alter durable graph"
+    );
 
     // 4. Exact replay after all collision attempts still succeeds
     let (final_status, _final_bytes) = f
@@ -915,14 +1193,18 @@ async fn c15_exact_replay_success_and_attribute_collisions() -> anyhow::Result<(
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() -> anyhow::Result<()> {
+async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() -> anyhow::Result<()>
+{
     // Start with an unaccepted, pending direct request.
     let f = live_direct_request::publish_request(false).await?;
-    f.alice_engine.as_ref().context("Alice engine")?.confirm_request_publication(
-        &f.request_id.to_string(),
-        &serde_json::to_vec(&f.receipt)?,
-        &f.server.receipt_public_key,
-    )?;
+    f.alice_engine
+        .as_ref()
+        .context("Alice engine")?
+        .confirm_request_publication(
+            &f.request_id.to_string(),
+            &serde_json::to_vec(&f.receipt)?,
+            &f.server.receipt_public_key,
+        )?;
 
     let alice_identity = format!("{}#{}", f.alice.did, f.alice.device_id);
     let bob_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
@@ -940,7 +1222,14 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
     let before = durable_comprehensive(&f)?;
 
     // Helper closure to build a signed applicationSendBody with real encrypted ciphertext
-    let make_app_send = |engine: &MlsEngine, identity: &str, did: &str, device_id: &Uuid, key_id: &str, payload: &MLSMessagePayload, blob_bindings: Value| -> anyhow::Result<Value> {
+    let make_app_send = |engine: &MlsEngine,
+                         identity: &str,
+                         did: &str,
+                         device_id: &Uuid,
+                         key_id: &str,
+                         payload: &MLSMessagePayload,
+                         blob_bindings: Value|
+     -> anyhow::Result<Value> {
         let message_id = Uuid::new_v4();
         let mut aad_prior = prior.clone();
         aad_prior["conversationId"] = json!(STANDARD.encode(f.conversation_id.as_bytes()));
@@ -952,7 +1241,12 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
             "prior": aad_prior
         });
         let content = payload.encode()?;
-        let ciphertext = engine.encrypt_canonical(&group, &content, canonical_application_aad_bytes(&aad)?, epoch)?;
+        let ciphertext = engine.encrypt_canonical(
+            &group,
+            &content,
+            canonical_application_aad_bytes(&aad)?,
+            epoch,
+        )?;
         let body = json!({
             "$type": "blue.catbird.chat.defs#applicationSendBody",
             "signatureDomain": "CATBIRD-CHAT-MESSAGE\0",
@@ -980,31 +1274,77 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
     // ========================================================================
 
     // 1. Extra application message: Alice attempts second message before consent
-    let alice_send = make_app_send(alice_engine, &alice_identity, &f.alice.did, &f.alice.device_id, &alice_key_id, &MLSMessagePayload::text("Extra app message by creator"), json!([]))?;
-    let (send_status, send_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.sendMessage", &json!({"signedRequest": alice_send}), true).await?;
-    assert_eq!(send_status, reqwest::StatusCode::BAD_REQUEST, "Creator extra app message must fail 400");
+    let alice_send = make_app_send(
+        alice_engine,
+        &alice_identity,
+        &f.alice.did,
+        &f.alice.device_id,
+        &alice_key_id,
+        &MLSMessagePayload::text("Extra app message by creator"),
+        json!([]),
+    )?;
+    let (send_status, send_bytes) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.sendMessage",
+            &json!({"signedRequest": alice_send}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        send_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Creator extra app message must fail 400"
+    );
     let err: Value = serde_json::from_slice(&send_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Creator sendMessage rejection must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Creator sendMessage rejection must leave graph unchanged"
+    );
 
     // 2. Typing: Alice attempts publishTyping while pending
-    let alice_typing = signed_ordinary(alice_engine, &alice_identity, json!({
-        "$type": "blue.catbird.chat.defs#typingBody",
-        "signatureDomain": "CATBIRD-CHAT-TYPING\0",
-        "typingId": Uuid::new_v4().to_string(),
-        "actorDid": f.alice.did,
-        "actorDeviceId": f.alice.device_id.to_string(),
-        "keyId": alice_key_id,
-        "authGeneration": 1,
-        "coordinates": prior,
-        "isTyping": true,
-        "signedAt": canonical_now()
-    }))?;
-    let (t_status, t_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.publishTyping", &json!({"signedRequest": alice_typing}), true).await?;
-    assert_eq!(t_status, reqwest::StatusCode::BAD_REQUEST, "Creator typing must fail 400");
+    let alice_typing = signed_ordinary(
+        alice_engine,
+        &alice_identity,
+        json!({
+            "$type": "blue.catbird.chat.defs#typingBody",
+            "signatureDomain": "CATBIRD-CHAT-TYPING\0",
+            "typingId": Uuid::new_v4().to_string(),
+            "actorDid": f.alice.did,
+            "actorDeviceId": f.alice.device_id.to_string(),
+            "keyId": alice_key_id,
+            "authGeneration": 1,
+            "coordinates": prior,
+            "isTyping": true,
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (t_status, t_bytes) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.publishTyping",
+            &json!({"signedRequest": alice_typing}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        t_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Creator typing must fail 400"
+    );
     let err: Value = serde_json::from_slice(&t_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Creator typing rejection must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Creator typing rejection must leave graph unchanged"
+    );
 
     // 3. Edits / Reactions / Receipts / Calls ride inside encrypted application
     //    content; the server is ciphertext-blind, so every one reaches it as a
@@ -1013,12 +1353,40 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
     //    variant (MLSMessageType) and v2 editFrameBody has no Rust encoder, so those
     //    two rows use a text carrier and are recorded as partial in evidence.
     for (name, payload) in control_payloads() {
-        let send_mut = make_app_send(alice_engine, &alice_identity, &f.alice.did, &f.alice.device_id, &alice_key_id, &payload, json!([]))?;
-        let (status, bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.sendMessage", &json!({"signedRequest": send_mut}), true).await?;
-        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "Creator {name} frame must fail 400");
+        let send_mut = make_app_send(
+            alice_engine,
+            &alice_identity,
+            &f.alice.did,
+            &f.alice.device_id,
+            &alice_key_id,
+            &payload,
+            json!([]),
+        )?;
+        let (status, bytes) = f
+            .alice
+            .post(
+                &f.client,
+                &f.server.base_url,
+                "blue.catbird.chat.sendMessage",
+                &json!({"signedRequest": send_mut}),
+                true,
+            )
+            .await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "Creator {name} frame must fail 400"
+        );
         let err: Value = serde_json::from_slice(&bytes)?;
-        assert_eq!(err["error"], "ConversationNotAccepted", "Creator {name} frame rejected: {err}");
-        assert_eq!(durable_comprehensive(&f)?, before, "Creator {name} must leave graph unchanged");
+        assert_eq!(
+            err["error"], "ConversationNotAccepted",
+            "Creator {name} frame rejected: {err}"
+        );
+        assert_eq!(
+            durable_comprehensive(&f)?,
+            before,
+            "Creator {name} must leave graph unchanged"
+        );
     }
 
     // 4. Attachment bind in sendMessage: applicationAttachmentBinding in blobBindings
@@ -1028,61 +1396,128 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "ciphertextSize": 2048,
         "purpose": "attachment"
     }]);
-    let alice_blob_send = make_app_send(alice_engine, &alice_identity, &f.alice.did, &f.alice.device_id, &alice_key_id, &MLSMessagePayload::text("Message with attachment bind"), blob_binding.clone())?;
-    let (bs_status, bs_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.sendMessage", &json!({"signedRequest": alice_blob_send}), true).await?;
-    assert_eq!(bs_status, reqwest::StatusCode::BAD_REQUEST, "Creator attachment bind must fail 400");
+    let alice_blob_send = make_app_send(
+        alice_engine,
+        &alice_identity,
+        &f.alice.did,
+        &f.alice.device_id,
+        &alice_key_id,
+        &MLSMessagePayload::text("Message with attachment bind"),
+        blob_binding.clone(),
+    )?;
+    let (bs_status, bs_bytes) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.sendMessage",
+            &json!({"signedRequest": alice_blob_send}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        bs_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Creator attachment bind must fail 400"
+    );
     let err: Value = serde_json::from_slice(&bs_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Attachment bind send must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Attachment bind send must leave graph unchanged"
+    );
 
     // 5. Blob upload preparation: prepareBlobUpload signed by Alice
-    let alice_blob_prep = signed_ordinary(alice_engine, &alice_identity, json!({
-        "$type": "blue.catbird.chat.defs#blobUploadPreparationBody",
-        "signatureDomain": "CATBIRD-CHAT-BLOB-PREPARE\0",
-        "blobId": Uuid::new_v4().to_string(),
-        "conversationId": f.conversation_id.to_string(),
-        "actorDid": f.alice.did,
-        "actorDeviceId": f.alice.device_id.to_string(),
-        "keyId": alice_key_id,
-        "authGeneration": 1,
-        "prior": prior,
-        "ciphertextSha256": STANDARD.encode(Sha256::digest(b"test-attachment-payload")),
-        "ciphertextSize": 4096,
-        "mediaType": "image/png",
-        "plaintextSize": 1024,
-        "purpose": "attachment",
-        "idempotencyKey": Uuid::new_v4().to_string(),
-        "signedAt": canonical_now()
-    }))?;
-    let (bp_status, bp_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.prepareBlobUpload", &json!({"signedRequest": alice_blob_prep}), true).await?;
-    assert_eq!(bp_status, reqwest::StatusCode::BAD_REQUEST, "Creator blob upload preparation must fail 400");
+    let alice_blob_prep = signed_ordinary(
+        alice_engine,
+        &alice_identity,
+        json!({
+            "$type": "blue.catbird.chat.defs#blobUploadPreparationBody",
+            "signatureDomain": "CATBIRD-CHAT-BLOB-PREPARE\0",
+            "blobId": Uuid::new_v4().to_string(),
+            "conversationId": f.conversation_id.to_string(),
+            "actorDid": f.alice.did,
+            "actorDeviceId": f.alice.device_id.to_string(),
+            "keyId": alice_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(b"test-attachment-payload")),
+            "ciphertextSize": 4096,
+            "mediaType": "image/png",
+            "plaintextSize": 1024,
+            "purpose": "attachment",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (bp_status, bp_bytes) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.prepareBlobUpload",
+            &json!({"signedRequest": alice_blob_prep}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        bp_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Creator blob upload preparation must fail 400"
+    );
     let err: Value = serde_json::from_slice(&bp_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Creator blob upload preparation must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Creator blob upload preparation must leave graph unchanged"
+    );
 
     // 6. Metadata/admin change: submitTransition with metadataTransitionBody
     let mut next_coord = prior.clone();
     next_coord["stateVersion"] = json!(prior["stateVersion"].as_u64().unwrap() + 1);
     let tid_alice_meta = Uuid::new_v4().to_string();
-    let alice_metadata_trans = signed_ordinary(alice_engine, &alice_identity, json!({
-        "$type": "blue.catbird.chat.defs#metadataTransitionBody",
-        "signatureDomain": "CATBIRD-CHAT-METADATA\0",
-        "transitionId": tid_alice_meta,
-        "actorDid": f.alice.did,
-        "actorDeviceId": f.alice.device_id.to_string(),
-        "keyId": alice_key_id,
-        "authGeneration": 1,
-        "prior": prior,
-        "next": next_coord,
-        "metadataSnapshot": f.publication["body"]["artifacts"]["metadataSnapshot"],
-        "idempotencyKey": tid_alice_meta,
-        "signedAt": canonical_now()
-    }))?;
-    let (meta_status, meta_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": alice_metadata_trans}), true).await?;
-    assert_eq!(meta_status, reqwest::StatusCode::BAD_REQUEST, "Creator metadata transition must fail 400");
+    let alice_metadata_trans = signed_ordinary(
+        alice_engine,
+        &alice_identity,
+        json!({
+            "$type": "blue.catbird.chat.defs#metadataTransitionBody",
+            "signatureDomain": "CATBIRD-CHAT-METADATA\0",
+            "transitionId": tid_alice_meta,
+            "actorDid": f.alice.did,
+            "actorDeviceId": f.alice.device_id.to_string(),
+            "keyId": alice_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "next": next_coord,
+            "metadataSnapshot": f.publication["body"]["artifacts"]["metadataSnapshot"],
+            "idempotencyKey": tid_alice_meta,
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (meta_status, meta_bytes) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.submitTransition",
+            &json!({"signedRequest": alice_metadata_trans}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        meta_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Creator metadata transition must fail 400"
+    );
     let err: Value = serde_json::from_slice(&meta_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Creator metadata transition must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Creator metadata transition must leave graph unchanged"
+    );
 
     // 7. Arbitrary Add / admin: submitTransition with policyTransitionBody addParticipant
     // A real registered third account (from an independent published request) so
@@ -1090,56 +1525,98 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
     let third = live_direct_request::publish_request(false).await?;
     let new_user = third.alice.did.as_str();
     let tid_alice_policy = Uuid::new_v4().to_string();
-    let alice_policy = signed_ordinary(alice_engine, &alice_identity, json!({
-        "$type": "blue.catbird.chat.defs#policyTransitionBody",
-        "signatureDomain": "CATBIRD-CHAT-POLICY\0",
-        "transitionId": tid_alice_policy,
-        "actorDid": f.alice.did,
-        "actorDeviceId": f.alice.device_id.to_string(),
-        "keyId": alice_key_id,
-        "authGeneration": 1,
-        "prior": prior,
-        "next": next_coord,
-        "participantChanges": [{
-            "$type": "blue.catbird.chat.defs#addParticipant",
-            "userDid": new_user,
-            "role": "member",
-            "status": "pending",
-            "invitationProvenance": {
-                "invitationTransitionId": f.request_id.to_string(),
-                "invitedByDid": f.alice.did,
-                "invitedByDeviceId": f.alice.device_id.to_string()
-            }
-        }],
-        "idempotencyKey": tid_alice_policy,
-        "signedAt": canonical_now()
-    }))?;
-    let (pol_status, pol_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": alice_policy}), true).await?;
-    assert_eq!(pol_status, reqwest::StatusCode::BAD_REQUEST, "Creator arbitrary Add must fail 400");
+    let alice_policy = signed_ordinary(
+        alice_engine,
+        &alice_identity,
+        json!({
+            "$type": "blue.catbird.chat.defs#policyTransitionBody",
+            "signatureDomain": "CATBIRD-CHAT-POLICY\0",
+            "transitionId": tid_alice_policy,
+            "actorDid": f.alice.did,
+            "actorDeviceId": f.alice.device_id.to_string(),
+            "keyId": alice_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "next": next_coord,
+            "participantChanges": [{
+                "$type": "blue.catbird.chat.defs#addParticipant",
+                "userDid": new_user,
+                "role": "member",
+                "status": "pending",
+                "invitationProvenance": {
+                    "invitationTransitionId": f.request_id.to_string(),
+                    "invitedByDid": f.alice.did,
+                    "invitedByDeviceId": f.alice.device_id.to_string()
+                }
+            }],
+            "idempotencyKey": tid_alice_policy,
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (pol_status, pol_bytes) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.submitTransition",
+            &json!({"signedRequest": alice_policy}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        pol_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Creator arbitrary Add must fail 400"
+    );
     let err: Value = serde_json::from_slice(&pol_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Arbitrary Add transition must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Arbitrary Add transition must leave graph unchanged"
+    );
 
     // 8. Reset: requestReset by Alice
     let reset_id = Uuid::new_v4();
-    let alice_reset = signed_ordinary(alice_engine, &alice_identity, json!({
-        "$type": "blue.catbird.chat.defs#resetRequestBody",
-        "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\0",
-        "resetRequestId": reset_id.to_string(),
-        "actorDid": f.alice.did,
-        "actorDeviceId": f.alice.device_id.to_string(),
-        "keyId": alice_key_id,
-        "authGeneration": 1,
-        "prior": prior,
-        "reason": "manualRecovery",
-        "idempotencyKey": reset_id.to_string(),
-        "signedAt": canonical_now()
-    }))?;
-    let (rst_status, rst_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.requestReset", &json!({"signedRequest": alice_reset}), true).await?;
-    assert_eq!(rst_status, reqwest::StatusCode::BAD_REQUEST, "Creator requestReset must fail 400");
+    let alice_reset = signed_ordinary(
+        alice_engine,
+        &alice_identity,
+        json!({
+            "$type": "blue.catbird.chat.defs#resetRequestBody",
+            "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\0",
+            "resetRequestId": reset_id.to_string(),
+            "actorDid": f.alice.did,
+            "actorDeviceId": f.alice.device_id.to_string(),
+            "keyId": alice_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "reason": "manualRecovery",
+            "idempotencyKey": reset_id.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (rst_status, rst_bytes) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.requestReset",
+            &json!({"signedRequest": alice_reset}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        rst_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Creator requestReset must fail 400"
+    );
     let err: Value = serde_json::from_slice(&rst_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Reset request must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Reset request must leave graph unchanged"
+    );
 
     // ========================================================================
     // PART B: Recipient (Bob) authority restrictions while pending
@@ -1149,154 +1626,334 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
     f.bob_engine.process_direct_request(&f.welcome_input)?;
 
     // 1. Extra application message: Bob attempts to send message before acceptance
-    let bob_send = make_app_send(&f.bob_engine, &bob_identity, &f.bob.did, &f.bob.device_id, &bob_key_id, &MLSMessagePayload::text("Recipient sending message before acceptance"), json!([]))?;
-    let (b_send_status, b_send_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.sendMessage", &json!({"signedRequest": bob_send}), true).await?;
-    assert_eq!(b_send_status, reqwest::StatusCode::BAD_REQUEST, "Recipient sendMessage must fail 400");
+    let bob_send = make_app_send(
+        &f.bob_engine,
+        &bob_identity,
+        &f.bob.did,
+        &f.bob.device_id,
+        &bob_key_id,
+        &MLSMessagePayload::text("Recipient sending message before acceptance"),
+        json!([]),
+    )?;
+    let (b_send_status, b_send_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.sendMessage",
+            &json!({"signedRequest": bob_send}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        b_send_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Recipient sendMessage must fail 400"
+    );
     let err: Value = serde_json::from_slice(&b_send_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Recipient sendMessage must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Recipient sendMessage must leave graph unchanged"
+    );
 
     // 2. Typing: Bob attempts publishTyping while pending
-    let bob_typing = signed_ordinary(&f.bob_engine, &bob_identity, json!({
-        "$type": "blue.catbird.chat.defs#typingBody",
-        "signatureDomain": "CATBIRD-CHAT-TYPING\0",
-        "typingId": Uuid::new_v4().to_string(),
-        "actorDid": f.bob.did,
-        "actorDeviceId": f.bob.device_id.to_string(),
-        "keyId": bob_key_id,
-        "authGeneration": 1,
-        "coordinates": prior,
-        "isTyping": true,
-        "signedAt": canonical_now()
-    }))?;
-    let (b_t_status, b_t_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.publishTyping", &json!({"signedRequest": bob_typing}), true).await?;
-    assert_eq!(b_t_status, reqwest::StatusCode::BAD_REQUEST, "Recipient typing must fail 400");
+    let bob_typing = signed_ordinary(
+        &f.bob_engine,
+        &bob_identity,
+        json!({
+            "$type": "blue.catbird.chat.defs#typingBody",
+            "signatureDomain": "CATBIRD-CHAT-TYPING\0",
+            "typingId": Uuid::new_v4().to_string(),
+            "actorDid": f.bob.did,
+            "actorDeviceId": f.bob.device_id.to_string(),
+            "keyId": bob_key_id,
+            "authGeneration": 1,
+            "coordinates": prior,
+            "isTyping": true,
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (b_t_status, b_t_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.publishTyping",
+            &json!({"signedRequest": bob_typing}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        b_t_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Recipient typing must fail 400"
+    );
     let err: Value = serde_json::from_slice(&b_t_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Recipient typing must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Recipient typing must leave graph unchanged"
+    );
 
     // 3. Edits / Reactions / Receipts / Calls: Bob attempts each control payload
     for (name, payload) in control_payloads() {
-        let b_send_mut = make_app_send(&f.bob_engine, &bob_identity, &f.bob.did, &f.bob.device_id, &bob_key_id, &payload, json!([]))?;
-        let (status, bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.sendMessage", &json!({"signedRequest": b_send_mut}), true).await?;
-        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "Recipient {name} frame must fail 400");
+        let b_send_mut = make_app_send(
+            &f.bob_engine,
+            &bob_identity,
+            &f.bob.did,
+            &f.bob.device_id,
+            &bob_key_id,
+            &payload,
+            json!([]),
+        )?;
+        let (status, bytes) = f
+            .bob
+            .post(
+                &f.client,
+                &f.server.base_url,
+                "blue.catbird.chat.sendMessage",
+                &json!({"signedRequest": b_send_mut}),
+                true,
+            )
+            .await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "Recipient {name} frame must fail 400"
+        );
         let err: Value = serde_json::from_slice(&bytes)?;
         assert_eq!(err["error"], "ConversationNotAccepted");
-        assert_eq!(durable_comprehensive(&f)?, before, "Recipient {name} must leave graph unchanged");
+        assert_eq!(
+            durable_comprehensive(&f)?,
+            before,
+            "Recipient {name} must leave graph unchanged"
+        );
     }
 
     // 3b. Attachment bind in sendMessage by Bob
-    let bob_blob_send = make_app_send(&f.bob_engine, &bob_identity, &f.bob.did, &f.bob.device_id, &bob_key_id, &MLSMessagePayload::text("Recipient attachment bind"), blob_binding.clone())?;
-    let (b_bs_status, b_bs_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.sendMessage", &json!({"signedRequest": bob_blob_send}), true).await?;
-    assert_eq!(b_bs_status, reqwest::StatusCode::BAD_REQUEST, "Recipient attachment bind must fail 400");
+    let bob_blob_send = make_app_send(
+        &f.bob_engine,
+        &bob_identity,
+        &f.bob.did,
+        &f.bob.device_id,
+        &bob_key_id,
+        &MLSMessagePayload::text("Recipient attachment bind"),
+        blob_binding.clone(),
+    )?;
+    let (b_bs_status, b_bs_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.sendMessage",
+            &json!({"signedRequest": bob_blob_send}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        b_bs_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Recipient attachment bind must fail 400"
+    );
     let err: Value = serde_json::from_slice(&b_bs_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Recipient attachment bind send must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Recipient attachment bind send must leave graph unchanged"
+    );
 
     // 4. Blob upload preparation by Bob
-    let bob_blob_prep = signed_ordinary(&f.bob_engine, &bob_identity, json!({
-        "$type": "blue.catbird.chat.defs#blobUploadPreparationBody",
-        "signatureDomain": "CATBIRD-CHAT-BLOB-PREPARE\0",
-        "blobId": Uuid::new_v4().to_string(),
-        "conversationId": f.conversation_id.to_string(),
-        "actorDid": f.bob.did,
-        "actorDeviceId": f.bob.device_id.to_string(),
-        "keyId": bob_key_id,
-        "authGeneration": 1,
-        "prior": prior,
-        "ciphertextSha256": STANDARD.encode(Sha256::digest(b"bob-attachment-payload")),
-        "ciphertextSize": 4096,
-        "mediaType": "image/png",
-        "plaintextSize": 1024,
-        "purpose": "attachment",
-        "idempotencyKey": Uuid::new_v4().to_string(),
-        "signedAt": canonical_now()
-    }))?;
-    let (b_bp_status, b_bp_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.prepareBlobUpload", &json!({"signedRequest": bob_blob_prep}), true).await?;
-    assert_eq!(b_bp_status, reqwest::StatusCode::BAD_REQUEST, "Recipient blob upload preparation must fail 400");
+    let bob_blob_prep = signed_ordinary(
+        &f.bob_engine,
+        &bob_identity,
+        json!({
+            "$type": "blue.catbird.chat.defs#blobUploadPreparationBody",
+            "signatureDomain": "CATBIRD-CHAT-BLOB-PREPARE\0",
+            "blobId": Uuid::new_v4().to_string(),
+            "conversationId": f.conversation_id.to_string(),
+            "actorDid": f.bob.did,
+            "actorDeviceId": f.bob.device_id.to_string(),
+            "keyId": bob_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(b"bob-attachment-payload")),
+            "ciphertextSize": 4096,
+            "mediaType": "image/png",
+            "plaintextSize": 1024,
+            "purpose": "attachment",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (b_bp_status, b_bp_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.prepareBlobUpload",
+            &json!({"signedRequest": bob_blob_prep}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        b_bp_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Recipient blob upload preparation must fail 400"
+    );
     let err: Value = serde_json::from_slice(&b_bp_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Recipient blob upload preparation must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Recipient blob upload preparation must leave graph unchanged"
+    );
 
     // 5. Reset by Bob
     let b_reset_id = Uuid::new_v4();
-    let bob_reset = signed_ordinary(&f.bob_engine, &bob_identity, json!({
-        "$type": "blue.catbird.chat.defs#resetRequestBody",
-        "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\0",
-        "resetRequestId": b_reset_id.to_string(),
-        "actorDid": f.bob.did,
-        "actorDeviceId": f.bob.device_id.to_string(),
-        "keyId": bob_key_id,
-        "authGeneration": 1,
-        "prior": prior,
-        "reason": "manualRecovery",
-        "idempotencyKey": b_reset_id.to_string(),
-        "signedAt": canonical_now()
-    }))?;
-    let (b_rst_status, b_rst_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.requestReset", &json!({"signedRequest": bob_reset}), true).await?;
-    assert_eq!(b_rst_status, reqwest::StatusCode::BAD_REQUEST, "Recipient requestReset must fail 400");
+    let bob_reset = signed_ordinary(
+        &f.bob_engine,
+        &bob_identity,
+        json!({
+            "$type": "blue.catbird.chat.defs#resetRequestBody",
+            "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\0",
+            "resetRequestId": b_reset_id.to_string(),
+            "actorDid": f.bob.did,
+            "actorDeviceId": f.bob.device_id.to_string(),
+            "keyId": bob_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "reason": "manualRecovery",
+            "idempotencyKey": b_reset_id.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (b_rst_status, b_rst_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.requestReset",
+            &json!({"signedRequest": bob_reset}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        b_rst_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Recipient requestReset must fail 400"
+    );
     let err: Value = serde_json::from_slice(&b_rst_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Recipient reset must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Recipient reset must leave graph unchanged"
+    );
 
     // 6. Metadata/admin change and arbitrary Add by Bob via submitTransition
     let tid_bob_meta = Uuid::new_v4().to_string();
-    let bob_metadata_trans = signed_ordinary(&f.bob_engine, &bob_identity, json!({
-        "$type": "blue.catbird.chat.defs#metadataTransitionBody",
-        "signatureDomain": "CATBIRD-CHAT-METADATA\0",
-        "transitionId": tid_bob_meta,
-        "actorDid": f.bob.did,
-        "actorDeviceId": f.bob.device_id.to_string(),
-        "keyId": bob_key_id,
-        "authGeneration": 1,
-        "prior": prior,
-        "next": next_coord,
-        "metadataSnapshot": f.publication["body"]["artifacts"]["metadataSnapshot"],
-        "idempotencyKey": tid_bob_meta,
-        "signedAt": canonical_now()
-    }))?;
-    let (b_meta_status, b_meta_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": bob_metadata_trans}), true).await?;
-    assert_eq!(b_meta_status, reqwest::StatusCode::BAD_REQUEST, "Recipient metadata transition must fail 400");
+    let bob_metadata_trans = signed_ordinary(
+        &f.bob_engine,
+        &bob_identity,
+        json!({
+            "$type": "blue.catbird.chat.defs#metadataTransitionBody",
+            "signatureDomain": "CATBIRD-CHAT-METADATA\0",
+            "transitionId": tid_bob_meta,
+            "actorDid": f.bob.did,
+            "actorDeviceId": f.bob.device_id.to_string(),
+            "keyId": bob_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "next": next_coord,
+            "metadataSnapshot": f.publication["body"]["artifacts"]["metadataSnapshot"],
+            "idempotencyKey": tid_bob_meta,
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (b_meta_status, b_meta_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.submitTransition",
+            &json!({"signedRequest": bob_metadata_trans}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        b_meta_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Recipient metadata transition must fail 400"
+    );
     let err: Value = serde_json::from_slice(&b_meta_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Recipient metadata transition must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Recipient metadata transition must leave graph unchanged"
+    );
 
     let tid_bob_policy = Uuid::new_v4().to_string();
-    let bob_policy = signed_ordinary(&f.bob_engine, &bob_identity, json!({
-        "$type": "blue.catbird.chat.defs#policyTransitionBody",
-        "signatureDomain": "CATBIRD-CHAT-POLICY\0",
-        "transitionId": tid_bob_policy,
-        "actorDid": f.bob.did,
-        "actorDeviceId": f.bob.device_id.to_string(),
-        "keyId": bob_key_id,
-        "authGeneration": 1,
-        "prior": prior,
-        "next": next_coord,
-        "participantChanges": [{
-            "$type": "blue.catbird.chat.defs#addParticipant",
-            "userDid": new_user,
-            "role": "member",
-            "status": "pending",
-            "invitationProvenance": {
-                "invitationTransitionId": f.request_id.to_string(),
-                "invitedByDid": f.bob.did,
-                "invitedByDeviceId": f.bob.device_id.to_string()
-            }
-        }],
-        "idempotencyKey": tid_bob_policy,
-        "signedAt": canonical_now()
-    }))?;
-    let (b_pol_status, b_pol_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.submitTransition", &json!({"signedRequest": bob_policy}), true).await?;
-    assert_eq!(b_pol_status, reqwest::StatusCode::BAD_REQUEST, "Recipient arbitrary Add must fail 400");
+    let bob_policy = signed_ordinary(
+        &f.bob_engine,
+        &bob_identity,
+        json!({
+            "$type": "blue.catbird.chat.defs#policyTransitionBody",
+            "signatureDomain": "CATBIRD-CHAT-POLICY\0",
+            "transitionId": tid_bob_policy,
+            "actorDid": f.bob.did,
+            "actorDeviceId": f.bob.device_id.to_string(),
+            "keyId": bob_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "next": next_coord,
+            "participantChanges": [{
+                "$type": "blue.catbird.chat.defs#addParticipant",
+                "userDid": new_user,
+                "role": "member",
+                "status": "pending",
+                "invitationProvenance": {
+                    "invitationTransitionId": f.request_id.to_string(),
+                    "invitedByDid": f.bob.did,
+                    "invitedByDeviceId": f.bob.device_id.to_string()
+                }
+            }],
+            "idempotencyKey": tid_bob_policy,
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (b_pol_status, b_pol_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.submitTransition",
+            &json!({"signedRequest": bob_policy}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        b_pol_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Recipient arbitrary Add must fail 400"
+    );
     let err: Value = serde_json::from_slice(&b_pol_bytes)?;
     assert_eq!(err["error"], "ConversationNotAccepted");
-    assert_eq!(durable_comprehensive(&f)?, before, "Recipient arbitrary Add must leave graph unchanged");
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        before,
+        "Recipient arbitrary Add must leave graph unchanged"
+    );
 
     // ========================================================================
-// PART C: Close / per-device Welcome rejection remain available
-// ========================================================================
+    // PART C: Close / per-device Welcome rejection remain available
+    // ========================================================================
 
-// 1. Per-device Welcome rejection: Bob calls rejectWelcome with real signed welcomeRejectionBody -> succeeds!
+    // 1. Per-device Welcome rejection: Bob calls rejectWelcome with real signed welcomeRejectionBody -> succeeds!
     let bob_reject_id = Uuid::new_v4();
     let bob_reject_body = json!({
         "$type": "blue.catbird.chat.defs#welcomeRejectionBody",
@@ -1312,15 +1969,32 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "idempotencyKey": bob_reject_id.to_string(),
         "signedAt": canonical_now()
     });
-    let signed_reject = sign_mutation(&f.bob_engine, &bob_identity, SignedMutationKind::WelcomeRejection, bob_reject_body)?;
-    let (reject_status, reject_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.rejectWelcome", &json!({"signedRequest": signed_reject}), true).await?;
+    let signed_reject = sign_mutation(
+        &f.bob_engine,
+        &bob_identity,
+        SignedMutationKind::WelcomeRejection,
+        bob_reject_body,
+    )?;
+    let (reject_status, reject_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.rejectWelcome",
+            &json!({"signedRequest": signed_reject}),
+            true,
+        )
+        .await?;
     anyhow::ensure!(
         reject_status == reqwest::StatusCode::OK,
         "Welcome rejection / decline must remain available while pending: {reject_status}: {}",
         String::from_utf8_lossy(&reject_bytes)
     );
     let reject_resp: Value = serde_json::from_slice(&reject_bytes)?;
-    assert_eq!(reject_resp["status"], "rejected", "rejectWelcome outcome must be recorded as rejected");
+    assert_eq!(
+        reject_resp["status"], "rejected",
+        "rejectWelcome outcome must be recorded as rejected"
+    );
     assert_eq!(
         psql_cmd(&format!("SELECT count(*) FROM chat.direct_request_welcome_outcomes WHERE request_id='{}' AND recipient_did='{}' AND status='rejected'", f.request_id, f.bob.did))?,
         "1",
@@ -1329,16 +2003,31 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
 
     // 2. Terminal close (account decline / creator close): Alice calls closeConversation with real signed conversationCloseBody -> succeeds!
     let (close_env, close_tx_id) = close_envelope(&f, true, None)?;
-    let (close_status, close_bytes) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.closeConversation", &close_env, true).await?;
+    let (close_status, close_bytes) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.closeConversation",
+            &close_env,
+            true,
+        )
+        .await?;
     anyhow::ensure!(
         close_status == reqwest::StatusCode::OK,
         "Close must remain available while pending: {close_status}: {}",
         String::from_utf8_lossy(&close_bytes)
     );
     let close_resp: Value = serde_json::from_slice(&close_bytes)?;
-    assert!(close_resp["result"]["tombstone"].is_object(), "Close response must contain tombstone");
+    assert!(
+        close_resp["result"]["tombstone"].is_object(),
+        "Close response must contain tombstone"
+    );
     assert_eq!(
-        psql_cmd(&format!("SELECT lifecycle FROM chat.conversations WHERE conversation_id='{}'", f.conversation_id))?,
+        psql_cmd(&format!(
+            "SELECT lifecycle FROM chat.conversations WHERE conversation_id='{}'",
+            f.conversation_id
+        ))?,
         "superseded",
         "Conversation lifecycle must be superseded after signed close"
     );
@@ -1426,7 +2115,9 @@ async fn c19_preview_fetch_import_ack_produce_no_peer_visible_signals() -> anyho
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
     let convos_resp: Value = serde_json::from_slice(&convos_bytes)?;
-    let session_id = convos_resp["inventorySessionId"].as_str().context("session id")?;
+    let session_id = convos_resp["inventorySessionId"]
+        .as_str()
+        .context("session id")?;
 
     let (status, welcomes_bytes) = f
         .bob
@@ -1444,18 +2135,27 @@ async fn c19_preview_fetch_import_ack_produce_no_peer_visible_signals() -> anyho
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
     let welcomes_resp: Value = serde_json::from_slice(&welcomes_bytes)?;
-    let items = welcomes_resp["items"].as_array().context("pending welcomes items")?;
+    let items = welcomes_resp["items"]
+        .as_array()
+        .context("pending welcomes items")?;
     assert!(
-        items.iter().any(|item| item["welcomeId"] == f.request_id.to_string()),
+        items
+            .iter()
+            .any(|item| item["welcomeId"] == f.request_id.to_string()),
         "Bob must receive the pending Welcome for this request"
     );
 
     // 3. Bob imports the Welcome and executes internal durability ACK via acknowledgeWelcome
     f.bob_engine.process_direct_request(&f.welcome_input)?;
     let intro = f.bob_engine.decrypt_direct_request(&f.welcome_input)?;
-    assert!(matches!(intro, DirectRequestIntroductionResult::Ready { .. }), "Bob natively imports and decrypts the preview");
+    assert!(
+        matches!(intro, DirectRequestIntroductionResult::Ready { .. }),
+        "Bob natively imports and decrypts the preview"
+    );
     let ack_id = Uuid::new_v4();
-    let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&f.bob_engine.identity_public_key(&bob_identity)?));
+    let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(
+        &f.bob_engine.identity_public_key(&bob_identity)?,
+    ));
     let ack_body = json!({
         "$type": "blue.catbird.chat.defs#welcomeAcknowledgementBody",
         "signatureDomain": "CATBIRD-CHAT-WELCOME-ACK\0",
@@ -1469,7 +2169,12 @@ async fn c19_preview_fetch_import_ack_produce_no_peer_visible_signals() -> anyho
         "idempotencyKey": ack_id.to_string(),
         "signedAt": canonical_now()
     });
-    let signed_ack = sign_mutation(&f.bob_engine, &bob_identity, SignedMutationKind::WelcomeAcknowledgement, ack_body)?;
+    let signed_ack = sign_mutation(
+        &f.bob_engine,
+        &bob_identity,
+        SignedMutationKind::WelcomeAcknowledgement,
+        ack_body,
+    )?;
 
     let (ack_status, ack_resp_bytes) = f
         .bob
@@ -1497,7 +2202,10 @@ async fn c19_preview_fetch_import_ack_produce_no_peer_visible_signals() -> anyho
     ))?
     .trim()
         == "t";
-    assert!(ack_recorded, "Internal durability ACK must be recorded in guarded database");
+    assert!(
+        ack_recorded,
+        "Internal durability ACK must be recorded in guarded database"
+    );
 
     // 5. Audit EVERY status projection for Alice: zero peer-visible read, delivery, presence, or typing!
     let (status, convos_after_bytes) = f
@@ -1576,34 +2284,49 @@ async fn c19_preview_fetch_import_ack_produce_no_peer_visible_signals() -> anyho
 #[tokio::test(flavor = "multi_thread")]
 async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result<()> {
     let f = live_direct_request::publish_request(false).await?;
-    f.alice_engine.as_ref().context("Alice engine")?.confirm_request_publication(
-        &f.request_id.to_string(),
-        &serde_json::to_vec(&f.receipt)?,
-        &f.server.receipt_public_key,
-    )?;
+    f.alice_engine
+        .as_ref()
+        .context("Alice engine")?
+        .confirm_request_publication(
+            &f.request_id.to_string(),
+            &serde_json::to_vec(&f.receipt)?,
+            &f.server.receipt_public_key,
+        )?;
 
     // 1. Bob imports the Welcome and decrypts the preview locally before close
     f.bob_engine.process_direct_request(&f.welcome_input)?;
     let intro_before = f.bob_engine.decrypt_direct_request(&f.welcome_input)?;
-    assert!(matches!(intro_before, DirectRequestIntroductionResult::Ready { .. }), "Bob must decrypt before close");
+    assert!(
+        matches!(intro_before, DirectRequestIntroductionResult::Ready { .. }),
+        "Bob must decrypt before close"
+    );
 
     // 2. Authoritative signed close via the real closeConversation RPC by Bob (pending invitee)
     let (close_env, close_tx_id) = close_envelope(&f, false, None)?;
-    let (close_status, close_bytes) = f.bob.post(
-        &f.client,
-        &f.server.base_url,
-        "blue.catbird.chat.closeConversation",
-        &close_env,
-        true,
-    ).await?;
+    let (close_status, close_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.closeConversation",
+            &close_env,
+            true,
+        )
+        .await?;
     anyhow::ensure!(
         close_status == reqwest::StatusCode::OK,
         "Real signed closeConversation failed: {close_status}: {}",
         String::from_utf8_lossy(&close_bytes)
     );
     let close_resp: Value = serde_json::from_slice(&close_bytes)?;
-    assert!(close_resp["result"]["tombstone"].is_object(), "Close response must contain tombstone");
-    assert!(close_resp["result"]["entry"].is_object(), "Close response must contain close entry");
+    assert!(
+        close_resp["result"]["tombstone"].is_object(),
+        "Close response must contain tombstone"
+    );
+    assert!(
+        close_resp["result"]["entry"].is_object(),
+        "Close response must contain close entry"
+    );
 
     // Verify in database: FK linkage to transitions is produced by production code!
     let conv_row = psql_cmd(&format!(
@@ -1611,28 +2334,45 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
         f.conversation_id
     ))?;
     let parts: Vec<&str> = conv_row.split('|').collect();
-    assert_eq!(parts[0], "superseded", "Conversation lifecycle must be superseded");
-    assert_eq!(parts[1], close_tx_id.to_string(), "close_transition_id must match signed transitionId");
+    assert_eq!(
+        parts[0], "superseded",
+        "Conversation lifecycle must be superseded"
+    );
+    assert_eq!(
+        parts[1],
+        close_tx_id.to_string(),
+        "close_transition_id must match signed transitionId"
+    );
 
     let transition_count: i64 = psql_cmd(&format!(
         "SELECT count(*) FROM chat.transitions WHERE transition_id='{close_tx_id}' AND kind='closeConversation' AND conversation_id='{}'",
         f.conversation_id
     ))?.parse()?;
-    assert_eq!(transition_count, 1, "chat.transitions must record closeConversation transition with exact FK");
+    assert_eq!(
+        transition_count, 1,
+        "chat.transitions must record closeConversation transition with exact FK"
+    );
 
     let consent_state: String = psql_cmd(&format!(
         "SELECT consent FROM chat.direct_request_lifecycle WHERE conversation_id='{}'",
         f.conversation_id
     ))?;
-    assert_eq!(consent_state, "closed", "direct_request_lifecycle consent must be closed");
+    assert_eq!(
+        consent_state, "closed",
+        "direct_request_lifecycle consent must be closed"
+    );
 
     // F1 (migration 20260919000021): publication already retired the pending
     // charge, so the signed close writes no pending release.
     let pending_releases: i64 = psql_cmd(&format!(
         "SELECT count(*) FROM chat.direct_request_pending_releases WHERE request_id='{}'",
         f.request_id
-    ))?.parse()?;
-    assert_eq!(pending_releases, 0, "close must not write a pending release after F1");
+    ))?
+    .parse()?;
+    assert_eq!(
+        pending_releases, 0,
+        "close must not write a pending release after F1"
+    );
 
     let durable_after_close = durable_comprehensive(&f)?;
 
@@ -1671,12 +2411,36 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
         "idempotencyKey": transition_id.to_string(),
         "signedAt": canonical_now()
     });
-    let signed_accept = signed_mls_request(&f.bob_engine, &bob_identity, DirectRequestKind::Accept, accept_body)?;
-    let (accept_status, accept_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.acceptConversation", &json!({"directRequest": signed_accept}), true).await?;
-    assert!(accept_status.is_client_error(), "Late accept must be rejected: {accept_status}");
+    let signed_accept = signed_mls_request(
+        &f.bob_engine,
+        &bob_identity,
+        DirectRequestKind::Accept,
+        accept_body,
+    )?;
+    let (accept_status, accept_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.acceptConversation",
+            &json!({"directRequest": signed_accept}),
+            true,
+        )
+        .await?;
+    assert!(
+        accept_status.is_client_error(),
+        "Late accept must be rejected: {accept_status}"
+    );
     let accept_err: Value = serde_json::from_slice(&accept_bytes)?;
-    assert_eq!(accept_err["error"], "InvitationNotPending", "Late accept must return InvitationNotPending");
-    assert_eq!(durable_comprehensive(&f)?, durable_after_close, "Late accept must leave graph unchanged");
+    assert_eq!(
+        accept_err["error"], "InvitationNotPending",
+        "Late accept must return InvitationNotPending"
+    );
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        durable_after_close,
+        "Late accept must leave graph unchanged"
+    );
 
     // Attempt B: Late acknowledgeWelcome -> REJECTED
     let ack_id = Uuid::new_v4();
@@ -1693,12 +2457,37 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
         "idempotencyKey": ack_id.to_string(),
         "signedAt": canonical_now()
     });
-    let signed_ack = sign_mutation(&f.bob_engine, &bob_identity, SignedMutationKind::WelcomeAcknowledgement, ack_body)?;
-    let (ack_status, ack_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.acknowledgeWelcome", &json!({"signedRequest": signed_ack}), true).await?;
-    assert_eq!(ack_status, reqwest::StatusCode::BAD_REQUEST, "Late welcome acknowledgement on closed conversation must fail 400: {ack_status}");
+    let signed_ack = sign_mutation(
+        &f.bob_engine,
+        &bob_identity,
+        SignedMutationKind::WelcomeAcknowledgement,
+        ack_body,
+    )?;
+    let (ack_status, ack_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.acknowledgeWelcome",
+            &json!({"signedRequest": signed_ack}),
+            true,
+        )
+        .await?;
+    assert_eq!(
+        ack_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Late welcome acknowledgement on closed conversation must fail 400: {ack_status}"
+    );
     let ack_err: Value = serde_json::from_slice(&ack_bytes)?;
-    assert_eq!(ack_err["error"], "WelcomeSuperseded", "Late ack on closed conversation returns typed WelcomeSuperseded error");
-    assert_eq!(durable_comprehensive(&f)?, durable_after_close, "Late ack must leave graph unchanged");
+    assert_eq!(
+        ack_err["error"], "WelcomeSuperseded",
+        "Late ack on closed conversation returns typed WelcomeSuperseded error"
+    );
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        durable_after_close,
+        "Late ack must leave graph unchanged"
+    );
 
     // Attempt C: Late sendMessage by Alice -> REJECTED
     let alice_identity = format!("{}#{}", f.alice.did, f.alice.device_id);
@@ -1718,52 +2507,103 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
         "messageId": STANDARD.encode(msg_id.as_bytes()),
         "prior": aad_prior
     });
-    let ciphertext = alice_engine.encrypt_canonical(&group, &MLSMessagePayload::text("Late message after close").encode()?, canonical_application_aad_bytes(&aad)?, epoch)?;
-    let late_send = signed_ordinary(alice_engine, &alice_identity, json!({
-        "$type": "blue.catbird.chat.defs#applicationSendBody",
-        "signatureDomain": "CATBIRD-CHAT-MESSAGE\0",
-        "messageId": msg_id.to_string(),
-        "actorDid": f.alice.did,
-        "actorDeviceId": f.alice.device_id.to_string(),
-        "keyId": alice_key_id,
-        "authGeneration": 1,
-        "prior": prior,
-        "aad": aad,
-        "applicationMessage": {
-            "framing": "mlsMessage",
-            "contentType": "privateMessageApplication",
-            "bytes": STANDARD.encode(&ciphertext),
-            "sha256": STANDARD.encode(Sha256::digest(&ciphertext))
-        },
-        "blobBindings": [],
-        "signedAt": canonical_now()
-    }))?;
-    let (send_status, _) = f.alice.post(&f.client, &f.server.base_url, "blue.catbird.chat.sendMessage", &json!({"signedRequest": late_send}), true).await?;
-    assert!(!send_status.is_success(), "Late sendMessage after close must fail");
-    assert_eq!(durable_comprehensive(&f)?, durable_after_close, "Late send must leave graph unchanged");
+    let ciphertext = alice_engine.encrypt_canonical(
+        &group,
+        &MLSMessagePayload::text("Late message after close").encode()?,
+        canonical_application_aad_bytes(&aad)?,
+        epoch,
+    )?;
+    let late_send = signed_ordinary(
+        alice_engine,
+        &alice_identity,
+        json!({
+            "$type": "blue.catbird.chat.defs#applicationSendBody",
+            "signatureDomain": "CATBIRD-CHAT-MESSAGE\0",
+            "messageId": msg_id.to_string(),
+            "actorDid": f.alice.did,
+            "actorDeviceId": f.alice.device_id.to_string(),
+            "keyId": alice_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "aad": aad,
+            "applicationMessage": {
+                "framing": "mlsMessage",
+                "contentType": "privateMessageApplication",
+                "bytes": STANDARD.encode(&ciphertext),
+                "sha256": STANDARD.encode(Sha256::digest(&ciphertext))
+            },
+            "blobBindings": [],
+            "signedAt": canonical_now()
+        }),
+    )?;
+    let (send_status, _) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.sendMessage",
+            &json!({"signedRequest": late_send}),
+            true,
+        )
+        .await?;
+    assert!(
+        !send_status.is_success(),
+        "Late sendMessage after close must fail"
+    );
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        durable_after_close,
+        "Late send must leave graph unchanged"
+    );
 
     // Attempt D: Exact completed replay of the original close succeeds idempotently
-    let (replay_status, replay_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.closeConversation", &close_env, true).await?;
-    assert_eq!(replay_status, reqwest::StatusCode::OK, "Exact close replay must succeed 200");
+    let (replay_status, replay_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.closeConversation",
+            &close_env,
+            true,
+        )
+        .await?;
+    assert_eq!(
+        replay_status,
+        reqwest::StatusCode::OK,
+        "Exact close replay must succeed 200"
+    );
     let replay_resp: Value = serde_json::from_slice(&replay_bytes)?;
-    assert_eq!(replay_resp, close_resp, "Replayed close response must equal original tombstone/entry");
-    assert_eq!(durable_comprehensive(&f)?, durable_after_close, "Idempotent replay must leave graph unchanged");
+    assert_eq!(
+        replay_resp, close_resp,
+        "Replayed close response must equal original tombstone/entry"
+    );
+    assert_eq!(
+        durable_comprehensive(&f)?,
+        durable_after_close,
+        "Idempotent replay must leave graph unchanged"
+    );
 
     // 4. No claim of retracting already decrypted content:
     // Bob's local decrypted introduction remains accessible after close.
     let intro_after = f.bob_engine.decrypt_direct_request(&f.welcome_input)?;
-    assert_eq!(intro_after, intro_before, "Already decrypted intro must remain readable locally");
+    assert_eq!(
+        intro_after, intro_before,
+        "Already decrypted intro must remain readable locally"
+    );
 
     Ok(())
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn c20_close_racing_accept_close_wins() -> anyhow::Result<()> {
     let f = live_direct_request::publish_request(false).await?;
-    f.alice_engine.as_ref().context("Alice engine")?.confirm_request_publication(
-        &f.request_id.to_string(),
-        &serde_json::to_vec(&f.receipt)?,
-        &f.server.receipt_public_key,
-    )?;
+    f.alice_engine
+        .as_ref()
+        .context("Alice engine")?
+        .confirm_request_publication(
+            &f.request_id.to_string(),
+            &serde_json::to_vec(&f.receipt)?,
+            &f.server.receipt_public_key,
+        )?;
     let (close_env, _close_tx_id) = close_envelope(&f, true, None)?;
 
     let bob_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
@@ -1799,21 +2639,54 @@ async fn c20_close_racing_accept_close_wins() -> anyhow::Result<()> {
         "idempotencyKey": transition_id.to_string(),
         "signedAt": canonical_now()
     });
-    let signed_accept = signed_mls_request(&f.bob_engine, &bob_identity, DirectRequestKind::Accept, accept_body)?;
+    let signed_accept = signed_mls_request(
+        &f.bob_engine,
+        &bob_identity,
+        DirectRequestKind::Accept,
+        accept_body,
+    )?;
     let accept_env = json!({"directRequest": signed_accept});
 
     // Queue close first on chat.conversations FOR UPDATE (which both take in execution):
     let barrier = Barrier::hold_conversation(f.conversation_id)?;
     let close_future = {
-        let (who, client, base, env) = (f.alice.clone(), f.client.clone(), f.server.base_url.clone(), close_env.clone());
-        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.closeConversation", &env, true).await })
+        let (who, client, base, env) = (
+            f.alice.clone(),
+            f.client.clone(),
+            f.server.base_url.clone(),
+            close_env.clone(),
+        );
+        tokio::spawn(async move {
+            who.post(
+                &client,
+                &base,
+                "blue.catbird.chat.closeConversation",
+                &env,
+                true,
+            )
+            .await
+        })
     };
     let queued_first = barrier.wait_for_waiters(1).await?;
 
     // Then queue accept: Bob's accept blocks behind close.
     let accept_future = {
-        let (who, client, base, env) = (f.bob.clone(), f.client.clone(), f.server.base_url.clone(), accept_env.clone());
-        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.acceptConversation", &env, true).await })
+        let (who, client, base, env) = (
+            f.bob.clone(),
+            f.client.clone(),
+            f.server.base_url.clone(),
+            accept_env.clone(),
+        );
+        tokio::spawn(async move {
+            who.post(
+                &client,
+                &base,
+                "blue.catbird.chat.acceptConversation",
+                &env,
+                true,
+            )
+            .await
+        })
     };
     let queued_both = barrier.wait_for_waiters(2).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1823,16 +2696,31 @@ async fn c20_close_racing_accept_close_wins() -> anyhow::Result<()> {
     let (accept_status, accept_bytes) = accept_future.await??;
     eprintln!("C20 close-vs-accept close-wins arm: queued first={queued_first} both={queued_both} close={close_status} accept={accept_status}");
 
-    assert_eq!(close_status, reqwest::StatusCode::OK, "Close must win when queued first: {close_status}: {}", String::from_utf8_lossy(&close_bytes));
-    assert_eq!(accept_status, reqwest::StatusCode::BAD_REQUEST, "Accept must fail 400 InvitationNotPending when close wins: {accept_status}");
+    assert_eq!(
+        close_status,
+        reqwest::StatusCode::OK,
+        "Close must win when queued first: {close_status}: {}",
+        String::from_utf8_lossy(&close_bytes)
+    );
+    assert_eq!(
+        accept_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Accept must fail 400 InvitationNotPending when close wins: {accept_status}"
+    );
     let accept_err: Value = serde_json::from_slice(&accept_bytes)?;
-    assert_eq!(accept_err["error"], "InvitationNotPending", "Loser accept gets InvitationNotPending");
+    assert_eq!(
+        accept_err["error"], "InvitationNotPending",
+        "Loser accept gets InvitationNotPending"
+    );
 
     let winners: String = psql_cmd(&format!(
         "SELECT string_agg(kind, ',' ORDER BY kind) FROM chat.transitions WHERE conversation_id='{}' AND kind IN ('closeConversation','directRequestAcceptance')",
         f.conversation_id
     ))?;
-    assert_eq!(winners, "closeConversation", "only close transition is durable");
+    assert_eq!(
+        winners, "closeConversation",
+        "only close transition is durable"
+    );
     release_by_close(&f).await?;
     Ok(())
 }
@@ -1840,11 +2728,14 @@ async fn c20_close_racing_accept_close_wins() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn c20_close_racing_accept_accept_wins() -> anyhow::Result<()> {
     let f = live_direct_request::publish_request(false).await?;
-    f.alice_engine.as_ref().context("Alice engine")?.confirm_request_publication(
-        &f.request_id.to_string(),
-        &serde_json::to_vec(&f.receipt)?,
-        &f.server.receipt_public_key,
-    )?;
+    f.alice_engine
+        .as_ref()
+        .context("Alice engine")?
+        .confirm_request_publication(
+            &f.request_id.to_string(),
+            &serde_json::to_vec(&f.receipt)?,
+            &f.server.receipt_public_key,
+        )?;
     let (close_env, _close_tx_id) = close_envelope(&f, true, None)?;
 
     let bob_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
@@ -1881,21 +2772,54 @@ async fn c20_close_racing_accept_accept_wins() -> anyhow::Result<()> {
         "signedAt": canonical_now()
     });
     let accepted_head = accept_body["next"].clone();
-    let signed_accept = signed_mls_request(&f.bob_engine, &bob_identity, DirectRequestKind::Accept, accept_body)?;
+    let signed_accept = signed_mls_request(
+        &f.bob_engine,
+        &bob_identity,
+        DirectRequestKind::Accept,
+        accept_body,
+    )?;
     let accept_env = json!({"directRequest": signed_accept});
 
     // Queue accept first on chat.conversations FOR UPDATE (which both take in execution):
     let barrier = Barrier::hold_conversation(f.conversation_id)?;
     let accept_future = {
-        let (who, client, base, env) = (f.bob.clone(), f.client.clone(), f.server.base_url.clone(), accept_env.clone());
-        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.acceptConversation", &env, true).await })
+        let (who, client, base, env) = (
+            f.bob.clone(),
+            f.client.clone(),
+            f.server.base_url.clone(),
+            accept_env.clone(),
+        );
+        tokio::spawn(async move {
+            who.post(
+                &client,
+                &base,
+                "blue.catbird.chat.acceptConversation",
+                &env,
+                true,
+            )
+            .await
+        })
     };
     let queued_first = barrier.wait_for_waiters(1).await?;
 
     // Then queue close: Alice's close blocks behind accept.
     let close_future = {
-        let (who, client, base, env) = (f.alice.clone(), f.client.clone(), f.server.base_url.clone(), close_env.clone());
-        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.closeConversation", &env, true).await })
+        let (who, client, base, env) = (
+            f.alice.clone(),
+            f.client.clone(),
+            f.server.base_url.clone(),
+            close_env.clone(),
+        );
+        tokio::spawn(async move {
+            who.post(
+                &client,
+                &base,
+                "blue.catbird.chat.closeConversation",
+                &env,
+                true,
+            )
+            .await
+        })
     };
     let queued_both = barrier.wait_for_waiters(2).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1905,16 +2829,31 @@ async fn c20_close_racing_accept_accept_wins() -> anyhow::Result<()> {
     let (accept_status, accept_bytes) = accept_future.await??;
     eprintln!("C20 close-vs-accept accept-wins arm: queued first={queued_first} both={queued_both} close={close_status} accept={accept_status}");
 
-    assert_eq!(accept_status, reqwest::StatusCode::OK, "Accept must win when queued first: {accept_status}: {}", String::from_utf8_lossy(&accept_bytes));
-    assert_eq!(close_status, reqwest::StatusCode::BAD_REQUEST, "Close with stale prior must fail 400 StaleCoordinates: {close_status}");
+    assert_eq!(
+        accept_status,
+        reqwest::StatusCode::OK,
+        "Accept must win when queued first: {accept_status}: {}",
+        String::from_utf8_lossy(&accept_bytes)
+    );
+    assert_eq!(
+        close_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Close with stale prior must fail 400 StaleCoordinates: {close_status}"
+    );
     let close_err: Value = serde_json::from_slice(&close_bytes)?;
-    assert_eq!(close_err["error"], "StaleCoordinates", "Stale prior close must return typed StaleCoordinates error");
+    assert_eq!(
+        close_err["error"], "StaleCoordinates",
+        "Stale prior close must return typed StaleCoordinates error"
+    );
 
     let winners: String = psql_cmd(&format!(
         "SELECT string_agg(kind, ',' ORDER BY kind) FROM chat.transitions WHERE conversation_id='{}' AND kind IN ('closeConversation','directRequestAcceptance')",
         f.conversation_id
     ))?;
-    assert_eq!(winners, "directRequestAcceptance", "only accept transition is durable");
+    assert_eq!(
+        winners, "directRequestAcceptance",
+        "only accept transition is durable"
+    );
     release_by_close_from(&f, Some(accepted_head)).await?;
     Ok(())
 }
@@ -1923,11 +2862,14 @@ async fn c20_close_racing_accept_accept_wins() -> anyhow::Result<()> {
 async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Result<()> {
     // Publish a fresh direct request fixture
     let f = live_direct_request::publish_request(false).await?;
-    f.alice_engine.as_ref().context("Alice engine")?.confirm_request_publication(
-        &f.request_id.to_string(),
-        &serde_json::to_vec(&f.receipt)?,
-        &f.server.receipt_public_key,
-    )?;
+    f.alice_engine
+        .as_ref()
+        .context("Alice engine")?
+        .confirm_request_publication(
+            &f.request_id.to_string(),
+            &serde_json::to_vec(&f.receipt)?,
+            &f.server.receipt_public_key,
+        )?;
 
     // Bob imports the Welcome natively (client-local, real OpenMLS import) and
     // decrypts the introduction; its server-visible completion is the signed
@@ -1935,35 +2877,71 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
     // barrier on both principals.
     f.bob_engine.process_direct_request(&f.welcome_input)?;
     let intro = f.bob_engine.decrypt_direct_request(&f.welcome_input)?;
-    assert!(matches!(intro, DirectRequestIntroductionResult::Ready { .. }), "Bob must decrypt successfully");
+    assert!(
+        matches!(intro, DirectRequestIntroductionResult::Ready { .. }),
+        "Bob must decrypt successfully"
+    );
 
     let bob_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
     let bob_public = f.bob_engine.identity_public_key(&bob_identity)?;
     let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
     let ack_id = Uuid::new_v4();
-    let signed_ack = sign_mutation(&f.bob_engine, &bob_identity, SignedMutationKind::WelcomeAcknowledgement, json!({
-        "$type": "blue.catbird.chat.defs#welcomeAcknowledgementBody",
-        "signatureDomain": "CATBIRD-CHAT-WELCOME-ACK\0",
-        "welcomeId": f.request_id.to_string(),
-        "transitionSeq": 1,
-        "coordinates": f.publication["body"]["next"],
-        "actorDid": f.bob.did,
-        "actorDeviceId": f.bob.device_id.to_string(),
-        "keyId": bob_key_id,
-        "authGeneration": 1,
-        "idempotencyKey": ack_id.to_string(),
-        "signedAt": canonical_now()
-    }))?;
+    let signed_ack = sign_mutation(
+        &f.bob_engine,
+        &bob_identity,
+        SignedMutationKind::WelcomeAcknowledgement,
+        json!({
+            "$type": "blue.catbird.chat.defs#welcomeAcknowledgementBody",
+            "signatureDomain": "CATBIRD-CHAT-WELCOME-ACK\0",
+            "welcomeId": f.request_id.to_string(),
+            "transitionSeq": 1,
+            "coordinates": f.publication["body"]["next"],
+            "actorDid": f.bob.did,
+            "actorDeviceId": f.bob.device_id.to_string(),
+            "keyId": bob_key_id,
+            "authGeneration": 1,
+            "idempotencyKey": ack_id.to_string(),
+            "signedAt": canonical_now()
+        }),
+    )?;
     let (close_env, close_tx_id) = close_envelope(&f, true, None)?;
 
     let barrier = Barrier::hold(&[&f.alice.did, &f.bob.did])?;
     let close_future = {
-        let (who, client, base, env) = (f.alice.clone(), f.client.clone(), f.server.base_url.clone(), close_env.clone());
-        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.closeConversation", &env, true).await })
+        let (who, client, base, env) = (
+            f.alice.clone(),
+            f.client.clone(),
+            f.server.base_url.clone(),
+            close_env.clone(),
+        );
+        tokio::spawn(async move {
+            who.post(
+                &client,
+                &base,
+                "blue.catbird.chat.closeConversation",
+                &env,
+                true,
+            )
+            .await
+        })
     };
     let ack_future = {
-        let (who, client, base, env) = (f.bob.clone(), f.client.clone(), f.server.base_url.clone(), json!({"signedRequest": signed_ack}));
-        tokio::spawn(async move { who.post(&client, &base, "blue.catbird.chat.acknowledgeWelcome", &env, true).await })
+        let (who, client, base, env) = (
+            f.bob.clone(),
+            f.client.clone(),
+            f.server.base_url.clone(),
+            json!({"signedRequest": signed_ack}),
+        );
+        tokio::spawn(async move {
+            who.post(
+                &client,
+                &base,
+                "blue.catbird.chat.acknowledgeWelcome",
+                &env,
+                true,
+            )
+            .await
+        })
     };
     let queued = barrier.wait_for_waiters(2).await?;
     barrier.release()?;
@@ -1973,7 +2951,11 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
 
     // Close is always permitted while pending, so it is the authoritative outcome
     // regardless of order; the ack is durable iff it committed before the close.
-    anyhow::ensure!(close_status == reqwest::StatusCode::OK, "close must win: {close_status}: {}", String::from_utf8_lossy(&close_bytes));
+    anyhow::ensure!(
+        close_status == reqwest::StatusCode::OK,
+        "close must win: {close_status}: {}",
+        String::from_utf8_lossy(&close_bytes)
+    );
     assert_eq!(
         psql_cmd(&format!("SELECT count(*) FROM chat.transitions WHERE conversation_id='{}' AND kind='closeConversation' AND transition_id='{close_tx_id}'", f.conversation_id))?,
         "1",
@@ -1984,18 +2966,32 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
         f.request_id
     ))?;
     if !ack_status.is_success() {
-        assert_eq!(ack_status, reqwest::StatusCode::BAD_REQUEST, "Late ack must fail 400: {ack_status}");
+        assert_eq!(
+            ack_status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "Late ack must fail 400: {ack_status}"
+        );
         let ack_err: Value = serde_json::from_slice(&ack_bytes)?;
-        assert_eq!(ack_err["error"], "WelcomeSuperseded", "Late ack must return typed WelcomeSuperseded error");
+        assert_eq!(
+            ack_err["error"], "WelcomeSuperseded",
+            "Late ack must return typed WelcomeSuperseded error"
+        );
     }
-    assert_eq!(acknowledged, if ack_status.is_success() { "1" } else { "0" }, "ack durability must match its response");
+    assert_eq!(
+        acknowledged,
+        if ack_status.is_success() { "1" } else { "0" },
+        "ack durability must match its response"
+    );
 
     // Authoritative outcome is that the conversation is superseded
     let lifecycle: String = psql_cmd(&format!(
         "SELECT lifecycle FROM chat.conversations WHERE conversation_id='{}'",
         f.conversation_id
     ))?;
-    assert_eq!(lifecycle, "superseded", "Authoritative outcome must be superseded");
+    assert_eq!(
+        lifecycle, "superseded",
+        "Authoritative outcome must be superseded"
+    );
 
     // Bob's subsequent accept attempt is rejected with InvitationNotPending
     let transition_id = Uuid::new_v4();
@@ -2028,9 +3024,26 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
         "idempotencyKey": transition_id.to_string(),
         "signedAt": canonical_now()
     });
-    let signed_accept = signed_mls_request(&f.bob_engine, &bob_identity, DirectRequestKind::Accept, accept_body)?;
-    let (accept_status, accept_bytes) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.acceptConversation", &json!({"directRequest": signed_accept}), true).await?;
-    assert!(accept_status.is_client_error(), "Post-close accept must fail");
+    let signed_accept = signed_mls_request(
+        &f.bob_engine,
+        &bob_identity,
+        DirectRequestKind::Accept,
+        accept_body,
+    )?;
+    let (accept_status, accept_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.acceptConversation",
+            &json!({"directRequest": signed_accept}),
+            true,
+        )
+        .await?;
+    assert!(
+        accept_status.is_client_error(),
+        "Post-close accept must fail"
+    );
     let accept_err: Value = serde_json::from_slice(&accept_bytes)?;
     assert_eq!(accept_err["error"], "InvitationNotPending");
 
@@ -2041,15 +3054,27 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
 async fn c20_block_prevents_repeat_request_under_current_rules() -> anyhow::Result<()> {
     // 1. Initial direct request from Alice to Bob succeeds and is published
     let f = live_direct_request::publish_request(false).await?;
-    f.alice_engine.as_ref().context("Alice engine")?.confirm_request_publication(
-        &f.request_id.to_string(),
-        &serde_json::to_vec(&f.receipt)?,
-        &f.server.receipt_public_key,
-    )?;
+    f.alice_engine
+        .as_ref()
+        .context("Alice engine")?
+        .confirm_request_publication(
+            &f.request_id.to_string(),
+            &serde_json::to_vec(&f.receipt)?,
+            &f.server.receipt_public_key,
+        )?;
 
     // 2. Terminal close via real RPC by Bob
     let (close_env, _) = close_envelope(&f, false, None)?;
-    let (close_status, _) = f.bob.post(&f.client, &f.server.base_url, "blue.catbird.chat.closeConversation", &close_env, true).await?;
+    let (close_status, _) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.closeConversation",
+            &close_env,
+            true,
+        )
+        .await?;
     assert_eq!(close_status, reqwest::StatusCode::OK);
 
     // 3. Set relationship policy override in HTTPS fixture:
@@ -2108,7 +3133,12 @@ async fn c20_block_prevents_repeat_request_under_current_rules() -> anyhow::Resu
 
     // Server must reject with RequestPolicyDenied receipt!
     let prep2_resp: Value = serde_json::from_slice(&prep2_bytes)?;
-    expect_rejected_receipt(prep2_status, &prep2_resp, &f.server.receipt_public_key, "RequestPolicyDenied")?;
+    expect_rejected_receipt(
+        prep2_status,
+        &prep2_resp,
+        &f.server.receipt_public_key,
+        "RequestPolicyDenied",
+    )?;
 
     // Verify in database: NO published attempt row for the new request, NO new conversation row!
     let attempts: i64 = psql_cmd(&format!(

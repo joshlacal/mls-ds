@@ -425,10 +425,7 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
         ledger.len() >= baseline.len() + prerequisites.len(),
         "migration ledger lost reviewed prerequisite rows"
     );
-    for (actual, expected) in ledger[baseline.len()..]
-        .iter()
-        .zip(prerequisites.iter())
-    {
+    for (actual, expected) in ledger[baseline.len()..].iter().zip(prerequisites.iter()) {
         anyhow::ensure!(
             actual.version == expected.version
                 && actual.description == expected.description

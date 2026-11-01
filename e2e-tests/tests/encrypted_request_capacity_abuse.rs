@@ -18,18 +18,20 @@
 //!   DYLD_FORCE_FLAT_NAMESPACE=1 FAKETIME_TIMESTAMP_FILE=$CLOCK FAKETIME_NO_CACHE=1 \
 //!   FAKETIME_DONT_FAKE_MONOTONIC=1 <test-binary> --nocapture --test-threads=1
 #![allow(dead_code, unused_imports)]
+#[path = "support/c12_c13.rs"]
+mod c12_c13;
 #[path = "support/encrypted_requests.rs"]
 mod encrypted_requests;
 #[path = "support/staged_direct_request.rs"]
 mod staged_direct_request;
-#[path = "support/c12_c13.rs"]
-mod c12_c13;
 
 use anyhow::Context as _;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use c12_c13::*;
 use catbird_mls::chat_v2::transcript::direct_request::DirectRequestKind;
-use encrypted_requests::{request_database_url, route_to_dedicated_database, ShippingServerFixture};
+use encrypted_requests::{
+    request_database_url, route_to_dedicated_database, ShippingServerFixture,
+};
 use serde_json::Value;
 use staged_direct_request::{stage_request, StagedRequest};
 use std::{path::PathBuf, process::Command, time::Duration};
@@ -52,13 +54,22 @@ impl FaketimeCluster {
     fn start(clock_file: &str) -> anyhow::Result<Self> {
         let run = &Uuid::new_v4().simple().to_string()[..12];
         let dir = std::env::temp_dir().join(format!("qf-faketime-{run}"));
-        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
         let db = format!("catbird_direct_requests_faketime_qf_{run}");
         let out = Command::new("python3")
             .arg(launcher())
             .args(["start", "--dir"])
             .arg(&dir)
-            .args(["--port", &port.to_string(), "--db", &db, "--clock-file", clock_file])
+            .args([
+                "--port",
+                &port.to_string(),
+                "--db",
+                &db,
+                "--clock-file",
+                clock_file,
+            ])
             .output()
             .context("launch faketime cluster")?;
         anyhow::ensure!(
@@ -70,7 +81,11 @@ impl FaketimeCluster {
         let started: Value = serde_json::from_slice(&out.stdout)?;
         println!("QuotaFix faketime cluster: {started}");
         let url = started["url"].as_str().context("cluster url")?.to_owned();
-        Ok(Self { dir, url, offset: 0.into() })
+        Ok(Self {
+            dir,
+            url,
+            offset: 0.into(),
+        })
     }
 
     /// Advance every faked clock to `+total` seconds past the start.
@@ -91,7 +106,10 @@ impl FaketimeCluster {
 impl Drop for FaketimeCluster {
     fn drop(&mut self) {
         let log = std::fs::read_to_string(self.dir.join("postgres.log")).unwrap_or_default();
-        let lines: Vec<&str> = log.lines().filter(|l| !l.contains("LOG:  checkpoint")).collect();
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|l| !l.contains("LOG:  checkpoint"))
+            .collect();
         println!("faketime postgres log tail:");
         for line in lines.iter().rev().take(25).rev() {
             println!("  {line}");
@@ -130,7 +148,10 @@ async fn wait_for(what: &str, sql: &str, expected: &str) -> anyhow::Result<()> {
         if scalar(sql)? == expected {
             return Ok(());
         }
-        anyhow::ensure!(std::time::Instant::now() < deadline, "sweeper never reached: {what}");
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "sweeper never reached: {what}"
+        );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
@@ -157,28 +178,44 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
 
     // A: published and left unanswered. B: published then closed by sender.
     let a = stage_request("qf-expire").await?;
-    let installed = scalar("SELECT count(*) FROM public._sqlx_migrations WHERE version=20260919000021")?;
-    assert_eq!(installed, "1", "harness installed the capacity-abuse migration");
+    let installed =
+        scalar("SELECT count(*) FROM public._sqlx_migrations WHERE version=20260919000021")?;
+    assert_eq!(
+        installed, "1",
+        "harness installed the capacity-abuse migration"
+    );
     let (pending0, retained0) = budget()?;
     println!("budget before publication: pending={pending0} retained={retained0}");
     assert!(pending0 > 0, "a live preparation reserves pending capacity");
     publish(&a).await?;
     let (pending_a, retained_a) = budget()?;
     println!("budget after publishing A: pending={pending_a} retained={retained_a}");
-    assert_eq!(pending_a, 0, "a published request holds no pending capacity");
+    assert_eq!(
+        pending_a, 0,
+        "a published request holds no pending capacity"
+    );
     let charge_a: i64 = scalar(&format!(
         "SELECT charged_bytes FROM chat.direct_request_retained_charges WHERE request_id='{}'",
         a.request_id
     ))?
     .parse()?;
-    assert_eq!(retained_a, charge_a, "retained equals A's exact publication charge");
+    assert_eq!(
+        retained_a, charge_a,
+        "retained equals A's exact publication charge"
+    );
 
     let b = stage_request("qf-close").await?;
     publish(&b).await?;
     let (status, closed, _) = close_published(&b).await?;
-    assert_eq!(status, OK, "real closeConversation of published B: {closed}");
     assert_eq!(
-        scalar(&format!("SELECT consent FROM chat.direct_request_lifecycle WHERE request_id='{}'", b.request_id))?,
+        status, OK,
+        "real closeConversation of published B: {closed}"
+    );
+    assert_eq!(
+        scalar(&format!(
+            "SELECT consent FROM chat.direct_request_lifecycle WHERE request_id='{}'",
+            b.request_id
+        ))?,
         "closed"
     );
     assert_eq!(budget()?.0, 0, "closed request holds no pending capacity");
@@ -196,7 +233,10 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
     // sweeper simply run its next cycle.
     set_env("REQUEST_FIXTURE_EXPIRY_SWEEP", "1");
     set_env("CHAT_EXPIRY_SWEEP_INTERVAL_SECS", "2");
-    set_env("REQUEST_SERVER_RUST_LOG", "error,catbird_server::handlers::chat::expiry_worker=info");
+    set_env(
+        "REQUEST_SERVER_RUST_LOG",
+        "error,catbird_server::handlers::chat::expiry_worker=info",
+    );
 
     // Day 29: a real sweep cycle runs; A (published day 0) must not expire.
     // B (closed day 0) is already past 14 days and may prune here.
@@ -204,7 +244,10 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
     let sweeper = start_sweeper(&a)?;
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(
-        scalar(&format!("SELECT count(*) FROM chat.direct_request_lifecycle WHERE request_id='{}'", a.request_id))?,
+        scalar(&format!(
+            "SELECT count(*) FROM chat.direct_request_lifecycle WHERE request_id='{}'",
+            a.request_id
+        ))?,
         "0",
         "request is still unanswered before 30 days"
     );
@@ -223,11 +266,18 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
     assert_eq!(status, OK, "{expired}");
     let receipt = verified_receipt(&a, &expired)?;
     println!("A expiry receipt: {receipt}");
-    assert_eq!(receipt["$type"], "blue.catbird.chat.defs#directRequestExpiredReceipt");
+    assert_eq!(
+        receipt["$type"],
+        "blue.catbird.chat.defs#directRequestExpiredReceipt"
+    );
     assert_eq!(receipt["requestKind"], "expiry");
     assert_eq!(receipt["requestId"], a.request_id.to_string());
-    assert_eq!(receipt["preparationRequestDigest"], STANDARD.encode(a.preparation_request_digest));
-    let publish_digest = request_digest(DirectRequestKind::Publish, &a.publication, &a.alice_public)?;
+    assert_eq!(
+        receipt["preparationRequestDigest"],
+        STANDARD.encode(a.preparation_request_digest)
+    );
+    let publish_digest =
+        request_digest(DirectRequestKind::Publish, &a.publication, &a.alice_public)?;
     assert_eq!(
         receipt["requestDigest"],
         STANDARD.encode(publish_digest),
@@ -242,15 +292,24 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
         "outcome serves the stored signed expiry receipt"
     );
     assert_eq!(
-        scalar(&format!("SELECT decision_kind FROM chat.direct_request_decision_slots WHERE request_id='{}'", a.request_id))?,
+        scalar(&format!(
+            "SELECT decision_kind FROM chat.direct_request_decision_slots WHERE request_id='{}'",
+            a.request_id
+        ))?,
         "expire"
     );
     // Expiry is terminal (C20): the sender can no longer close it, and the
     // lifecycle row is unchanged.
     let (status, late_close, _) = close_published(&a).await?;
-    assert!(status.is_client_error(), "close after expiry must be refused: {status} {late_close}");
+    assert!(
+        status.is_client_error(),
+        "close after expiry must be refused: {status} {late_close}"
+    );
     assert_eq!(
-        scalar(&format!("SELECT consent FROM chat.direct_request_lifecycle WHERE request_id='{}'", a.request_id))?,
+        scalar(&format!(
+            "SELECT consent FROM chat.direct_request_lifecycle WHERE request_id='{}'",
+            a.request_id
+        ))?,
         "expired"
     );
 
@@ -294,11 +353,18 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
         "B tombstone identity row retained"
     );
     assert_eq!(
-        scalar(&format!("SELECT count(*) FROM chat.entries WHERE conversation_id='{}'", b.conversation_id))?,
+        scalar(&format!(
+            "SELECT count(*) FROM chat.entries WHERE conversation_id='{}'",
+            b.conversation_id
+        ))?,
         b_entries,
         "pruning never deletes conversation history"
     );
-    assert_eq!(budget()?.1, retained_before_prune - released_b, "retained drops by B's release");
+    assert_eq!(
+        budget()?.1,
+        retained_before_prune - released_b,
+        "retained drops by B's release"
+    );
 
     // Day 46: A (expired day 31) prunes too.
     drop(sweeper);
@@ -324,24 +390,39 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
     let (pending_end, retained_end) = budget()?;
     println!("budget after pruning: pending={pending_end} retained={retained_end} released A={released_a} B={released_b}");
     assert_eq!(pending_end, 0);
-    assert!(released_a >= 4 * 1_048_576 && released_a < charge_a, "A reclaim {released_a} of {charge_a}");
-    assert_eq!(retained_end, retained_before_prune - released_b - released_a);
+    assert!(
+        released_a >= 4 * 1_048_576 && released_a < charge_a,
+        "A reclaim {released_a} of {charge_a}"
+    );
+    assert_eq!(
+        retained_end,
+        retained_before_prune - released_b - released_a
+    );
 
     // Post-prune replay is fenced: the outcome is still the retained signed
     // expiry receipt, and replaying the original publish mints nothing.
     let (status, late) = outcome(&a, a.request_id).await?;
     assert_eq!(status, OK, "{late}");
     assert_eq!(late["outcome"], expired["outcome"]);
-    let pubs_before = scalar(&format!("SELECT count(*) FROM chat.direct_request_publications WHERE actor_did='{}'", a.alice.did))?;
+    let pubs_before = scalar(&format!(
+        "SELECT count(*) FROM chat.direct_request_publications WHERE actor_did='{}'",
+        a.alice.did
+    ))?;
     let (status, replay) = post(&a, PUBLISH_NSID, &a.publication).await?;
     println!("post-prune publish replay: {status} {replay}");
     assert_eq!(
-        scalar(&format!("SELECT count(*) FROM chat.direct_request_publications WHERE actor_did='{}'", a.alice.did))?,
+        scalar(&format!(
+            "SELECT count(*) FROM chat.direct_request_publications WHERE actor_did='{}'",
+            a.alice.did
+        ))?,
         pubs_before,
         "post-prune replay creates no publication"
     );
     assert_eq!(
-        scalar(&format!("SELECT status FROM chat.direct_request_attempts WHERE request_id='{}'", a.request_id))?,
+        scalar(&format!(
+            "SELECT status FROM chat.direct_request_attempts WHERE request_id='{}'",
+            a.request_id
+        ))?,
         "published"
     );
 

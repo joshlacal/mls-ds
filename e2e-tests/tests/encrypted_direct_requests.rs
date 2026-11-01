@@ -201,7 +201,10 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
         .await?;
     assert_eq!(state_status, reqwest::StatusCode::OK);
     let state_json: Value = serde_json::from_slice(&state_bytes)?;
-    assert_eq!(state_json["state"]["directRequest"]["consent"], "incomingPending");
+    assert_eq!(
+        state_json["state"]["directRequest"]["consent"],
+        "incomingPending"
+    );
 
     // 2. Addressed recipient: getConversations returns 200 OK
     let (inv_status, _inv_bytes) = f
@@ -235,9 +238,18 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
         .await?;
     assert_eq!(entries_status, reqwest::StatusCode::OK);
     let entries_json: Value = serde_json::from_slice(&entries_bytes)?;
-    let entries = entries_json["entries"].as_array().context("entries array")?;
-    assert_eq!(entries.len(), 1, "pending request delivers only the control request entry");
-    assert_eq!(entries[0]["$type"], "blue.catbird.chat.defs#directRequestEntry");
+    let entries = entries_json["entries"]
+        .as_array()
+        .context("entries array")?;
+    assert_eq!(
+        entries.len(),
+        1,
+        "pending request delivers only the control request entry"
+    );
+    assert_eq!(
+        entries[0]["$type"],
+        "blue.catbird.chat.defs#directRequestEntry"
+    );
     assert_eq!(entries[0]["conversationId"], f.conversation_id.to_string());
     assert_eq!(entries[0]["seq"], 1);
 
@@ -258,7 +270,10 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
         .await?;
     assert_eq!(sibling_status, reqwest::StatusCode::BAD_REQUEST);
     let sibling_err: Value = serde_json::from_slice(&sibling_bytes)?;
-    assert_eq!(sibling_err["error"], "NotEntitled", "unaddressed sibling must fail with NotEntitled");
+    assert_eq!(
+        sibling_err["error"], "NotEntitled",
+        "unaddressed sibling must fail with NotEntitled"
+    );
 
     // 5. Closed request: creator closes conversation, getEntries denied as AccessOutsideMembershipInterval
     let prior_coord = f.publication["body"]["next"].clone();
@@ -296,7 +311,12 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
             true,
         )
         .await?;
-    assert_eq!(close_status, reqwest::StatusCode::OK, "closeConversation must succeed: {}", String::from_utf8_lossy(&close_bytes));
+    assert_eq!(
+        close_status,
+        reqwest::StatusCode::OK,
+        "closeConversation must succeed: {}",
+        String::from_utf8_lossy(&close_bytes)
+    );
 
     let (closed_get_status, closed_get_bytes) = f
         .bob
@@ -314,18 +334,22 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
     // Bob legitimately holds a terminal proof on the closed conversation;
     // under ruling BREAD-04 / line 1370, an exact device whose interval ended in Close
     // obtains only separately entitled control entries within terminal_control_interval.
-    assert_eq!(closed_get_status, reqwest::StatusCode::OK, "terminal proof holder receives control entries in closed interval");
+    assert_eq!(
+        closed_get_status,
+        reqwest::StatusCode::OK,
+        "terminal proof holder receives control entries in closed interval"
+    );
     let closed_entries_json: Value = serde_json::from_slice(&closed_get_bytes)?;
-    let closed_entries = closed_entries_json["entries"].as_array().context("closed entries array")?;
+    let closed_entries = closed_entries_json["entries"]
+        .as_array()
+        .context("closed entries array")?;
     for entry in closed_entries {
         assert_ne!(
-            entry["$type"],
-            "blue.catbird.chat.defs#message",
+            entry["$type"], "blue.catbird.chat.defs#message",
             "closed interval must never leak application ciphertext"
         );
         assert_ne!(
-            entry["$type"],
-            "blue.catbird.chat.defs#applicationEntry",
+            entry["$type"], "blue.catbird.chat.defs#applicationEntry",
             "closed interval must never leak application ciphertext"
         );
     }
@@ -346,7 +370,10 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
         .await?;
     assert_eq!(sibling_closed_status, reqwest::StatusCode::BAD_REQUEST);
     let sibling_closed_err: Value = serde_json::from_slice(&sibling_closed_bytes)?;
-    assert_eq!(sibling_closed_err["error"], "NotEntitled", "sibling without interval must be rejected");
+    assert_eq!(
+        sibling_closed_err["error"], "NotEntitled",
+        "sibling without interval must be rejected"
+    );
 
     Ok(())
 }
