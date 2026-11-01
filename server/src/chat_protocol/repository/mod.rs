@@ -182,23 +182,27 @@ pub(crate) mod push_binding;
 pub(crate) mod transport_welcome;
 
 #[cfg(test)]
+#[path = "auth/tests.rs"]
+mod auth_repository_tests;
+#[cfg(test)]
 mod concurrency_tests;
 #[cfg(test)]
-mod rollback_tests;
-#[cfg(test)]
-mod inventory_repository_tests;
+mod conversation_substrate_tests;
 #[cfg(test)]
 #[path = "delivery/read_tests.rs"]
 mod delivery_read_tests;
 #[cfg(test)]
-#[path = "welcome/tests.rs"]
-mod welcome_tests;
+mod g7_entitlement_tests;
+#[cfg(test)]
+mod inventory_repository_tests;
+#[cfg(test)]
+mod inventory_tests;
 #[cfg(test)]
 #[path = "recovery/tests.rs"]
 mod recovery_tests;
 #[cfg(test)]
-#[path = "ticket/tests.rs"]
-mod ticket_tests;
+#[path = "relationship/tests.rs"]
+mod relationship_repository_tests;
 #[cfg(test)]
 #[path = "reset/tests.rs"]
 mod reset_repository_tests;
@@ -206,17 +210,13 @@ mod reset_repository_tests;
 #[path = "reset/wedge_tests.rs"]
 mod reset_wedge_tests;
 #[cfg(test)]
-#[path = "relationship/tests.rs"]
-mod relationship_repository_tests;
+mod rollback_tests;
+#[cfg(test)]
+#[path = "ticket/tests.rs"]
+mod ticket_tests;
 #[cfg(test)]
 #[path = "transition/tests.rs"]
 mod transition_repository_tests;
 #[cfg(test)]
-#[path = "auth/tests.rs"]
-mod auth_repository_tests;
-#[cfg(test)]
-mod inventory_tests;
-#[cfg(test)]
-mod g7_entitlement_tests;
-#[cfg(test)]
-mod conversation_substrate_tests;
+#[path = "welcome/tests.rs"]
+mod welcome_tests;

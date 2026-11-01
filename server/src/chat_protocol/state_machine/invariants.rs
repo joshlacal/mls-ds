@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 pub(in crate::chat_protocol::state_machine) fn require_transition_actor(
     evidence: &TransitionEvidence,
     expected: &DeviceIdentity,
@@ -61,7 +60,9 @@ pub(in crate::chat_protocol::state_machine) fn metadata_author_matches_evidence(
     })
 }
 
-pub(in crate::chat_protocol::state_machine) fn transition_metadata(evidence: &TransitionEvidence) -> Option<&MetadataSnapshotBinding> {
+pub(in crate::chat_protocol::state_machine) fn transition_metadata(
+    evidence: &TransitionEvidence,
+) -> Option<&MetadataSnapshotBinding> {
     match evidence.body_binding.as_ref()? {
         TransitionBodyBinding::DirectRequestPublication { metadata, .. }
         | TransitionBodyBinding::Creation { metadata, .. }

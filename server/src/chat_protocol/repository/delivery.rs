@@ -527,7 +527,10 @@ pub(crate) async fn compare_exact_application_entry(
         return Ok(false);
     };
 
-    let payload_matches = match (accepted_payload_bytes.as_deref(), signed_request_bytes.as_deref()) {
+    let payload_matches = match (
+        accepted_payload_bytes.as_deref(),
+        signed_request_bytes.as_deref(),
+    ) {
         (Some(stored_payload), Some(stored_signed)) => {
             stored_payload == send.entry.accepted_payload_bytes.as_slice()
                 && stored_signed == send.entry.signed_request_bytes.as_slice()
@@ -572,7 +575,10 @@ pub(crate) async fn compare_exact_application_entry(
         return Ok(false);
     };
 
-    let send_payload_matches = match (signing_transcript_bytes.as_deref(), outcome_bytes.as_deref()) {
+    let send_payload_matches = match (
+        signing_transcript_bytes.as_deref(),
+        outcome_bytes.as_deref(),
+    ) {
         (Some(stored_transcript), Some(stored_outcome)) => {
             stored_transcript == send.signing_transcript_bytes.as_slice()
                 && stored_outcome == send.outcome_bytes.as_slice()

@@ -285,12 +285,8 @@ pub(crate) struct MetadataAuthorColumns {
 /// without storing media bytes in `mls-ds`.
 #[derive(Clone, Debug)]
 pub(crate) enum MetadataAvatarPersistence {
-    Reuse {
-        snapshot: MetadataAvatarBinding,
-    },
-    Fresh {
-        snapshot: MetadataAvatarBinding,
-    },
+    Reuse { snapshot: MetadataAvatarBinding },
+    Fresh { snapshot: MetadataAvatarBinding },
 }
 
 impl MetadataAvatarPersistence {
@@ -421,13 +417,21 @@ pub(in crate::chat_protocol::state_machine::executor) fn prepared_revocation_eve
 
 #[path = "executor/event_chain.rs"]
 mod event_chain;
-pub(crate) use self::event_chain::EventChainCursorError;
+pub(crate) use self::event_chain::batch_transaction_bindings_match;
+use self::event_chain::event_chain_cursor_binding_digest;
+pub(crate) use self::event_chain::plan_transaction_bindings_match;
+pub(crate) use self::event_chain::AppliedTransition;
 pub(crate) use self::event_chain::EventChainCursor;
-pub(crate) use self::event_chain::WelcomeExpiryContext;
-pub(crate) use self::event_chain::WelcomeResponseContext;
-pub(crate) use self::event_chain::WelcomeRejectionWork;
+pub(crate) use self::event_chain::EventChainCursorError;
 pub(crate) use self::event_chain::ExecutionContext;
+use self::event_chain::PendingPreparedEvent;
 pub(crate) use self::event_chain::PreparedConversationExecution;
+pub(crate) use self::event_chain::RecoveryOpenContext;
+pub(crate) use self::event_chain::ResetRequestRow;
+pub(crate) use self::event_chain::WelcomeDispositionInput;
+pub(crate) use self::event_chain::WelcomeExpiryContext;
+pub(crate) use self::event_chain::WelcomeRejectionWork;
+pub(crate) use self::event_chain::WelcomeResponseContext;
 #[cfg(any(
     test,
     all(
@@ -436,151 +440,148 @@ pub(crate) use self::event_chain::PreparedConversationExecution;
     )
 ))]
 pub(crate) use self::event_chain::{DropSafetyProbe, DropSafetyProbeMode};
-pub(crate) use self::event_chain::plan_transaction_bindings_match;
-pub(crate) use self::event_chain::batch_transaction_bindings_match;
-pub(crate) use self::event_chain::WelcomeDispositionInput;
-pub(crate) use self::event_chain::RecoveryOpenContext;
-pub(crate) use self::event_chain::ResetRequestRow;
-pub(crate) use self::event_chain::AppliedTransition;
-use self::event_chain::PendingPreparedEvent;
-use self::event_chain::event_chain_cursor_binding_digest;
 #[path = "executor/read_ops.rs"]
 mod read_ops;
-use self::read_ops::principal_did;
+use self::read_ops::checked_i64;
+use self::read_ops::classify_prior_bound_staling;
 use self::read_ops::device_did;
 use self::read_ops::device_uuid;
-use self::read_ops::checked_i64;
+use self::read_ops::old_role_provenance_matches;
+use self::read_ops::principal_did;
+use self::read_ops::reject_if_present;
+use self::read_ops::repo_participant_role;
+use self::read_ops::repo_participant_status;
 use self::read_ops::require_execution_authority;
 use self::read_ops::server_instant;
-use self::read_ops::repo_participant_status;
-use self::read_ops::repo_participant_role;
-use self::read_ops::old_role_provenance_matches;
-use self::read_ops::validate_policy_participant_writes;
+use self::read_ops::terminal_is_exact_due_expiry;
+use self::read_ops::terminal_is_exact_transition;
 use self::read_ops::terminalize_policy_participants;
-use self::read_ops::reject_if_present;
+use self::read_ops::validate_policy_participant_writes;
 use self::read_ops::verify_recovery_package_bijection;
 use self::read_ops::verify_recovery_package_consistency;
-use self::read_ops::terminal_is_exact_transition;
-use self::read_ops::terminal_is_exact_due_expiry;
 use self::read_ops::OwnStalingKind;
-use self::read_ops::classify_prior_bound_staling;
 #[path = "executor/prior_bound_ops.rs"]
 mod prior_bound_ops;
+use self::prior_bound_ops::interval_identity_is_unchanged;
+use self::prior_bound_ops::leaf_matches_hydration;
+use self::prior_bound_ops::leave_request_identity_is_unchanged;
 use self::prior_bound_ops::prior_bound;
 use self::prior_bound_ops::prior_bound::*;
 use self::prior_bound_ops::recovery_request_identity_is_unchanged;
 use self::prior_bound_ops::recovery_reservation_identity_is_unchanged;
 use self::prior_bound_ops::reset_request_identity_is_unchanged;
-use self::prior_bound_ops::leave_request_identity_is_unchanged;
 use self::prior_bound_ops::welcome_identity_is_unchanged;
-use self::prior_bound_ops::interval_identity_is_unchanged;
-use self::prior_bound_ops::leaf_matches_hydration;
 #[path = "executor/preflight.rs"]
 mod preflight;
-use self::preflight::preflight_reset_activation;
 use self::preflight::preflight_leaf_recovery_fulfillment;
+use self::preflight::preflight_reset_activation;
 #[path = "executor/dispatch.rs"]
 mod dispatch;
 pub(crate) use self::dispatch::apply_conversation_persistence_plan;
+use self::dispatch::apply_conversation_persistence_plan_inner;
 #[cfg(test)]
 pub(crate) use self::dispatch::apply_conversation_persistence_plan_unscoped_for_test;
-use self::dispatch::MetadataExecutionBinding;
 use self::dispatch::preflight_metadata_transition;
-use self::dispatch::apply_conversation_persistence_plan_inner;
+use self::dispatch::MetadataExecutionBinding;
 #[path = "executor/welcome_ops.rs"]
 mod welcome_ops;
 use self::welcome_ops::apply_leaf_recovery_request;
-use self::welcome_ops::terminal_welcome_context_is_closed;
-use self::welcome_ops::exact_welcome_actor_role;
-use self::welcome_ops::repository_welcome_rejection_reason;
-use self::welcome_ops::preflight_welcome_terminal_event;
-use self::welcome_ops::preflight_welcome_response_execution_context;
-use self::welcome_ops::preflight_welcome_expiry_execution_context;
 use self::welcome_ops::apply_welcome_expiry;
+use self::welcome_ops::exact_welcome_actor_role;
+use self::welcome_ops::preflight_welcome_expiry_execution_context;
+use self::welcome_ops::preflight_welcome_response_execution_context;
+use self::welcome_ops::preflight_welcome_terminal_event;
+use self::welcome_ops::repository_welcome_rejection_reason;
+use self::welcome_ops::terminal_welcome_context_is_closed;
 #[path = "executor/federation_ops.rs"]
 mod federation_ops;
-pub(crate) use self::federation_ops::PreparedDeviceRevocationBatchMembers;
-pub(crate) use self::federation_ops::PrefixedDeviceRevocationBatchMembers;
-pub(crate) use self::federation_ops::prepare_device_revocation_batch_members;
-pub(crate) use self::federation_ops::apply_prepared_device_revocation_prefix;
-pub(crate) use self::federation_ops::apply_prepared_device_revocation_members;
+use self::federation_ops::apply_device_revocation;
+use self::federation_ops::apply_device_revocation_batch_prefix;
 #[cfg(test)]
 pub(crate) use self::federation_ops::apply_device_revocation_batch_unscoped_for_test;
-use self::federation_ops::apply_device_revocation;
-use self::federation_ops::PreparedRevocationMember;
+use self::federation_ops::apply_prepared_device_revocation_member;
+pub(crate) use self::federation_ops::apply_prepared_device_revocation_members;
+pub(crate) use self::federation_ops::apply_prepared_device_revocation_prefix;
+use self::federation_ops::preflight_device_revocation_batch;
 use self::federation_ops::preflight_device_revocation_plan_and_context;
+pub(crate) use self::federation_ops::prepare_device_revocation_batch_members;
 use self::federation_ops::prepared_device_revocation_members_binding_digest;
 use self::federation_ops::prepared_revocation_event_from_fanout;
-use self::federation_ops::apply_prepared_device_revocation_member;
 use self::federation_ops::write_revocation_bound_supersessions;
-use self::federation_ops::preflight_device_revocation_batch;
-use self::federation_ops::apply_device_revocation_batch_prefix;
+pub(crate) use self::federation_ops::PrefixedDeviceRevocationBatchMembers;
+pub(crate) use self::federation_ops::PreparedDeviceRevocationBatchMembers;
+use self::federation_ops::PreparedRevocationMember;
 #[path = "executor/recovery_ops.rs"]
 mod recovery_ops;
-use self::recovery_ops::apply_welcome_response;
 use self::recovery_ops::apply_leaf_recovery_cancellation;
 use self::recovery_ops::apply_leaf_recovery_expiry;
+use self::recovery_ops::apply_welcome_response;
 #[path = "executor/fulfillment_ops.rs"]
 mod fulfillment_ops;
 use self::fulfillment_ops::apply_leaf_recovery_fulfillment;
 #[path = "executor/commit_leave_ops.rs"]
 mod commit_leave_ops;
 use self::commit_leave_ops::apply_generic_commit;
-use self::commit_leave_ops::preflight_leave_fulfillment;
-use self::commit_leave_ops::partition_leave_fulfillment_requests;
 use self::commit_leave_ops::apply_leave_fulfillment;
+use self::commit_leave_ops::partition_leave_fulfillment_requests;
+use self::commit_leave_ops::preflight_leave_fulfillment;
 #[path = "executor/creation_ops.rs"]
 mod creation_ops;
 use self::creation_ops::apply_creation;
-use self::creation_ops::apply_policy;
 use self::creation_ops::apply_metadata_transition;
+use self::creation_ops::apply_policy;
 #[path = "executor/lifecycle_ops.rs"]
 mod lifecycle_ops;
-use self::lifecycle_ops::apply_zero_leaf_leave;
 use self::lifecycle_ops::apply_close;
-use self::lifecycle_ops::apply_reset_request;
 use self::lifecycle_ops::apply_leave_request;
+use self::lifecycle_ops::apply_reset_request;
+use self::lifecycle_ops::apply_zero_leaf_leave;
 #[path = "executor/reset_accept_ops.rs"]
 mod reset_accept_ops;
+use self::reset_accept_ops::apply_acceptance;
 use self::reset_accept_ops::apply_leave_cancellation;
 use self::reset_accept_ops::apply_reset_activation;
-use self::reset_accept_ops::apply_acceptance;
 #[path = "executor/write_ops.rs"]
 mod write_ops;
-use self::write_ops::write_recovery_open;
-use self::write_ops::write_successor_leaf;
-use self::write_ops::closing_leaf_period;
-use self::write_ops::repo_interval_close_kind;
-use self::write_ops::direct_pair;
 use self::write_ops::build_append_entry;
+use self::write_ops::build_entry_recipients;
+use self::write_ops::closing_leaf_period;
+use self::write_ops::direct_pair;
+use self::write_ops::participant_period_for;
+use self::write_ops::repo_interval_close_kind;
+use self::write_ops::write_commit_metadata_snapshot;
+use self::write_ops::write_creation_intervals;
+use self::write_ops::write_creation_leaves;
 use self::write_ops::write_creation_metadata_snapshot;
 use self::write_ops::write_metadata_update_snapshot;
-use self::write_ops::write_commit_metadata_snapshot;
 use self::write_ops::write_participants;
-use self::write_ops::write_creation_leaves;
-use self::write_ops::participant_period_for;
-use self::write_ops::write_creation_intervals;
-use self::write_ops::build_entry_recipients;
+use self::write_ops::write_recovery_open;
+use self::write_ops::write_successor_leaf;
 #[path = "executor/pruning.rs"]
 mod pruning;
-use self::pruning::write_prior_bound_supersessions;
-use self::pruning::write_prior_bound_staling;
-use self::pruning::write_observed_leave_expiries;
-use self::pruning::FamilyCounts;
-use self::pruning::reconcile_coordinate_change_families;
-use self::pruning::WelcomeSupersessionCause;
-use self::pruning::write_welcome_supersessions;
-use self::pruning::write_welcome_supersessions_with_cursor;
 use self::pruning::append_one_event;
-use self::pruning::append_one_event_with_cursor;
 use self::pruning::append_one_event_at_with_cursor;
+use self::pruning::append_one_event_with_cursor;
+use self::pruning::reconcile_coordinate_change_families;
 use self::pruning::write_events;
 use self::pruning::write_events_with_cursor;
+use self::pruning::write_observed_leave_expiries;
+use self::pruning::write_prior_bound_staling;
+use self::pruning::write_prior_bound_supersessions;
+use self::pruning::write_welcome_supersessions;
+use self::pruning::write_welcome_supersessions_with_cursor;
+use self::pruning::FamilyCounts;
+use self::pruning::WelcomeSupersessionCause;
 #[path = "executor/inline_tests.rs"]
 mod inline_tests;
-#[cfg(any(test, all(feature = "chat-protocol-production-proof", not(feature = "server-bin"))))]
+#[cfg(any(
+    test,
+    all(
+        feature = "chat-protocol-production-proof",
+        not(feature = "server-bin")
+    )
+))]
 use self::inline_tests::metadata_executor_tests;
-
 
 #[cfg(all(
     feature = "chat-protocol-production-proof",

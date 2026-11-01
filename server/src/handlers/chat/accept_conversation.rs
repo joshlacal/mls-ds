@@ -77,7 +77,9 @@ async fn handle_inner(
 
         let parsed_req: serde_json::Value = serde_json::from_str(envelope.request.get())
             .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-        let convo_id_str = parsed_req["body"]["prior"]["conversationId"].as_str().unwrap_or_default();
+        let convo_id_str = parsed_req["body"]["prior"]["conversationId"]
+            .as_str()
+            .unwrap_or_default();
         let conversation_id = uuid::Uuid::parse_str(convo_id_str)
             .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
 
@@ -103,12 +105,24 @@ async fn handle_inner(
         };
 
         let Some(creator) = creator_did.as_ref() else {
-            return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvitationNotPending));
+            return Err(ChatFailure::protocol(
+                endpoint,
+                ChatProtocolErrorCode::InvitationNotPending,
+            ));
         };
 
-        let coord = crate::federation::canonical_relay::resolve_pair_coordinator(pool, creator, principal.did())
-            .await
-            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::RelationshipPolicyUnavailable))?;
+        let coord = crate::federation::canonical_relay::resolve_pair_coordinator(
+            pool,
+            creator,
+            principal.did(),
+        )
+        .await
+        .map_err(|_| {
+            ChatFailure::protocol(
+                endpoint,
+                ChatProtocolErrorCode::RelationshipPolicyUnavailable,
+            )
+        })?;
         if !coord.is_coordinator {
             let device_id = parsed_req
                 .pointer("/body/actorDeviceId")
@@ -129,16 +143,18 @@ async fn handle_inner(
                 .ok_or_else(|| {
                     ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
                 })?;
-            let request_id = uuid::Uuid::parse_str(request_id_str)
-                .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+            let request_id = uuid::Uuid::parse_str(request_id_str).map_err(|_| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
             let transition_id_str = parsed_req
                 .pointer("/body/transitionId")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
                     ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
                 })?;
-            let transition_id = uuid::Uuid::parse_str(transition_id_str)
-                .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+            let transition_id = uuid::Uuid::parse_str(transition_id_str).map_err(|_| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
 
             let device_key: Option<(Vec<u8>, i64)> = sqlx::query_as(
                 "SELECT k.signing_public_key, d.auth_generation FROM chat.device_keys k \
@@ -153,8 +169,9 @@ async fn handle_inner(
             .fetch_optional(pool)
             .await
             .map_err(|_| ChatFailure::storage(endpoint))?;
-            let (public_key, generation) = device_key
-                .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized))?;
+            let (public_key, generation) = device_key.ok_or_else(|| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
+            })?;
             let verified = crate::chat_protocol::direct_request_transcript::verify_signed_request(
                 crate::chat_protocol::direct_request_transcript::DirectRequestKind::Accept,
                 envelope.request.get().as_bytes(),
@@ -236,8 +253,8 @@ async fn handle_inner(
                         None
                     };
 
-                    let old_req = old_signed_request
-                        .ok_or_else(|| ChatFailure::invariant(endpoint))?;
+                    let old_req =
+                        old_signed_request.ok_or_else(|| ChatFailure::invariant(endpoint))?;
                     if old_req != parsed_req {
                         return Err(ChatFailure::protocol(
                             endpoint,
@@ -255,14 +272,24 @@ async fn handle_inner(
                             let stored_proof: serde_json::Value =
                                 serde_json::from_slice(proof_b)
                                     .map_err(|_| ChatFailure::invariant(endpoint))?;
-                            let presented_proof = stored_outcome.get("acceptanceProof")
-                                .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+                            let presented_proof =
+                                stored_outcome.get("acceptanceProof").ok_or_else(|| {
+                                    ChatFailure::protocol(
+                                        endpoint,
+                                        ChatProtocolErrorCode::InvalidRequest,
+                                    )
+                                })?;
                             let normalized_proof = crate::chat_protocol::direct_request_transcript::normalize_read_presentation(
                                 &serde_json::to_vec(presented_proof).map_err(|_| ChatFailure::invariant(endpoint))?,
                                 "directRequestAcceptanceProof", false,
                             ).map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-                            let presented_coordinates = stored_outcome.get("coordinates")
-                                .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+                            let presented_coordinates =
+                                stored_outcome.get("coordinates").ok_or_else(|| {
+                                    ChatFailure::protocol(
+                                        endpoint,
+                                        ChatProtocolErrorCode::InvalidRequest,
+                                    )
+                                })?;
                             let normalized_coordinates = crate::chat_protocol::direct_request_transcript::normalize_read_presentation(
                                 &serde_json::to_vec(presented_coordinates).map_err(|_| ChatFailure::invariant(endpoint))?,
                                 "conversationCoordinates", false,
@@ -329,7 +356,8 @@ async fn handle_inner(
                 if intro_val.get("conversationId").and_then(|v| v.as_str())
                     != Some(conversation_id.to_string().as_str())
                     || intro_val.get("seq").and_then(|v| v.as_i64()) != Some(1)
-                    || intro_val.pointer("/signedRequest/body/next") != parsed_req.pointer("/body/prior")
+                    || intro_val.pointer("/signedRequest/body/next")
+                        != parsed_req.pointer("/body/prior")
                 {
                     return Err(ChatFailure::protocol(
                         endpoint,
@@ -375,11 +403,9 @@ async fn handle_inner(
                     ChatProtocolErrorCode::InvalidRequest,
                 ));
             }
-            let key_id_receipt = proof_receipt["keyId"]
-                .as_str()
-                .ok_or_else(|| {
-                    ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-                })?;
+            let key_id_receipt = proof_receipt["keyId"].as_str().ok_or_else(|| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
 
             let entry_seq = output
                 .entry
@@ -669,23 +695,30 @@ async fn handle_inner(
             .fetch_one(pool)
             .await
             .map_err(|_| ChatFailure::storage(endpoint))?;
-            let entry_val = serde_json::from_slice(&entry_row)
-                .map_err(|_| ChatFailure::invariant(endpoint))?;
-            let proof_val: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|_| ChatFailure::invariant(endpoint))?;
-            let proof = proof_val.get("acceptanceProof")
+            let entry_val =
+                serde_json::from_slice(&entry_row).map_err(|_| ChatFailure::invariant(endpoint))?;
+            let proof_val: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| ChatFailure::invariant(endpoint))?;
+            let proof = proof_val
+                .get("acceptanceProof")
                 .ok_or_else(|| ChatFailure::invariant(endpoint))?;
             let deliver_input = crate::federation::canonical_relay::DeliverAcceptanceEntryInput {
                 conversation_id,
                 entry: entry_val,
                 acceptance_proof: proof.clone(),
             };
-            if let Err(error) = crate::federation::canonical_relay::deliver_acceptance_entry_to_peer(
-                &coord.sender_home.endpoint,
-                &coord.sender_home.did,
-                deliver_input.clone(),
-            ).await {
-                tracing::warn!(?error, "Failed to deliver acceptance entry to peer, queueing for retry");
+            if let Err(error) =
+                crate::federation::canonical_relay::deliver_acceptance_entry_to_peer(
+                    &coord.sender_home.endpoint,
+                    &coord.sender_home.did,
+                    deliver_input.clone(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    ?error,
+                    "Failed to deliver acceptance entry to peer, queueing for retry"
+                );
                 sqlx::query(
                     "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, last_error, next_retry_at) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + INTERVAL '5 seconds') \
@@ -810,4 +843,3 @@ fn log_direct_acceptance_storage_error(stage: &'static str, error: &sqlx::Error)
         "direct request acceptance database failure"
     );
 }
-

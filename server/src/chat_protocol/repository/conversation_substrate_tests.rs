@@ -2170,7 +2170,8 @@ mod historical_control_path {
     };
     use crate::chat_protocol::validation::ed25519_key_id;
 
-    const CONTRACT_VECTORS: &str = include_str!("../../../tests/fixtures/mls_chat_contract_vectors.json");
+    const CONTRACT_VECTORS: &str =
+        include_str!("../../../tests/fixtures/mls_chat_contract_vectors.json");
     const LEXICON: &str =
         include_str!("../../../../lexicon/blue/catbird/chat/blue.catbird.chat.defs.json");
 
@@ -3163,8 +3164,8 @@ mod historical_control_loader {
     };
     use crate::chat_protocol::repository::delivery::{EntryEntitlementKind, EventKind};
     use crate::chat_protocol::repository::execution_context::{
-        hydrate_execution_context_unscoped_for_test, prepare_execution_context_for_test, ExecutionContextArtifacts,
-        ExecutionContextHydrationError,
+        hydrate_execution_context_unscoped_for_test, prepare_execution_context_for_test,
+        ExecutionContextArtifacts, ExecutionContextHydrationError,
     };
     use crate::chat_protocol::snapshot::{
         PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
@@ -3489,7 +3490,8 @@ mod historical_control_loader {
     async fn corpus_bound_creation_fixture_hydrates_through_the_production_aggregate() {
         let (pool, _database) = crate::common::executor_seed::setup().await;
         let cid = Uuid::new_v4();
-        let graph = crate::common::executor_seed::seed_hydratable_genuine_creation_graph(&pool, cid).await;
+        let graph =
+            crate::common::executor_seed::seed_hydratable_genuine_creation_graph(&pool, cid).await;
 
         let locked_at: DateTime<Utc> =
             sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
@@ -3922,9 +3924,14 @@ mod historical_control_loader {
         entry: &RealCreationEntry,
         public_state: &ActivePublicState,
     ) -> Uuid {
-        crate::common::executor_seed::seed_genuine_creation_graph(pool, entry, Some(public_state), None)
-            .await
-            .creation_transition_id
+        crate::common::executor_seed::seed_genuine_creation_graph(
+            pool,
+            entry,
+            Some(public_state),
+            None,
+        )
+        .await
+        .creation_transition_id
     }
 
     async fn seed_real_creation_graph_with_public_state_and_group_info(
@@ -5987,6 +5994,7 @@ mod historical_control_loader {
         use super::super::historical_control_path::{
             build_real_corpus_creation_entry, build_real_creation_entry, RealCreationEntry,
         };
+        use super::super::random_plc_did;
         use super::reset_leave_leg::{
             build_real_commit_with_signed_at,
             build_real_control_request_entry_with_id_at_and_signed_at, build_real_reset_activation,
@@ -6111,7 +6119,6 @@ mod historical_control_loader {
         pub(super) use crate::common::executor_seed::genuine_terminal_fixture::{
             coordinate_json, AcceptanceInvitee,
         };
-        use super::super::random_plc_did;
 
         fn g6_raw_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
             let mut cursor = start;
@@ -6454,7 +6461,49 @@ mod historical_control_loader {
         fn g6_capsule_binding_covers_prepared_plan_context_and_event_schedule() {
             // state_machine's executor module moved to its own file post-C2-seal;
             // the guard scans the same source text, now split across two files.
-            let state_machine = concat!(include_str!("../state_machine.rs"), include_str!("../state_machine/commands.rs"), include_str!("../state_machine/creation.rs"), include_str!("../state_machine/direct_requests.rs"), include_str!("../state_machine/effects.rs"), include_str!("../state_machine/evidence.rs"), include_str!("../state_machine/historical.rs"), include_str!("../state_machine/hydration_entries.rs"), include_str!("../state_machine/hydration_requests.rs"), include_str!("../state_machine/hydration_rows.rs"), include_str!("../state_machine/invariants.rs"), include_str!("../state_machine/lifecycle.rs"), include_str!("../state_machine/membership_rules.rs"), include_str!("../state_machine/messages.rs"), include_str!("../state_machine/metadata.rs"), include_str!("../state_machine/planned_transition.rs"), include_str!("../state_machine/planners.rs"), include_str!("../state_machine/recovery.rs"), include_str!("../state_machine/recovery_encoder.rs"), include_str!("../state_machine/recovery_fingerprint.rs"), include_str!("../state_machine/registration.rs"), include_str!("../state_machine/state_graph.rs"), include_str!("../state_machine/transitions.rs"), include_str!("../state_machine/types.rs"), include_str!("../state_machine/work_validation.rs"), include_str!("../state_machine/executor.rs"), include_str!("../state_machine/executor/commit_leave_ops.rs"), include_str!("../state_machine/executor/creation_ops.rs"), include_str!("../state_machine/executor/dispatch.rs"), include_str!("../state_machine/executor/event_chain.rs"), include_str!("../state_machine/executor/federation_ops.rs"), include_str!("../state_machine/executor/fulfillment_ops.rs"), include_str!("../state_machine/executor/lifecycle_ops.rs"), include_str!("../state_machine/executor/preflight.rs"), include_str!("../state_machine/executor/prior_bound_ops.rs"), include_str!("../state_machine/executor/pruning.rs"), include_str!("../state_machine/executor/read_ops.rs"), include_str!("../state_machine/executor/recovery_ops.rs"), include_str!("../state_machine/executor/reset_accept_ops.rs"), include_str!("../state_machine/executor/welcome_ops.rs"), include_str!("../state_machine/executor/write_ops.rs"));
+            let state_machine = concat!(
+                include_str!("../state_machine.rs"),
+                include_str!("../state_machine/commands.rs"),
+                include_str!("../state_machine/creation.rs"),
+                include_str!("../state_machine/direct_requests.rs"),
+                include_str!("../state_machine/effects.rs"),
+                include_str!("../state_machine/evidence.rs"),
+                include_str!("../state_machine/historical.rs"),
+                include_str!("../state_machine/hydration_entries.rs"),
+                include_str!("../state_machine/hydration_requests.rs"),
+                include_str!("../state_machine/hydration_rows.rs"),
+                include_str!("../state_machine/invariants.rs"),
+                include_str!("../state_machine/lifecycle.rs"),
+                include_str!("../state_machine/membership_rules.rs"),
+                include_str!("../state_machine/messages.rs"),
+                include_str!("../state_machine/metadata.rs"),
+                include_str!("../state_machine/planned_transition.rs"),
+                include_str!("../state_machine/planners.rs"),
+                include_str!("../state_machine/recovery.rs"),
+                include_str!("../state_machine/recovery_encoder.rs"),
+                include_str!("../state_machine/recovery_fingerprint.rs"),
+                include_str!("../state_machine/registration.rs"),
+                include_str!("../state_machine/state_graph.rs"),
+                include_str!("../state_machine/transitions.rs"),
+                include_str!("../state_machine/types.rs"),
+                include_str!("../state_machine/work_validation.rs"),
+                include_str!("../state_machine/executor.rs"),
+                include_str!("../state_machine/executor/commit_leave_ops.rs"),
+                include_str!("../state_machine/executor/creation_ops.rs"),
+                include_str!("../state_machine/executor/dispatch.rs"),
+                include_str!("../state_machine/executor/event_chain.rs"),
+                include_str!("../state_machine/executor/federation_ops.rs"),
+                include_str!("../state_machine/executor/fulfillment_ops.rs"),
+                include_str!("../state_machine/executor/lifecycle_ops.rs"),
+                include_str!("../state_machine/executor/preflight.rs"),
+                include_str!("../state_machine/executor/prior_bound_ops.rs"),
+                include_str!("../state_machine/executor/pruning.rs"),
+                include_str!("../state_machine/executor/read_ops.rs"),
+                include_str!("../state_machine/executor/recovery_ops.rs"),
+                include_str!("../state_machine/executor/reset_accept_ops.rs"),
+                include_str!("../state_machine/executor/welcome_ops.rs"),
+                include_str!("../state_machine/executor/write_ops.rs")
+            );
             let execution = include_str!("execution_context.rs");
             let member_digest_item = g6_source_item(
                 state_machine,
@@ -10221,7 +10270,10 @@ mod historical_control_loader {
             );
             let sender_leaf_index = add_senders[0].leaf_index();
             assert_eq!(sender_leaf_index, 0, "frozen Add sender is Alice leaf zero");
-            let add = crate::common::frozen_public_state::restore_add_commit(&add_prior, sender_leaf_index);
+            let add = crate::common::frozen_public_state::restore_add_commit(
+                &add_prior,
+                sender_leaf_index,
+            );
             assert_eq!(add.adds().len(), 1);
             let key_package_ref: [u8; 32] = corpus_file("key-package-ref.bin")
                 .try_into()
@@ -14053,15 +14105,16 @@ mod historical_control_loader {
                 pending_recipients: creation_pending,
                 operation: AdmissionOperation::Group,
             };
-            let live_creation = crate::chat_protocol::relationship_policy::collect_admission_projection(
-                &relationship_authority,
-                &FixedProjectionClock(trusted_at),
-                PolicyProjectionRevisionGuard::for_test(1),
-                ProjectionOperationScope::Creation,
-                creation_admission,
-            )
-            .await
-            .expect("collect lifecycle Creation relationship projection");
+            let live_creation =
+                crate::chat_protocol::relationship_policy::collect_admission_projection(
+                    &relationship_authority,
+                    &FixedProjectionClock(trusted_at),
+                    PolicyProjectionRevisionGuard::for_test(1),
+                    ProjectionOperationScope::Creation,
+                    creation_admission,
+                )
+                .await
+                .expect("collect lifecycle Creation relationship projection");
             let mut fallback_tx = pool.begin().await.expect("begin Creation fallback");
             let creation_allocation = allocate_projection_revision(&mut fallback_tx)
                 .await
@@ -14098,15 +14151,16 @@ mod historical_control_loader {
                 pending_recipients: vec![invitee.did.clone()],
                 operation: AdmissionOperation::Group,
             };
-            let live_acceptance = crate::chat_protocol::relationship_policy::collect_admission_projection(
-                &acceptance_relationship_authority,
-                &FixedProjectionClock(trusted_at),
-                PolicyProjectionRevisionGuard::for_test(1),
-                ProjectionOperationScope::Acceptance,
-                acceptance_admission,
-            )
-            .await
-            .expect("collect lifecycle Acceptance relationship projection");
+            let live_acceptance =
+                crate::chat_protocol::relationship_policy::collect_admission_projection(
+                    &acceptance_relationship_authority,
+                    &FixedProjectionClock(trusted_at),
+                    PolicyProjectionRevisionGuard::for_test(1),
+                    ProjectionOperationScope::Acceptance,
+                    acceptance_admission,
+                )
+                .await
+                .expect("collect lifecycle Acceptance relationship projection");
             let mut fallback_tx = pool.begin().await.expect("begin Acceptance fallback");
             let acceptance_allocation = allocate_projection_revision(&mut fallback_tx)
                 .await
@@ -14137,15 +14191,16 @@ mod historical_control_loader {
             );
             let mut fulfillment_roster = vec![entry.actor_did.clone(), invitee.did.clone()];
             fulfillment_roster.sort();
-            let live_fulfillment = crate::chat_protocol::relationship_policy::collect_block_projection(
-                &fulfillment_relationship_authority,
-                &FixedProjectionClock(trusted_at),
-                PolicyProjectionRevisionGuard::for_test(1),
-                ProjectionOperationScope::RecoveryFulfillment,
-                fulfillment_roster,
-            )
-            .await
-            .expect("collect lifecycle Fulfillment relationship projection");
+            let live_fulfillment =
+                crate::chat_protocol::relationship_policy::collect_block_projection(
+                    &fulfillment_relationship_authority,
+                    &FixedProjectionClock(trusted_at),
+                    PolicyProjectionRevisionGuard::for_test(1),
+                    ProjectionOperationScope::RecoveryFulfillment,
+                    fulfillment_roster,
+                )
+                .await
+                .expect("collect lifecycle Fulfillment relationship projection");
             let mut fallback_tx = pool.begin().await.expect("begin Fulfillment fallback");
             let fulfillment_allocation = allocate_projection_revision(&mut fallback_tx)
                 .await

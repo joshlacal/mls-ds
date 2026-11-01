@@ -264,26 +264,6 @@ async fn build_router_with_options(
     .fetch_one(&pool)
     .await
     .expect("cursor key");
-    static ENV: Once = Once::new();
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK.lock().expect("env lock");
-    ENV.call_once(|| {
-        let point = nest_key().verifying_key().to_encoded_point(false);
-        std::env::set_var("CHAT_NEST_ISSUER", ISSUER);
-        std::env::set_var("CHAT_NEST_AUDIENCE", AUDIENCE);
-        std::env::set_var("CHAT_NEST_KEY_ID", NEST_KEY_ID);
-        std::env::set_var("CHAT_NEST_VERIFYING_KEY", STANDARD.encode(point.as_bytes()));
-        std::env::set_var("CHAT_INSTANCE_ID", CHAT_INSTANCE);
-        std::env::set_var("CHAT_EXTERNAL_BASE", EXTERNAL_BASE);
-        std::env::set_var(
-            "CHAT_CURSOR_SEALING_SECRET",
-            URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
-        );
-        std::env::set_var(
-            "CHAT_SUBSCRIPTION_ENDPOINT",
-            "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
-        );
-    });
     let point = nest_key().verifying_key().to_encoded_point(false);
     let jwk_val = serde_json::json!({
         "kty": "EC",
@@ -304,6 +284,27 @@ async fn build_router_with_options(
         service: None,
     };
     catbird_server::auth::cache_test_did_document(doc).await;
+
+    static ENV: Once = Once::new();
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock().expect("env lock");
+    ENV.call_once(|| {
+        let point = nest_key().verifying_key().to_encoded_point(false);
+        std::env::set_var("CHAT_NEST_ISSUER", ISSUER);
+        std::env::set_var("CHAT_NEST_AUDIENCE", AUDIENCE);
+        std::env::set_var("CHAT_NEST_KEY_ID", NEST_KEY_ID);
+        std::env::set_var("CHAT_NEST_VERIFYING_KEY", STANDARD.encode(point.as_bytes()));
+        std::env::set_var("CHAT_INSTANCE_ID", CHAT_INSTANCE);
+        std::env::set_var("CHAT_EXTERNAL_BASE", EXTERNAL_BASE);
+        std::env::set_var(
+            "CHAT_CURSOR_SEALING_SECRET",
+            URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
+        );
+        std::env::set_var(
+            "CHAT_SUBSCRIPTION_ENDPOINT",
+            "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
+        );
+    });
     std::env::set_var("CHAT_CURSOR_KEY_ID", key_id);
     std::env::set_var(
         "CHAT_SUBSCRIPTION_ENDPOINT",
@@ -326,7 +327,10 @@ async fn build_router_with_options(
 }
 
 fn current_audience() -> String {
-    format!("{}#atproto_mls", catbird_server::identity::service_did_base())
+    format!(
+        "{}#atproto_mls",
+        catbird_server::identity::service_did_base()
+    )
 }
 
 pub fn unsigned_request(device: &Device, nsid: &str, method: &str, query: &str) -> Request<Body> {

@@ -40,7 +40,6 @@ fn audience_matches_expected(claimed: &str, expected: &str) -> bool {
     claimed == expected || (expected.contains('#') && claimed == canonical_did(expected))
 }
 
-
 /// Authentication errors
 #[derive(Debug, Error)]
 pub enum AuthError {

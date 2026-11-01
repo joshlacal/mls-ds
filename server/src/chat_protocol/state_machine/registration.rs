@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 impl TransitionEffects {
     pub(in crate::chat_protocol::state_machine) fn new(kind: PlanKind) -> Self {
         Self {
@@ -143,7 +142,11 @@ impl TransitionEffects {
         self.head_cas.as_ref()
     }
 
-    pub(in crate::chat_protocol::state_machine) fn complete(&mut self, before: Option<&ConversationState>, after: &ConversationState) {
+    pub(in crate::chat_protocol::state_machine) fn complete(
+        &mut self,
+        before: Option<&ConversationState>,
+        after: &ConversationState,
+    ) {
         self.before_counts = before.map_or_else(StateCounts::default, state_counts);
         self.after_counts = state_counts(after);
         let before_metadata = before.and_then(|state| state.metadata.clone());
@@ -222,7 +225,9 @@ pub(in crate::chat_protocol::state_machine) fn complete_effects(
     effects
 }
 
-pub(in crate::chat_protocol::state_machine) fn state_counts(state: &ConversationState) -> StateCounts {
+pub(in crate::chat_protocol::state_machine) fn state_counts(
+    state: &ConversationState,
+) -> StateCounts {
     StateCounts {
         participants: state.participants.len(),
         pending_participants: state
@@ -279,7 +284,11 @@ pub(in crate::chat_protocol::state_machine) fn state_counts(state: &Conversation
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn diff_by_key<T, K, F>(before: &[T], after: &[T], key: F) -> Vec<StateChange<T>>
+pub(in crate::chat_protocol::state_machine) fn diff_by_key<T, K, F>(
+    before: &[T],
+    after: &[T],
+    key: F,
+) -> Vec<StateChange<T>>
 where
     T: Clone + PartialEq,
     K: Clone + Ord,
@@ -354,7 +363,9 @@ pub(in crate::chat_protocol::state_machine) fn package_transitions(
         .collect()
 }
 
-pub(in crate::chat_protocol::state_machine) fn package_cas_bijection_valid(effects: &TransitionEffects) -> bool {
+pub(in crate::chat_protocol::state_machine) fn package_cas_bijection_valid(
+    effects: &TransitionEffects,
+) -> bool {
     let Some(head) = effects.head_cas.as_ref() else {
         return false;
     };
@@ -390,7 +401,9 @@ pub(in crate::chat_protocol::state_machine) fn package_cas_bijection_valid(effec
         })
 }
 
-pub(in crate::chat_protocol::state_machine) fn revocation_package_cas_bijection_valid(effects: &TransitionEffects) -> bool {
+pub(in crate::chat_protocol::state_machine) fn revocation_package_cas_bijection_valid(
+    effects: &TransitionEffects,
+) -> bool {
     let Some(head) = effects.head_cas.as_ref() else {
         return false;
     };
@@ -428,7 +441,9 @@ pub(in crate::chat_protocol::state_machine) fn revocation_package_cas_bijection_
         })
 }
 
-pub(in crate::chat_protocol::state_machine) fn work_terminal_time(evidence: &WorkTerminalEvidence) -> ServerTimestamp {
+pub(in crate::chat_protocol::state_machine) fn work_terminal_time(
+    evidence: &WorkTerminalEvidence,
+) -> ServerTimestamp {
     match evidence {
         WorkTerminalEvidence::Transition(value) => value.received_at,
         WorkTerminalEvidence::Request(value) => value.received_at,
@@ -439,9 +454,12 @@ pub(in crate::chat_protocol::state_machine) fn work_terminal_time(evidence: &Wor
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedTransition {
-    pub(in crate::chat_protocol::state_machine) expected_prior: Option<PublicGroupSnapshotCoordinate>,
-    pub(in crate::chat_protocol::state_machine) retired_coordinate: Option<PublicGroupSnapshotCoordinate>,
-    pub(in crate::chat_protocol::state_machine) successor_coordinate: Option<PublicGroupSnapshotCoordinate>,
+    pub(in crate::chat_protocol::state_machine) expected_prior:
+        Option<PublicGroupSnapshotCoordinate>,
+    pub(in crate::chat_protocol::state_machine) retired_coordinate:
+        Option<PublicGroupSnapshotCoordinate>,
+    pub(in crate::chat_protocol::state_machine) successor_coordinate:
+        Option<PublicGroupSnapshotCoordinate>,
     pub(in crate::chat_protocol::state_machine) state: ConversationState,
     pub(in crate::chat_protocol::state_machine) effects: TransitionEffects,
 }
@@ -452,9 +470,12 @@ pub(crate) struct PlannedTransition {
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct ConversationPersistencePlan {
-    pub(in crate::chat_protocol::state_machine) expected_prior: Option<PublicGroupSnapshotCoordinate>,
-    pub(in crate::chat_protocol::state_machine) retired_coordinate: Option<PublicGroupSnapshotCoordinate>,
-    pub(in crate::chat_protocol::state_machine) successor_coordinate: Option<PublicGroupSnapshotCoordinate>,
+    pub(in crate::chat_protocol::state_machine) expected_prior:
+        Option<PublicGroupSnapshotCoordinate>,
+    pub(in crate::chat_protocol::state_machine) retired_coordinate:
+        Option<PublicGroupSnapshotCoordinate>,
+    pub(in crate::chat_protocol::state_machine) successor_coordinate:
+        Option<PublicGroupSnapshotCoordinate>,
     pub(in crate::chat_protocol::state_machine) state: ConversationStateHydration,
     pub(in crate::chat_protocol::state_machine) effects: TransitionEffects,
 }
@@ -613,7 +634,9 @@ pub(crate) fn recovery_plan_fingerprint(
     })
 }
 
-pub(in crate::chat_protocol::state_machine) fn recovery_plan_class_code(class: RecoveryPlanClass) -> u8 {
+pub(in crate::chat_protocol::state_machine) fn recovery_plan_class_code(
+    class: RecoveryPlanClass,
+) -> u8 {
     match class {
         RecoveryPlanClass::Request => 1,
         RecoveryPlanClass::Cancellation => 2,

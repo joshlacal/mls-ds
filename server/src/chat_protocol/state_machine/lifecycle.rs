@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 impl HistoricalRehydrationAuthority {
     /// Production constructor: binds the read-time authority to an EXISTING
     /// locked head (`prior_coordinate` = `Some`, `next_entry_seq >= 2`). The

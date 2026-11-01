@@ -113,14 +113,9 @@ async fn execute(
     let method =
         CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let instant = TrustedRequestInstant::capture().map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-    let pre_replay = dpop::standard_service_auth_evidence(
-        principal,
-        &actor_device_str,
-        method,
-        instant,
-        None,
-    )
-    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+    let pre_replay =
+        dpop::standard_service_auth_evidence(principal, &actor_device_str, method, instant, None)
+            .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
     auth::authorize_unsigned_request(pool, pre_replay)
         .await
         .map_err(|error| context::auth_repository_failure(ENDPOINT, error))?;
@@ -344,10 +339,11 @@ async fn execute(
 fn decode_signature_field(value: &Value) -> Result<[u8; 64], ChatFailure> {
     let encoded = match value {
         Value::String(s) => s.as_str(),
-        Value::Object(map) if map.len() == 1 => map
-            .get("$bytes")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?,
+        Value::Object(map) if map.len() == 1 => {
+            map.get("$bytes").and_then(Value::as_str).ok_or_else(|| {
+                ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+            })?
+        }
         _ => {
             return Err(ChatFailure::protocol(
                 ENDPOINT,

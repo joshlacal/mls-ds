@@ -189,7 +189,9 @@ pub(in crate::chat_protocol::state_machine::executor) fn exact_welcome_actor_rol
     })
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn repository_welcome_rejection_reason(value: &str) -> Option<WelcomeRejectionReason> {
+pub(in crate::chat_protocol::state_machine::executor) fn repository_welcome_rejection_reason(
+    value: &str,
+) -> Option<WelcomeRejectionReason> {
     match value {
         "noMatchingKeyPackage" => Some(WelcomeRejectionReason::NoMatchingKeyPackage),
         "invalidWelcome" => Some(WelcomeRejectionReason::InvalidWelcome),
@@ -261,8 +263,12 @@ pub(in crate::chat_protocol::state_machine::executor) async fn preflight_welcome
 ) -> Result<(), ExecutorError> {
     terminal_welcome_context_is_closed(ctx, true)?;
     let expected_kind = match successor_status {
-        WelcomeStatus::Acknowledged => crate::chat_protocol::state_machine::RequestEntryKind::WelcomeAcknowledgement,
-        WelcomeStatus::Rejected => crate::chat_protocol::state_machine::RequestEntryKind::WelcomeRejection,
+        WelcomeStatus::Acknowledged => {
+            crate::chat_protocol::state_machine::RequestEntryKind::WelcomeAcknowledgement
+        }
+        WelcomeStatus::Rejected => {
+            crate::chat_protocol::state_machine::RequestEntryKind::WelcomeRejection
+        }
         _ => {
             return Err(ExecutorError::InconsistentPlan(
                 "Welcome response has an invalid successor",
@@ -377,9 +383,10 @@ pub(in crate::chat_protocol::state_machine::executor) async fn preflight_welcome
                 .ok_or(ExecutorError::MissingContext(
                     "welcome rejection recovery work",
                 ))?;
-            if !crate::chat_protocol::state_machine::is_uuid_v4(rejection.recovery_work_id.as_bytes())
-                || signed_reason.and_then(repository_welcome_rejection_reason)
-                    != Some(rejection.reason)
+            if !crate::chat_protocol::state_machine::is_uuid_v4(
+                rejection.recovery_work_id.as_bytes(),
+            ) || signed_reason.and_then(repository_welcome_rejection_reason)
+                != Some(rejection.reason)
             {
                 return Err(ExecutorError::InconsistentPlan(
                     "Welcome rejection work is not bound to the signed reason",
@@ -710,4 +717,3 @@ pub(in crate::chat_protocol::state_machine::executor) async fn apply_welcome_exp
         successor_coordinate: plan.successor_coordinate().copied(),
     })
 }
-

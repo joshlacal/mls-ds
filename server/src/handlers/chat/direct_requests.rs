@@ -2,7 +2,6 @@
 //! attempt claims and commit-before-response behavior; feature activation is off
 //! until the dedicated receipt authority has passed its durable startup check.
 use super::{context, errors::ChatFailure, runtime::ChatRuntime};
-use base64::Engine;
 use crate::{
     chat_protocol::{
         error::{ChatEndpoint, ChatProtocolErrorCode},
@@ -18,6 +17,7 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
+use base64::Engine;
 use std::sync::Arc;
 
 fn failure(endpoint: ChatEndpoint, error: DirectRequestStoreError) -> ChatFailure {
@@ -118,9 +118,12 @@ async fn mutate(
             ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
         })?;
 
-        let req_actor_did = body.get("actorDid").and_then(|v| v.as_str()).ok_or_else(|| {
-            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-        })?;
+        let req_actor_did = body
+            .get("actorDid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
         if req_actor_did != principal.did() {
             tracing::warn!(
                 claimed_actor = %req_actor_did,
@@ -131,16 +134,22 @@ async fn mutate(
         }
         let actor_did = principal.did();
 
-        let recipient_did = body.get("recipientDid").and_then(|v| v.as_str()).ok_or_else(|| {
-            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-        })?;
+        let recipient_did = body
+            .get("recipientDid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
         if !crate::chat_protocol::is_bare_did(recipient_did) || recipient_did == actor_did {
             return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
         }
 
-        let actor_device_id_str = body.get("actorDeviceId").and_then(|v| v.as_str()).ok_or_else(|| {
-            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-        })?;
+        let actor_device_id_str = body
+            .get("actorDeviceId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
         let actor_device_id = uuid::Uuid::parse_str(actor_device_id_str)
             .map_err(|_| failure(endpoint, DirectRequestStoreError::IdentityConflict))?;
 
@@ -148,13 +157,19 @@ async fn mutate(
             ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
         })?;
 
-        let auth_generation = body.get("authGeneration").and_then(|v| v.as_i64()).ok_or_else(|| {
-            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-        })?;
+        let auth_generation = body
+            .get("authGeneration")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
 
-        let request_id_str = body.get("requestId").and_then(|v| v.as_str()).ok_or_else(|| {
-            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-        })?;
+        let request_id_str = body
+            .get("requestId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
         let request_id = uuid::Uuid::parse_str(request_id_str)
             .map_err(|_| failure(endpoint, DirectRequestStoreError::InvalidReceipt))?;
 
@@ -196,24 +211,33 @@ async fn mutate(
         )
         .map_err(|_| failure(endpoint, DirectRequestStoreError::InvalidSignature))?;
 
-
-        let coord = crate::federation::canonical_relay::resolve_pair_coordinator(pool, actor_did, recipient_did)
-            .await
-            .map_err(|e| match e {
-                crate::federation::FederationError::Unsupported(_)
-                | crate::federation::FederationError::AuthFailed { .. }
-                | crate::federation::FederationError::EndpointNotFound { .. } => {
-                    failure(endpoint, DirectRequestStoreError::RecipientAuthorityUnsupported)
-                }
-                _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
-            })?;
+        let coord = crate::federation::canonical_relay::resolve_pair_coordinator(
+            pool,
+            actor_did,
+            recipient_did,
+        )
+        .await
+        .map_err(|e| match e {
+            crate::federation::FederationError::Unsupported(_)
+            | crate::federation::FederationError::AuthFailed { .. }
+            | crate::federation::FederationError::EndpointNotFound { .. } => failure(
+                endpoint,
+                DirectRequestStoreError::RecipientAuthorityUnsupported,
+            ),
+            _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
+        })?;
         if !coord.is_sender_home {
-            return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
+            return Err(ChatFailure::protocol(
+                endpoint,
+                ChatProtocolErrorCode::NotAuthorized,
+            ));
         }
 
-
         if !coord.is_coordinator {
-            let mut route_tx = pool.begin().await.map_err(|_| ChatFailure::storage(endpoint))?;
+            let mut route_tx = pool
+                .begin()
+                .await
+                .map_err(|_| ChatFailure::storage(endpoint))?;
             let (p1, p2) = if actor_did <= recipient_did {
                 (actor_did, recipient_did)
             } else {
@@ -243,8 +267,11 @@ async fn mutate(
             if recent >= 20 && !existing {
                 return Err(failure(endpoint, DirectRequestStoreError::QuotaExceeded));
             }
-            if let Some(crate::federation::canonical_relay::PairFenceConflict::ForeignCoordinator { .. }) =
-                crate::federation::canonical_relay::check_pair_owner_fence(
+            if let Some(
+                crate::federation::canonical_relay::PairFenceConflict::ForeignCoordinator {
+                    ..
+                },
+            ) = crate::federation::canonical_relay::check_pair_owner_fence(
                 &mut route_tx,
                 actor_did,
                 recipient_did,
@@ -252,7 +279,8 @@ async fn mutate(
                 Some(&coord.coordinator_did),
             )
             .await
-            .map_err(|_| ChatFailure::storage(endpoint))? {
+            .map_err(|_| ChatFailure::storage(endpoint))?
+            {
                 return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
             }
             let route: Option<uuid::Uuid> = sqlx::query_scalar(
@@ -277,7 +305,10 @@ async fn mutate(
             if route.is_none() {
                 return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
             }
-            route_tx.commit().await.map_err(|_| ChatFailure::storage(endpoint))?;
+            route_tx
+                .commit()
+                .await
+                .map_err(|_| ChatFailure::storage(endpoint))?;
             let relay_payload = serde_json::json!({
                 "signedRequest": parsed_req,
                 "senderDeviceKey": {
@@ -300,8 +331,8 @@ async fn mutate(
                 }
                 _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
             })?;
-            let bytes = serde_json::to_vec(&outcome)
-                .map_err(|_| ChatFailure::invariant(endpoint))?;
+            let bytes =
+                serde_json::to_vec(&outcome).map_err(|_| ChatFailure::invariant(endpoint))?;
             return Ok(context::json_ok(bytes));
         } else {
             let mut tx = pool
@@ -329,12 +360,13 @@ async fn mutate(
                 Some(&coord.coordinator_did),
             )
             .await
-            .map_err(|_| ChatFailure::storage(endpoint))? {
+            .map_err(|_| ChatFailure::storage(endpoint))?
+            {
                 return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
             }
             // Repository replay must not reserve another peer package for the same attempt.
             let existing: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)"
+                "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)",
             )
             .bind(request_id)
             .fetch_one(&mut *tx)
@@ -342,43 +374,63 @@ async fn mutate(
             .map_err(|_| ChatFailure::storage(endpoint))?;
             if existing {
                 let result = requests::prepare_direct_request(
-                    &mut tx, &principal, envelope.signed_request.get().as_bytes(), signer,
-                    runtime.relationship_authority().as_ref(), now,
+                    &mut tx,
+                    &principal,
+                    envelope.signed_request.get().as_bytes(),
+                    signer,
+                    runtime.relationship_authority().as_ref(),
+                    now,
                 )
                 .await
                 .map_err(|e| failure(endpoint, e))?;
                 let bytes = output(result, endpoint)?;
-                tx.commit().await.map_err(|_| ChatFailure::storage(endpoint))?;
+                tx.commit()
+                    .await
+                    .map_err(|_| ChatFailure::storage(endpoint))?;
                 return Ok(context::json_ok(bytes));
             }
 
-
             if !coord.is_recipient_home {
-                let remote_devices = crate::federation::canonical_relay::reserve_remote_recipient_bootstrap(
-                    pool,
-                    &coord.recipient_home.endpoint,
-                    &coord.recipient_home.did,
-                    request_id,
-                    actor_did,
-                    recipient_did,
-                    Some(parsed_req.clone()),
-                )
-                .await
-                .map_err(|e| {
-                    tracing::error!("reserve_remote_recipient_bootstrap failed: {:?}", e);
-                    failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable)
-                })?;
+                let remote_devices =
+                    crate::federation::canonical_relay::reserve_remote_recipient_bootstrap(
+                        pool,
+                        &coord.recipient_home.endpoint,
+                        &coord.recipient_home.did,
+                        request_id,
+                        actor_did,
+                        recipient_did,
+                        Some(parsed_req.clone()),
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("reserve_remote_recipient_bootstrap failed: {:?}", e);
+                        failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable)
+                    })?;
 
-                if let Err(error) = crate::federation::canonical_relay::stage_remote_recipient_devices(
-                    pool, &mut tx, request_id, &remote_devices, now,
-                ).await {
+                if let Err(error) =
+                    crate::federation::canonical_relay::stage_remote_recipient_devices(
+                        pool,
+                        &mut tx,
+                        request_id,
+                        &remote_devices,
+                        now,
+                    )
+                    .await
+                {
                     crate::federation::canonical_relay::release_remote_recipient_bootstrap(
                         pool,
-                        &coord.recipient_home.endpoint, &coord.recipient_home.did,
-                        request_id, recipient_did,
-                    ).await.map_err(|_| ChatFailure::storage(endpoint))?;
+                        &coord.recipient_home.endpoint,
+                        &coord.recipient_home.did,
+                        request_id,
+                        recipient_did,
+                    )
+                    .await
+                    .map_err(|_| ChatFailure::storage(endpoint))?;
                     tracing::error!("stage_remote_recipient_devices failed: {error:?}");
-                    return Err(failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable));
+                    return Err(failure(
+                        endpoint,
+                        DirectRequestStoreError::RecipientKeysUnavailable,
+                    ));
                 }
             }
 
@@ -398,9 +450,13 @@ async fn mutate(
                     if !coord.is_recipient_home {
                         crate::federation::canonical_relay::release_remote_recipient_bootstrap(
                             pool,
-                            &coord.recipient_home.endpoint, &coord.recipient_home.did,
-                            request_id, recipient_did,
-                        ).await.map_err(|_| ChatFailure::storage(endpoint))?;
+                            &coord.recipient_home.endpoint,
+                            &coord.recipient_home.did,
+                            request_id,
+                            recipient_did,
+                        )
+                        .await
+                        .map_err(|_| ChatFailure::storage(endpoint))?;
                     }
                     return Err(failure(endpoint, error));
                 }
@@ -419,9 +475,14 @@ async fn mutate(
 
             let bytes = output(result, endpoint)?;
             if bytes.len() > 8_388_608 {
-                return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::ArtifactTooLarge));
+                return Err(ChatFailure::protocol(
+                    endpoint,
+                    ChatProtocolErrorCode::ArtifactTooLarge,
+                ));
             }
-            tx.commit().await.map_err(|_| ChatFailure::storage(endpoint))?;
+            tx.commit()
+                .await
+                .map_err(|_| ChatFailure::storage(endpoint))?;
             return Ok(context::json_ok(bytes));
         }
     }
@@ -538,11 +599,18 @@ pub(super) async fn outcome(
         .map_err(|_| ChatFailure::storage(endpoint))?;
         if let Some((actor_did, actor_device_id, recipient_did, coordinator_did)) = route {
             if actor_did != principal.did() || actor_device_id != device {
-                return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
+                return Err(ChatFailure::protocol(
+                    endpoint,
+                    ChatProtocolErrorCode::NotAuthorized,
+                ));
             }
             let coord = crate::federation::canonical_relay::resolve_pair_coordinator(
-                pool, &actor_did, &recipient_did,
-            ).await.map_err(|_| ChatFailure::storage(endpoint))?;
+                pool,
+                &actor_did,
+                &recipient_did,
+            )
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
             if !coord.is_sender_home || coord.is_coordinator {
                 return Err(ChatFailure::invariant(endpoint));
             }
@@ -558,7 +626,7 @@ pub(super) async fn outcome(
             // Fast local idempotent replay check: if mirror already exists on sender home
             let existing: Option<Vec<u8>> = sqlx::query_scalar(
                 "SELECT publication_receipt FROM chat.direct_request_transport_inbox \
-                 WHERE request_id=$1 AND sender_did=$2 AND sender_device_id=$3 LIMIT 1"
+                 WHERE request_id=$1 AND sender_did=$2 AND sender_device_id=$3 LIMIT 1",
             )
             .bind(request)
             .bind(&actor_did)
@@ -575,21 +643,31 @@ pub(super) async fn outcome(
             }
 
             let result = crate::federation::canonical_relay::relay_get_outcome(
-                coord.coordinator_endpoint(), &coordinator_did, request, device,
-            ).await.map_err(|error| {
+                coord.coordinator_endpoint(),
+                &coordinator_did,
+                request,
+                device,
+            )
+            .await
+            .map_err(|error| {
                 tracing::warn!(?error, "Coordinator outcome unavailable");
                 ChatFailure::storage(endpoint)
             })?;
 
             let outcome_val = result.get("outcome").unwrap_or(&result);
-            let receipt_type = outcome_val.pointer("/receipt/$type")
+            let receipt_type = outcome_val
+                .pointer("/receipt/$type")
                 .or_else(|| outcome_val.pointer("/body/receipt/$type"))
                 .or_else(|| outcome_val.get("$type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let is_published = receipt_type == "blue.catbird.chat.defs#directRequestPublishedReceipt"
+            let is_published = receipt_type
+                == "blue.catbird.chat.defs#directRequestPublishedReceipt"
                 || (receipt_type == "blue.catbird.chat.defs#signedDirectRequestReceipt"
-                    && outcome_val.pointer("/receipt/$type").and_then(|v| v.as_str()) == Some("blue.catbird.chat.defs#directRequestPublishedReceipt"));
+                    && outcome_val
+                        .pointer("/receipt/$type")
+                        .and_then(|v| v.as_str())
+                        == Some("blue.catbird.chat.defs#directRequestPublishedReceipt"));
 
             if is_published {
                 let receipt = crate::handlers::chat::publish_direct_request::materialize_sender_home_published_mirror(
@@ -610,7 +688,8 @@ pub(super) async fn outcome(
                 return Ok(context::json_ok(bytes));
             }
 
-            let bytes = serde_json::to_vec(&result).map_err(|_| ChatFailure::invariant(endpoint))?;
+            let bytes =
+                serde_json::to_vec(&result).map_err(|_| ChatFailure::invariant(endpoint))?;
             return Ok(context::json_ok(bytes));
         }
         let recipient_receipt: Option<Vec<u8>> = sqlx::query_scalar(
@@ -624,18 +703,17 @@ pub(super) async fn outcome(
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
         if let Some(receipt) = recipient_receipt {
-            let receipt: serde_json::Value = serde_json::from_slice(&receipt)
-                .map_err(|_| ChatFailure::invariant(endpoint))?;
-            return Ok(context::json_ok(serde_json::to_vec(&serde_json::json!({"outcome":receipt}))
-                .map_err(|_| ChatFailure::invariant(endpoint))?));
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&receipt).map_err(|_| ChatFailure::invariant(endpoint))?;
+            return Ok(context::json_ok(
+                serde_json::to_vec(&serde_json::json!({"outcome":receipt}))
+                    .map_err(|_| ChatFailure::invariant(endpoint))?,
+            ));
         }
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|error| {
-                tracing::error!(%error, "get_direct_request_outcome pool.begin failed");
-                ChatFailure::storage(endpoint)
-            })?;
+        let mut tx = pool.begin().await.map_err(|error| {
+            tracing::error!(%error, "get_direct_request_outcome pool.begin failed");
+            ChatFailure::storage(endpoint)
+        })?;
         let result =
             requests::get_direct_request_outcome(&mut tx, &principal, device, request, signer, now)
                 .await

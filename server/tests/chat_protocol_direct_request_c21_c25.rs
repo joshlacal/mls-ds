@@ -83,29 +83,52 @@ async fn c21_unaddressed_device_gains_no_welcome_slots_on_publication_or_accepta
     .fetch_one(&mut *tx)
     .await
     .unwrap();
-    assert_eq!(proof, (false, false), "unaddressed leaf must have no preview authority");
+    assert_eq!(
+        proof,
+        (false, false),
+        "unaddressed leaf must have no preview authority"
+    );
 
     // 2. Setup principal and unaddressed device
-    sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,transaction_timestamp())")
-        .bind(&bob_did).execute(&mut *tx).await.unwrap();
+    sqlx::query(
+        "INSERT INTO chat.principals(user_did,created_at) VALUES($1,transaction_timestamp())",
+    )
+    .bind(&bob_did)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'unaddressed','active',$3,1,chat.protocol_capabilities(),transaction_timestamp(),transaction_timestamp())")
         .bind(&bob_did).bind(bob_device_unaddressed).bind(random_jkt(1)).execute(&mut *tx).await.unwrap();
 
     // 3. Inserting a welcome outcome for an unaddressed device fails via delivery FK constraint
-    sqlx::query("SAVEPOINT sp_unaddressed_outcome").execute(&mut *tx).await.unwrap();
+    sqlx::query("SAVEPOINT sp_unaddressed_outcome")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     let err = sqlx::query("INSERT INTO chat.direct_request_welcome_outcomes(request_id,recipient_did,recipient_device_id,status,terminal_at,signed_request_bytes,request_digest) VALUES($1,$2,$3,'acknowledged',transaction_timestamp(),$4,$5)")
         .bind(request_id).bind(&bob_did).bind(bob_device_unaddressed).bind(vec![11u8;32]).bind(vec![12u8;32])
         .execute(&mut *tx)
         .await
         .expect_err("unaddressed device must not be able to record welcome outcome");
-    assert_eq!(err.as_database_error().unwrap().code().as_deref(), Some("23503"));
-    sqlx::query("ROLLBACK TO SAVEPOINT sp_unaddressed_outcome").execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        err.as_database_error().unwrap().code().as_deref(),
+        Some("23503")
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT sp_unaddressed_outcome")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // Precharge attempt & lifecycle reserve for 1 delivery
     let alice_did = random_did();
     let alice_device = Uuid::new_v4();
-    sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,transaction_timestamp())")
-        .bind(&alice_did).execute(&mut *tx).await.unwrap();
+    sqlx::query(
+        "INSERT INTO chat.principals(user_did,created_at) VALUES($1,transaction_timestamp())",
+    )
+    .bind(&alice_did)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
     let alice_key = insert_test_device(&mut tx, &alice_did, alice_device, "alice", 10).await;
     let term_resp = b"ok".to_vec();
     let term_sha = Sha256::digest(&term_resp).to_vec();
@@ -116,7 +139,10 @@ async fn c21_unaddressed_device_gains_no_welcome_slots_on_publication_or_accepta
     sqlx::query("INSERT INTO chat.direct_request_lifecycle_reserves(request_id,decision_bytes,welcome_bytes_per_delivery,delivery_count) VALUES($1,5242880,524288,1)")
         .bind(request_id).execute(&mut *tx).await.unwrap();
     // 4. Welcome slots constraint: deferred delivery FK triggers on immediate check
-    sqlx::query("SAVEPOINT sp_unaddressed_slot").execute(&mut *tx).await.unwrap();
+    sqlx::query("SAVEPOINT sp_unaddressed_slot")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO chat.direct_request_welcome_slots(request_id,recipient_did,recipient_device_id,operation_id,request_digest,charged_bytes) VALUES($1,$2,$3,$4,$5,32768)")
         .bind(request_id).bind(&bob_did).bind(bob_device_unaddressed).bind(Uuid::new_v4()).bind(vec![1u8; 32])
         .execute(&mut *tx)
@@ -126,8 +152,14 @@ async fn c21_unaddressed_device_gains_no_welcome_slots_on_publication_or_accepta
         .execute(&mut *tx)
         .await
         .expect_err("unaddressed device cannot satisfy deferred delivery FK constraint");
-    assert_eq!(err.as_database_error().unwrap().code().as_deref(), Some("23514"));
-    sqlx::query("ROLLBACK TO SAVEPOINT sp_unaddressed_slot").execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        err.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT sp_unaddressed_slot")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // 5. Post-acceptance state: unaddressed device has zero deliveries, zero welcome slots, zero outcomes
     let outcomes_count: i64 = sqlx::query_scalar(
@@ -137,7 +169,10 @@ async fn c21_unaddressed_device_gains_no_welcome_slots_on_publication_or_accepta
     .fetch_one(&mut *tx)
     .await
     .unwrap();
-    assert_eq!(outcomes_count, 0, "unaddressed device has zero welcome outcomes");
+    assert_eq!(
+        outcomes_count, 0,
+        "unaddressed device has zero welcome outcomes"
+    );
 
     let deliveries_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM chat.direct_request_device_deliveries WHERE owner_device_id=$1",
@@ -146,7 +181,10 @@ async fn c21_unaddressed_device_gains_no_welcome_slots_on_publication_or_accepta
     .fetch_one(&mut *tx)
     .await
     .unwrap();
-    assert_eq!(deliveries_count, 0, "unaddressed device has zero deliveries");
+    assert_eq!(
+        deliveries_count, 0,
+        "unaddressed device has zero deliveries"
+    );
 
     tx.rollback().await.unwrap();
 }
@@ -154,31 +192,50 @@ async fn c21_unaddressed_device_gains_no_welcome_slots_on_publication_or_accepta
 /// C22: Unimported expired device reports unavailable; already imported device retains preview/group.
 /// Sibling expiry cannot delete entire request or history.
 #[tokio::test]
-async fn c22_expired_unimported_device_cannot_claim_welcome_while_imported_sibling_retains_history() {
+async fn c22_expired_unimported_device_cannot_claim_welcome_while_imported_sibling_retains_history()
+{
     let pool = common::direct_request_database::setup().await;
     let mut tx = pool.begin().await.unwrap();
 
     // Verify database check constraint: expired welcome outcome requires NULL signed_request_bytes and NULL request_digest
     let req_id = Uuid::new_v4();
     let dev_id = Uuid::new_v4();
-    sqlx::query("SAVEPOINT sp_expired_nonnull").execute(&mut *tx).await.unwrap();
+    sqlx::query("SAVEPOINT sp_expired_nonnull")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     let err = sqlx::query("INSERT INTO chat.direct_request_welcome_outcomes(request_id,recipient_did,recipient_device_id,status,terminal_at,signed_request_bytes,request_digest) VALUES($1,'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa',$2,'expired',transaction_timestamp(),$3,$4)")
         .bind(req_id).bind(dev_id).bind(vec![1u8;32]).bind(vec![2u8;32])
         .execute(&mut *tx)
         .await
         .expect_err("expired outcome with nonnull digest must be rejected by check constraint");
-    assert_eq!(err.as_database_error().unwrap().code().as_deref(), Some("23514"));
-    sqlx::query("ROLLBACK TO SAVEPOINT sp_expired_nonnull").execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        err.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT sp_expired_nonnull")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // Verify acknowledged welcome outcome requires nonnull signed digest
-    sqlx::query("SAVEPOINT sp_ack_null").execute(&mut *tx).await.unwrap();
+    sqlx::query("SAVEPOINT sp_ack_null")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     let err = sqlx::query("INSERT INTO chat.direct_request_welcome_outcomes(request_id,recipient_did,recipient_device_id,status,terminal_at,signed_request_bytes,request_digest) VALUES($1,'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa',$2,'acknowledged',transaction_timestamp(),$3,NULL)")
         .bind(req_id).bind(dev_id).bind(vec![1u8;32])
         .execute(&mut *tx)
         .await
         .expect_err("acknowledged outcome with null digest must be rejected");
-    assert_eq!(err.as_database_error().unwrap().code().as_deref(), Some("23514"));
-    sqlx::query("ROLLBACK TO SAVEPOINT sp_ack_null").execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        err.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT sp_ack_null")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     tx.rollback().await.unwrap();
 }
@@ -228,12 +285,21 @@ async fn c23_legacy_pending_upgrade_preserves_conversation_and_rejects_races_and
     let inv_entry = Uuid::new_v4();
 
     for did in [&alice_did, &bob_did] {
-        sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,transaction_timestamp())")
-            .bind(did).execute(&mut *tx).await.unwrap();
+        sqlx::query(
+            "INSERT INTO chat.principals(user_did,created_at) VALUES($1,transaction_timestamp())",
+        )
+        .bind(did)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     }
     let alice_key_id = insert_test_device(&mut tx, &alice_did, alice_device, "alice", 1).await;
 
-    let (low, high) = if alice_did < bob_did { (&alice_did, &bob_did) } else { (&bob_did, &alice_did) };
+    let (low, high) = if alice_did < bob_did {
+        (&alice_did, &bob_did)
+    } else {
+        (&bob_did, &alice_did)
+    };
 
     // Setup legacy v1 active direct conversation with Alice active and Bob pending
     sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,direct_did_low,direct_did_high,protocol_version,lifecycle,current_generation,current_state_version,next_entry_seq,created_at) VALUES($1,'direct',$2,$3,'1','active',1,1,2,transaction_timestamp())")
@@ -248,25 +314,47 @@ async fn c23_legacy_pending_upgrade_preserves_conversation_and_rejects_races_and
     assert!(check_upgrade_eligibility(&mut tx, conversation_id, &alice_did, &bob_did).await);
 
     // Race 1: Bob accepts legacy conversation first
-    sqlx::query("SAVEPOINT race_accept").execute(&mut *tx).await.unwrap();
+    sqlx::query("SAVEPOINT race_accept")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     sqlx::query("UPDATE chat.participants SET status='active', acceptance_transition_id=$3, acceptance_entry_id=$4, accepted_at=transaction_timestamp() WHERE conversation_id=$1 AND user_did=$2")
         .bind(conversation_id).bind(&bob_did).bind(Uuid::new_v4()).bind(Uuid::new_v4()).execute(&mut *tx).await.unwrap();
-    assert!(!check_upgrade_eligibility(&mut tx, conversation_id, &alice_did, &bob_did).await, "accepted legacy conversation must reject upgrade");
-    sqlx::query("ROLLBACK TO SAVEPOINT race_accept").execute(&mut *tx).await.unwrap();
+    assert!(
+        !check_upgrade_eligibility(&mut tx, conversation_id, &alice_did, &bob_did).await,
+        "accepted legacy conversation must reject upgrade"
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT race_accept")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // Race 2: Conversation closed/superseded first
-    sqlx::query("SAVEPOINT race_close").execute(&mut *tx).await.unwrap();
+    sqlx::query("SAVEPOINT race_close")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     sqlx::query("UPDATE chat.conversations SET lifecycle='superseded', close_transition_id=$2, close_generation=1, close_state_version=1, close_seq=2, closed_at=transaction_timestamp() WHERE conversation_id=$1")
         .bind(conversation_id).bind(Uuid::new_v4()).execute(&mut *tx).await.unwrap();
-    assert!(!check_upgrade_eligibility(&mut tx, conversation_id, &alice_did, &bob_did).await, "closed/superseded legacy conversation must reject upgrade");
-    sqlx::query("ROLLBACK TO SAVEPOINT race_close").execute(&mut *tx).await.unwrap();
+    assert!(
+        !check_upgrade_eligibility(&mut tx, conversation_id, &alice_did, &bob_did).await,
+        "closed/superseded legacy conversation must reject upgrade"
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT race_close")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // Race 3: Conflicting pending recovery/reset work
     let reset_id = Uuid::new_v4();
     let transcript = b"reset-transcript".to_vec();
     let transcript_sha = Sha256::digest(&transcript).to_vec();
-    sqlx::query("SAVEPOINT race_recovery").execute(&mut *tx).await.unwrap();
-    sqlx::query(r#"INSERT INTO chat.reset_requests(
+    sqlx::query("SAVEPOINT race_recovery")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"INSERT INTO chat.reset_requests(
         reset_request_id, conversation_id, requester_did, requester_device_id, requester_key_id,
         requester_auth_generation, prior_generation, prior_state_version, prior_group_id,
         prior_epoch, prior_group_context_hash, prior_confirmation_tag, reason, status,
@@ -278,28 +366,63 @@ async fn c23_legacy_pending_upgrade_preserves_conversation_and_rejects_races_and
         0, $7, $8, 'localStateLost', 'pending',
         $9, $9, $10, $11,
         transaction_timestamp(), transaction_timestamp() + interval '24 hours'
-    )"#)
-        .bind(reset_id).bind(conversation_id).bind(&alice_did).bind(alice_device).bind(&alice_key_id)
-        .bind(vec![1u8;32]).bind(vec![2u8;32]).bind(vec![3u8;32])
-        .bind(&transcript).bind(&transcript_sha).bind(vec![5u8;64])
-        .execute(&mut *tx).await.unwrap();
-    assert!(!check_upgrade_eligibility(&mut tx, conversation_id, &alice_did, &bob_did).await, "pending reset request must reject upgrade");
-    sqlx::query("ROLLBACK TO SAVEPOINT race_recovery").execute(&mut *tx).await.unwrap();
+    )"#,
+    )
+    .bind(reset_id)
+    .bind(conversation_id)
+    .bind(&alice_did)
+    .bind(alice_device)
+    .bind(&alice_key_id)
+    .bind(vec![1u8; 32])
+    .bind(vec![2u8; 32])
+    .bind(vec![3u8; 32])
+    .bind(&transcript)
+    .bind(&transcript_sha)
+    .bind(vec![5u8; 64])
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    assert!(
+        !check_upgrade_eligibility(&mut tx, conversation_id, &alice_did, &bob_did).await,
+        "pending reset request must reject upgrade"
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT race_recovery")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // Successful upgrade execution: keeps same conversation_id, advances generation and protocol_version
     sqlx::query("UPDATE chat.conversations SET protocol_version='2', current_generation=2, next_entry_seq=3 WHERE conversation_id=$1")
         .bind(conversation_id).execute(&mut *tx).await.unwrap();
 
-    let version: String = sqlx::query_scalar("SELECT protocol_version FROM chat.conversations WHERE conversation_id=$1")
-        .bind(conversation_id).fetch_one(&mut *tx).await.unwrap();
+    let version: String = sqlx::query_scalar(
+        "SELECT protocol_version FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
     assert_eq!(version, "2", "upgraded protocol version");
 
     // Monotonic upgrade trigger: attempting to downgrade from '2' to '1' is rejected by enforce_request_protocol_upgrade
-    sqlx::query("SAVEPOINT sp_downgrade").execute(&mut *tx).await.unwrap();
-    let err = sqlx::query("UPDATE chat.conversations SET protocol_version='1' WHERE conversation_id=$1")
-        .bind(conversation_id).execute(&mut *tx).await.expect_err("protocol downgrade must be rejected by trigger");
-    assert_eq!(err.as_database_error().unwrap().code().as_deref(), Some("23514"));
-    sqlx::query("ROLLBACK TO SAVEPOINT sp_downgrade").execute(&mut *tx).await.unwrap();
+    sqlx::query("SAVEPOINT sp_downgrade")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let err =
+        sqlx::query("UPDATE chat.conversations SET protocol_version='1' WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await
+            .expect_err("protocol downgrade must be rejected by trigger");
+    assert_eq!(
+        err.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT sp_downgrade")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     tx.rollback().await.unwrap();
 }
@@ -319,13 +442,23 @@ async fn c24_unscoped_inventory_session_rejects_v2_and_cannot_mint_destructive_p
     let v2_convo = Uuid::new_v4();
 
     for did in [&creator_did, &bob_did] {
-        sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,transaction_timestamp())")
-            .bind(did).execute(&mut *tx).await.unwrap();
+        sqlx::query(
+            "INSERT INTO chat.principals(user_did,created_at) VALUES($1,transaction_timestamp())",
+        )
+        .bind(did)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     }
-    let _creator_key = insert_test_device(&mut tx, &creator_did, creator_device, "creator", 1).await;
+    let _creator_key =
+        insert_test_device(&mut tx, &creator_did, creator_device, "creator", 1).await;
     let _bob_key = insert_test_device(&mut tx, &bob_did, bob_device, "bob-dev", 2).await;
 
-    let (low, high) = if creator_did < bob_did { (&creator_did, &bob_did) } else { (&bob_did, &creator_did) };
+    let (low, high) = if creator_did < bob_did {
+        (&creator_did, &bob_did)
+    } else {
+        (&bob_did, &creator_did)
+    };
     sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,direct_did_low,direct_did_high,protocol_version,lifecycle,current_generation,current_state_version,next_entry_seq,created_at) VALUES($1,'direct',$2,$3,'2','active',1,1,2,transaction_timestamp())")
         .bind(v2_convo).bind(low).bind(high).execute(&mut *tx).await.unwrap();
 
@@ -338,7 +471,10 @@ async fn c24_unscoped_inventory_session_rejects_v2_and_cannot_mint_destructive_p
         "SELECT EXISTS (SELECT 1 FROM chat.conversations c WHERE NOT (c.protocol_version = ANY($3)) AND (EXISTS (SELECT 1 FROM chat.participants p WHERE p.conversation_id=c.conversation_id AND p.user_did=$1) OR EXISTS (SELECT 1 FROM chat.application_intervals i WHERE i.conversation_id=c.conversation_id AND i.recipient_did=$1 AND i.recipient_device_id=$2)))"
     )
     .bind(&bob_did).bind(bob_device).bind(&versions).fetch_one(&mut *tx).await.unwrap();
-    assert!(unsupported, "unsupported inventory must be detected for unscoped reader");
+    assert!(
+        unsupported,
+        "unsupported inventory must be detected for unscoped reader"
+    );
 
     // Test database trigger: attempting to create or scope an inventory session for an unsupported protocol version fails
     sqlx::query("INSERT INTO chat.protocol_instances(singleton,protocol_version,protocol_instance_id,cursor_key_id) VALUES(TRUE,'1',$1,$2) ON CONFLICT DO NOTHING")
@@ -350,13 +486,26 @@ async fn c24_unscoped_inventory_session_rejects_v2_and_cannot_mint_destructive_p
         .bind(session).bind(vec![7u8;32]).bind(&bob_did).bind(bob_device).bind(random_jkt(2)).bind(vec![1u8;12]).bind(vec![2u8;32]).execute(&mut *tx).await.unwrap();
 
     // Attempting to set supported_protocol_versions = ['1'] while scoping a v2 conversation fails with version mismatch!
-    sqlx::query("SAVEPOINT sp_scope_mismatch").execute(&mut *tx).await.unwrap();
+    sqlx::query("SAVEPOINT sp_scope_mismatch")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     let scope_v1 = json!({"supportedProtocolVersions":["1"],"scopeDigest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="});
     let err = sqlx::query("UPDATE chat.inventory_sessions SET inventory_scope=$2,supported_protocol_versions=ARRAY['1'],scoped_conversation_ids=ARRAY[$3]::uuid[] WHERE inventory_session_id=$1")
         .bind(session).bind(&scope_v1).bind(v2_convo).execute(&mut *tx).await.expect_err("v1 scope cannot claim v2 conversation");
-    assert_eq!(err.as_database_error().unwrap().code().as_deref(), Some("23514"));
-    assert!(err.as_database_error().unwrap().message().contains("scope audience version mismatch"));
-    sqlx::query("ROLLBACK TO SAVEPOINT sp_scope_mismatch").execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        err.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+    assert!(err
+        .as_database_error()
+        .unwrap()
+        .message()
+        .contains("scope audience version mismatch"));
+    sqlx::query("ROLLBACK TO SAVEPOINT sp_scope_mismatch")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // Setting supported_protocol_versions = ['1', '2'] succeeds
     let scope_v2 = json!({"supportedProtocolVersions":["1","2"],"scopeDigest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="});
@@ -378,8 +527,13 @@ async fn c25_inventory_scope_bound_to_domains_and_cursor_compatibility() {
     let session = Uuid::new_v4();
     let convo_scoped = Uuid::new_v4();
 
-    sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,transaction_timestamp())")
-        .bind(&did).execute(&mut *tx).await.unwrap();
+    sqlx::query(
+        "INSERT INTO chat.principals(user_did,created_at) VALUES($1,transaction_timestamp())",
+    )
+    .bind(&did)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'c25-test','active',$3,1,chat.protocol_capabilities(),transaction_timestamp(),transaction_timestamp())")
         .bind(&did).bind(device).bind(random_jkt(1)).execute(&mut *tx).await.unwrap();
 
@@ -400,16 +554,34 @@ async fn c25_inventory_scope_bound_to_domains_and_cursor_compatibility() {
         .bind(session).bind(&scope).bind(convo_scoped).execute(&mut *tx).await.unwrap();
 
     // 1. Scope immutability: changing inventory scope on the session is rejected
-    sqlx::query("SAVEPOINT sp_mutate_scope").execute(&mut *tx).await.unwrap();
+    sqlx::query("SAVEPOINT sp_mutate_scope")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     let mutated_scope = json!({"supportedProtocolVersions":["1","2"],"scopeDigest":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="});
-    let err = sqlx::query("UPDATE chat.inventory_sessions SET inventory_scope=$2 WHERE inventory_session_id=$1")
-        .bind(session).bind(mutated_scope).execute(&mut *tx).await.expect_err("inventory scope must be immutable");
-    assert_eq!(err.as_database_error().unwrap().code().as_deref(), Some("23514"));
-    sqlx::query("ROLLBACK TO SAVEPOINT sp_mutate_scope").execute(&mut *tx).await.unwrap();
+    let err = sqlx::query(
+        "UPDATE chat.inventory_sessions SET inventory_scope=$2 WHERE inventory_session_id=$1",
+    )
+    .bind(session)
+    .bind(mutated_scope)
+    .execute(&mut *tx)
+    .await
+    .expect_err("inventory scope must be immutable");
+    assert_eq!(
+        err.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT sp_mutate_scope")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // 2. assert_direct_request_inventory_scope succeeds when session has valid scope and no unscoped items
     sqlx::query("SELECT chat.assert_direct_request_inventory_scope($1)")
-        .bind(session).execute(&mut *tx).await.expect("clean scoped session must pass assert_direct_request_inventory_scope");
+        .bind(session)
+        .execute(&mut *tx)
+        .await
+        .expect("clean scoped session must pass assert_direct_request_inventory_scope");
 
     // 3. Schema validation: unknown welcome union cannot be silently dropped
     let unknown_welcome = json!({

@@ -1,12 +1,12 @@
 //! DS-to-DS handlers for canonical blue.catbird.chat direct requests.
 
-use std::sync::Arc;
 use axum::{
     extract::{Query, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -44,8 +44,11 @@ pub async fn reserve_recipient_bootstrap(
     auth_user: AuthUser,
     Json(input): Json<ReserveRecipientBootstrapInput>,
 ) -> Result<Json<ReserveRecipientBootstrapOutput>, FederationError> {
-    let security = enforce_ds_request_security(&pool, &auth_user, RESERVE_BOOTSTRAP_NSID, None).await?;
-    let selected_devices = canonical_relay::local_reserve_recipient_bootstrap(&pool, &security.requester_ds, &input).await?;
+    let security =
+        enforce_ds_request_security(&pool, &auth_user, RESERVE_BOOTSTRAP_NSID, None).await?;
+    let selected_devices =
+        canonical_relay::local_reserve_recipient_bootstrap(&pool, &security.requester_ds, &input)
+            .await?;
     Ok(Json(ReserveRecipientBootstrapOutput { selected_devices }))
 }
 /// POST /xrpc/blue.catbird.mlsDS.releaseRecipientBootstrap
@@ -54,11 +57,17 @@ pub async fn release_recipient_bootstrap(
     auth_user: AuthUser,
     Json(input): Json<canonical_relay::ReleaseRecipientBootstrapInput>,
 ) -> Result<Json<Value>, FederationError> {
-    let security = enforce_ds_request_security(&pool, &auth_user, RELEASE_BOOTSTRAP_NSID, None).await?;
-    canonical_relay::local_release_recipient_bootstrap(&pool, &security.requester_ds, input.request_id, &input.recipient_did).await?;
+    let security =
+        enforce_ds_request_security(&pool, &auth_user, RELEASE_BOOTSTRAP_NSID, None).await?;
+    canonical_relay::local_release_recipient_bootstrap(
+        &pool,
+        &security.requester_ds,
+        input.request_id,
+        &input.recipient_did,
+    )
+    .await?;
     Ok(Json(json!({ "released": true })))
 }
-
 
 /// POST /xrpc/blue.catbird.mlsDS.prepareDirectRequest
 pub async fn prepare_direct_request(
@@ -68,7 +77,13 @@ pub async fn prepare_direct_request(
     Json(input): Json<Value>,
 ) -> Result<Json<Value>, FederationError> {
     let security = enforce_ds_request_security(&pool, &auth_user, PREPARE_NSID, None).await?;
-    let outcome = canonical_relay::coordinator_prepare_direct_request(&pool, &runtime, &security.requester_ds, &input).await?;
+    let outcome = canonical_relay::coordinator_prepare_direct_request(
+        &pool,
+        &runtime,
+        &security.requester_ds,
+        &input,
+    )
+    .await?;
     Ok(Json(outcome))
 }
 
@@ -80,7 +95,13 @@ pub async fn publish_direct_request(
     Json(input): Json<Value>,
 ) -> Result<Json<Value>, FederationError> {
     let security = enforce_ds_request_security(&pool, &auth_user, PUBLISH_NSID, None).await?;
-    let outcome = canonical_relay::coordinator_publish_direct_request(&pool, &runtime, &security.requester_ds, &input).await?;
+    let outcome = canonical_relay::coordinator_publish_direct_request(
+        &pool,
+        &runtime,
+        &security.requester_ds,
+        &input,
+    )
+    .await?;
     Ok(Json(outcome))
 }
 
@@ -91,7 +112,8 @@ pub async fn deliver_direct_request(
     auth_user: AuthUser,
     Json(input): Json<DeliverDirectRequestInput>,
 ) -> Result<Json<Value>, FederationError> {
-    let security = enforce_ds_request_security(&pool, &auth_user, DELIVER_REQUEST_NSID, None).await?;
+    let security =
+        enforce_ds_request_security(&pool, &auth_user, DELIVER_REQUEST_NSID, None).await?;
     canonical_relay::ingest_remote_direct_request_delivery(
         &pool,
         Some(runtime.sse_state()),
@@ -109,7 +131,8 @@ pub async fn deliver_acceptance(
     auth_user: AuthUser,
     Json(input): Json<DeliverAcceptanceInput>,
 ) -> Result<Json<DeliverAcceptanceOutput>, FederationError> {
-    let security = enforce_ds_request_security(&pool, &auth_user, DELIVER_ACCEPT_NSID, None).await?;
+    let security =
+        enforce_ds_request_security(&pool, &auth_user, DELIVER_ACCEPT_NSID, None).await?;
     let output = canonical_relay::coordinator_accept_direct_request(
         &pool,
         &runtime,
@@ -128,7 +151,8 @@ pub async fn deliver_acceptance_entry(
     auth_user: AuthUser,
     Json(input): Json<DeliverAcceptanceEntryInput>,
 ) -> Result<Json<Value>, FederationError> {
-    let security = enforce_ds_request_security(&pool, &auth_user, DELIVER_ACCEPT_ENTRY_NSID, None).await?;
+    let security =
+        enforce_ds_request_security(&pool, &auth_user, DELIVER_ACCEPT_ENTRY_NSID, None).await?;
     canonical_relay::ingest_remote_acceptance_entry(
         &pool,
         Some(runtime.sse_state()),
@@ -148,7 +172,8 @@ pub async fn relay_send_message(
     auth_user: AuthUser,
     Json(input): Json<RelaySendMessageInput>,
 ) -> Result<Json<Value>, FederationError> {
-    let security = enforce_ds_request_security(&pool, &auth_user, RELAY_SEND_MESSAGE_NSID, None).await?;
+    let security =
+        enforce_ds_request_security(&pool, &auth_user, RELAY_SEND_MESSAGE_NSID, None).await?;
     let output = canonical_relay::coordinator_handle_message(
         &pool,
         &runtime,
@@ -167,7 +192,8 @@ pub async fn deliver_message_entry(
     auth_user: AuthUser,
     Json(input): Json<DeliverMessageEntryInput>,
 ) -> Result<Json<Value>, FederationError> {
-    let security = enforce_ds_request_security(&pool, &auth_user, DELIVER_MESSAGE_ENTRY_NSID, None).await?;
+    let security =
+        enforce_ds_request_security(&pool, &auth_user, DELIVER_MESSAGE_ENTRY_NSID, None).await?;
     canonical_relay::ingest_remote_message_entry(
         &pool,
         Some(runtime.sse_state()),

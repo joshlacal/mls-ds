@@ -119,10 +119,7 @@ mod repository {
             }
         }
 
-        async fn lock(
-            tx: &mut Transaction<'_, Postgres>,
-            i: &AttemptIdentity,
-        ) -> R<LockedAttempt> {
+        async fn lock(tx: &mut Transaction<'_, Postgres>, i: &AttemptIdentity) -> R<LockedAttempt> {
             let op = super::prelude::lock_direct_request_operation(tx, i.request_id).await?;
             super::prelude::lock_direct_request_identity_scope(
                 tx,

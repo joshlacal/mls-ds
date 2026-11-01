@@ -361,7 +361,9 @@ pub async fn seed_clean_slate_application_fixture(
     )
     .map_err(|error| format!("verify native clean-slate application: {error:?}"))?;
     if native.aad() != expected_aad {
-        return Err("native MLS AAD differs from the clean-slate signed request projection".to_owned());
+        return Err(
+            "native MLS AAD differs from the clean-slate signed request projection".to_owned(),
+        );
     }
 
     Ok(CleanSlateApplicationFixture {
@@ -449,14 +451,24 @@ pub async fn seed_clean_slate_expired_direct_request_fixture(
     let actor_leaf_id = Uuid::new_v4();
     let recipient_leaf_id = Uuid::new_v4();
 
-    let (genesis_info, final_state, tree_bytes, tree_sha256, final_info, welcome_bytes, initial_ct, kp_ref, kp_wrapper, kp_init_key) =
-        application_routing_fixture::build_c33_two_leaf_artifacts(
-            &actor,
-            &recipient,
-            conversation_id,
-            request_id,
-            created_at,
-        )?;
+    let (
+        genesis_info,
+        final_state,
+        tree_bytes,
+        tree_sha256,
+        final_info,
+        welcome_bytes,
+        initial_ct,
+        kp_ref,
+        kp_wrapper,
+        kp_init_key,
+    ) = application_routing_fixture::build_c33_two_leaf_artifacts(
+        &actor,
+        &recipient,
+        conversation_id,
+        request_id,
+        created_at,
+    )?;
 
     let context_hash = [0x31_u8; 32];
     let prepare_digest = [0x32_u8; 32];
@@ -499,7 +511,8 @@ pub async fn seed_clean_slate_expired_direct_request_fixture(
         "signature": STANDARD.encode([0x77_u8; 64]),
     });
     let signed_publication = serde_json::to_vec(&signed_pub_val).map_err(|e| e.to_string())?;
-    let unsigned_body_bytes = serde_json::to_vec(&signed_pub_val["body"]).map_err(|e| e.to_string())?;
+    let unsigned_body_bytes =
+        serde_json::to_vec(&signed_pub_val["body"]).map_err(|e| e.to_string())?;
     let publication_digest: [u8; 32] = Sha256::digest(&unsigned_body_bytes).into();
     let request_entry_val = serde_json::json!({
         "$type": "blue.catbird.chat.defs#directRequestEntry",
@@ -864,8 +877,7 @@ pub async fn seed_clean_slate_expired_direct_request_fixture(
     let recipient_leaf = leaves
         .iter()
         .find(|l| {
-            l.basic_credential()
-                == format!("{}#{}", recipient.did, recipient.device_id).as_bytes()
+            l.basic_credential() == format!("{}#{}", recipient.did, recipient.device_id).as_bytes()
         })
         .ok_or_else(|| "missing recipient leaf in c33 final_state".to_owned())?;
 
@@ -1078,6 +1090,482 @@ pub async fn seed_clean_slate_expired_direct_request_fixture(
         actor_did: actor.did,
         recipient_did: recipient.did,
     })
+}
+
+/// Seed a 3rd active zero-leaf participant into an existing clean-slate group conversation
+/// (via committed `'policy'` invitation + `'acceptConversation'` acceptance transitions) for SpaceHost tests.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn seed_clean_slate_active_zero_leaf_member_for_test(
+    pool: &sqlx::PgPool,
+    conversation_id: uuid::Uuid,
+    admin_did: &str,
+    member_did: &str,
+) -> Result<(), String> {
+    use chrono::SecondsFormat;
+    use sha2::{Digest as _, Sha256};
+    use uuid::Uuid;
+
+    let now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let trusted_past =
+        super::validation::TrustedRequestInstant::from_datetime(now - chrono::Duration::seconds(5))
+            .map_err(|e| format!("trusted instant: {e:?}"))?;
+    let member_ident = application_routing_fixture::FixtureIdentity::fresh_for_did(
+        member_did,
+        b"space-zero-leaf",
+    )?;
+    application_routing_fixture::seed_identity(pool, &member_ident, &trusted_past).await?;
+
+    let (gen, cur_sv, next_seq): (i64, i64, i64) = sqlx::query_as(
+        "SELECT current_generation, current_state_version, next_entry_seq \
+           FROM chat.conversations WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (admin_dev, admin_kid): (Uuid, String) = sqlx::query_as(
+        "SELECT d.device_id, k.key_id \
+           FROM chat.devices d \
+           JOIN chat.device_keys k USING (user_did, device_id) \
+          WHERE d.user_did = $1 AND d.status = 'active' LIMIT 1",
+    )
+    .bind(admin_did)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (group_id, epoch, gch, ct, snap, snap_sha, tree, tree_sha, leaf_count): (
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT group_id, epoch, group_context_hash, confirmation_tag, public_snapshot_bytes, \
+                snapshot_sha256, tree_summary_bytes, tree_summary_sha256, leaf_count \
+           FROM chat.generation_states \
+          WHERE conversation_id = $1 AND generation = $2 AND state_version = $3",
+    )
+    .bind(conversation_id)
+    .bind(gen)
+    .bind(cur_sv)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let inv_tid = Uuid::new_v4();
+    let inv_eid = Uuid::new_v4();
+    let inv_at = now;
+    let inv_seq = next_seq;
+    let inv_sv = cur_sv + 1;
+
+    let acc_tid = Uuid::new_v4();
+    let acc_eid = Uuid::new_v4();
+    let acc_at = now + chrono::Duration::milliseconds(10);
+    let acc_seq = next_seq + 1;
+    let acc_sv = cur_sv + 2;
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    for (
+        tid,
+        eid,
+        kind,
+        entry_kind,
+        prior_sv,
+        next_sv,
+        seq,
+        ts,
+        actor_d,
+        actor_dev,
+        actor_k,
+        actor_r,
+    ) in [
+        (
+            inv_tid,
+            inv_eid,
+            "policy",
+            "blue.catbird.chat.defs#policyEntry",
+            cur_sv,
+            inv_sv,
+            inv_seq,
+            inv_at,
+            admin_did,
+            admin_dev,
+            admin_kid.as_str(),
+            "admin",
+        ),
+        (
+            acc_tid,
+            acc_eid,
+            "acceptConversation",
+            "blue.catbird.chat.defs#participantAcceptanceEntry",
+            inv_sv,
+            acc_sv,
+            acc_seq,
+            acc_at,
+            member_did,
+            member_ident.device_id,
+            member_ident.key_id.as_str(),
+            "member",
+        ),
+    ] {
+        let req_bytes = format!("{{\"transitionId\":\"{tid}\"}}").into_bytes();
+        let req_digest: [u8; 32] = Sha256::digest(&req_bytes).into();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "$type": entry_kind,
+            "entryId": eid.to_string(),
+            "conversationId": conversation_id.to_string(),
+            "seq": seq,
+            "receivedAt": ts.to_rfc3339_opts(SecondsFormat::Millis, true),
+        }))
+        .map_err(|e| e.to_string())?;
+        let payload_sha: [u8; 32] = Sha256::digest(&payload).into();
+        let server_fields = serde_json::to_vec(&serde_json::json!({
+            "entryId": eid.to_string(),
+            "conversationId": conversation_id.to_string(),
+            "seq": seq,
+            "receivedAt": ts.to_rfc3339_opts(SecondsFormat::Millis, true),
+        }))
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "INSERT INTO chat.generation_states( \
+                 conversation_id, generation, state_version, group_id, epoch, group_context_hash, \
+                 confirmation_tag, lifecycle, state_kind, producing_transition_id, \
+                 public_snapshot_bytes, snapshot_sha256, tree_summary_bytes, tree_summary_sha256, \
+                 leaf_count, created_at \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8,$9,$10,$11,$12,$13,$14,$15)",
+        )
+        .bind(conversation_id)
+        .bind(gen)
+        .bind(next_sv)
+        .bind(&group_id)
+        .bind(epoch)
+        .bind(&gch)
+        .bind(&ct)
+        .bind(kind)
+        .bind(tid)
+        .bind(&snap)
+        .bind(&snap_sha)
+        .bind(&tree)
+        .bind(&tree_sha)
+        .bind(leaf_count)
+        .bind(ts)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert {kind} state: {e}"))?;
+
+        sqlx::query(
+            "INSERT INTO chat.transitions( \
+                 transition_id, conversation_id, kind, actor_did, actor_device_id, actor_key_id, \
+                 actor_auth_generation, actor_role, actor_device_status, signed_request_bytes, \
+                 unsigned_projection_bytes, signing_transcript_bytes, request_digest, signature, \
+                 prior_generation, prior_state_version, next_generation, next_state_version, \
+                 entry_seq, accepted_at \
+             ) VALUES ($1,$2,$3,$4,$5,$6,1,$7,'active',$8,$8,$8,$9,$10,$11,$12,$11,$13,$14,$15)",
+        )
+        .bind(tid)
+        .bind(conversation_id)
+        .bind(kind)
+        .bind(actor_d)
+        .bind(actor_dev)
+        .bind(actor_k)
+        .bind(actor_r)
+        .bind(&req_bytes)
+        .bind(req_digest.as_slice())
+        .bind([0x55_u8; 64].as_slice())
+        .bind(gen)
+        .bind(prior_sv)
+        .bind(next_sv)
+        .bind(seq)
+        .bind(ts)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert {kind} transition: {e}"))?;
+
+        sqlx::query(
+            "INSERT INTO chat.entries( \
+                 conversation_id, seq, entry_id, entry_kind, accepted_payload_bytes, \
+                 accepted_payload_sha256, signed_request_bytes, request_digest, signature, \
+                 server_fields_bytes, outer_entry_fingerprint, actor_did, actor_device_id, \
+                 actor_key_id, actor_auth_generation, generation, state_version, transition_id, received_at \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$6,$11,$12,$13,1,$14,$15,$16,$17)",
+        )
+        .bind(conversation_id)
+        .bind(seq)
+        .bind(eid)
+        .bind(entry_kind)
+        .bind(&payload)
+        .bind(payload_sha.as_slice())
+        .bind(&req_bytes)
+        .bind(req_digest.as_slice())
+        .bind([0x55_u8; 64].as_slice())
+        .bind(&server_fields)
+        .bind(actor_d)
+        .bind(actor_dev)
+        .bind(actor_k)
+        .bind(gen)
+        .bind(next_sv)
+        .bind(tid)
+        .bind(ts)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert {kind} entry: {e}"))?;
+    }
+
+    sqlx::query(
+        "INSERT INTO chat.participants( \
+             participant_period_id, conversation_id, user_did, status, role, role_transition_id, \
+             role_changed_at, created_by_did, created_by_device_id, invitation_transition_id, \
+             invitation_entry_id, invited_at, acceptance_transition_id, acceptance_entry_id, \
+             accepted_at, current_membership, created_at \
+         ) VALUES ($1,$2,$3,'active','member',$4,$5,$6,$7,$4,$8,$5,$9,$10,$11,true,$5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(conversation_id)
+    .bind(member_did)
+    .bind(inv_tid)
+    .bind(inv_at)
+    .bind(admin_did)
+    .bind(admin_dev)
+    .bind(inv_eid)
+    .bind(acc_tid)
+    .bind(acc_eid)
+    .bind(acc_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert zero-leaf participant: {e}"))?;
+
+    sqlx::query("UPDATE chat.generations SET current_state_version = $3 WHERE conversation_id = $1 AND generation = $2")
+        .bind(conversation_id)
+        .bind(gen)
+        .bind(acc_sv)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("UPDATE chat.conversations SET current_state_version = $2, next_entry_seq = $3 WHERE conversation_id = $1")
+        .bind(conversation_id)
+        .bind(acc_sv)
+        .bind(acc_seq + 1)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("commit zero-leaf member: {e}"))?;
+    Ok(())
+}
+
+/// Remove a zero-leaf active participant via a committed `'policy'` removal transition (`D3` / SpaceHost tests).
+#[cfg(any(test, feature = "test-support"))]
+pub async fn seed_clean_slate_remove_zero_leaf_member_for_test(
+    pool: &sqlx::PgPool,
+    conversation_id: uuid::Uuid,
+    admin_did: &str,
+    member_did: &str,
+) -> Result<(), String> {
+    use chrono::SecondsFormat;
+    use sha2::{Digest as _, Sha256};
+    use uuid::Uuid;
+
+    let now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (gen, cur_sv, next_seq): (i64, i64, i64) = sqlx::query_as(
+        "SELECT current_generation, current_state_version, next_entry_seq \
+           FROM chat.conversations WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (admin_dev, admin_kid): (Uuid, String) = sqlx::query_as(
+        "SELECT d.device_id, k.key_id \
+           FROM chat.devices d \
+           JOIN chat.device_keys k USING (user_did, device_id) \
+          WHERE d.user_did = $1 AND d.status = 'active' LIMIT 1",
+    )
+    .bind(admin_did)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (group_id, epoch, gch, ct, snap, snap_sha, tree, tree_sha, leaf_count): (
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT group_id, epoch, group_context_hash, confirmation_tag, public_snapshot_bytes, \
+                snapshot_sha256, tree_summary_bytes, tree_summary_sha256, leaf_count \
+           FROM chat.generation_states \
+          WHERE conversation_id = $1 AND generation = $2 AND state_version = $3",
+    )
+    .bind(conversation_id)
+    .bind(gen)
+    .bind(cur_sv)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let rem_tid = Uuid::new_v4();
+    let rem_eid = Uuid::new_v4();
+    let rem_sv = cur_sv + 1;
+    let rem_seq = next_seq;
+    let req_bytes = format!("{{\"transitionId\":\"{rem_tid}\"}}").into_bytes();
+    let req_digest: [u8; 32] = Sha256::digest(&req_bytes).into();
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "$type": "blue.catbird.chat.defs#policyEntry",
+        "entryId": rem_eid.to_string(),
+        "conversationId": conversation_id.to_string(),
+        "seq": rem_seq,
+        "receivedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+    }))
+    .map_err(|e| e.to_string())?;
+    let payload_sha: [u8; 32] = Sha256::digest(&payload).into();
+    let server_fields = serde_json::to_vec(&serde_json::json!({
+        "entryId": rem_eid.to_string(),
+        "conversationId": conversation_id.to_string(),
+        "seq": rem_seq,
+        "receivedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+    }))
+    .map_err(|e| e.to_string())?;
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "INSERT INTO chat.generation_states( \
+             conversation_id, generation, state_version, group_id, epoch, group_context_hash, \
+             confirmation_tag, lifecycle, state_kind, producing_transition_id, \
+             public_snapshot_bytes, snapshot_sha256, tree_summary_bytes, tree_summary_sha256, \
+             leaf_count, created_at \
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,'active','policy',$8,$9,$10,$11,$12,$13,$14)",
+    )
+    .bind(conversation_id)
+    .bind(gen)
+    .bind(rem_sv)
+    .bind(&group_id)
+    .bind(epoch)
+    .bind(&gch)
+    .bind(&ct)
+    .bind(rem_tid)
+    .bind(&snap)
+    .bind(&snap_sha)
+    .bind(&tree)
+    .bind(&tree_sha)
+    .bind(leaf_count)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert remove state: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.transitions( \
+             transition_id, conversation_id, kind, actor_did, actor_device_id, actor_key_id, \
+             actor_auth_generation, actor_role, actor_device_status, signed_request_bytes, \
+             unsigned_projection_bytes, signing_transcript_bytes, request_digest, signature, \
+             prior_generation, prior_state_version, next_generation, next_state_version, \
+             entry_seq, accepted_at \
+         ) VALUES ($1,$2,'policy',$3,$4,$5,1,'admin','active',$6,$6,$6,$7,$8,$9,$10,$9,$11,$12,$13)",
+    )
+    .bind(rem_tid)
+    .bind(conversation_id)
+    .bind(admin_did)
+    .bind(admin_dev)
+    .bind(&admin_kid)
+    .bind(&req_bytes)
+    .bind(req_digest.as_slice())
+    .bind([0x66_u8; 64].as_slice())
+    .bind(gen)
+    .bind(cur_sv)
+    .bind(rem_sv)
+    .bind(rem_seq)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert remove transition: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO chat.entries( \
+             conversation_id, seq, entry_id, entry_kind, accepted_payload_bytes, \
+             accepted_payload_sha256, signed_request_bytes, request_digest, signature, \
+             server_fields_bytes, outer_entry_fingerprint, actor_did, actor_device_id, \
+             actor_key_id, actor_auth_generation, generation, state_version, transition_id, received_at \
+         ) VALUES ($1,$2,$3,'blue.catbird.chat.defs#policyEntry',$4,$5,$6,$7,$8,$9,$5,$10,$11,$12,1,$13,$14,$15,$16)",
+    )
+    .bind(conversation_id)
+    .bind(rem_seq)
+    .bind(rem_eid)
+    .bind(&payload)
+    .bind(payload_sha.as_slice())
+    .bind(&req_bytes)
+    .bind(req_digest.as_slice())
+    .bind([0x66_u8; 64].as_slice())
+    .bind(&server_fields)
+    .bind(admin_did)
+    .bind(admin_dev)
+    .bind(&admin_kid)
+    .bind(gen)
+    .bind(rem_sv)
+    .bind(rem_tid)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert remove entry: {e}"))?;
+
+    sqlx::query(
+        "UPDATE chat.participants \
+            SET current_membership = FALSE, removing_transition_id = $3, removing_seq = $4, removed_at = $5 \
+          WHERE conversation_id = $1 AND user_did = $2 AND current_membership = TRUE",
+    )
+    .bind(conversation_id)
+    .bind(member_did)
+    .bind(rem_tid)
+    .bind(rem_seq)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("terminalize removed participant: {e}"))?;
+
+    sqlx::query("UPDATE chat.generations SET current_state_version = $3 WHERE conversation_id = $1 AND generation = $2")
+        .bind(conversation_id)
+        .bind(gen)
+        .bind(rem_sv)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("UPDATE chat.conversations SET current_state_version = $2, next_entry_seq = $3 WHERE conversation_id = $1")
+        .bind(conversation_id)
+        .bind(rem_sv)
+        .bind(rem_seq + 1)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("commit remove zero-leaf member: {e}"))?;
+    Ok(())
 }
 
 #[cfg(any(test, feature = "test-support"))]

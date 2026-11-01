@@ -4,26 +4,29 @@
 //! authenticated XRPC relaying, remote Welcome/entry delivery, and acceptance/reply routing
 //! across independent chat authorities with zero legacy fallback.
 
-use std::sync::Arc;
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use sqlx::{Postgres, Row, Transaction};
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
-use sha2::{Digest, Sha256};
-use crate::chat_protocol::validation::TrustedRequestInstant;
-use crate::identity::canonical_did;
-use crate::realtime::SseState;
-use crate::storage::DbPool;
-use crate::handlers::chat::ChatRuntime;
 use super::{
     errors::FederationError,
     outbound::OutboundClient,
     resolver::{DsEndpoint, DsResolver},
     service_auth::ServiceAuthClient,
 };
+use crate::chat_protocol::validation::TrustedRequestInstant;
+use crate::handlers::chat::ChatRuntime;
+use crate::identity::canonical_did;
+use crate::realtime::SseState;
+use crate::storage::DbPool;
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use sqlx::{Postgres, Row, Transaction};
+use std::sync::Arc;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// Deterministic pair coordinator calculation.
 ///
@@ -116,11 +119,18 @@ pub enum PairFenceConflict {
 impl std::fmt::Display for PairFenceConflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PairFenceConflict::ForeignCoordinator { coordinator_did, source, status } => {
+            PairFenceConflict::ForeignCoordinator {
+                coordinator_did,
+                source,
+                status,
+            } => {
                 write!(f, "pair already owned by coordinator {coordinator_did} (source: {source}, status: {status})")
             }
             PairFenceConflict::LocalConflict { source, status } => {
-                write!(f, "pair conflict exists (source: {source}, status: {status})")
+                write!(
+                    f,
+                    "pair conflict exists (source: {source}, status: {status})"
+                )
             }
         }
     }
@@ -273,24 +283,19 @@ pub async fn check_pair_owner_fence(
 /// Mint an authenticated S2S service token with explicit target audience and method NSID.
 pub fn mint_s2s_auth_token(target_did: &str, method: &str) -> Result<String, FederationError> {
     let service_did = crate::identity::service_did();
-    let signing_key_pem = std::env::var("SIGNING_KEY_PEM").map_err(|_| {
-        FederationError::ConfigError {
+    let signing_key_pem =
+        std::env::var("SIGNING_KEY_PEM").map_err(|_| FederationError::ConfigError {
             reason: "SIGNING_KEY_PEM is required for S2S federation".to_string(),
-        }
-    })?;
-    let client = ServiceAuthClient::from_es256_pem(
-        service_did,
-        signing_key_pem.as_bytes(),
-        None,
-    )
-    .map_err(|e| FederationError::ConfigError {
+        })?;
+    let client = ServiceAuthClient::from_es256_pem(service_did, signing_key_pem.as_bytes(), None)
+        .map_err(|e| FederationError::ConfigError {
         reason: format!("ServiceAuthClient error: {e}"),
     })?;
-    client.mint_token(target_did, method).map_err(|e| {
-        FederationError::AuthFailed {
+    client
+        .mint_token(target_did, method)
+        .map_err(|e| FederationError::AuthFailed {
             reason: format!("mint S2S token error: {e}"),
-        }
-    })
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +344,6 @@ pub struct ReleaseRecipientBootstrapInput {
     pub request_id: Uuid,
     pub recipient_did: String,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -419,18 +423,21 @@ pub async fn reserve_remote_recipient_bootstrap(
     let existing_intent: Option<(String, Option<Uuid>, String, String, String)> = sqlx::query_as(
         "SELECT actor_did, actor_device_id, recipient_did, recipient_ds_did, status \
          FROM chat.direct_request_reservation_intents \
-         WHERE request_id = $1"
+         WHERE request_id = $1",
     )
     .bind(request_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| FederationError::Storage(format!("intent check failed: {e}")))?;
 
-    if let Some((existing_actor, existing_dev, existing_rec, existing_ds, status)) = existing_intent {
+    if let Some((existing_actor, existing_dev, existing_rec, existing_ds, status)) = existing_intent
+    {
         if canonical_did(&existing_actor) != canonical_did(sender_did)
             || canonical_did(&existing_rec) != canonical_did(recipient_did)
             || canonical_did(&existing_ds) != canonical_did(target_did)
-            || (actor_device_id_opt.is_some() && existing_dev.is_some() && actor_device_id_opt != existing_dev)
+            || (actor_device_id_opt.is_some()
+                && existing_dev.is_some()
+                && actor_device_id_opt != existing_dev)
         {
             return Err(FederationError::InvalidRequest(format!(
                 "request_id {request_id} re-used with conflicting intent identity ({existing_actor} -> {existing_rec} @ {existing_ds})"
@@ -457,7 +464,9 @@ pub async fn reserve_remote_recipient_bootstrap(
     }
 
     let request_digest = signed_prepare.as_ref().and_then(|p| {
-        serde_json::to_vec(p).ok().map(|b| hex::encode(Sha256::digest(&b)))
+        serde_json::to_vec(p)
+            .ok()
+            .map(|b| hex::encode(Sha256::digest(&b)))
     });
 
     let token = mint_s2s_auth_token(target_did, "blue.catbird.mlsDS.reserveRecipientBootstrap")?;
@@ -481,12 +490,11 @@ pub async fn reserve_remote_recipient_bootstrap(
             status: 502,
             body: format!("reserveRecipientBootstrap RPC failed: {e}"),
         })?;
-    let output: ReserveRecipientBootstrapOutput = serde_json::from_value(resp).map_err(|e| {
-        FederationError::RemoteError {
+    let output: ReserveRecipientBootstrapOutput =
+        serde_json::from_value(resp).map_err(|e| FederationError::RemoteError {
             status: 502,
             body: format!("malformed reserveRecipientBootstrap response: {e}"),
-        }
-    })?;
+        })?;
     Ok(output.selected_devices)
 }
 pub async fn release_remote_recipient_bootstrap(
@@ -504,13 +512,11 @@ pub async fn release_remote_recipient_bootstrap(
     .await
     .map_err(|e| FederationError::Storage(format!("cancel intent failed: {e}")))?;
 
-    sqlx::query(
-        "DELETE FROM chat.direct_request_reserved_remote_packages WHERE request_id = $1"
-    )
-    .bind(request_id)
-    .execute(pool)
-    .await
-    .map_err(|e| FederationError::Storage(format!("clear reserved packages failed: {e}")))?;
+    sqlx::query("DELETE FROM chat.direct_request_reserved_remote_packages WHERE request_id = $1")
+        .bind(request_id)
+        .execute(pool)
+        .await
+        .map_err(|e| FederationError::Storage(format!("clear reserved packages failed: {e}")))?;
 
     let token = mint_s2s_auth_token(target_did, "blue.catbird.mlsDS.releaseRecipientBootstrap")?;
     let outbound = OutboundClient::new(5, 15);
@@ -532,7 +538,6 @@ pub async fn release_remote_recipient_bootstrap(
         })?;
     Ok(())
 }
-
 
 pub async fn relay_prepare_direct_request(
     endpoint: &str,
@@ -757,9 +762,13 @@ pub async fn stage_remote_recipient_devices(
     devices: &[RemoteDeviceBootstrap],
     now: DateTime<Utc>,
 ) -> Result<(), FederationError> {
-    let recipient_did = devices.first()
-        .ok_or_else(|| FederationError::InvalidRequest("recipient home selected no devices".into()))?
-        .owner_did.as_str();
+    let recipient_did = devices
+        .first()
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("recipient home selected no devices".into())
+        })?
+        .owner_did
+        .as_str();
     let resolver = DsResolver::with_default_endpoint(
         pool.clone(),
         super::resolver::build_resolver_http_client(),
@@ -768,135 +777,211 @@ pub async fn stage_remote_recipient_devices(
         None,
         0,
     );
-    let authorized_keys = resolver.resolve_authorized_device_keys(recipient_did).await?;
+    let authorized_keys = resolver
+        .resolve_authorized_device_keys(recipient_did)
+        .await?;
     if authorized_keys.is_empty() {
-        return Err(FederationError::Forbidden("recipient PDS authorizes no MLS device keys".into()));
+        return Err(FederationError::Forbidden(
+            "recipient PDS authorizes no MLS device keys".into(),
+        ));
     }
     for b in devices {
         if b.owner_did != recipient_did {
-            return Err(FederationError::InvalidRequest("recipient bootstrap mixes account DIDs".into()));
+            return Err(FederationError::InvalidRequest(
+                "recipient bootstrap mixes account DIDs".into(),
+            ));
         }
-        let pub_key_bytes = STANDARD.decode(&b.signature_public_key)
-            .map_err(|e| FederationError::InvalidRequest(format!("invalid signature_public_key base64: {e}")))?;
+        let pub_key_bytes = STANDARD.decode(&b.signature_public_key).map_err(|e| {
+            FederationError::InvalidRequest(format!("invalid signature_public_key base64: {e}"))
+        })?;
         if !authorized_keys.iter().any(|key| key == &pub_key_bytes) {
-            return Err(FederationError::Forbidden("recipient key is not authorized by the PDS".into()));
+            return Err(FederationError::Forbidden(
+                "recipient key is not authorized by the PDS".into(),
+            ));
         }
-        let wrapper = STANDARD.decode(&b.wrapper_bytes)
-            .map_err(|e| FederationError::InvalidRequest(format!("invalid wrapper_bytes base64: {e}")))?;
-        let expected_key_ref = STANDARD.decode(&b.key_package_ref)
-            .map_err(|e| FederationError::InvalidRequest(format!("invalid key_package_ref base64: {e}")))?;
+        let wrapper = STANDARD.decode(&b.wrapper_bytes).map_err(|e| {
+            FederationError::InvalidRequest(format!("invalid wrapper_bytes base64: {e}"))
+        })?;
+        let expected_key_ref = STANDARD.decode(&b.key_package_ref).map_err(|e| {
+            FederationError::InvalidRequest(format!("invalid key_package_ref base64: {e}"))
+        })?;
 
         // 1. Verify device key ID thumbprint
         let calculated_key_id = crate::chat_protocol::validation::ed25519_key_id(&pub_key_bytes)
-            .map_err(|e| FederationError::InvalidRequest(format!("invalid ed25519 public key: {e:?}")))?;
+            .map_err(|e| {
+                FederationError::InvalidRequest(format!("invalid ed25519 public key: {e:?}"))
+            })?;
         if calculated_key_id.as_str() != b.owner_key_id {
-            return Err(FederationError::InvalidRequest("keyId does not match public key thumbprint".into()));
+            return Err(FederationError::InvalidRequest(
+                "keyId does not match public key thumbprint".into(),
+            ));
         }
 
         let dev_id_str = b.owner_device_id.to_string();
 
         // 2. Verify signed Keys publication
-        let signed_keys_bytes = serde_json::to_vec(&b.signed_keys_publication)
-            .map_err(FederationError::Json)?;
+        let signed_keys_bytes =
+            serde_json::to_vec(&b.signed_keys_publication).map_err(FederationError::Json)?;
         let verified_keys = crate::chat_protocol::direct_request_transcript::verify_signed_request(
             crate::chat_protocol::direct_request_transcript::DirectRequestKind::Keys,
             &signed_keys_bytes,
             &pub_key_bytes,
         )
-        .map_err(|e| FederationError::InvalidRequest(format!("keys publication signature verification failed: {e:?}")))?;
+        .map_err(|e| {
+            FederationError::InvalidRequest(format!(
+                "keys publication signature verification failed: {e:?}"
+            ))
+        })?;
 
         if verified_keys.actor_did() != Some(b.owner_did.as_str())
             || verified_keys.actor_device_id() != Some(dev_id_str.as_str())
             || verified_keys.key_id() != b.owner_key_id.as_str()
             || verified_keys.auth_generation() != Some(b.auth_generation as u64)
         {
-            return Err(FederationError::InvalidRequest("keys publication actor identity mismatch".into()));
+            return Err(FederationError::InvalidRequest(
+                "keys publication actor identity mismatch".into(),
+            ));
         }
 
-        let pub_digest_bytes = STANDARD.decode(&b.publication_digest)
-            .map_err(|e| FederationError::InvalidRequest(format!("invalid publication_digest base64: {e}")))?;
-        if pub_digest_bytes.len() != 32 || pub_digest_bytes.as_slice() != verified_keys.request_digest() {
-            return Err(FederationError::InvalidRequest("publication digest mismatch".into()));
+        let pub_digest_bytes = STANDARD.decode(&b.publication_digest).map_err(|e| {
+            FederationError::InvalidRequest(format!("invalid publication_digest base64: {e}"))
+        })?;
+        if pub_digest_bytes.len() != 32
+            || pub_digest_bytes.as_slice() != verified_keys.request_digest()
+        {
+            return Err(FederationError::InvalidRequest(
+                "publication digest mismatch".into(),
+            ));
         }
         let keys_body = verified_keys.body();
         if keys_body.get("revision").and_then(|v| v.as_i64()) != Some(b.capability_revision) {
-            return Err(FederationError::InvalidRequest("keys publication revision mismatch".into()));
+            return Err(FederationError::InvalidRequest(
+                "keys publication revision mismatch".into(),
+            ));
         }
         if keys_body.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
-            return Err(FederationError::InvalidRequest("keys publication not enabled".into()));
+            return Err(FederationError::InvalidRequest(
+                "keys publication not enabled".into(),
+            ));
         }
 
-
         // 3. Verify signed grant
-        let signed_grant_bytes = serde_json::to_vec(&b.signed_grant)
-            .map_err(FederationError::Json)?;
-        let verified_grant = crate::chat_protocol::direct_request_transcript::verify_signed_request(
-            crate::chat_protocol::direct_request_transcript::DirectRequestKind::Grant,
-            &signed_grant_bytes,
-            &pub_key_bytes,
-        )
-        .map_err(|e| FederationError::InvalidRequest(format!("grant signature verification failed: {e:?}")))?;
+        let signed_grant_bytes =
+            serde_json::to_vec(&b.signed_grant).map_err(FederationError::Json)?;
+        let verified_grant =
+            crate::chat_protocol::direct_request_transcript::verify_signed_request(
+                crate::chat_protocol::direct_request_transcript::DirectRequestKind::Grant,
+                &signed_grant_bytes,
+                &pub_key_bytes,
+            )
+            .map_err(|e| {
+                FederationError::InvalidRequest(format!(
+                    "grant signature verification failed: {e:?}"
+                ))
+            })?;
 
         if verified_grant.actor_did() != Some(b.owner_did.as_str())
             || verified_grant.actor_device_id() != Some(dev_id_str.as_str())
             || verified_grant.key_id() != b.owner_key_id.as_str()
             || verified_grant.auth_generation() != Some(b.auth_generation as u64)
         {
-            return Err(FederationError::InvalidRequest("grant actor identity mismatch".into()));
+            return Err(FederationError::InvalidRequest(
+                "grant actor identity mismatch".into(),
+            ));
         }
 
-        let grant_digest_bytes = STANDARD.decode(&b.grant_digest)
-            .map_err(|e| FederationError::InvalidRequest(format!("invalid grant_digest base64: {e}")))?;
-        if grant_digest_bytes.len() != 32 || grant_digest_bytes.as_slice() != verified_grant.request_digest() {
-            return Err(FederationError::InvalidRequest("grant digest mismatch".into()));
+        let grant_digest_bytes = STANDARD.decode(&b.grant_digest).map_err(|e| {
+            FederationError::InvalidRequest(format!("invalid grant_digest base64: {e}"))
+        })?;
+        if grant_digest_bytes.len() != 32
+            || grant_digest_bytes.as_slice() != verified_grant.request_digest()
+        {
+            return Err(FederationError::InvalidRequest(
+                "grant digest mismatch".into(),
+            ));
         }
 
         let grant_body = verified_grant.body();
-        let grant_pkg_ref_str = grant_body.get("keyPackageRef")
+        let grant_pkg_ref_str = grant_body
+            .get("keyPackageRef")
             .and_then(|v| v.as_str())
             .ok_or_else(|| FederationError::InvalidRequest("grant missing keyPackageRef".into()))?;
-        let grant_pkg_ref = STANDARD.decode(grant_pkg_ref_str)
-            .map_err(|e| FederationError::InvalidRequest(format!("invalid grant keyPackageRef base64: {e}")))?;
+        let grant_pkg_ref = STANDARD.decode(grant_pkg_ref_str).map_err(|e| {
+            FederationError::InvalidRequest(format!("invalid grant keyPackageRef base64: {e}"))
+        })?;
         if grant_pkg_ref != expected_key_ref {
-            return Err(FederationError::InvalidRequest("grant keyPackageRef does not bind to KeyPackage".into()));
+            return Err(FederationError::InvalidRequest(
+                "grant keyPackageRef does not bind to KeyPackage".into(),
+            ));
         }
 
-        let grant_sha256_str = grant_body.get("keyPackageSha256")
+        let grant_sha256_str = grant_body
+            .get("keyPackageSha256")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| FederationError::InvalidRequest("grant missing keyPackageSha256".into()))?;
-        let grant_sha256 = STANDARD.decode(grant_sha256_str)
-            .map_err(|e| FederationError::InvalidRequest(format!("invalid grant keyPackageSha256 base64: {e}")))?;
+            .ok_or_else(|| {
+                FederationError::InvalidRequest("grant missing keyPackageSha256".into())
+            })?;
+        let grant_sha256 = STANDARD.decode(grant_sha256_str).map_err(|e| {
+            FederationError::InvalidRequest(format!("invalid grant keyPackageSha256 base64: {e}"))
+        })?;
         if grant_sha256 != Sha256::digest(&wrapper).as_slice() {
-            return Err(FederationError::InvalidRequest("grant keyPackageSha256 mismatch".into()));
+            return Err(FederationError::InvalidRequest(
+                "grant keyPackageSha256 mismatch".into(),
+            ));
         }
         // Verify that the grant and key package are present in the signed keys publication
-        let keys_array = keys_body.get("keys").and_then(|v| v.as_array()).ok_or_else(|| {
-            FederationError::InvalidRequest("keys publication missing keys array".into())
-        })?;
+        let keys_array = keys_body
+            .get("keys")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                FederationError::InvalidRequest("keys publication missing keys array".into())
+            })?;
 
         let grant_id_str = b.grant_id.to_string();
-        let _matching_key_entry = keys_array.iter().find(|k| {
-            let pkg_ref_match = k.pointer("/keyPackage/keyPackageRef").and_then(|v| v.as_str()) == Some(b.key_package_ref.as_str());
-            let grant_id_match = k.pointer("/grant/body/grantId").and_then(|v| v.as_str()) == Some(&grant_id_str);
-            pkg_ref_match && grant_id_match
-        }).ok_or_else(|| {
-            FederationError::InvalidRequest(format!(
-                "grant {} with keyPackageRef {} not found in signed keys publication",
-                b.grant_id, b.key_package_ref
-            ))
-        })?;
+        let _matching_key_entry = keys_array
+            .iter()
+            .find(|k| {
+                let pkg_ref_match = k
+                    .pointer("/keyPackage/keyPackageRef")
+                    .and_then(|v| v.as_str())
+                    == Some(b.key_package_ref.as_str());
+                let grant_id_match = k.pointer("/grant/body/grantId").and_then(|v| v.as_str())
+                    == Some(&grant_id_str);
+                pkg_ref_match && grant_id_match
+            })
+            .ok_or_else(|| {
+                FederationError::InvalidRequest(format!(
+                    "grant {} with keyPackageRef {} not found in signed keys publication",
+                    b.grant_id, b.key_package_ref
+                ))
+            })?;
 
-        let grant_rev = grant_body.get("revision").and_then(|v| v.as_i64()).unwrap_or(1);
-        let grant_purpose = grant_body.get("purpose").and_then(|v| v.as_str()).unwrap_or("direct-request-bootstrap");
-        let grant_proto = grant_body.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("2");
-        let grant_profile = grant_body.get("profile").and_then(|v| v.as_str()).unwrap_or("encryptedIntroduction1");
+        let grant_rev = grant_body
+            .get("revision")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1);
+        let grant_purpose = grant_body
+            .get("purpose")
+            .and_then(|v| v.as_str())
+            .unwrap_or("direct-request-bootstrap");
+        let grant_proto = grant_body
+            .get("protocolVersion")
+            .and_then(|v| v.as_str())
+            .unwrap_or("2");
+        let grant_profile = grant_body
+            .get("profile")
+            .and_then(|v| v.as_str())
+            .unwrap_or("encryptedIntroduction1");
 
         // 4. Verify MLS KeyPackage wrapper
         let bare_did = crate::chat_protocol::validation::BareDid::parse(&b.owner_did)
             .map_err(|_| FederationError::InvalidRequest("invalid owner DID".into()))?;
         let canon_device_id = crate::chat_protocol::validation::CanonicalUuidV4::parse(&dev_id_str)
             .map_err(|_| FederationError::InvalidRequest("invalid device UUID".into()))?;
-        let credential = crate::chat_protocol::validation::basic_credential_identity(&bare_did, &canon_device_id);
+        let credential = crate::chat_protocol::validation::basic_credential_identity(
+            &bare_did,
+            &canon_device_id,
+        );
 
         let valid_pkg = crate::chat_protocol::wire::validate_direct_request_key_package(
             &wrapper,
@@ -907,19 +992,26 @@ pub async fn stage_remote_recipient_devices(
                 max_bytes: 65536,
             },
         )
-        .map_err(|e| FederationError::InvalidRequest(format!("KeyPackage validation failed: {e:?}")))?;
+        .map_err(|e| {
+            FederationError::InvalidRequest(format!("KeyPackage validation failed: {e:?}"))
+        })?;
 
         if grant_body.get("grantId").and_then(|v| v.as_str()) != Some(&b.grant_id.to_string()) {
             return Err(FederationError::InvalidRequest("grantId mismatch".into()));
         }
-        let signed_expiry = grant_body.get("expiresAt").and_then(|v| v.as_str())
+        let signed_expiry = grant_body
+            .get("expiresAt")
+            .and_then(|v| v.as_str())
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok());
         let selected_expiry = DateTime::parse_from_rfc3339(&b.expires_at).ok();
-        if signed_expiry.is_none() || selected_expiry.is_none()
+        if signed_expiry.is_none()
+            || selected_expiry.is_none()
             || selected_expiry > signed_expiry
             || selected_expiry.is_some_and(|expiry| expiry <= now)
         {
-            return Err(FederationError::InvalidRequest("selected import horizon exceeds signed grant or is expired".into()));
+            return Err(FederationError::InvalidRequest(
+                "selected import horizon exceeds signed grant or is expired".into(),
+            ));
         }
 
         let existing_device: Option<(String, i64)> = sqlx::query_as(
@@ -933,10 +1025,14 @@ pub async fn stage_remote_recipient_devices(
 
         if let Some((status, gen)) = existing_device {
             if status != "active" {
-                return Err(FederationError::Forbidden("recipient device is not active".into()));
+                return Err(FederationError::Forbidden(
+                    "recipient device is not active".into(),
+                ));
             }
             if b.auth_generation < gen {
-                return Err(FederationError::InvalidRequest("device auth_generation rollback".into()));
+                return Err(FederationError::InvalidRequest(
+                    "device auth_generation rollback".into(),
+                ));
             }
         }
 
@@ -952,35 +1048,45 @@ pub async fn stage_remote_recipient_devices(
 
         if let Some(existing_pk) = existing_key {
             if existing_pk != pub_key_bytes {
-                return Err(FederationError::InvalidRequest("device signing public key mismatch with existing key".into()));
+                return Err(FederationError::InvalidRequest(
+                    "device signing public key mismatch with existing key".into(),
+                ));
             }
         }
 
         if valid_pkg.key_package_ref() != expected_key_ref.as_slice() {
-            return Err(FederationError::InvalidRequest("KeyPackage ref mismatch".into()));
+            return Err(FederationError::InvalidRequest(
+                "KeyPackage ref mismatch".into(),
+            ));
         }
 
         // 5. Fail-closed temporal bounds
         let expires_at = DateTime::parse_from_rfc3339(&b.expires_at)
-            .map_err(|e| FederationError::InvalidRequest(format!("invalid expires_at format: {e}")))?
+            .map_err(|e| {
+                FederationError::InvalidRequest(format!("invalid expires_at format: {e}"))
+            })?
             .with_timezone(&Utc);
         if expires_at <= now {
             return Err(FederationError::InvalidRequest("grant is expired".into()));
         }
 
-        let not_before = DateTime::from_timestamp(valid_pkg.not_before() as i64, 0)
-            .ok_or_else(|| FederationError::InvalidRequest("invalid not_before timestamp".into()))?;
+        let not_before =
+            DateTime::from_timestamp(valid_pkg.not_before() as i64, 0).ok_or_else(|| {
+                FederationError::InvalidRequest("invalid not_before timestamp".into())
+            })?;
         let not_after = DateTime::from_timestamp(valid_pkg.not_after() as i64, 0)
             .ok_or_else(|| FederationError::InvalidRequest("invalid not_after timestamp".into()))?;
         if not_after <= now {
-            return Err(FederationError::InvalidRequest("KeyPackage is expired".into()));
+            return Err(FederationError::InvalidRequest(
+                "KeyPackage is expired".into(),
+            ));
         }
 
         // 6. Stage into coordinator DB
         sqlx::query(
             "INSERT INTO chat.principals (user_did, created_at) \
              VALUES ($1, $2) \
-             ON CONFLICT (user_did) DO NOTHING"
+             ON CONFLICT (user_did) DO NOTHING",
         )
         .bind(&b.owner_did)
         .bind(now)
@@ -1115,40 +1221,58 @@ pub async fn local_reserve_recipient_bootstrap(
 ) -> Result<Vec<RemoteDeviceBootstrap>, FederationError> {
     let coord = resolve_pair_coordinator(pool, &input.sender_did, &input.recipient_did).await?;
     if !coord.is_recipient_home {
-        return Err(FederationError::Forbidden("Local node is not recipient home DS".into()));
+        return Err(FederationError::Forbidden(
+            "Local node is not recipient home DS".into(),
+        ));
     }
     if canonical_did(&coord.coordinator_did) != canonical_did(requester_ds) {
         return Err(FederationError::AuthFailed {
-            reason: format!("Requester {requester_ds} is not resolved coordinator {}", coord.coordinator_did),
+            reason: format!(
+                "Requester {requester_ds} is not resolved coordinator {}",
+                coord.coordinator_did
+            ),
         });
     }
 
     // C33-LEASE-003: Require and independently verify actor signed prepare
     let signed_prep = input.signed_prepare.as_ref().ok_or_else(|| {
-        FederationError::InvalidRequest("signedPrepare is required for remote bootstrap reservation".into())
+        FederationError::InvalidRequest(
+            "signedPrepare is required for remote bootstrap reservation".into(),
+        )
     })?;
     let sender_device_id_opt: Option<Uuid> = signed_prep
         .pointer("/body/actorDeviceId")
         .or_else(|| signed_prep.get("actorDeviceId"))
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s).ok());
-    let actor_did = signed_prep.pointer("/body/actorDid")
+    let actor_did = signed_prep
+        .pointer("/body/actorDid")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing actorDid in signedPrepare".into()))?;
-    let rec_did = signed_prep.pointer("/body/recipientDid")
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing actorDid in signedPrepare".into())
+        })?;
+    let rec_did = signed_prep
+        .pointer("/body/recipientDid")
         .or_else(|| signed_prep.get("recipientDid"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing recipientDid in signedPrepare".into()))?;
-    let req_id_str = signed_prep.pointer("/body/requestId")
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing recipientDid in signedPrepare".into())
+        })?;
+    let req_id_str = signed_prep
+        .pointer("/body/requestId")
         .or_else(|| signed_prep.get("requestId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing requestId in signedPrepare".into()))?;
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing requestId in signedPrepare".into())
+        })?;
 
     if canonical_did(actor_did) != canonical_did(&input.sender_did)
         || canonical_did(rec_did) != canonical_did(&input.recipient_did)
         || req_id_str != input.request_id.to_string()
     {
-        return Err(FederationError::InvalidRequest("signedPrepare does not match reservation input".into()));
+        return Err(FederationError::InvalidRequest(
+            "signedPrepare does not match reservation input".into(),
+        ));
     }
 
     let http = super::resolver::build_resolver_http_client();
@@ -1160,21 +1284,32 @@ pub async fn local_reserve_recipient_bootstrap(
         std::env::var("DEFAULT_DS_ENDPOINT").ok(),
         3600,
     );
-    let authorized_keys = resolver.resolve_authorized_device_keys(&input.sender_did).await?;
-    let prep_key_id = signed_prep.pointer("/body/keyId").and_then(|v| v.as_str()).unwrap_or_default();
-    let matching_key = authorized_keys.iter().find(|k| {
-        URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == prep_key_id
-            || STANDARD.encode(k) == prep_key_id
-            || crate::chat_protocol::validation::ed25519_key_id(k).map(|id| id.as_str() == prep_key_id).unwrap_or(false)
-    }).or_else(|| {
-        if authorized_keys.len() == 1 {
-            authorized_keys.first()
-        } else {
-            None
-        }
-    }).ok_or_else(|| {
-        FederationError::Forbidden(format!("sender key {prep_key_id} is not authorized by PDS"))
-    })?;
+    let authorized_keys = resolver
+        .resolve_authorized_device_keys(&input.sender_did)
+        .await?;
+    let prep_key_id = signed_prep
+        .pointer("/body/keyId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let matching_key = authorized_keys
+        .iter()
+        .find(|k| {
+            URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == prep_key_id
+                || STANDARD.encode(k) == prep_key_id
+                || crate::chat_protocol::validation::ed25519_key_id(k)
+                    .map(|id| id.as_str() == prep_key_id)
+                    .unwrap_or(false)
+        })
+        .or_else(|| {
+            if authorized_keys.len() == 1 {
+                authorized_keys.first()
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            FederationError::Forbidden(format!("sender key {prep_key_id} is not authorized by PDS"))
+        })?;
 
     let signed_prep_bytes = serde_json::to_vec(signed_prep).map_err(FederationError::Json)?;
     crate::chat_protocol::direct_request_transcript::verify_signed_request(
@@ -1182,19 +1317,28 @@ pub async fn local_reserve_recipient_bootstrap(
         &signed_prep_bytes,
         matching_key,
     )
-    .map_err(|e| FederationError::InvalidRequest(format!("signedPrepare signature verification failed: {e:?}")))?;
+    .map_err(|e| {
+        FederationError::InvalidRequest(format!(
+            "signedPrepare signature verification failed: {e:?}"
+        ))
+    })?;
 
     if let Some(expected_digest) = &input.request_digest {
         let actual_hex = hex::encode(Sha256::digest(&signed_prep_bytes));
         let actual_b64 = STANDARD.encode(Sha256::digest(&signed_prep_bytes));
         if expected_digest != &actual_hex && expected_digest != &actual_b64 {
-            return Err(FederationError::InvalidRequest("requestDigest mismatch".into()));
+            return Err(FederationError::InvalidRequest(
+                "requestDigest mismatch".into(),
+            ));
         }
     }
 
     let sender_signing_key_bytes = matching_key.clone();
     let prepare_digest_bytes = Sha256::digest(&signed_prep_bytes).to_vec();
-    let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
     let (p1, p2) = if input.sender_did <= input.recipient_did {
         (&input.sender_did, &input.recipient_did)
     } else {
@@ -1214,8 +1358,12 @@ pub async fn local_reserve_recipient_bootstrap(
         input.request_id,
         Some(requester_ds),
     )
-    .await? {
-        if let PairFenceConflict::ForeignCoordinator { coordinator_did, .. } = conflict {
+    .await?
+    {
+        if let PairFenceConflict::ForeignCoordinator {
+            coordinator_did, ..
+        } = conflict
+        {
             return Err(FederationError::RemoteError {
                 status: 409,
                 body: format!(
@@ -1225,28 +1373,34 @@ pub async fn local_reserve_recipient_bootstrap(
         }
     }
 
-
     // ponytail: global advisory xact lock for remote lease capacity and idempotency; per-peer locks if throughput matters
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('chat.direct_request_remote_leases', 0))")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-    // C33-LEASE-003: Immutable exact request identity and digest check on replay
-    let existing_lease_meta: Option<(String, String, Option<Uuid>, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT coordinator_did, sender_did, sender_device_id, prepare_digest \
-         FROM chat.direct_request_remote_leases \
-         WHERE request_id = $1 AND recipient_did = $2 LIMIT 1"
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('chat.direct_request_remote_leases', 0))",
     )
-    .bind(input.request_id)
-    .bind(&input.recipient_did)
-    .fetch_optional(&mut *tx)
+    .execute(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
+    // C33-LEASE-003: Immutable exact request identity and digest check on replay
+    let existing_lease_meta: Option<(String, String, Option<Uuid>, Option<Vec<u8>>)> =
+        sqlx::query_as(
+            "SELECT coordinator_did, sender_did, sender_device_id, prepare_digest \
+         FROM chat.direct_request_remote_leases \
+         WHERE request_id = $1 AND recipient_did = $2 LIMIT 1",
+        )
+        .bind(input.request_id)
+        .bind(&input.recipient_did)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    if let Some((stored_coord, stored_sender, stored_sender_dev, stored_digest)) = existing_lease_meta {
+    if let Some((stored_coord, stored_sender, stored_sender_dev, stored_digest)) =
+        existing_lease_meta
+    {
         if canonical_did(&stored_coord) != canonical_did(&coord.coordinator_did)
             || canonical_did(&stored_sender) != canonical_did(&input.sender_did)
-            || (sender_device_id_opt.is_some() && stored_sender_dev.is_some() && sender_device_id_opt != stored_sender_dev)
+            || (sender_device_id_opt.is_some()
+                && stored_sender_dev.is_some()
+                && sender_device_id_opt != stored_sender_dev)
             || (stored_digest.is_some() && stored_digest.as_deref() != Some(&prepare_digest_bytes))
         {
             return Err(FederationError::InvalidRequest(format!(
@@ -1281,33 +1435,66 @@ pub async fn local_reserve_recipient_bootstrap(
     if !existing_rows.is_empty() {
         let mut bootstraps = Vec::with_capacity(existing_rows.len());
         for row in existing_rows {
-            let grant_digest: Vec<u8> = row.try_get("grant_digest").map_err(|e| FederationError::Storage(e.to_string()))?;
-            let key_pkg_ref: Vec<u8> = row.try_get("key_package_ref").map_err(|e| FederationError::Storage(e.to_string()))?;
-            let wrapper: Vec<u8> = row.try_get("wrapper_bytes").map_err(|e| FederationError::Storage(e.to_string()))?;
-            let sig_pub: Vec<u8> = row.try_get("signing_public_key").map_err(|e| FederationError::Storage(e.to_string()))?;
-            let exp: DateTime<Utc> = row.try_get("expires_at").map_err(|e| FederationError::Storage(e.to_string()))?;
-            let signed_keys_bytes: Vec<u8> = row.try_get("signed_publication").map_err(|e| FederationError::Storage(e.to_string()))?;
-            let signed_keys_pub: Value = serde_json::from_slice(&signed_keys_bytes).map_err(|e| FederationError::Storage(e.to_string()))?;
-            let pub_digest: Vec<u8> = row.try_get("publication_digest").map_err(|e| FederationError::Storage(e.to_string()))?;
+            let grant_digest: Vec<u8> = row
+                .try_get("grant_digest")
+                .map_err(|e| FederationError::Storage(e.to_string()))?;
+            let key_pkg_ref: Vec<u8> = row
+                .try_get("key_package_ref")
+                .map_err(|e| FederationError::Storage(e.to_string()))?;
+            let wrapper: Vec<u8> = row
+                .try_get("wrapper_bytes")
+                .map_err(|e| FederationError::Storage(e.to_string()))?;
+            let sig_pub: Vec<u8> = row
+                .try_get("signing_public_key")
+                .map_err(|e| FederationError::Storage(e.to_string()))?;
+            let exp: DateTime<Utc> = row
+                .try_get("expires_at")
+                .map_err(|e| FederationError::Storage(e.to_string()))?;
+            let signed_keys_bytes: Vec<u8> = row
+                .try_get("signed_publication")
+                .map_err(|e| FederationError::Storage(e.to_string()))?;
+            let signed_keys_pub: Value = serde_json::from_slice(&signed_keys_bytes)
+                .map_err(|e| FederationError::Storage(e.to_string()))?;
+            let pub_digest: Vec<u8> = row
+                .try_get("publication_digest")
+                .map_err(|e| FederationError::Storage(e.to_string()))?;
 
             bootstraps.push(RemoteDeviceBootstrap {
-                owner_did: row.try_get("owner_did").map_err(|e| FederationError::Storage(e.to_string()))?,
-                owner_device_id: row.try_get("owner_device_id").map_err(|e| FederationError::Storage(e.to_string()))?,
-                owner_key_id: row.try_get("owner_key_id").map_err(|e| FederationError::Storage(e.to_string()))?,
-                auth_generation: row.try_get("owner_auth_generation").map_err(|e| FederationError::Storage(e.to_string()))?,
-                grant_id: row.try_get("grant_id").map_err(|e| FederationError::Storage(e.to_string()))?,
+                owner_did: row
+                    .try_get("owner_did")
+                    .map_err(|e| FederationError::Storage(e.to_string()))?,
+                owner_device_id: row
+                    .try_get("owner_device_id")
+                    .map_err(|e| FederationError::Storage(e.to_string()))?,
+                owner_key_id: row
+                    .try_get("owner_key_id")
+                    .map_err(|e| FederationError::Storage(e.to_string()))?,
+                auth_generation: row
+                    .try_get("owner_auth_generation")
+                    .map_err(|e| FederationError::Storage(e.to_string()))?,
+                grant_id: row
+                    .try_get("grant_id")
+                    .map_err(|e| FederationError::Storage(e.to_string()))?,
                 grant_digest: STANDARD.encode(&grant_digest),
-                capability_revision: row.try_get("capability_revision").map_err(|e| FederationError::Storage(e.to_string()))?,
+                capability_revision: row
+                    .try_get("capability_revision")
+                    .map_err(|e| FederationError::Storage(e.to_string()))?,
                 key_package_ref: STANDARD.encode(&key_pkg_ref),
                 wrapper_bytes: STANDARD.encode(&wrapper),
-                signed_grant: serde_json::from_slice::<Value>(&row.try_get::<Vec<u8>, _>("signed_grant").map_err(|e| FederationError::Storage(e.to_string()))?).map_err(|e| FederationError::Storage(e.to_string()))?,
+                signed_grant: serde_json::from_slice::<Value>(
+                    &row.try_get::<Vec<u8>, _>("signed_grant")
+                        .map_err(|e| FederationError::Storage(e.to_string()))?,
+                )
+                .map_err(|e| FederationError::Storage(e.to_string()))?,
                 expires_at: exp.to_rfc3339(),
                 signature_public_key: STANDARD.encode(&sig_pub),
                 signed_keys_publication: signed_keys_pub,
                 publication_digest: STANDARD.encode(&pub_digest),
             });
         }
-        tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
         return Ok(bootstraps);
     }
 
@@ -1319,7 +1506,7 @@ pub async fn local_reserve_recipient_bootstrap(
     sqlx::query(
         "UPDATE chat.direct_request_remote_leases \
          SET status = 'expired' \
-         WHERE recipient_did = $1 AND status = 'active' AND expires_at <= clock_timestamp()"
+         WHERE recipient_did = $1 AND status = 'active' AND expires_at <= clock_timestamp()",
     )
     .bind(&input.recipient_did)
     .execute(&mut *tx)
@@ -1331,7 +1518,7 @@ pub async fn local_reserve_recipient_bootstrap(
         "SELECT request_id, coordinator_did, sender_device_id \
          FROM chat.direct_request_remote_leases \
          WHERE recipient_did = $1 AND status = 'expired' AND sender_device_id IS NOT NULL \
-         LIMIT 5"
+         LIMIT 5",
     )
     .bind(&input.recipient_did)
     .fetch_all(&mut *tx)
@@ -1346,13 +1533,17 @@ pub async fn local_reserve_recipient_bootstrap(
                     &coord.coordinator_did,
                     exp_req_id,
                     actor_device_id,
-                ).await {
+                )
+                .await
+                {
                     let outcome_val = outcome.get("outcome").unwrap_or(&outcome);
-                    let outcome_type = outcome_val.pointer("/receipt/$type")
+                    let outcome_type = outcome_val
+                        .pointer("/receipt/$type")
                         .or_else(|| outcome_val.pointer("/$type"))
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
-                    let is_terminal = outcome_type == "blue.catbird.chat.defs#directRequestUnknownOutcome"
+                    let is_terminal = outcome_type
+                        == "blue.catbird.chat.defs#directRequestUnknownOutcome"
                         || outcome_type == "blue.catbird.chat.defs#directRequestRejectedReceipt"
                         || outcome_type == "blue.catbird.chat.defs#directRequestExpiredReceipt"
                         || outcome_type == "blue.catbird.chat.defs#directRequestCancelledReceipt";
@@ -1360,7 +1551,7 @@ pub async fn local_reserve_recipient_bootstrap(
                         let _ = sqlx::query(
                             "UPDATE chat.direct_request_remote_leases \
                              SET status = 'released', released_at = clock_timestamp() \
-                             WHERE request_id = $1 AND recipient_did = $2 AND status = 'expired'"
+                             WHERE request_id = $1 AND recipient_did = $2 AND status = 'expired'",
                         )
                         .bind(exp_req_id)
                         .bind(&input.recipient_did)
@@ -1472,26 +1663,56 @@ pub async fn local_reserve_recipient_bootstrap(
     let mut bootstraps = Vec::new();
 
     for r in rows {
-        let owner_device_id: Uuid = r.try_get("owner_device_id").map_err(|e| FederationError::Storage(e.to_string()))?;
+        let owner_device_id: Uuid = r
+            .try_get("owner_device_id")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
         if !seen_devices.insert(owner_device_id) {
             continue;
         }
 
-        let key_package_ref: Vec<u8> = r.try_get("key_package_ref").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let owner_did: String = r.try_get("owner_did").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let owner_key_id: String = r.try_get("owner_key_id").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let auth_generation: i64 = r.try_get("owner_auth_generation").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let grant_id: Uuid = r.try_get("grant_id").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let grant_digest: Vec<u8> = r.try_get("grant_digest").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let capability_revision: i64 = r.try_get("capability_revision").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let wrapper_bytes: Vec<u8> = r.try_get("wrapper_bytes").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let signed_grant_bytes: Vec<u8> = r.try_get("signed_grant").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let signed_grant: Value = serde_json::from_slice(&signed_grant_bytes).map_err(|e| FederationError::Storage(e.to_string()))?;
-        let expires_at: DateTime<Utc> = r.try_get("expires_at").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let signing_public_key: Vec<u8> = r.try_get("signing_public_key").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let signed_keys_bytes: Vec<u8> = r.try_get("signed_publication").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let signed_keys_pub: Value = serde_json::from_slice(&signed_keys_bytes).map_err(|e| FederationError::Storage(e.to_string()))?;
-        let pub_digest: Vec<u8> = r.try_get("publication_digest").map_err(|e| FederationError::Storage(e.to_string()))?;
+        let key_package_ref: Vec<u8> = r
+            .try_get("key_package_ref")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let owner_did: String = r
+            .try_get("owner_did")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let owner_key_id: String = r
+            .try_get("owner_key_id")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let auth_generation: i64 = r
+            .try_get("owner_auth_generation")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let grant_id: Uuid = r
+            .try_get("grant_id")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let grant_digest: Vec<u8> = r
+            .try_get("grant_digest")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let capability_revision: i64 = r
+            .try_get("capability_revision")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let wrapper_bytes: Vec<u8> = r
+            .try_get("wrapper_bytes")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let signed_grant_bytes: Vec<u8> = r
+            .try_get("signed_grant")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let signed_grant: Value = serde_json::from_slice(&signed_grant_bytes)
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let expires_at: DateTime<Utc> = r
+            .try_get("expires_at")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let signing_public_key: Vec<u8> = r
+            .try_get("signing_public_key")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let signed_keys_bytes: Vec<u8> = r
+            .try_get("signed_publication")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let signed_keys_pub: Value = serde_json::from_slice(&signed_keys_bytes)
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let pub_digest: Vec<u8> = r
+            .try_get("publication_digest")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
 
         sqlx::query(
             "INSERT INTO chat.direct_request_remote_leases ( \
@@ -1538,7 +1759,9 @@ pub async fn local_reserve_recipient_bootstrap(
         ));
     }
 
-    tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
     Ok(bootstraps)
 }
 /// Compensating release of remote recipient bootstrap leases on reservation failure.
@@ -1550,7 +1773,7 @@ pub async fn local_release_recipient_bootstrap(
 ) -> Result<(), FederationError> {
     let existing_coord: Option<String> = sqlx::query_scalar(
         "SELECT coordinator_did FROM chat.direct_request_remote_leases \
-         WHERE request_id = $1 AND recipient_did = $2 AND status IN ('active', 'expired') LIMIT 1"
+         WHERE request_id = $1 AND recipient_did = $2 AND status IN ('active', 'expired') LIMIT 1",
     )
     .bind(request_id)
     .bind(recipient_did)
@@ -1580,7 +1803,6 @@ pub async fn local_release_recipient_bootstrap(
     Ok(())
 }
 
-
 /// Ingest an inbound direct request delivery on the recipient's home DS.
 ///
 /// Stores verified Welcome + request entry in `chat.direct_request_transport_inbox`,
@@ -1591,65 +1813,104 @@ pub async fn ingest_remote_direct_request_delivery(
     requester_ds: &str,
     input: DeliverDirectRequestInput,
 ) -> Result<(), FederationError> {
-    let actor_did = input.entry.pointer("/signedRequest/body/actorDid")
+    let actor_did = input
+        .entry
+        .pointer("/signedRequest/body/actorDid")
         .or_else(|| input.entry.pointer("/body/actorDid"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing actorDid in delivery entry".into()))?;
-    let recipient_did = input.entry.pointer("/signedRequest/body/recipientDid")
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing actorDid in delivery entry".into())
+        })?;
+    let recipient_did = input
+        .entry
+        .pointer("/signedRequest/body/recipientDid")
         .or_else(|| input.entry.pointer("/body/recipientDid"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing recipientDid in delivery entry".into()))?;
-    let sender_device_id_str = input.entry.pointer("/signedRequest/body/actorDeviceId")
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing recipientDid in delivery entry".into())
+        })?;
+    let sender_device_id_str = input
+        .entry
+        .pointer("/signedRequest/body/actorDeviceId")
         .or_else(|| input.entry.pointer("/body/actorDeviceId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing actorDeviceId in delivery entry".into()))?;
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing actorDeviceId in delivery entry".into())
+        })?;
     let sender_device_id = Uuid::parse_str(sender_device_id_str)
         .map_err(|e| FederationError::InvalidRequest(format!("invalid actorDeviceId UUID: {e}")))?;
-    let key_id = input.entry.pointer("/signedRequest/body/keyId")
+    let key_id = input
+        .entry
+        .pointer("/signedRequest/body/keyId")
         .or_else(|| input.entry.pointer("/body/keyId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| FederationError::InvalidRequest("missing keyId in delivery entry".into()))?;
 
-    let entry_req_id_str = input.entry.pointer("/signedRequest/body/requestId")
+    let entry_req_id_str = input
+        .entry
+        .pointer("/signedRequest/body/requestId")
         .or_else(|| input.entry.pointer("/body/requestId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing requestId in delivery entry".into()))?;
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing requestId in delivery entry".into())
+        })?;
     let entry_req_id = Uuid::parse_str(entry_req_id_str)
         .map_err(|e| FederationError::InvalidRequest(format!("invalid requestId UUID: {e}")))?;
     if entry_req_id != input.request_id {
-        return Err(FederationError::InvalidRequest("requestId mismatch between input and entry".into()));
+        return Err(FederationError::InvalidRequest(
+            "requestId mismatch between input and entry".into(),
+        ));
     }
 
-    let entry_convo_str = input.entry.pointer("/signedRequest/body/conversationId")
+    let entry_convo_str = input
+        .entry
+        .pointer("/signedRequest/body/conversationId")
         .or_else(|| input.entry.pointer("/body/conversationId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing conversationId in delivery entry".into()))?;
-    let entry_convo_id = Uuid::parse_str(entry_convo_str)
-        .map_err(|e| FederationError::InvalidRequest(format!("invalid conversationId UUID: {e}")))?;
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing conversationId in delivery entry".into())
+        })?;
+    let entry_convo_id = Uuid::parse_str(entry_convo_str).map_err(|e| {
+        FederationError::InvalidRequest(format!("invalid conversationId UUID: {e}"))
+    })?;
     if entry_convo_id != input.conversation_id {
-        return Err(FederationError::InvalidRequest("conversationId mismatch between input and entry".into()));
+        return Err(FederationError::InvalidRequest(
+            "conversationId mismatch between input and entry".into(),
+        ));
     }
 
-    let entry_msg_str = input.entry.pointer("/signedRequest/body/firstMessageId")
+    let entry_msg_str = input
+        .entry
+        .pointer("/signedRequest/body/firstMessageId")
         .or_else(|| input.entry.pointer("/body/firstMessageId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing firstMessageId in delivery entry".into()))?;
-    let entry_first_msg_id = Uuid::parse_str(entry_msg_str)
-        .map_err(|e| FederationError::InvalidRequest(format!("invalid firstMessageId UUID: {e}")))?;
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing firstMessageId in delivery entry".into())
+        })?;
+    let entry_first_msg_id = Uuid::parse_str(entry_msg_str).map_err(|e| {
+        FederationError::InvalidRequest(format!("invalid firstMessageId UUID: {e}"))
+    })?;
     if entry_first_msg_id != input.first_message_id {
-        return Err(FederationError::InvalidRequest("firstMessageId mismatch between input and entry".into()));
+        return Err(FederationError::InvalidRequest(
+            "firstMessageId mismatch between input and entry".into(),
+        ));
     }
 
     let coord = resolve_pair_coordinator(pool, actor_did, recipient_did).await?;
 
     if !coord.is_recipient_home {
-        return Err(FederationError::Forbidden("Local node is not recipient home DS".into()));
+        return Err(FederationError::Forbidden(
+            "Local node is not recipient home DS".into(),
+        ));
     }
     if canonical_did(&coord.coordinator_did) != canonical_did(requester_ds)
         || canonical_did(&input.coordinator_did) != canonical_did(requester_ds)
     {
         return Err(FederationError::AuthFailed {
-            reason: format!("Requester {requester_ds} is not resolved coordinator {}", coord.coordinator_did),
+            reason: format!(
+                "Requester {requester_ds} is not resolved coordinator {}",
+                coord.coordinator_did
+            ),
         });
     }
 
@@ -1657,37 +1918,61 @@ pub async fn ingest_remote_direct_request_delivery(
 
     // 1. Determine full_welcome bytes and sha256 (fail closed)
     let full_welcome = if let Some(b64) = &input.full_welcome_bytes {
-        STANDARD.decode(b64).map_err(|e| FederationError::InvalidRequest(format!("invalid full_welcome_bytes base64: {e}")))?
-    } else if let Some(b64) = input.publication_receipt.pointer("/receipt/artifacts/welcome/opaqueWelcome").and_then(|v| v.as_str()) {
-        STANDARD.decode(b64).map_err(|e| FederationError::InvalidRequest(format!("invalid opaqueWelcome base64: {e}")))?
-    } else if let Some(b64) = input.entry.pointer("/signedRequest/artifacts/welcome/opaqueWelcome").and_then(|v| v.as_str()) {
-        STANDARD.decode(b64).map_err(|e| FederationError::InvalidRequest(format!("invalid opaqueWelcome base64: {e}")))?
+        STANDARD.decode(b64).map_err(|e| {
+            FederationError::InvalidRequest(format!("invalid full_welcome_bytes base64: {e}"))
+        })?
+    } else if let Some(b64) = input
+        .publication_receipt
+        .pointer("/receipt/artifacts/welcome/opaqueWelcome")
+        .and_then(|v| v.as_str())
+    {
+        STANDARD.decode(b64).map_err(|e| {
+            FederationError::InvalidRequest(format!("invalid opaqueWelcome base64: {e}"))
+        })?
+    } else if let Some(b64) = input
+        .entry
+        .pointer("/signedRequest/artifacts/welcome/opaqueWelcome")
+        .and_then(|v| v.as_str())
+    {
+        STANDARD.decode(b64).map_err(|e| {
+            FederationError::InvalidRequest(format!("invalid opaqueWelcome base64: {e}"))
+        })?
     } else {
-        return Err(FederationError::InvalidRequest("missing full_welcome in delivery input".into()));
+        return Err(FederationError::InvalidRequest(
+            "missing full_welcome in delivery input".into(),
+        ));
     };
     if full_welcome.is_empty() {
-        return Err(FederationError::InvalidRequest("empty full_welcome in delivery input".into()));
+        return Err(FederationError::InvalidRequest(
+            "empty full_welcome in delivery input".into(),
+        ));
     }
     let full_welcome_sha256 = Sha256::digest(&full_welcome).to_vec();
 
-    let request_entry_bytes = serde_json::to_vec(&input.entry)
-        .map_err(FederationError::Json)?;
+    let request_entry_bytes = serde_json::to_vec(&input.entry).map_err(FederationError::Json)?;
 
-    let signed_pub_val = input.signed_publication.as_ref()
+    let signed_pub_val = input
+        .signed_publication
+        .as_ref()
         .or_else(|| input.entry.get("signedRequest"))
         .unwrap_or(&input.entry);
-    let signed_pub_bytes = serde_json::to_vec(signed_pub_val)
-        .map_err(FederationError::Json)?;
+    let signed_pub_bytes = serde_json::to_vec(signed_pub_val).map_err(FederationError::Json)?;
 
-    let import_until_str = input.publication_receipt.pointer("/receipt/importUntil")
+    let import_until_str = input
+        .publication_receipt
+        .pointer("/receipt/importUntil")
         .or_else(|| input.entry.pointer("/signedRequest/body/importUntil"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing importUntil in delivery input".into()))?;
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing importUntil in delivery input".into())
+        })?;
     let import_until = DateTime::parse_from_rfc3339(import_until_str)
         .map_err(|e| FederationError::InvalidRequest(format!("invalid importUntil format: {e}")))?
         .with_timezone(&Utc);
     if import_until <= now {
-        return Err(FederationError::InvalidRequest("importUntil is in the past".into()));
+        return Err(FederationError::InvalidRequest(
+            "importUntil is in the past".into(),
+        ));
     }
 
     // 2. Independently verify trusted coordinator DID doc receipt signature (M-F04: before tx)
@@ -1702,44 +1987,70 @@ pub async fn ingest_remote_direct_request_delivery(
     );
 
     let receipt_val = &input.publication_receipt;
-    let receipt_bytes = serde_json::to_vec(receipt_val)
-        .map_err(FederationError::Json)?;
+    let receipt_bytes = serde_json::to_vec(receipt_val).map_err(FederationError::Json)?;
 
-    let receipt_authority_did = receipt_val.pointer("/body/authorityDid")
+    let receipt_authority_did = receipt_val
+        .pointer("/body/authorityDid")
         .or_else(|| receipt_val.pointer("/receipt/authorityDid"))
         .or_else(|| receipt_val.get("authorityDid"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing authorityDid in publication receipt".into()))?;
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing authorityDid in publication receipt".into())
+        })?;
     if canonical_did(receipt_authority_did) != canonical_did(&coord.coordinator_did) {
         return Err(FederationError::AuthFailed {
-            reason: format!("receipt authorityDid {receipt_authority_did} does not match coordinator {}", coord.coordinator_did),
+            reason: format!(
+                "receipt authorityDid {receipt_authority_did} does not match coordinator {}",
+                coord.coordinator_did
+            ),
         });
     }
 
-    let receipt_key_id = receipt_val.pointer("/body/keyId")
+    let receipt_key_id = receipt_val
+        .pointer("/body/keyId")
         .or_else(|| receipt_val.pointer("/receipt/keyId"))
         .or_else(|| receipt_val.get("keyId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing keyId in publication receipt".into()))?;
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing keyId in publication receipt".into())
+        })?;
 
-    let receipt_public_key = resolver.resolve_coordinator_receipt_key(pool, receipt_authority_did, receipt_key_id).await?;
+    let receipt_public_key = resolver
+        .resolve_coordinator_receipt_key(pool, receipt_authority_did, receipt_key_id)
+        .await?;
 
-    let verified_receipt = crate::chat_protocol::direct_request_transcript::verify_received_signed_request(
-        crate::chat_protocol::direct_request_transcript::DirectRequestKind::Outcome,
-        &receipt_bytes,
-        &receipt_public_key,
-    )
-    .map_err(|e| FederationError::InvalidRequest(format!("coordinator receipt signature verification failed: {e:?}")))?;
+    let verified_receipt =
+        crate::chat_protocol::direct_request_transcript::verify_received_signed_request(
+            crate::chat_protocol::direct_request_transcript::DirectRequestKind::Outcome,
+            &receipt_bytes,
+            &receipt_public_key,
+        )
+        .map_err(|e| {
+            FederationError::InvalidRequest(format!(
+                "coordinator receipt signature verification failed: {e:?}"
+            ))
+        })?;
 
     // 3. Verify actor signature: live PDS or commit-time proof (M-F04: HTTP before tx)
-    let authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await.unwrap_or_default();
-    let matching_key = authorized_keys.iter().find(|k| {
-        URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == key_id
-            || STANDARD.encode(k) == key_id
-            || crate::chat_protocol::validation::ed25519_key_id(k).map(|id| id.as_str() == key_id).unwrap_or(false)
-    }).cloned();
+    let authorized_keys = resolver
+        .resolve_authorized_device_keys(actor_did)
+        .await
+        .unwrap_or_default();
+    let matching_key = authorized_keys
+        .iter()
+        .find(|k| {
+            URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == key_id
+                || STANDARD.encode(k) == key_id
+                || crate::chat_protocol::validation::ed25519_key_id(k)
+                    .map(|id| id.as_str() == key_id)
+                    .unwrap_or(false)
+        })
+        .cloned();
 
-    let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let matching_key = match matching_key {
         Some(k) => k,
@@ -1750,7 +2061,7 @@ pub async fn ingest_remote_direct_request_delivery(
                 "SELECT sender_signing_key, sender_device_id, prepare_digest \
                  FROM chat.direct_request_remote_leases \
                  WHERE request_id = $1 AND recipient_did = $2 AND status IN ('active', 'expired') \
-                   AND sender_signing_key IS NOT NULL LIMIT 1"
+                   AND sender_signing_key IS NOT NULL LIMIT 1",
             )
             .bind(input.request_id)
             .bind(recipient_did)
@@ -1778,7 +2089,10 @@ pub async fn ingest_remote_direct_request_delivery(
             let calculated_key_id = crate::chat_protocol::validation::ed25519_key_id(&retained_key)
                 .map(|id| id.to_string())
                 .unwrap_or_default();
-            if key_id != calculated_thumbprint && key_id != calculated_key_id && key_id != STANDARD.encode(&retained_key) {
+            if key_id != calculated_thumbprint
+                && key_id != calculated_key_id
+                && key_id != STANDARD.encode(&retained_key)
+            {
                 return Err(FederationError::InvalidRequest(format!(
                     "keyId {key_id} does not match retained public key thumbprint"
                 )));
@@ -1793,70 +2107,119 @@ pub async fn ingest_remote_direct_request_delivery(
         &signed_pub_bytes,
         &matching_key,
     )
-    .map_err(|e| FederationError::InvalidRequest(format!("actor signature verification failed: {e:?}")))?;
+    .map_err(|e| {
+        FederationError::InvalidRequest(format!("actor signature verification failed: {e:?}"))
+    })?;
     let publication_body = verified_pub.body();
-    let signed_welcome = publication_body.pointer("/artifacts/welcome/opaqueWelcome")
+    let signed_welcome = publication_body
+        .pointer("/artifacts/welcome/opaqueWelcome")
         .and_then(|value| value.as_str())
         .and_then(|encoded| STANDARD.decode(encoded).ok())
-        .ok_or_else(|| FederationError::InvalidRequest("signed publication lacks a valid Welcome".into()))?;
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("signed publication lacks a valid Welcome".into())
+        })?;
     if input.entry.get("signedRequest") != Some(signed_pub_val)
         || full_welcome != signed_welcome
-        || publication_body.pointer("/artifacts/welcome/deliveries")
+        || publication_body
+            .pointer("/artifacts/welcome/deliveries")
             .and_then(|value| value.as_array())
-            .map(Vec::as_slice) != Some(input.deliveries.as_slice())
+            .map(Vec::as_slice)
+            != Some(input.deliveries.as_slice())
     {
-        return Err(FederationError::InvalidRequest("transport artifacts differ from sender-signed publication".into()));
+        return Err(FederationError::InvalidRequest(
+            "transport artifacts differ from sender-signed publication".into(),
+        ));
     }
     // 4. Verify exact cross-bindings
-    let receipt_req_digest_b64 = verified_receipt.body().pointer("/receipt/requestDigest")
+    let receipt_req_digest_b64 = verified_receipt
+        .body()
+        .pointer("/receipt/requestDigest")
         .or_else(|| verified_receipt.body().get("requestDigest"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing requestDigest in receipt body".into()))?;
-    let receipt_req_digest = STANDARD.decode(receipt_req_digest_b64)
-        .map_err(|e| FederationError::InvalidRequest(format!("invalid requestDigest base64: {e}")))?;
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing requestDigest in receipt body".into())
+        })?;
+    let receipt_req_digest = STANDARD.decode(receipt_req_digest_b64).map_err(|e| {
+        FederationError::InvalidRequest(format!("invalid requestDigest base64: {e}"))
+    })?;
     if receipt_req_digest.as_slice() != verified_pub.request_digest() {
-        return Err(FederationError::InvalidRequest("receipt requestDigest does not match publication digest".into()));
+        return Err(FederationError::InvalidRequest(
+            "receipt requestDigest does not match publication digest".into(),
+        ));
     }
 
-    let receipt_req_id = verified_receipt.body().pointer("/receipt/requestId")
+    let receipt_req_id = verified_receipt
+        .body()
+        .pointer("/receipt/requestId")
         .or_else(|| verified_receipt.body().get("requestId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| FederationError::InvalidRequest("missing requestId in receipt body".into()))?;
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing requestId in receipt body".into())
+        })?;
     if receipt_req_id != input.request_id.to_string() {
-        return Err(FederationError::InvalidRequest("receipt requestId mismatch".into()));
+        return Err(FederationError::InvalidRequest(
+            "receipt requestId mismatch".into(),
+        ));
     }
 
     if verified_receipt.body().pointer("/receipt/coordinates") != publication_body.get("next")
-        || verified_receipt.body().pointer("/receipt/conversationId")
-            .and_then(|value| value.as_str()) != Some(input.conversation_id.to_string().as_str())
-        || verified_receipt.body().pointer("/receipt/firstMessageId")
-            .and_then(|value| value.as_str()) != Some(input.first_message_id.to_string().as_str())
-        || verified_receipt.body().pointer("/receipt/actorDid")
-            .and_then(|value| value.as_str()) != Some(actor_did)
-        || verified_receipt.body().pointer("/receipt/requestKind")
-            .and_then(|value| value.as_str()) != Some("publish")
+        || verified_receipt
+            .body()
+            .pointer("/receipt/conversationId")
+            .and_then(|value| value.as_str())
+            != Some(input.conversation_id.to_string().as_str())
+        || verified_receipt
+            .body()
+            .pointer("/receipt/firstMessageId")
+            .and_then(|value| value.as_str())
+            != Some(input.first_message_id.to_string().as_str())
+        || verified_receipt
+            .body()
+            .pointer("/receipt/actorDid")
+            .and_then(|value| value.as_str())
+            != Some(actor_did)
+        || verified_receipt
+            .body()
+            .pointer("/receipt/requestKind")
+            .and_then(|value| value.as_str())
+            != Some("publish")
     {
-        return Err(FederationError::InvalidRequest("signed receipt does not bind published conversation".into()));
+        return Err(FederationError::InvalidRequest(
+            "signed receipt does not bind published conversation".into(),
+        ));
     }
 
-    if let Some(entry_hash_b64) = verified_receipt.body().pointer("/receipt/entryHash").and_then(|v| v.as_str()) {
-        let expected_hash = STANDARD.decode(entry_hash_b64)
+    if let Some(entry_hash_b64) = verified_receipt
+        .body()
+        .pointer("/receipt/entryHash")
+        .and_then(|v| v.as_str())
+    {
+        let expected_hash = STANDARD
+            .decode(entry_hash_b64)
             .map_err(|_| FederationError::InvalidRequest("invalid receipt entry hash".into()))?;
         let mut untagged_entry = input.entry.clone();
-        untagged_entry.as_object_mut()
+        untagged_entry
+            .as_object_mut()
             .ok_or_else(|| FederationError::InvalidRequest("invalid canonical entry".into()))?
             .remove("$type");
         let untagged_bytes = serde_json::to_vec(&untagged_entry).map_err(FederationError::Json)?;
-        let actual_hash = crate::chat_protocol::direct_request_transcript::direct_request_entry_hash(&untagged_bytes)
+        let actual_hash =
+            crate::chat_protocol::direct_request_transcript::direct_request_entry_hash(
+                &untagged_bytes,
+            )
             .map_err(|_| FederationError::InvalidRequest("invalid canonical entry hash".into()))?;
         if expected_hash != actual_hash {
-            return Err(FederationError::InvalidRequest("receipt entryHash does not match canonical entry".into()));
+            return Err(FederationError::InvalidRequest(
+                "receipt entryHash does not match canonical entry".into(),
+            ));
         }
     }
 
     // 5. Validate deliveries and provenance
     if input.deliveries.is_empty() {
-        return Err(FederationError::InvalidRequest("deliveries array cannot be empty".into()));
+        return Err(FederationError::InvalidRequest(
+            "deliveries array cannot be empty".into(),
+        ));
     }
 
     for d in &input.deliveries {
@@ -1864,7 +2227,9 @@ pub async fn ingest_remote_direct_request_delivery(
             FederationError::InvalidRequest("missing recipientDid in delivery item".into())
         })?;
         if rec_did != recipient_did && rec_did != actor_did {
-            return Err(FederationError::InvalidRequest("delivery is not for a signed pair member".into()));
+            return Err(FederationError::InvalidRequest(
+                "delivery is not for a signed pair member".into(),
+            ));
         }
         let rec_device_str = d["recipientDeviceId"].as_str().ok_or_else(|| {
             FederationError::InvalidRequest("missing recipientDeviceId in delivery item".into())
@@ -1875,8 +2240,12 @@ pub async fn ingest_remote_direct_request_delivery(
         let provenance = d.get("provenance").ok_or_else(|| {
             FederationError::InvalidRequest("missing provenance in delivery item".into())
         })?;
-        if provenance.get("requestId").and_then(|v| v.as_str()) != Some(&input.request_id.to_string()) {
-            return Err(FederationError::InvalidRequest("provenance requestId mismatch".into()));
+        if provenance.get("requestId").and_then(|v| v.as_str())
+            != Some(&input.request_id.to_string())
+        {
+            return Err(FederationError::InvalidRequest(
+                "provenance requestId mismatch".into(),
+            ));
         }
     }
 
@@ -1884,7 +2253,7 @@ pub async fn ingest_remote_direct_request_delivery(
     let existing_inbox: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
         "SELECT full_welcome_sha256, request_entry \
          FROM chat.direct_request_transport_inbox \
-         WHERE request_id = $1"
+         WHERE request_id = $1",
     )
     .bind(input.request_id)
     .fetch_all(&mut *tx)
@@ -1900,7 +2269,9 @@ pub async fn ingest_remote_direct_request_delivery(
                 });
             }
         }
-        tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
         return Ok(());
     }
 
@@ -1910,7 +2281,7 @@ pub async fn ingest_remote_direct_request_delivery(
          SET status = 'finalized', finalized_at = $1 \
          WHERE request_id = $2 AND recipient_did = $3 AND coordinator_did = $4 \
            AND status IN ('active', 'expired') \
-         RETURNING lease_id, key_package_ref, owner_device_id"
+         RETURNING lease_id, key_package_ref, owner_device_id",
     )
     .bind(now)
     .bind(input.request_id)
@@ -1921,15 +2292,20 @@ pub async fn ingest_remote_direct_request_delivery(
     .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     if leased_packages.is_empty() {
-        return Err(FederationError::InvalidRequest("no lease found for request".into()));
+        return Err(FederationError::InvalidRequest(
+            "no lease found for request".into(),
+        ));
     }
 
-    if leased_packages.len() != input.deliveries.iter()
-        .filter(|delivery| delivery["recipientDid"].as_str() == Some(recipient_did))
-        .count()
+    if leased_packages.len()
+        != input
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery["recipientDid"].as_str() == Some(recipient_did))
+            .count()
     {
         return Err(FederationError::InvalidRequest(
-            "leased recipient packages differ from signed local deliveries".into()
+            "leased recipient packages differ from signed local deliveries".into(),
         ));
     }
 
@@ -1945,9 +2321,9 @@ pub async fn ingest_remote_direct_request_delivery(
             FederationError::InvalidRequest(format!("invalid keyPackageRef in provenance: {e}"))
         })?;
 
-        let matching_lease = leased_packages.iter().find(|(_, pkg_ref, dev_id)| {
-            *dev_id == rec_device_id && *pkg_ref == prov_key_pkg
-        });
+        let matching_lease = leased_packages
+            .iter()
+            .find(|(_, pkg_ref, dev_id)| *dev_id == rec_device_id && *pkg_ref == prov_key_pkg);
 
         if matching_lease.is_none() {
             return Err(FederationError::InvalidRequest(format!(
@@ -1957,8 +2333,8 @@ pub async fn ingest_remote_direct_request_delivery(
     }
 
     // 8. Insert into chat.direct_request_transport_inbox
-    let publication_receipt_bytes = serde_json::to_vec(&input.publication_receipt)
-        .map_err(FederationError::Json)?;
+    let publication_receipt_bytes =
+        serde_json::to_vec(&input.publication_receipt).map_err(FederationError::Json)?;
 
     for d in &input.deliveries {
         if d["recipientDid"].as_str() != Some(recipient_did) {
@@ -2003,7 +2379,7 @@ pub async fn ingest_remote_direct_request_delivery(
         let res = sqlx::query(
             "UPDATE chat.key_packages \
              SET status = 'consumed', terminal_remote_lease_id = $1, terminal_at = $2 \
-             WHERE key_package_ref = $3 AND status = 'available'"
+             WHERE key_package_ref = $3 AND status = 'available'",
         )
         .bind(lease_id)
         .bind(now)
@@ -2013,23 +2389,29 @@ pub async fn ingest_remote_direct_request_delivery(
         .map_err(|e| FederationError::Storage(e.to_string()))?;
 
         if res.rows_affected() != 1 {
-            return Err(FederationError::InvalidRequest("key package was not available for consumption".into()));
+            return Err(FederationError::InvalidRequest(
+                "key package was not available for consumption".into(),
+            ));
         }
     }
 
     // 10. Insert initial introduction entry into chat.direct_request_transport_entries
     let seq = input.entry.get("seq").and_then(|v| v.as_i64()).unwrap_or(1);
     if seq != 1 {
-        return Err(FederationError::InvalidRequest("initial entry seq must be 1".into()));
+        return Err(FederationError::InvalidRequest(
+            "initial entry seq must be 1".into(),
+        ));
     }
     let entry_id_str = input.entry.get("entryId").and_then(|v| v.as_str());
-    let entry_id = entry_id_str.and_then(|s| Uuid::parse_str(s).ok()).unwrap_or(input.request_id);
+    let entry_id = entry_id_str
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or(input.request_id);
 
     let res = sqlx::query(
         "INSERT INTO chat.direct_request_transport_entries ( \
             conversation_id, seq, entry_id, entry_bytes, created_at \
          ) VALUES ($1, $2, $3, $4, clock_timestamp()) \
-         ON CONFLICT (conversation_id, seq) DO NOTHING"
+         ON CONFLICT (conversation_id, seq) DO NOTHING",
     )
     .bind(input.conversation_id)
     .bind(seq)
@@ -2059,7 +2441,9 @@ pub async fn ingest_remote_direct_request_delivery(
         }
     }
 
-    tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
     Ok(())
 }
 
@@ -2072,16 +2456,18 @@ pub async fn ingest_remote_acceptance_entry(
     entry: &Value,
     acceptance_proof: &Value,
 ) -> Result<(), FederationError> {
-    let signed_acceptance = entry.get("signedRequest")
+    let signed_acceptance = entry
+        .get("signedRequest")
         .ok_or_else(|| FederationError::InvalidRequest("missing signed acceptance".into()))?;
-    let actor_device_id = signed_acceptance.pointer("/body/actorDeviceId")
+    let actor_device_id = signed_acceptance
+        .pointer("/body/actorDeviceId")
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or_else(|| FederationError::InvalidRequest("invalid accepting device".into()))?;
     let convo_info: Option<(String, String, String, String)> = sqlx::query_as(
         "SELECT coordinator_did, sender_did, recipient_did, status \
          FROM chat.direct_request_transport_inbox \
-         WHERE conversation_id=$1 AND recipient_device_id=$2 LIMIT 1"
+         WHERE conversation_id=$1 AND recipient_device_id=$2 LIMIT 1",
     )
     .bind(conversation_id)
     .bind(actor_device_id)
@@ -2090,7 +2476,9 @@ pub async fn ingest_remote_acceptance_entry(
     .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let (coord_did, _sender_did, recipient_did, _status) = convo_info.ok_or_else(|| {
-        FederationError::NotFound(format!("conversation {conversation_id} not found in transport inbox"))
+        FederationError::NotFound(format!(
+            "conversation {conversation_id} not found in transport inbox"
+        ))
     })?;
 
     if canonical_did(&coord_did) != canonical_did(requester_ds) {
@@ -2099,16 +2487,25 @@ pub async fn ingest_remote_acceptance_entry(
         });
     }
 
-    let proof_receipt = acceptance_proof.pointer("/receipt/body")
+    let proof_receipt = acceptance_proof
+        .pointer("/receipt/body")
         .ok_or_else(|| FederationError::InvalidRequest("missing signed acceptance proof".into()))?;
     if proof_receipt["authorityDid"].as_str() != Some(coord_did.as_str())
-        || signed_acceptance.pointer("/body/actorDid").and_then(Value::as_str) != Some(recipient_did.as_str())
+        || signed_acceptance
+            .pointer("/body/actorDid")
+            .and_then(Value::as_str)
+            != Some(recipient_did.as_str())
     {
-        return Err(FederationError::InvalidRequest("acceptance actor or authority mismatch".into()));
+        return Err(FederationError::InvalidRequest(
+            "acceptance actor or authority mismatch".into(),
+        ));
     }
-    let key_id = proof_receipt["keyId"].as_str()
+    let key_id = proof_receipt["keyId"]
+        .as_str()
         .ok_or_else(|| FederationError::InvalidRequest("missing acceptance receipt key".into()))?;
-    let signer_key_id = signed_acceptance.pointer("/body/keyId").and_then(Value::as_str)
+    let signer_key_id = signed_acceptance
+        .pointer("/body/keyId")
+        .and_then(Value::as_str)
         .ok_or_else(|| FederationError::InvalidRequest("missing accepting device key".into()))?;
     let resolver = DsResolver::with_default_endpoint(
         pool.clone(),
@@ -2118,62 +2515,83 @@ pub async fn ingest_remote_acceptance_entry(
         std::env::var("DEFAULT_DS_ENDPOINT").ok(),
         3600,
     );
-    let authority_key = resolver.resolve_coordinator_receipt_key(pool, &coord_did, key_id).await?;
-    let authorized_keys = resolver.resolve_authorized_device_keys(&recipient_did).await?;
-    let actor_key = authorized_keys.iter()
+    let authority_key = resolver
+        .resolve_coordinator_receipt_key(pool, &coord_did, key_id)
+        .await?;
+    let authorized_keys = resolver
+        .resolve_authorized_device_keys(&recipient_did)
+        .await?;
+    let actor_key = authorized_keys
+        .iter()
         .find(|key| URL_SAFE_NO_PAD.encode(Sha256::digest(key)) == signer_key_id)
-        .ok_or_else(|| FederationError::Forbidden("accepting device key is not PDS-authorized".into()))?;
+        .ok_or_else(|| {
+            FederationError::Forbidden("accepting device key is not PDS-authorized".into())
+        })?;
     let proof_bytes = serde_json::to_vec(acceptance_proof).map_err(FederationError::Json)?;
     let verified_proof = crate::chat_protocol::direct_request_transcript::verify_received_direct_request_acceptance_proof(
         &proof_bytes, &authority_key, actor_key,
     ).map_err(|_| FederationError::InvalidProof)?;
     let mut untagged_entry = entry.clone();
-    untagged_entry.as_object_mut()
+    untagged_entry
+        .as_object_mut()
         .ok_or_else(|| FederationError::InvalidRequest("invalid acceptance entry".into()))?
         .remove("$type");
     if verified_proof.get("entry") != Some(&untagged_entry) {
-        return Err(FederationError::InvalidRequest("acceptance proof does not bind delivered entry".into()));
+        return Err(FederationError::InvalidRequest(
+            "acceptance proof does not bind delivered entry".into(),
+        ));
     }
 
     let entry_convo = entry.get("conversationId").and_then(|v| v.as_str());
     if entry_convo != Some(&conversation_id.to_string()) {
-        return Err(FederationError::InvalidRequest("conversationId mismatch in acceptance entry".into()));
+        return Err(FederationError::InvalidRequest(
+            "conversationId mismatch in acceptance entry".into(),
+        ));
     }
 
     if let Some(t) = entry.get("$type").and_then(|v| v.as_str()) {
         if t != "blue.catbird.chat.defs#directRequestAcceptanceEntry" {
-            return Err(FederationError::InvalidRequest(format!("invalid entry $type {t} for acceptance")));
+            return Err(FederationError::InvalidRequest(format!(
+                "invalid entry $type {t} for acceptance"
+            )));
         }
     }
 
-    let seq = entry.get("seq").and_then(|v| v.as_i64()).ok_or_else(|| {
-        FederationError::InvalidRequest("missing seq in acceptance entry".into())
-    })?;
+    let seq = entry
+        .get("seq")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| FederationError::InvalidRequest("missing seq in acceptance entry".into()))?;
     if seq != 2 {
-        return Err(FederationError::InvalidRequest(format!("acceptance entry seq must be 2, got {seq}")));
+        return Err(FederationError::InvalidRequest(format!(
+            "acceptance entry seq must be 2, got {seq}"
+        )));
     }
 
     let intro_bytes: Vec<u8> = sqlx::query_scalar(
         "SELECT entry_bytes FROM chat.direct_request_transport_entries \
-         WHERE conversation_id=$1 AND seq=1"
+         WHERE conversation_id=$1 AND seq=1",
     )
     .bind(conversation_id)
     .fetch_one(pool)
     .await
     .map_err(|_| FederationError::InvalidProof)?;
     let intro: Value = serde_json::from_slice(&intro_bytes).map_err(FederationError::Json)?;
-    if intro.pointer("/signedRequest/body/next")
-        != signed_acceptance.pointer("/body/prior")
-    {
-        return Err(FederationError::InvalidRequest("acceptance prior differs from verified introduction".into()));
+    if intro.pointer("/signedRequest/body/next") != signed_acceptance.pointer("/body/prior") {
+        return Err(FederationError::InvalidRequest(
+            "acceptance prior differs from verified introduction".into(),
+        ));
     }
 
-    let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let outcome_bytes = serde_json::to_vec(&json!({
         "entry": entry,
         "acceptanceProof": acceptance_proof,
-    })).map_err(FederationError::Json)?;
+    }))
+    .map_err(FederationError::Json)?;
 
     sqlx::query(
         "UPDATE chat.direct_request_transport_inbox \
@@ -2187,17 +2605,19 @@ pub async fn ingest_remote_acceptance_entry(
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    let entry_id_str = entry.get("entryId").and_then(|v| v.as_str()).unwrap_or_default();
-    let entry_id = Uuid::parse_str(entry_id_str).map_err(|e| {
-        FederationError::InvalidRequest(format!("invalid entryId UUID: {e}"))
-    })?;
+    let entry_id_str = entry
+        .get("entryId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let entry_id = Uuid::parse_str(entry_id_str)
+        .map_err(|e| FederationError::InvalidRequest(format!("invalid entryId UUID: {e}")))?;
     let entry_bytes = serde_json::to_vec(entry).map_err(FederationError::Json)?;
 
     let res = sqlx::query(
         "INSERT INTO chat.direct_request_transport_entries ( \
             conversation_id, seq, entry_id, entry_bytes, created_at \
          ) VALUES ($1, $2, $3, $4, clock_timestamp()) \
-         ON CONFLICT (conversation_id, seq) DO NOTHING"
+         ON CONFLICT (conversation_id, seq) DO NOTHING",
     )
     .bind(conversation_id)
     .bind(seq)
@@ -2227,7 +2647,9 @@ pub async fn ingest_remote_acceptance_entry(
         }
     }
 
-    tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
     Ok(())
 }
 
@@ -2239,20 +2661,27 @@ pub async fn ingest_remote_message_entry(
     conversation_id: Uuid,
     entry: &Value,
 ) -> Result<(), FederationError> {
-    let signed_message = entry.get("signedRequest")
-        .ok_or_else(|| FederationError::InvalidRequest("missing signed application message".into()))?;
-    let actor_did = signed_message.pointer("/body/actorDid").and_then(Value::as_str)
+    let signed_message = entry.get("signedRequest").ok_or_else(|| {
+        FederationError::InvalidRequest("missing signed application message".into())
+    })?;
+    let actor_did = signed_message
+        .pointer("/body/actorDid")
+        .and_then(Value::as_str)
         .ok_or_else(|| FederationError::InvalidRequest("missing message actor".into()))?;
-    let actor_device_id = signed_message.pointer("/body/actorDeviceId").and_then(Value::as_str)
+    let actor_device_id = signed_message
+        .pointer("/body/actorDeviceId")
+        .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or_else(|| FederationError::InvalidRequest("invalid message actor device".into()))?;
-    let signer_key_id = signed_message.pointer("/body/keyId").and_then(Value::as_str)
+    let signer_key_id = signed_message
+        .pointer("/body/keyId")
+        .and_then(Value::as_str)
         .ok_or_else(|| FederationError::InvalidRequest("missing message key ID".into()))?;
     let coord_info: Option<(String, String)> = sqlx::query_as(
         "SELECT coordinator_did, status FROM chat.direct_request_transport_inbox \
          WHERE conversation_id=$1 AND \
            ((sender_did=$2 AND sender_device_id=$3) OR \
-            (recipient_did=$2 AND recipient_device_id=$3)) LIMIT 1"
+            (recipient_did=$2 AND recipient_device_id=$3)) LIMIT 1",
     )
     .bind(conversation_id)
     .bind(actor_did)
@@ -2260,10 +2689,13 @@ pub async fn ingest_remote_message_entry(
     .fetch_optional(pool)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
-    let (coord_did, status) = coord_info
-        .ok_or_else(|| FederationError::Forbidden("message actor is not an entitled pair device".into()))?;
+    let (coord_did, status) = coord_info.ok_or_else(|| {
+        FederationError::Forbidden("message actor is not an entitled pair device".into())
+    })?;
     if status != "accepted" {
-        return Err(FederationError::Forbidden("direct request has not been accepted".into()));
+        return Err(FederationError::Forbidden(
+            "direct request has not been accepted".into(),
+        ));
     }
 
     if canonical_did(&coord_did) != canonical_did(requester_ds) {
@@ -2280,31 +2712,49 @@ pub async fn ingest_remote_message_entry(
         3600,
     );
     let authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await?;
-    let actor_key = authorized_keys.iter()
+    let actor_key = authorized_keys
+        .iter()
         .find(|key| URL_SAFE_NO_PAD.encode(Sha256::digest(key)) == signer_key_id)
-        .ok_or_else(|| FederationError::Forbidden("message signing key is not PDS-authorized".into()))?;
+        .ok_or_else(|| {
+            FederationError::Forbidden("message signing key is not PDS-authorized".into())
+        })?;
     let signed_bytes = serde_json::to_vec(signed_message).map_err(FederationError::Json)?;
     let verified = crate::chat_protocol::transcript::decode_and_verify_signed_mutation(
-        &signed_bytes, actor_key,
-    ).map_err(|_| FederationError::InvalidProof)?;
-    if !matches!(verified.projection(), crate::chat_protocol::transcript::VerifiedMutationProjection::ApplicationSend(_)) {
-        return Err(FederationError::InvalidRequest("relayed entry is not an application send".into()));
+        &signed_bytes,
+        actor_key,
+    )
+    .map_err(|_| FederationError::InvalidProof)?;
+    if !matches!(
+        verified.projection(),
+        crate::chat_protocol::transcript::VerifiedMutationProjection::ApplicationSend(_)
+    ) {
+        return Err(FederationError::InvalidRequest(
+            "relayed entry is not an application send".into(),
+        ));
     }
 
     let entry_convo = entry.get("conversationId").and_then(|v| v.as_str());
     if entry_convo != Some(&conversation_id.to_string()) {
-        return Err(FederationError::InvalidRequest("conversationId mismatch in message entry".into()));
+        return Err(FederationError::InvalidRequest(
+            "conversationId mismatch in message entry".into(),
+        ));
     }
 
-    if entry.get("$type").and_then(Value::as_str) != Some("blue.catbird.chat.defs#applicationEntry") {
-        return Err(FederationError::InvalidRequest("invalid application entry type".into()));
+    if entry.get("$type").and_then(Value::as_str) != Some("blue.catbird.chat.defs#applicationEntry")
+    {
+        return Err(FederationError::InvalidRequest(
+            "invalid application entry type".into(),
+        ));
     }
 
-    let seq = entry.get("seq").and_then(|v| v.as_i64()).ok_or_else(|| {
-        FederationError::InvalidRequest("missing seq in message entry".into())
-    })?;
+    let seq = entry
+        .get("seq")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| FederationError::InvalidRequest("missing seq in message entry".into()))?;
     if seq < 3 {
-        return Err(FederationError::InvalidRequest(format!("message entry seq must be >= 3, got {seq}")));
+        return Err(FederationError::InvalidRequest(format!(
+            "message entry seq must be >= 3, got {seq}"
+        )));
     }
 
     let predecessor_bytes: Vec<u8> = sqlx::query_scalar(
@@ -2317,7 +2767,8 @@ pub async fn ingest_remote_message_entry(
     .fetch_one(pool)
     .await
     .map_err(|_| FederationError::InvalidRequest("missing signed predecessor entry".into()))?;
-    let predecessor: Value = serde_json::from_slice(&predecessor_bytes).map_err(FederationError::Json)?;
+    let predecessor: Value =
+        serde_json::from_slice(&predecessor_bytes).map_err(FederationError::Json)?;
     let prior = signed_message.pointer("/body/prior");
     let prior_entry = if seq == 3 {
         predecessor.pointer("/signedRequest/body/next")
@@ -2325,26 +2776,32 @@ pub async fn ingest_remote_message_entry(
         predecessor.pointer("/signedRequest/body/prior")
     };
     if prior.is_none() || prior != prior_entry {
-        return Err(FederationError::InvalidRequest("message coordinates differ from retained predecessor".into()));
+        return Err(FederationError::InvalidRequest(
+            "message coordinates differ from retained predecessor".into(),
+        ));
     }
 
-    let entry_id_str = entry.get("entryId").and_then(|v| v.as_str()).ok_or_else(|| {
-        FederationError::InvalidRequest("missing entryId in message entry".into())
-    })?;
-    let entry_id = Uuid::parse_str(entry_id_str).map_err(|e| {
-        FederationError::InvalidRequest(format!("invalid entryId UUID: {e}"))
-    })?;
+    let entry_id_str = entry
+        .get("entryId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing entryId in message entry".into())
+        })?;
+    let entry_id = Uuid::parse_str(entry_id_str)
+        .map_err(|e| FederationError::InvalidRequest(format!("invalid entryId UUID: {e}")))?;
 
-    let entry_bytes = serde_json::to_vec(entry)
-        .map_err(FederationError::Json)?;
+    let entry_bytes = serde_json::to_vec(entry).map_err(FederationError::Json)?;
 
-    let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let res = sqlx::query(
         "INSERT INTO chat.direct_request_transport_entries ( \
             conversation_id, seq, entry_id, entry_bytes, created_at \
          ) VALUES ($1, $2, $3, $4, clock_timestamp()) \
-         ON CONFLICT (conversation_id, seq) DO NOTHING"
+         ON CONFLICT (conversation_id, seq) DO NOTHING",
     )
     .bind(conversation_id)
     .bind(seq)
@@ -2374,7 +2831,9 @@ pub async fn ingest_remote_message_entry(
         }
     }
 
-    tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
     Ok(())
 }
 
@@ -2386,26 +2845,30 @@ pub async fn coordinator_prepare_direct_request(
     input: &Value,
 ) -> Result<Value, FederationError> {
     let signed_req = input.get("signedRequest").unwrap_or(input);
-    let actor_did = signed_req["body"]["actorDid"].as_str().ok_or_else(|| {
-        FederationError::InvalidRequest("missing actorDid".into())
-    })?;
-    let recipient_did = signed_req["body"]["recipientDid"].as_str().ok_or_else(|| {
-        FederationError::InvalidRequest("missing recipientDid".into())
-    })?;
-    let request_id_str = signed_req["body"]["requestId"].as_str().ok_or_else(|| {
-        FederationError::InvalidRequest("missing requestId".into())
-    })?;
-    let request_id = Uuid::parse_str(request_id_str).map_err(|_| {
-        FederationError::InvalidRequest("invalid requestId".into())
-    })?;
+    let actor_did = signed_req["body"]["actorDid"]
+        .as_str()
+        .ok_or_else(|| FederationError::InvalidRequest("missing actorDid".into()))?;
+    let recipient_did = signed_req["body"]["recipientDid"]
+        .as_str()
+        .ok_or_else(|| FederationError::InvalidRequest("missing recipientDid".into()))?;
+    let request_id_str = signed_req["body"]["requestId"]
+        .as_str()
+        .ok_or_else(|| FederationError::InvalidRequest("missing requestId".into()))?;
+    let request_id = Uuid::parse_str(request_id_str)
+        .map_err(|_| FederationError::InvalidRequest("invalid requestId".into()))?;
 
     let coord = resolve_pair_coordinator(pool, actor_did, recipient_did).await?;
     if !coord.is_coordinator {
-        return Err(FederationError::Forbidden("Local node is not coordinator".into()));
+        return Err(FederationError::Forbidden(
+            "Local node is not coordinator".into(),
+        ));
     }
     if canonical_did(&coord.sender_home.did) != canonical_did(requester_ds) {
         return Err(FederationError::AuthFailed {
-            reason: format!("Requester {requester_ds} is not sender home DS {}", coord.sender_home.did),
+            reason: format!(
+                "Requester {requester_ds} is not sender home DS {}",
+                coord.sender_home.did
+            ),
         });
     }
 
@@ -2425,43 +2888,57 @@ pub async fn coordinator_prepare_direct_request(
         let sender_key = match input.get("senderDeviceKey") {
             Some(k) => k,
             None => {
-                return Err(FederationError::InvalidRequest("missing senderDeviceKey from sender home DS".into()));
+                return Err(FederationError::InvalidRequest(
+                    "missing senderDeviceKey from sender home DS".into(),
+                ));
             }
         };
         let device_id_str = match sender_key["deviceId"].as_str() {
             Some(s) => s,
             None => {
-                return Err(FederationError::InvalidRequest("missing senderDeviceKey.deviceId".into()));
+                return Err(FederationError::InvalidRequest(
+                    "missing senderDeviceKey.deviceId".into(),
+                ));
             }
         };
         let key_id = match sender_key["keyId"].as_str() {
             Some(k) => k.to_string(),
             None => {
-                return Err(FederationError::InvalidRequest("missing senderDeviceKey.keyId".into()));
+                return Err(FederationError::InvalidRequest(
+                    "missing senderDeviceKey.keyId".into(),
+                ));
             }
         };
         let auth_gen = match sender_key["authGeneration"].as_i64() {
             Some(g) => g,
             None => {
-                return Err(FederationError::InvalidRequest("missing senderDeviceKey.authGeneration".into()));
+                return Err(FederationError::InvalidRequest(
+                    "missing senderDeviceKey.authGeneration".into(),
+                ));
             }
         };
         let pub_key_b64 = match sender_key["signingPublicKey"].as_str() {
             Some(p) => p,
             None => {
-                return Err(FederationError::InvalidRequest("missing senderDeviceKey.signingPublicKey".into()));
+                return Err(FederationError::InvalidRequest(
+                    "missing senderDeviceKey.signingPublicKey".into(),
+                ));
             }
         };
         let device_id = match Uuid::parse_str(device_id_str) {
             Ok(d) => d,
             Err(_) => {
-                return Err(FederationError::InvalidRequest("invalid senderDeviceKey.deviceId".into()));
+                return Err(FederationError::InvalidRequest(
+                    "invalid senderDeviceKey.deviceId".into(),
+                ));
             }
         };
         let pub_key = match STANDARD.decode(pub_key_b64) {
             Ok(k) => k,
             Err(_) => {
-                return Err(FederationError::InvalidRequest("invalid senderDeviceKey.signingPublicKey base64".into()));
+                return Err(FederationError::InvalidRequest(
+                    "invalid senderDeviceKey.signingPublicKey base64".into(),
+                ));
             }
         };
 
@@ -2469,7 +2946,9 @@ pub async fn coordinator_prepare_direct_request(
             || signed_req["body"]["keyId"].as_str() != Some(key_id.as_str())
             || signed_req["body"]["authGeneration"].as_i64() != Some(auth_gen)
         {
-            return Err(FederationError::InvalidRequest("signedRequest fields do not match senderDeviceKey".into()));
+            return Err(FederationError::InvalidRequest(
+                "signedRequest fields do not match senderDeviceKey".into(),
+            ));
         }
         let http = super::resolver::build_resolver_http_client();
         let resolver = DsResolver::with_default_endpoint(
@@ -2492,16 +2971,22 @@ pub async fn coordinator_prepare_direct_request(
             &signed_bytes,
             &pub_key,
         ) {
-            return Err(FederationError::InvalidRequest(format!("prepare signature verification failed against senderDeviceKey: {e:?}")));
+            return Err(FederationError::InvalidRequest(format!(
+                "prepare signature verification failed against senderDeviceKey: {e:?}"
+            )));
         }
         let calculated_key_id = match crate::chat_protocol::validation::ed25519_key_id(&pub_key) {
             Ok(k) => k,
             Err(e) => {
-                return Err(FederationError::InvalidRequest(format!("invalid ed25519 public key: {e:?}")));
+                return Err(FederationError::InvalidRequest(format!(
+                    "invalid ed25519 public key: {e:?}"
+                )));
             }
         };
         if calculated_key_id.as_str() != key_id {
-            return Err(FederationError::InvalidRequest("senderDeviceKey keyId does not match public key thumbprint".into()));
+            return Err(FederationError::InvalidRequest(
+                "senderDeviceKey keyId does not match public key thumbprint".into(),
+            ));
         }
         Some((device_id, key_id, auth_gen, pub_key))
     } else {
@@ -2510,7 +2995,7 @@ pub async fn coordinator_prepare_direct_request(
 
     // Quick pre-check before remote reservation HTTP so replays/conflicts do not unnecessarily reserve
     let has_existing_attempt: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)"
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)",
     )
     .bind(request_id)
     .fetch_one(pool)
@@ -2534,7 +3019,10 @@ pub async fn coordinator_prepare_direct_request(
         None
     };
 
-    let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     // Acquire transaction advisory lock for the unordered participant pair
     if let Err(e) = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -2563,9 +3051,12 @@ pub async fn coordinator_prepare_direct_request(
         request_id,
         Some(&coord.coordinator_did),
     )
-    .await? {
+    .await?
+    {
         let msg = match conflict {
-            PairFenceConflict::ForeignCoordinator { coordinator_did, .. } => {
+            PairFenceConflict::ForeignCoordinator {
+                coordinator_did, ..
+            } => {
                 format!("Direct request or pair already owned by coordinator {coordinator_did}")
             }
             PairFenceConflict::LocalConflict { .. } => {
@@ -2589,26 +3080,38 @@ pub async fn coordinator_prepare_direct_request(
         });
     }
     let existing_attempt: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)"
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)",
     )
     .bind(request_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
     if existing_attempt {
-        let signer = runtime.request_receipt_signer().ok_or_else(|| {
-            FederationError::ConfigError { reason: "request receipt signer not configured".into() }
-        })?;
+        let signer =
+            runtime
+                .request_receipt_signer()
+                .ok_or_else(|| FederationError::ConfigError {
+                    reason: "request receipt signer not configured".into(),
+                })?;
         let principal = crate::auth::VerifiedServicePrincipal::for_federated_s2s(
-            actor_did, "blue.catbird.chat.prepareDirectRequest",
+            actor_did,
+            "blue.catbird.chat.prepareDirectRequest",
         );
         let signed_bytes = serde_json::to_vec(signed_req).map_err(FederationError::Json)?;
-        let result = crate::chat_protocol::repository::direct_request_preparation::prepare_direct_request(
-            &mut tx, &principal, &signed_bytes, signer,
-            runtime.relationship_authority().as_ref(), now,
-        ).await.map_err(|error| FederationError::RemoteError {
-            status: 409, body: format!("prepare replay rejected: {error:?}"),
-        })?;
+        let result =
+            crate::chat_protocol::repository::direct_request_preparation::prepare_direct_request(
+                &mut tx,
+                &principal,
+                &signed_bytes,
+                signer,
+                runtime.relationship_authority().as_ref(),
+                now,
+            )
+            .await
+            .map_err(|error| FederationError::RemoteError {
+                status: 409,
+                body: format!("prepare replay rejected: {error:?}"),
+            })?;
         let rejected = matches!(&result,
             crate::chat_protocol::repository::direct_request_preparation::DirectRequestResult::Terminal(_));
         let outcome = match result {
@@ -2623,7 +3126,9 @@ pub async fn coordinator_prepare_direct_request(
             }
             _ => return Err(FederationError::Invariant("invalid retained preparation outcome".into())),
         };
-        tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
         if (rejected || reserved_remote_devices.is_some()) && !coord.is_recipient_home {
             release_remote_recipient_bootstrap(
                 pool,
@@ -2631,7 +3136,8 @@ pub async fn coordinator_prepare_direct_request(
                 &coord.recipient_home.did,
                 request_id,
                 recipient_did,
-            ).await?;
+            )
+            .await?;
         }
         return Ok(json!({"outcome": outcome}));
     }
@@ -2656,9 +3162,12 @@ pub async fn coordinator_prepare_direct_request(
                         &coord.recipient_home.did,
                         request_id,
                         recipient_did,
-                    ).await;
+                    )
+                    .await;
                 }
-                return Err(FederationError::Forbidden("sender device is not active".into()));
+                return Err(FederationError::Forbidden(
+                    "sender device is not active".into(),
+                ));
             }
             if auth_gen < gen {
                 drop(tx);
@@ -2669,9 +3178,12 @@ pub async fn coordinator_prepare_direct_request(
                         &coord.recipient_home.did,
                         request_id,
                         recipient_did,
-                    ).await;
+                    )
+                    .await;
                 }
-                return Err(FederationError::InvalidRequest("sender device auth_generation rollback".into()));
+                return Err(FederationError::InvalidRequest(
+                    "sender device auth_generation rollback".into(),
+                ));
             }
         }
 
@@ -2695,9 +3207,12 @@ pub async fn coordinator_prepare_direct_request(
                         &coord.recipient_home.did,
                         request_id,
                         recipient_did,
-                    ).await;
+                    )
+                    .await;
                 }
-                return Err(FederationError::InvalidRequest("sender signing key mismatch with existing coordinator key".into()));
+                return Err(FederationError::InvalidRequest(
+                    "sender signing key mismatch with existing coordinator key".into(),
+                ));
             }
         }
 
@@ -2742,20 +3257,21 @@ pub async fn coordinator_prepare_direct_request(
         .map_err(|e| FederationError::Storage(e.to_string()))?;
     }
 
-    let signer = runtime.request_receipt_signer().ok_or_else(|| {
-        FederationError::ConfigError {
+    let signer = runtime
+        .request_receipt_signer()
+        .ok_or_else(|| FederationError::ConfigError {
             reason: "request receipt signer not configured".into(),
-        }
-    })?;
+        })?;
     let principal = crate::auth::VerifiedServicePrincipal::for_federated_s2s(
         actor_did,
         "blue.catbird.chat.prepareDirectRequest",
     );
 
-    let signed_bytes = serde_json::to_vec(signed_req)
-        .map_err(FederationError::Json)?;
+    let signed_bytes = serde_json::to_vec(signed_req).map_err(FederationError::Json)?;
     if let Some(ref remote_devices) = reserved_remote_devices {
-        if let Err(e) = stage_remote_recipient_devices(pool, &mut tx, request_id, remote_devices, now).await {
+        if let Err(e) =
+            stage_remote_recipient_devices(pool, &mut tx, request_id, remote_devices, now).await
+        {
             drop(tx);
             release_remote_recipient_bootstrap(
                 pool,
@@ -2763,39 +3279,42 @@ pub async fn coordinator_prepare_direct_request(
                 &coord.recipient_home.did,
                 request_id,
                 recipient_did,
-            ).await?;
+            )
+            .await?;
             return Err(e);
         }
     }
 
-    let result = match crate::chat_protocol::repository::direct_request_preparation::prepare_direct_request(
-        &mut tx,
-        &principal,
-        &signed_bytes,
-        signer,
-        runtime.relationship_authority().as_ref(),
-        now,
-    )
-    .await {
-        Ok(r) => r,
-        Err(e) => {
-            drop(tx);
-            if reserved_remote_devices.is_some() {
-                release_remote_recipient_bootstrap(
-                    pool,
-                    &coord.recipient_home.endpoint,
-                    &coord.recipient_home.did,
-                    request_id,
-                    recipient_did,
-                )
-                .await?;
+    let result =
+        match crate::chat_protocol::repository::direct_request_preparation::prepare_direct_request(
+            &mut tx,
+            &principal,
+            &signed_bytes,
+            signer,
+            runtime.relationship_authority().as_ref(),
+            now,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                drop(tx);
+                if reserved_remote_devices.is_some() {
+                    release_remote_recipient_bootstrap(
+                        pool,
+                        &coord.recipient_home.endpoint,
+                        &coord.recipient_home.did,
+                        request_id,
+                        recipient_did,
+                    )
+                    .await?;
+                }
+                return Err(FederationError::RemoteError {
+                    status: 400,
+                    body: format!("prepare_direct_request error: {e:?}"),
+                });
             }
-            return Err(FederationError::RemoteError {
-                status: 400,
-                body: format!("prepare_direct_request error: {e:?}"),
-            });
-        }
-    };
+        };
     let should_release_remote = reserved_remote_devices.is_some()
         && !matches!(&result,
             crate::chat_protocol::repository::direct_request_preparation::DirectRequestResult::Prepared(_));
@@ -2818,7 +3337,9 @@ pub async fn coordinator_prepare_direct_request(
         }
     };
 
-    tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
     if should_release_remote {
         release_remote_recipient_bootstrap(
             pool,
@@ -2826,7 +3347,8 @@ pub async fn coordinator_prepare_direct_request(
             &coord.recipient_home.did,
             request_id,
             recipient_did,
-        ).await?;
+        )
+        .await?;
     }
     Ok(json!({ "outcome": output_val }))
 }
@@ -2839,36 +3361,39 @@ pub async fn coordinator_publish_direct_request(
     input: &Value,
 ) -> Result<Value, FederationError> {
     let signed_req = input.get("signedRequest").unwrap_or(input);
-    let actor_did = signed_req["body"]["actorDid"].as_str().ok_or_else(|| {
-        FederationError::InvalidRequest("missing actorDid".into())
-    })?;
-    let recipient_did = signed_req["body"]["recipientDid"].as_str().ok_or_else(|| {
-        FederationError::InvalidRequest("missing recipientDid".into())
-    })?;
+    let actor_did = signed_req["body"]["actorDid"]
+        .as_str()
+        .ok_or_else(|| FederationError::InvalidRequest("missing actorDid".into()))?;
+    let recipient_did = signed_req["body"]["recipientDid"]
+        .as_str()
+        .ok_or_else(|| FederationError::InvalidRequest("missing recipientDid".into()))?;
 
     let coord = resolve_pair_coordinator(pool, actor_did, recipient_did).await?;
     if !coord.is_coordinator {
-        return Err(FederationError::Forbidden("Local node is not coordinator".into()));
+        return Err(FederationError::Forbidden(
+            "Local node is not coordinator".into(),
+        ));
     }
     if canonical_did(&coord.sender_home.did) != canonical_did(requester_ds) {
         return Err(FederationError::AuthFailed {
-            reason: format!("Requester {requester_ds} is not sender home DS {}", coord.sender_home.did),
+            reason: format!(
+                "Requester {requester_ds} is not sender home DS {}",
+                coord.sender_home.did
+            ),
         });
     }
 
-
-    let signer = runtime.request_receipt_signer().ok_or_else(|| {
-        FederationError::ConfigError {
+    let signer = runtime
+        .request_receipt_signer()
+        .ok_or_else(|| FederationError::ConfigError {
             reason: "request receipt signer not configured".into(),
-        }
-    })?;
+        })?;
     let principal = crate::auth::VerifiedServicePrincipal::for_federated_s2s(
         actor_did,
         "blue.catbird.chat.publishDirectRequest",
     );
 
-    let signed_bytes = serde_json::to_vec(signed_req)
-        .map_err(FederationError::Json)?;
+    let signed_bytes = serde_json::to_vec(signed_req).map_err(FederationError::Json)?;
 
     let now = TrustedRequestInstant::capture()
         .map_err(|_| FederationError::Invariant("trusted instant".into()))?
@@ -2885,11 +3410,16 @@ pub async fn coordinator_publish_direct_request(
         3600,
     );
     let actor_authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await?;
-    let actor_key_id = signed_req.pointer("/body/keyId").and_then(|v| v.as_str()).unwrap_or_default();
+    let actor_key_id = signed_req
+        .pointer("/body/keyId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let actor_key_authorized = actor_authorized_keys.iter().any(|k| {
         URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == actor_key_id
             || STANDARD.encode(k) == actor_key_id
-            || crate::chat_protocol::validation::ed25519_key_id(k).map(|id| id.as_str() == actor_key_id).unwrap_or(false)
+            || crate::chat_protocol::validation::ed25519_key_id(k)
+                .map(|id| id.as_str() == actor_key_id)
+                .unwrap_or(false)
     });
     if !actor_key_authorized {
         return Err(FederationError::Forbidden(format!(
@@ -2897,21 +3427,34 @@ pub async fn coordinator_publish_direct_request(
         )));
     }
 
-    let recipient_authorized_keys = resolver.resolve_authorized_device_keys(recipient_did).await?;
+    let recipient_authorized_keys = resolver
+        .resolve_authorized_device_keys(recipient_did)
+        .await?;
     if recipient_authorized_keys.is_empty() {
         return Err(FederationError::Forbidden(format!(
             "recipient {recipient_did} authorizes no MLS device keys on PDS at publication commit"
         )));
     }
 
-    let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let request_id = Uuid::parse_str(signed_req["body"]["requestId"].as_str().unwrap_or_default())
         .unwrap_or_default();
-    let conversation_id = Uuid::parse_str(signed_req["body"]["conversationId"].as_str().unwrap_or_default())
-        .unwrap_or_default();
-    let first_message_id = Uuid::parse_str(signed_req["body"]["firstMessageId"].as_str().unwrap_or_default())
-        .unwrap_or_default();
+    let conversation_id = Uuid::parse_str(
+        signed_req["body"]["conversationId"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default();
+    let first_message_id = Uuid::parse_str(
+        signed_req["body"]["firstMessageId"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default();
     let (p1, p2) = if actor_did <= recipient_did {
         (actor_did, recipient_did)
     } else {
@@ -2931,9 +3474,12 @@ pub async fn coordinator_publish_direct_request(
         request_id,
         Some(&coord.coordinator_did),
     )
-    .await? {
+    .await?
+    {
         let msg = match conflict {
-            PairFenceConflict::ForeignCoordinator { coordinator_did, .. } => {
+            PairFenceConflict::ForeignCoordinator {
+                coordinator_did, ..
+            } => {
                 format!("Direct request or pair already owned by coordinator {coordinator_did}")
             }
             PairFenceConflict::LocalConflict { .. } => {
@@ -2966,20 +3512,21 @@ pub async fn coordinator_publish_direct_request(
         }
     }
 
-    let prepared = crate::chat_protocol::repository::direct_request_publication::prepare_publication(
-        &mut tx,
-        &principal,
-        &signed_bytes,
-        signer,
-        runtime.relationship_authority().as_ref(),
-        now,
-        runtime.request_producers_enabled(),
-    )
-    .await
-    .map_err(|e| FederationError::RemoteError {
-        status: 400,
-        body: format!("prepare_publication error: {e:?}"),
-    })?;
+    let prepared =
+        crate::chat_protocol::repository::direct_request_publication::prepare_publication(
+            &mut tx,
+            &principal,
+            &signed_bytes,
+            signer,
+            runtime.relationship_authority().as_ref(),
+            now,
+            runtime.request_producers_enabled(),
+        )
+        .await
+        .map_err(|e| FederationError::RemoteError {
+            status: 400,
+            body: format!("prepare_publication error: {e:?}"),
+        })?;
 
     let receipt_bytes = match prepared {
         crate::chat_protocol::repository::direct_request_publication::PublicationPreparation::Terminal(bytes) => bytes,
@@ -2998,20 +3545,22 @@ pub async fn coordinator_publish_direct_request(
         }
     };
 
-    let mut receipt: Value = serde_json::from_slice(&receipt_bytes)
-        .map_err(FederationError::Json)?;
+    let mut receipt: Value =
+        serde_json::from_slice(&receipt_bytes).map_err(FederationError::Json)?;
     receipt["$type"] = json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
 
-    let entry_row: Option<Vec<u8>> = sqlx::query_scalar("SELECT accepted_payload_bytes FROM chat.entries WHERE transition_id = $1")
-        .bind(request_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
+    let entry_row: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT accepted_payload_bytes FROM chat.entries WHERE transition_id = $1",
+    )
+    .bind(request_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    let entry_val: Option<Value> = entry_row
-        .and_then(|b| serde_json::from_slice(&b).ok());
+    let entry_val: Option<Value> = entry_row.and_then(|b| serde_json::from_slice(&b).ok());
 
-    let deliveries = signed_req.pointer("/body/artifacts/welcome/deliveries")
+    let deliveries = signed_req
+        .pointer("/body/artifacts/welcome/deliveries")
         .or_else(|| signed_req.pointer("/artifacts/welcome/deliveries"))
         .or_else(|| receipt.pointer("/receipt/artifacts/welcome/deliveries"))
         .or_else(|| receipt.pointer("/artifacts/welcome/deliveries"))
@@ -3065,7 +3614,9 @@ pub async fn coordinator_publish_direct_request(
         .await?;
     }
 
-    tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     if !coord.is_recipient_home {
         if let Ok(()) = deliver_direct_request_to_peer(
@@ -3073,7 +3624,8 @@ pub async fn coordinator_publish_direct_request(
             &coord.recipient_home.did,
             deliver_input,
         )
-        .await {
+        .await
+        {
             let _ = crate::federation::queue::mark_delivered_by_id(pool, &queue_id).await;
         }
     }
@@ -3093,15 +3645,16 @@ pub async fn coordinator_accept_direct_request(
     conversation_id: Uuid,
     direct_request: &Value,
 ) -> Result<DeliverAcceptanceOutput, FederationError> {
-    let actor_did = direct_request["body"]["actorDid"].as_str().ok_or_else(|| {
-        FederationError::InvalidRequest("missing actorDid".into())
-    })?;
-    let request_id_str = direct_request["body"]["requestId"].as_str().ok_or_else(|| {
-        FederationError::InvalidRequest("missing requestId in direct request body".into())
-    })?;
-    let request_id = Uuid::parse_str(request_id_str).map_err(|_| {
-        FederationError::InvalidRequest("invalid requestId".into())
-    })?;
+    let actor_did = direct_request["body"]["actorDid"]
+        .as_str()
+        .ok_or_else(|| FederationError::InvalidRequest("missing actorDid".into()))?;
+    let request_id_str = direct_request["body"]["requestId"]
+        .as_str()
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing requestId in direct request body".into())
+        })?;
+    let request_id = Uuid::parse_str(request_id_str)
+        .map_err(|_| FederationError::InvalidRequest("invalid requestId".into()))?;
 
     let stored_pair: Option<(String, String)> = sqlx::query_as(
         "SELECT actor_did, recipient_did FROM chat.direct_request_publications WHERE request_id = $1 \
@@ -3114,7 +3667,9 @@ pub async fn coordinator_accept_direct_request(
     .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let (sender_did, expected_recipient_did) = stored_pair.ok_or_else(|| {
-        FederationError::NotFound(format!("direct request {request_id} not found on coordinator"))
+        FederationError::NotFound(format!(
+            "direct request {request_id} not found on coordinator"
+        ))
     })?;
 
     if actor_did != expected_recipient_did {
@@ -3125,32 +3680,39 @@ pub async fn coordinator_accept_direct_request(
 
     let coord = resolve_pair_coordinator(pool, &sender_did, &expected_recipient_did).await?;
     if !coord.is_coordinator {
-        return Err(FederationError::Forbidden("Local node is not coordinator".into()));
+        return Err(FederationError::Forbidden(
+            "Local node is not coordinator".into(),
+        ));
     }
     if canonical_did(&coord.recipient_home.did) != canonical_did(requester_ds) {
         return Err(FederationError::AuthFailed {
-            reason: format!("Requester {requester_ds} is not recipient home DS {}", coord.recipient_home.did),
+            reason: format!(
+                "Requester {requester_ds} is not recipient home DS {}",
+                coord.recipient_home.did
+            ),
         });
     }
 
-    let raw_bytes = serde_json::to_vec(direct_request)
-        .map_err(FederationError::Json)?;
+    let raw_bytes = serde_json::to_vec(direct_request).map_err(FederationError::Json)?;
 
     let now = TrustedRequestInstant::capture()
         .map_err(|_| FederationError::Invariant("trusted instant".into()))?
         .datetime();
 
-    let signer = runtime.request_receipt_signer().ok_or_else(|| {
-        FederationError::ConfigError {
+    let signer = runtime
+        .request_receipt_signer()
+        .ok_or_else(|| FederationError::ConfigError {
             reason: "request receipt signer not configured".into(),
-        }
-    })?;
+        })?;
     let principal = crate::auth::VerifiedServicePrincipal::for_federated_s2s(
         actor_did,
         "blue.catbird.chat.acceptConversation",
     );
 
-    let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
     let bytes = crate::chat_protocol::repository::acceptance::accept_direct_request(
         &mut tx,
         &principal,
@@ -3165,11 +3727,13 @@ pub async fn coordinator_accept_direct_request(
         body: format!("accept_direct_request error: {e:?}"),
     })?;
 
-    let entry_row: Option<Vec<u8>> = sqlx::query_scalar("SELECT accepted_payload_bytes FROM chat.entries WHERE conversation_id = $1 AND seq = 2")
-        .bind(conversation_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
+    let entry_row: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT accepted_payload_bytes FROM chat.entries WHERE conversation_id = $1 AND seq = 2",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let entry: Value = entry_row
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -3204,14 +3768,18 @@ pub async fn coordinator_accept_direct_request(
         .await?;
     }
 
-    tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     if canonical_did(&coord.sender_home.did) != canonical_did(&self_did) {
         if let Ok(()) = deliver_acceptance_entry_to_peer(
             &coord.sender_home.endpoint,
             &coord.sender_home.did,
             deliver_payload,
-        ).await {
+        )
+        .await
+        {
             let _ = crate::federation::queue::mark_delivered_by_id(pool, &queue_id).await;
         }
     }
@@ -3231,29 +3799,37 @@ pub async fn coordinator_handle_message(
     conversation_id: Uuid,
     message: &Value,
 ) -> Result<Value, FederationError> {
-    let actor_did = message.pointer("/body/actorDid").and_then(|v| v.as_str()).ok_or_else(|| {
-        FederationError::InvalidRequest("missing actorDid in message body".into())
-    })?;
-    let actor_device_id_str = message.pointer("/body/actorDeviceId").and_then(|v| v.as_str()).ok_or_else(|| {
-        FederationError::InvalidRequest("missing actorDeviceId in message body".into())
-    })?;
-    let actor_device_id = Uuid::parse_str(actor_device_id_str).map_err(|_| {
-        FederationError::InvalidRequest("invalid actorDeviceId".into())
-    })?;
-    let key_id = message.pointer("/body/keyId").and_then(|v| v.as_str()).ok_or_else(|| {
-        FederationError::InvalidRequest("missing keyId in message body".into())
-    })?;
-    let message_id_str = message.pointer("/body/messageId").and_then(|v| v.as_str()).ok_or_else(|| {
-        FederationError::InvalidRequest("missing messageId in message body".into())
-    })?;
-    let message_id = Uuid::parse_str(message_id_str).map_err(|_| {
-        FederationError::InvalidRequest("invalid messageId".into())
-    })?;
+    let actor_did = message
+        .pointer("/body/actorDid")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing actorDid in message body".into())
+        })?;
+    let actor_device_id_str = message
+        .pointer("/body/actorDeviceId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing actorDeviceId in message body".into())
+        })?;
+    let actor_device_id = Uuid::parse_str(actor_device_id_str)
+        .map_err(|_| FederationError::InvalidRequest("invalid actorDeviceId".into()))?;
+    let key_id = message
+        .pointer("/body/keyId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| FederationError::InvalidRequest("missing keyId in message body".into()))?;
+    let message_id_str = message
+        .pointer("/body/messageId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            FederationError::InvalidRequest("missing messageId in message body".into())
+        })?;
+    let message_id = Uuid::parse_str(message_id_str)
+        .map_err(|_| FederationError::InvalidRequest("invalid messageId".into()))?;
 
     // 1. Verify actor membership in conversation
     let actor_participant: Option<(String, bool, String)> = sqlx::query_as(
         "SELECT role, current_membership, status FROM chat.participants \
-         WHERE conversation_id = $1 AND user_did = $2"
+         WHERE conversation_id = $1 AND user_did = $2",
     )
     .bind(conversation_id)
     .bind(actor_did)
@@ -3266,7 +3842,9 @@ pub async fn coordinator_handle_message(
     })?;
 
     if !current_membership || status != "active" || (role != "member" && role != "admin") {
-        return Err(FederationError::Forbidden("actor is not an active member in this conversation".into()));
+        return Err(FederationError::Forbidden(
+            "actor is not an active member in this conversation".into(),
+        ));
     }
 
     // 2. Query conversation to check direct conversation rules and find peer
@@ -3279,16 +3857,24 @@ pub async fn coordinator_handle_message(
     .map_err(|e| FederationError::Storage(e.to_string()))?
     .ok_or_else(|| FederationError::NotFound(format!("conversation {conversation_id} not found")))?;
 
-    let kind: String = convo_row.try_get("kind").map_err(|e| FederationError::Storage(e.to_string()))?;
+    let kind: String = convo_row
+        .try_get("kind")
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
     let peer_did: String = if kind == "direct" {
-        let low: String = convo_row.try_get("direct_did_low").map_err(|e| FederationError::Storage(e.to_string()))?;
-        let high: String = convo_row.try_get("direct_did_high").map_err(|e| FederationError::Storage(e.to_string()))?;
+        let low: String = convo_row
+            .try_get("direct_did_low")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let high: String = convo_row
+            .try_get("direct_did_high")
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
         if actor_did == low {
             high
         } else if actor_did == high {
             low
         } else {
-            return Err(FederationError::Forbidden("actor does not belong to direct conversation".into()));
+            return Err(FederationError::Forbidden(
+                "actor does not belong to direct conversation".into(),
+            ));
         }
     } else {
         let peer: Option<String> = sqlx::query_scalar(
@@ -3305,11 +3891,16 @@ pub async fn coordinator_handle_message(
     // 3. Authenticate that requester_ds is the authoritative home DS of actor_did
     let coord = resolve_pair_coordinator(pool, actor_did, &peer_did).await?;
     if !coord.is_coordinator {
-        return Err(FederationError::Forbidden("Local node is not coordinator".into()));
+        return Err(FederationError::Forbidden(
+            "Local node is not coordinator".into(),
+        ));
     }
     if canonical_did(&coord.sender_home.did) != canonical_did(requester_ds) {
         return Err(FederationError::AuthFailed {
-            reason: format!("Requester {requester_ds} is not actor {actor_did} home DS {}", coord.sender_home.did),
+            reason: format!(
+                "Requester {requester_ds} is not actor {actor_did} home DS {}",
+                coord.sender_home.did
+            ),
         });
     }
 
@@ -3329,7 +3920,9 @@ pub async fn coordinator_handle_message(
     .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let (signing_public_key, auth_generation) = key_row.ok_or_else(|| {
-        FederationError::NotFound(format!("Active device key {key_id} not found on coordinator"))
+        FederationError::NotFound(format!(
+            "Active device key {key_id} not found on coordinator"
+        ))
     })?;
 
     let signed_bytes = serde_json::to_vec(message).map_err(FederationError::Json)?;
@@ -3338,50 +3931,90 @@ pub async fn coordinator_handle_message(
         &signed_bytes,
         &signing_public_key,
     )
-    .map_err(|e| FederationError::InvalidRequest(format!("mutation signature verification failed: {e:?}")))?;
+    .map_err(|e| {
+        FederationError::InvalidRequest(format!("mutation signature verification failed: {e:?}"))
+    })?;
 
     // 5. Validate application message and AAD from projection
     let projection = match verified.projection() {
         crate::chat_protocol::transcript::VerifiedMutationProjection::ApplicationSend(p) => p,
-        _ => return Err(FederationError::InvalidRequest("mutation is not an application send".into())),
+        _ => {
+            return Err(FederationError::InvalidRequest(
+                "mutation is not an application send".into(),
+            ))
+        }
     };
 
     let app_msg = projection.application_message();
     let msg_bytes = match app_msg.get("bytes") {
         Some(crate::chat_protocol::transcript::CanonicalValueRef::Bytes(b)) => b,
-        _ => return Err(FederationError::InvalidRequest("invalid application message bytes".into())),
+        _ => {
+            return Err(FederationError::InvalidRequest(
+                "invalid application message bytes".into(),
+            ))
+        }
     };
     let msg_hash = match app_msg.get("sha256") {
         Some(crate::chat_protocol::transcript::CanonicalValueRef::Bytes(b)) if b.len() == 32 => b,
-        _ => return Err(FederationError::InvalidRequest("invalid application message sha256".into())),
+        _ => {
+            return Err(FederationError::InvalidRequest(
+                "invalid application message sha256".into(),
+            ))
+        }
     };
     if Sha256::digest(msg_bytes).as_slice() != msg_hash
-        || !matches!(app_msg.get("framing"), Some(crate::chat_protocol::transcript::CanonicalValueRef::Text("mlsMessage")))
-        || !matches!(app_msg.get("contentType"), Some(crate::chat_protocol::transcript::CanonicalValueRef::Text("privateMessageApplication")))
+        || !matches!(
+            app_msg.get("framing"),
+            Some(crate::chat_protocol::transcript::CanonicalValueRef::Text(
+                "mlsMessage"
+            ))
+        )
+        || !matches!(
+            app_msg.get("contentType"),
+            Some(crate::chat_protocol::transcript::CanonicalValueRef::Text(
+                "privateMessageApplication"
+            ))
+        )
     {
-        return Err(FederationError::InvalidRequest("application message framing or digest mismatch".into()));
+        return Err(FederationError::InvalidRequest(
+            "application message framing or digest mismatch".into(),
+        ));
     }
 
     let aad = projection.aad();
     let aad_convo = match aad.get("conversationId") {
         Some(crate::chat_protocol::transcript::CanonicalValueRef::Bytes(v)) if v.len() == 16 => {
-            Uuid::from_slice(v).map_err(|_| FederationError::InvalidRequest("invalid aad convo".into()))?
+            Uuid::from_slice(v)
+                .map_err(|_| FederationError::InvalidRequest("invalid aad convo".into()))?
         }
-        _ => return Err(FederationError::InvalidRequest("invalid aad conversationId".into())),
+        _ => {
+            return Err(FederationError::InvalidRequest(
+                "invalid aad conversationId".into(),
+            ))
+        }
     };
     let aad_msg = match aad.get("messageId") {
         Some(crate::chat_protocol::transcript::CanonicalValueRef::Bytes(v)) if v.len() == 16 => {
-            Uuid::from_slice(v).map_err(|_| FederationError::InvalidRequest("invalid aad msg".into()))?
+            Uuid::from_slice(v)
+                .map_err(|_| FederationError::InvalidRequest("invalid aad msg".into()))?
         }
-        _ => return Err(FederationError::InvalidRequest("invalid aad messageId".into())),
+        _ => {
+            return Err(FederationError::InvalidRequest(
+                "invalid aad messageId".into(),
+            ))
+        }
     };
     if aad_convo != conversation_id || aad_msg != message_id {
-        return Err(FederationError::InvalidRequest("aad conversationId or messageId mismatch".into()));
+        return Err(FederationError::InvalidRequest(
+            "aad conversationId or messageId mismatch".into(),
+        ));
     }
 
     // 6. Idempotency check with replay redrive
-    let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
-
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     // 7. Lock conversation head and check coordinates
     let head_row = sqlx::query(
@@ -3400,7 +4033,7 @@ pub async fn coordinator_handle_message(
     let existing_send: Option<(String, Option<i64>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
         "SELECT status, accepted_entry_seq, request_digest, outcome_bytes \
          FROM chat.message_sends \
-         WHERE conversation_id = $1 AND message_id = $2"
+         WHERE conversation_id = $1 AND message_id = $2",
     )
     .bind(conversation_id)
     .bind(message_id)
@@ -3416,23 +4049,31 @@ pub async fn coordinator_handle_message(
             });
         }
         if status == "accepted" {
-            let mut resp_val: Value = serde_json::from_slice(&outcome_bytes).map_err(FederationError::Json)?;
-            tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+            let mut resp_val: Value =
+                serde_json::from_slice(&outcome_bytes).map_err(FederationError::Json)?;
+            tx.commit()
+                .await
+                .map_err(|e| FederationError::Storage(e.to_string()))?;
 
             // Redrive peer delivery if remote peer
-            let response_entry = resp_val.get_mut("entry")
-                .ok_or_else(|| FederationError::Invariant("retained message outcome lacks entry".into()))?;
+            let response_entry = resp_val.get_mut("entry").ok_or_else(|| {
+                FederationError::Invariant("retained message outcome lacks entry".into())
+            })?;
             response_entry["$type"] = json!("blue.catbird.chat.defs#applicationEntry");
             let response_entry = response_entry.clone();
             let self_did = crate::identity::service_did();
             if !peer_did.is_empty() && peer_did != actor_did {
-                let (target_endpoint, target_did) = (coord.recipient_home.endpoint.as_str(), coord.recipient_home.did.as_str());
+                let (target_endpoint, target_did) = (
+                    coord.recipient_home.endpoint.as_str(),
+                    coord.recipient_home.did.as_str(),
+                );
                 if canonical_did(target_did) != canonical_did(&self_did) {
                     let deliver_payload = DeliverMessageEntryInput {
                         conversation_id,
                         entry: response_entry,
                     };
-                    deliver_message_entry_to_peer(target_endpoint, target_did, deliver_payload).await?;
+                    deliver_message_entry_to_peer(target_endpoint, target_did, deliver_payload)
+                        .await?;
                 }
             }
 
@@ -3440,43 +4081,94 @@ pub async fn coordinator_handle_message(
         }
     }
 
-    let lifecycle: String = head_row.try_get("lifecycle").map_err(|e| FederationError::Storage(e.to_string()))?;
+    let lifecycle: String = head_row
+        .try_get("lifecycle")
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
     if lifecycle != "active" {
-        return Err(FederationError::InvalidRequest("conversation is not active".into()));
+        return Err(FederationError::InvalidRequest(
+            "conversation is not active".into(),
+        ));
     }
 
-    let head_generation: i64 = head_row.try_get("current_generation").map_err(|e| FederationError::Storage(e.to_string()))?;
-    let head_state_version: i64 = head_row.try_get("current_state_version").map_err(|e| FederationError::Storage(e.to_string()))?;
-    let head_group_id: Vec<u8> = head_row.try_get("group_id").map_err(|e| FederationError::Storage(e.to_string()))?;
-    let head_epoch: i64 = head_row.try_get("epoch").map_err(|e| FederationError::Storage(e.to_string()))?;
-    let head_gch: Vec<u8> = head_row.try_get("group_context_hash").map_err(|e| FederationError::Storage(e.to_string()))?;
-    let head_confirm_tag: Vec<u8> = head_row.try_get("confirmation_tag").map_err(|e| FederationError::Storage(e.to_string()))?;
-    let next_seq: i64 = head_row.try_get("next_entry_seq").map_err(|e| FederationError::Storage(e.to_string()))?;
+    let head_generation: i64 = head_row
+        .try_get("current_generation")
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
+    let head_state_version: i64 = head_row
+        .try_get("current_state_version")
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
+    let head_group_id: Vec<u8> = head_row
+        .try_get("group_id")
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
+    let head_epoch: i64 = head_row
+        .try_get("epoch")
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
+    let head_gch: Vec<u8> = head_row
+        .try_get("group_context_hash")
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
+    let head_confirm_tag: Vec<u8> = head_row
+        .try_get("confirmation_tag")
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
+    let next_seq: i64 = head_row
+        .try_get("next_entry_seq")
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let prior = projection.prior();
     let prior_gen = match prior.get("generation") {
-        Some(crate::chat_protocol::transcript::CanonicalValueRef::Integer(v)) => i64::try_from(v).map_err(|_| FederationError::InvalidRequest("invalid prior gen".into()))?,
-        _ => return Err(FederationError::InvalidRequest("missing prior generation".into())),
+        Some(crate::chat_protocol::transcript::CanonicalValueRef::Integer(v)) => {
+            i64::try_from(v)
+                .map_err(|_| FederationError::InvalidRequest("invalid prior gen".into()))?
+        }
+        _ => {
+            return Err(FederationError::InvalidRequest(
+                "missing prior generation".into(),
+            ))
+        }
     };
     let prior_ver = match prior.get("stateVersion") {
-        Some(crate::chat_protocol::transcript::CanonicalValueRef::Integer(v)) => i64::try_from(v).map_err(|_| FederationError::InvalidRequest("invalid prior ver".into()))?,
-        _ => return Err(FederationError::InvalidRequest("missing prior stateVersion".into())),
+        Some(crate::chat_protocol::transcript::CanonicalValueRef::Integer(v)) => {
+            i64::try_from(v)
+                .map_err(|_| FederationError::InvalidRequest("invalid prior ver".into()))?
+        }
+        _ => {
+            return Err(FederationError::InvalidRequest(
+                "missing prior stateVersion".into(),
+            ))
+        }
     };
     let prior_epoch = match prior.get("epoch") {
-        Some(crate::chat_protocol::transcript::CanonicalValueRef::Integer(v)) => i64::try_from(v).map_err(|_| FederationError::InvalidRequest("invalid prior epoch".into()))?,
-        _ => return Err(FederationError::InvalidRequest("missing prior epoch".into())),
+        Some(crate::chat_protocol::transcript::CanonicalValueRef::Integer(v)) => {
+            i64::try_from(v)
+                .map_err(|_| FederationError::InvalidRequest("invalid prior epoch".into()))?
+        }
+        _ => {
+            return Err(FederationError::InvalidRequest(
+                "missing prior epoch".into(),
+            ))
+        }
     };
     let prior_group_id = match prior.get("groupId") {
         Some(crate::chat_protocol::transcript::CanonicalValueRef::Bytes(v)) => v,
-        _ => return Err(FederationError::InvalidRequest("missing prior groupId".into())),
+        _ => {
+            return Err(FederationError::InvalidRequest(
+                "missing prior groupId".into(),
+            ))
+        }
     };
     let prior_gch = match prior.get("groupContextHash") {
         Some(crate::chat_protocol::transcript::CanonicalValueRef::Bytes(v)) => v,
-        _ => return Err(FederationError::InvalidRequest("missing prior groupContextHash".into())),
+        _ => {
+            return Err(FederationError::InvalidRequest(
+                "missing prior groupContextHash".into(),
+            ))
+        }
     };
     let prior_tag = match prior.get("confirmationTag") {
         Some(crate::chat_protocol::transcript::CanonicalValueRef::Bytes(v)) => v,
-        _ => return Err(FederationError::InvalidRequest("missing prior confirmationTag".into())),
+        _ => {
+            return Err(FederationError::InvalidRequest(
+                "missing prior confirmationTag".into(),
+            ))
+        }
     };
 
     if prior_gen != head_generation
@@ -3486,7 +4178,9 @@ pub async fn coordinator_handle_message(
         || prior_gch != head_gch.as_slice()
         || prior_tag != head_confirm_tag.as_slice()
     {
-        return Err(FederationError::InvalidRequest("stale application coordinates".into()));
+        return Err(FederationError::InvalidRequest(
+            "stale application coordinates".into(),
+        ));
     }
 
     // 8. Device leaf check
@@ -3507,7 +4201,9 @@ pub async fn coordinator_handle_message(
     .map_err(|error| FederationError::Storage(error.to_string()))?;
 
     if !is_leaf {
-        return Err(FederationError::Forbidden("actor device is not a leaf in conversation".into()));
+        return Err(FederationError::Forbidden(
+            "actor device is not a leaf in conversation".into(),
+        ));
     }
 
     // 9. Recipient readiness
@@ -3529,7 +4225,9 @@ pub async fn coordinator_handle_message(
     .map_err(|error| FederationError::Storage(error.to_string()))?;
 
     if !recipient_ready {
-        return Err(FederationError::Forbidden("recipient not ready or has not accepted conversation".into()));
+        return Err(FederationError::Forbidden(
+            "recipient not ready or has not accepted conversation".into(),
+        ));
     }
 
     let mut head_binding = Sha256::new();
@@ -3565,8 +4263,9 @@ pub async fn coordinator_handle_message(
 
     let canon_entry_id = crate::chat_protocol::validation::CanonicalUuidV4::parse(&entry_id_str)
         .map_err(|_| FederationError::Invariant("invalid entry_id".into()))?;
-    let canon_convo_id = crate::chat_protocol::validation::CanonicalUuidV4::parse(&conversation_id.to_string())
-        .map_err(|_| FederationError::Invariant("invalid convo_id".into()))?;
+    let canon_convo_id =
+        crate::chat_protocol::validation::CanonicalUuidV4::parse(&conversation_id.to_string())
+            .map_err(|_| FederationError::Invariant("invalid convo_id".into()))?;
 
     let entry_product = crate::chat_protocol::transcript::build_verified_application_entry(
         verified,
@@ -3582,8 +4281,9 @@ pub async fn coordinator_handle_message(
     let request_digest = entry_product.mutation().request_digest().to_vec();
     let signature = entry_product.mutation().signature().to_vec();
     let fingerprint = entry_product.outer_application_fingerprint().to_vec();
-    let server_fields = serde_ipld_dagcbor::to_vec(&std::collections::BTreeMap::<String, String>::new())
-        .map_err(|_| FederationError::Invariant("server fields".into()))?;
+    let server_fields =
+        serde_ipld_dagcbor::to_vec(&std::collections::BTreeMap::<String, String>::new())
+            .map_err(|_| FederationError::Invariant("server fields".into()))?;
 
     let outcome_json = json!({
         "entry": {
@@ -3643,7 +4343,9 @@ pub async fn coordinator_handle_message(
     let seq = match outcome {
         crate::chat_protocol::repository::delivery::ApplicationSendOutcome::Accepted { seq } => seq,
         crate::chat_protocol::repository::delivery::ApplicationSendOutcome::Stale => {
-            return Err(FederationError::InvalidRequest("stale application coordinates".into()));
+            return Err(FederationError::InvalidRequest(
+                "stale application coordinates".into(),
+            ));
         }
     };
 
@@ -3674,7 +4376,8 @@ pub async fn coordinator_handle_message(
 
     if !peer_did.is_empty() && peer_did != actor_did {
         if canonical_did(&coord.recipient_home.did) != canonical_did(&self_did) {
-            let payload_bytes = serde_json::to_vec(&deliver_payload).map_err(FederationError::Json)?;
+            let payload_bytes =
+                serde_json::to_vec(&deliver_payload).map_err(FederationError::Json)?;
             crate::federation::queue::enqueue_c33_in_tx(
                 pool,
                 &mut tx,
@@ -3690,7 +4393,9 @@ pub async fn coordinator_handle_message(
         }
     }
 
-    tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     if !peer_did.is_empty() && peer_did != actor_did {
         if canonical_did(&coord.recipient_home.did) != canonical_did(&self_did) {
@@ -3698,7 +4403,9 @@ pub async fn coordinator_handle_message(
                 &coord.recipient_home.endpoint,
                 &coord.recipient_home.did,
                 deliver_payload,
-            ).await {
+            )
+            .await
+            {
                 let _ = crate::federation::queue::mark_delivered_by_id(pool, &queue_id).await;
             }
         }
@@ -3715,7 +4422,7 @@ pub async fn coordinator_get_outcome(
     actor_device_id: Uuid,
 ) -> Result<Value, FederationError> {
     let attempt: Option<(String, String)> = sqlx::query_as(
-        "SELECT actor_did, recipient_did FROM chat.direct_request_attempts WHERE request_id = $1"
+        "SELECT actor_did, recipient_did FROM chat.direct_request_attempts WHERE request_id = $1",
     )
     .bind(request_id)
     .fetch_optional(pool)
@@ -3772,7 +4479,9 @@ pub async fn coordinator_get_outcome(
                     }));
                 } else {
                     // Intent is still within active prepare window (<300s old): cannot prove unknown yet
-                    return Err(FederationError::NotFound("attempt in flight or not found".into()));
+                    return Err(FederationError::NotFound(
+                        "attempt in flight or not found".into(),
+                    ));
                 }
             }
             return Err(FederationError::NotFound("attempt not found".into()));
@@ -3780,9 +4489,11 @@ pub async fn coordinator_get_outcome(
     };
     let coord = resolve_pair_coordinator(pool, &actor_did, &recipient_did).await;
     let authorized = match &coord {
-        Ok(c) => canonical_did(&c.sender_home.did) == canonical_did(requester_ds)
-            || canonical_did(&c.recipient_home.did) == canonical_did(requester_ds)
-            || canonical_did(&c.coordinator_did) == canonical_did(requester_ds),
+        Ok(c) => {
+            canonical_did(&c.sender_home.did) == canonical_did(requester_ds)
+                || canonical_did(&c.recipient_home.did) == canonical_did(requester_ds)
+                || canonical_did(&c.coordinator_did) == canonical_did(requester_ds)
+        }
         Err(_) => false,
     };
     if !authorized {
@@ -3797,8 +4508,12 @@ pub async fn coordinator_get_outcome(
         );
         let actor_home = resolver.resolve_authoritative_ds(&actor_did).await.ok();
         let rec_home = resolver.resolve_authoritative_ds(&recipient_did).await.ok();
-        let home_matches = actor_home.as_ref().is_some_and(|h| canonical_did(&h.did) == canonical_did(requester_ds))
-            || rec_home.as_ref().is_some_and(|h| canonical_did(&h.did) == canonical_did(requester_ds));
+        let home_matches = actor_home
+            .as_ref()
+            .is_some_and(|h| canonical_did(&h.did) == canonical_did(requester_ds))
+            || rec_home
+                .as_ref()
+                .is_some_and(|h| canonical_did(&h.did) == canonical_did(requester_ds));
         if !home_matches {
             return Err(FederationError::AuthFailed {
                 reason: format!("Requester {requester_ds} is not authorized for outcome of request {request_id}"),
@@ -3809,31 +4524,35 @@ pub async fn coordinator_get_outcome(
     let now = TrustedRequestInstant::capture()
         .map_err(|_| FederationError::Invariant("trusted instant".into()))?
         .datetime();
-    let signer = runtime.request_receipt_signer().ok_or_else(|| {
-        FederationError::ConfigError {
+    let signer = runtime
+        .request_receipt_signer()
+        .ok_or_else(|| FederationError::ConfigError {
             reason: "request receipt signer not configured".into(),
-        }
-    })?;
+        })?;
 
     let principal = crate::auth::VerifiedServicePrincipal::for_federated_s2s(
         &actor_did,
         "blue.catbird.chat.getDirectRequestOutcome",
     );
 
-    let mut tx = pool.begin().await.map_err(|e| FederationError::Storage(e.to_string()))?;
-    let result = crate::chat_protocol::repository::direct_request_preparation::get_direct_request_outcome(
-        &mut tx,
-        &principal,
-        actor_device_id,
-        request_id,
-        signer,
-        now,
-    )
-    .await
-    .map_err(|e| FederationError::RemoteError {
-        status: 400,
-        body: format!("get_direct_request_outcome error: {e:?}"),
-    })?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
+    let result =
+        crate::chat_protocol::repository::direct_request_preparation::get_direct_request_outcome(
+            &mut tx,
+            &principal,
+            actor_device_id,
+            request_id,
+            signer,
+            now,
+        )
+        .await
+        .map_err(|e| FederationError::RemoteError {
+            status: 400,
+            body: format!("get_direct_request_outcome error: {e:?}"),
+        })?;
 
     let outcome_val = match result {
         crate::chat_protocol::repository::direct_request_preparation::DirectRequestResult::Keys(bytes) => {
@@ -3852,14 +4571,18 @@ pub async fn coordinator_get_outcome(
             val
         }
     };
-    tx.commit().await.map_err(|e| FederationError::Storage(e.to_string()))?;
-
-    let entry_row: Option<Vec<u8>> = sqlx::query_scalar("SELECT accepted_payload_bytes FROM chat.entries WHERE transition_id = $1")
-        .bind(request_id)
-        .fetch_optional(pool)
+    tx.commit()
         .await
-        .ok()
-        .flatten();
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
+
+    let entry_row: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT accepted_payload_bytes FROM chat.entries WHERE transition_id = $1",
+    )
+    .bind(request_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
 
     let entry_val: Option<Value> = entry_row.and_then(|b| serde_json::from_slice(&b).ok());
     let mut resp = json!({ "outcome": outcome_val });

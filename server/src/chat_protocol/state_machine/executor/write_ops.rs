@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 /// Open a leaf-recovery request + its paired reservation and reserve the
 /// requester's key package (Available -> Reserved), all bound to
 /// `recovery.bound_coordinate()`. Shared by the acceptance edge (source
@@ -159,7 +158,9 @@ pub(in crate::chat_protocol::state_machine::executor) fn closing_leaf_period(
         .ok_or(ExecutorError::MissingContext("closing leaf period id"))
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn repo_interval_close_kind(kind: CloseKind) -> IntervalCloseKind {
+pub(in crate::chat_protocol::state_machine::executor) fn repo_interval_close_kind(
+    kind: CloseKind,
+) -> IntervalCloseKind {
     match kind {
         CloseKind::DirectRequest => IntervalCloseKind::DirectRequest,
         CloseKind::Remove => IntervalCloseKind::Remove,
@@ -654,4 +655,3 @@ pub(in crate::chat_protocol::state_machine::executor) fn build_entry_recipients(
         })
         .collect()
 }
-

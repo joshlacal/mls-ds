@@ -313,7 +313,7 @@ pub async fn expire_due_published_requests(
            AND p.created_at <= clock_timestamp() - INTERVAL '30 days'
          ORDER BY p.created_at, p.request_id
          LIMIT $1
-        "#
+        "#,
     )
     .bind(limit.clamp(1, 100))
     .fetch_all(pool)
@@ -322,8 +322,12 @@ pub async fn expire_due_published_requests(
     let mut count = 0;
     for id in ids {
         let mut tx = pool.begin().await?;
-        sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *tx).await?;
-        let _operation = match super::prelude::try_lock_direct_request_operation_only(&mut tx, id).await {
+        sqlx::query("SET LOCAL lock_timeout = '1s'")
+            .execute(&mut *tx)
+            .await?;
+        let _operation = match super::prelude::try_lock_direct_request_operation_only(&mut tx, id)
+            .await
+        {
             Ok(Some(op)) => op,
             Ok(None) => {
                 tx.rollback().await?;
@@ -338,7 +342,17 @@ pub async fn expire_due_published_requests(
                 continue;
             }
         };
-        let row: Option<(Uuid, String, Uuid, String, i64, String, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+        let row: Option<(
+            Uuid,
+            String,
+            Uuid,
+            String,
+            i64,
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            i64,
+        )> = sqlx::query_as(
             r#"
             SELECT p.conversation_id, a.actor_did, a.actor_device_id, a.actor_key_id,
                    a.actor_auth_generation, a.recipient_did, a.prepare_digest,
@@ -351,13 +365,24 @@ pub async fn expire_due_published_requests(
                AND a.status = 'published'
                AND l.request_id IS NULL
                AND p.created_at <= clock_timestamp() - INTERVAL '30 days'
-            "#
+            "#,
         )
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
 
-        let Some((conversation_id, actor_did, actor_device_id, actor_key_id, actor_auth_generation, recipient_did, prepare_digest, publication_digest, decision_bytes)) = row else {
+        let Some((
+            conversation_id,
+            actor_did,
+            actor_device_id,
+            actor_key_id,
+            actor_auth_generation,
+            recipient_did,
+            prepare_digest,
+            publication_digest,
+            decision_bytes,
+        )) = row
+        else {
             tx.rollback().await?;
             continue;
         };
@@ -368,7 +393,8 @@ pub async fn expire_due_published_requests(
         )
         .await
         {
-            let is_timeout = matches!(&error, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"));
+            let is_timeout =
+                matches!(&error, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"));
             if !is_timeout {
                 tracing::warn!(%error, request_id = %id, "expire_due_published_requests identity scope lock failed, sweep skipped");
             }
@@ -376,11 +402,10 @@ pub async fn expire_due_published_requests(
             continue;
         }
 
-        let now: DateTime<Utc> = sqlx::query_scalar(
-            "SELECT date_trunc('milliseconds', clock_timestamp())"
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        let now: DateTime<Utc> =
+            sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                .fetch_one(&mut *tx)
+                .await?;
 
         use base64::Engine as _;
         use sha2::Digest as _;
@@ -546,7 +571,9 @@ pub async fn prune_expired_application_payloads(
         let did_prune =
             super::delivery::prune_application_entry_payload(&mut tx, conversation_id, seq, now)
                 .await
-                .map_err(|e| ExpirySweepError::DirectRequest(format!("prune 30d payload: {e:?}")))?;
+                .map_err(|e| {
+                    ExpirySweepError::DirectRequest(format!("prune 30d payload: {e:?}"))
+                })?;
         if did_prune {
             tx.commit().await?;
             pruned += 1;
@@ -591,8 +618,12 @@ pub async fn prune_terminal_request_artifacts(
     let mut count = 0;
     for (id, _consent) in candidates {
         let mut tx = pool.begin().await?;
-        sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *tx).await?;
-        let _operation = match super::prelude::try_lock_direct_request_operation_only(&mut tx, id).await {
+        sqlx::query("SET LOCAL lock_timeout = '1s'")
+            .execute(&mut *tx)
+            .await?;
+        let _operation = match super::prelude::try_lock_direct_request_operation_only(&mut tx, id)
+            .await
+        {
             Ok(Some(op)) => op,
             Ok(None) => {
                 tx.rollback().await?;
@@ -652,11 +683,10 @@ pub async fn prune_terminal_request_artifacts(
             "expired_pruned"
         };
 
-        let now: DateTime<Utc> = sqlx::query_scalar(
-            "SELECT date_trunc('milliseconds', clock_timestamp())"
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        let now: DateTime<Utc> =
+            sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                .fetch_one(&mut *tx)
+                .await?;
 
         sqlx::query(
             "INSERT INTO chat.direct_request_retained_releases(request_id, released_bytes, released_at, reason) VALUES ($1, $2, $3, $4)"
@@ -679,7 +709,7 @@ pub async fn prune_terminal_request_artifacts(
                     metadata_snapshot = NULL,
                     pruned_at = $2
               WHERE request_id = $1
-            "#
+            "#,
         )
         .bind(id)
         .bind(now)

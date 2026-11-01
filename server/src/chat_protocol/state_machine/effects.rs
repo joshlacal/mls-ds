@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 impl PlannedTransition {
     #[cfg(test)]
     pub(crate) fn expected_prior(&self) -> Option<&PublicGroupSnapshotCoordinate> {
@@ -406,7 +405,10 @@ impl PlannedTransition {
         self.bind_recovery_package_cas(package_cas)
     }
 
-    pub(in crate::chat_protocol::state_machine) fn bind_welcome_cas(mut self, binding: WelcomeCasBinding) -> Result<Self, StateMachineError> {
+    pub(in crate::chat_protocol::state_machine) fn bind_welcome_cas(
+        mut self,
+        binding: WelcomeCasBinding,
+    ) -> Result<Self, StateMachineError> {
         let exact_edge = self.effects.welcome_changes.iter().any(|change| {
             matches!(
                 (change.before.as_ref(), change.after.as_ref()),
@@ -822,7 +824,9 @@ pub(crate) fn plan_creation_inner(
     }))
 }
 
-pub(in crate::chat_protocol::state_machine) fn validate_creation_command(command: &CreationCommand) -> Result<(), StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn validate_creation_command(
+    command: &CreationCommand,
+) -> Result<(), StateMachineError> {
     let coordinate = command.public_state.coordinate();
     if coordinate.generation() != 0
         || coordinate.state_version() != 0
@@ -841,7 +845,10 @@ pub(in crate::chat_protocol::state_machine) fn validate_creation_command(command
     Ok(())
 }
 
-pub(in crate::chat_protocol::state_machine) fn canonical_pair(left: &PrincipalId, right: &PrincipalId) -> (PrincipalId, PrincipalId) {
+pub(in crate::chat_protocol::state_machine) fn canonical_pair(
+    left: &PrincipalId,
+    right: &PrincipalId,
+) -> (PrincipalId, PrincipalId) {
     if left <= right {
         (left.clone(), right.clone())
     } else {
@@ -849,7 +856,9 @@ pub(in crate::chat_protocol::state_machine) fn canonical_pair(left: &PrincipalId
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn existing_direct_pair(state: &ConversationState) -> Option<(PrincipalId, PrincipalId)> {
+pub(in crate::chat_protocol::state_machine) fn existing_direct_pair(
+    state: &ConversationState,
+) -> Option<(PrincipalId, PrincipalId)> {
     let [left, right] = state.participants.as_slice() else {
         return None;
     };

@@ -1,6 +1,6 @@
-use super::relationship_policy::*;
-use super::relationship_policy;
 use super::model;
+use super::relationship_policy;
+use super::relationship_policy::*;
 use super::validation::{self, CanonicalTimestamp, TrustedRequestInstant};
 
 use async_trait::async_trait;

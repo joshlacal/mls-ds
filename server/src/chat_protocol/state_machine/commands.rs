@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 /// Assemble a `ConversationPersistencePlan` from a pure-planner `PlannedTransition`
 /// plus a synthesized head CAS, mirroring what `into_persistence_plan` produces in
 /// production (which is `#[cfg(not(test))]` and unreachable from the test build).

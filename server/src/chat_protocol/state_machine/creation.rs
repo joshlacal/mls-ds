@@ -1,13 +1,13 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 pub(in crate::chat_protocol::state_machine) const MAX_PARTICIPANTS: usize = 100;
 pub(in crate::chat_protocol::state_machine) const MAX_LEAVES: usize = 100;
 pub(in crate::chat_protocol::state_machine) const MAX_LEAVES_PER_PRINCIPAL: usize = 20;
 pub(in crate::chat_protocol::state_machine) const RECOVERY_RESERVATION_TTL_MILLIS: i64 = 300_000;
 pub(in crate::chat_protocol::state_machine) const CONSENT_TTL_MILLIS: i64 = 86_400_000;
-pub(in crate::chat_protocol::state_machine) const COMMIT_AAD_DOMAIN: &[u8] = b"CATBIRD-CHAT-MLS-AAD-COMMIT\0";
+pub(in crate::chat_protocol::state_machine) const COMMIT_AAD_DOMAIN: &[u8] =
+    b"CATBIRD-CHAT-MLS-AAD-COMMIT\0";
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StateMachineError {
@@ -87,7 +87,9 @@ pub(crate) enum StateMachineError {
     MetadataVersionOverflow,
 }
 
-pub(in crate::chat_protocol::state_machine) fn relationship_consumption_error(error: RelationshipConsumptionError) -> StateMachineError {
+pub(in crate::chat_protocol::state_machine) fn relationship_consumption_error(
+    error: RelationshipConsumptionError,
+) -> StateMachineError {
     match error {
         RelationshipConsumptionError::InvalidWitness => {
             StateMachineError::InvalidHydrationAuthority
@@ -103,7 +105,9 @@ pub(in crate::chat_protocol::state_machine) fn relationship_consumption_error(er
 pub(crate) struct ServerTimestamp(pub(in crate::chat_protocol::state_machine) i64);
 
 impl ServerTimestamp {
-    pub(in crate::chat_protocol::state_machine) fn from_unix_millis(value: i64) -> Result<Self, StateMachineError> {
+    pub(in crate::chat_protocol::state_machine) fn from_unix_millis(
+        value: i64,
+    ) -> Result<Self, StateMachineError> {
         if value < 0 {
             return Err(StateMachineError::InvalidServerTime);
         }
@@ -131,7 +135,10 @@ impl ServerTimestamp {
         self.0
     }
 
-    pub(in crate::chat_protocol::state_machine) fn checked_add_millis(self, millis: i64) -> Result<Self, StateMachineError> {
+    pub(in crate::chat_protocol::state_machine) fn checked_add_millis(
+        self,
+        millis: i64,
+    ) -> Result<Self, StateMachineError> {
         self.0
             .checked_add(millis)
             .and_then(|value| (value >= 0).then_some(Self(value)))
@@ -489,7 +496,8 @@ pub(crate) struct MetadataSnapshotBinding {
     pub(in crate::chat_protocol::state_machine) nonce: [u8; 12],
     pub(in crate::chat_protocol::state_machine) ciphertext: Vec<u8>,
     pub(in crate::chat_protocol::state_machine) ciphertext_sha256: [u8; 32],
-    pub(in crate::chat_protocol::state_machine) avatar_binding: Option<MetadataAvatarDescriptorBinding>,
+    pub(in crate::chat_protocol::state_machine) avatar_binding:
+        Option<MetadataAvatarDescriptorBinding>,
     pub(in crate::chat_protocol::state_machine) author_proof: MetadataAuthorProofBinding,
     pub(in crate::chat_protocol::state_machine) canonical_snapshot: Vec<u8>,
     pub(in crate::chat_protocol::state_machine) digest: [u8; 32],

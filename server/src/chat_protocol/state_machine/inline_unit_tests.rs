@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 #[cfg(test)]
 mod invitation_quota_binding_tests {
     use super::*;
@@ -1048,7 +1047,9 @@ mod direct_request_history_tests {
         let row = serde_json::to_vec(&entry).unwrap();
         let signed = serde_json::to_vec(&wrapper).unwrap();
         // Dedicated admission remains mandatory; historical kinds are never v1 mutations.
-        assert!(crate::chat_protocol::transcript::decode_canonical_signed_mutation(&signed).is_err());
+        assert!(
+            crate::chat_protocol::transcript::decode_canonical_signed_mutation(&signed).is_err()
+        );
         let authority = HistoricalRehydrationAuthority::new(
             *uuid::Uuid::parse_str(conversation.as_str().unwrap())
                 .unwrap()
@@ -1070,10 +1071,13 @@ mod direct_request_history_tests {
         wire.as_object_mut().unwrap().remove("$type");
         let wire = serde_json::to_vec(&wire).unwrap();
         let expected = if kind == "directRequestEntry" {
-            crate::chat_protocol::direct_request_transcript::direct_request_entry_hash(&wire).unwrap()
-        } else {
-            crate::chat_protocol::direct_request_transcript::direct_request_acceptance_entry_hash(&wire)
+            crate::chat_protocol::direct_request_transcript::direct_request_entry_hash(&wire)
                 .unwrap()
+        } else {
+            crate::chat_protocol::direct_request_transcript::direct_request_acceptance_entry_hash(
+                &wire,
+            )
+            .unwrap()
         };
         assert_eq!(evidence.outer_entry_fingerprint, expected);
         (evidence, row, signed)

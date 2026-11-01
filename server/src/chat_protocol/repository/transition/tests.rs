@@ -3,7 +3,6 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::common;
 use crate::chat_protocol::repository::transition::{
     cas_key_package_status, cas_participant_active_role, cas_participant_pending_to_active,
     cas_registration_revoke, close_leaf_period, insert_device_revocation,
@@ -21,6 +20,7 @@ use crate::chat_protocol::repository::transition::{
     RegistrationRevoke, ReservationTermination, ResetReason, ResetRequestTermination,
     TransitionActorRole, TransitionCoordinates, TransitionKind, TransitionRepositoryError,
 };
+use crate::common;
 
 use crate::chat_protocol::repository::delivery::{
     close_application_interval, insert_application_interval, insert_recovery_work_item,

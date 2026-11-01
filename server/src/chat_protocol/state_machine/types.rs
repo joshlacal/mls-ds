@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 pub(crate) fn closed_coordinate(
     object: &crate::chat_protocol::transcript::ClosedObjectRef<'_>,
 ) -> Result<PublicGroupSnapshotCoordinate, StateMachineError> {
@@ -54,7 +53,9 @@ pub(in crate::chat_protocol::state_machine) fn closed_coordinate_from_field(
     closed_coordinate(&coordinates)
 }
 
-pub(in crate::chat_protocol::state_machine) fn parse_conversation_kind(value: &str) -> Result<ConversationKind, StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn parse_conversation_kind(
+    value: &str,
+) -> Result<ConversationKind, StateMachineError> {
     match value {
         "direct" => Ok(ConversationKind::Direct),
         "group" => Ok(ConversationKind::Group),
@@ -62,11 +63,15 @@ pub(in crate::chat_protocol::state_machine) fn parse_conversation_kind(value: &s
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn sealed_object_digest(object: &crate::chat_protocol::transcript::ClosedObjectRef<'_>) -> [u8; 32] {
+pub(in crate::chat_protocol::state_machine) fn sealed_object_digest(
+    object: &crate::chat_protocol::transcript::ClosedObjectRef<'_>,
+) -> [u8; 32] {
     Sha256::digest(object.canonical_dag_cbor()).into()
 }
 
-pub(crate) fn commit_aad_bytes(object: &crate::chat_protocol::transcript::ClosedObjectRef<'_>) -> Vec<u8> {
+pub(crate) fn commit_aad_bytes(
+    object: &crate::chat_protocol::transcript::ClosedObjectRef<'_>,
+) -> Vec<u8> {
     let encoded = object.canonical_dag_cbor();
     let mut aad = Vec::with_capacity(COMMIT_AAD_DOMAIN.len() + encoded.len());
     aad.extend_from_slice(COMMIT_AAD_DOMAIN);
@@ -74,7 +79,9 @@ pub(crate) fn commit_aad_bytes(object: &crate::chat_protocol::transcript::Closed
     aad
 }
 
-pub(in crate::chat_protocol::state_machine) fn commit_aad_sha256(object: &crate::chat_protocol::transcript::ClosedObjectRef<'_>) -> [u8; 32] {
+pub(in crate::chat_protocol::state_machine) fn commit_aad_sha256(
+    object: &crate::chat_protocol::transcript::ClosedObjectRef<'_>,
+) -> [u8; 32] {
     Sha256::digest(commit_aad_bytes(object)).into()
 }
 
@@ -455,7 +462,9 @@ pub(in crate::chat_protocol::state_machine) fn closed_device(
     DeviceIdentity::new(principal, device_id)
 }
 
-pub(in crate::chat_protocol::state_machine) fn parse_participant_role(value: &str) -> Result<ParticipantRole, StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn parse_participant_role(
+    value: &str,
+) -> Result<ParticipantRole, StateMachineError> {
     match value {
         "admin" => Ok(ParticipantRole::Admin),
         "member" => Ok(ParticipantRole::Member),
@@ -463,7 +472,9 @@ pub(in crate::chat_protocol::state_machine) fn parse_participant_role(value: &st
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn parse_participant_status(value: &str) -> Result<ParticipantStatus, StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn parse_participant_status(
+    value: &str,
+) -> Result<ParticipantStatus, StateMachineError> {
     match value {
         "pending" => Ok(ParticipantStatus::Pending),
         "active" => Ok(ParticipantStatus::Active),
@@ -561,7 +572,9 @@ pub(in crate::chat_protocol::state_machine) fn parse_participant_changes(
     Ok(changes)
 }
 
-pub(in crate::chat_protocol::state_machine) fn manifest_change_principal(change: &ManifestParticipantChange) -> &PrincipalId {
+pub(in crate::chat_protocol::state_machine) fn manifest_change_principal(
+    change: &ManifestParticipantChange,
+) -> &PrincipalId {
     match change {
         ManifestParticipantChange::Add(value)
         | ManifestParticipantChange::Remove(value)
@@ -696,7 +709,9 @@ pub(in crate::chat_protocol::state_machine) fn durable_signed_request_row_digest
     Ok(digest.finalize().into())
 }
 
-pub(in crate::chat_protocol::state_machine) fn device_revocation_row_digest(evidence: &DeviceRevocationEvidence) -> [u8; 32] {
+pub(in crate::chat_protocol::state_machine) fn device_revocation_row_digest(
+    evidence: &DeviceRevocationEvidence,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"CATBIRD-CHAT-DURABLE-DEVICE-REVOCATION\0");
     digest.update(evidence.revocation_id);
@@ -718,7 +733,9 @@ pub(in crate::chat_protocol::state_machine) fn device_revocation_row_digest(evid
     digest.finalize().into()
 }
 
-pub(in crate::chat_protocol::state_machine) fn validate_device_revocation_evidence(evidence: &DeviceRevocationEvidence) -> bool {
+pub(in crate::chat_protocol::state_machine) fn validate_device_revocation_evidence(
+    evidence: &DeviceRevocationEvidence,
+) -> bool {
     is_uuid_v4(&evidence.revocation_id)
         && evidence.actor.principal() == evidence.target.principal()
         // Self-revoke (actor device == target device) is a first-class spec
@@ -824,7 +841,9 @@ impl PersistedRegistrationRow {
 }
 
 #[cfg(test)]
-pub(in crate::chat_protocol::state_machine) fn registration_row_digest(row: &PersistedRegistrationRow) -> [u8; 32] {
+pub(in crate::chat_protocol::state_machine) fn registration_row_digest(
+    row: &PersistedRegistrationRow,
+) -> [u8; 32] {
     registration_row_digest_fields(
         &row.conversation_id,
         &row.actor,
@@ -861,7 +880,6 @@ pub(in crate::chat_protocol::state_machine) fn registration_row_digest_fields(
 }
 
 impl LockedRegistrationProjection {
-
     #[cfg(test)]
     pub(crate) fn for_test(evidence: &RequestEvidence) -> Self {
         Self {

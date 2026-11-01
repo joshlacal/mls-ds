@@ -1,12 +1,12 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 #[derive(Debug)]
 pub(in crate::chat_protocol::state_machine::executor) struct MetadataExecutionBinding<'a> {
     pub(in crate::chat_protocol::state_machine::executor) metadata: &'a MetadataSnapshotBinding,
     pub(in crate::chat_protocol::state_machine::executor) author: &'a MetadataAuthorColumns,
-    pub(in crate::chat_protocol::state_machine::executor) avatar: Option<&'a MetadataAvatarPersistence>,
+    pub(in crate::chat_protocol::state_machine::executor) avatar:
+        Option<&'a MetadataAvatarPersistence>,
     /// The classified prior-bound families, carried to `apply_metadata_transition`
     /// so it reconciles the writer's receipt against them before any other writer
     /// runs (design 5 step 6).
@@ -884,4 +884,3 @@ pub(crate) async fn apply_conversation_persistence_plan_unscoped_for_test(
 ) -> Result<AppliedTransition, ExecutorError> {
     apply_conversation_persistence_plan_inner(transaction, plan, context, None, None).await
 }
-

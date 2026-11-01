@@ -161,7 +161,9 @@ pub fn configured_receipt_signer(
 
     let Some((method_owner, "mls-receipt-1")) = receipt_verification_method
         .and_then(|v| v.split_once('#'))
-        .filter(|(did, _)| !did.is_empty() && (did.starts_with("did:web:") || did.starts_with("did:plc:")))
+        .filter(|(did, _)| {
+            !did.is_empty() && (did.starts_with("did:web:") || did.starts_with("did:plc:"))
+        })
     else {
         return Err(ReceiptConfigError::UnexpectedVerificationMethod);
     };
@@ -216,6 +218,11 @@ impl I13ReceiptSigner {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_signing_key_for_test(sequencer_did: String, signing_key: SigningKey) -> Self {
+        Self::new(signing_key, sequencer_did)
+    }
+
     pub fn sequencer_did(&self) -> &str {
         &self.sequencer_did
     }
@@ -240,7 +247,10 @@ impl I13ReceiptSigner {
         archive_commitment: &[u8; 32],
         seq: u64,
         issued_at_ms: i64,
-    ) -> Result<labyrinth_protocol::receipt::SignedSequencerReceipt, labyrinth_protocol::ProtocolError> {
+    ) -> Result<
+        labyrinth_protocol::receipt::SignedSequencerReceipt,
+        labyrinth_protocol::ProtocolError,
+    > {
         let payload = labyrinth_protocol::receipt::SequencerReceiptPayload {
             sequencer_did: self.sequencer_did.clone(),
             conversation_id: conversation_id.to_string(),
@@ -252,7 +262,11 @@ impl I13ReceiptSigner {
             seq,
             issued_at_ms,
         };
-        labyrinth_protocol::receipt::sign_sequencer_receipt(&self.signing_key, &self.key_id, &payload)
+        labyrinth_protocol::receipt::sign_sequencer_receipt(
+            &self.signing_key,
+            &self.key_id,
+            &payload,
+        )
     }
 
     /// Project a `SignedSequencerReceipt` + `generation` into the canonical `blue.catbird.chat.defs#sequencerReceipt` JSON object (bare base64 for internal storage; `present_endpoint_output` / `encode_canonical_generated_chat_json_v1` wrap `$bytes` on wire).

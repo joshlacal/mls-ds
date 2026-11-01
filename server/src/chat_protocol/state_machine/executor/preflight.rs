@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 /// Complete logical-shape fence for ResetActivation. This runs before the
 /// head CAS; applied-row reconciliation remains a second fence.
 pub(in crate::chat_protocol::state_machine::executor) fn preflight_reset_activation(
@@ -245,7 +244,8 @@ pub(in crate::chat_protocol::state_machine::executor) fn preflight_reset_activat
                 if after.recipient == *successor_device
                     && after.generation == hydration.coordinate.generation()
                     && after.opening == *producer
-                    && after.opening_kind == crate::chat_protocol::state_machine::OpeningKind::Reset
+                    && after.opening_kind
+                        == crate::chat_protocol::state_machine::OpeningKind::Reset
                     && after.opening_context == hydration.coordinate
                     && after.end.is_none() =>
             {
@@ -709,7 +709,8 @@ pub(in crate::chat_protocol::state_machine::executor) fn preflight_leaf_recovery
         match (change.before(), change.after()) {
             (None, Some(after))
                 if after.recipient() == target
-                    && after.opening_kind() == crate::chat_protocol::state_machine::OpeningKind::Add
+                    && after.opening_kind()
+                        == crate::chat_protocol::state_machine::OpeningKind::Add
                     && after.opening == *producer
                     && after.generation == hydration.coordinate.generation()
                     && after.end().is_none()

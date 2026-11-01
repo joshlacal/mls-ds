@@ -115,10 +115,11 @@ async fn submit(
         .mutation_kind()
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
 
-    let response = match mutation_kind {
-        SignedMutationKind::LeafRecoveryFulfillment => {
-            recovery::execute_prepared(&mut transaction, runtime, ENDPOINT, prepared).await?
-        }
+    let (response, post_commit_bytes) = match mutation_kind {
+        SignedMutationKind::LeafRecoveryFulfillment => (
+            recovery::execute_prepared(&mut transaction, runtime, ENDPOINT, prepared).await?,
+            None,
+        ),
         SignedMutationKind::CommitTransition
         | SignedMutationKind::PolicyTransition
         | SignedMutationKind::MetadataTransition
@@ -132,18 +133,22 @@ async fn submit(
             )
             .await
             .map_err(|error| submit_failure(mutation_kind, error))?;
-            context::canonical_json_response(
-                ENDPOINT,
-                outcome.status(),
-                outcome.response_bytes().to_vec(),
+            let bytes = outcome.response_bytes().to_vec();
+            let post_commit = matches!(
+                mutation_kind,
+                SignedMutationKind::CommitTransition
+                    | SignedMutationKind::PolicyTransition
+                    | SignedMutationKind::LeaveCommitFulfillment
             )
-            .map_err(|error| {
-                tracing::error!(
-                    ?error,
-                    "submitTransition canonical response construction failed"
-                );
-                error
-            })?
+            .then(|| bytes.clone());
+            let resp = context::canonical_json_response(ENDPOINT, outcome.status(), bytes)
+                .inspect_err(|error| {
+                    tracing::error!(
+                        ?error,
+                        "submitTransition canonical response construction failed"
+                    );
+                })?;
+            (resp, post_commit)
         }
         _ => return Err(ChatFailure::invariant(ENDPOINT)),
     };
@@ -152,6 +157,9 @@ async fn submit(
         tracing::error!(?error, "submitTransition outer transaction commit failed");
         ChatFailure::storage(ENDPOINT)
     })?;
+    if let Some(bytes) = post_commit_bytes {
+        runtime.spawn_post_commit_membership_transition(pool, &bytes);
+    }
     runtime.notify_events();
     Ok(response)
 }

@@ -263,7 +263,8 @@ mod repository {
             let pool = crate::common::direct_request_database::setup().await;
             let mut tx = pool.begin().await.unwrap();
             let actor_did = test_did("csevenactora");
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
+            let actor =
+                seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
 
             // (1) Schema truth: the migration default is 'recovery', so an
             // ordinary/legacy publication never lands in the request pool.
@@ -291,12 +292,13 @@ mod repository {
             .execute(&mut *tx)
             .await
             .unwrap();
-            let default_scope: String =
-                sqlx::query_scalar("SELECT usage_scope FROM chat.key_packages WHERE key_package_ref=$1")
-                    .bind(&unscoped_ref)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .unwrap();
+            let default_scope: String = sqlx::query_scalar(
+                "SELECT usage_scope FROM chat.key_packages WHERE key_package_ref=$1",
+            )
+            .bind(&unscoped_ref)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
             assert_eq!(
                 default_scope, "recovery",
                 "a package published without an explicit scope defaults to recovery"
@@ -307,7 +309,8 @@ mod repository {
             // package (with its grant) AND an additional legacy recovery package.
             // Only the direct-request package may be selected.
             let mixed_did = test_did("csevenmixed");
-            let mixed = seed_device(&mut tx, DeviceConfig::valid(&mixed_did, "direct-request")).await;
+            let mixed =
+                seed_device(&mut tx, DeviceConfig::valid(&mixed_did, "direct-request")).await;
             let legacy_wrapper = vec![9u8; 40];
             let legacy_ref = Sha256::digest(Uuid::new_v4().as_bytes()).to_vec();
             sqlx::query(
@@ -408,7 +411,8 @@ mod repository {
             let pool = crate::common::direct_request_database::setup().await;
             let mut tx = pool.begin().await.unwrap();
             let actor_did = test_did("csevenactorb");
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
+            let actor =
+                seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
 
             let recip1_did = test_did("csevenrecipc");
             // 1. Schema check constraint enforces protocol_version = '2' on direct_request_capabilities
@@ -427,7 +431,9 @@ mod repository {
             sp.rollback().await.unwrap();
 
             assert!(
-                invalid_proto_err.to_string().contains("direct_request_capabilities_protocol_version_check"),
+                invalid_proto_err
+                    .to_string()
+                    .contains("direct_request_capabilities_protocol_version_check"),
                 "database schema must reject unsupported capability protocol version"
             );
 
@@ -453,7 +459,8 @@ mod repository {
             let pool = crate::common::direct_request_database::setup().await;
             let mut tx = pool.begin().await.unwrap();
             let actor_did = test_did("csevenactorc");
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
+            let actor =
+                seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
 
             // 1. Missing grant entirely
             let r1 = test_did("csevennogrant");
@@ -461,7 +468,10 @@ mod repository {
             c1.grant = false;
             seed_device(&mut tx, c1).await;
             let l1 = lock_attempt(&mut tx, make_identity(&actor, &r1)).await;
-            assert!(matches!(select_devices(&mut tx, &l1, Utc::now()).await, Err(DirectRequestStoreError::RecipientKeysUnavailable)));
+            assert!(matches!(
+                select_devices(&mut tx, &l1, Utc::now()).await,
+                Err(DirectRequestStoreError::RecipientKeysUnavailable)
+            ));
 
             // 2. Misbound key package ref rejected by schema foreign key constraint
             let r2 = test_did("csevenmisbound");
@@ -485,7 +495,9 @@ mod repository {
             .unwrap_err();
             sp1.rollback().await.unwrap();
             assert!(
-                misbound_fk_err.to_string().contains("direct_request_grants_key_package_ref_owner_did_owner_devi_fkey"),
+                misbound_fk_err
+                    .to_string()
+                    .contains("direct_request_grants_key_package_ref_owner_did_owner_devi_fkey"),
                 "schema foreign key must reject misbound grant package ref"
             );
             // 3. Misbound auth generation rejected by foreign key constraint
@@ -506,7 +518,9 @@ mod repository {
             .unwrap_err();
             sp2.rollback().await.unwrap();
             assert!(
-                misbound_auth_err.to_string().contains("direct_request_grants_key_package_ref_owner_did_owner_devi_fkey"),
+                misbound_auth_err
+                    .to_string()
+                    .contains("direct_request_grants_key_package_ref_owner_did_owner_devi_fkey"),
                 "schema foreign key must reject misbound grant auth generation"
             );
             // 4. Expired grant (expires in past)
@@ -515,7 +529,10 @@ mod repository {
             c4.grant_expires_in_days = -1;
             seed_device(&mut tx, c4).await;
             let l4 = lock_attempt(&mut tx, make_identity(&actor, &r4)).await;
-            assert!(matches!(select_devices(&mut tx, &l4, Utc::now()).await, Err(DirectRequestStoreError::RecipientKeysUnavailable)));
+            assert!(matches!(
+                select_devices(&mut tx, &l4, Utc::now()).await,
+                Err(DirectRequestStoreError::RecipientKeysUnavailable)
+            ));
 
             // 5. Short-horizon grant (< 7 days horizon, e.g. 3 days)
             let r5 = test_did("csevenshorthorizon");
@@ -523,7 +540,10 @@ mod repository {
             c5.grant_expires_in_days = 3;
             seed_device(&mut tx, c5).await;
             let l5 = lock_attempt(&mut tx, make_identity(&actor, &r5)).await;
-            assert!(matches!(select_devices(&mut tx, &l5, Utc::now()).await, Err(DirectRequestStoreError::RecipientKeysUnavailable)));
+            assert!(matches!(
+                select_devices(&mut tx, &l5, Utc::now()).await,
+                Err(DirectRequestStoreError::RecipientKeysUnavailable)
+            ));
 
             // 6. Disabled grant (revoked_at set)
             let r6 = test_did("csevenrevokedgrant");
@@ -531,7 +551,10 @@ mod repository {
             c6.grant_revoked = true;
             seed_device(&mut tx, c6).await;
             let l6 = lock_attempt(&mut tx, make_identity(&actor, &r6)).await;
-            assert!(matches!(select_devices(&mut tx, &l6, Utc::now()).await, Err(DirectRequestStoreError::RecipientKeysUnavailable)));
+            assert!(matches!(
+                select_devices(&mut tx, &l6, Utc::now()).await,
+                Err(DirectRequestStoreError::RecipientKeysUnavailable)
+            ));
 
             tx.rollback().await.unwrap();
         }
@@ -542,10 +565,15 @@ mod repository {
             let mut tx = pool.begin().await.unwrap();
             let actor_did = test_did("csevenactorexhaust");
             let recipient_did = test_did("csevenrecipexhaust");
-            let actor = seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
+            let actor =
+                seed_device(&mut tx, DeviceConfig::valid(&actor_did, "direct-request")).await;
 
             // Recipient has exactly 1 direct-request device with 1 direct-request package
-            let recip_device = seed_device(&mut tx, DeviceConfig::valid(&recipient_did, "direct-request")).await;
+            let recip_device = seed_device(
+                &mut tx,
+                DeviceConfig::valid(&recipient_did, "direct-request"),
+            )
+            .await;
 
             // Seed 3 recovery packages on that exact recipient device
             let now = Utc::now();
@@ -574,11 +602,13 @@ mod repository {
 
             // Verify all 3 recovery packages are available
             for r in &recovery_refs {
-                let status: String = sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
-                    .bind(r)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .unwrap();
+                let status: String = sqlx::query_scalar(
+                    "SELECT status FROM chat.key_packages WHERE key_package_ref=$1",
+                )
+                .bind(r)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
                 assert_eq!(status, "available");
             }
 
@@ -594,20 +624,23 @@ mod repository {
                 .unwrap();
 
             // Direct-request package is now reserved
-            let dr_status: String = sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
-                .bind(&recip_device.key_package_ref)
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
+            let dr_status: String =
+                sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
+                    .bind(&recip_device.key_package_ref)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
             assert_eq!(dr_status, "reserved");
 
             // Recovery packages remain completely available
             for r in &recovery_refs {
-                let status: String = sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
-                    .bind(r)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .unwrap();
+                let status: String = sqlx::query_scalar(
+                    "SELECT status FROM chat.key_packages WHERE key_package_ref=$1",
+                )
+                .bind(r)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
                 assert_eq!(status, "available");
             }
 
@@ -623,11 +656,13 @@ mod repository {
 
             // Invariant: Recovery packages CANNOT be drained by request exhaustion!
             for r in &recovery_refs {
-                let status: String = sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
-                    .bind(r)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .unwrap();
+                let status: String = sqlx::query_scalar(
+                    "SELECT status FROM chat.key_packages WHERE key_package_ref=$1",
+                )
+                .bind(r)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
                 assert_eq!(
                     status, "available",
                     "recovery package must remain available after direct-request exhaustion"

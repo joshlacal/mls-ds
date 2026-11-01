@@ -191,7 +191,12 @@ async fn reads_require_a_device_signed_claim_over_the_exact_query() {
 async fn retired_mailbox_virtual_device_and_orf_endpoints_return_404() {
     let env = Env::new().await;
     let alice = env.account().await;
-    for query_name in ["listDevices", "listEpochs", "getVirtualDevice", "listVirtualDevices"] {
+    for query_name in [
+        "listDevices",
+        "listEpochs",
+        "getVirtualDevice",
+        "listVirtualDevices",
+    ] {
         let reply = alice.query(query_name, &[]).await;
         assert_eq!(
             reply.status,

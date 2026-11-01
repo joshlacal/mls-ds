@@ -1,8 +1,9 @@
 #![allow(unused_imports)]
 use super::*;
 
-
-pub(in crate::chat_protocol::state_machine) fn validate_recovery_work(state: &ConversationState) -> Result<(), StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn validate_recovery_work(
+    state: &ConversationState,
+) -> Result<(), StateMachineError> {
     if state.recovery_requests.len() != state.recovery_reservations.len()
         || state.recovery_requests.windows(2).any(|pair| {
             pair[0]
@@ -214,14 +215,18 @@ pub(in crate::chat_protocol::state_machine) fn revocation_supersedes_request(
         && evidence.accepted_at < request.expires_at
 }
 
-pub(in crate::chat_protocol::state_machine) fn recovery_origin_received_at(origin: &RecoveryOriginEvidence) -> ServerTimestamp {
+pub(in crate::chat_protocol::state_machine) fn recovery_origin_received_at(
+    origin: &RecoveryOriginEvidence,
+) -> ServerTimestamp {
     match origin {
         RecoveryOriginEvidence::Acceptance(evidence) => evidence.received_at,
         RecoveryOriginEvidence::Request(evidence) => evidence.received_at,
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn recovery_origin_request_digest(origin: &RecoveryOriginEvidence) -> [u8; 32] {
+pub(in crate::chat_protocol::state_machine) fn recovery_origin_request_digest(
+    origin: &RecoveryOriginEvidence,
+) -> [u8; 32] {
     match origin {
         RecoveryOriginEvidence::Acceptance(evidence) => evidence
             .authority
@@ -233,7 +238,9 @@ pub(in crate::chat_protocol::state_machine) fn recovery_origin_request_digest(or
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn validate_reset_work(state: &ConversationState) -> Result<(), StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn validate_reset_work(
+    state: &ConversationState,
+) -> Result<(), StateMachineError> {
     if state
         .reset_requests
         .windows(2)
@@ -314,7 +321,9 @@ pub(in crate::chat_protocol::state_machine) fn validate_reset_work(state: &Conve
     Ok(())
 }
 
-pub(in crate::chat_protocol::state_machine) fn validate_leave_work(state: &ConversationState) -> Result<(), StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn validate_leave_work(
+    state: &ConversationState,
+) -> Result<(), StateMachineError> {
     if state.leave_requests.windows(2).any(|pair| {
         pair[0]
             .requester
@@ -423,7 +432,9 @@ pub(in crate::chat_protocol::state_machine) fn validate_leave_work(state: &Conve
     Ok(())
 }
 
-pub(in crate::chat_protocol::state_machine) fn validate_welcome_work(state: &ConversationState) -> Result<(), StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn validate_welcome_work(
+    state: &ConversationState,
+) -> Result<(), StateMachineError> {
     if state
         .welcomes
         .windows(2)
@@ -563,7 +574,10 @@ pub(in crate::chat_protocol::state_machine) fn validate_welcome_work(state: &Con
     Ok(())
 }
 
-pub(in crate::chat_protocol::state_machine) fn would_remove_last_active_admin(state: &ConversationState, principal: &PrincipalId) -> bool {
+pub(in crate::chat_protocol::state_machine) fn would_remove_last_active_admin(
+    state: &ConversationState,
+    principal: &PrincipalId,
+) -> bool {
     state.participant(principal).is_some_and(|participant| {
         participant.status == ParticipantStatus::Active
             && participant.role == ParticipantRole::Admin

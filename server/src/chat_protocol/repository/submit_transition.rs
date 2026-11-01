@@ -339,7 +339,8 @@ pub(crate) async fn preflight_remote_commit(
         return Ok(RemoteCommitPreflightOutcome::NotRemoteOrDeferred);
     };
     if let Some(r) = routing {
-        if !parsed.add_principals.is_empty() && r.recheck_added_dids(&parsed.add_principals).is_err()
+        if !parsed.add_principals.is_empty()
+            && r.recheck_added_dids(&parsed.add_principals).is_err()
         {
             return Ok(RemoteCommitPreflightOutcome::NotRemoteOrDeferred);
         }
@@ -651,7 +652,10 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         };
         let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
         if verified.output.receipt.conversation_id != conversation_id.to_string()
-            || !crate::identity::dids_equivalent(&verified.output.receipt.sequencer_did, &sequencer_ds)
+            || !crate::identity::dids_equivalent(
+                &verified.output.receipt.sequencer_did,
+                &sequencer_ds,
+            )
             || verified.output.receipt.sequencer_term != sequencer_term
             || verified.submit_transition_response_bytes.as_slice() != local_response.as_bytes()
         {

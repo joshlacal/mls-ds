@@ -192,4 +192,3 @@ pub async fn health_check(pool: &DbPool) -> Result<bool> {
         .context("health check SELECT 1")?;
     Ok(one == 1)
 }
-

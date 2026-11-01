@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::common;
 use crate::chat_protocol::relationship_policy::{
     AdmissionOperation, AdmissionRequest, AllocatedProjectionRevisionGuard, HttpRelationshipSource,
     PolicyDenial, ProjectionClock, ProjectionOperationScope, ProjectionScope, PublicGet,
@@ -17,6 +16,10 @@ use crate::chat_protocol::relationship_policy::{
     TrafficGraphScope, TransportError, TrustedRelationshipPersistenceInstant,
     HARD_MAX_REQUEST_BURST, HARD_MAX_REQUEST_RATE, MAX_ADMISSION_GRAPH_CALLS,
     MAX_ADMISSION_SOURCE_CALLS, MAX_DECLARATION_HTTP_CALLS, MAX_TRAFFIC_GRAPH_CALLS,
+};
+use crate::chat_protocol::repository::core::{
+    LockedConversationHeadGuard, LockedConversationStateGuard, LockedDirectConversationLookupGuard,
+    LockedDirectLookupOutcome, LockedInvitationQuotaGuard,
 };
 use crate::chat_protocol::repository::relationship::{
     allocate_projection_revision, load_fallback_relationship_projection,
@@ -26,20 +29,16 @@ use crate::chat_protocol::repository::relationship::{
     seal_recovery_fallback_scope, seal_traffic_fallback_scope, LockedRelationshipFallbackScope,
     LockedTrafficFallbackScope,
 };
-use crate::chat_protocol::validation::{CanonicalTimestamp, TrustedRequestInstant};
-use crate::chat_protocol::repository::core::{
-    LockedConversationHeadGuard, LockedConversationStateGuard, LockedDirectConversationLookupGuard,
-    LockedDirectLookupOutcome, LockedInvitationQuotaGuard,
-};
 use crate::chat_protocol::state_machine::{
     ConversationKind, ConversationState, DeviceIdentity, LockedRegistrationProjection,
     ParticipantRecord, ParticipantStatus, PersistedRegistrationStatus,
 };
+use crate::chat_protocol::validation::{CanonicalTimestamp, TrustedRequestInstant};
+use crate::common;
 
 fn observe_relationship_persistence() -> TrustedRelationshipPersistenceInstant {
     TrustedRelationshipPersistenceInstant::for_test(chrono::Utc::now())
 }
-
 
 #[test]
 fn repository_source_seals_projection_and_scope_authority() {
@@ -300,7 +299,20 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         transaction_id,
         alice.clone(),
         bob.clone(),
-        LockedDirectLookupOutcome::Existing { conversation_id: Uuid::from_bytes([0x12; 16]), coordinate: crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new([0x12; 16], 1, 1, [0; 32], 0, [0; 32], [0; 32], crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Active), locked_head_digest: [1; 32] },
+        LockedDirectLookupOutcome::Existing {
+            conversation_id: Uuid::from_bytes([0x12; 16]),
+            coordinate: crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
+                [0x12; 16],
+                1,
+                1,
+                [0; 32],
+                0,
+                [0; 32],
+                [0; 32],
+                crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Active,
+            ),
+            locked_head_digest: [1; 32],
+        },
         [0x14; 32],
     );
     assert!(seal_direct_creation_fallback_scope(
@@ -318,7 +330,11 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         ConversationKind::Group,
         vec![
             ParticipantRecord::for_relationship_scope_test(&alice, ParticipantStatus::Active, None),
-            ParticipantRecord::for_relationship_scope_test(&bob, ParticipantStatus::Pending, Some(inviter.clone())),
+            ParticipantRecord::for_relationship_scope_test(
+                &bob,
+                ParticipantStatus::Pending,
+                Some(inviter.clone()),
+            ),
         ],
         [0x21; 32],
         [0x22; 32],

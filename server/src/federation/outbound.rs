@@ -6,7 +6,9 @@ use tracing::debug;
 
 use super::ack::DeliveryAck;
 use super::receipt::SequencerReceipt;
-use super::resolver::{get_or_build_pinned_client, resolve_and_pin_destination, validate_endpoint_url};
+use super::resolver::{
+    get_or_build_pinned_client, resolve_and_pin_destination, validate_endpoint_url,
+};
 use crate::util::outbound_body::{
     collect_bounded, decode_json_bounded, summarize_error_body, OutboundBodyError,
     ResponseBodyBudget, SanitizedErrorSummary, ERROR_RESPONSE_MAX_BYTES,
@@ -66,7 +68,9 @@ impl DsResponse {
 impl OutboundClient {
     pub fn new(connect_timeout_secs: u64, request_timeout_secs: u64) -> Self {
         #[cfg(feature = "test-support")]
-        if let Some(transport) = crate::chat_protocol::relationship_policy::installed_test_https_relationship_transport() {
+        if let Some(transport) =
+            crate::chat_protocol::relationship_policy::installed_test_https_relationship_transport()
+        {
             return Self {
                 http: transport.client,
                 connect_timeout: Duration::from_secs(connect_timeout_secs),
@@ -123,33 +127,31 @@ impl OutboundClient {
     ) -> Result<(reqwest::Client, url::Url), OutboundError> {
         #[cfg(test)]
         if endpoint.starts_with("http://127.0.0.1:") {
-            let parsed = url::Url::parse(endpoint).map_err(|e| OutboundError::ConnectionFailed {
+            let parsed =
+                url::Url::parse(endpoint).map_err(|e| OutboundError::ConnectionFailed {
+                    endpoint: REMOTE_DS.to_string(),
+                    reason: format!("endpoint URL validation failed: {e}"),
+                })?;
+            return Ok((self.http.clone(), parsed));
+        }
+        let parsed =
+            validate_endpoint_url(endpoint).map_err(|e| OutboundError::ConnectionFailed {
                 endpoint: REMOTE_DS.to_string(),
                 reason: format!("endpoint URL validation failed: {e}"),
             })?;
-            return Ok((self.http.clone(), parsed));
-        }
-        let parsed = validate_endpoint_url(endpoint).map_err(|e| OutboundError::ConnectionFailed {
-            endpoint: REMOTE_DS.to_string(),
-            reason: format!("endpoint URL validation failed: {e}"),
-        })?;
-        let (host, addrs) = resolve_and_pin_destination(&parsed)
-            .await
-            .map_err(|e| OutboundError::ConnectionFailed {
+        let (host, addrs) = resolve_and_pin_destination(&parsed).await.map_err(|e| {
+            OutboundError::ConnectionFailed {
                 endpoint: REMOTE_DS.to_string(),
                 reason: format!("destination address validation failed: {e}"),
-            })?;
-        let client = get_or_build_pinned_client(
-            &host,
-            &addrs,
-            self.connect_timeout,
-            self.request_timeout,
-        )
-        .await
-        .map_err(|e| OutboundError::ConnectionFailed {
-            endpoint: REMOTE_DS.to_string(),
-            reason: format!("client initialization failed: {e}"),
+            }
         })?;
+        let client =
+            get_or_build_pinned_client(&host, &addrs, self.connect_timeout, self.request_timeout)
+                .await
+                .map_err(|e| OutboundError::ConnectionFailed {
+                    endpoint: REMOTE_DS.to_string(),
+                    reason: format!("client initialization failed: {e}"),
+                })?;
         Ok((client, parsed))
     }
     /// Make an authenticated XRPC procedure call to a remote DS.
@@ -554,7 +556,9 @@ impl OutboundError {
 
     pub fn predecessor_reason(&self) -> Option<&str> {
         match self {
-            Self::RemoteError { predecessor_reason, .. } => predecessor_reason.as_deref(),
+            Self::RemoteError {
+                predecessor_reason, ..
+            } => predecessor_reason.as_deref(),
             _ => None,
         }
     }
@@ -586,11 +590,14 @@ async fn parse_error_response(
         }
         Err(err) => {
             let summary = match err {
-                OutboundBodyError::DeclaredTooLarge { declared_bytes, .. } => SanitizedErrorSummary {
-                    declared_bytes: Some(declared_bytes),
-                    observed_at_least_bytes: usize::try_from(declared_bytes).unwrap_or(usize::MAX),
-                    truncated: true,
-                },
+                OutboundBodyError::DeclaredTooLarge { declared_bytes, .. } => {
+                    SanitizedErrorSummary {
+                        declared_bytes: Some(declared_bytes),
+                        observed_at_least_bytes: usize::try_from(declared_bytes)
+                            .unwrap_or(usize::MAX),
+                        truncated: true,
+                    }
+                }
                 OutboundBodyError::StreamedTooLarge {
                     observed_at_least_bytes,
                     ..
@@ -1073,12 +1080,17 @@ mod tests {
             Some("missing signed predecessor entry")
         );
         assert!(!error.is_retryable());
-        assert!(!error.to_string().contains("missing signed predecessor entry"));
+        assert!(!error
+            .to_string()
+            .contains("missing signed predecessor entry"));
     }
 
     #[tokio::test]
     async fn outbound_post_does_not_follow_redirect_to_private_sink() {
-        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
 
         let sink_hits = Arc::new(AtomicUsize::new(0));
         let hits = sink_hits.clone();
@@ -1091,7 +1103,8 @@ mod tests {
                     Json(json!({"accepted": true}))
                 }
             }),
-        )).await;
+        ))
+        .await;
         let redirect = spawn_ds(Router::new().route(
             &format!("/xrpc/{TEST_METHOD}"),
             post(move || {
@@ -1104,7 +1117,8 @@ mod tests {
                         .unwrap()
                 }
             }),
-        )).await;
+        ))
+        .await;
         let failure = OutboundClient::new(1, 2)
             .call_procedure_json(&redirect, TEST_METHOD, "secret", &json!({}))
             .await
@@ -1113,7 +1127,11 @@ mod tests {
             matches!(failure, OutboundError::InvalidResponse { ref reason } if reason.contains("307"))
                 || matches!(failure, OutboundError::RemoteError { status: 307, .. })
         );
-        assert_eq!(sink_hits.load(Ordering::SeqCst), 0, "redirected request reached private sink");
+        assert_eq!(
+            sink_hits.load(Ordering::SeqCst),
+            0,
+            "redirected request reached private sink"
+        );
     }
     #[tokio::test]
     async fn procedure_rejects_307_redirect_to_private_target_without_following() {
@@ -1132,7 +1150,12 @@ mod tests {
         let client = OutboundClient::new(1, 1);
 
         let error = client
-            .call_procedure(&endpoint, TEST_METHOD, "token", &json!({ "private_data": "secret" }))
+            .call_procedure(
+                &endpoint,
+                TEST_METHOD,
+                "token",
+                &json!({ "private_data": "secret" }),
+            )
             .await
             .unwrap_err();
 

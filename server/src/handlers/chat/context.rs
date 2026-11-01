@@ -61,7 +61,11 @@ pub(crate) fn require_cutover(
 
 fn capture_instant(endpoint: ChatEndpoint) -> Result<TrustedRequestInstant, ChatFailure> {
     TrustedRequestInstant::capture().map_err(|error| {
-        tracing::error!(endpoint = endpoint.nsid(), ?error, "clean-chat trusted instant capture failed");
+        tracing::error!(
+            endpoint = endpoint.nsid(),
+            ?error,
+            "clean-chat trusted instant capture failed"
+        );
         ChatFailure::invariant(endpoint)
     })
 }
@@ -527,10 +531,8 @@ mod tests {
                 "endpoint {} must declare ConversationNotAccepted",
                 endpoint.nsid()
             );
-            let failure = operation_prelude_failure(
-                endpoint,
-                PreludeError::DirectRequestConsentRequired,
-            );
+            let failure =
+                operation_prelude_failure(endpoint, PreludeError::DirectRequestConsentRequired);
             assert_eq!(
                 failure.code(),
                 Some(ChatProtocolErrorCode::ConversationNotAccepted),
@@ -546,16 +548,17 @@ mod tests {
             );
         }
 
-        for endpoint in [ChatEndpoint::AcknowledgeWelcome, ChatEndpoint::RejectWelcome] {
+        for endpoint in [
+            ChatEndpoint::AcknowledgeWelcome,
+            ChatEndpoint::RejectWelcome,
+        ] {
             assert!(
                 endpoint.declares(ChatProtocolErrorCode::WelcomeSuperseded),
                 "endpoint {} must declare WelcomeSuperseded",
                 endpoint.nsid()
             );
-            let failure = operation_prelude_failure(
-                endpoint,
-                PreludeError::DirectRequestConsentRequired,
-            );
+            let failure =
+                operation_prelude_failure(endpoint, PreludeError::DirectRequestConsentRequired);
             assert_eq!(
                 failure.code(),
                 Some(ChatProtocolErrorCode::WelcomeSuperseded),

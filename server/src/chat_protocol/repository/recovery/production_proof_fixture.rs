@@ -1441,14 +1441,22 @@ fn build_two_member_fulfillment_products(
     // fixture at v2, but bind this Commit to the subsequent policy coordinate.
     let policy_prior = if after_policy {
         let c = prior.coordinate();
-        Some(rebind_active_snapshot(
-            &prior,
-            PublicGroupSnapshotCoordinate::new(
-                *c.conversation_id(), c.generation(), c.state_version() + 1,
-                *c.group_id(), c.epoch(), *c.group_context_hash(),
-                *c.confirmation_tag(), PublicGroupSnapshotLifecycle::Active,
-            ),
-        ).map_err(|e| format!("rebind renewal policy coordinate: {e:?}"))?)
+        Some(
+            rebind_active_snapshot(
+                &prior,
+                PublicGroupSnapshotCoordinate::new(
+                    *c.conversation_id(),
+                    c.generation(),
+                    c.state_version() + 1,
+                    *c.group_id(),
+                    c.epoch(),
+                    *c.group_context_hash(),
+                    *c.confirmation_tag(),
+                    PublicGroupSnapshotLifecycle::Active,
+                ),
+            )
+            .map_err(|e| format!("rebind renewal policy coordinate: {e:?}"))?,
+        )
     } else {
         None
     };
@@ -1459,21 +1467,46 @@ fn build_two_member_fulfillment_products(
         fulfillment_prior.coordinate(),
     )?;
     requester_group.set_aad(Vec::new());
-    let application_message=requester_group.create_message(&provider,&requester_signer,b"retained application history")
-        .map_err(|e|format!("encrypt real application fixture: {e:?}"))?.tls_serialize_detached()
-        .map_err(|e|format!("encode real application fixture: {e:?}"))?;
+    let application_message = requester_group
+        .create_message(
+            &provider,
+            &requester_signer,
+            b"retained application history",
+        )
+        .map_err(|e| format!("encrypt real application fixture: {e:?}"))?
+        .tls_serialize_detached()
+        .map_err(|e| format!("encode real application fixture: {e:?}"))?;
     requester_group.set_aad(fulfillment_aad.clone());
     let (removal_message, _, removal_info) = requester_group
         .remove_members(&provider, &requester_signer, &[LeafNodeIndex::new(1)])
-        .map_err(|e|format!("build genuine terminal Remove: {e:?}"))?;
-    let removal_commit=removal_message.tls_serialize_detached().map_err(|e|format!("encode Remove: {e:?}"))?;
-    let removal_context=removal_info.ok_or("missing Remove group info")?.group_context()
-        .tls_serialize_detached().map_err(|e|format!("encode Remove group context: {e:?}"))?;
-    requester_group.merge_pending_commit(&provider).map_err(|e|format!("merge Remove: {e:?}"))?;
-    let removal_coordinate=coordinate_from_merged_group(&requester_group,&removal_context,conversation_id,3 + u64::from(after_policy))?;
-    let removal_next=process_commit(fulfillment_prior,&removal_commit,&fulfillment_aad,removal_coordinate,
-        u64::try_from(at.timestamp()).map_err(|_|"negative Remove time")?,2)
-        .map_err(|e|format!("verify real Remove: {e:?}"))?.into_next();
+        .map_err(|e| format!("build genuine terminal Remove: {e:?}"))?;
+    let removal_commit = removal_message
+        .tls_serialize_detached()
+        .map_err(|e| format!("encode Remove: {e:?}"))?;
+    let removal_context = removal_info
+        .ok_or("missing Remove group info")?
+        .group_context()
+        .tls_serialize_detached()
+        .map_err(|e| format!("encode Remove group context: {e:?}"))?;
+    requester_group
+        .merge_pending_commit(&provider)
+        .map_err(|e| format!("merge Remove: {e:?}"))?;
+    let removal_coordinate = coordinate_from_merged_group(
+        &requester_group,
+        &removal_context,
+        conversation_id,
+        3 + u64::from(after_policy),
+    )?;
+    let removal_next = process_commit(
+        fulfillment_prior,
+        &removal_commit,
+        &fulfillment_aad,
+        removal_coordinate,
+        u64::try_from(at.timestamp()).map_err(|_| "negative Remove time")?,
+        2,
+    )
+    .map_err(|e| format!("verify real Remove: {e:?}"))?
+    .into_next();
     fulfiller_group.set_aad(fulfillment_aad.clone());
     // `swap_members` is OpenMLS's inline Remove+Add commit-builder path:
     // it never routes either proposal through the pending proposal store, so
@@ -1511,8 +1544,12 @@ fn build_two_member_fulfillment_products(
     fulfiller_group
         .merge_pending_commit(&fulfiller_provider)
         .map_err(|error| format!("merge Recovery fulfillment Commit: {error:?}"))?;
-    let next_coordinate =
-        coordinate_from_merged_group(&fulfiller_group, &next_group_context, conversation_id, 3 + u64::from(after_policy))?;
+    let next_coordinate = coordinate_from_merged_group(
+        &fulfiller_group,
+        &next_group_context,
+        conversation_id,
+        3 + u64::from(after_policy),
+    )?;
     let fulfillment_verified = process_commit(
         fulfillment_prior,
         &commit,
@@ -1771,10 +1808,19 @@ pub(super) async fn seed_durable_recovery_fixture_with_pending(
     let prior = state.coordinate().clone();
     let mut creation = match pending {
         Some(pending) => build_real_creation_entry_with_pending(
-            &identity, pending, conversation_id, &prior, &group_info, trusted_instant.as_str(),
+            &identity,
+            pending,
+            conversation_id,
+            &prior,
+            &group_info,
+            trusted_instant.as_str(),
         )?,
         None => build_real_creation_entry(
-            &identity, conversation_id, &prior, &group_info, trusted_instant.as_str(),
+            &identity,
+            conversation_id,
+            &prior,
+            &group_info,
+            trusted_instant.as_str(),
         )?,
     };
     if direct {
@@ -1783,8 +1829,9 @@ pub(super) async fn seed_durable_recovery_fixture_with_pending(
     let (key_package_ref, key_package_wrapper, init_key) =
         build_available_key_package(&identity, at)?;
     seed_identity(pool, &identity, trusted_instant).await?;
-    if let Some(pending) = pending { seed_identity(pool, pending, trusted_instant).await?; }
-
+    if let Some(pending) = pending {
+        seed_identity(pool, pending, trusted_instant).await?;
+    }
 
     let verified =
         decode_and_verify_signed_mutation(&creation.raw_wrapper, &identity.signing_public_key())
@@ -1809,7 +1856,13 @@ pub(super) async fn seed_durable_recovery_fixture_with_pending(
         .begin()
         .await
         .map_err(|error| format!("begin durable fixture: {error}"))?;
-    let pair = pending.map(|other| if identity.did < other.did { (&identity.did, &other.did) } else { (&other.did, &identity.did) });
+    let pair = pending.map(|other| {
+        if identity.did < other.did {
+            (&identity.did, &other.did)
+        } else {
+            (&other.did, &identity.did)
+        }
+    });
     sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at,direct_did_low,direct_did_high) VALUES($1,$3,'active',0,0,2,$2,$4,$5)")
         .bind(conversation_id).bind(at).bind(if direct { "direct" } else { "group" })
         .bind(if direct { pair.map(|p| p.0) } else { None }).bind(if direct { pair.map(|p| p.1) } else { None })
@@ -1892,7 +1945,12 @@ pub(super) async fn seed_durable_recovery_fulfillment_fixture_for_identities(
     fulfillment_transition_id: Uuid,
 ) -> Result<DurableRecoveryFulfillmentFixture, String> {
     seed_recovery_package_reuse_fixture(
-        pool, trusted_instant, requester, fulfiller, fulfillment_transition_id, false,
+        pool,
+        trusted_instant,
+        requester,
+        fulfiller,
+        fulfillment_transition_id,
+        false,
     )
     .await
 }
@@ -2512,9 +2570,17 @@ pub(super) async fn authorize(
 }
 
 pub(super) async fn admit_entry_read(
-    pool: &PgPool, identity: &FixtureIdentity, trusted_instant: &TrustedRequestInstant,
+    pool: &PgPool,
+    identity: &FixtureIdentity,
+    trusted_instant: &TrustedRequestInstant,
 ) -> Result<crate::chat_protocol::dpop::VerifiedReadAdmission, String> {
-    admit_read(pool, identity, "blue.catbird.chat.getEntries", trusted_instant).await
+    admit_read(
+        pool,
+        identity,
+        "blue.catbird.chat.getEntries",
+        trusted_instant,
+    )
+    .await
 }
 
 pub(super) async fn admit_read(
@@ -2576,8 +2642,10 @@ pub(super) async fn admit_read(
         trusted_instant,
     )
     .map_err(|error| format!("verify Recovery proof Nest/DPoP request: {error:?}"))?;
-    let authority = crate::chat_protocol::repository::auth::authorize_unsigned_request(pool, pre_replay)
-        .await.map_err(|e| format!("authorize signed read request: {e:?}"))?;
+    let authority =
+        crate::chat_protocol::repository::auth::authorize_unsigned_request(pool, pre_replay)
+            .await
+            .map_err(|e| format!("authorize signed read request: {e:?}"))?;
     crate::chat_protocol::dpop::seal_read_admission(authority)
         .map_err(|e| format!("seal signed read admission: {e:?}"))
 }
@@ -2644,8 +2712,11 @@ pub(super) async fn admit_lifecycle(
     .map_err(|error| format!("verify Recovery proof Nest/DPoP request: {error:?}"))?;
     let canonical = decode_canonical_signed_mutation(&envelope.raw_wrapper)
         .map_err(|error| format!("decode Recovery proof signed request: {error:?}"))?;
-    crate::chat_protocol::repository::auth::authorize_signed_operation_only(pool, pre_replay, canonical)
-        .await.map_err(|error| format!("admit lifecycle signed operation: {error:?}"))
+    crate::chat_protocol::repository::auth::authorize_signed_operation_only(
+        pool, pre_replay, canonical,
+    )
+    .await
+    .map_err(|error| format!("admit lifecycle signed operation: {error:?}"))
 }
 
 pub(super) fn leaf_recovery_request(
@@ -2762,7 +2833,9 @@ pub(super) fn sign_canonical_wrapper(
     body: Value,
     expected_kind: SignedMutationKind,
 ) -> Result<SignedRecoveryEnvelope, String> {
-    let operation_id = body.get("idempotencyKey").or_else(|| body.get("messageId"))
+    let operation_id = body
+        .get("idempotencyKey")
+        .or_else(|| body.get("messageId"))
         .and_then(Value::as_str)
         .ok_or_else(|| "Recovery fixture body is missing idempotencyKey".to_owned())
         .and_then(|value| {
@@ -2883,12 +2956,21 @@ pub(super) fn creation_envelope(
 ) -> Result<SignedRecoveryEnvelope, String> {
     let (group_info, state) = build_genesis_state(creator, conversation_id, trusted.datetime())?;
     let creation = build_real_creation_entry(
-        creator, conversation_id, state.coordinate(), &group_info, trusted.as_str(),
+        creator,
+        conversation_id,
+        state.coordinate(),
+        &group_info,
+        trusted.as_str(),
     )?;
-    let mut wrapper: Value = serde_json::from_slice(&creation.raw_wrapper).map_err(|e| e.to_string())?;
+    let mut wrapper: Value =
+        serde_json::from_slice(&creation.raw_wrapper).map_err(|e| e.to_string())?;
     wrapper["body"]["signedAt"] = json!(trusted.as_str());
     wrapper["body"]["idempotencyKey"] = wrapper["body"]["transitionId"].clone();
-    sign_canonical_wrapper(creator, wrapper["body"].clone(), SignedMutationKind::Creation)
+    sign_canonical_wrapper(
+        creator,
+        wrapper["body"].clone(),
+        SignedMutationKind::Creation,
+    )
 }
 
 #[allow(clippy::type_complexity)]
@@ -2978,7 +3060,8 @@ pub(super) fn build_c33_two_leaf_artifacts(
         .map_err(|e| format!("export c33 genesis info: {e:?}"))?
         .tls_serialize_detached()
         .map_err(|e| format!("serialize c33 genesis info: {e:?}"))?;
-    let genesis = public_state_from_group_info(&genesis_group_info, actor, conversation_id, 0, 0, at)?;
+    let genesis =
+        public_state_from_group_info(&genesis_group_info, actor, conversation_id, 0, 0, at)?;
 
     let recipient_cred = format!("{}#{}", recipient.did, recipient.device_id).into_bytes();
     let package = KeyPackage::builder()
@@ -3035,7 +3118,8 @@ pub(super) fn build_c33_two_leaf_artifacts(
         .group_context()
         .tls_serialize_detached()
         .map_err(|e| format!("c33 group_context serialize: {e:?}"))?;
-    let final_coord = coordinate_from_merged_group(&actor_group, &add_group_context, conversation_id, 1)?;
+    let final_coord =
+        coordinate_from_merged_group(&actor_group, &add_group_context, conversation_id, 1)?;
     let final_state = crate::chat_protocol::public_state::process_direct_request_commit(
         &genesis,
         &add_commit_bytes,

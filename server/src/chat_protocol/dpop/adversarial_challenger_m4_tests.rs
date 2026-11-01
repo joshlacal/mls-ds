@@ -10,7 +10,7 @@
 
 use std::{
     collections::BTreeSet,
-    sync::{Arc, Mutex, Once},
+    sync::{Arc, Mutex},
 };
 
 use axum::{
@@ -31,16 +31,11 @@ use tower_util::ServiceExt;
 
 use crate::{
     chat_protocol::{
-        dpop::{
-            verify_enrollment_request_auth, verify_ordinary_request_auth, TrustedNestVerifier,
-        },
+        dpop::{verify_enrollment_request_auth, verify_ordinary_request_auth, TrustedNestVerifier},
         error::ChatEndpoint,
-        transcript::{
-            decode_and_verify_enrollment_body, decode_canonical_signed_mutation,
-        },
+        transcript::{decode_and_verify_enrollment_body, decode_canonical_signed_mutation},
         validation::{
-            self,
-            ed25519_key_id, enrollment_grant_expiry, CanonicalHttpMethod, CanonicalTimestamp,
+            self, ed25519_key_id, enrollment_grant_expiry, CanonicalHttpMethod, CanonicalTimestamp,
             CanonicalUuidV4, NumericDate, TrustedExternalBase, TrustedRequestInstant,
             ValidatedChatNsid,
         },
@@ -1074,30 +1069,27 @@ impl FromRef<RouteTestState> for Arc<ChatRuntime> {
 }
 
 fn test_runtime(cutover_enabled: bool) -> Arc<ChatRuntime> {
-    static INIT: Once = Once::new();
     static LOCK: Mutex<()> = Mutex::new(());
-    INIT.call_once(|| {
-        let key = SigningKey::from_bytes((&[0x5a_u8; 32]).into()).expect("signing key");
-        std::env::set_var("CHAT_NEST_ISSUER", "did:web:api.catbird.blue");
-        std::env::set_var("CHAT_NEST_AUDIENCE", "did:web:chat.catbird.blue");
-        std::env::set_var("CHAT_NEST_KEY_ID", "route-inventory");
-        std::env::set_var(
-            "CHAT_NEST_VERIFYING_KEY",
-            STANDARD.encode(key.verifying_key().to_encoded_point(false).as_bytes()),
-        );
-        std::env::set_var("CHAT_INSTANCE_ID", "018f3f6a-7b2c-4d91-8a5e-0f123456789a");
-        std::env::set_var("CHAT_EXTERNAL_BASE", "https://chat.example.net");
-        std::env::set_var("CHAT_CURSOR_KEY_ID", URL_SAFE_NO_PAD.encode([0x11_u8; 32]));
-        std::env::set_var(
-            "CHAT_CURSOR_SEALING_SECRET",
-            URL_SAFE_NO_PAD.encode([0x22_u8; 32]),
-        );
-        std::env::set_var(
-            "CHAT_SUBSCRIPTION_ENDPOINT",
-            "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
-        );
-    });
     let _guard = LOCK.lock().expect("runtime env lock");
+    let key = SigningKey::from_bytes((&[0x5a_u8; 32]).into()).expect("signing key");
+    std::env::set_var("CHAT_NEST_ISSUER", "did:web:api.catbird.blue");
+    std::env::set_var("CHAT_NEST_AUDIENCE", "did:web:chat.catbird.blue");
+    std::env::set_var("CHAT_NEST_KEY_ID", "route-inventory");
+    std::env::set_var(
+        "CHAT_NEST_VERIFYING_KEY",
+        STANDARD.encode(key.verifying_key().to_encoded_point(false).as_bytes()),
+    );
+    std::env::set_var("CHAT_INSTANCE_ID", "018f3f6a-7b2c-4d91-8a5e-0f123456789a");
+    std::env::set_var("CHAT_EXTERNAL_BASE", "https://chat.example.net");
+    std::env::set_var("CHAT_CURSOR_KEY_ID", URL_SAFE_NO_PAD.encode([0x11_u8; 32]));
+    std::env::set_var(
+        "CHAT_CURSOR_SEALING_SECRET",
+        URL_SAFE_NO_PAD.encode([0x22_u8; 32]),
+    );
+    std::env::set_var(
+        "CHAT_SUBSCRIPTION_ENDPOINT",
+        "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
+    );
     if cutover_enabled {
         std::env::set_var("CHAT_CUTOVER_ENABLED", "true");
     } else {
@@ -1105,7 +1097,14 @@ fn test_runtime(cutover_enabled: bool) -> Arc<ChatRuntime> {
     }
     let rt =
         Arc::new(ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("clean-chat runtime"));
-    std::env::remove_var("CHAT_CUTOVER_ENABLED");
+    for var in [
+        "CHAT_CUTOVER_ENABLED",
+        "CHAT_CURSOR_KEY_ID",
+        "CHAT_CURSOR_SEALING_SECRET",
+        "CHAT_SUBSCRIPTION_ENDPOINT",
+    ] {
+        std::env::remove_var(var);
+    }
     rt
 }
 

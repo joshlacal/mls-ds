@@ -74,100 +74,290 @@ use super::{
     },
 };
 
-#[path = "state_machine/creation.rs"] mod creation;
-pub(crate) use self::creation::{StateMachineError, ServerTimestamp, PrincipalId, DeviceIdentity, ConversationKind, ParticipantStatus, ParticipantRole, InvitationProvenance, ParticipantRecord, LeafRecord, OpeningKind, CloseKind, AuthenticatedEntryEvidence, MetadataSnapshotBinding, MetadataAvatarDescriptorBinding, TransitionEvidence, RequestEntryKind, RequestEvidence, DeviceRevocationEvidence};
-use self::creation::{MAX_PARTICIPANTS, MAX_LEAVES, MAX_LEAVES_PER_PRINCIPAL, RECOVERY_RESERVATION_TTL_MILLIS, CONSENT_TTL_MILLIS, COMMIT_AAD_DOMAIN, relationship_consumption_error, is_uuid_v4, TransitionBodyBinding, MetadataCryptoCoordinate, MetadataAuthorProofBinding, RosterManifestBinding, RosterParticipantBinding, InvitationBinding, AcceptanceRecoveryBinding, TransitionManifestBinding, ManifestParticipantChange, ManifestLeafChange, ManifestWelcomeBinding, RequestBodyBinding};
-#[path = "state_machine/transitions.rs"] mod transitions;
-pub(crate) use self::transitions::{HydrationAuthority};
-pub(in crate::chat_protocol) use self::transitions::{HistoricalPlanWitness, RecoveryPlannedKind, PlannedRecoveryMutation, PlannedClientRecoveryExpiry, PlannedSchedulerRecoveryExpiry};
+#[path = "state_machine/creation.rs"]
+mod creation;
+use self::creation::{
+    is_uuid_v4, relationship_consumption_error, AcceptanceRecoveryBinding, InvitationBinding,
+    ManifestLeafChange, ManifestParticipantChange, ManifestWelcomeBinding,
+    MetadataAuthorProofBinding, MetadataCryptoCoordinate, RequestBodyBinding,
+    RosterManifestBinding, RosterParticipantBinding, TransitionBodyBinding,
+    TransitionManifestBinding, COMMIT_AAD_DOMAIN, CONSENT_TTL_MILLIS, MAX_LEAVES,
+    MAX_LEAVES_PER_PRINCIPAL, MAX_PARTICIPANTS, RECOVERY_RESERVATION_TTL_MILLIS,
+};
+pub(crate) use self::creation::{
+    AuthenticatedEntryEvidence, CloseKind, ConversationKind, DeviceIdentity,
+    DeviceRevocationEvidence, InvitationProvenance, LeafRecord, MetadataAvatarDescriptorBinding,
+    MetadataSnapshotBinding, OpeningKind, ParticipantRecord, ParticipantRole, ParticipantStatus,
+    PrincipalId, RequestEntryKind, RequestEvidence, ServerTimestamp, StateMachineError,
+    TransitionEvidence,
+};
+#[path = "state_machine/transitions.rs"]
+mod transitions;
+pub(crate) use self::transitions::HydrationAuthority;
 use self::transitions::{historical_actor, LockedHydrationBinding};
-#[path = "state_machine/messages.rs"] mod messages;
-#[path = "state_machine/recovery.rs"] mod recovery;
-#[path = "state_machine/direct_requests.rs"] mod direct_requests;
-#[path = "state_machine/metadata.rs"] mod metadata;
-pub(crate) use self::metadata::{PersistedSignedRequestRow, PersistedControlRow, PersistedControlAuthority, classify_role_producer, classify_invitation, classify_acceptance, acceptance_recovery_package_artifact_matches, HistoricalRehydrationAuthority};
-#[path = "state_machine/lifecycle.rs"] mod lifecycle;
-pub(crate) use self::lifecycle::{PersistedDeviceRevocationRow, DurableSignedRequestEnvelope, WelcomeTerminalPlan};
-use self::lifecycle::{historical_signed_request_evidence, historical_transition_evidence, historical_control_request_evidence, authenticated_entry, request_evidence_from_verified, canonical_server_timestamp, parse_direct_request_publication, closed_uuid, closed_integer, closed_text, closed_principal, closed_key_id, closed_timestamp};
-#[path = "state_machine/types.rs"] mod types;
-pub(crate) use self::types::{closed_coordinate, commit_aad_bytes, checked_artifact_bytes, PersistedRegistrationStatus};
-use self::types::{closed_coordinate_from_field, parse_conversation_kind, sealed_object_digest, commit_aad_sha256, checked_artifact_sha256, checked_metadata_snapshot_digest, parse_metadata_snapshot, metadata_coordinate_matches, transition_binding_is_route_bound, transition_body_prior, validate_special_server_fields, parse_acceptance_recovery, closed_fixed_bytes, closed_device, parse_participant_role, parse_participant_status, parse_invitation, parse_roster_manifest, parse_participant_changes, manifest_change_principal, parse_transition_manifest, closed_coordinate_conversation_id, durable_signed_request_row_digest, device_revocation_row_digest, validate_device_revocation_evidence};
-#[cfg(test)] pub(crate) use self::types::PersistedRegistrationRow;
-#[cfg(test)] use self::types::registration_row_digest;
-#[cfg(test)] use self::types::registration_row_digest_fields;
-#[path = "state_machine/evidence.rs"] mod evidence;
-pub(crate) use self::evidence::{FederatedOperationAdmission, LockedRecoveryReservationProjection, historical_available_package_cas, reserved_package_cas_for_request};
-use self::evidence::{WorkTerminalEvidence, validate_request_evidence, durable_signed_request_evidence_digest, durable_control_transition_row_digest, durable_control_request_row_digest, durable_control_row_digest, require_request_prior, require_leaf_recovery_request_binding};
-#[cfg(test)] pub(crate) use self::evidence::PersistedRecoveryReservationSelectionRow;
-#[cfg(test)] use self::evidence::recovery_reservation_selection_digest;
-#[cfg(test)] use self::evidence::recovery_reservation_selection_digest_fields;
-#[cfg(test)] use self::evidence::coordinate_digest;
-#[cfg(test)] use self::evidence::uuid_from_test_byte;
-#[path = "state_machine/hydration_entries.rs"] mod hydration_entries;
-pub(crate) use self::hydration_entries::{AccessIntervalEnd, AccessInterval, ScheduleTerminalProof, LeafRecoveryKind, RecoverySource, RecoveryRequestStatus, ReservationStatus, ResetRequestStatus, LeaveRequestStatus, WelcomeStatus, RecoveryRequest, RecoveryReservation, ResetRequest, LeaveRequest, ParticipantRemovalEvidence, WelcomeWork, ConversationState, ConversationStateHydration, InvitationHydrationRow, ParticipantHydrationRow, LeafHydrationRow, IntervalEndHydrationRow, IntervalHydrationRow, TerminalProofHydrationRow, WorkTerminalHydrationRow, RecoveryOriginHydrationRow, RecoveryRequestHydrationRow, RecoveryReservationHydrationRow, ResetRequestHydrationRow, LeaveRequestHydrationRow, WelcomeHydrationRow};
-use self::hydration_entries::{require_request_coordinate_binding, request_entry_signed_kind, RecoveryOriginEvidence};
-#[cfg(test)] pub(crate) use self::hydration_entries::LeaveFulfillmentTestMutation;
-#[path = "state_machine/hydration_requests.rs"] mod hydration_requests;
-pub(crate) use self::hydration_requests::{hydrate_conversation_state, PlanKind, PackageStatus, PackageTransition};
+pub(in crate::chat_protocol) use self::transitions::{
+    HistoricalPlanWitness, PlannedClientRecoveryExpiry, PlannedRecoveryMutation,
+    PlannedSchedulerRecoveryExpiry, RecoveryPlannedKind,
+};
+#[path = "state_machine/direct_requests.rs"]
+mod direct_requests;
+#[path = "state_machine/messages.rs"]
+mod messages;
+#[path = "state_machine/metadata.rs"]
+mod metadata;
+#[path = "state_machine/recovery.rs"]
+mod recovery;
+pub(crate) use self::metadata::{
+    acceptance_recovery_package_artifact_matches, classify_acceptance, classify_invitation,
+    classify_role_producer, HistoricalRehydrationAuthority, PersistedControlAuthority,
+    PersistedControlRow, PersistedSignedRequestRow,
+};
+#[path = "state_machine/lifecycle.rs"]
+mod lifecycle;
+use self::lifecycle::{
+    authenticated_entry, canonical_server_timestamp, closed_integer, closed_key_id,
+    closed_principal, closed_text, closed_timestamp, closed_uuid,
+    historical_control_request_evidence, historical_signed_request_evidence,
+    historical_transition_evidence, parse_direct_request_publication,
+    request_evidence_from_verified,
+};
+pub(crate) use self::lifecycle::{
+    DurableSignedRequestEnvelope, PersistedDeviceRevocationRow, WelcomeTerminalPlan,
+};
+#[path = "state_machine/types.rs"]
+mod types;
+#[cfg(test)]
+use self::types::registration_row_digest;
+#[cfg(test)]
+use self::types::registration_row_digest_fields;
+#[cfg(test)]
+pub(crate) use self::types::PersistedRegistrationRow;
+pub(crate) use self::types::{
+    checked_artifact_bytes, closed_coordinate, commit_aad_bytes, PersistedRegistrationStatus,
+};
+use self::types::{
+    checked_artifact_sha256, checked_metadata_snapshot_digest, closed_coordinate_conversation_id,
+    closed_coordinate_from_field, closed_device, closed_fixed_bytes, commit_aad_sha256,
+    device_revocation_row_digest, durable_signed_request_row_digest, manifest_change_principal,
+    metadata_coordinate_matches, parse_acceptance_recovery, parse_conversation_kind,
+    parse_invitation, parse_metadata_snapshot, parse_participant_changes, parse_participant_role,
+    parse_participant_status, parse_roster_manifest, parse_transition_manifest,
+    sealed_object_digest, transition_binding_is_route_bound, transition_body_prior,
+    validate_device_revocation_evidence, validate_special_server_fields,
+};
+#[path = "state_machine/evidence.rs"]
+mod evidence;
+#[cfg(test)]
+use self::evidence::coordinate_digest;
+#[cfg(test)]
+use self::evidence::recovery_reservation_selection_digest;
+#[cfg(test)]
+use self::evidence::recovery_reservation_selection_digest_fields;
+#[cfg(test)]
+use self::evidence::uuid_from_test_byte;
+#[cfg(test)]
+pub(crate) use self::evidence::PersistedRecoveryReservationSelectionRow;
+use self::evidence::{
+    durable_control_request_row_digest, durable_control_row_digest,
+    durable_control_transition_row_digest, durable_signed_request_evidence_digest,
+    require_leaf_recovery_request_binding, require_request_prior, validate_request_evidence,
+    WorkTerminalEvidence,
+};
+pub(crate) use self::evidence::{
+    historical_available_package_cas, reserved_package_cas_for_request,
+    FederatedOperationAdmission, LockedRecoveryReservationProjection,
+};
+#[path = "state_machine/hydration_entries.rs"]
+mod hydration_entries;
+#[cfg(test)]
+pub(crate) use self::hydration_entries::LeaveFulfillmentTestMutation;
+use self::hydration_entries::{
+    request_entry_signed_kind, require_request_coordinate_binding, RecoveryOriginEvidence,
+};
+pub(crate) use self::hydration_entries::{
+    AccessInterval, AccessIntervalEnd, ConversationState, ConversationStateHydration,
+    IntervalEndHydrationRow, IntervalHydrationRow, InvitationHydrationRow, LeafHydrationRow,
+    LeafRecoveryKind, LeaveRequest, LeaveRequestHydrationRow, LeaveRequestStatus,
+    ParticipantHydrationRow, ParticipantRemovalEvidence, RecoveryOriginHydrationRow,
+    RecoveryRequest, RecoveryRequestHydrationRow, RecoveryRequestStatus, RecoveryReservation,
+    RecoveryReservationHydrationRow, RecoverySource, ReservationStatus, ResetRequest,
+    ResetRequestHydrationRow, ResetRequestStatus, ScheduleTerminalProof, TerminalProofHydrationRow,
+    WelcomeHydrationRow, WelcomeStatus, WelcomeWork, WorkTerminalHydrationRow,
+};
+#[path = "state_machine/hydration_requests.rs"]
+mod hydration_requests;
+pub(crate) use self::hydration_requests::{
+    hydrate_conversation_state, PackageStatus, PackageTransition, PlanKind,
+};
 use self::hydration_requests::{work_terminal_from_hydration, work_terminal_to_hydration};
-#[path = "state_machine/historical.rs"] mod historical;
-pub(crate) use self::historical::{RecoveryPackageCasBinding, RevocationTargetCasBinding, RevocationPackageCasBinding, InvitationQuotaRecipientCasFact, InvitationQuotaCasBinding, WelcomeCasBinding, RecoveryExpiryPlanAuthority, WelcomeExpiryAuthority, StateChange, PlanAuthority, ConversationHeadCasBinding, StateCounts, TransitionEffects};
-use self::historical::{recovery_package_cas_authority_digest, welcome_cas_seal, welcome_status_code};
-#[path = "state_machine/registration.rs"] mod registration;
-pub(crate) use self::registration::{PlannedTransition, ConversationPersistencePlan, RecoveryPlanClass, RecoveryPlanFingerprint, RecoveryPlanFingerprintError, recovery_plan_fingerprint};
-use self::registration::{complete_effects, state_counts, diff_by_key, package_transitions, package_cas_bijection_valid, revocation_package_cas_bijection_valid, work_terminal_time, recovery_plan_class_code, classify_recovery_plan_shape};
-#[path = "state_machine/state_graph.rs"] mod state_graph;
-use self::state_graph::{fulfillment_fingerprint_families_are_closed, exact_recovery_request_edge, exact_reservation_edge, RecoveryPlanEncoder};
-#[path = "state_machine/hydration_rows.rs"] mod hydration_rows;
-use self::hydration_rows::{conversation_kind_code, opening_kind_code, close_kind_code, recovery_source_code, recovery_request_status_code, reservation_status_code, reset_request_status_code, leave_request_status_code, package_status_code, registration_status_code, plan_kind_code, participant_status_code, participant_role_code, recovery_kind_code, request_kind_code, signed_mutation_kind_code, invitation_quota_recipient_facts_valid};
-#[path = "state_machine/effects.rs"] mod effects;
-pub(crate) use self::effects::{CreationDecision, CreationCommand, plan_creation_inner, PolicyCommand};
-use self::effects::{validate_creation_command, canonical_pair, existing_direct_pair, singleton_genesis_leaf};
-#[path = "state_machine/recovery_fingerprint.rs"] mod recovery_fingerprint;
-pub(crate) use self::recovery_fingerprint::{plan_policy_transition, AcceptConversation, plan_accept_conversation_inner, MetadataCommand, LeafRecoveryRequestCommand, LeafRecoveryCancellation};
-use self::recovery_fingerprint::{plan_metadata_inner, plan_leaf_recovery_request_inner, sort_recovery_requests, sort_recovery_reservations, sort_reset_requests, sort_leave_requests, recovery_expiry, plan_leaf_recovery_cancellation_inner, plan_leaf_recovery_expiry_inner, recovery_expiry_plan_authority, plan_welcome_response, plan_welcome_expiry, welcome_response_reason_matches, welcome_endpoint_matches, welcome_cas_from_guard, invitation_quota_cas_from_guard};
-#[path = "state_machine/recovery_encoder.rs"] mod recovery_encoder;
-pub(crate) use self::recovery_encoder::{LeafRecoveryFulfillment, plan_leaf_recovery_fulfillment_inner, CommitCommand, ResetRequestCommand, ResetActivation, ZeroLeafLeave, LeaveRequestCommand, LeaveCancellation, LeaveFulfillment};
-use self::recovery_encoder::{plan_device_revocation_inner, plan_commit_inner, verify_commit_actor, materialize_next_leaves, plan_reset_request_inner, plan_reset_activation_inner, plan_zero_leaf_leave_inner, plan_leave_request_inner, plan_leave_cancellation_inner};
-#[path = "state_machine/planned_transition.rs"] mod planned_transition;
-pub(crate) use self::planned_transition::{CloseConversation};
-use self::planned_transition::{plan_leave_fulfillment_inner, plan_close_inner};
-#[path = "state_machine/commands.rs"] mod commands;
-#[cfg(test)] pub(crate) use self::commands::persistence_plan_for_test;
-#[cfg(test)] use self::commands::dummy_principal;
-#[cfg(test)] pub(crate) use self::commands::PolicyPlanMutation;
-#[cfg(test)] pub(crate) use self::commands::plan_policy;
-#[cfg(test)] pub(crate) use self::commands::plan_creation;
-#[cfg(test)] pub(crate) use self::commands::plan_accept_conversation;
-#[cfg(test)] pub(crate) use self::commands::plan_metadata;
-#[cfg(test)] pub(crate) use self::commands::plan_leaf_recovery_request;
-#[cfg(test)] pub(crate) use self::commands::plan_leaf_recovery_cancellation;
-#[cfg(test)] pub(crate) use self::commands::plan_leaf_recovery_expiry;
-#[cfg(test)] pub(crate) use self::commands::plan_device_revocation;
-#[cfg(test)] pub(crate) use self::commands::device_revocation_plan_for_test;
-#[cfg(test)] pub(crate) use self::commands::plan_leaf_recovery_fulfillment;
-#[path = "state_machine/planners.rs"] mod planners;
-use self::planners::{ensure_active, resolve_prior_bound_work, expire_due_leave_requests, coordinate_only_successor, retired_coordinate, open_interval, close_open_interval, sort_intervals, pending_request_leaf_is_bound, validate_state, validate_participants, participant_provenance_matches, initial_participant_role, participant_role_provenance_matches, invitation_matches_participant, acceptance_matches_participant, current_state_producer_matches, metadata_provenance_matches, validate_terminal_state, validate_transition_evidence, require_transition_kind};
-#[cfg(test)] pub(crate) use self::planners::plan_commit;
-#[cfg(test)] pub(crate) use self::planners::plan_reset_request;
-#[cfg(test)] pub(crate) use self::planners::plan_welcome_expiry_for_test;
-#[cfg(test)] pub(crate) use self::planners::plan_welcome_response_for_test;
-#[cfg(test)] pub(crate) use self::planners::plan_reset_activation;
-#[cfg(test)] pub(crate) use self::planners::plan_zero_leaf_leave;
-#[cfg(test)] pub(crate) use self::planners::plan_leave_request;
-#[cfg(test)] pub(crate) use self::planners::plan_leave_cancellation;
-#[cfg(test)] pub(crate) use self::planners::plan_leave_fulfillment;
-#[cfg(test)] pub(crate) use self::planners::plan_close;
-#[path = "state_machine/invariants.rs"] mod invariants;
-pub(crate) use self::invariants::{metadata_binding_of_transition};
-use self::invariants::{require_transition_actor, require_creation_body, metadata_author_matches_evidence, transition_metadata, creation_manifest_matches, require_commit_body, commit_metadata_matches, CommitManifestForm, require_commit_manifest, require_acceptance_body, require_metadata_body, require_reset_activation_body, reset_metadata_matches, reset_manifest_matches, require_coordinate_only_body, transition_has_one_of_kinds, validate_intervals};
-#[path = "state_machine/membership_rules.rs"] mod membership_rules;
-pub(crate) use self::membership_rules::{recovery_fulfillment_terminal_matches, recovery_cancellation_terminal_matches, recovery_supersession_terminal_matches};
-use self::membership_rules::{opening_matches_interval, end_matches_interval, coordinate_after_opening, commit_coordinate_edge, reset_successor_edge, validate_terminal_proofs, coordinate_is_in_lineage, exact_expiry, transition_follows_origin, transition_consumes_coordinate, recovery_fulfillment_matches_request, recovery_fulfillment_binding_matches, acceptance_origin_matches_recovery, reset_activation_matches_request, leave_fulfillment_matches_request, validate_work};
-#[path = "state_machine/work_validation.rs"] mod work_validation;
-use self::work_validation::{validate_recovery_work, revocation_supersedes_request, recovery_origin_received_at, recovery_origin_request_digest, validate_reset_work, validate_leave_work, validate_welcome_work, would_remove_last_active_admin};
-#[cfg(test)] #[path = "state_machine/inline_unit_tests.rs"] mod inline_unit_tests;
-
+#[path = "state_machine/historical.rs"]
+mod historical;
+use self::historical::{
+    recovery_package_cas_authority_digest, welcome_cas_seal, welcome_status_code,
+};
+pub(crate) use self::historical::{
+    ConversationHeadCasBinding, InvitationQuotaCasBinding, InvitationQuotaRecipientCasFact,
+    PlanAuthority, RecoveryExpiryPlanAuthority, RecoveryPackageCasBinding,
+    RevocationPackageCasBinding, RevocationTargetCasBinding, StateChange, StateCounts,
+    TransitionEffects, WelcomeCasBinding, WelcomeExpiryAuthority,
+};
+#[path = "state_machine/registration.rs"]
+mod registration;
+use self::registration::{
+    classify_recovery_plan_shape, complete_effects, diff_by_key, package_cas_bijection_valid,
+    package_transitions, recovery_plan_class_code, revocation_package_cas_bijection_valid,
+    state_counts, work_terminal_time,
+};
+pub(crate) use self::registration::{
+    recovery_plan_fingerprint, ConversationPersistencePlan, PlannedTransition, RecoveryPlanClass,
+    RecoveryPlanFingerprint, RecoveryPlanFingerprintError,
+};
+#[path = "state_machine/state_graph.rs"]
+mod state_graph;
+use self::state_graph::{
+    exact_recovery_request_edge, exact_reservation_edge,
+    fulfillment_fingerprint_families_are_closed, RecoveryPlanEncoder,
+};
+#[path = "state_machine/hydration_rows.rs"]
+mod hydration_rows;
+use self::hydration_rows::{
+    close_kind_code, conversation_kind_code, invitation_quota_recipient_facts_valid,
+    leave_request_status_code, opening_kind_code, package_status_code, participant_role_code,
+    participant_status_code, plan_kind_code, recovery_kind_code, recovery_request_status_code,
+    recovery_source_code, registration_status_code, request_kind_code, reservation_status_code,
+    reset_request_status_code, signed_mutation_kind_code,
+};
+#[path = "state_machine/effects.rs"]
+mod effects;
+use self::effects::{
+    canonical_pair, existing_direct_pair, singleton_genesis_leaf, validate_creation_command,
+};
+pub(crate) use self::effects::{
+    plan_creation_inner, CreationCommand, CreationDecision, PolicyCommand,
+};
+#[path = "state_machine/recovery_fingerprint.rs"]
+mod recovery_fingerprint;
+use self::recovery_fingerprint::{
+    invitation_quota_cas_from_guard, plan_leaf_recovery_cancellation_inner,
+    plan_leaf_recovery_expiry_inner, plan_leaf_recovery_request_inner, plan_metadata_inner,
+    plan_welcome_expiry, plan_welcome_response, recovery_expiry, recovery_expiry_plan_authority,
+    sort_leave_requests, sort_recovery_requests, sort_recovery_reservations, sort_reset_requests,
+    welcome_cas_from_guard, welcome_endpoint_matches, welcome_response_reason_matches,
+};
+pub(crate) use self::recovery_fingerprint::{
+    plan_accept_conversation_inner, plan_policy_transition, AcceptConversation,
+    LeafRecoveryCancellation, LeafRecoveryRequestCommand, MetadataCommand,
+};
+#[path = "state_machine/recovery_encoder.rs"]
+mod recovery_encoder;
+use self::recovery_encoder::{
+    materialize_next_leaves, plan_commit_inner, plan_device_revocation_inner,
+    plan_leave_cancellation_inner, plan_leave_request_inner, plan_reset_activation_inner,
+    plan_reset_request_inner, plan_zero_leaf_leave_inner, verify_commit_actor,
+};
+pub(crate) use self::recovery_encoder::{
+    plan_leaf_recovery_fulfillment_inner, CommitCommand, LeafRecoveryFulfillment,
+    LeaveCancellation, LeaveFulfillment, LeaveRequestCommand, ResetActivation, ResetRequestCommand,
+    ZeroLeafLeave,
+};
+#[path = "state_machine/planned_transition.rs"]
+mod planned_transition;
+pub(crate) use self::planned_transition::CloseConversation;
+use self::planned_transition::{plan_close_inner, plan_leave_fulfillment_inner};
+#[path = "state_machine/commands.rs"]
+mod commands;
+#[cfg(test)]
+pub(crate) use self::commands::device_revocation_plan_for_test;
+#[cfg(test)]
+use self::commands::dummy_principal;
+#[cfg(test)]
+pub(crate) use self::commands::persistence_plan_for_test;
+#[cfg(test)]
+pub(crate) use self::commands::plan_accept_conversation;
+#[cfg(test)]
+pub(crate) use self::commands::plan_creation;
+#[cfg(test)]
+pub(crate) use self::commands::plan_device_revocation;
+#[cfg(test)]
+pub(crate) use self::commands::plan_leaf_recovery_cancellation;
+#[cfg(test)]
+pub(crate) use self::commands::plan_leaf_recovery_expiry;
+#[cfg(test)]
+pub(crate) use self::commands::plan_leaf_recovery_fulfillment;
+#[cfg(test)]
+pub(crate) use self::commands::plan_leaf_recovery_request;
+#[cfg(test)]
+pub(crate) use self::commands::plan_metadata;
+#[cfg(test)]
+pub(crate) use self::commands::plan_policy;
+#[cfg(test)]
+pub(crate) use self::commands::PolicyPlanMutation;
+#[path = "state_machine/planners.rs"]
+mod planners;
+#[cfg(test)]
+pub(crate) use self::planners::plan_close;
+#[cfg(test)]
+pub(crate) use self::planners::plan_commit;
+#[cfg(test)]
+pub(crate) use self::planners::plan_leave_cancellation;
+#[cfg(test)]
+pub(crate) use self::planners::plan_leave_fulfillment;
+#[cfg(test)]
+pub(crate) use self::planners::plan_leave_request;
+#[cfg(test)]
+pub(crate) use self::planners::plan_reset_activation;
+#[cfg(test)]
+pub(crate) use self::planners::plan_reset_request;
+#[cfg(test)]
+pub(crate) use self::planners::plan_welcome_expiry_for_test;
+#[cfg(test)]
+pub(crate) use self::planners::plan_welcome_response_for_test;
+#[cfg(test)]
+pub(crate) use self::planners::plan_zero_leaf_leave;
+use self::planners::{
+    acceptance_matches_participant, close_open_interval, coordinate_only_successor,
+    current_state_producer_matches, ensure_active, expire_due_leave_requests,
+    initial_participant_role, invitation_matches_participant, metadata_provenance_matches,
+    open_interval, participant_provenance_matches, participant_role_provenance_matches,
+    pending_request_leaf_is_bound, require_transition_kind, resolve_prior_bound_work,
+    retired_coordinate, sort_intervals, validate_participants, validate_state,
+    validate_terminal_state, validate_transition_evidence,
+};
+#[path = "state_machine/invariants.rs"]
+mod invariants;
+pub(crate) use self::invariants::metadata_binding_of_transition;
+use self::invariants::{
+    commit_metadata_matches, creation_manifest_matches, metadata_author_matches_evidence,
+    require_acceptance_body, require_commit_body, require_commit_manifest,
+    require_coordinate_only_body, require_creation_body, require_metadata_body,
+    require_reset_activation_body, require_transition_actor, reset_manifest_matches,
+    reset_metadata_matches, transition_has_one_of_kinds, transition_metadata, validate_intervals,
+    CommitManifestForm,
+};
+#[path = "state_machine/membership_rules.rs"]
+mod membership_rules;
+use self::membership_rules::{
+    acceptance_origin_matches_recovery, commit_coordinate_edge, coordinate_after_opening,
+    coordinate_is_in_lineage, end_matches_interval, exact_expiry,
+    leave_fulfillment_matches_request, opening_matches_interval,
+    recovery_fulfillment_binding_matches, recovery_fulfillment_matches_request,
+    reset_activation_matches_request, reset_successor_edge, transition_consumes_coordinate,
+    transition_follows_origin, validate_terminal_proofs, validate_work,
+};
+pub(crate) use self::membership_rules::{
+    recovery_cancellation_terminal_matches, recovery_fulfillment_terminal_matches,
+    recovery_supersession_terminal_matches,
+};
+#[path = "state_machine/work_validation.rs"]
+mod work_validation;
+use self::work_validation::{
+    recovery_origin_received_at, recovery_origin_request_digest, revocation_supersedes_request,
+    validate_leave_work, validate_recovery_work, validate_reset_work, validate_welcome_work,
+    would_remove_last_active_admin,
+};
+#[cfg(test)]
+#[path = "state_machine/inline_unit_tests.rs"]
+mod inline_unit_tests;
 
 /// Non-cloneable sealed registration projection. It is exact-device, exact-key
 /// and auth-generation bound and records the trusted instant at which the row
@@ -187,7 +377,10 @@ pub(crate) struct LockedRegistrationProjection {
 }
 
 impl LockedRegistrationProjection {
-    pub(in crate::chat_protocol::state_machine) fn authorizes(&self, evidence: &RequestEvidence) -> bool {
+    pub(in crate::chat_protocol::state_machine) fn authorizes(
+        &self,
+        evidence: &RequestEvidence,
+    ) -> bool {
         self.status == PersistedRegistrationStatus::Active
             && self.conversation_id == evidence.conversation_id
             && self.actor == evidence.actor
@@ -197,7 +390,10 @@ impl LockedRegistrationProjection {
             && self.durable_row_digest != [0; 32]
     }
 
-    pub(in crate::chat_protocol::state_machine) fn authorizes_transition(&self, evidence: &TransitionEvidence) -> bool {
+    pub(in crate::chat_protocol::state_machine) fn authorizes_transition(
+        &self,
+        evidence: &TransitionEvidence,
+    ) -> bool {
         let Some(authority) = evidence.authority.as_ref() else {
             return false;
         };
@@ -210,7 +406,10 @@ impl LockedRegistrationProjection {
             && self.durable_row_digest != [0; 32]
     }
 
-    pub(in crate::chat_protocol::state_machine) fn authorizes_revocation(&self, evidence: &DeviceRevocationEvidence) -> bool {
+    pub(in crate::chat_protocol::state_machine) fn authorizes_revocation(
+        &self,
+        evidence: &DeviceRevocationEvidence,
+    ) -> bool {
         self.status == PersistedRegistrationStatus::Active
             && self.actor == evidence.actor
             && self.key_id == evidence.actor_key_id
@@ -275,9 +474,7 @@ pub(crate) struct DeviceRevocationBatchPersistencePlan {
     conversations: Vec<ConversationPersistencePlan>,
 }
 
-
 impl HydrationAuthority {
-
     pub(crate) fn plan_recovery_fulfillment_input<T: PublicTransport>(
         input: RecoveryFulfillmentPlanInput,
         relationship_authority: &RelationshipAuthority<T>,
@@ -817,7 +1014,6 @@ impl HydrationAuthority {
         })
     }
 }
-
 
 //
 //

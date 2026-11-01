@@ -1,14 +1,14 @@
 use sqlx::PgPool;
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
+use std::net::SocketAddr;
 #[cfg(any(test, feature = "test-support"))]
 use std::pin::Pin;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
-use std::net::SocketAddr;
+use std::sync::LazyLock;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::OnceLock;
-use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
@@ -1644,7 +1644,9 @@ impl DsResolver {
             let value = root
                 .get("value")
                 .and_then(|v| v.as_object())
-                .ok_or_else(|| invalid("Missing value record in chat declaration response".into()))?;
+                .ok_or_else(|| {
+                    invalid("Missing value record in chat declaration response".into())
+                })?;
             let record_type = value.get("$type").and_then(|v| v.as_str()).unwrap_or("");
             if record_type != DECLARATION_COLLECTION {
                 return Err(invalid(format!(
@@ -2148,8 +2150,8 @@ fn allow_insecure_http() -> bool {
     // cannot be talked into plaintext federation by environment alone.
     cfg!(any(test, feature = "test-support"))
         && std::env::var("FEDERATION_ALLOW_INSECURE_HTTP")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
 }
 
 static FEDERATION_HOST_ALLOWLIST: LazyLock<Option<Vec<String>>> = LazyLock::new(|| {
@@ -2216,7 +2218,12 @@ pub(crate) fn is_explicit_debug_fixture(host: &str, port: u16, is_http: bool) ->
             return true;
         }
         if let Some(fixture) = TEST_FIXTURE_HOSTS.get() {
-            if fixture.port == port && fixture.hosts.iter().any(|h| h.eq_ignore_ascii_case(&host_lc)) {
+            if fixture.port == port
+                && fixture
+                    .hosts
+                    .iter()
+                    .any(|h| h.eq_ignore_ascii_case(&host_lc))
+            {
                 return true;
             }
         }
@@ -2465,10 +2472,8 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
     // Named fixture hosts (custom-CA HTTPS DID fixtures) are served on loopback.
     #[cfg(any(test, feature = "test-support"))]
     if is_fixture {
-        let loopback = std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            port,
-        );
+        let loopback =
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
         return Ok(ValidatedRemoteDestination {
             url: parsed,
             host,
@@ -2547,41 +2552,43 @@ pub(crate) async fn send_hardened_resolution_request(
     did: &str,
     context: &str,
 ) -> Result<reqwest::Response, FederationError> {
-    let port = destination
-        .url
-        .port_or_known_default()
-        .unwrap_or(if destination.url.scheme() == "http" { 80 } else { 443 });
-    let client = if is_explicit_debug_fixture(
-        &destination.host,
-        port,
-        destination.url.scheme() == "http",
-    ) {
-        build_pinned_client(
-            &destination.host,
-            &destination.addrs,
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-        )
-        .map_err(|e| FederationError::ResolutionFailed {
-            did: did.to_string(),
-            kind: ResolutionFailureKind::InvalidConfiguration(format!(
-                "{context}: fixture client build failed: {e}"
-            )),
-        })?
-    } else {
-        reqwest::Client::builder()
-            .user_agent("catbird-mls-ds/1.0")
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(&destination.host, &destination.addrs)
-            .build()
+    let port =
+        destination
+            .url
+            .port_or_known_default()
+            .unwrap_or(if destination.url.scheme() == "http" {
+                80
+            } else {
+                443
+            });
+    let client =
+        if is_explicit_debug_fixture(&destination.host, port, destination.url.scheme() == "http") {
+            build_pinned_client(
+                &destination.host,
+                &destination.addrs,
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )
             .map_err(|e| FederationError::ResolutionFailed {
                 did: did.to_string(),
                 kind: ResolutionFailureKind::InvalidConfiguration(format!(
-                    "{context}: client build failed: {e}"
+                    "{context}: fixture client build failed: {e}"
                 )),
             })?
-    };
+        } else {
+            reqwest::Client::builder()
+                .user_agent("catbird-mls-ds/1.0")
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve_to_addrs(&destination.host, &destination.addrs)
+                .build()
+                .map_err(|e| FederationError::ResolutionFailed {
+                    did: did.to_string(),
+                    kind: ResolutionFailureKind::InvalidConfiguration(format!(
+                        "{context}: client build failed: {e}"
+                    )),
+                })?
+        };
 
     let resp = tokio::time::timeout_at(deadline, client.get(destination.url.clone()).send())
         .await
@@ -4777,7 +4784,10 @@ mod tests {
         assert!(resolve_and_pin_destination(&mapped).await.is_err());
     }
 
-    async fn redirecting_server(location: &'static str, status_line: &'static str) -> std::net::SocketAddr {
+    async fn redirecting_server(
+        location: &'static str,
+        status_line: &'static str,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
@@ -4798,8 +4808,16 @@ mod tests {
     #[tokio::test]
     async fn send_resolution_request_rejects_307_and_308_redirects_to_private_targets() {
         for (status_line, location, code) in [
-            ("307 Temporary Redirect", "http://169.254.169.254/latest/meta-data/", "307"),
-            ("308 Permanent Redirect", "http://10.0.0.1:8080/sensitive", "308"),
+            (
+                "307 Temporary Redirect",
+                "http://169.254.169.254/latest/meta-data/",
+                "307",
+            ),
+            (
+                "308 Permanent Redirect",
+                "http://10.0.0.1:8080/sensitive",
+                "308",
+            ),
         ] {
             let address = redirecting_server(location, status_line).await;
             let client = reqwest::Client::builder()
@@ -4821,7 +4839,8 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_http_client_does_not_follow_redirects() {
-        let address = redirecting_server("http://127.0.0.1:9/private", "307 Temporary Redirect").await;
+        let address =
+            redirecting_server("http://127.0.0.1:9/private", "307 Temporary Redirect").await;
         let error = send_resolution_request(
             build_resolver_http_client().get(format!("http://{address}/")),
             tokio::time::Instant::now() + Duration::from_secs(2),
@@ -4857,23 +4876,54 @@ mod tests {
         ] {
             let parsed = url::Url::parse(target).unwrap();
             let result = resolve_and_pin_destination(&parsed).await;
-            assert!(result.is_err(), "expected error for private target {target}, got {result:?}");
+            assert!(
+                result.is_err(),
+                "expected error for private target {target}, got {result:?}"
+            );
         }
     }
 
     #[test]
     fn test_is_private_ip_coverage() {
         for private in [
-            "127.0.0.1", "127.255.255.255", "::1", "10.0.0.1", "10.255.255.254", "172.16.0.1",
-            "172.31.255.254", "192.168.0.1", "192.168.255.254", "169.254.169.254", "fe80::1",
-            "100.64.0.1", "100.127.255.254", "192.0.2.1", "198.51.100.1", "203.0.113.1",
-            "fc00::1", "fd12:3456:789a::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1",
+            "127.0.0.1",
+            "127.255.255.255",
+            "::1",
+            "10.0.0.1",
+            "10.255.255.254",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.0.1",
+            "192.168.255.254",
+            "169.254.169.254",
+            "fe80::1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "fc00::1",
+            "fd12:3456:789a::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
             "::ffff:169.254.169.254",
         ] {
-            assert!(is_private_ip(&private.parse::<IpAddr>().unwrap()), "{private}");
+            assert!(
+                is_private_ip(&private.parse::<IpAddr>().unwrap()),
+                "{private}"
+            );
         }
-        for public in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
-            assert!(!is_private_ip(&public.parse::<IpAddr>().unwrap()), "{public}");
+        for public in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(
+                !is_private_ip(&public.parse::<IpAddr>().unwrap()),
+                "{public}"
+            );
         }
     }
 

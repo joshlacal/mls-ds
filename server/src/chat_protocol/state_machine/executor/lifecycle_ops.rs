@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 /// Apply a `zeroLeafLeave` edge: an active but LEAFLESS participant (a pending
 /// invitee who never joined) self-removes immediately. `stateVersion+1`, same
 /// generation/epoch (a coordinate-only rebind, NO crypto commit and NO metadata
@@ -978,4 +977,3 @@ pub(in crate::chat_protocol::state_machine::executor) async fn apply_leave_reque
         successor_coordinate: plan.successor_coordinate().copied(),
     })
 }
-

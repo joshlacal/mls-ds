@@ -1,9 +1,7 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 impl HydrationAuthority {
-
     /// Consume the exact signed Policy body and the complete relationship
     /// projection under the conversation lock. No caller-selected roster or
     /// participant-change command crosses this seam.

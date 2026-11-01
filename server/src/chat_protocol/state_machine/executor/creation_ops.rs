@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 #[allow(clippy::too_many_arguments)]
 pub(in crate::chat_protocol::state_machine::executor) async fn apply_creation(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,

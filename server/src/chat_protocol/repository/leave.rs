@@ -187,7 +187,9 @@ async fn execute_first(
         .prior
         .is_some_and(|prior| aggregate.state().coordinate() != &prior)
     {
-        return Err(LeaveFacadeError::StateMachine(crate::chat_protocol::state_machine::StateMachineError::StaleCoordinates));
+        return Err(LeaveFacadeError::StateMachine(
+            crate::chat_protocol::state_machine::StateMachineError::StaleCoordinates,
+        ));
     }
     // The head may have changed between discovery and its lock. Rediscovery
     // uses the same complete audience recipe, including historical Close

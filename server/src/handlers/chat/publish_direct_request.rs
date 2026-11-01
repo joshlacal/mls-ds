@@ -1,8 +1,6 @@
 //! Single-transaction request publication transport. A success response is only
 //! constructed after commit; no separate creation, Add or send endpoint runs.
 use super::{context, errors::ChatFailure, runtime::ChatRuntime};
-use base64::Engine;
-use sha2::{Digest, Sha256};
 use crate::{
     chat_protocol::{
         error::{ChatEndpoint, ChatProtocolErrorCode},
@@ -17,6 +15,8 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
+use base64::Engine;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 pub(super) async fn handle(
@@ -54,14 +54,16 @@ async fn inner(
         .datetime();
     let parsed_req: serde_json::Value = serde_json::from_str(envelope.signed_request.get())
         .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-    let recipient_did = parsed_req["body"]["recipientDid"].as_str().ok_or_else(|| {
-        ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-    })?;
+    let recipient_did = parsed_req["body"]["recipientDid"]
+        .as_str()
+        .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
     let actor_did = principal.did();
-    let actor_device_id = parsed_req["body"]["actorDeviceId"].as_str()
+    let actor_device_id = parsed_req["body"]["actorDeviceId"]
+        .as_str()
         .and_then(|id| uuid::Uuid::parse_str(id).ok())
         .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-    let key_id = parsed_req["body"]["keyId"].as_str()
+    let key_id = parsed_req["body"]["keyId"]
+        .as_str()
         .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
     let signer_key: Option<(Vec<u8>, i64)> = sqlx::query_as(
         "SELECT k.signing_public_key, d.auth_generation FROM chat.device_keys k \
@@ -88,27 +90,35 @@ async fn inner(
         || verified.actor_device_id() != Some(actor_device_id.to_string().as_str())
         || verified.auth_generation() != Some(auth_generation as u64)
     {
-        return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
+        return Err(ChatFailure::protocol(
+            endpoint,
+            ChatProtocolErrorCode::NotAuthorized,
+        ));
     }
-
 
     let coord = crate::federation::canonical_relay::resolve_pair_coordinator(pool, actor_did, recipient_did)
         .await
         .map_err(|_| failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::PolicyDenied)))?;
     if !coord.is_sender_home {
-        return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
+        return Err(ChatFailure::protocol(
+            endpoint,
+            ChatProtocolErrorCode::NotAuthorized,
+        ));
     }
     if !coord.is_coordinator {
-        let request_id = parsed_req["body"]["requestId"].as_str()
+        let request_id = parsed_req["body"]["requestId"]
+            .as_str()
             .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+            .ok_or_else(|| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
 
         // Fast local idempotent replay check
         let existing: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
             "SELECT publication_receipt, signed_publication \
              FROM chat.direct_request_transport_inbox \
              WHERE request_id=$1 AND sender_did=$2 AND sender_device_id=$3 \
-             LIMIT 1"
+             LIMIT 1",
         )
         .bind(request_id)
         .bind(actor_did)
@@ -120,7 +130,10 @@ async fn inner(
             let signed: serde_json::Value = serde_json::from_slice(&signed_bytes)
                 .map_err(|_| ChatFailure::invariant(endpoint))?;
             if signed != parsed_req {
-                return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::IdempotencyConflict));
+                return Err(ChatFailure::protocol(
+                    endpoint,
+                    ChatProtocolErrorCode::IdempotencyConflict,
+                ));
             }
             let receipt: serde_json::Value = serde_json::from_slice(&receipt_bytes)
                 .map_err(|_| ChatFailure::invariant(endpoint))?;
@@ -137,7 +150,7 @@ async fn inner(
              WHERE chat.direct_request_outbound_routes.actor_did=EXCLUDED.actor_did \
                AND chat.direct_request_outbound_routes.actor_device_id=EXCLUDED.actor_device_id \
                AND chat.direct_request_outbound_routes.recipient_did=EXCLUDED.recipient_did \
-               AND chat.direct_request_outbound_routes.coordinator_did=EXCLUDED.coordinator_did"
+               AND chat.direct_request_outbound_routes.coordinator_did=EXCLUDED.coordinator_did",
         )
         .bind(request_id)
         .bind(actor_did)
@@ -157,20 +170,24 @@ async fn inner(
         })?;
 
         let receipt_val = relayed.get("outcome").unwrap_or(&relayed);
-        let receipt_type = receipt_val.pointer("/receipt/$type")
+        let receipt_type = receipt_val
+            .pointer("/receipt/$type")
             .or_else(|| receipt_val.pointer("/body/receipt/$type"))
             .or_else(|| receipt_val.get("$type"))
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let is_published = receipt_type == "blue.catbird.chat.defs#directRequestPublishedReceipt"
             || (receipt_type == "blue.catbird.chat.defs#signedDirectRequestReceipt"
-                && receipt_val.pointer("/receipt/$type").and_then(|v| v.as_str()) == Some("blue.catbird.chat.defs#directRequestPublishedReceipt"));
+                && receipt_val
+                    .pointer("/receipt/$type")
+                    .and_then(|v| v.as_str())
+                    == Some("blue.catbird.chat.defs#directRequestPublishedReceipt"));
 
         if !is_published {
             // A non-published outcome (e.g. rejection) has no published conversation.
             // Return the relayed receipt without writing phantom transport rows.
-            let bytes = serde_json::to_vec(&relayed)
-                .map_err(|_| ChatFailure::invariant(endpoint))?;
+            let bytes =
+                serde_json::to_vec(&relayed).map_err(|_| ChatFailure::invariant(endpoint))?;
             return Ok(context::json_ok(bytes));
         }
 
@@ -186,7 +203,8 @@ async fn inner(
             Some(&parsed_req),
             now,
             endpoint,
-        ).await?;
+        )
+        .await?;
 
         let resp_bytes = serde_json::to_vec(&serde_json::json!({ "outcome": receipt }))
             .map_err(|_| ChatFailure::invariant(endpoint))?;
@@ -204,14 +222,23 @@ async fn inner(
         3600,
     );
     let actor_authorized_keys = resolver.resolve_authorized_device_keys(actor_did).await.map_err(|_| failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::PolicyDenied)))?;
-    let actor_key_id = parsed_req.pointer("/body/keyId").and_then(|v| v.as_str()).unwrap_or_default();
+    let actor_key_id = parsed_req
+        .pointer("/body/keyId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let actor_key_authorized = actor_authorized_keys.iter().any(|k| {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(k)) == actor_key_id
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(k))
+            == actor_key_id
             || base64::engine::general_purpose::STANDARD.encode(k) == actor_key_id
-            || crate::chat_protocol::validation::ed25519_key_id(k).map(|id| id.as_str() == actor_key_id).unwrap_or(false)
+            || crate::chat_protocol::validation::ed25519_key_id(k)
+                .map(|id| id.as_str() == actor_key_id)
+                .unwrap_or(false)
     });
     if !actor_key_authorized {
-        return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized));
+        return Err(ChatFailure::protocol(
+            endpoint,
+            ChatProtocolErrorCode::NotAuthorized,
+        ));
     }
 
     let recipient_authorized_keys = if coord.is_coordinator && !coord.is_recipient_home {
@@ -229,12 +256,21 @@ async fn inner(
         ChatFailure::storage(endpoint)
     })?;
 
-    let request_id = uuid::Uuid::parse_str(parsed_req["body"]["requestId"].as_str().unwrap_or_default())
-        .unwrap_or_default();
-    let conversation_id = uuid::Uuid::parse_str(parsed_req["body"]["conversationId"].as_str().unwrap_or_default())
-        .unwrap_or_default();
-    let first_message_id = uuid::Uuid::parse_str(parsed_req["body"]["firstMessageId"].as_str().unwrap_or_default())
-        .unwrap_or_default();
+    let request_id =
+        uuid::Uuid::parse_str(parsed_req["body"]["requestId"].as_str().unwrap_or_default())
+            .unwrap_or_default();
+    let conversation_id = uuid::Uuid::parse_str(
+        parsed_req["body"]["conversationId"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default();
+    let first_message_id = uuid::Uuid::parse_str(
+        parsed_req["body"]["firstMessageId"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default();
     let (p1, p2) = if actor_did <= recipient_did {
         (actor_did, recipient_did)
     } else {
@@ -255,12 +291,12 @@ async fn inner(
         Some(&coord.coordinator_did),
     )
     .await
-    .map_err(|_| ChatFailure::storage(endpoint))? {
+    .map_err(|_| ChatFailure::storage(endpoint))?
+    {
         return Err(failure(PublicationError::Store(crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError::IdentityConflict)));
     }
 
     if let Some(recipient_authorized_keys) = recipient_authorized_keys.as_ref() {
-
         let selected_recipient_keys: Vec<Vec<u8>> = sqlx::query_scalar(
             "SELECT k.signing_public_key \
              FROM chat.direct_request_selected_devices s \
@@ -317,11 +353,13 @@ async fn inner(
     let mut queue_id_opt = None;
 
     if coord.is_coordinator && !coord.is_recipient_home {
-        let entry_row: Option<Vec<u8>> = sqlx::query_scalar("SELECT accepted_payload_bytes FROM chat.entries WHERE transition_id = $1")
-            .bind(request_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))?;
+        let entry_row: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT accepted_payload_bytes FROM chat.entries WHERE transition_id = $1",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
 
         let pub_row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
             "SELECT full_welcome, signed_publication FROM chat.direct_request_publications WHERE request_id = $1"
@@ -336,9 +374,11 @@ async fn inner(
                 .map_err(|_| ChatFailure::invariant(endpoint))?;
             let full_welcome_b64 = Some(base64::engine::general_purpose::STANDARD.encode(&welcome));
             let signed_pub_val = Some(
-                serde_json::from_slice(&signed_pub).map_err(|_| ChatFailure::invariant(endpoint))?
+                serde_json::from_slice(&signed_pub)
+                    .map_err(|_| ChatFailure::invariant(endpoint))?,
             );
-            let deliveries = parsed_req.pointer("/body/artifacts/welcome/deliveries")
+            let deliveries = parsed_req
+                .pointer("/body/artifacts/welcome/deliveries")
                 .or_else(|| parsed_req.pointer("/artifacts/welcome/deliveries"))
                 .or_else(|| receipt.pointer("/receipt/artifacts/welcome/deliveries"))
                 .or_else(|| receipt.pointer("/artifacts/welcome/deliveries"))
@@ -359,7 +399,8 @@ async fn inner(
             };
 
             let queue_id = format!("direct-request-delivery-{request_id}");
-            let payload_bytes = serde_json::to_vec(&deliver_input).map_err(|_| ChatFailure::invariant(endpoint))?;
+            let payload_bytes =
+                serde_json::to_vec(&deliver_input).map_err(|_| ChatFailure::invariant(endpoint))?;
 
             crate::federation::queue::enqueue_c33_in_tx(
                 pool,
@@ -390,7 +431,9 @@ async fn inner(
             &coord.recipient_home.endpoint,
             &coord.recipient_home.did,
             deliver_input,
-        ).await {
+        )
+        .await
+        {
             let _ = crate::federation::queue::mark_delivered_by_id(pool, &queue_id).await;
         }
     }

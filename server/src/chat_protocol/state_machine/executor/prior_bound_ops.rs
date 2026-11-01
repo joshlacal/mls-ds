@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 /// Everything the nine executor arms may know about prior-bound recovery work.
 ///
 /// `PriorBoundPartition`'s fields are private to this module and it has no public
@@ -61,7 +60,9 @@ pub(in crate::chat_protocol::state_machine::executor) mod prior_bound {
         }
 
         /// The arm's own family key, when `OwnFamilyKind` is not `None`.
-        pub(in crate::chat_protocol::state_machine::executor) fn own(&self) -> Option<([u8; 16], [u8; 32])> {
+        pub(in crate::chat_protocol::state_machine::executor) fn own(
+            &self,
+        ) -> Option<([u8; 16], [u8; 32])> {
             self.own
         }
 
@@ -83,7 +84,9 @@ pub(in crate::chat_protocol::state_machine::executor) mod prior_bound {
             Self { keys, own }
         }
 
-        pub(in crate::chat_protocol::state_machine::executor) fn keys(&self) -> &BTreeSet<([u8; 16], [u8; 32])> {
+        pub(in crate::chat_protocol::state_machine::executor) fn keys(
+            &self,
+        ) -> &BTreeSet<([u8; 16], [u8; 32])> {
             &self.keys
         }
     }
@@ -678,7 +681,10 @@ pub(in crate::chat_protocol::state_machine::executor) fn recovery_reservation_id
         && before.terminal.is_none()
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn reset_request_identity_is_unchanged(before: &ResetRequest, after: &ResetRequest) -> bool {
+pub(in crate::chat_protocol::state_machine::executor) fn reset_request_identity_is_unchanged(
+    before: &ResetRequest,
+    after: &ResetRequest,
+) -> bool {
     before.request_id == after.request_id
         && before.requester == after.requester
         && before.bound_coordinate == after.bound_coordinate
@@ -702,7 +708,10 @@ pub(in crate::chat_protocol::state_machine::executor) fn leave_request_identity_
         && before.terminal.is_none()
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn welcome_identity_is_unchanged(before: &WelcomeWork, after: &WelcomeWork) -> bool {
+pub(in crate::chat_protocol::state_machine::executor) fn welcome_identity_is_unchanged(
+    before: &WelcomeWork,
+    after: &WelcomeWork,
+) -> bool {
     before.welcome_id == after.welcome_id
         && before.recipient == after.recipient
         && before.transition_seq == after.transition_seq
@@ -727,7 +736,10 @@ pub(in crate::chat_protocol::state_machine::executor) fn interval_identity_is_un
         && before.end.is_none()
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn leaf_matches_hydration(leaf: &LeafRecord, row: &LeafHydrationRow) -> bool {
+pub(in crate::chat_protocol::state_machine::executor) fn leaf_matches_hydration(
+    leaf: &LeafRecord,
+    row: &LeafHydrationRow,
+) -> bool {
     leaf.device == row.device
         && leaf.leaf_index == row.leaf_index
         && leaf.basic_credential == row.basic_credential

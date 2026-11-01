@@ -43,70 +43,150 @@ async fn send(
     let admission =
         context::admit_signed_operation_only(pool, runtime, ENDPOINT, headers, body).await?;
     let body_json: Option<serde_json::Value> = serde_json::from_slice(body).ok();
-    let signed_req = body_json.as_ref()
+    let signed_req = body_json
+        .as_ref()
         .and_then(|v| v.get("signedRequest"))
         .unwrap_or(body_json.as_ref().unwrap_or(&serde_json::Value::Null));
 
-    let convo_id_from_body: Option<uuid::Uuid> = signed_req.pointer("/body/prior/conversationId")
+    let convo_id_from_body: Option<uuid::Uuid> = signed_req
+        .pointer("/body/prior/conversationId")
         .or_else(|| signed_req.pointer("/body/conversationId"))
         .and_then(|v| {
             if let Some(s) = v.as_str() {
-                uuid::Uuid::parse_str(s).ok()
-                    .or_else(|| {
-                        use base64::Engine;
-                        base64::engine::general_purpose::STANDARD.decode(s).ok().and_then(|b| {
+                uuid::Uuid::parse_str(s).ok().or_else(|| {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(s)
+                        .ok()
+                        .and_then(|b| {
                             if b.len() == 16 {
                                 Some(uuid::Uuid::from_bytes(b.try_into().unwrap()))
                             } else {
                                 None
                             }
                         })
-                    })
+                })
             } else if let Some(b64) = v.pointer("/$bytes").and_then(|b| b.as_str()) {
                 use base64::Engine;
-                base64::engine::general_purpose::STANDARD.decode(b64).ok().and_then(|b| {
-                    if b.len() == 16 {
-                        Some(uuid::Uuid::from_bytes(b.try_into().unwrap()))
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            signed_req.pointer("/body/aad/conversationId").and_then(|v| {
-                if let Some(s) = v.as_str() {
-                    use base64::Engine;
-                    base64::engine::general_purpose::STANDARD.decode(s).ok().and_then(|b| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .ok()
+                    .and_then(|b| {
                         if b.len() == 16 {
                             Some(uuid::Uuid::from_bytes(b.try_into().unwrap()))
                         } else {
                             None
                         }
                     })
-                } else {
-                    None
-                }
-            })
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            signed_req
+                .pointer("/body/aad/conversationId")
+                .and_then(|v| {
+                    if let Some(s) = v.as_str() {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(s)
+                            .ok()
+                            .and_then(|b| {
+                                if b.len() == 16 {
+                                    Some(uuid::Uuid::from_bytes(b.try_into().unwrap()))
+                                } else {
+                                    None
+                                }
+                            })
+                    } else {
+                        None
+                    }
+                })
         });
 
     if let Some(convo_id) = convo_id_from_body {
-        let is_local_convo: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id = $1)"
+        let local_convo: Option<(String, bool, Option<String>)> = sqlx::query_as(
+            "SELECT kind, is_remote, sequencer_ds FROM chat.conversations WHERE conversation_id = $1"
         )
         .bind(convo_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
-        .unwrap_or(false);
+        .ok()
+        .flatten();
+        let is_local_convo = local_convo.is_some();
+
+        if let Some((ref kind, true, Some(ref seq_ds))) = local_convo {
+            if kind == "group"
+                && runtime.resolver().is_some()
+                && crate::federation::FederationMode::effective().allows_remote_traffic()
+            {
+                if let Ok(secret) = std::env::var("FEDERATION_GROUP_RELAY_HMAC_SECRET") {
+                    if !secret.is_empty() {
+                        let authenticated_did = admission.subject();
+                        let actor_did = signed_req
+                            .pointer("/body/actorDid")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if actor_did != authenticated_did {
+                            return Err(ChatFailure::protocol(
+                                ENDPOINT,
+                                ChatProtocolErrorCode::NotAuthorized,
+                            ));
+                        }
+                        let actor_device_str = signed_req
+                            .pointer("/body/actorDeviceId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let actor_device_uuid =
+                            uuid::Uuid::parse_str(actor_device_str).map_err(|_| {
+                                ChatFailure::protocol(
+                                    ENDPOINT,
+                                    ChatProtocolErrorCode::InvalidRequest,
+                                )
+                            })?;
+                        let resolver = runtime.resolver().unwrap();
+                        let dest = resolver
+                            .resolve_ds_destination_uncached(seq_ds)
+                            .await
+                            .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+                        let out =
+                            crate::federation::group_relay::relay_group_mutation_to_sequencer(
+                                dest.url.as_str(),
+                                &crate::identity::service_did(),
+                                seq_ds,
+                                secret.as_bytes(),
+                                &crate::federation::group_relay::RelayGroupMutationRequest {
+                                    conversation_id: convo_id,
+                                    endpoint: "blue.catbird.chat.sendMessage".to_string(),
+                                    actor_did: actor_did.to_string(),
+                                    actor_device_id: actor_device_uuid,
+                                    signed_request: signed_req.clone(),
+                                },
+                            )
+                            .await
+                            .map_err(|e| {
+                                tracing::error!("relay_group_mutation_to_sequencer failed: {e}");
+                                ChatFailure::storage(ENDPOINT)
+                            })?;
+                        let mut entry = out.entry;
+                        if let Some(obj) = entry.as_object_mut() {
+                            obj.remove("$type");
+                        }
+                        let response_bytes =
+                            serde_json::to_vec(&serde_json::json!({ "entry": entry }))
+                                .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+                        return context::canonical_json_response(ENDPOINT, 200, response_bytes);
+                    }
+                }
+            }
+        }
 
         if !is_local_convo {
             let any_inbox: Option<(String, String)> = sqlx::query_as(
                 "SELECT sender_did, recipient_did \
                  FROM chat.direct_request_transport_inbox \
                  WHERE conversation_id = $1 \
-                 LIMIT 1"
+                 LIMIT 1",
             )
             .bind(convo_id)
             .fetch_optional(pool)
@@ -114,21 +194,30 @@ async fn send(
             .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
             if any_inbox.is_none() {
-                return Err(ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::ConversationNotFound));
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::ConversationNotFound,
+                ));
             }
 
             // Actor-pair and device binding before relaying
             let authenticated_did = admission.subject();
-            let actor_did = signed_req.pointer("/body/actorDid").and_then(|v| v.as_str()).unwrap_or_default();
+            let actor_did = signed_req
+                .pointer("/body/actorDid")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if actor_did != authenticated_did {
-                return Err(ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::NotAuthorized));
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::NotAuthorized,
+                ));
             }
 
             let is_participant: bool = sqlx::query_scalar(
                 "SELECT EXISTS( \
                     SELECT 1 FROM chat.direct_request_transport_inbox \
                     WHERE conversation_id = $1 AND (sender_did = $2 OR recipient_did = $2) \
-                 )"
+                 )",
             )
             .bind(convo_id)
             .bind(actor_did)
@@ -137,12 +226,19 @@ async fn send(
             .unwrap_or(false);
 
             if !is_participant {
-                return Err(ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::NotAuthorized));
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::NotAuthorized,
+                ));
             }
 
-            let actor_device_str = signed_req.pointer("/body/actorDeviceId").and_then(|v| v.as_str()).unwrap_or_default();
-            let actor_device_uuid = uuid::Uuid::parse_str(actor_device_str)
-                .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+            let actor_device_str = signed_req
+                .pointer("/body/actorDeviceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let actor_device_uuid = uuid::Uuid::parse_str(actor_device_str).map_err(|_| {
+                ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+            })?;
 
             // Entitlement check by owner and device before LIMIT 1
             let inbox_info: Option<(String, String, Option<uuid::Uuid>, String, uuid::Uuid, String)> = sqlx::query_as(
@@ -162,21 +258,37 @@ async fn send(
             .await
             .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
-            let Some((coord_did, sender_did, sender_device_id, recipient_did, recipient_device_id, status)) = inbox_info else {
-                return Err(ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::NotEntitled));
+            let Some((
+                coord_did,
+                sender_did,
+                sender_device_id,
+                recipient_did,
+                recipient_device_id,
+                status,
+            )) = inbox_info
+            else {
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::NotEntitled,
+                ));
             };
 
             // Durable acceptance check
             if status != "accepted" {
-                return Err(ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::ConversationNotAccepted));
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::ConversationNotAccepted,
+                ));
             }
             // Stable idempotent retry check: if message already committed, return cached entry
-            let message_id_str = signed_req.pointer("/body/messageId").and_then(|v| v.as_str());
+            let message_id_str = signed_req
+                .pointer("/body/messageId")
+                .and_then(|v| v.as_str());
             if let Some(msg_id_str) = message_id_str {
                 let existing_entries: Vec<Vec<u8>> = sqlx::query_scalar(
                     "SELECT entry_bytes FROM chat.direct_request_transport_entries \
                      WHERE conversation_id = $1 \
-                     ORDER BY seq DESC"
+                     ORDER BY seq DESC",
                 )
                 .bind(convo_id)
                 .fetch_all(pool)
@@ -184,12 +296,23 @@ async fn send(
                 .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
                 for e_bytes in existing_entries {
-                    if let Ok(mut entry_val) = serde_json::from_slice::<serde_json::Value>(&e_bytes) {
-                        if entry_val.pointer("/signedRequest/body/messageId").and_then(|v| v.as_str()) == Some(msg_id_str) {
+                    if let Ok(mut entry_val) = serde_json::from_slice::<serde_json::Value>(&e_bytes)
+                    {
+                        if entry_val
+                            .pointer("/signedRequest/body/messageId")
+                            .and_then(|v| v.as_str())
+                            == Some(msg_id_str)
+                        {
                             if entry_val.get("signedRequest") != Some(signed_req) {
-                                return Err(ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::IdempotencyConflict));
+                                return Err(ChatFailure::protocol(
+                                    ENDPOINT,
+                                    ChatProtocolErrorCode::IdempotencyConflict,
+                                ));
                             }
-                            entry_val.as_object_mut().ok_or_else(|| ChatFailure::invariant(ENDPOINT))?.remove("$type");
+                            entry_val
+                                .as_object_mut()
+                                .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?
+                                .remove("$type");
                             let resp_val = serde_json::json!({ "entry": entry_val });
                             let response_bytes = serde_json::to_vec(&resp_val)
                                 .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
@@ -200,10 +323,16 @@ async fn send(
             }
 
             // Resolve coordinator using the conversation participants (sender_did, recipient_did)
-            let coord = crate::federation::canonical_relay::resolve_pair_coordinator(pool, &sender_did, &recipient_did)
-                .await
-                .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-            if crate::identity::canonical_did(&coord.coordinator_did) != crate::identity::canonical_did(&coord_did) {
+            let coord = crate::federation::canonical_relay::resolve_pair_coordinator(
+                pool,
+                &sender_did,
+                &recipient_did,
+            )
+            .await
+            .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+            if crate::identity::canonical_did(&coord.coordinator_did)
+                != crate::identity::canonical_did(&coord_did)
+            {
                 return Err(ChatFailure::invariant(ENDPOINT));
             }
 
@@ -223,21 +352,28 @@ async fn send(
                 ChatFailure::storage(ENDPOINT)
             })?;
 
-            let entry = result.get("entry").ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
+            let entry = result
+                .get("entry")
+                .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
             if entry.get("signedRequest") != Some(signed_req) {
                 return Err(ChatFailure::invariant(ENDPOINT));
             }
             crate::federation::canonical_relay::ingest_remote_message_entry(
                 pool, None, &coord_did, convo_id, entry,
-            ).await.map_err(|error| {
+            )
+            .await
+            .map_err(|error| {
                 tracing::error!(?error, "Invalid coordinator application entry");
                 ChatFailure::storage(ENDPOINT)
             })?;
 
             let mut result = result;
-            result["entry"].as_object_mut().ok_or_else(|| ChatFailure::invariant(ENDPOINT))?.remove("$type");
-            let response_bytes = serde_json::to_vec(&result)
-                .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+            result["entry"]
+                .as_object_mut()
+                .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?
+                .remove("$type");
+            let response_bytes =
+                serde_json::to_vec(&result).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
             return context::canonical_json_response(ENDPOINT, 200, response_bytes);
         }
     }
@@ -255,7 +391,10 @@ async fn send(
             tx.commit()
                 .await
                 .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-            let actor_did = signed_req.pointer("/body/actorDid").and_then(|v| v.as_str()).unwrap_or_default();
+            let actor_did = signed_req
+                .pointer("/body/actorDid")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             deliver_message_entry_to_remote_peers(pool, actor_did, replay.response_bytes()).await?;
             Ok(response)
         }
@@ -292,7 +431,12 @@ async fn send(
                 ChatFailure::storage(ENDPOINT)
             })?;
             runtime.notify_events();
-            deliver_message_entry_to_remote_peers(pool, authority.subject().as_str(), &response_bytes).await?;
+            deliver_message_entry_to_remote_peers(
+                pool,
+                authority.subject().as_str(),
+                &response_bytes,
+            )
+            .await?;
 
             context::canonical_json_response(ENDPOINT, 200, response_bytes)
         }
@@ -304,13 +448,17 @@ async fn deliver_message_entry_to_remote_peers(
     actor_did: &str,
     response_bytes: &[u8],
 ) -> Result<(), ChatFailure> {
-    let response: serde_json::Value = serde_json::from_slice(response_bytes)
-        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-    let entry = response.get("entry").ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
-    let convo_id = entry["conversationId"].as_str()
+    let response: serde_json::Value =
+        serde_json::from_slice(response_bytes).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+    let entry = response
+        .get("entry")
+        .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
+    let convo_id = entry["conversationId"]
+        .as_str()
         .and_then(|value| uuid::Uuid::parse_str(value).ok())
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
-    let entry_id = entry["entryId"].as_str()
+    let entry_id = entry["entryId"]
+        .as_str()
         .and_then(|value| uuid::Uuid::parse_str(value).ok())
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
     let conversation_routing: Option<(String, bool)> =
@@ -349,16 +497,23 @@ async fn deliver_message_entry_to_remote_peers(
         }
         let coord = crate::federation::canonical_relay::resolve_pair_coordinator(
             pool, actor_did, other_did,
-        ).await.map_err(|error| {
+        )
+        .await
+        .map_err(|error| {
             tracing::error!(?error, "Failed to resolve application entry peer");
             ChatFailure::storage(ENDPOINT)
         })?;
         let (target_endpoint, target_did) = if coord.is_coordinator {
-            (coord.recipient_home.endpoint.as_str(), coord.recipient_home.did.as_str())
+            (
+                coord.recipient_home.endpoint.as_str(),
+                coord.recipient_home.did.as_str(),
+            )
         } else {
             (coord.coordinator_endpoint(), coord.coordinator_did.as_str())
         };
-        if crate::identity::canonical_did(target_did) == crate::identity::canonical_did(&crate::identity::service_did()) {
+        if crate::identity::canonical_did(target_did)
+            == crate::identity::canonical_did(&crate::identity::service_did())
+        {
             continue;
         }
         let mut typed_entry = entry.clone();
@@ -368,9 +523,16 @@ async fn deliver_message_entry_to_remote_peers(
             entry: typed_entry,
         };
         if let Err(error) = crate::federation::canonical_relay::deliver_message_entry_to_peer(
-            target_endpoint, target_did, delivery.clone(),
-        ).await {
-            tracing::warn!(?error, "Failed to deliver application entry to peer, queueing for retry");
+            target_endpoint,
+            target_did,
+            delivery.clone(),
+        )
+        .await
+        {
+            tracing::warn!(
+                ?error,
+                "Failed to deliver application entry to peer, queueing for retry"
+            );
             sqlx::query(
                 "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, last_error, next_retry_at) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + INTERVAL '5 seconds') \
@@ -457,6 +619,9 @@ mod tests {
     #[test]
     fn map_failure_maps_invalid_coordinates() {
         let failure = map_failure(MessageDeliveryError::InvalidCoordinates);
-        assert_eq!(failure.code(), Some(ChatProtocolErrorCode::StaleCoordinates));
+        assert_eq!(
+            failure.code(),
+            Some(ChatProtocolErrorCode::StaleCoordinates)
+        );
     }
 }

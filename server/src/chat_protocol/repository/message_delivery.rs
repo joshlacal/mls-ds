@@ -540,12 +540,14 @@ pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
                     scope.trusted_instant().timestamp_millis(),
                 )
                 .map_err(|_| MessageDeliveryError::Invariant)?;
-            Some(crate::federation::receipt::I13ReceiptSigner::receipt_wire_json(
-                &signed_receipt,
-                generation_u64,
-                scope.actor_did(),
-                &sender_device_text,
-            ))
+            Some(
+                crate::federation::receipt::I13ReceiptSigner::receipt_wire_json(
+                    &signed_receipt,
+                    generation_u64,
+                    scope.actor_did(),
+                    &sender_device_text,
+                ),
+            )
         }
         _ => None,
     };

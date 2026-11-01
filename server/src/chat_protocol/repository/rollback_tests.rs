@@ -57,8 +57,6 @@ use sha2::{Digest, Sha256};
 use sqlx::{Acquire, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-
-
 async fn test_pool() -> PgPool {
     let url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
         "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722".to_string()
@@ -249,7 +247,10 @@ async fn blob_and_quota_boundary_rolls_back_but_the_stale_tombstone_survives() {
         .fetch_one(&mut *sp)
         .await
         .expect("send visible in savepoint");
-        assert_eq!(send_in_sp, 1, "the business boundary wrote inside the savepoint");
+        assert_eq!(
+            send_in_sp, 1,
+            "the business boundary wrote inside the savepoint"
+        );
         sp.rollback().await.expect("rollback savepoint");
     }
 
@@ -261,7 +262,10 @@ async fn blob_and_quota_boundary_rolls_back_but_the_stale_tombstone_survives() {
     .fetch_one(&mut *tx)
     .await
     .expect("count rolled-back send");
-    assert_eq!(aborted_after_rollback, 0, "business boundary rolled back completely");
+    assert_eq!(
+        aborted_after_rollback, 0,
+        "business boundary rolled back completely"
+    );
 
     // The DOCUMENTED EXCEPTION survives the business rollback: the stale tombstone
     // is still present with no entry.

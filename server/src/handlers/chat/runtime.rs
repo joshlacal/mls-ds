@@ -37,7 +37,10 @@ pub const MAX_WS_GLOBAL: usize = 8_192;
 struct WsRegistryState {
     total: usize,
     per_did: std::collections::HashMap<String, usize>,
-    per_device: std::collections::HashMap<(String, uuid::Uuid), Vec<(u64, tokio::sync::watch::Sender<bool>)>>,
+    per_device: std::collections::HashMap<
+        (String, uuid::Uuid),
+        Vec<(u64, tokio::sync::watch::Sender<bool>)>,
+    >,
     next_conn_id: u64,
 }
 
@@ -99,6 +102,8 @@ pub struct ChatRuntime {
     subscription_endpoint: Option<String>,
     resolver: Option<Arc<crate::federation::DsResolver>>,
     commit_submitter: Option<Arc<crate::federation::commit_submitter::RemoteCommitSubmitter>>,
+    space_host_config: Option<crate::space_host::SpaceHostConfig>,
+    push_gateway_client: Option<Arc<crate::push_gateway::client::PushGatewayClient>>,
 }
 
 impl fmt::Debug for ChatRuntime {
@@ -108,7 +113,10 @@ impl fmt::Debug for ChatRuntime {
             .field("cutover_enabled", &self.cutover_enabled)
             .field("relationship_authority", &"fixed-production-authority")
             .field("request_push_enabled", &self.request_push.is_some())
-            .field("i13_receipt_signer_configured", &self.i13_receipt_signer.is_some())
+            .field(
+                "i13_receipt_signer_configured",
+                &self.i13_receipt_signer.is_some(),
+            )
             .field("require_signed_reads", &self.require_signed_reads)
             .field("sse_state", &"conversation-filtered")
             .field("cursor_sealer_configured", &self.cursor_sealer.is_some())
@@ -120,6 +128,11 @@ impl fmt::Debug for ChatRuntime {
             .field(
                 "commit_submitter_configured",
                 &self.commit_submitter.is_some(),
+            )
+            .field("space_host_configured", &self.space_host_config.is_some())
+            .field(
+                "push_gateway_client_configured",
+                &self.push_gateway_client.is_some(),
             )
             .finish()
     }
@@ -206,6 +219,13 @@ impl ChatRuntime {
         let request_push = RequestPushConfig::from_env(request_push_enabled)?;
         let require_signed_reads = env_flag("CHAT_REQUIRE_SIGNED_READS");
         let i13_receipt_signer = build_i13_receipt_signer_from_env()?;
+        let space_host_config = crate::space_host::SpaceHostConfig::from_env();
+        let push_gateway_client = space_host_config.as_ref().map(|cfg| {
+            Arc::new(crate::push_gateway::client::PushGatewayClient::new_es256(
+                cfg.authority_did.clone(),
+                cfg.signing_key.clone(),
+            ))
+        });
         Ok(Self {
             cutover_enabled,
             request_producers_enabled,
@@ -222,6 +242,8 @@ impl ChatRuntime {
             subscription_endpoint,
             resolver: None,
             commit_submitter: None,
+            space_host_config,
+            push_gateway_client,
         })
     }
 
@@ -323,10 +345,9 @@ impl ChatRuntime {
             "clean-chat protocol fence cannot be validated without a cursor sealer".to_owned()
         })?;
         let expected_key_id = URL_SAFE_NO_PAD.encode(sealer.key_id());
-        let mut conn = pool
-            .acquire()
-            .await
-            .map_err(|error| format!("failed to acquire connection for clean-chat protocol fence: {error}"))?;
+        let mut conn = pool.acquire().await.map_err(|error| {
+            format!("failed to acquire connection for clean-chat protocol fence: {error}")
+        })?;
 
         let protocol = sqlx::query_as::<_, (uuid::Uuid, String)>(
             "SELECT p.protocol_instance_id, p.cursor_key_id \
@@ -482,7 +503,10 @@ impl ChatRuntime {
         let did_count = guard.per_did.get(did).copied().unwrap_or(0);
         let key = (did.to_owned(), device_id);
         let dev_count = guard.per_device.get(&key).map(Vec::len).unwrap_or(0);
-        if guard.total >= MAX_WS_GLOBAL || did_count >= MAX_WS_PER_DID || dev_count >= MAX_WS_PER_DEVICE {
+        if guard.total >= MAX_WS_GLOBAL
+            || did_count >= MAX_WS_PER_DID
+            || dev_count >= MAX_WS_PER_DEVICE
+        {
             return Err(());
         }
         guard.total += 1;
@@ -490,7 +514,11 @@ impl ChatRuntime {
         guard.next_conn_id += 1;
         let conn_id = guard.next_conn_id;
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        guard.per_device.entry(key).or_default().push((conn_id, cancel_tx));
+        guard
+            .per_device
+            .entry(key)
+            .or_default()
+            .push((conn_id, cancel_tx));
         Ok(WsSlotGuard {
             registry: Arc::clone(&self.ws_registry),
             did: did.to_owned(),
@@ -523,6 +551,101 @@ impl ChatRuntime {
             .await
             .is_ok()
     }
+
+    pub fn push_gateway_client(
+        &self,
+    ) -> Option<&Arc<crate::push_gateway::client::PushGatewayClient>> {
+        self.push_gateway_client.as_ref()
+    }
+
+    /// Post-commit (`M-F04`) Space credential revocation + webhook fan-out across all active Spaces
+    /// for `did` when one of `did`'s devices is revoked (`revokeDevice`).
+    pub fn spawn_post_commit_device_revoked(&self, pool: &DbPool, did: &str) {
+        let Some(cfg) = self.space_host_config.clone() else {
+            return;
+        };
+        let pool = pool.clone();
+        let did = did.to_owned();
+        tokio::spawn(async move {
+            let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
+            let _ = crate::space_host::revocation_fanout::revoke_user_space_credentials_across_conversations(
+                &host,
+                &did,
+            )
+            .await;
+        });
+    }
+
+    /// Post-commit (`M-F04`) Space deletion fan-out when `closeConversation` closes a generation.
+    pub fn spawn_post_commit_close_conversation(
+        &self,
+        pool: &DbPool,
+        endpoint: crate::chat_protocol::error::ChatEndpoint,
+        response_bytes: &[u8],
+    ) {
+        if endpoint != crate::chat_protocol::error::ChatEndpoint::CloseConversation {
+            return;
+        }
+        let Some(cfg) = self.space_host_config.clone() else {
+            return;
+        };
+        let Ok(val) = serde_json::from_slice::<Value>(response_bytes) else {
+            return;
+        };
+        let Some(cid) = val
+            .pointer("/entry/conversationId")
+            .and_then(Value::as_str)
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        else {
+            return;
+        };
+        let gen = val
+            .pointer("/entry/generation")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
+            let _ = crate::space_host::revocation_fanout::fan_out_space_deleted_for_conversation(
+                &host, cid, gen,
+            )
+            .await;
+        });
+    }
+
+    /// Post-commit (`M-F04`) Space credential revocation + webhook fan-out when a membership transition
+    /// (`commit`, `policy`, `leaveCommit`, zero-leaf `leavePolicy`) removes or closes a participant period.
+    pub fn spawn_post_commit_membership_transition(&self, pool: &DbPool, response_bytes: &[u8]) {
+        let Some(cfg) = self.space_host_config.clone() else {
+            return;
+        };
+        let Ok(val) = serde_json::from_slice::<Value>(response_bytes) else {
+            return;
+        };
+        let Some(cid) = val
+            .pointer("/entry/conversationId")
+            .or_else(|| val.pointer("/conversationId"))
+            .and_then(Value::as_str)
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        else {
+            return;
+        };
+        let gen = val
+            .pointer("/entry/generation")
+            .or_else(|| val.pointer("/generation"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
+            let _ = crate::space_host::revocation_fanout::revoke_inactive_space_credentials_for_conversation(
+                &host,
+                cid,
+                gen,
+            )
+            .await;
+        });
+    }
 }
 
 fn build_i13_receipt_signer_from_env(
@@ -540,10 +663,9 @@ fn build_i13_receipt_signer_from_env(
     let secret = p256::SecretKey::from_pkcs8_pem(pem.trim())
         .map_err(|_| "RECEIPT_SIGNING_KEY_PEM is not valid P-256 PKCS#8 PEM".to_owned())?;
     let signing_key = p256::ecdsa::SigningKey::from(secret);
-    Ok(Some(Arc::new(crate::federation::receipt::I13ReceiptSigner::new(
-        signing_key,
-        service_did,
-    ))))
+    Ok(Some(Arc::new(
+        crate::federation::receipt::I13ReceiptSigner::new(signing_key, service_did),
+    )))
 }
 
 #[cfg(test)]

@@ -59,7 +59,6 @@ extern crate self as catbird_server;
 #[path = "common_tests.rs"]
 pub mod common;
 
-
 pub mod atproto_bytes;
 pub mod auth;
 pub mod chat_protocol;
@@ -78,7 +77,9 @@ pub mod labyrinth;
 pub mod metrics;
 pub mod middleware;
 pub mod mls_group_info_verifier;
+pub mod push_gateway;
 pub mod realtime;
+pub mod space_host;
 pub mod storage;
 pub mod util;
 pub mod workers;
@@ -123,7 +124,8 @@ pub fn request_body_limit(path: &str) -> usize {
         | "/xrpc/blue.catbird.mlsDS.submitCommit"
         | "/xrpc/blue.catbird.mlsDS.relaySendMessage"
         | "/xrpc/blue.catbird.mlsDS.deliverMessageEntry"
-        | "/xrpc/blue.catbird.mlsDS.relayGroupMutation" => SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
+        | "/xrpc/blue.catbird.mlsDS.relayGroupMutation"
+        | "/xrpc/blue.catbird.mlsDS.deliverGroupEntry" => SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
         p if p.starts_with("/xrpc/blue.catbird.labyrinth.") => 1_572_864,
         _ => DEFAULT_REQUEST_BODY_LIMIT_BYTES,
     }
@@ -132,4 +134,3 @@ pub fn request_body_limit(path: &str) -> usize {
 #[cfg(all(test, feature = "test-support"))]
 #[path = "../tests/common/chat_protocol_heartbeat_transport.rs"]
 mod heartbeat_transport_tests;
-

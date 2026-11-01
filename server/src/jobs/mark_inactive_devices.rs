@@ -43,10 +43,7 @@ pub async fn mark_inactive_devices(pool: &PgPool) -> Result<u64> {
 }
 
 /// Deterministic clock seam for integration tests.
-pub async fn mark_inactive_devices_at(
-    pool: &PgPool,
-    now: chrono::DateTime<Utc>,
-) -> Result<u64> {
+pub async fn mark_inactive_devices_at(pool: &PgPool, now: chrono::DateTime<Utc>) -> Result<u64> {
     let cutoff = now - chrono::Duration::days(DEVICE_DORMANCY_DAYS);
 
     let result = sqlx::query(

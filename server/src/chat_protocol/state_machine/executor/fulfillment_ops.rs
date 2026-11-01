@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 /// Apply a `signedLeafRecoveryFulfillment` edge (kind `leafRecovery`): the
 /// epoch-changing commit that adds the recovered target by KeyPackage and emits
 /// its Welcome. sv+1, epoch+1 (new hash/tag), same generation. Composes: head

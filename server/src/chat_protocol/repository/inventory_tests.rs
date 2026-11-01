@@ -1,160 +1,157 @@
 use crate::common;
 mod inventory_bridge {
-        use crate::chat_protocol::dpop::{seal_read_admission, ReadAdmissionAttempt};
-        use crate::chat_protocol::read_authority::{
-            from_locked_inventory_fence_record, lock_read_device_authority_once,
-            LockedInventoryFenceRecord, LockedReadDeviceAuthority, VerifiedInventoryFence,
+    use crate::chat_protocol::dpop::{seal_read_admission, ReadAdmissionAttempt};
+    use crate::chat_protocol::read_authority::{
+        from_locked_inventory_fence_record, lock_read_device_authority_once,
+        LockedInventoryFenceRecord, LockedReadDeviceAuthority, VerifiedInventoryFence,
+    };
+    use sqlx::{Postgres, Transaction};
+    use uuid::Uuid;
+
+    pub(crate) const GET_CONVERSATIONS_NSID: &str = "blue.catbird.chat.getConversations";
+    pub(crate) const FIXED_TEST_DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+    pub(crate) const FIXED_TEST_DEVICE: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
+    pub(crate) const FIXED_TEST_JKT: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    pub(crate) const FIXED_TEST_INSTANT: &str = "2026-07-22T12:00:00.000Z";
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum FenceOutcome {
+        /// The fence verified: the session is live and servable.
+        Accepted,
+        /// The fence was rejected (temporal, device, protocol, or storage).
+        Rejected,
+    }
+
+    /// Drive the REAL B-read chain for one inventory initial-page request
+    /// against the fixed registered device, lock the session row, and
+    /// verify its fence (`verify_locked_inventory_fence` composition:
+    /// loader seam -> `from_lock_material` -> durable-row constructor ->
+    /// consuming verification). `captured_at` is the session row's
+    /// `created_at`; a session older than 15 minutes fails the temporal
+    /// bound exactly as the production request does.
+    pub(crate) async fn verify_session_fence_for_test(
+        pool: &sqlx::PgPool,
+        inventory_session_id: Uuid,
+    ) -> FenceOutcome {
+        let authority = match crate::chat_protocol::repository::auth::authorize_unsigned_request(
+            pool,
+            crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
+                Uuid::new_v4(),
+                Uuid::new_v4().as_bytes()[..12]
+                    .try_into()
+                    .expect("proof JTI window"),
+                GET_CONVERSATIONS_NSID,
+                FIXED_TEST_INSTANT,
+            ),
+        )
+        .await
+        {
+            Ok(authority) => authority,
+            Err(_) => return FenceOutcome::Rejected,
         };
-        use sqlx::{Postgres, Transaction};
-        use uuid::Uuid;
-
-        pub(crate) const GET_CONVERSATIONS_NSID: &str = "blue.catbird.chat.getConversations";
-        pub(crate) const FIXED_TEST_DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
-        pub(crate) const FIXED_TEST_DEVICE: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
-        pub(crate) const FIXED_TEST_JKT: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        pub(crate) const FIXED_TEST_INSTANT: &str = "2026-07-22T12:00:00.000Z";
-
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        pub(crate) enum FenceOutcome {
-            /// The fence verified: the session is live and servable.
-            Accepted,
-            /// The fence was rejected (temporal, device, protocol, or storage).
-            Rejected,
-        }
-
-        /// Drive the REAL B-read chain for one inventory initial-page request
-        /// against the fixed registered device, lock the session row, and
-        /// verify its fence (`verify_locked_inventory_fence` composition:
-        /// loader seam -> `from_lock_material` -> durable-row constructor ->
-        /// consuming verification). `captured_at` is the session row's
-        /// `created_at`; a session older than 15 minutes fails the temporal
-        /// bound exactly as the production request does.
-        pub(crate) async fn verify_session_fence_for_test(
-            pool: &sqlx::PgPool,
-            inventory_session_id: Uuid,
-        ) -> FenceOutcome {
-            let authority = match crate::chat_protocol::repository::auth::authorize_unsigned_request(
-                pool,
-                crate::chat_protocol::dpop::repository_test_evidence::ordinary_registered_device(
-                    Uuid::new_v4(),
-                    Uuid::new_v4().as_bytes()[..12]
-                        .try_into()
-                        .expect("proof JTI window"),
-                    GET_CONVERSATIONS_NSID,
-                    FIXED_TEST_INSTANT,
-                ),
-            )
+        let admission = match seal_read_admission(authority) {
+            Ok(admission) => admission,
+            Err(_) => return FenceOutcome::Rejected,
+        };
+        let attempts: [ReadAdmissionAttempt; 3] =
+            match admission.into_inventory_read_attempts(GET_CONVERSATIONS_NSID, "GET") {
+                Ok(attempts) => attempts,
+                Err(_) => return FenceOutcome::Rejected,
+            };
+        let mut transaction = match pool.begin().await {
+            Ok(transaction) => transaction,
+            Err(_) => return FenceOutcome::Rejected,
+        };
+        let device = match lock_read_device_authority_once(
+            &mut transaction,
+            attempts.into_iter().next().unwrap(),
+        )
+        .await
+        {
+            Ok(device) => device,
+            Err(_) => return FenceOutcome::Rejected,
+        };
+        match verify_session_fence_in_transaction(&mut transaction, device, inventory_session_id)
             .await
-            {
-                Ok(authority) => authority,
-                Err(_) => return FenceOutcome::Rejected,
-            };
-            let admission = match seal_read_admission(authority) {
-                Ok(admission) => admission,
-                Err(_) => return FenceOutcome::Rejected,
-            };
-            let attempts: [ReadAdmissionAttempt; 3] =
-                match admission.into_inventory_read_attempts(GET_CONVERSATIONS_NSID, "GET") {
-                    Ok(attempts) => attempts,
-                    Err(_) => return FenceOutcome::Rejected,
-                };
-            let mut transaction = match pool.begin().await {
-                Ok(transaction) => transaction,
-                Err(_) => return FenceOutcome::Rejected,
-            };
-            let device = match lock_read_device_authority_once(
-                &mut transaction,
-                attempts.into_iter().next().unwrap(),
-            )
-            .await
-            {
-                Ok(device) => device,
-                Err(_) => return FenceOutcome::Rejected,
-            };
-            match verify_session_fence_in_transaction(
-                &mut transaction,
-                device,
-                inventory_session_id,
-            )
-            .await
-            {
-                Ok(_) => {
-                    let _ = transaction.rollback().await;
-                    FenceOutcome::Accepted
-                }
-                Err(_) => {
-                    let _ = transaction.rollback().await;
-                    FenceOutcome::Rejected
-                }
+        {
+            Ok(_) => {
+                let _ = transaction.rollback().await;
+                FenceOutcome::Accepted
+            }
+            Err(_) => {
+                let _ = transaction.rollback().await;
+                FenceOutcome::Rejected
             }
         }
+    }
 
-        /// The loader seam: `SELECT ... FOR UPDATE` over the retained session
-        /// row, `from_lock_material`, the durable-row constructor, and the
-        /// consuming `verify_inventory_fence` — the same chain
-        /// `verify_locked_inventory_fence` (inventory.rs) composes. `device`
-        /// is consumed by the verification.
-        pub(crate) async fn verify_session_fence_in_transaction(
-            transaction: &mut Transaction<'_, Postgres>,
-            device: LockedReadDeviceAuthority,
-            inventory_session_id: Uuid,
-        ) -> Result<VerifiedInventoryFence, ()> {
-            let row: Option<(
-                Uuid,
-                String,
-                i64,
-                Vec<u8>,
-                i64,
-                chrono::DateTime<chrono::Utc>,
-            )> = sqlx::query_as(
-                r#"
+    /// The loader seam: `SELECT ... FOR UPDATE` over the retained session
+    /// row, `from_lock_material`, the durable-row constructor, and the
+    /// consuming `verify_inventory_fence` — the same chain
+    /// `verify_locked_inventory_fence` (inventory.rs) composes. `device`
+    /// is consumed by the verification.
+    pub(crate) async fn verify_session_fence_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
+        device: LockedReadDeviceAuthority,
+        inventory_session_id: Uuid,
+    ) -> Result<VerifiedInventoryFence, ()> {
+        let row: Option<(
+            Uuid,
+            String,
+            i64,
+            Vec<u8>,
+            i64,
+            chrono::DateTime<chrono::Utc>,
+        )> = sqlx::query_as(
+            r#"
                 SELECT protocol_instance_id, cursor_key_id, snapshot_event_position,
                        snapshot_event_cursor_sha256, snapshot_retained_floor, created_at
                   FROM chat.inventory_sessions
                  WHERE inventory_session_id = $1
                  FOR UPDATE
                 "#,
-            )
-            .bind(inventory_session_id)
-            .fetch_optional(&mut **transaction)
-            .await
-            .map_err(|_| ())?;
-            let (
-                protocol_instance_id,
-                cursor_key_id,
-                event_position,
-                cursor_sha256,
-                floor,
-                captured_at,
-            ) = row.ok_or(())?;
-            let event_position = u64::try_from(event_position).map_err(|_| ())?;
-            let floor = u64::try_from(floor).map_err(|_| ())?;
-            let cursor_sha256: [u8; 32] = cursor_sha256.try_into().map_err(|_| ())?;
-            let record = LockedInventoryFenceRecord::from_lock_material(
-                protocol_instance_id,
-                cursor_key_id,
-                event_position,
-                cursor_sha256,
-                floor,
-                captured_at,
-            )
-            .map_err(|_| ())?;
-            let durable_row = from_locked_inventory_fence_record(record);
-            crate::chat_protocol::read_authority::verify_inventory_fence(transaction, device, durable_row)
-                .await
-                .map_err(|_| ())
-        }
+        )
+        .bind(inventory_session_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| ())?;
+        let (
+            protocol_instance_id,
+            cursor_key_id,
+            event_position,
+            cursor_sha256,
+            floor,
+            captured_at,
+        ) = row.ok_or(())?;
+        let event_position = u64::try_from(event_position).map_err(|_| ())?;
+        let floor = u64::try_from(floor).map_err(|_| ())?;
+        let cursor_sha256: [u8; 32] = cursor_sha256.try_into().map_err(|_| ())?;
+        let record = LockedInventoryFenceRecord::from_lock_material(
+            protocol_instance_id,
+            cursor_key_id,
+            event_position,
+            cursor_sha256,
+            floor,
+            captured_at,
+        )
+        .map_err(|_| ())?;
+        let durable_row = from_locked_inventory_fence_record(record);
+        crate::chat_protocol::read_authority::verify_inventory_fence(
+            transaction,
+            device,
+            durable_row,
+        )
+        .await
+        .map_err(|_| ())
     }
-
+}
 
 use crate::common::executor_seed;
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use crate::chat_protocol::cursor::{
     decode_capability_token, mint_capability_token, CapabilityToken, CursorSealer,
     SealedCapability, SealerBinding, SecureRandom, SecureRandomError,
 };
-use chrono::{DateTime, Duration, TimeZone, Utc};
 use crate::chat_protocol::repository::inventory::{
     create_device_inventory_session, get_devices, CreateDeviceInventorySessionRequest,
     DeviceInventorySubject, EventTerminalHint, IntervalSummaryTerminalHint, InventoryDomain,
@@ -162,6 +159,8 @@ use crate::chat_protocol::repository::inventory::{
     TombstoneTerminalHint, INVENTORY_CONVERSATIONS_NSID, MAX_GET_DEVICES_DIDS,
 };
 use crate::chat_protocol::repository::ticket::{ticket_hash, SUBSCRIBE_EVENTS_PATH};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -701,12 +700,7 @@ async fn seed_device_with_key(pool: &PgPool, at: DateTime<Utc>) -> SessionDevice
 /// evidence subject) so the real admission seam can lock it.
 async fn seed_fixed_admission_device(pool: &PgPool) {
     let fixed_at = Utc.timestamp_opt(1_753_190_400, 0).unwrap(); // 2026-07-22T12:00:00Z
-    seed_principal(
-        pool,
-        inventory_bridge::FIXED_TEST_DID,
-        fixed_at,
-    )
-    .await;
+    seed_principal(pool, inventory_bridge::FIXED_TEST_DID, fixed_at).await;
     let public_key = fresh_blob();
     let key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
         .bind(&public_key)
@@ -1445,8 +1439,14 @@ const DOMAIN_ENDPOINTS: [(&str, &str); 3] = [
         "conversations",
         crate::chat_protocol::repository::inventory::INVENTORY_CONVERSATIONS_NSID,
     ),
-    ("welcomes", crate::chat_protocol::repository::inventory::INVENTORY_WELCOMES_NSID),
-    ("recovery", crate::chat_protocol::repository::inventory::INVENTORY_RECOVERY_NSID),
+    (
+        "welcomes",
+        crate::chat_protocol::repository::inventory::INVENTORY_WELCOMES_NSID,
+    ),
+    (
+        "recovery",
+        crate::chat_protocol::repository::inventory::INVENTORY_RECOVERY_NSID,
+    ),
 ];
 
 /// The reassembled canonical response for one served receipt, proven to match
@@ -3706,7 +3706,9 @@ async fn seed_pending_invited_conversation(pool: &PgPool, invitee: &SessionDevic
 /// include harness (`crate::chat_protocol::repository::inventory::PagingDeviceAuthority`, the
 /// `cfg(test)` identity arm of the production alias). Built fresh per call —
 /// the entrypoints consume it.
-fn paging_device(device: &SessionDevice) -> crate::chat_protocol::repository::inventory::PagingDeviceAuthority {
+fn paging_device(
+    device: &SessionDevice,
+) -> crate::chat_protocol::repository::inventory::PagingDeviceAuthority {
     crate::chat_protocol::repository::inventory::PagingDeviceAuthority::for_test(
         device.did.clone(),
         device.device_id,

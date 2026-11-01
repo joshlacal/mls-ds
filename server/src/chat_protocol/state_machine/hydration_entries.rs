@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 pub(in crate::chat_protocol::state_machine) fn require_request_coordinate_binding(
     evidence: &RequestEvidence,
     expected_conversation_id: &[u8; 16],
@@ -15,7 +14,9 @@ pub(in crate::chat_protocol::state_machine) fn require_request_coordinate_bindin
     Ok(())
 }
 
-pub(in crate::chat_protocol::state_machine) fn request_entry_signed_kind(kind: RequestEntryKind) -> SignedMutationKind {
+pub(in crate::chat_protocol::state_machine) fn request_entry_signed_kind(
+    kind: RequestEntryKind,
+) -> SignedMutationKind {
     match kind {
         RequestEntryKind::LeafRecoveryRequest => SignedMutationKind::LeafRecoveryRequest,
         RequestEntryKind::LeafRecoveryCancellation => SignedMutationKind::LeafRecoveryCancellation,
@@ -301,7 +302,8 @@ pub(crate) struct LeaveRequest {
     pub(in crate::chat_protocol::state_machine) status: LeaveRequestStatus,
     pub(in crate::chat_protocol::state_machine) origin: RequestEvidence,
     pub(in crate::chat_protocol::state_machine) terminal: Option<WorkTerminalEvidence>,
-    pub(in crate::chat_protocol::state_machine) fulfilled_participant: Option<ParticipantRemovalEvidence>,
+    pub(in crate::chat_protocol::state_machine) fulfilled_participant:
+        Option<ParticipantRemovalEvidence>,
 }
 
 impl LeaveRequest {

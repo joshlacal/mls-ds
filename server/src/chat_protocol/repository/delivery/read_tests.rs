@@ -1,5 +1,5 @@
-use super::*;
 use super::delivery::*;
+use super::*;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
@@ -493,8 +493,10 @@ fn parse_ts(text: &str) -> DateTime<Utc> {
 }
 
 fn load_contract_vectors() -> Value {
-    serde_json::from_str(include_str!("../../../../tests/fixtures/mls_chat_contract_vectors.json"))
-        .expect("contract vectors fixture")
+    serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/mls_chat_contract_vectors.json"
+    ))
+    .expect("contract vectors fixture")
 }
 
 // ===========================================================================

@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 pub(in crate::chat_protocol::state_machine) fn opening_matches_interval(
     interval: &AccessInterval,
     conversation_kind: ConversationKind,
@@ -296,7 +295,9 @@ pub(in crate::chat_protocol::state_machine) fn reset_successor_edge(
         && prior.group_id() != successor.group_id()
 }
 
-pub(in crate::chat_protocol::state_machine) fn validate_terminal_proofs(state: &ConversationState) -> Result<(), StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn validate_terminal_proofs(
+    state: &ConversationState,
+) -> Result<(), StateMachineError> {
     if state
         .terminal_proofs
         .windows(2)
@@ -738,7 +739,10 @@ pub(in crate::chat_protocol::state_machine) fn leave_fulfillment_matches_request
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn validate_work(state: &ConversationState, terminal_state: bool) -> Result<(), StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn validate_work(
+    state: &ConversationState,
+    terminal_state: bool,
+) -> Result<(), StateMachineError> {
     validate_recovery_work(state)?;
     validate_reset_work(state)?;
     validate_leave_work(state)?;

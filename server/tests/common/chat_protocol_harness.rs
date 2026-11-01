@@ -106,10 +106,6 @@ pub mod repository {
     pub mod direct_request_receipts;
     #[path = "../../../server/src/chat_protocol/repository/direct_request_retention.rs"]
     pub mod direct_request_retention;
-    #[path = "../../../server/src/chat_protocol/repository/message_event.rs"]
-    pub mod message_event;
-    #[path = "../../../server/src/chat_protocol/repository/push_binding.rs"]
-    pub mod push_binding;
     #[path = "../../../server/src/chat_protocol/repository/entry_read.rs"]
     pub mod entry_read;
     #[path = "../../../server/src/chat_protocol/repository/execution_context.rs"]
@@ -124,8 +120,12 @@ pub mod repository {
     pub mod leave;
     #[path = "../../../server/src/chat_protocol/repository/message_delivery.rs"]
     pub mod message_delivery;
+    #[path = "../../../server/src/chat_protocol/repository/message_event.rs"]
+    pub mod message_event;
     #[path = "../../../server/src/chat_protocol/repository/prelude.rs"]
     pub mod prelude;
+    #[path = "../../../server/src/chat_protocol/repository/push_binding.rs"]
+    pub mod push_binding;
     #[path = "../../../server/src/chat_protocol/repository/recovery.rs"]
     pub mod recovery;
     #[path = "../../../server/src/chat_protocol/repository/relationship.rs"]

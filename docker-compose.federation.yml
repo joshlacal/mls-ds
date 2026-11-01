@@ -1,0 +1,105 @@
+version: "3.9"
+
+# Catbird MLS Delivery Service — 2-DS Clean-Slate Federation & Spaces Topology
+# Exercises:
+# - Option A Conversation Space Authority & Space Host (`com.atproto.space.*` on `ds-a` & `ds-b`)
+# - `D1` Cross-Server Group Mutation Relay (`relayGroupMutation` / `deliverGroupEntry`)
+# - `3A` Stateless Home-`mls-ds` Space Relays (`relaySpaceCredential` / `relaySpaceRead`)
+# - `D2` Authenticated Push Gateway Wakes (`blue.catbird.push.deliver`, zero APNs/FCM keys on `mls-ds`)
+# - Zero-Content Transient Delivery (`G6` / `I14`: zero long-term message or media retention on `mls-ds`)
+
+services:
+  postgres-a:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: catbird
+      POSTGRES_PASSWORD: catbird_dev_password
+      POSTGRES_DB: mls_ds_a
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catbird -d mls_ds_a"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres-b:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: catbird
+      POSTGRES_PASSWORD: catbird_dev_password
+      POSTGRES_DB: mls_ds_b
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catbird -d mls_ds_b"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  swan-pds:
+    build:
+      context: ../Swan
+      dockerfile: Dockerfile
+    environment:
+      PDS_HOSTNAME: swan.federation.local
+      PDS_PORT: "2583"
+      PDS_SPACES_ENABLED: "true"
+    ports:
+      - "2583:2583"
+
+  ds-a:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    depends_on:
+      postgres-a:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "3001"
+      DATABASE_URL: postgresql://catbird:catbird_dev_password@postgres-a:5432/mls_ds_a
+      SERVICE_DID: did:web:ds-a.federation.local
+      SELF_ENDPOINT: https://ds-a.federation.local
+      CHAT_CUTOVER_ENABLED: "true"
+      CHAT_REQUIRE_SIGNED_READS: "true"
+      LABYRINTH_ENABLED: "true"
+      FEDERATION_ENABLED: "true"
+      FEDERATION_MODE: open_intelligent
+      CHAT_SUBSCRIPTION_ENDPOINT: wss://ds-a.federation.local/xrpc/blue.catbird.chat.subscribeEvents
+      SIGNING_KEY_PEM: ${DS_A_SIGNING_KEY_PEM}
+      SPACE_HOST_SIGNING_KEY_PEM: ${DS_A_SIGNING_KEY_PEM}
+      RECEIPT_SIGNING_KEY_PEM: ${DS_A_RECEIPT_SIGNING_KEY_PEM}
+      CHAT_CURSOR_KEY_ID: ${DS_A_CURSOR_KEY_ID}
+      CHAT_CURSOR_SEALING_SECRET: ${DS_A_CURSOR_SEALING_SECRET}
+    ports:
+      - "3001:3001"
+
+  ds-b:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    depends_on:
+      postgres-b:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "3002"
+      DATABASE_URL: postgresql://catbird:catbird_dev_password@postgres-b:5432/mls_ds_b
+      SERVICE_DID: did:web:ds-b.federation.local
+      SELF_ENDPOINT: https://ds-b.federation.local
+      CHAT_CUTOVER_ENABLED: "true"
+      CHAT_REQUIRE_SIGNED_READS: "true"
+      LABYRINTH_ENABLED: "true"
+      FEDERATION_ENABLED: "true"
+      FEDERATION_MODE: open_intelligent
+      CHAT_SUBSCRIPTION_ENDPOINT: wss://ds-b.federation.local/xrpc/blue.catbird.chat.subscribeEvents
+      SIGNING_KEY_PEM: ${DS_B_SIGNING_KEY_PEM}
+      SPACE_HOST_SIGNING_KEY_PEM: ${DS_B_SIGNING_KEY_PEM}
+      RECEIPT_SIGNING_KEY_PEM: ${DS_B_RECEIPT_SIGNING_KEY_PEM}
+      CHAT_CURSOR_KEY_ID: ${DS_B_CURSOR_KEY_ID}
+      CHAT_CURSOR_SEALING_SECRET: ${DS_B_CURSOR_SEALING_SECRET}
+    ports:
+      - "3002:3002"

@@ -9,12 +9,8 @@ use sqlx::{postgres::PgPoolOptions, Acquire, PgPool, Postgres, Transaction};
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
-use crate::common;
 use crate::chat_protocol::{
-    dpop,
-    model,
-    public_state,
-    relationship_policy,
+    dpop, model, public_state, relationship_policy,
     repository::{
         self,
         auth::{
@@ -44,7 +40,7 @@ use crate::chat_protocol::{
         ValidatedChatNsid,
     },
 };
-
+use crate::common;
 
 const ALICE_DID: &str = "did:plc:alicefixtureaaaaaaaaaaaa";
 const ALICE_DEVICE: &str = "2f93a82d-b061-4c75-8f61-57f23146b910";
@@ -204,15 +200,16 @@ fn verified_request(
         VerifiedMutationProjection::ResetActivation(_) => "blue.catbird.chat.activateReset",
         _ => panic!("reset test helper requires a Reset mutation"),
     };
-    let pre_replay = crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
-        Uuid::new_v4(),
-        *Uuid::new_v4().as_bytes().first_chunk::<12>().unwrap(),
-        endpoint,
-        &at.to_rfc3339_opts(SecondsFormat::Millis, true),
-        &fixture.actor_did,
-        fixture.actor_device_id,
-        &fixture.actor_dpop_jkt,
-    );
+    let pre_replay =
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
+            Uuid::new_v4(),
+            *Uuid::new_v4().as_bytes().first_chunk::<12>().unwrap(),
+            endpoint,
+            &at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            &fixture.actor_dpop_jkt,
+        );
     let canonical =
         decode_canonical_signed_mutation(mutation.accepted_wrapper_bytes().unwrap()).unwrap();
     let receipt = crate::chat_protocol::repository::auth::reset_existing_device_receipt_for_test(

@@ -140,12 +140,9 @@ async fn variable_authority_direct_request_receipt_signer_persists_and_verifies(
     })
     .to_string();
 
-    let signer = DirectRequestReceiptSigner::configured(
-        receipt_pem.as_str(),
-        service_pem.as_str(),
-        &doc,
-    )
-    .unwrap();
+    let signer =
+        DirectRequestReceiptSigner::configured(receipt_pem.as_str(), service_pem.as_str(), &doc)
+            .unwrap();
 
     assert_eq!(signer.authority_did(), authority_did);
     assert_eq!(signer.key_id(), key_id);

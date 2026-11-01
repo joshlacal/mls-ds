@@ -158,13 +158,9 @@ pub(crate) mod validation;
 #[cfg(any(test, feature = "test-support"))]
 pub mod validation;
 
-pub mod wire;
 #[cfg(test)]
-#[path = "state_machine/tests.rs"]
-mod state_machine_tests;
-#[cfg(test)]
-#[path = "state_machine/executor_tests.rs"]
-mod state_machine_executor_tests;
+#[path = "dpop/adversarial_challenger_m4_tests.rs"]
+mod adversarial_challenger_m4_tests;
 #[cfg(test)]
 #[path = "transcript/application_entry_tests.rs"]
 mod application_entry_tests;
@@ -172,8 +168,12 @@ mod application_entry_tests;
 #[path = "relationship_policy/tests.rs"]
 mod relationship_policy_tests;
 #[cfg(test)]
-#[path = "dpop/adversarial_challenger_m4_tests.rs"]
-mod adversarial_challenger_m4_tests;
+#[path = "state_machine/executor_tests.rs"]
+mod state_machine_executor_tests;
+#[cfg(test)]
+#[path = "state_machine/tests.rs"]
+mod state_machine_tests;
+pub mod wire;
 
 /// Non-shipping executable proof runners. Only zero-authority scenario
 /// functions are exported; opaque protocol authorities and prepared graphs

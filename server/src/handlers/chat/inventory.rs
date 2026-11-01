@@ -394,7 +394,8 @@ mod tests {
 
     #[test]
     fn session_mismatch_maps_to_inventory_session_mismatch_for_conversations() {
-        assert!(ChatEndpoint::GetConversations.declares(ChatProtocolErrorCode::InventorySessionMismatch));
+        assert!(ChatEndpoint::GetConversations
+            .declares(ChatProtocolErrorCode::InventorySessionMismatch));
         let failure = map_repository_error(
             ChatEndpoint::GetConversations,
             InventoryRepositoryError::SessionPresentationMismatch,

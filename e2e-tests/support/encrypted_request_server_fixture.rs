@@ -203,20 +203,24 @@ async fn main() -> Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3600);
-        let resolver = Arc::new(catbird_server::federation::DsResolver::with_default_endpoint(
-            pool.clone(),
-            catbird_server::federation::resolver::build_resolver_http_client(),
-            catbird_server::identity::service_did(),
-            catbird_server::identity::self_endpoint(),
-            std::env::var("DEFAULT_DS_ENDPOINT").ok(),
-            cache_ttl,
-        ));
+        let resolver = Arc::new(
+            catbird_server::federation::DsResolver::with_default_endpoint(
+                pool.clone(),
+                catbird_server::federation::resolver::build_resolver_http_client(),
+                catbird_server::identity::service_did(),
+                catbird_server::identity::self_endpoint(),
+                std::env::var("DEFAULT_DS_ENDPOINT").ok(),
+                cache_ttl,
+            ),
+        );
         let queue = Arc::new(catbird_server::federation::queue::OutboundQueue::new(
             pool.clone(),
             catbird_server::auth::AuthMiddleware::new(),
             resolver,
         ));
-        let outbound = Arc::new(catbird_server::federation::outbound::OutboundClient::new(10, 30));
+        let outbound = Arc::new(catbird_server::federation::outbound::OutboundClient::new(
+            10, 30,
+        ));
         let auth_fn: Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync> =
             Arc::new(|target: &str, method: &str| {
                 catbird_server::federation::canonical_relay::mint_s2s_auth_token(target, method)

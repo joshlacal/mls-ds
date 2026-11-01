@@ -17,6 +17,7 @@ pub(crate) enum EntryReadFacadeError {
     AccessOutsideMembershipInterval,
     ConversationNotFound,
     DeviceRevoked,
+    InvitationNotPending,
     InvalidRequest,
     NotEntitled,
     Storage,
@@ -83,6 +84,121 @@ async fn read_entries_in_transaction(
             tracing::error!("lock_read_device_authority_once failed: {:?}", e);
             map_authority_error(e)
         })?;
+    let is_local_convo: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id = $1)",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| EntryReadFacadeError::Storage)?;
+    if !is_local_convo {
+        let actor_did = device.user_did().to_owned();
+        let actor_device_uuid = device.device_id();
+        let inbox_opt: Option<(
+            String,
+            String,
+            Option<Uuid>,
+            String,
+            Uuid,
+            chrono::DateTime<Utc>,
+        )> = sqlx::query_as(
+            "SELECT status, sender_did, sender_device_id, recipient_did, recipient_device_id, import_until \
+             FROM chat.direct_request_transport_inbox \
+             WHERE conversation_id = $1 \
+               AND ((recipient_did = $2 AND recipient_device_id = $3) \
+                    OR (sender_did = $2 AND sender_device_id = $3)) \
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .bind(&actor_did)
+        .bind(actor_device_uuid)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| EntryReadFacadeError::Storage)?;
+
+        let Some((
+            status,
+            sender_did,
+            sender_device_id,
+            recipient_did,
+            recipient_device_id,
+            import_until,
+        )) = inbox_opt
+        else {
+            return Err(EntryReadFacadeError::ConversationNotFound);
+        };
+
+        let is_sender = actor_did == sender_did;
+        let is_recipient = actor_did == recipient_did;
+        if !is_sender && !is_recipient {
+            return Err(EntryReadFacadeError::ConversationNotFound);
+        }
+        if is_recipient && actor_device_uuid != recipient_device_id {
+            return Err(EntryReadFacadeError::NotEntitled);
+        }
+        if is_sender
+            && sender_device_id
+                .is_some_and(|expected_sender_dev| actor_device_uuid != expected_sender_dev)
+        {
+            return Err(EntryReadFacadeError::NotEntitled);
+        }
+        if status == "pending" {
+            if Utc::now() > import_until {
+                return Err(EntryReadFacadeError::InvitationNotPending);
+            }
+        } else if status != "accepted" {
+            return Err(EntryReadFacadeError::ConversationNotFound);
+        }
+
+        let stored_entries: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT entry_bytes FROM chat.direct_request_transport_entries \
+             WHERE conversation_id = $1 AND seq > $2 \
+             ORDER BY seq ASC LIMIT $3",
+        )
+        .bind(conversation_id)
+        .bind(after_seq as i64)
+        .bind(limit + 1)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| EntryReadFacadeError::Storage)?;
+
+        let has_more = stored_entries.len() > limit as usize;
+        let entries: Vec<Value> = stored_entries
+            .into_iter()
+            .take(limit as usize)
+            .map(|bytes| {
+                let mut val: Value =
+                    serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
+                if val.get("$type").is_none()
+                    && val
+                        .pointer("/signedRequest/body/$type")
+                        .and_then(|v| v.as_str())
+                        == Some("blue.catbird.chat.defs#applicationSendBody")
+                {
+                    val["$type"] = json!("blue.catbird.chat.defs#applicationEntry");
+                }
+                crate::chat_protocol::direct_request_transcript::present_read_presentation(
+                    "conversationEntry",
+                    &mut val,
+                )
+                .map_err(|_| EntryReadFacadeError::Invariant)?;
+                Ok(val)
+            })
+            .collect::<Result<_, EntryReadFacadeError>>()?;
+
+        let next_after_seq = entries
+            .last()
+            .and_then(|e| e.get("seq").and_then(|v| v.as_u64()))
+            .unwrap_or(after_seq);
+        let body = json!({
+            "entries": entries,
+            "nextAfterSeq": next_after_seq,
+            "hasMore": has_more,
+        });
+        let response_bytes =
+            serde_json::to_vec(&body).map_err(|_| EntryReadFacadeError::Invariant)?;
+        return Ok(CanonicalEntriesResponse { response_bytes });
+    }
     let authority = read_authority::authorize_entries(transaction, device, conversation_id)
         .await
         .map_err(|e| {
@@ -136,8 +252,8 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
                 .signed_request_bytes
                 .as_deref()
                 .ok_or(EntryReadFacadeError::Invariant)?;
-            let signed_request: Value =
-                serde_json::from_slice(signed_bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
+            let signed_request: Value = serde_json::from_slice(signed_bytes)
+                .map_err(|_| EntryReadFacadeError::Invariant)?;
             json!({
                 "$type": row.entry_kind,
                 "conversationId": row.conversation_id.hyphenated().to_string(),
@@ -177,9 +293,8 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
             #[serde(default, with = "serde_bytes")]
             signature: Option<Vec<u8>>,
         }
-        let fields: AccountDeletedFields =
-            serde_ipld_dagcbor::from_slice(&row.server_fields_bytes)
-                .map_err(|_| EntryReadFacadeError::Invariant)?;
+        let fields: AccountDeletedFields = serde_ipld_dagcbor::from_slice(&row.server_fields_bytes)
+            .map_err(|_| EntryReadFacadeError::Invariant)?;
         let mut obj = json!({
             "$type": row.entry_kind,
             "conversationId": row.conversation_id.hyphenated().to_string(),

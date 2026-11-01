@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 pub(crate) fn plan_policy_transition(
     prior: &ConversationState,
     command: PolicyCommand,
@@ -375,7 +374,9 @@ pub(in crate::chat_protocol::state_machine) fn plan_leaf_recovery_request_inner(
     })
 }
 
-pub(in crate::chat_protocol::state_machine) fn sort_recovery_requests(requests: &mut [RecoveryRequest]) {
+pub(in crate::chat_protocol::state_machine) fn sort_recovery_requests(
+    requests: &mut [RecoveryRequest],
+) {
     requests.sort_by(|left, right| {
         left.target
             .cmp(&right.target)
@@ -383,7 +384,9 @@ pub(in crate::chat_protocol::state_machine) fn sort_recovery_requests(requests: 
     });
 }
 
-pub(in crate::chat_protocol::state_machine) fn sort_recovery_reservations(reservations: &mut [RecoveryReservation]) {
+pub(in crate::chat_protocol::state_machine) fn sort_recovery_reservations(
+    reservations: &mut [RecoveryReservation],
+) {
     reservations.sort_by(|left, right| {
         left.target
             .cmp(&right.target)
@@ -692,7 +695,10 @@ pub(in crate::chat_protocol::state_machine) fn plan_welcome_expiry(
     })
 }
 
-pub(in crate::chat_protocol::state_machine) fn welcome_response_reason_matches(kind: RequestEntryKind, rejection_reason: Option<&str>) -> bool {
+pub(in crate::chat_protocol::state_machine) fn welcome_response_reason_matches(
+    kind: RequestEntryKind,
+    rejection_reason: Option<&str>,
+) -> bool {
     match (kind, rejection_reason) {
         (RequestEntryKind::WelcomeAcknowledgement, None) => true,
         (

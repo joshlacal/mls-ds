@@ -35,8 +35,10 @@ pub(crate) struct EventChainCursor {
     pub(in crate::chat_protocol::state_machine::executor) prelude_digest: [u8; 32],
     pub(in crate::chat_protocol::state_machine::executor) devices: Vec<DeviceIdentity>,
     pub(in crate::chat_protocol::state_machine::executor) current_tails: Vec<Option<i64>>,
-    pub(in crate::chat_protocol::state_machine::executor) remaining: VecDeque<PreparedRevocationEvent>,
-    pub(in crate::chat_protocol::state_machine::executor) pending_event: Option<PendingPreparedEvent>,
+    pub(in crate::chat_protocol::state_machine::executor) remaining:
+        VecDeque<PreparedRevocationEvent>,
+    pub(in crate::chat_protocol::state_machine::executor) pending_event:
+        Option<PendingPreparedEvent>,
     pub(in crate::chat_protocol::state_machine::executor) initial_binding_digest: [u8; 32],
 }
 
@@ -89,7 +91,9 @@ impl EventChainCursor {
         })
     }
 
-    pub(in crate::chat_protocol::state_machine::executor) fn recompute_initial_binding_digest(&self) -> [u8; 32] {
+    pub(in crate::chat_protocol::state_machine::executor) fn recompute_initial_binding_digest(
+        &self,
+    ) -> [u8; 32] {
         event_chain_cursor_binding_digest(
             &self.prelude_digest,
             &self.devices,
@@ -99,12 +103,16 @@ impl EventChainCursor {
         )
     }
 
-    pub(in crate::chat_protocol::state_machine::executor) fn initial_binding_is_intact(&self) -> bool {
+    pub(in crate::chat_protocol::state_machine::executor) fn initial_binding_is_intact(
+        &self,
+    ) -> bool {
         self.pending_event.is_none()
             && self.initial_binding_digest == self.recompute_initial_binding_digest()
     }
 
-    pub(in crate::chat_protocol::state_machine::executor) fn initial_binding_digest(&self) -> &[u8; 32] {
+    pub(in crate::chat_protocol::state_machine::executor) fn initial_binding_digest(
+        &self,
+    ) -> &[u8; 32] {
         &self.initial_binding_digest
     }
 
@@ -247,7 +255,9 @@ impl EventChainCursor {
     }
 
     #[cfg(test)]
-    pub(in crate::chat_protocol::state_machine::executor) fn finish_for_test(&self) -> Result<(), EventChainCursorError> {
+    pub(in crate::chat_protocol::state_machine::executor) fn finish_for_test(
+        &self,
+    ) -> Result<(), EventChainCursorError> {
         if self.pending_event.is_some() || !self.remaining.is_empty() {
             Err(EventChainCursorError::IncompleteSchedule)
         } else {
@@ -256,7 +266,9 @@ impl EventChainCursor {
     }
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn event_chain_cursor_binding_digest<'event>(
+pub(in crate::chat_protocol::state_machine::executor) fn event_chain_cursor_binding_digest<
+    'event,
+>(
     prelude_digest: &[u8; 32],
     devices: &[DeviceIdentity],
     initial_tails: &[Option<i64>],
@@ -399,14 +411,17 @@ impl ExecutionContext {
 /// plan or raw `ExecutionContext`.
 #[must_use = "a prepared execution must be consumed by the atomic executor"]
 pub(crate) struct PreparedConversationExecution<'borrow, 'connection, 'plan> {
-    pub(in crate::chat_protocol::state_machine::executor) transaction: &'borrow mut sqlx::Transaction<'connection, sqlx::Postgres>,
+    pub(in crate::chat_protocol::state_machine::executor) transaction:
+        &'borrow mut sqlx::Transaction<'connection, sqlx::Postgres>,
     pub(in crate::chat_protocol::state_machine::executor) plan: &'plan ConversationPersistencePlan,
     pub(in crate::chat_protocol::state_machine::executor) context: ExecutionContext,
     pub(in crate::chat_protocol::state_machine::executor) expected_transaction_id: Box<str>,
     pub(in crate::chat_protocol::state_machine::executor) recovery_write_authority:
         Option<crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'plan>>,
-    pub(in crate::chat_protocol::state_machine::executor) historical_write_authority: Option<HistoricalExecutionWriteAuthority>,
-    pub(in crate::chat_protocol::state_machine::executor) _proof: crate::chat_protocol::repository::execution_context::ExecutionContextHydrationProof,
+    pub(in crate::chat_protocol::state_machine::executor) historical_write_authority:
+        Option<HistoricalExecutionWriteAuthority>,
+    pub(in crate::chat_protocol::state_machine::executor) _proof:
+        crate::chat_protocol::repository::execution_context::ExecutionContextHydrationProof,
     #[cfg(any(
         test,
         all(
@@ -414,7 +429,8 @@ pub(crate) struct PreparedConversationExecution<'borrow, 'connection, 'plan> {
             not(feature = "server-bin")
         )
     ))]
-    pub(in crate::chat_protocol::state_machine::executor) drop_safety_probe: Option<DropSafetyProbe>,
+    pub(in crate::chat_protocol::state_machine::executor) drop_safety_probe:
+        Option<DropSafetyProbe>,
 }
 
 impl<'borrow, 'connection, 'plan> PreparedConversationExecution<'borrow, 'connection, 'plan> {
@@ -469,7 +485,9 @@ impl<'borrow, 'connection, 'plan> PreparedConversationExecution<'borrow, 'connec
 
     pub(in crate::chat_protocol) fn with_recovery_write_authority(
         mut self,
-        authority: crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'plan>,
+        authority: crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<
+            'plan,
+        >,
     ) -> Self {
         self.recovery_write_authority = Some(authority);
         self
@@ -640,4 +658,3 @@ pub(crate) struct AppliedTransition {
     pub(crate) event_positions: Vec<i64>,
     pub(crate) successor_coordinate: Option<PublicGroupSnapshotCoordinate>,
 }
-

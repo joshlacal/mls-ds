@@ -9,7 +9,6 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::common::executor_seed::{self, private_genuine_pending_reset_graph, PrivateGenuinePendingResetGraph};
 use crate::chat_protocol::repository::auth::RepositoryAuthorityClass;
 use crate::chat_protocol::repository::core::hydrate_locked_conversation_state;
 use crate::chat_protocol::repository::prelude::{
@@ -22,7 +21,9 @@ use crate::chat_protocol::transcript::{
     decode_and_verify_signed_mutation, decode_canonical_signed_mutation, SignedMutationKind,
     VerifiedMutationProjection, VerifiedSignedMutation,
 };
-
+use crate::common::executor_seed::{
+    self, private_genuine_pending_reset_graph, PrivateGenuinePendingResetGraph,
+};
 
 /// One principal's exact signing + registration identity. Field names match the
 /// `ResetFixture` the sibling reset harness uses, so the signing helpers below
@@ -100,15 +101,16 @@ fn verified_request(
         VerifiedMutationProjection::ResetActivation(_) => "blue.catbird.chat.activateReset",
         _ => panic!("reset test helper requires a Reset mutation"),
     };
-    let pre_replay = crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
-        Uuid::new_v4(),
-        *Uuid::new_v4().as_bytes().first_chunk::<12>().unwrap(),
-        endpoint,
-        &at.to_rfc3339_opts(SecondsFormat::Millis, true),
-        &fixture.actor_did,
-        fixture.actor_device_id,
-        &fixture.actor_dpop_jkt,
-    );
+    let pre_replay =
+        crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
+            Uuid::new_v4(),
+            *Uuid::new_v4().as_bytes().first_chunk::<12>().unwrap(),
+            endpoint,
+            &at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            &fixture.actor_dpop_jkt,
+        );
     let canonical =
         decode_canonical_signed_mutation(mutation.accepted_wrapper_bytes().unwrap()).unwrap();
     let receipt = crate::chat_protocol::repository::auth::reset_existing_device_receipt_for_test(
@@ -859,7 +861,24 @@ fn exactly_two_writers_clear_a_pending_reset_row_and_revocation_is_one() {
     let reset = include_str!("../reset.rs");
     let transition = include_str!("../transition.rs");
     let sweep = include_str!("../expiry_sweep.rs");
-    let executor = concat!(include_str!("../../state_machine/executor.rs"), include_str!("../../state_machine/executor/commit_leave_ops.rs"), include_str!("../../state_machine/executor/creation_ops.rs"), include_str!("../../state_machine/executor/dispatch.rs"), include_str!("../../state_machine/executor/event_chain.rs"), include_str!("../../state_machine/executor/federation_ops.rs"), include_str!("../../state_machine/executor/fulfillment_ops.rs"), include_str!("../../state_machine/executor/lifecycle_ops.rs"), include_str!("../../state_machine/executor/preflight.rs"), include_str!("../../state_machine/executor/prior_bound_ops.rs"), include_str!("../../state_machine/executor/pruning.rs"), include_str!("../../state_machine/executor/read_ops.rs"), include_str!("../../state_machine/executor/recovery_ops.rs"), include_str!("../../state_machine/executor/reset_accept_ops.rs"), include_str!("../../state_machine/executor/welcome_ops.rs"), include_str!("../../state_machine/executor/write_ops.rs"));
+    let executor = concat!(
+        include_str!("../../state_machine/executor.rs"),
+        include_str!("../../state_machine/executor/commit_leave_ops.rs"),
+        include_str!("../../state_machine/executor/creation_ops.rs"),
+        include_str!("../../state_machine/executor/dispatch.rs"),
+        include_str!("../../state_machine/executor/event_chain.rs"),
+        include_str!("../../state_machine/executor/federation_ops.rs"),
+        include_str!("../../state_machine/executor/fulfillment_ops.rs"),
+        include_str!("../../state_machine/executor/lifecycle_ops.rs"),
+        include_str!("../../state_machine/executor/preflight.rs"),
+        include_str!("../../state_machine/executor/prior_bound_ops.rs"),
+        include_str!("../../state_machine/executor/pruning.rs"),
+        include_str!("../../state_machine/executor/read_ops.rs"),
+        include_str!("../../state_machine/executor/recovery_ops.rs"),
+        include_str!("../../state_machine/executor/reset_accept_ops.rs"),
+        include_str!("../../state_machine/executor/welcome_ops.rs"),
+        include_str!("../../state_machine/executor/write_ops.rs")
+    );
 
     // Positive controls: each source really is the file it claims to be, so a
     // path that stops resolving cannot masquerade as a clean absence.
@@ -1079,7 +1098,10 @@ async fn activation_keeps_full_strict_live_authority_even_on_a_lapsed_row() {
 #[test]
 fn recorded_authority_disposal_still_binds_the_immutable_signed_bytes() {
     let source = include_str!("../reset.rs");
-    let prod_source = source.split("pub(super) mod test_support").next().unwrap_or(source);
+    let prod_source = source
+        .split("pub(super) mod test_support")
+        .next()
+        .unwrap_or(source);
     // Positive controls.
     assert!(prod_source.contains("fn seal_pending_reset("));
     assert!(prod_source.contains("enum ResetAuthorityBinding"));

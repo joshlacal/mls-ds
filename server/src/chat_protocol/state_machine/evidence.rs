@@ -267,7 +267,10 @@ pub(crate) struct LockedRecoveryReservationProjection {
 }
 
 impl LockedRecoveryReservationProjection {
-    pub(in crate::chat_protocol::state_machine) fn authorizes_acceptance(&self, transition: &TransitionEvidence) -> bool {
+    pub(in crate::chat_protocol::state_machine) fn authorizes_acceptance(
+        &self,
+        transition: &TransitionEvidence,
+    ) -> bool {
         let Some(TransitionBodyBinding::Acceptance { recovery, .. }) =
             transition.body_binding.as_ref()
         else {
@@ -295,7 +298,11 @@ impl LockedRecoveryReservationProjection {
             && self.durable_row_digest != [0; 32]
     }
 
-    pub(in crate::chat_protocol::state_machine) fn authorizes_request(&self, evidence: &RequestEvidence, kind: LeafRecoveryKind) -> bool {
+    pub(in crate::chat_protocol::state_machine) fn authorizes_request(
+        &self,
+        evidence: &RequestEvidence,
+        kind: LeafRecoveryKind,
+    ) -> bool {
         evidence.kind == RequestEntryKind::LeafRecoveryRequest
             && evidence.conversation_id == self.conversation_id
             && evidence.request_id == self.request_id
@@ -362,7 +369,9 @@ impl LockedRecoveryReservationProjection {
         &self.transaction_id
     }
 
-    pub(in crate::chat_protocol::state_machine) fn available_package_cas(&self) -> RecoveryPackageCasBinding {
+    pub(in crate::chat_protocol::state_machine) fn available_package_cas(
+        &self,
+    ) -> RecoveryPackageCasBinding {
         let mut binding = RecoveryPackageCasBinding {
             transaction_id: self.transaction_id.clone(),
             conversation_id: self.conversation_id,
@@ -636,7 +645,9 @@ pub(in crate::chat_protocol::state_machine) fn recovery_reservation_selection_di
 }
 
 #[cfg(test)]
-pub(in crate::chat_protocol::state_machine) fn coordinate_digest(coordinate: &PublicGroupSnapshotCoordinate) -> [u8; 32] {
+pub(in crate::chat_protocol::state_machine) fn coordinate_digest(
+    coordinate: &PublicGroupSnapshotCoordinate,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"CATBIRD-CHAT-COORDINATE\0");
     digest.update(coordinate.conversation_id());
@@ -774,7 +785,9 @@ pub(in crate::chat_protocol::state_machine) fn validate_request_evidence(
     Ok(())
 }
 
-pub(in crate::chat_protocol::state_machine) fn durable_signed_request_evidence_digest(evidence: &RequestEvidence) -> [u8; 32] {
+pub(in crate::chat_protocol::state_machine) fn durable_signed_request_evidence_digest(
+    evidence: &RequestEvidence,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"CATBIRD-CHAT-DURABLE-SIGNED-ROW\0");
     digest.update([evidence.kind as u8]);

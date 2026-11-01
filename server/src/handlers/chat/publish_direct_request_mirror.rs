@@ -395,7 +395,9 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
         let rec_device_id = d["recipientDeviceId"]
             .as_str()
             .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+            .ok_or_else(|| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
         let prov_bytes =
             serde_json::to_vec(&d["provenance"]).map_err(|_| ChatFailure::invariant(endpoint))?;
 

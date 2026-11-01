@@ -67,11 +67,10 @@ pub async fn claim_authorized_clean_key_package_candidate(
     .fetch_optional(&mut *tx)
     .await?;
 
-    let still_unexpired: bool =
-        sqlx::query_scalar("SELECT $1::timestamptz > clock_timestamp()")
-            .bind(not_after)
-            .fetch_one(&mut *tx)
-            .await?;
+    let still_unexpired: bool = sqlx::query_scalar("SELECT $1::timestamptz > clock_timestamp()")
+        .bind(not_after)
+        .fetch_one(&mut *tx)
+        .await?;
 
     if !still_unexpired {
         sqlx::query(
@@ -154,15 +153,11 @@ where
             });
         }
 
-        match claim_authorized_clean_key_package_candidate(
-            pool,
-            recipient_did,
-            &authoritative_keys,
-        )
-        .await
-        .map_err(|_| FederationError::ConfigError {
-            reason: "authorized KeyPackage claim failed".to_string(),
-        })? {
+        match claim_authorized_clean_key_package_candidate(pool, recipient_did, &authoritative_keys)
+            .await
+            .map_err(|_| FederationError::ConfigError {
+                reason: "authorized KeyPackage claim failed".to_string(),
+            })? {
             CleanFederationKeyPackageClaim::Claimed(bytes, hash) => {
                 return Ok(Some((bytes, hash)));
             }
@@ -299,19 +294,16 @@ mod tests {
     #[tokio::test]
     async fn incomplete_authority_returns_auth_failed_without_touching_pool() {
         let pool = DbPool::connect_lazy("postgres://127.0.0.1:5432/unused").expect("lazy pool");
-        let result = claim_current_authorized_key_package_with(
-            &pool,
-            "did:plc:w2incomplete",
-            || async {
+        let result =
+            claim_current_authorized_key_package_with(&pool, "did:plc:w2incomplete", || async {
                 Err(FederationError::ResolutionFailed {
                     did: String::new(),
                     kind: crate::federation::ResolutionFailureKind::InvalidPayload(
                         "pagination incomplete".to_string(),
                     ),
                 })
-            },
-        )
-        .await;
+            })
+            .await;
         assert!(matches!(result, Err(FederationError::AuthFailed { .. })));
     }
 

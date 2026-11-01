@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 impl HydrationAuthority {
     #[cfg(test)]
     pub(crate) fn new(expected_conversation_id: [u8; 16]) -> Result<Self, StateMachineError> {
@@ -331,7 +330,9 @@ impl HydrationAuthority {
         })
     }
 
-    pub(in crate::chat_protocol::state_machine) fn locked_binding(&self) -> Option<&LockedHydrationBinding> {
+    pub(in crate::chat_protocol::state_machine) fn locked_binding(
+        &self,
+    ) -> Option<&LockedHydrationBinding> {
         self.locked.as_ref()
     }
 

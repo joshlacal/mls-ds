@@ -342,34 +342,41 @@ mod tests {
             &document(&[&receipt]),
         )
         .unwrap();
-        let body = |checked: chrono::DateTime<Utc>, lifetime: Duration| RequestPushEligibilityBody {
-            protocol_version: 1,
-            authority_did: REQUEST_RECEIPT_AUTHORITY.into(),
-            key_id: signer.key_id().into(),
-            event_id: Uuid::new_v4().to_string(),
-            request_id: Uuid::new_v4().to_string(),
-            recipient_did: "did:web:bob.example.org".into(),
-            device_id: Uuid::new_v4().to_string(),
-            provider: "apns".into(),
-            registration_id: Uuid::new_v4().to_string(),
-            token_generation: 1,
-            binding_digest: URL_SAFE_NO_PAD.encode([3_u8; 32]),
-            target_key_id: URL_SAFE_NO_PAD.encode([7_u8; 32]),
-            device_auth_generation: 1,
-            conversation_id: Uuid::new_v4().to_string(),
-            first_message_id: Uuid::new_v4().to_string(),
-            sender_did: "did:web:alice.example.org".into(),
-            eligible: true,
-            checked_at: checked.to_rfc3339_opts(SecondsFormat::Millis, true),
-            expires_at: (checked + lifetime).to_rfc3339_opts(SecondsFormat::Millis, true),
-        };
+        let body =
+            |checked: chrono::DateTime<Utc>, lifetime: Duration| RequestPushEligibilityBody {
+                protocol_version: 1,
+                authority_did: REQUEST_RECEIPT_AUTHORITY.into(),
+                key_id: signer.key_id().into(),
+                event_id: Uuid::new_v4().to_string(),
+                request_id: Uuid::new_v4().to_string(),
+                recipient_did: "did:web:bob.example.org".into(),
+                device_id: Uuid::new_v4().to_string(),
+                provider: "apns".into(),
+                registration_id: Uuid::new_v4().to_string(),
+                token_generation: 1,
+                binding_digest: URL_SAFE_NO_PAD.encode([3_u8; 32]),
+                target_key_id: URL_SAFE_NO_PAD.encode([7_u8; 32]),
+                device_auth_generation: 1,
+                conversation_id: Uuid::new_v4().to_string(),
+                first_message_id: Uuid::new_v4().to_string(),
+                sender_did: "did:web:alice.example.org".into(),
+                eligible: true,
+                checked_at: checked.to_rfc3339_opts(SecondsFormat::Millis, true),
+                expires_at: (checked + lifetime).to_rfc3339_opts(SecondsFormat::Millis, true),
+            };
         for skew in [Duration::minutes(10), Duration::minutes(-10)] {
             let database_now = Utc::now() + skew;
             signer
-                .seal_request_push_eligibility(body(database_now, Duration::seconds(5)), database_now)
+                .seal_request_push_eligibility(
+                    body(database_now, Duration::seconds(5)),
+                    database_now,
+                )
                 .expect("eligibility at the database decision instant seals despite host skew");
             assert!(signer
-                .seal_request_push_eligibility(body(database_now, Duration::seconds(6)), database_now)
+                .seal_request_push_eligibility(
+                    body(database_now, Duration::seconds(6)),
+                    database_now
+                )
                 .is_err());
         }
     }
@@ -491,7 +498,8 @@ mod tests {
         let public = receipt.verifying_key().to_encoded_point(true);
         let mut multikey = vec![0x80, 0x24];
         multikey.extend_from_slice(public.as_bytes());
-        let key_id = direct_request_receipt_key_id_for_authority(authority, public.as_bytes()).unwrap();
+        let key_id =
+            direct_request_receipt_key_id_for_authority(authority, public.as_bytes()).unwrap();
         let methods = vec![serde_json::json!({
             "id": key_id,
             "controller": authority,
@@ -504,12 +512,9 @@ mod tests {
         })
         .to_string();
 
-        let signer = DirectRequestReceiptSigner::configured(
-            pem.as_str(),
-            service_pem.as_str(),
-            &doc,
-        )
-        .unwrap();
+        let signer =
+            DirectRequestReceiptSigner::configured(pem.as_str(), service_pem.as_str(), &doc)
+                .unwrap();
 
         assert_eq!(signer.authority_did(), authority);
         assert_eq!(signer.key_id(), key_id);

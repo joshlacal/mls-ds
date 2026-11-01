@@ -1,9 +1,7 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 impl HydrationAuthority {
-
     /// Re-enters a persisted public control row only after re-verifying its
     /// separately retained exact signed wrapper. Stored canonical projection,
     /// special server fields, fingerprint, and the digest of the complete

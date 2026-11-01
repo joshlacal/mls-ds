@@ -3,11 +3,12 @@ pub mod ack;
 pub(crate) mod bootstrap;
 #[cfg(any(test, feature = "test-support"))]
 pub mod bootstrap;
-pub mod commit_submitter;
 pub mod canonical_relay;
+pub mod commit_submitter;
 pub mod declaration_client;
 pub mod envelope;
 pub mod errors;
+pub mod group_relay;
 pub mod outbound;
 pub mod peer_policy;
 pub mod queue;
@@ -16,6 +17,7 @@ pub mod reconciliation;
 pub mod resolver;
 pub mod sequencer;
 pub mod service_auth;
+pub mod space_read_relay;
 pub mod transfer;
 
 pub use ack::*;
@@ -31,8 +33,8 @@ pub(crate) use bootstrap::{
     fetch_remote_prefix_admission, QuarantineReason, RemotePrefixApplyOutcome,
     RemotePrefixBootstrapError, RemotePrefixBootstrapSelector, VerifiedRemotePrefixAdmission,
 };
-pub use commit_submitter::*;
 pub use canonical_relay::*;
+pub use commit_submitter::*;
 pub use declaration_client::{DeviceRecord, DeviceRecordClient, DeviceRecordValue, MLSChatPolicy};
 pub use envelope::*;
 pub use errors::{FederationError, ResolutionFailureKind};
@@ -41,8 +43,8 @@ pub use receipt::{
     ReceiptDidDocumentError, ReceiptSigner, SequencerReceipt, RECEIPT_VERIFICATION_METHOD,
 };
 pub use resolver::{DsEndpoint, DsResolver};
-pub use service_auth::ServiceAuthClient;
 pub use sequencer::{CommitResult, Sequencer};
+pub use service_auth::ServiceAuthClient;
 use std::collections::BTreeSet;
 use std::sync::{OnceLock, RwLock};
 pub use transfer::{SequencerTransfer, TransferError, TransferResult};

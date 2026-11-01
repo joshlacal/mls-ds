@@ -6,16 +6,13 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::chat_protocol::validation;
-use crate::chat_protocol::repository;
-use crate::common;
 use crate::chat_protocol::dpop;
+use crate::chat_protocol::repository;
 use crate::chat_protocol::repository::auth::{
-    self, authorize_enrollment_operation_only,
-    authorize_replenishment_operation_only, authorize_signed_request, authorize_unsigned_request,
-    test_arbitrate_business_idempotency, test_recheck_business_authority,
-    test_record_completed_idempotency, AuthRepositoryError, AuthorizationOutcome,
-    EnrollmentOperationAdmission, SignedOperationAdmission,
+    self, authorize_enrollment_operation_only, authorize_replenishment_operation_only,
+    authorize_signed_request, authorize_unsigned_request, test_arbitrate_business_idempotency,
+    test_recheck_business_authority, test_record_completed_idempotency, AuthRepositoryError,
+    AuthorizationOutcome, EnrollmentOperationAdmission, SignedOperationAdmission,
     TestBusinessIdempotencyOutcome,
 };
 use crate::chat_protocol::repository::key_packages::NewKeyPackage;
@@ -23,6 +20,8 @@ use crate::chat_protocol::repository::prelude::{self, PreludeError};
 use crate::chat_protocol::transcript::{
     self, decode_and_verify_enrollment_body, decode_canonical_signed_mutation,
 };
+use crate::chat_protocol::validation;
+use crate::common;
 
 #[test]
 fn final_authority_constructor_requires_the_concrete_repository_receipt() {
@@ -596,8 +595,6 @@ async fn persist_and_complete_enrollment(
     )
     .await
 }
-
-
 
 async fn validate_enrollment_replay(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1879,8 +1876,6 @@ async fn completed_enrollment_replay_requires_exact_installed_generation_one_aut
     );
     transaction.rollback().await.unwrap();
 }
-
-
 
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]

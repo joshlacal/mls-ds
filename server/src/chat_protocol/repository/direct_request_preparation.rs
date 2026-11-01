@@ -1249,7 +1249,9 @@ pub(crate) async fn expire_due_preparations(
     let mut count = 0;
     for id in ids {
         let mut tx = pool.begin().await?;
-        sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *tx).await?;
+        sqlx::query("SET LOCAL lock_timeout = '1s'")
+            .execute(&mut *tx)
+            .await?;
         let operation = match super::prelude::try_lock_direct_request_operation(&mut tx, id).await {
             Ok(Some(op)) => op,
             Ok(None) => {
@@ -1277,7 +1279,8 @@ pub(crate) async fn expire_due_preparations(
         )
         .await
         {
-            let is_timeout = matches!(&error, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"));
+            let is_timeout =
+                matches!(&error, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"));
             if !is_timeout {
                 tracing::warn!(%error, request_id = %id, "expire_due_preparations identity scope lock failed, sweep skipped");
             }

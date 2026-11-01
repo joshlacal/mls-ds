@@ -3016,13 +3016,23 @@ pub(crate) async fn register_conversation_space_if_migrated(
     let Some((is_remote, sequencer_ds)) = row else {
         return Ok(());
     };
+    let canonicalize_did = |raw: &str| -> String {
+        raw.split('#')
+            .next()
+            .unwrap_or(raw)
+            .trim_end_matches('/')
+            .to_owned()
+    };
     let authority_did = if is_remote {
         let Some(ds) = sequencer_ds else {
             return Ok(());
         };
-        crate::identity::canonical_did(&ds).to_owned()
+        canonicalize_did(&ds)
     } else {
-        crate::identity::service_did_base_opt()
+        std::env::var("SERVICE_DID")
+            .ok()
+            .map(|raw| canonicalize_did(&raw))
+            .filter(|did| !did.is_empty())
             .unwrap_or_else(|| "did:web:localhost".to_owned())
     };
     let space_uri = format!(

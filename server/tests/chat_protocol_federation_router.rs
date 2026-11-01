@@ -4282,11 +4282,9 @@ async fn test_deliver_message_router_with_attachment_binding() {
     let clean_entry_id = Uuid::new_v4();
     let (_, clean_signed_req_bytes) =
         make_message_body(convo_id, clean_msg_id, &actor, &group_id, vec![], now);
-    let clean_mutation = decode_and_verify_signed_mutation(
-        &clean_signed_req_bytes,
-        actor.public_key.as_slice(),
-    )
-    .unwrap();
+    let clean_mutation =
+        decode_and_verify_signed_mutation(&clean_signed_req_bytes, actor.public_key.as_slice())
+            .unwrap();
     let clean_built = build_verified_application_entry(
         clean_mutation,
         CanonicalUuidV4::parse(&clean_entry_id.to_string()).unwrap(),
@@ -12980,7 +12978,9 @@ mod chat_protocol {
     pub mod read_projection {
         pub struct DummyCanonical;
         impl DummyCanonical {
-            pub fn bytes(&self) -> &[u8] { &[] }
+            pub fn bytes(&self) -> &[u8] {
+                &[]
+            }
         }
         pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
             _value: &T,
@@ -12990,4 +12990,3 @@ mod chat_protocol {
         }
     }
 }
-

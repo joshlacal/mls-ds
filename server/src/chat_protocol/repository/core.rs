@@ -4979,7 +4979,10 @@ async fn historical_request_receipt_key(
     key_id: &str,
 ) -> Result<Vec<u8>, ControlEvidenceLoadError> {
     sqlx::query_scalar("SELECT public_key FROM chat.direct_request_receipt_keys WHERE key_id=$1")
-        .bind(key_id).fetch_optional(&mut **tx).await?.ok_or(ControlEvidenceLoadError::InvalidEvidence)
+        .bind(key_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ControlEvidenceLoadError::InvalidEvidence)
 }
 
 // ===========================================================================
@@ -11034,7 +11037,6 @@ mod retained_recovery_package_tests {
         }
     }
 }
-
 
 #[cfg(test)]
 impl LockedConversationHeadGuard {

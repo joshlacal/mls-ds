@@ -222,9 +222,13 @@ pub fn verify_signed_request(
     ) {
         use p256::ecdsa::signature::Verifier;
         let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key).map_err(error)?;
-        let authority_did = body["authorityDid"].as_str().unwrap_or("did:web:chat.catbird.blue");
+        let authority_did = body["authorityDid"]
+            .as_str()
+            .unwrap_or("did:web:chat.catbird.blue");
         if body["keyId"].as_str()
-            != Some(direct_request_receipt_key_id_for_authority(authority_did, public_key)?.as_str())
+            != Some(
+                direct_request_receipt_key_id_for_authority(authority_did, public_key)?.as_str(),
+            )
         {
             return Err(error("receipt method fingerprint mismatch"));
         }
@@ -566,7 +570,9 @@ pub fn resolve_direct_request_receipt_key(
     }
     strict_document(authenticated_document)?;
     let doc: Value = serde_json::from_slice(authenticated_document).map_err(error)?;
-    let doc_id = doc["id"].as_str().ok_or_else(|| error("missing document id"))?;
+    let doc_id = doc["id"]
+        .as_str()
+        .ok_or_else(|| error("missing document id"))?;
     if !crate::chat_protocol::is_bare_did(doc_id) {
         return Err(error("invalid document owner DID"));
     }
@@ -587,8 +593,7 @@ pub fn resolve_direct_request_receipt_key(
         return Err(error("receipt method missing or ambiguous"));
     }
     let method = found[0];
-    if method["controller"].as_str() != Some(doc_id)
-        || method["type"].as_str() != Some("Multikey")
+    if method["controller"].as_str() != Some(doc_id) || method["type"].as_str() != Some("Multikey")
     {
         return Err(error("receipt controller or key type mismatch"));
     }
@@ -700,8 +705,10 @@ mod receipt_rotation_tests {
         let other_point = other_key.verifying_key().to_encoded_point(true);
         let mut other_multikey = vec![0x80, 0x24];
         other_multikey.extend_from_slice(other_point.as_bytes());
-        tampered_key["verificationMethod"][0]["publicKeyMultibase"] =
-            json!(multibase::encode(multibase::Base::Base58Btc, other_multikey));
+        tampered_key["verificationMethod"][0]["publicKeyMultibase"] = json!(multibase::encode(
+            multibase::Base::Base58Btc,
+            other_multikey
+        ));
         assert!(resolve_direct_request_receipt_key(
             &serde_json::to_vec(&tampered_key).unwrap(),
             id_a
@@ -1151,11 +1158,7 @@ fn read_definition(name: &str) -> Result<&'static Value> {
 /// not mutation admission: the strict signing and ingress APIs remain unchanged.
 /// Duplicate raw fields are rejected before JSON values can discard evidence.
 /// The returned value still passes the complete closed contract projection.
-pub fn normalize_read_presentation(
-    raw: &[u8],
-    name: &str,
-    tagged: bool,
-) -> Result<Value> {
+pub fn normalize_read_presentation(raw: &[u8], name: &str, tagged: bool) -> Result<Value> {
     if raw.len() > MAX_PUBLISH_HTTP_BODY_BYTES {
         return Err(error("JSON body cap"));
     }
@@ -1260,17 +1263,43 @@ fn endpoint_output_schema(nsid: &str) -> Option<&'static Value> {
     SCHEMAS
         .get_or_init(|| {
             endpoint_lexicons![
-                "acceptConversation", "acknowledgeEntries", "acknowledgeWelcome",
-                "activateReset", "authFull", "cancelDirectRequestPreparation",
-                "cancelLeafRecovery", "cancelLeave", "closeConversation", "createConversation",
-                "enrollDevice", "getConversationState", "getConversations", "getDeviceKey",
-                "getDevices", "getDirectRequestOutcome", "getEntries", "getLeafRecoveryInbox",
-                "getOwnDevices", "getPendingWelcomes", "getSubscriptionTicket",
-                "prepareDirectRequest", "publishDirectRequest", "publishDirectRequestKeys",
-                "publishTyping", "registerPushGateway", "rejectWelcome",
-                "relaySpaceCredential", "relaySpaceRead", "replenishKeyPackages",
-                "requestLeafRecovery", "requestLeave", "requestReset", "revokeDevice",
-                "sendMessage", "submitTransition", "subscribeEvents",
+                "acceptConversation",
+                "acknowledgeEntries",
+                "acknowledgeWelcome",
+                "activateReset",
+                "authFull",
+                "cancelDirectRequestPreparation",
+                "cancelLeafRecovery",
+                "cancelLeave",
+                "closeConversation",
+                "createConversation",
+                "enrollDevice",
+                "getConversationState",
+                "getConversations",
+                "getDeviceKey",
+                "getDevices",
+                "getDirectRequestOutcome",
+                "getEntries",
+                "getLeafRecoveryInbox",
+                "getOwnDevices",
+                "getPendingWelcomes",
+                "getSubscriptionTicket",
+                "prepareDirectRequest",
+                "publishDirectRequest",
+                "publishDirectRequestKeys",
+                "publishTyping",
+                "registerPushGateway",
+                "rejectWelcome",
+                "relaySpaceCredential",
+                "relaySpaceRead",
+                "replenishKeyPackages",
+                "requestLeafRecovery",
+                "requestLeave",
+                "requestReset",
+                "revokeDevice",
+                "sendMessage",
+                "submitTransition",
+                "subscribeEvents",
             ]
             .into_iter()
             .map(|(nsid, raw)| {
@@ -1379,8 +1408,7 @@ pub fn verify_received_signed_request(
     strict_document(raw_wrapper)?;
     let wrapper: Value = serde_json::from_slice(raw_wrapper).map_err(error)?;
     let tagged = kind == DirectRequestKind::Outcome && wrapper.get("$type").is_some();
-    let normalized =
-        normalize_read_presentation(raw_wrapper, kind.wrapper_name(), tagged)?;
+    let normalized = normalize_read_presentation(raw_wrapper, kind.wrapper_name(), tagged)?;
     let mut verified = verify_signed_request(
         kind,
         &serde_json::to_vec(&normalized).map_err(error)?,
@@ -1397,11 +1425,7 @@ pub fn verify_received_direct_request_acceptance_proof(
     trusted_authority_key: &[u8],
     recipient_device_key: &[u8],
 ) -> Result<Value> {
-    let proof = normalize_read_presentation(
-        raw_proof,
-        "directRequestAcceptanceProof",
-        false,
-    )?;
+    let proof = normalize_read_presentation(raw_proof, "directRequestAcceptanceProof", false)?;
     verify_direct_request_acceptance_proof(
         &serde_json::to_vec(&proof).map_err(error)?,
         trusted_authority_key,

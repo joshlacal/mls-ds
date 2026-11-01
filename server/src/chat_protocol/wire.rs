@@ -1271,7 +1271,12 @@ pub fn process_public_commit(
     commit: ValidatedPublicCommit,
     policy: PublicCommitValidationPolicy<'_>,
 ) -> Result<ProcessedPublicCommit, WireValidationError> {
-    process_public_commit_with_max(prior_state, commit, policy, MAX_KEY_PACKAGE_LIFETIME_SECONDS)
+    process_public_commit_with_max(
+        prior_state,
+        commit,
+        policy,
+        MAX_KEY_PACKAGE_LIFETIME_SECONDS,
+    )
 }
 
 /// Process a `C33` direct-request bootstrap Add Commit allowing `direct-request`

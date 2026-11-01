@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 /// Apply a generic `signedCommitTransition` (zero Adds): an epoch-changing
 /// crypto commit that may carry canonical RemoveLeaf effects. sv+1 AND epoch+1
 /// with a fresh hash/tag, metadata re-encryption, exact removed leaf-period and

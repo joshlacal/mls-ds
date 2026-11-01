@@ -1,9 +1,11 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 impl RecoveryPlanEncoder {
-    pub(in crate::chat_protocol::state_machine) fn public_state(&mut self, value: &ActivePublicState) {
+    pub(in crate::chat_protocol::state_machine) fn public_state(
+        &mut self,
+        value: &ActivePublicState,
+    ) {
         self.coordinate(value.coordinate());
         self.bytes(value.snapshot());
         self.bytes(value.snapshot_sha256());
@@ -24,7 +26,10 @@ impl RecoveryPlanEncoder {
         );
     }
 
-    pub(in crate::chat_protocol::state_machine) fn participant_hydration(&mut self, value: &ParticipantHydrationRow) {
+    pub(in crate::chat_protocol::state_machine) fn participant_hydration(
+        &mut self,
+        value: &ParticipantHydrationRow,
+    ) {
         self.bytes(value.principal.as_bytes());
         self.u8(participant_status_code(value.status));
         self.u8(participant_role_code(value.role));
@@ -36,7 +41,10 @@ impl RecoveryPlanEncoder {
         self.option(value.acceptance.as_ref(), Self::transition);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn leaf_hydration(&mut self, value: &LeafHydrationRow) {
+    pub(in crate::chat_protocol::state_machine) fn leaf_hydration(
+        &mut self,
+        value: &LeafHydrationRow,
+    ) {
         self.device(&value.device);
         self.u32(value.leaf_index);
         self.bytes(&value.basic_credential);
@@ -47,7 +55,10 @@ impl RecoveryPlanEncoder {
         });
     }
 
-    pub(in crate::chat_protocol::state_machine) fn interval_hydration(&mut self, value: &IntervalHydrationRow) {
+    pub(in crate::chat_protocol::state_machine) fn interval_hydration(
+        &mut self,
+        value: &IntervalHydrationRow,
+    ) {
         self.device(&value.recipient);
         self.u64(value.generation);
         self.transition(&value.opening);
@@ -59,13 +70,19 @@ impl RecoveryPlanEncoder {
         });
     }
 
-    pub(in crate::chat_protocol::state_machine) fn terminal_proof_hydration(&mut self, value: &TerminalProofHydrationRow) {
+    pub(in crate::chat_protocol::state_machine) fn terminal_proof_hydration(
+        &mut self,
+        value: &TerminalProofHydrationRow,
+    ) {
         self.device(&value.recipient);
         self.bytes(&value.conversation_id);
         self.transition(&value.evidence);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn work_terminal_hydration(&mut self, value: &WorkTerminalHydrationRow) {
+    pub(in crate::chat_protocol::state_machine) fn work_terminal_hydration(
+        &mut self,
+        value: &WorkTerminalHydrationRow,
+    ) {
         match value {
             WorkTerminalHydrationRow::Transition(value) => {
                 self.u8(1);
@@ -86,7 +103,10 @@ impl RecoveryPlanEncoder {
         }
     }
 
-    pub(in crate::chat_protocol::state_machine) fn recovery_request_hydration(&mut self, value: &RecoveryRequestHydrationRow) {
+    pub(in crate::chat_protocol::state_machine) fn recovery_request_hydration(
+        &mut self,
+        value: &RecoveryRequestHydrationRow,
+    ) {
         self.bytes(&value.request_id);
         self.device(&value.target);
         self.u8(recovery_kind_code(value.kind));
@@ -109,7 +129,10 @@ impl RecoveryPlanEncoder {
         self.option(value.terminal.as_ref(), Self::work_terminal_hydration);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn recovery_reservation_hydration(&mut self, value: &RecoveryReservationHydrationRow) {
+    pub(in crate::chat_protocol::state_machine) fn recovery_reservation_hydration(
+        &mut self,
+        value: &RecoveryReservationHydrationRow,
+    ) {
         self.bytes(&value.request_id);
         self.device(&value.target);
         self.coordinate(&value.bound_coordinate);
@@ -121,7 +144,10 @@ impl RecoveryPlanEncoder {
         self.option(value.terminal.as_ref(), Self::work_terminal_hydration);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn reset_hydration(&mut self, value: &ResetRequestHydrationRow) {
+    pub(in crate::chat_protocol::state_machine) fn reset_hydration(
+        &mut self,
+        value: &ResetRequestHydrationRow,
+    ) {
         self.bytes(&value.request_id);
         self.device(&value.requester);
         self.coordinate(&value.bound_coordinate);
@@ -132,12 +158,18 @@ impl RecoveryPlanEncoder {
         self.option(value.terminal.as_ref(), Self::work_terminal_hydration);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn participant_removal(&mut self, value: &ParticipantRemovalEvidence) {
+    pub(in crate::chat_protocol::state_machine) fn participant_removal(
+        &mut self,
+        value: &ParticipantRemovalEvidence,
+    ) {
         self.participant_hydration(&value.participant_hydration());
         self.transition(value.terminal());
     }
 
-    pub(in crate::chat_protocol::state_machine) fn leave_hydration(&mut self, value: &LeaveRequestHydrationRow) {
+    pub(in crate::chat_protocol::state_machine) fn leave_hydration(
+        &mut self,
+        value: &LeaveRequestHydrationRow,
+    ) {
         self.bytes(&value.request_id);
         self.device(&value.requester);
         self.coordinate(&value.bound_coordinate);
@@ -152,7 +184,10 @@ impl RecoveryPlanEncoder {
         );
     }
 
-    pub(in crate::chat_protocol::state_machine) fn welcome_hydration(&mut self, value: &WelcomeHydrationRow) {
+    pub(in crate::chat_protocol::state_machine) fn welcome_hydration(
+        &mut self,
+        value: &WelcomeHydrationRow,
+    ) {
         self.bytes(&value.welcome_id);
         self.device(&value.recipient);
         self.u64(value.transition_seq);
@@ -166,7 +201,10 @@ impl RecoveryPlanEncoder {
         self.option(value.terminal.as_ref(), Self::work_terminal_hydration);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn state_hydration(&mut self, value: &ConversationStateHydration) {
+    pub(in crate::chat_protocol::state_machine) fn state_hydration(
+        &mut self,
+        value: &ConversationStateHydration,
+    ) {
         self.bytes(b"successor-state");
         self.u8(conversation_kind_code(value.kind));
         self.coordinate(&value.coordinate);
@@ -190,7 +228,10 @@ impl RecoveryPlanEncoder {
 }
 
 impl RecoveryPlanEncoder {
-    pub(in crate::chat_protocol::state_machine) fn work_terminal(&mut self, value: &WorkTerminalEvidence) {
+    pub(in crate::chat_protocol::state_machine) fn work_terminal(
+        &mut self,
+        value: &WorkTerminalEvidence,
+    ) {
         match value {
             WorkTerminalEvidence::Transition(value) => {
                 self.u8(1);
@@ -211,7 +252,10 @@ impl RecoveryPlanEncoder {
         }
     }
 
-    pub(in crate::chat_protocol::state_machine) fn participant(&mut self, value: &ParticipantRecord) {
+    pub(in crate::chat_protocol::state_machine) fn participant(
+        &mut self,
+        value: &ParticipantRecord,
+    ) {
         self.bytes(value.principal.as_bytes());
         self.u8(participant_status_code(value.status));
         self.u8(participant_role_code(value.role));
@@ -246,13 +290,19 @@ impl RecoveryPlanEncoder {
         });
     }
 
-    pub(in crate::chat_protocol::state_machine) fn terminal_proof(&mut self, value: &ScheduleTerminalProof) {
+    pub(in crate::chat_protocol::state_machine) fn terminal_proof(
+        &mut self,
+        value: &ScheduleTerminalProof,
+    ) {
         self.device(&value.recipient);
         self.bytes(&value.conversation_id);
         self.transition(&value.evidence);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn recovery_request(&mut self, value: &RecoveryRequest) {
+    pub(in crate::chat_protocol::state_machine) fn recovery_request(
+        &mut self,
+        value: &RecoveryRequest,
+    ) {
         self.bytes(&value.request_id);
         self.device(&value.target);
         self.u8(recovery_kind_code(value.kind));
@@ -275,7 +325,10 @@ impl RecoveryPlanEncoder {
         self.option(value.terminal.as_ref(), Self::work_terminal);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn recovery_reservation(&mut self, value: &RecoveryReservation) {
+    pub(in crate::chat_protocol::state_machine) fn recovery_reservation(
+        &mut self,
+        value: &RecoveryReservation,
+    ) {
         self.bytes(&value.request_id);
         self.device(&value.target);
         self.coordinate(&value.bound_coordinate);
@@ -343,7 +396,11 @@ impl RecoveryPlanEncoder {
         self.usize(value.pending_welcomes);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn state_change<T>(&mut self, value: &StateChange<T>, mut encode: impl FnMut(&mut Self, &T)) {
+    pub(in crate::chat_protocol::state_machine) fn state_change<T>(
+        &mut self,
+        value: &StateChange<T>,
+        mut encode: impl FnMut(&mut Self, &T),
+    ) {
         self.option(value.before.as_ref(), |encoder, value| {
             encode(encoder, value)
         });
@@ -352,14 +409,20 @@ impl RecoveryPlanEncoder {
         });
     }
 
-    pub(in crate::chat_protocol::state_machine) fn package_transition(&mut self, value: &PackageTransition) {
+    pub(in crate::chat_protocol::state_machine) fn package_transition(
+        &mut self,
+        value: &PackageTransition,
+    ) {
         self.bytes(&value.request_id);
         self.bytes(&value.key_package_ref);
         self.u8(package_status_code(value.from));
         self.u8(package_status_code(value.to));
     }
 
-    pub(in crate::chat_protocol::state_machine) fn recovery_package_cas(&mut self, value: &RecoveryPackageCasBinding) {
+    pub(in crate::chat_protocol::state_machine) fn recovery_package_cas(
+        &mut self,
+        value: &RecoveryPackageCasBinding,
+    ) {
         self.bytes(value.transaction_id.as_bytes());
         self.bytes(&value.conversation_id);
         self.bytes(&value.request_id);
@@ -377,7 +440,10 @@ impl RecoveryPlanEncoder {
         self.bytes(&value.authority_digest);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn revocation_package_cas(&mut self, value: &RevocationPackageCasBinding) {
+    pub(in crate::chat_protocol::state_machine) fn revocation_package_cas(
+        &mut self,
+        value: &RevocationPackageCasBinding,
+    ) {
         self.bytes(value.transaction_id.as_bytes());
         self.device(&value.target);
         self.bytes(&value.target_key_id);
@@ -400,7 +466,10 @@ impl RecoveryPlanEncoder {
         self.bytes(&value.locked_row_digest);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn revocation_target_cas(&mut self, value: &RevocationTargetCasBinding) {
+    pub(in crate::chat_protocol::state_machine) fn revocation_target_cas(
+        &mut self,
+        value: &RevocationTargetCasBinding,
+    ) {
         self.bytes(value.transaction_id.as_bytes());
         self.device(&value.target);
         self.u64(value.expected_auth_generation);
@@ -410,7 +479,10 @@ impl RecoveryPlanEncoder {
         self.bytes(&value.locked_row_digest);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn welcome_cas(&mut self, value: &WelcomeCasBinding) {
+    pub(in crate::chat_protocol::state_machine) fn welcome_cas(
+        &mut self,
+        value: &WelcomeCasBinding,
+    ) {
         self.bytes(value.transaction_id.as_bytes());
         self.bytes(&value.conversation_id);
         self.bytes(&value.welcome_id);
@@ -428,7 +500,10 @@ impl RecoveryPlanEncoder {
         self.bytes(&value.seal);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn invitation_quota_cas(&mut self, value: &InvitationQuotaCasBinding) {
+    pub(in crate::chat_protocol::state_machine) fn invitation_quota_cas(
+        &mut self,
+        value: &InvitationQuotaCasBinding,
+    ) {
         self.bytes(value.transaction_id.as_bytes());
         self.bytes(value.inviter.as_bytes());
         self.slice(&value.new_recipients, |encoder, value| {
@@ -450,7 +525,10 @@ impl RecoveryPlanEncoder {
         self.bytes(&value.locked_row_digest);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn head_cas(&mut self, value: &ConversationHeadCasBinding) {
+    pub(in crate::chat_protocol::state_machine) fn head_cas(
+        &mut self,
+        value: &ConversationHeadCasBinding,
+    ) {
         self.bytes(value.transaction_id.as_bytes());
         self.bytes(&value.conversation_id);
         self.option(value.expected_prior.as_ref(), Self::coordinate);
@@ -466,7 +544,10 @@ impl RecoveryPlanEncoder {
         self.bytes(&value.locked_head_digest);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn transition_effects(&mut self, value: &TransitionEffects) {
+    pub(in crate::chat_protocol::state_machine) fn transition_effects(
+        &mut self,
+        value: &TransitionEffects,
+    ) {
         self.bytes(b"transition-effects");
         self.u8(plan_kind_code(value.kind));
         self.slice(&value.opened_intervals, Self::device);
@@ -528,7 +609,9 @@ impl RecoveryPlanEncoder {
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn conversation_kind_code(value: ConversationKind) -> u8 {
+pub(in crate::chat_protocol::state_machine) fn conversation_kind_code(
+    value: ConversationKind,
+) -> u8 {
     match value {
         ConversationKind::Direct => 1,
         ConversationKind::Group => 2,
@@ -561,7 +644,9 @@ pub(in crate::chat_protocol::state_machine) fn recovery_source_code(value: Recov
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn recovery_request_status_code(value: RecoveryRequestStatus) -> u8 {
+pub(in crate::chat_protocol::state_machine) fn recovery_request_status_code(
+    value: RecoveryRequestStatus,
+) -> u8 {
     match value {
         RecoveryRequestStatus::Open => 1,
         RecoveryRequestStatus::Fulfilled => 2,
@@ -571,7 +656,9 @@ pub(in crate::chat_protocol::state_machine) fn recovery_request_status_code(valu
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn reservation_status_code(value: ReservationStatus) -> u8 {
+pub(in crate::chat_protocol::state_machine) fn reservation_status_code(
+    value: ReservationStatus,
+) -> u8 {
     match value {
         ReservationStatus::Active => 1,
         ReservationStatus::Consumed => 2,
@@ -580,7 +667,9 @@ pub(in crate::chat_protocol::state_machine) fn reservation_status_code(value: Re
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn reset_request_status_code(value: ResetRequestStatus) -> u8 {
+pub(in crate::chat_protocol::state_machine) fn reset_request_status_code(
+    value: ResetRequestStatus,
+) -> u8 {
     match value {
         ResetRequestStatus::Pending => 1,
         ResetRequestStatus::Stale => 2,
@@ -593,7 +682,9 @@ pub(in crate::chat_protocol::state_machine) fn reset_request_status_code(value: 
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn leave_request_status_code(value: LeaveRequestStatus) -> u8 {
+pub(in crate::chat_protocol::state_machine) fn leave_request_status_code(
+    value: LeaveRequestStatus,
+) -> u8 {
     match value {
         LeaveRequestStatus::Pending => 1,
         LeaveRequestStatus::Fulfilled => 2,
@@ -613,7 +704,9 @@ pub(in crate::chat_protocol::state_machine) fn package_status_code(value: Packag
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn registration_status_code(value: PersistedRegistrationStatus) -> u8 {
+pub(in crate::chat_protocol::state_machine) fn registration_status_code(
+    value: PersistedRegistrationStatus,
+) -> u8 {
     match value {
         PersistedRegistrationStatus::Active => 1,
         PersistedRegistrationStatus::Revoked => 2,
@@ -643,7 +736,9 @@ pub(in crate::chat_protocol::state_machine) fn plan_kind_code(value: PlanKind) -
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn participant_status_code(value: ParticipantStatus) -> u8 {
+pub(in crate::chat_protocol::state_machine) fn participant_status_code(
+    value: ParticipantStatus,
+) -> u8 {
     match value {
         ParticipantStatus::Pending => 1,
         ParticipantStatus::Active => 2,
@@ -676,7 +771,9 @@ pub(in crate::chat_protocol::state_machine) fn request_kind_code(value: RequestE
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn signed_mutation_kind_code(value: SignedMutationKind) -> u8 {
+pub(in crate::chat_protocol::state_machine) fn signed_mutation_kind_code(
+    value: SignedMutationKind,
+) -> u8 {
     match value {
         SignedMutationKind::DirectRequestPublication => 26,
         SignedMutationKind::DirectRequestAcceptance => 27,
@@ -707,7 +804,9 @@ pub(in crate::chat_protocol::state_machine) fn signed_mutation_kind_code(value: 
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn invitation_quota_recipient_facts_valid(binding: &InvitationQuotaCasBinding) -> bool {
+pub(in crate::chat_protocol::state_machine) fn invitation_quota_recipient_facts_valid(
+    binding: &InvitationQuotaCasBinding,
+) -> bool {
     binding.recipient_facts.len() == binding.new_recipients.len()
         && binding
             .recipient_facts

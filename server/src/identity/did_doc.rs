@@ -5,8 +5,8 @@
 use p256::ecdsa::VerifyingKey;
 use serde_json::{json, Value};
 
-pub use super::did_web_document_path;
 use super::canonical_did;
+pub use super::did_web_document_path;
 use crate::chat_protocol::direct_request_transcript::direct_request_receipt_key_id_for_authority;
 
 /// Encode a P-256 public key as a compressed `Multikey` (`0x80 0x24` `p256-pub` multicodec + 33-byte SEC1 compressed point in `base58btc`).

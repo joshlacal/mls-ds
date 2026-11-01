@@ -30,14 +30,14 @@ use super::super::relationship_policy::{
     fixed_production_relationship_policy_config,
     hydrate_persisted_fallback_relationship_projection,
     hydrate_persisted_fallback_traffic_projection, AdmissionOperation, AdmissionRequest,
-    DatabaseAnchoredProjectionClock,
-    DeclarationRecordEvidenceKind, EvidenceKind, IncomingPolicy, PersistedDeclarationEvidence,
-    PersistedGraphRelationshipEvidence, PersistedRelationshipProjection,
-    PersistedTrafficProjection, ProductionRelationshipTransport, ProjectionOperationScope,
-    ProjectionScope, PublicTransport, RelationshipAuthority, RelationshipPolicyConfig,
-    RelationshipPolicyConfigError, RelationshipProjection, ReqwestPinnedTransport,
-    SealedRelationshipProjection, SealedTrafficProjection, SystemDnsResolver, TrafficGraphScope,
-    TrafficProjection, TransportError, TransportSecurityProfile, HARDENED_SOURCE_PROFILE_V1,
+    DatabaseAnchoredProjectionClock, DeclarationRecordEvidenceKind, EvidenceKind, IncomingPolicy,
+    PersistedDeclarationEvidence, PersistedGraphRelationshipEvidence,
+    PersistedRelationshipProjection, PersistedTrafficProjection, ProductionRelationshipTransport,
+    ProjectionOperationScope, ProjectionScope, PublicTransport, RelationshipAuthority,
+    RelationshipPolicyConfig, RelationshipPolicyConfigError, RelationshipProjection,
+    ReqwestPinnedTransport, SealedRelationshipProjection, SealedTrafficProjection,
+    SystemDnsResolver, TrafficGraphScope, TrafficProjection, TransportError,
+    TransportSecurityProfile, HARDENED_SOURCE_PROFILE_V1,
 };
 #[cfg(feature = "test-support")]
 use super::super::relationship_policy::{
@@ -2694,15 +2694,21 @@ pub(crate) async fn verify_federated_send_policy<T: PublicTransport>(
     let clock = anchor_projection_clock(&mut **tx)
         .await
         .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
-    let projection = authority.collect_traffic_projection(
-        &clock, revision, actor.to_owned(), roster,
-    ).await.map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    let projection = authority
+        .collect_traffic_projection(&clock, revision, actor.to_owned(), roster)
+        .await
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
     let observed_at = observe_post_lock_time(tx)
         .await
         .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
     let decision = TrustedRelationshipDecisionInstant::from_locked_traffic_scope(
-        transaction_id, scope, authenticated_request_digest, locked_head_digest, observed_at,
-    ).ok_or(RelationshipConsumptionError::InvalidWitness)?;
+        transaction_id,
+        scope,
+        authenticated_request_digest,
+        locked_head_digest,
+        observed_at,
+    )
+    .ok_or(RelationshipConsumptionError::InvalidWitness)?;
     consume_traffic_projection(&projection, authority, &decision)
         .map_err(|_| RelationshipConsumptionError::PolicyDenied)
 }

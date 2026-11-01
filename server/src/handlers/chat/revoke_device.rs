@@ -84,6 +84,7 @@ async fn revoke(
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
     if let Some((did, device_id)) = revoked_ws_target {
         runtime.disconnect_device_ws(&did, device_id);
+        runtime.spawn_post_commit_device_revoked(pool, &did);
         runtime.notify_events();
     }
     Ok(response)

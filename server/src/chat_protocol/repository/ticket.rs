@@ -736,13 +736,19 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
     Ok((URL_SAFE_NO_PAD.encode(opaque), expires_at, inventory_scope))
 }
 
-fn map_inventory_session_error(error: inventory::InventoryRepositoryError) -> TicketRepositoryError {
+fn map_inventory_session_error(
+    error: inventory::InventoryRepositoryError,
+) -> TicketRepositoryError {
     match error {
-        inventory::InventoryRepositoryError::SessionNotFound => TicketRepositoryError::SessionMissing,
+        inventory::InventoryRepositoryError::SessionNotFound => {
+            TicketRepositoryError::SessionMissing
+        }
         inventory::InventoryRepositoryError::DeviceAuthorityMismatch => {
             TicketRepositoryError::DeviceBindingMismatch
         }
-        inventory::InventoryRepositoryError::Database(error) => TicketRepositoryError::Database(error),
+        inventory::InventoryRepositoryError::Database(error) => {
+            TicketRepositoryError::Database(error)
+        }
         _ => TicketRepositoryError::SessionBindingMismatch,
     }
 }

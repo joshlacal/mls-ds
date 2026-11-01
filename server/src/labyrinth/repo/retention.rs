@@ -35,6 +35,19 @@ pub async fn purge_account(
         .bind(did)
         .execute(&mut *conn)
         .await?;
+    sqlx::query("DELETE FROM chat.conversation_space_writers WHERE writer_did = $1")
+        .bind(did)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        "UPDATE chat.space_credential_jtis \
+            SET revoked_at = COALESCE(revoked_at, $2) \
+          WHERE writer_did = $1",
+    )
+    .bind(did)
+    .bind(at)
+    .execute(&mut *conn)
+    .await?;
     purge_mailbox(conn, did).await?;
     Ok(sequenced)
 }

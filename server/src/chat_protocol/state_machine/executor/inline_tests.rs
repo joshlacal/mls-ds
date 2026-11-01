@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[cfg(test)]
 mod authority_shape_tests {
     use super::*;
@@ -261,6 +260,7 @@ mod authority_shape_tests {
     )
 ))]
 pub(in crate::chat_protocol::state_machine::executor) mod metadata_executor_tests {
+    use super::*;
     use crate::chat_protocol::state_machine::{
         AuthenticatedEntryEvidence, ConversationPersistencePlan, ConversationStateHydration,
         LeaveRequest, LeaveRequestHydrationRow, MetadataAvatarDescriptorBinding,
@@ -270,7 +270,6 @@ pub(in crate::chat_protocol::state_machine::executor) mod metadata_executor_test
         RequestEvidence, ResetRequestHydrationRow, StateChange, StateCounts, TransitionBodyBinding,
         TransitionEffects, WelcomeHydrationRow, WorkTerminalHydrationRow,
     };
-    use super::*;
 
     fn uuid(marker: u8) -> [u8; 16] {
         let mut value = [marker; 16];
@@ -479,17 +478,19 @@ pub(in crate::chat_protocol::state_machine::executor) mod metadata_executor_test
             after: Some(next_metadata.clone()),
         });
         effects.authority = Some(PlanAuthority::Transition(producer.clone()));
-        effects.head_cas = Some(crate::chat_protocol::state_machine::ConversationHeadCasBinding {
-            transaction_id: "metadata-executor-test-tx".to_owned(),
-            conversation_id,
-            expected_prior: Some(prior),
-            expected_next_entry_seq: 6,
-            allocated_entry_id: Some(transition_id),
-            allocated_seq: Some(6),
-            successor_next_entry_seq: 7,
-            locked_at: received_at,
-            locked_head_digest: [0x34; 32],
-        });
+        effects.head_cas = Some(
+            crate::chat_protocol::state_machine::ConversationHeadCasBinding {
+                transaction_id: "metadata-executor-test-tx".to_owned(),
+                conversation_id,
+                expected_prior: Some(prior),
+                expected_next_entry_seq: 6,
+                allocated_entry_id: Some(transition_id),
+                allocated_seq: Some(6),
+                successor_next_entry_seq: 7,
+                locked_at: received_at,
+                locked_head_digest: [0x34; 32],
+            },
+        );
         let plan = ConversationPersistencePlan {
             expected_prior: Some(prior),
             retired_coordinate: None,

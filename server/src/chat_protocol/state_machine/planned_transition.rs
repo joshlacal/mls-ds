@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 /// Fulfill retained group-leave consent with a different-DID current leaf.
 /// The Commit must remove every and only requester leaf and contain no Add.
 pub(in crate::chat_protocol::state_machine) fn plan_leave_fulfillment_inner(

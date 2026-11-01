@@ -23,7 +23,10 @@ fn state_machine_source() -> String {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut source = fs::read_to_string(manifest_dir.join("src/chat_protocol/state_machine.rs"))
         .expect("read state-machine source");
-    append_non_test_rs_files(&manifest_dir.join("src/chat_protocol/state_machine"), &mut source);
+    append_non_test_rs_files(
+        &manifest_dir.join("src/chat_protocol/state_machine"),
+        &mut source,
+    );
     append_non_test_rs_files(
         &manifest_dir.join("src/chat_protocol/state_machine/executor"),
         &mut source,

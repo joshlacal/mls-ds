@@ -57,7 +57,6 @@ async fn concurrency_db(
 // Harness (adapted from tests/chat_protocol_delivery.rs + the executor seeders).
 // ---------------------------------------------------------------------------
 
-
 struct BaseConversation {
     conversation_id: Uuid,
     actor_did: String,

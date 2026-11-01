@@ -1,5 +1,5 @@
-use super::transcript::*;
 use super::model;
+use super::transcript::*;
 use super::validation::{
     ed25519_key_id, CanonicalTimestamp, CanonicalUuidV4, TrustedRequestInstant,
 };

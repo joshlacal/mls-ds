@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 /// Fingerprint admission must reject every Recovery-fulfillment family splice,
 /// not merely find one valid edge inside a larger malformed family. The
 /// executor repeats the deeper identity/bijection checks before its first
@@ -286,7 +285,11 @@ impl RecoveryPlanEncoder {
         self.u8(u8::from(value));
     }
 
-    pub(in crate::chat_protocol::state_machine) fn option<T: ?Sized>(&mut self, value: Option<&T>, encode: impl FnOnce(&mut Self, &T)) {
+    pub(in crate::chat_protocol::state_machine) fn option<T: ?Sized>(
+        &mut self,
+        value: Option<&T>,
+        encode: impl FnOnce(&mut Self, &T),
+    ) {
         match value {
             None => self.u8(0),
             Some(value) => {
@@ -296,14 +299,21 @@ impl RecoveryPlanEncoder {
         }
     }
 
-    pub(in crate::chat_protocol::state_machine) fn slice<T>(&mut self, values: &[T], mut encode: impl FnMut(&mut Self, &T)) {
+    pub(in crate::chat_protocol::state_machine) fn slice<T>(
+        &mut self,
+        values: &[T],
+        mut encode: impl FnMut(&mut Self, &T),
+    ) {
         self.u64(values.len() as u64);
         for value in values {
             encode(self, value);
         }
     }
 
-    pub(in crate::chat_protocol::state_machine) fn coordinate(&mut self, value: &PublicGroupSnapshotCoordinate) {
+    pub(in crate::chat_protocol::state_machine) fn coordinate(
+        &mut self,
+        value: &PublicGroupSnapshotCoordinate,
+    ) {
         self.bytes(value.conversation_id());
         self.u64(value.generation());
         self.u64(value.state_version());
@@ -326,7 +336,10 @@ impl RecoveryPlanEncoder {
         self.i64(value.unix_millis());
     }
 
-    pub(in crate::chat_protocol::state_machine) fn authenticated_entry(&mut self, value: &AuthenticatedEntryEvidence) {
+    pub(in crate::chat_protocol::state_machine) fn authenticated_entry(
+        &mut self,
+        value: &AuthenticatedEntryEvidence,
+    ) {
         self.u8(signed_mutation_kind_code(value.kind));
         self.bytes(value.type_id.as_bytes());
         self.bytes(&value.domain);
@@ -347,7 +360,10 @@ impl RecoveryPlanEncoder {
         self.bytes(&value.transcript_bytes);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn transition(&mut self, value: &TransitionEvidence) {
+    pub(in crate::chat_protocol::state_machine) fn transition(
+        &mut self,
+        value: &TransitionEvidence,
+    ) {
         self.u64(value.seq);
         self.bytes(&value.transition_id);
         self.bytes(&value.outer_entry_fingerprint);
@@ -359,7 +375,10 @@ impl RecoveryPlanEncoder {
         self.option(value.body_binding.as_ref(), Self::transition_body);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn transition_body(&mut self, value: &TransitionBodyBinding) {
+    pub(in crate::chat_protocol::state_machine) fn transition_body(
+        &mut self,
+        value: &TransitionBodyBinding,
+    ) {
         match value {
             TransitionBodyBinding::DirectRequestPublication {
                 prior,
@@ -525,7 +544,10 @@ impl RecoveryPlanEncoder {
         }
     }
 
-    pub(in crate::chat_protocol::state_machine) fn roster_manifest(&mut self, value: &RosterManifestBinding) {
+    pub(in crate::chat_protocol::state_machine) fn roster_manifest(
+        &mut self,
+        value: &RosterManifestBinding,
+    ) {
         self.slice(&value.participants, |encoder, participant| {
             encoder.bytes(participant.principal.as_bytes());
             encoder.u8(participant_status_code(participant.status));
@@ -535,12 +557,18 @@ impl RecoveryPlanEncoder {
         self.device(&value.actor_leaf);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn invitation_binding(&mut self, value: &InvitationBinding) {
+    pub(in crate::chat_protocol::state_machine) fn invitation_binding(
+        &mut self,
+        value: &InvitationBinding,
+    ) {
         self.bytes(&value.transition_id);
         self.device(&value.inviter);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn acceptance_recovery(&mut self, value: &AcceptanceRecoveryBinding) {
+    pub(in crate::chat_protocol::state_machine) fn acceptance_recovery(
+        &mut self,
+        value: &AcceptanceRecoveryBinding,
+    ) {
         self.bytes(&value.request_id);
         self.bytes(&value.conversation_id);
         self.device(&value.target);
@@ -556,7 +584,10 @@ impl RecoveryPlanEncoder {
         self.bytes(&value.canonical_digest);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn transition_manifest(&mut self, value: &TransitionManifestBinding) {
+    pub(in crate::chat_protocol::state_machine) fn transition_manifest(
+        &mut self,
+        value: &TransitionManifestBinding,
+    ) {
         self.slice(
             &value.participant_changes,
             Self::manifest_participant_change,
@@ -575,7 +606,10 @@ impl RecoveryPlanEncoder {
         });
     }
 
-    pub(in crate::chat_protocol::state_machine) fn manifest_participant_change(&mut self, value: &ManifestParticipantChange) {
+    pub(in crate::chat_protocol::state_machine) fn manifest_participant_change(
+        &mut self,
+        value: &ManifestParticipantChange,
+    ) {
         match value {
             ManifestParticipantChange::Add(principal) => {
                 self.u8(1);
@@ -593,7 +627,10 @@ impl RecoveryPlanEncoder {
         }
     }
 
-    pub(in crate::chat_protocol::state_machine) fn manifest_leaf_change(&mut self, value: &ManifestLeafChange) {
+    pub(in crate::chat_protocol::state_machine) fn manifest_leaf_change(
+        &mut self,
+        value: &ManifestLeafChange,
+    ) {
         match value {
             ManifestLeafChange::Add {
                 device,
@@ -680,7 +717,10 @@ impl RecoveryPlanEncoder {
         );
     }
 
-    pub(in crate::chat_protocol::state_machine) fn device_revocation(&mut self, value: &DeviceRevocationEvidence) {
+    pub(in crate::chat_protocol::state_machine) fn device_revocation(
+        &mut self,
+        value: &DeviceRevocationEvidence,
+    ) {
         self.bytes(&value.revocation_id);
         self.device(&value.actor);
         self.device(&value.target);
@@ -696,7 +736,10 @@ impl RecoveryPlanEncoder {
         self.bytes(&value.durable_row_digest);
     }
 
-    pub(in crate::chat_protocol::state_machine) fn plan_authority(&mut self, value: &PlanAuthority) {
+    pub(in crate::chat_protocol::state_machine) fn plan_authority(
+        &mut self,
+        value: &PlanAuthority,
+    ) {
         match value {
             PlanAuthority::Transition(value) => {
                 self.u8(1);
@@ -731,7 +774,10 @@ impl RecoveryPlanEncoder {
         }
     }
 
-    pub(in crate::chat_protocol::state_machine) fn metadata(&mut self, value: &MetadataSnapshotBinding) {
+    pub(in crate::chat_protocol::state_machine) fn metadata(
+        &mut self,
+        value: &MetadataSnapshotBinding,
+    ) {
         self.bytes(&value.coordinate.conversation_id);
         self.u64(value.coordinate.generation);
         self.u64(value.coordinate.epoch);

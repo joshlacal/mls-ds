@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 pub(in crate::chat_protocol::state_machine) fn plan_device_revocation_inner(
     prior: &ConversationState,
     evidence: DeviceRevocationEvidence,

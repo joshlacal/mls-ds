@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 /// Exact KeyPackage row authority retained for adapter-side compare-and-set.
 /// Unlike `PackageTransition`, this is not a semantic summary: it binds the
 /// transaction, owner generation, immutable wrapper, lifetime, coordinate,
@@ -28,7 +27,9 @@ pub(crate) struct RecoveryPackageCasBinding {
     pub(in crate::chat_protocol::state_machine) authority_digest: [u8; 32],
 }
 
-pub(in crate::chat_protocol::state_machine) fn recovery_package_cas_authority_digest(binding: &RecoveryPackageCasBinding) -> [u8; 32] {
+pub(in crate::chat_protocol::state_machine) fn recovery_package_cas_authority_digest(
+    binding: &RecoveryPackageCasBinding,
+) -> [u8; 32] {
     fn status_byte(status: PackageStatus) -> u8 {
         match status {
             PackageStatus::Available => 1,
@@ -247,7 +248,8 @@ pub(crate) struct InvitationQuotaCasBinding {
     pub(in crate::chat_protocol::state_machine) expected_inviter_recent_24h: u64,
     pub(in crate::chat_protocol::state_machine) successor_inviter_recent_24h: u64,
     pub(in crate::chat_protocol::state_machine) inviter_limit: u64,
-    pub(in crate::chat_protocol::state_machine) recipient_facts: Vec<InvitationQuotaRecipientCasFact>,
+    pub(in crate::chat_protocol::state_machine) recipient_facts:
+        Vec<InvitationQuotaRecipientCasFact>,
     pub(in crate::chat_protocol::state_machine) locked_at: ServerTimestamp,
     pub(in crate::chat_protocol::state_machine) locked_row_digest: [u8; 32],
 }
@@ -353,7 +355,9 @@ impl WelcomeCasBinding {
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn welcome_cas_seal(binding: &WelcomeCasBinding) -> [u8; 32] {
+pub(in crate::chat_protocol::state_machine) fn welcome_cas_seal(
+    binding: &WelcomeCasBinding,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"CATBIRD-CHAT-WELCOME-CAS-BINDING\0");
     digest.update((binding.transaction_id.len() as u64).to_be_bytes());
@@ -649,7 +653,8 @@ pub(crate) enum PlanAuthority {
 pub(crate) struct ConversationHeadCasBinding {
     pub(in crate::chat_protocol::state_machine) transaction_id: String,
     pub(in crate::chat_protocol::state_machine) conversation_id: [u8; 16],
-    pub(in crate::chat_protocol::state_machine) expected_prior: Option<PublicGroupSnapshotCoordinate>,
+    pub(in crate::chat_protocol::state_machine) expected_prior:
+        Option<PublicGroupSnapshotCoordinate>,
     pub(in crate::chat_protocol::state_machine) expected_next_entry_seq: u64,
     pub(in crate::chat_protocol::state_machine) allocated_entry_id: Option<[u8; 16]>,
     pub(in crate::chat_protocol::state_machine) allocated_seq: Option<u64>,
@@ -743,23 +748,34 @@ pub(crate) struct TransitionEffects {
     pub(in crate::chat_protocol::state_machine) complete: bool,
     pub(in crate::chat_protocol::state_machine) before_counts: StateCounts,
     pub(in crate::chat_protocol::state_machine) after_counts: StateCounts,
-    pub(in crate::chat_protocol::state_machine) metadata_change: Option<StateChange<MetadataSnapshotBinding>>,
+    pub(in crate::chat_protocol::state_machine) metadata_change:
+        Option<StateChange<MetadataSnapshotBinding>>,
     pub(in crate::chat_protocol::state_machine) policy_evidence_digest: Option<[u8; 32]>,
-    pub(in crate::chat_protocol::state_machine) participant_changes: Vec<StateChange<ParticipantRecord>>,
+    pub(in crate::chat_protocol::state_machine) participant_changes:
+        Vec<StateChange<ParticipantRecord>>,
     pub(in crate::chat_protocol::state_machine) leaf_changes: Vec<StateChange<LeafRecord>>,
     pub(in crate::chat_protocol::state_machine) interval_changes: Vec<StateChange<AccessInterval>>,
-    pub(in crate::chat_protocol::state_machine) terminal_proof_changes: Vec<StateChange<ScheduleTerminalProof>>,
-    pub(in crate::chat_protocol::state_machine) recovery_request_changes: Vec<StateChange<RecoveryRequest>>,
-    pub(in crate::chat_protocol::state_machine) reservation_changes: Vec<StateChange<RecoveryReservation>>,
-    pub(in crate::chat_protocol::state_machine) reset_request_changes: Vec<StateChange<ResetRequest>>,
-    pub(in crate::chat_protocol::state_machine) leave_request_changes: Vec<StateChange<LeaveRequest>>,
+    pub(in crate::chat_protocol::state_machine) terminal_proof_changes:
+        Vec<StateChange<ScheduleTerminalProof>>,
+    pub(in crate::chat_protocol::state_machine) recovery_request_changes:
+        Vec<StateChange<RecoveryRequest>>,
+    pub(in crate::chat_protocol::state_machine) reservation_changes:
+        Vec<StateChange<RecoveryReservation>>,
+    pub(in crate::chat_protocol::state_machine) reset_request_changes:
+        Vec<StateChange<ResetRequest>>,
+    pub(in crate::chat_protocol::state_machine) leave_request_changes:
+        Vec<StateChange<LeaveRequest>>,
     pub(in crate::chat_protocol::state_machine) welcome_changes: Vec<StateChange<WelcomeWork>>,
     pub(in crate::chat_protocol::state_machine) package_transitions: Vec<PackageTransition>,
-    pub(in crate::chat_protocol::state_machine) recovery_package_cas: Vec<RecoveryPackageCasBinding>,
-    pub(in crate::chat_protocol::state_machine) revocation_package_cas: Vec<RevocationPackageCasBinding>,
-    pub(in crate::chat_protocol::state_machine) revocation_target_cas: Option<RevocationTargetCasBinding>,
+    pub(in crate::chat_protocol::state_machine) recovery_package_cas:
+        Vec<RecoveryPackageCasBinding>,
+    pub(in crate::chat_protocol::state_machine) revocation_package_cas:
+        Vec<RevocationPackageCasBinding>,
+    pub(in crate::chat_protocol::state_machine) revocation_target_cas:
+        Option<RevocationTargetCasBinding>,
     pub(in crate::chat_protocol::state_machine) welcome_cas: Option<WelcomeCasBinding>,
-    pub(in crate::chat_protocol::state_machine) invitation_quota_cas: Option<InvitationQuotaCasBinding>,
+    pub(in crate::chat_protocol::state_machine) invitation_quota_cas:
+        Option<InvitationQuotaCasBinding>,
     pub(in crate::chat_protocol::state_machine) authority: Option<PlanAuthority>,
     pub(in crate::chat_protocol::state_machine) head_cas: Option<ConversationHeadCasBinding>,
 }

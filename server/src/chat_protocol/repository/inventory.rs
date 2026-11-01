@@ -1579,6 +1579,7 @@ pub(crate) struct CreateInventorySessionRequest {
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) expires_at: DateTime<Utc>,
     pub(crate) supported_protocol_versions: Option<Vec<String>>,
+    pub(crate) expected_generation: Option<InventoryGenerationFence>,
 }
 
 /// Create one retained inventory session under one captured event fence and
@@ -1625,18 +1626,6 @@ pub(crate) async fn create_inventory_session(
     request: CreateInventorySessionRequest,
     sealer: &CursorSealer,
     random: &mut (dyn SecureRandom + Send),
-) -> Result<CreatedInventorySession, InventoryRepositoryError> {
-    create_inventory_session_for_generation(transaction, device, request, sealer, random, None)
-        .await
-}
-
-async fn create_inventory_session_for_generation(
-    transaction: &mut Transaction<'_, Postgres>,
-    device: super::super::read_authority::LockedReadDeviceAuthority,
-    request: CreateInventorySessionRequest,
-    sealer: &CursorSealer,
-    random: &mut (dyn SecureRandom + Send),
-    generation: Option<&InventoryGenerationFence>,
 ) -> Result<CreatedInventorySession, InventoryRepositoryError> {
     let created_at = request.created_at;
     let expires_at = request.expires_at;
@@ -1709,17 +1698,15 @@ async fn create_inventory_session_for_generation(
         return Err(InventoryRepositoryError::ProtocolFenceMismatch);
     }
     let snapshot_event_position = head_event_position;
-    if let Some(expected) = generation {
-        if expected.protocol_instance_id != protocol.protocol_instance_id
-            || expected.cursor_key_id != protocol.cursor_key_id
-            || expected.retained_floor != retention.retained_floor
-            || expected.event_position
-                != i64::try_from(snapshot_event_position)
-                    .map_err(|_| InventoryRepositoryError::ProtocolFenceMismatch)?
-        {
-            return Err(InventoryRepositoryError::SnapshotConflict);
-        }
-    }
+    let generation_mismatch = request
+        .expected_generation
+        .as_ref()
+        .is_some_and(|expected| {
+            expected.protocol_instance_id != protocol.protocol_instance_id
+                || expected.cursor_key_id != protocol.cursor_key_id
+                || expected.retained_floor != retention.retained_floor
+                || Some(expected.event_position) != i64::try_from(snapshot_event_position).ok()
+        });
 
     // 2. Mint the random session/event-cursor capability and seal it at rest.
     //    The plaintext exists only in this stack frame; the durable lookup hash
@@ -1833,7 +1820,7 @@ async fn create_inventory_session_for_generation(
             .map_err(|_| InventoryRepositoryError::ProtocolFenceMismatch)?,
         None => 0,
     };
-    if revalidated_head != snapshot_event_position {
+    if revalidated_head != snapshot_event_position || generation_mismatch {
         return Err(InventoryRepositoryError::SnapshotConflict);
     }
 
@@ -1990,7 +1977,15 @@ async fn create_inventory_session_for_generation(
         );
         query.push_values(
             chunk,
-            |mut values, (ordinal, conversation_id, arm_columns, payload_bytes, payload_sha256, transport_inbox_delivery_id)| {
+            |mut values,
+             (
+                ordinal,
+                conversation_id,
+                arm_columns,
+                payload_bytes,
+                payload_sha256,
+                transport_inbox_delivery_id,
+            )| {
                 values
                     .push_bind(request.inventory_session_id)
                     .push_bind(*ordinal)
@@ -2068,7 +2063,14 @@ async fn create_inventory_session_for_generation(
         .await?;
         for (id, bytes, transport_delivery_id) in request_items {
             let hash: [u8; 32] = Sha256::digest(&bytes).into();
-            welcome_items.push((0, id, bytes, hash, transport_delivery_id.is_none().then_some(id), transport_delivery_id));
+            welcome_items.push((
+                0,
+                id,
+                bytes,
+                hash,
+                transport_delivery_id.is_none().then_some(id),
+                transport_delivery_id,
+            ));
         }
         welcome_items.sort_by_key(|item| item.1);
         for (ordinal, item) in welcome_items.iter_mut().enumerate() {
@@ -2087,7 +2089,15 @@ async fn create_inventory_session_for_generation(
         );
         query.push_values(
             chunk,
-            |mut values, (ordinal, welcome_id, payload_bytes, payload_sha256, request_id, transport_delivery_id)| {
+            |mut values,
+             (
+                ordinal,
+                welcome_id,
+                payload_bytes,
+                payload_sha256,
+                request_id,
+                transport_delivery_id,
+            )| {
                 values
                     .push_bind(request.inventory_session_id)
                     .push_bind(*ordinal)
@@ -3591,7 +3601,7 @@ fn derive_inventory_session_uuid_for_version(
 }
 
 #[derive(Clone, Debug)]
-struct InventoryGenerationFence {
+pub(crate) struct InventoryGenerationFence {
     protocol_instance_id: Uuid,
     cursor_key_id: String,
     retained_floor: i64,
@@ -5230,7 +5240,7 @@ async fn create_inventory_snapshot_attempt(
         sqlx::query("SAVEPOINT create_inventory_session_arm")
             .execute(&mut **transaction)
             .await?;
-        match create_inventory_session_for_generation(
+        match create_inventory_session(
             transaction,
             device,
             CreateInventorySessionRequest {
@@ -5238,10 +5248,10 @@ async fn create_inventory_snapshot_attempt(
                 created_at,
                 expires_at,
                 supported_protocol_versions: request.supported_protocol_versions.clone(),
+                expected_generation: Some(generation.clone()),
             },
             sealer,
             random,
-            Some(&generation),
         )
         .await
         {
@@ -6056,17 +6066,20 @@ pub(crate) async fn load_remote_transport_conversation_source(
     requester_did: &str,
     requester_device_id: Uuid,
 ) -> Result<
-    (Uuid, crate::chat_protocol::read_projection::ConversationProjectionSource),
+    (
+        Uuid,
+        crate::chat_protocol::read_projection::ConversationProjectionSource,
+    ),
     InventoryRepositoryError,
 > {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use serde_json::Value;
-    use sqlx::Row;
     use crate::chat_protocol::read_projection::{
         CheckedConversationCoordinates, CheckedDeviceLeafView, CheckedInvitationProvenance,
         CheckedMetadataAuthorProof, CheckedMetadataCryptoContext, CheckedMetadataSnapshot,
         CheckedParticipantView, ConversationProjectionSource,
     };
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde_json::Value;
+    use sqlx::Row;
 
     let row = sqlx::query(
         "SELECT delivery_id, request_id, conversation_id, first_message_id, \
@@ -6134,11 +6147,26 @@ pub(crate) async fn load_remote_transport_conversation_source(
         "active"
     };
 
-    let group_id = STANDARD.decode(next["groupId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+    let group_id = STANDARD
+        .decode(
+            next["groupId"]
+                .as_str()
+                .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-    let ctx_hash = STANDARD.decode(next["groupContextHash"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+    let ctx_hash = STANDARD
+        .decode(
+            next["groupContextHash"]
+                .as_str()
+                .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-    let tag = STANDARD.decode(next["confirmationTag"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+    let tag = STANDARD
+        .decode(
+            next["confirmationTag"]
+                .as_str()
+                .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
 
     let coordinates = CheckedConversationCoordinates::new(
@@ -6155,9 +6183,11 @@ pub(crate) async fn load_remote_transport_conversation_source(
 
     let prov: Value = serde_json::from_slice(&provenance_bytes)
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-    let pkg_ref_b64 = prov["keyPackageRef"].as_str()
+    let pkg_ref_b64 = prov["keyPackageRef"]
+        .as_str()
         .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
-    let pkg_ref = STANDARD.decode(pkg_ref_b64)
+    let pkg_ref = STANDARD
+        .decode(pkg_ref_b64)
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
 
     let recipient_key_id: String = match sqlx::query_scalar(
@@ -6165,7 +6195,8 @@ pub(crate) async fn load_remote_transport_conversation_source(
     )
     .bind(&pkg_ref)
     .fetch_optional(&mut **transaction)
-    .await? {
+    .await?
+    {
         Some(k) => k,
         None => sqlx::query_scalar(
             "SELECT key_id FROM chat.device_keys \
@@ -6179,7 +6210,9 @@ pub(crate) async fn load_remote_transport_conversation_source(
         .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
     };
 
-    let sender_key_id = body["keyId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+    let sender_key_id = body["keyId"]
+        .as_str()
+        .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
     let sender_leaf = CheckedDeviceLeafView::new(
         &sender_did,
         &sender_device_id.to_string(),
@@ -6207,13 +6240,33 @@ pub(crate) async fn load_remote_transport_conversation_source(
 
     let meta = &body["artifacts"]["metadataSnapshot"];
     let meta_coord_obj = &meta["coordinate"];
-    let meta_convo_id = STANDARD.decode(meta_coord_obj["conversationId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+    let meta_convo_id = STANDARD
+        .decode(
+            meta_coord_obj["conversationId"]
+                .as_str()
+                .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-    let meta_group_id = STANDARD.decode(meta_coord_obj["groupId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+    let meta_group_id = STANDARD
+        .decode(
+            meta_coord_obj["groupId"]
+                .as_str()
+                .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-    let meta_ctx_hash = STANDARD.decode(meta_coord_obj["groupContextHash"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+    let meta_ctx_hash = STANDARD
+        .decode(
+            meta_coord_obj["groupContextHash"]
+                .as_str()
+                .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-    let meta_conf_tag = STANDARD.decode(meta_coord_obj["confirmationTag"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+    let meta_conf_tag = STANDARD
+        .decode(
+            meta_coord_obj["confirmationTag"]
+                .as_str()
+                .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
 
     let meta_coord = CheckedMetadataCryptoContext::new(
@@ -6227,60 +6280,95 @@ pub(crate) async fn load_remote_transport_conversation_source(
     .map_err(InventoryRepositoryError::Projection)?;
 
     let proof = &meta["authorProof"];
-    let sig_pub_key = STANDARD.decode(proof["signaturePublicKey"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+    let sig_pub_key = STANDARD
+        .decode(
+            proof["signaturePublicKey"]
+                .as_str()
+                .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
 
     let author_proof = CheckedMetadataAuthorProof::new(
-        proof["authorDid"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
-        proof["authorDeviceId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
-        proof["authorKeyId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        proof["authorDid"]
+            .as_str()
+            .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        proof["authorDeviceId"]
+            .as_str()
+            .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        proof["authorKeyId"]
+            .as_str()
+            .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
         &sig_pub_key,
-        proof["authGenerationAtOrigin"].as_i64().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
-        proof["originTransitionId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        proof["authGenerationAtOrigin"]
+            .as_i64()
+            .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        proof["originTransitionId"]
+            .as_str()
+            .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
         proof["originSeq"].as_i64().unwrap_or(1),
         proof["roleAtOrigin"].as_str().unwrap_or("admin"),
         proof["deviceStatusAtOrigin"].as_str().unwrap_or("active"),
     )
     .map_err(InventoryRepositoryError::Projection)?;
 
-    let nonce = STANDARD.decode(meta["nonce"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+    let nonce = STANDARD
+        .decode(
+            meta["nonce"]
+                .as_str()
+                .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-    let ciphertext = STANDARD.decode(meta["ciphertext"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+    let ciphertext = STANDARD
+        .decode(
+            meta["ciphertext"]
+                .as_str()
+                .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-    let ciphertext_sha256 = STANDARD.decode(meta["ciphertextSha256"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?)
+    let ciphertext_sha256 = STANDARD
+        .decode(
+            meta["ciphertextSha256"]
+                .as_str()
+                .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
 
     let metadata_snapshot = CheckedMetadataSnapshot::new(
         meta_coord,
-        meta["originTransitionId"].as_str().ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        meta["originTransitionId"]
+            .as_str()
+            .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
         meta["metadataVersion"].as_i64().unwrap_or(1),
         &nonce,
         &ciphertext,
         &ciphertext_sha256,
-        meta["ciphertextSize"].as_i64().unwrap_or(ciphertext.len() as i64),
+        meta["ciphertextSize"]
+            .as_i64()
+            .unwrap_or(ciphertext.len() as i64),
         author_proof,
         None,
     )
     .map_err(InventoryRepositoryError::Projection)?;
 
-    let sender_participant = CheckedParticipantView::new(
-        &sender_did,
-        "admin",
-        "active",
-        1,
-        None,
-    )
-    .map_err(InventoryRepositoryError::Projection)?;
+    let sender_participant = CheckedParticipantView::new(&sender_did, "admin", "active", 1, None)
+        .map_err(InventoryRepositoryError::Projection)?;
 
-    let invitation = Some(CheckedInvitationProvenance::new(
-        &request_id.to_string(),
-        &sender_did,
-        &sender_device_id.to_string(),
-    ).map_err(InventoryRepositoryError::Projection)?);
+    let invitation = Some(
+        CheckedInvitationProvenance::new(
+            &request_id.to_string(),
+            &sender_did,
+            &sender_device_id.to_string(),
+        )
+        .map_err(InventoryRepositoryError::Projection)?,
+    );
     let recipient_participant = CheckedParticipantView::for_direct_request(
         &recipient_did,
         "admin",
-        if status == "accepted" { "active" } else { "pending" },
+        if status == "accepted" {
+            "active"
+        } else {
+            "pending"
+        },
         1,
         invitation,
         &verified_pub,
@@ -6338,7 +6426,8 @@ pub(crate) async fn load_remote_transport_conversation_source(
     )
     .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
 
-    let source = source.with_direct_request(direct_request)
+    let source = source
+        .with_direct_request(direct_request)
         .map_err(InventoryRepositoryError::Projection)?;
 
     Ok((delivery_id, source))

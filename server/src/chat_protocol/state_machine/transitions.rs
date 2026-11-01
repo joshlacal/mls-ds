@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 impl DeviceRevocationEvidence {
     pub(crate) fn revocation_id(&self) -> &[u8; 16] {
         &self.revocation_id
@@ -330,7 +329,8 @@ pub(crate) struct HydrationAuthority {
 /// within the crate from bypassing live quota checks by calling `into_historical_persistence_plan`.
 #[derive(Debug)]
 pub(in crate::chat_protocol) struct HistoricalPlanWitness {
-    pub(in crate::chat_protocol::state_machine) _witness: crate::chat_protocol::repository::remote_prefix::HistoricalWriteWitness,
+    pub(in crate::chat_protocol::state_machine) _witness:
+        crate::chat_protocol::repository::remote_prefix::HistoricalWriteWitness,
     pub(in crate::chat_protocol::state_machine) source_entry_id: Uuid,
 }
 
@@ -347,7 +347,9 @@ impl HistoricalPlanWitness {
 }
 
 /// The device the transition's sealed authority names as actor.
-pub(in crate::chat_protocol::state_machine) fn historical_actor(transition: &TransitionEvidence) -> Result<DeviceIdentity, StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn historical_actor(
+    transition: &TransitionEvidence,
+) -> Result<DeviceIdentity, StateMachineError> {
     transition
         .authority
         .as_ref()
@@ -473,7 +475,8 @@ impl PlannedSchedulerRecoveryExpiry {
 
 pub(in crate::chat_protocol::state_machine) struct LockedHydrationBinding {
     pub(in crate::chat_protocol::state_machine) transaction_id: String,
-    pub(in crate::chat_protocol::state_machine) expected_prior: Option<PublicGroupSnapshotCoordinate>,
+    pub(in crate::chat_protocol::state_machine) expected_prior:
+        Option<PublicGroupSnapshotCoordinate>,
     pub(in crate::chat_protocol::state_machine) expected_next_entry_seq: u64,
     pub(in crate::chat_protocol::state_machine) locked_at: ServerTimestamp,
     pub(in crate::chat_protocol::state_machine) locked_head_digest: [u8; 32],

@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 impl ConversationState {
     pub(crate) fn kind(&self) -> ConversationKind {
         self.kind
@@ -693,7 +692,9 @@ pub(crate) fn hydrate_conversation_state(
     Ok(candidate)
 }
 
-pub(in crate::chat_protocol::state_machine) fn work_terminal_from_hydration(row: WorkTerminalHydrationRow) -> WorkTerminalEvidence {
+pub(in crate::chat_protocol::state_machine) fn work_terminal_from_hydration(
+    row: WorkTerminalHydrationRow,
+) -> WorkTerminalEvidence {
     match row {
         WorkTerminalHydrationRow::Transition(value) => WorkTerminalEvidence::Transition(value),
         WorkTerminalHydrationRow::Request(value) => WorkTerminalEvidence::Request(value),
@@ -861,7 +862,9 @@ impl ConversationStateHydration {
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn work_terminal_to_hydration(row: WorkTerminalEvidence) -> WorkTerminalHydrationRow {
+pub(in crate::chat_protocol::state_machine) fn work_terminal_to_hydration(
+    row: WorkTerminalEvidence,
+) -> WorkTerminalHydrationRow {
     match row {
         WorkTerminalEvidence::Transition(value) => WorkTerminalHydrationRow::Transition(value),
         WorkTerminalEvidence::Request(value) => WorkTerminalHydrationRow::Request(value),

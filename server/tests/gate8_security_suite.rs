@@ -22,7 +22,9 @@ use base64::{
 };
 use catbird_server::{
     chat_protocol::{
-        read_auth::{canonical_query, ReadClaim, CHAT_READ_DOMAIN, CHAT_READ_HEADER, CHAT_READ_SIG_HEADER},
+        read_auth::{
+            canonical_query, ReadClaim, CHAT_READ_DOMAIN, CHAT_READ_HEADER, CHAT_READ_SIG_HEADER,
+        },
         test_support::seed_clean_slate_application_fixture,
     },
     handlers::chat::ChatRuntime,
@@ -127,9 +129,8 @@ async fn mf05_sse_state_prunes_idle_channels_and_ws_registry_enforces_caps_and_n
 
     // Notify wakeup fires immediately (< 50ms) when notify_events() is called
     let r2 = runtime.clone();
-    let waiter = tokio::spawn(async move {
-        r2.wait_for_events_or_timeout(Duration::from_secs(5)).await
-    });
+    let waiter =
+        tokio::spawn(async move { r2.wait_for_events_or_timeout(Duration::from_secs(5)).await });
     tokio::time::sleep(Duration::from_millis(10)).await;
     let start = tokio::time::Instant::now();
     runtime.notify_events();
@@ -147,9 +148,10 @@ async fn mf06_and_mf07_retired_push_route_is_404_and_signed_reads_enforce_ed2551
     let pool = db.connect(4).await;
     http::ensure_fence(&pool).await;
 
-    let fixture = seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
-        .await
-        .expect("fixture");
+    let fixture =
+        seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
+            .await
+            .expect("fixture");
 
     let sender_p256 = http::random_p256();
     let sender_jwk = http::public_jwk(&sender_p256);
@@ -217,7 +219,10 @@ async fn mf06_and_mf07_retired_push_route_is_404_and_signed_reads_enforce_ed2551
     );
     let (tampered_status, _) = http::send(router.clone(), bad_req).await;
     assert!(
-        matches!(tampered_status, StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED),
+        matches!(
+            tampered_status,
+            StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED
+        ),
         "tampered query claim must fail closed, got {tampered_status}"
     );
 
@@ -243,11 +248,16 @@ async fn mf06_and_mf07_retired_push_route_is_404_and_signed_reads_enforce_ed2551
         URL_SAFE_NO_PAD.encode(good_sig.to_bytes()).parse().unwrap(),
     );
     let (good_status, good_body) = http::send(router.clone(), good_req).await;
-    assert_eq!(good_status, StatusCode::OK, "valid signed read failed: {good_body}");
+    assert_eq!(
+        good_status,
+        StatusCode::OK,
+        "valid signed read failed: {good_body}"
+    );
 }
 
 #[tokio::test]
-async fn f03_non_admin_group_request_reset_rejected_while_admin_succeeds_and_mf08_revoke_cleans_up() {
+async fn f03_non_admin_group_request_reset_rejected_while_admin_succeeds_and_mf08_revoke_cleans_up()
+{
     std::env::set_var("SERVICE_DID", "did:web:chat.catbird.blue");
     std::env::set_var("SELF_ENDPOINT", "https://chat.catbird.blue");
 
@@ -255,9 +265,10 @@ async fn f03_non_admin_group_request_reset_rejected_while_admin_succeeds_and_mf0
     let pool = db.connect(4).await;
     http::ensure_fence(&pool).await;
 
-    let fixture = seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
-        .await
-        .expect("group fixture (sender is admin, recipient is member)");
+    let fixture =
+        seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
+            .await
+            .expect("group fixture (sender is admin, recipient is member)");
 
     let recipient_p256 = http::random_p256();
     let recipient_jwk = http::public_jwk(&recipient_p256);
@@ -301,11 +312,12 @@ async fn f03_non_admin_group_request_reset_rejected_while_admin_succeeds_and_mf0
         "signedAt": signed_at,
     });
     let non_admin_ed = EdSigningKey::from_bytes(&fixture.recipient_ed25519_seed);
-    let non_admin_signed = catbird_server::chat_protocol::test_support::sign_mutation_json_for_test(
-        &non_admin_body,
-        &non_admin_ed,
-    )
-    .expect("sign resetRequestBody");
+    let non_admin_signed =
+        catbird_server::chat_protocol::test_support::sign_mutation_json_for_test(
+            &non_admin_body,
+            &non_admin_ed,
+        )
+        .expect("sign resetRequestBody");
 
     let (non_admin_status, non_admin_resp) = http::send(
         router.clone(),
@@ -353,7 +365,11 @@ async fn f03_non_admin_group_request_reset_rejected_while_admin_succeeds_and_mf0
         ),
     )
     .await;
-    assert_eq!(admin_status, StatusCode::OK, "admin group requestReset failed: {admin_resp}");
+    assert_eq!(
+        admin_status,
+        StatusCode::OK,
+        "admin group requestReset failed: {admin_resp}"
+    );
 
     // M-F08: Seed a push_gateway_binding on recipient_device_id, revoke the device, verify binding is deleted and reads fail!
     sqlx::query(
@@ -394,7 +410,11 @@ async fn f03_non_admin_group_request_reset_rejected_while_admin_succeeds_and_mf0
         ),
     )
     .await;
-    assert_eq!(rev_status, StatusCode::OK, "revokeDevice failed: {rev_resp}");
+    assert_eq!(
+        rev_status,
+        StatusCode::OK,
+        "revokeDevice failed: {rev_resp}"
+    );
 
     let remaining_push_bindings: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM chat.push_gateway_bindings WHERE user_did = $1 AND device_id = $2",
@@ -404,7 +424,10 @@ async fn f03_non_admin_group_request_reset_rejected_while_admin_succeeds_and_mf0
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(remaining_push_bindings, 0, "revokeDevice must purge push_gateway_bindings");
+    assert_eq!(
+        remaining_push_bindings, 0,
+        "revokeDevice must purge push_gateway_bindings"
+    );
 
     let (post_revoke_read_status, _) = http::send(
         router,
@@ -419,7 +442,10 @@ async fn f03_non_admin_group_request_reset_rejected_while_admin_succeeds_and_mf0
     )
     .await;
     assert!(
-        matches!(post_revoke_read_status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+        matches!(
+            post_revoke_read_status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
         "revoked device must immediately lose read entitlement, got {post_revoke_read_status}"
     );
     let _ = STANDARD;

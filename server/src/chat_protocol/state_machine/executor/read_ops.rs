@@ -1,19 +1,27 @@
 #![allow(unused_imports)]
 use super::*;
 
-pub(in crate::chat_protocol::state_machine::executor) fn principal_did(principal: &PrincipalId) -> Result<String, ExecutorError> {
+pub(in crate::chat_protocol::state_machine::executor) fn principal_did(
+    principal: &PrincipalId,
+) -> Result<String, ExecutorError> {
     String::from_utf8(principal.as_bytes().to_vec()).map_err(|_| ExecutorError::ValueOutOfRange)
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn device_did(device: &DeviceIdentity) -> Result<String, ExecutorError> {
+pub(in crate::chat_protocol::state_machine::executor) fn device_did(
+    device: &DeviceIdentity,
+) -> Result<String, ExecutorError> {
     principal_did(device.principal())
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn device_uuid(device: &DeviceIdentity) -> Uuid {
+pub(in crate::chat_protocol::state_machine::executor) fn device_uuid(
+    device: &DeviceIdentity,
+) -> Uuid {
     Uuid::from_bytes(*device.device_id())
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn checked_i64(value: u64) -> Result<i64, ExecutorError> {
+pub(in crate::chat_protocol::state_machine::executor) fn checked_i64(
+    value: u64,
+) -> Result<i64, ExecutorError> {
     i64::try_from(value).map_err(|_| ExecutorError::ValueOutOfRange)
 }
 
@@ -39,19 +47,25 @@ pub(in crate::chat_protocol::state_machine::executor) fn require_execution_autho
     }
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn server_instant(value: ServerTimestamp) -> Result<DateTime<Utc>, ExecutorError> {
+pub(in crate::chat_protocol::state_machine::executor) fn server_instant(
+    value: ServerTimestamp,
+) -> Result<DateTime<Utc>, ExecutorError> {
     DateTime::<Utc>::from_timestamp_millis(value.unix_millis())
         .ok_or(ExecutorError::ValueOutOfRange)
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn repo_participant_status(status: ParticipantStatus) -> RepoParticipantStatus {
+pub(in crate::chat_protocol::state_machine::executor) fn repo_participant_status(
+    status: ParticipantStatus,
+) -> RepoParticipantStatus {
     match status {
         ParticipantStatus::Pending => RepoParticipantStatus::Pending,
         ParticipantStatus::Active => RepoParticipantStatus::Active,
     }
 }
 
-pub(in crate::chat_protocol::state_machine::executor) fn repo_participant_role(role: ParticipantRole) -> RepoParticipantRole {
+pub(in crate::chat_protocol::state_machine::executor) fn repo_participant_role(
+    role: ParticipantRole,
+) -> RepoParticipantRole {
     match role {
         ParticipantRole::Member => RepoParticipantRole::Member,
         ParticipantRole::Admin => RepoParticipantRole::Admin,
@@ -299,7 +313,10 @@ pub(in crate::chat_protocol::state_machine::executor) async fn terminalize_polic
 /// Reject any non-empty effect family the executor does not (yet) persist,
 /// so nothing is ever silently dropped. Called for every family this
 /// composition path does not translate.
-pub(in crate::chat_protocol::state_machine::executor) fn reject_if_present<T>(family: &'static str, changes: &[T]) -> Result<(), ExecutorError> {
+pub(in crate::chat_protocol::state_machine::executor) fn reject_if_present<T>(
+    family: &'static str,
+    changes: &[T],
+) -> Result<(), ExecutorError> {
     if changes.is_empty() {
         Ok(())
     } else {
@@ -317,7 +334,9 @@ pub(in crate::chat_protocol::state_machine::executor) fn reject_if_present<T>(fa
 /// ref — a planner that disagreed would be a hard error, never a silent skip.
 /// The `recovery_package_cas` <-> `package_transitions` bijection production
 /// requires (`package_cas_bijection_valid`), made load-bearing (E2b-6b MINOR-1).
-pub(in crate::chat_protocol::state_machine::executor) fn verify_recovery_package_bijection(effects: &TransitionEffects) -> Result<(), ExecutorError> {
+pub(in crate::chat_protocol::state_machine::executor) fn verify_recovery_package_bijection(
+    effects: &TransitionEffects,
+) -> Result<(), ExecutorError> {
     let edges = effects.package_transitions();
     let cas = effects.recovery_package_cas();
     if edges.len() != cas.len() {

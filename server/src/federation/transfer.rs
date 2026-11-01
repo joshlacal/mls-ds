@@ -284,7 +284,8 @@ impl SequencerTransfer {
         .await
         .map_err(TransferError::Database)?;
 
-        let Some((was_remote, seq_ds, current_epoch_i64, current_term_raw, lease_observed_at)) = row
+        let Some((was_remote, seq_ds, current_epoch_i64, current_term_raw, lease_observed_at)) =
+            row
         else {
             return Err(TransferError::ConversationNotFound(convo_id.to_string()));
         };

@@ -1,9 +1,9 @@
-use super::*;
 use super::delivery::{
     canonical_leaf_recovery_event_payload, canonical_welcome_available_event_payload,
     LeafRecoveryEventStatus,
 };
 use super::recovery::*;
+use super::*;
 use crate::chat_protocol::dpop;
 use crate::chat_protocol::model;
 use crate::chat_protocol::public_state;
@@ -580,7 +580,24 @@ fn recovery_prewrite_reloads_full_aggregate_custom_head_and_every_exact_row_befo
 #[test]
 fn production_executor_requires_exact_recovery_write_authority_and_fences_legacy_fallbacks_to_tests(
 ) {
-    let source = concat!(include_str!("../../state_machine/executor.rs"), include_str!("../../state_machine/executor/commit_leave_ops.rs"), include_str!("../../state_machine/executor/creation_ops.rs"), include_str!("../../state_machine/executor/dispatch.rs"), include_str!("../../state_machine/executor/event_chain.rs"), include_str!("../../state_machine/executor/federation_ops.rs"), include_str!("../../state_machine/executor/fulfillment_ops.rs"), include_str!("../../state_machine/executor/lifecycle_ops.rs"), include_str!("../../state_machine/executor/preflight.rs"), include_str!("../../state_machine/executor/prior_bound_ops.rs"), include_str!("../../state_machine/executor/pruning.rs"), include_str!("../../state_machine/executor/read_ops.rs"), include_str!("../../state_machine/executor/recovery_ops.rs"), include_str!("../../state_machine/executor/reset_accept_ops.rs"), include_str!("../../state_machine/executor/welcome_ops.rs"), include_str!("../../state_machine/executor/write_ops.rs"));
+    let source = concat!(
+        include_str!("../../state_machine/executor.rs"),
+        include_str!("../../state_machine/executor/commit_leave_ops.rs"),
+        include_str!("../../state_machine/executor/creation_ops.rs"),
+        include_str!("../../state_machine/executor/dispatch.rs"),
+        include_str!("../../state_machine/executor/event_chain.rs"),
+        include_str!("../../state_machine/executor/federation_ops.rs"),
+        include_str!("../../state_machine/executor/fulfillment_ops.rs"),
+        include_str!("../../state_machine/executor/lifecycle_ops.rs"),
+        include_str!("../../state_machine/executor/preflight.rs"),
+        include_str!("../../state_machine/executor/prior_bound_ops.rs"),
+        include_str!("../../state_machine/executor/pruning.rs"),
+        include_str!("../../state_machine/executor/read_ops.rs"),
+        include_str!("../../state_machine/executor/recovery_ops.rs"),
+        include_str!("../../state_machine/executor/reset_accept_ops.rs"),
+        include_str!("../../state_machine/executor/welcome_ops.rs"),
+        include_str!("../../state_machine/executor/write_ops.rs")
+    );
     assert!(
         source
             .matches("missing validated Recovery executor write authority")
@@ -832,7 +849,33 @@ fn scheduler_expiry_stays_unclaimed_and_prelude_free() {
 
 #[test]
 fn recovery_planners_consume_exact_inputs_and_the_facade_mints_payloads() {
-    let state_machine = concat!(include_str!("../../state_machine.rs"), include_str!("../../state_machine/commands.rs"), include_str!("../../state_machine/creation.rs"), include_str!("../../state_machine/direct_requests.rs"), include_str!("../../state_machine/effects.rs"), include_str!("../../state_machine/evidence.rs"), include_str!("../../state_machine/historical.rs"), include_str!("../../state_machine/hydration_entries.rs"), include_str!("../../state_machine/hydration_requests.rs"), include_str!("../../state_machine/hydration_rows.rs"), include_str!("../../state_machine/invariants.rs"), include_str!("../../state_machine/lifecycle.rs"), include_str!("../../state_machine/membership_rules.rs"), include_str!("../../state_machine/messages.rs"), include_str!("../../state_machine/metadata.rs"), include_str!("../../state_machine/planned_transition.rs"), include_str!("../../state_machine/planners.rs"), include_str!("../../state_machine/recovery.rs"), include_str!("../../state_machine/recovery_encoder.rs"), include_str!("../../state_machine/recovery_fingerprint.rs"), include_str!("../../state_machine/registration.rs"), include_str!("../../state_machine/state_graph.rs"), include_str!("../../state_machine/transitions.rs"), include_str!("../../state_machine/types.rs"), include_str!("../../state_machine/work_validation.rs"));
+    let state_machine = concat!(
+        include_str!("../../state_machine.rs"),
+        include_str!("../../state_machine/commands.rs"),
+        include_str!("../../state_machine/creation.rs"),
+        include_str!("../../state_machine/direct_requests.rs"),
+        include_str!("../../state_machine/effects.rs"),
+        include_str!("../../state_machine/evidence.rs"),
+        include_str!("../../state_machine/historical.rs"),
+        include_str!("../../state_machine/hydration_entries.rs"),
+        include_str!("../../state_machine/hydration_requests.rs"),
+        include_str!("../../state_machine/hydration_rows.rs"),
+        include_str!("../../state_machine/invariants.rs"),
+        include_str!("../../state_machine/lifecycle.rs"),
+        include_str!("../../state_machine/membership_rules.rs"),
+        include_str!("../../state_machine/messages.rs"),
+        include_str!("../../state_machine/metadata.rs"),
+        include_str!("../../state_machine/planned_transition.rs"),
+        include_str!("../../state_machine/planners.rs"),
+        include_str!("../../state_machine/recovery.rs"),
+        include_str!("../../state_machine/recovery_encoder.rs"),
+        include_str!("../../state_machine/recovery_fingerprint.rs"),
+        include_str!("../../state_machine/registration.rs"),
+        include_str!("../../state_machine/state_graph.rs"),
+        include_str!("../../state_machine/transitions.rs"),
+        include_str!("../../state_machine/types.rs"),
+        include_str!("../../state_machine/work_validation.rs")
+    );
     for (planner, input) in [
         ("plan_recovery_request_input", "RecoveryRequestPlanInput"),
         (
@@ -953,7 +996,9 @@ fn recovery_fulfillment_and_replay_present_welcome_bytes_objects() {
     let source = include_str!("../recovery.rs");
     // Assert fulfillment_response_bytes uses $bytes for welcome byte fields.
     assert!(
-        source.contains("\"opaqueWelcome\": { \"$bytes\": STANDARD.encode(welcome.opaque_welcome()) }"),
+        source.contains(
+            "\"opaqueWelcome\": { \"$bytes\": STANDARD.encode(welcome.opaque_welcome()) }"
+        ),
         "fulfillment_response_bytes must present opaqueWelcome as $bytes object"
     );
     assert!(
@@ -961,13 +1006,17 @@ fn recovery_fulfillment_and_replay_present_welcome_bytes_objects() {
         "fulfillment_response_bytes must present sha256 as $bytes object"
     );
     assert!(
-        source.contains("\"keyPackageRef\": { \"$bytes\": STANDARD.encode(welcome.key_package_ref()) }"),
+        source.contains(
+            "\"keyPackageRef\": { \"$bytes\": STANDARD.encode(welcome.key_package_ref()) }"
+        ),
         "fulfillment_response_bytes must present keyPackageRef as $bytes object"
     );
 
     // Assert lock_recovery_fulfillment_replay_graph uses $bytes for welcome byte fields.
     assert!(
-        source.contains("\"opaqueWelcome\": { \"$bytes\": STANDARD.encode(&row.welcome_wrapper_bytes) }"),
+        source.contains(
+            "\"opaqueWelcome\": { \"$bytes\": STANDARD.encode(&row.welcome_wrapper_bytes) }"
+        ),
         "lock_recovery_fulfillment_replay_graph must present opaqueWelcome as $bytes object"
     );
     assert!(
@@ -975,7 +1024,9 @@ fn recovery_fulfillment_and_replay_present_welcome_bytes_objects() {
         "lock_recovery_fulfillment_replay_graph must present sha256 as $bytes object"
     );
     assert!(
-        source.contains("\"keyPackageRef\": { \"$bytes\": STANDARD.encode(&row.delivery_key_package_ref) }"),
+        source.contains(
+            "\"keyPackageRef\": { \"$bytes\": STANDARD.encode(&row.delivery_key_package_ref) }"
+        ),
         "lock_recovery_fulfillment_replay_graph must present keyPackageRef as $bytes object"
     );
 

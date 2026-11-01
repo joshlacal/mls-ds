@@ -1,5 +1,5 @@
-use super::*;
 use super::ticket::*;
+use super::*;
 use crate::chat_protocol::cursor::{CursorSealer, SealerBinding, SecureRandom, SecureRandomError};
 use zeroize::Zeroizing;
 
@@ -21,82 +21,82 @@ async fn test_pool(max_connections: u32) -> PgPool {
 }
 
 #[test]
-    fn capability_hash_requires_the_canonical_43_character_encoding() {
-        let capability = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        assert_eq!(
-            capability_hash(capability).unwrap(),
-            <[u8; 32]>::from(Sha256::digest([0u8; 32]))
-        );
-        assert!(capability_hash("not-a-capability").is_err());
-        assert!(capability_hash("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").is_err());
-    }
+fn capability_hash_requires_the_canonical_43_character_encoding() {
+    let capability = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    assert_eq!(
+        capability_hash(capability).unwrap(),
+        <[u8; 32]>::from(Sha256::digest([0u8; 32]))
+    );
+    assert!(capability_hash("not-a-capability").is_err());
+    assert!(capability_hash("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").is_err());
+}
 
-    #[test]
-    fn source_contains_no_plaintext_cursor_columns() {
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/ticket.rs"
-        ));
-        assert!(!source.contains(concat!("snapshot_event_cursor_", "bytes")));
-        assert!(!source.contains(concat!("event_cursor_", "bytes")));
-    }
+#[test]
+fn source_contains_no_plaintext_cursor_columns() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/chat_protocol/repository/ticket.rs"
+    ));
+    assert!(!source.contains(concat!("snapshot_event_cursor_", "bytes")));
+    assert!(!source.contains(concat!("event_cursor_", "bytes")));
+}
 
-    #[test]
-    fn mint_request_debug_redacts_bearer_material() {
-        let request = MintSubscriptionTicket {
-            ticket_hash: vec![0xA5; 32],
-            user_did: "did:plc:example".to_owned(),
-            device_id: Uuid::nil(),
-            jkt: Some("secret-jkt".to_owned()),
-            auth_generation: 7,
-            inventory_session_id: "session-capability-secret".to_owned(),
-            event_cursor: "event-capability-secret".to_owned(),
-            subscription_path: SUBSCRIBE_EVENTS_PATH.to_owned(),
-            created_at: Utc::now(),
-            expires_at: Utc::now(),
-        };
-        let debug = format!("{request:?}");
-        assert!(!debug.contains("A5"));
-        assert!(!debug.contains("secret-jkt"));
-        assert!(!debug.contains("session-capability-secret"));
-        assert!(!debug.contains("event-capability-secret"));
-        assert!(debug.contains("REDACTED"));
-    }
+#[test]
+fn mint_request_debug_redacts_bearer_material() {
+    let request = MintSubscriptionTicket {
+        ticket_hash: vec![0xA5; 32],
+        user_did: "did:plc:example".to_owned(),
+        device_id: Uuid::nil(),
+        jkt: Some("secret-jkt".to_owned()),
+        auth_generation: 7,
+        inventory_session_id: "session-capability-secret".to_owned(),
+        event_cursor: "event-capability-secret".to_owned(),
+        subscription_path: SUBSCRIBE_EVENTS_PATH.to_owned(),
+        created_at: Utc::now(),
+        expires_at: Utc::now(),
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("A5"));
+    assert!(!debug.contains("secret-jkt"));
+    assert!(!debug.contains("session-capability-secret"));
+    assert!(!debug.contains("event-capability-secret"));
+    assert!(debug.contains("REDACTED"));
+}
 
-    #[test]
-    fn sealed_receipt_boundary_rejects_nonce_reuse_shapes() {
-        let now = Utc::now();
-        let mut receipt = NewEventCursorReceipt {
-            cursor_hash: [1; 32],
-            inventory_session_id: Uuid::new_v4(),
-            user_did: "did:plc:example".to_owned(),
-            device_id: Uuid::new_v4(),
-            jkt: Some("jkt".to_owned()),
-            auth_generation: 1,
-            protocol_instance_id: Uuid::new_v4(),
-            cursor_key_id: "key".to_owned(),
-            event_position: 1,
-            predecessor_cursor_hash: None,
-            retained_floor_at_issue: 0,
-            cursor_nonce: [1; 12],
-            cursor_ciphertext: vec![2; 17],
-            canonical_envelope_sha256: None,
-            created_at: now,
-            expires_at: now + chrono::Duration::minutes(1),
-        };
-        assert!(receipt.validate().is_ok());
-        receipt.cursor_nonce = [0; 12];
-        assert!(matches!(
-            receipt.validate(),
-            Err(TicketRepositoryError::InvalidReceipt)
-        ));
-        receipt.cursor_nonce = [1; 12];
-        receipt.cursor_ciphertext = vec![2; 16];
-        assert!(matches!(
-            receipt.validate(),
-            Err(TicketRepositoryError::InvalidReceipt)
-        ));
-    }
+#[test]
+fn sealed_receipt_boundary_rejects_nonce_reuse_shapes() {
+    let now = Utc::now();
+    let mut receipt = NewEventCursorReceipt {
+        cursor_hash: [1; 32],
+        inventory_session_id: Uuid::new_v4(),
+        user_did: "did:plc:example".to_owned(),
+        device_id: Uuid::new_v4(),
+        jkt: Some("jkt".to_owned()),
+        auth_generation: 1,
+        protocol_instance_id: Uuid::new_v4(),
+        cursor_key_id: "key".to_owned(),
+        event_position: 1,
+        predecessor_cursor_hash: None,
+        retained_floor_at_issue: 0,
+        cursor_nonce: [1; 12],
+        cursor_ciphertext: vec![2; 17],
+        canonical_envelope_sha256: None,
+        created_at: now,
+        expires_at: now + chrono::Duration::minutes(1),
+    };
+    assert!(receipt.validate().is_ok());
+    receipt.cursor_nonce = [0; 12];
+    assert!(matches!(
+        receipt.validate(),
+        Err(TicketRepositoryError::InvalidReceipt)
+    ));
+    receipt.cursor_nonce = [1; 12];
+    receipt.cursor_ciphertext = vec![2; 16];
+    assert!(matches!(
+        receipt.validate(),
+        Err(TicketRepositoryError::InvalidReceipt)
+    ));
+}
 
 #[test]
 fn ticket_repository_uses_only_g7_hash_and_sealed_columns() {
@@ -981,7 +981,6 @@ async fn consume_serializes_with_exact_device_revocation() {
     ));
 }
 
-
 #[tokio::test]
 async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_device() {
     let pool = test_pool(4).await;
@@ -1026,7 +1025,11 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
         ),
     )
     .await;
-    assert_eq!(owner_status, axum::http::StatusCode::OK, "owner_response: {owner_response:?}");
+    assert_eq!(
+        owner_status,
+        axum::http::StatusCode::OK,
+        "owner_response: {owner_response:?}"
+    );
     assert_eq!(
         owner_response["endpoint"],
         "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents"
@@ -1130,11 +1133,7 @@ async fn subscription_ticket_mints_when_session_created_at_is_in_the_future() {
 
     let (owner_status, owner_response) = http::send(
         router.clone(),
-        http::unsigned_json_request(
-            &owner,
-            "blue.catbird.chat.getSubscriptionTicket",
-            body,
-        ),
+        http::unsigned_json_request(&owner, "blue.catbird.chat.getSubscriptionTicket", body),
     )
     .await;
     assert_eq!(
@@ -1154,8 +1153,7 @@ async fn subscription_ticket_mints_when_session_created_at_is_in_the_future() {
         .expect("valid rfc3339 returned")
         .with_timezone(&Utc);
     assert_eq!(
-        parsed_expiry,
-        expected_expiry,
+        parsed_expiry, expected_expiry,
         "ticket expiry must be derived from clamped session.created_at"
     );
 }

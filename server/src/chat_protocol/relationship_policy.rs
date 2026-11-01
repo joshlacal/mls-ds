@@ -1413,10 +1413,7 @@ pub fn parse_declaration_response(
 
 /// A non-200 getRecord response is absence only when it is exactly the
 /// PDS's typed `RecordNotFound`; every other status is unavailability.
-fn require_record_not_found(
-    status: u16,
-    root: &Map<String, Value>,
-) -> Result<(), AuthorityError> {
+fn require_record_not_found(status: u16, root: &Map<String, Value>) -> Result<(), AuthorityError> {
     if status != 400 && status != 404 {
         return Err(AuthorityError::Unavailable);
     }
@@ -1467,7 +1464,13 @@ pub fn parse_chat_declaration_response(
         .and_then(object)?;
     reject_unknown(
         record,
-        &["$type", "allowIncoming", "deliveryService", "protocolVersion", "createdAt"],
+        &[
+            "$type",
+            "allowIncoming",
+            "deliveryService",
+            "protocolVersion",
+            "createdAt",
+        ],
     )?;
     if required_string(record, "$type")? != CHAT_DECLARATION_COLLECTION {
         return Err(AuthorityError::Malformed);
@@ -2529,8 +2532,12 @@ fn hydrate_declaration_evidence(
             .map_err(|_| ProjectionPersistenceError::Invalid)?,
     );
     let expected_record_request_digest = request_evidence_digest(
-        &declaration_record_url(&resolved_pds_origin, expected_recipient, DECLARATION_COLLECTION)
-            .map_err(|_| ProjectionPersistenceError::Invalid)?,
+        &declaration_record_url(
+            &resolved_pds_origin,
+            expected_recipient,
+            DECLARATION_COLLECTION,
+        )
+        .map_err(|_| ProjectionPersistenceError::Invalid)?,
     );
     let absent = match values.record_evidence_kind {
         DeclarationRecordEvidenceKind::RecordPresent => false,
@@ -5225,7 +5232,6 @@ mod projection_integrity_tests {
     }
 }
 
-
 #[cfg(test)]
 mod database_anchored_clock_tests {
     use super::*;
@@ -5245,7 +5251,10 @@ mod database_anchored_clock_tests {
             let host_completed = Utc::now();
             std::thread::sleep(std::time::Duration::from_millis(2));
             let decision = database_clock();
-            assert!(fresh_window(started, completed, decision), "anchored, skew {skew}");
+            assert!(
+                fresh_window(started, completed, decision),
+                "anchored, skew {skew}"
+            );
             assert!(
                 !fresh_window(host_started, host_completed, decision),
                 "host clock window must not pass at skew {skew}"

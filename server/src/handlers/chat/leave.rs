@@ -102,6 +102,11 @@ async fn execute(
     tx.commit()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
+    if endpoint == ChatEndpoint::RequestLeave {
+        runtime.spawn_post_commit_membership_transition(pool, &outcome.response_bytes);
+    }
+    runtime.spawn_post_commit_close_conversation(pool, endpoint, &outcome.response_bytes);
+    runtime.notify_events();
     Ok(response)
 }
 

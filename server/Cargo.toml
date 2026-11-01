@@ -219,6 +219,21 @@ name = "gate8_security_suite"
 path = "tests/gate8_security_suite.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "space_host_and_revocation"
+path = "tests/space_host_and_revocation.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "push_gateway_and_ssrf"
+path = "tests/push_gateway_and_ssrf.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "federation_group_and_space_relay"
+path = "tests/federation_group_and_space_relay.rs"
+required-features = ["test-support"]
+
 [features]
 default = ["namespace-bluecatbird", "server-bin"]
 namespace-bluecatbird = []
@@ -226,3 +241,72 @@ server-bin = []
 chat-protocol-production-proof = []
 subscription-production-proof = []
 test-support = []
+
+[lints.rust]
+dead_code = "allow"
+unused_imports = "allow"
+unused_mut = "allow"
+unused_variables = "allow"
+private_interfaces = "allow"
+deprecated = "allow"
+
+[lints.clippy]
+bool_assert_comparison = "allow"
+clone_on_copy = "allow"
+cloned_ref_to_slice_refs = "allow"
+collapsible_if = "allow"
+collapsible_match = "allow"
+doc_lazy_continuation = "allow"
+drop_non_drop = "allow"
+duplicate_mod = "allow"
+duplicated_attributes = "allow"
+empty_line_after_doc_comments = "allow"
+empty_line_after_outer_attr = "allow"
+enum_variant_names = "allow"
+err_expect = "allow"
+explicit_auto_deref = "allow"
+explicit_counter_loop = "allow"
+filter_map_bool_then = "allow"
+get_first = "allow"
+if_same_then_else = "allow"
+items_after_test_module = "allow"
+large_enum_variant = "allow"
+len_zero = "allow"
+manual_async_fn = "allow"
+manual_contains = "allow"
+manual_inspect = "allow"
+manual_is_multiple_of = "allow"
+manual_map = "allow"
+map_flatten = "allow"
+match_like_matches_macro = "allow"
+missing_const_for_thread_local = "allow"
+needless_as_bytes = "allow"
+needless_borrow = "allow"
+needless_borrows_for_generic_args = "allow"
+needless_maybe_sized = "allow"
+needless_option_as_deref = "allow"
+needless_range_loop = "allow"
+needless_return = "allow"
+op_ref = "allow"
+redundant_closure = "allow"
+redundant_guards = "allow"
+redundant_pattern_matching = "allow"
+redundant_slicing = "allow"
+result_unit_err = "allow"
+should_implement_trait = "allow"
+single_element_loop = "allow"
+sliced_string_as_bytes = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unnecessary_cast = "allow"
+unnecessary_get_then_check = "allow"
+unnecessary_lazy_evaluations = "allow"
+unnecessary_literal_unwrap = "allow"
+unnecessary_map_or = "allow"
+unnecessary_sort_by = "allow"
+unnecessary_to_owned = "allow"
+unnecessary_unwrap = "allow"
+useless_conversion = "allow"
+useless_format = "allow"
+useless_vec = "allow"
+

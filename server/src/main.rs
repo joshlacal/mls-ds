@@ -40,7 +40,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use catbird_server::{
     auth, config, db, federation, handlers, health, jobs, metrics, middleware, realtime,
     request_body_limit, workers, CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES,
-    DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+    CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES, DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+    SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
 };
 
 mod xrpc_proxy;
@@ -1067,12 +1068,42 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(app_state.clone());
 
+    let ds_router = ds_router.merge(catbird_server::federation::group_relay::group_relay_router(
+        catbird_server::federation::group_relay::GroupRelayState::new(
+            db_pool.clone(),
+            fed_config.self_did.clone(),
+            app_state
+                .chat_runtime
+                .i13_receipt_signer()
+                .cloned()
+                .map(Arc::new),
+            app_state.chat_runtime.push_gateway_client().cloned(),
+        ),
+    ));
+
     let chat_router =
         catbird_server::handlers::chat::chat_router::<AppState>().with_state(app_state.clone());
     let base_router = base_router.merge(chat_router);
 
+    let base_router =
+        if let Some(space_cfg) = catbird_server::space_host::SpaceHostConfig::from_env() {
+            tracing::info!(
+                authority_did = %space_cfg.authority_did,
+                "Option A Conversation SpaceHost enabled (com.atproto.space.*)"
+            );
+            let space_rt = Arc::new(catbird_server::space_host::SpaceHostRuntime::new(
+                db_pool.clone(),
+                space_cfg,
+            ));
+            base_router.merge(catbird_server::space_host::space_host_router(space_rt))
+        } else {
+            base_router
+        };
+
     let base_router = if truthy_env_var("LABYRINTH_ENABLED") {
-        tracing::info!("Labyrinth recovery/epoch-head directory enabled (blue.catbird.labyrinth.*)");
+        tracing::info!(
+            "Labyrinth recovery/epoch-head directory enabled (blue.catbird.labyrinth.*)"
+        );
         tokio::spawn(catbird_server::labyrinth::repo::retention::gc_worker(
             db_pool.clone(),
             std::time::Duration::from_secs(3600),

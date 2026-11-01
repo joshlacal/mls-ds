@@ -573,7 +573,7 @@ async fn prepare_first_welcome_terminal(
     authority: VerifiedChatDeviceRequest,
     reservation: super::prelude::OperationReservationGuard,
 ) -> Result<WelcomeTerminalTransactionOutcome, WelcomeTerminalFacadeError> {
-    let trusted_instant = authority.trusted_instant();
+    let trusted_datetime = authority.trusted_instant().datetime();
     let admitted = authority
         .mutation()
         .ok_or(WelcomeTerminalFacadeError::InvalidRequest)?;
@@ -588,51 +588,24 @@ async fn prepare_first_welcome_terminal(
         parsed.operation_id,
         &mutation,
     )?;
-    if prelude.scope_authority().trusted_instant() != trusted_instant.datetime() {
+    if prelude.scope_authority().trusted_instant() != trusted_datetime {
         return Err(WelcomeTerminalFacadeError::InvalidRequest);
     }
 
-    if let Some((material, _, _, _)) = direct_request_welcome_terminal(
+    let (authority, prelude) = match try_prepare_direct_request_welcome_terminal(
         transaction,
+        authority,
         &parsed,
         &mutation,
-        trusted_instant.datetime(),
-        true,
+        prelude,
+        trusted_datetime,
     )
     .await?
     {
-        let response = canonical_welcome_response(parsed.endpoint, &material)?;
-        let raw = mutation
-            .accepted_wrapper_bytes()
-            .ok_or(WelcomeTerminalFacadeError::InvalidRequest)?;
-        let charged = super::direct_request_retention::logical_charge(
-            &[
-                raw,
-                raw,
-                mutation.transcript_bytes(),
-                response.as_bytes(),
-                mutation.signature().as_slice(),
-            ],
-            0,
-            6,
-        )?;
-        super::direct_request_retention::consume_welcome(
-            transaction,
-            parsed.welcome_id,
-            mutation.actor_did().as_str(),
-            Uuid::from_bytes(*mutation.actor_device_id().as_bytes()),
-            parsed.operation_id,
-            mutation.request_digest(),
-            charged,
-        )
-        .await?;
-        let (scope_authority, completion) = prelude.into_execution_parts();
-        return Ok(WelcomeTerminalTransactionOutcome::Classified {
-            completion: WelcomeCompletion::new(authority, scope_authority, completion, &response),
-            material,
-            response,
-        });
-    }
+        Ok(outcome) => return Ok(outcome),
+        Err(unchanged) => unchanged,
+    };
+    let trusted_instant = authority.trusted_instant();
 
     let aggregate = hydrate_locked_conversation_state(
         transaction,
@@ -1632,6 +1605,61 @@ mod tests {
         proof.expected_status = 400;
         assert!(!proof.validates_seal());
     }
+}
+
+async fn try_prepare_direct_request_welcome_terminal(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: VerifiedChatDeviceRequest,
+    parsed: &ParsedWelcomeRequest,
+    mutation: &VerifiedSignedMutation,
+    prelude: super::prelude::PreparedBusinessPrelude,
+    trusted_at: DateTime<Utc>,
+) -> Result<
+    Result<
+        WelcomeTerminalTransactionOutcome,
+        (
+            VerifiedChatDeviceRequest,
+            super::prelude::PreparedBusinessPrelude,
+        ),
+    >,
+    WelcomeTerminalFacadeError,
+> {
+    let Some((material, _, _, _)) =
+        direct_request_welcome_terminal(transaction, parsed, mutation, trusted_at, true).await?
+    else {
+        return Ok(Err((authority, prelude)));
+    };
+    let response = canonical_welcome_response(parsed.endpoint, &material)?;
+    let raw = mutation
+        .accepted_wrapper_bytes()
+        .ok_or(WelcomeTerminalFacadeError::InvalidRequest)?;
+    let charged = super::direct_request_retention::logical_charge(
+        &[
+            raw,
+            raw,
+            mutation.transcript_bytes(),
+            response.as_bytes(),
+            mutation.signature().as_slice(),
+        ],
+        0,
+        6,
+    )?;
+    super::direct_request_retention::consume_welcome(
+        transaction,
+        parsed.welcome_id,
+        mutation.actor_did().as_str(),
+        Uuid::from_bytes(*mutation.actor_device_id().as_bytes()),
+        parsed.operation_id,
+        mutation.request_digest(),
+        charged,
+    )
+    .await?;
+    let (scope_authority, completion) = prelude.into_execution_parts();
+    Ok(Ok(WelcomeTerminalTransactionOutcome::Classified {
+        completion: WelcomeCompletion::new(authority, scope_authority, completion, &response),
+        material,
+        response,
+    }))
 }
 
 /// Exact-device request Welcome CAS. Publication provenance is immutable and

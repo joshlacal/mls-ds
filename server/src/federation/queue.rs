@@ -1102,7 +1102,11 @@ impl OutboundQueue {
                     .or(resp.message.as_deref())
                     .map(is_predecessor_error)
                     .unwrap_or(false)
-                    || resp.error.as_deref().map(is_predecessor_error).unwrap_or(false)
+                    || resp
+                        .error
+                        .as_deref()
+                        .map(is_predecessor_error)
+                        .unwrap_or(false)
                 {
                     let reason = resp
                         .reason_code
@@ -1548,19 +1552,17 @@ pub async fn enqueue_c33_in_tx(
         convo_id,
     };
 
-    let existing_binding = existing.as_ref().map(|(ds, ep, m, p, c, _)| EnqueueBinding {
-        target_ds_did: ds.as_str(),
-        target_endpoint: ep.as_str(),
-        method: m.as_str(),
-        payload: p.as_slice(),
-        convo_id: c.as_str(),
-    });
+    let existing_binding = existing
+        .as_ref()
+        .map(|(ds, ep, m, p, c, _)| EnqueueBinding {
+            target_ds_did: ds.as_str(),
+            target_endpoint: ep.as_str(),
+            method: m.as_str(),
+            payload: p.as_slice(),
+            convo_id: c.as_str(),
+        });
 
-    let is_replay = check_idempotent_replay(
-        id,
-        existing_binding.as_ref(),
-        &requested_binding,
-    )?;
+    let is_replay = check_idempotent_replay(id, existing_binding.as_ref(), &requested_binding)?;
 
     if is_replay {
         debug!(
@@ -1664,10 +1666,10 @@ pub async fn mark_delivered_by_id(pool: &PgPool, id: &str) -> Result<(), Federat
          SET status = 'delivered', claim_token = NULL, claim_expires_at = NULL \
          WHERE id = $1",
     )
-        .bind(id)
-        .execute(pool)
-        .await
-        .map_err(FederationError::Database)?;
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(FederationError::Database)?;
     Ok(())
 }
 
@@ -2143,7 +2145,10 @@ mod tests {
     #[test]
     fn pending_bytes_cap_uses_default_for_invalid_or_missing_values() {
         assert_eq!(parse_pending_bytes_cap(None, 52_428_800), 52_428_800);
-        assert_eq!(parse_pending_bytes_cap(Some("invalid"), 52_428_800), 52_428_800);
+        assert_eq!(
+            parse_pending_bytes_cap(Some("invalid"), 52_428_800),
+            52_428_800
+        );
     }
 
     #[test]
@@ -2267,13 +2272,31 @@ mod tests {
 
         // At cap - 1: succeeds
         assert!(check_capacity_bounds(
-            "did:web:peer", "convo-1", 50, 9, 400, 2, 100, &caps, &policy
-        ).is_ok());
+            "did:web:peer",
+            "convo-1",
+            50,
+            9,
+            400,
+            2,
+            100,
+            &caps,
+            &policy
+        )
+        .is_ok());
 
         // At cap: fails
         let err = check_capacity_bounds(
-            "did:web:peer", "convo-1", 50, 10, 400, 2, 100, &caps, &policy
-        ).unwrap_err();
+            "did:web:peer",
+            "convo-1",
+            50,
+            10,
+            400,
+            2,
+            100,
+            &caps,
+            &policy,
+        )
+        .unwrap_err();
         match err {
             FederationError::OutboundQueuePeerCapExceeded { pending, limit, .. } => {
                 assert_eq!(pending, 10);
@@ -2301,13 +2324,22 @@ mod tests {
 
         // Exactly at cap (950 + 50 = 1000): succeeds
         assert!(check_capacity_bounds(
-            "did:web:peer", "convo-1", 50, 5, 950, 1, 50, &caps, &policy
-        ).is_ok());
+            "did:web:peer",
+            "convo-1",
+            50,
+            5,
+            950,
+            1,
+            50,
+            &caps,
+            &policy
+        )
+        .is_ok());
 
         // 1 byte over cap (951 + 50 = 1001): fails
-        let err = check_capacity_bounds(
-            "did:web:peer", "convo-1", 50, 5, 951, 1, 50, &caps, &policy
-        ).unwrap_err();
+        let err =
+            check_capacity_bounds("did:web:peer", "convo-1", 50, 5, 951, 1, 50, &caps, &policy)
+                .unwrap_err();
         match err {
             FederationError::OutboundQueuePeerCapExceeded { pending, limit, .. } => {
                 assert_eq!(pending, 1001);
@@ -2335,8 +2367,17 @@ mod tests {
 
         // Convo row cap exceeded
         let err = check_capacity_bounds(
-            "did:web:peer", "convo-1", 50, 10, 500, 5, 200, &caps, &policy
-        ).unwrap_err();
+            "did:web:peer",
+            "convo-1",
+            50,
+            10,
+            500,
+            5,
+            200,
+            &caps,
+            &policy,
+        )
+        .unwrap_err();
         match err {
             FederationError::OutboundQueueConvoPeerCapExceeded { pending, limit, .. } => {
                 assert_eq!(pending, 5);
@@ -2347,8 +2388,17 @@ mod tests {
 
         // Convo byte cap exceeded
         let err = check_capacity_bounds(
-            "did:web:peer", "convo-1", 100, 10, 500, 2, 450, &caps, &policy
-        ).unwrap_err();
+            "did:web:peer",
+            "convo-1",
+            100,
+            10,
+            500,
+            2,
+            450,
+            &caps,
+            &policy,
+        )
+        .unwrap_err();
         match err {
             FederationError::OutboundQueueConvoPeerCapExceeded { pending, limit, .. } => {
                 assert_eq!(pending, 550);
@@ -2358,9 +2408,10 @@ mod tests {
         }
 
         // Empty convo_id bypasses convo limits even if values exceed convo caps
-        assert!(check_capacity_bounds(
-            "did:web:peer", "", 100, 10, 500, 999, 9999, &caps, &policy
-        ).is_ok());
+        assert!(
+            check_capacity_bounds("did:web:peer", "", 100, 10, 500, 999, 9999, &caps, &policy)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2413,7 +2464,8 @@ mod tests {
         );
 
         // Same ID + conflicting payload -> Err(InvalidRequest)
-        let err = check_idempotent_replay("queue-id-1", Some(&binding_a), &binding_diff_payload).unwrap_err();
+        let err = check_idempotent_replay("queue-id-1", Some(&binding_a), &binding_diff_payload)
+            .unwrap_err();
         match err {
             FederationError::InvalidRequest(reason) => {
                 assert!(reason.contains("queue-id-1"));
@@ -2423,7 +2475,8 @@ mod tests {
         }
 
         // Same ID + conflicting peer -> Err(InvalidRequest)
-        let err = check_idempotent_replay("queue-id-1", Some(&binding_a), &binding_diff_peer).unwrap_err();
+        let err = check_idempotent_replay("queue-id-1", Some(&binding_a), &binding_diff_peer)
+            .unwrap_err();
         match err {
             FederationError::InvalidRequest(reason) => {
                 assert!(reason.contains("queue-id-1"));
@@ -2433,7 +2486,8 @@ mod tests {
         }
 
         // Same ID + conflicting method -> Err(InvalidRequest)
-        let err = check_idempotent_replay("queue-id-1", Some(&binding_a), &binding_diff_method).unwrap_err();
+        let err = check_idempotent_replay("queue-id-1", Some(&binding_a), &binding_diff_method)
+            .unwrap_err();
         match err {
             FederationError::InvalidRequest(reason) => {
                 assert!(reason.contains("queue-id-1"));
@@ -2443,7 +2497,8 @@ mod tests {
         }
 
         // Same ID + conflicting endpoint -> Err(InvalidRequest)
-        let err = check_idempotent_replay("queue-id-1", Some(&binding_a), &binding_diff_endpoint).unwrap_err();
+        let err = check_idempotent_replay("queue-id-1", Some(&binding_a), &binding_diff_endpoint)
+            .unwrap_err();
         match err {
             FederationError::InvalidRequest(reason) => {
                 assert!(reason.contains("queue-id-1"));
@@ -2453,7 +2508,8 @@ mod tests {
         }
 
         // Same ID + conflicting convo -> Err(InvalidRequest)
-        let err = check_idempotent_replay("queue-id-1", Some(&binding_a), &binding_diff_convo).unwrap_err();
+        let err = check_idempotent_replay("queue-id-1", Some(&binding_a), &binding_diff_convo)
+            .unwrap_err();
         match err {
             FederationError::InvalidRequest(reason) => {
                 assert!(reason.contains("queue-id-1"));

@@ -611,7 +611,6 @@ mod tests {
             "chat.principals",
             "chat.operation_claims",
             "chat.welcome_bundles",
-            "chat.blobs",
         ] {
             let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
                 .fetch_one(&pool)

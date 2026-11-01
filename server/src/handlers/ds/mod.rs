@@ -1,6 +1,6 @@
 pub mod deliver_message;
-pub mod direct_requests;
 pub mod deliver_welcome;
+pub mod direct_requests;
 pub mod fetch_key_package;
 pub mod get_convo_digest;
 pub mod get_convo_events;

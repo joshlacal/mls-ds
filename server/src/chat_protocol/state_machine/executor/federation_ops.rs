@@ -169,8 +169,10 @@ pub(in crate::chat_protocol::state_machine::executor) struct PreparedRevocationM
 /// symbolic events never cross the module boundary.
 #[must_use = "prepared revocation members must be consumed atomically"]
 pub(crate) struct PreparedDeviceRevocationBatchMembers<'plan> {
-    pub(in crate::chat_protocol::state_machine::executor) plan: &'plan DeviceRevocationBatchPersistencePlan,
-    pub(in crate::chat_protocol::state_machine::executor) members: Vec<PreparedRevocationMember<'plan>>,
+    pub(in crate::chat_protocol::state_machine::executor) plan:
+        &'plan DeviceRevocationBatchPersistencePlan,
+    pub(in crate::chat_protocol::state_machine::executor) members:
+        Vec<PreparedRevocationMember<'plan>>,
     pub(in crate::chat_protocol::state_machine::executor) cursor: EventChainCursor,
     pub(in crate::chat_protocol::state_machine::executor) binding_digest: [u8; 32],
 }
@@ -194,7 +196,8 @@ impl PreparedDeviceRevocationBatchMembers<'_> {
 /// Typestate returned only after the immutable/device-global prefix has
 /// succeeded. It remains opaque and can be consumed exactly once.
 pub(crate) struct PrefixedDeviceRevocationBatchMembers<'plan> {
-    pub(in crate::chat_protocol::state_machine::executor) members: Vec<PreparedRevocationMember<'plan>>,
+    pub(in crate::chat_protocol::state_machine::executor) members:
+        Vec<PreparedRevocationMember<'plan>>,
     pub(in crate::chat_protocol::state_machine::executor) cursor: EventChainCursor,
 }
 
@@ -202,7 +205,9 @@ pub(crate) struct PrefixedDeviceRevocationBatchMembers<'plan> {
 /// reachable from `apply_device_revocation`. In particular, this validates
 /// every family edge and requires an exact bijection between superseded
 /// Welcome IDs and disposition artifacts.
-pub(in crate::chat_protocol::state_machine::executor) fn preflight_device_revocation_plan_and_context<'plan>(
+pub(in crate::chat_protocol::state_machine::executor) fn preflight_device_revocation_plan_and_context<
+    'plan,
+>(
     plan: &'plan ConversationPersistencePlan,
     context: ExecutionContext,
     batch_revocation_id: Uuid,
@@ -793,4 +798,3 @@ pub(crate) async fn apply_device_revocation_batch_unscoped_for_test(
     }
     Ok(applied)
 }
-

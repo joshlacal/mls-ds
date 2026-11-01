@@ -33,12 +33,14 @@ mod publish_direct_request;
 mod publish_typing;
 mod recovery;
 mod recovery_scheduler;
+mod register_push_gateway;
 mod replenish_key_packages;
 pub(crate) mod request_push;
 mod reset;
 mod revoke_device;
 mod runtime;
 mod send_message;
+mod space_relay;
 mod submit_transition;
 mod subscribe_events;
 mod subscription;
@@ -119,6 +121,9 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::GetDeviceKey
             | ChatEndpoint::GetDevices
             | ChatEndpoint::GetOwnDevices
+            | ChatEndpoint::RegisterPushGateway
+            | ChatEndpoint::RelaySpaceCredential
+            | ChatEndpoint::RelaySpaceRead
             | ChatEndpoint::RequestLeave
             | ChatEndpoint::CancelLeave
             | ChatEndpoint::CloseConversation
@@ -192,6 +197,18 @@ where
         .route(
             &xrpc_path(ChatEndpoint::GetOwnDevices),
             get(get_own_devices::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::RegisterPushGateway),
+            post(register_push_gateway::handle).layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::RelaySpaceCredential),
+            post(space_relay::handle_credential).layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::RelaySpaceRead),
+            post(space_relay::handle_read).layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             &xrpc_path(ChatEndpoint::CreateConversation),

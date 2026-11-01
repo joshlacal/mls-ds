@@ -3538,7 +3538,6 @@ pub(crate) async fn discover_control_scope_for_proof(
     .map_err(|e| format!("control scope: {e:?}"))
 }
 
-
 #[cfg(test)]
 pub(super) use test_support::*;
 
@@ -3569,7 +3568,8 @@ pub(super) mod test_support {
         ExpiresAt,
     }
 
-    pub(crate) const ALL_PENDING_RESET_CAS_EXPECTATION_MUTATIONS: [PendingResetCasExpectationMutation; 19] = [
+    pub(crate) const ALL_PENDING_RESET_CAS_EXPECTATION_MUTATIONS:
+        [PendingResetCasExpectationMutation; 19] = [
         PendingResetCasExpectationMutation::ResetRequestId,
         PendingResetCasExpectationMutation::ConversationId,
         PendingResetCasExpectationMutation::RequesterDid,
@@ -3751,9 +3751,7 @@ pub(super) mod test_support {
             PendingResetCasExpectationMutation::SigningTranscriptBytes => {
                 guard.signing_transcript_bytes[0] ^= 1
             }
-            PendingResetCasExpectationMutation::RequestDigest => {
-                guard.request_digest[0] ^= 1
-            }
+            PendingResetCasExpectationMutation::RequestDigest => guard.request_digest[0] ^= 1,
             PendingResetCasExpectationMutation::Signature => guard.signature[0] ^= 1,
             PendingResetCasExpectationMutation::ReceivedAt => {
                 guard.received_at += chrono::Duration::milliseconds(1)

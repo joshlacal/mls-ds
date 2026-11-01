@@ -1,9 +1,7 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 impl HydrationAuthority {
-
     pub(crate) fn plan_leave_cancellation_entry(
         &self,
         locked: &LockedConversationStateGuard,

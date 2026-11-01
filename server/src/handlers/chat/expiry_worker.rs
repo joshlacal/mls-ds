@@ -12,8 +12,7 @@ use tokio::time::interval;
 
 use super::runtime::ChatRuntime;
 use crate::chat_protocol::repository::expiry_sweep::{
-    due_leaf_recovery_targets, due_welcome_delivery_targets, sweep_one_welcome,
-    WelcomeSweepOutcome,
+    due_leaf_recovery_targets, due_welcome_delivery_targets, sweep_one_welcome, WelcomeSweepOutcome,
 };
 use crate::handlers::chat::recovery_scheduler::{expire_one, RecoveryExpiryServiceOutcome};
 use crate::storage::DbPool;
@@ -138,9 +137,12 @@ pub async fn run_chat_expiry_sweeper(pool: DbPool, runtime: Arc<ChatRuntime>) {
             Err(error) => tracing::warn!(%error, "terminal direct request artifact pruning failed"),
         }
         let now = chrono::Utc::now();
-        match crate::chat_protocol::repository::expiry_sweep::mark_inactive_devices(&pool, now).await
+        match crate::chat_protocol::repository::expiry_sweep::mark_inactive_devices(&pool, now)
+            .await
         {
-            Ok(marked) if marked > 0 => tracing::info!(marked, "marked 60d inactive devices dormant"),
+            Ok(marked) if marked > 0 => {
+                tracing::info!(marked, "marked 60d inactive devices dormant")
+            }
             Ok(_) => {}
             Err(error) => tracing::warn!(%error, "device dormancy sweep failed"),
         }

@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-
 #[cfg(test)]
 pub(crate) fn plan_commit(
     prior: &ConversationState,
@@ -83,7 +82,9 @@ pub(crate) fn plan_close(
     plan_close_inner(prior, command)
 }
 
-pub(in crate::chat_protocol::state_machine) fn ensure_active(state: &ConversationState) -> Result<(), StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn ensure_active(
+    state: &ConversationState,
+) -> Result<(), StateMachineError> {
     if state.coordinate.lifecycle() != PublicGroupSnapshotLifecycle::Active
         || state.public_state.is_none()
     {
@@ -208,7 +209,10 @@ pub(in crate::chat_protocol::state_machine) fn resolve_prior_bound_work(
 /// The boundary matches `classify_pending_reset_at` and `classify_locked_recovery`:
 /// `observed_at < expires_at` is still live, `observed_at >= expires_at` is due.
 /// Returns the number of requests swept.
-pub(in crate::chat_protocol::state_machine) fn expire_due_leave_requests(state: &mut ConversationState, observed_at: ServerTimestamp) -> usize {
+pub(in crate::chat_protocol::state_machine) fn expire_due_leave_requests(
+    state: &mut ConversationState,
+    observed_at: ServerTimestamp,
+) -> usize {
     let mut swept = 0;
     for request in &mut state.leave_requests {
         if request.status != LeaveRequestStatus::Pending || observed_at < request.expires_at {
@@ -340,7 +344,10 @@ pub(in crate::chat_protocol::state_machine) fn sort_intervals(intervals: &mut [A
     });
 }
 
-pub(in crate::chat_protocol::state_machine) fn pending_request_leaf_is_bound(state: &ConversationState, leaf: &LeafRecord) -> bool {
+pub(in crate::chat_protocol::state_machine) fn pending_request_leaf_is_bound(
+    state: &ConversationState,
+    leaf: &LeafRecord,
+) -> bool {
     state.kind == ConversationKind::Direct && state.intervals.iter().any(|interval| {
         interval.recipient == leaf.device && interval.end.is_none() && interval.generation == state.coordinate.generation()
         && interval.opening_kind == OpeningKind::DirectRequest
@@ -351,7 +358,9 @@ pub(in crate::chat_protocol::state_machine) fn pending_request_leaf_is_bound(sta
     })
 }
 
-pub(in crate::chat_protocol::state_machine) fn validate_state(state: &ConversationState) -> Result<(), StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn validate_state(
+    state: &ConversationState,
+) -> Result<(), StateMachineError> {
     validate_participants(state)?;
     if !current_state_producer_matches(state)
         || !metadata_provenance_matches(state)
@@ -456,7 +465,9 @@ pub(in crate::chat_protocol::state_machine) fn validate_state(state: &Conversati
     validate_work(state, false)
 }
 
-pub(in crate::chat_protocol::state_machine) fn validate_participants(state: &ConversationState) -> Result<(), StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn validate_participants(
+    state: &ConversationState,
+) -> Result<(), StateMachineError> {
     if !(1..=MAX_PARTICIPANTS).contains(&state.participants.len())
         || state
             .participants
@@ -740,7 +751,9 @@ pub(in crate::chat_protocol::state_machine) fn acceptance_matches_participant(
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn current_state_producer_matches(state: &ConversationState) -> bool {
+pub(in crate::chat_protocol::state_machine) fn current_state_producer_matches(
+    state: &ConversationState,
+) -> bool {
     let evidence = &state.producer;
     if !validate_transition_evidence(evidence) {
         return false;
@@ -811,7 +824,9 @@ pub(in crate::chat_protocol::state_machine) fn current_state_producer_matches(st
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn metadata_provenance_matches(state: &ConversationState) -> bool {
+pub(in crate::chat_protocol::state_machine) fn metadata_provenance_matches(
+    state: &ConversationState,
+) -> bool {
     match (state.metadata.as_ref(), state.metadata_producer.as_ref()) {
         (None, None) => true,
         (Some(metadata), Some(producer)) => {
@@ -843,7 +858,9 @@ pub(in crate::chat_protocol::state_machine) fn metadata_provenance_matches(state
     }
 }
 
-pub(in crate::chat_protocol::state_machine) fn validate_terminal_state(state: &ConversationState) -> Result<(), StateMachineError> {
+pub(in crate::chat_protocol::state_machine) fn validate_terminal_state(
+    state: &ConversationState,
+) -> Result<(), StateMachineError> {
     validate_participants(state)?;
     if !current_state_producer_matches(state)
         || !metadata_provenance_matches(state)
@@ -862,7 +879,9 @@ pub(in crate::chat_protocol::state_machine) fn validate_terminal_state(state: &C
     validate_work(state, true)
 }
 
-pub(in crate::chat_protocol::state_machine) fn validate_transition_evidence(evidence: &TransitionEvidence) -> bool {
+pub(in crate::chat_protocol::state_machine) fn validate_transition_evidence(
+    evidence: &TransitionEvidence,
+) -> bool {
     evidence.seq > 0
         && evidence.seq <= MAX_PROTOCOL_INTEGER
         && is_uuid_v4(&evidence.transition_id)
