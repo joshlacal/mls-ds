@@ -29,8 +29,12 @@ fn p256_pem(sk: &P256SigningKey) -> String {
         .to_string()
 }
 
+static ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 #[tokio::test]
 async fn c33_published_direct_request_expiry_supersedes_conversation_and_unblocks_re_request() {
+    let _env_guard = ENV_LOCK.lock().await;
     std::env::set_var("SERVICE_DID", "did:web:chat.catbird.blue");
     std::env::set_var("SELF_ENDPOINT", "https://chat.catbird.blue");
 
@@ -98,6 +102,7 @@ async fn c33_published_direct_request_expiry_supersedes_conversation_and_unblock
 
 #[tokio::test]
 async fn conversation_spaces_registered_on_creation_with_active_vs_historical_roster_queries() {
+    let _env_guard = ENV_LOCK.lock().await;
     let authority_did = "did:web:ds-space.selfhost.example.com";
     std::env::set_var("SERVICE_DID", authority_did);
     std::env::set_var("SELF_ENDPOINT", "https://ds-space.selfhost.example.com");

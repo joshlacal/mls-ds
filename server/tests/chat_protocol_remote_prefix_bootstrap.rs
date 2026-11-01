@@ -3867,9 +3867,7 @@ async fn historical_authority_fails_on_package_graph_drift() {
     let pkg_not_after = actor_created_at + chrono::Duration::days(30);
 
     let build_test_state = || async {
-        let Some((pool, _db_guard)) = setup_test_db().await else {
-            return None;
-        };
+        let (pool, _db_guard) = setup_test_db().await?;
         seed_protocol_instance(&pool).await;
         seed_actor_at(
             &pool,

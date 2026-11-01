@@ -254,23 +254,20 @@ async fn admin_seed_group_fixture(
     Json(input): Json<SeedGroupInput>,
 ) -> impl IntoResponse {
     let commitment = match input.archive_commitment_hex.as_deref() {
-        Some(h) => {
-            let bytes = match hex::decode(h) {
-                Ok(b) if b.len() == 32 => {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&b);
-                    Some(arr)
-                }
-                _ => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": "archiveCommitmentHex must be 32 bytes hex" })),
-                    )
-                        .into_response();
-                }
-            };
-            bytes
-        }
+        Some(h) => match hex::decode(h) {
+            Ok(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                Some(arr)
+            }
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "archiveCommitmentHex must be 32 bytes hex" })),
+                )
+                    .into_response();
+            }
+        },
         None => None,
     };
 

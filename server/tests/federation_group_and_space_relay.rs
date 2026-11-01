@@ -82,8 +82,12 @@ async fn count_mutable_chat_rows(pool: &sqlx::PgPool) -> i64 {
     total
 }
 
+static ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 #[tokio::test]
 async fn d1_cross_server_group_relay_sequences_on_authority_and_fans_out_with_i13_receipt() {
+    let _env_guard = ENV_LOCK.lock().await;
     let seq_did = "did:web:ds-seq.example.com";
     let home_a_did = "did:web:ds-home-a.example.com";
     let home_b_did = "did:web:ds-home-b.example.com";
@@ -202,6 +206,7 @@ async fn d1_cross_server_group_relay_sequences_on_authority_and_fans_out_with_i1
 #[tokio::test]
 async fn stateless_3a_space_credential_and_read_relays_preserve_headers_reject_ssrf_and_write_zero_rows(
 ) {
+    let _env_guard = ENV_LOCK.lock().await;
     let authority_did = "did:web:remote-space.example.com";
     let home_did = "did:web:chat.catbird.blue";
     std::env::set_var("SERVICE_DID", authority_did);
