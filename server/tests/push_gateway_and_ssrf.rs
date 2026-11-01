@@ -13,11 +13,15 @@
 mod common;
 
 use axum::{
+    body::Bytes as AxumBytes,
     http::{HeaderMap, StatusCode},
     routing::post,
     Json, Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use catbird_server::{
     chat_protocol::test_support::seed_clean_slate_application_fixture,
     push_gateway::{
@@ -29,8 +33,11 @@ use catbird_server::{
 use chrono::{SecondsFormat, Utc};
 use common::http_acceptance as http;
 use ed25519_dalek::{Signer as _, SigningKey as EdSigningKey};
-use p256::ecdsa::SigningKey as P256SigningKey;
+use p256::ecdsa::{
+    signature::Verifier as _, Signature as P256Signature, SigningKey as P256SigningKey,
+};
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
@@ -43,6 +50,7 @@ use tokio::net::TcpListener;
 #[derive(Clone, Default)]
 struct CapturedWake {
     auth: Option<String>,
+    raw_body: Vec<u8>,
     body: Value,
 }
 
@@ -176,15 +184,17 @@ async fn register_push_gateway_and_client_enforce_i12_cutoff_home_privacy_and_41
     let gone_clone = return_gone.clone();
     let gw_app = Router::new().route(
         "/xrpc/blue.catbird.push.deliver",
-        post(move |headers: HeaderMap, Json(body): Json<Value>| {
+        post(move |headers: HeaderMap, raw_body: AxumBytes| {
             let cap = cap_clone.clone();
             let gone = gone_clone.clone();
             async move {
+                let body: Value = serde_json::from_slice(&raw_body).expect("valid JSON wake body");
                 cap.lock().unwrap().push(CapturedWake {
                     auth: headers
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_owned),
+                    raw_body: raw_body.to_vec(),
                     body,
                 });
                 if gone.load(Ordering::SeqCst) {
@@ -280,6 +290,7 @@ async fn register_push_gateway_and_client_enforce_i12_cutoff_home_privacy_and_41
 
     // 3. Dispatch 2200-byte ciphertext (inlined!) vs 2201-byte ciphertext (omitted per I12!)
     let ds_key = P256SigningKey::from_bytes((&[0x55u8; 32]).into()).unwrap();
+    let ds_vk = *ds_key.verifying_key();
     let client = PushGatewayClient::new_es256("did:web:chat.catbird.blue".to_string(), ds_key);
 
     // Also verify remote federated DID (did:plc:remotefederatedmemberaaa with routing_ds != self) is NEVER woken by this DS!
@@ -338,11 +349,44 @@ async fn register_push_gateway_and_client_enforce_i12_cutoff_home_privacy_and_41
     {
         let wakes = captured.lock().unwrap();
         assert_eq!(wakes.len(), 2);
-        assert!(wakes[0]
-            .auth
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("Bearer "));
+        for w in wakes.iter() {
+            let bearer = w
+                .auth
+                .as_deref()
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .expect("Bearer JWT required");
+            let parts: Vec<&str> = bearer.split('.').collect();
+            assert_eq!(parts.len(), 3, "compact JWT must have 3 segments");
+            let hdr: Value =
+                serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+            let claims: Value =
+                serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+            let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+            let sig = P256Signature::from_slice(&sig_bytes).unwrap();
+            let signing_input = format!("{}.{}", parts[0], parts[1]);
+            ds_vk
+                .verify(signing_input.as_bytes(), &sig)
+                .expect("mls-ds #atproto ES256 signature must verify");
+            assert_eq!(hdr["alg"], "ES256");
+            assert_eq!(hdr["typ"], "atproto-push-wake+jwt");
+            assert_eq!(hdr["kid"], "#atproto");
+            assert_eq!(claims["iss"], "did:web:chat.catbird.blue");
+            assert_eq!(claims["aud"], "did:web:nest-gw.example.test");
+            assert_eq!(claims["lxm"], "blue.catbird.push.deliver");
+            assert_eq!(claims["htm"], "POST");
+            assert_eq!(claims["htu"], gw_url);
+            let mut expected_hex = String::with_capacity(64);
+            for b in Sha256::digest(&w.raw_body) {
+                use std::fmt::Write as _;
+                let _ = write!(&mut expected_hex, "{b:02x}");
+            }
+            assert_eq!(
+                claims["body_sha256"].as_str().unwrap(),
+                expected_hex,
+                "WakeJwtClaims.body_sha256 must match SHA-256 of exact HTTP body bytes"
+            );
+            assert!(!claims["jti"].as_str().unwrap_or_default().is_empty());
+        }
         assert_eq!(
             wakes[0].body["payload"]["ciphertext"]["$bytes"],
             STANDARD.encode(&exact_2200),

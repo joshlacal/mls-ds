@@ -20,11 +20,21 @@ use chrono::Utc;
 use jacquard_common::deps::bytes::Bytes;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey as P256SigningKey};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use sqlx::FromRow;
 use uuid::Uuid;
 
 use super::ssrf::validate_push_gateway_url;
 use crate::storage::DbPool;
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
 
 /// Maximum MLS `PrivateMessage` ciphertext size (`2,200` bytes) eligible for inline embedding (`I12`).
 pub const INLINE_CIPHERTEXT_MAX_BYTES: usize = 2_200;
@@ -88,14 +98,23 @@ impl PushGatewayClient {
         Ok(Self::new_es256(service_did, key))
     }
 
-    fn mint_deliver_jwt(&self, gateway_origin_or_aud: &str) -> Result<String, String> {
+    fn mint_deliver_jwt(
+        &self,
+        gateway_origin_or_aud: &str,
+        canonical_gateway_url: &str,
+        body_sha256: &str,
+    ) -> Result<String, String> {
         let now = Utc::now().timestamp();
-        let header = URL_SAFE_NO_PAD.encode(br##"{"alg":"ES256","typ":"JWT","kid":"#atproto"}"##);
+        let header = URL_SAFE_NO_PAD
+            .encode(br##"{"alg":"ES256","typ":"atproto-push-wake+jwt","kid":"#atproto"}"##);
         let claims = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&json!({
                 "iss": self.service_did,
                 "aud": gateway_origin_or_aud,
                 "lxm": "blue.catbird.push.deliver",
+                "htm": "POST",
+                "htu": canonical_gateway_url,
+                "body_sha256": body_sha256,
                 "iat": now,
                 "exp": now + 60,
                 "jti": Uuid::new_v4().to_string(),
@@ -184,9 +203,6 @@ impl PushGatewayClient {
             }
             let http_client = client_builder.build().map_err(|e| e.to_string())?;
 
-            let aud_did = format!("did:web:{}", validated.host);
-            let jwt = self.mint_deliver_jwt(&aud_did)?;
-
             let req_body = Deliver {
                 app_id: binding.app_id.clone().into(),
                 push_key: binding.push_key.clone().into(),
@@ -194,6 +210,10 @@ impl PushGatewayClient {
                 extra_data: None,
             };
             let body_bytes = serde_json::to_vec(&req_body).map_err(|e| e.to_string())?;
+            let body_sha256 = hex_lower(&Sha256::digest(&body_bytes));
+
+            let aud_did = format!("did:web:{}", validated.host);
+            let jwt = self.mint_deliver_jwt(&aud_did, &binding.gateway_url, &body_sha256)?;
 
             let resp = http_client
                 .post(&validated.effective_url)
@@ -226,5 +246,62 @@ impl PushGatewayClient {
         }
 
         Ok(delivered)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mint_deliver_jwt_binds_htm_htu_and_exact_http_body_sha256() {
+        let mut key_bytes = [0u8; 32];
+        key_bytes[31] = 7;
+        let signing_key = P256SigningKey::from_bytes((&key_bytes).into()).expect("valid P-256 key");
+        let client = PushGatewayClient::new_es256(
+            "did:web:chat.catbird.blue#atproto_mls".to_string(),
+            signing_key,
+        );
+
+        let gateway_url = "https://api.catbird.blue/xrpc/blue.catbird.push.deliver";
+        let req_body: Deliver = Deliver {
+            app_id: "blue.catbird.ios".into(),
+            push_key: "pk_test_1234567890abcdef".into(),
+            payload: WakePayload {
+                wake_kind: WakePayloadWakeKind::ApplicationMessage,
+                conversation_id: Uuid::nil().to_string().into(),
+                generation: 1,
+                seq: 42,
+                epoch: 3,
+                ciphertext: Some(Bytes::from_static(b"mls-private-message")),
+                extra_data: None,
+            },
+            extra_data: None,
+        };
+        let body_bytes = serde_json::to_vec(&req_body).expect("serialize Deliver");
+        let expected_sha = hex_lower(&Sha256::digest(&body_bytes));
+
+        let jwt = client
+            .mint_deliver_jwt("did:web:api.catbird.blue", gateway_url, &expected_sha)
+            .expect("mint_deliver_jwt");
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).expect("b64url header"))
+                .expect("json header");
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["typ"], "atproto-push-wake+jwt");
+        assert_eq!(header["kid"], "#atproto");
+
+        let claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).expect("b64url claims"))
+                .expect("json claims");
+        assert_eq!(claims["iss"], "did:web:chat.catbird.blue");
+        assert_eq!(claims["aud"], "did:web:api.catbird.blue");
+        assert_eq!(claims["lxm"], "blue.catbird.push.deliver");
+        assert_eq!(claims["htm"], "POST");
+        assert_eq!(claims["htu"], gateway_url);
+        assert_eq!(claims["body_sha256"], expected_sha);
     }
 }

@@ -56,8 +56,9 @@ use base64::{
 use bird_daemon::bot::{BotLlmResponder, FederatedBirdBot, FederatedBotConfig};
 use catbird_mls::{
     client::{
-        CatbirdMlsClient, CatbirdMlsClientConfig, PlatformHttpHeader, PlatformHttpRequest,
-        PlatformHttpResponse, PlatformKeyStore, PlatformTransport, REQUIRED_LABYRINTH_OAUTH_SCOPES,
+        account_did_hash_hex, CatbirdMlsClient, CatbirdMlsClientConfig, PlatformHttpHeader,
+        PlatformHttpRequest, PlatformHttpResponse, PlatformKeyStore, PlatformTransport,
+        REQUIRED_LABYRINTH_OAUTH_SCOPES,
     },
     groups::{
         lifecycle::MemberRole,
@@ -81,7 +82,8 @@ use labyrinth::{
 use labyrinth_protocol::receipt::{verify_sequencer_receipt_sec1, SignedSequencerReceipt};
 use p256::{
     ecdsa::{
-        Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
+        signature::Verifier as _, Signature as P256Signature, SigningKey as P256SigningKey,
+        VerifyingKey as P256VerifyingKey,
     },
     pkcs8::{EncodePrivateKey as _, LineEnding},
     SecretKey as P256Secret,
@@ -985,6 +987,7 @@ async fn pds_notify_space_deleted(
 #[derive(Clone, Debug)]
 struct CapturedPushWake {
     auth_header: String,
+    raw_body: Vec<u8>,
     body: Value,
 }
 
@@ -1000,7 +1003,7 @@ impl LoopbackPushGateway {
         let wakes_clone = wakes.clone();
         let app = Router::new().route(
             "/xrpc/blue.catbird.push.deliver",
-            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            post(move |headers: HeaderMap, raw_body: AxumBytes| {
                 let wakes = wakes_clone.clone();
                 async move {
                     let auth_header = headers
@@ -1008,10 +1011,13 @@ impl LoopbackPushGateway {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or_default()
                         .to_string();
-                    wakes
-                        .lock()
-                        .unwrap()
-                        .push(CapturedPushWake { auth_header, body });
+                    let body: Value =
+                        serde_json::from_slice(&raw_body).expect("valid JSON push wake body");
+                    wakes.lock().unwrap().push(CapturedPushWake {
+                        auth_header,
+                        raw_body: raw_body.to_vec(),
+                        body,
+                    });
                     (
                         StatusCode::OK,
                         Json(json!({
@@ -1048,6 +1054,7 @@ struct FirewalledClientTransport {
     allowed_origins: Vec<String>,
     http: reqwest::Client,
     blocked_attempts: AtomicUsize,
+    chat_bearer_token: Mutex<Option<String>>,
 }
 
 impl FirewalledClientTransport {
@@ -1063,7 +1070,12 @@ impl FirewalledClientTransport {
                 .build()
                 .unwrap(),
             blocked_attempts: AtomicUsize::new(0),
+            chat_bearer_token: Mutex::new(None),
         }
+    }
+
+    fn set_chat_bearer_token(&self, token: String) {
+        *self.chat_bearer_token.lock().unwrap() = Some(token);
     }
 
     fn assert_allowed(&self, url: &str) -> Result<()> {
@@ -1123,6 +1135,7 @@ impl PlatformTransport for FirewalledClientTransport {
         self.assert_allowed(&request.url)
             .map_err(|e| MLSError::Internal(e.to_string()))?;
         let http = self.http.clone();
+        let chat_bearer = self.chat_bearer_token.lock().unwrap().clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1141,6 +1154,10 @@ impl PlatformTransport for FirewalledClientTransport {
                 }
                 if !has_auth && request.url.contains("/xrpc/com.atproto.space.applyWrites") {
                     builder = builder.header("authorization", "Bearer sdk-pds-oauth");
+                } else if !has_auth && request.url.contains("/xrpc/blue.catbird.chat.") {
+                    if let Some(tok) = chat_bearer {
+                        builder = builder.header("authorization", format!("Bearer {tok}"));
+                    }
                 }
                 if let Some(b) = request.body {
                     builder = builder.body(b);
@@ -2100,7 +2117,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             2,
             "D2: home ds-a must dispatch both push wakes"
         );
-        assert!(wakes[0].auth_header.starts_with("Bearer "));
+        let ds_a_vk = *ds_a.signing_key.verifying_key();
         assert_eq!(wakes[0].body["payload"]["wakeKind"], "applicationMessage");
         assert!(
             wakes[0].body["payload"]["ciphertext"].is_object()
@@ -2114,6 +2131,31 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             "I12: >2200B wake MUST omit inline ciphertext (fetch-required)"
         );
         for w in wakes.iter() {
+            let bearer = w
+                .auth_header
+                .strip_prefix("Bearer ")
+                .expect("D2: Bearer wake JWT required");
+            let parts: Vec<&str> = bearer.split('.').collect();
+            assert_eq!(parts.len(), 3, "D2: compact wake JWT must have 3 segments");
+            let hdr: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0])?)?;
+            let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1])?)?;
+            let sig = P256Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2])?)?;
+            ds_a_vk
+                .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
+                .expect("D2: ds-a #atproto ES256 signature on wake JWT must verify");
+            assert_eq!(hdr["alg"], "ES256");
+            assert_eq!(hdr["typ"], "atproto-push-wake+jwt");
+            assert_eq!(hdr["kid"], "#atproto");
+            assert_eq!(claims["iss"], DS_A_DID);
+            assert_eq!(claims["aud"], "did:web:nest-push.federation.catbird.blue");
+            assert_eq!(claims["lxm"], "blue.catbird.push.deliver");
+            assert_eq!(claims["htm"], "POST");
+            assert_eq!(claims["htu"], push_gw.canonical_https_url);
+            assert_eq!(
+                claims["body_sha256"].as_str().unwrap(),
+                hex::encode(Sha256::digest(&w.raw_body)),
+                "D2: WakeJwtClaims.body_sha256 must bind exact wire JSON bytes"
+            );
             let raw = serde_json::to_string(&w.body)?;
             assert!(
                 !raw.contains(&bob_admin_did),
@@ -3207,23 +3249,9 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .await?;
     let app_seq = prune_send_out["entry"]["seq"].as_i64().unwrap();
 
-    // Both active leaf devices call `blue.catbird.chat.acknowledgeEntries` (`upToSeq = app_seq`)
-    for (did, dev_id, kid, ed_sk, p256_sk) in [
-        (
-            &p_sender_did,
-            p_sender_dev,
-            &p_sender_kid,
-            &p_sender_ed,
-            &p_sender_p256,
-        ),
-        (
-            &p_rcpt_did,
-            p_rcpt_dev,
-            &p_rcpt_kid,
-            &p_rcpt_ed,
-            &p_rcpt_p256,
-        ),
-    ] {
+    // Sender ACKs via HTTP, then Recipient ACKs via real `CatbirdMlsClient::acknowledge_entries_up_to`
+    // AND registers push gateway via `CatbirdMlsClient::build_signed_push_gateway_registration`!
+    {
         let ack_signed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         #[derive(serde::Serialize)]
         struct AckPayload<'a> {
@@ -3242,19 +3270,19 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             conversation_id: String,
         }
         let cbor = serde_ipld_dagcbor::to_vec(&AckPayload {
-            key_id: kid,
+            key_id: &p_sender_kid,
             up_to_seq: app_seq,
             signed_at: &ack_signed_at,
             generation: 0,
-            actor_device_id: dev_id.to_string(),
+            actor_device_id: p_sender_dev.to_string(),
             auth_generation: 1,
             conversation_id: prune_cid.to_string(),
         })?;
         let ack_sig: Ed25519Signature =
-            ed_sk.sign(&[b"CATBIRD-CHAT-ACK-ENTRIES\0".as_slice(), &cbor].concat());
+            p_sender_ed.sign(&[b"CATBIRD-CHAT-ACK-ENTRIES\0".as_slice(), &cbor].concat());
         let ack_jwt = mint_es256_service_jwt(
-            p256_sk,
-            did,
+            &p_sender_p256,
+            &p_sender_did,
             &format!("{DS_A_DID}#atproto_mls"),
             "blue.catbird.chat.acknowledgeEntries",
         );
@@ -3268,8 +3296,8 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             .json(&json!({
                 "conversationId": prune_cid,
                 "generation": 0,
-                "actorDeviceId": dev_id,
-                "keyId": kid,
+                "actorDeviceId": p_sender_dev,
+                "keyId": p_sender_kid,
                 "authGeneration": 1,
                 "upToSeq": app_seq,
                 "signedAt": ack_signed_at,
@@ -3278,6 +3306,73 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             .send()
             .await?
             .error_for_status()?;
+
+        // Now drive Recipient (`p_rcpt_did`) through the real `CatbirdMlsClient` SDK!
+        let rcpt_ks = Arc::new(MemoryKeyStore::new());
+        let rcpt_hash = account_did_hash_hex(&p_rcpt_did)?;
+        rcpt_ks.store_signature_keypair(
+            format!("mls-signer:{rcpt_hash}"),
+            p_rcpt_ed.to_bytes().to_vec(),
+        )?;
+        let rcpt_transport = Arc::new(FirewalledClientTransport::new(vec![
+            ds_a.base_url.clone(),
+            swan_pds.base_url.clone(),
+        ]));
+        let rcpt_sdk = CatbirdMlsClient::open(
+            CatbirdMlsClientConfig {
+                storage_root: temp_root
+                    .path()
+                    .join("rcpt-prune-sdk")
+                    .to_string_lossy()
+                    .into(),
+                account_did: p_rcpt_did.clone(),
+                device_id: p_rcpt_dev.to_string(),
+                home_ds_did: DS_A_DID.to_string(),
+                home_ds_endpoint: ds_a.base_url.clone(),
+                pds_endpoint: swan_pds.base_url.clone(),
+            },
+            rcpt_ks,
+            rcpt_transport.clone(),
+            None,
+        )?;
+
+        let sdk_pg_reg = rcpt_sdk.build_signed_push_gateway_registration(
+            &push_gw.canonical_https_url,
+            "blue.catbird.android",
+            "push_key_sdk_signed_opaque_0123456789abcdef",
+            true,
+        )?;
+        assert_eq!(sdk_pg_reg.key_id, p_rcpt_kid);
+        let rcpt_pg_jwt = mint_es256_service_jwt(
+            &p_rcpt_p256,
+            &p_rcpt_did,
+            &format!("{DS_A_DID}#atproto_mls"),
+            "blue.catbird.chat.registerPushGateway",
+        );
+        admin_http
+            .post(format!(
+                "{}/xrpc/blue.catbird.chat.registerPushGateway",
+                ds_a.base_url
+            ))
+            .header("authorization", format!("Bearer {rcpt_pg_jwt}"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(sdk_pg_reg.request_json)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let rcpt_ack_jwt = mint_es256_service_jwt(
+            &p_rcpt_p256,
+            &p_rcpt_did,
+            &format!("{DS_A_DID}#atproto_mls"),
+            "blue.catbird.chat.acknowledgeEntries",
+        );
+        rcpt_transport.set_chat_bearer_token(rcpt_ack_jwt);
+        let prune_cid_str = prune_cid.to_string();
+        tokio::task::spawn_blocking(move || {
+            rcpt_sdk.acknowledge_entries_up_to(&prune_cid_str, app_seq)
+        })
+        .await??;
     }
 
     let prune_row = ds_a
