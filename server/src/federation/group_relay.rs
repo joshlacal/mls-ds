@@ -155,7 +155,15 @@ where
     fn call(self, req: axum::extract::Request, state: GroupRelayState) -> Self::Future {
         let clock = Arc::clone(state.clock());
         let inner = self.0.call(req, state);
-        Box::pin(crate::sim_hooks::scope_ds_clock(clock, inner))
+        Box::pin(async move {
+            let deterministic = clock.is_deterministic();
+            let scoped = crate::sim_hooks::scope_ds_clock(clock, inner);
+            if deterministic {
+                crate::sim_hooks::drive_sim_io(scoped).await
+            } else {
+                scoped.await
+            }
+        })
     }
 }
 

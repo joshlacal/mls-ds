@@ -68,6 +68,9 @@ pub trait DsClock: Send + Sync {
     /// Sample the current UTC timestamp.
     fn now_utc(&self) -> DateTime<Utc>;
 
+    /// Advance a simulated clock to a publication horizon; wall clocks do nothing.
+    fn advance_to(&self, _target: DateTime<Utc>) {}
+
     /// Sample the current UTC timestamp in Unix epoch milliseconds.
     fn now_millis(&self) -> i64 {
         self.now_utc().timestamp_millis()
@@ -163,6 +166,11 @@ impl ManualDsClock {
 impl DsClock for ManualDsClock {
     fn now_utc(&self) -> DateTime<Utc> {
         *self.current.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn advance_to(&self, target: DateTime<Utc>) {
+        let mut guard = self.current.write().unwrap_or_else(|e| e.into_inner());
+        *guard = (*guard).max(target);
     }
 
     fn simulation_counters(&self) -> Option<&DsClockCounters> {
@@ -401,7 +409,8 @@ impl QueuedTaskSpawner {
         let Some((_label, fut)) = next else {
             return false;
         };
-        fut.await;
+        // Queued work captures its own clock inside the future, not on the caller.
+        drive_sim_io(fut).await;
         true
     }
 
@@ -579,9 +588,7 @@ async fn migrate_and_seed_sim_database(db_url: &str) -> Result<(), String> {
 /// Keep the paused Tokio driver from advancing pool timers while real PostgreSQL
 /// I/O is pending. This caller-owned loop has a real deadline, no spawned task,
 /// and no assumption that a released connection must become idle.
-async fn drive_sim_postgres_io<T>(
-    future: impl Future<Output = sqlx::Result<T>>,
-) -> sqlx::Result<T> {
+pub async fn drive_sim_io<F: Future>(future: F) -> F::Output {
     let started = std::time::Instant::now();
     tokio::pin!(future);
     loop {
@@ -590,12 +597,10 @@ async fn drive_sim_postgres_io<T>(
             result = &mut future => return result,
             () = tokio::task::yield_now() => {}
         }
-        if started.elapsed() >= Duration::from_secs(10) {
-            return Err(sqlx::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "simulation PostgreSQL I/O exceeded its 10s real-time deadline",
-            )));
-        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "simulation I/O exceeded its 10s real-time deadline"
+        );
     }
 }
 
@@ -625,7 +630,7 @@ pub async fn open_sim_worker_pool(base_url: Option<&str>, db_name: &str) -> Resu
     target_url.set_path(&format!("/{db_name}"));
     migrate_and_seed_sim_database(target_url.as_str()).await?;
 
-    drive_sim_postgres_io(
+    drive_sim_io(
         PgPoolOptions::new()
             .max_connections(1)
             .test_before_acquire(false)
@@ -672,12 +677,15 @@ impl DisposableSimPool {
     pub async fn cleanup(mut self) -> Result<(), String> {
         self.cleaned_up = true;
         validate_sim_database_name(&self.database_name)?;
-        self.pool.close().await;
-        RESET_SQL_PLAN_CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.database_name);
-        drop_sim_database_async(&self.maintenance_url, &self.database_name).await
+        drive_sim_io(async {
+            self.pool.close().await;
+            RESET_SQL_PLAN_CACHE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.database_name);
+            drop_sim_database_async(&self.maintenance_url, &self.database_name).await
+        })
+        .await
     }
 }
 
@@ -999,7 +1007,7 @@ async fn reset_sim_postgres_schema_inner(
     pool: &PgPool,
     force_compaction: bool,
 ) -> sqlx::Result<()> {
-    drive_sim_postgres_io(async {
+    drive_sim_io(async {
         let mut conn = pool.acquire().await?;
         let (db_name, server_addr): (String, Option<String>) =
             sqlx::query_as("SELECT current_database(), host(inet_server_addr())")

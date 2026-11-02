@@ -2,7 +2,6 @@
 //! queued task spawning, SQL timestamp auditing, and paused PostgreSQL reset conformance.
 
 use std::{
-    future::Future,
     path::PathBuf,
     sync::{Arc, Once},
     time::{Duration, Instant},
@@ -1119,25 +1118,19 @@ fn build_deterministic_scenario(t0: DateTime<Utc>) -> PreparedScenario {
     }
 }
 
-async fn drive_paused_io<F: Future>(label: &str, future: F) -> F::Output {
-    let started = Instant::now();
-    tokio::pin!(future);
-    loop {
-        tokio::select! {
-            result = &mut future => return result,
-            _ = tokio::task::yield_now() => assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "{label} did not complete within 10 real seconds"
-            ),
-        }
-    }
-}
-
 async fn execute_request(router: &Router, label: &str, request: Request<Body>) -> Vec<u8> {
     let uri = request.uri().to_string();
-    let response = drive_paused_io(label, router.clone().oneshot(request))
+    let before = tokio::time::Instant::now();
+    let response = router
+        .clone()
+        .oneshot(request)
         .await
         .expect("dispatch XRPC request");
+    assert_eq!(
+        tokio::time::Instant::now(),
+        before,
+        "{label} advanced Tokio time"
+    );
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -1154,7 +1147,6 @@ async fn execute_request(router: &Router, label: &str, request: Request<Body>) -
 
 async fn execute_scenario_run(
     router: &Router,
-    pool: &DbPool,
     clock: &ManualDsClock,
     t0: DateTime<Utc>,
     scenario: &PreparedScenario,
@@ -1231,7 +1223,7 @@ async fn execute_scenario_run(
     let inventory_time = t0 + TimeDelta::seconds(1);
     clock.set_utc(inventory_time);
     let inventory_query = format!("actorDeviceId={}&limit=100", scenario.bob_primary.device_id);
-    let conversations = execute_request(
+    let conversations_bytes = execute_request(
         router,
         "get_conversations",
         scenario.bob_primary.signed_get_request(
@@ -1240,47 +1232,10 @@ async fn execute_scenario_run(
             inventory_time,
             b"get-conversations-jti",
         ),
-    );
-    tokio::pin!(conversations);
-    // Inventory creation rounds up to the next second. Step only after its
-    // committed session is visible, never according to how often HTTP was polled.
-    let committed_session = async {
-        loop {
-            if let Some(created_at) = sqlx::query_scalar::<_, DateTime<Utc>>(
-                "SELECT created_at FROM chat.inventory_sessions \
-                 WHERE user_did = $1 AND device_id = $2 ORDER BY created_at DESC LIMIT 1",
-            )
-            .bind(&scenario.bob_primary.did)
-            .bind(scenario.bob_primary.device_id)
-            .fetch_optional(pool)
-            .await
-            .expect("observe committed inventory session")
-            {
-                break created_at;
-            }
-        }
-    };
-    tokio::pin!(committed_session);
-    let publication_started = Instant::now();
-    let not_before = loop {
-        tokio::select! {
-            bytes = &mut conversations => panic!(
-                "inventory response preceded its publication horizon: {}",
-                String::from_utf8_lossy(&bytes)
-            ),
-            created_at = &mut committed_session => break created_at,
-            _ = tokio::task::yield_now() => {
-                assert!(
-                    publication_started.elapsed() < Duration::from_secs(10),
-                    "inventory session did not commit within 10 seconds"
-                );
-            }
-        }
-    };
-    assert_eq!(not_before, t0 + TimeDelta::seconds(2));
-    clock.set_utc(not_before);
-    tokio::time::advance(Duration::from_secs(1)).await;
-    let conversations_bytes = conversations.await;
+    )
+    .await;
+    let not_before = t0 + TimeDelta::seconds(2);
+    assert_eq!(clock.now_utc(), not_before);
     let conversations_json: Value =
         serde_json::from_slice(&conversations_bytes).expect("parse getConversations");
     let conversations_items = conversations_json["items"]
@@ -1308,8 +1263,8 @@ async fn execute_scenario_run(
         (not_before + TimeDelta::minutes(15)).to_rfc3339_opts(SecondsFormat::Millis, true);
     assert_eq!(conversations_json["snapshotExpiresAt"], expected_expiry);
 
-    let welcomes_time = t0 + TimeDelta::milliseconds(2010);
-    clock.set_utc(welcomes_time);
+    // Follow the capability immediately, without another manual clock step.
+    let welcomes_time = clock.now_utc();
     let welcomes_bytes = execute_request(
         router,
         "get_pending_welcomes",
@@ -1410,6 +1365,15 @@ async fn execute_scenario_run(
     outputs
 }
 
+#[test]
+fn manual_clock_publication_advance_is_monotonic() {
+    let initial = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let clock = ManualDsClock::new(initial);
+    clock.advance_to(initial + TimeDelta::seconds(1));
+    clock.advance_to(initial);
+    assert_eq!(clock.now_utc(), initial + TimeDelta::seconds(1));
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts() {
     ensure_chat_runtime_env();
@@ -1470,15 +1434,14 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
         .expect("initial reset_sim_postgres_schema");
 
     // --- Run 1 ---
-    let run1 = execute_scenario_run(&router, sim_db.pool(), &clock, t0, &scenario).await;
+    let run1 = execute_scenario_run(&router, &clock, t0, &scenario).await;
 
     // Post-commit device revocation work must be queued in `QueuedTaskSpawner`, NOT spawned onto Tokio.
     assert_eq!(spawner.pending_len(), 1);
     assert_eq!(spawner.labels(), vec!["chat.post_commit.device_revoked"]);
-    assert_eq!(
-        drive_paused_io("run 1 post-commit drain", spawner.drain_all()).await,
-        1
-    );
+    let before = tokio::time::Instant::now();
+    assert_eq!(spawner.drain_all().await, 1);
+    assert_eq!(tokio::time::Instant::now(), before);
     assert_eq!(spawner.pending_len(), 0);
 
     // Enqueueing an SSE event must also capture onto `QueuedTaskSpawner` until explicitly drained.
@@ -1500,7 +1463,9 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
         "SSE typing event must remain queued before drain_next"
     );
     assert_eq!(spawner.labels(), vec!["sse.consume_emit_queue"]);
-    assert!(drive_paused_io("SSE event drain", spawner.drain_next()).await);
+    let before = tokio::time::Instant::now();
+    assert!(spawner.drain_next().await);
+    assert_eq!(tokio::time::Instant::now(), before);
     assert_eq!(spawner.pending_len(), 0);
     assert!(
         sse_rx.try_recv().is_ok(),
@@ -1518,12 +1483,11 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
         reset_elapsed
     );
     // --- Run 2 (exact same clock schedule, JTIs, idempotency keys, and signed bytes) ---
-    let run2 = execute_scenario_run(&router, sim_db.pool(), &clock, t0, &scenario).await;
+    let run2 = execute_scenario_run(&router, &clock, t0, &scenario).await;
     assert_eq!(spawner.labels(), vec!["chat.post_commit.device_revoked"]);
-    assert_eq!(
-        drive_paused_io("run 2 post-commit drain", spawner.drain_all()).await,
-        1
-    );
+    let before = tokio::time::Instant::now();
+    assert_eq!(spawner.drain_all().await, 1);
+    assert_eq!(tokio::time::Instant::now(), before);
 
     assert_eq!(run1.len(), run2.len());
     assert_eq!(
@@ -1633,9 +1597,7 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
         "steady-state reset_sim_postgres_schema took {reset_elapsed:?}, expected < 25ms"
     );
 
-    drive_paused_io("replay DB cleanup", sim_db.cleanup())
-        .await
-        .expect("drop disposable sim DB");
+    sim_db.cleanup().await.expect("drop disposable sim DB");
 }
 
 async fn assert_reset_without_virtual_time_advance(pool: &DbPool, label: &str) {

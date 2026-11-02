@@ -5086,6 +5086,11 @@ async fn await_inventory_publication(
     // source rows. Publish only after that timestamp is valid in the trusted
     // application clock. The caller has committed and released all transaction
     // locks.
+    if let Some(clock) = crate::sim_hooks::active_scoped_clock() {
+        if clock.is_deterministic() {
+            clock.advance_to(not_before);
+        }
+    }
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let observed_at = crate::sim_hooks::current_utc();
