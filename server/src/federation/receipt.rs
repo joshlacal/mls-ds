@@ -364,7 +364,7 @@ impl ReceiptSigner {
         commit_ciphertext: &[u8],
     ) -> SequencerReceipt {
         let commit_hash = hash_commit(commit_ciphertext);
-        let issued_at = Utc::now().timestamp();
+        let issued_at = crate::sim_hooks::current_utc().timestamp();
         let canonical = canonical_receipt_bytes(
             convo_id,
             epoch,

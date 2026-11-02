@@ -503,6 +503,19 @@ pub static SPACE_AUTHORITY_IP_LIMITER: Lazy<SpaceAuthorityRateLimiter> =
 /// Per-IP rate limiter instance
 pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
 
+pub(crate) fn clear_all_rate_limiters() {
+    DID_RATE_LIMITER.buckets.invalidate_all();
+    DID_RATE_LIMITER.buckets.run_pending_tasks();
+    FEDERATION_DS_RATE_LIMITER.buckets.invalidate_all();
+    FEDERATION_DS_RATE_LIMITER.buckets.run_pending_tasks();
+    SPACE_AUTHORITY_RATE_LIMITER.buckets.invalidate_all();
+    SPACE_AUTHORITY_RATE_LIMITER.buckets.run_pending_tasks();
+    SPACE_AUTHORITY_IP_LIMITER.buckets.invalidate_all();
+    SPACE_AUTHORITY_IP_LIMITER.buckets.run_pending_tasks();
+    IP_LIMITER.buckets.invalidate_all();
+    IP_LIMITER.buckets.run_pending_tasks();
+}
+
 fn default_trusted_proxy_cidrs() -> Vec<IpNet> {
     [
         "127.0.0.0/8",

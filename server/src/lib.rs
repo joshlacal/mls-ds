@@ -79,6 +79,7 @@ pub mod middleware;
 pub mod mls_group_info_verifier;
 pub mod push_gateway;
 pub mod realtime;
+pub mod sim_hooks;
 pub mod space_host;
 pub mod storage;
 pub mod util;

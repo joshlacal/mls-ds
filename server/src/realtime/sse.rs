@@ -72,6 +72,7 @@ pub struct SseState {
     pub channels: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
     pub buffer_size: usize,
     pub(crate) emit_queue: Arc<DashMap<String, mpsc::UnboundedSender<EmitJob>>>,
+    spawner: std::sync::RwLock<Arc<dyn crate::sim_hooks::TaskSpawner>>,
 }
 
 impl SseState {
@@ -81,7 +82,17 @@ impl SseState {
             channels: Arc::new(RwLock::new(HashMap::new())),
             buffer_size,
             emit_queue: Arc::new(DashMap::new()),
+            spawner: std::sync::RwLock::new(Arc::new(crate::sim_hooks::TokioTaskSpawner)),
         }
+    }
+
+    pub fn set_spawner(&self, spawner: Arc<dyn crate::sim_hooks::TaskSpawner>) {
+        let mut guard = self.spawner.write().unwrap_or_else(|e| e.into_inner());
+        *guard = spawner;
+    }
+
+    pub fn spawner(&self) -> Arc<dyn crate::sim_hooks::TaskSpawner> {
+        Arc::clone(&self.spawner.read().unwrap_or_else(|e| e.into_inner()))
     }
 
     pub async fn get_channel(&self, convo_id: &str) -> broadcast::Sender<StreamEvent> {
@@ -110,13 +121,25 @@ impl SseState {
                 let buffer_size = self.buffer_size;
                 let queue_ref = self.emit_queue.clone();
                 let convo_id_owned = convo_id.to_string();
-                tokio::spawn(consume_emit_queue(
-                    channels,
-                    buffer_size,
-                    queue_ref,
-                    convo_id_owned,
-                    rx,
-                ));
+                let spawner = self.spawner();
+                let fut: crate::sim_hooks::BoxedTaskFuture = if spawner.is_queued() {
+                    Box::pin(flush_emit_queue_batch(
+                        channels,
+                        buffer_size,
+                        queue_ref,
+                        convo_id_owned,
+                        rx,
+                    ))
+                } else {
+                    Box::pin(consume_emit_queue(
+                        channels,
+                        buffer_size,
+                        queue_ref,
+                        convo_id_owned,
+                        rx,
+                    ))
+                };
+                spawner.spawn_box("sse.consume_emit_queue", fut);
                 v.insert(tx).clone()
             }
         };
@@ -186,6 +209,26 @@ async fn consume_emit_queue(
         convo = %crate::crypto::redact_for_log(&convo_id),
         "per-convo emit queue consumer exited"
     );
+}
+
+async fn flush_emit_queue_batch(
+    channels: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
+    buffer_size: usize,
+    queue_ref: Arc<DashMap<String, mpsc::UnboundedSender<EmitJob>>>,
+    convo_id: String,
+    mut rx: mpsc::UnboundedReceiver<EmitJob>,
+) {
+    queue_ref.remove(&convo_id);
+    while let Some(job) = rx.recv().await {
+        let tx = {
+            let mut chans = channels.write().await;
+            chans
+                .entry(convo_id.clone())
+                .or_insert_with(|| broadcast::channel(buffer_size).0)
+                .clone()
+        };
+        let _ = tx.send(job.event);
+    }
 }
 
 #[cfg(test)]

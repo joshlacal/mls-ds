@@ -2725,8 +2725,8 @@ pub(super) async fn persist_enrollment_bootstrap_effects(
         r#"
         INSERT INTO chat.devices (
             user_did, device_id, device_name, status, dpop_jkt,
-            auth_generation, capabilities, created_at, updated_at
-        ) VALUES ($1,$2,$3,'active',$4,1,chat.protocol_capabilities(),$5,$5)
+            auth_generation, capabilities, last_active_at, created_at, updated_at
+        ) VALUES ($1,$2,$3,'active',$4,1,chat.protocol_capabilities(),$5,$5,$5)
         "#,
     )
     .bind(scope.subject())

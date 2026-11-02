@@ -447,6 +447,11 @@ pub(crate) fn observe_relationship_persistence(
 pub(crate) async fn anchor_projection_clock<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
 ) -> Result<DatabaseAnchoredProjectionClock, sqlx::Error> {
+    if crate::sim_hooks::is_deterministic_clock_active() {
+        return Ok(DatabaseAnchoredProjectionClock::from_database_sample(
+            crate::sim_hooks::current_utc(),
+        ));
+    }
     let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(executor)
         .await?;
@@ -1821,6 +1826,9 @@ async fn require_witness_transaction(
 async fn observe_post_lock_time(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<DateTime<Utc>, RelationshipRepositoryError> {
+    if crate::sim_hooks::is_deterministic_clock_active() {
+        return Ok(crate::sim_hooks::current_utc());
+    }
     Ok(sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&mut **transaction)
         .await?)

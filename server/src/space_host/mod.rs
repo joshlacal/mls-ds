@@ -149,7 +149,11 @@ impl SpaceHostRuntime {
     }
 
     pub fn mint_service_jwt(&self, aud: &str, lxm: &str) -> Result<String, String> {
-        let now = Utc::now().timestamp();
+        let now = crate::sim_hooks::current_utc().timestamp();
+        let jti = crate::sim_hooks::mint_outbound_jti_uuid_v4(
+            b"space_host.service_jwt",
+            &[aud.as_bytes(), lxm.as_bytes()],
+        );
         let header = URL_SAFE_NO_PAD.encode(br##"{"alg":"ES256","typ":"JWT","kid":"#atproto"}"##);
         let claims = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&json!({
@@ -158,7 +162,7 @@ impl SpaceHostRuntime {
                 "lxm": lxm,
                 "iat": now,
                 "exp": now + 60,
-                "jti": Uuid::new_v4().to_string(),
+                "jti": jti.to_string(),
             }))
             .map_err(|e| e.to_string())?,
         );

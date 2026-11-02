@@ -421,7 +421,10 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     let next = prepared.bootstrap.final_state().coordinate();
     let generation = next.generation() as i64;
     let final_state = prepared.bootstrap.final_state();
-    let entry_id = Uuid::new_v4();
+    let entry_id = crate::sim_hooks::mint_entry_uuid_v4(
+        b"chat.publishDirectRequest",
+        &[convo.as_bytes(), &seq.to_be_bytes(), request.as_bytes()],
+    );
     let signed: Value =
         serde_json::from_slice(&signed_bytes).map_err(|_| PublicationError::Invariant)?;
     let entry = json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":entry_id.to_string(),"conversationId":convo.to_string(),"seq":seq,"signedRequest":signed,"receivedAt":time(now)});

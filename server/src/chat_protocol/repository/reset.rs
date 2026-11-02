@@ -1884,9 +1884,16 @@ async fn prepare_reset_request_graph(
     let parsed = parse_reset_authority(mutation, ResetPreparationKind::Request)?;
     let scope = authority.prelude.scope_authority();
     let verified_mutation = reverify_scope_mutation(scope, mutation)?;
-    let entry_id = canonical_uuid_v4(Uuid::new_v4())?;
     let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
     let seq = authority.aggregate.head().next_entry_seq();
+    let entry_id = canonical_uuid_v4(crate::sim_hooks::mint_entry_uuid_v4(
+        b"chat.requestReset",
+        &[
+            conversation_id.as_bytes(),
+            &seq.to_be_bytes(),
+            mutation.request_digest(),
+        ],
+    ))?;
     let entry = build_verified_control_entry(
         verified_mutation,
         request.endpoint(),
@@ -1961,9 +1968,16 @@ async fn prepare_reset_activation_graph(
     let scope = authority.prelude.scope_authority();
     let verified_mutation = reverify_scope_mutation(scope, mutation)?;
     let group_info = reset_group_info_bytes(mutation)?;
-    let entry_id = canonical_uuid_v4(Uuid::new_v4())?;
     let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
     let seq = authority.aggregate.head().next_entry_seq();
+    let entry_id = canonical_uuid_v4(crate::sim_hooks::mint_entry_uuid_v4(
+        b"chat.activateReset",
+        &[
+            conversation_id.as_bytes(),
+            &seq.to_be_bytes(),
+            mutation.request_digest(),
+        ],
+    ))?;
     let entry = build_verified_control_entry(
         verified_mutation,
         request.endpoint(),

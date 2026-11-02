@@ -291,9 +291,14 @@ impl TrustedRequestInstant {
         Ok(Self(CanonicalTimestamp::parse(&text)?))
     }
 
+    pub(crate) fn from_clock(
+        clock: &dyn crate::sim_hooks::DsClock,
+    ) -> Result<Self, AuthPrimitiveError> {
+        Self::from_datetime(clock.now_utc())
+    }
+
     pub(crate) fn capture() -> Result<Self, AuthPrimitiveError> {
-        let text = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        Ok(Self(CanonicalTimestamp::parse(&text)?))
+        Self::from_datetime(crate::sim_hooks::current_utc())
     }
 
     /// Construct from an already validated canonical timestamp. Production

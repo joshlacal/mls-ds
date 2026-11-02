@@ -4258,7 +4258,14 @@ pub async fn coordinator_handle_message(
     let trusted_now = trusted_instant.datetime();
     let canonical_now_str = trusted_now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    let entry_id = Uuid::new_v4();
+    let entry_id = crate::sim_hooks::mint_entry_uuid_v4(
+        b"mlsDS.relaySendMessage",
+        &[
+            conversation_id.as_bytes(),
+            &next_seq.to_be_bytes(),
+            message_id.as_bytes(),
+        ],
+    );
     let entry_id_str = entry_id.to_string();
 
     let canon_entry_id = crate::chat_protocol::validation::CanonicalUuidV4::parse(&entry_id_str)

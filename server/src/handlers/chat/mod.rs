@@ -64,6 +64,45 @@ pub(crate) async fn admit_signed_operation_for_test(
     context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await
 }
 
+#[derive(Clone, Copy)]
+struct ClockScoped<H>(H);
+
+impl<H, T, S> axum::handler::Handler<T, S> for ClockScoped<H>
+where
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+    Arc<ChatRuntime>: FromRef<S>,
+{
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>;
+
+    fn call(self, req: axum::extract::Request, state: S) -> Self::Future {
+        let clock = Arc::clone(<Arc<ChatRuntime> as FromRef<S>>::from_ref(&state).clock());
+        let inner = self.0.call(req, state);
+        Box::pin(crate::sim_hooks::scope_ds_clock(clock, inner))
+    }
+}
+
+fn sget<H, T, S>(handler: H) -> axum::routing::MethodRouter<S>
+where
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+    Arc<ChatRuntime>: FromRef<S>,
+{
+    get(ClockScoped(handler))
+}
+
+fn spost<H, T, S>(handler: H) -> axum::routing::MethodRouter<S>
+where
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+    Arc<ChatRuntime>: FromRef<S>,
+{
+    post(ClockScoped(handler))
+}
+
 /// Build the isolated `blue.catbird.chat.*` router.
 pub fn chat_router<S>() -> Router<S>
 where
@@ -81,9 +120,9 @@ where
             not_implemented(endpoint, &runtime)
         };
         router = if uses_http_get(endpoint) {
-            router.route(&path, get(handler))
+            router.route(&path, sget(handler))
         } else {
-            router.route(&path, post(handler))
+            router.route(&path, spost(handler))
         };
     }
     router
@@ -160,202 +199,202 @@ where
     Router::new()
         .route(
             &xrpc_path(ChatEndpoint::PublishDirectRequestKeys),
-            post(direct_requests::publish_keys).layer(DefaultBodyLimit::max(16_777_216)),
+            spost(direct_requests::publish_keys).layer(DefaultBodyLimit::max(16_777_216)),
         )
         .route(
             &xrpc_path(ChatEndpoint::PublishDirectRequest),
-            post(publish_direct_request::handle).layer(DefaultBodyLimit::max(16_777_216)),
+            spost(publish_direct_request::handle).layer(DefaultBodyLimit::max(16_777_216)),
         )
         .route(
             &xrpc_path(ChatEndpoint::PrepareDirectRequest),
-            post(direct_requests::prepare).layer(DefaultBodyLimit::max(65_536)),
+            spost(direct_requests::prepare).layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             &xrpc_path(ChatEndpoint::CancelDirectRequestPreparation),
-            post(direct_requests::cancel).layer(DefaultBodyLimit::max(65_536)),
+            spost(direct_requests::cancel).layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetDirectRequestOutcome),
-            get(direct_requests::outcome),
+            sget(direct_requests::outcome),
         )
         .route(
             &xrpc_path(ChatEndpoint::EnrollDevice),
-            post(enroll_device::handle),
+            spost(enroll_device::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::ReplenishKeyPackages),
-            post(replenish_key_packages::handle),
+            spost(replenish_key_packages::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetDeviceKey),
-            get(get_device_key::handle),
+            sget(get_device_key::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetDevices),
-            get(get_devices::handle),
+            sget(get_devices::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetOwnDevices),
-            get(get_own_devices::handle),
+            sget(get_own_devices::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::RegisterPushGateway),
-            post(register_push_gateway::handle).layer(DefaultBodyLimit::max(65_536)),
+            spost(register_push_gateway::handle).layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             &xrpc_path(ChatEndpoint::RelaySpaceCredential),
-            post(space_relay::handle_credential).layer(DefaultBodyLimit::max(65_536)),
+            spost(space_relay::handle_credential).layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             &xrpc_path(ChatEndpoint::RelaySpaceRead),
-            post(space_relay::handle_read).layer(DefaultBodyLimit::max(65_536)),
+            spost(space_relay::handle_read).layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             &xrpc_path(ChatEndpoint::CreateConversation),
-            post(create_conversation::handle).layer(DefaultBodyLimit::max(15_728_640)),
+            spost(create_conversation::handle).layer(DefaultBodyLimit::max(15_728_640)),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetConversationState),
-            get(conversation_state::handle),
+            sget(conversation_state::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::RequestReset),
-            post(reset::handle_request),
+            spost(reset::handle_request),
         )
         .route(
             &xrpc_path(ChatEndpoint::ActivateReset),
-            post(reset::handle_activation),
+            spost(reset::handle_activation),
         )
         .route(
             &xrpc_path(ChatEndpoint::RevokeDevice),
-            post(revoke_device::handle),
+            spost(revoke_device::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::AcknowledgeWelcome),
-            post(welcome::handle_acknowledgement),
+            spost(welcome::handle_acknowledgement),
         )
         .route(
             &xrpc_path(ChatEndpoint::RejectWelcome),
-            post(welcome::handle_rejection),
+            spost(welcome::handle_rejection),
         )
         .route(
             &xrpc_path(ChatEndpoint::RequestLeafRecovery),
-            post(recovery::handle_request),
+            spost(recovery::handle_request),
         )
         .route(
             &xrpc_path(ChatEndpoint::CancelLeafRecovery),
-            post(recovery::handle_cancellation),
+            spost(recovery::handle_cancellation),
         )
         .route(
             &xrpc_path(ChatEndpoint::SubmitTransition),
-            post(submit_transition::handle).layer(DefaultBodyLimit::max(15_728_640)),
+            spost(submit_transition::handle).layer(DefaultBodyLimit::max(15_728_640)),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetEntries),
-            get(get_entries::handle),
+            sget(get_entries::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::AcknowledgeEntries),
-            post(acknowledge_entries::handle).layer(DefaultBodyLimit::max(65_536)),
+            spost(acknowledge_entries::handle).layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             &xrpc_path(ChatEndpoint::RequestLeave),
-            post(leave::handle_request),
+            spost(leave::handle_request),
         )
         .route(
             &xrpc_path(ChatEndpoint::CancelLeave),
-            post(leave::handle_cancellation),
+            spost(leave::handle_cancellation),
         )
         .route(
             &xrpc_path(ChatEndpoint::CloseConversation),
-            post(leave::handle_close),
+            spost(leave::handle_close),
         )
         .route(
             &xrpc_path(ChatEndpoint::SendMessage),
-            post(send_message::handle).layer(DefaultBodyLimit::max(15_728_640)),
+            spost(send_message::handle).layer(DefaultBodyLimit::max(15_728_640)),
         )
         .route(
             &xrpc_path(ChatEndpoint::PublishTyping),
-            post(publish_typing::handle),
+            spost(publish_typing::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::AcceptConversation),
-            post(accept_conversation::handle),
+            spost(accept_conversation::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetConversations),
-            get(inventory::conversations),
+            sget(inventory::conversations),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetPendingWelcomes),
-            get(inventory::welcomes),
+            sget(inventory::welcomes),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetLeafRecoveryInbox),
-            get(inventory::recovery),
+            sget(inventory::recovery),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetSubscriptionTicket),
-            post(subscription::handle),
+            spost(subscription::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::SubscribeEvents),
-            get(subscribe_events::handle),
+            sget(subscribe_events::handle),
         )
         .route(
             "/internal/chat/request-push-eligibility",
-            post(request_push::eligibility).layer(DefaultBodyLimit::max(
+            spost(request_push::eligibility).layer(DefaultBodyLimit::max(
                 crate::chat_protocol::request_push::MAX_INTERNAL_BODY_BYTES,
             )),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.reserveRecipientBootstrap",
-            post(crate::handlers::ds::direct_requests::reserve_recipient_bootstrap)
+            spost(crate::handlers::ds::direct_requests::reserve_recipient_bootstrap)
                 .layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.releaseRecipientBootstrap",
-            post(crate::handlers::ds::direct_requests::release_recipient_bootstrap)
+            spost(crate::handlers::ds::direct_requests::release_recipient_bootstrap)
                 .layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.prepareDirectRequest",
-            post(crate::handlers::ds::direct_requests::prepare_direct_request)
+            spost(crate::handlers::ds::direct_requests::prepare_direct_request)
                 .layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.publishDirectRequest",
-            post(crate::handlers::ds::direct_requests::publish_direct_request)
+            spost(crate::handlers::ds::direct_requests::publish_direct_request)
                 .layer(DefaultBodyLimit::max(16_777_216)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.deliverDirectRequest",
-            post(crate::handlers::ds::direct_requests::deliver_direct_request)
+            spost(crate::handlers::ds::direct_requests::deliver_direct_request)
                 .layer(DefaultBodyLimit::max(16_777_216)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.deliverAcceptance",
-            post(crate::handlers::ds::direct_requests::deliver_acceptance)
+            spost(crate::handlers::ds::direct_requests::deliver_acceptance)
                 .layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.deliverAcceptanceEntry",
-            post(crate::handlers::ds::direct_requests::deliver_acceptance_entry)
+            spost(crate::handlers::ds::direct_requests::deliver_acceptance_entry)
                 .layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.relaySendMessage",
-            post(crate::handlers::ds::direct_requests::relay_send_message)
+            spost(crate::handlers::ds::direct_requests::relay_send_message)
                 .layer(DefaultBodyLimit::max(15_728_640)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.deliverMessageEntry",
-            post(crate::handlers::ds::direct_requests::deliver_message_entry)
+            spost(crate::handlers::ds::direct_requests::deliver_message_entry)
                 .layer(DefaultBodyLimit::max(15_728_640)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.getDirectRequestOutcome",
-            get(crate::handlers::ds::direct_requests::get_direct_request_outcome),
+            sget(crate::handlers::ds::direct_requests::get_direct_request_outcome),
         )
 }
 

@@ -164,11 +164,12 @@ pub(crate) async fn admit_unsigned_read(
         .await?;
     } else if let Ok(device_uuid) = uuid::Uuid::parse_str(actor_device_id) {
         let _ = sqlx::query(
-            "UPDATE chat.devices SET last_active_at = clock_timestamp() \
+            "UPDATE chat.devices SET last_active_at = $3 \
              WHERE user_did = $1 AND device_id = $2 AND status = 'active'",
         )
         .bind(principal.did())
         .bind(device_uuid)
+        .bind(crate::sim_hooks::current_utc())
         .execute(pool)
         .await;
     }

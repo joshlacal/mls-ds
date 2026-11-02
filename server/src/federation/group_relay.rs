@@ -52,6 +52,8 @@ pub struct GroupRelayState {
     s2s_shared_secret: Option<Arc<Vec<u8>>>,
     i13_receipt_signer: Option<Arc<I13ReceiptSigner>>,
     push_gateway_client: Option<Arc<PushGatewayClient>>,
+    clock: Arc<dyn crate::sim_hooks::DsClock>,
+    spawner: Arc<dyn crate::sim_hooks::TaskSpawner>,
 }
 
 impl GroupRelayState {
@@ -71,7 +73,27 @@ impl GroupRelayState {
             s2s_shared_secret,
             i13_receipt_signer,
             push_gateway_client,
+            clock: Arc::new(crate::sim_hooks::SystemDsClock),
+            spawner: Arc::new(crate::sim_hooks::TokioTaskSpawner),
         }
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn crate::sim_hooks::DsClock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn clock(&self) -> &Arc<dyn crate::sim_hooks::DsClock> {
+        &self.clock
+    }
+
+    pub fn with_spawner(mut self, spawner: Arc<dyn crate::sim_hooks::TaskSpawner>) -> Self {
+        self.spawner = spawner;
+        self
+    }
+
+    pub fn spawner(&self) -> &Arc<dyn crate::sim_hooks::TaskSpawner> {
+        &self.spawner
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -98,6 +120,8 @@ impl GroupRelayState {
             s2s_shared_secret: Some(Arc::new(s2s_secret.to_vec())),
             i13_receipt_signer,
             push_gateway_client,
+            clock: Arc::new(crate::sim_hooks::SystemDsClock),
+            spawner: Arc::new(crate::sim_hooks::TokioTaskSpawner),
         }
     }
 }
@@ -130,6 +154,7 @@ pub struct DeliverGroupEntryRequest {
 }
 
 pub fn group_relay_router(state: GroupRelayState) -> Router {
+    let clock = Arc::clone(&state.clock);
     Router::new()
         .route(
             "/xrpc/blue.catbird.mlsDS.relayGroupMutation",
@@ -141,6 +166,12 @@ pub fn group_relay_router(state: GroupRelayState) -> Router {
             post(handle_deliver_group_entry)
                 .layer(DefaultBodyLimit::max(SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES)),
         )
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let clock = Arc::clone(&clock);
+                async move { crate::sim_hooks::scope_ds_clock(clock, next.run(req)).await }
+            },
+        ))
         .with_state(state)
 }
 
@@ -671,7 +702,10 @@ async fn sequence_relayed_group_application_send(
     let trusted_now = trusted_instant.datetime();
     let canonical_now_str = trusted_now.to_rfc3339_opts(SecondsFormat::Millis, true);
 
-    let entry_id = Uuid::new_v4();
+    let entry_id = crate::sim_hooks::mint_entry_uuid_v4(
+        b"mlsDS.relayGroupMutation",
+        &[conversation_id.as_bytes(), &signed_bytes],
+    );
     let entry_id_str = entry_id.to_string();
     let canon_entry_id = crate::chat_protocol::validation::CanonicalUuidV4::parse(&entry_id_str)
         .map_err(|_| {
@@ -926,13 +960,14 @@ async fn handle_deliver_group_entry(
     if let Err(e) = sqlx::query(
         "INSERT INTO chat.direct_request_transport_entries ( \
              conversation_id, seq, entry_id, entry_bytes, created_at \
-         ) VALUES ($1, $2, $3, $4, clock_timestamp()) \
+         ) VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (conversation_id, seq) DO NOTHING",
     )
     .bind(req.conversation_id)
     .bind(seq)
     .bind(entry_id)
     .bind(&entry_bytes)
+    .bind(crate::sim_hooks::current_utc())
     .execute(&state.pool)
     .await
     {

@@ -199,7 +199,16 @@ async fn execute_first(
     }
     let registration = HydrationAuthority::from_locked_conversation(&aggregate)?
         .locked_registration_from_scope_authority(scope_authority)?;
-    let entry_id = CanonicalUuidV4::parse(&Uuid::new_v4().hyphenated().to_string())
+    let next_seq = aggregate.head().next_entry_seq();
+    let minted_entry_uuid = crate::sim_hooks::mint_entry_uuid_v4(
+        b"chat.leave",
+        &[
+            parsed.conversation_id.as_bytes(),
+            &next_seq.to_be_bytes(),
+            mutation.request_digest(),
+        ],
+    );
+    let entry_id = CanonicalUuidV4::parse(&minted_entry_uuid.hyphenated().to_string())
         .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
     let entry = build_entry(
         &authority,

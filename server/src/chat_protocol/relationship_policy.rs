@@ -724,6 +724,8 @@ pub(crate) enum ProductionRelationshipTransport {
     /// Synthetic allow-all federation transport for the container E2E suite.
     #[cfg(feature = "test-support")]
     FederationAllowAll,
+    /// Deterministic offline allow-all transport for the simulation harness.
+    SimAllowAll,
 }
 
 #[async_trait]
@@ -735,6 +737,7 @@ impl PublicTransport for ProductionRelationshipTransport {
             Self::TestHttps(transport) => transport.get(request).await,
             #[cfg(feature = "test-support")]
             Self::FederationAllowAll => federation_allow_all_response(&request),
+            Self::SimAllowAll => federation_allow_all_response(&request),
         }
     }
 }
@@ -3059,6 +3062,9 @@ impl DatabaseAnchoredProjectionClock {
 
 impl ProjectionClock for DatabaseAnchoredProjectionClock {
     fn now(&self) -> DateTime<Utc> {
+        if crate::sim_hooks::is_deterministic_clock_active() {
+            return crate::sim_hooks::current_utc();
+        }
         let elapsed = TimeDelta::from_std(self.local_anchor.elapsed()).unwrap_or(TimeDelta::MAX);
         self.database_anchor
             .checked_add_signed(elapsed)
@@ -3084,7 +3090,6 @@ pub(crate) type ProductionRelationshipAuthority =
 pub(crate) type ProductionRelationshipAuthority =
     RelationshipAuthority<ProductionRelationshipTransport>;
 
-#[cfg(feature = "test-support")]
 fn federation_allow_all_response(request: &PublicGet) -> Result<PublicResponse, TransportError> {
     let path = request.url.path();
     if path == /* did-web-test */ "/.well-known/did.json" {
@@ -3447,6 +3452,14 @@ impl ProductionRelationshipAuthority {
             fixed_production_relationship_policy_config()?,
             ProductionRelationshipTransport::FederationAllowAll,
             FEDERATION_TEST_SOURCE_PROFILE,
+        ))
+    }
+
+    pub(crate) fn sim_allow_all() -> Result<Self, RelationshipPolicyConfigError> {
+        Ok(Self::from_parts(
+            fixed_production_relationship_policy_config()?,
+            ProductionRelationshipTransport::SimAllowAll,
+            b"catbird-sim-allow-all/v1",
         ))
     }
 }

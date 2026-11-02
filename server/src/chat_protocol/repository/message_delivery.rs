@@ -499,7 +499,15 @@ pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
     let message_id = Uuid::from_bytes(*projection.message_id().as_bytes());
     validate_application_message(&projection)?;
     let archive_commitment = validate_artifacts(&projection, expected, message_id)?;
-    let entry_id = CanonicalUuidV4::parse(&Uuid::new_v4().to_string())
+    let minted_entry_uuid = crate::sim_hooks::mint_entry_uuid_v4(
+        b"chat.sendMessage",
+        &[
+            expected.conversation_id.as_bytes(),
+            &head.next_seq.to_be_bytes(),
+            message_id.as_bytes(),
+        ],
+    );
+    let entry_id = CanonicalUuidV4::parse(&minted_entry_uuid.to_string())
         .map_err(|_| MessageDeliveryError::Invariant)?;
     let conversation_id = CanonicalUuidV4::parse(&expected.conversation_id.to_string())
         .map_err(|_| MessageDeliveryError::Invariant)?;
@@ -671,6 +679,15 @@ pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
 
 static TYPING_LAST: OnceLock<Mutex<HashMap<(Uuid, Uuid), (bool, DateTime<Utc>)>>> = OnceLock::new();
 static TYPING_RATE: OnceLock<Mutex<HashMap<(Uuid, String, Uuid), DateTime<Utc>>>> = OnceLock::new();
+
+pub(crate) fn clear_ephemeral_typing_state() {
+    if let Some(m) = TYPING_LAST.get() {
+        m.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    if let Some(m) = TYPING_RATE.get() {
+        m.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
 
 pub(crate) async fn typing<T: PublicTransport>(
     tx: &mut Transaction<'_, Postgres>,

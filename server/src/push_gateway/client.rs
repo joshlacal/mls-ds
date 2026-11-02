@@ -104,7 +104,11 @@ impl PushGatewayClient {
         canonical_gateway_url: &str,
         body_sha256: &str,
     ) -> Result<String, String> {
-        let now = Utc::now().timestamp();
+        let now = crate::sim_hooks::current_utc().timestamp();
+        let jti = crate::sim_hooks::mint_outbound_jti_uuid_v4(
+            b"push.deliver_jwt",
+            &[canonical_gateway_url.as_bytes(), body_sha256.as_bytes()],
+        );
         let header = URL_SAFE_NO_PAD
             .encode(br##"{"alg":"ES256","typ":"atproto-push-wake+jwt","kid":"#atproto"}"##);
         let claims = URL_SAFE_NO_PAD.encode(
@@ -117,7 +121,7 @@ impl PushGatewayClient {
                 "body_sha256": body_sha256,
                 "iat": now,
                 "exp": now + 60,
-                "jti": Uuid::new_v4().to_string(),
+                "jti": jti.to_string(),
             }))
             .map_err(|e| e.to_string())?,
         );

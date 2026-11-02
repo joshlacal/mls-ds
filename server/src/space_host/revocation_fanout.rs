@@ -102,17 +102,19 @@ pub async fn revoke_member_space_credentials_and_fan_out(
         return Ok(0);
     };
 
+    let now = crate::sim_hooks::current_utc();
     let revoked_rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
         "UPDATE chat.space_credential_jtis \
-            SET revoked_at = clock_timestamp() \
+            SET revoked_at = $3 \
           WHERE space_uri = $1 \
             AND writer_did = $2 \
             AND revoked_at IS NULL \
-            AND expires_at > clock_timestamp() \
+            AND expires_at > $3 \
       RETURNING jti, expires_at",
     )
     .bind(&space_uri)
     .bind(target_did)
+    .bind(now)
     .fetch_all(runtime.pool())
     .await
     .map_err(|e| e.to_string())?;
@@ -164,9 +166,10 @@ pub async fn revoke_member_space_credentials_and_fan_out(
     let syncers: Vec<(String, String)> = sqlx::query_as(
         "SELECT service_ref, endpoint_url \
            FROM chat.conversation_space_syncers \
-          WHERE space_uri = $1 AND expires_at > clock_timestamp()",
+          WHERE space_uri = $1 AND expires_at > $2",
     )
     .bind(&space_uri)
+    .bind(now)
     .fetch_all(runtime.pool())
     .await
     .map_err(|e| e.to_string())?;
@@ -191,16 +194,18 @@ pub async fn revoke_user_space_credentials_across_conversations(
     runtime: &SpaceHostRuntime,
     target_did: &str,
 ) -> Result<usize, String> {
+    let now = crate::sim_hooks::current_utc();
     let pairs: Vec<(Uuid, i64)> = sqlx::query_as(
         "SELECT cs.conversation_id, cs.generation \
            FROM chat.conversation_spaces cs \
            JOIN chat.space_credential_jtis j ON j.space_uri = cs.space_uri \
           WHERE j.writer_did = $1 \
             AND j.revoked_at IS NULL \
-            AND j.expires_at > clock_timestamp() \
+            AND j.expires_at > $2 \
           GROUP BY cs.conversation_id, cs.generation",
     )
     .bind(target_did)
+    .bind(now)
     .fetch_all(runtime.pool())
     .await
     .map_err(|e| e.to_string())?;
@@ -225,6 +230,7 @@ pub async fn revoke_inactive_space_credentials_for_conversation(
     conversation_id: Uuid,
     generation: i64,
 ) -> Result<usize, String> {
+    let now = crate::sim_hooks::current_utc();
     let inactive_writers: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT j.writer_did \
            FROM chat.conversation_spaces cs \
@@ -232,7 +238,7 @@ pub async fn revoke_inactive_space_credentials_for_conversation(
           WHERE cs.conversation_id = $1 \
             AND cs.generation = $2 \
             AND j.revoked_at IS NULL \
-            AND j.expires_at > clock_timestamp() \
+            AND j.expires_at > $3 \
             AND NOT EXISTS ( \
                 SELECT 1 \
                   FROM chat.participants p \
@@ -244,6 +250,7 @@ pub async fn revoke_inactive_space_credentials_for_conversation(
     )
     .bind(conversation_id)
     .bind(generation)
+    .bind(now)
     .fetch_all(runtime.pool())
     .await
     .map_err(|e| e.to_string())?;
@@ -268,14 +275,16 @@ pub async fn fan_out_space_deleted_for_conversation(
     conversation_id: Uuid,
     generation: i64,
 ) -> Result<usize, String> {
+    let now = crate::sim_hooks::current_utc();
     let space_uri: Option<String> = sqlx::query_scalar(
         "UPDATE chat.conversation_spaces \
-            SET deleted_at = COALESCE(deleted_at, clock_timestamp()) \
+            SET deleted_at = COALESCE(deleted_at, $3) \
           WHERE conversation_id = $1 AND generation = $2 \
       RETURNING space_uri",
     )
     .bind(conversation_id)
     .bind(generation)
+    .bind(now)
     .fetch_optional(runtime.pool())
     .await
     .map_err(|e| e.to_string())?;
@@ -286,10 +295,11 @@ pub async fn fan_out_space_deleted_for_conversation(
 
     let _ = sqlx::query(
         "UPDATE chat.space_credential_jtis \
-            SET revoked_at = COALESCE(revoked_at, clock_timestamp()) \
+            SET revoked_at = COALESCE(revoked_at, $2) \
           WHERE space_uri = $1 AND revoked_at IS NULL",
     )
     .bind(&space_uri)
+    .bind(now)
     .execute(runtime.pool())
     .await;
 
@@ -299,9 +309,10 @@ pub async fn fan_out_space_deleted_for_conversation(
     let syncers: Vec<(String, String)> = sqlx::query_as(
         "SELECT service_ref, endpoint_url \
            FROM chat.conversation_space_syncers \
-          WHERE space_uri = $1 AND expires_at > clock_timestamp()",
+          WHERE space_uri = $1 AND expires_at > $2",
     )
     .bind(&space_uri)
+    .bind(now)
     .fetch_all(runtime.pool())
     .await
     .map_err(|e| e.to_string())?;
@@ -357,12 +368,14 @@ pub(crate) async fn fan_out_notify_write_to_syncers(
     space_rev: &str,
     data_cid: &[u8; 32],
 ) -> Result<usize, String> {
+    let now = crate::sim_hooks::current_utc();
     let syncers: Vec<(String, String)> = sqlx::query_as(
         "SELECT service_ref, endpoint_url \
            FROM chat.conversation_space_syncers \
-          WHERE space_uri = $1 AND expires_at > clock_timestamp()",
+          WHERE space_uri = $1 AND expires_at > $2",
     )
     .bind(space_uri)
+    .bind(now)
     .fetch_all(runtime.pool())
     .await
     .map_err(|e| e.to_string())?;

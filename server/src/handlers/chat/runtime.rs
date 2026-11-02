@@ -104,6 +104,8 @@ pub struct ChatRuntime {
     commit_submitter: Option<Arc<crate::federation::commit_submitter::RemoteCommitSubmitter>>,
     space_host_config: Option<crate::space_host::SpaceHostConfig>,
     push_gateway_client: Option<Arc<crate::push_gateway::client::PushGatewayClient>>,
+    clock: Arc<dyn crate::sim_hooks::DsClock>,
+    spawner: Arc<dyn crate::sim_hooks::TaskSpawner>,
 }
 
 impl fmt::Debug for ChatRuntime {
@@ -244,7 +246,49 @@ impl ChatRuntime {
             commit_submitter: None,
             space_host_config,
             push_gateway_client,
+            clock: Arc::new(crate::sim_hooks::SystemDsClock),
+            spawner: Arc::new(crate::sim_hooks::TokioTaskSpawner),
         })
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn crate::sim_hooks::DsClock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn clock(&self) -> &Arc<dyn crate::sim_hooks::DsClock> {
+        &self.clock
+    }
+
+    pub fn with_spawner(mut self, spawner: Arc<dyn crate::sim_hooks::TaskSpawner>) -> Self {
+        self.sse_state.set_spawner(Arc::clone(&spawner));
+        self.spawner = spawner;
+        self
+    }
+
+    pub fn spawner(&self) -> &Arc<dyn crate::sim_hooks::TaskSpawner> {
+        &self.spawner
+    }
+
+    pub fn with_space_host_config(mut self, config: crate::space_host::SpaceHostConfig) -> Self {
+        self.push_gateway_client = Some(Arc::new(
+            crate::push_gateway::client::PushGatewayClient::new_es256(
+                config.authority_did.clone(),
+                config.signing_key.clone(),
+            ),
+        ));
+        self.space_host_config = Some(config);
+        self
+    }
+
+    /// Configure an offline deterministic allow-all relationship authority for the
+    /// simulation harness without modifying production `from_env` startup guards.
+    pub fn with_sim_allow_all_relationships(mut self) -> Result<Self, String> {
+        self.relationship_authority = Arc::new(
+            ProductionRelationshipAuthority::sim_allow_all()
+                .map_err(|e| format!("sim relationship authority rejected: {e:?}"))?,
+        );
+        Ok(self)
     }
 
     pub fn from_env_with_resolver(
@@ -566,14 +610,18 @@ impl ChatRuntime {
         };
         let pool = pool.clone();
         let did = did.to_owned();
-        tokio::spawn(async move {
-            let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
-            let _ = crate::space_host::revocation_fanout::revoke_user_space_credentials_across_conversations(
-                &host,
-                &did,
-            )
-            .await;
-        });
+        let clock = Arc::clone(&self.clock);
+        self.spawner.spawn_box(
+            "chat.post_commit.device_revoked",
+            Box::pin(crate::sim_hooks::scope_ds_clock(clock, async move {
+                let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
+                let _ = crate::space_host::revocation_fanout::revoke_user_space_credentials_across_conversations(
+                    &host,
+                    &did,
+                )
+                .await;
+            })),
+        );
     }
 
     /// Post-commit (`M-F04`) Space deletion fan-out when `closeConversation` closes a generation.
@@ -604,13 +652,18 @@ impl ChatRuntime {
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let pool = pool.clone();
-        tokio::spawn(async move {
-            let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
-            let _ = crate::space_host::revocation_fanout::fan_out_space_deleted_for_conversation(
-                &host, cid, gen,
-            )
-            .await;
-        });
+        let clock = Arc::clone(&self.clock);
+        self.spawner.spawn_box(
+            "chat.post_commit.close_conversation",
+            Box::pin(crate::sim_hooks::scope_ds_clock(clock, async move {
+                let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
+                let _ =
+                    crate::space_host::revocation_fanout::fan_out_space_deleted_for_conversation(
+                        &host, cid, gen,
+                    )
+                    .await;
+            })),
+        );
     }
 
     /// Post-commit (`M-F04`) Space credential revocation + webhook fan-out when a membership transition
@@ -636,15 +689,19 @@ impl ChatRuntime {
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let pool = pool.clone();
-        tokio::spawn(async move {
-            let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
-            let _ = crate::space_host::revocation_fanout::revoke_inactive_space_credentials_for_conversation(
-                &host,
-                cid,
-                gen,
-            )
-            .await;
-        });
+        let clock = Arc::clone(&self.clock);
+        self.spawner.spawn_box(
+            "chat.post_commit.membership_transition",
+            Box::pin(crate::sim_hooks::scope_ds_clock(clock, async move {
+                let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
+                let _ = crate::space_host::revocation_fanout::revoke_inactive_space_credentials_for_conversation(
+                    &host,
+                    cid,
+                    gen,
+                )
+                .await;
+            })),
+        );
     }
 }
 

@@ -8,17 +8,25 @@ const ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
 
 static LAST_MICROS: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) fn reset_tid_state() {
+    LAST_MICROS.store(0, Ordering::SeqCst);
+}
+
 /// A new TID. `clock_id` keeps concurrent processes apart; the per-process
 /// counter keeps one process monotone even when the clock stalls.
 pub fn next_tid() -> String {
-    let now = chrono::Utc::now().timestamp_micros().max(0) as u64;
+    let now = crate::sim_hooks::current_utc().timestamp_micros().max(0) as u64;
     let micros = LAST_MICROS
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
             Some(now.max(last + 1))
         })
         .map(|last| now.max(last + 1))
         .unwrap_or(now);
-    let clock_id = u64::from(rand::random::<u16>() & 0x3ff);
+    let clock_id = if crate::sim_hooks::is_deterministic_clock_active() {
+        0
+    } else {
+        u64::from(rand::random::<u16>() & 0x3ff)
+    };
     encode(((micros & ((1 << 53) - 1)) << 10) | clock_id)
 }
 

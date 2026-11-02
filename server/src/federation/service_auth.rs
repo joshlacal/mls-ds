@@ -76,14 +76,22 @@ impl ServiceAuthClient {
 
     /// Sign a request to a target DS for a specific XRPC method.
     pub fn sign_request(&self, target_did: &str, method: &str) -> Result<String, FederationError> {
-        let now = Utc::now().timestamp();
+        let now = crate::sim_hooks::current_utc().timestamp();
+        let jti = crate::sim_hooks::mint_outbound_jti_uuid_v4(
+            b"federation.service_auth",
+            &[
+                self.self_did.as_bytes(),
+                target_did.as_bytes(),
+                method.as_bytes(),
+            ],
+        );
         let claims = ServiceAuthClaims {
             iss: self.self_did.clone(),
             aud: target_did.to_string(),
             exp: now + 120,
             iat: now,
             lxm: method.to_string(),
-            jti: uuid::Uuid::new_v4().to_string(),
+            jti: jti.to_string(),
         };
 
         let mut header = Header::new(self.algorithm);

@@ -315,11 +315,15 @@ impl VerifiedServicePrincipal {
     }
 
     pub fn for_federated_s2s(did: &str, endpoint_nsid: &str) -> Self {
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::sim_hooks::current_utc().timestamp();
+        let jti = crate::sim_hooks::mint_outbound_jti_uuid_v4(
+            b"auth.for_federated_s2s",
+            &[did.as_bytes(), endpoint_nsid.as_bytes()],
+        );
         Self {
             did: did.to_string(),
             endpoint_nsid: endpoint_nsid.to_string(),
-            jti: uuid::Uuid::new_v4().to_string(),
+            jti: jti.to_string(),
             iat: now,
             exp: now + 300,
             token: "federated-s2s-token".to_string(),
@@ -562,7 +566,7 @@ impl AuthMiddleware {
         // Expiration & lifetime bounds
         const MAX_SERVICE_JWT_LIFETIME_SECS: i64 = 300;
         const MAX_SERVICE_JWT_FUTURE_SKEW_SECS: i64 = 60;
-        let now = Utc::now().timestamp();
+        let now = crate::sim_hooks::current_utc().timestamp();
         if claims.exp < now {
             return Err(AuthError::TokenExpired);
         }
@@ -1210,6 +1214,19 @@ pub async fn cache_test_did_document(doc: DidDocument) {
     shared_auth_middleware_ref().cache_did_document(doc).await;
 }
 
+pub(crate) async fn cache_sim_did_document(doc: DidDocument) {
+    shared_auth_middleware_ref().cache_did_document(doc).await;
+}
+
+pub(crate) fn clear_sim_auth_caches() {
+    JTI_CACHE.invalidate_all();
+    JTI_CACHE.run_pending_tasks();
+    shared_auth_middleware_ref().rate_limiters.invalidate_all();
+    shared_auth_middleware_ref()
+        .rate_limiters
+        .run_pending_tasks();
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub async fn get_cached_test_did_document_json(did: &str) -> Option<serde_json::Value> {
     let cached = shared_auth_middleware_ref().did_cache.get(did).await?;
@@ -1725,7 +1742,7 @@ async fn verify_mls_service_principal_with(
     let claims = shared_auth_middleware_ref()
         .verify_jwt_for_audience(token, Some(&expected_service_ref))
         .await?;
-    let now = Utc::now().timestamp();
+    let now = crate::sim_hooks::current_utc().timestamp();
     let (issuer, iat) = validate_mls_service_claims(&claims, endpoint_nsid, now)?;
     enforce_standard_with_replay_store(&claims, endpoint_nsid, pool).await?;
     if issuer_quota {
