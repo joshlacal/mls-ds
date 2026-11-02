@@ -425,6 +425,7 @@ impl ChatRuntime {
                 protocol.0
             ));
         }
+        drop(conn);
         if self.request_receipt_signer.is_none() {
             let schema_present: bool = sqlx::query_scalar(
                 "SELECT to_regclass('chat.direct_request_attempts') IS NOT NULL",

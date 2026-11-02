@@ -689,6 +689,9 @@ fn signed_identity(
 async fn request_database_instant(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<DateTime<Utc>, DirectRequestStoreError> {
+    if crate::sim_hooks::is_deterministic_clock_active() {
+        return Ok(crate::sim_hooks::current_utc());
+    }
     Ok(
         sqlx::query_scalar("SELECT date_trunc('milliseconds',clock_timestamp())")
             .fetch_one(&mut **tx)
