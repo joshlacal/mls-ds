@@ -87,7 +87,7 @@ pub struct WriteBody {
 }
 
 fn now_ms() -> DateTime<Utc> {
-    let now = Utc::now();
+    let now = crate::sim_hooks::current_utc();
     DateTime::from_timestamp_millis(now.timestamp_millis()).unwrap_or(now)
 }
 
