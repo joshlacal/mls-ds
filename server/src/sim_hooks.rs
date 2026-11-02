@@ -1,5 +1,5 @@
 //! Deterministic simulation hooks, clock/spawner seams, SQL wall-clock default audit,
-//! and sub-millisecond PostgreSQL schema reset for the Catbird MLS Hydrostatic Pressure Tank.
+//! and fast PostgreSQL schema reset for the Catbird MLS Hydrostatic Pressure Tank.
 //!
 //! Production runtimes default to [`SystemDsClock`] and [`TokioTaskSpawner`] with zero
 //! behavioral change. Simulation harnesses inject [`ManualDsClock`] and [`QueuedTaskSpawner`]
@@ -58,8 +58,6 @@ static IN_PROCESS_MIGRATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
 static RESET_SQL_PLAN_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static SIM_JTI_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 // =============================================================================
 // 1. Deterministic Server Clock (`DsClock`)
 // =============================================================================
@@ -75,10 +73,15 @@ pub trait DsClock: Send + Sync {
         self.now_utc().timestamp_millis()
     }
 
+    /// Counter state owned by this deterministic clock, never shared across workers.
+    fn simulation_counters(&self) -> Option<&DsClockCounters> {
+        None
+    }
+
     /// Whether this clock represents a deterministic simulation clock rather than
     /// the host wall clock (`SystemDsClock`).
     fn is_deterministic(&self) -> bool {
-        true
+        self.simulation_counters().is_some()
     }
 }
 
@@ -96,9 +99,28 @@ impl DsClock for SystemDsClock {
     }
 }
 
+/// Replay sequences owned by a deterministic clock instance.
+#[derive(Debug, Default)]
+pub struct DsClockCounters {
+    entry_uuid: AtomicU64,
+    outbound_jti: AtomicU64,
+    tid_micros: AtomicU64,
+    entropy: AtomicU64,
+}
+
+impl DsClockCounters {
+    fn reset(&self) {
+        self.entry_uuid.store(0, Ordering::SeqCst);
+        self.outbound_jti.store(0, Ordering::SeqCst);
+        self.tid_micros.store(0, Ordering::SeqCst);
+        self.entropy.store(0, Ordering::SeqCst);
+    }
+}
+
 /// Manually controlled simulation clock with atomic/synchronized stepping.
 pub struct ManualDsClock {
     current: RwLock<DateTime<Utc>>,
+    counters: DsClockCounters,
 }
 
 impl std::fmt::Debug for ManualDsClock {
@@ -113,6 +135,7 @@ impl ManualDsClock {
     pub fn new(initial: DateTime<Utc>) -> Self {
         Self {
             current: RwLock::new(initial),
+            counters: DsClockCounters::default(),
         }
     }
 
@@ -127,11 +150,23 @@ impl ManualDsClock {
             .checked_add_signed(delta)
             .unwrap_or(DateTime::<Utc>::MAX_UTC);
     }
+
+    /// Restart this worker's UUID, JTI, TID, and capability-entropy sequences.
+    ///
+    /// Call only between runs, after this clock's queued work has been drained.
+    /// The current timestamp is unchanged; use [`Self::set_utc`] to rewind it.
+    pub fn reset_counters(&self) {
+        self.counters.reset();
+    }
 }
 
 impl DsClock for ManualDsClock {
     fn now_utc(&self) -> DateTime<Utc> {
         *self.current.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn simulation_counters(&self) -> Option<&DsClockCounters> {
+        Some(&self.counters)
     }
 }
 
@@ -168,7 +203,7 @@ pub fn with_ds_clock<R>(clock: Arc<dyn DsClock>, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-fn active_scoped_clock() -> Option<Arc<dyn DsClock>> {
+pub(crate) fn active_scoped_clock() -> Option<Arc<dyn DsClock>> {
     if let Ok(clock) = TASK_DS_CLOCK.try_with(Arc::clone) {
         return Some(clock);
     }
@@ -190,18 +225,55 @@ pub fn is_deterministic_clock_active() -> bool {
 
 /// Mint a canonical RFC 4122 UUIDv4 for server-assigned transcript `entryId` fields.
 ///
-/// Under `SystemDsClock` (production), delegates directly to `Uuid::new_v4()`.
-/// Under an active deterministic `DsClock`, derives a reproducible RFC 4122 v4 UUID
-/// from `(current_utc, domain, parts)` so replays produce byte-identical entries and receipts.
+/// Production uses `Uuid::new_v4()`. A deterministic clock owns its sequence,
+/// so identical worker-local schedules replay without sharing process state.
 pub(crate) fn mint_entry_uuid_v4(domain: &[u8], parts: &[&[u8]]) -> Uuid {
-    if !is_deterministic_clock_active() {
+    let Some(clock) = active_scoped_clock().filter(|clock| clock.is_deterministic()) else {
         return Uuid::new_v4();
-    }
-    let now = current_utc();
+    };
+    let counters = clock
+        .simulation_counters()
+        .expect("deterministic clocks own simulation counters");
+    let sequence = counters.entry_uuid.fetch_add(1, Ordering::SeqCst);
+    deterministic_uuid_v4(
+        b"CATBIRD-SIM-ENTRY-UUID-V4\0",
+        clock.now_utc(),
+        sequence,
+        domain,
+        parts,
+    )
+}
+
+/// Mint an outbound JWT `jti` with a clock-local sequence, random in production.
+pub(crate) fn mint_outbound_jti_uuid_v4(domain: &[u8], parts: &[&[u8]]) -> Uuid {
+    let Some(clock) = active_scoped_clock().filter(|clock| clock.is_deterministic()) else {
+        return Uuid::new_v4();
+    };
+    let counters = clock
+        .simulation_counters()
+        .expect("deterministic clocks own simulation counters");
+    let sequence = counters.outbound_jti.fetch_add(1, Ordering::SeqCst);
+    deterministic_uuid_v4(
+        b"CATBIRD-SIM-JTI-UUID-V4\0",
+        clock.now_utc(),
+        sequence,
+        domain,
+        parts,
+    )
+}
+
+fn deterministic_uuid_v4(
+    purpose: &[u8],
+    now: DateTime<Utc>,
+    sequence: u64,
+    domain: &[u8],
+    parts: &[&[u8]],
+) -> Uuid {
     let mut hasher = Sha256::new();
-    hasher.update(b"CATBIRD-SIM-ENTRY-UUID-V4\0");
+    hasher.update(purpose);
     hasher.update(now.timestamp().to_be_bytes());
     hasher.update(now.timestamp_subsec_nanos().to_be_bytes());
+    hasher.update(sequence.to_be_bytes());
     hasher.update((domain.len() as u32).to_be_bytes());
     hasher.update(domain);
     for part in parts {
@@ -215,16 +287,47 @@ pub(crate) fn mint_entry_uuid_v4(domain: &[u8], parts: &[&[u8]]) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-/// Mint an outbound JWT `jti` UUIDv4 (deterministic counter under `DsClock`, random otherwise).
-pub(crate) fn mint_outbound_jti_uuid_v4(domain: &[u8], parts: &[&[u8]]) -> Uuid {
-    if !is_deterministic_clock_active() {
-        return Uuid::new_v4();
+/// Fill simulation capability entropy, leaving `output` untouched in production.
+pub(crate) fn deterministic_entropy(domain: &[u8], output: &mut [u8]) -> bool {
+    let Some(clock) = active_scoped_clock().filter(|clock| clock.is_deterministic()) else {
+        return false;
+    };
+    let counters = clock
+        .simulation_counters()
+        .expect("deterministic clocks own simulation counters");
+    let sequence = counters.entropy.fetch_add(1, Ordering::SeqCst);
+    let now = clock.now_utc();
+    let mut hasher = Sha256::new();
+    hasher.update(b"CATBIRD-SIM-CAPABILITY-ENTROPY\0");
+    hasher.update(now.timestamp().to_be_bytes());
+    hasher.update(now.timestamp_subsec_nanos().to_be_bytes());
+    hasher.update(sequence.to_be_bytes());
+    hasher.update((domain.len() as u32).to_be_bytes());
+    hasher.update(domain);
+    for (block, chunk) in output.chunks_mut(32).enumerate() {
+        let mut block_hasher = hasher.clone();
+        block_hasher.update((block as u64).to_be_bytes());
+        let digest = block_hasher.finalize();
+        chunk.copy_from_slice(&digest[..chunk.len()]);
     }
-    let seq = SIM_JTI_COUNTER.fetch_add(1, Ordering::SeqCst).to_be_bytes();
-    let mut extended: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
-    extended.extend_from_slice(parts);
-    extended.push(&seq);
-    mint_entry_uuid_v4(domain, &extended)
+    true
+}
+
+pub(crate) fn next_deterministic_tid_micros() -> Option<u64> {
+    let clock = active_scoped_clock().filter(|clock| clock.is_deterministic())?;
+    let counters = clock
+        .simulation_counters()
+        .expect("deterministic clocks own simulation counters");
+    let now = clock.now_utc().timestamp_micros().max(0) as u64;
+    Some(
+        counters
+            .tid_micros
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+                Some(now.max(last.saturating_add(1)))
+            })
+            .map(|last| now.max(last.saturating_add(1)))
+            .expect("TID counter updates cannot fail"),
+    )
 }
 
 // =============================================================================
@@ -370,6 +473,31 @@ fn validate_sim_database_name(db_name: &str) -> Result<(), String> {
             "invalid simulation database identifier {db_name:?} (must be lowercase ASCII [a-z0-9_], <=63 chars)"
         ));
     }
+    if !["catbird_sim_", SIM_DISPOSABLE_DB_PREFIX]
+        .iter()
+        .any(|&prefix| {
+            db_name
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| !suffix.is_empty())
+        })
+    {
+        return Err(format!(
+            "refusing database {db_name:?}: simulation databases require catbird_sim_ or sim_tank_ prefix"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sim_reset_target(db_name: &str, server_addr: Option<&str>) -> Result<(), String> {
+    validate_sim_database_name(db_name)?;
+    if !server_addr
+        .and_then(|addr| addr.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|addr| addr.is_loopback())
+    {
+        return Err(format!(
+            "refusing simulation reset on non-loopback PostgreSQL server {server_addr:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -448,6 +576,29 @@ async fn migrate_and_seed_sim_database(db_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Keep the paused Tokio driver from advancing pool timers while real PostgreSQL
+/// I/O is pending. This caller-owned loop has a real deadline, no spawned task,
+/// and no assumption that a released connection must become idle.
+async fn drive_sim_postgres_io<T>(
+    future: impl Future<Output = sqlx::Result<T>>,
+) -> sqlx::Result<T> {
+    let started = std::time::Instant::now();
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut future => return result,
+            () = tokio::task::yield_now() => {}
+        }
+        if started.elapsed() >= Duration::from_secs(10) {
+            return Err(sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulation PostgreSQL I/O exceeded its 10s real-time deadline",
+            )));
+        }
+    }
+}
+
 /// Create (if absent), migrate, and open a `max_connections(1)` worker pool for `db_name`.
 pub async fn open_sim_worker_pool(base_url: Option<&str>, db_name: &str) -> Result<PgPool, String> {
     validate_sim_database_name(db_name)?;
@@ -474,71 +625,25 @@ pub async fn open_sim_worker_pool(base_url: Option<&str>, db_name: &str) -> Resu
     target_url.set_path(&format!("/{db_name}"));
     migrate_and_seed_sim_database(target_url.as_str()).await?;
 
-    // Under `#[tokio::test(flavor = "current_thread", start_paused = true)]`, `PgPoolOptions::connect`
-    // wraps the initial loopback TCP handshake in `tokio::time::timeout(acquire_timeout, ...)`.
-    // Keeping a lightweight yield task runnable until the handshake completes prevents Tokio's
-    // paused time driver from auto-advancing `acquire_timeout` while kqueue completes the socket
-    // connect, and preserves `tokio::time::Instant::now()` at +0ns.
-    // Setting `test_before_acquire(false)`, `idle_timeout(None)`, and `max_lifetime(None)` ensures
-    // the warm single connection stays in `idle_conns` and every subsequent `acquire()` resolves in
-    // `Poll::Ready` on its first poll without registering any Tokio `Sleep` timer.
-    let yield_guard = tokio::spawn(async {
-        loop {
-            std::thread::sleep(Duration::from_micros(50));
-            tokio::task::yield_now().await;
-        }
-    });
-    let pool_slot: Arc<Mutex<Option<sqlx::pool::Pool<sqlx::Postgres>>>> =
-        Arc::new(Mutex::new(None));
-    let pool_slot_for_release = Arc::clone(&pool_slot);
-    let connect_res = PgPoolOptions::new()
-        .max_connections(1)
-        .test_before_acquire(false)
-        .idle_timeout(None)
-        .max_lifetime(None)
-        .acquire_timeout(Duration::from_secs(10))
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                sqlx::query("SET synchronous_commit = off")
-                    .execute(conn)
-                    .await?;
-                Ok(())
+    drive_sim_postgres_io(
+        PgPoolOptions::new()
+            .max_connections(1)
+            .test_before_acquire(false)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .acquire_timeout(Duration::from_secs(10))
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET synchronous_commit = off")
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
             })
-        })
-        .after_release(move |_conn, _meta| {
-            let pool_opt = pool_slot_for_release
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            Box::pin(async move {
-                // `sqlx` runs `self.raw.ping().await` right after `after_release` before
-                // releasing the single semaphore permit. Under `#[tokio::test(start_paused = true)]`,
-                // keeping a micro-yield task runnable until `ping()` returns the connection to
-                // `idle_conns` prevents Tokio from auto-advancing `acquire_timeout` mid-ping.
-                if let Some(pool) = pool_opt {
-                    tokio::spawn(async move {
-                        let started = std::time::Instant::now();
-                        while !pool.is_closed()
-                            && pool.num_idle() == 0
-                            && started.elapsed() < Duration::from_millis(250)
-                        {
-                            std::thread::sleep(Duration::from_micros(50));
-                            tokio::task::yield_now().await;
-                        }
-                    });
-                }
-                Ok(true)
-            })
-        })
-        .connect(target_url.as_str())
-        .await;
-    yield_guard.abort();
-    let _ = yield_guard.await;
-
-    let pool =
-        connect_res.map_err(|e| format!("connect max_connections(1) sim pool {db_name}: {e}"))?;
-    *pool_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(pool.clone());
-    Ok(pool)
+            .connect(target_url.as_str()),
+    )
+    .await
+    .map_err(|e| format!("connect max_connections(1) sim pool {db_name}: {e}"))
 }
 
 /// Isolated disposable simulation PostgreSQL database with `max_connections(1)` and RAII drop reaper.
@@ -690,43 +795,86 @@ async fn build_reset_sql_batch(conn: &mut PgConnection) -> sqlx::Result<String> 
     .fetch_one(&mut *conn)
     .await?;
 
-    // Compile a session-local `pg_temp.catbird_sim_reset()` PL/pgSQL function so PostgreSQL caches
-    // the query plans for all `EXISTS (SELECT 1 ... LIMIT 1)` occupancy probes across resets
-    // (~1.5-3 ms steady-state instead of ~20 ms anonymous-DO re-parse overhead).
-    let mut create_fn = String::with_capacity(12_288);
+    // One physical-storage filter gates cached static DELETE plans, avoiding
+    // unused-table work and dynamic replanning on every reset.
+    let mut create_fn = String::with_capacity(16_384);
     create_fn.push_str(
-        "CREATE OR REPLACE FUNCTION pg_temp.catbird_sim_reset() RETURNS void\n\
+        "CREATE OR REPLACE FUNCTION pg_temp.catbird_sim_delete(force_plan_warm boolean) RETURNS void\n\
+         LANGUAGE plpgsql\n\
+         SET plan_cache_mode = force_generic_plan\n\
+         AS $sim_delete$\n\
+         DECLARE\n\
+             active_relations text[];\n\
+         BEGIN\n\
+             EXECUTE 'SET LOCAL session_replication_role = replica';\n\
+             SELECT COALESCE(array_agg(relation_name), '{}'::text[]) INTO active_relations\n\
+               FROM unnest(ARRAY[\n",
+    );
+
+    for (index, (schema, table)) in tables.iter().enumerate() {
+        if index > 0 {
+            create_fn.push_str(",\n");
+        }
+        create_fn.push_str(&format!("'\"{schema}\".\"{table}\"'"));
+    }
+    create_fn.push_str(
+        "]::text[]) AS targets(relation_name)\n\
+                  WHERE pg_relation_size(relation_name::regclass) > 0;\n",
+    );
+    for (schema, table) in &tables {
+        create_fn.push_str(&format!(
+            "    IF force_plan_warm OR '\"{schema}\".\"{table}\"' = ANY(active_relations) THEN\n\
+                     DELETE FROM \"{schema}\".\"{table}\";\n\
+                 END IF;\n"
+        ));
+    }
+
+    if has_event_retention {
+        create_fn.push_str(
+            "            UPDATE chat.event_retention er\n\
+                            SET retained_floor = 0, updated_at = pi.created_at\n\
+                           FROM chat.protocol_instances pi\n\
+                          WHERE pi.singleton = TRUE\n\
+                            AND er.protocol_instance_id = pi.protocol_instance_id\n\
+                            AND (er.retained_floor <> 0 OR er.updated_at <> pi.created_at);\n\
+                         INSERT INTO chat.event_retention (protocol_instance_id, retained_floor, updated_at)\n\
+                         SELECT protocol_instance_id, 0, created_at\n\
+                           FROM chat.protocol_instances WHERE singleton = TRUE\n\
+                         ON CONFLICT (protocol_instance_id) DO NOTHING;\n",
+        );
+    }
+
+    create_fn.push_str(
+        "END\n\
+         $sim_delete$;\n\
+         CREATE OR REPLACE FUNCTION pg_temp.catbird_sim_reset(force_compaction boolean) RETURNS void\n\
          LANGUAGE plpgsql\n\
          SET plan_cache_mode = force_generic_plan\n\
          AS $sim_reset$\n\
          DECLARE\n\
              targets text[] := ARRAY[]::text[];\n\
+             reset_count integer := COALESCE(NULLIF(current_setting('catbird_sim.resets_since_compaction', TRUE), ''), '0')::integer;\n\
+             cold_session boolean := NULLIF(current_setting('catbird_sim.resets_since_compaction', TRUE), '') IS NULL;\n\
+             fast_reset boolean := FALSE;\n\
              reseed_retention boolean := FALSE;\n\
          BEGIN\n\
-             BEGIN\n\
-                 EXECUTE 'SET LOCAL session_replication_role = replica';\n",
+             IF NOT force_compaction AND NOT cold_session AND reset_count < 63 THEN\n\
+                 BEGIN\n\
+                     PERFORM pg_temp.catbird_sim_delete(FALSE);\n\
+                     fast_reset := TRUE;\n\
+                 EXCEPTION WHEN insufficient_privilege THEN\n\
+                     fast_reset := FALSE;\n\
+                 END;\n\
+             END IF;\n\
+             IF fast_reset THEN\n\
+                 reset_count := reset_count + 1;\n\
+             ELSE\n",
     );
 
     for (schema, table) in &tables {
-        create_fn.push_str(&format!("        DELETE FROM \"{schema}\".\"{table}\";\n"));
-    }
-
-    if has_event_retention {
-        create_fn.push_str(
-            "        UPDATE chat.event_retention er\n\
-                        SET retained_floor = 0, updated_at = pi.created_at\n\
-                       FROM chat.protocol_instances pi\n\
-                      WHERE pi.singleton = TRUE\n\
-                        AND er.protocol_instance_id = pi.protocol_instance_id\n\
-                        AND (er.retained_floor <> 0 OR er.updated_at <> pi.created_at);\n",
-        );
-    }
-
-    create_fn.push_str("    EXCEPTION WHEN insufficient_privilege THEN\n");
-
-    for (schema, table) in &tables {
         create_fn.push_str(&format!(
-            "        IF EXISTS (SELECT 1 FROM \"{schema}\".\"{table}\" LIMIT 1) THEN\n\
+            "        IF EXISTS (SELECT 1 FROM \"{schema}\".\"{table}\" LIMIT 1)\n\
+                        OR pg_relation_size('\"{schema}\".\"{table}\"'::regclass) > 0 THEN\n\
                          targets := array_append(targets, '\"{schema}\".\"{table}\"');\n\
                      END IF;\n"
         ));
@@ -741,9 +889,21 @@ async fn build_reset_sql_batch(conn: &mut PgConnection) -> sqlx::Result<String> 
                           WHERE pi.singleton = TRUE\n\
                             AND er.retained_floor = 0\n\
                             AND er.updated_at = pi.created_at\n\
-                     ) THEN\n\
-                         targets := array_append(targets, '\"chat\".\"event_retention\"');\n\
+                     ) OR pg_relation_size('chat.event_retention') > 0 THEN\n\
                          reseed_retention := TRUE;\n\
+                         IF EXISTS (SELECT 1 FROM chat.event_retention LIMIT 1)\n\
+                            OR pg_relation_size('chat.event_retention') > 0 THEN\n\
+                             targets := array_append(targets, '\"chat\".\"event_retention\"');\n\
+                         END IF;\n\
+                     END IF;\n",
+        );
+    }
+
+    if has_direct_budget {
+        create_fn.push_str(
+            "        IF EXISTS (SELECT 1 FROM chat.direct_request_budget WHERE pending_bytes <> 0 OR retained_bytes <> 0)\n\
+                        OR pg_relation_size('chat.direct_request_budget') > 0 THEN\n\
+                         targets := array_append(targets, '\"chat\".\"direct_request_budget\"');\n\
                      END IF;\n",
         );
     }
@@ -766,7 +926,17 @@ async fn build_reset_sql_batch(conn: &mut PgConnection) -> sqlx::Result<String> 
         );
     }
 
-    create_fn.push_str("    END;\n");
+    // Prime all static DELETE plans on the slow compaction path, after every
+    // operational heap is empty. These warm-up DELETEs create no tombstones.
+    create_fn.push_str(
+        "        BEGIN\n\
+                     PERFORM pg_temp.catbird_sim_delete(TRUE);\n\
+                 EXCEPTION WHEN insufficient_privilege THEN\n\
+                     NULL;\n\
+                 END;\n\
+                 reset_count := 0;\n\
+             END IF;\n",
+    );
 
     for (schema, seq, start_val) in &sequences {
         create_fn.push_str(&format!(
@@ -778,85 +948,118 @@ async fn build_reset_sql_batch(conn: &mut PgConnection) -> sqlx::Result<String> 
         create_fn.push_str(
             "    UPDATE chat.direct_request_budget\n\
                     SET pending_bytes = 0, retained_bytes = 0\n\
-                  WHERE singleton = TRUE\n\
-                    AND (pending_bytes <> 0 OR retained_bytes <> 0);\n",
+                  WHERE singleton = TRUE AND (pending_bytes <> 0 OR retained_bytes <> 0);\n\
+                 INSERT INTO chat.direct_request_budget (singleton, pending_bytes, retained_bytes)\n\
+                     VALUES (TRUE, 0, 0) ON CONFLICT (singleton) DO NOTHING;\n",
         );
     }
 
     create_fn.push_str(
-        "END\n\
+        "    PERFORM set_config('catbird_sim.resets_since_compaction', reset_count::text, FALSE);\n\
+         END\n\
          $sim_reset$;\n",
     );
 
     Ok(create_fn)
 }
 
-/// Sub-25ms schema + in-memory cache reset over a simulation worker pool (`max_connections(1)`).
+/// Reset an isolated simulation worker's schema, sequences, and scoped counters.
 ///
-/// Refuses every database listed in [`PROTECTED_DATABASE_NAMES`]. Truncates all operational
-/// `chat.*`, `labyrinth.*`, `federation.*`, and `public.*` tables with `RESTART IDENTITY CASCADE`,
-/// restarts standalone sequences, restores singleton budget/retention floors, and clears all
-/// process-local JTI, rate-limiter, typing, and TID caches while keeping seeded DID documents intact.
+/// Checks the actual database name and server address: only `catbird_sim_*` /
+/// `sim_tank_*` databases on TCP loopback are allowed, and protected names remain
+/// forbidden. Privileged local workers use `SET LOCAL session_replication_role =
+/// replica` plus DELETE for the steady-state fast path (target: <25ms).
+///
+/// Every 64th warm reset uses occupancy/storage-filtered `TRUNCATE ... RESTART
+/// IDENTITY CASCADE` to bound dead tuples to 63 fast resets. Exact physical heap
+/// size includes live-empty DELETE-bloated tables without relying on stale stats.
+/// A fresh/replacement session first compacts existing heap storage. Call
+/// [`compact_sim_postgres_schema`] to compact explicitly. Compaction and the
+/// insufficient-privilege TRUNCATE fallback are not covered by the <25ms target.
+///
+/// A scoped clock's counters reset after success. Outside [`scope_ds_clock`],
+/// call [`ManualDsClock::reset_counters`] separately. Process-global production
+/// caches and seeded DID documents are untouched; deterministic requests bypass
+/// the global replay/rate/typing fast paths.
 pub async fn reset_sim_postgres_schema(pool: &PgPool) -> sqlx::Result<()> {
-    let mut conn = pool.acquire().await?;
-    let db_name: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(&mut *conn)
-        .await?;
-    if PROTECTED_DATABASE_NAMES.contains(&db_name.as_str()) {
-        return Err(sqlx::Error::Configuration(
-            format!("refusing reset_sim_postgres_schema on protected database {db_name:?}").into(),
-        ));
-    }
+    reset_sim_postgres_schema_inner(pool, false).await
+}
 
-    let cached_create_fn = {
-        RESET_SQL_PLAN_CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&db_name)
-            .cloned()
-    };
-    let create_fn = match cached_create_fn {
-        Some(plan) => plan,
-        None => {
-            let plan = build_reset_sql_batch(&mut conn).await?;
-            sqlx::raw_sql(&plan).execute(&mut *conn).await?;
+/// Force full worker compaction, including live-empty heaps left by fast resets.
+///
+/// Uses the same allowlist/loopback guard as [`reset_sim_postgres_schema`],
+/// truncates occupied/nonempty heap storage, resets sequences and floors,
+/// and restarts the session's 64-reset cadence at zero. This is intentionally
+/// slower than a steady-state fast reset and requires no replication privilege.
+pub async fn compact_sim_postgres_schema(pool: &PgPool) -> sqlx::Result<()> {
+    reset_sim_postgres_schema_inner(pool, true).await
+}
+
+async fn reset_sim_postgres_schema_inner(
+    pool: &PgPool,
+    force_compaction: bool,
+) -> sqlx::Result<()> {
+    drive_sim_postgres_io(async {
+        let mut conn = pool.acquire().await?;
+        let (db_name, server_addr): (String, Option<String>) =
+            sqlx::query_as("SELECT current_database(), host(inet_server_addr())")
+                .fetch_one(&mut *conn)
+                .await?;
+        validate_sim_reset_target(&db_name, server_addr.as_deref())
+            .map_err(|err| sqlx::Error::Configuration(err.into()))?;
+
+        let cached_create_fn = {
             RESET_SQL_PLAN_CACHE
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(db_name, plan.clone());
-            plan
-        }
-    };
+                .get(&db_name)
+                .cloned()
+        };
+        let create_fn = match cached_create_fn {
+            Some(plan) => plan,
+            None => {
+                let plan = build_reset_sql_batch(&mut conn).await?;
+                sqlx::raw_sql(&plan).execute(&mut *conn).await?;
+                RESET_SQL_PLAN_CACHE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(db_name, plan.clone());
+                plan
+            }
+        };
 
-    const CALL_FAST_RESET_SQL: &str =
-        "BEGIN; SET LOCAL synchronous_commit = off; SELECT pg_temp.catbird_sim_reset(); COMMIT;";
-    if let Err(err) = sqlx::raw_sql(CALL_FAST_RESET_SQL).execute(&mut *conn).await {
-        let _ = sqlx::raw_sql("ROLLBACK;").execute(&mut *conn).await;
-        let is_undefined_fn = err
-            .as_database_error()
-            .and_then(|db_err| db_err.code())
-            .is_some_and(|code| code == "42883");
-        if is_undefined_fn {
-            sqlx::raw_sql(&create_fn).execute(&mut *conn).await?;
-            sqlx::raw_sql(CALL_FAST_RESET_SQL)
-                .execute(&mut *conn)
-                .await?;
+        let reset_sql = if force_compaction {
+            "BEGIN; SET LOCAL synchronous_commit = off; SELECT pg_temp.catbird_sim_reset(TRUE); COMMIT;"
         } else {
-            return Err(err);
+            "BEGIN; SET LOCAL synchronous_commit = off; SELECT pg_temp.catbird_sim_reset(FALSE); COMMIT;"
+        };
+        if let Err(err) = sqlx::raw_sql(reset_sql).execute(&mut *conn).await {
+            let _ = sqlx::raw_sql("ROLLBACK;").execute(&mut *conn).await;
+            let missing_session_plan = err
+                .as_database_error()
+                .and_then(|db_err| db_err.code())
+                .is_some_and(|code| code == "42883" || code == "3F000");
+            if missing_session_plan {
+                sqlx::raw_sql(&create_fn).execute(&mut *conn).await?;
+                sqlx::raw_sql(reset_sql)
+                    .execute(&mut *conn)
+                    .await?;
+            } else {
+                return Err(err);
+            }
         }
-    }
-    drop(conn);
-    while !pool.is_closed() && pool.num_idle() == 0 {
-        tokio::task::yield_now().await;
-    }
+        // Await sqlx's health check/return directly. A discarded connection is
+        // valid too; unlike waiting for num_idle(), this cannot livelock on it.
+        conn.return_to_pool().await;
 
-    crate::auth::clear_sim_auth_caches();
-    crate::middleware::rate_limit::clear_all_rate_limiters();
-    crate::chat_protocol::repository::message_delivery::clear_ephemeral_typing_state();
-    crate::labyrinth::tid::reset_tid_state();
-    SIM_JTI_COUNTER.store(0, Ordering::SeqCst);
-
-    Ok(())
+        if let Some(clock) = active_scoped_clock() {
+            if let Some(counters) = clock.simulation_counters() {
+                counters.reset();
+            }
+        }
+        Ok(())
+    })
+    .await
 }
 
 // =============================================================================
@@ -1179,4 +1382,81 @@ pub fn sign_sim_chat_body(
         "signature": STANDARD.encode(signature.to_bytes()),
     }))
     .map_err(|e| format!("encode signed wrapper: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_uuid_and_entropy_sequences_are_clock_local_and_resettable() {
+        fn draw(clock: Arc<ManualDsClock>) -> ([Uuid; 4], [u8; 65]) {
+            with_ds_clock(clock, || {
+                let uuids = [
+                    mint_entry_uuid_v4(b"same-domain", &[b"same-input"]),
+                    mint_outbound_jti_uuid_v4(b"same-domain", &[b"same-input"]),
+                    mint_entry_uuid_v4(b"same-domain", &[b"same-input"]),
+                    mint_outbound_jti_uuid_v4(b"same-domain", &[b"same-input"]),
+                ];
+                let mut entropy = [0; 65];
+                assert!(deterministic_entropy(b"cursor", &mut entropy));
+                (uuids, entropy)
+            })
+        }
+
+        let now = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let first = Arc::new(ManualDsClock::new(now));
+        let second = Arc::new(ManualDsClock::new(now));
+        let baseline = draw(first.clone());
+        assert_eq!(draw(second.clone()), baseline);
+        assert_ne!(baseline.0[0], baseline.0[1]);
+        assert_ne!(baseline.0[0], baseline.0[2]);
+        assert_ne!(baseline.0[1], baseline.0[3]);
+        first.reset_counters();
+        assert_eq!(draw(first.clone()), baseline);
+        assert_eq!(draw(first.clone()), draw(second.clone()));
+        first.reset_counters();
+        with_ds_clock(first.clone(), || {
+            mint_entry_uuid_v4(b"independent-stream", &[]);
+        });
+        second.reset_counters();
+        let first_jti = with_ds_clock(first, || mint_outbound_jti_uuid_v4(b"jti-stream", &[]));
+        let second_jti = with_ds_clock(second, || mint_outbound_jti_uuid_v4(b"jti-stream", &[]));
+        assert_eq!(first_jti, second_jti);
+    }
+
+    #[test]
+    fn production_entropy_leaves_output_untouched() {
+        let mut output = [0xa5; 33];
+        assert!(!deterministic_entropy(b"cursor", &mut output));
+        with_ds_clock(Arc::new(SystemDsClock), || {
+            assert!(!deterministic_entropy(b"cursor", &mut output));
+        });
+        assert_eq!(output, [0xa5; 33]);
+    }
+
+    #[test]
+    fn reset_target_requires_allowlisted_database_and_actual_loopback_address() {
+        for db in ["catbird_sim_w0", "sim_tank_0123456789abcdef"] {
+            for addr in ["127.0.0.1", "127.0.0.2", "::1"] {
+                validate_sim_reset_target(db, Some(addr)).unwrap();
+            }
+            for addr in [
+                None,
+                Some("192.0.2.1"),
+                Some("localhost"),
+                Some("::ffff:192.0.2.1"),
+            ] {
+                assert!(validate_sim_reset_target(db, addr).is_err());
+            }
+        }
+        for db in PROTECTED_DATABASE_NAMES.iter().copied().chain([
+            "production",
+            "catbird_sim_",
+            "sim_tank_",
+            "catbird_sim_w0;DROP DATABASE catbird",
+        ]) {
+            assert!(validate_sim_reset_target(db, Some("127.0.0.1")).is_err());
+        }
+    }
 }

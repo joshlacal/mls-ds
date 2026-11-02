@@ -166,7 +166,8 @@ async fn register(
         .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidSignature))?;
 
     let now: DateTime<Utc> =
-        sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', $1::timestamptz)")
+            .bind(crate::sim_hooks::current_utc())
             .fetch_one(pool)
             .await
             .map_err(|_| ChatFailure::storage(ENDPOINT))?;

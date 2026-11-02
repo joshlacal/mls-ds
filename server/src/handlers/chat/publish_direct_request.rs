@@ -144,8 +144,8 @@ async fn inner(
 
         let _ = sqlx::query(
             "INSERT INTO chat.direct_request_outbound_routes \
-                (request_id, actor_did, actor_device_id, recipient_did, coordinator_did) \
-             VALUES ($1, $2, $3, $4, $5) \
+                (request_id, actor_did, actor_device_id, recipient_did, coordinator_did, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (request_id) DO UPDATE SET request_id=EXCLUDED.request_id \
              WHERE chat.direct_request_outbound_routes.actor_did=EXCLUDED.actor_did \
                AND chat.direct_request_outbound_routes.actor_device_id=EXCLUDED.actor_device_id \
@@ -157,6 +157,7 @@ async fn inner(
         .bind(actor_device_id)
         .bind(recipient_did)
         .bind(&coord.coordinator_did)
+        .bind(crate::sim_hooks::current_utc())
         .execute(pool)
         .await;
 

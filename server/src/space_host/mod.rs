@@ -81,6 +81,7 @@ struct CachedDidEntry {
 pub struct SpaceHostRuntime {
     pool: DbPool,
     config: SpaceHostConfig,
+    clock: Arc<dyn crate::sim_hooks::DsClock>,
     tid_counter: AtomicU64,
     did_cache: RwLock<HashMap<String, CachedDidEntry>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -92,11 +93,22 @@ impl SpaceHostRuntime {
         Self {
             pool,
             config,
+            clock: Arc::new(crate::sim_hooks::SystemDsClock),
             tid_counter: AtomicU64::new(0),
             did_cache: RwLock::new(HashMap::new()),
             #[cfg(any(test, feature = "test-support"))]
             test_did_overrides: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Set the clock scoped across every request served by [`space_host_router`].
+    pub fn with_clock(mut self, clock: Arc<dyn crate::sim_hooks::DsClock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn clock(&self) -> &Arc<dyn crate::sim_hooks::DsClock> {
+        &self.clock
     }
 
     pub fn pool(&self) -> &DbPool {

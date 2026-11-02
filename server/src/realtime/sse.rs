@@ -122,24 +122,28 @@ impl SseState {
                 let queue_ref = self.emit_queue.clone();
                 let convo_id_owned = convo_id.to_string();
                 let spawner = self.spawner();
-                let fut: crate::sim_hooks::BoxedTaskFuture = if spawner.is_queued() {
-                    Box::pin(flush_emit_queue_batch(
-                        channels,
-                        buffer_size,
-                        queue_ref,
-                        convo_id_owned,
-                        rx,
-                    ))
-                } else {
-                    Box::pin(consume_emit_queue(
-                        channels,
-                        buffer_size,
-                        queue_ref,
-                        convo_id_owned,
-                        rx,
-                    ))
+                let queued = spawner.is_queued();
+                let fut = async move {
+                    if queued {
+                        flush_emit_queue_batch(
+                            channels,
+                            buffer_size,
+                            queue_ref,
+                            convo_id_owned,
+                            rx,
+                        )
+                        .await;
+                    } else {
+                        consume_emit_queue(channels, buffer_size, queue_ref, convo_id_owned, rx)
+                            .await;
+                    }
                 };
-                spawner.spawn_box("sse.consume_emit_queue", fut);
+                let clock = crate::sim_hooks::active_scoped_clock()
+                    .unwrap_or_else(|| Arc::new(crate::sim_hooks::SystemDsClock));
+                spawner.spawn_box(
+                    "sse.consume_emit_queue",
+                    Box::pin(crate::sim_hooks::scope_ds_clock(clock, fut)),
+                );
                 v.insert(tx).clone()
             }
         };
@@ -234,7 +238,13 @@ async fn flush_emit_queue_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::sim_hooks::{scope_ds_clock, DsClock, ManualDsClock, QueuedTaskSpawner};
+    use std::{
+        future::Future,
+        sync::Mutex,
+        task::{Context, Wake, Waker},
+        time::Duration,
+    };
 
     fn make_test_typing_event(convo_id: &str, typing_id: &str) -> StreamEvent {
         serde_json::from_value(serde_json::json!({
@@ -247,6 +257,51 @@ mod tests {
             "typingId": typing_id
         }))
         .expect("test typing event should deserialize")
+    }
+
+    #[derive(Default)]
+    struct ClockOnWake(Mutex<Option<chrono::DateTime<chrono::Utc>>>);
+
+    impl Wake for ClockOnWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            *self.0.lock().unwrap() = Some(crate::sim_hooks::current_utc());
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_emit_keeps_enqueuing_clock_when_drained_under_another_clock() {
+        let now = chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        let clock = Arc::new(ManualDsClock::new(now));
+        let spawner = Arc::new(QueuedTaskSpawner::new());
+        let state = SseState::new(10);
+        state.set_spawner(spawner.clone());
+        let mut receiver = state.get_channel("clock-convo").await.subscribe();
+        let mut received = Box::pin(receiver.recv());
+        let observed = Arc::new(ClockOnWake::default());
+        let waker = Waker::from(observed.clone());
+        assert!(received
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+
+        scope_ds_clock(clock.clone(), async {
+            state.enqueue(
+                "clock-convo",
+                make_test_typing_event("clock-convo", "clock-typing"),
+            );
+        })
+        .await;
+        assert_eq!(spawner.labels(), vec!["sse.consume_emit_queue"]);
+        clock.advance(chrono::Duration::seconds(1));
+        let ambient = Arc::new(ManualDsClock::new(now + chrono::Duration::days(1)));
+        assert!(scope_ds_clock(ambient, spawner.drain_next()).await);
+        assert_eq!(*observed.0.lock().unwrap(), Some(clock.now_utc()));
+        let StreamEvent::CleanTypingEvent { typing_id, .. } = received.await.unwrap();
+        assert_eq!(typing_id.as_str(), "clock-typing");
     }
 
     #[tokio::test]

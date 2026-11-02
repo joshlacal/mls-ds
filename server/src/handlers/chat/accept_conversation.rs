@@ -328,12 +328,13 @@ async fn handle_inner(
                                 sqlx::query(
                                     "UPDATE chat.direct_request_transport_inbox \
                                      SET status='accepted', acceptance_proof=$2, acceptance_outcome=$3, \
-                                         updated_at=clock_timestamp() \
+                                         updated_at=$4 \
                                      WHERE conversation_id=$1 AND status='pending'",
                                 )
                                 .bind(conversation_id)
                                 .bind(proof_b)
                                 .bind(outcome_b)
+                                .bind(crate::sim_hooks::current_utc())
                                 .execute(pool)
                                 .await
                                 .map_err(|_| ChatFailure::storage(endpoint))?;
@@ -546,12 +547,13 @@ async fn handle_inner(
                 let updated = sqlx::query(
                     "UPDATE chat.direct_request_transport_inbox \
                      SET status='accepted', acceptance_proof=$2, acceptance_outcome=$3, \
-                         updated_at=clock_timestamp() \
+                         updated_at=$4 \
                      WHERE conversation_id=$1 AND status='pending'",
                 )
                 .bind(conversation_id)
                 .bind(&proof_bytes)
                 .bind(&presented_outcome)
+                .bind(crate::sim_hooks::current_utc())
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| ChatFailure::storage(endpoint))?;
@@ -588,13 +590,14 @@ async fn handle_inner(
                 let inserted = sqlx::query(
                     "INSERT INTO chat.direct_request_transport_entries ( \
                         conversation_id, seq, entry_id, entry_bytes, created_at \
-                     ) VALUES ($1, $2, $3, $4, clock_timestamp()) \
+                     ) VALUES ($1, $2, $3, $4, $5) \
                      ON CONFLICT (conversation_id, seq) DO NOTHING",
                 )
                 .bind(conversation_id)
                 .bind(2i64)
                 .bind(transition_id)
                 .bind(&entry_bytes)
+                .bind(crate::sim_hooks::current_utc())
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| ChatFailure::storage(endpoint))?;
@@ -721,7 +724,7 @@ async fn handle_inner(
                 );
                 sqlx::query(
                     "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, last_error, next_retry_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + INTERVAL '5 seconds') \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                      ON CONFLICT (id) DO NOTHING",
                 )
                 .bind(format!("acceptance-delivery-{conversation_id}"))
@@ -731,6 +734,7 @@ async fn handle_inner(
                 .bind(serde_json::to_vec(&deliver_input).map_err(|_| ChatFailure::invariant(endpoint))?)
                 .bind(conversation_id.to_string())
                 .bind(error.to_string())
+                .bind(crate::sim_hooks::current_utc() + chrono::Duration::seconds(5))
                 .execute(pool)
                 .await
                 .map_err(|_| ChatFailure::storage(endpoint))?;

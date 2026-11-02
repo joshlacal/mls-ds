@@ -253,8 +253,9 @@ pub(crate) async fn pending_request_welcomes(
     use base64::{engine::general_purpose::STANDARD, Engine};
     use serde_json::{json, Value};
     use sqlx::Row;
-    let rows=sqlx::query("SELECT p.request_id,p.conversation_id,p.request_entry,p.signed_publication,p.full_welcome,p.full_welcome_sha256,d.provenance FROM chat.direct_request_device_deliveries d JOIN chat.direct_request_publications p USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id LEFT JOIN chat.direct_request_welcome_outcomes o ON o.request_id=d.request_id AND o.recipient_did=d.owner_did AND o.recipient_device_id=d.owner_device_id WHERE d.owner_did=$1 AND d.owner_device_id=$2 AND d.import_until>transaction_timestamp() AND o.request_id IS NULL AND c.lifecycle='active' AND c.current_generation=p.generation ORDER BY p.request_id")
-        .bind(user_did).bind(device_id).fetch_all(&mut **tx).await?;
+    let observed_at = crate::sim_hooks::current_utc();
+    let rows=sqlx::query("SELECT p.request_id,p.conversation_id,p.request_entry,p.signed_publication,p.full_welcome,p.full_welcome_sha256,d.provenance FROM chat.direct_request_device_deliveries d JOIN chat.direct_request_publications p USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id LEFT JOIN chat.direct_request_welcome_outcomes o ON o.request_id=d.request_id AND o.recipient_did=d.owner_did AND o.recipient_device_id=d.owner_device_id WHERE d.owner_did=$1 AND d.owner_device_id=$2 AND d.import_until>$3 AND o.request_id IS NULL AND c.lifecycle='active' AND c.current_generation=p.generation ORDER BY p.request_id")
+        .bind(user_did).bind(device_id).bind(observed_at).fetch_all(&mut **tx).await?;
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
         let request_id: Uuid = row.try_get("request_id")?;
@@ -286,10 +287,10 @@ pub(crate) async fn pending_request_welcomes(
          FROM chat.direct_request_transport_inbox \
          WHERE recipient_did = $1 AND recipient_device_id = $2 \
            AND status = 'pending' \
-           AND import_until > transaction_timestamp() \
+           AND import_until > $3 \
          ORDER BY request_id"
     )
-    .bind(user_did).bind(device_id).fetch_all(&mut **tx).await?;
+    .bind(user_did).bind(device_id).bind(observed_at).fetch_all(&mut **tx).await?;
     for row in inbox_rows {
         let request_id: Uuid = row.try_get("request_id")?;
         let entry: Value = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("request_entry")?)

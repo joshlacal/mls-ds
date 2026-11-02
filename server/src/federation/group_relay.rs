@@ -10,7 +10,7 @@
 //! - Each remote home `mls-ds` stores the replicated entry in `chat.direct_request_transport_entries`
 //!   and wakes only its own local devices (`D2`).
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 
 use axum::{
     body::Bytes,
@@ -45,6 +45,7 @@ const S2S_CALLER_DID_HEADER: &str = "x-catbird-s2s-caller-did";
 const S2S_TARGET_DID_HEADER: &str = "x-catbird-s2s-target-did";
 const S2S_MAC_HEADER: &str = "x-catbird-s2s-mac";
 
+/// Relay fan-out and push wakes are awaited inline within the request's clock scope.
 #[derive(Clone)]
 pub struct GroupRelayState {
     pool: DbPool,
@@ -53,7 +54,6 @@ pub struct GroupRelayState {
     i13_receipt_signer: Option<Arc<I13ReceiptSigner>>,
     push_gateway_client: Option<Arc<PushGatewayClient>>,
     clock: Arc<dyn crate::sim_hooks::DsClock>,
-    spawner: Arc<dyn crate::sim_hooks::TaskSpawner>,
 }
 
 impl GroupRelayState {
@@ -74,7 +74,6 @@ impl GroupRelayState {
             i13_receipt_signer,
             push_gateway_client,
             clock: Arc::new(crate::sim_hooks::SystemDsClock),
-            spawner: Arc::new(crate::sim_hooks::TokioTaskSpawner),
         }
     }
 
@@ -85,15 +84,6 @@ impl GroupRelayState {
 
     pub fn clock(&self) -> &Arc<dyn crate::sim_hooks::DsClock> {
         &self.clock
-    }
-
-    pub fn with_spawner(mut self, spawner: Arc<dyn crate::sim_hooks::TaskSpawner>) -> Self {
-        self.spawner = spawner;
-        self
-    }
-
-    pub fn spawner(&self) -> &Arc<dyn crate::sim_hooks::TaskSpawner> {
-        &self.spawner
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -121,7 +111,6 @@ impl GroupRelayState {
             i13_receipt_signer,
             push_gateway_client,
             clock: Arc::new(crate::sim_hooks::SystemDsClock),
-            spawner: Arc::new(crate::sim_hooks::TokioTaskSpawner),
         }
     }
 }
@@ -153,25 +142,35 @@ pub struct DeliverGroupEntryRequest {
     pub entry: Value,
 }
 
+#[derive(Clone, Copy)]
+struct ClockScoped<H>(H);
+
+impl<H, T> axum::handler::Handler<T, GroupRelayState> for ClockScoped<H>
+where
+    H: axum::handler::Handler<T, GroupRelayState>,
+    T: 'static,
+{
+    type Future = std::pin::Pin<Box<dyn Future<Output = Response> + Send>>;
+
+    fn call(self, req: axum::extract::Request, state: GroupRelayState) -> Self::Future {
+        let clock = Arc::clone(state.clock());
+        let inner = self.0.call(req, state);
+        Box::pin(crate::sim_hooks::scope_ds_clock(clock, inner))
+    }
+}
+
 pub fn group_relay_router(state: GroupRelayState) -> Router {
-    let clock = Arc::clone(&state.clock);
     Router::new()
         .route(
             "/xrpc/blue.catbird.mlsDS.relayGroupMutation",
-            post(handle_relay_group_mutation)
+            post(ClockScoped(handle_relay_group_mutation))
                 .layer(DefaultBodyLimit::max(SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES)),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.deliverGroupEntry",
-            post(handle_deliver_group_entry)
+            post(ClockScoped(handle_deliver_group_entry))
                 .layer(DefaultBodyLimit::max(SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES)),
         )
-        .layer(axum::middleware::from_fn(
-            move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let clock = Arc::clone(&clock);
-                async move { crate::sim_hooks::scope_ds_clock(clock, next.run(req)).await }
-            },
-        ))
         .with_state(state)
 }
 
@@ -1014,4 +1013,54 @@ async fn handle_deliver_group_entry(
     }
 
     (StatusCode::OK, Json(json!({ "accepted": true }))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim_hooks::{scope_ds_clock, ManualDsClock};
+    use axum::{body::Body, http::Request};
+    use tower_util::ServiceExt;
+
+    #[tokio::test]
+    async fn group_relay_handler_keeps_state_clock_across_awaits() {
+        let now = chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1/group_clock_test")
+            .unwrap();
+        let state = GroupRelayState::for_test(
+            pool,
+            "did:web:group-clock.test".to_string(),
+            b"group-clock-secret",
+            None,
+        )
+        .with_clock(Arc::new(ManualDsClock::new(now)));
+        let router = Router::new()
+            .route(
+                "/clock",
+                post(ClockScoped(|| async {
+                    let before = crate::sim_hooks::current_utc();
+                    tokio::task::yield_now().await;
+                    assert_eq!(crate::sim_hooks::current_utc(), before);
+                    before.timestamp_millis().to_string()
+                })),
+            )
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/clock")
+            .body(Body::empty())
+            .unwrap();
+        let ambient = Arc::new(ManualDsClock::new(now + chrono::Duration::days(1)));
+        let response = scope_ds_clock(ambient, router.oneshot(request))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            now.timestamp_millis().to_string().as_bytes()
+        );
+    }
 }

@@ -694,10 +694,10 @@ pub(crate) async fn lock_inventory_session(
     .await?
     .ok_or(InventoryRepositoryError::SessionNotFound)?;
 
-    let (transaction_id, locked_at): (String, DateTime<Utc>) =
-        sqlx::query_as("SELECT txid_current()::text, transaction_timestamp()")
-            .fetch_one(&mut **transaction)
-            .await?;
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let locked_at = crate::sim_hooks::current_utc();
 
     let protocol: ProtocolInstanceRow = sqlx::query_as(
         r#"
@@ -1824,6 +1824,7 @@ pub(crate) async fn create_inventory_session(
         return Err(InventoryRepositoryError::SnapshotConflict);
     }
 
+    let observed_at = crate::sim_hooks::current_utc();
     // Scope is captured from the complete audience before any domain is paged.
     if let Some(versions) = &request.supported_protocol_versions {
         let mut digest = Sha256::new();
@@ -1839,10 +1840,11 @@ pub(crate) async fn create_inventory_session(
             let inbox_convo_ids: Vec<Uuid> = sqlx::query_scalar(
                 "SELECT conversation_id FROM chat.direct_request_transport_inbox \
                  WHERE recipient_did = $1 AND recipient_device_id = $2 \
-                   AND (status = 'accepted' OR (status = 'pending' AND import_until > transaction_timestamp()))"
+                   AND (status = 'accepted' OR (status = 'pending' AND import_until > $3))",
             )
             .bind(&user_did)
             .bind(device_id)
+            .bind(observed_at)
             .fetch_all(&mut **transaction)
             .await?;
 
@@ -1904,11 +1906,12 @@ pub(crate) async fn create_inventory_session(
         let inbox_convos: Vec<Uuid> = sqlx::query_scalar(
             "SELECT conversation_id FROM chat.direct_request_transport_inbox \
              WHERE recipient_did = $1 AND recipient_device_id = $2 \
-               AND (status = 'accepted' OR (status = 'pending' AND import_until > transaction_timestamp())) \
+               AND (status = 'accepted' OR (status = 'pending' AND import_until > $3)) \
              ORDER BY conversation_id",
         )
         .bind(&user_did)
         .bind(device_id)
+        .bind(observed_at)
         .fetch_all(&mut **transaction)
         .await?;
 
@@ -2370,10 +2373,8 @@ async fn reap_expired_and_excess_inventory_sessions(
     Ok(())
 }
 
-/// The caller holds the exact device UPDATE lock. Count with the same trusted
-/// transaction-time cutoff as the deferred cap, then advertise the earliest
-/// retained expiry using a fresh PostgreSQL clock observation. A transaction
-/// that waited past that expiry gets a one-second retry, never a new grant.
+/// The caller holds the exact device UPDATE lock. Count and advertise the
+/// earliest retained expiry using one trusted application-clock cutoff.
 async fn check_inventory_session_capacity(
     transaction: &mut Transaction<'_, Postgres>,
     user_did: &str,
@@ -2382,19 +2383,20 @@ async fn check_inventory_session_capacity(
     let retry_after_secs: Option<i64> = sqlx::query_scalar(
         r#"WITH active AS (
                SELECT expires_at FROM chat.inventory_sessions
-                WHERE user_did=$1 AND device_id=$2 AND expires_at > transaction_timestamp()
+                WHERE user_did=$1 AND device_id=$2 AND expires_at > $3
                UNION ALL
                SELECT expires_at FROM chat.device_inventory_sessions
-                WHERE user_did=$1 AND device_id=$2 AND expires_at > transaction_timestamp()
+                WHERE user_did=$1 AND device_id=$2 AND expires_at > $3
            )
            SELECT CASE WHEN count(*) >= chat.max_active_inventory_sessions_per_device()
                   THEN greatest(1, ceil(extract(epoch FROM
-                       (min(expires_at) - clock_timestamp()))))::bigint
+                       (min(expires_at) - $3::timestamptz))))::bigint
                   ELSE NULL END
              FROM active"#,
     )
     .bind(user_did)
     .bind(device_id)
+    .bind(crate::sim_hooks::current_utc())
     .fetch_one(&mut **transaction)
     .await?;
     if let Some(seconds) = retry_after_secs {
@@ -3715,17 +3717,16 @@ mod materialization_version_tests {
 }
 
 /// The repository-owned whole-second base instant for a session/receipt:
-/// `transaction_timestamp()` truncated to a whole second by the database. This
-/// is the ONLY clock the D-2 facade uses; it never samples a wall clock in
-/// process.
+/// the trusted application clock rounded forward to the next whole second.
 async fn current_whole_second(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<DateTime<Utc>, InventoryRepositoryError> {
-    Ok(sqlx::query_scalar(
-        "SELECT date_trunc('second', transaction_timestamp() + interval '1 second')",
+    Ok(
+        sqlx::query_scalar("SELECT date_trunc('second', $1::timestamptz + interval '1 second')")
+            .bind(crate::sim_hooks::current_utc())
+            .fetch_one(&mut **transaction)
+            .await?,
     )
-    .fetch_one(&mut **transaction)
-    .await?)
 }
 
 /// The checked canonical UTC text (`YYYY-MM-DDTHH:MM:SS.sssZ`) the C1 checked
@@ -4097,9 +4098,7 @@ pub(crate) async fn snapshot_capability_for_ticket(
         return Err(InventoryRepositoryError::DurableRowInvalid);
     }
     let capability = URL_SAFE_NO_PAD.encode(&plaintext);
-    let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
-        .fetch_one(&mut **transaction)
-        .await?;
+    let now = crate::sim_hooks::current_utc();
     if now >= row.expires_at {
         return Err(InventoryRepositoryError::DurableRowInvalid);
     }
@@ -5081,17 +5080,15 @@ async fn prepare_initial_inventory_page(
 }
 
 async fn await_inventory_publication(
-    pool: &sqlx::PgPool,
     not_before: DateTime<Utc>,
 ) -> Result<(), InventoryRepositoryError> {
     // Materialization timestamps remain rounded up to include fractional-time
-    // source rows. Publish only after that timestamp is valid in PostgreSQL's
-    // clock domain. The caller has committed and released all transaction locks.
+    // source rows. Publish only after that timestamp is valid in the trusted
+    // application clock. The caller has committed and released all transaction
+    // locks.
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let observed_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
-                .fetch_one(pool)
-                .await?;
+            let observed_at = crate::sim_hooks::current_utc();
             if observed_at >= not_before {
                 return Ok(());
             }
@@ -5174,11 +5171,12 @@ async fn create_inventory_snapshot_attempt(
             let remote_state: Vec<(Uuid, String)> = sqlx::query_as(
                 "SELECT delivery_id, status FROM chat.direct_request_transport_inbox \
                  WHERE recipient_did = $1 AND recipient_device_id = $2 \
-                   AND (status = 'accepted' OR (status = 'pending' AND import_until > transaction_timestamp())) \
+                   AND (status = 'accepted' OR (status = 'pending' AND import_until > $3)) \
                  ORDER BY delivery_id",
             )
             .bind(device.user_did())
             .bind(device.device_id())
+            .bind(crate::sim_hooks::current_utc())
             .fetch_all(&mut **transaction)
             .await?;
             for (delivery_id, status) in remote_state {
@@ -5196,9 +5194,7 @@ async fn create_inventory_snapshot_attempt(
     };
     // Expiry admission uses actual trusted time, never the rounded-up sealing
     // timestamp: a retained chain stays valid through its original deadline.
-    let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
-        .fetch_one(&mut **transaction)
-        .await?;
+    let now = crate::sim_hooks::current_utc();
     let mut existing = lock_inventory_session_row(transaction, inventory_session_id).await?;
     if existing.as_ref().is_some_and(|row| row.expires_at <= now) {
         let deleted: bool =
@@ -5340,7 +5336,7 @@ pub(crate) async fn create_inventory_snapshot_and_first_page(
                     .commit()
                     .await
                     .map_err(InventoryRepositoryError::Database)?;
-                await_inventory_publication(pool, response.not_before).await?;
+                await_inventory_publication(response.not_before).await?;
                 return Ok(response.canonical);
             }
             Err(InventoryRepositoryError::SnapshotConflict)

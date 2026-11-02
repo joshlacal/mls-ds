@@ -3278,9 +3278,10 @@ pub mod production_composition_proof {
         sqlx::query_scalar(
             "SELECT recovery_request_id FROM chat.leaf_recovery_requests \
              WHERE status='open' \
-               AND expires_at <= date_trunc('milliseconds',transaction_timestamp()) \
+               AND expires_at <= date_trunc('milliseconds', $1::timestamptz) \
              ORDER BY requested_at DESC,recovery_request_id DESC LIMIT 1",
         )
+        .bind(crate::sim_hooks::current_utc())
         .fetch_optional(&mut **transaction)
         .await
         .map_err(|error| format!("locate due Recovery proof fixture: {error}"))?
@@ -5799,8 +5800,8 @@ fn reverify_scope_mutation(
 /// The recovery request id is the global advisory identity. The initial
 /// locator read acquires no row lock; it only identifies the canonical
 /// principal/device/key prefix. Every authoritative fact is re-read under the
-/// subsequent locks, and authority exists only at the exact whole-millisecond
-/// boundary `transaction_timestamp() == expires_at`.
+/// subsequent locks, and authority exists only at the exact expiry boundary
+/// after truncating `current_utc()` to whole milliseconds.
 pub(crate) async fn prepare_recovery_expiry_authority(
     transaction: &mut Transaction<'_, Postgres>,
     request_id: Uuid,
@@ -5879,7 +5880,8 @@ pub(crate) async fn prepare_recovery_expiry_authority(
 
     let transaction_id = live_transaction_id(transaction).await?;
     let trusted_instant: DateTime<Utc> =
-        sqlx::query_scalar("SELECT date_trunc('milliseconds', transaction_timestamp())")
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', $1::timestamptz)")
+            .bind(crate::sim_hooks::current_utc())
             .fetch_one(&mut **transaction)
             .await?;
     if !whole_millis(trusted_instant) {

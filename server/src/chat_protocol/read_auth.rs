@@ -8,7 +8,6 @@
 
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -123,7 +122,7 @@ pub(crate) async fn verify_chat_read_headers(
         }
     }
 
-    let now_ms = Utc::now().timestamp_millis();
+    let now_ms = crate::sim_hooks::current_utc().timestamp_millis();
     if (now_ms - claim.issued_at).abs() > MAX_READ_CLAIM_SKEW_MS {
         return Err(ChatFailure::protocol(
             endpoint,

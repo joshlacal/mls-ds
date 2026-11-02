@@ -159,7 +159,7 @@ pub async fn check_pair_owner_fence(
             WHERE ((a.actor_did = $1 AND a.recipient_did = $2) OR (a.actor_did = $2 AND a.recipient_did = $1)) \
               AND a.request_id <> $3 \
               AND ( \
-                  (a.status = 'prepared' AND a.lease_expires_at > clock_timestamp()) \
+                  (a.status = 'prepared' AND a.lease_expires_at > $6) \
                   OR (a.status IN ('published', 'existing-direct') \
                       AND NOT EXISTS ( \
                           SELECT 1 FROM chat.direct_request_lifecycle l \
@@ -206,7 +206,7 @@ pub async fn check_pair_owner_fence(
             WHERE ((r.sender_did = $1 AND r.recipient_did = $2) OR (r.sender_did = $2 AND r.recipient_did = $1)) \
               AND r.request_id <> $3 \
               AND ( \
-                  (r.status = 'active' AND r.expires_at > clock_timestamp()) \
+                  (r.status = 'active' AND r.expires_at > $6) \
                   OR (r.status = 'finalized' \
                       AND NOT EXISTS ( \
                           SELECT 1 FROM chat.direct_request_transport_inbox t \
@@ -244,6 +244,7 @@ pub async fn check_pair_owner_fence(
     .bind(request_id)
     .bind(expected_coordinator_did)
     .bind(&service_did)
+    .bind(crate::sim_hooks::current_utc())
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
@@ -451,13 +452,14 @@ pub async fn reserve_remote_recipient_bootstrap(
     } else {
         sqlx::query(
             "INSERT INTO chat.direct_request_reservation_intents (request_id, actor_did, actor_device_id, recipient_did, recipient_ds_did, status, created_at) \
-             VALUES ($1, $2, $3, $4, $5, 'pending', clock_timestamp())"
+             VALUES ($1, $2, $3, $4, $5, 'pending', $6)"
         )
         .bind(request_id)
         .bind(sender_did)
         .bind(actor_device_id_opt)
         .bind(recipient_did)
         .bind(target_did)
+        .bind(crate::sim_hooks::current_utc())
         .execute(pool)
         .await
         .map_err(|e| FederationError::Storage(format!("mandatory intent insertion failed: {e}")))?;
@@ -1411,6 +1413,7 @@ pub async fn local_reserve_recipient_bootstrap(
     }
 
     // Idempotency: return existing active lease if already reserved for this request_id
+    let now = crate::sim_hooks::current_utc();
     let existing_rows = sqlx::query(
         "SELECT p.owner_did, p.owner_device_id, p.owner_key_id, p.owner_auth_generation, \
                 g.grant_id, g.grant_digest, c.revision AS capability_revision, \
@@ -1424,10 +1427,11 @@ pub async fn local_reserve_recipient_bootstrap(
            JOIN chat.direct_request_capabilities c ON c.owner_did = p.owner_did AND c.owner_device_id = p.owner_device_id \
            JOIN chat.direct_request_grants g ON g.key_package_ref = p.key_package_ref \
           WHERE l.request_id = $1 AND l.recipient_did = $2 \
-            AND l.status = 'active' AND l.expires_at > clock_timestamp()"
+            AND l.status = 'active' AND l.expires_at > $3"
     )
     .bind(input.request_id)
     .bind(&input.recipient_did)
+    .bind(now)
     .fetch_all(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
@@ -1498,7 +1502,6 @@ pub async fn local_reserve_recipient_bootstrap(
         return Ok(bootstraps);
     }
 
-    let now = Utc::now();
     let horizon = now + chrono::Duration::seconds(605_100);
 
     // Expiry marks a lease unresolved; the package remains reserved until the
@@ -1506,9 +1509,10 @@ pub async fn local_reserve_recipient_bootstrap(
     sqlx::query(
         "UPDATE chat.direct_request_remote_leases \
          SET status = 'expired' \
-         WHERE recipient_did = $1 AND status = 'active' AND expires_at <= clock_timestamp()",
+         WHERE recipient_did = $1 AND status = 'active' AND expires_at <= $2",
     )
     .bind(&input.recipient_did)
+    .bind(now)
     .execute(&mut *tx)
     .await
     .map_err(|error| FederationError::Storage(error.to_string()))?;
@@ -1550,11 +1554,12 @@ pub async fn local_reserve_recipient_bootstrap(
                     if is_terminal {
                         let _ = sqlx::query(
                             "UPDATE chat.direct_request_remote_leases \
-                             SET status = 'released', released_at = clock_timestamp() \
+                             SET status = 'released', released_at = $3 \
                              WHERE request_id = $1 AND recipient_did = $2 AND status = 'expired'",
                         )
                         .bind(exp_req_id)
                         .bind(&input.recipient_did)
+                        .bind(now)
                         .execute(&mut *tx)
                         .await;
                     }
@@ -1791,12 +1796,13 @@ pub async fn local_release_recipient_bootstrap(
 
     sqlx::query(
         "UPDATE chat.direct_request_remote_leases \
-         SET status = 'released', released_at = clock_timestamp() \
+         SET status = 'released', released_at = $4 \
          WHERE request_id = $1 AND recipient_did = $2 AND coordinator_did = $3 AND status IN ('active', 'expired')"
     )
     .bind(request_id)
     .bind(recipient_did)
     .bind(requester_ds)
+    .bind(crate::sim_hooks::current_utc())
     .execute(pool)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
@@ -1914,7 +1920,7 @@ pub async fn ingest_remote_direct_request_delivery(
         });
     }
 
-    let now = Utc::now();
+    let now = crate::sim_hooks::current_utc();
 
     // 1. Determine full_welcome bytes and sha256 (fail closed)
     let full_welcome = if let Some(b64) = &input.full_welcome_bytes {
@@ -2410,13 +2416,14 @@ pub async fn ingest_remote_direct_request_delivery(
     let res = sqlx::query(
         "INSERT INTO chat.direct_request_transport_entries ( \
             conversation_id, seq, entry_id, entry_bytes, created_at \
-         ) VALUES ($1, $2, $3, $4, clock_timestamp()) \
+         ) VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (conversation_id, seq) DO NOTHING",
     )
     .bind(input.conversation_id)
     .bind(seq)
     .bind(entry_id)
     .bind(&request_entry_bytes)
+    .bind(now)
     .execute(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
@@ -2582,6 +2589,7 @@ pub async fn ingest_remote_acceptance_entry(
         ));
     }
 
+    let now = crate::sim_hooks::current_utc();
     let mut tx = pool
         .begin()
         .await
@@ -2595,12 +2603,13 @@ pub async fn ingest_remote_acceptance_entry(
 
     sqlx::query(
         "UPDATE chat.direct_request_transport_inbox \
-         SET status = 'accepted', acceptance_proof = $2, acceptance_outcome = $3, updated_at = clock_timestamp() \
-         WHERE conversation_id = $1"
+         SET status = 'accepted', acceptance_proof = $2, acceptance_outcome = $3, updated_at = $4 \
+         WHERE conversation_id = $1",
     )
     .bind(conversation_id)
     .bind(&proof_bytes)
     .bind(&outcome_bytes)
+    .bind(now)
     .execute(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
@@ -2616,13 +2625,14 @@ pub async fn ingest_remote_acceptance_entry(
     let res = sqlx::query(
         "INSERT INTO chat.direct_request_transport_entries ( \
             conversation_id, seq, entry_id, entry_bytes, created_at \
-         ) VALUES ($1, $2, $3, $4, clock_timestamp()) \
+         ) VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (conversation_id, seq) DO NOTHING",
     )
     .bind(conversation_id)
     .bind(seq)
     .bind(entry_id)
     .bind(&entry_bytes)
+    .bind(now)
     .execute(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
@@ -2800,13 +2810,14 @@ pub async fn ingest_remote_message_entry(
     let res = sqlx::query(
         "INSERT INTO chat.direct_request_transport_entries ( \
             conversation_id, seq, entry_id, entry_bytes, created_at \
-         ) VALUES ($1, $2, $3, $4, clock_timestamp()) \
+         ) VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (conversation_id, seq) DO NOTHING",
     )
     .bind(conversation_id)
     .bind(seq)
     .bind(entry_id)
     .bind(&entry_bytes)
+    .bind(crate::sim_hooks::current_utc())
     .execute(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
@@ -4558,7 +4569,7 @@ pub async fn coordinator_get_outcome(
                     }
                 }
 
-                let now = Utc::now();
+                let now = crate::sim_hooks::current_utc();
                 if status == "cancelled" {
                     return Ok(json!({
                         "outcome": {

@@ -72,8 +72,8 @@ const PENDING_LEAF_RECOVERIES_SQL: &str = r#"
            AND NOT (request.requester_did = $2 AND request.requester_device_id = $3)
            AND conversation.lifecycle = 'active'
            AND state.lifecycle = 'active'
-           AND request.status = 'open' AND request.expires_at > statement_timestamp()
-           AND reservation.status = 'active' AND reservation.expires_at > statement_timestamp()
+           AND request.status = 'open' AND request.expires_at > $4
+           AND reservation.status = 'active' AND reservation.expires_at > $4
            AND request.generation = state.generation
            AND request.bound_state_version = state.state_version
            AND request.bound_group_id = state.group_id
@@ -89,8 +89,8 @@ const PENDING_LEAF_RECOVERIES_SQL: &str = r#"
            AND package.owner_device_id = request.requester_device_id
            AND package.owner_key_id = request.requester_key_id
            AND package.owner_auth_generation = request.requester_auth_generation
-           AND package.not_before <= statement_timestamp()
-           AND package.not_after > statement_timestamp()
+           AND package.not_before <= $4
+           AND package.not_after > $4
            AND reservation.expires_at <= package.not_after
            AND participant.status = 'active'
            AND device.status = 'active' AND device.revoked_at IS NULL
@@ -115,6 +115,7 @@ pub(super) async fn load_pending_leaf_recoveries(
         .bind(authority.conversation_id())
         .bind(authority.user_did())
         .bind(authority.device_id())
+        .bind(crate::sim_hooks::current_utc())
         .fetch_all(&mut **transaction)
         .await
         .map_err(|_| ConversationStateReadError::Storage)?;
@@ -424,6 +425,7 @@ mod tests {
             .bind(cid)
             .bind("did:plc:alice")
             .bind(sibling)
+            .bind(crate::sim_hooks::current_utc())
             .fetch_all(&mut *tx)
             .await
             .unwrap();
@@ -432,6 +434,7 @@ mod tests {
             .bind(cid)
             .bind("did:plc:alice")
             .bind(target)
+            .bind(crate::sim_hooks::current_utc())
             .fetch_all(&mut *tx)
             .await
             .unwrap();
@@ -448,7 +451,7 @@ mod tests {
         ] {
             sqlx::query("SAVEPOINT mutation").execute(&mut *tx).await.unwrap();
             sqlx::query(mutation).execute(&mut *tx).await.unwrap();
-            let rows: Vec<LeafRecoverySourceRow> = sqlx::query_as(&query).bind(cid).bind("did:plc:alice").bind(sibling).fetch_all(&mut *tx).await.unwrap();
+            let rows: Vec<LeafRecoverySourceRow> = sqlx::query_as(&query).bind(cid).bind("did:plc:alice").bind(sibling).bind(crate::sim_hooks::current_utc()).fetch_all(&mut *tx).await.unwrap();
             assert!(rows.is_empty(), "{mutation}");
             sqlx::query("ROLLBACK TO SAVEPOINT mutation").execute(&mut *tx).await.unwrap();
         }

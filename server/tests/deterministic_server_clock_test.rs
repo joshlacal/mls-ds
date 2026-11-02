@@ -1,7 +1,8 @@
-//! Deterministic server clock, queued task spawner, SQL wall-clock default audit,
-//! and sub-millisecond Postgres schema reset conformance suite (`mls-ds`).
+//! Deterministic signed mutation/read/ACK replay, per-clock counter isolation,
+//! queued task spawning, SQL timestamp auditing, and paused PostgreSQL reset conformance.
 
 use std::{
+    future::Future,
     path::PathBuf,
     sync::{Arc, Once},
     time::{Duration, Instant},
@@ -18,7 +19,7 @@ use base64::{
     Engine as _,
 };
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
-use ed25519_dalek::SigningKey as Ed25519SigningKey;
+use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
 use openmls::prelude::{
     tls_codec::Serialize as TlsSerialize, BasicCredential, Capabilities, CredentialType,
     CredentialWithKey, GroupId, KeyPackage, Lifetime, MlsGroup, MlsGroupCreateConfig,
@@ -26,32 +27,34 @@ use openmls::prelude::{
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
-use p256::ecdsa::{
-    signature::Signer as _, Signature as P256Signature, SigningKey as P256SigningKey,
-};
+use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
+use sqlx::postgres::PgPoolOptions;
 use tower_util::ServiceExt;
 use uuid::Uuid;
 
 use catbird_server::{
     auth::{DidDocument, VerificationMethod, MLS_APPVIEW_SERVICE_REF},
     chat_protocol::{
+        read_auth::{
+            canonical_query, ReadClaim, CHAT_READ_DOMAIN, CHAT_READ_HEADER, CHAT_READ_SIG_HEADER,
+        },
         snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle},
         wire::{
             validate_group_info, GroupInfoValidationPolicy, MAX_GROUP_INFO_WIRE_BYTES,
             XWING_CIPHERSUITE,
         },
     },
-    federation::receipt::I13ReceiptSigner,
+    federation::{receipt::I13ReceiptSigner, service_auth::ServiceAuthClient},
     handlers::chat::{chat_router, ChatRuntime},
     realtime::{SseState, StreamEvent},
     sim_hooks::{
         audit_live_catalog_timestamp_defaults, audit_sql_timestamp_defaults,
-        derive_sim_ed25519_key_id, open_disposable_sim_pool, reset_sim_postgres_schema,
-        seed_sim_did_document, sign_sim_chat_body, DsClock, ManualDsClock, QueuedTaskSpawner,
-        PROTECTED_DATABASE_NAMES,
+        compact_sim_postgres_schema, derive_sim_ed25519_key_id, open_disposable_sim_pool,
+        reset_sim_postgres_schema, scope_ds_clock, seed_sim_did_document, sign_sim_chat_body,
+        DsClock, ManualDsClock, QueuedTaskSpawner, PROTECTED_DATABASE_NAMES,
     },
     space_host::SpaceHostConfig,
     storage::DbPool,
@@ -192,6 +195,97 @@ impl SimActorDevice {
         let signing_input = format!("{header}.{claims}");
         let sig: P256Signature = self.service_signing.sign(signing_input.as_bytes());
         format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    }
+
+    fn signed_get_request(
+        &self,
+        nsid: &str,
+        query: &str,
+        now: DateTime<Utc>,
+        jti_label: &[u8],
+    ) -> Request<Body> {
+        let claim = ReadClaim {
+            v: 1,
+            nsid: nsid.to_owned(),
+            query: canonical_query(Some(query)),
+            did: self.did.clone(),
+            device_id: self.device_id.to_string(),
+            issued_at: now.timestamp_millis(),
+        };
+        let claim_bytes = serde_json::to_vec(&claim).expect("encode signed read claim");
+        let mut transcript = CHAT_READ_DOMAIN.to_vec();
+        transcript.extend_from_slice(&claim_bytes);
+        let signature = self.device_signing.sign(&transcript);
+        Request::builder()
+            .method("GET")
+            .uri(format!("/xrpc/{nsid}?{query}"))
+            .header(
+                "authorization",
+                format!(
+                    "Bearer {}",
+                    self.service_jwt(nsid, now.timestamp(), deterministic_uuid_v4(jti_label))
+                ),
+            )
+            .header(CHAT_READ_HEADER, URL_SAFE_NO_PAD.encode(claim_bytes))
+            .header(
+                CHAT_READ_SIG_HEADER,
+                URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            )
+            .body(Body::empty())
+            .expect("build signed GET request")
+    }
+
+    fn acknowledge_entries_request(
+        &self,
+        conversation_id: Uuid,
+        up_to_seq: i64,
+        now: DateTime<Utc>,
+        jti_label: &[u8],
+    ) -> Request<Body> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AckTranscriptPayload<'a> {
+            key_id: &'a str,
+            up_to_seq: i64,
+            signed_at: &'a str,
+            generation: i64,
+            actor_device_id: String,
+            auth_generation: i64,
+            conversation_id: String,
+        }
+        let signed_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let payload = AckTranscriptPayload {
+            key_id: &self.key_id,
+            up_to_seq,
+            signed_at: &signed_at,
+            generation: 0,
+            actor_device_id: self.device_id.to_string(),
+            auth_generation: 1,
+            conversation_id: conversation_id.to_string(),
+        };
+        let mut transcript = b"CATBIRD-CHAT-ACK-ENTRIES\0".to_vec();
+        transcript.extend_from_slice(
+            &serde_ipld_dagcbor::to_vec(&payload).expect("encode ACK transcript"),
+        );
+        let signature = self.device_signing.sign(&transcript);
+        let mut body = serde_json::to_value(&payload).expect("encode ACK body");
+        body["signature"] = json!({ "$bytes": STANDARD.encode(signature.to_bytes()) });
+        let nsid = "blue.catbird.chat.acknowledgeEntries";
+        Request::builder()
+            .method("POST")
+            .uri(format!("/xrpc/{nsid}"))
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!(
+                    "Bearer {}",
+                    self.service_jwt(nsid, now.timestamp(), deterministic_uuid_v4(jti_label))
+                ),
+            )
+            .body(Body::from(
+                serde_json::to_vec(&body).expect("encode ACK request"),
+            ))
+            .expect("build acknowledgeEntries request")
     }
 }
 
@@ -1025,13 +1119,48 @@ fn build_deterministic_scenario(t0: DateTime<Utc>) -> PreparedScenario {
     }
 }
 
+async fn drive_paused_io<F: Future>(label: &str, future: F) -> F::Output {
+    let started = Instant::now();
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::task::yield_now() => assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{label} did not complete within 10 real seconds"
+            ),
+        }
+    }
+}
+
+async fn execute_request(router: &Router, label: &str, request: Request<Body>) -> Vec<u8> {
+    let uri = request.uri().to_string();
+    let response = drive_paused_io(label, router.clone().oneshot(request))
+        .await
+        .expect("dispatch XRPC request");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read response bytes")
+        .to_vec();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "step '{label}' ({uri}) failed with {status}: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    bytes
+}
+
 async fn execute_scenario_run(
     router: &Router,
+    pool: &DbPool,
     clock: &ManualDsClock,
     t0: DateTime<Utc>,
     scenario: &PreparedScenario,
 ) -> Vec<(String, Vec<u8>)> {
-    let mut outputs = Vec::with_capacity(scenario.steps.len());
+    clock.reset_counters();
+    let mut outputs = Vec::with_capacity(scenario.steps.len() + 6);
     for step in &scenario.steps {
         clock.set_utc(t0 + TimeDelta::milliseconds(step.clock_offset_ms));
         let request = Request::builder()
@@ -1041,27 +1170,243 @@ async fn execute_scenario_run(
             .header("authorization", format!("Bearer {}", step.bearer_jwt))
             .body(Body::from(step.body_bytes.clone()))
             .expect("build XRPC request");
-        let response = router
-            .clone()
-            .oneshot(request)
-            .await
-            .expect("dispatch XRPC request");
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read response bytes")
-            .to_vec();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "step '{}' ({}) failed with {}: {}",
-            step.label,
-            step.nsid,
-            status,
-            String::from_utf8_lossy(&bytes)
-        );
+        let bytes = execute_request(router, step.label, request).await;
         outputs.push((step.label.to_owned(), bytes));
     }
+
+    let entries_query = format!(
+        "actorDeviceId={}&conversationId={}&afterSeq=0&limit=100",
+        scenario.alice.device_id, scenario.conversation_id
+    );
+    let entries_time = t0 + TimeDelta::milliseconds(70);
+    clock.set_utc(entries_time);
+    let entries_bytes = execute_request(
+        router,
+        "get_entries",
+        scenario.alice.signed_get_request(
+            "blue.catbird.chat.getEntries",
+            &entries_query,
+            entries_time,
+            b"get-entries-jti",
+        ),
+    )
+    .await;
+    let entries_json: Value = serde_json::from_slice(&entries_bytes).expect("parse getEntries");
+    let entries = entries_json["entries"].as_array().expect("entries array");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4],
+        "signed getEntries must retain the whole contiguous transcript"
+    );
+    assert_eq!(entries_json["nextAfterSeq"], 4);
+    assert_eq!(entries_json["hasMore"], false);
+    let application_entry = entries.last().expect("application entry");
+    assert_eq!(
+        application_entry["$type"],
+        "blue.catbird.chat.defs#applicationEntry"
+    );
+    assert!(application_entry["signedRequest"].is_object());
+    assert_ne!(application_entry["payloadPruned"], true);
+    let send_json: Value = serde_json::from_slice(
+        &outputs
+            .iter()
+            .find(|(label, _)| label == "send_message")
+            .unwrap()
+            .1,
+    )
+    .expect("parse sendMessage");
+    assert_eq!(
+        application_entry["sequencerReceipt"],
+        send_json["sequencerReceipt"]
+    );
+    assert_eq!(
+        application_entry["receivedAt"],
+        (t0 + TimeDelta::milliseconds(50)).to_rfc3339_opts(SecondsFormat::Millis, true)
+    );
+    outputs.push(("get_entries".to_owned(), entries_bytes));
+
+    let inventory_time = t0 + TimeDelta::seconds(1);
+    clock.set_utc(inventory_time);
+    let inventory_query = format!("actorDeviceId={}&limit=100", scenario.bob_primary.device_id);
+    let conversations = execute_request(
+        router,
+        "get_conversations",
+        scenario.bob_primary.signed_get_request(
+            "blue.catbird.chat.getConversations",
+            &inventory_query,
+            inventory_time,
+            b"get-conversations-jti",
+        ),
+    );
+    tokio::pin!(conversations);
+    // Inventory creation rounds up to the next second. Step only after its
+    // committed session is visible, never according to how often HTTP was polled.
+    let committed_session = async {
+        loop {
+            if let Some(created_at) = sqlx::query_scalar::<_, DateTime<Utc>>(
+                "SELECT created_at FROM chat.inventory_sessions \
+                 WHERE user_did = $1 AND device_id = $2 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(&scenario.bob_primary.did)
+            .bind(scenario.bob_primary.device_id)
+            .fetch_optional(pool)
+            .await
+            .expect("observe committed inventory session")
+            {
+                break created_at;
+            }
+        }
+    };
+    tokio::pin!(committed_session);
+    let publication_started = Instant::now();
+    let not_before = loop {
+        tokio::select! {
+            bytes = &mut conversations => panic!(
+                "inventory response preceded its publication horizon: {}",
+                String::from_utf8_lossy(&bytes)
+            ),
+            created_at = &mut committed_session => break created_at,
+            _ = tokio::task::yield_now() => {
+                assert!(
+                    publication_started.elapsed() < Duration::from_secs(10),
+                    "inventory session did not commit within 10 seconds"
+                );
+            }
+        }
+    };
+    assert_eq!(not_before, t0 + TimeDelta::seconds(2));
+    clock.set_utc(not_before);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let conversations_bytes = conversations.await;
+    let conversations_json: Value =
+        serde_json::from_slice(&conversations_bytes).expect("parse getConversations");
+    let conversations_items = conversations_json["items"]
+        .as_array()
+        .expect("conversation items");
+    assert_eq!(conversations_items.len(), 1);
+    assert_eq!(
+        conversations_items[0]["state"]["coordinates"]["conversationId"],
+        scenario.conversation_id.to_string()
+    );
+    assert_eq!(conversations_items[0]["state"]["snapshotSeq"], 3);
+    assert_eq!(conversations_json["hasMore"], false);
+    let inventory_session_id = conversations_json["inventorySessionId"]
+        .as_str()
+        .expect("inventory capability");
+    assert_eq!(
+        URL_SAFE_NO_PAD.decode(inventory_session_id).unwrap().len(),
+        32
+    );
+    assert_eq!(
+        conversations_json["snapshotEventCursor"],
+        inventory_session_id
+    );
+    let expected_expiry =
+        (not_before + TimeDelta::minutes(15)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    assert_eq!(conversations_json["snapshotExpiresAt"], expected_expiry);
+
+    let welcomes_time = t0 + TimeDelta::milliseconds(2010);
+    clock.set_utc(welcomes_time);
+    let welcomes_bytes = execute_request(
+        router,
+        "get_pending_welcomes",
+        scenario.bob_primary.signed_get_request(
+            "blue.catbird.chat.getPendingWelcomes",
+            &format!(
+                "actorDeviceId={}&inventorySessionId={inventory_session_id}&limit=100",
+                scenario.bob_primary.device_id
+            ),
+            welcomes_time,
+            b"get-pending-welcomes-jti",
+        ),
+    )
+    .await;
+    let welcomes_json: Value =
+        serde_json::from_slice(&welcomes_bytes).expect("parse getPendingWelcomes");
+    let welcomes = welcomes_json["items"].as_array().expect("welcome items");
+    assert_eq!(
+        welcomes.len(),
+        1,
+        "Bob's unacknowledged Welcome must be visible"
+    );
+    assert_eq!(
+        welcomes[0]["welcomeId"],
+        deterministic_uuid_v4(b"sim-welcome-1").to_string()
+    );
+    assert_eq!(
+        welcomes[0]["conversationId"],
+        scenario.conversation_id.to_string()
+    );
+    assert_eq!(welcomes[0]["recipientDid"], scenario.bob_primary.did);
+    assert_eq!(
+        welcomes[0]["recipientDeviceId"],
+        scenario.bob_primary.device_id.to_string()
+    );
+    assert_eq!(welcomes[0]["transitionSeq"], 3);
+    assert_eq!(welcomes_json["inventorySessionId"], inventory_session_id);
+    assert_eq!(welcomes_json["snapshotExpiresAt"], expected_expiry);
+    assert_eq!(welcomes_json["hasMore"], false);
+    outputs.push(("get_conversations".to_owned(), conversations_bytes));
+    outputs.push(("get_pending_welcomes".to_owned(), welcomes_bytes));
+
+    for (label, actor, offset_ms, expected_pruned) in [
+        ("acknowledge_entries_alice", &scenario.alice, 2020, 0),
+        ("acknowledge_entries_bob", &scenario.bob_primary, 2030, 1),
+    ] {
+        let ack_time = t0 + TimeDelta::milliseconds(offset_ms);
+        clock.set_utc(ack_time);
+        let bytes = execute_request(
+            router,
+            label,
+            actor.acknowledge_entries_request(
+                scenario.conversation_id,
+                4,
+                ack_time,
+                label.as_bytes(),
+            ),
+        )
+        .await;
+        let ack: Value = serde_json::from_slice(&bytes).expect("parse acknowledgeEntries");
+        assert_eq!(ack["acknowledgedSeq"], 4);
+        assert_eq!(ack["prunedCount"], expected_pruned);
+        outputs.push((label.to_owned(), bytes));
+    }
+
+    let pruned_time = t0 + TimeDelta::milliseconds(2040);
+    clock.set_utc(pruned_time);
+    let pruned_bytes = execute_request(
+        router,
+        "get_entries_pruned",
+        scenario.alice.signed_get_request(
+            "blue.catbird.chat.getEntries",
+            &entries_query,
+            pruned_time,
+            b"get-entries-pruned-jti",
+        ),
+    )
+    .await;
+    let pruned_json: Value =
+        serde_json::from_slice(&pruned_bytes).expect("parse pruned getEntries");
+    let pruned_entries = pruned_json["entries"].as_array().expect("pruned entries");
+    assert_eq!(pruned_entries.len(), entries.len());
+    for (before, after) in entries.iter().zip(pruned_entries) {
+        assert_eq!(before["seq"], after["seq"]);
+        assert_eq!(before["entryId"], after["entryId"]);
+        assert_eq!(before["receivedAt"], after["receivedAt"]);
+    }
+    let pruned_application = pruned_entries.last().expect("pruned application entry");
+    assert_eq!(pruned_application["payloadPruned"], true);
+    assert!(pruned_application.get("signedRequest").is_none());
+    assert_eq!(
+        pruned_application["sequencerReceipt"],
+        application_entry["sequencerReceipt"]
+    );
+    assert_eq!(pruned_json["hasMore"], false);
+    assert_eq!(pruned_json["nextAfterSeq"], 4);
+    outputs.push(("get_entries_pruned".to_owned(), pruned_bytes));
     outputs
 }
 
@@ -1125,12 +1470,15 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
         .expect("initial reset_sim_postgres_schema");
 
     // --- Run 1 ---
-    let run1 = execute_scenario_run(&router, &clock, t0, &scenario).await;
+    let run1 = execute_scenario_run(&router, sim_db.pool(), &clock, t0, &scenario).await;
 
     // Post-commit device revocation work must be queued in `QueuedTaskSpawner`, NOT spawned onto Tokio.
     assert_eq!(spawner.pending_len(), 1);
     assert_eq!(spawner.labels(), vec!["chat.post_commit.device_revoked"]);
-    assert_eq!(spawner.drain_all().await, 1);
+    assert_eq!(
+        drive_paused_io("run 1 post-commit drain", spawner.drain_all()).await,
+        1
+    );
     assert_eq!(spawner.pending_len(), 0);
 
     // Enqueueing an SSE event must also capture onto `QueuedTaskSpawner` until explicitly drained.
@@ -1152,7 +1500,7 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
         "SSE typing event must remain queued before drain_next"
     );
     assert_eq!(spawner.labels(), vec!["sse.consume_emit_queue"]);
-    assert!(spawner.drain_next().await);
+    assert!(drive_paused_io("SSE event drain", spawner.drain_next()).await);
     assert_eq!(spawner.pending_len(), 0);
     assert!(
         sse_rx.try_recv().is_ok(),
@@ -1169,17 +1517,20 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
         "[deterministic_server_clock_test] steady-state reset_sim_postgres_schema elapsed: {:?}",
         reset_elapsed
     );
-    assert!(
-        reset_elapsed < Duration::from_millis(25),
-        "steady-state reset_sim_postgres_schema took {reset_elapsed:?}, expected < 25ms"
+    // --- Run 2 (exact same clock schedule, JTIs, idempotency keys, and signed bytes) ---
+    let run2 = execute_scenario_run(&router, sim_db.pool(), &clock, t0, &scenario).await;
+    assert_eq!(spawner.labels(), vec!["chat.post_commit.device_revoked"]);
+    assert_eq!(
+        drive_paused_io("run 2 post-commit drain", spawner.drain_all()).await,
+        1
     );
 
-    // --- Run 2 (exact same clock schedule, JTIs, idempotency keys, and signed bytes) ---
-    let run2 = execute_scenario_run(&router, &clock, t0, &scenario).await;
-    assert_eq!(spawner.labels(), vec!["chat.post_commit.device_revoked"]);
-    assert_eq!(spawner.drain_all().await, 1);
-
     assert_eq!(run1.len(), run2.len());
+    assert_eq!(
+        run1.len(),
+        14,
+        "all mutation, signed read, and ACK steps must replay"
+    );
     for ((label1, bytes1), (label2, bytes2)) in run1.iter().zip(run2.iter()) {
         assert_eq!(label1, label2);
         assert_eq!(
@@ -1277,7 +1628,293 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
     )
     .expect("ES256 sequencerReceipt must verify cryptographically");
 
-    sim_db.cleanup().await.expect("drop disposable sim DB");
+    assert!(
+        reset_elapsed < Duration::from_millis(25),
+        "steady-state reset_sim_postgres_schema took {reset_elapsed:?}, expected < 25ms"
+    );
+
+    drive_paused_io("replay DB cleanup", sim_db.cleanup())
+        .await
+        .expect("drop disposable sim DB");
+}
+
+async fn assert_reset_without_virtual_time_advance(pool: &DbPool, label: &str) {
+    let before = tokio::time::Instant::now();
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+    let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+    // A Tokio timeout can auto-advance paused time or never fire during a yield
+    // loop. A sleeping OS thread bounds hangs without keeping Tokio runnable.
+    let watchdog = std::thread::spawn(move || {
+        if matches!(
+            cancel_rx.recv_timeout(Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            let _ = deadline_tx.send(());
+        }
+    });
+    let reset = tokio::select! {
+        result = reset_sim_postgres_schema(pool) => Some(result),
+        _ = deadline_rx => None,
+    };
+    drop(cancel_tx);
+    watchdog.join().expect("join reset watchdog");
+    reset
+        .unwrap_or_else(|| panic!("{label} schema reset hung for 10 real seconds"))
+        .unwrap_or_else(|error| panic!("{label} schema reset failed: {error}"));
+    assert_eq!(
+        tokio::time::Instant::now(),
+        before,
+        "{label} schema reset must not advance paused Tokio time"
+    );
+    assert_eq!(
+        pool.num_idle(),
+        1,
+        "{label} must return its single connection"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn schema_reset_does_not_advance_paused_time_for_worker_or_plain_single_connection_pool() {
+    // Establish both pools in real time; only schema reset is under test.
+    tokio::time::resume();
+    let sim_db = open_disposable_sim_pool(None)
+        .await
+        .expect("open worker pool for paused reset regression");
+    let plain_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(sim_db.pool().connect_options().as_ref().clone())
+        .await
+        .expect("open plain single-connection pool without worker release hooks");
+    tokio::time::pause();
+    for (label, pool) in [
+        ("worker cold", sim_db.pool()),
+        ("worker warm", sim_db.pool()),
+        ("plain cold", &plain_pool),
+        ("plain warm", &plain_pool),
+    ] {
+        assert_reset_without_virtual_time_advance(pool, label).await;
+    }
+    tokio::time::resume();
+    plain_pool.close().await;
+    sim_db
+        .cleanup()
+        .await
+        .expect("cleanup paused reset regression DB");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hybrid_schema_reset_compacts_every_64_passes_and_explicitly_reclaims_empty_heaps() {
+    async fn probe_state(pool: &DbPool) -> (i64, i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT count(*), \
+                    pg_relation_filenode('public.sim_reset_probe'::regclass)::bigint, \
+                    pg_relation_size('public.sim_reset_probe'::regclass), \
+                    COALESCE(NULLIF(current_setting( \
+                        'catbird_sim.resets_since_compaction', true), ''), '0')::bigint \
+             FROM public.sim_reset_probe",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read reset probe rows, heap, and session reset count")
+    }
+
+    async fn insert_probe(pool: &DbPool) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO public.sim_reset_probe (payload) VALUES ('live compaction probe') \
+             RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("insert reset probe with generated identity")
+    }
+
+    let sim_db = open_disposable_sim_pool(None)
+        .await
+        .expect("open disposable pool for hybrid reset regression");
+    let pool = sim_db.pool();
+    // Create before the reset plan is cached. Disable autovacuum so physical
+    // heap measurements distinguish fast DELETE from actual compaction.
+    sqlx::query(
+        "CREATE TABLE public.sim_reset_probe ( \
+             id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+             payload TEXT NOT NULL \
+         ) WITH (autovacuum_enabled = false)",
+    )
+    .execute(pool)
+    .await
+    .expect("create operational identity probe");
+    reset_sim_postgres_schema(pool)
+        .await
+        .expect("cold startup compaction");
+    let cold = probe_state(pool).await;
+    assert_eq!(cold.0, 0);
+    assert_eq!(cold.2, 0);
+    assert_eq!(
+        cold.3, 0,
+        "cold compaction establishes the cadence baseline"
+    );
+    sqlx::query(
+        "INSERT INTO public.sim_reset_probe (payload) \
+         SELECT repeat('x', 512) FROM generate_series(1, 32)",
+    )
+    .execute(pool)
+    .await
+    .expect("populate reset probe heap");
+    let populated = probe_state(pool).await;
+    assert_eq!(populated.0, 32);
+    assert!(populated.2 > 0);
+
+    reset_sim_postgres_schema(pool)
+        .await
+        .expect("first fast reset");
+    let deleted = probe_state(pool).await;
+    assert_eq!(deleted.0, 0);
+    assert_eq!(
+        deleted.1, populated.1,
+        "fast reset must not rewrite the heap"
+    );
+    assert!(deleted.2 > 0, "DELETE must leave measurable heap storage");
+    assert_eq!(deleted.3, 1);
+    assert_eq!(insert_probe(pool).await, 1, "fast reset restarts identity");
+
+    compact_sim_postgres_schema(pool)
+        .await
+        .expect("explicit occupied compaction");
+    let compacted = probe_state(pool).await;
+    assert_eq!(
+        compacted.0, 0,
+        "explicit compaction clears operational rows"
+    );
+    assert_ne!(compacted.1, deleted.1);
+    assert_eq!(compacted.2, 0, "new heap cannot retain dead tuples");
+    assert_eq!(compacted.3, 0, "explicit compaction restarts the cadence");
+
+    for pass in 1..=64 {
+        assert_eq!(
+            insert_probe(pool).await,
+            1,
+            "identity restart before pass {pass}"
+        );
+        reset_sim_postgres_schema(pool)
+            .await
+            .unwrap_or_else(|error| panic!("hybrid reset pass {pass} failed: {error}"));
+        let state = probe_state(pool).await;
+        assert_eq!(state.0, 0, "pass {pass} must clear operational rows");
+        if pass < 64 {
+            assert_eq!(state.1, compacted.1, "pass {pass} must stay on fast DELETE");
+            assert!(state.2 > 0);
+            assert_eq!(state.3, pass);
+        } else {
+            assert_ne!(state.1, compacted.1, "64th reset must compact");
+            assert_eq!(state.2, 0, "periodic compaction removes heap tombstones");
+            assert_eq!(state.3, 0, "periodic compaction restarts the cadence");
+        }
+    }
+
+    assert_eq!(
+        insert_probe(pool).await,
+        1,
+        "periodic compaction restarts identity"
+    );
+    reset_sim_postgres_schema(pool)
+        .await
+        .expect("delete before empty compaction");
+    let empty_bloated = probe_state(pool).await;
+    assert_eq!(empty_bloated.0, 0);
+    assert!(empty_bloated.2 > 0);
+    assert_eq!(empty_bloated.3, 1);
+    // Occupancy alone cannot find this heap: the fast path already deleted
+    // every live row, but its physical storage still needs reclamation.
+    compact_sim_postgres_schema(pool)
+        .await
+        .expect("explicit empty-heap compaction");
+    let empty_compacted = probe_state(pool).await;
+    assert_eq!(empty_compacted.0, 0);
+    assert_ne!(empty_compacted.1, empty_bloated.1);
+    assert_eq!(
+        empty_compacted.2, 0,
+        "empty compaction must reclaim DELETE storage"
+    );
+    assert_eq!(empty_compacted.3, 0);
+    assert_eq!(
+        insert_probe(pool).await,
+        1,
+        "empty compaction restarts identity"
+    );
+
+    sim_db
+        .cleanup()
+        .await
+        .expect("cleanup hybrid reset regression DB");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_manual_clocks_keep_jti_and_tid_sequences_and_resets_isolated() {
+    async fn samples(client: &ServiceAuthClient, count: usize) -> Vec<(String, String)> {
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            values.push((
+                catbird_server::labyrinth::tid::next_tid(),
+                client
+                    .sign_request(
+                        "did:web:peer.catbird.blue",
+                        "blue.catbird.mlsDS.deliverMessage",
+                    )
+                    .expect("mint deterministic outbound JWT"),
+            ));
+            tokio::task::yield_now().await;
+        }
+        values
+    }
+
+    let t0 = DateTime::from_timestamp(1_800_000_000, 0).expect("fixed clock origin");
+    let client = Arc::new(ServiceAuthClient::from_shared_secret(
+        SERVICE_DID.to_owned(),
+        b"deterministic-counter-isolation-test",
+    ));
+    let expected = scope_ds_clock(Arc::new(ManualDsClock::new(t0)), samples(&client, 5)).await;
+    assert!(
+        expected
+            .windows(2)
+            .all(|pair| pair[0].0 < pair[1].0 && pair[0].1 != pair[1].1),
+        "stalled-clock TIDs must increase and each outbound JTI must remain unique"
+    );
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let spawn_worker = |clock: Arc<ManualDsClock>, reset: bool| {
+        let client = Arc::clone(&client);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(scope_ds_clock(
+            Arc::clone(&clock) as Arc<dyn DsClock>,
+            async move {
+                let before = samples(&client, 4).await;
+                barrier.wait().await;
+                if reset {
+                    clock.reset_counters();
+                }
+                barrier.wait().await;
+                let after = samples(&client, 1).await;
+                (before, after)
+            },
+        ))
+    };
+    let first = spawn_worker(Arc::new(ManualDsClock::new(t0)), true);
+    let second = spawn_worker(Arc::new(ManualDsClock::new(t0)), false);
+    let (first, second) = tokio::join!(first, second);
+    let (first_before, first_after) = first.expect("first parallel clock");
+    let (second_before, second_after) = second.expect("second parallel clock");
+    assert_eq!(first_before.as_slice(), &expected[..4]);
+    assert_eq!(second_before.as_slice(), &expected[..4]);
+    assert_eq!(
+        first_after.as_slice(),
+        &expected[..1],
+        "reset must replay only its clock"
+    );
+    assert_eq!(
+        second_after.as_slice(),
+        &expected[4..],
+        "resetting the first clock must not rewind the live second clock"
+    );
 }
 
 #[tokio::test]

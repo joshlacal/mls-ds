@@ -40,12 +40,13 @@ pub(crate) async fn replay_high_water(
     transaction: &mut Transaction<'_, Postgres>,
     ticket: &ConsumedTicket,
 ) -> Result<i64, TicketRepositoryError> {
-    let (high_water, observed_at): (i64, DateTime<Utc>) = sqlx::query_as(
-        "SELECT coalesce(max(event_position),0)::bigint, transaction_timestamp() FROM chat.events WHERE protocol_instance_id=$1",
+    let high_water: i64 = sqlx::query_scalar(
+        "SELECT coalesce(max(event_position),0)::bigint FROM chat.events WHERE protocol_instance_id=$1",
     )
     .bind(ticket.protocol_instance_id)
     .fetch_one(&mut **transaction)
     .await?;
+    let observed_at = crate::sim_hooks::current_utc();
     revalidate_consumed_ticket(transaction, ticket, ticket.event_position, observed_at).await?;
     Ok(high_water.max(ticket.event_position))
 }
@@ -66,9 +67,7 @@ pub(crate) async fn visible_events(
     {
         return Err(TicketRepositoryError::InvalidReceipt);
     }
-    let observed_at: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
-        .fetch_one(&mut **transaction)
-        .await?;
+    let observed_at = crate::sim_hooks::current_utc();
     revalidate_consumed_ticket(transaction, ticket, after_position, observed_at).await?;
     let rows = sqlx::query(
         r#"SELECT event.event_position, event.payload_bytes,
@@ -212,6 +211,7 @@ pub(crate) async fn materialize_envelope(
     .fetch_optional(&mut **transaction)
     .await?;
 
+    let created_at = crate::sim_hooks::current_utc();
     let (cursor, cursor_hash, expected_envelope_hash) = if let Some(row) = existing {
         let cursor_hash: [u8; 32] = row
             .try_get::<Vec<u8>, _>("cursor_hash")?
@@ -263,9 +263,6 @@ pub(crate) async fn materialize_envelope(
             expected_hash,
         )
     } else {
-        let created_at: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
-            .fetch_one(&mut **transaction)
-            .await?;
         if created_at >= ticket.expires_at {
             return Err(TicketRepositoryError::TicketExpired);
         }
@@ -309,11 +306,6 @@ pub(crate) async fn materialize_envelope(
             }
         }
     } else {
-        // Recreate the sealing inputs after envelope construction. This is
-        // intentionally inside the transaction that persists the receipt.
-        let created_at: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
-            .fetch_one(&mut **transaction)
-            .await?;
         let decoded = URL_SAFE_NO_PAD
             .decode(&cursor)
             .map_err(|_| TicketRepositoryError::InvalidReceipt)?;

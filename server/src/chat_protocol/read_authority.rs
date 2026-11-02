@@ -805,7 +805,8 @@ pub(crate) async fn authorize_conversation_state(
     assert_same_transaction(tx, device.txid()).await?;
 
     let locked_at: DateTime<Utc> =
-        sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', $1::timestamptz)")
+            .bind(crate::sim_hooks::current_utc())
             .fetch_one(&mut **tx)
             .await
             .map_err(|_| ReadAuthorityError::Storage)?;
@@ -1393,7 +1394,8 @@ pub(crate) async fn authorize_entries(
 ) -> Result<EntryReadAuthority, ReadAuthorityError> {
     assert_same_transaction(tx, device.txid()).await?;
     let locked_at: DateTime<Utc> =
-        sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', $1::timestamptz)")
+            .bind(crate::sim_hooks::current_utc())
             .fetch_one(&mut **tx)
             .await
             .map_err(|_| ReadAuthorityError::Storage)?;
@@ -1689,11 +1691,8 @@ pub(in crate::chat_protocol) async fn verify_inventory_fence(
 
     // Temporal bounds: the fence was captured now or in the recent past, and
     // never in the future or beyond the schema's session expiry horizon. Judged
-    // on the same database clock that stamped `captured_at`.
-    let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|_| ReadAuthorityError::Storage)?;
+    // on the same trusted application clock that stamped `captured_at`.
+    let now = crate::sim_hooks::current_utc();
     if row.captured_at > now + chrono::Duration::seconds(5)
         || now.signed_duration_since(row.captured_at) > chrono::Duration::minutes(15)
     {
@@ -2040,7 +2039,8 @@ pub(crate) async fn inventory_authorities(
     for conversation_id in candidates {
         // Conversation head lock, ascending UUID byte order.
         let locked_at: DateTime<Utc> =
-            sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            sqlx::query_scalar("SELECT date_trunc('milliseconds', $1::timestamptz)")
+                .bind(crate::sim_hooks::current_utc())
                 .fetch_one(&mut **tx)
                 .await
                 .map_err(|_| ReadAuthorityError::Storage)?;

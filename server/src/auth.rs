@@ -834,7 +834,7 @@ impl AuthMiddleware {
         let doc = resolution?;
         let cached = CachedDidDoc {
             doc: doc.clone(),
-            cached_at: Utc::now(),
+            cached_at: crate::sim_hooks::current_utc(),
         };
         self.did_cache.insert(did.to_string(), cached).await;
 
@@ -844,7 +844,7 @@ impl AuthMiddleware {
     pub async fn cache_did_document(&self, doc: DidDocument) {
         let cached = CachedDidDoc {
             doc: doc.clone(),
-            cached_at: Utc::now(),
+            cached_at: crate::sim_hooks::current_utc(),
         };
         self.did_cache.insert(doc.id.clone(), cached).await;
     }
@@ -1031,6 +1031,10 @@ impl AuthMiddleware {
     }
     /// Check rate limit for a DID
     fn check_rate_limit(&self, did: &str) -> Result<(), AuthError> {
+        // Simulation admission must not spend another worker's wall-clock bucket.
+        if crate::sim_hooks::is_deterministic_clock_active() {
+            return Ok(());
+        }
         let quota = self.rate_limit_quota;
         let limiter = self
             .rate_limiters
@@ -1216,15 +1220,6 @@ pub async fn cache_test_did_document(doc: DidDocument) {
 
 pub(crate) async fn cache_sim_did_document(doc: DidDocument) {
     shared_auth_middleware_ref().cache_did_document(doc).await;
-}
-
-pub(crate) fn clear_sim_auth_caches() {
-    JTI_CACHE.invalidate_all();
-    JTI_CACHE.run_pending_tasks();
-    shared_auth_middleware_ref().rate_limiters.invalidate_all();
-    shared_auth_middleware_ref()
-        .rate_limiters
-        .run_pending_tasks();
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1635,7 +1630,7 @@ impl JtiReplayStore for PostgresJtiReplayStore<'_> {
     ) -> Result<bool, AuthError> {
         let inserted: Option<String> = sqlx::query_scalar(
             "INSERT INTO auth_jti_nonce (issuer_did, jti, endpoint_nsid, expires_at, created_at) \
-             VALUES ($1, $2, $3, NOW() + make_interval(secs => $4), NOW()) \
+             VALUES ($1, $2, $3, $5::timestamptz + make_interval(secs => $4), $5) \
              ON CONFLICT (issuer_did, jti) DO NOTHING \
              RETURNING issuer_did",
         )
@@ -1643,6 +1638,7 @@ impl JtiReplayStore for PostgresJtiReplayStore<'_> {
         .bind(jti)
         .bind(endpoint_nsid)
         .bind(ttl_seconds as f64)
+        .bind(crate::sim_hooks::current_utc())
         .fetch_optional(self.0)
         .await
         .map_err(|e| AuthError::Internal(format!("shared jti store failed: {e}")))?;
@@ -1681,9 +1677,14 @@ async fn enforce_standard_with_store(
 
     let jti = claims.jti.as_ref().ok_or(AuthError::MissingJti)?;
     let canonical_issuer = canonical_did(&claims.iss);
-    let local_key = format!("{}|{}", canonical_issuer, jti);
-    if JTI_CACHE.get(&local_key).is_some() {
-        return Err(AuthError::ReplayDetected);
+    // The database remains authoritative for replay detection. The process cache
+    // is only a production fast path and must not couple isolated worker stores.
+    let local_key = (!crate::sim_hooks::is_deterministic_clock_active())
+        .then(|| format!("{}|{}", canonical_issuer, jti));
+    if let Some(key) = &local_key {
+        if JTI_CACHE.get(key).is_some() {
+            return Err(AuthError::ReplayDetected);
+        }
     }
 
     if !store
@@ -1693,12 +1694,15 @@ async fn enforce_standard_with_store(
         return Err(AuthError::ReplayDetected);
     }
 
-    JTI_CACHE.insert(local_key, ());
+    if let Some(key) = local_key {
+        JTI_CACHE.insert(key, ());
+    }
     Ok(())
 }
 
 pub async fn cleanup_expired_jti_nonces(pool: &crate::storage::DbPool) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM auth_jti_nonce WHERE expires_at < NOW()")
+    let result = sqlx::query("DELETE FROM auth_jti_nonce WHERE expires_at < $1")
+        .bind(crate::sim_hooks::current_utc())
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
@@ -2384,6 +2388,65 @@ mod tests {
             enforce_standard_with_policy(&claims, "blue.catbird.chat.getConversations", policy,),
             Err(AuthError::MissingJti)
         ));
+    }
+
+    #[tokio::test]
+    async fn deterministic_auth_bypasses_process_caches_but_enforces_store_replays() {
+        #[derive(Default)]
+        struct ReplayStore(std::sync::Mutex<std::collections::HashSet<(String, String)>>);
+
+        #[async_trait::async_trait]
+        impl JtiReplayStore for ReplayStore {
+            async fn insert_if_absent(
+                &self,
+                issuer_did: &str,
+                jti: &str,
+                _endpoint_nsid: &str,
+                _ttl_seconds: u64,
+            ) -> Result<bool, AuthError> {
+                Ok(self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .insert((issuer_did.to_owned(), jti.to_owned())))
+            }
+        }
+
+        let mut claims = claims("did:plc:deterministic-cache-isolation", None);
+        claims.jti = Some(uuid::Uuid::new_v4().to_string());
+        let key = format!("{}|{}", claims.iss, claims.jti.as_ref().unwrap());
+        JTI_CACHE.insert(key.clone(), ());
+        let now = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let first = Arc::new(crate::sim_hooks::ManualDsClock::new(now));
+        let second = Arc::new(crate::sim_hooks::ManualDsClock::new(now));
+        let store = ReplayStore::default();
+        let other_store = ReplayStore::default();
+        let endpoint = "blue.catbird.chat.getConversations";
+        let policy = AuthEnforcementPolicy::strict_for_test();
+        let middleware = AuthMiddleware::new();
+        crate::sim_hooks::scope_ds_clock(first, async {
+            assert!(middleware.check_rate_limit(&claims.iss).is_ok());
+            assert!(middleware.rate_limiters.get(&claims.iss).is_none());
+            enforce_standard_with_store(&claims, endpoint, &store, policy)
+                .await
+                .unwrap();
+            assert!(matches!(
+                enforce_standard_with_store(&claims, endpoint, &store, policy).await,
+                Err(AuthError::ReplayDetected)
+            ));
+        })
+        .await;
+        crate::sim_hooks::scope_ds_clock(second, async {
+            enforce_standard_with_store(&claims, endpoint, &other_store, policy)
+                .await
+                .unwrap();
+        })
+        .await;
+        assert!(
+            JTI_CACHE.get(&key).is_some(),
+            "worker must not clear production cache"
+        );
+        JTI_CACHE.invalidate(&key);
     }
 
     fn claims(iss: &str, sub: Option<&str>) -> AtProtoClaims {

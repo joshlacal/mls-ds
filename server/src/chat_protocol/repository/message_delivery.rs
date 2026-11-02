@@ -680,42 +680,21 @@ pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
 static TYPING_LAST: OnceLock<Mutex<HashMap<(Uuid, Uuid), (bool, DateTime<Utc>)>>> = OnceLock::new();
 static TYPING_RATE: OnceLock<Mutex<HashMap<(Uuid, String, Uuid), DateTime<Utc>>>> = OnceLock::new();
 
-pub(crate) fn clear_ephemeral_typing_state() {
-    if let Some(m) = TYPING_LAST.get() {
-        m.lock().unwrap_or_else(|e| e.into_inner()).clear();
+fn admit_typing(
+    conversation_id: Uuid,
+    typing_id: Uuid,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    state: bool,
+    now: DateTime<Utc>,
+) -> Result<(), MessageDeliveryError> {
+    // Ephemeral abuse/idempotency caches are a production optimization. A
+    // deterministic worker must neither consult nor alter another worker's state.
+    if crate::sim_hooks::is_deterministic_clock_active() {
+        return Ok(());
     }
-    if let Some(m) = TYPING_RATE.get() {
-        m.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
-}
-
-pub(crate) async fn typing<T: PublicTransport>(
-    tx: &mut Transaction<'_, Postgres>,
-    authority: &crate::chat_protocol::dpop::VerifiedChatDeviceRequest,
-    scope: &ScopeBoundBusinessAuthority,
-    relationship_authority: &RelationshipAuthority<T>,
-) -> Result<Vec<u8>, MessageDeliveryError> {
-    let mutation = verified_mutation(authority, scope)?;
-    let projection = match mutation.projection() {
-        transcript::VerifiedMutationProjection::Typing(p) => p,
-        _ => return Err(MessageDeliveryError::Invariant),
-    };
-    let expected = coordinate(projection.coordinates())?;
-    let head = lock_head(tx, expected).await?;
-    require_current_leaf(tx, head.coordinate, scope).await?;
-    require_recipient_ready(tx, head.coordinate, scope, &head).await?;
-    require_relationship_policy(tx, scope, head.coordinate, relationship_authority).await?;
-    let now = scope.trusted_instant();
-    let key = (
-        expected.conversation_id,
-        Uuid::from_bytes(*projection.typing_id().as_bytes()),
-    );
-    let rate_key = (
-        expected.conversation_id,
-        scope.actor_did().to_owned(),
-        scope.actor_device_id(),
-    );
-    let state = projection.is_typing();
+    let key = (conversation_id, typing_id);
+    let rate_key = (conversation_id, actor_did.to_owned(), actor_device_id);
     let guard = TYPING_LAST.get_or_init(|| Mutex::new(HashMap::new()));
     let mut values = guard.lock().map_err(|_| MessageDeliveryError::Invariant)?;
     values.retain(|_, (_, sent_at)| now.signed_duration_since(*sent_at) < Duration::minutes(10));
@@ -739,7 +718,66 @@ pub(crate) async fn typing<T: PublicTransport>(
     }
     values.insert(key, (state, now));
     rates.insert(rate_key, now);
+    Ok(())
+}
+
+pub(crate) async fn typing<T: PublicTransport>(
+    tx: &mut Transaction<'_, Postgres>,
+    authority: &crate::chat_protocol::dpop::VerifiedChatDeviceRequest,
+    scope: &ScopeBoundBusinessAuthority,
+    relationship_authority: &RelationshipAuthority<T>,
+) -> Result<Vec<u8>, MessageDeliveryError> {
+    let mutation = verified_mutation(authority, scope)?;
+    let projection = match mutation.projection() {
+        transcript::VerifiedMutationProjection::Typing(p) => p,
+        _ => return Err(MessageDeliveryError::Invariant),
+    };
+    let expected = coordinate(projection.coordinates())?;
+    let head = lock_head(tx, expected).await?;
+    require_current_leaf(tx, head.coordinate, scope).await?;
+    require_recipient_ready(tx, head.coordinate, scope, &head).await?;
+    require_relationship_policy(tx, scope, head.coordinate, relationship_authority).await?;
+    let now = scope.trusted_instant();
+    let state = projection.is_typing();
+    admit_typing(
+        expected.conversation_id,
+        Uuid::from_bytes(*projection.typing_id().as_bytes()),
+        scope.actor_did(),
+        scope.actor_device_id(),
+        state,
+        now,
+    )?;
     let expires = now + Duration::seconds(8);
     let response = json!({"typing": {"typingId": projection.typing_id().as_str(), "conversationId": expected.conversation_id.to_string(), "actorDid": scope.actor_did(), "actorDeviceId": scope.actor_device_id(), "isTyping": state, "expiresAt": expires.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)}});
     serde_json::to_vec(&response).map_err(|_| MessageDeliveryError::Invariant)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_typing_does_not_consult_or_mutate_process_state() {
+        use crate::sim_hooks::{with_ds_clock, ManualDsClock};
+        use std::sync::Arc;
+
+        let now = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let conversation = Uuid::new_v4();
+        let typing = Uuid::new_v4();
+        let device = Uuid::new_v4();
+        let did = "did:plc:typing-cache-isolation";
+        assert!(admit_typing(conversation, typing, did, device, false, now).is_ok());
+        with_ds_clock(Arc::new(ManualDsClock::new(now)), || {
+            assert!(admit_typing(conversation, typing, did, device, true, now).is_ok());
+            assert!(admit_typing(conversation, typing, did, device, true, now).is_ok());
+        });
+        assert!(matches!(
+            admit_typing(conversation, typing, did, device, true, now),
+            Err(MessageDeliveryError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            admit_typing(conversation, typing, did, device, false, now),
+            Err(MessageDeliveryError::RateLimited)
+        ));
+    }
 }

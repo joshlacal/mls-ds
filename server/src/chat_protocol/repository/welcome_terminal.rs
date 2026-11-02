@@ -1726,7 +1726,8 @@ async fn direct_request_welcome_terminal(
 
     // Lock waits cannot extend the immutable Welcome import horizon.
     let now = if first {
-        sqlx::query_scalar("SELECT date_trunc('milliseconds',clock_timestamp())")
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', $1::timestamptz)")
+            .bind(crate::sim_hooks::current_utc())
             .fetch_one(&mut **tx)
             .await?
     } else {

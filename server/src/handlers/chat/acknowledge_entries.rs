@@ -113,6 +113,7 @@ async fn execute(
     let method =
         CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let instant = TrustedRequestInstant::capture().map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+    let now = instant.datetime();
     let pre_replay =
         dpop::standard_service_auth_evidence(principal, &actor_device_str, method, instant, None)
             .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
@@ -122,10 +123,6 @@ async fn execute(
 
     let mut tx = pool
         .begin()
-        .await
-        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
-        .fetch_one(&mut *tx)
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 

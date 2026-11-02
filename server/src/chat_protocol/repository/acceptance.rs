@@ -997,7 +997,8 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
         return Err(DirectAcceptanceError::NotPending);
     }
     let mut now: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar("SELECT date_trunc('milliseconds',clock_timestamp())")
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', $1::timestamptz)")
+            .bind(crate::sim_hooks::current_utc())
             .fetch_one(&mut **tx)
             .await?;
     let signed_at = chrono::DateTime::parse_from_rfc3339(&text(&body["signedAt"])?)
@@ -1030,7 +1031,8 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
         .map_err(|_| DirectAcceptanceError::PolicyUnavailable)?;
     // Policy resolution may perform I/O while the durable head remains locked.
     // Recheck first-execution freshness at the actual commit decision boundary.
-    now = sqlx::query_scalar("SELECT date_trunc('milliseconds',clock_timestamp())")
+    now = sqlx::query_scalar("SELECT date_trunc('milliseconds', $1::timestamptz)")
+        .bind(crate::sim_hooks::current_utc())
         .fetch_one(&mut **tx)
         .await?;
     if signed_at > now + chrono::Duration::seconds(30)

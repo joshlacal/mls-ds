@@ -1555,7 +1555,7 @@ impl fmt::Display for SecureRandomError {
 
 impl Error for SecureRandomError {}
 
-/// Production `SecureRandom` over the operating-system entropy source.
+/// Operating-system entropy, or a clock-local deterministic stream in simulation.
 #[allow(dead_code)]
 pub(crate) struct OsSecureRandom(OsRng);
 
@@ -1580,6 +1580,9 @@ impl fmt::Debug for OsSecureRandom {
 
 impl SecureRandom for OsSecureRandom {
     fn fill(&mut self, out: &mut [u8]) -> Result<(), SecureRandomError> {
+        if crate::sim_hooks::deterministic_entropy(b"chat.capability", out) {
+            return Ok(());
+        }
         self.0.try_fill_bytes(out).map_err(|_| SecureRandomError)
     }
 }
@@ -2152,5 +2155,32 @@ pub(crate) struct SealedCapability {
 impl fmt::Debug for SealedCapability {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SealedCapability(REDACTED)")
+    }
+}
+
+#[cfg(test)]
+mod deterministic_random_tests {
+    use super::*;
+    use crate::sim_hooks::{with_ds_clock, ManualDsClock};
+    use std::sync::Arc;
+
+    #[test]
+    fn capability_entropy_is_clock_local_and_resettable() {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let clock = Arc::new(ManualDsClock::new(now));
+        let independent = Arc::new(ManualDsClock::new(now));
+        let draw = |clock: Arc<ManualDsClock>| {
+            with_ds_clock(clock, || {
+                let mut bytes = [0; 32];
+                OsSecureRandom::new().fill(&mut bytes).unwrap();
+                bytes
+            })
+        };
+
+        let first = draw(clock.clone());
+        assert_ne!(first, draw(clock.clone()));
+        assert_eq!(first, draw(independent));
+        clock.reset_counters();
+        assert_eq!(first, draw(clock));
     }
 }

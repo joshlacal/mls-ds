@@ -143,7 +143,7 @@ async fn read_entries_in_transaction(
             return Err(EntryReadFacadeError::NotEntitled);
         }
         if status == "pending" {
-            if Utc::now() > import_until {
+            if crate::sim_hooks::current_utc() > import_until {
                 return Err(EntryReadFacadeError::InvitationNotPending);
             }
         } else if status != "accepted" {

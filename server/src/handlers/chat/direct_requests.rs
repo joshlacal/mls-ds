@@ -255,12 +255,14 @@ async fn mutate(
                 .execute(&mut *route_tx)
                 .await
                 .map_err(|_| ChatFailure::storage(endpoint))?;
+            let observed_at = crate::sim_hooks::current_utc();
             let (recent, existing): (i64, bool) = sqlx::query_as(
-                "SELECT (SELECT count(*) FROM chat.direct_request_outbound_routes WHERE actor_did=$1 AND created_at>clock_timestamp()-INTERVAL '1 hour'), \
+                "SELECT (SELECT count(*) FROM chat.direct_request_outbound_routes WHERE actor_did=$1 AND created_at>$3::timestamptz-INTERVAL '1 hour'), \
                         EXISTS(SELECT 1 FROM chat.direct_request_outbound_routes WHERE request_id=$2 AND actor_did=$1)",
             )
             .bind(actor_did)
             .bind(request_id)
+            .bind(observed_at)
             .fetch_one(&mut *route_tx)
             .await
             .map_err(|_| ChatFailure::storage(endpoint))?;
@@ -285,8 +287,8 @@ async fn mutate(
             }
             let route: Option<uuid::Uuid> = sqlx::query_scalar(
                 "INSERT INTO chat.direct_request_outbound_routes \
-                    (request_id, actor_did, actor_device_id, recipient_did, coordinator_did) \
-                 VALUES ($1, $2, $3, $4, $5) \
+                    (request_id, actor_did, actor_device_id, recipient_did, coordinator_did, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (request_id) DO UPDATE SET request_id=EXCLUDED.request_id \
                  WHERE chat.direct_request_outbound_routes.actor_did=EXCLUDED.actor_did \
                    AND chat.direct_request_outbound_routes.actor_device_id=EXCLUDED.actor_device_id \
@@ -299,6 +301,7 @@ async fn mutate(
             .bind(actor_device_id)
             .bind(recipient_did)
             .bind(&coord.coordinator_did)
+            .bind(observed_at)
             .fetch_optional(&mut *route_tx)
             .await
             .map_err(|_| ChatFailure::storage(endpoint))?;

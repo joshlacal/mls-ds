@@ -587,10 +587,10 @@ pub(crate) async fn read_direct_request_pool_hint(
     if !present {
         return Ok(None);
     }
-    // A single statement timestamp and exact capability/key/generation binding
-    // make both counts describe one hint horizon. Final prepare is authoritative.
+    // A single trusted application timestamp and exact capability/key/generation
+    // binding make both counts describe one hint horizon. Final prepare is authoritative.
     Ok(sqlx::query_as(r#"
-      WITH instant AS (SELECT date_trunc('milliseconds',clock_timestamp()) AS at)
+      WITH instant AS (SELECT date_trunc('milliseconds', $5::timestamptz) AS at)
       SELECT (c.enabled AND c.auth_generation=d.auth_generation AND c.owner_key_id=k.key_id
         AND d.status='active' AND k.revoked_at IS NULL) AS enabled,c.revision,
         count(p.key_package_ref) FILTER(WHERE p.status='available' AND NOT EXISTS(
@@ -607,7 +607,7 @@ pub(crate) async fn read_direct_request_pool_hint(
         AND p.owner_key_id=c.owner_key_id AND p.owner_auth_generation=c.auth_generation
         AND p.usage_scope='direct-request' AND p.status IN('available','reserved')
         AND p.not_before<=instant.at AND p.not_after>=instant.at+INTERVAL '605400 seconds'
-        AND NOT EXISTS (SELECT 1 FROM chat.direct_request_remote_leases l WHERE l.key_package_ref=p.key_package_ref AND l.status = 'active' AND l.expires_at > clock_timestamp())
+        AND NOT EXISTS (SELECT 1 FROM chat.direct_request_remote_leases l WHERE l.key_package_ref=p.key_package_ref AND l.status = 'active' AND l.expires_at > $5::timestamptz)
         AND EXISTS(SELECT 1 FROM chat.direct_request_grants g WHERE g.key_package_ref=p.key_package_ref
           AND g.owner_did=p.owner_did AND g.owner_device_id=p.owner_device_id AND g.owner_key_id=p.owner_key_id
           AND g.auth_generation=p.owner_auth_generation AND g.revoked_at IS NULL
@@ -615,7 +615,7 @@ pub(crate) async fn read_direct_request_pool_hint(
           AND g.expires_at>=instant.at+INTERVAL '605400 seconds')
       WHERE c.owner_did=$1 AND c.owner_device_id=$2 AND k.key_id=$3 AND d.auth_generation=$4
       GROUP BY c.enabled,c.revision,c.auth_generation,c.owner_key_id,d.auth_generation,d.status,k.key_id,k.revoked_at,instant.at
-    "#).bind(did).bind(device).bind(key_id).bind(generation).fetch_optional(&mut **tx).await?)
+    "#).bind(did).bind(device).bind(key_id).bind(generation).bind(crate::sim_hooks::current_utc()).fetch_optional(&mut **tx).await?)
 }
 
 /// Exact immutable candidate material, including revoked historical devices.

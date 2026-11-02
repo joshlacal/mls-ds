@@ -116,6 +116,9 @@ impl RateLimiter {
 
     /// Check if request is allowed for given key
     pub fn check(&self, key: &str) -> Result<(), u64> {
+        if crate::sim_hooks::is_deterministic_clock_active() {
+            return Ok(());
+        }
         let bucket = self.buckets.get_with(key.to_string(), || {
             Arc::new(Mutex::new(TokenBucket::new(
                 self.capacity,
@@ -180,6 +183,9 @@ impl DidRateLimiter {
 
     /// Check if request is allowed for given DID and endpoint
     pub fn check_did_limit(&self, did: &str, endpoint: &str) -> Result<(), u64> {
+        if crate::sim_hooks::is_deterministic_clock_active() {
+            return Ok(());
+        }
         let (limit, window) = get_endpoint_quota(endpoint);
         let refill_rate = limit as f64 / window.as_secs_f64();
 
@@ -234,6 +240,9 @@ impl FederationPeerRateLimiter {
         endpoint_nsid: &str,
         per_minute_override: Option<u32>,
     ) -> Result<(), u64> {
+        if crate::sim_hooks::is_deterministic_clock_active() {
+            return Ok(());
+        }
         let (limit, window) = get_federation_endpoint_quota(endpoint_nsid, per_minute_override);
         let refill_rate = limit as f64 / window.as_secs_f64();
 
@@ -356,6 +365,9 @@ impl SpaceAuthorityRateLimiter {
         user: Option<&str>,
         quota: SpaceAuthorityQuota,
     ) -> Result<(), u64> {
+        if crate::sim_hooks::is_deterministic_clock_active() {
+            return Ok(());
+        }
         if let Some(user) = user {
             self.take(format!("{authority}|{endpoint}|{user}"), quota.per_user)?;
         }
@@ -365,6 +377,9 @@ impl SpaceAuthorityRateLimiter {
     /// Take one pre-auth call to the policy endpoint at `path` from
     /// `client_ip`. `Err` carries the Retry-After seconds.
     pub fn check_client(&self, client_ip: &str, path: &str, per_minute: u32) -> Result<(), u64> {
+        if crate::sim_hooks::is_deterministic_clock_active() {
+            return Ok(());
+        }
         self.take(format!("{client_ip}|{path}"), per_minute)
     }
 
@@ -502,19 +517,6 @@ pub static SPACE_AUTHORITY_IP_LIMITER: Lazy<SpaceAuthorityRateLimiter> =
 
 /// Per-IP rate limiter instance
 pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
-
-pub(crate) fn clear_all_rate_limiters() {
-    DID_RATE_LIMITER.buckets.invalidate_all();
-    DID_RATE_LIMITER.buckets.run_pending_tasks();
-    FEDERATION_DS_RATE_LIMITER.buckets.invalidate_all();
-    FEDERATION_DS_RATE_LIMITER.buckets.run_pending_tasks();
-    SPACE_AUTHORITY_RATE_LIMITER.buckets.invalidate_all();
-    SPACE_AUTHORITY_RATE_LIMITER.buckets.run_pending_tasks();
-    SPACE_AUTHORITY_IP_LIMITER.buckets.invalidate_all();
-    SPACE_AUTHORITY_IP_LIMITER.buckets.run_pending_tasks();
-    IP_LIMITER.buckets.invalidate_all();
-    IP_LIMITER.buckets.run_pending_tasks();
-}
 
 fn default_trusted_proxy_cidrs() -> Vec<IpNet> {
     [
@@ -719,6 +721,47 @@ mod tests {
 
         // Different user should have own bucket
         assert!(limiter.check("user2").is_ok());
+    }
+
+    #[test]
+    fn deterministic_admission_does_not_read_or_spend_shared_buckets() {
+        use crate::sim_hooks::{with_ds_clock, ManualDsClock};
+
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let clock = Arc::new(ManualDsClock::new(now));
+        let ip = RateLimiter::new(1, 0.0);
+        let did = DidRateLimiter::new();
+        let federation = FederationPeerRateLimiter::new();
+        let authority = SpaceAuthorityRateLimiter::new();
+        let quota = SpaceAuthorityQuota {
+            per_user: 1,
+            per_authority: 1,
+        };
+        with_ds_clock(clock, || {
+            for _ in 0..8 {
+                assert!(ip.check("127.0.0.1").is_ok());
+                assert!(did
+                    .check_did_limit("did:plc:alice", "createConversation")
+                    .is_ok());
+                assert!(federation
+                    .check_peer_limit(AUTHORITY, "deliverMessage", Some(1))
+                    .is_ok());
+                assert!(authority
+                    .check(AUTHORITY, MEMBERSHIP, Some("did:plc:alice"), quota)
+                    .is_ok());
+                assert!(authority.check_client("127.0.0.1", MEMBERSHIP, 1).is_ok());
+            }
+        });
+        for buckets in [
+            &ip.buckets,
+            &did.buckets,
+            &federation.buckets,
+            &authority.buckets,
+        ] {
+            assert!(buckets.iter().next().is_none());
+        }
+        assert!(ip.check("127.0.0.1").is_ok());
+        assert!(ip.check("127.0.0.1").is_err());
     }
 
     const MEMBERSHIP: &str = "blue.catbird.labyrinth.getSpaceMembership";

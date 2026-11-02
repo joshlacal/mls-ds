@@ -97,14 +97,19 @@ pub(super) async fn handle(
             ws.max_message_size(65_536)
                 .max_frame_size(65_536)
                 .on_upgrade(move |socket| {
-                    stream(
-                        socket,
-                        pool,
-                        runtime,
-                        ticket,
-                        parsed.cursor,
-                        replay_through,
-                        ws_guard,
+                    // Axum polls the upgraded connection in a separate task.
+                    let clock = Arc::clone(runtime.clock());
+                    crate::sim_hooks::scope_ds_clock(
+                        clock,
+                        stream(
+                            socket,
+                            pool,
+                            runtime,
+                            ticket,
+                            parsed.cursor,
+                            replay_through,
+                            ws_guard,
+                        ),
                     )
                 })
                 .into_response()
@@ -210,10 +215,7 @@ async fn authorize(
         .begin()
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-    let now = sqlx::query_scalar("SELECT transaction_timestamp()")
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+    let now = crate::sim_hooks::current_utc();
     let ticket = consume_subscription_ticket(
         &mut transaction,
         &ticket_hash(&opaque),

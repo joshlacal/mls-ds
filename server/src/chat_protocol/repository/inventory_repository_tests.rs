@@ -1746,6 +1746,10 @@ fn session_fence_and_receipt_lifetimes_fail_closed_at_fifteen_minutes() {
         fence_region.contains("now.signed_duration_since(row.captured_at) >"),
         "a fence older than 15 minutes fails closed"
     );
+    assert!(
+        fence_region.contains("let now = crate::sim_hooks::current_utc();"),
+        "the fence and session creation must share the scoped application clock"
+    );
 
     // The model: at exactly 15 minutes the session is still at the bound;
     // one second later the fence and the serve path refuse.

@@ -1,6 +1,6 @@
 //! Axum HTTP handlers for Option A Conversation `SpaceHost` (`com.atproto.space.*`).
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use atproto_spaces::{
     http_signature::verify_credential_request,
@@ -29,23 +29,52 @@ use uuid::Uuid;
 use super::{decode_tid_micros, SpaceHostRuntime};
 use crate::storage::DbPool;
 
+#[derive(Clone, Copy)]
+struct ClockScoped<H>(H);
+
+impl<H, T> axum::handler::Handler<T, Arc<SpaceHostRuntime>> for ClockScoped<H>
+where
+    H: axum::handler::Handler<T, Arc<SpaceHostRuntime>>,
+    T: 'static,
+{
+    type Future = std::pin::Pin<Box<dyn Future<Output = Response> + Send>>;
+
+    fn call(self, req: axum::extract::Request, state: Arc<SpaceHostRuntime>) -> Self::Future {
+        let clock = Arc::clone(state.clock());
+        let inner = self.0.call(req, state);
+        Box::pin(crate::sim_hooks::scope_ds_clock(clock, inner))
+    }
+}
+
 pub fn space_host_router(runtime: Arc<SpaceHostRuntime>) -> Router {
     Router::new()
         .route(
             "/xrpc/com.atproto.space.getSpaceCredential",
-            get(get_space_credential),
+            get(ClockScoped(get_space_credential)),
         )
-        .route("/xrpc/com.atproto.space.listRepos", get(list_repos))
-        .route("/xrpc/com.atproto.space.getSpace", get(get_space))
-        .route("/xrpc/com.atproto.space.notifyWrite", post(notify_write))
-        .route("/xrpc/com.atproto.space.removeWriter", post(remove_writer))
+        .route(
+            "/xrpc/com.atproto.space.listRepos",
+            get(ClockScoped(list_repos)),
+        )
+        .route(
+            "/xrpc/com.atproto.space.getSpace",
+            get(ClockScoped(get_space)),
+        )
+        .route(
+            "/xrpc/com.atproto.space.notifyWrite",
+            post(ClockScoped(notify_write)),
+        )
+        .route(
+            "/xrpc/com.atproto.space.removeWriter",
+            post(ClockScoped(remove_writer)),
+        )
         .route(
             "/xrpc/com.atproto.space.registerNotify",
-            post(register_notify),
+            post(ClockScoped(register_notify)),
         )
         .route(
             "/xrpc/com.atproto.space.unregisterNotify",
-            post(unregister_notify),
+            post(ClockScoped(unregister_notify)),
         )
         .with_state(runtime)
 }
@@ -155,7 +184,8 @@ async fn authenticate_credential_request(
     space_uri: &str,
 ) -> Result<(SpaceStatusRow, SpaceTokenClaims), Response> {
     let status = load_active_space_status(runtime.pool(), space_uri).await?;
-    let now_sec = Utc::now().timestamp().max(0) as u64;
+    let now = crate::sim_hooks::current_utc();
+    let now_sec = now.timestamp().max(0) as u64;
 
     let auth_hdr = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -232,7 +262,7 @@ async fn authenticate_credential_request(
             "unknown or pruned credential jti",
         ));
     };
-    if revoked_at.is_some() || expires_at <= Utc::now() {
+    if revoked_at.is_some() || expires_at <= now {
         return Err(xrpc_err(
             StatusCode::UNAUTHORIZED,
             "CredentialRevoked",
@@ -323,7 +353,7 @@ async fn authenticate_service_jwt(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let exp = claims_json.get("exp").and_then(Value::as_i64).unwrap_or(0);
-    let now = Utc::now().timestamp();
+    let now = crate::sim_hooks::current_utc().timestamp();
     if exp + 30 < now {
         return Err(xrpc_err(
             StatusCode::UNAUTHORIZED,
@@ -415,7 +445,8 @@ async fn get_space_credential(
         );
     };
 
-    let now_sec = Utc::now().timestamp().max(0) as u64;
+    let now = crate::sim_hooks::current_utc();
+    let now_sec = now.timestamp().max(0) as u64;
     let del_claims = match runtime
         .verify_space_token_send(SpaceTokenKind::Delegation, delegation_jwt, now_sec)
         .await
@@ -474,22 +505,23 @@ async fn get_space_credential(
     }
 
     // Single-use 60s delegation jti replay cache
-    let _ =
-        sqlx::query("DELETE FROM chat.space_delegation_jtis WHERE expires_at <= clock_timestamp()")
-            .execute(runtime.pool())
-            .await;
+    let _ = sqlx::query("DELETE FROM chat.space_delegation_jtis WHERE expires_at <= $1")
+        .bind(now)
+        .execute(runtime.pool())
+        .await;
     let del_exp = Utc
         .timestamp_opt(del_claims.exp as i64, 0)
         .single()
-        .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(60));
+        .unwrap_or_else(|| now + chrono::Duration::seconds(60));
     let inserted = match sqlx::query(
         "INSERT INTO chat.space_delegation_jtis (authority_did, jti, expires_at, created_at) \
-         VALUES ($1, $2, $3, clock_timestamp()) \
+         VALUES ($1, $2, $3, $4) \
          ON CONFLICT (authority_did, jti) DO NOTHING",
     )
     .bind(runtime.authority_did())
     .bind(&del_claims.jti)
     .bind(del_exp)
+    .bind(now)
     .execute(runtime.pool())
     .await
     {
@@ -515,7 +547,7 @@ async fn get_space_credential(
     let exp_dt = Utc
         .timestamp_opt(exp_sec as i64, 0)
         .single()
-        .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(600));
+        .unwrap_or_else(|| now + chrono::Duration::seconds(600));
 
     let cred_claims = SpaceTokenClaims {
         iss: runtime.authority_did().to_string(),
@@ -539,12 +571,13 @@ async fn get_space_credential(
 
     if let Err(e) = sqlx::query(
         "INSERT INTO chat.space_credential_jtis (jti, space_uri, writer_did, expires_at, created_at) \
-         VALUES ($1, $2, $3, $4, clock_timestamp())",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(&cred_jti)
     .bind(space_uri)
     .bind(&del_claims.iss)
     .bind(exp_dt)
+    .bind(now)
     .execute(runtime.pool())
     .await
     {
@@ -763,7 +796,8 @@ async fn notify_write(
         Err(resp) => return resp,
     }
 
-    let now_sec = Utc::now().timestamp().max(0) as u64;
+    let now = crate::sim_hooks::current_utc();
+    let now_sec = now.timestamp().max(0) as u64;
     let Some(repo_micros) = decode_tid_micros(&input.repo_rev) else {
         return xrpc_err(
             StatusCode::BAD_REQUEST,
@@ -830,7 +864,7 @@ async fn notify_write(
     if let Err(e) = sqlx::query(
         "INSERT INTO chat.conversation_space_writers ( \
              space_uri, writer_did, repo_rev, space_rev, data_cid, updated_at \
-         ) VALUES ($1, $2, $3, $4, $5, clock_timestamp()) \
+         ) VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT (space_uri, writer_did) DO UPDATE SET \
              repo_rev = EXCLUDED.repo_rev, \
              space_rev = EXCLUDED.space_rev, \
@@ -842,6 +876,7 @@ async fn notify_write(
     .bind(&input.repo_rev)
     .bind(&space_rev)
     .bind(data_cid.as_slice())
+    .bind(now)
     .execute(&mut *tx)
     .await
     {
@@ -947,11 +982,12 @@ async fn remove_writer(
 
     let _ = sqlx::query(
         "UPDATE chat.space_credential_jtis \
-            SET revoked_at = COALESCE(revoked_at, clock_timestamp()) \
+            SET revoked_at = COALESCE(revoked_at, $3) \
           WHERE space_uri = $1 AND writer_did = $2",
     )
     .bind(&input.space)
     .bind(&writer_did)
+    .bind(crate::sim_hooks::current_utc())
     .execute(runtime.pool())
     .await;
 
@@ -992,11 +1028,12 @@ async fn register_notify(
         Err(e) => return xrpc_err(StatusCode::BAD_REQUEST, "InvalidService", e.to_string()),
     };
 
-    let expires_at = Utc::now() + chrono::Duration::hours(24);
+    let now = crate::sim_hooks::current_utc();
+    let expires_at = now + chrono::Duration::hours(24);
     if let Err(e) = sqlx::query(
         "INSERT INTO chat.conversation_space_syncers ( \
              space_uri, service_did, service_ref, endpoint_url, registered_at, expires_at \
-         ) VALUES ($1, $2, $3, $4, clock_timestamp(), $5) \
+         ) VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT (space_uri, service_ref) DO UPDATE SET \
              service_did = EXCLUDED.service_did, \
              endpoint_url = EXCLUDED.endpoint_url, \
@@ -1007,6 +1044,7 @@ async fn register_notify(
     .bind(&service_did)
     .bind(&input.service)
     .bind(&endpoint_url)
+    .bind(now)
     .bind(expires_at)
     .execute(runtime.pool())
     .await
@@ -1050,4 +1088,58 @@ async fn unregister_notify(
     .await;
 
     (StatusCode::OK, Json(json!({}))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        sim_hooks::{scope_ds_clock, with_ds_clock, ManualDsClock},
+        space_host::SpaceHostConfig,
+    };
+    use axum::{body::Body, http::Request};
+    use p256::ecdsa::SigningKey;
+    use tower_util::ServiceExt;
+
+    #[tokio::test]
+    async fn space_host_router_uses_runtime_clock_for_service_auth() {
+        let now = chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        let clock = Arc::new(ManualDsClock::new(now));
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1/space_clock_test")
+            .unwrap();
+        let authority = "did:web:space-clock.test";
+        let runtime = Arc::new(
+            SpaceHostRuntime::new(
+                pool,
+                SpaceHostConfig::for_test(
+                    authority.to_string(),
+                    SigningKey::from_slice(&[1; 32]).unwrap(),
+                ),
+            )
+            .with_clock(clock.clone()),
+        );
+        let jwt = with_ds_clock(clock, || {
+            runtime
+                .mint_service_jwt(authority, "com.atproto.space.notifyWrite")
+                .unwrap()
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.space.notifyWrite")
+            .header("authorization", format!("Bearer {jwt}"))
+            .body(Body::from("{"))
+            .unwrap();
+        let ambient = Arc::new(ManualDsClock::new(now + chrono::Duration::days(1)));
+        let response = scope_ds_clock(ambient, space_host_router(runtime).oneshot(request))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"], "InvalidRequest");
+    }
 }

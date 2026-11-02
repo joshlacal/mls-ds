@@ -427,11 +427,12 @@ fn available_package_lock_is_full_row_deterministic_and_terminal_null() {
 }
 
 #[test]
-fn fresh_expiry_path_has_a_canonical_identity_prefix_and_database_trusted_millisecond() {
+fn fresh_expiry_path_has_a_canonical_identity_prefix_and_clock_scoped_millisecond() {
     let source = include_str!("../recovery.rs");
     assert!(source.contains("pub(crate) async fn prepare_recovery_expiry_authority("));
     assert!(source.contains("canonical_operation_lock_key(request_id)"));
-    assert!(source.contains("date_trunc('milliseconds', transaction_timestamp())"));
+    assert!(source.contains("date_trunc('milliseconds', $1::timestamptz)"));
+    assert!(source.contains(".bind(crate::sim_hooks::current_utc())"));
     assert!(compact(LOCK_RECOVERY_EXPIRY_PRINCIPAL_SQL).contains("FOR UPDATE"));
     assert!(compact(LOCK_RECOVERY_EXPIRY_DEVICE_SQL).contains("FOR UPDATE"));
     assert!(compact(LOCK_RECOVERY_EXPIRY_KEY_SQL).contains("FOR UPDATE"));
