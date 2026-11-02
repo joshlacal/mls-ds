@@ -20,7 +20,7 @@ use base64::{
     Engine as _,
 };
 use catbird_server::{
-    auth::{cache_test_did_document, DidDocument, PublicKeyJwk, VerificationMethod},
+    auth::{cache_test_did_document, DidDocument, PublicKeyJwk, Service, VerificationMethod},
     chat_protocol::{
         repository::{
             direct_request_receipts::DirectRequestReceiptSigner,
@@ -96,6 +96,7 @@ struct CleanSlateServerState {
     runtime: Arc<ChatRuntime>,
     resolver: Arc<DsResolver>,
     outbound: Arc<OutboundClient>,
+    service_auth: Option<Arc<ServiceAuthClient>>,
     space_host: Arc<SpaceHostRuntime>,
     service_did: String,
     signing_key: P256SigningKey,
@@ -127,8 +128,8 @@ impl FromRef<CleanSlateServerState> for Arc<OutboundClient> {
 }
 
 impl FromRef<CleanSlateServerState> for Option<Arc<ServiceAuthClient>> {
-    fn from_ref(_: &CleanSlateServerState) -> Self {
-        None
+    fn from_ref(state: &CleanSlateServerState) -> Self {
+        state.service_auth.clone()
     }
 }
 
@@ -146,6 +147,10 @@ struct RegisterDidInput {
     did: String,
     p256_jwk: Value,
     endpoint_url: String,
+    #[serde(default)]
+    did_document: Option<Value>,
+    #[serde(default)]
+    is_ds: bool,
 }
 
 async fn admin_register_did(
@@ -180,18 +185,45 @@ async fn admin_register_did(
         }
     };
 
-    cache_test_did_document(DidDocument {
-        id: input.did.clone(),
-        verification_method: vec![VerificationMethod {
-            id: format!("{}#atproto", input.did),
-            key_type: "JsonWebKey2020".to_string(),
-            controller: input.did.clone(),
-            public_key_jwk: Some(jwk),
-            public_key_multibase: None,
-        }],
-        service: None,
-    })
-    .await;
+    if let Some(doc_val) = input.did_document {
+        let doc: DidDocument = match serde_json::from_value(doc_val) {
+            Ok(d) => d,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("bad did_document: {e}") })),
+                );
+            }
+        };
+        cache_test_did_document(doc).await;
+    } else {
+        cache_test_did_document(DidDocument {
+            id: input.did.clone(),
+            verification_method: vec![VerificationMethod {
+                id: format!("{}#atproto", input.did),
+                key_type: "JsonWebKey2020".to_string(),
+                controller: input.did.clone(),
+                public_key_jwk: Some(jwk),
+                public_key_multibase: None,
+            }],
+            service: Some(vec![Service {
+                id: "#atproto_pds".to_string(),
+                service_type: "AtprotoPersonalDataServer".to_string(),
+                service_endpoint: input.endpoint_url.clone(),
+            }]),
+        })
+        .await;
+    }
+
+    if input.is_ds {
+        let _ = sqlx::query(
+            "INSERT INTO federation_peers (ds_did, status) VALUES ($1, 'allow') \
+             ON CONFLICT (ds_did) DO UPDATE SET status = 'allow'",
+        )
+        .bind(&input.did)
+        .execute(&state.pool)
+        .await;
+    }
 
     state
         .space_host
@@ -2038,7 +2070,16 @@ async fn main() -> Result<()> {
     .await
     .context("insert chat.event_retention")?;
 
+    let receipt_doc =
+        build_direct_request_receipt_did_document(&service_did, receipt_key.verifying_key());
+
     std::env::set_var("CHAT_CUTOVER_ENABLED", "1");
+    std::env::set_var("CHAT_DIRECT_REQUESTS_ENABLED", "1");
+    std::env::set_var("CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM", &receipt_pem);
+    std::env::set_var(
+        "CHAT_REQUEST_RECEIPT_DID_DOCUMENT_JSON",
+        serde_json::to_string(&receipt_doc).context("encode receipt DID doc")?,
+    );
     std::env::set_var("CHAT_CURSOR_KEY_ID", &cursor_key_id);
     std::env::set_var(
         "CHAT_CURSOR_SEALING_SECRET",
@@ -2049,6 +2090,17 @@ async fn main() -> Result<()> {
         "wss://chat.federation.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents",
     );
     std::env::set_var("FEDERATION_TEST_ALLOW_ALL_RELATIONSHIPS", "true");
+    std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
+    std::env::set_var("FEDERATION_MODE", "open");
+
+    let resolver = Arc::new(DsResolver::with_default_endpoint(
+        pool.clone(),
+        catbird_server::federation::resolver::build_resolver_http_client(),
+        service_did.clone(),
+        base_url.clone(),
+        None,
+        3600,
+    ));
 
     let i13_signer = I13ReceiptSigner::new(receipt_key.clone(), service_did.clone());
     let push_client = Arc::new(PushGatewayClient::new_es256(
@@ -2056,11 +2108,27 @@ async fn main() -> Result<()> {
         signing_key.clone(),
     ));
 
-    let runtime = Arc::new(
-        ChatRuntime::from_env(Arc::new(SseState::new(64)))
-            .map_err(anyhow::Error::msg)?
-            .with_i13_receipt_signer(i13_signer.clone()),
-    );
+    let outbound = Arc::new(OutboundClient::new(10, 30));
+    let service_auth =
+        ServiceAuthClient::from_es256_pem(service_did.clone(), signing_pem.as_bytes(), None)
+            .ok()
+            .map(Arc::new);
+    let mut runtime_builder = ChatRuntime::from_env(Arc::new(SseState::new(64)))
+        .map_err(anyhow::Error::msg)?
+        .with_resolver(resolver.clone())
+        .with_i13_receipt_signer(i13_signer.clone());
+    if let Some(ref sa) = service_auth {
+        let submitter = Arc::new(
+            catbird_server::federation::commit_submitter::RemoteCommitSubmitter::new(
+                resolver.clone(),
+                outbound.clone(),
+                sa.clone(),
+                catbird_server::auth::shared_auth_middleware(),
+            ),
+        );
+        runtime_builder = runtime_builder.with_commit_submitter(submitter);
+    }
+    let runtime = Arc::new(runtime_builder);
     runtime
         .validate_protocol_fence(&pool)
         .await
@@ -2071,33 +2139,16 @@ async fn main() -> Result<()> {
         SpaceHostConfig::new(service_did.clone(), signing_key.clone()),
     ));
 
-    // Cache own DID document for self-issued tokens
-    let self_point = signing_key.verifying_key().to_encoded_point(false);
-    let self_jwk: PublicKeyJwk = serde_json::from_value(json!({
-        "kty": "EC",
-        "crv": "P-256",
-        "x": URL_SAFE_NO_PAD.encode(self_point.x().unwrap()),
-        "y": URL_SAFE_NO_PAD.encode(self_point.y().unwrap()),
-    }))?;
-    cache_test_did_document(DidDocument {
-        id: service_did.clone(),
-        verification_method: vec![VerificationMethod {
-            id: format!("{service_did}#atproto"),
-            key_type: "JsonWebKey2020".to_string(),
-            controller: service_did.clone(),
-            public_key_jwk: Some(self_jwk),
-            public_key_multibase: None,
-        }],
-        service: None,
-    })
-    .await;
-
     let did_doc = build_service_did_document(
         &service_did,
         &base_url,
         signing_key.verifying_key(),
         Some(receipt_key.verifying_key()),
     );
+    let self_cached_doc: DidDocument =
+        serde_json::from_value(did_doc.clone()).context("parse self DidDocument")?;
+    cache_test_did_document(self_cached_doc).await;
+
     let mut well_known_router = Router::new();
     if let Some(path) = did_web_document_path(&service_did) {
         let doc_arc = Arc::new(did_doc.clone());
@@ -2109,15 +2160,6 @@ async fn main() -> Result<()> {
             }),
         );
     }
-
-    let resolver = Arc::new(DsResolver::with_default_endpoint(
-        pool.clone(),
-        catbird_server::federation::resolver::build_resolver_http_client(),
-        service_did.clone(),
-        base_url.clone(),
-        None,
-        3600,
-    ));
 
     let group_relay = group_relay_router(GroupRelayState::for_test_with_push(
         pool.clone(),
@@ -2131,7 +2173,8 @@ async fn main() -> Result<()> {
         pool: pool.clone(),
         runtime,
         resolver,
-        outbound: Arc::new(OutboundClient::new(10, 30)),
+        outbound,
+        service_auth,
         space_host: space_host.clone(),
         service_did: service_did.clone(),
         signing_key,

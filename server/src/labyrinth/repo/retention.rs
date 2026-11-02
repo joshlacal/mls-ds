@@ -92,10 +92,14 @@ async fn sequence_account_deleted_entries(
     let mut sequenced = 0_usize;
     for conversation_id in active_convos {
         let head: Option<(i64, i64, i64, Option<String>)> = sqlx::query_as(
-            "SELECT current_generation, current_state_version, next_entry_seq, sequencer_ds \
-               FROM chat.conversations \
-              WHERE conversation_id = $1 AND lifecycle = 'active' \
-              FOR UPDATE",
+            "SELECT c.current_generation, c.current_state_version, c.next_entry_seq, \
+                    COALESCE(c.sequencer_ds, cs.authority_did) \
+               FROM chat.conversations c \
+               LEFT JOIN chat.conversation_spaces cs \
+                 ON cs.conversation_id = c.conversation_id \
+                AND cs.generation = c.current_generation \
+              WHERE c.conversation_id = $1 AND c.lifecycle = 'active' \
+              FOR UPDATE OF c",
         )
         .bind(conversation_id)
         .fetch_optional(&mut *conn)

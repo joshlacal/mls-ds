@@ -202,6 +202,85 @@ pub async fn deliver_message_entry(
         &input.entry,
     )
     .await?;
+    runtime.notify_events();
+
+    if let Some(push_client) = runtime.push_gateway_client() {
+        let actor_did = input
+            .entry
+            .pointer("/signedRequest/body/actorDid")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let inbox_rows: Vec<(String, Option<Uuid>, String, Uuid)> = sqlx::query_as(
+            "SELECT sender_did, sender_device_id, recipient_did, recipient_device_id \
+               FROM chat.direct_request_transport_inbox \
+              WHERE conversation_id = $1 AND status = 'accepted'",
+        )
+        .bind(input.conversation_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+        let mut candidates: Vec<(String, Uuid)> = Vec::new();
+        for (sender_did, sender_dev_opt, recipient_did, recipient_dev) in inbox_rows {
+            if crate::identity::canonical_did(&recipient_did)
+                != crate::identity::canonical_did(actor_did)
+            {
+                candidates.push((recipient_did, recipient_dev));
+            }
+            if let Some(sender_dev) = sender_dev_opt {
+                if crate::identity::canonical_did(&sender_did)
+                    != crate::identity::canonical_did(actor_did)
+                {
+                    candidates.push((sender_did, sender_dev));
+                }
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+
+        if !candidates.is_empty() {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            let seq = input.entry.get("seq").and_then(Value::as_i64).unwrap_or(0);
+            let generation = input
+                .entry
+                .pointer("/signedRequest/body/prior/generation")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let epoch = input
+                .entry
+                .pointer("/signedRequest/body/prior/epoch")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let ct = input
+                .entry
+                .pointer("/signedRequest/body/applicationMessage/bytes")
+                .and_then(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("$bytes").and_then(Value::as_str))
+                })
+                .and_then(|s| {
+                    STANDARD
+                        .decode(s)
+                        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s))
+                        .ok()
+                });
+            let _ = push_client
+                .dispatch_for_local_recipients(
+                    &pool,
+                    &candidates,
+                    crate::push_gateway::client::PushWakeDispatch {
+                        wake_kind: crate::push_gateway::client::PushWakeKind::ApplicationMessage,
+                        conversation_id: input.conversation_id,
+                        generation,
+                        seq,
+                        epoch,
+                        ciphertext: ct,
+                    },
+                )
+                .await;
+        }
+    }
+
     Ok(Json(json!({ "accepted": true, "delivered": true })))
 }
 

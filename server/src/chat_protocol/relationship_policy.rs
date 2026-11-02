@@ -3105,6 +3105,19 @@ fn federation_allow_all_response(request: &PublicGet) -> Result<PublicResponse, 
             }),
         ));
     }
+    if let Some(plc_did) = path.strip_prefix('/').filter(|s| s.starts_with("did:plc:")) {
+        return Ok(PublicResponse::json(
+            200,
+            serde_json::json!({
+                "id": plc_did,
+                "service": [{
+                    "id": format!("{plc_did}#atproto_pds"),
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "https://pds.example.net",
+                }],
+            }),
+        ));
+    }
     if path == GET_RECORD_PATH {
         let actor = request
             .url
@@ -3121,7 +3134,7 @@ fn federation_allow_all_response(request: &PublicGet) -> Result<PublicResponse, 
                     "$type": DECLARATION_TYPE,
                     "allowIncoming": "all",
                     "deliveryService": "did:web:chat.catbird.blue",
-                    "protocolVersion": "1",
+                    "protocolVersion": "2",
                     "createdAt": "2026-08-29T00:00:00Z",
                 },
             }),

@@ -171,8 +171,12 @@ fn dynamic_service_did_doc_and_i13_receipt_signer_support_self_hosted_web_and_pl
     }
 }
 
+static ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 #[tokio::test]
 async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_contiguity() {
+    let _env_guard = ENV_LOCK.lock().await;
     let self_did = "did:web:ds-pruning.selfhost.example.com";
     std::env::set_var("SERVICE_DID", self_did);
     std::env::set_var("SELF_ENDPOINT", "https://ds-pruning.selfhost.example.com");
@@ -394,6 +398,7 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
 
 #[tokio::test]
 async fn dormant_60d_devices_and_30d_ceiling_prune_without_stalling_active_conversations() {
+    let _env_guard = ENV_LOCK.lock().await;
     std::env::set_var("SERVICE_DID", "did:web:chat.catbird.blue");
     std::env::set_var("SELF_ENDPOINT", "https://chat.catbird.blue");
 
@@ -484,6 +489,7 @@ async fn dormant_60d_devices_and_30d_ceiling_prune_without_stalling_active_conve
 
 #[tokio::test]
 async fn delete_account_data_sequences_account_deleted_entry_in_active_conversations() {
+    let _env_guard = ENV_LOCK.lock().await;
     std::env::set_var("SERVICE_DID", "did:web:chat.catbird.blue");
     std::env::set_var("SELF_ENDPOINT", "https://chat.catbird.blue");
 

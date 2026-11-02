@@ -68,8 +68,7 @@ use catbird_mls::{
         },
     },
     metadata::GroupMetadataV1,
-    requests::c33::archive_accepted_opening_messages,
-    storage::RequestRow,
+    push::{process_push_notification, PushKeystore, PushWakePayload},
     MLSError,
 };
 use chrono::{SecondsFormat, Utc};
@@ -389,6 +388,8 @@ struct StoredSpaceRepoState {
 
 type SpaceBlobKey = (String, String, String);
 
+type AtprotoRecordKey = (String, String, String);
+
 #[derive(Clone)]
 struct LoopbackSpacesPdsState {
     pds_did: String,
@@ -402,6 +403,9 @@ struct LoopbackSpacesPdsState {
     revoked_jtis: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     deleted_spaces: Arc<RwLock<HashSet<String>>>,
     tid_seq: Arc<AtomicUsize>,
+    atproto_records: Arc<RwLock<HashMap<AtprotoRecordKey, Value>>>,
+    did_documents: Arc<RwLock<HashMap<String, Value>>>,
+    account_signing_keys: Arc<RwLock<HashMap<String, P256SigningKey>>>,
 }
 
 struct LoopbackSpacesPds {
@@ -428,10 +432,30 @@ impl LoopbackSpacesPds {
             revoked_jtis: Arc::new(RwLock::new(HashMap::new())),
             deleted_spaces: Arc::new(RwLock::new(HashSet::new())),
             tid_seq: Arc::new(AtomicUsize::new(1)),
+            atproto_records: Arc::new(RwLock::new(HashMap::new())),
+            did_documents: Arc::new(RwLock::new(HashMap::new())),
+            account_signing_keys: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let app = Router::new()
             .route("/xrpc/com.atproto.repo.uploadBlob", post(pds_upload_blob))
+            .route(
+                "/xrpc/com.atproto.repo.putRecord",
+                post(pds_repo_put_record),
+            )
+            .route("/xrpc/com.atproto.repo.getRecord", get(pds_repo_get_record))
+            .route(
+                "/xrpc/com.atproto.repo.listRecords",
+                get(pds_repo_list_records),
+            )
+            .route(
+                "/xrpc/com.atproto.identity.resolveDid",
+                get(pds_identity_resolve_did),
+            )
+            .route(
+                "/xrpc/com.atproto.server.getServiceAuth",
+                get(pds_server_get_service_auth),
+            )
             .route(
                 "/xrpc/com.atproto.sync.getBlob",
                 get(pds_public_sync_get_blob),
@@ -484,6 +508,194 @@ impl LoopbackSpacesPds {
             .insert(writer_did.to_string(), sk);
         did_key
     }
+
+    fn register_did_document(&self, did: &str, doc: Value) {
+        self.state
+            .did_documents
+            .write()
+            .unwrap()
+            .insert(did.to_string(), doc);
+    }
+
+    fn register_account_signing_key(&self, did: &str, sk: P256SigningKey) {
+        self.state.resolver.insert(did, sk.verifying_key());
+        let pub_jwk = p256_public_jwk(sk.verifying_key());
+        let doc = json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": did,
+            "verificationMethod": [{
+                "id": format!("{did}#atproto"),
+                "type": "JsonWebKey2020",
+                "controller": did,
+                "publicKeyJwk": pub_jwk,
+            }],
+            "service": [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": self.base_url,
+            }],
+        });
+        self.state
+            .did_documents
+            .write()
+            .unwrap()
+            .insert(did.to_string(), doc);
+        self.state
+            .account_signing_keys
+            .write()
+            .unwrap()
+            .insert(did.to_string(), sk);
+    }
+}
+
+async fn pds_repo_put_record(
+    State(state): State<LoopbackSpacesPdsState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if !auth.starts_with("Bearer ") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "AuthMissing" })),
+        )
+            .into_response();
+    }
+    let repo = body["repo"].as_str().unwrap_or_default().to_string();
+    let collection = body["collection"].as_str().unwrap_or_default().to_string();
+    let rkey = body["rkey"].as_str().unwrap_or_default().to_string();
+    let record = body["record"].clone();
+    state
+        .atproto_records
+        .write()
+        .unwrap()
+        .insert((repo.clone(), collection.clone(), rkey.clone()), record);
+    let cid = format!(
+        "bafyrei{}",
+        hex::encode(&Sha256::digest(format!("{repo}/{collection}/{rkey}").as_bytes())[..16])
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "uri": format!("at://{repo}/{collection}/{rkey}"),
+            "cid": cid,
+        })),
+    )
+        .into_response()
+}
+
+async fn pds_repo_get_record(
+    State(state): State<LoopbackSpacesPdsState>,
+    Query(q): Query<BTreeMap<String, String>>,
+) -> Response {
+    let repo = q.get("repo").cloned().unwrap_or_default();
+    let collection = q.get("collection").cloned().unwrap_or_default();
+    let rkey = q.get("rkey").cloned().unwrap_or_default();
+    let Some(val) = state
+        .atproto_records
+        .read()
+        .unwrap()
+        .get(&(repo.clone(), collection.clone(), rkey.clone()))
+        .cloned()
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "RecordNotFound" })),
+        )
+            .into_response();
+    };
+    let cid = format!(
+        "bafyrei{}",
+        hex::encode(&Sha256::digest(format!("{repo}/{collection}/{rkey}").as_bytes())[..16])
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "uri": format!("at://{repo}/{collection}/{rkey}"),
+            "cid": cid,
+            "value": val,
+        })),
+    )
+        .into_response()
+}
+
+async fn pds_repo_list_records(
+    State(state): State<LoopbackSpacesPdsState>,
+    Query(q): Query<BTreeMap<String, String>>,
+) -> Response {
+    let repo = q.get("repo").cloned().unwrap_or_default();
+    let collection = q.get("collection").cloned().unwrap_or_default();
+    let mut records = Vec::new();
+    for ((r, c, rk), val) in state.atproto_records.read().unwrap().iter() {
+        if r == &repo && c == &collection {
+            let cid = format!(
+                "bafyrei{}",
+                hex::encode(&Sha256::digest(format!("{r}/{c}/{rk}").as_bytes())[..16])
+            );
+            records.push(json!({
+                "uri": format!("at://{r}/{c}/{rk}"),
+                "cid": cid,
+                "value": val,
+            }));
+        }
+    }
+    (StatusCode::OK, Json(json!({ "records": records }))).into_response()
+}
+
+async fn pds_identity_resolve_did(
+    State(state): State<LoopbackSpacesPdsState>,
+    Query(q): Query<BTreeMap<String, String>>,
+) -> Response {
+    let did = q.get("did").cloned().unwrap_or_default();
+    let Some(doc) = state.did_documents.read().unwrap().get(&did).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "DidNotFound" })),
+        )
+            .into_response();
+    };
+    (StatusCode::OK, Json(json!({ "didDoc": doc }))).into_response()
+}
+
+async fn pds_server_get_service_auth(
+    State(state): State<LoopbackSpacesPdsState>,
+    headers: HeaderMap,
+    Query(q): Query<BTreeMap<String, String>>,
+) -> Response {
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if !auth.starts_with("Bearer ") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "AuthMissing" })),
+        )
+            .into_response();
+    }
+    let aud = q.get("aud").cloned().unwrap_or_default();
+    let lxm = q.get("lxm").cloned().unwrap_or_default();
+    let iss = q.get("iss").cloned().unwrap_or_default();
+    let Some(sk) = state
+        .account_signing_keys
+        .read()
+        .unwrap()
+        .get(&iss)
+        .cloned()
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "error": "UnknownIssuer", "message": format!("no signing key for {iss}") }),
+            ),
+        )
+            .into_response();
+    };
+    let token = mint_es256_service_jwt(&sk, &iss, &aud, &lxm);
+    (StatusCode::OK, Json(json!({ "token": token }))).into_response()
 }
 
 fn pds_not_supported() -> Response {
@@ -999,6 +1211,10 @@ struct LoopbackPushGateway {
 
 impl LoopbackPushGateway {
     async fn start() -> Self {
+        Self::start_with_host("nest-push.federation.catbird.blue").await
+    }
+
+    async fn start_with_host(host: &str) -> Self {
         let wakes: Arc<Mutex<Vec<CapturedPushWake>>> = Arc::new(Mutex::new(Vec::new()));
         let wakes_clone = wakes.clone();
         let app = Router::new().route(
@@ -1037,9 +1253,7 @@ impl LoopbackPushGateway {
         });
 
         Self {
-            canonical_https_url:
-                "https://nest-push.federation.catbird.blue/xrpc/blue.catbird.push.deliver"
-                    .to_string(),
+            canonical_https_url: format!("https://{host}/xrpc/blue.catbird.push.deliver"),
             loopback_http_url: format!("http://{addr}/xrpc/blue.catbird.push.deliver"),
             wakes,
         }
@@ -1055,6 +1269,7 @@ struct FirewalledClientTransport {
     http: reqwest::Client,
     blocked_attempts: AtomicUsize,
     chat_bearer_token: Mutex<Option<String>>,
+    auto_service_auth: Mutex<Option<(String, P256SigningKey, String)>>,
 }
 
 impl FirewalledClientTransport {
@@ -1071,11 +1286,16 @@ impl FirewalledClientTransport {
                 .unwrap(),
             blocked_attempts: AtomicUsize::new(0),
             chat_bearer_token: Mutex::new(None),
+            auto_service_auth: Mutex::new(None),
         }
     }
 
     fn set_chat_bearer_token(&self, token: String) {
         *self.chat_bearer_token.lock().unwrap() = Some(token);
+    }
+
+    fn set_auto_service_auth(&self, iss_did: String, sk: P256SigningKey, home_ds_did: String) {
+        *self.auto_service_auth.lock().unwrap() = Some((iss_did, sk, home_ds_did));
     }
 
     fn assert_allowed(&self, url: &str) -> Result<()> {
@@ -1136,6 +1356,7 @@ impl PlatformTransport for FirewalledClientTransport {
             .map_err(|e| MLSError::Internal(e.to_string()))?;
         let http = self.http.clone();
         let chat_bearer = self.chat_bearer_token.lock().unwrap().clone();
+        let auto_sa = self.auto_service_auth.lock().unwrap().clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1152,11 +1373,22 @@ impl PlatformTransport for FirewalledClientTransport {
                     }
                     builder = builder.header(&h.name, &h.value);
                 }
-                if !has_auth && request.url.contains("/xrpc/com.atproto.space.applyWrites") {
+                if !has_auth
+                    && (request.url.contains("/xrpc/com.atproto.space.applyWrites")
+                        || request.url.contains("/xrpc/com.atproto.repo.putRecord"))
+                {
                     builder = builder.header("authorization", "Bearer sdk-pds-oauth");
-                } else if !has_auth && request.url.contains("/xrpc/blue.catbird.chat.") {
+                } else if !has_auth && request.url.contains("/xrpc/blue.catbird.") {
                     if let Some(tok) = chat_bearer {
                         builder = builder.header("authorization", format!("Bearer {tok}"));
+                    } else if let Some((iss, sk, ds_did)) = auto_sa {
+                        if let Some(after_xrpc) = request.url.split("/xrpc/").nth(1) {
+                            let nsid = after_xrpc.split('?').next().unwrap_or(after_xrpc);
+                            let ds_base = ds_did.split('#').next().unwrap_or(&ds_did);
+                            let aud = format!("{ds_base}#atproto_mls");
+                            let tok = mint_es256_service_jwt(&sk, &iss, &aud, nsid);
+                            builder = builder.header("authorization", format!("Bearer {tok}"));
+                        }
                     }
                 }
                 if let Some(b) = request.body {
@@ -1214,6 +1446,34 @@ impl MemoryKeyStore {
             keys: Mutex::new(HashMap::new()),
             dpop: Mutex::new(HashMap::new()),
         }
+    }
+}
+
+impl PushKeystore for MemoryKeyStore {
+    fn load_db_key(&self, account_did_hash: String) -> Result<Vec<u8>, MLSError> {
+        self.keys
+            .lock()
+            .unwrap()
+            .get(&format!("db:{account_did_hash}"))
+            .cloned()
+            .ok_or_else(|| MLSError::Internal(format!("missing db key for {account_did_hash}")))
+    }
+
+    fn load_signature_keypair(&self, key_id: String) -> Result<Option<Vec<u8>>, MLSError> {
+        Ok(self.keys.lock().unwrap().get(&key_id).cloned())
+    }
+
+    fn load_cached_chat_dpop_token(
+        &self,
+        account_did_hash: String,
+    ) -> Result<Option<String>, MLSError> {
+        let now_ms = Utc::now().timestamp_millis();
+        Ok(self
+            .dpop
+            .lock()
+            .unwrap()
+            .get(&account_did_hash)
+            .and_then(|(tok, exp)| (*exp > now_ms).then(|| tok.clone())))
     }
 }
 
@@ -1407,6 +1667,8 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
                 "did": ds_a.service_did,
                 "p256Jwk": p256_public_jwk(ds_a.signing_key.verifying_key()),
                 "endpointUrl": ds_a.base_url,
+                "didDocument": ds_a.did_document,
+                "isDs": true,
             }))
             .send()
             .await?
@@ -1417,6 +1679,8 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
                 "did": ds_b.service_did,
                 "p256Jwk": p256_public_jwk(ds_b.signing_key.verifying_key()),
                 "endpointUrl": ds_b.base_url,
+                "didDocument": ds_b.did_document,
+                "isDs": true,
             }))
             .send()
             .await?
@@ -1442,6 +1706,8 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             .await?
             .error_for_status()?;
     }
+    swan_pds.register_did_document(&ds_a.service_did, ds_a.did_document.clone());
+    swan_pds.register_did_document(&ds_b.service_did, ds_b.did_document.clone());
 
     // ========================================================================
     // Scenario 1: Federated Enrollment (`did:web` + `did:plc`), `I15` Spaces Gate,
@@ -1535,7 +1801,16 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .unwrap();
     let alice_ed_sk = Ed25519SigningKey::from_bytes(&alice_ed_seed);
 
-    // Register P-256 `#atproto` DID keys + PDS endpoints for Alice (`swan_pds`), Bob (`swan_pds`), and Eve (`ref_pds`)
+    // Dedicated real-SDK DIDs for live federated C33 + group SDK round-trips (no synthetic fixture rows!)
+    let alice_sdk_did = "did:plc:alicesdkfederated24chars".to_string();
+    let alice_sdk_device_id = Uuid::new_v4();
+    let alice_sdk_p256 = P256SigningKey::random(&mut rand::rngs::OsRng);
+
+    let bob_sdk_did = "did:plc:bobsdkfederatedaa24chars".to_string();
+    let bob_sdk_device_id = Uuid::new_v4();
+    let bob_sdk_p256 = P256SigningKey::random(&mut rand::rngs::OsRng);
+
+    // Register P-256 `#atproto` DID keys + PDS endpoints for fixture & real-SDK accounts
     let alice_p256 = P256SigningKey::random(&mut rand::rngs::OsRng);
     let bob_p256 = P256SigningKey::random(&mut rand::rngs::OsRng);
     let eve_p256 = P256SigningKey::random(&mut rand::rngs::OsRng);
@@ -1546,6 +1821,10 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let alice_kem_did_key = swan_pds.register_writer_kem(&alice_remote_did);
     let bob_kem_did_key = swan_pds.register_writer_kem(&bob_admin_did);
     let eve_kem_did_key = ref_pds.register_writer_kem(eve_did);
+    swan_pds.register_writer_kem(&alice_sdk_did);
+    swan_pds.register_writer_kem(&bob_sdk_did);
+    swan_pds.register_account_signing_key(&alice_sdk_did, alice_sdk_p256.clone());
+    swan_pds.register_account_signing_key(&bob_sdk_did, bob_sdk_p256.clone());
 
     for ds in [&ds_a, &ds_b] {
         for (did, sk, pds_url) in [
@@ -1560,6 +1839,16 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
                 swan_pds.base_url.as_str(),
             ),
             (eve_did, &eve_p256, ref_pds.base_url.as_str()),
+            (
+                alice_sdk_did.as_str(),
+                &alice_sdk_p256,
+                swan_pds.base_url.as_str(),
+            ),
+            (
+                bob_sdk_did.as_str(),
+                &bob_sdk_p256,
+                swan_pds.base_url.as_str(),
+            ),
         ] {
             admin_http
                 .post(format!("{}/_test/clean-slate/register-did", ds.base_url))
@@ -1609,22 +1898,44 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         ds_a.base_url.clone(),
         swan_pds.base_url.clone(),
     ]));
+    alice_firewall.set_auto_service_auth(
+        alice_sdk_did.clone(),
+        alice_sdk_p256.clone(),
+        DS_A_DID.to_string(),
+    );
 
-    // Enroll Alice's `CatbirdMlsClient` (`MLS_256_XWING` + `D4` default-on Labyrinth) and provision personal mailbox Space
-    let alice_sdk = CatbirdMlsClient::open(
-        CatbirdMlsClientConfig {
-            storage_root: temp_root.path().join("alice-sdk").to_string_lossy().into(),
-            account_did: alice_remote_did.clone(),
-            device_id: alice_device_id.to_string(),
-            home_ds_did: DS_A_DID.into(),
-            home_ds_endpoint: ds_a.base_url.clone(),
-            pds_endpoint: swan_pds.base_url.clone(),
-        },
-        Arc::new(MemoryKeyStore::new()),
-        alice_firewall.clone(),
-        None,
-    )?;
-    let alice_enroll = alice_sdk.enroll_device(&scopes)?;
+    // Enroll Alice's `CatbirdMlsClient` (`MLS_256_XWING` + `D4` default-on Labyrinth) on `ds-a` + `swan_pds`
+    let alice_keystore = Arc::new(MemoryKeyStore::new());
+    let alice_sdk = {
+        let storage_root = temp_root.path().join("alice-sdk").to_string_lossy().into();
+        let did = alice_sdk_did.clone();
+        let dev_id = alice_sdk_device_id.to_string();
+        let ds_url = ds_a.base_url.clone();
+        let pds_url = swan_pds.base_url.clone();
+        let ks = alice_keystore.clone();
+        let fw = alice_firewall.clone();
+        tokio::task::spawn_blocking(move || {
+            CatbirdMlsClient::open(
+                CatbirdMlsClientConfig {
+                    storage_root,
+                    account_did: did,
+                    device_id: dev_id,
+                    home_ds_did: DS_A_DID.into(),
+                    home_ds_endpoint: ds_url,
+                    pds_endpoint: pds_url,
+                },
+                ks,
+                fw,
+                None,
+            )
+        })
+        .await??
+    };
+    let alice_enroll = {
+        let sdk = alice_sdk.clone();
+        let sc = scopes.clone();
+        tokio::task::spawn_blocking(move || sdk.enroll_device(&sc)).await??
+    };
     assert!(
         alice_enroll
             .direct_request_kp_bytes
@@ -1638,7 +1949,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     );
     assert_eq!(
         alice_enroll.mailbox_space_uri,
-        format!("at://{alice_remote_did}/space/blue.catbird.labyrinth.mailbox/self")
+        format!("at://{alice_sdk_did}/space/blue.catbird.labyrinth.mailbox/self")
     );
 
     let (put_space_status, _, _) = alice_firewall
@@ -1775,7 +2086,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
 
     // ========================================================================
     // Scenario 2: `C33` Direct Request Lifecycle, Pending Space Exclusion,
-    // 30-Day Expiry Release, and Bidirectional DM + Labyrinth Flush
+    // 30-Day Expiry Release, and Real-SDK Bidirectional Federated DM + Labyrinth Flush
     // ========================================================================
     let c33_res: Value = admin_http
         .post(format!(
@@ -1800,75 +2111,417 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         "C33: pair-owner fence MUST release after 30-day expiry so clean re-request succeeds"
     );
 
-    // Live `CatbirdMlsClient` DM request -> accept -> opening message Space archival + Labyrinth outbox drain
-    let bob_sdk = CatbirdMlsClient::open(
-        CatbirdMlsClientConfig {
-            storage_root: temp_root.path().join("bob-sdk").to_string_lossy().into(),
-            account_did: bob_admin_did.clone(),
-            device_id: bob_device_id.to_string(),
-            home_ds_did: DS_B_DID.into(),
-            home_ds_endpoint: ds_b.base_url.clone(),
-            pds_endpoint: swan_pds.base_url.clone(),
-        },
-        Arc::new(MemoryKeyStore::new()),
-        Arc::new(FirewalledClientTransport::new(vec![
-            ds_b.base_url.clone(),
-            swan_pds.base_url.clone(),
-        ])),
-        None,
-    )?;
-    bob_sdk.enroll_device(&scopes)?;
-    alice_sdk.create_group("convo-c33-live", DS_A_DID, Some("C33 DM".into()), None)?;
-    bob_sdk.create_group("convo-c33-live", DS_A_DID, Some("C33 DM".into()), None)?;
-    let alice_opening_msg = alice_sdk.send_message(
-        "convo-c33-live",
-        "msg-c33-opening",
-        "Hey Bob, federated C33 request!",
-    )?;
-    let c33_now_ms = Utc::now().timestamp_millis();
-    let pending_req = RequestRow {
-        request_id: "req-c33-live".into(),
-        conversation_id: "convo-c33-live".into(),
-        sender_did: alice_remote_did.clone(),
-        recipient_did: bob_admin_did.clone(),
-        consent: "pending".into(),
-        first_message_id: Some(alice_opening_msg.message_id.clone()),
-        first_message_archived: false,
-        payload_json: json!({ "openingText": "Hey Bob, federated C33 request!" }).to_string(),
-        expires_at_ms: c33_now_ms + 30 * 86_400_000,
-        updated_at_ms: c33_now_ms,
-    };
-    alice_sdk
-        .db()
-        .write_tx(|tx| tx.upsert_request(&pending_req))?;
-    bob_sdk
-        .db()
-        .write_tx(|tx| tx.upsert_request(&pending_req))?;
-    assert_eq!(bob_sdk.list_requests(Some("pending"))?.len(), 1);
-    bob_sdk.accept_direct_request("req-c33-live")?;
-    assert_eq!(bob_sdk.list_requests(Some("accepted"))?.len(), 1);
-    alice_sdk.accept_direct_request("req-c33-live")?;
-    let archived_opening =
-        archive_accepted_opening_messages(alice_sdk.db(), |_cid, msg| async move {
-            assert!(msg
-                .plaintext_json
-                .contains("Hey Bob, federated C33 request!"));
-            Ok(())
-        })
-        .await?;
-    assert_eq!(
-        archived_opening, 1,
-        "C33: sender must archive opening message upon acceptance"
+    // Step 1: Real-SDK federated enrollment (`alice_sdk` on `ds-a` `did:web` + `bob_sdk` on `ds-b` `did:plc`)
+    let bob_firewall = Arc::new(FirewalledClientTransport::new(vec![
+        ds_b.base_url.clone(),
+        swan_pds.base_url.clone(),
+    ]));
+    bob_firewall.set_auto_service_auth(
+        bob_sdk_did.clone(),
+        bob_sdk_p256.clone(),
+        DS_B_DID.to_string(),
     );
-    let alice_dm_msg =
-        alice_sdk.send_message("convo-c33-live", "msg-c33-1", "Hello after C33 accept!")?;
+    let bob_keystore = Arc::new(MemoryKeyStore::new());
+    let bob_storage_root = temp_root.path().join("bob-sdk");
+    let bob_sdk = {
+        let storage_root = bob_storage_root.to_string_lossy().into();
+        let did = bob_sdk_did.clone();
+        let dev_id = bob_sdk_device_id.to_string();
+        let ds_url = ds_b.base_url.clone();
+        let pds_url = swan_pds.base_url.clone();
+        let ks = bob_keystore.clone();
+        let fw = bob_firewall.clone();
+        tokio::task::spawn_blocking(move || {
+            CatbirdMlsClient::open(
+                CatbirdMlsClientConfig {
+                    storage_root,
+                    account_did: did,
+                    device_id: dev_id,
+                    home_ds_did: DS_B_DID.into(),
+                    home_ds_endpoint: ds_url,
+                    pds_endpoint: pds_url,
+                },
+                ks,
+                fw,
+                None,
+            )
+        })
+        .await??
+    };
+    let bob_enroll = {
+        let sdk = bob_sdk.clone();
+        let sc = scopes.clone();
+        tokio::task::spawn_blocking(move || sdk.enroll_device(&sc)).await??
+    };
+    assert!(bob_enroll.labyrinth_backup_enabled);
+    let (put_bob_space_status, _, _) = bob_firewall
+        .post_json_with_headers(
+            &format!("{}/xrpc/com.atproto.space.putSpace", swan_pds.base_url),
+            &[("authorization", "Bearer bob-pds-oauth".into())],
+            &json!({ "space": bob_enroll.mailbox_space_uri }),
+        )
+        .await?;
+    assert_eq!(put_bob_space_status, 200);
+
+    // Assert live PostgreSQL `chat.devices` + PDS `blue.catbird.chat.device` records exist for BOTH SDK clients (`ADR-009` / `I4`)
+    let alice_dev_rows: i64 = ds_a
+        .pool
+        .query_one(
+            "SELECT COUNT(*) FROM chat.devices WHERE user_did = $1 AND device_id = $2 AND status = 'active'",
+            &[&alice_sdk_did, &alice_sdk_device_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        alice_dev_rows, 1,
+        "alice_sdk.enroll_device must register active device on ds-a"
+    );
+    let bob_dev_rows: i64 = ds_b
+        .pool
+        .query_one(
+            "SELECT COUNT(*) FROM chat.devices WHERE user_did = $1 AND device_id = $2 AND status = 'active'",
+            &[&bob_sdk_did, &bob_sdk_device_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        bob_dev_rows, 1,
+        "bob_sdk.enroll_device must register active device on ds-b"
+    );
+    assert!(
+        swan_pds
+            .state
+            .atproto_records
+            .read()
+            .unwrap()
+            .contains_key(&(
+                alice_sdk_did.clone(),
+                "blue.catbird.chat.device".to_string(),
+                alice_sdk_device_id.to_string(),
+            )),
+        "I4/ADR-009: alice_sdk.enroll_device must publish blue.catbird.chat.device record on PDS"
+    );
+    assert!(
+        swan_pds
+            .state
+            .atproto_records
+            .read()
+            .unwrap()
+            .contains_key(&(
+                bob_sdk_did.clone(),
+                "blue.catbird.chat.device".to_string(),
+                bob_sdk_device_id.to_string(),
+            )),
+        "I4/ADR-009: bob_sdk.enroll_device must publish blue.catbird.chat.device record on PDS"
+    );
+
+    // Step 2: `alice_sdk` initiates a federated `C33` Direct Request to `bob_sdk_did` across `ds-a` -> `ds-b`
+    let requested_convo_uuid = Uuid::new_v4().to_string();
+    let alice_dm_convo = {
+        let sdk = alice_sdk.clone();
+        let cid = requested_convo_uuid.clone();
+        let peer = bob_sdk_did.clone();
+        tokio::task::spawn_blocking(move || {
+            sdk.create_group(
+                &cid,
+                DS_A_DID,
+                vec![peer],
+                None,
+                Some("Hey Bob, federated C33 request!".into()),
+            )
+        })
+        .await??
+    };
+    let fed_convo_id = alice_dm_convo.conversation_id.clone();
+    assert_eq!(
+        {
+            let sdk = alice_sdk.clone();
+            tokio::task::spawn_blocking(move || sdk.flush_labyrinth_queue()).await??
+        },
+        0,
+        "C33: sender MUST NOT flush opening message to Conversation Space while direct request is pending"
+    );
+
+    // Step 3: `bob_sdk.sync()` on `ds-b` discovers pending Welcome + C33 request, verifies Alice's `I4` PDS device key,
+    // decrypts the opening message, acknowledges Welcome, and accepts the request across `ds-b` -> `ds-a` (`seq = 2`)
+    let bob_synced = {
+        let sdk = bob_sdk.clone();
+        tokio::task::spawn_blocking(move || sdk.sync()).await??
+    };
+    assert!(
+        bob_synced >= 1,
+        "bob_sdk.sync() must discover relayed federated C33 Welcome/request on ds-b"
+    );
+    let bob_pending_reqs = {
+        let sdk = bob_sdk.clone();
+        tokio::task::spawn_blocking(move || sdk.list_requests(Some("pending"))).await??
+    };
+    assert_eq!(
+        bob_pending_reqs.len(),
+        1,
+        "bob_sdk must list 1 pending federated C33 direct request"
+    );
+    let bob_req_id = bob_pending_reqs[0].request_id.clone();
+    let bob_convos = {
+        let sdk = bob_sdk.clone();
+        tokio::task::spawn_blocking(move || sdk.list_conversations(None, 50)).await??
+    };
+    let bob_dm_convo = bob_convos
+        .iter()
+        .find(|c| c.conversation_id == fed_convo_id)
+        .expect("bob_sdk must hold identical federated conversation_id after Welcome import");
+    assert_eq!(
+        bob_dm_convo.group_id, alice_dm_convo.group_id,
+        "MLS group_id must match bit-for-bit across alice_sdk (ds-a) and bob_sdk (ds-b)"
+    );
+    let bob_initial_msgs = {
+        let sdk = bob_sdk.clone();
+        let cid = fed_convo_id.clone();
+        tokio::task::spawn_blocking(move || sdk.list_messages(&cid, None, 50)).await??
+    };
+    assert!(
+        bob_initial_msgs
+            .iter()
+            .any(|m| m.plaintext_json.contains("Hey Bob, federated C33 request!")),
+        "bob_sdk must decrypt Alice's C33 opening message over MLS_256_XWING Welcome"
+    );
+
+    {
+        let sdk = bob_sdk.clone();
+        let rid = bob_req_id.clone();
+        tokio::task::spawn_blocking(move || sdk.accept_direct_request(&rid)).await??;
+    }
+    assert_eq!(
+        {
+            let sdk = bob_sdk.clone();
+            tokio::task::spawn_blocking(move || sdk.list_requests(Some("accepted")))
+                .await??
+                .len()
+        },
+        1,
+        "bob_sdk must transition request to accepted"
+    );
+    {
+        let sdk = alice_sdk.clone();
+        tokio::task::spawn_blocking(move || sdk.sync()).await??;
+    }
+
+    // Step 4: Register Bob's Push Gateway on `ds-b`, send live federated `MLS_256_XWING` messages in BOTH directions
+    // (`alice_sdk` -> `ds-a` -> `ds-b` -> `D2` push wake -> `process_push_notification` + `bob_sdk.sync()`,
+    //  then `bob_sdk` -> `ds-b` -> `ds-a` -> `alice_sdk.sync()`), verifying ES256 `I13` receipts!
+    let bob_push_gw =
+        LoopbackPushGateway::start_with_host("nest-push-b.federation.catbird.blue").await;
+    admin_http
+        .post(format!(
+            "{}/_test/clean-slate/register-push-override",
+            ds_b.base_url
+        ))
+        .json(&json!({
+            "canonicalHttpsUrl": bob_push_gw.canonical_https_url,
+            "loopbackHttpUrl": bob_push_gw.loopback_http_url,
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let bob_pg_reg = {
+        let sdk = bob_sdk.clone();
+        let gw_url = bob_push_gw.canonical_https_url.clone();
+        tokio::task::spawn_blocking(move || {
+            sdk.build_signed_push_gateway_registration(
+                &gw_url,
+                "blue.catbird.ios",
+                "opaque-push-key-bob-sdk-0001",
+                true,
+            )
+        })
+        .await??
+    };
+    let bob_pg_jwt = mint_es256_service_jwt(
+        &bob_sdk_p256,
+        &bob_sdk_did,
+        &format!("{DS_B_DID}#atproto_mls"),
+        "blue.catbird.chat.registerPushGateway",
+    );
+    admin_http
+        .post(format!(
+            "{}/xrpc/blue.catbird.chat.registerPushGateway",
+            ds_b.base_url
+        ))
+        .header("authorization", format!("Bearer {bob_pg_jwt}"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(bob_pg_reg.request_json)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let alice_msg_id = Uuid::new_v4().to_string();
+    let alice_dm_msg = {
+        let sdk = alice_sdk.clone();
+        let cid = fed_convo_id.clone();
+        let mid = alice_msg_id.clone();
+        tokio::task::spawn_blocking(move || sdk.send_message(&cid, &mid, "Hello after C33 accept!"))
+            .await??
+    };
     assert!(alice_dm_msg
         .plaintext_json
         .contains("Hello after C33 accept!"));
-    let bob_dm_msg = bob_sdk.send_message("convo-c33-live", "msg-c33-2", "Hi Alice from ds-b!")?;
+    assert_eq!(
+        alice_dm_msg.seq, 3,
+        "Alice's post-accept message must be sequenced at seq = 3"
+    );
+
+    let captured_bob_wake = {
+        let wakes = bob_push_gw.wakes.lock().unwrap();
+        assert_eq!(
+            wakes.len(),
+            1,
+            "D2: home ds-b must dispatch exactly 1 push wake to Bob's registered Push Gateway upon inbound federated delivery"
+        );
+        wakes[0].clone()
+    };
+    {
+        let bearer = captured_bob_wake
+            .auth_header
+            .strip_prefix("Bearer ")
+            .expect("D2: Bearer wake JWT required");
+        let parts: Vec<&str> = bearer.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2])?;
+        let sig = P256Signature::from_slice(&sig_bytes)?;
+        ds_b.signing_key
+            .verifying_key()
+            .verify(signing_input.as_bytes(), &sig)
+            .expect("D2: ds-b push wake JWT must verify under ds-b's ES256 #atproto key");
+    }
+    let inline_ct_val = &captured_bob_wake.body["payload"]["ciphertext"];
+    let inline_ct_b64 = inline_ct_val
+        .get("$bytes")
+        .and_then(Value::as_str)
+        .or_else(|| inline_ct_val.as_str())
+        .expect("I12: <=2200B federated push wake must include inline ciphertext");
+    let inline_ct_bytes = STANDARD
+        .decode(inline_ct_b64)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(inline_ct_b64))?;
+    let wake_seq = captured_bob_wake.body["payload"]["seq"]
+        .as_i64()
+        .unwrap_or(3);
+    let push_preview = {
+        let root = bob_storage_root.clone();
+        let did_hash = bob_sdk.account_did_hash().to_string();
+        let ks: Arc<dyn PushKeystore> = bob_keystore.clone();
+        let wake = PushWakePayload {
+            kind: "applicationMessage".to_string(),
+            conversation_id: fed_convo_id.clone(),
+            generation: 0,
+            entry_seq: wake_seq,
+            message_id: alice_msg_id.clone(),
+            recipient_account_hash: did_hash.clone(),
+            fetch_required: false,
+            sender_did: Some(alice_sdk_did.clone()),
+            inline_ciphertext: Some(inline_ct_bytes),
+        };
+        tokio::task::spawn_blocking(move || {
+            process_push_notification(&root, &did_hash, ks, None, &wake)
+        })
+        .await??
+    };
+    assert!(
+        !push_preview.fallback_generic && push_preview.body.contains("Hello after C33 accept!"),
+        "G1/D2: process_push_notification must decrypt inline federated push ciphertext without Tokio or generic fallback"
+    );
+    {
+        let sdk = bob_sdk.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), MLSError> {
+            sdk.handle_darwin_push_wakeup()?;
+            sdk.sync()?;
+            Ok(())
+        })
+        .await??;
+    }
+    let bob_msgs_after_push = {
+        let sdk = bob_sdk.clone();
+        let cid = fed_convo_id.clone();
+        tokio::task::spawn_blocking(move || sdk.list_messages(&cid, None, 50)).await??
+    };
+    assert!(
+        bob_msgs_after_push
+            .iter()
+            .any(|m| m.seq == 3 && m.plaintext_json.contains("Hello after C33 accept!")),
+        "bob_sdk must surface Alice's seq=3 decrypted message after push wake + sync without double-decrypting"
+    );
+
+    let bob_reply_id = Uuid::new_v4().to_string();
+    let bob_dm_msg = {
+        let sdk = bob_sdk.clone();
+        let cid = fed_convo_id.clone();
+        let mid = bob_reply_id.clone();
+        tokio::task::spawn_blocking(move || sdk.send_message(&cid, &mid, "Hi Alice from ds-b!"))
+            .await??
+    };
     assert!(bob_dm_msg.plaintext_json.contains("Hi Alice from ds-b!"));
-    assert!(alice_sdk.flush_labyrinth_queue()? >= 1);
-    assert!(bob_sdk.flush_labyrinth_queue()? >= 1);
+    assert_eq!(
+        bob_dm_msg.seq, 4,
+        "Bob's cross-DS reply relayed ds-b -> ds-a must be sequenced at seq = 4 with ES256 I13 receipt"
+    );
+
+    {
+        let sdk = alice_sdk.clone();
+        tokio::task::spawn_blocking(move || sdk.sync()).await??;
+    }
+    let alice_msgs_after_reply = {
+        let sdk = alice_sdk.clone();
+        let cid = fed_convo_id.clone();
+        tokio::task::spawn_blocking(move || sdk.list_messages(&cid, None, 50)).await??
+    };
+    assert!(
+        alice_msgs_after_reply
+            .iter()
+            .any(|m| m.seq == 4 && m.plaintext_json.contains("Hi Alice from ds-b!")),
+        "alice_sdk.sync() on ds-a must decrypt Bob's federated reply from ds-b at seq = 4"
+    );
+
+    // Step 5: Receipt-verified Labyrinth Conversation Space archival on `swan_pds` (`I13`, `D1` firewall == 0 blocked)
+    let alice_flushed = {
+        let sdk = alice_sdk.clone();
+        tokio::task::spawn_blocking(move || sdk.flush_labyrinth_queue()).await??
+    };
+    let bob_flushed = {
+        let sdk = bob_sdk.clone();
+        tokio::task::spawn_blocking(move || sdk.flush_labyrinth_queue()).await??
+    };
+    assert!(
+        alice_flushed >= 2,
+        "alice_sdk.flush_labyrinth_queue() must commit C33 opening + post-accept messages to Conversation Space"
+    );
+    assert!(
+        bob_flushed >= 1,
+        "bob_sdk.flush_labyrinth_queue() must commit receipt-verified reply batch to Conversation Space"
+    );
+    let pair_coord_did = std::cmp::min(DS_A_DID, DS_B_DID);
+    let fed_space_uri =
+        format!("at://{pair_coord_did}/space/blue.catbird.labyrinth.conversation/{fed_convo_id}-0");
+    {
+        let repo_states = swan_pds.state.repo_states.read().unwrap();
+        let alice_space_ops = repo_states
+            .get(&(fed_space_uri.clone(), alice_sdk_did.clone()))
+            .expect("swan_pds must hold Alice's Conversation Space batch writes");
+        let bob_space_ops = repo_states
+            .get(&(fed_space_uri.clone(), bob_sdk_did.clone()))
+            .expect("swan_pds must hold Bob's Conversation Space batch writes");
+        assert!(!alice_space_ops.ops.is_empty());
+        assert!(!bob_space_ops.ops.is_empty());
+    }
+    assert_eq!(
+        alice_firewall.blocked_attempts.load(Ordering::SeqCst),
+        0,
+        "D1: alice_sdk MUST NEVER contact peer ds-b directly"
+    );
+    assert_eq!(
+        bob_firewall.blocked_attempts.load(Ordering::SeqCst),
+        0,
+        "D1: bob_sdk MUST NEVER contact peer ds-a directly"
+    );
 
     // ========================================================================
     // Scenario 3: `D1` Cross-Server Group Relay (`relayGroupMutation` / `deliverGroupEntry`),
@@ -3117,14 +3770,30 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     );
 
     // ========================================================================
-    // Scenario 7: `BIRDaemon` `nest`-Free Federated Group Participation (`G3`)
+    // Scenario 7: `BIRDaemon` `nest`-Free Federated Group & C33 Participation (`G3`)
     // ========================================================================
     assert!(
         std::env::var("BIRD_NEST_BASE_URL").is_err(),
         "G3: BIRD_NEST_BASE_URL must be completely unset"
     );
     let bird_did = "did:plc:birdaemonfederated24chrs";
-    let bird_bot = FederatedBirdBot::open_and_enroll(
+    let bird_p256 = P256SigningKey::random(&mut rand::rngs::OsRng);
+    swan_pds.register_writer_kem(bird_did);
+    swan_pds.register_account_signing_key(bird_did, bird_p256.clone());
+    for ds in [&ds_a, &ds_b] {
+        admin_http
+            .post(format!("{}/_test/clean-slate/register-did", ds.base_url))
+            .json(&json!({
+                "did": bird_did,
+                "p256Jwk": p256_public_jwk(bird_p256.verifying_key()),
+                "endpointUrl": swan_pds.base_url,
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+
+    let bird_bot = FederatedBirdBot::open_and_enroll_with_tokens(
         FederatedBotConfig {
             storage_root: temp_root.path().join("bird-bot"),
             bot_did: bird_did.to_string(),
@@ -3140,25 +3809,95 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             max_reply_characters: 500,
         },
         Arc::new(DeterministicBirdResponder),
+        None,
+        Some("bird-pds-oauth".into()),
     )?;
-    bird_bot.set_auth_tokens(Some("bird-ds-jwt".into()), Some("bird-pds-oauth".into()));
     assert!(bird_bot
         .enrollment_receipt()
         .direct_request_kp_bytes
         .windows(2)
         .any(|w| w == [0x00, 0x4d]));
     assert!(bird_bot.enrollment_receipt().labyrinth_backup_enabled);
-    bird_bot.create_group(&convo_id.to_string(), Some("Federated Bird Group".into()))?;
-    let bird_reply = bird_bot
-        .handle_incoming_group_text(
-            &convo_id.to_string(),
-            &alice_remote_did,
-            "Hey @bird.catbird.blue status check over federated DS!",
+    admin_http
+        .post(format!(
+            "{}/xrpc/com.atproto.space.putSpace",
+            swan_pds.base_url
+        ))
+        .bearer_auth("bird-pds-oauth")
+        .json(&json!({ "space": bird_bot.enrollment_receipt().mailbox_space_uri }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // 7a. Live federated group creation on `ds-b` with cross-DS participants (`alice_sdk_did` on `ds-a`, `bob_sdk_did` on `ds-b`)
+    let bird_group_id = Uuid::new_v4().to_string();
+    let bird_group_row = bird_bot.create_group(
+        &bird_group_id,
+        vec![alice_sdk_did.clone(), bob_sdk_did.clone()],
+        Some("Federated Bird Group".into()),
+    )?;
+    assert_eq!(
+        bird_group_row.title.as_deref(),
+        Some("Federated Bird Group")
+    );
+    let bird_group_uuid = Uuid::parse_str(&bird_group_row.conversation_id)?;
+    let bird_group_db_count: i64 = ds_b
+        .pool
+        .query_one(
+            "SELECT COUNT(*) FROM chat.conversations WHERE conversation_id = $1",
+            &[&bird_group_uuid],
         )
         .await?
-        .expect("G3: FederatedBirdBot must reply to @bird.catbird.blue mention with zero nest URL");
-    assert!(bird_reply.plaintext_json.contains("chirp! federated reply"));
+        .get(0);
+    assert_eq!(
+        bird_group_db_count, 1,
+        "G3: FederatedBirdBot.create_group must sequence live conversation on ds-b"
+    );
+
+    // 7b. Live federated C33 DM from `alice_sdk` (`ds-a`) -> `bird_bot` (`ds-b`) -> `sync_and_reply()` -> `alice_sdk.sync()`
+    let bird_dm_requested_id = Uuid::new_v4().to_string();
+    let bird_dm_convo = {
+        let sdk = alice_sdk.clone();
+        let cid = bird_dm_requested_id.clone();
+        let peer = bird_did.to_string();
+        tokio::task::spawn_blocking(move || {
+            sdk.create_group(
+                &cid,
+                DS_A_DID,
+                vec![peer],
+                None,
+                Some("Hey @bird.catbird.blue status check over federated DS!".into()),
+            )
+        })
+        .await??
+    };
+    let bird_replies = bird_bot.sync_and_reply().await?;
+    assert_eq!(
+        bird_replies.len(),
+        1,
+        "G3: FederatedBirdBot.sync_and_reply must accept federated C33 request and reply to @bird.catbird.blue mention"
+    );
+    assert!(bird_replies[0]
+        .plaintext_json
+        .contains("chirp! federated reply"));
     assert!(bird_bot.flush_labyrinth_queue()? >= 1);
+
+    // Verify `alice_sdk` on `ds-a` receives and decrypts `bird_bot`'s federated reply!
+    {
+        let sdk = alice_sdk.clone();
+        tokio::task::spawn_blocking(move || sdk.sync()).await??;
+    }
+    let alice_bird_msgs = {
+        let sdk = alice_sdk.clone();
+        let cid = bird_dm_convo.conversation_id.clone();
+        tokio::task::spawn_blocking(move || sdk.list_messages(&cid, None, 20)).await??
+    };
+    assert!(
+        alice_bird_msgs
+            .iter()
+            .any(|m| m.plaintext_json.contains("chirp! federated reply")),
+        "G3: alice_sdk on ds-a must decrypt FederatedBirdBot's live MLS_256_XWING reply from ds-b"
+    );
 
     // ========================================================================
     // Scenario 8: `G6` & `I14` Zero-Content Retention & PostgreSQL Schema Audit

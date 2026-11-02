@@ -1209,6 +1209,12 @@ pub fn install_test_https_did_resolver(
 pub async fn cache_test_did_document(doc: DidDocument) {
     shared_auth_middleware_ref().cache_did_document(doc).await;
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn get_cached_test_did_document_json(did: &str) -> Option<serde_json::Value> {
+    let cached = shared_auth_middleware_ref().did_cache.get(did).await?;
+    serde_json::to_value(&cached.doc).ok()
+}
 pub fn is_test_fixture_host(host: &str) -> bool {
     #[cfg(feature = "test-support")]
     let host_lc = host.trim().to_ascii_lowercase();

@@ -1367,6 +1367,11 @@ impl DsResolver {
     /// Fetch and parse a DID document (did:web or did:plc), with SSRF
     /// validation of the document URL.
     async fn fetch_did_document(&self, did: &str) -> Result<serde_json::Value, FederationError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(cached_doc) = crate::auth::get_cached_test_did_document_json(did).await {
+            return Ok(cached_doc);
+        }
+
         let did_doc_url = if did.starts_with("did:web:") {
             did_web_document_url(did).ok_or_else(|| FederationError::ResolutionFailed {
                 did: did.to_string(),

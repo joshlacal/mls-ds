@@ -4267,6 +4267,13 @@ pub async fn coordinator_handle_message(
         crate::chat_protocol::validation::CanonicalUuidV4::parse(&conversation_id.to_string())
             .map_err(|_| FederationError::Invariant("invalid convo_id".into()))?;
 
+    let archive_commitment: Option<[u8; 32]> = match projection.aad().get("archiveCommitment") {
+        Some(crate::chat_protocol::transcript::CanonicalValueRef::Bytes(v)) if v.len() == 32 => {
+            v.try_into().ok()
+        }
+        _ => None,
+    };
+
     let entry_product = crate::chat_protocol::transcript::build_verified_application_entry(
         verified,
         canon_entry_id,
@@ -4284,16 +4291,48 @@ pub async fn coordinator_handle_message(
     let server_fields =
         serde_ipld_dagcbor::to_vec(&std::collections::BTreeMap::<String, String>::new())
             .map_err(|_| FederationError::Invariant("server fields".into()))?;
-
-    let outcome_json = json!({
-        "entry": {
-            "entryId": entry_id_str,
-            "conversationId": conversation_id.to_string(),
-            "seq": next_seq,
-            "signedRequest": message,
-            "receivedAt": canonical_now_str
+    let i13_receipt_json = match (archive_commitment, runtime.i13_receipt_signer()) {
+        (Some(commitment), Some(signer)) => {
+            let signed_receipt = signer
+                .sign_application_receipt(
+                    &conversation_id.to_string(),
+                    &head_group_id,
+                    head_epoch.max(0) as u64,
+                    actor_did,
+                    &actor_device_id.to_string(),
+                    &entry_id_str,
+                    &commitment,
+                    next_seq.max(0) as u64,
+                    trusted_now.timestamp_millis(),
+                )
+                .map_err(|e| FederationError::Invariant(e.to_string()))?;
+            Some(
+                crate::federation::receipt::I13ReceiptSigner::receipt_wire_json(
+                    &signed_receipt,
+                    head_generation.max(0) as u64,
+                    actor_did,
+                    &actor_device_id.to_string(),
+                ),
+            )
         }
+        _ => None,
+    };
+
+    let mut entry_for_outcome = json!({
+        "entryId": entry_id_str,
+        "conversationId": conversation_id.to_string(),
+        "seq": next_seq,
+        "signedRequest": message,
+        "receivedAt": canonical_now_str
     });
+    let mut outcome_json = json!({ "entry": entry_for_outcome });
+    if let Some(ref rcpt) = i13_receipt_json {
+        entry_for_outcome["sequencerReceipt"] = rcpt.clone();
+        outcome_json = json!({
+            "entry": entry_for_outcome,
+            "sequencerReceipt": rcpt.clone(),
+        });
+    }
     let outcome_bytes = serde_json::to_vec(&outcome_json).map_err(FederationError::Json)?;
 
     let append_entry = crate::chat_protocol::repository::delivery::AppendEntry {
@@ -4358,7 +4397,7 @@ pub async fn coordinator_handle_message(
     )
     .await;
 
-    let response_entry = json!({
+    let mut response_entry = json!({
         "$type": "blue.catbird.chat.defs#applicationEntry",
         "entryId": entry_id_str,
         "conversationId": conversation_id.to_string(),
@@ -4366,6 +4405,9 @@ pub async fn coordinator_handle_message(
         "signedRequest": message,
         "receivedAt": canonical_now_str
     });
+    if let Some(ref rcpt) = i13_receipt_json {
+        response_entry["sequencerReceipt"] = rcpt.clone();
+    }
 
     let self_did = crate::identity::service_did();
     let deliver_payload = DeliverMessageEntryInput {
@@ -4397,6 +4439,51 @@ pub async fn coordinator_handle_message(
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;
 
+    runtime.notify_events();
+
+    if let Some(push_client) = runtime.push_gateway_client() {
+        let local_devices: Vec<(String, Uuid)> = sqlx::query_as(
+            "SELECT recipient_did, recipient_device_id FROM chat.application_intervals \
+              WHERE conversation_id = $1 AND generation = $2 \
+                AND recipient_did != $3 \
+                AND terminal_seq IS NULL",
+        )
+        .bind(conversation_id)
+        .bind(head_generation)
+        .bind(actor_did)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        if !local_devices.is_empty() {
+            let ct = message
+                .pointer("/body/applicationMessage/bytes")
+                .and_then(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("$bytes").and_then(Value::as_str))
+                })
+                .and_then(|s| {
+                    STANDARD
+                        .decode(s)
+                        .or_else(|_| URL_SAFE_NO_PAD.decode(s))
+                        .ok()
+                });
+            let _ = push_client
+                .dispatch_for_local_recipients(
+                    pool,
+                    &local_devices,
+                    crate::push_gateway::client::PushWakeDispatch {
+                        wake_kind: crate::push_gateway::client::PushWakeKind::ApplicationMessage,
+                        conversation_id,
+                        generation: head_generation,
+                        seq: seq as i64,
+                        epoch: head_epoch,
+                        ciphertext: ct,
+                    },
+                )
+                .await;
+        }
+    }
+
     if !peer_did.is_empty() && peer_did != actor_did {
         if canonical_did(&coord.recipient_home.did) != canonical_did(&self_did) {
             if let Ok(()) = deliver_message_entry_to_peer(
@@ -4410,7 +4497,11 @@ pub async fn coordinator_handle_message(
             }
         }
     }
-    Ok(json!({ "entry": response_entry }))
+    let mut out = json!({ "entry": response_entry });
+    if let Some(rcpt) = i13_receipt_json {
+        out["sequencerReceipt"] = rcpt;
+    }
+    Ok(out)
 }
 
 /// Coordinator execution for getDirectRequestOutcome.

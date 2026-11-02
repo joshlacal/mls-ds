@@ -947,8 +947,16 @@ async fn handle_deliver_group_entry(
         let ct = req
             .entry
             .pointer("/signedRequest/body/applicationMessage/bytes")
-            .and_then(Value::as_str)
-            .and_then(|s| STANDARD.decode(s).ok());
+            .and_then(|v| {
+                v.as_str()
+                    .or_else(|| v.get("$bytes").and_then(Value::as_str))
+            })
+            .and_then(|s| {
+                STANDARD
+                    .decode(s)
+                    .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s))
+                    .ok()
+            });
         let epoch = req
             .entry
             .pointer("/signedRequest/body/prior/epoch")

@@ -42,12 +42,24 @@ pub fn build_service_did_document(
         "publicKeyMultibase": encode_p256_multikey(service_auth_verifying_key),
     })];
     if let Some(receipt_vk) = receipt_verifying_key {
+        let receipt_multikey = encode_p256_multikey(receipt_vk);
         methods.push(json!({
             "id": format!("{base_did}#mls-receipt-1"),
             "type": "Multikey",
             "controller": base_did,
-            "publicKeyMultibase": encode_p256_multikey(receipt_vk),
+            "publicKeyMultibase": receipt_multikey,
         }));
+        let compressed = receipt_vk.to_encoded_point(true);
+        if let Ok(req_key_id) =
+            direct_request_receipt_key_id_for_authority(base_did, compressed.as_bytes())
+        {
+            methods.push(json!({
+                "id": req_key_id,
+                "type": "Multikey",
+                "controller": base_did,
+                "publicKeyMultibase": encode_p256_multikey(receipt_vk),
+            }));
+        }
     }
     json!({
         "@context": [
@@ -59,7 +71,7 @@ pub fn build_service_did_document(
         "service": [
             {
                 "id": "#atproto_mls",
-                "type": "AtprotoMlsDeliveryService",
+                "type": "AtprotoMLSDeliveryService",
                 "serviceEndpoint": endpoint,
             },
             {
