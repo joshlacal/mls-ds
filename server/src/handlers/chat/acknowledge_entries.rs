@@ -137,19 +137,45 @@ async fn execute(
         ));
     }
 
-    let convo_head: Option<i64> = sqlx::query_scalar(
-        "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE",
+    let convo_head: Option<(i64, bool)> = sqlx::query_as(
+        "SELECT next_entry_seq, is_remote FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE",
     )
     .bind(input.conversation_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-    let Some(next_entry_seq) = convo_head else {
+
+    let transport_inbox: Option<(String, String, Option<Uuid>, String, Uuid, DateTime<Utc>)> =
+        if convo_head.is_none() {
+            sqlx::query_as(
+                "SELECT status, sender_did, sender_device_id, recipient_did, recipient_device_id, import_until \
+                   FROM chat.direct_request_transport_inbox \
+                  WHERE conversation_id = $1 \
+                    AND (recipient_did = $2 OR sender_did = $2) \
+                  ORDER BY CASE \
+                    WHEN (recipient_did = $2 AND recipient_device_id = $3) \
+                      OR (sender_did = $2 AND sender_device_id = $3) THEN 0 \
+                    ELSE 1 \
+                  END \
+                  LIMIT 1 \
+                  FOR UPDATE",
+            )
+            .bind(input.conversation_id)
+            .bind(&actor_did)
+            .bind(input.actor_device_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| ChatFailure::storage(ENDPOINT))?
+        } else {
+            None
+        };
+
+    if convo_head.is_none() && transport_inbox.is_none() {
         return Err(ChatFailure::protocol(
             ENDPOINT,
             ChatProtocolErrorCode::ConversationNotFound,
         ));
-    };
+    }
 
     let dev_row: Option<(String, i64, Option<i64>, Option<Vec<u8>>)> = sqlx::query_as(
         "SELECT d.status, d.auth_generation, dk.enrollment_auth_generation, dk.signing_public_key \
@@ -201,6 +227,79 @@ async fn execute(
         .verify(&transcript, &signature)
         .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidSignature))?;
 
+    let Some((next_entry_seq, is_remote)) = convo_head else {
+        let (
+            status,
+            sender_did,
+            sender_device_id,
+            recipient_did,
+            recipient_device_id,
+            import_until,
+        ) = transport_inbox.ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::ConversationNotFound)
+        })?;
+        if status == "pending" {
+            if now > import_until {
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::ConversationNotFound,
+                ));
+            }
+        } else if status != "accepted" {
+            return Err(ChatFailure::protocol(
+                ENDPOINT,
+                ChatProtocolErrorCode::ConversationNotFound,
+            ));
+        }
+        let device_matches = (actor_did == recipient_did
+            && input.actor_device_id == recipient_device_id)
+            || (actor_did == sender_did
+                && !sender_device_id.is_some_and(|dev| dev != input.actor_device_id));
+        if !device_matches {
+            return Err(ChatFailure::protocol(
+                ENDPOINT,
+                ChatProtocolErrorCode::DeviceNotLeaf,
+            ));
+        }
+
+        sqlx::query(
+            "UPDATE chat.devices \
+                SET last_active_at = $3, dormant_at = NULL \
+              WHERE user_did = $1 AND device_id = $2",
+        )
+        .bind(&actor_did)
+        .bind(input.actor_device_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+
+        let transport_max: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) FROM chat.direct_request_transport_entries WHERE conversation_id = $1",
+        )
+        .bind(input.conversation_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+        if input.up_to_seq > transport_max.max(0) {
+            return Err(ChatFailure::protocol(
+                ENDPOINT,
+                ChatProtocolErrorCode::InvalidRequest,
+            ));
+        }
+
+        tx.commit()
+            .await
+            .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+
+        let out = serde_json::to_vec(&json!({
+            "acknowledgedSeq": input.up_to_seq,
+            "prunedCount": 0_i64,
+        }))
+        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+        return Ok(context::json_ok(out));
+    };
+
     let is_leaf: bool = sqlx::query_scalar(
         "SELECT EXISTS( \
              SELECT 1 FROM chat.application_intervals \
@@ -238,7 +337,18 @@ async fn execute(
     .await
     .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
-    let max_seq = (next_entry_seq - 1).max(0);
+    let max_seq = if is_remote {
+        let transport_max: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) FROM chat.direct_request_transport_entries WHERE conversation_id = $1",
+        )
+        .bind(input.conversation_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+        (next_entry_seq - 1).max(transport_max).max(0)
+    } else {
+        (next_entry_seq - 1).max(0)
+    };
     if input.up_to_seq > max_seq {
         return Err(ChatFailure::protocol(
             ENDPOINT,
