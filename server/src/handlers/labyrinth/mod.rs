@@ -8,6 +8,7 @@ mod directory;
 mod params;
 mod retention;
 
+pub(crate) use directory::read_federated_directory;
 use std::sync::Arc;
 
 use axum::{

@@ -181,6 +181,8 @@ pub(crate) mod push_binding;
 
 pub(crate) mod transport_welcome;
 
+pub(crate) mod close_terminal;
+
 #[cfg(test)]
 #[path = "auth/tests.rs"]
 mod auth_repository_tests;

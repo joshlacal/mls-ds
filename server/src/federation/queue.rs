@@ -351,6 +351,9 @@ pub struct OutboundQueue {
     per_convo_peer_pending_cap: i64,
     per_peer_pending_bytes_cap: i64,
     per_convo_peer_pending_bytes_cap: i64,
+    /// Sim drains reconcile on the production interval of DS-clock time.
+    #[cfg(feature = "sim")]
+    sim_reconciled_at: std::sync::Mutex<Option<DateTime<Utc>>>,
 }
 
 impl OutboundQueue {
@@ -386,7 +389,32 @@ impl OutboundQueue {
             per_convo_peer_pending_cap,
             per_peer_pending_bytes_cap,
             per_convo_peer_pending_bytes_cap,
+            #[cfg(feature = "sim")]
+            sim_reconciled_at: std::sync::Mutex::new(None),
         }
+    }
+
+    pub fn resolver(&self) -> &Arc<DsResolver> {
+        &self.resolver
+    }
+
+    /// Claim a sim reconciliation pass: the first call, then once per `interval`
+    /// of DS-clock time, matching the production worker's first-tick cadence.
+    #[cfg(feature = "sim")]
+    pub(crate) fn claim_sim_reconciliation(
+        &self,
+        now: DateTime<Utc>,
+        interval: chrono::Duration,
+    ) -> bool {
+        let mut last = self
+            .sim_reconciled_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if matches!(*last, Some(at) if now - at < interval) {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 
     // -- Enqueue ----------------------------------------------------------------
@@ -416,7 +444,7 @@ impl OutboundQueue {
         sqlx::query(
             "INSERT INTO outbound_queue \
                (id, target_ds_did, target_endpoint, method, payload, convo_id, last_error, next_retry_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + make_interval(secs => $8))",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $9 + make_interval(secs => $8))",
         )
         .bind(&id)
         .bind(&canonical_target_ds_did)
@@ -426,6 +454,7 @@ impl OutboundQueue {
         .bind(convo_id)
         .bind(error_msg)
         .bind(initial_delay_secs)
+        .bind(crate::sim_hooks::current_utc())
         .execute(&self.pool)
         .await
         .map_err(FederationError::Database)?;
@@ -558,6 +587,7 @@ impl OutboundQueue {
     // -- Batch processing -------------------------------------------------------
 
     pub async fn claim_due_batch(&self, limit: i64) -> Result<Vec<QueueItem>, sqlx::Error> {
+        let now = crate::sim_hooks::current_utc();
         let mut tx = self.pool.begin().await?;
 
         // Head-of-line ordering from the encrypted-requests line: at most one
@@ -584,12 +614,13 @@ impl OutboundQueue {
                      created_at ASC, id ASC \
              ) \
              SELECT q.id FROM outbound_queue q \
-             WHERE q.id IN (SELECT id FROM heads WHERE status = 'pending' AND next_retry_at <= NOW()) \
+             WHERE q.id IN (SELECT id FROM heads WHERE status = 'pending' AND next_retry_at <= $2) \
              ORDER BY q.next_retry_at ASC \
              LIMIT $1 \
              FOR UPDATE SKIP LOCKED",
         )
         .bind(limit)
+        .bind(now)
         .fetch_all(&mut *tx)
         .await?;
 
@@ -599,7 +630,8 @@ impl OutboundQueue {
         }
 
         let ids: Vec<String> = candidates.into_iter().map(|(id,)| id).collect();
-        let claim_token = Uuid::new_v4();
+        let claim_token =
+            crate::sim_hooks::mint_entry_uuid_v4(b"outbound_queue.claim", &[ids[0].as_bytes()]);
         let lease_secs = 120.0;
 
         let rows: Vec<(
@@ -618,7 +650,7 @@ impl OutboundQueue {
             "UPDATE outbound_queue \
              SET status = 'in_flight', \
                  claim_token = $2, \
-                 claim_expires_at = NOW() + make_interval(secs => $3) \
+                 claim_expires_at = $4 + make_interval(secs => $3) \
              WHERE id = ANY($1) \
              RETURNING id, target_ds_did, target_endpoint, method, payload, convo_id, \
                        retry_count, max_retries, payload_sha256, envelope_version, claim_token",
@@ -626,6 +658,7 @@ impl OutboundQueue {
         .bind(&ids)
         .bind(claim_token)
         .bind(lease_secs)
+        .bind(now)
         .fetch_all(&mut *tx)
         .await?;
 
@@ -668,8 +701,9 @@ impl OutboundQueue {
             "UPDATE outbound_queue \
              SET status = 'pending', claim_token = NULL, claim_expires_at = NULL \
              WHERE status = 'in_flight' \
-               AND (claim_expires_at <= NOW() OR (claim_expires_at IS NULL AND created_at < NOW() - make_interval(secs => 120)))",
+               AND (claim_expires_at <= $1 OR (claim_expires_at IS NULL AND created_at < $1 - make_interval(secs => 120)))",
         )
+        .bind(crate::sim_hooks::current_utc())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -1434,7 +1468,7 @@ impl OutboundQueue {
         let result = sqlx::query(
             "UPDATE outbound_queue \
              SET status = 'pending', retry_count = $2, last_error = $3, \
-                 next_retry_at = NOW() + make_interval(secs => $4), \
+                 next_retry_at = $6 + make_interval(secs => $4), \
                  claim_token = NULL, claim_expires_at = NULL \
              WHERE id = $1 AND ($5::uuid IS NULL OR claim_token = $5)",
         )
@@ -1443,6 +1477,7 @@ impl OutboundQueue {
         .bind(error_msg)
         .bind(delay.as_secs() as f64)
         .bind(claim_token)
+        .bind(crate::sim_hooks::current_utc())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -1454,9 +1489,10 @@ impl OutboundQueue {
         let result = sqlx::query(
             "DELETE FROM outbound_queue \
              WHERE status IN ('delivered', 'failed', 'dead') \
-               AND created_at < NOW() - make_interval(hours => $1::integer)",
+               AND created_at < $2 - make_interval(hours => $1::integer)",
         )
         .bind(max_age_hours as i32)
+        .bind(crate::sim_hooks::current_utc())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -1467,9 +1503,10 @@ impl OutboundQueue {
         let result = sqlx::query(
             "DELETE FROM outbound_queue \
              WHERE status = 'dead' \
-               AND created_at < NOW() - make_interval(secs => $1)",
+               AND created_at < $2 - make_interval(secs => $1)",
         )
         .bind(max_age.as_secs() as f64)
+        .bind(crate::sim_hooks::current_utc())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -1514,7 +1551,7 @@ impl OutboundQueue {
 /// 5. Shared-transaction admission: runs inside caller's `tx`, guaranteeing that a full
 ///    queue rolls back the caller's transaction and never strands already committed work.
 pub async fn enqueue_c33_in_tx(
-    pool: &PgPool,
+    _pool: &PgPool,
     tx: &mut sqlx::Transaction<'_, Postgres>,
     id: &str,
     target_ds_did: &str,
@@ -1525,8 +1562,7 @@ pub async fn enqueue_c33_in_tx(
     error_msg: &str,
 ) -> Result<(), FederationError> {
     let canonical_target_ds_did = canonical_did(target_ds_did).to_string();
-    let policy = peer_policy::enforce_outbound_peer_policy(pool, &canonical_target_ds_did).await?;
-
+    let policy = peer_policy::enforce_outbound_peer_policy_tx(tx, &canonical_target_ds_did).await?;
     // Peer-scoped advisory transaction lock to serialize queue operations for this peer
     let lock_key = format!("federation-outbound-peer:{canonical_target_ds_did}");
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -1627,8 +1663,8 @@ pub async fn enqueue_c33_in_tx(
 
     sqlx::query(
         "INSERT INTO outbound_queue \
-           (id, target_ds_did, target_endpoint, method, payload, convo_id, last_error, next_retry_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + INTERVAL '5 seconds')",
+           (id, target_ds_did, target_endpoint, method, payload, convo_id, last_error, next_retry_at, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8 + INTERVAL '5 seconds', $8)",
     )
     .bind(id)
     .bind(&canonical_target_ds_did)
@@ -1637,6 +1673,7 @@ pub async fn enqueue_c33_in_tx(
     .bind(payload)
     .bind(convo_id)
     .bind(error_msg)
+    .bind(crate::sim_hooks::current_utc())
     .execute(&mut **tx)
     .await
     .map_err(|e| match e {
@@ -3019,6 +3056,28 @@ pub async fn enforce_pending_caps_with_pool(
     per_peer_pending_cap: i64,
     per_convo_peer_pending_cap: i64,
 ) -> Result<(), FederationError> {
+    enforce_pending_caps_with_executor(
+        pool,
+        target_ds_did,
+        convo_id,
+        policy,
+        per_peer_pending_cap,
+        per_convo_peer_pending_cap,
+    )
+    .await
+}
+
+pub(crate) async fn enforce_pending_caps_with_executor<'e, E>(
+    executor: E,
+    target_ds_did: &str,
+    convo_id: &str,
+    policy: &peer_policy::PeerPolicy,
+    per_peer_pending_cap: i64,
+    per_convo_peer_pending_cap: i64,
+) -> Result<(), FederationError>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
     let cap_ratio = policy
         .configured_max_requests_per_minute
         .zip(policy.max_requests_per_minute)
@@ -3044,10 +3103,9 @@ pub async fn enforce_pending_caps_with_pool(
     )
     .bind(target_ds_did)
     .bind(convo_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .map_err(FederationError::Database)?;
-
     if peer_pending >= adaptive_peer_cap {
         crate::metrics::record_federation_queue_capacity_rejection(
             "peer",

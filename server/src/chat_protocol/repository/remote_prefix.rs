@@ -675,14 +675,6 @@ async fn plan_historical_recovery_fulfillment_entry<'borrow, 'conn>(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BootstrapPhase {
-    ExpectCreation,
-    PolicyOrAcceptance,
-    ExpectFulfillment,
-    ApplicationTail,
-}
-
 async fn bootstrap_projection_ids_match(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
@@ -901,6 +893,7 @@ pub(crate) async fn apply_remote_clean_prefix(
     .await
     .map_err(|_| RemotePrefixBootstrapError::Database)?;
 
+    let mut existing_prefix_len = 0;
     if let Some((is_remote, existing_seq_ds, existing_seq_term, existing_cutoff)) = existing_convo {
         // Conversation already exists
         if !is_remote
@@ -1076,117 +1069,97 @@ pub(crate) async fn apply_remote_clean_prefix(
         }
 
         if local_count < remote_count {
-            // Existing shorter exact remote prefix -> zero-write error; ordinary reconciliation owns suffixes
-            return Err(RemotePrefixBootstrapError::Conflict);
-        }
+            let local_state = reconciliation::local_clean_digest_state_tx(tx, conversation_id)
+                .await
+                .map_err(|_| RemotePrefixBootstrapError::Database)?;
+            if !matches!(
+                sync_row.as_ref(),
+                Some((status, None, None, term, seq, epoch, digest))
+                    if status == "healthy" && *term == sequencer_term
+                        && *seq == local_state.last_seq && *epoch == local_state.last_epoch
+                        && digest == &local_state.digest_sha256
+            ) || existing_cutoff.is_none()
+            {
+                return Err(RemotePrefixBootstrapError::Conflict);
+            }
+            existing_prefix_len = local_count;
+        } else {
+            let Some((
+                status,
+                quarantine_reason,
+                first_mismatch_seq,
+                sync_term,
+                sync_last_seq,
+                sync_last_epoch,
+                sync_last_digest,
+            )) = sync_row
+            else {
+                return Err(RemotePrefixBootstrapError::Conflict);
+            };
+            if status != "healthy"
+                || quarantine_reason.is_some()
+                || first_mismatch_seq.is_some()
+                || sync_term != sequencer_term
+                || sync_last_seq != digest_anchor.last_seq()
+                || sync_last_epoch != digest_anchor.last_generation()
+                || sync_last_digest != hex::encode(digest_anchor.digest_sha256())
+            {
+                return Err(RemotePrefixBootstrapError::Conflict);
+            }
 
-        let Some((
-            status,
-            quarantine_reason,
-            first_mismatch_seq,
-            sync_term,
-            sync_last_seq,
-            sync_last_epoch,
-            sync_last_digest,
-        )) = sync_row
-        else {
-            return Err(RemotePrefixBootstrapError::Conflict);
-        };
-        if status != "healthy"
-            || quarantine_reason.is_some()
-            || first_mismatch_seq.is_some()
-            || sync_term != sequencer_term
-            || sync_last_seq != digest_anchor.last_seq()
-            || sync_last_epoch != digest_anchor.last_generation()
-            || sync_last_digest != hex::encode(digest_anchor.digest_sha256())
-        {
-            return Err(RemotePrefixBootstrapError::Conflict);
-        }
+            let local_state = reconciliation::local_clean_digest_state_tx(tx, conversation_id)
+                .await
+                .map_err(|_| RemotePrefixBootstrapError::Database)?;
+            if local_state.digest_sha256 != hex::encode(digest_anchor.digest_sha256())
+                || local_state.last_seq != digest_anchor.last_seq()
+                || local_state.event_count != digest_anchor.event_count()
+                || local_state.last_epoch != digest_anchor.last_generation()
+            {
+                return Err(RemotePrefixBootstrapError::Conflict);
+            }
 
-        let local_state = reconciliation::local_clean_digest_state_tx(tx, conversation_id)
+            let expected_next_seq = u64::try_from(digest_anchor.last_seq())
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or(RemotePrefixBootstrapError::Conflict)?;
+            let locked_convo = core::hydrate_locked_conversation_state(
+                tx,
+                conversation_id,
+                last_event.received_at(),
+            )
             .await
-            .map_err(|_| RemotePrefixBootstrapError::Database)?;
-        if local_state.digest_sha256 != hex::encode(digest_anchor.digest_sha256())
-            || local_state.last_seq != digest_anchor.last_seq()
-            || local_state.event_count != digest_anchor.event_count()
-            || local_state.last_epoch != digest_anchor.last_generation()
-        {
-            return Err(RemotePrefixBootstrapError::Conflict);
-        }
+            .map_err(map_hydration_error)?;
+            let head_coordinate = locked_convo
+                .head()
+                .prior_coordinate()
+                .ok_or(RemotePrefixBootstrapError::Conflict)?;
+            if locked_convo.head().next_entry_seq() != expected_next_seq
+                || i64::try_from(head_coordinate.generation()).ok()
+                    != Some(digest_anchor.last_generation())
+                || !bootstrap_projection_ids_match(tx, conversation_id)
+                    .await
+                    .map_err(|_| RemotePrefixBootstrapError::Database)?
+            {
+                return Err(RemotePrefixBootstrapError::Conflict);
+            }
+            if !existing_cutoff.is_some_and(|cutoff| cutoff <= digest_anchor.last_seq()) {
+                return Err(RemotePrefixBootstrapError::Conflict);
+            }
 
-        let expected_next_seq = u64::try_from(digest_anchor.last_seq())
-            .ok()
-            .and_then(|value| value.checked_add(1))
-            .ok_or(RemotePrefixBootstrapError::Conflict)?;
-        let locked_convo =
-            core::hydrate_locked_conversation_state(tx, conversation_id, last_event.received_at())
-                .await
-                .map_err(map_hydration_error)?;
-        let head_coordinate = locked_convo
-            .head()
-            .prior_coordinate()
-            .ok_or(RemotePrefixBootstrapError::Conflict)?;
-        if locked_convo.head().next_entry_seq() != expected_next_seq
-            || i64::try_from(head_coordinate.generation()).ok()
-                != Some(digest_anchor.last_generation())
-            || !bootstrap_projection_ids_match(tx, conversation_id)
-                .await
-                .map_err(|_| RemotePrefixBootstrapError::Database)?
-        {
-            return Err(RemotePrefixBootstrapError::Conflict);
+            return Ok(RemotePrefixApplyOutcome::ExactReplay {
+                conversation_id,
+                sequencer_term,
+                last_seq: digest_anchor.last_seq(),
+                digest_sha256: *digest_anchor.digest_sha256(),
+            });
         }
-        if existing_cutoff != Some(digest_anchor.last_seq()) {
-            return Err(RemotePrefixBootstrapError::Conflict);
-        }
-
-        return Ok(RemotePrefixApplyOutcome::ExactReplay {
-            conversation_id,
-            sequencer_term,
-            last_seq: digest_anchor.last_seq(),
-            digest_sha256: *digest_anchor.digest_sha256(),
-        });
     }
 
-    // Absent mailbox: bootstrap clean prefix
-    // 4. Closed grammar validation starting at ExpectCreation
-    let mut phase = BootstrapPhase::ExpectCreation;
-    let mut control_indices = Vec::new();
-    let mut tail_start = None;
-
-    for (i, event) in events.iter().enumerate() {
-        if event.seq() != (i + 1) as i64 {
+    crate::federation::bootstrap::validate_prefix_grammar(&events)?;
+    for (index, event) in events.iter().enumerate() {
+        if event.seq() != (index + 1) as i64 {
             return Err(RemotePrefixBootstrapError::InvalidEvent);
         }
-
-        phase = match (phase, event.entry_kind()) {
-            (BootstrapPhase::ExpectCreation, CleanEntryKind::Creation) => {
-                control_indices.push(i);
-                BootstrapPhase::PolicyOrAcceptance
-            }
-            (BootstrapPhase::PolicyOrAcceptance, CleanEntryKind::Policy) => {
-                control_indices.push(i);
-                BootstrapPhase::PolicyOrAcceptance
-            }
-            (BootstrapPhase::PolicyOrAcceptance, CleanEntryKind::ParticipantAcceptance) => {
-                control_indices.push(i);
-                BootstrapPhase::ExpectFulfillment
-            }
-            (BootstrapPhase::ExpectFulfillment, CleanEntryKind::LeafRecoveryFulfillment) => {
-                control_indices.push(i);
-                BootstrapPhase::ApplicationTail
-            }
-            (BootstrapPhase::ApplicationTail, CleanEntryKind::Application) => {
-                if tail_start.is_none() {
-                    tail_start = Some(i);
-                }
-                BootstrapPhase::ApplicationTail
-            }
-            _ => return Err(RemotePrefixBootstrapError::InvalidEvent),
-        };
-    }
-
-    if phase != BootstrapPhase::ApplicationTail {
-        return Err(RemotePrefixBootstrapError::InvalidEvent);
     }
 
     // Canonical locking order before execution:
@@ -1307,9 +1280,52 @@ pub(crate) async fn apply_remote_clean_prefix(
         }
     }
 
-    // 5. Apply control steps
-    for &idx in &control_indices {
-        let event = &events[idx];
+    // Apply only the verified suffix, preserving the source's control/application order.
+    // Entries after an already sealed cutoff are ordinary replicated sends.
+    let application_mode = if existing_prefix_len == 0 {
+        reconciliation::ApplicationImportMode::HistoricalBootstrap
+    } else {
+        reconciliation::ApplicationImportMode::OrdinaryReconciliation
+    };
+    let mut index = existing_prefix_len;
+    while index < events.len() {
+        if events[index].entry_kind() == CleanEntryKind::Application {
+            let start = index;
+            while index < events.len() && events[index].entry_kind() == CleanEntryKind::Application
+            {
+                index += 1;
+            }
+            let prior_seq = events[start - 1].seq();
+            let last_seq = events[index - 1].seq();
+            reconciliation::apply_remote_clean_events(
+                tx,
+                conversation_id,
+                &events[start..index],
+                application_mode,
+            )
+            .await
+            .map_err(|error| match error {
+                reconciliation::ApplyRemoteCleanEventsError::Database(_) => {
+                    RemotePrefixBootstrapError::Database
+                }
+                _ => RemotePrefixBootstrapError::Authority,
+            })?;
+            let updated = sqlx::query(
+                "UPDATE chat.conversations SET next_entry_seq = $3 + 1 \
+                  WHERE conversation_id = $1 AND next_entry_seq = $2 + 1",
+            )
+            .bind(conversation_id)
+            .bind(prior_seq)
+            .bind(last_seq)
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| RemotePrefixBootstrapError::Database)?;
+            if updated.rows_affected() != 1 {
+                return Err(RemotePrefixBootstrapError::Authority);
+            }
+            continue;
+        }
+        let event = &events[index];
         let authority = HistoricalPrefixAuthority::verify_and_bind_for_event(
             tx,
             digest_anchor.digest_sha256(),
@@ -1320,7 +1336,6 @@ pub(crate) async fn apply_remote_clean_prefix(
             &event_scope,
         )
         .await?;
-
         let step = match event.entry_kind() {
             CleanEntryKind::Creation => plan_historical_creation_entry(authority, event).await?,
             CleanEntryKind::Policy => plan_historical_policy_add_entry(authority, event).await?,
@@ -1332,49 +1347,11 @@ pub(crate) async fn apply_remote_clean_prefix(
             }
             _ => return Err(RemotePrefixBootstrapError::InvalidEvent),
         };
-
         step.apply(&event_scope).await.map_err(|err| match err {
             ExecutorError::HydrationDatabase(_) => RemotePrefixBootstrapError::Database,
             _ => RemotePrefixBootstrapError::Authority,
         })?;
-    }
-
-    // 6. Apply application tail
-    if let Some(start) = tail_start {
-        let prior_head_seq = events[start - 1].seq();
-        let tail_last_seq = last_event.seq();
-
-        reconciliation::apply_remote_clean_events(
-            tx,
-            conversation_id,
-            &events[start..],
-            reconciliation::ApplicationImportMode::HistoricalBootstrap,
-        )
-        .await
-        .map_err(|error| match error {
-            reconciliation::ApplyRemoteCleanEventsError::Database(_) => {
-                RemotePrefixBootstrapError::Database
-            }
-            reconciliation::ApplyRemoteCleanEventsError::InvalidEvent(_)
-            | reconciliation::ApplyRemoteCleanEventsError::Authority(_) => {
-                RemotePrefixBootstrapError::Authority
-            }
-        })?;
-
-        let convo_updated = sqlx::query(
-            "UPDATE chat.conversations SET next_entry_seq = $3 + 1 WHERE conversation_id = $1 AND next_entry_seq = $2 + 1",
-        )
-        .bind(conversation_id)
-        .bind(prior_head_seq)
-        .bind(tail_last_seq)
-        .execute(&mut **tx)
-        .await
-        .map_err(|_| RemotePrefixBootstrapError::Database)?
-        .rows_affected();
-
-        if convo_updated != 1 {
-            return Err(RemotePrefixBootstrapError::Authority);
-        }
+        index += 1;
     }
 
     // 7. Verify final state before commit
@@ -1442,19 +1419,20 @@ pub(crate) async fn apply_remote_clean_prefix(
         return Err(RemotePrefixBootstrapError::Authority);
     }
 
-    // Seal historical bootstrap cutoff after sync-state upsert and before SET CONSTRAINTS
-    let sealed_cutoff = sqlx::query(
-        "UPDATE chat.conversations SET historical_bootstrap_last_seq = $2 WHERE conversation_id = $1",
-    )
-    .bind(conversation_id)
-    .bind(local_state.last_seq)
-    .execute(&mut **tx)
-    .await
-    .map_err(|_| RemotePrefixBootstrapError::Database)?
-    .rows_affected();
-
-    if sealed_cutoff != 1 {
-        return Err(RemotePrefixBootstrapError::Authority);
+    // Seal the historical cutoff once, in the mirror's birth transaction.
+    if existing_prefix_len == 0 {
+        let sealed_cutoff = sqlx::query(
+            "UPDATE chat.conversations SET historical_bootstrap_last_seq = $2 WHERE conversation_id = $1",
+        )
+        .bind(conversation_id)
+        .bind(local_state.last_seq)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| RemotePrefixBootstrapError::Database)?
+        .rows_affected();
+        if sealed_cutoff != 1 {
+            return Err(RemotePrefixBootstrapError::Authority);
+        }
     }
 
     // 9. Execute SET CONSTRAINTS ALL IMMEDIATE

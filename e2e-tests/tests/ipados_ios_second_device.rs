@@ -615,31 +615,62 @@ async fn ipados_ios_second_device_every_row_branches() -> anyhow::Result<()> {
         String::from_utf8_lossy(&close_bytes)
     );
 
-    let consent_sql = format!(
-        "SELECT consent FROM chat.direct_request_lifecycle WHERE conversation_id='{}'",
-        f.conversation_id
-    );
-    let output = std::process::Command::new("psql")
-        .args([
-            request_database_url(),
-            "-X",
-            "-A",
-            "-t",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-c",
-            &consent_sql,
-        ])
-        .output()?;
-    anyhow::ensure!(output.status.success(), "consent query failed");
-    let consent_state = String::from_utf8(output.stdout)?;
+    encrypted_requests::assert_closed_conversation_wiped(
+        f.conversation_id,
+        Some(f.request_id),
+    )?;
+
+    // Alice was offline for the close. Operational history is gone, but her
+    // frozen close-event entitlement still exposes the authenticated terminal
+    // entry rather than a silently missing conversation.
+    let closed_response: Value = serde_json::from_slice(&close_bytes)?;
+    let (peer_status, peer_bytes) = f
+        .alice
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getEntries",
+            &[
+                ("conversationId".into(), f.conversation_id.to_string()),
+                ("afterSeq".into(), "0".into()),
+                ("limit".into(), "100".into()),
+            ],
+        )
+        .await?;
     assert_eq!(
-        consent_state.trim(),
-        "closed",
-        "lifecycle consent must be closed"
+        peer_status,
+        reqwest::StatusCode::OK,
+        "peer must still learn the close: {}",
+        String::from_utf8_lossy(&peer_bytes)
     );
-    // Idempotent duplicate close replay succeeds
-    let (replay_status, _) = f
+    let peer_page: Value = serde_json::from_slice(&peer_bytes)?;
+    assert_eq!(peer_page["entries"], json!([closed_response["result"]["entry"]]));
+    assert_eq!(peer_page["entries"][0]["signedRequest"], close_signed);
+    assert_eq!(peer_page["hasMore"], false);
+
+    // A new signed close is not an idempotent replay. It cannot recreate the
+    // wiped conversation, while the exact original completion remains usable.
+    let fresh_id = Uuid::new_v4().to_string();
+    let mut fresh_body = close_signed["body"].clone();
+    fresh_body["transitionId"] = json!(fresh_id);
+    fresh_body["idempotencyKey"] = json!(fresh_id);
+    fresh_body["signedAt"] = json!(canonical_now());
+    let fresh_signed = signed_ordinary(&f.bob_engine, &bob_identity, fresh_body)?;
+    let (fresh_status, fresh_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.closeConversation",
+            &json!({"signedRequest": fresh_signed}),
+            true,
+        )
+        .await?;
+    assert_eq!(fresh_status, reqwest::StatusCode::BAD_REQUEST);
+    let fresh_error: Value = serde_json::from_slice(&fresh_bytes)?;
+    assert_eq!(fresh_error["error"], "ConversationNotFound");
+
+    let (replay_status, replay_bytes) = f
         .bob
         .post(
             &f.client,
@@ -649,11 +680,15 @@ async fn ipados_ios_second_device_every_row_branches() -> anyhow::Result<()> {
             true,
         )
         .await?;
+    assert_eq!(replay_status, reqwest::StatusCode::OK);
     assert_eq!(
-        replay_status,
-        reqwest::StatusCode::OK,
-        "duplicate close replay succeeds"
+        replay_bytes, close_bytes,
+        "late exact replay returns the byte-identical retained completion"
     );
+    encrypted_requests::assert_closed_conversation_wiped(
+        f.conversation_id,
+        Some(f.request_id),
+    )?;
 
     println!("ipados_ios_second_device: decline/block monotonicity verified");
     Ok(())

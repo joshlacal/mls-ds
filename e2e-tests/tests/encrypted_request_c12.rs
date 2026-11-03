@@ -233,28 +233,20 @@ async fn c12_barrier_publish_first_cancel_returns_committed_identity_and_withdra
     );
 
     // Withdrawal is the real signed closeConversation, not cancel.
-    let (status, closed, transition_id) = close_published(&s).await?;
+    let (status, closed, _) = close_published(&s).await?;
     assert_eq!(status, OK, "signed close: {closed}");
     assert!(
         closed["result"]["tombstone"].is_object(),
         "close returns the tombstone: {closed}"
     );
-    let (r, c) = (s.request_id, s.conversation_id);
-    let after = db_query(&format!(
-        "SELECT (SELECT lifecycle FROM chat.conversations WHERE conversation_id='{c}')||'|'||\
-                (SELECT kind FROM chat.transitions WHERE transition_id='{transition_id}' AND conversation_id='{c}')||'|'||\
-                (SELECT consent FROM chat.direct_request_lifecycle WHERE request_id='{r}')||'|'||\
-                (SELECT (closed_at IS NOT NULL)::text FROM chat.direct_request_lifecycle WHERE request_id='{r}')||'|'||\
-                COALESCE((SELECT reason FROM chat.direct_request_pending_releases WHERE request_id='{r}'),'none')||'|'||\
-                (SELECT status FROM chat.direct_request_attempts WHERE request_id='{r}')"
-    ))?;
-    println!(
-        "C12 after signed close lifecycle|transition|consent|closed|release|attempt = {after}"
-    );
-    // F1 (migration 20260919000021): publication retired pending, so close writes no pending release.
+    encrypted_requests::assert_closed_conversation_wiped(
+        s.conversation_id,
+        Some(s.request_id),
+    )?;
     assert_eq!(
-        after,
-        "superseded|closeConversation|closed|true|none|published"
+        stored_terminal(s.request_id)?,
+        ("published".to_owned(), Some(untyped_outcome(&published)?)),
+        "close retains only the immutable request-level replay receipt"
     );
 
     // Cancel after the withdrawal still only reports the committed publication.

@@ -2317,6 +2317,10 @@ pub(crate) async fn prune_application_entry_payload(
     seq: i64,
     pruned_at: DateTime<Utc>,
 ) -> Result<bool, DeliveryRepositoryError> {
+    #[cfg(feature = "sim")]
+    if crate::sim_hooks::active_sim_ds().is_some_and(|hooks| hooks.retain_application_ciphertext) {
+        return Ok(false);
+    }
     let entry_res = sqlx::query(
         r#"
         UPDATE chat.entries

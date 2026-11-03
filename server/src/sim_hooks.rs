@@ -5,6 +5,12 @@
 //! behavioral change. Simulation harnesses inject [`ManualDsClock`] and [`QueuedTaskSpawner`]
 //! so identical schedules and seeds produce bit-for-bit identical transcripts, sequencer
 //! receipts, and fan-out task queues across isolated worker databases.
+//!
+//! Crash faults target client SQLite/SQLCipher state, not the PostgreSQL process
+//! or host OS. [`open_sim_worker_pool`] therefore disables synchronous commit
+//! only on its guarded loopback simulation pool sessions. Transaction isolation
+//! and committed-row visibility are unchanged; server crash durability is outside
+//! this model.
 
 use std::{
     cell::RefCell,
@@ -57,6 +63,144 @@ static IN_PROCESS_MIGRATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
 
 static RESET_SQL_PLAN_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Request-local service identity and wire transport for multi-DS simulations.
+///
+/// Enable the `sim` feature to run independent delivery services in one process.
+/// Each runtime owns its hooks; nested S2S requests enter the target runtime's
+/// scope. Only HTTP/DNS are substituted: JWTs, device signatures, SSRF policy,
+/// bounded decoding, and the real federation handlers remain on the normal path.
+#[cfg(feature = "sim")]
+pub struct SimDsHooks {
+    pub service_did: String,
+    pub self_endpoint: String,
+    pub signing_key_pem: Option<String>,
+    pub group_relay_hmac_secret: Option<String>,
+    pub http_transport: SimHttpTransport,
+    pub dns_resolver: SimDnsResolver,
+    /// P8 plant: deliberately retain application ciphertext when pruning is due.
+    pub retain_application_ciphertext: bool,
+}
+
+/// Exact HTTP request emitted by a real DS client, before network I/O.
+#[cfg(feature = "sim")]
+pub struct SimHttpRequest {
+    pub method: http::Method,
+    pub url: url::Url,
+    pub headers: http::HeaderMap,
+    pub body: Vec<u8>,
+}
+
+/// Route requests through real in-process routers; return an error to partition a link.
+#[cfg(feature = "sim")]
+pub type SimHttpTransport = Arc<
+    dyn Fn(
+            SimHttpRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<http::Response<Vec<u8>>, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Deterministic DNS answers still pass the ordinary public-address checks.
+#[cfg(feature = "sim")]
+pub type SimDnsResolver = Arc<dyn Fn(&str) -> Result<Vec<std::net::IpAddr>, String> + Send + Sync>;
+
+#[cfg(feature = "sim")]
+tokio::task_local! {
+    static TASK_SIM_DS: Arc<SimDsHooks>;
+}
+
+#[cfg(feature = "sim")]
+thread_local! {
+    static SYNC_SIM_DS: RefCell<Option<Arc<SimDsHooks>>> = const { RefCell::new(None) };
+}
+
+#[cfg(feature = "sim")]
+struct SyncSimDsGuard(Option<Arc<SimDsHooks>>);
+
+#[cfg(feature = "sim")]
+impl Drop for SyncSimDsGuard {
+    fn drop(&mut self) {
+        SYNC_SIM_DS.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+/// Scope one DS's identity, transport, and fault plants across every await point.
+#[cfg(feature = "sim")]
+pub async fn scope_sim_ds<F: Future>(hooks: Arc<SimDsHooks>, fut: F) -> F::Output {
+    TASK_SIM_DS.scope(hooks, fut).await
+}
+
+/// Scope synchronous runtime construction without changing process environment.
+#[cfg(feature = "sim")]
+pub fn with_sim_ds<R>(hooks: Arc<SimDsHooks>, f: impl FnOnce() -> R) -> R {
+    let previous = SYNC_SIM_DS.with(|slot| slot.borrow_mut().replace(hooks));
+    let _guard = SyncSimDsGuard(previous);
+    f()
+}
+
+#[cfg(feature = "sim")]
+pub fn active_sim_ds() -> Option<Arc<SimDsHooks>> {
+    TASK_SIM_DS
+        .try_with(Arc::clone)
+        .ok()
+        .or_else(|| SYNC_SIM_DS.with(|slot| slot.borrow().as_ref().map(Arc::clone)))
+}
+
+#[cfg(feature = "sim")]
+pub(crate) async fn scope_optional_sim_ds<F: Future>(
+    hooks: Option<Arc<SimDsHooks>>,
+    fut: F,
+) -> F::Output {
+    match hooks {
+        Some(hooks) => scope_sim_ds(hooks, fut).await,
+        None => fut.await,
+    }
+}
+
+#[cfg(feature = "sim")]
+pub(crate) fn intercept_sim_dns(host: &str) -> Option<Result<Vec<std::net::IpAddr>, String>> {
+    active_sim_ds().map(|hooks| (hooks.dns_resolver)(host))
+}
+
+#[cfg(feature = "sim")]
+pub(crate) fn intercept_sim_http(
+    request: &reqwest::RequestBuilder,
+) -> Option<Pin<Box<dyn Future<Output = Result<reqwest::Response, String>> + Send>>> {
+    let hooks = active_sim_ds()?;
+    let request = request
+        .try_clone()
+        .ok_or_else(|| "simulation transport requires a replayable HTTP body".to_string())
+        .and_then(|request| request.build().map_err(|error| error.to_string()));
+    Some(Box::pin(async move {
+        let request = request?;
+        let body = match request.body() {
+            Some(body) => body
+                .as_bytes()
+                .ok_or_else(|| "simulation transport requires a buffered HTTP body".to_string())?
+                .to_vec(),
+            None => Vec::new(),
+        };
+        let response = (hooks.http_transport)(SimHttpRequest {
+            method: request.method().clone(),
+            url: request.url().clone(),
+            headers: request.headers().clone(),
+            body,
+        })
+        .await?;
+        Ok(reqwest::Response::from(response))
+    }))
+}
+
+pub(crate) async fn send_reqwest(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, String> {
+    #[cfg(feature = "sim")]
+    if let Some(response) = intercept_sim_http(&request) {
+        return response.await;
+    }
+    request.send().await.map_err(|error| error.to_string())
+}
 
 // =============================================================================
 // 1. Deterministic Server Clock (`DsClock`)
@@ -211,7 +355,7 @@ pub fn with_ds_clock<R>(clock: Arc<dyn DsClock>, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-pub(crate) fn active_scoped_clock() -> Option<Arc<dyn DsClock>> {
+pub fn active_scoped_clock() -> Option<Arc<dyn DsClock>> {
     if let Ok(clock) = TASK_DS_CLOCK.try_with(Arc::clone) {
         return Some(clock);
     }
@@ -235,7 +379,7 @@ pub fn is_deterministic_clock_active() -> bool {
 ///
 /// Production uses `Uuid::new_v4()`. A deterministic clock owns its sequence,
 /// so identical worker-local schedules replay without sharing process state.
-pub(crate) fn mint_entry_uuid_v4(domain: &[u8], parts: &[&[u8]]) -> Uuid {
+pub fn mint_entry_uuid_v4(domain: &[u8], parts: &[&[u8]]) -> Uuid {
     let Some(clock) = active_scoped_clock().filter(|clock| clock.is_deterministic()) else {
         return Uuid::new_v4();
     };
@@ -296,7 +440,7 @@ fn deterministic_uuid_v4(
 }
 
 /// Fill simulation capability entropy, leaving `output` untouched in production.
-pub(crate) fn deterministic_entropy(domain: &[u8], output: &mut [u8]) -> bool {
+pub fn deterministic_entropy(domain: &[u8], output: &mut [u8]) -> bool {
     let Some(clock) = active_scoped_clock().filter(|clock| clock.is_deterministic()) else {
         return false;
     };
@@ -361,6 +505,8 @@ pub struct TokioTaskSpawner;
 
 impl TaskSpawner for TokioTaskSpawner {
     fn spawn_box(&self, _label: &'static str, fut: BoxedTaskFuture) {
+        #[cfg(feature = "sim")]
+        let fut = scope_optional_sim_ds(active_sim_ds(), fut);
         tokio::spawn(fut);
     }
 }
@@ -431,6 +577,11 @@ impl QueuedTaskSpawner {
 
 impl TaskSpawner for QueuedTaskSpawner {
     fn spawn_box(&self, label: &'static str, fut: BoxedTaskFuture) {
+        #[cfg(feature = "sim")]
+        let fut = match active_sim_ds() {
+            Some(hooks) => Box::pin(scope_sim_ds(hooks, fut)) as BoxedTaskFuture,
+            None => fut,
+        };
         self.queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -605,6 +756,12 @@ pub async fn drive_sim_io<F: Future>(future: F) -> F::Output {
 }
 
 /// Create (if absent), migrate, and open a `max_connections(1)` worker pool for `db_name`.
+///
+/// Every pooled connection, including a replacement connection, runs session-local
+/// `SET synchronous_commit = off` after connecting. The loopback and simulation-name
+/// guards run first; no database-wide, server-wide, or production setting changes.
+/// This assumes the tank crashes clients, not PostgreSQL or its host: a server/OS
+/// crash could lose recently acknowledged commits with this session setting.
 pub async fn open_sim_worker_pool(base_url: Option<&str>, db_name: &str) -> Result<PgPool, String> {
     validate_sim_database_name(db_name)?;
     let maintenance_url = resolve_local_maintenance_url(base_url)?;
@@ -1466,5 +1623,80 @@ mod tests {
         ]) {
             assert!(validate_sim_reset_target(db, Some("127.0.0.1")).is_err());
         }
+    }
+
+    #[cfg(feature = "sim")]
+    #[tokio::test]
+    async fn sim_ds_scope_isolates_nested_identities_and_intercepts_transport() {
+        let hooks_a = Arc::new(SimDsHooks {
+            service_did: "did:web:chat.catbird.blue#atproto_mls".to_string(),
+            self_endpoint: "https://chat.catbird.blue".to_string(),
+            signing_key_pem: None,
+            group_relay_hmac_secret: Some("secret-a".to_string()),
+            http_transport: Arc::new(|req| {
+                Box::pin(async move {
+                    Ok(http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(
+                            serde_json::to_vec(&serde_json::json!({
+                                "url": req.url.as_str(),
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap())
+                })
+            }),
+            dns_resolver: Arc::new(|_| Ok(vec!["93.184.216.34".parse().unwrap()])),
+            retain_application_ciphertext: false,
+        });
+        let hooks_b = Arc::new(SimDsHooks {
+            service_did: "did:plc:dsbsimdeliveryaaaaaaaaaa".to_string(),
+            self_endpoint: "https://ds-b.catbird.blue".to_string(),
+            signing_key_pem: None,
+            group_relay_hmac_secret: None,
+            http_transport: Arc::new(|_| Box::pin(async { Err("partitioned".to_string()) })),
+            dns_resolver: Arc::new(|_| Err("nxdomain".to_string())),
+            retain_application_ciphertext: true,
+        });
+
+        scope_sim_ds(Arc::clone(&hooks_a), async {
+            assert_eq!(
+                crate::identity::service_did_base(),
+                "did:web:chat.catbird.blue"
+            );
+            assert_eq!(
+                crate::identity::self_endpoint(),
+                "https://chat.catbird.blue"
+            );
+            let resp =
+                send_reqwest(reqwest::Client::new().get("https://ds-b.catbird.blue/xrpc/test"))
+                    .await
+                    .unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+
+            scope_sim_ds(Arc::clone(&hooks_b), async {
+                assert_eq!(
+                    crate::identity::service_did_base(),
+                    "did:plc:dsbsimdeliveryaaaaaaaaaa"
+                );
+                assert_eq!(
+                    crate::identity::self_endpoint(),
+                    "https://ds-b.catbird.blue"
+                );
+                assert!(send_reqwest(
+                    reqwest::Client::new().get("https://chat.catbird.blue/xrpc/test")
+                )
+                .await
+                .is_err());
+            })
+            .await;
+
+            assert_eq!(
+                crate::identity::service_did_base(),
+                "did:web:chat.catbird.blue"
+            );
+        })
+        .await;
     }
 }

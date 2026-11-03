@@ -3580,7 +3580,17 @@ async fn hydrate_locked_available_recovery_package_at_coordinate(
           AND kp.not_before < $5
           AND kp.created_at <= $5
           AND $5 < kp.not_after
-        ORDER BY kp.created_at, kp.key_package_ref
+          AND NOT EXISTS (
+              SELECT 1 FROM chat.group_key_package_exports exported
+               WHERE exported.key_package_ref = kp.key_package_ref
+                 AND exported.expires_at > $5
+                 AND exported.recovery_request_id <> $6
+          )
+        ORDER BY EXISTS (
+            SELECT 1 FROM chat.group_key_package_exports exported
+             WHERE exported.key_package_ref = kp.key_package_ref
+               AND exported.recovery_request_id = $6
+        ) DESC, kp.created_at, kp.key_package_ref
         LIMIT 1
         FOR UPDATE OF kp
         "#,
@@ -3590,6 +3600,7 @@ async fn hydrate_locked_available_recovery_package_at_coordinate(
     .bind(target_key_id)
     .bind(target_auth_generation)
     .bind(claimed_at)
+    .bind(request_id)
     .fetch_optional(&mut **transaction)
     .await?;
     let row = row.ok_or(RecoveryPackageHydrationError::PackageMissing)?;

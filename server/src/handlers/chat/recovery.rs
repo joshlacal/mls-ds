@@ -83,7 +83,7 @@ async fn handle(
     let prepared = prelude::prepare_signed_operation(&mut transaction, admission)
         .await
         .map_err(|error| context::operation_prelude_failure(endpoint, error))?;
-    let response = execute_prepared(&mut transaction, runtime, endpoint, prepared).await?;
+    let (response, _) = execute_prepared(&mut transaction, runtime, endpoint, prepared).await?;
     transaction
         .commit()
         .await
@@ -99,7 +99,7 @@ pub(super) async fn execute_prepared(
     runtime: &ChatRuntime,
     endpoint: ChatEndpoint,
     prepared: PreparedSignedOperation,
-) -> Result<Response, ChatFailure> {
+) -> Result<(Response, Vec<u8>), ChatFailure> {
     let outcome = recovery::execute_prepared_recovery(
         transaction,
         prepared,
@@ -107,11 +107,9 @@ pub(super) async fn execute_prepared(
     )
     .await
     .map_err(|error| recovery_failure(endpoint, error))?;
-    context::canonical_json_response(
-        endpoint,
-        outcome.status(),
-        outcome.response_bytes().to_vec(),
-    )
+    let bytes = outcome.response_bytes().to_vec();
+    let resp = context::canonical_json_response(endpoint, outcome.status(), bytes.clone())?;
+    Ok((resp, bytes))
 }
 
 fn recovery_failure(endpoint: ChatEndpoint, error: RecoveryRepositoryError) -> ChatFailure {

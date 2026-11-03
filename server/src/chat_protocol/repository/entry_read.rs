@@ -116,7 +116,8 @@ async fn read_entries_in_transaction(
         .await
         .map_err(|_| EntryReadFacadeError::Storage)?;
 
-        let Some((
+        let is_transport_inbox = inbox_opt.is_some();
+        if let Some((
             status,
             sender_did,
             sender_device_id,
@@ -124,40 +125,88 @@ async fn read_entries_in_transaction(
             recipient_device_id,
             import_until,
         )) = inbox_opt
-        else {
-            return Err(EntryReadFacadeError::ConversationNotFound);
-        };
-
-        let is_sender = actor_did == sender_did;
-        let is_recipient = actor_did == recipient_did;
-        if !is_sender && !is_recipient {
-            return Err(EntryReadFacadeError::ConversationNotFound);
-        }
-        if is_recipient && actor_device_uuid != recipient_device_id {
-            return Err(EntryReadFacadeError::NotEntitled);
-        }
-        if is_sender
-            && sender_device_id
-                .is_some_and(|expected_sender_dev| actor_device_uuid != expected_sender_dev)
         {
-            return Err(EntryReadFacadeError::NotEntitled);
-        }
-        if status == "pending" {
-            if crate::sim_hooks::current_utc() > import_until {
-                return Err(EntryReadFacadeError::InvitationNotPending);
+            let is_sender = actor_did == sender_did;
+            let is_recipient = actor_did == recipient_did;
+            if !is_sender && !is_recipient {
+                return Err(EntryReadFacadeError::ConversationNotFound);
             }
-        } else if status != "accepted" {
-            return Err(EntryReadFacadeError::ConversationNotFound);
+            if is_recipient && actor_device_uuid != recipient_device_id {
+                return Err(EntryReadFacadeError::NotEntitled);
+            }
+            if is_sender
+                && sender_device_id
+                    .is_some_and(|expected_sender_dev| actor_device_uuid != expected_sender_dev)
+            {
+                return Err(EntryReadFacadeError::NotEntitled);
+            }
+            if status == "pending" {
+                if crate::sim_hooks::current_utc() > import_until {
+                    return Err(EntryReadFacadeError::InvitationNotPending);
+                }
+            } else if status != "accepted" {
+                return Err(EntryReadFacadeError::ConversationNotFound);
+            }
+        } else {
+            let has_replicated_group: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM chat.group_transport_entry_recipients \
+                  WHERE conversation_id = $1 AND user_did = $2 AND device_id = $3)",
+            )
+            .bind(conversation_id)
+            .bind(&actor_did)
+            .bind(actor_device_uuid)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(|_| EntryReadFacadeError::Storage)?;
+            if !has_replicated_group {
+                // After the I14 close wipe, a device in the close event's frozen
+                // audience still receives the authenticated terminal entry.
+                let Some(entry) = super::close_terminal::retained_close_entry_for_device(
+                    transaction,
+                    conversation_id,
+                    &actor_did,
+                    actor_device_uuid,
+                )
+                .await
+                .map_err(|_| EntryReadFacadeError::Storage)?
+                else {
+                    return Err(EntryReadFacadeError::ConversationNotFound);
+                };
+                let terminal_seq = entry
+                    .get("seq")
+                    .and_then(Value::as_u64)
+                    .ok_or(EntryReadFacadeError::Invariant)?;
+                let entries = if terminal_seq > after_seq {
+                    vec![entry]
+                } else {
+                    Vec::new()
+                };
+                let body = json!({
+                    "entries": entries,
+                    "nextAfterSeq": terminal_seq.max(after_seq),
+                    "hasMore": false,
+                });
+                let response_bytes =
+                    serde_json::to_vec(&body).map_err(|_| EntryReadFacadeError::Invariant)?;
+                return Ok(CanonicalEntriesResponse { response_bytes });
+            }
         }
 
         let stored_entries: Vec<Vec<u8>> = sqlx::query_scalar(
-            "SELECT entry_bytes FROM chat.direct_request_transport_entries \
-             WHERE conversation_id = $1 AND seq > $2 \
-             ORDER BY seq ASC LIMIT $3",
+            "SELECT e.entry_bytes FROM chat.direct_request_transport_entries e \
+             WHERE e.conversation_id = $1 AND e.seq > $2 \
+               AND ($4 OR EXISTS( \
+                   SELECT 1 FROM chat.group_transport_entry_recipients r \
+                    WHERE r.conversation_id = e.conversation_id AND r.seq = e.seq \
+                      AND r.user_did = $5 AND r.device_id = $6)) \
+             ORDER BY e.seq ASC LIMIT $3",
         )
         .bind(conversation_id)
         .bind(after_seq as i64)
         .bind(limit + 1)
+        .bind(is_transport_inbox)
+        .bind(&actor_did)
+        .bind(actor_device_uuid)
         .fetch_all(&mut **transaction)
         .await
         .map_err(|_| EntryReadFacadeError::Storage)?;
@@ -169,20 +218,50 @@ async fn read_entries_in_transaction(
             .map(|bytes| {
                 let mut val: Value =
                     serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
-                if val.get("$type").is_none()
-                    && val
+                if val.get("$type").is_none() {
+                    let inferred = match val
                         .pointer("/signedRequest/body/$type")
-                        .and_then(|v| v.as_str())
-                        == Some("blue.catbird.chat.defs#applicationSendBody")
-                {
-                    val["$type"] = json!("blue.catbird.chat.defs#applicationEntry");
+                        .and_then(Value::as_str)
+                    {
+                        Some("blue.catbird.chat.defs#applicationSendBody") => {
+                            Some("blue.catbird.chat.defs#applicationEntry")
+                        }
+                        Some("blue.catbird.chat.defs#commitTransitionBody") => {
+                            Some("blue.catbird.chat.defs#commitEntry")
+                        }
+                        Some("blue.catbird.chat.defs#metadataTransitionBody") => {
+                            Some("blue.catbird.chat.defs#metadataEntry")
+                        }
+                        Some("blue.catbird.chat.defs#policyTransitionBody") => {
+                            Some("blue.catbird.chat.defs#policyEntry")
+                        }
+                        Some("blue.catbird.chat.defs#leafRecoveryFulfillmentBody") => {
+                            Some("blue.catbird.chat.defs#leafRecoveryFulfillmentEntry")
+                        }
+                        Some("blue.catbird.chat.defs#leaveCommitFulfillmentBody") => {
+                            Some("blue.catbird.chat.defs#leaveCommitFulfillmentEntry")
+                        }
+                        _ => None,
+                    };
+                    if let Some(ty) = inferred {
+                        val["$type"] = json!(ty);
+                    }
                 }
-                crate::chat_protocol::direct_request_transcript::present_read_presentation(
-                    "conversationEntry",
-                    &mut val,
-                )
-                .map_err(|_| EntryReadFacadeError::Invariant)?;
-                Ok(val)
+                let presented = if let Ok(canonical) = encode_canonical_generated_chat_json_v1(
+                    &val,
+                    "blue.catbird.chat.defs#conversationEntry",
+                ) {
+                    serde_json::from_slice(canonical.bytes())
+                        .map_err(|_| EntryReadFacadeError::Invariant)?
+                } else {
+                    crate::chat_protocol::direct_request_transcript::present_read_presentation(
+                        "conversationEntry",
+                        &mut val,
+                    )
+                    .map_err(|_| EntryReadFacadeError::Invariant)?;
+                    val
+                };
+                Ok(presented)
             })
             .collect::<Result<_, EntryReadFacadeError>>()?;
 
@@ -217,15 +296,120 @@ async fn read_entries_in_transaction(
     .await
     .map_err(map_delivery_error)?;
 
-    let entries = page
+    let mut entries = page
         .entries
         .iter()
         .map(entry_json)
         .collect::<Result<Vec<_>, _>>()?;
+    let mut next_after_seq = page.next_after_seq;
+    let mut has_more = page.has_more;
+
+    let is_remote_convo: bool = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT is_remote FROM chat.conversations WHERE conversation_id = $1), FALSE)",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| EntryReadFacadeError::Storage)?;
+    if is_remote_convo {
+        let replicated_rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT e.seq, e.entry_bytes FROM chat.direct_request_transport_entries e \
+              JOIN chat.group_transport_entry_recipients r \
+                ON r.conversation_id = e.conversation_id AND r.seq = e.seq \
+             WHERE e.conversation_id = $1 AND e.seq > $2 \
+               AND r.user_did = $4 AND r.device_id = $5 \
+             ORDER BY e.seq ASC LIMIT $3",
+        )
+        .bind(conversation_id)
+        .bind(after_seq as i64)
+        .bind(limit + 1)
+        .bind(authority.conversation().user_did())
+        .bind(authority.conversation().device_id())
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| EntryReadFacadeError::Storage)?;
+        if !replicated_rows.is_empty() {
+            let mut by_seq = std::collections::BTreeMap::<u64, Value>::new();
+            for item in entries {
+                if let Some(s) = item.get("seq").and_then(Value::as_u64) {
+                    by_seq.insert(s, item);
+                }
+            }
+            for (seq_i64, bytes) in replicated_rows {
+                let Ok(seq_u64) = u64::try_from(seq_i64) else {
+                    continue;
+                };
+                // Mirrored rows lack the sequencer receipt that the replicated
+                // entry carries; serve the replicated entry for those seqs.
+                let local_has_receipt = by_seq
+                    .get(&seq_u64)
+                    .map(|local| local.get("sequencerReceipt").is_some());
+                if local_has_receipt == Some(true) {
+                    continue;
+                }
+                let mut val: Value =
+                    serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
+                if local_has_receipt == Some(false) && val.get("sequencerReceipt").is_none() {
+                    continue;
+                }
+                if val.get("$type").is_none() {
+                    let inferred = match val
+                        .pointer("/signedRequest/body/$type")
+                        .and_then(Value::as_str)
+                    {
+                        Some("blue.catbird.chat.defs#applicationSendBody") => {
+                            Some("blue.catbird.chat.defs#applicationEntry")
+                        }
+                        Some("blue.catbird.chat.defs#commitTransitionBody") => {
+                            Some("blue.catbird.chat.defs#commitEntry")
+                        }
+                        Some("blue.catbird.chat.defs#metadataTransitionBody") => {
+                            Some("blue.catbird.chat.defs#metadataEntry")
+                        }
+                        Some("blue.catbird.chat.defs#policyTransitionBody") => {
+                            Some("blue.catbird.chat.defs#policyEntry")
+                        }
+                        Some("blue.catbird.chat.defs#leafRecoveryFulfillmentBody") => {
+                            Some("blue.catbird.chat.defs#leafRecoveryFulfillmentEntry")
+                        }
+                        Some("blue.catbird.chat.defs#leaveCommitFulfillmentBody") => {
+                            Some("blue.catbird.chat.defs#leaveCommitFulfillmentEntry")
+                        }
+                        _ => None,
+                    };
+                    if let Some(ty) = inferred {
+                        val["$type"] = json!(ty);
+                    }
+                }
+                let presented = if let Ok(canonical) = encode_canonical_generated_chat_json_v1(
+                    &val,
+                    "blue.catbird.chat.defs#conversationEntry",
+                ) {
+                    serde_json::from_slice(canonical.bytes())
+                        .map_err(|_| EntryReadFacadeError::Invariant)?
+                } else {
+                    let _ =
+                        crate::chat_protocol::direct_request_transcript::present_read_presentation(
+                            "conversationEntry",
+                            &mut val,
+                        );
+                    val
+                };
+                by_seq.insert(seq_u64, presented);
+            }
+            has_more = has_more || by_seq.len() > limit as usize;
+            entries = by_seq.into_values().take(limit as usize).collect();
+            next_after_seq = entries
+                .last()
+                .and_then(|e| e.get("seq").and_then(Value::as_u64))
+                .unwrap_or(after_seq);
+        }
+    }
+
     let body = json!({
         "entries": entries,
-        "nextAfterSeq": page.next_after_seq,
-        "hasMore": page.has_more,
+        "nextAfterSeq": next_after_seq,
+        "hasMore": has_more,
     });
     let response_bytes = serde_json::to_vec(&body).map_err(|_| EntryReadFacadeError::Invariant)?;
     Ok(CanonicalEntriesResponse { response_bytes })

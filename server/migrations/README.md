@@ -355,3 +355,90 @@ idempotency, malformed authority fields and unchanged unrelated constraints.
 The authenticated generated Rust and Swift policy handler tests cover the full
 cryptographic and persistence path separately. Applied migration files are
 unchanged; production application of this migration is a separate operator gate.
+
+## Replicated group entry audiences
+
+`20261102000001_group_transport_entry_recipients.sql` retains the exact local
+device audience supplied by authenticated group fan-out. Replicated group reads
+require a grant for each sequence; merely knowing the conversation ID is not
+enough. Duplicate deliveries cannot widen the stored audience. The grant rows
+cascade when operational entries are wiped on close. The simulation migrator
+loads the complete migration catalog, and its schema-discovered reset includes
+this `chat` table automatically.
+
+## Strict-home group membership
+
+Group creation and pending-participant policy changes resolve and stage remote
+device authority from the participant's home DS and its PDS device directory.
+Only the participant's home receives the client request. Authenticated
+`deliverGroupEntry` fan-out triggers verified prefix bootstrap there, including
+pending-invitation and acceptance-only prefixes. Existing exact prefixes admit
+verified membership suffixes in source order; mismatching overlaps still
+quarantine.
+
+`getConversations` and `getConversationState` therefore expose a remote pending
+invitation at the home DS. Its normal `acceptConversation` request relays to the
+sequencer, which obtains the exact device's recovery KeyPackage through S2S
+`fetchKeyPackage`. Migration `20261102000002_group_key_package_exports.sql` adds
+a short request-bound home lease so concurrent recovery cannot select that
+still-available package before the accepted prefix is mirrored. These leases
+cascade on conversation deletion and are removed on close.
+
+The real fulfillment/outbox path delivers the Welcome to the home mailbox.
+`getPendingWelcomes`, `acknowledgeWelcome`, and `acknowledgeEntries` stay at the
+home endpoint; acknowledgements also relay to the sequencer, while local
+mailbox dispositions and watermarks remain durable at home. No client needs to
+enroll its device or publish KeyPackages on another DS.
+
+The sequencer sends every control entry to the home of each remote participant
+that is still waiting for its first leaf, whether it is invited or has already
+accepted. While a local participant is waiting, a membership entry (creation,
+add policy, acceptance, or recovery fulfillment) makes the home apply the
+verified suffix to its existing mirror.
+That suffix never reseals the immutable historical cutoff; replicated
+application entries after the cutoff use the ordinary reconciled-send mapping.
+Once every local participant has a leaf, the home stores replicated entries
+without further membership catch-up. For `getConversationState` on a remote
+group, the home relays the read to the sequencer over S2S
+`getGroupConversationState`, so the roster, coordinates, and `sequencerDid` stay
+current across commits, metadata changes, and removals. The sequencer applies
+its own read authority, and the home serves its mirror only when the sequencer
+is unreachable.
+
+Relayed group operations keep the sequencer's answer. This covers membership
+operations, `sendMessage`, and `submitTransition`. Any 4xx protocol rejection,
+such as `StaleCoordinates` or `KeyPackageUnavailable`, reaches the client
+unchanged, so the client can resync and retry. A rejected acceptance also frees
+its exported KeyPackage lease. An authority failure on either DS returns
+`NotAuthorized`. An unreachable sequencer or a 5xx answer returns the endpoint's
+declared retryable code: `RelationshipPolicyUnavailable`, or
+`CapacityUnavailable` for Welcome dispositions. `acknowledgeEntries` declares
+neither, so it returns an internal error.
+
+Historical mirroring still supports only creation, add-only policy, acceptance,
+recovery fulfillment, and application entries. If the sequencer's history past
+the home's mirror contains a generic Commit, metadata change, removal or role
+policy, reset, leave, or close, the mirror's `getConversations` inventory state
+stays at the earlier coordinate; a pending invitee that signs acceptance from
+inventory rather than `getConversationState` hits `StaleCoordinates`.
+
+Two-DS simulations configure a dedicated request receipt signer on each
+`ChatRuntime` using the sim-only `with_request_receipt_keys` builder before
+protocol-fence validation. C33 chooses the lexicographically smaller canonical
+home DID as coordinator; that node's receipt authority and published
+`#chat-request-receipt-*` method must agree with its own DID, not a process-global
+receipt document belonging to the other node.
+
+Remote Labyrinth directory reads also stay on the caller's home endpoint.
+`getEpochHead` and `getChatDeviceKeys` resolve the subject's declared DS and
+forward the original device-signed read claim through the authenticated,
+read-only `getLabyrinthDirectory` S2S endpoint. The authoritative home rechecks
+the caller-home binding and the device's current PDS-authorized key, verifies
+the exact endpoint/query claim, and serves its live epoch chain or device roster.
+Local replicated keys never substitute for the remote subject's current roster;
+no home database connection remains held during federation I/O.
+
+Group federation uses ordinary DS-to-DS service-auth tokens: `aud` is the target's
+canonical bare DID, and `lxm` is the exact `blue.catbird.mlsDS.*` method. The
+`#atproto_mls` audience belongs to client AppView authentication, not these S2S
+tokens.

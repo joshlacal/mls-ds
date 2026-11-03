@@ -18,6 +18,7 @@ use crate::{
     chat_protocol::{
         error::{ChatEndpoint, ChatProtocolErrorCode},
         repository::{
+            auth::SignedOperationAdmission,
             prelude, transport_welcome,
             welcome_terminal::{
                 self, WelcomeTerminalFacadeError, WelcomeTerminalTransactionOutcome,
@@ -75,6 +76,24 @@ async fn handle(
     // post-state checks occur under this one caller-owned transaction.
     let admission =
         context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
+    crate::federation::group_relay::try_relay_home_group_operation(
+        pool,
+        admission.subject(),
+        admission.device_id(),
+        endpoint.nsid(),
+        body,
+    )
+    .await
+    .map_err(|error| error.into_failure(endpoint))?;
+    execute_admitted(pool, admission, endpoint, body).await
+}
+
+pub(crate) async fn execute_admitted(
+    pool: &DbPool,
+    admission: SignedOperationAdmission,
+    endpoint: ChatEndpoint,
+    body: &[u8],
+) -> Result<Response, ChatFailure> {
     let actor_did = admission.subject().to_string();
     let actor_device_id = admission.device_id();
 
@@ -169,6 +188,11 @@ fn welcome_failure(endpoint: ChatEndpoint, error: WelcomeTerminalFacadeError) ->
         | E::ExecutionHydration(
             crate::chat_protocol::repository::execution_context::ExecutionContextHydrationError::Database(_),
         ) => ChatFailure::storage(endpoint),
+        E::Aggregate(
+            crate::chat_protocol::repository::core::ConversationStateHydrationError::Head(
+                crate::chat_protocol::repository::core::ConversationHeadHydrationError::ConversationMissing,
+            ),
+        ) => ChatFailure::protocol(endpoint, C::WelcomeNotFound),
         E::Aggregate(crate::chat_protocol::repository::core::ConversationStateHydrationError::ReadSetMismatch) => {
             match endpoint {
                 ChatEndpoint::AcknowledgeWelcome => {

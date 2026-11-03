@@ -57,6 +57,11 @@ async fn submit(
 ) -> Result<Response, ChatFailure> {
     let admission =
         context::admit_signed_operation_only(pool, runtime, ENDPOINT, headers, body).await?;
+    if let Some(relayed) =
+        try_relay_remote_group_submit_transition(pool, runtime, &admission, body).await?
+    {
+        return Ok(relayed);
+    }
     let completed_preflight =
         crate::chat_protocol::repository::auth::preflight_completed_response(pool, &admission)
             .await
@@ -82,6 +87,11 @@ async fn submit(
                 );
                 ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::NotAuthorized)
             })?;
+            crate::federation::group_relay::stage_remote_group_participants(pool, &routes)
+                .await
+                .map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::NotAuthorized)
+                })?;
             Some(crate::chat_protocol::federation_routing::ParticipantRoutingIntent::new(routes))
         } else {
             None
@@ -115,11 +125,14 @@ async fn submit(
         .mutation_kind()
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
 
-    let (response, post_commit_bytes) = match mutation_kind {
-        SignedMutationKind::LeafRecoveryFulfillment => (
-            recovery::execute_prepared(&mut transaction, runtime, ENDPOINT, prepared).await?,
-            None,
-        ),
+    let (response, post_commit_bytes, group_fanout, local_push) = match mutation_kind {
+        SignedMutationKind::LeafRecoveryFulfillment => {
+            let (resp, bytes) =
+                recovery::execute_prepared(&mut transaction, runtime, ENDPOINT, prepared).await?;
+            let (fanout, local_push) =
+                prepare_post_commit_work(&mut transaction, runtime, &bytes).await?;
+            (resp, None, fanout, local_push)
+        }
         SignedMutationKind::CommitTransition
         | SignedMutationKind::PolicyTransition
         | SignedMutationKind::MetadataTransition
@@ -134,6 +147,8 @@ async fn submit(
             .await
             .map_err(|error| submit_failure(mutation_kind, error))?;
             let bytes = outcome.response_bytes().to_vec();
+            let (fanout, local_push) =
+                prepare_post_commit_work(&mut transaction, runtime, &bytes).await?;
             let post_commit = matches!(
                 mutation_kind,
                 SignedMutationKind::CommitTransition
@@ -148,7 +163,7 @@ async fn submit(
                         "submitTransition canonical response construction failed"
                     );
                 })?;
-            (resp, post_commit)
+            (resp, post_commit, fanout, local_push)
         }
         _ => return Err(ChatFailure::invariant(ENDPOINT)),
     };
@@ -157,11 +172,82 @@ async fn submit(
         tracing::error!(?error, "submitTransition outer transaction commit failed");
         ChatFailure::storage(ENDPOINT)
     })?;
+    if let Some(fanout) = group_fanout {
+        runtime.spawn_post_commit_group_entry_fanout(pool, fanout);
+    }
+    if let Some(wake) = local_push {
+        runtime.spawn_post_commit_local_push(pool, wake);
+    }
     if let Some(bytes) = post_commit_bytes {
         runtime.spawn_post_commit_membership_transition(pool, &bytes);
     }
     runtime.notify_events();
     Ok(response)
+}
+
+/// Capture remote group fan-out and local push audiences before commit.
+async fn prepare_post_commit_work(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    runtime: &ChatRuntime,
+    bytes: &[u8],
+) -> Result<
+    (
+        Option<crate::federation::group_fanout::PreparedGroupEntryFanout>,
+        Option<crate::push_gateway::client::PreparedLocalWake>,
+    ),
+    ChatFailure,
+> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Ok((None, None));
+    };
+    let fanout = crate::federation::group_fanout::prepare_group_entry_fanout(transaction, &value)
+        .await
+        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+    let local_push = match runtime.push_gateway_client() {
+        Some(_) => crate::push_gateway::client::prepare_local_entry_wake(transaction, &value)
+            .await
+            .map_err(|_| ChatFailure::storage(ENDPOINT))?,
+        None => None,
+    };
+    Ok((fanout, local_push))
+}
+
+async fn try_relay_remote_group_submit_transition(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    admission: &crate::chat_protocol::repository::auth::SignedOperationAdmission,
+    body: &[u8],
+) -> Result<Option<Response>, ChatFailure> {
+    let kind = admission.mutation_kind();
+    if !matches!(
+        kind,
+        SignedMutationKind::CommitTransition
+            | SignedMutationKind::PolicyTransition
+            | SignedMutationKind::MetadataTransition
+            | SignedMutationKind::LeaveCommitFulfillment
+    ) {
+        return Ok(None);
+    }
+    let Some(resolver) = runtime.resolver() else {
+        return Ok(None);
+    };
+    let mailbox_commit =
+        kind == SignedMutationKind::CommitTransition && runtime.commit_submitter().is_some();
+    crate::federation::group_relay::relay_remote_group_submit_transition(
+        pool,
+        resolver,
+        admission.subject(),
+        admission.device_id(),
+        mailbox_commit,
+        body,
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(?error, "relayed group submitTransition failed");
+        error.into_failure(ENDPOINT)
+    })?
+    .map(|bytes| context::canonical_json_response(ENDPOINT, 200, bytes))
+    .transpose()
 }
 
 fn submit_failure(

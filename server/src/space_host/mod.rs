@@ -209,6 +209,14 @@ impl SpaceHostRuntime {
     ) -> Result<(SpaceVerifyingKey, String, bool), atproto_spaces::SpacesError> {
         let bare_did = crate::identity::canonical_did(did_or_ref).to_string();
         if bare_did == self.config.authority_did {
+            #[cfg(feature = "sim")]
+            if let Some(hooks) = crate::sim_hooks::active_sim_ds() {
+                return Ok((
+                    self.authority_verifying_key(),
+                    hooks.self_endpoint.clone(),
+                    false,
+                ));
+            }
             let self_ep = std::env::var("SELF_ENDPOINT")
                 .unwrap_or_else(|_| "https://chat.catbird.blue".to_string());
             return Ok((self.authority_verifying_key(), self_ep, false));
@@ -264,11 +272,9 @@ impl SpaceHostRuntime {
             .build()
             .map_err(|e| atproto_spaces::SpacesError::DidResolution(e.to_string()))?;
 
-        let resp = client
-            .get(&validated.effective_url)
-            .send()
+        let resp = crate::sim_hooks::send_reqwest(client.get(&validated.effective_url))
             .await
-            .map_err(|e| atproto_spaces::SpacesError::DidResolution(e.to_string()))?;
+            .map_err(atproto_spaces::SpacesError::DidResolution)?;
         if !resp.status().is_success() {
             return Err(atproto_spaces::SpacesError::DidResolution(format!(
                 "DID document HTTP {}",

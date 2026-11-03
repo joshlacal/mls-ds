@@ -53,6 +53,11 @@ pub use runtime::install_test_https_relationship_resolver;
 pub use runtime::ChatRuntime;
 pub use subscribe_events::{parse_query as parse_subscribe_events_query, SubscribeEventsQuery};
 
+pub(crate) use accept_conversation::execute_admitted as execute_federated_group_acceptance;
+pub(crate) use acknowledge_entries::execute_for_principal as execute_federated_group_entries_ack;
+pub(crate) use conversation_state::execute_federated_read as execute_federated_conversation_state_read;
+pub(crate) use welcome::execute_admitted as execute_federated_group_welcome;
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn admit_signed_operation_for_test(
     pool: &DbPool,
@@ -78,7 +83,11 @@ where
 
     fn call(self, req: axum::extract::Request, state: S) -> Self::Future {
         let clock = Arc::clone(<Arc<ChatRuntime> as FromRef<S>>::from_ref(&state).clock());
+        #[cfg(feature = "sim")]
+        let sim_hooks = <Arc<ChatRuntime> as FromRef<S>>::from_ref(&state).sim_hooks();
         let inner = self.0.call(req, state);
+        #[cfg(feature = "sim")]
+        let inner = crate::sim_hooks::scope_optional_sim_ds(sim_hooks, inner);
         Box::pin(async move {
             let deterministic = clock.is_deterministic();
             let scoped = crate::sim_hooks::scope_ds_clock(clock, inner);
@@ -136,6 +145,45 @@ where
     router
         .merge(implemented_routes::<S>())
         .layer(axum::middleware::from_fn(attach_canonical_query_header))
+}
+
+/// Build the `blue.catbird.mlsDS.*` router with per-runtime clock and simulation scoping.
+pub fn mls_ds_router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    DbPool: FromRef<S>,
+    Arc<ChatRuntime>: FromRef<S>,
+    Option<Arc<crate::federation::AckSigner>>: FromRef<S>,
+{
+    Router::new()
+        .route(
+            "/xrpc/blue.catbird.mlsDS.deliverMessage",
+            spost(crate::handlers::ds::deliver_message).layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            spost(crate::handlers::ds::deliver_welcome).layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.submitCommit",
+            spost(crate::handlers::ds::submit_commit).layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
+            sget(crate::handlers::ds::get_convo_digest),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
+            sget(crate::handlers::ds::get_convo_events),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.transferSequencer",
+            spost(crate::handlers::ds::transfer_sequencer),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.healthCheck",
+            sget(crate::handlers::ds::health_check),
+        )
 }
 
 async fn attach_canonical_query_header(

@@ -41,6 +41,18 @@ The authority first persists a pending-deletion state that refuses new credentia
 
 Once terminal, policy, placement discovery, reference reads, wrapped-key lookup (`findMeks`), writes and attachment-liveness checks fail closed with `SpaceDeleted`. Swan may acknowledge deletion only after the DS succeeds and local terminal state plus standard deletion notifications to registered recipients are durable. A failed DS request leaves the authority pending and credential issuance disabled; retries cannot create another generation. Recipient notification handling must reject a previously cached credential after receiving the terminal notification. Local runtime verification of these separate stages is recorded in [the verification report](SPACE_CONVERSATION_STORAGE_VERIFICATION.md); this contract alone is not a production lifecycle qualification.
 
+## Conversation close and operational wipe
+
+`CatbirdMlsClient::close_conversation` signs the canonical close request and calls `blue.catbird.chat.closeConversation`. A direct participant can close a direct conversation; a group can close only when its final participant is an active administrator.
+
+The sequencer authorizes the close, records its immutable completion and signed terminal entry, and calls `chat.wipe_closed_conversation_operational_rows` in the same transaction. The wipe removes operational conversation history, ciphertext, membership, request deliveries and Space bindings. It releases the remaining retained request charge, including when part of that charge was already reclaimed. Permanent request-attempt receipts, immutable events and operation completions remain as terminal evidence rather than live conversation state.
+
+The sequencer captures the historical remote audience and Space-deletion targets before the wipe, then sends `deliverGroupEntry` and Space-deletion notifications after commit. A recipient home verifies the authenticated close and applies the same wipe to its mirrored or transport-only conversation. The signed close survives as an attachment keyed by its immutable `conversationClosed` event, not as a conversation row. `getEntries` exposes only that terminal entry to devices in the event's frozen audience, so an offline peer can learn the close without retaining application ciphertext.
+
+Replaying the exact signed close and idempotency key returns the original response bytes without recreating operational rows. A new close against the wiped conversation returns `ConversationNotFound`. The native client retains already decrypted local history, marks its coordinate closed, and refuses further sends.
+
+`ipados_ios_second_device_every_row_branches` covers zero operational residue, peer retrieval of the signed close, rejection of a fresh close, and byte-identical late replay of the original close.
+
 ## Local verification
 
 `server/tests/labyrinth_space.rs` uses disposable PostgreSQL databases and the actual authenticated Axum routes. Its deterministic encrypted-byte fixtures test admission and persistence only; they do not assert live PDS publication or successful MLS decryption. The normal suite covers reference/CID binding, replay, per-MEK reads, server ordering, generation bounds, redaction, terminal deletion, SQL immutability, and the authority policy route.

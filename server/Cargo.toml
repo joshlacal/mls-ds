@@ -246,6 +246,7 @@ server-bin = []
 chat-protocol-production-proof = []
 subscription-production-proof = []
 test-support = []
+sim = []
 
 [lints.rust]
 dead_code = "allow"

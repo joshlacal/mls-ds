@@ -1,13 +1,14 @@
 pub mod ack;
-#[cfg(not(any(test, feature = "test-support")))]
+#[cfg(not(any(test, feature = "test-support", feature = "sim")))]
 pub(crate) mod bootstrap;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "sim"))]
 pub mod bootstrap;
 pub mod canonical_relay;
 pub mod commit_submitter;
 pub mod declaration_client;
 pub mod envelope;
 pub mod errors;
+pub mod group_fanout;
 pub mod group_relay;
 pub mod outbound;
 pub mod peer_policy;
@@ -21,13 +22,13 @@ pub mod space_read_relay;
 pub mod transfer;
 
 pub use ack::*;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "sim"))]
 pub use bootstrap::{
     bootstrap_remote_mailbox_from_selector, compute_bootstrap_advisory_lock_key,
     fetch_remote_prefix_admission, QuarantineReason, RemotePrefixApplyOutcome,
     RemotePrefixBootstrapError, RemotePrefixBootstrapSelector, VerifiedRemotePrefixAdmission,
 };
-#[cfg(not(any(test, feature = "test-support")))]
+#[cfg(not(any(test, feature = "test-support", feature = "sim")))]
 pub(crate) use bootstrap::{
     bootstrap_remote_mailbox_from_selector, compute_bootstrap_advisory_lock_key,
     fetch_remote_prefix_admission, QuarantineReason, RemotePrefixApplyOutcome,
@@ -160,6 +161,21 @@ pub(crate) fn parse_capabilities_from_json_array(
 }
 
 pub fn local_federation_capabilities() -> Vec<String> {
+    #[cfg(feature = "sim")]
+    if crate::sim_hooks::active_sim_ds().is_some() {
+        let configured = std::env::var("FEDERATION_CAPABILITIES")
+            .ok()
+            .map(|raw| parse_capabilities_csv(&raw))
+            .unwrap_or_default();
+        if !configured.is_empty() {
+            return configured;
+        }
+        return vec![
+            CAPABILITY_BASELINE.to_string(),
+            CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
+            CAPABILITY_RECONCILIATION_V1.to_string(),
+        ];
+    }
     let configured = std::env::var("FEDERATION_CAPABILITIES")
         .ok()
         .map(|raw| parse_capabilities_csv(&raw))
@@ -347,6 +363,31 @@ impl FederationConfig {
             // N31: fail-loudly identity — no hardcoded fallback DID/endpoint.
             self_did: crate::identity::service_did(),
             self_endpoint: crate::identity::self_endpoint(),
+            #[cfg(feature = "sim")]
+            signing_key_pem: match crate::sim_hooks::active_sim_ds()
+                .and_then(|hooks| hooks.signing_key_pem.clone())
+                .filter(|pem| !pem.trim().is_empty())
+            {
+                Some(pem) => Some(pem),
+                None => match std::env::var("SIGNING_KEY_PEM") {
+                    Ok(pem) if !pem.trim().is_empty() => Some(pem),
+                    _ => match std::env::var("SIGNING_KEY_PATH")
+                        .or_else(|_| std::env::var("SIGNING_KEY_FILE"))
+                    {
+                        Ok(path) if !path.trim().is_empty() => {
+                            let content = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+                                panic!(
+                                    "Configured signing key file '{}' could not be read: {}",
+                                    path, err
+                                );
+                            });
+                            Some(content)
+                        }
+                        _ => None,
+                    },
+                },
+            },
+            #[cfg(not(feature = "sim"))]
             signing_key_pem: match std::env::var("SIGNING_KEY_PEM") {
                 Ok(pem) if !pem.trim().is_empty() => Some(pem),
                 _ => match std::env::var("SIGNING_KEY_PATH")

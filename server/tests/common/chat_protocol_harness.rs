@@ -82,6 +82,8 @@ pub mod repository {
     pub mod acceptance;
     #[path = "../../../server/src/chat_protocol/repository/auth.rs"]
     pub mod auth;
+    #[path = "../../../server/src/chat_protocol/repository/close_terminal.rs"]
+    pub mod close_terminal;
     #[path = "../../../server/src/chat_protocol/repository/conversation.rs"]
     pub mod conversation;
     #[path = "../../../server/src/chat_protocol/repository/coordinate.rs"]

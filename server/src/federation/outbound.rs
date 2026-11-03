@@ -171,12 +171,8 @@ impl OutboundClient {
             .post(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .header("Content-Type", "application/json")
-            .json(body)
-            .send();
-        let resp = tokio::time::timeout_at(deadline, send)
-            .await
-            .map_err(|_| timeout_error(method))?
-            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
+            .json(body);
+        let resp = send_ordinary_request(send, deadline, method).await?;
 
         parse_response(resp, method, deadline).await
     }
@@ -199,12 +195,8 @@ impl OutboundClient {
             .post(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .header("Content-Type", "application/json")
-            .json(body)
-            .send();
-        let resp = tokio::time::timeout_at(deadline, send)
-            .await
-            .map_err(|_| timeout_error(method))?
-            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
+            .json(body);
+        let resp = send_ordinary_request(send, deadline, method).await?;
 
         parse_response(resp, method, deadline).await
     }
@@ -231,12 +223,8 @@ impl OutboundClient {
             .post(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .header("Content-Type", "application/json")
-            .json(body)
-            .send();
-        let resp = tokio::time::timeout_at(deadline, send)
-            .await
-            .map_err(|_| timeout_error(method))?
-            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
+            .json(body);
+        let resp = send_ordinary_request(send, deadline, method).await?;
         let status = resp.status();
         if status.is_redirection() {
             return Err(OutboundError::InvalidResponse {
@@ -271,12 +259,8 @@ impl OutboundClient {
         let send = client
             .get(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
-            .query(params)
-            .send();
-        let resp = tokio::time::timeout_at(deadline, send)
-            .await
-            .map_err(|_| timeout_error(method))?
-            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
+            .query(params);
+        let resp = send_ordinary_request(send, deadline, method).await?;
 
         let status = resp.status();
         if status.is_redirection() {
@@ -321,12 +305,8 @@ impl OutboundClient {
         let send = client
             .get(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
-            .query(params)
-            .send();
-        let resp = tokio::time::timeout_at(deadline, send)
-            .await
-            .map_err(|_| timeout_error(method))?
-            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
+            .query(params);
+        let resp = send_ordinary_request(send, deadline, method).await?;
         decode_raw_json_response(resp, method, deadline, REMOTE_DS).await
     }
 
@@ -347,12 +327,8 @@ impl OutboundClient {
             .post(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .header("Content-Type", "application/json")
-            .json(body)
-            .send();
-        let resp = tokio::time::timeout_at(deadline, send)
-            .await
-            .map_err(|_| timeout_error(method))?
-            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
+            .json(body);
+        let resp = send_ordinary_request(send, deadline, method).await?;
         decode_raw_json_response(resp, method, deadline, endpoint).await
     }
 
@@ -407,6 +383,27 @@ fn classify_ordinary_reqwest_error(error: reqwest::Error, method: &str) -> Outbo
             reason: "request failed".to_string(),
         }
     }
+}
+
+async fn send_ordinary_request(
+    request: reqwest::RequestBuilder,
+    deadline: Instant,
+    method: &str,
+) -> Result<reqwest::Response, OutboundError> {
+    #[cfg(feature = "sim")]
+    if let Some(response) = crate::sim_hooks::intercept_sim_http(&request) {
+        return tokio::time::timeout_at(deadline, response)
+            .await
+            .map_err(|_| timeout_error(method))?
+            .map_err(|reason| OutboundError::ConnectionFailed {
+                endpoint: REMOTE_DS.to_string(),
+                reason,
+            });
+    }
+    tokio::time::timeout_at(deadline, request.send())
+        .await
+        .map_err(|_| timeout_error(method))?
+        .map_err(|error| classify_ordinary_reqwest_error(error, method))
 }
 
 async fn parse_response(

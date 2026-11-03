@@ -75,7 +75,33 @@ pub async fn submit_commit(
         )
         .await?;
 
+        let mut commit_entry_val =
+            serde_json::to_value(&output.commit_entry).map_err(FederationError::Json)?;
+        if commit_entry_val.get("$type").is_none() {
+            commit_entry_val["$type"] = serde_json::json!("blue.catbird.chat.defs#commitEntry");
+        }
+        let fanout =
+            crate::federation::group_fanout::prepare_group_entry_fanout(&mut tx, &commit_entry_val)
+                .await
+                .map_err(|e| FederationError::Storage(format!("prepare group fanout: {e}")))?;
+        let local_push = match runtime.push_gateway_client() {
+            Some(_) => {
+                crate::push_gateway::client::prepare_local_entry_wake(&mut tx, &commit_entry_val)
+                    .await
+                    .map_err(FederationError::Database)?
+            }
+            None => None,
+        };
+
         tx.commit().await.map_err(FederationError::Database)?;
+
+        if let Some(fanout) = fanout {
+            runtime.spawn_post_commit_group_entry_fanout(&pool, fanout);
+        }
+        if let Some(wake) = local_push {
+            runtime.spawn_post_commit_local_push(&pool, wake);
+        }
+        runtime.notify_events();
 
         debug!(
             delivery_id = %output.receipt.delivery_id,

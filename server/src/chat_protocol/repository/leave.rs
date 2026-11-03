@@ -646,6 +646,61 @@ async fn lock_leave_replay_post_state(
         .accepted_wrapper_bytes()
         .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
     let entry: Option<(Uuid, i64, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as("SELECT entry_id,seq,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes FROM chat.entries WHERE conversation_id=$1 AND signed_request_bytes=$2 FOR SHARE").bind(parsed.conversation_id).bind(accepted).fetch_optional(&mut **transaction).await?;
+    if entry.is_none() && parsed.kind == SignedMutationKind::ConversationClose {
+        let head_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id=$1)",
+        )
+        .bind(parsed.conversation_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if head_exists {
+            return Err(LeaveFacadeError::InvalidCanonicalMaterial);
+        }
+        let completed =
+            super::auth::load_signed_operation_replay_completion(transaction, locked.authority())
+                .await?
+                .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
+        let response: Value = serde_json::from_slice(completed.response_bytes())
+            .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
+        let resp_entry = response
+            .pointer("/result/entry")
+            .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
+        let entry_id = resp_entry
+            .get("entryId")
+            .and_then(Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
+        let seq = resp_entry
+            .get("seq")
+            .and_then(Value::as_i64)
+            .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
+        let generation = resp_entry
+            .pointer("/signedRequest/body/retired/generation")
+            .and_then(Value::as_i64)
+            .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
+        let state_version = resp_entry
+            .pointer("/signedRequest/body/retired/stateVersion")
+            .and_then(Value::as_i64)
+            .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
+        if seq <= 0
+            || resp_entry
+                .get("conversationId")
+                .and_then(Value::as_str)
+                .and_then(|s| Uuid::parse_str(s).ok())
+                != Some(parsed.conversation_id)
+        {
+            return Err(LeaveFacadeError::InvalidCanonicalMaterial);
+        }
+        return LeaveReplayPostStateProof::new(
+            locked,
+            &completed,
+            entry_id,
+            seq,
+            generation,
+            state_version,
+        )
+        .ok_or(LeaveFacadeError::InvalidCanonicalMaterial);
+    }
     let (entry_id, seq, accepted_payload, accepted_payload_sha256, signed_request_bytes) =
         entry.ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
     if signed_request_bytes != accepted

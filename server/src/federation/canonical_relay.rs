@@ -284,10 +284,7 @@ pub async fn check_pair_owner_fence(
 /// Mint an authenticated S2S service token with explicit target audience and method NSID.
 pub fn mint_s2s_auth_token(target_did: &str, method: &str) -> Result<String, FederationError> {
     let service_did = crate::identity::service_did();
-    let signing_key_pem =
-        std::env::var("SIGNING_KEY_PEM").map_err(|_| FederationError::ConfigError {
-            reason: "SIGNING_KEY_PEM is required for S2S federation".to_string(),
-        })?;
+    let signing_key_pem = configured_s2s_signing_key_pem()?;
     let client = ServiceAuthClient::from_es256_pem(service_did, signing_key_pem.as_bytes(), None)
         .map_err(|e| FederationError::ConfigError {
         reason: format!("ServiceAuthClient error: {e}"),
@@ -297,6 +294,22 @@ pub fn mint_s2s_auth_token(target_did: &str, method: &str) -> Result<String, Fed
         .map_err(|e| FederationError::AuthFailed {
             reason: format!("mint S2S token error: {e}"),
         })
+}
+
+pub(crate) fn configured_s2s_signing_key_pem() -> Result<String, FederationError> {
+    #[cfg(feature = "sim")]
+    if let Some(hooks) = crate::sim_hooks::active_sim_ds() {
+        if let Some(pem) = hooks
+            .signing_key_pem
+            .as_ref()
+            .filter(|pem| !pem.trim().is_empty())
+        {
+            return Ok(pem.clone());
+        }
+    }
+    std::env::var("SIGNING_KEY_PEM").map_err(|_| FederationError::ConfigError {
+        reason: "SIGNING_KEY_PEM is required for S2S federation".to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -753,15 +766,40 @@ pub async fn relay_get_outcome(
 // Local Staging and Ingestion
 // ---------------------------------------------------------------------------
 
-/// Stage remote recipient device packages into the coordinator's local tables.
+/// Resolve recipient key authority before opening the staging transaction.
+pub(crate) async fn resolve_remote_recipient_device_keys(
+    pool: &DbPool,
+    recipient_did: &str,
+) -> Result<Vec<Vec<u8>>, FederationError> {
+    let resolver = DsResolver::with_default_endpoint(
+        pool.clone(),
+        super::resolver::build_resolver_http_client(),
+        crate::identity::service_did(),
+        crate::identity::self_endpoint(),
+        None,
+        0,
+    );
+    let keys = resolver
+        .resolve_authorized_device_keys(recipient_did)
+        .await?;
+    if keys.is_empty() {
+        return Err(FederationError::Forbidden(
+            "recipient PDS authorizes no MLS device keys".into(),
+        ));
+    }
+    Ok(keys)
+}
+
+/// Stage remote recipient device packages using authority resolved before the transaction.
 ///
 /// Cryptographically verifies Ed25519 thumbprint, signed grant, and MLS KeyPackage
-/// before atomically inserting into coordinator repository tables.
+/// before atomically inserting into coordinator repository tables. No network or
+/// second pool connection may be used while the transaction is held.
 pub async fn stage_remote_recipient_devices(
-    pool: &DbPool,
     tx: &mut Transaction<'_, Postgres>,
     request_id: Uuid,
     devices: &[RemoteDeviceBootstrap],
+    authorized_keys: &[Vec<u8>],
     now: DateTime<Utc>,
 ) -> Result<(), FederationError> {
     let recipient_did = devices
@@ -771,17 +809,6 @@ pub async fn stage_remote_recipient_devices(
         })?
         .owner_did
         .as_str();
-    let resolver = DsResolver::with_default_endpoint(
-        pool.clone(),
-        super::resolver::build_resolver_http_client(),
-        crate::identity::service_did(),
-        crate::identity::self_endpoint(),
-        None,
-        0,
-    );
-    let authorized_keys = resolver
-        .resolve_authorized_device_keys(recipient_did)
-        .await?;
     if authorized_keys.is_empty() {
         return Err(FederationError::Forbidden(
             "recipient PDS authorizes no MLS device keys".into(),
@@ -3014,18 +3041,18 @@ pub async fn coordinator_prepare_direct_request(
     .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     let reserved_remote_devices = if !has_existing_attempt && !coord.is_recipient_home {
-        Some(
-            reserve_remote_recipient_bootstrap(
-                pool,
-                &coord.recipient_home.endpoint,
-                &coord.recipient_home.did,
-                request_id,
-                actor_did,
-                recipient_did,
-                Some(signed_req.clone()),
-            )
-            .await?,
+        let authorized_keys = resolve_remote_recipient_device_keys(pool, recipient_did).await?;
+        let devices = reserve_remote_recipient_bootstrap(
+            pool,
+            &coord.recipient_home.endpoint,
+            &coord.recipient_home.did,
+            request_id,
+            actor_did,
+            recipient_did,
+            Some(signed_req.clone()),
         )
+        .await?;
+        Some((devices, authorized_keys))
     } else {
         None
     };
@@ -3041,7 +3068,9 @@ pub async fn coordinator_prepare_direct_request(
         .execute(&mut *tx)
         .await
     {
-        drop(tx);
+        tx.rollback()
+            .await
+            .map_err(|error| FederationError::Storage(error.to_string()))?;
         if reserved_remote_devices.is_some() {
             let _ = release_remote_recipient_bootstrap(
                 pool,
@@ -3074,7 +3103,9 @@ pub async fn coordinator_prepare_direct_request(
                 "Direct request already in progress for this pair".to_string()
             }
         };
-        drop(tx);
+        tx.rollback()
+            .await
+            .map_err(|error| FederationError::Storage(error.to_string()))?;
         if reserved_remote_devices.is_some() {
             let _ = release_remote_recipient_bootstrap(
                 pool,
@@ -3140,7 +3171,7 @@ pub async fn coordinator_prepare_direct_request(
         tx.commit()
             .await
             .map_err(|e| FederationError::Storage(e.to_string()))?;
-        if (rejected || reserved_remote_devices.is_some()) && !coord.is_recipient_home {
+        if rejected && !coord.is_recipient_home {
             release_remote_recipient_bootstrap(
                 pool,
                 &coord.recipient_home.endpoint,
@@ -3165,7 +3196,9 @@ pub async fn coordinator_prepare_direct_request(
 
         if let Some((status, gen)) = existing_device {
             if status != "active" {
-                drop(tx);
+                tx.rollback()
+                    .await
+                    .map_err(|error| FederationError::Storage(error.to_string()))?;
                 if reserved_remote_devices.is_some() {
                     let _ = release_remote_recipient_bootstrap(
                         pool,
@@ -3181,7 +3214,9 @@ pub async fn coordinator_prepare_direct_request(
                 ));
             }
             if auth_gen < gen {
-                drop(tx);
+                tx.rollback()
+                    .await
+                    .map_err(|error| FederationError::Storage(error.to_string()))?;
                 if reserved_remote_devices.is_some() {
                     let _ = release_remote_recipient_bootstrap(
                         pool,
@@ -3210,7 +3245,9 @@ pub async fn coordinator_prepare_direct_request(
 
         if let Some(existing_pk) = existing_key {
             if &existing_pk != pub_key {
-                drop(tx);
+                tx.rollback()
+                    .await
+                    .map_err(|error| FederationError::Storage(error.to_string()))?;
                 if reserved_remote_devices.is_some() {
                     let _ = release_remote_recipient_bootstrap(
                         pool,
@@ -3279,11 +3316,19 @@ pub async fn coordinator_prepare_direct_request(
     );
 
     let signed_bytes = serde_json::to_vec(signed_req).map_err(FederationError::Json)?;
-    if let Some(ref remote_devices) = reserved_remote_devices {
-        if let Err(e) =
-            stage_remote_recipient_devices(pool, &mut tx, request_id, remote_devices, now).await
+    if let Some((remote_devices, authorized_keys)) = reserved_remote_devices.as_ref() {
+        if let Err(e) = stage_remote_recipient_devices(
+            &mut tx,
+            request_id,
+            remote_devices,
+            authorized_keys,
+            now,
+        )
+        .await
         {
-            drop(tx);
+            tx.rollback()
+                .await
+                .map_err(|error| FederationError::Storage(error.to_string()))?;
             release_remote_recipient_bootstrap(
                 pool,
                 &coord.recipient_home.endpoint,
@@ -3309,7 +3354,9 @@ pub async fn coordinator_prepare_direct_request(
         {
             Ok(r) => r,
             Err(e) => {
-                drop(tx);
+                tx.rollback()
+                    .await
+                    .map_err(|error| FederationError::Storage(error.to_string()))?;
                 if reserved_remote_devices.is_some() {
                     release_remote_recipient_bootstrap(
                         pool,
@@ -4405,6 +4452,18 @@ pub async fn coordinator_handle_message(
             ));
         }
     };
+    // A replay returns its stored seq; this receipt signs only a fresh append.
+    if let (true, Some(rcpt)) = (seq as i64 == next_seq, &i13_receipt_json) {
+        let rcpt_bytes = serde_json::to_vec(rcpt).map_err(FederationError::Json)?;
+        crate::chat_protocol::repository::delivery::set_entry_sequencer_receipt(
+            &mut tx,
+            conversation_id,
+            seq,
+            &rcpt_bytes,
+        )
+        .await
+        .map_err(|e| FederationError::Storage(format!("{e:?}")))?;
+    }
 
     let _ = crate::chat_protocol::repository::message_event::append_message_available_event(
         &mut tx,

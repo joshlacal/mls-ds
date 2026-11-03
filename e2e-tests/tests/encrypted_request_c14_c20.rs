@@ -288,7 +288,7 @@ fn alice_event_audience(
 fn durable_comprehensive(
     f: &live_direct_request::PublishedRequestFixture,
 ) -> anyhow::Result<String> {
-    let (r, c, a, b) = (f.request_id, f.conversation_id, &f.alice.did, &f.bob.did);
+    let (r, c) = (f.request_id, f.conversation_id);
     psql_cmd(&format!(
         r#"SELECT jsonb_build_object(
       'conversation',(SELECT to_jsonb(x) FROM chat.conversations x WHERE conversation_id='{c}'),
@@ -300,8 +300,6 @@ fn durable_comprehensive(
       'participants',(SELECT jsonb_agg(to_jsonb(p) ORDER BY user_did) FROM chat.participants p WHERE conversation_id='{c}'),
       'entries',(SELECT jsonb_agg(to_jsonb(e) ORDER BY seq) FROM chat.entries e WHERE conversation_id='{c}'),
       'transitions',(SELECT jsonb_agg(to_jsonb(t) ORDER BY transition_id) FROM chat.transitions t WHERE conversation_id='{c}'),
-      'blobs',(SELECT count(*) FROM chat.blobs WHERE owner_did IN ('{a}', '{b}')),
-      'blobBindings',(SELECT count(*) FROM chat.blob_bindings WHERE conversation_id='{c}'),
       'resets',(SELECT count(*) FROM chat.reset_requests WHERE conversation_id='{c}'),
       'recoveries',(SELECT count(*) FROM chat.leaf_recovery_requests WHERE conversation_id='{c}')
     )::text"#
@@ -2002,7 +2000,7 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
     );
 
     // 2. Terminal close (account decline / creator close): Alice calls closeConversation with real signed conversationCloseBody -> succeeds!
-    let (close_env, close_tx_id) = close_envelope(&f, true, None)?;
+    let (close_env, _) = close_envelope(&f, true, None)?;
     let (close_status, close_bytes) = f
         .alice
         .post(
@@ -2023,18 +2021,13 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         close_resp["result"]["tombstone"].is_object(),
         "Close response must contain tombstone"
     );
+    encrypted_requests::assert_closed_conversation_wiped(
+        f.conversation_id,
+        Some(f.request_id),
+    )?;
     assert_eq!(
-        psql_cmd(&format!(
-            "SELECT lifecycle FROM chat.conversations WHERE conversation_id='{}'",
-            f.conversation_id
-        ))?,
-        "superseded",
-        "Conversation lifecycle must be superseded after signed close"
-    );
-    assert_eq!(
-        psql_cmd(&format!("SELECT count(*) FROM chat.transitions WHERE transition_id='{close_tx_id}' AND kind='closeConversation'"))?,
-        "1",
-        "Production code must record closeConversation transition row"
+        close_resp["result"]["entry"]["signedRequest"], close_env["signedRequest"],
+        "the retained terminal entry binds the exact authenticated close"
     );
 
     release_by_close(&third).await?;
@@ -2302,7 +2295,7 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
     );
 
     // 2. Authoritative signed close via the real closeConversation RPC by Bob (pending invitee)
-    let (close_env, close_tx_id) = close_envelope(&f, false, None)?;
+    let (close_env, _) = close_envelope(&f, false, None)?;
     let (close_status, close_bytes) = f
         .bob
         .post(
@@ -2328,50 +2321,13 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
         "Close response must contain close entry"
     );
 
-    // Verify in database: FK linkage to transitions is produced by production code!
-    let conv_row = psql_cmd(&format!(
-        "SELECT lifecycle, close_transition_id, close_seq FROM chat.conversations WHERE conversation_id='{}'",
-        f.conversation_id
-    ))?;
-    let parts: Vec<&str> = conv_row.split('|').collect();
+    encrypted_requests::assert_closed_conversation_wiped(
+        f.conversation_id,
+        Some(f.request_id),
+    )?;
     assert_eq!(
-        parts[0], "superseded",
-        "Conversation lifecycle must be superseded"
-    );
-    assert_eq!(
-        parts[1],
-        close_tx_id.to_string(),
-        "close_transition_id must match signed transitionId"
-    );
-
-    let transition_count: i64 = psql_cmd(&format!(
-        "SELECT count(*) FROM chat.transitions WHERE transition_id='{close_tx_id}' AND kind='closeConversation' AND conversation_id='{}'",
-        f.conversation_id
-    ))?.parse()?;
-    assert_eq!(
-        transition_count, 1,
-        "chat.transitions must record closeConversation transition with exact FK"
-    );
-
-    let consent_state: String = psql_cmd(&format!(
-        "SELECT consent FROM chat.direct_request_lifecycle WHERE conversation_id='{}'",
-        f.conversation_id
-    ))?;
-    assert_eq!(
-        consent_state, "closed",
-        "direct_request_lifecycle consent must be closed"
-    );
-
-    // F1 (migration 20260919000021): publication already retired the pending
-    // charge, so the signed close writes no pending release.
-    let pending_releases: i64 = psql_cmd(&format!(
-        "SELECT count(*) FROM chat.direct_request_pending_releases WHERE request_id='{}'",
-        f.request_id
-    ))?
-    .parse()?;
-    assert_eq!(
-        pending_releases, 0,
-        "close must not write a pending release after F1"
+        close_resp["result"]["entry"]["signedRequest"], close_env["signedRequest"],
+        "the retained terminal entry binds the exact authenticated close"
     );
 
     let durable_after_close = durable_comprehensive(&f)?;
@@ -2480,8 +2436,8 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
     );
     let ack_err: Value = serde_json::from_slice(&ack_bytes)?;
     assert_eq!(
-        ack_err["error"], "WelcomeSuperseded",
-        "Late ack on closed conversation returns typed WelcomeSuperseded error"
+        ack_err["error"], "WelcomeNotFound",
+        "the wiped Welcome cannot be acknowledged or recreated"
     );
     assert_eq!(
         durable_comprehensive(&f)?,
@@ -2572,10 +2528,9 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
         reqwest::StatusCode::OK,
         "Exact close replay must succeed 200"
     );
-    let replay_resp: Value = serde_json::from_slice(&replay_bytes)?;
     assert_eq!(
-        replay_resp, close_resp,
-        "Replayed close response must equal original tombstone/entry"
+        replay_bytes, close_bytes,
+        "replay returns the byte-identical retained tombstone and signed entry"
     );
     assert_eq!(
         durable_comprehensive(&f)?,
@@ -2713,14 +2668,10 @@ async fn c20_close_racing_accept_close_wins() -> anyhow::Result<()> {
         "Loser accept gets InvitationNotPending"
     );
 
-    let winners: String = psql_cmd(&format!(
-        "SELECT string_agg(kind, ',' ORDER BY kind) FROM chat.transitions WHERE conversation_id='{}' AND kind IN ('closeConversation','directRequestAcceptance')",
-        f.conversation_id
-    ))?;
-    assert_eq!(
-        winners, "closeConversation",
-        "only close transition is durable"
-    );
+    encrypted_requests::assert_closed_conversation_wiped(
+        f.conversation_id,
+        Some(f.request_id),
+    )?;
     release_by_close(&f).await?;
     Ok(())
 }
@@ -2904,7 +2855,7 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
             "signedAt": canonical_now()
         }),
     )?;
-    let (close_env, close_tx_id) = close_envelope(&f, true, None)?;
+    let (close_env, _) = close_envelope(&f, true, None)?;
 
     let barrier = Barrier::hold(&[&f.alice.did, &f.bob.did])?;
     let close_future = {
@@ -2949,22 +2900,17 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
     let (ack_status, ack_bytes) = ack_future.await??;
     eprintln!("C20 close-vs-import race: queued={queued} close={close_status} ack={ack_status}");
 
-    // Close is always permitted while pending, so it is the authoritative outcome
-    // regardless of order; the ack is durable iff it committed before the close.
+    // Close remains authoritative regardless of order. A successful earlier
+    // acknowledgement is wiped with the rest of the operational conversation.
     anyhow::ensure!(
         close_status == reqwest::StatusCode::OK,
         "close must win: {close_status}: {}",
         String::from_utf8_lossy(&close_bytes)
     );
-    assert_eq!(
-        psql_cmd(&format!("SELECT count(*) FROM chat.transitions WHERE conversation_id='{}' AND kind='closeConversation' AND transition_id='{close_tx_id}'", f.conversation_id))?,
-        "1",
-        "the signed close is the single durable close transition"
-    );
-    let acknowledged = psql_cmd(&format!(
-        "SELECT count(*) FROM chat.direct_request_welcome_outcomes WHERE request_id='{}' AND status='acknowledged'",
-        f.request_id
-    ))?;
+    encrypted_requests::assert_closed_conversation_wiped(
+        f.conversation_id,
+        Some(f.request_id),
+    )?;
     if !ack_status.is_success() {
         assert_eq!(
             ack_status,
@@ -2973,25 +2919,12 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
         );
         let ack_err: Value = serde_json::from_slice(&ack_bytes)?;
         assert_eq!(
-            ack_err["error"], "WelcomeSuperseded",
-            "Late ack must return typed WelcomeSuperseded error"
+            ack_err["error"], "WelcomeNotFound",
+            "an acknowledgement after the wipe cannot find its Welcome"
         );
     }
-    assert_eq!(
-        acknowledged,
-        if ack_status.is_success() { "1" } else { "0" },
-        "ack durability must match its response"
-    );
-
-    // Authoritative outcome is that the conversation is superseded
-    let lifecycle: String = psql_cmd(&format!(
-        "SELECT lifecycle FROM chat.conversations WHERE conversation_id='{}'",
-        f.conversation_id
-    ))?;
-    assert_eq!(
-        lifecycle, "superseded",
-        "Authoritative outcome must be superseded"
-    );
+    // An earlier successful acknowledgement does not retain operational rows.
+    // An exact completed close remains replayable through its retained receipt.
 
     // Bob's subsequent accept attempt is rejected with InvitationNotPending
     let transition_id = Uuid::new_v4();

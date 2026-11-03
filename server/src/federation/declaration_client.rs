@@ -252,6 +252,21 @@ impl DeviceRecordClient {
         deadline: tokio::time::Instant,
         did: &str,
     ) -> Result<reqwest::Response, FederationError> {
+        #[cfg(feature = "sim")]
+        if let Some(response) = crate::sim_hooks::intercept_sim_http(&request) {
+            return tokio::time::timeout_at(deadline, response)
+                .await
+                .map_err(|_| FederationError::ResolutionFailed {
+                    did: did.to_string(),
+                    kind: super::errors::ResolutionFailureKind::Timeout(
+                        "HTTP request failed: outbound request deadline exceeded".to_string(),
+                    ),
+                })?
+                .map_err(|error| FederationError::ResolutionFailed {
+                    did: did.to_string(),
+                    kind: super::errors::ResolutionFailureKind::ConnectionFailed(error),
+                });
+        }
         tokio::time::timeout_at(deadline, request.send())
             .await
             .map_err(|_| FederationError::ResolutionFailed {

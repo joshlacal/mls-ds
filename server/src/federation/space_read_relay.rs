@@ -116,11 +116,9 @@ async fn resolve_ssrf_safe_space_endpoint(
             .resolve_to_addrs(&validated_plc.host, &validated_plc.pinned_addrs)
             .build()
             .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))?;
-        let doc_resp = plc_client
-            .get(&validated_plc.effective_url)
-            .send()
+        let doc_resp = crate::sim_hooks::send_reqwest(plc_client.get(&validated_plc.effective_url))
             .await
-            .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))?;
+            .map_err(SpaceRelayError::UpstreamError)?;
         if !doc_resp.status().is_success() {
             return Err(SpaceRelayError::InvalidTargetEndpoint(format!(
                 "PLC resolution HTTP {}",
@@ -207,11 +205,9 @@ pub async fn relay_space_credential_stateless(
         url.push_str(&urlencoding::encode(kid));
     }
 
-    let resp = client
-        .get(&url)
-        .send()
+    let resp = crate::sim_hooks::send_reqwest(client.get(&url))
         .await
-        .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))?;
+        .map_err(SpaceRelayError::UpstreamError)?;
     let status = resp.status();
     let bytes = resp
         .bytes()
@@ -284,10 +280,9 @@ pub async fn relay_space_read_stateless(
         req = req.header("atproto-space-want-mac", wm.trim());
     }
 
-    let resp = req
-        .send()
+    let resp = crate::sim_hooks::send_reqwest(req)
         .await
-        .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))?;
+        .map_err(SpaceRelayError::UpstreamError)?;
     let status = resp.status().as_u16();
     let content_type = resp
         .headers()

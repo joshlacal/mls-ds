@@ -63,14 +63,14 @@ async fn post_space_notice(
         format!("{target_did_or_ref}#atproto_pds")
     };
     let jwt = runtime.mint_service_jwt(&aud, nsid)?;
-    let resp = http_client
-        .post(&full_url)
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let resp = crate::sim_hooks::send_reqwest(
+        http_client
+            .post(&full_url)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(body),
+    )
+    .await?;
 
     if !resp.status().is_success() {
         return Err(format!(
@@ -266,6 +266,96 @@ pub async fn revoke_inactive_space_credentials_for_conversation(
         .await?;
     }
     Ok(total)
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedSpaceDeletedFanout {
+    pub space_uri: String,
+    pub syncers: Vec<(String, String)>,
+    pub writer_dids: Vec<String>,
+}
+
+/// Capture Space deletion notification targets inside the caller's transaction
+/// before `chat.wipe_closed_conversation_operational_rows` deletes the rows.
+pub async fn prepare_space_deleted_fanout_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    conversation_id: Uuid,
+    generation: i64,
+) -> Result<Option<PreparedSpaceDeletedFanout>, String> {
+    let now = crate::sim_hooks::current_utc();
+    let space_uri: Option<String> = sqlx::query_scalar(
+        "SELECT space_uri FROM chat.conversation_spaces \
+          WHERE conversation_id = $1 AND generation = $2",
+    )
+    .bind(conversation_id)
+    .bind(generation)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some(space_uri) = space_uri else {
+        return Ok(None);
+    };
+    let syncers: Vec<(String, String)> = sqlx::query_as(
+        "SELECT service_ref, endpoint_url \
+           FROM chat.conversation_space_syncers \
+          WHERE space_uri = $1 AND expires_at > $2",
+    )
+    .bind(&space_uri)
+    .bind(now)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    let writer_dids: BTreeSet<String> = sqlx::query_scalar(
+        "SELECT writer_did FROM chat.conversation_space_writers WHERE space_uri = $1",
+    )
+    .bind(&space_uri)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .collect();
+    Ok(Some(PreparedSpaceDeletedFanout {
+        space_uri,
+        syncers,
+        writer_dids: writer_dids.into_iter().collect(),
+    }))
+}
+
+pub async fn deliver_prepared_space_deleted(
+    runtime: &SpaceHostRuntime,
+    prepared: PreparedSpaceDeletedFanout,
+) -> Result<usize, String> {
+    let payload = json!({ "space": prepared.space_uri });
+    let mut delivered = 0_usize;
+    for (service_ref, endpoint_url) in &prepared.syncers {
+        if post_space_notice(
+            runtime,
+            service_ref,
+            Some(endpoint_url),
+            "com.atproto.space.notifySpaceDeleted",
+            &payload,
+        )
+        .await
+        .is_ok()
+        {
+            delivered += 1;
+        }
+    }
+    for writer_did in &prepared.writer_dids {
+        if post_space_notice(
+            runtime,
+            writer_did,
+            None,
+            "com.atproto.space.notifySpaceDeleted",
+            &payload,
+        )
+        .await
+        .is_ok()
+        {
+            delivered += 1;
+        }
+    }
+    Ok(delivered)
 }
 
 /// Mark a conversation generation's Space deleted and fan out `com.atproto.space.notifySpaceDeleted`

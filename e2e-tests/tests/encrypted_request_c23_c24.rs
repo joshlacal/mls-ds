@@ -516,13 +516,13 @@ fn legacy_rows(cid: Uuid) -> anyhow::Result<Value> {
 
 fn head(cid: Uuid) -> anyhow::Result<Value> {
     db_json(&format!(
-        "SELECT json_build_object('protocolVersion',c.protocol_version,'lifecycle',c.lifecycle,\
+        "SELECT COALESCE((SELECT json_build_object('protocolVersion',c.protocol_version,'lifecycle',c.lifecycle,\
          'generation',c.current_generation,'stateVersion',c.current_state_version,'nextSeq',c.next_entry_seq,\
          'groupId',encode(s.group_id,'hex'),'epoch',s.epoch,\
          'pending',(SELECT count(*) FROM chat.participants p WHERE p.conversation_id=c.conversation_id AND p.current_membership AND p.status='pending'),\
          'requests',(SELECT count(*) FROM chat.direct_request_publications r WHERE r.conversation_id=c.conversation_id))\
          FROM chat.conversations c JOIN chat.generation_states s ON s.conversation_id=c.conversation_id \
-         AND s.generation=c.current_generation AND s.state_version=c.current_state_version WHERE c.conversation_id='{cid}'"
+         AND s.generation=c.current_generation AND s.state_version=c.current_state_version WHERE c.conversation_id='{cid}'),'null'::json)"
     ))
 }
 
@@ -1270,11 +1270,16 @@ async fn race(leg: RaceLeg, label: &str) -> anyhow::Result<&'static str> {
         String::from_utf8_lossy(&c_bytes)
     );
     println!("[{label}] head {after}");
-    assert_eq!(
-        legacy_rows(cid)?,
-        l.rows,
-        "[{label}] v1 authority byte-exact"
-    );
+    if matches!(leg, RaceLeg::Close) && c_status == reqwest::StatusCode::OK {
+        encrypted_requests::assert_closed_conversation_wiped(cid, None)?;
+        assert!(after.is_null(), "[{label}] close removes the operational head");
+    } else {
+        assert_eq!(
+            legacy_rows(cid)?,
+            l.rows,
+            "[{label}] v1 authority byte-exact until the conversation closes"
+        );
+    }
     if matches!(leg, RaceLeg::SecondUpgrade) {
         let duplicate = publication_receipt(f, c_status, &c_bytes)?;
         assert_eq!(receipt_kind(&upgrade_receipt).0, PUBLISHED, "[{label}]");
@@ -1360,9 +1365,7 @@ async fn race(leg: RaceLeg, label: &str) -> anyhow::Result<&'static str> {
             "acceptConversation"
         }
         (RaceLeg::Close, false) => {
-            assert_eq!(after["lifecycle"], "superseded", "[{label}]");
-            assert_eq!(after["protocolVersion"], "1", "[{label}]");
-            assert_eq!(after["requests"], 0, "[{label}]");
+            assert!(after.is_null(), "[{label}] close removes the operational head");
             "closeConversation"
         }
         (RaceLeg::Reset, false) => {
@@ -1818,11 +1821,16 @@ async fn controlled(leg: RaceLeg, order: Order, label: &str) -> anyhow::Result<S
         receipt_kind(&receipt),
         c_body["error"].as_str().unwrap_or("ok")
     );
-    assert_eq!(
-        legacy_rows(cid)?,
-        l.rows,
-        "[{label}] v1 authority byte-exact"
-    );
+    if matches!(leg, RaceLeg::Close) && c_status == reqwest::StatusCode::OK {
+        encrypted_requests::assert_closed_conversation_wiped(cid, None)?;
+        assert!(after.is_null(), "[{label}] close removes the operational head");
+    } else {
+        assert_eq!(
+            legacy_rows(cid)?,
+            l.rows,
+            "[{label}] v1 authority byte-exact until the conversation closes"
+        );
+    }
     let outcome = match order {
         Order::UpgradeFirst => {
             assert_eq!(
@@ -1857,11 +1865,13 @@ async fn controlled(leg: RaceLeg, order: Order, label: &str) -> anyhow::Result<S
                 (REJECTED, "StaleLegacyPrior"),
                 "[{label}]"
             );
-            assert_eq!(after["protocolVersion"], "1", "[{label}]");
-            assert_eq!(after["requests"], 0, "[{label}]");
+            if !matches!(leg, RaceLeg::Close) {
+                assert_eq!(after["protocolVersion"], "1", "[{label}]");
+                assert_eq!(after["requests"], 0, "[{label}]");
+            }
             match leg {
                 RaceLeg::Accept => assert_eq!(after["pending"], 0, "[{label}]"),
-                RaceLeg::Close => assert_eq!(after["lifecycle"], "superseded", "[{label}]"),
+                RaceLeg::Close => assert!(after.is_null(), "[{label}] operational head was wiped"),
                 RaceLeg::Reset => assert_eq!(pending_resets(cid)?, "1", "[{label}]"),
                 RaceLeg::SecondUpgrade => unreachable!(),
             }

@@ -109,6 +109,7 @@ pub(in crate::chat_protocol::state_machine::executor) async fn apply_creation(
             activated_seq: seq_i64,
             activated_at: applied_at,
         },
+        crate::identity::service_did_base_opt().as_deref(),
     )
     .await?;
 

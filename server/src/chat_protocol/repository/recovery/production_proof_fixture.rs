@@ -1875,6 +1875,7 @@ pub(super) async fn seed_durable_recovery_fixture_with_pending(
         conversation_id,
         0,
         at,
+        crate::identity::service_did_base_opt().as_deref(),
     )
     .await
     .map_err(|error| format!("register durable fixture space: {error}"))?;
@@ -2195,6 +2196,7 @@ async fn seed_two_member_fixture(
         conversation_id,
         0,
         at,
+        crate::identity::service_did_base_opt().as_deref(),
     )
     .await
     .map_err(|error| format!("register two-member fixture space: {error}"))?;

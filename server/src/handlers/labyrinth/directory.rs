@@ -13,8 +13,8 @@ use serde_json::json;
 use super::params::{admit_procedure, admit_query, begin_write};
 use super::respond;
 use crate::handlers::chat::ChatRuntime;
-use crate::labyrinth::auth::begin_read;
-use crate::labyrinth::error::LabyrinthError;
+use crate::labyrinth::auth::{begin_read, Admission};
+use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
 use crate::labyrinth::repo::{directory as repo, parse_thread_id};
 use crate::labyrinth::wire::bytes::{check_did, Bytes as AtBytes, MAX_EPOCH_NUMBER};
 use crate::labyrinth::wire::io::{body, datetime, to_bytes, Page, PublishHeadIn, Received};
@@ -64,17 +64,19 @@ pub async fn get_epoch_head(
             let did = p.req("did")?.to_owned();
             check_did("did", &did)?;
             let n = p.int("epochNumber", MAX_EPOCH_NUMBER)?;
-            let mut r = begin_read(&pool, adm).await?;
-            let lookup = repo::get_head(&mut r.tx, &did, n)
-                .await?
-                .ok_or_else(|| LabyrinthError::not_found("EpochNotFound"))?;
-            r.finish_read().await?;
-            to_bytes(&json!({
-                "epoch": lookup.epoch,
-                "chain": lookup.chain,
-                "floorSeq": lookup.floor_seq,
-                "receivedAt": datetime(lookup.received_at),
-            }))
+            if let Some(bytes) = crate::federation::group_relay::try_relay_labyrinth_directory(
+                &pool,
+                rt.resolver().map(Arc::as_ref),
+                &adm,
+                &did,
+                "blue.catbird.labyrinth.getEpochHead",
+                q.as_deref(),
+            )
+            .await?
+            {
+                return Ok(bytes);
+            }
+            epoch_response(&pool, adm, &did, n).await
         }
         .await,
     )
@@ -100,24 +102,19 @@ pub async fn get_chat_device_keys(
             let did = p.req("did")?.to_owned();
             check_did("did", &did)?;
             let page = p.page()?;
-            let mut r = begin_read(&pool, adm).await?;
-            let (rows, cursor) = repo::chat_device_keys(&mut r.tx, &did, &page).await?;
-            r.finish_read().await?;
-            let items: Vec<_> = rows
-                .into_iter()
-                .map(|k| {
-                    let mut v = json!({
-                        "keyId": k.key_id,
-                        "signingPublicKey": AtBytes(k.signing_public_key),
-                        "createdAt": datetime(k.created_at),
-                    });
-                    if let Some(at) = k.revoked_at {
-                        v["revokedAt"] = json!(datetime(at));
-                    }
-                    v
-                })
-                .collect();
-            to_bytes(&Page { items, cursor })
+            if let Some(bytes) = crate::federation::group_relay::try_relay_labyrinth_directory(
+                &pool,
+                rt.resolver().map(Arc::as_ref),
+                &adm,
+                &did,
+                "blue.catbird.labyrinth.getChatDeviceKeys",
+                q.as_deref(),
+            )
+            .await?
+            {
+                return Ok(bytes);
+            }
+            keys_response(&pool, adm, &did, &page).await
         }
         .await,
     )
@@ -167,4 +164,116 @@ pub async fn get_member_devices(
         }
         .await,
     )
+}
+
+async fn epoch_response(
+    pool: &DbPool,
+    admission: Admission,
+    did: &str,
+    epoch_number: Option<u64>,
+) -> LabyrinthResult<Vec<u8>> {
+    let mut read = begin_read(pool, admission).await?;
+    let lookup = repo::get_head(&mut read.tx, did, epoch_number)
+        .await?
+        .ok_or_else(|| LabyrinthError::not_found("EpochNotFound"))?;
+    read.finish_read().await?;
+    to_bytes(&json!({
+        "epoch": lookup.epoch,
+        "chain": lookup.chain,
+        "floorSeq": lookup.floor_seq,
+        "receivedAt": datetime(lookup.received_at),
+    }))
+}
+
+async fn keys_response(
+    pool: &DbPool,
+    admission: Admission,
+    did: &str,
+    page: &crate::labyrinth::repo::PageReq,
+) -> LabyrinthResult<Vec<u8>> {
+    let mut read = begin_read(pool, admission).await?;
+    let (rows, cursor) = repo::chat_device_keys(&mut read.tx, did, page).await?;
+    read.finish_read().await?;
+    let items: Vec<_> = rows
+        .into_iter()
+        .map(|key| {
+            let mut item = json!({
+                "keyId": key.key_id,
+                "signingPublicKey": AtBytes(key.signing_public_key),
+                "createdAt": datetime(key.created_at),
+            });
+            if let Some(revoked_at) = key.revoked_at {
+                item["revokedAt"] = json!(datetime(revoked_at));
+            }
+            item
+        })
+        .collect();
+    to_bytes(&Page { items, cursor })
+}
+
+pub(crate) async fn read_federated_directory(
+    pool: &DbPool,
+    endpoint: &str,
+    query: &str,
+    actor: &str,
+    device: uuid::Uuid,
+    proof: crate::labyrinth::read_auth::ReadProof,
+) -> LabyrinthResult<Vec<u8>> {
+    let allowed: &[&str] = match endpoint {
+        "blue.catbird.labyrinth.getEpochHead" => &["did", "epochNumber"],
+        "blue.catbird.labyrinth.getChatDeviceKeys" => &["did", "cursor", "limit"],
+        _ => return Err(LabyrinthError::invalid("unsupported directory endpoint")),
+    };
+    let params = super::params::Params::parse(Some(query), allowed)?;
+    let did = params.req("did")?;
+    check_did("did", did)?;
+    if crate::labyrinth::auth::actor_device_from_query(Some(query))? != device {
+        return Err(LabyrinthError::invalid(
+            "actorDeviceId does not match the relay",
+        ));
+    }
+    let canonical = crate::labyrinth::read_auth::canonical_query(Some(query));
+    let (admission, _) = crate::labyrinth::auth::relayed_read(
+        pool,
+        proof,
+        crate::labyrinth::read_auth::Expected {
+            did: actor,
+            nsid: endpoint,
+            query: Some(&canonical),
+        },
+        &device.to_string(),
+    )
+    .await?;
+    if endpoint == "blue.catbird.labyrinth.getEpochHead" {
+        epoch_response(
+            pool,
+            admission,
+            did,
+            params.int("epochNumber", MAX_EPOCH_NUMBER)?,
+        )
+        .await
+    } else {
+        keys_response(pool, admission, did, &params.page()?).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn federated_directory_rejects_procedures_before_touching_storage() {
+        let pool = crate::storage::DbPool::connect_lazy("postgres://127.0.0.1/unused").unwrap();
+        let result = super::read_federated_directory(
+            &pool,
+            "blue.catbird.labyrinth.purgeMailbox",
+            "",
+            "did:web:actor.catbird.blue",
+            uuid::Uuid::new_v4(),
+            crate::labyrinth::read_auth::ReadProof {
+                header: String::new(),
+                signature: String::new(),
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().name(), "InvalidRequest");
+    }
 }

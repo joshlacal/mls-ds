@@ -2048,9 +2048,8 @@ mod historical_signed_path {
     /// `hydrate_historical_signed_request_from_durable_bytes`: for every signed
     /// kind, deriving the durable-row digest from the bytes (loader path) is
     /// byte-equal to the row path that is handed the digest from its durable row,
-    /// which is in turn byte-equal to append-time admission. It also fails closed
-    /// under a wrong key and a foreign-conversation authority, exactly like the
-    /// row path (the seam re-verifies through `hydrate_historical_signed_request`).
+    /// which is in turn byte-equal to append-time admission and the exact-field
+    /// adapter. Wrong keys and foreign conversations still fail closed.
     #[test]
     fn historical_signed_request_from_durable_bytes_matches_row_path() {
         let conversation_id = uuid_v4_bytes(0x21);
@@ -2075,6 +2074,9 @@ mod historical_signed_path {
 
         for raw in all_kinds(&coordinate, &actor, &signing_key) {
             let mutation = decode_and_verify_signed_mutation(&raw, &verifying).unwrap();
+            let transcript = mutation.transcript_bytes().to_vec();
+            let request_digest = *mutation.request_digest();
+            let signature = *mutation.signature();
             let envelope =
                 DurableSignedRequestEnvelope::new(conversation_id, &trusted_received_at()).unwrap();
             let admitted = append.signed_request(envelope, mutation).unwrap();
@@ -2095,6 +2097,18 @@ mod historical_signed_path {
                 .unwrap();
             assert_eq!(from_bytes, row_path);
             assert_eq!(from_bytes, admitted);
+            let exact = historical
+                .hydrate_historical_signed_request_from_exact_durable_fields(
+                    conversation_id,
+                    RECEIVED_AT,
+                    &raw,
+                    &transcript,
+                    request_digest,
+                    signature,
+                    &verifying,
+                )
+                .unwrap();
+            assert_eq!(exact, from_bytes);
         }
 
         // Wrong key fails closed.
@@ -2120,6 +2134,94 @@ mod historical_signed_path {
             ),
             Err(StateMachineError::InvalidHydrationAuthority)
         );
+    }
+
+    #[test]
+    fn historical_signed_request_durable_adapters_reject_tamper_and_noncanonical_fields() {
+        let conversation_id = uuid_v4_bytes(0x21);
+        let coordinate = sample_coordinate(conversation_id);
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let verifying = signing_key.verifying_key().to_bytes();
+        let actor = sample_actor();
+        let raw = leaf_recovery_request_raw(&coordinate, &actor, uuid_v4_bytes(0x31), &signing_key);
+        let historical = HistoricalRehydrationAuthority::new(conversation_id, 9).unwrap();
+        let hydrate = |cid, received_at: &str, bytes: &[u8]| {
+            historical.hydrate_historical_signed_request_from_durable_bytes(
+                cid,
+                received_at,
+                bytes,
+                &verifying,
+            )
+        };
+
+        for received_at in [
+            "2030-01-01T00:00:00Z",
+            "2030-01-01T00:00:00.000+00:00",
+            "2030-01-01T00:00:00.000000Z",
+            "2030-02-30T00:00:00.000Z",
+        ] {
+            assert_eq!(
+                hydrate(conversation_id, received_at, &raw),
+                Err(StateMachineError::InvalidHydrationAuthority)
+            );
+            assert!(PersistedSignedRequestRow::new(conversation_id, received_at, [1; 32]).is_err());
+        }
+        let mut non_v4 = conversation_id;
+        non_v4[6] = 0x10;
+        for cid in [[0; 16], non_v4] {
+            assert_eq!(
+                hydrate(cid, RECEIVED_AT, &raw),
+                Err(StateMachineError::InvalidHydrationAuthority)
+            );
+            assert!(PersistedSignedRequestRow::new(cid, RECEIVED_AT, [1; 32]).is_err());
+        }
+        assert!(PersistedSignedRequestRow::new(conversation_id, RECEIVED_AT, [0; 32]).is_err());
+
+        let mut tampered: Value = serde_json::from_slice(&raw).unwrap();
+        tampered["signature"] = json!(STANDARD.encode([0x99; 64]));
+        let tampered = serde_json::to_vec(&tampered).unwrap();
+        for bytes in [b"{}".as_slice(), tampered.as_slice()] {
+            assert_eq!(
+                hydrate(conversation_id, RECEIVED_AT, bytes),
+                Err(StateMachineError::InvalidHydrationAuthority)
+            );
+        }
+        let foreign = sample_coordinate(uuid_v4_bytes(0x55));
+        let foreign_raw =
+            leaf_recovery_request_raw(&foreign, &actor, uuid_v4_bytes(0x31), &signing_key);
+        assert_eq!(
+            hydrate(conversation_id, RECEIVED_AT, &foreign_raw),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+
+        let mutation = decode_and_verify_signed_mutation(&raw, &verifying).unwrap();
+        let transcript = mutation.transcript_bytes().to_vec();
+        let digest = *mutation.request_digest();
+        let signature = *mutation.signature();
+        let mut wrong_transcript = transcript.clone();
+        wrong_transcript[0] ^= 1;
+        let mut wrong_digest = digest;
+        wrong_digest[0] ^= 1;
+        let mut wrong_signature = signature;
+        wrong_signature[0] ^= 1;
+        for (transcript, digest, signature) in [
+            (wrong_transcript, digest, signature),
+            (transcript.clone(), wrong_digest, signature),
+            (transcript, digest, wrong_signature),
+        ] {
+            assert_eq!(
+                historical.hydrate_historical_signed_request_from_exact_durable_fields(
+                    conversation_id,
+                    RECEIVED_AT,
+                    &raw,
+                    &transcript,
+                    digest,
+                    signature,
+                    &verifying,
+                ),
+                Err(StateMachineError::InvalidHydrationAuthority)
+            );
+        }
     }
 }
 
@@ -2913,7 +3015,7 @@ mod historical_control_path {
     // loader reads `accepted_payload_bytes` + `signed_request_bytes` from
     // `chat.entries` (+ the `chat.device_keys` signing key), then calls this seam
     // — which DERIVES the un-stored outer-row projection/fingerprint/server-fields
-    // and the durable row digest and re-verifies through `hydrate_historical_control`.
+    // and the durable row digest from the once-verified, rebound entry.
     // Drift fence: byte-equality to the `hydrate_historical_control` row path for
     // every control-entry kind (the row path is itself the certified drift fence
     // vs the append-time minters). Pure-crypto, corpus-independent.
@@ -2924,7 +3026,7 @@ mod historical_control_path {
         let cases = build_cases();
         assert_eq!(cases.len(), 13);
         for case in &cases {
-            let auth = HistoricalRehydrationAuthority::new(case.cid, case.seq + 1_000_000).unwrap();
+            let auth = HistoricalRehydrationAuthority::new(case.cid, case.seq + 1).unwrap();
             // Certified reference: the `PersistedControlRow` path.
             let from_row = auth
                 .hydrate_historical_control(case.row(), &case.public_key)
@@ -2940,6 +3042,20 @@ mod historical_control_path {
                     panic!("durable-bytes path failed for {}: {e:?}", case.entry_kind)
                 });
             assert_eq!(from_bytes, from_row, "kind {}", case.entry_kind);
+            for head_next_entry_seq in [case.seq - 1, case.seq] {
+                let at_or_beyond_head =
+                    HistoricalRehydrationAuthority::new(case.cid, head_next_entry_seq).unwrap();
+                assert_eq!(
+                    at_or_beyond_head.hydrate_historical_control_from_durable_bytes(
+                        case.public_row_json.clone(),
+                        case.raw_wrapper.clone(),
+                        &case.public_key,
+                    ),
+                    Err(StateMachineError::InvalidHydrationAuthority),
+                    "kind {} at head {head_next_entry_seq}",
+                    case.entry_kind,
+                );
+            }
         }
 
         let template = crate::common::frozen_public_state::restore_genesis();
@@ -3052,8 +3168,7 @@ mod historical_control_path {
             Err(StateMachineError::InvalidHydrationAuthority)
         );
 
-        // Control-only global constraint delegated to `hydrate_historical_control`:
-        // an entry seq NOT strictly below the head fails closed.
+        // The durable adapter must enforce the strict historical head bound itself.
         let at_head = HistoricalRehydrationAuthority::new(case.cid, case.seq).unwrap();
         assert_eq!(
             at_head.hydrate_historical_control_from_durable_bytes(
@@ -3063,6 +3178,131 @@ mod historical_control_path {
             ),
             Err(StateMachineError::InvalidHydrationAuthority)
         );
+
+        let foreign =
+            HistoricalRehydrationAuthority::new(uuid_v4_bytes(0x55), case.seq + 10).unwrap();
+        assert_eq!(
+            foreign.hydrate_historical_control_from_durable_bytes(
+                case.public_row_json.clone(),
+                case.raw_wrapper.clone(),
+                &case.public_key,
+            ),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+
+        let mut wrapper: Value = serde_json::from_slice(&case.raw_wrapper).unwrap();
+        wrapper["signature"] = json!(STANDARD.encode([0x99; 64]));
+        let bad_signature = serde_json::to_vec(&wrapper).unwrap();
+        let mut wrapper: Value = serde_json::from_slice(&case.raw_wrapper).unwrap();
+        wrapper["body"]["idempotencyKey"] = json!(Uuid::from_bytes(uuid_v4_bytes(0x6e))
+            .hyphenated()
+            .to_string());
+        let spliced = resign(wrapper, &SigningKey::from_bytes(&[0x24; 32]));
+        crate::chat_protocol::transcript::decode_and_verify_signed_mutation(
+            &spliced,
+            &case.public_key,
+        )
+        .expect("spliced wrapper has a valid signature under the same historical key");
+        for wrapper in [b"{}".to_vec(), bad_signature, spliced] {
+            assert_eq!(
+                auth.hydrate_historical_control_from_durable_bytes(
+                    case.public_row_json.clone(),
+                    wrapper,
+                    &case.public_key,
+                ),
+                Err(StateMachineError::InvalidHydrationAuthority)
+            );
+        }
+
+        let close = cases
+            .iter()
+            .find(|c| c.entry_kind.ends_with("conversationCloseEntry"))
+            .unwrap();
+        let mut row: Value = serde_json::from_slice(&close.public_row_json).unwrap();
+        row["tombstone"]["terminalSeq"] = json!(close.seq + 1);
+        let row = serde_json::to_vec(&row).unwrap();
+        decode_and_verify_control_entry(&row, &close.public_key)
+            .expect("server-field tamper leaves the embedded signature valid");
+        assert_eq!(
+            HistoricalRehydrationAuthority::new(close.cid, close.seq + 1)
+                .unwrap()
+                .hydrate_historical_control_from_durable_bytes(
+                    row,
+                    close.raw_wrapper.clone(),
+                    &close.public_key,
+                ),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+    }
+
+    #[test]
+    fn historical_control_from_durable_bytes_preserves_row_size_bounds() {
+        const MAX_BYTES: usize = 1_048_576;
+        let cases = build_cases();
+        for case in cases.iter().filter(|case| {
+            case.entry_kind.ends_with("commitEntry")
+                || case.entry_kind.ends_with("leaveRequestEntry")
+        }) {
+            let auth = HistoricalRehydrationAuthority::new(case.cid, case.seq + 1).unwrap();
+            for pad_public_row in [true, false] {
+                for size in [MAX_BYTES, MAX_BYTES + 1] {
+                    let mut public_row = case.public_row_json.clone();
+                    let mut wrapper = case.raw_wrapper.clone();
+                    if pad_public_row {
+                        public_row.resize(size, b' ');
+                    } else {
+                        wrapper.resize(size, b' ');
+                    }
+                    let decoded =
+                        decode_and_verify_control_entry(&public_row, &case.public_key).unwrap();
+                    rebind_persisted_control_entry(decoded, &wrapper, &case.public_key)
+                        .expect("whitespace preserves both signatures and all splice comparisons");
+                    let result = auth.hydrate_historical_control_from_durable_bytes(
+                        public_row,
+                        wrapper,
+                        &case.public_key,
+                    );
+                    if size == MAX_BYTES {
+                        assert!(
+                            result.is_ok(),
+                            "inclusive row limit for {}",
+                            case.entry_kind
+                        );
+                    } else {
+                        assert_eq!(result, Err(StateMachineError::InvalidHydrationAuthority));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_control_row_checks_all_buffers_and_nonzero_digests() {
+        const MAX_BYTES: usize = 1_048_576;
+        for field in 0..4 {
+            for size in [0, MAX_BYTES, MAX_BYTES + 1] {
+                let mut fields = [vec![1], vec![1], vec![1], vec![1]];
+                fields[field].resize(size, 1);
+                let [public_row, wrapper, outer, server] = fields;
+                assert_eq!(
+                    PersistedControlRow::new(public_row, wrapper, outer, server, [1; 32], [1; 32],)
+                        .is_ok(),
+                    size == MAX_BYTES,
+                    "buffer {field}, size {size}",
+                );
+            }
+        }
+        for (fingerprint, digest) in [([0; 32], [1; 32]), ([1; 32], [0; 32])] {
+            assert!(PersistedControlRow::new(
+                vec![1],
+                vec![1],
+                vec![1],
+                vec![1],
+                fingerprint,
+                digest,
+            )
+            .is_err());
+        }
     }
 
     /// The G1b-2 participant classifiers fail closed on a real, fully re-verified

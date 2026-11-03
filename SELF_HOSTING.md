@@ -8,7 +8,7 @@ A clean-slate `mls-ds` stores **zero long-term user message history, Labyrinth a
 
 - User message history (`blue.catbird.labyrinth.msgEntry`), Labyrinth key envelopes (`blue.catbird.labyrinth.mek`), and encrypted media/avatar blobs live exclusively inside each user's ATProto Spaces (`com.atproto.space.*`) on their own Spaces-capable PDS (`#atproto_pds` + `#atproto_kem`).
 - `mls-ds` stores only transient operational MLS delivery state (`chat.entries`), device leaf & post-quantum `X-Wing` KeyPackages (`chat.devices`, `chat.key_packages` with `>= 35d` direct-request lifetime for `C33`), Labyrinth head metadata (`labyrinth.epoch_heads`, `labyrinth.device_keys`, `labyrinth.otc_sessions`), and Option A Space authority metadata (`chat.conversation_spaces`, `chat.conversation_space_writers`, `chat.space_credential_jtis`).
-- Once every active participant device acknowledges a `seq` via `blue.catbird.chat.acknowledgeEntries` (or after the `30d` TTL), `mls-ds` nulls `chat.entries.payload_json` while keeping sequence numbers contiguous (`payloadPruned = true`).
+- Once every active participant device that can still fetch a `seq` acknowledges it via `blue.catbird.chat.acknowledgeEntries` (or after the `30d` TTL), `mls-ds` nulls `chat.entries.payload_json` while keeping sequence numbers contiguous (`payloadPruned = true`). A removed device can fetch only control entries, so it never holds a payload back. A home DS that mirrors a remote group waits only for its own devices; the sequencer prunes its copy separately.
 
 ## 2. Server Identity (`did:web` or `did:plc`)
 

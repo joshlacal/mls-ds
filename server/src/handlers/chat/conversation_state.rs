@@ -44,10 +44,49 @@ async fn get_conversation_state(
     context::require_cutover(runtime, ENDPOINT)?;
     let (actor_device_id, conversation_id) = parse_query(query)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-    let admission =
-        context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers, &actor_device_id)
-            .await?;
+    let (admission, subject) = context::admit_unsigned_read_for_subject(
+        pool,
+        runtime,
+        ENDPOINT,
+        method,
+        headers,
+        &actor_device_id,
+    )
+    .await?;
+    // A remote group's roster and coordinates belong to its sequencer.
+    if let Ok(device_id) = uuid::Uuid::parse_str(&actor_device_id) {
+        use crate::federation::group_relay::{try_relay_group_state, GroupRelayError};
+        match try_relay_group_state(pool, &subject, device_id, conversation_id).await {
+            Ok(Some(bytes)) => return Ok(context::json_ok(bytes)),
+            Ok(None) => {}
+            Err(GroupRelayError::Rejected(code)) => {
+                return Err(ChatFailure::protocol(ENDPOINT, code));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "sequencer state read unavailable; serving the home mirror"
+                );
+            }
+        }
+    }
 
+    let response = read_conversation_state_for_admission(pool, admission, conversation_id)
+        .await
+        .map_err(facade_failure)?;
+    Ok(context::json_ok(response.into_response_bytes()))
+}
+
+/// Answer a `getConversationState` read that the account's home DS relayed.
+pub(crate) async fn execute_federated_read(
+    pool: &DbPool,
+    principal: crate::auth::VerifiedServicePrincipal,
+    actor_device_id: uuid::Uuid,
+    conversation_id: uuid::Uuid,
+) -> Result<Response, ChatFailure> {
+    let admission =
+        context::admit_federated_read(pool, ENDPOINT, principal, &actor_device_id.to_string())
+            .await?;
     let response = read_conversation_state_for_admission(pool, admission, conversation_id)
         .await
         .map_err(facade_failure)?;

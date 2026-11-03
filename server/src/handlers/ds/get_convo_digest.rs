@@ -182,7 +182,7 @@ pub async fn get_convo_digest(
             hasher.update_row(&row);
         }
         let digest_sha256 = hasher.finalize();
-        let generated_at = Utc::now();
+        let generated_at = crate::sim_hooks::current_utc();
 
         Ok(Json(GetConvoDigestOutput {
             convo_id: state.convo_id,

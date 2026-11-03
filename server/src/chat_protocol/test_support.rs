@@ -684,6 +684,7 @@ pub async fn seed_clean_slate_expired_direct_request_fixture(
         conversation_id,
         0,
         created_at,
+        crate::identity::service_did_base_opt().as_deref(),
     )
     .await
     .map_err(|e| format!("register c33 space: {e}"))?;

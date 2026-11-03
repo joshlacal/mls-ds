@@ -86,7 +86,15 @@ async fn execute(
             ChatProtocolErrorCode::InvalidRequest,
         ));
     }
+    let principal = context::verify_service_principal(pool, ENDPOINT, headers).await?;
+    execute_for_principal(pool, principal, body).await
+}
 
+pub(crate) async fn execute_for_principal(
+    pool: &DbPool,
+    principal: crate::auth::VerifiedServicePrincipal,
+    body: &[u8],
+) -> Result<Response, ChatFailure> {
     let input: AcknowledgeEntriesInput = serde_json::from_slice(body)
         .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
     if input.conversation_id.get_version_num() != 4
@@ -107,7 +115,6 @@ async fn execute(
     let signature_bytes = decode_signature_field(&input.signature)?;
     let signature = Signature::from_bytes(&signature_bytes);
 
-    let principal = context::verify_service_principal(pool, ENDPOINT, headers).await?;
     let actor_did = principal.did().to_owned();
     let actor_device_str = input.actor_device_id.to_string();
     let method =
@@ -120,6 +127,16 @@ async fn execute(
     auth::authorize_unsigned_request(pool, pre_replay)
         .await
         .map_err(|error| context::auth_repository_failure(ENDPOINT, error))?;
+
+    crate::federation::group_relay::try_relay_home_group_operation(
+        pool,
+        &actor_did,
+        input.actor_device_id,
+        ENDPOINT.nsid(),
+        body,
+    )
+    .await
+    .map_err(|error| error.into_failure(ENDPOINT))?;
 
     let mut tx = pool
         .begin()
@@ -371,6 +388,10 @@ async fn execute(
     .await
     .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
+    // A payload waits only for devices that can still fetch it: current members
+    // (a removed device reads only control entries) and, on a remote mirror,
+    // only devices homed here; the sequencer prunes its own copy. A mirror row
+    // without a local audience is never served, so it may go immediately.
     let prunable_seqs: Vec<i64> = sqlx::query_scalar(
         "SELECT e.seq \
            FROM chat.entries e \
@@ -379,7 +400,7 @@ async fn execute(
             AND e.seq <= $3 \
             AND e.entry_kind = 'blue.catbird.chat.defs#applicationEntry' \
             AND e.payload_pruned_at IS NULL \
-            AND EXISTS ( \
+            AND ($4 OR EXISTS ( \
                 SELECT 1 \
                   FROM chat.application_intervals ai \
                   JOIN chat.devices d \
@@ -391,7 +412,7 @@ async fn execute(
                    AND (ai.terminal_seq IS NULL OR e.seq <= ai.terminal_seq) \
                    AND d.status = 'active' \
                    AND d.dormant_at IS NULL \
-            ) \
+            )) \
             AND NOT EXISTS ( \
                 SELECT 1 \
                   FROM chat.application_intervals ai \
@@ -409,12 +430,26 @@ async fn execute(
                    AND d.status = 'active' \
                    AND d.dormant_at IS NULL \
                    AND COALESCE(ack.acked_through_seq, 0) < e.seq \
+                   AND EXISTS ( \
+                       SELECT 1 FROM chat.application_intervals current_interval \
+                        WHERE current_interval.conversation_id = ai.conversation_id \
+                          AND current_interval.recipient_did = ai.recipient_did \
+                          AND current_interval.recipient_device_id = ai.recipient_device_id \
+                          AND current_interval.terminal_seq IS NULL \
+                   ) \
+                   AND (NOT $4 OR EXISTS ( \
+                       SELECT 1 FROM chat.participants p \
+                        WHERE p.conversation_id = ai.conversation_id \
+                          AND p.user_did = ai.recipient_did \
+                          AND p.ds_did IS NULL \
+                   )) \
             ) \
           ORDER BY e.seq ASC",
     )
     .bind(input.conversation_id)
     .bind(input.generation)
     .bind(acked_seq)
+    .bind(is_remote)
     .fetch_all(&mut *tx)
     .await
     .map_err(|_| ChatFailure::storage(ENDPOINT))?;

@@ -538,12 +538,11 @@ async fn handle_inner(
                 )
                 .map_err(|_| ChatFailure::invariant(endpoint))?;
 
-            let mut tx = pool.begin().await.map_err(|e| {
-                tracing::error!("accept_conversation pool.begin failed: {e}");
-                ChatFailure::storage(endpoint)
-            })?;
-
             if is_inbox {
+                let mut tx = pool.begin().await.map_err(|e| {
+                    tracing::error!("accept_conversation pool.begin failed: {e}");
+                    ChatFailure::storage(endpoint)
+                })?;
                 let updated = sqlx::query(
                     "UPDATE chat.direct_request_transport_inbox \
                      SET status='accepted', acceptance_proof=$2, acceptance_outcome=$3, \
@@ -619,6 +618,10 @@ async fn handle_inner(
                         ));
                     }
                 }
+                tx.commit().await.map_err(|e| {
+                    tracing::error!("accept_conversation tx.commit failed: {e}");
+                    ChatFailure::storage(endpoint)
+                })?;
             } else {
                 crate::federation::canonical_relay::ingest_remote_acceptance_entry(
                     pool,
@@ -634,11 +637,6 @@ async fn handle_inner(
                     ChatFailure::storage(endpoint)
                 })?;
             }
-
-            tx.commit().await.map_err(|e| {
-                tracing::error!("accept_conversation tx.commit failed: {e}");
-                ChatFailure::storage(endpoint)
-            })?;
 
             return Ok(context::json_ok(presented_outcome));
         }
@@ -752,6 +750,31 @@ async fn handle_inner(
     }
     let admission =
         context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
+    if let Some(output) = crate::federation::group_relay::try_relay_home_group_operation(
+        pool,
+        admission.subject(),
+        admission.device_id(),
+        endpoint.nsid(),
+        body,
+    )
+    .await
+    .map_err(|error| error.into_failure(endpoint))?
+    {
+        return Ok(context::json_ok(
+            serde_json::to_vec(&output).map_err(|_| ChatFailure::invariant(endpoint))?,
+        ));
+    }
+    execute_admitted(pool, admission, runtime.relationship_authority().as_ref()).await
+}
+
+pub(crate) async fn execute_admitted<
+    T: crate::chat_protocol::relationship_policy::PublicTransport,
+>(
+    pool: &DbPool,
+    admission: crate::chat_protocol::repository::auth::SignedOperationAdmission,
+    relationship_authority: &crate::chat_protocol::relationship_policy::RelationshipAuthority<T>,
+) -> Result<Response, ChatFailure> {
+    let endpoint = ChatEndpoint::AcceptConversation;
     let mut transaction = pool
         .begin()
         .await
@@ -762,22 +785,31 @@ async fn handle_inner(
     )
     .await
     .map_err(|error| context::operation_prelude_failure(endpoint, error))?;
-    let outcome = acceptance::execute_prepared_acceptance(
-        &mut transaction,
-        prepared,
-        runtime.relationship_authority().as_ref(),
-    )
-    .await
-    .map_err(|error| acceptance_failure(endpoint, error))?;
+    let outcome =
+        acceptance::execute_prepared_acceptance(&mut transaction, prepared, relationship_authority)
+            .await
+            .map_err(|error| acceptance_failure(endpoint, error))?;
     let response = context::canonical_json_response(
         endpoint,
         outcome.status(),
         outcome.response_bytes().to_vec(),
     )?;
+    let value = serde_json::from_slice(outcome.response_bytes())
+        .map_err(|_| ChatFailure::invariant(endpoint))?;
+    let fanout =
+        crate::federation::group_fanout::prepare_group_entry_fanout(&mut transaction, &value)
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
     transaction
         .commit()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
+    if let Some(fanout) = fanout {
+        fanout
+            .deliver(pool, None)
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
+    }
     Ok(response)
 }
 

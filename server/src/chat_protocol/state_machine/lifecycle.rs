@@ -76,21 +76,12 @@ impl HistoricalRehydrationAuthority {
     /// the canonical stored instant) under the historical signing key JOINed from
     /// `chat.device_keys`.
     ///
-    /// The `durable_row_digest` is NOT a stored column on the signed-request
-    /// projection tables (`chat.leaf_recovery_requests` etc.); it is DERIVED here by
-    /// minting candidate evidence through the SAME head-binding-free minter
-    /// (`historical_signed_request_evidence`) that `hydrate_historical_signed_request`
-    /// dispatches to, then the assembled `PersistedSignedRequestRow` is re-verified
-    /// by `hydrate_historical_signed_request` itself — whose independent re-decode +
-    /// `durable_row_digest` equality are the loader-consistency guards over this
-    /// derivation (the digest is derived, not independently stored, so that equality
-    /// is self-consistency — the integrity boundary is the ed25519 verification
-    /// re-run inside `decode_and_verify_signed_mutation`, which is NEVER skipped).
-    /// Forced into state_machine.rs because the digest minter is module-private;
-    /// additive companion to `hydrate_historical_signed_request`, touching no
-    /// existing fn. Drift fence: the cfg(test)
-    /// `historical_signed_request_from_durable_bytes_matches_row_path` equivalence
-    /// test (byte-equal to the `hydrate_historical_signed_request` row path).
+    /// The `durable_row_digest` is derived, not independently stored. Mint once
+    /// from the verified mutation with the SAME head-binding-free minter as the
+    /// independent row path, then retain `PersistedSignedRequestRow::new`'s
+    /// canonical timestamp, UUID, and nonzero-digest checks. Re-decoding the same
+    /// bytes would only compare this derived digest with itself.
+    /// Drift fence: `historical_signed_request_from_durable_bytes_matches_row_path`.
     #[allow(dead_code)]
     pub(crate) fn hydrate_historical_signed_request_from_durable_bytes(
         &self,
@@ -103,18 +94,14 @@ impl HistoricalRehydrationAuthority {
             .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
         let mutation = decode_and_verify_signed_mutation(raw_signed_request, historical_public_key)
             .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
-        // Candidate digest via the SAME dispatch `hydrate_historical_signed_request`
-        // uses (same conversation_id + received_at envelope + mutation bytes), so
-        // the digest re-computed inside the re-verification below is identical.
         let envelope = DurableSignedRequestEnvelope {
             conversation_id,
             received_at: canonical_server_timestamp(&parsed)?,
         };
-        let durable_row_digest =
-            historical_signed_request_evidence(envelope, mutation, &self.expected_conversation_id)?
-                .durable_row_digest;
-        let row = PersistedSignedRequestRow::new(conversation_id, received_at, durable_row_digest)?;
-        self.hydrate_historical_signed_request(row, raw_signed_request, historical_public_key)
+        let evidence =
+            historical_signed_request_evidence(envelope, mutation, &self.expected_conversation_id)?;
+        PersistedSignedRequestRow::new(conversation_id, received_at, evidence.durable_row_digest)?;
+        Ok(evidence)
     }
 
     /// Exact durable-row companion for signed terminal requests. In addition to
@@ -224,25 +211,14 @@ impl HistoricalRehydrationAuthority {
     /// as the public row JSON, `signed_request_bytes` as the raw signed wrapper —
     /// under the historical signing key JOINed from `chat.device_keys`.
     ///
-    /// The frozen outer-row material (`outer_control_projection` /
-    /// `outer_entry_fingerprint` / `server_fields_dag_cbor`) and the
-    /// `durable_row_digest` are NOT stored as `chat.entries` columns; they are
-    /// DERIVED here — the outer material by decoding the public row, the digest by
-    /// minting evidence through the SAME head-binding-free minters
-    /// (`historical_control_request_evidence` / `historical_transition_evidence`)
-    /// that `hydrate_historical_control` dispatches to. The assembled
-    /// `PersistedControlRow` is then re-verified by `hydrate_historical_control`
-    /// itself, whose independent re-decode + `durable_row_digest` equality are the
-    /// loader-consistency guards over this derivation (the digest column is
-    /// derived, not independently stored, so that equality is self-consistency —
-    /// the integrity boundary is the ed25519 verification re-run inside
-    /// `decode_and_verify_control_entry` + `rebind_persisted_control_entry`, which
-    /// is NEVER skipped). Forced into state_machine.rs because the digest minters
-    /// are module-private; additive companion to `hydrate_historical_control`,
-    /// touching no existing fn. Drift fence: the cfg(test)
-    /// `historical_control_from_durable_bytes_matches_row_path_per_kind`
-    /// equivalence test (byte-equal to the `hydrate_historical_control` row path
-    /// for every control-entry kind).
+    /// The frozen outer-row material and durable digest are derived here, not
+    /// independently supplied. Decode the public row and rebind its separately
+    /// persisted signed wrapper once, retaining all signed/outer/server splice
+    /// comparisons in `rebind_persisted_control_entry`. Mint from that verified
+    /// entry only after checking the expected conversation and strict `seq < head`
+    /// bound, and retain `PersistedControlRow::new`'s size/nonzero checks.
+    /// Independently supplied frozen fields still use `hydrate_historical_control`.
+    /// Drift fence: `historical_control_from_durable_bytes_matches_row_path_per_kind`.
     #[allow(dead_code)]
     pub(crate) fn hydrate_historical_control_from_durable_bytes(
         &self,
@@ -252,6 +228,9 @@ impl HistoricalRehydrationAuthority {
     ) -> Result<PersistedControlAuthority, StateMachineError> {
         let decoded = decode_and_verify_control_entry(&public_row_json, historical_public_key)
             .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        if decoded.conversation_id().as_bytes() != &self.expected_conversation_id {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
         let outer_control_projection = decoded.outer_control_projection().to_vec();
         let outer_entry_fingerprint = *decoded.outer_control_fingerprint();
         let server_fields_dag_cbor = decoded
@@ -260,22 +239,28 @@ impl HistoricalRehydrationAuthority {
         let entry =
             rebind_persisted_control_entry(decoded, &raw_signed_wrapper, historical_public_key)
                 .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
-        // Candidate digest via the SAME dispatch `hydrate_historical_control`
-        // uses. The `seq < head` global constraint and the authoritative
-        // re-verification are re-run by `hydrate_historical_control` below.
-        let durable_row_digest = match entry.mutation().projection() {
+        if entry.seq() >= self.head_next_entry_seq {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let evidence = match entry.mutation().projection() {
             VerifiedMutationProjection::ResetRequest(_)
             | VerifiedMutationProjection::LeaveRequest(_)
             | VerifiedMutationProjection::LeaveCancellation(_) => {
-                historical_control_request_evidence(entry, &self.expected_conversation_id)?
-                    .durable_row_digest
+                PersistedControlAuthority::Request(historical_control_request_evidence(
+                    entry,
+                    &self.expected_conversation_id,
+                )?)
             }
-            _ => {
-                historical_transition_evidence(&entry, &self.expected_conversation_id)?
-                    .durable_row_digest
-            }
+            _ => PersistedControlAuthority::Transition(historical_transition_evidence(
+                &entry,
+                &self.expected_conversation_id,
+            )?),
         };
-        let row = PersistedControlRow::new(
+        let durable_row_digest = match &evidence {
+            PersistedControlAuthority::Request(evidence) => evidence.durable_row_digest,
+            PersistedControlAuthority::Transition(evidence) => evidence.durable_row_digest,
+        };
+        PersistedControlRow::new(
             public_row_json,
             raw_signed_wrapper,
             outer_control_projection,
@@ -283,7 +268,7 @@ impl HistoricalRehydrationAuthority {
             outer_entry_fingerprint,
             durable_row_digest,
         )?;
-        self.hydrate_historical_control(row, historical_public_key)
+        Ok(evidence)
     }
 }
 

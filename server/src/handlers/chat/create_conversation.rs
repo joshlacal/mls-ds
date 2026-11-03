@@ -70,6 +70,9 @@ async fn handle_inner(
             );
             ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
         })?;
+        crate::federation::group_relay::stage_remote_group_participants(pool, &routes)
+            .await
+            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized))?;
         Some(
             crate::chat_protocol::federation_routing::ConversationRoutingIntent::local_creation(
                 routes,
@@ -100,10 +103,22 @@ async fn handle_inner(
         outcome.status(),
         outcome.response_bytes().to_vec(),
     )?;
+    let value = serde_json::from_slice(outcome.response_bytes())
+        .map_err(|_| ChatFailure::invariant(endpoint))?;
+    let fanout =
+        crate::federation::group_fanout::prepare_group_entry_fanout(&mut transaction, &value)
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
     transaction
         .commit()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
+    if let Some(fanout) = fanout {
+        fanout
+            .deliver(pool, None)
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
+    }
     Ok(response)
 }
 

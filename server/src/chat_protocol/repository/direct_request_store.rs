@@ -307,8 +307,11 @@ async fn finish_terminal_charged(
         {
             return Err(DirectRequestStoreError::Expired);
         }
-        let written = sqlx::query("UPDATE chat.direct_request_attempts SET status=$2,terminal_at=$3,terminal_response=$4,terminal_response_sha256=$5,publication_digest=$6,reserved_bytes=$7 WHERE request_id=$1 AND status='prepared' AND ($2<>'published' OR lease_expires_at>clock_timestamp())")
-            .bind(lock.identity.request_id).bind(outcome.as_str()).bind(now).bind(receipt).bind(digest).bind(publication_digest).bind(charge).execute(&mut **tx).await?;
+        // Production keeps the live database clock; a deterministic sim clock replaces it.
+        let lease_checked_at = crate::sim_hooks::is_deterministic_clock_active()
+            .then(crate::sim_hooks::current_utc);
+        let written = sqlx::query("UPDATE chat.direct_request_attempts SET status=$2,terminal_at=$3,terminal_response=$4,terminal_response_sha256=$5,publication_digest=$6,reserved_bytes=$7 WHERE request_id=$1 AND status='prepared' AND ($2<>'published' OR lease_expires_at>COALESCE($8::timestamptz,clock_timestamp()))")
+            .bind(lock.identity.request_id).bind(outcome.as_str()).bind(now).bind(receipt).bind(digest).bind(publication_digest).bind(charge).bind(lease_checked_at).execute(&mut **tx).await?;
         if written.rows_affected() != 1 {
             return Err(DirectRequestStoreError::Expired);
         }

@@ -81,7 +81,7 @@ pub(crate) async fn visible_events(
               AND event.event_position > $4
               AND event.event_position <= $5
               AND (session.supported_protocol_versions IS NULL
-                   OR event.event_kind = 'watermark'
+                   OR event.event_kind IN ('watermark', 'conversationClosed')
                    OR EXISTS (SELECT 1 FROM chat.conversations c
                        WHERE c.conversation_id::text = COALESCE(
                            convert_from(event.payload_bytes, 'UTF8')::jsonb->>'conversationId',

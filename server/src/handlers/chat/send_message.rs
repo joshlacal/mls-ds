@@ -120,63 +120,60 @@ async fn send(
                 && runtime.resolver().is_some()
                 && crate::federation::FederationMode::effective().allows_remote_traffic()
             {
-                if let Ok(secret) = std::env::var("FEDERATION_GROUP_RELAY_HMAC_SECRET") {
-                    if !secret.is_empty() {
-                        let authenticated_did = admission.subject();
-                        let actor_did = signed_req
-                            .pointer("/body/actorDid")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default();
-                        if actor_did != authenticated_did {
-                            return Err(ChatFailure::protocol(
-                                ENDPOINT,
-                                ChatProtocolErrorCode::NotAuthorized,
-                            ));
-                        }
-                        let actor_device_str = signed_req
-                            .pointer("/body/actorDeviceId")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default();
-                        let actor_device_uuid =
-                            uuid::Uuid::parse_str(actor_device_str).map_err(|_| {
-                                ChatFailure::protocol(
-                                    ENDPOINT,
-                                    ChatProtocolErrorCode::InvalidRequest,
-                                )
-                            })?;
-                        let resolver = runtime.resolver().unwrap();
-                        let dest = resolver
-                            .resolve_ds_destination_uncached(seq_ds)
-                            .await
-                            .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-                        let out =
-                            crate::federation::group_relay::relay_group_mutation_to_sequencer(
-                                dest.url.as_str(),
-                                &crate::identity::service_did(),
-                                seq_ds,
-                                secret.as_bytes(),
-                                &crate::federation::group_relay::RelayGroupMutationRequest {
-                                    conversation_id: convo_id,
-                                    endpoint: "blue.catbird.chat.sendMessage".to_string(),
-                                    actor_did: actor_did.to_string(),
-                                    actor_device_id: actor_device_uuid,
-                                    signed_request: signed_req.clone(),
-                                },
-                            )
-                            .await
-                            .map_err(|e| {
-                                tracing::error!("relay_group_mutation_to_sequencer failed: {e}");
-                                ChatFailure::storage(ENDPOINT)
-                            })?;
-                        let mut entry = out.entry;
-                        if let Some(obj) = entry.as_object_mut() {
-                            obj.remove("$type");
-                        }
-                        let response_bytes =
-                            serde_json::to_vec(&serde_json::json!({ "entry": entry }))
-                                .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-                        return context::canonical_json_response(ENDPOINT, 200, response_bytes);
+                let secret = crate::federation::group_relay::configured_group_relay_hmac_secret();
+                let can_authenticate_s2s = secret.is_some()
+                    || crate::federation::canonical_relay::configured_s2s_signing_key_pem().is_ok();
+                if can_authenticate_s2s {
+                    let secret_bytes = secret.as_deref().map(str::as_bytes).unwrap_or(&[]);
+                    let authenticated_did = admission.subject();
+                    let actor_did = signed_req
+                        .pointer("/body/actorDid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if actor_did != authenticated_did {
+                        return Err(ChatFailure::protocol(
+                            ENDPOINT,
+                            ChatProtocolErrorCode::NotAuthorized,
+                        ));
                     }
+                    let actor_device_str = signed_req
+                        .pointer("/body/actorDeviceId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let actor_device_uuid =
+                        uuid::Uuid::parse_str(actor_device_str).map_err(|_| {
+                            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                        })?;
+                    let resolver = runtime.resolver().unwrap();
+                    let dest = resolver
+                        .resolve_ds_destination_uncached(seq_ds)
+                        .await
+                        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+                    let out = crate::federation::group_relay::relay_group_mutation_to_sequencer(
+                        dest.url.as_str(),
+                        &crate::identity::service_did(),
+                        seq_ds,
+                        secret_bytes,
+                        &crate::federation::group_relay::RelayGroupMutationRequest {
+                            conversation_id: convo_id,
+                            endpoint: "blue.catbird.chat.sendMessage".to_string(),
+                            actor_did: actor_did.to_string(),
+                            actor_device_id: actor_device_uuid,
+                            signed_request: signed_req.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(?error, "relayed group sendMessage failed");
+                        error.into_failure(ENDPOINT)
+                    })?;
+                    let mut entry = out.entry;
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.remove("$type");
+                    }
+                    let response_bytes = serde_json::to_vec(&serde_json::json!({ "entry": entry }))
+                        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+                    return context::canonical_json_response(ENDPOINT, 200, response_bytes);
                 }
             }
         }
@@ -387,15 +384,27 @@ async fn send(
         .map_err(|e| context::operation_prelude_failure(ENDPOINT, e))?;
     match prepared {
         PreparedChatAdmission::Replay(replay) => {
+            let replay_bytes = replay.response_bytes().to_vec();
+            let group_fanout = match serde_json::from_slice::<serde_json::Value>(&replay_bytes) {
+                Ok(val) => {
+                    crate::federation::group_fanout::prepare_group_entry_fanout(&mut tx, &val)
+                        .await
+                        .map_err(|_| ChatFailure::storage(ENDPOINT))?
+                }
+                Err(_) => None,
+            };
             let response = context::replay_response(ENDPOINT, &replay)?;
             tx.commit()
                 .await
                 .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+            if let Some(fanout) = group_fanout {
+                runtime.spawn_post_commit_group_entry_fanout(pool, fanout);
+            }
             let actor_did = signed_req
                 .pointer("/body/actorDid")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            deliver_message_entry_to_remote_peers(pool, actor_did, replay.response_bytes()).await?;
+            deliver_message_entry_to_remote_peers(pool, actor_did, &replay_bytes).await?;
             Ok(response)
         }
         PreparedChatAdmission::First(first) => {
@@ -426,10 +435,33 @@ async fn send(
                 tracing::error!("complete_operation error: {:?}", e);
                 context::operation_prelude_failure(ENDPOINT, e)
             })?;
+            let response_value = serde_json::from_slice::<serde_json::Value>(&response_bytes).ok();
+            let group_fanout = match &response_value {
+                Some(val) => {
+                    crate::federation::group_fanout::prepare_group_entry_fanout(&mut tx, val)
+                        .await
+                        .map_err(|_| ChatFailure::storage(ENDPOINT))?
+                }
+                None => None,
+            };
+            let local_push = match &response_value {
+                Some(val) if runtime.push_gateway_client().is_some() => {
+                    crate::push_gateway::client::prepare_local_entry_wake(&mut tx, val)
+                        .await
+                        .map_err(|_| ChatFailure::storage(ENDPOINT))?
+                }
+                _ => None,
+            };
             tx.commit().await.map_err(|e| {
                 tracing::error!("tx.commit error: {:?}", e);
                 ChatFailure::storage(ENDPOINT)
             })?;
+            if let Some(fanout) = group_fanout {
+                runtime.spawn_post_commit_group_entry_fanout(pool, fanout);
+            }
+            if let Some(wake) = local_push {
+                runtime.spawn_post_commit_local_push(pool, wake);
+            }
             runtime.notify_events();
             deliver_message_entry_to_remote_peers(
                 pool,
@@ -535,7 +567,7 @@ async fn deliver_message_entry_to_remote_peers(
             );
             sqlx::query(
                 "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, last_error, next_retry_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + INTERVAL '5 seconds') \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                  ON CONFLICT (id) DO NOTHING",
             )
             .bind(format!("message-delivery-{entry_id}-{}", crate::identity::canonical_did(target_did)))
@@ -545,6 +577,7 @@ async fn deliver_message_entry_to_remote_peers(
             .bind(serde_json::to_vec(&delivery).map_err(|_| ChatFailure::invariant(ENDPOINT))?)
             .bind(convo_id.to_string())
             .bind(error.to_string())
+            .bind(crate::sim_hooks::current_utc() + chrono::Duration::seconds(5))
             .execute(pool)
             .await
             .map_err(|_| ChatFailure::storage(ENDPOINT))?;

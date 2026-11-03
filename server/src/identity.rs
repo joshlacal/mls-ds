@@ -24,6 +24,10 @@ pub fn dids_equivalent(left: &str, right: &str) -> bool {
 /// Pattern lifted from the tested `system_reset_did` helper in
 /// `actors/conversation.rs`, which now delegates here.
 pub fn service_did() -> String {
+    #[cfg(feature = "sim")]
+    if let Some(hooks) = crate::sim_hooks::active_sim_ds() {
+        return service_did_from_env_value(Ok(hooks.service_did.clone()));
+    }
     service_did_from_env_value(std::env::var("SERVICE_DID"))
 }
 
@@ -56,6 +60,10 @@ pub fn service_did_base() -> String {
 /// the fail-loudly [`service_did`] accessor (N31, WS-1.4). Once clients
 /// route on `sequencerDid` (WS-4 rung 3), revisit per D4 rule 2.
 pub fn service_did_base_opt() -> Option<String> {
+    #[cfg(feature = "sim")]
+    if let Some(hooks) = crate::sim_hooks::active_sim_ds() {
+        return service_did_base_opt_from_env_value(Ok(hooks.service_did.clone()));
+    }
     service_did_base_opt_from_env_value(std::env::var("SERVICE_DID"))
 }
 
@@ -85,6 +93,10 @@ fn service_did_base_opt_from_env_value(raw: Result<String, std::env::VarError>) 
 /// Panics when neither source is available — same fail-loudly rationale as
 /// [`service_did`]; never silently advertises someone else's endpoint.
 pub fn self_endpoint() -> String {
+    #[cfg(feature = "sim")]
+    if let Some(hooks) = crate::sim_hooks::active_sim_ds() {
+        return self_endpoint_from_env_values(Ok(hooks.self_endpoint.clone()), &service_did());
+    }
     self_endpoint_from_env_values(std::env::var("SELF_ENDPOINT"), &service_did())
 }
 

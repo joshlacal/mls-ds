@@ -2956,9 +2956,12 @@ pub(crate) struct NewGeneration {
     pub(crate) activated_at: DateTime<Utc>,
 }
 
+/// `local_authority_did` is this DS's base DID, the Space authority of a local
+/// conversation; a remote mirror's Space belongs to its sequencer.
 pub(crate) async fn insert_generation(
     transaction: &mut Transaction<'_, Postgres>,
     generation: &NewGeneration,
+    local_authority_did: Option<&str>,
 ) -> Result<(), TransitionRepositoryError> {
     sqlx::query(
         r#"
@@ -2987,6 +2990,7 @@ pub(crate) async fn insert_generation(
         generation.conversation_id,
         generation.generation,
         generation.activated_at,
+        local_authority_did,
     )
     .await?;
     Ok(())
@@ -2994,11 +2998,14 @@ pub(crate) async fn insert_generation(
 
 /// Register the Option A conversation Space (`at://{authorityDid}/space/blue.catbird.labyrinth.conversation/{conversationId}-{generation}`)
 /// in `chat.conversation_spaces` when the clean-slate migration is present.
+/// A local conversation's authority is `local_authority_did` (this DS); a
+/// remote mirror's is its sequencer.
 pub(crate) async fn register_conversation_space_if_migrated(
     conn: &mut sqlx::PgConnection,
     conversation_id: Uuid,
     generation: i64,
     created_at: DateTime<Utc>,
+    local_authority_did: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     let table_exists: bool =
         sqlx::query_scalar("SELECT to_regclass('chat.conversation_spaces') IS NOT NULL")
@@ -3029,9 +3036,8 @@ pub(crate) async fn register_conversation_space_if_migrated(
         };
         canonicalize_did(&ds)
     } else {
-        std::env::var("SERVICE_DID")
-            .ok()
-            .map(|raw| canonicalize_did(&raw))
+        local_authority_did
+            .map(canonicalize_did)
             .filter(|did| !did.is_empty())
             .unwrap_or_else(|| "did:web:localhost".to_owned())
     };

@@ -146,53 +146,6 @@ fn apply_verified_migration(url: &str, migration: &BaselineMigration) -> Result<
     Ok(())
 }
 
-fn prerequisite_migrations() -> [BaselineMigration; 6] {
-    [
-        BaselineMigration {
-            version: 20260816000001,
-            description: "enable send message operation claims",
-            filename: "20260816000001_enable_send_message_operation_claims.sql",
-            sql: include_str!("../../server/migrations/20260816000001_enable_send_message_operation_claims.sql"),
-            reviewed_sha384: "ae9cc21dd145c3608a57e1f96654b67d53709dba17e3f347758aa8b93830c725d380230751d83f85c497132b8669a30e",
-        },
-        BaselineMigration {
-            version: 20260820000001,
-            description: "chat service auth admissions",
-            filename: "20260820000001_chat_service_auth_admissions.sql",
-            sql: include_str!("../../server/migrations/20260820000001_chat_service_auth_admissions.sql"),
-            reviewed_sha384: "2e8cb6bf47498402e56ba5c2fc753114c1d46e0767c98aa243c47993eb4f51a84de89469a8ae9af6bfac751ddadd18ac",
-        },
-        BaselineMigration {
-            version: 20260820000002,
-            description: "chat nullable legacy dpop jkt",
-            filename: "20260820000002_chat_nullable_legacy_dpop_jkt.sql",
-            sql: include_str!("../../server/migrations/20260820000002_chat_nullable_legacy_dpop_jkt.sql"),
-            reviewed_sha384: "d1914c731e0fbf81f5b0a9bf9cd77c12f2943fd940c36b9a351b1156b5ca09b55f2b4b44c6810012b4377f6ac283955d",
-        },
-        BaselineMigration {
-            version: 20260821000001,
-            description: "fix expired inventory session gc",
-            filename: "20260821000001_fix_expired_inventory_session_gc.sql",
-            sql: include_str!("../../server/migrations/20260821000001_fix_expired_inventory_session_gc.sql"),
-            reviewed_sha384: "42790274fbeb43bce44aa9638d23328223042933af03e6453a0c8c3640b9bcf236d0bc0b8cd76e1e5d846be7c6bfc78a",
-        },
-        BaselineMigration {
-            version: 20260824000001,
-            description: "chat performance indices",
-            filename: "20260824000001_chat_performance_indices.sql",
-            sql: include_str!("../../server/migrations/20260824000001_chat_performance_indices.sql"),
-            reviewed_sha384: "e5f3f169724d2afc84043d80057bf9e494fbc9ad617ced0feaebb469d1be68788e7c19e19a67fb36296b85ee803139e0",
-        },
-        BaselineMigration {
-            version: 20260907000001,
-            description: "chat direct pending inventory",
-            filename: "20260907000001_chat_direct_pending_inventory.sql",
-            sql: include_str!("../../server/migrations/20260907000001_chat_direct_pending_inventory.sql"),
-            reviewed_sha384: "82708d24b2deb72452ebdaf28749aa86ed95075f7ed920c4cc5526962e2ae9f9d8561a5029fc853ba654564d76ef63f1",
-        },
-    ]
-}
-
 const AUTH_JTI_SQL: &str =
     include_str!("../../server/migrations/20260214000002_auth_jti_nonce.sql");
 const AUTH_JTI_SHA384: &str =
@@ -298,9 +251,9 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         apply_verified_migration(&dedicated_url, migration)?;
     }
 
-    // 1c. Install 6 prerequisites in exact production version order
-    let prerequisites = prerequisite_migrations();
-    println!("C34: Installing 6 reviewed prerequisite migrations in production order...");
+    // 1c. Install the shared reviewed prerequisites in production version order.
+    let prerequisites = reviewed_prerequisites();
+    println!("C34: Installing {} reviewed prerequisite migrations in production order...", prerequisites.len());
     for migration in &prerequisites {
         apply_verified_migration(&dedicated_url, migration)?;
     }

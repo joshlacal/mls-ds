@@ -325,7 +325,7 @@ impl VerifiedServicePrincipal {
             endpoint_nsid: endpoint_nsid.to_string(),
             jti: jti.to_string(),
             iat: now,
-            exp: now + 300,
+            exp: now + SERVICE_AUTH_MAX_LIFETIME_SECONDS,
             token: "federated-s2s-token".to_string(),
         }
     }
@@ -521,6 +521,10 @@ impl AuthMiddleware {
             }
         }
 
+        #[cfg(feature = "sim")]
+        if let Some(hooks) = crate::sim_hooks::active_sim_ds() {
+            return Some(hooks.service_did.clone());
+        }
         std::env::var("SERVICE_DID").ok()
     }
 
@@ -1007,6 +1011,32 @@ impl AuthMiddleware {
                     "DID resolution deadline could not be represented".to_string(),
                 )
             })?;
+        #[cfg(feature = "sim")]
+        if let Some(response) = crate::sim_hooks::intercept_sim_http(&request) {
+            let response = tokio::time::timeout_at(deadline, response)
+                .await
+                .map_err(|_| {
+                    AuthError::DidResolutionFailed("DID resolution deadline exceeded".to_string())
+                })?
+                .map_err(|error| {
+                    AuthError::DidResolutionFailed(format!(
+                        "DID resolution request failed: {error}"
+                    ))
+                })?;
+            if !response.status().is_success() {
+                return Err(AuthError::DidResolutionFailed(status_error(
+                    response.status(),
+                )));
+            }
+            return decode_json_bounded(
+                response,
+                ResponseBodyBudget::new(DID_DOCUMENT_MAX_BYTES, deadline),
+            )
+            .await
+            .map_err(|error| {
+                AuthError::DidResolutionFailed(format!("Failed to parse DID document: {error}"))
+            });
+        }
         let response = tokio::time::timeout_at(deadline, request.send())
             .await
             .map_err(|_| {
@@ -1492,9 +1522,30 @@ async fn validate_resolved_host_is_public(
         return Ok(vec![std::net::SocketAddr::new(ip, port)]);
     }
 
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| AuthError::DidResolutionFailed(format!("DNS resolution failed: {e}")))?;
+    let addrs: Vec<std::net::SocketAddr> = {
+        #[cfg(feature = "sim")]
+        if let Some(result) = crate::sim_hooks::intercept_sim_dns(host) {
+            result
+                .map_err(|error| {
+                    AuthError::DidResolutionFailed(format!("DNS resolution failed: {error}"))
+                })?
+                .into_iter()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+                .collect()
+        } else {
+            tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|e| AuthError::DidResolutionFailed(format!("DNS resolution failed: {e}")))?
+                .collect()
+        }
+        #[cfg(not(feature = "sim"))]
+        {
+            tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|e| AuthError::DidResolutionFailed(format!("DNS resolution failed: {e}")))?
+                .collect()
+        }
+    };
 
     let mut resolved = Vec::new();
     for addr in addrs {
@@ -3363,6 +3414,16 @@ mod tests {
             validate_mls_service_claims(&too_long, endpoint, now),
             Err(AuthError::InvalidToken(_))
         ));
+    }
+
+    #[test]
+    fn federated_s2s_principal_fits_the_service_auth_profile() {
+        let principal = VerifiedServicePrincipal::for_federated_s2s(
+            "did:plc:alice",
+            "blue.catbird.chat.acceptConversation",
+        );
+        assert!(principal.exp() > principal.iat());
+        assert!(principal.exp() - principal.iat() <= SERVICE_AUTH_MAX_LIFETIME_SECONDS);
     }
 }
 

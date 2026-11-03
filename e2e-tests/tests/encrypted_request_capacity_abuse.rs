@@ -206,23 +206,27 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
 
     let b = stage_request("qf-close").await?;
     publish(&b).await?;
+    let charge_b: i64 = scalar(&format!(
+        "SELECT charged_bytes FROM chat.direct_request_retained_charges WHERE request_id='{}'",
+        b.request_id
+    ))?
+    .parse()?;
+    let retained_before_close = budget()?.1;
     let (status, closed, _) = close_published(&b).await?;
     assert_eq!(
         status, OK,
         "real closeConversation of published B: {closed}"
     );
-    assert_eq!(
-        scalar(&format!(
-            "SELECT consent FROM chat.direct_request_lifecycle WHERE request_id='{}'",
-            b.request_id
-        ))?,
-        "closed"
-    );
+    encrypted_requests::assert_closed_conversation_wiped(
+        b.conversation_id,
+        Some(b.request_id),
+    )?;
     assert_eq!(budget()?.0, 0, "closed request holds no pending capacity");
-    let b_entries = scalar(&format!(
-        "SELECT count(*) FROM chat.entries WHERE conversation_id='{}'",
-        b.conversation_id
-    ))?;
+    assert_eq!(
+        budget()?.1,
+        retained_before_close - charge_b,
+        "close atomically returns the entire retained operational charge"
+    );
     let (_, retained_before_prune) = budget()?;
 
     // Production sweeper fixtures. Each is started after its clock jump and
@@ -313,37 +317,12 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
         "expired"
     );
 
-    wait_for(
-        "B pruned",
-        &format!("SELECT count(*) FROM chat.direct_request_retained_releases WHERE request_id='{}' AND reason='closed_pruned'", b.request_id),
-        "1",
-    )
-    .await?;
-    let released_b: i64 = scalar(&format!(
-        "SELECT released_bytes FROM chat.direct_request_retained_releases WHERE request_id='{}'",
-        b.request_id
-    ))?
-    .parse()?;
-    let charge_b: i64 = scalar(&format!(
-        "SELECT charged_bytes FROM chat.direct_request_retained_charges WHERE request_id='{}'",
-        b.request_id
-    ))?
-    .parse()?;
-    println!("B charge={charge_b} released={released_b}");
-    // The 4 MiB decision reserve floor plus one 512 KiB Welcome slot are
-    // precharged; after close+14d the unused reserve and pruned blobs return.
-    assert!(
-        released_b >= 4 * 1_048_576 && released_b < charge_b,
-        "pruning must reclaim the bulk of B's charge ({released_b} of {charge_b})"
-    );
-    assert_eq!(
-        scalar(&format!(
-            "SELECT (signed_publication IS NULL AND full_welcome IS NULL AND initial_ciphertext IS NULL AND pruned_at IS NOT NULL)::text FROM chat.direct_request_publications WHERE request_id='{}'",
-            b.request_id
-        ))?,
-        "true",
-        "B heavy artifacts pruned"
-    );
+    // Close has already wiped B and released its full charge. The later
+    // sweeper must not recreate either operational artifacts or accounting.
+    encrypted_requests::assert_closed_conversation_wiped(
+        b.conversation_id,
+        Some(b.request_id),
+    )?;
     assert_eq!(
         scalar(&format!(
             "SELECT (terminal_response_sha256 IS NOT NULL AND status='published')::text FROM chat.direct_request_attempts WHERE request_id='{}'",
@@ -353,17 +332,9 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
         "B tombstone identity row retained"
     );
     assert_eq!(
-        scalar(&format!(
-            "SELECT count(*) FROM chat.entries WHERE conversation_id='{}'",
-            b.conversation_id
-        ))?,
-        b_entries,
-        "pruning never deletes conversation history"
-    );
-    assert_eq!(
         budget()?.1,
-        retained_before_prune - released_b,
-        "retained drops by B's release"
+        retained_before_prune,
+        "the later sweeper cannot release B's already returned charge twice"
     );
 
     // Day 46: A (expired day 31) prunes too.
@@ -388,7 +359,7 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
     ))?
     .parse()?;
     let (pending_end, retained_end) = budget()?;
-    println!("budget after pruning: pending={pending_end} retained={retained_end} released A={released_a} B={released_b}");
+    println!("budget after pruning: pending={pending_end} retained={retained_end} released A={released_a}; B was released at close");
     assert_eq!(pending_end, 0);
     assert!(
         released_a >= 4 * 1_048_576 && released_a < charge_a,
@@ -396,7 +367,7 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
     );
     assert_eq!(
         retained_end,
-        retained_before_prune - released_b - released_a
+        retained_before_prune - released_a
     );
 
     // Post-prune replay is fenced: the outcome is still the retained signed

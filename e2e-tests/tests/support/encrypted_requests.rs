@@ -152,7 +152,7 @@ pub fn reviewed_baseline() -> [BaselineMigration; 14] {
     ]
 }
 
-pub fn reviewed_request_migrations() -> [BaselineMigration; 24] {
+pub fn reviewed_request_migrations() -> [BaselineMigration; 43] {
     [
         baseline!(20260919000001, "direct request preparation", "20260919000001_direct_request_preparation.sql", "d4d3527aa77b8fe91d8d754f72290b682571cc6731866d72c059f10d4b2f7cf8ef629069737addeedaabd6f6eee682ca"),
         baseline!(20260919000002, "direct request publication", "20260919000002_direct_request_publication.sql", "7fda0b09fcdef20e4da2e1701f6a56c12f636f7881b46e2f6e249cb0d5fc2aa63c734dc07cbb543169398253e29cec9e"),
@@ -178,6 +178,25 @@ pub fn reviewed_request_migrations() -> [BaselineMigration; 24] {
         baseline!(20260919000023, "expired federated lease release", "20260919000023_expired_federated_lease_release.sql", "f8b78fd5368f0d9521ec0498f14aaf7f928be8ca4cef35c7e794aac7ed72970a7337e348675ab9eaf873351df3c5b0c5"),
         baseline!(20260919000024, "C33 coordinator hardening", "20260919000024_c33_coordinator_hardening.sql", "ebc8d84f7b7ad0dd3005fb268956f52a4b9c8bea8134ae5fdeee94fda232e222d816dbbbf16a45d7420f3a5099a7c5e7"),
         baseline!(20260919000025, "federated inventory conversation items", "20260919000025_federated_inventory_conversation_items.sql", "c8cd858bc6805485334ad90e96673123b215591282f9625c55e2315a624430f77460fdda0e444a61abffe45433f0a9b1"),
+        baseline!(20261004000001, "reconcile conversation identity whitelist", "20261004000001_reconcile_conversation_identity_whitelist.sql", "10579dbb921d3e024a5bdc6ac221e1906d381375849a127da3b3784dc36630d0e50ff624485464d04d66b1a10e074a53"),
+        baseline!(20261004100001, "labyrinth mailbox and directory", "20261004100001_labyrinth_mailbox_and_directory.sql", "78413b0611149fe8b7208d065ea455d05cef061ee2f213030bc41a70ee96739928dcdc126d550c0f6898dbf6e95c74c3"),
+        baseline!(20261004100002, "labyrinth threads", "20261004100002_labyrinth_threads.sql", "0c57cba0d98367123234c154be7e6d1f26a304aff48b34ea192d2698f0f564629ac15ad6b5e32237c12d1aecc9e46b04"),
+        baseline!(20261004100003, "labyrinth orf and attachments", "20261004100003_labyrinth_orf_and_attachments.sql", "118124f987ae00db52e938aaa627a14721becb8ceda48bd4aa0dbfe799cc0004f3120c7297c1956db3b772a3f1413764"),
+        baseline!(20261004100004, "labyrinth device binding", "20261004100004_labyrinth_device_binding.sql", "c5f6e9627a9ff1fb5d2da93c17a73dcef74679d57a5c3d7cf12e86f45c814d8e9e45797b2547abaa37621e99f39ac50e"),
+        baseline!(20261004100005, "labyrinth attachment refs v2", "20261004100005_labyrinth_attachment_refs_v2.sql", "2dcc30aeebbe4d2de63ef0b794beef8a9958665f6df391011b56515c963cce6cec89c0c60e7e357bb54a32d4e9be12c4"),
+        baseline!(20261004100006, "labyrinth retention", "20261004100006_labyrinth_retention.sql", "b7ce72e7f162c626695739dbf5a62c6eb59126c95629e24c6c5c94857f0638f1e29c6f71a7eac5a2798e6b820e2a7b53"),
+        baseline!(20261004100007, "labyrinth blob gc pin", "20261004100007_labyrinth_blob_gc_pin.sql", "e3efe50d180d6250c722918628ed7334cde492246460f18dc92ca6ebc2a3ae7b43f5be9dfdb35a341439f7f25994f740"),
+        baseline!(20261004100008, "labyrinth lookup indexes", "20261004100008_labyrinth_lookup_indexes.sql", "0e5908d59cbe9758b1de17fb06aefff6461c3592df05a3493012d892b23ef0d045476b14d97b41a895c52c896a672f54"),
+        baseline!(20261004100009, "labyrinth review2 hardening", "20261004100009_labyrinth_review2_hardening.sql", "990321ab67d1bb32f19e5f98cb1647f7c6267663b91b69d922efacb50a5fac3c1c384724c8c10ba18bf6afc7b02ce61f"),
+        baseline!(20261023000001, "labyrinth space references", "20261023000001_labyrinth_space_references.sql", "1011321e3d877785ecb846e84a44d347d6478e6ecaa015b2aa0833f571eb6a784eb8cc1c2e69bfe6aaf9efa6f3ec0748"),
+        baseline!(20261025000001, "generated transition wrapper kind", "20261025000001_generated_transition_wrapper_kind.sql", "ab163acf42140744e86c5892e434068f14c31830e396e38ed07d814d4ca4936c6f7c348ec92bfa7993b4acbe525db983"),
+        baseline!(20261031100001, "labyrinth security hardening", "20261031100001_labyrinth_security_hardening.sql", "e21a41990ae1234c2b438fc69011636037a7bd83ace728c30afafb2b16ab4e22221cd1215638ac3348d8336e99402051"),
+        baseline!(20261031200001, "clean slate spaces only", "20261031200001_clean_slate_spaces_only.sql", "9680fd2643b146edb6168f68d39ed3f164429243a4777273a89e63cbb081bfc9847eba4fecef998ee102766d09d1a829"),
+        baseline!(20261031200002, "space host operational state", "20261031200002_space_host_operational_state.sql", "7b332d3e52efd64bafd7275c078dff9bd06769582f811974639f35600afcbb9988eb17c8783acb57f66cbcfa8c1a1dbe"),
+        baseline!(20261031200003, "fix wipe closed conversation operational rows", "20261031200003_fix_wipe_closed_conversation_operational_rows.sql", "4853b31de7c5960b546089db2128d2c9095ac661734ba8991b484b5a4bedb8420ee70bb063d8642278a362ca23bab96f"),
+        baseline!(20261102000001, "group transport entry recipients", "20261102000001_group_transport_entry_recipients.sql", "918fb25c2c7c6826ae18eed9c38241efee20d27214e7c42dce5fdcccd7a02adcc73af45f0aa69747aa1e2ecfe40f2195"),
+        baseline!(20261102000002, "group key package exports", "20261102000002_group_key_package_exports.sql", "17d3d172e4c8340a80f2677fac9387ae69c8210a3cf4c4a9bc6d08375a99ac1fbf78488f891a114bc96da3b56d300554"),
+        baseline!(20261102000003, "conversation close terminal entries", "20261102000003_conversation_close_terminal_entries.sql", "3b32d6d3b3dab9d0f785d48d8b9a1b352e7c5329ff3697bcf83fc00744fe91edf4b1763243e4a17dbab885c344c57e30"),
     ]
 }
 
@@ -282,13 +301,23 @@ fn reviewed_performance_indices_prerequisite() -> BaselineMigration {
 /// Every reviewed prerequisite between the immutable baseline and the request
 /// migrations, in production version order. The guarded ledger prefix must
 /// match this exact sequence.
-fn reviewed_prerequisites() -> [BaselineMigration; 6] {
+pub fn reviewed_prerequisites() -> [BaselineMigration; 16] {
     [
         reviewed_send_message_prerequisite(),
         reviewed_service_auth_prerequisite(),
         reviewed_legacy_dpop_prerequisite(),
         reviewed_inventory_gc_prerequisite(),
         reviewed_performance_indices_prerequisite(),
+        baseline!(20260824000002, "chat actor ds mapping", "20260824000002_chat_actor_ds_mapping.sql", "57b80b7f4e753c12bd97553fc8308b4eb04f9f2e39809cc32ed2b65337319721d73c31d9acf33b3c8c64c8f516d60c31"),
+        baseline!(20260824000003, "chat federation routing", "20260824000003_chat_federation_routing.sql", "0a70985a3b5811483791911b6ae3b9d0ebd0fbcd9fc53363e65c59ca1c71a1cbd2a74fc02e87ba22dd0321c7f30713e6"),
+        baseline!(20260824000004, "chat federation delivery receipts", "20260824000004_chat_federation_delivery_receipts.sql", "37ce660ad4630345dfdb0c106631b8926b2d2dfed0780210c072825e3a93f6455ba16a017ffdaaba243afe4c83f5f222"),
+        baseline!(20260824000005, "chat federation outbox retry", "20260824000005_chat_federation_outbox_retry.sql", "6d20fd054646d7da6de338b9ae27fea7c81a19569dfebc6231de5bc23bc79ca9aa22ab790cead55d82b06846f81dd799"),
+        baseline!(20260828000001, "chat historical bootstrap quota", "20260828000001_chat_historical_bootstrap_quota.sql", "c063fd2991cb28ce6947c587f11e2316bb5e02587873d86e89ff74476f880796c63ca1a90064f70c10fe7ed7cc0eb293"),
+        baseline!(20260828000002, "chat historical bootstrap application", "20260828000002_chat_historical_bootstrap_application.sql", "7095f7c32b74c6660fcf8c03610ee88c8db5330639088a907fc996a20d7f47f948ca43ff64cef014a1107bf9626c0013"),
+        baseline!(20260828000003, "chat historical bootstrap cutoff validate", "20260828000003_chat_historical_bootstrap_cutoff_validate.sql", "4e2387ebf31369278e1504a8e00e548a0fd80eafc2adb5a461c01ceab30be2bd84e841eba12a366f51f5a1b1617a3917"),
+        baseline!(20260828000004, "chat device push tokens", "20260828000004_chat_device_push_tokens.sql", "f8f4da493f6a3bf6261d2e09d6706ec6b4a395511a1eed6c5a557b5bb119b6f04aeabd9d3514db984e5e695894fe2fb1"),
+        baseline!(20260828000005, "fix inventory session gc scoping", "20260828000005_fix_inventory_session_gc_scoping.sql", "cae43253509fd13c468a741f360d1371e0d9a099a67ed951c683b23fb98960861e2d00ed3522d341ff026801f86059a2"),
+        baseline!(20260905000001, "chat historical recovery package mapping", "20260905000001_chat_historical_recovery_package_mapping.sql", "a66f9dc9bd5f8f1cb3da0f3ddfcb64c08fc068de39602891e584c86cdbaebd1de2d29b6bb46959155496639ad12f9c5d"),
         reviewed_pending_inventory_prerequisite(),
     ]
 }
@@ -579,21 +608,15 @@ fn install_or_validate_reviewed_baseline() -> Result<()> {
         }
     }
 
-    let send_message = reviewed_send_message_prerequisite();
-    anyhow::ensure!(
-        hex::encode(Sha384::digest(send_message.sql.as_bytes())) == send_message.reviewed_sha384,
-        "send-message prerequisite source checksum mismatch"
-    );
-    if !installed_versions.contains(&send_message.version) {
-        apply_migration(&send_message)?;
-    }
-    let inventory_gc = reviewed_inventory_gc_prerequisite();
-    anyhow::ensure!(
-        hex::encode(Sha384::digest(inventory_gc.sql.as_bytes())) == inventory_gc.reviewed_sha384,
-        "inventory-GC prerequisite source checksum mismatch"
-    );
-    if !installed_versions.contains(&inventory_gc.version) {
-        apply_migration(&inventory_gc)?;
+    for migration in reviewed_prerequisites() {
+        anyhow::ensure!(
+            hex::encode(Sha384::digest(migration.sql.as_bytes())) == migration.reviewed_sha384,
+            "prerequisite source checksum mismatch for {}",
+            migration.filename
+        );
+        if !installed_versions.contains(&migration.version) {
+            apply_migration(&migration)?;
+        }
     }
     let inventory_gc_contract = psql_query(
         "SELECT (position('device_inventory_items' in immutable.prosrc)>0 AND position('session_replication_role' in immutable.prosrc)=0)::text||E'\\t'||(count(gc.oid)=2 AND bool_and(position('session_replication_role' in gc.prosrc)=0))::text FROM pg_proc immutable JOIN pg_namespace immutable_ns ON immutable_ns.oid=immutable.pronamespace LEFT JOIN pg_proc gc ON gc.pronamespace=immutable.pronamespace AND gc.proname IN ('gc_expired_inventory_sessions','gc_expired_device_inventory_sessions') WHERE immutable_ns.nspname='chat' AND immutable.proname='enforce_immutable_identity' GROUP BY immutable.prosrc",
@@ -602,32 +625,6 @@ fn install_or_validate_reviewed_baseline() -> Result<()> {
         inventory_gc_contract.trim() == "true\ttrue",
         "inventory-GC immutable-row allowlist contract is unavailable"
     );
-    let legacy_dpop = reviewed_legacy_dpop_prerequisite();
-    anyhow::ensure!(
-        hex::encode(Sha384::digest(legacy_dpop.sql.as_bytes())) == legacy_dpop.reviewed_sha384,
-        "legacy-DPoP prerequisite source checksum mismatch"
-    );
-    if !installed_versions.contains(&legacy_dpop.version) {
-        apply_migration(&legacy_dpop)?;
-    }
-    let performance_indices = reviewed_performance_indices_prerequisite();
-    anyhow::ensure!(
-        hex::encode(Sha384::digest(performance_indices.sql.as_bytes()))
-            == performance_indices.reviewed_sha384,
-        "performance-indices prerequisite source checksum mismatch"
-    );
-    if !installed_versions.contains(&performance_indices.version) {
-        apply_migration(&performance_indices)?;
-    }
-    let pending_inventory = reviewed_pending_inventory_prerequisite();
-    anyhow::ensure!(
-        hex::encode(Sha384::digest(pending_inventory.sql.as_bytes()))
-            == pending_inventory.reviewed_sha384,
-        "pending-inventory prerequisite source checksum mismatch"
-    );
-    if !installed_versions.contains(&pending_inventory.version) {
-        apply_migration(&pending_inventory)?;
-    }
     for migration in reviewed_request_migrations() {
         if !installed_versions.contains(&migration.version) {
             apply_migration(&migration)?;
@@ -1288,6 +1285,56 @@ pub fn request_database_snapshot(request_id: Uuid) -> Result<ServerSnapshot> {
         welcome_rows: fields[2].parse()?,
         plaintext_matches: fields[3].parse()?,
     })
+}
+
+/// `I14`/`O7`: closing removes operational rows, not immutable terminal evidence.
+/// Inspect the live schema so adding a conversation/request table cannot silently
+/// weaken these assertions. Request attempts are permanent signed idempotency
+/// receipts, without a conversation id; operation completions and close events
+/// likewise intentionally survive the operational wipe.
+pub fn assert_closed_conversation_wiped(
+    conversation_id: Uuid,
+    request_id: Option<Uuid>,
+) -> Result<()> {
+    let request_filter = if request_id.is_some() {
+        "OR c.column_name IN ('request_id','direct_request_id')"
+    } else {
+        ""
+    };
+    let statements = psql_query(&format!(
+        "SELECT string_agg(format( \
+             'SELECT %L AS source, count(*) AS row_count FROM %I.%I WHERE %I::text = %L', \
+             c.table_schema||'.'||c.table_name||'.'||c.column_name, \
+             c.table_schema,c.table_name,c.column_name, \
+             CASE WHEN c.column_name IN ('conversation_id','convo_id') THEN '{conversation_id}' ELSE '{}' END), \
+             ' UNION ALL ' ORDER BY c.table_schema,c.table_name,c.column_name) \
+         FROM information_schema.columns c \
+         JOIN information_schema.tables t USING (table_schema,table_name) \
+         WHERE t.table_type='BASE TABLE' AND c.table_schema IN ('chat','public') \
+           AND c.table_name NOT IN ('operation_claims','idempotency_records','direct_request_attempts') \
+           AND (c.column_name IN ('conversation_id','convo_id') {request_filter})",
+        request_id.map(|id| id.to_string()).unwrap_or_default(),
+    ))?;
+    anyhow::ensure!(!statements.trim().is_empty(), "operational schema is missing");
+    let residue = psql_query(&format!(
+        "SELECT source||'='||row_count FROM ({}) residue WHERE row_count<>0 ORDER BY source",
+        statements.trim(),
+    ))?;
+    anyhow::ensure!(
+        residue.trim().is_empty(),
+        "closed conversation {conversation_id} retains operational rows: {residue}"
+    );
+    let terminal_count = psql_query(&format!(
+        "SELECT count(*) FROM chat.conversation_close_terminal_entries terminal \
+           JOIN chat.events event USING (event_position) \
+          WHERE event.event_kind='conversationClosed' \
+            AND convert_from(event.payload_bytes,'UTF8')::jsonb->>'conversationId'='{conversation_id}'"
+    ))?;
+    anyhow::ensure!(
+        terminal_count.trim() == "1",
+        "closed conversation must retain exactly one authenticated close event, found {terminal_count}"
+    );
+    Ok(())
 }
 
 pub fn push_auth_snapshot(identity: &ServiceIdentity, provider: &str) -> Result<PushAuthSnapshot> {

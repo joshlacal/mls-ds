@@ -252,6 +252,14 @@ impl VerifiedRemotePrefixAdmission {
         self.page_count
     }
 
+    pub(crate) fn events(&self) -> &[StrictCleanRemoteEvent] {
+        &self.events
+    }
+
+    pub(crate) fn participant_routes(&self) -> &BTreeMap<String, Option<String>> {
+        &self.participant_routes
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -273,7 +281,7 @@ impl VerifiedRemotePrefixAdmission {
     }
 }
 
-fn validate_prefix_grammar(
+pub(crate) fn validate_prefix_grammar(
     events: &[StrictCleanRemoteEvent],
 ) -> Result<(), RemotePrefixBootstrapError> {
     if events.is_empty() {
@@ -285,33 +293,22 @@ fn validate_prefix_grammar(
 
     #[derive(Clone, Copy)]
     enum State {
-        CreationSeen,
-        AcceptanceSeen,
-        FulfillmentSeen,
-        ApplicationSeen,
+        Ready,
+        AwaitingFulfillment,
     }
 
-    let mut state = State::CreationSeen;
+    let mut state = State::Ready;
     for event in &events[1..] {
         state = match (state, event.entry_kind()) {
-            (State::CreationSeen, CleanEntryKind::Policy) => State::CreationSeen,
-            (State::CreationSeen, CleanEntryKind::ParticipantAcceptance) => State::AcceptanceSeen,
-            (State::AcceptanceSeen, CleanEntryKind::LeafRecoveryFulfillment) => {
-                State::FulfillmentSeen
-            }
-            (State::FulfillmentSeen | State::ApplicationSeen, CleanEntryKind::Application) => {
-                State::ApplicationSeen
-            }
+            (State::Ready, CleanEntryKind::Policy | CleanEntryKind::Application) => State::Ready,
+            (State::Ready, CleanEntryKind::ParticipantAcceptance) => State::AwaitingFulfillment,
+            (State::AwaitingFulfillment, CleanEntryKind::LeafRecoveryFulfillment) => State::Ready,
             _ => return Err(RemotePrefixBootstrapError::InvalidEvent),
         };
     }
-
-    match state {
-        State::FulfillmentSeen | State::ApplicationSeen => Ok(()),
-        State::CreationSeen | State::AcceptanceSeen => {
-            Err(RemotePrefixBootstrapError::InvalidEvent)
-        }
-    }
+    // Pending invitations and accepted-but-not-yet-fulfilled invitations are
+    // real home mailboxes. The historical planner still validates every edge.
+    Ok(())
 }
 
 /// Fetch, verify, and seal an authoritative remote prefix admission from a live sequencer.
@@ -700,17 +697,11 @@ mod tests {
         );
 
         let creation = test_strict_event(1, CleanEntryKind::Creation);
-        assert_eq!(
-            validate_prefix_grammar(&[creation]).unwrap_err(),
-            RemotePrefixBootstrapError::InvalidEvent
-        );
+        assert!(validate_prefix_grammar(&[creation]).is_ok());
 
         let c = test_strict_event(1, CleanEntryKind::Creation);
         let acc = test_strict_event(2, CleanEntryKind::ParticipantAcceptance);
-        assert_eq!(
-            validate_prefix_grammar(&[c, acc]).unwrap_err(),
-            RemotePrefixBootstrapError::InvalidEvent
-        );
+        assert!(validate_prefix_grammar(&[c, acc]).is_ok());
 
         // Creation -> Acceptance -> Fulfillment is valid
         let c = test_strict_event(1, CleanEntryKind::Creation);
@@ -726,16 +717,13 @@ mod tests {
         let app = test_strict_event(5, CleanEntryKind::Application);
         assert!(validate_prefix_grammar(&[c, pol, acc, ful, app]).is_ok());
 
-        // Policy after Application is rejected
+        // Another invitation can be added after application traffic.
         let c = test_strict_event(1, CleanEntryKind::Creation);
         let acc = test_strict_event(2, CleanEntryKind::ParticipantAcceptance);
         let ful = test_strict_event(3, CleanEntryKind::LeafRecoveryFulfillment);
         let app = test_strict_event(4, CleanEntryKind::Application);
         let pol = test_strict_event(5, CleanEntryKind::Policy);
-        assert_eq!(
-            validate_prefix_grammar(&[c, acc, ful, app, pol]).unwrap_err(),
-            RemotePrefixBootstrapError::InvalidEvent
-        );
+        assert!(validate_prefix_grammar(&[c, acc, ful, app, pol]).is_ok());
 
         // Skip Acceptance (Creation -> Fulfillment) is rejected
         let c = test_strict_event(1, CleanEntryKind::Creation);
@@ -753,5 +741,15 @@ mod tests {
             validate_prefix_grammar(&[c, acc, app]).unwrap_err(),
             RemotePrefixBootstrapError::InvalidEvent
         );
+
+        let repeated = [
+            test_strict_event(1, CleanEntryKind::Creation),
+            test_strict_event(2, CleanEntryKind::ParticipantAcceptance),
+            test_strict_event(3, CleanEntryKind::LeafRecoveryFulfillment),
+            test_strict_event(4, CleanEntryKind::Application),
+            test_strict_event(5, CleanEntryKind::ParticipantAcceptance),
+            test_strict_event(6, CleanEntryKind::LeafRecoveryFulfillment),
+        ];
+        assert!(validate_prefix_grammar(&repeated).is_ok());
     }
 }

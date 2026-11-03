@@ -338,63 +338,26 @@ async fn mutate(
                 serde_json::to_vec(&outcome).map_err(|_| ChatFailure::invariant(endpoint))?;
             return Ok(context::json_ok(bytes));
         } else {
-            let mut tx = pool
-                .begin()
-                .await
-                .map_err(|_| ChatFailure::storage(endpoint))?;
-
-            let (p1, p2) = if actor_did <= recipient_did {
-                (actor_did, recipient_did)
-            } else {
-                (recipient_did, actor_did)
-            };
-            let pair_lock_key = format!("chat-direct-request-pair:{p1}:{p2}");
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(&pair_lock_key)
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| ChatFailure::storage(endpoint))?;
-
-            if let Some(_conflict) = crate::federation::canonical_relay::check_pair_owner_fence(
-                &mut tx,
-                actor_did,
-                recipient_did,
-                request_id,
-                Some(&coord.coordinator_did),
-            )
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))?
-            {
-                return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
-            }
-            // Repository replay must not reserve another peer package for the same attempt.
-            let existing: bool = sqlx::query_scalar(
+            // This preflight is advisory; the pair-locked transaction rechecks the attempt.
+            // Reservation and PDS authority resolution must not hold a pool connection.
+            let has_existing_attempt: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)",
             )
             .bind(request_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(pool)
             .await
             .map_err(|_| ChatFailure::storage(endpoint))?;
-            if existing {
-                let result = requests::prepare_direct_request(
-                    &mut tx,
-                    &principal,
-                    envelope.signed_request.get().as_bytes(),
-                    signer,
-                    runtime.relationship_authority().as_ref(),
-                    now,
-                )
-                .await
-                .map_err(|e| failure(endpoint, e))?;
-                let bytes = output(result, endpoint)?;
-                tx.commit()
+            let remote_bootstrap = if !has_existing_attempt && !coord.is_recipient_home {
+                let authorized_keys =
+                    crate::federation::canonical_relay::resolve_remote_recipient_device_keys(
+                        pool,
+                        recipient_did,
+                    )
                     .await
-                    .map_err(|_| ChatFailure::storage(endpoint))?;
-                return Ok(context::json_ok(bytes));
-            }
-
-            if !coord.is_recipient_home {
-                let remote_devices =
+                    .map_err(|_| {
+                        failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable)
+                    })?;
+                let devices =
                     crate::federation::canonical_relay::reserve_remote_recipient_bootstrap(
                         pool,
                         &coord.recipient_home.endpoint,
@@ -405,87 +368,118 @@ async fn mutate(
                         Some(parsed_req.clone()),
                     )
                     .await
-                    .map_err(|e| {
-                        tracing::error!("reserve_remote_recipient_bootstrap failed: {:?}", e);
+                    .map_err(|error| {
+                        tracing::error!(?error, "reserve_remote_recipient_bootstrap failed");
                         failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable)
                     })?;
+                Some((devices, authorized_keys))
+            } else {
+                None
+            };
 
-                if let Err(error) =
-                    crate::federation::canonical_relay::stage_remote_recipient_devices(
-                        pool,
+            let operation = async {
+                let mut tx = pool
+                    .begin()
+                    .await
+                    .map_err(|_| ChatFailure::storage(endpoint))?;
+                let prepared = async {
+                    let (p1, p2) = if actor_did <= recipient_did {
+                        (actor_did, recipient_did)
+                    } else {
+                        (recipient_did, actor_did)
+                    };
+                    let pair_lock_key = format!("chat-direct-request-pair:{p1}:{p2}");
+                    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                        .bind(&pair_lock_key)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|_| ChatFailure::storage(endpoint))?;
+                    if crate::federation::canonical_relay::check_pair_owner_fence(
                         &mut tx,
+                        actor_did,
+                        recipient_did,
                         request_id,
-                        &remote_devices,
+                        Some(&coord.coordinator_did),
+                    )
+                    .await
+                    .map_err(|_| ChatFailure::storage(endpoint))?
+                    .is_some()
+                    {
+                        return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
+                    }
+                    let existing: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)",
+                    )
+                    .bind(request_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|_| ChatFailure::storage(endpoint))?;
+                    if !existing {
+                        if let Some((devices, authorized_keys)) = remote_bootstrap.as_ref() {
+                            crate::federation::canonical_relay::stage_remote_recipient_devices(
+                                &mut tx,
+                                request_id,
+                                devices,
+                                authorized_keys,
+                                now,
+                            )
+                            .await
+                            .map_err(|error| {
+                                tracing::error!(?error, "stage_remote_recipient_devices failed");
+                                failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable)
+                            })?;
+                        }
+                    }
+                    let result = requests::prepare_direct_request(
+                        &mut tx,
+                        &principal,
+                        envelope.signed_request.get().as_bytes(),
+                        signer,
+                        runtime.relationship_authority().as_ref(),
                         now,
                     )
                     .await
-                {
-                    crate::federation::canonical_relay::release_remote_recipient_bootstrap(
-                        pool,
-                        &coord.recipient_home.endpoint,
-                        &coord.recipient_home.did,
-                        request_id,
-                        recipient_did,
-                    )
-                    .await
-                    .map_err(|_| ChatFailure::storage(endpoint))?;
-                    tracing::error!("stage_remote_recipient_devices failed: {error:?}");
-                    return Err(failure(
-                        endpoint,
-                        DirectRequestStoreError::RecipientKeysUnavailable,
-                    ));
+                    .map_err(|error| failure(endpoint, error))?;
+                    let release_remote = !matches!(&result, DirectRequestResult::Prepared(_));
+                    let bytes = output(result, endpoint)?;
+                    Ok::<_, ChatFailure>((bytes, release_remote))
+                }
+                .await;
+                match prepared {
+                    Ok(result) => {
+                        tx.commit()
+                            .await
+                            .map_err(|_| ChatFailure::storage(endpoint))?;
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        tx.rollback()
+                            .await
+                            .map_err(|_| ChatFailure::storage(endpoint))?;
+                        Err(error)
+                    }
                 }
             }
-
-            let result = requests::prepare_direct_request(
-                &mut tx,
-                &principal,
-                envelope.signed_request.get().as_bytes(),
-                signer,
-                runtime.relationship_authority().as_ref(),
-                now,
-            )
             .await;
 
-            let result = match result {
-                Ok(r) => r,
-                Err(error) => {
-                    if !coord.is_recipient_home {
-                        crate::federation::canonical_relay::release_remote_recipient_bootstrap(
-                            pool,
-                            &coord.recipient_home.endpoint,
-                            &coord.recipient_home.did,
-                            request_id,
-                            recipient_did,
-                        )
-                        .await
-                        .map_err(|_| ChatFailure::storage(endpoint))?;
-                    }
-                    return Err(failure(endpoint, error));
-                }
+            // A concurrent Prepared replay shares the same idempotent remote lease.
+            // Only terminal outcomes or failed new attempts release it, after tx completion.
+            let release_remote = match &operation {
+                Ok((_, release)) => *release,
+                Err(_) => remote_bootstrap.is_some(),
             };
-
-            // C33-LEASE-004: Release remote leases for non-Prepared outcomes (e.g. Terminal receipts)
-            if !coord.is_recipient_home
-                && !matches!(&result, crate::chat_protocol::repository::direct_request_preparation::DirectRequestResult::Prepared(_))
-            {
+            if release_remote && !coord.is_recipient_home {
                 crate::federation::canonical_relay::release_remote_recipient_bootstrap(
                     pool,
-                    &coord.recipient_home.endpoint, &coord.recipient_home.did,
-                    request_id, recipient_did,
-                ).await.map_err(|_| ChatFailure::storage(endpoint))?;
-            }
-
-            let bytes = output(result, endpoint)?;
-            if bytes.len() > 8_388_608 {
-                return Err(ChatFailure::protocol(
-                    endpoint,
-                    ChatProtocolErrorCode::ArtifactTooLarge,
-                ));
-            }
-            tx.commit()
+                    &coord.recipient_home.endpoint,
+                    &coord.recipient_home.did,
+                    request_id,
+                    recipient_did,
+                )
                 .await
                 .map_err(|_| ChatFailure::storage(endpoint))?;
+            }
+            let (bytes, _) = operation?;
             return Ok(context::json_ok(bytes));
         }
     }

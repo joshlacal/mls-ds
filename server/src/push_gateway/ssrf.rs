@@ -242,6 +242,14 @@ where
 }
 
 pub fn system_dns_resolve(host: &str) -> Result<Vec<IpAddr>, String> {
+    #[cfg(feature = "sim")]
+    if let Some(result) = crate::sim_hooks::intercept_sim_dns(host) {
+        let addrs = result?;
+        if addrs.is_empty() {
+            return Err("no A/AAAA records".to_string());
+        }
+        return Ok(addrs);
+    }
     let addrs: Vec<IpAddr> = (host, 443u16)
         .to_socket_addrs()
         .map_err(|e| e.to_string())?

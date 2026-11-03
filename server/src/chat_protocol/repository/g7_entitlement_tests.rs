@@ -1647,9 +1647,11 @@ const FROZEN_EXECUTOR_SEED_SHA256: &str =
 // `graph_digest_reset` encodes the fifth status. Taken from POST-rustfmt bytes.
 // Re-pinned for the clean cutover's fail-closed routing and locked-hydration
 // repository changes.
+// Re-pinned 2026-11-02 for federated group KeyPackage export reservation in
+// `hydrate_locked_available_recovery_package_at_coordinate` (post-rustfmt bytes).
 // An unexplained mismatch here still means core.rs drifted.
 const SEALED_REPOSITORY_CORE_SHA256: &str =
-    "420ad7d9c040bb33be7a411de14a1eeed47b8f26b8de3cc9e32be0122edb24a5";
+    "ae77b36f65eae4fb2970f38e213a08cba5a16ef211b467722c869d7dd3ddbea3";
 
 #[test]
 fn frozen_executor_seed_helper_is_byte_identical_to_the_sealed_baseline() {
@@ -9563,4 +9565,80 @@ async fn pending_invitations_authorize_state_only_for_group_and_direct() {
         "an unrelated DID has no entry authority on direct conversation"
     );
     rollback_with_constraints(tx).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database"]
+async fn replicated_group_entries_require_exact_device_grants() {
+    let (pool, _guard) = b_auth_pool().await;
+    let conversation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO chat.direct_request_transport_entries \
+         (conversation_id,seq,entry_id,entry_bytes) VALUES($1,1,$2,$3)",
+    )
+    .bind(conversation_id)
+    .bind(Uuid::new_v4())
+    .bind(b"{}".as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let denied = super::entry_read::get_entries_for_admission(
+        &pool,
+        real_read_admission(&pool, "blue.catbird.chat.getEntries").await,
+        conversation_id,
+        1,
+        1,
+    )
+    .await
+    .err()
+    .expect("transport rows alone grant no access");
+    assert!(matches!(
+        denied,
+        super::entry_read::EntryReadFacadeError::ConversationNotFound
+    ));
+
+    sqlx::query(
+        "INSERT INTO chat.group_transport_entry_recipients \
+         (conversation_id,seq,user_did,device_id) VALUES($1,1,$2,$3)",
+    )
+    .bind(conversation_id)
+    .bind(B_AUTH_DID)
+    .bind(Uuid::parse_str(B_AUTH_DEVICE).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let allowed = super::entry_read::get_entries_for_admission(
+        &pool,
+        real_read_admission(&pool, "blue.catbird.chat.getEntries").await,
+        conversation_id,
+        1,
+        1,
+    )
+    .await
+    .expect("the explicitly granted device can read its empty successor page");
+    let page: serde_json::Value = serde_json::from_slice(&allowed.into_response_bytes()).unwrap();
+    assert_eq!(page["entries"], json!([]));
+    let sibling = Uuid::new_v4();
+    let sibling_jkt = register_read_device(&pool, B_AUTH_DID, sibling).await;
+    let denied = super::entry_read::get_entries_for_admission(
+        &pool,
+        fixture_read_admission(
+            &pool,
+            "blue.catbird.chat.getEntries",
+            B_AUTH_DID,
+            sibling,
+            &sibling_jkt,
+        )
+        .await,
+        conversation_id,
+        1,
+        1,
+    )
+    .await
+    .err()
+    .expect("an account sibling does not inherit another device's grant");
+    assert!(matches!(
+        denied,
+        super::entry_read::EntryReadFacadeError::ConversationNotFound
+    ));
 }

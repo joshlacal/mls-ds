@@ -6,6 +6,9 @@
 //! - Zero display strings (`senderHandle`, `title`, `body`, `conversationTitle`) ever leave `mls-ds`.
 //! - Home-`mls-ds`-only privacy (`D2`): `mls-ds` ONLY wakes devices whose `user_did` is homed on
 //!   this `mls-ds` (never remote federated participants).
+//! - After committing an entry it sequenced, `mls-ds` wakes that entry's local recipient
+//!   devices that registered a gateway, except the producing device; remote members are
+//!   woken by their own home after `deliverGroupEntry`.
 //! - DNS-pinned HTTPS client per target host (zero redirects) and `#atproto` ES256 DID-JWT auth
 //!   (`lxm = "blue.catbird.push.deliver"`).
 //! - Immediate `chat.push_gateway_bindings` pruning when the Push Gateway returns `410 Gone` (`PushTokenGone`).
@@ -166,9 +169,10 @@ impl PushGatewayClient {
             // D2 home-DS-only check: if `public.did_ds_mappings` explicitly maps `user_did` to a
             // different DS DID, this DS is NOT the user's home DS and MUST NOT send push wakes!
             let mapped_ds: Option<String> = sqlx::query_scalar(
-                "SELECT ds_did FROM public.did_ds_mappings WHERE actor_did = $1 AND expires_at > NOW()",
+                "SELECT ds_did FROM public.did_ds_mappings WHERE actor_did = $1 AND expires_at > $2",
             )
             .bind(user_did)
+            .bind(crate::sim_hooks::current_utc())
             .fetch_optional(pool)
             .await
             .map_err(|e| format!("query did_ds_mappings: {e}"))?;
@@ -219,14 +223,15 @@ impl PushGatewayClient {
             let aud_did = format!("did:web:{}", validated.host);
             let jwt = self.mint_deliver_jwt(&aud_did, &binding.gateway_url, &body_sha256)?;
 
-            let resp = http_client
-                .post(&validated.effective_url)
-                .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body_bytes)
-                .send()
-                .await
-                .map_err(|e| format!("push gateway POST failed: {e}"))?;
+            let resp = crate::sim_hooks::send_reqwest(
+                http_client
+                    .post(&validated.effective_url)
+                    .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body_bytes),
+            )
+            .await
+            .map_err(|e| format!("push gateway POST failed: {e}"))?;
 
             let status = resp.status();
             if status == reqwest::StatusCode::GONE {
@@ -251,6 +256,145 @@ impl PushGatewayClient {
 
         Ok(delivered)
     }
+}
+
+/// Local devices to wake for one entry this DS has just sequenced (`D2`, `I12`).
+pub struct PreparedLocalWake {
+    candidates: Vec<(String, Uuid)>,
+    wake: PushWakeDispatch,
+}
+
+impl PreparedLocalWake {
+    pub async fn dispatch(
+        self,
+        pool: &DbPool,
+        client: &PushGatewayClient,
+    ) -> Result<usize, String> {
+        client
+            .dispatch_for_local_recipients(pool, &self.candidates, self.wake)
+            .await
+    }
+}
+
+/// Capture an accepted entry's exact local wake audience inside its sequencing
+/// transaction. Remote members are woken by their own home after
+/// `deliverGroupEntry`; the producing device is never woken.
+pub async fn prepare_local_entry_wake(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    entry_or_response: &serde_json::Value,
+) -> Result<Option<PreparedLocalWake>, sqlx::Error> {
+    use serde_json::Value;
+    let entry = entry_or_response
+        .pointer("/result/entry")
+        .or_else(|| entry_or_response.get("entry"))
+        .unwrap_or(entry_or_response);
+    let conversation_id = entry
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok());
+    let (Some(conversation_id), Some(seq)) =
+        (conversation_id, entry.get("seq").and_then(Value::as_i64))
+    else {
+        return Ok(None);
+    };
+    let Some(current_generation) = sqlx::query_scalar::<_, i64>(
+        "SELECT current_generation FROM chat.conversations \
+          WHERE conversation_id = $1 AND NOT is_remote",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let body = entry.pointer("/signedRequest/body");
+    let field = |name: &str| body.and_then(|body| body.get(name));
+    let is_application = entry.get("$type").and_then(Value::as_str)
+        == Some("blue.catbird.chat.defs#applicationEntry")
+        || field("$type").and_then(Value::as_str)
+            == Some("blue.catbird.chat.defs#applicationSendBody");
+    let generation = entry
+        .get("generation")
+        .or_else(|| body.and_then(|body| body.pointer("/prior/generation")))
+        .and_then(Value::as_i64)
+        .unwrap_or(current_generation);
+    let mut candidates: Vec<(String, Uuid)> = if is_application {
+        sqlx::query_as(
+            "SELECT DISTINCT ai.recipient_did, ai.recipient_device_id \
+               FROM chat.application_intervals ai \
+               JOIN chat.participants p \
+                 ON p.conversation_id = ai.conversation_id AND p.user_did = ai.recipient_did \
+               JOIN chat.push_gateway_bindings b \
+                 ON b.user_did = ai.recipient_did AND b.device_id = ai.recipient_device_id \
+              WHERE ai.conversation_id = $1 AND ai.generation = $2 AND ai.start_seq <= $3 \
+                AND (ai.terminal_seq IS NULL OR $3 <= ai.terminal_seq) AND p.ds_did IS NULL \
+              ORDER BY 1, 2",
+        )
+        .bind(conversation_id)
+        .bind(generation)
+        .bind(seq)
+        .fetch_all(&mut **tx)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT DISTINCT er.user_did, er.device_id \
+               FROM chat.entry_recipients er \
+               JOIN chat.participants p \
+                 ON p.conversation_id = er.conversation_id AND p.user_did = er.user_did \
+               JOIN chat.push_gateway_bindings b \
+                 ON b.user_did = er.user_did AND b.device_id = er.device_id \
+              WHERE er.conversation_id = $1 AND er.seq = $2 AND p.ds_did IS NULL \
+              ORDER BY 1, 2",
+        )
+        .bind(conversation_id)
+        .bind(seq)
+        .fetch_all(&mut **tx)
+        .await?
+    };
+    let actor_did = field("actorDid").and_then(Value::as_str);
+    let actor_device = field("actorDeviceId")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok());
+    candidates
+        .retain(|(did, device)| Some(did.as_str()) != actor_did || Some(*device) != actor_device);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let ciphertext = if is_application {
+        field("applicationMessage")
+            .and_then(|message| message.get("bytes"))
+            .and_then(|bytes| {
+                bytes
+                    .as_str()
+                    .or_else(|| bytes.get("$bytes").and_then(Value::as_str))
+            })
+            .and_then(|encoded| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .or_else(|_| URL_SAFE_NO_PAD.decode(encoded))
+                    .ok()
+            })
+    } else {
+        None
+    };
+    Ok(Some(PreparedLocalWake {
+        candidates,
+        wake: PushWakeDispatch {
+            wake_kind: if is_application {
+                PushWakeKind::ApplicationMessage
+            } else {
+                PushWakeKind::ControlTransition
+            },
+            conversation_id,
+            generation,
+            seq,
+            epoch: body
+                .and_then(|body| body.pointer("/prior/epoch"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            ciphertext,
+        },
+    }))
 }
 
 #[cfg(test)]

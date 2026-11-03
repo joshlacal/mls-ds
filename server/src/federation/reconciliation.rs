@@ -225,6 +225,14 @@ pub(crate) struct LocalDigestState {
     pub(crate) event_count: i64,
     pub(crate) digest_sha256: String,
 }
+/// Production reconciliation cadence (`RECONCILIATION_INTERVAL_SECS`, default 30).
+pub(crate) fn reconciliation_interval_secs() -> u64 {
+    std::env::var("RECONCILIATION_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30)
+}
+
 pub async fn run_reconciliation_worker(
     pool: PgPool,
     resolver: Arc<DsResolver>,
@@ -233,10 +241,7 @@ pub async fn run_reconciliation_worker(
     self_did: String,
     shutdown: CancellationToken,
 ) {
-    let interval_secs = std::env::var("RECONCILIATION_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30);
+    let interval_secs = reconciliation_interval_secs();
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     info!("Federation reconciliation worker started");
@@ -254,6 +259,17 @@ pub async fn run_reconciliation_worker(
             }
         }
     }
+}
+
+#[cfg(feature = "sim")]
+pub async fn run_reconciliation_once_for_sim(
+    pool: &PgPool,
+    resolver: &DsResolver,
+    outbound: &OutboundClient,
+    auth_sign: &(dyn Fn(&str, &str) -> Result<String, String> + Send + Sync),
+    self_did: &str,
+) -> Result<(), String> {
+    run_once(pool, resolver, outbound, auth_sign, self_did).await
 }
 
 async fn run_once(
@@ -515,18 +531,19 @@ async fn reconcile_clean_conversation(
             ));
         }
 
+        let now = crate::sim_hooks::current_utc();
         sqlx::query(
             r#"
             INSERT INTO federation_sync_state
                 (convo_id, sequencer_ds_did, sequencer_term, last_seq, last_epoch, last_digest, last_reconciled_at, drift_count, updated_at, status)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW(), 0, NOW(), 'healthy')
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $7, 'healthy')
              ON CONFLICT (convo_id, sequencer_ds_did) DO UPDATE SET
                 sequencer_term = EXCLUDED.sequencer_term,
                 last_seq = EXCLUDED.last_seq,
                 last_epoch = EXCLUDED.last_epoch,
                 last_digest = EXCLUDED.last_digest,
-                last_reconciled_at = NOW(),
-                updated_at = NOW()
+                last_reconciled_at = $7,
+                updated_at = $7
              WHERE federation_sync_state.status = 'healthy'
             "#,
         )
@@ -536,6 +553,7 @@ async fn reconcile_clean_conversation(
         .bind(local_snapshot.last_seq)
         .bind(local_snapshot.last_epoch)
         .bind(&local_snapshot.digest_sha256)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -793,6 +811,17 @@ async fn reconcile_clean_conversation(
             Ok(())
         }
         CleanDriftDecision::ApplySuffix { after_seq } => {
+            // Reconciliation imports only replicated application entries. The
+            // first control entry ends the importable suffix; local members read
+            // later entries from the sequencer's replicated transport rows.
+            let importable = retained_suffix_chunk
+                .iter()
+                .take_while(|event| event.entry_kind() == CleanEntryKind::Application)
+                .count();
+            if importable == 0 {
+                return Ok(());
+            }
+            retained_suffix_chunk.truncate(importable);
             let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
             let locked_convo: Option<(bool, Option<String>, i64)> = sqlx::query_as(
                 "SELECT is_remote, sequencer_ds, sequencer_term FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE",
@@ -866,19 +895,20 @@ async fn reconcile_clean_conversation(
                 .await
                 .map_err(|e| e.to_string())?;
 
+            let now = crate::sim_hooks::current_utc();
             let update_res = sqlx::query(
                 r#"
                 INSERT INTO federation_sync_state
                     (convo_id, sequencer_ds_did, sequencer_term, last_seq, last_epoch, last_digest, last_reconciled_at, drift_count, updated_at, status)
-                 VALUES ($1, $2, $3, $4, $5, $6, NOW(), 1, NOW(), 'healthy')
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $7, 'healthy')
                  ON CONFLICT (convo_id, sequencer_ds_did) DO UPDATE SET
                     sequencer_term = EXCLUDED.sequencer_term,
                     last_seq = EXCLUDED.last_seq,
                     last_epoch = EXCLUDED.last_epoch,
                     last_digest = EXCLUDED.last_digest,
-                    last_reconciled_at = NOW(),
+                    last_reconciled_at = $7,
                     drift_count = federation_sync_state.drift_count + 1,
-                    updated_at = NOW()
+                    updated_at = $7
                  WHERE federation_sync_state.status = 'healthy'
                 "#,
             )
@@ -888,6 +918,7 @@ async fn reconcile_clean_conversation(
             .bind(new_local.last_seq)
             .bind(new_local.last_epoch)
             .bind(&new_local.digest_sha256)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;

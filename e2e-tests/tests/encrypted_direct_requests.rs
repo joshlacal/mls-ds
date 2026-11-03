@@ -331,18 +331,26 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
             ],
         )
         .await?;
-    // Bob legitimately holds a terminal proof on the closed conversation;
-    // under ruling BREAD-04 / line 1370, an exact device whose interval ended in Close
-    // obtains only separately entitled control entries within terminal_control_interval.
+    encrypted_requests::assert_closed_conversation_wiped(
+        f.conversation_id,
+        Some(f.request_id),
+    )?;
+    // Bob's frozen close-event entitlement survives the operational wipe,
+    // without retaining application ciphertext or ordinary control history.
     assert_eq!(
         closed_get_status,
         reqwest::StatusCode::OK,
-        "terminal proof holder receives control entries in closed interval"
+        "terminal event recipient receives the signed close entry"
     );
     let closed_entries_json: Value = serde_json::from_slice(&closed_get_bytes)?;
     let closed_entries = closed_entries_json["entries"]
         .as_array()
         .context("closed entries array")?;
+    let closed_response: Value = serde_json::from_slice(&close_bytes)?;
+    assert_eq!(
+        closed_entries.as_slice(),
+        std::slice::from_ref(&closed_response["result"]["entry"])
+    );
     for entry in closed_entries {
         assert_ne!(
             entry["$type"], "blue.catbird.chat.defs#message",
@@ -354,7 +362,8 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
         );
     }
 
-    // Conversely, the unaddressed sibling without terminal proof must be denied.
+    // An unaddressed sibling has neither a terminal event nor an operational
+    // conversation row and must not gain access to the retained close.
     let (sibling_closed_status, sibling_closed_bytes) = sibling
         .service
         .get(
@@ -371,8 +380,8 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
     assert_eq!(sibling_closed_status, reqwest::StatusCode::BAD_REQUEST);
     let sibling_closed_err: Value = serde_json::from_slice(&sibling_closed_bytes)?;
     assert_eq!(
-        sibling_closed_err["error"], "NotEntitled",
-        "sibling without interval must be rejected"
+        sibling_closed_err["error"], "ConversationNotFound",
+        "sibling without terminal entitlement must not see the close"
     );
 
     Ok(())

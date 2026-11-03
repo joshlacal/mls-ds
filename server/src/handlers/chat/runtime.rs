@@ -106,6 +106,8 @@ pub struct ChatRuntime {
     push_gateway_client: Option<Arc<crate::push_gateway::client::PushGatewayClient>>,
     clock: Arc<dyn crate::sim_hooks::DsClock>,
     spawner: Arc<dyn crate::sim_hooks::TaskSpawner>,
+    #[cfg(feature = "sim")]
+    sim_hooks: Option<Arc<crate::sim_hooks::SimDsHooks>>,
 }
 
 impl fmt::Debug for ChatRuntime {
@@ -248,6 +250,8 @@ impl ChatRuntime {
             push_gateway_client,
             clock: Arc::new(crate::sim_hooks::SystemDsClock),
             spawner: Arc::new(crate::sim_hooks::TokioTaskSpawner),
+            #[cfg(feature = "sim")]
+            sim_hooks: crate::sim_hooks::active_sim_ds(),
         })
     }
 
@@ -258,6 +262,25 @@ impl ChatRuntime {
 
     pub fn clock(&self) -> &Arc<dyn crate::sim_hooks::DsClock> {
         &self.clock
+    }
+
+    #[cfg(feature = "sim")]
+    pub fn with_sim_hooks(mut self, hooks: Arc<crate::sim_hooks::SimDsHooks>) -> Self {
+        self.sim_hooks = Some(hooks);
+        self
+    }
+
+    #[cfg(feature = "sim")]
+    pub(crate) fn sim_hooks(&self) -> Option<Arc<crate::sim_hooks::SimDsHooks>> {
+        self.sim_hooks.clone()
+    }
+
+    pub fn with_push_gateway_client(
+        mut self,
+        client: Arc<crate::push_gateway::client::PushGatewayClient>,
+    ) -> Self {
+        self.push_gateway_client = Some(client);
+        self
     }
 
     pub fn with_spawner(mut self, spawner: Arc<dyn crate::sim_hooks::TaskSpawner>) -> Self {
@@ -528,6 +551,23 @@ impl ChatRuntime {
         self
     }
 
+    /// Supply a node-local C33 authority before validating the simulation pool.
+    #[cfg(feature = "sim")]
+    pub fn with_request_receipt_keys(
+        mut self,
+        receipt_pem: &str,
+        service_pem: &str,
+        document_json: &str,
+    ) -> Result<Self, String> {
+        let signer = crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner::configured(
+            receipt_pem, service_pem, document_json,
+        )?;
+        self.request_receipt_signer = Some(Arc::new(signer));
+        self.requests_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(self)
+    }
+
     pub fn i13_receipt_signer(&self) -> Option<&crate::federation::receipt::I13ReceiptSigner> {
         self.i13_receipt_signer.as_deref()
     }
@@ -612,16 +652,28 @@ impl ChatRuntime {
         let pool = pool.clone();
         let did = did.to_owned();
         let clock = Arc::clone(&self.clock);
+        #[cfg(feature = "sim")]
+        let sim_hooks = self.sim_hooks.clone();
         self.spawner.spawn_box(
             "chat.post_commit.device_revoked",
-            Box::pin(crate::sim_hooks::scope_ds_clock(clock, async move {
-                let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
-                let _ = crate::space_host::revocation_fanout::revoke_user_space_credentials_across_conversations(
-                    &host,
-                    &did,
-                )
-                .await;
-            })),
+            Box::pin(async move {
+                let fut = crate::sim_hooks::scope_ds_clock(clock, async move {
+                    let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
+                    let _ = crate::space_host::revocation_fanout::revoke_user_space_credentials_across_conversations(
+                        &host,
+                        &did,
+                    )
+                    .await;
+                });
+                #[cfg(feature = "sim")]
+                {
+                    crate::sim_hooks::scope_optional_sim_ds(sim_hooks, fut).await;
+                }
+                #[cfg(not(feature = "sim"))]
+                {
+                    fut.await;
+                }
+            }),
         );
     }
 
@@ -631,6 +683,7 @@ impl ChatRuntime {
         pool: &DbPool,
         endpoint: crate::chat_protocol::error::ChatEndpoint,
         response_bytes: &[u8],
+        prepared_space: Option<crate::space_host::revocation_fanout::PreparedSpaceDeletedFanout>,
     ) {
         if endpoint != crate::chat_protocol::error::ChatEndpoint::CloseConversation {
             return;
@@ -638,32 +691,74 @@ impl ChatRuntime {
         let Some(cfg) = self.space_host_config.clone() else {
             return;
         };
+        if let Some(prepared) = prepared_space {
+            let pool = pool.clone();
+            let clock = Arc::clone(&self.clock);
+            #[cfg(feature = "sim")]
+            let sim_hooks = self.sim_hooks.clone();
+            self.spawner.spawn_box(
+                "chat.post_commit.close_conversation",
+                Box::pin(async move {
+                    let fut = crate::sim_hooks::scope_ds_clock(clock, async move {
+                        let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
+                        let _ =
+                            crate::space_host::revocation_fanout::deliver_prepared_space_deleted(
+                                &host, prepared,
+                            )
+                            .await;
+                    });
+                    #[cfg(feature = "sim")]
+                    {
+                        crate::sim_hooks::scope_optional_sim_ds(sim_hooks, fut).await;
+                    }
+                    #[cfg(not(feature = "sim"))]
+                    {
+                        fut.await;
+                    }
+                }),
+            );
+            return;
+        }
         let Ok(val) = serde_json::from_slice::<Value>(response_bytes) else {
             return;
         };
         let Some(cid) = val
-            .pointer("/entry/conversationId")
+            .pointer("/result/entry/conversationId")
+            .or_else(|| val.pointer("/entry/conversationId"))
             .and_then(Value::as_str)
             .and_then(|s| uuid::Uuid::parse_str(s).ok())
         else {
             return;
         };
         let gen = val
-            .pointer("/entry/generation")
+            .pointer("/result/entry/signedRequest/body/prior/generation")
+            .or_else(|| val.pointer("/entry/generation"))
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let pool = pool.clone();
         let clock = Arc::clone(&self.clock);
+        #[cfg(feature = "sim")]
+        let sim_hooks = self.sim_hooks.clone();
         self.spawner.spawn_box(
             "chat.post_commit.close_conversation",
-            Box::pin(crate::sim_hooks::scope_ds_clock(clock, async move {
-                let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
-                let _ =
-                    crate::space_host::revocation_fanout::fan_out_space_deleted_for_conversation(
-                        &host, cid, gen,
-                    )
-                    .await;
-            })),
+            Box::pin(async move {
+                let fut = crate::sim_hooks::scope_ds_clock(clock, async move {
+                    let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
+                    let _ =
+                        crate::space_host::revocation_fanout::fan_out_space_deleted_for_conversation(
+                            &host, cid, gen,
+                        )
+                        .await;
+                });
+                #[cfg(feature = "sim")]
+                {
+                    crate::sim_hooks::scope_optional_sim_ds(sim_hooks, fut).await;
+                }
+                #[cfg(not(feature = "sim"))]
+                {
+                    fut.await;
+                }
+            }),
         );
     }
 
@@ -691,17 +786,89 @@ impl ChatRuntime {
             .unwrap_or(0);
         let pool = pool.clone();
         let clock = Arc::clone(&self.clock);
+        #[cfg(feature = "sim")]
+        let sim_hooks = self.sim_hooks.clone();
         self.spawner.spawn_box(
             "chat.post_commit.membership_transition",
-            Box::pin(crate::sim_hooks::scope_ds_clock(clock, async move {
-                let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
-                let _ = crate::space_host::revocation_fanout::revoke_inactive_space_credentials_for_conversation(
-                    &host,
-                    cid,
-                    gen,
-                )
-                .await;
-            })),
+            Box::pin(async move {
+                let fut = crate::sim_hooks::scope_ds_clock(clock, async move {
+                    let host = crate::space_host::SpaceHostRuntime::new(pool, cfg);
+                    let _ = crate::space_host::revocation_fanout::revoke_inactive_space_credentials_for_conversation(
+                        &host,
+                        cid,
+                        gen,
+                    )
+                    .await;
+                });
+                #[cfg(feature = "sim")]
+                {
+                    crate::sim_hooks::scope_optional_sim_ds(sim_hooks, fut).await;
+                }
+                #[cfg(not(feature = "sim"))]
+                {
+                    fut.await;
+                }
+            }),
+        );
+    }
+
+    /// Post-commit S2S `deliverGroupEntry` fan-out to remote member home `mls-ds` nodes (`D1`, `I13`, `I14`).
+    pub fn spawn_post_commit_group_entry_fanout(
+        &self,
+        pool: &DbPool,
+        prepared: crate::federation::group_fanout::PreparedGroupEntryFanout,
+    ) {
+        let pool = pool.clone();
+        let resolver = self.resolver.clone();
+        let clock = Arc::clone(&self.clock);
+        #[cfg(feature = "sim")]
+        let sim_hooks = self.sim_hooks.clone();
+        self.spawner.spawn_box(
+            "chat.post_commit.group_entry_fanout",
+            Box::pin(async move {
+                let fut = crate::sim_hooks::scope_ds_clock(clock, async move {
+                    let _ = prepared.deliver(&pool, resolver.as_deref()).await;
+                });
+                #[cfg(feature = "sim")]
+                {
+                    crate::sim_hooks::scope_optional_sim_ds(sim_hooks, fut).await;
+                }
+                #[cfg(not(feature = "sim"))]
+                {
+                    fut.await;
+                }
+            }),
+        );
+    }
+
+    /// Post-commit push wakes for this DS's own recipient devices (`D2`, `I12`).
+    pub fn spawn_post_commit_local_push(
+        &self,
+        pool: &DbPool,
+        prepared: crate::push_gateway::client::PreparedLocalWake,
+    ) {
+        let Some(client) = self.push_gateway_client.clone() else {
+            return;
+        };
+        let pool = pool.clone();
+        let clock = Arc::clone(&self.clock);
+        #[cfg(feature = "sim")]
+        let sim_hooks = self.sim_hooks.clone();
+        self.spawner.spawn_box(
+            "chat.post_commit.local_push",
+            Box::pin(async move {
+                let fut = crate::sim_hooks::scope_ds_clock(clock, async move {
+                    let _ = prepared.dispatch(&pool, &client).await;
+                });
+                #[cfg(feature = "sim")]
+                {
+                    crate::sim_hooks::scope_optional_sim_ds(sim_hooks, fut).await;
+                }
+                #[cfg(not(feature = "sim"))]
+                {
+                    fut.await;
+                }
+            }),
         );
     }
 }
@@ -732,6 +899,50 @@ mod tests {
     use crate::realtime::{SseState, StreamEvent};
     use serde_json::json;
     use std::sync::Arc;
+
+    #[cfg(feature = "sim")]
+    #[test]
+    fn sim_request_receipt_authority_is_node_local_and_requires_validation() {
+        use p256::pkcs8::{EncodePrivateKey, LineEnding};
+        let receipt = p256::ecdsa::SigningKey::from_bytes((&[0x31; 32]).into()).unwrap();
+        let service = p256::ecdsa::SigningKey::from_bytes((&[0x32; 32]).into()).unwrap();
+        let authority = "did:web:ds-b.catbird.blue";
+        let public = receipt.verifying_key().to_encoded_point(true);
+        let key_id = crate::chat_protocol::direct_request_transcript::direct_request_receipt_key_id_for_authority(
+            authority, public.as_bytes(),
+        ).unwrap();
+        let mut multikey = vec![0x80, 0x24];
+        multikey.extend_from_slice(public.as_bytes());
+        let document = json!({
+            "id": authority,
+            "verificationMethod": [{
+                "id": key_id,
+                "controller": authority,
+                "type": "Multikey",
+                "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, multikey),
+            }],
+        });
+        let runtime = ChatRuntime::from_env(Arc::new(SseState::new(8))).unwrap();
+        runtime
+            .requests_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        let runtime = runtime
+            .with_request_receipt_keys(
+                receipt.to_pkcs8_pem(LineEnding::LF).unwrap().as_str(),
+                service.to_pkcs8_pem(LineEnding::LF).unwrap().as_str(),
+                &document.to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .request_receipt_signer
+                .as_ref()
+                .unwrap()
+                .authority_did(),
+            authority
+        );
+        assert!(runtime.request_receipt_signer().is_none());
+    }
 
     #[tokio::test]
     async fn sse_typing_fanout_is_filtered_by_conversation() {

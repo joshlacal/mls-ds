@@ -923,13 +923,15 @@ impl DsResolver {
     /// Look up cached endpoint for an actor DID from did_ds_mappings joined with ds_endpoints.
     async fn get_cached(&self, actor_did: &str) -> Result<Option<DsEndpoint>, FederationError> {
         let canonical = canonical_did(actor_did);
+        let now = crate::sim_hooks::current_utc();
         let row = sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT e.did, e.endpoint, e.supported_cipher_suites \
              FROM did_ds_mappings m \
              JOIN ds_endpoints e ON m.ds_did = e.did \
-             WHERE m.actor_did = $1 AND m.expires_at > NOW() AND e.expires_at > NOW()",
+             WHERE m.actor_did = $1 AND m.expires_at > $2 AND e.expires_at > $2",
         )
         .bind(&canonical)
+        .bind(now)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -968,11 +970,13 @@ impl DsResolver {
         ds_did: &str,
     ) -> Result<Option<DsEndpoint>, FederationError> {
         let canonical = canonical_did(ds_did);
+        let now = crate::sim_hooks::current_utc();
         let row = sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT did, endpoint, supported_cipher_suites \
-             FROM ds_endpoints WHERE did = $1 AND expires_at > NOW()",
+             FROM ds_endpoints WHERE did = $1 AND expires_at > $2",
         )
         .bind(&canonical)
+        .bind(now)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -1017,39 +1021,41 @@ impl DsResolver {
             .supported_cipher_suites
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
+        let now = crate::sim_hooks::current_utc();
 
         // 1. Insert/update ds_endpoints
         sqlx::query(
             "INSERT INTO ds_endpoints (did, endpoint, supported_cipher_suites, resolved_at, expires_at) \
-             VALUES ($1, $2, $3, NOW(), NOW() + make_interval(secs => $4)) \
+             VALUES ($1, $2, $3, $5, $5 + make_interval(secs => $4)) \
              ON CONFLICT (did) DO UPDATE SET \
                endpoint = $2, \
                supported_cipher_suites = $3, \
-               resolved_at = NOW(), \
-               expires_at = NOW() + make_interval(secs => $4)",
+               resolved_at = $5, \
+               expires_at = $5 + make_interval(secs => $4)",
         )
         .bind(&canonical_ds)
         .bind(&endpoint.endpoint)
         .bind(&suites_json)
         .bind(self.cache_ttl_secs as f64)
+        .bind(now)
         .execute(&self.pool)
         .await?;
 
         // 2. Insert/update did_ds_mappings
         sqlx::query(
             "INSERT INTO did_ds_mappings (actor_did, ds_did, resolved_at, expires_at) \
-             VALUES ($1, $2, NOW(), NOW() + make_interval(secs => $3)) \
+             VALUES ($1, $2, $4, $4 + make_interval(secs => $3)) \
              ON CONFLICT (actor_did) DO UPDATE SET \
                ds_did = $2, \
-               resolved_at = NOW(), \
-               expires_at = NOW() + make_interval(secs => $3)",
+               resolved_at = $4, \
+               expires_at = $4 + make_interval(secs => $3)",
         )
         .bind(&canonical_actor)
         .bind(&canonical_ds)
         .bind(self.cache_ttl_secs as f64)
+        .bind(now)
         .execute(&self.pool)
         .await?;
-
         Ok(())
     }
 
@@ -1059,23 +1065,23 @@ impl DsResolver {
             .supported_cipher_suites
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
-
+        let now = crate::sim_hooks::current_utc();
         sqlx::query(
             "INSERT INTO ds_endpoints (did, endpoint, supported_cipher_suites, resolved_at, expires_at) \
-             VALUES ($1, $2, $3, NOW(), NOW() + make_interval(secs => $4)) \
+             VALUES ($1, $2, $3, $5, $5 + make_interval(secs => $4)) \
              ON CONFLICT (did) DO UPDATE SET \
                endpoint = $2, \
                supported_cipher_suites = $3, \
-               resolved_at = NOW(), \
-               expires_at = NOW() + make_interval(secs => $4)",
+               resolved_at = $5, \
+               expires_at = $5 + make_interval(secs => $4)",
         )
         .bind(&canonical_ds)
         .bind(&endpoint.endpoint)
         .bind(&suites_json)
         .bind(self.cache_ttl_secs as f64)
+        .bind(now)
         .execute(&self.pool)
         .await?;
-
         Ok(())
     }
 
@@ -1512,12 +1518,15 @@ impl DsResolver {
     }
 
     pub async fn cleanup_expired(&self) -> Result<u64, FederationError> {
+        let now = crate::sim_hooks::current_utc();
         let mut deleted = 0u64;
-        let r1 = sqlx::query("DELETE FROM did_ds_mappings WHERE expires_at < NOW()")
+        let r1 = sqlx::query("DELETE FROM did_ds_mappings WHERE expires_at < $1")
+            .bind(now)
             .execute(&self.pool)
             .await?;
         deleted += r1.rows_affected();
-        let r2 = sqlx::query("DELETE FROM ds_endpoints WHERE expires_at < NOW()")
+        let r2 = sqlx::query("DELETE FROM ds_endpoints WHERE expires_at < $1")
+            .bind(now)
             .execute(&self.pool)
             .await?;
         deleted += r2.rows_affected();
@@ -1785,6 +1794,29 @@ async fn send_resolution_request(
     did: &str,
     context: &str,
 ) -> Result<reqwest::Response, FederationError> {
+    #[cfg(feature = "sim")]
+    if let Some(response) = crate::sim_hooks::intercept_sim_http(&request) {
+        let response = tokio::time::timeout_at(deadline, response)
+            .await
+            .map_err(|_| FederationError::ResolutionFailed {
+                did: did.to_string(),
+                kind: ResolutionFailureKind::Timeout(format!("{context}: deadline exceeded")),
+            })?
+            .map_err(|error| FederationError::ResolutionFailed {
+                did: did.to_string(),
+                kind: ResolutionFailureKind::ConnectionFailed(format!("{context}: {error}")),
+            })?;
+        if response.status().is_redirection() {
+            return Err(FederationError::ResolutionFailed {
+                did: did.to_string(),
+                kind: ResolutionFailureKind::RedirectRejected(format!(
+                    "{context}: redirect rejected (status {})",
+                    response.status()
+                )),
+            });
+        }
+        return Ok(response);
+    }
     let response = tokio::time::timeout_at(deadline, request.send())
         .await
         .map_err(|_| FederationError::ResolutionFailed {
@@ -2486,31 +2518,27 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
         });
     }
 
-    let addrs_iter = match tokio::time::timeout(
-        federation_dns_timeout(),
-        tokio::net::lookup_host((host.as_str(), port)),
-    )
-    .await
-    {
-        Ok(Ok(addrs)) => addrs,
-        Ok(Err(e)) => {
-            let kind = classify_dns_io_error(&e, &host);
-            return Err(FederationError::ResolutionFailed {
-                did: String::new(),
-                kind,
-            });
+    let mut addrs: Vec<std::net::SocketAddr> = {
+        #[cfg(feature = "sim")]
+        if let Some(result) = crate::sim_hooks::intercept_sim_dns(&host) {
+            result
+                .map_err(|reason| FederationError::ResolutionFailed {
+                    did: String::new(),
+                    kind: ResolutionFailureKind::DnsTemporary(format!(
+                        "DNS lookup failed for host {host}: {reason}"
+                    )),
+                })?
+                .into_iter()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+                .collect()
+        } else {
+            resolve_system_destination_addrs(&host, port).await?
         }
-        Err(_) => {
-            return Err(FederationError::ResolutionFailed {
-                did: String::new(),
-                kind: ResolutionFailureKind::DnsTimeout(format!(
-                    "DNS lookup timed out for host {host}"
-                )),
-            });
+        #[cfg(not(feature = "sim"))]
+        {
+            resolve_system_destination_addrs(&host, port).await?
         }
     };
-
-    let mut addrs: Vec<std::net::SocketAddr> = addrs_iter.collect();
     addrs.sort_unstable();
     addrs.dedup();
 
@@ -2541,6 +2569,30 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
         host,
         addrs,
     })
+}
+
+async fn resolve_system_destination_addrs(
+    host: &str,
+    port: u16,
+) -> Result<Vec<std::net::SocketAddr>, FederationError> {
+    match tokio::time::timeout(
+        federation_dns_timeout(),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(addrs)) => Ok(addrs.collect()),
+        Ok(Err(error)) => Err(FederationError::ResolutionFailed {
+            did: String::new(),
+            kind: classify_dns_io_error(&error, host),
+        }),
+        Err(_) => Err(FederationError::ResolutionFailed {
+            did: String::new(),
+            kind: ResolutionFailureKind::DnsTimeout(format!(
+                "DNS lookup timed out for host {host}"
+            )),
+        }),
+    }
 }
 
 pub(crate) async fn validate_resolved_host_is_public(
@@ -2595,47 +2647,7 @@ pub(crate) async fn send_hardened_resolution_request(
                 })?
         };
 
-    let resp = tokio::time::timeout_at(deadline, client.get(destination.url.clone()).send())
-        .await
-        .map_err(|_| FederationError::ResolutionFailed {
-            did: did.to_string(),
-            kind: ResolutionFailureKind::Timeout(format!("{context}: deadline exceeded")),
-        })?
-        .map_err(|error| {
-            if error.is_timeout() {
-                FederationError::ResolutionFailed {
-                    did: did.to_string(),
-                    kind: ResolutionFailureKind::Timeout(format!("{context}: {error}")),
-                }
-            } else if error.is_connect() {
-                FederationError::ResolutionFailed {
-                    did: did.to_string(),
-                    kind: ResolutionFailureKind::ConnectionFailed(format!("{context}: {error}")),
-                }
-            } else if let Some(status) = error.status() {
-                FederationError::ResolutionFailed {
-                    did: did.to_string(),
-                    kind: ResolutionFailureKind::HttpStatus {
-                        status: status.as_u16(),
-                        message: format!("{context}: {error}"),
-                    },
-                }
-            } else {
-                FederationError::Http(error)
-            }
-        })?;
-
-    if resp.status().is_redirection() {
-        return Err(FederationError::ResolutionFailed {
-            did: did.to_string(),
-            kind: ResolutionFailureKind::RedirectRejected(format!(
-                "{context}: redirect rejected ({})",
-                resp.status()
-            )),
-        });
-    }
-
-    Ok(resp)
+    send_resolution_request(client.get(destination.url.clone()), deadline, did, context).await
 }
 
 /// Validate `url` and resolve it to the socket addresses a client MUST be

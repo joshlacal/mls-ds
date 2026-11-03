@@ -34,7 +34,10 @@
 pub mod federation_outbox;
 pub mod request_push;
 
+pub use federation_outbox::process_federation_outbox_tick;
 pub use federation_outbox::run_federation_outbox_worker;
+#[cfg(feature = "sim")]
+pub use federation_outbox::{drain_federation_outbox, step_federation_outbox};
 #[cfg(feature = "test-support")]
 pub use request_push::renew_request_push_lease_for_test;
 #[cfg(feature = "test-support")]
@@ -127,24 +130,29 @@ pub fn compute_backoff(attempts: i32) -> Duration {
 /// Returns the number of rows reclaimed. A non-zero return is logged but
 /// is not an error condition.
 pub async fn reclaim_stuck_in_flight(pool: &PgPool, table: &str) -> Result<u64, sqlx::Error> {
+    let now = crate::sim_hooks::current_utc();
     let timeout_secs = IN_FLIGHT_VISIBILITY_TIMEOUT.as_secs() as f64;
     let sql = match table {
         "notification_outbox" => {
             format!(
-                "UPDATE {table} SET status = 'pending', updated_at = NOW() \
+                "UPDATE {table} SET status = 'pending', updated_at = $2 \
                  WHERE status = 'in_flight' \
-                   AND updated_at < NOW() - make_interval(secs => $1)"
+                   AND updated_at < $2 - make_interval(secs => $1)"
             )
         }
         _ => {
             format!(
-                "UPDATE {table} SET status = 'pending', claim_token = NULL, claim_expires_at = NULL, updated_at = NOW() \
+                "UPDATE {table} SET status = 'pending', claim_token = NULL, claim_expires_at = NULL, updated_at = $2 \
                  WHERE status = 'in_flight' \
-                   AND (claim_expires_at <= NOW() OR (claim_expires_at IS NULL AND updated_at < NOW() - make_interval(secs => $1)))"
+                   AND (claim_expires_at <= $2 OR (claim_expires_at IS NULL AND updated_at < $2 - make_interval(secs => $1)))"
             )
         }
     };
-    let result = sqlx::query(&sql).bind(timeout_secs).execute(pool).await?;
+    let result = sqlx::query(&sql)
+        .bind(timeout_secs)
+        .bind(now)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -172,7 +180,8 @@ pub async fn record_failure(
     created_at: chrono::DateTime<chrono::Utc>,
     error_msg: &str,
 ) -> Result<&'static str, sqlx::Error> {
-    let lifetime_exceeded = chrono::Utc::now()
+    let now = crate::sim_hooks::current_utc();
+    let lifetime_exceeded = now
         .signed_duration_since(created_at)
         .to_std()
         .map(|d| d > MAX_LIFETIME)
@@ -203,11 +212,11 @@ pub async fn record_failure(
                 "UPDATE {table} \
                  SET status = $1, \
                      attempts = $2, \
-                     next_attempt_at = NOW() + make_interval(secs => $3), \
+                     next_attempt_at = $7 + make_interval(secs => $3), \
                      last_error = $4, \
                      claim_token = NULL, \
                      claim_expires_at = NULL, \
-                     updated_at = NOW() \
+                     updated_at = $7 \
                  WHERE id = $5 AND status = 'in_flight' AND ($6::uuid IS NULL OR claim_token = $6)"
             );
             let result = sqlx::query(&sql)
@@ -217,6 +226,7 @@ pub async fn record_failure(
                 .bind(error_msg)
                 .bind(row_id)
                 .bind(claim_token)
+                .bind(now)
                 .execute(pool)
                 .await?;
             result.rows_affected()
@@ -226,9 +236,9 @@ pub async fn record_failure(
                 "UPDATE {table} \
                  SET status = $1, \
                      attempts = $2, \
-                     next_attempt_at = NOW() + make_interval(secs => $3), \
+                     next_attempt_at = $6 + make_interval(secs => $3), \
                      last_error = $4, \
-                     updated_at = NOW() \
+                     updated_at = $6 \
                  WHERE id = $5"
             );
             let result = sqlx::query(&sql)
@@ -237,6 +247,7 @@ pub async fn record_failure(
                 .bind(backoff_secs)
                 .bind(error_msg)
                 .bind(row_id)
+                .bind(now)
                 .execute(pool)
                 .await?;
             result.rows_affected()
@@ -246,11 +257,11 @@ pub async fn record_failure(
                 "UPDATE {table} \
                  SET status = $1, \
                      attempts = $2, \
-                     next_attempt_at = NOW() + make_interval(secs => $3), \
+                     next_attempt_at = $7 + make_interval(secs => $3), \
                      last_error = $4, \
                      claim_token = NULL, \
                      claim_expires_at = NULL, \
-                     updated_at = NOW() \
+                     updated_at = $7 \
                  WHERE id = $5 AND status = 'in_flight' AND ($6::uuid IS NULL OR claim_token = $6)"
             );
             let result = sqlx::query(&sql)
@@ -260,6 +271,7 @@ pub async fn record_failure(
                 .bind(error_msg)
                 .bind(row_id)
                 .bind(claim_token)
+                .bind(now)
                 .execute(pool)
                 .await?;
             result.rows_affected()
@@ -276,8 +288,12 @@ pub async fn record_failure(
 /// Mark a row as `done`. Idempotent — already-done rows match zero rows
 /// and that's fine.
 async fn mark_done(pool: &PgPool, table: &str, row_id: &str) -> Result<(), sqlx::Error> {
-    let sql = format!("UPDATE {table} SET status = 'done', updated_at = NOW() WHERE id = $1");
-    sqlx::query(&sql).bind(row_id).execute(pool).await?;
+    let sql = format!("UPDATE {table} SET status = 'done', updated_at = $2 WHERE id = $1");
+    sqlx::query(&sql)
+        .bind(row_id)
+        .bind(crate::sim_hooks::current_utc())
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -287,13 +303,14 @@ pub async fn cleanup_dead_rows(
     table: &str,
     max_age: Duration,
 ) -> Result<u64, sqlx::Error> {
+    let now = crate::sim_hooks::current_utc();
     let secs = max_age.as_secs() as f64;
     let sql = format!(
         "DELETE FROM {table} \
          WHERE status = 'dead' \
-           AND (updated_at < NOW() - make_interval(secs => $1) OR (updated_at IS NULL AND created_at < NOW() - make_interval(secs => $1)))"
+           AND (updated_at < $2 - make_interval(secs => $1) OR (updated_at IS NULL AND created_at < $2 - make_interval(secs => $1)))"
     );
-    let result = sqlx::query(&sql).bind(secs).execute(pool).await?;
+    let result = sqlx::query(&sql).bind(secs).bind(now).execute(pool).await?;
     Ok(result.rows_affected())
 }
 

@@ -2,7 +2,9 @@
 
 mod common;
 
-pub use catbird_server::{auth, crypto, federation, handlers, identity, sqlx_jacquard, util};
+pub use catbird_server::{
+    auth, crypto, federation, handlers, identity, sim_hooks, sqlx_jacquard, util,
+};
 
 #[path = "common/chat_protocol_harness.rs"]
 mod chat_protocol;
@@ -2395,12 +2397,12 @@ async fn admission_fails_on_disordered_grammar_with_no_db_write() {
         &fp,
         now,
     );
-    // Policy entry placed after Application entry (disordered grammar)
+    // A second Creation after application traffic is never a valid prefix.
     let ev5 = build_test_event_json(
         5,
         0,
         entry_5,
-        POLICY_ENTRY_TYPE_ID,
+        CREATION_ENTRY_TYPE_ID,
         b"p5",
         b"{\"signed\":{}}",
         &fp,
@@ -2452,7 +2454,7 @@ async fn admission_fails_on_disordered_grammar_with_no_db_write() {
         5,
         0,
         entry_5,
-        POLICY_ENTRY_TYPE_ID,
+        CREATION_ENTRY_TYPE_ID,
         b"p5",
         b"{\"signed\":{}}",
         &fp,
@@ -6106,8 +6108,8 @@ async fn bootstrap_closed_grammar_rejects_invalid_event_sequences() {
             vec![fixture.events[0].clone(), fixture.events[3].clone()],
         ),
         (
-            "creation then application (skips policy/acceptance/fulfillment)",
-            vec![fixture.events[0].clone(), fixture.events[4].clone()],
+            "creation then another creation",
+            vec![fixture.events[0].clone(), fixture.events[0].clone()],
         ),
         (
             "creation then policy then fulfillment (skips acceptance)",
@@ -6145,26 +6147,6 @@ async fn bootstrap_closed_grammar_rejects_invalid_event_sequences() {
             ],
         ),
         (
-            "creation then policy then acceptance then fulfillment then policy (policy in ApplicationTail)",
-            vec![
-                fixture.events[0].clone(),
-                fixture.events[1].clone(),
-                fixture.events[2].clone(),
-                fixture.events[3].clone(),
-                fixture.events[1].clone(),
-            ],
-        ),
-        (
-            "creation then policy then acceptance then fulfillment then acceptance (acceptance in ApplicationTail)",
-            vec![
-                fixture.events[0].clone(),
-                fixture.events[1].clone(),
-                fixture.events[2].clone(),
-                fixture.events[3].clone(),
-                fixture.events[2].clone(),
-            ],
-        ),
-        (
             "creation then policy then acceptance then fulfillment then fulfillment (fulfillment in ApplicationTail)",
             vec![
                 fixture.events[0].clone(),
@@ -6181,7 +6163,7 @@ async fn bootstrap_closed_grammar_rejects_invalid_event_sequences() {
     ];
 
     for (name, mut invalid_events) in invalid_cases {
-        // Renumber events strictly to 1..=n with distinct entry IDs so sequence contiguity succeeds and BootstrapPhase transition is the sole rejection reason
+        // Renumber strictly to 1..=n so the closed kind/order check rejects first.
         for (idx, event) in invalid_events.iter_mut().enumerate() {
             let seq = (idx + 1) as i64;
             event["seq"] = json!(seq);
@@ -6742,35 +6724,63 @@ async fn bootstrap_conflict_and_quarantine_classification_matrix() {
         tx.rollback().await.unwrap();
     }
 
-    // A valid local four-entry prefix is shorter than the offered five-entry prefix.
+    // A pending invitation mailbox accepts the exact verified membership suffix.
     let shorter_fixture =
         build_full_5_event_prefix_fixture(Uuid::new_v4(), sequencer_did, actor_created_at);
     seed_full_test_authority(&pool, &shorter_fixture, actor_created_at).await;
     let mut tx = pool.begin().await.unwrap();
     let outcome = test_apply_remote_clean_prefix(
         &mut tx,
-        test_admission_from_events(&shorter_fixture, shorter_fixture.events[..4].to_vec()),
+        test_admission_from_events(&shorter_fixture, shorter_fixture.events[..1].to_vec()),
     )
     .await
     .unwrap();
     assert!(matches!(outcome, RemotePrefixApplyOutcome::Applied { .. }));
     tx.commit().await.unwrap();
 
-    let before_shorter_conflict = snapshot_db_content(&pool).await;
     let mut tx = pool.begin().await.unwrap();
-    let error = test_apply_remote_clean_prefix(
+    let outcome = test_apply_remote_clean_prefix(
         &mut tx,
         test_admission_from_events(&shorter_fixture, shorter_fixture.events.clone()),
     )
     .await
-    .expect_err("existing shorter prefix must conflict");
-    assert_eq!(error, RemotePrefixBootstrapError::Conflict);
-    tx.rollback().await.unwrap();
+    .expect("an exact shorter prefix admits the verified suffix");
+    assert!(matches!(
+        outcome,
+        RemotePrefixApplyOutcome::Applied { last_seq: 5, .. }
+    ));
+    tx.commit().await.unwrap();
+    let (cutoff, reconciled_sends): (Option<i64>, i64) = sqlx::query_as(
+        "SELECT c.historical_bootstrap_last_seq, \
+                (SELECT count(*) FROM chat.message_sends s \
+                  WHERE s.conversation_id = c.conversation_id) \
+           FROM chat.conversations c WHERE c.conversation_id = $1",
+    )
+    .bind(shorter_fixture.convo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        before_shorter_conflict,
-        snapshot_db_content(&pool).await,
-        "shorter-prefix conflict must write nothing"
+        cutoff,
+        Some(1),
+        "a membership suffix never reseals the cutoff"
     );
+    assert_eq!(
+        reconciled_sends, 1,
+        "post-cutoff applications map to reconciled sends"
+    );
+    let mut tx = pool.begin().await.unwrap();
+    let replay = test_apply_remote_clean_prefix(
+        &mut tx,
+        test_admission_from_events(&shorter_fixture, shorter_fixture.events.clone()),
+    )
+    .await
+    .expect("the completed suffix replays exactly");
+    assert!(matches!(
+        replay,
+        RemotePrefixApplyOutcome::ExactReplay { last_seq: 5, .. }
+    ));
+    tx.rollback().await.unwrap();
 
     // Same-length overlap mismatch quarantines at the first differing sequence.
     let mismatch_fixture =

@@ -138,7 +138,7 @@ pub(crate) fn actor_device_id_from_query(
 ///
 /// Unsigned requests never carry an idempotency record, so the repository
 /// outcome is always a first-execution authority. That raw authority is
-/// consumed here and never escapes: this is the sole non-test
+/// consumed in [`admit_principal_read`], the sole non-test
 /// `dpop::seal_read_admission` callsite, and every seal failure becomes a
 /// redacted endpoint invariant so no binding detail reaches the wire.
 pub(crate) async fn admit_unsigned_read(
@@ -149,6 +149,21 @@ pub(crate) async fn admit_unsigned_read(
     headers: &HeaderMap,
     actor_device_id: &str,
 ) -> Result<VerifiedReadAdmission, ChatFailure> {
+    admit_unsigned_read_for_subject(pool, runtime, endpoint, method, headers, actor_device_id)
+        .await
+        .map(|(admission, _)| admission)
+}
+
+/// [`admit_unsigned_read`] that also returns the authenticated account DID,
+/// for reads that a remote group's sequencer must answer.
+pub(crate) async fn admit_unsigned_read_for_subject(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    endpoint: ChatEndpoint,
+    method: CanonicalHttpMethod,
+    headers: &HeaderMap,
+    actor_device_id: &str,
+) -> Result<(VerifiedReadAdmission, String), ChatFailure> {
     require_cutover(runtime, endpoint)?;
     let principal = verify_service_principal(pool, endpoint, headers).await?;
     if (method.as_str() == "GET" && runtime.require_signed_reads())
@@ -173,6 +188,31 @@ pub(crate) async fn admit_unsigned_read(
         .execute(pool)
         .await;
     }
+    let subject = principal.did().to_owned();
+    let admission =
+        admit_principal_read(pool, endpoint, method, principal, actor_device_id).await?;
+    Ok((admission, subject))
+}
+
+/// Admit a GET read that the account's home DS relayed over authenticated
+/// S2S. The home vouches for its device; this DS's read authority decides.
+pub(crate) async fn admit_federated_read(
+    pool: &DbPool,
+    endpoint: ChatEndpoint,
+    principal: crate::auth::VerifiedServicePrincipal,
+    actor_device_id: &str,
+) -> Result<VerifiedReadAdmission, ChatFailure> {
+    let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(endpoint))?;
+    admit_principal_read(pool, endpoint, method, principal, actor_device_id).await
+}
+
+async fn admit_principal_read(
+    pool: &DbPool,
+    endpoint: ChatEndpoint,
+    method: CanonicalHttpMethod,
+    principal: crate::auth::VerifiedServicePrincipal,
+    actor_device_id: &str,
+) -> Result<VerifiedReadAdmission, ChatFailure> {
     let instant = capture_instant(endpoint)?;
     let pre_replay =
         dpop::standard_service_auth_evidence(principal, actor_device_id, method, instant, None)
