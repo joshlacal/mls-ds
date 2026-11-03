@@ -420,6 +420,11 @@ pub async fn resolve_registry_verified_device_signer(
             AND d.auth_generation = $4
             AND d.status = 'active'
             AND dk.revoked_at IS NULL
+            AND dk.enrollment_auth_generation<=d.auth_generation
+            AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=dk.user_did AND newer.device_id=dk.device_id
+                  AND newer.enrollment_auth_generation>dk.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=d.auth_generation)
           FOR SHARE OF d",
     )
     .bind(device.user_did())

@@ -314,14 +314,15 @@ pub(crate) use self::planners::plan_welcome_expiry_for_test;
 pub(crate) use self::planners::plan_welcome_response_for_test;
 #[cfg(test)]
 pub(crate) use self::planners::plan_zero_leaf_leave;
+pub(crate) use self::planners::retired_coordinate;
 use self::planners::{
     acceptance_matches_participant, close_open_interval, coordinate_only_successor,
     current_state_producer_matches, ensure_active, expire_due_leave_requests,
     initial_participant_role, invitation_matches_participant, metadata_provenance_matches,
     open_interval, participant_provenance_matches, participant_role_provenance_matches,
     pending_request_leaf_is_bound, require_transition_kind, resolve_prior_bound_work,
-    retired_coordinate, sort_intervals, validate_participants, validate_state,
-    validate_terminal_state, validate_transition_evidence,
+    sort_intervals, validate_participants, validate_state, validate_terminal_state,
+    validate_transition_evidence,
 };
 #[path = "state_machine/invariants.rs"]
 mod invariants;

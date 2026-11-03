@@ -16,7 +16,8 @@ pub struct PublishedRequestFixture {
     pub publication: Value,
     pub receipt: Value,
     pub push_event_id: Uuid,
-    // Synthetic provider token is retained only in this process-local object.
+    // Signed D2 registerPushGateway request (opaque gateway pushKey; the DS never
+    // sees a provider token) and its ack, retained only in this process.
     pub push_registration_request: Value,
     pub push_registration_ack: Value,
     pub _https: HttpsDidFixture,
@@ -24,10 +25,167 @@ pub struct PublishedRequestFixture {
 
 #[path = "live_direct_request_siblings.rs"]
 pub mod siblings;
-pub use siblings::accept_before_both_recipient_imports;
 
 pub async fn publish_request(import_recipient: bool) -> anyhow::Result<PublishedRequestFixture> {
     Ok(publish_request_variant(import_recipient, false).await?.0)
+}
+
+pub const PUSH_GATEWAY_NSID: &str = "blue.catbird.chat.registerPushGateway";
+/// Canonical gateway URL of the fixture device. `.invalid` never resolves, so
+/// only a fixture-process override can route it (to a loopback gateway).
+pub const REQUEST_FIXTURE_PUSH_GATEWAY_URL: &str =
+    "https://push.request-fixture.invalid/xrpc/blue.catbird.push.deliver";
+
+/// `device`'s signed `registerPushGateway` body: `CATBIRD-CHAT-PUSH-GATEWAY\0 ||
+/// DAG-CBOR(...)` signed by its enrolled MLS identity key, checked against the
+/// generated lexicon type. Not sent.
+pub fn signed_push_gateway_registration(
+    device: &ServiceIdentity,
+    engine: &MlsEngine,
+    auth_generation: i64,
+    gateway_url: &str,
+    app_id: &str,
+    push_key: &str,
+) -> anyhow::Result<Value> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Transcript<'a> {
+        app_id: &'a str,
+        auth_generation: i64,
+        device_id: String,
+        enabled: bool,
+        gateway_url: &'a str,
+        key_id: &'a str,
+        push_key: &'a str,
+        signed_at: &'a str,
+    }
+    let identity = format!("{}#{}", device.did, device.device_id);
+    let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(engine.identity_public_key(&identity)?));
+    let signed_at = canonical_now();
+    let mut transcript = b"CATBIRD-CHAT-PUSH-GATEWAY\0".to_vec();
+    transcript.extend(serde_ipld_dagcbor::to_vec(&Transcript {
+        app_id,
+        auth_generation,
+        device_id: device.device_id.to_string(),
+        enabled: true,
+        gateway_url,
+        key_id: &key_id,
+        push_key,
+        signed_at: &signed_at,
+    })?);
+    let request = json!({
+        "deviceId": device.device_id.to_string(),
+        "keyId": key_id,
+        "authGeneration": auth_generation,
+        "gatewayUrl": gateway_url,
+        "appId": app_id,
+        "pushKey": push_key,
+        "enabled": true,
+        "signedAt": signed_at,
+        "signature": {"$bytes": STANDARD.encode(engine.sign_identity(&identity, transcript)?)},
+    });
+    serde_json::from_value::<
+        catbird_mls::atproto::blue_catbird::chat::register_push_gateway::RegisterPushGateway,
+    >(request.clone())
+    .context("registerPushGateway request does not match the lexicon")?;
+    Ok(request)
+}
+
+/// Real D2 registration through the shipping router at auth generation 1 (an
+/// upsert for an already-registered device). Asserts the typed ack and that
+/// the stored binding is exactly what was signed. Returns (request, ack).
+pub async fn register_push_gateway(
+    client: &reqwest::Client,
+    base_url: &str,
+    device: &ServiceIdentity,
+    engine: &MlsEngine,
+    gateway_url: &str,
+    app_id: &str,
+    push_key: &str,
+) -> anyhow::Result<(Value, Value)> {
+    let request =
+        signed_push_gateway_registration(device, engine, 1, gateway_url, app_id, push_key)?;
+    let (status, bytes) = device
+        .post(client, base_url, PUSH_GATEWAY_NSID, &request, true)
+        .await?;
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "real signed push gateway registration failed {status}: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let ack: Value = serde_json::from_slice(&bytes)?;
+    serde_json::from_value::<
+        catbird_mls::atproto::blue_catbird::chat::register_push_gateway::RegisterPushGatewayOutput,
+    >(ack.clone())
+    .context("registerPushGateway ack does not match the lexicon")?;
+    let stored = super::encrypted_requests::push_auth_snapshot(device)?.gateway_binding;
+    let mut mismatches = Vec::new();
+    for (column, field) in [
+        ("gateway_url", "gatewayUrl"),
+        ("app_id", "appId"),
+        ("push_key", "pushKey"),
+        ("key_id", "keyId"),
+        ("auth_generation", "authGeneration"),
+    ] {
+        if stored[column] != request[field] {
+            mismatches.push(column);
+        }
+    }
+    let instant = |value: &Value| -> anyhow::Result<_> {
+        Ok(chrono::DateTime::parse_from_rfc3339(
+            value.as_str().context("signed_at is not a timestamp")?,
+        )?)
+    };
+    if instant(&stored["signed_at"])? != instant(&request["signedAt"])? {
+        mismatches.push("signed_at");
+    }
+    anyhow::ensure!(
+        mismatches.is_empty(),
+        "stored push gateway binding differs from the signed registration in {mismatches:?}"
+    );
+    Ok((request, ack))
+}
+
+/// Route `canonical_https_url` to `loopback_http_url` inside one fixture
+/// server process (test-only route of `encrypted_request_server_fixture`).
+pub async fn register_push_override(
+    client: &reqwest::Client,
+    base_url: &str,
+    canonical_https_url: &str,
+    loopback_http_url: &str,
+) -> anyhow::Result<()> {
+    let status = client
+        .post(format!(
+            "{base_url}/_test/request-fixture/register-push-override"
+        ))
+        .json(&json!({
+            "canonicalHttpsUrl": canonical_https_url,
+            "loopbackHttpUrl": loopback_http_url,
+        }))
+        .send()
+        .await?
+        .status();
+    anyhow::ensure!(
+        status == reqwest::StatusCode::OK,
+        "fixture push gateway override refused: {status}"
+    );
+    Ok(())
+}
+
+/// Loopback stand-in for the device's Push Gateway: accepts every D2 wake the
+/// fixture DS dispatches (202) and keeps none. Returns its deliver URL.
+async fn blind_push_gateway() -> anyhow::Result<String> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!(
+        "http://{}/xrpc/blue.catbird.push.deliver",
+        listener.local_addr()?
+    );
+    let gateway = axum::Router::new().route(
+        "/xrpc/blue.catbird.push.deliver",
+        axum::routing::post(|| async { axum::http::StatusCode::ACCEPTED }),
+    );
+    tokio::spawn(async move { axum::serve(listener, gateway).await });
+    Ok(url)
 }
 
 pub async fn publish_request_variant(
@@ -79,78 +237,28 @@ async fn publish_request_variant_configured(
     let (bob_package, bob_package_ref) = bob_engine.create_key_package(&bob_identity)?;
     let alice_public = alice_engine.identity_public_key(&alice_identity)?;
     let bob_public = bob_engine.identity_public_key(&bob_identity)?;
-    for (identity, public_key) in [(&alice, &alice_public), (&bob, &bob_public)] {
-        let name = identity.did.replace(':', "%3A");
-        let declarations = https.root.join("_policy/catbirdDeclaration");
-        std::fs::create_dir_all(&declarations)?;
-        std::fs::write(
-            declarations.join(&name),
-            serde_json::to_vec(&json!({
-                "$type": "blue.catbird.chat.declaration",
-                "protocolVersion": "1",
-                "allowIncoming": "all",
-                "deliveryService": "did:web:chat.catbird.blue",
-                "createdAt": canonical_now()
-            }))?,
-        )?;
-        let devices = https.root.join("_policy/deviceKeys");
-        std::fs::create_dir_all(&devices)?;
-        std::fs::write(
-            devices.join(name),
-            serde_json::to_vec(&json!({
-                "records": [{"value": {
-                    "algorithm": "ed25519",
-                    "mlsSignaturePublicKey": {"$bytes": STANDARD.encode(public_key)},
-                    "createdAt": canonical_now()
-                }}]
-            }))?,
-        )?;
-    }
     seed_service_device(&alice, &alice_public)?;
     seed_service_device(&bob, &bob_public)?;
 
     let server = ShippingServerFixture::start(&https)?;
     let client = reqwest::Client::builder().build()?;
-    let synthetic_token = format!("request-fixture-{}", Uuid::new_v4().simple());
-    let registration_body: catbird_mls::atproto::blue_catbird::chat::PushRegistrationBody =
-        serde_json::from_value(json!({
-            "protocolVersion":"2", "signatureDomain":"CATBIRD-CHAT-PUSH-BINDING\0",
-            "authorityDid":"did:web:chat.catbird.blue", "actorDid":bob.did,
-            "actorDeviceId":bob.device_id.to_string(), "keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),
-            "authGeneration":1,"registrationId":Uuid::new_v4().to_string(),"provider":"apns",
-            "appId":"blue.catbird","tokenGeneration":1,"tokenSha256":{"$bytes":STANDARD.encode(Sha256::digest(synthetic_token.as_bytes()))},
-            "enabled":true,"signedAt":canonical_now()
-        }))?;
-    let registration_transcript =
-        catbird_mls::atproto::push_registration::transcript(&registration_body)?;
-    let signature = bob_engine.sign_identity(&bob_identity, registration_transcript.clone())?;
-    let registration = catbird_mls::atproto::blue_catbird::chat::SignedPushRegistration {
-        body: registration_body.clone(),
-        signature: signature.into(),
-        extra_data: None,
-    };
-    let push_registration_request = json!({"token":synthetic_token,"registration":registration});
-    let (registration_status, registration_bytes) = bob
-        .post(
-            &client,
-            &server.base_url,
-            "blue.catbird.chat.updatePushToken",
-            &push_registration_request,
-            true,
-        )
-        .await?;
-    anyhow::ensure!(
-        registration_status == reqwest::StatusCode::OK,
-        "real signed push registration failed {registration_status}"
-    );
-    let push_registration_ack: Value = serde_json::from_slice(&registration_bytes)?;
-    let binding: catbird_mls::atproto::blue_catbird::chat::PushRegistrationBinding =
-        serde_json::from_value(push_registration_ack["pushBinding"].clone())?;
-    assert_eq!(binding.body, registration_body);
-    assert_eq!(
-        binding.binding_digest.as_ref(),
-        Sha256::digest(&registration_transcript).as_slice()
-    );
+    register_push_override(
+        &client,
+        &server.base_url,
+        REQUEST_FIXTURE_PUSH_GATEWAY_URL,
+        &blind_push_gateway().await?,
+    )
+    .await?;
+    let (push_registration_request, push_registration_ack) = register_push_gateway(
+        &client,
+        &server.base_url,
+        &bob,
+        &bob_engine,
+        REQUEST_FIXTURE_PUSH_GATEWAY_URL,
+        "blue.catbird",
+        &format!("request-fixture-{}", Uuid::new_v4().simple()),
+    )
+    .await?;
     let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
     let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
     let (device_key_status, device_key_response) = alice
@@ -429,6 +537,8 @@ async fn publish_request_variant_configured(
         authority_import_until,
         preparation_request_digest: *verified_prepare.request_digest(),
         receipt_authority_key: server.receipt_public_key.clone(),
+        sequencer_did: "did:web:chat.catbird.blue".into(),
+        sequencer_receipt_authority_key: server.sequencer_receipt_public_key.clone(),
         text: "Real encrypted first contact".into(),
         invitation: None,
         metadata: GroupMetadataV1 {
@@ -437,6 +547,7 @@ async fn publish_request_variant_configured(
             description: String::new(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            space_avatar: None,
         },
     })?;
     if tamper_introduction {
@@ -451,6 +562,7 @@ async fn publish_request_variant_configured(
     publish_body["preparationRequestDigest"] =
         json!(STANDARD.encode(verified_prepare.request_digest()));
     publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
+    publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
     publish_body["next"] = bootstrap.coordinates.clone();
     publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
         bootstrap.import_until as i64,
@@ -592,7 +704,7 @@ async fn publish_request_variant_configured(
         false,
     )?;
     let welcome_input = DirectRequestWelcomeInput {
-        bootstrap: bootstrap.clone(),
+        bootstrap: super::encrypted_requests::recipient_bootstrap(bootstrap),
         local_identity: bob_identity.as_bytes().to_vec(),
         local_package_ref: bob_package_ref,
         publication_request: serde_json::to_vec(&publication)?,
@@ -600,6 +712,7 @@ async fn publish_request_variant_configured(
         published_receipt: serde_json::to_vec(&normalized_receipt)?,
         receipt_authority_did: "did:web:chat.catbird.blue".into(),
         receipt_authority_key: server.receipt_public_key.clone(),
+        sequencer_receipt_authority_key: server.sequencer_receipt_public_key.clone(),
         preparation_request_digest: *verified_prepare.request_digest(),
     };
     if import_recipient {
@@ -629,7 +742,7 @@ async fn publish_request_variant_configured(
         );
         bob_engine.process_direct_request(&welcome_input)?;
         let decrypted = bob_engine.decrypt_direct_request(&welcome_input)?;
-        let DirectRequestIntroductionResult::Ready { plaintext } = decrypted else {
+        let DirectRequestIntroductionResult::Ready { plaintext, .. } = decrypted else {
             anyhow::bail!("recipient introduction unavailable")
         };
         let introduction = protocol::decode_direct_request_introduction(&plaintext)?;
@@ -895,7 +1008,7 @@ pub async fn accept_reply_offline(
     assert!(f.alice_engine.is_none());
     if !accept_before_import {
         f.bob_engine.process_direct_request(&f.welcome_input)?;
-        let DirectRequestIntroductionResult::Ready { plaintext } =
+        let DirectRequestIntroductionResult::Ready { plaintext, .. } =
             f.bob_engine.decrypt_direct_request(&f.welcome_input)?
         else {
             anyhow::bail!("pending introduction unavailable with sender offline")
@@ -1034,7 +1147,7 @@ pub async fn accept_reply_offline(
     }
     assert_eq!(f.bob_engine.epoch(&group)?, epoch);
     let introduction = f.bob_engine.decrypt_direct_request(&f.welcome_input)?;
-    let DirectRequestIntroductionResult::Ready { plaintext } = &introduction else {
+    let DirectRequestIntroductionResult::Ready { plaintext, .. } = &introduction else {
         anyhow::bail!("introduction unavailable after acceptance")
     };
     assert_eq!(
@@ -1158,6 +1271,44 @@ pub async fn accept_reply_offline(
         .iter()
         .find(|e| e["$type"] == "blue.catbird.chat.defs#directRequestEntry")
         .context("introduction entry")?;
+    assert!(introduction_entry["sequencerReceipt"].is_object());
+    assert_eq!(
+        introduction_entry["publicationReceipt"]["$type"],
+        "blue.catbird.chat.defs#signedDirectRequestReceipt"
+    );
+    assert_eq!(
+        introduction_entry["publicationReceipt"]["body"]["receipt"]["sequencerReceipt"],
+        introduction_entry["sequencerReceipt"]
+    );
+    assert_eq!(
+        introduction_entry["sequencerReceipt"]["entryId"],
+        introduction_entry["signedRequest"]["body"]["firstMessageId"]
+    );
+    assert_eq!(
+        introduction_entry["sequencerReceipt"]["seq"],
+        introduction_entry["seq"]
+    );
+    assert_eq!(introduction_entry["seq"], 1);
+    // `publicationReceipt` is a closed union member, so it projects tagged;
+    // only its validated tag differs from the untagged publish receipt.
+    let mut inline_publication_receipt = protocol::normalize_read_presentation(
+        &serde_json::to_vec(&introduction_entry["publicationReceipt"])?,
+        "signedDirectRequestReceipt",
+        true,
+    )?;
+    assert_eq!(
+        inline_publication_receipt
+            .as_object_mut()
+            .context("publication receipt object")?
+            .remove("$type"),
+        Some(json!("blue.catbird.chat.defs#signedDirectRequestReceipt"))
+    );
+    let published_receipt = protocol::normalize_read_presentation(
+        &serde_json::to_vec(&f.receipt)?,
+        "signedDirectRequestReceipt",
+        false,
+    )?;
+    assert_eq!(inline_publication_receipt, published_receipt);
     let introduction_entry = protocol::normalize_read_presentation(
         &serde_json::to_vec(introduction_entry)?,
         "directRequestEntry",
@@ -1207,7 +1358,6 @@ pub async fn accept_reply_offline(
     assert_generated_accepted_reads(&f, &state_bytes, &bytes).await
 }
 pub async fn accept_reply_offline_with_followup() -> anyhow::Result<Uuid> {
-    use catbird_mls::chat_v2::transcript::{decode_strict_json, VerifiedApplicationEntry};
     use catbird_mls::orchestrator::{canonical_application_aad_bytes, MLSMessagePayload};
     let mut f = publish_request(false).await?;
     let (pending_status, pending_bytes) = f
@@ -1354,7 +1504,7 @@ async fn assert_generated_accepted_reads(
     let page: GetEntriesOutput = serde_json::from_slice(entries_bytes)
         .context("getEntries whole page does not decode into generated types")?;
     assert_eq!(page.entries.len(), 3);
-    assert_eq!(page.has_more, false);
+    assert!(!page.has_more);
     assert_eq!(page.next_after_seq, 3);
     let typed_introduction = page
         .entries
@@ -1365,7 +1515,12 @@ async fn assert_generated_accepted_reads(
         })
         .context("typed introduction entry")?;
     assert_eq!(
-        typed_introduction.signed_request.signature.as_ref(),
+        typed_introduction
+            .signed_request
+            .as_ref()
+            .context("unpruned introduction entry must carry signedRequest")?
+            .signature
+            .as_ref(),
         STANDARD
             .decode(
                 f.publication["signature"]
@@ -1474,6 +1629,34 @@ async fn assert_generated_accepted_reads(
         STANDARD.decode(receipt_sig)?.as_slice()
     );
     Ok(())
+}
+
+/// A device's signing key as served by the live device directory: what a
+/// client's credential store answers as the account's repository-published key.
+pub async fn directory_key(
+    f: &PublishedRequestFixture,
+    owner: &ServiceIdentity,
+    engine: &MlsEngine,
+) -> anyhow::Result<Vec<u8>> {
+    let identity = format!("{}#{}", owner.did, owner.device_id);
+    let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(engine.identity_public_key(&identity)?));
+    let (status, body) = f
+        .alice
+        .get_device_key(
+            &f.client,
+            &f.server.base_url,
+            &owner.did,
+            owner.device_id,
+            &key_id,
+        )
+        .await?;
+    anyhow::ensure!(status == reqwest::StatusCode::OK, "getDeviceKey {status}");
+    let key: Value = serde_json::from_slice(&body)?;
+    Ok(STANDARD.decode(
+        key["signaturePublicKey"]["$bytes"]
+            .as_str()
+            .context("signaturePublicKey")?,
+    )?)
 }
 
 /// Accept a retained live fixture without importing a Welcome or dropping its

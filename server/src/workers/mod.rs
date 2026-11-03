@@ -1,6 +1,6 @@
 //! Phase 3 — durable outbox workers.
 //!
-//! These workers drain `federation_outbox` and `notification_outbox` rows
+//! These workers drain `federation_outbox` rows
 //! that were written in the SAME Postgres transaction as their originating
 //! `delivery_events` INSERT (in
 //! `actors/reset_chokepoint.rs::{request_crypto_session_reset_tx,
@@ -16,13 +16,15 @@
 //!
 //! Worker behavior is identical across both kinds:
 //!  - Poll every 5 seconds for `WHERE status='pending' AND next_attempt_at
-//!    <= NOW()` ordered by `next_attempt_at`, with `LIMIT 100` and
+//!    <= NOW()` ordered by `(next_attempt_at, id)`, with `LIMIT 100` and
 //!    `FOR UPDATE SKIP LOCKED`.
-//!  - Mark `status='in_flight'`, dispatch, transition to
+//!  - Mark `status='in_flight'`, dispatch in that order, transition to
 //!    `done | failed | dead`.
 //!  - Exponential backoff: `next_attempt_at = NOW() + 2^attempts *
 //!    BASE_INTERVAL`, capped at 1h.
-//!  - After 10 failures OR 24h elapsed since `created_at`: `status='dead'`.
+//!  - A permanent failure (peer policy denial) is `dead` at once; any other
+//!    (this DS's storage, a full peer queue) stays `pending` with backoff
+//!    however many attempts and hours it takes.
 //!
 //! `FOR UPDATE SKIP LOCKED` lets multiple replicas run the same worker
 //! pool without double-dispatch. The transactional claim flips
@@ -39,13 +41,13 @@ pub use federation_outbox::run_federation_outbox_worker;
 #[cfg(feature = "sim")]
 pub use federation_outbox::{drain_federation_outbox, step_federation_outbox};
 #[cfg(feature = "test-support")]
-pub use request_push::renew_request_push_lease_for_test;
-#[cfg(feature = "test-support")]
-pub use request_push::run_request_push_event_once_for_test;
-#[cfg(feature = "test-support")]
-pub use request_push::run_request_push_once_for_test;
-pub use request_push::run_request_push_worker;
+pub use request_push::{
+    renew_request_push_lease_for_test, run_request_push_event_once_for_test,
+    run_request_push_once_for_test, run_transport_wake_once_for_test,
+};
+pub use request_push::{run_request_push_worker, WakeRun};
 
+use crate::chat_protocol::repository::delivery::QUEUED_COPY_OF_PRUNED_ENTRY_SQL;
 use sqlx::PgPool;
 use std::time::Duration;
 use tracing::{error, info};
@@ -56,31 +58,13 @@ use uuid::Uuid;
 /// bottleneck (each tick costs 1 SELECT + N UPDATEs in worst case).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Base for exponential backoff. With `MAX_ATTEMPTS=10`, the curve is:
-///  attempt 1: +5s
-///  attempt 2: +10s
-///  attempt 3: +20s
-///  attempt 4: +40s
-///  attempt 5: +80s
-///  attempt 6: +160s
-///  attempt 7: +320s
-///  attempt 8: +640s
-///  attempt 9: +1280s (capped to BACKOFF_CAP = 3600s)
-///  attempt 10: +3600s
-/// Total worst-case time-in-pending ≈ 6,755s ≈ 1h53m. After attempt 10,
-/// status flips to `dead`.
+/// Base for exponential backoff: `+5s`, `+10s`, `+20s`, … doubling per
+/// attempt up to [`BACKOFF_CAP`].
 pub const BACKOFF_BASE: Duration = Duration::from_secs(5);
 
 /// Maximum backoff between retries. Caps the exponential growth.
 pub const BACKOFF_CAP: Duration = Duration::from_secs(3600);
 
-/// Maximum retry attempts before flipping to `status='dead'`.
-pub const MAX_ATTEMPTS: i32 = 10;
-
-/// Maximum age (since `created_at`) before flipping to `status='dead'`.
-/// A row that has been pending+retrying for more than this is given up on
-/// regardless of attempt count.
-pub const MAX_LIFETIME: Duration = Duration::from_secs(86_400);
 /// Maximum age for dead outbox rows before being purged during periodic cleanup.
 /// Default: 7 days.
 pub const DEAD_ROWS_MAX_AGE: Duration = Duration::from_secs(7 * 86_400);
@@ -132,22 +116,11 @@ pub fn compute_backoff(attempts: i32) -> Duration {
 pub async fn reclaim_stuck_in_flight(pool: &PgPool, table: &str) -> Result<u64, sqlx::Error> {
     let now = crate::sim_hooks::current_utc();
     let timeout_secs = IN_FLIGHT_VISIBILITY_TIMEOUT.as_secs() as f64;
-    let sql = match table {
-        "notification_outbox" => {
-            format!(
-                "UPDATE {table} SET status = 'pending', updated_at = $2 \
-                 WHERE status = 'in_flight' \
-                   AND updated_at < $2 - make_interval(secs => $1)"
-            )
-        }
-        _ => {
-            format!(
-                "UPDATE {table} SET status = 'pending', claim_token = NULL, claim_expires_at = NULL, updated_at = $2 \
-                 WHERE status = 'in_flight' \
-                   AND (claim_expires_at <= $2 OR (claim_expires_at IS NULL AND updated_at < $2 - make_interval(secs => $1)))"
-            )
-        }
-    };
+    let sql = format!(
+        "UPDATE {table} SET status = 'pending', claim_token = NULL, claim_expires_at = NULL, updated_at = $2 \
+         WHERE status = 'in_flight' \
+           AND (claim_expires_at <= $2 OR (claim_expires_at IS NULL AND updated_at < $2 - make_interval(secs => $1)))"
+    );
     let result = sqlx::query(&sql)
         .bind(timeout_secs)
         .bind(now)
@@ -156,36 +129,25 @@ pub async fn reclaim_stuck_in_flight(pool: &PgPool, table: &str) -> Result<u64, 
     Ok(result.rows_affected())
 }
 
-/// Mark a row as retryable (`pending` with backoff) or terminal
-/// (`dead`) based on retry policy. Computes new `next_attempt_at` from
-/// [`compute_backoff`].
+/// Settle a claimed row's failed attempt: a `permanent` failure is `dead`
+/// at once; any other (this DS's own storage, a peer that could not take
+/// it now) goes back to `pending` with [`compute_backoff`] however many
+/// attempts and hours it has taken, since nothing was decided.
 ///
-/// Returns the **stored** status — `"dead"` if attempts exhausted or
-/// lifetime exceeded, otherwise `"pending"` (the row is re-queued for
-/// the next worker tick after `next_attempt_at`). The `attempts`
-/// counter is incremented and `last_error` records the error message
-/// even on the retry path, so the failure trail is preserved.
-///
-/// `pub` (rather than module-private) so the durable-outbox
-/// integration test in `tests/durable_outbox_test.rs` can verify the
-/// codex-P2 backoff regression directly without re-implementing the
-/// retry SQL — see `record_failure_pre_increment_backoff_curve` in
-/// that file.
+/// Returns the **stored** status — `"dead"`, `"pending"`, or `"stale"`
+/// when the claim no longer matches. The `attempts` counter is incremented
+/// and `last_error` records the error message on both paths, so the
+/// failure trail is preserved.
 pub async fn record_failure(
     pool: &PgPool,
     table: &str,
     row_id: &str,
     claim_token: Option<Uuid>,
     attempts: i32,
-    created_at: chrono::DateTime<chrono::Utc>,
     error_msg: &str,
+    permanent: bool,
 ) -> Result<&'static str, sqlx::Error> {
     let now = crate::sim_hooks::current_utc();
-    let lifetime_exceeded = now
-        .signed_duration_since(created_at)
-        .to_std()
-        .map(|d| d > MAX_LIFETIME)
-        .unwrap_or(false);
 
     // codex P2 fix: pass the PRE-increment `attempts` to
     // compute_backoff. A row with `attempts=0` (first failure) MUST
@@ -195,31 +157,37 @@ pub async fn record_failure(
     // instead of 10s, etc.).
     let next_attempt_at = compute_backoff(attempts);
     let new_attempts = attempts + 1;
-    let dead = new_attempts >= MAX_ATTEMPTS || lifetime_exceeded;
     let backoff_secs = next_attempt_at.as_secs() as i64;
 
     // Retry semantics: the claim query filters `status = 'pending'`,
     // so flipping a transient failure to 'pending' (with a backoff
-    // `next_attempt_at`) is what actually re-queues it. 'failed' as a
-    // distinct status was considered but would require a second
-    // status in the claim filter and adds no value over the
-    // (attempts > 0, last_error IS NOT NULL) projection.
-    let stored_status = if dead { "dead" } else { "pending" };
+    // `next_attempt_at`) is what actually re-queues it.
+    let stored_status = if permanent { "dead" } else { "pending" };
 
     let rows_affected = match table {
         "federation_outbox" => {
+            // A job dying after its entry's prune leaves no row behind (O7):
+            // nothing sends it again.
+            let fence = "q.id = $5 AND q.status = 'in_flight' \
+                         AND ($6::uuid IS NULL OR q.claim_token = $6)";
+            let dropped = format!("($1 = 'dead' AND {QUEUED_COPY_OF_PRUNED_ENTRY_SQL})");
             let sql = format!(
-                "UPDATE {table} \
-                 SET status = $1, \
-                     attempts = $2, \
-                     next_attempt_at = $7 + make_interval(secs => $3), \
-                     last_error = $4, \
-                     claim_token = NULL, \
-                     claim_expires_at = NULL, \
-                     updated_at = $7 \
-                 WHERE id = $5 AND status = 'in_flight' AND ($6::uuid IS NULL OR claim_token = $6)"
+                "WITH gone AS ( \
+                     DELETE FROM {table} q WHERE {fence} AND {dropped} RETURNING 1 \
+                 ), kept AS ( \
+                     UPDATE {table} q \
+                        SET status = $1, \
+                            attempts = $2, \
+                            next_attempt_at = $7 + make_interval(secs => $3), \
+                            last_error = $4, \
+                            claim_token = NULL, \
+                            claim_expires_at = NULL, \
+                            updated_at = $7 \
+                      WHERE {fence} AND NOT {dropped} RETURNING 1 \
+                 ) \
+                 SELECT (SELECT count(*) FROM gone) + (SELECT count(*) FROM kept)"
             );
-            let result = sqlx::query(&sql)
+            let settled: i64 = sqlx::query_scalar(&sql)
                 .bind(stored_status)
                 .bind(new_attempts)
                 .bind(backoff_secs)
@@ -227,30 +195,9 @@ pub async fn record_failure(
                 .bind(row_id)
                 .bind(claim_token)
                 .bind(now)
-                .execute(pool)
+                .fetch_one(pool)
                 .await?;
-            result.rows_affected()
-        }
-        "notification_outbox" => {
-            let sql = format!(
-                "UPDATE {table} \
-                 SET status = $1, \
-                     attempts = $2, \
-                     next_attempt_at = $6 + make_interval(secs => $3), \
-                     last_error = $4, \
-                     updated_at = $6 \
-                 WHERE id = $5"
-            );
-            let result = sqlx::query(&sql)
-                .bind(stored_status)
-                .bind(new_attempts)
-                .bind(backoff_secs)
-                .bind(error_msg)
-                .bind(row_id)
-                .bind(now)
-                .execute(pool)
-                .await?;
-            result.rows_affected()
+            settled as u64
         }
         _ => {
             let sql = format!(

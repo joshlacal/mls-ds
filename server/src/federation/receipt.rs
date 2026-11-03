@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use p256::ecdsa::{signature::Verifier, Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey;
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,8 @@ use super::errors::FederationError;
 use catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput;
 use catbird_atproto::generated::blue_catbird::chat::ConversationEntry;
 use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommitOutput;
+use serde_json::Value;
+use uuid::Uuid;
 /// The only verification method clients may resolve for V1 sequencer receipts.
 ///
 /// The DID document itself is published by the edge/operations layer. The
@@ -207,6 +209,273 @@ pub struct I13ReceiptSigner {
     key_id: String,
 }
 
+/// The sequencing DS's dedicated receipt-key attestation that an exact group
+/// close was authorized by its final, singleton active-admin roster.
+///
+/// This is not a replacement for the actor's device signature. Receivers must
+/// verify that signature with the actor's current authoritative signing key too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalCloseAuthority {
+    pub sequencer_did: String,
+    pub conversation_id: Uuid,
+    pub close_entry_sha256: [u8; 32],
+    pub final_roster_sha256: [u8; 32],
+    pub actor_did: String,
+    pub actor_device_id: Uuid,
+    pub actor_key_id: String,
+    pub actor_auth_generation: u64,
+    pub key_id: String,
+    pub signature: Vec<u8>,
+}
+
+impl TerminalCloseAuthority {
+    pub fn verify(
+        &self,
+        verifying_key: &VerifyingKey,
+        expected_sequencer: &str,
+        conversation_id: Uuid,
+        entry: &Value,
+    ) -> Result<(), String> {
+        let expected_sequencer = crate::identity::canonical_did(expected_sequencer);
+        if self.sequencer_did != expected_sequencer
+            || self.key_id
+                != labyrinth_protocol::receipt::expected_receipt_key_id(expected_sequencer)
+            || self.conversation_id != conversation_id
+            || self.close_entry_sha256 != terminal_close_entry_sha256(entry)?
+        {
+            return Err("terminal close authority binding mismatch".to_string());
+        }
+        let mutation = terminal_close_mutation(conversation_id, entry)?;
+        if self.actor_did != mutation.actor_did().as_str()
+            || self.actor_device_id != Uuid::from_bytes(*mutation.actor_device_id().as_bytes())
+            || self.actor_key_id != mutation.key_id().as_str()
+            || self.actor_auth_generation != mutation.auth_generation()
+            || self.final_roster_sha256
+                != terminal_close_roster_sha256(mutation.actor_did().as_str())
+        {
+            return Err("terminal close actor or final roster mismatch".to_string());
+        }
+        let signature = Signature::from_slice(&self.signature)
+            .map_err(|_| "invalid terminal close signature")?;
+        verifying_key
+            .verify(&self.signing_bytes(), &signature)
+            .map_err(|_| "invalid terminal close authority signature".to_string())
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        const DOMAIN: &[u8] = b"CATBIRD-TERMINAL-CLOSE-AUTHORITY-V1\0";
+        let fields = [
+            self.sequencer_did.as_bytes(),
+            self.key_id.as_bytes(),
+            self.actor_did.as_bytes(),
+            self.actor_key_id.as_bytes(),
+        ];
+        let mut bytes = Vec::with_capacity(
+            DOMAIN.len()
+                + 4 * 4
+                + fields.iter().map(|field| field.len()).sum::<usize>()
+                + 16
+                + 16
+                + 8
+                + 32
+                + 32,
+        );
+        bytes.extend_from_slice(DOMAIN);
+        for field in fields {
+            bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(field);
+        }
+        bytes.extend_from_slice(self.conversation_id.as_bytes());
+        bytes.extend_from_slice(self.actor_device_id.as_bytes());
+        bytes.extend_from_slice(&self.actor_auth_generation.to_be_bytes());
+        bytes.extend_from_slice(&self.close_entry_sha256);
+        bytes.extend_from_slice(&self.final_roster_sha256);
+        bytes
+    }
+}
+
+const ACCOUNT_DELETED_ENTRY_TYPE: &str = "blue.catbird.chat.defs#accountDeletedEntry";
+
+/// One sequenced `blue.catbird.chat.defs#accountDeletedEntry`: everything its
+/// [`AccountDeletionAuthority`] binds. `deleted_at` is the entry's `receivedAt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDeletion {
+    pub sequencer_did: String,
+    pub conversation_id: Uuid,
+    pub deleted_did: String,
+    pub seq: i64,
+    pub entry_id: Uuid,
+    pub deleted_at: DateTime<Utc>,
+}
+
+/// `blue.catbird.chat.defs#accountDeletionAuthority`: the sequencer's signature
+/// over one [`AccountDeletion`] with its dedicated `#mls-receipt-1` key, never
+/// its service-auth key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountDeletionAuthority {
+    pub sequencer_did: String,
+    pub key_id: String,
+    /// Low-S ES256 `r || s`, as lexicon `{"$bytes": …}`.
+    #[serde(with = "crate::atproto_bytes")]
+    pub signature: Vec<u8>,
+}
+
+impl AccountDeletion {
+    /// `catbird-mls-account-deletion-v1\0`, then sequencerDid, conversationId,
+    /// deletedDid, seq (decimal), entryId and deletedAt (RFC 3339 UTC with
+    /// milliseconds), each as u32-BE length-prefixed UTF-8.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let (conversation_id, seq, entry_id, deleted_at) = (
+            self.conversation_id.to_string(),
+            self.seq.to_string(),
+            self.entry_id.to_string(),
+            self.deleted_at_text(),
+        );
+        let mut bytes = b"catbird-mls-account-deletion-v1\0".to_vec();
+        for field in [
+            self.sequencer_did.as_str(),
+            &conversation_id,
+            &self.deleted_did,
+            &seq,
+            &entry_id,
+            &deleted_at,
+        ] {
+            bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(field.as_bytes());
+        }
+        bytes
+    }
+
+    fn deleted_at_text(&self) -> String {
+        self.deleted_at.to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
+    /// The canonical entry, exactly as every home stores and `getEntries` presents it.
+    pub fn entry(&self, authority: &AccountDeletionAuthority) -> Value {
+        serde_json::json!({
+            "$type": ACCOUNT_DELETED_ENTRY_TYPE,
+            "conversationId": self.conversation_id,
+            "deletedDid": self.deleted_did,
+            "entryId": self.entry_id,
+            "receivedAt": self.deleted_at_text(),
+            "seq": self.seq,
+            "sequencerAuthority": authority,
+            "sequencerDid": self.sequencer_did,
+        })
+    }
+
+    /// Parse an entry that is exactly [`Self::entry`]'s canonical form. This
+    /// authenticates nothing: verify the returned authority.
+    pub fn from_entry(entry: &Value) -> Result<(Self, AccountDeletionAuthority), String> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            #[serde(rename = "$type")]
+            kind: String,
+            conversation_id: Uuid,
+            deleted_did: String,
+            entry_id: Uuid,
+            received_at: DateTime<Utc>,
+            seq: i64,
+            sequencer_authority: AccountDeletionAuthority,
+            sequencer_did: String,
+        }
+        let wire = Wire::deserialize(entry)
+            .map_err(|error| format!("invalid account-deleted entry: {error}"))?;
+        let deletion = Self {
+            sequencer_did: wire.sequencer_did,
+            conversation_id: wire.conversation_id,
+            deleted_did: wire.deleted_did,
+            seq: wire.seq,
+            entry_id: wire.entry_id,
+            deleted_at: wire.received_at,
+        };
+        if wire.kind != ACCOUNT_DELETED_ENTRY_TYPE
+            || deletion.seq < 1
+            || deletion.entry(&wire.sequencer_authority) != *entry
+        {
+            return Err("account-deleted entry is not canonical".to_string());
+        }
+        Ok((deletion, wire.sequencer_authority))
+    }
+}
+
+impl AccountDeletionAuthority {
+    /// Verify that `deletion`'s own sequencer signed it with its `#mls-receipt-1` key.
+    pub fn verify(
+        &self,
+        verifying_key: &VerifyingKey,
+        deletion: &AccountDeletion,
+    ) -> Result<(), String> {
+        if self.sequencer_did != deletion.sequencer_did
+            || self.key_id
+                != labyrinth_protocol::receipt::expected_receipt_key_id(&deletion.sequencer_did)
+        {
+            return Err("account deletion authority binding mismatch".to_string());
+        }
+        let signature = Signature::from_slice(&self.signature)
+            .ok()
+            .filter(|signature| signature.normalize_s().is_none())
+            .ok_or_else(|| "account deletion signature is not low-S ES256".to_string())?;
+        verifying_key
+            .verify(&deletion.signing_bytes(), &signature)
+            .map_err(|_| "invalid account deletion authority signature".to_string())
+    }
+}
+
+fn terminal_close_entry_sha256(entry: &Value) -> Result<[u8; 32], String> {
+    // Match the retained terminal attachment's exact JSON-byte digest.
+    let bytes = serde_json::to_vec(entry).map_err(|error| error.to_string())?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+fn terminal_close_roster_sha256(actor_did: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-TERMINAL-CLOSE-ROSTER-V1\0");
+    digest.update(1_u32.to_be_bytes());
+    for field in [actor_did.as_bytes(), b"active", b"admin"] {
+        digest.update((field.len() as u32).to_be_bytes());
+        digest.update(field);
+    }
+    digest.finalize().into()
+}
+
+fn terminal_close_mutation(
+    conversation_id: Uuid,
+    entry: &Value,
+) -> Result<crate::chat_protocol::transcript::CanonicalSignedMutation, String> {
+    let entry_conversation = entry
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let prior_conversation = entry
+        .pointer("/signedRequest/body/prior/conversationId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    if entry_conversation != Some(conversation_id)
+        || prior_conversation != Some(conversation_id)
+        || entry.get("$type").and_then(Value::as_str)
+            != Some("blue.catbird.chat.defs#conversationCloseEntry")
+        || entry
+            .pointer("/signedRequest/body/conversationKind")
+            .and_then(Value::as_str)
+            != Some("group")
+    {
+        return Err("terminal close authority requires the exact group close entry".to_string());
+    }
+    // The entry's wire presentation (`signature` as `$bytes`), not the request wrapper form.
+    let bytes = serde_json::to_vec(entry).map_err(|error| error.to_string())?;
+    let mutation =
+        crate::chat_protocol::transcript::decode_control_entry_mutation_unverified(&bytes)
+            .map_err(|error| format!("invalid terminal close entry: {error:?}"))?;
+    if mutation.kind() != crate::chat_protocol::transcript::SignedMutationKind::ConversationClose {
+        return Err("terminal close authority requires a close mutation".to_string());
+    }
+    Ok(mutation)
+}
+
 impl I13ReceiptSigner {
     pub fn new(signing_key: SigningKey, sequencer_did: String) -> Self {
         let base = crate::identity::canonical_did(&sequencer_did).to_string();
@@ -233,6 +502,58 @@ impl I13ReceiptSigner {
 
     pub fn verifying_key(&self) -> VerifyingKey {
         *self.signing_key.verifying_key()
+    }
+
+    /// Attest an already-authorized group close, using only the dedicated I13 key.
+    /// The caller must prove the applied close and current actor/roster in its
+    /// transaction before calling this method; see `attach_close_authority`.
+    pub fn sign_terminal_close_authority(
+        &self,
+        conversation_id: Uuid,
+        entry: &Value,
+    ) -> Result<TerminalCloseAuthority, String> {
+        let mutation = terminal_close_mutation(conversation_id, entry)?;
+        let mut authority = TerminalCloseAuthority {
+            sequencer_did: self.sequencer_did.clone(),
+            conversation_id,
+            close_entry_sha256: terminal_close_entry_sha256(entry)?,
+            final_roster_sha256: terminal_close_roster_sha256(mutation.actor_did().as_str()),
+            actor_did: mutation.actor_did().as_str().to_string(),
+            actor_device_id: Uuid::from_bytes(*mutation.actor_device_id().as_bytes()),
+            actor_key_id: mutation.key_id().as_str().to_string(),
+            actor_auth_generation: mutation.auth_generation(),
+            key_id: self.key_id.clone(),
+            signature: Vec::new(),
+        };
+        let signature: Signature =
+            p256::ecdsa::signature::Signer::sign(&self.signing_key, &authority.signing_bytes());
+        authority.signature = signature
+            .normalize_s()
+            .unwrap_or(signature)
+            .to_bytes()
+            .to_vec();
+        Ok(authority)
+    }
+
+    /// Sign `deletion`, which must name this sequencer, with only the dedicated I13 key.
+    pub fn sign_account_deletion(
+        &self,
+        deletion: &AccountDeletion,
+    ) -> Result<AccountDeletionAuthority, String> {
+        if deletion.sequencer_did != self.sequencer_did {
+            return Err("account deletion names another sequencer".to_string());
+        }
+        let signature: Signature =
+            p256::ecdsa::signature::Signer::sign(&self.signing_key, &deletion.signing_bytes());
+        Ok(AccountDeletionAuthority {
+            sequencer_did: self.sequencer_did.clone(),
+            key_id: self.key_id.clone(),
+            signature: signature
+                .normalize_s()
+                .unwrap_or(signature)
+                .to_bytes()
+                .to_vec(),
+        })
     }
 
     /// Sign an `I13` `SequencerReceiptPayload` binding `archive_commitment` to the sequenced entry.
@@ -466,6 +787,211 @@ mod tests {
     use p256::ecdsa::SigningKey;
     use p256::pkcs8::{EncodePrivateKey, LineEnding};
     use rand::rngs::OsRng;
+
+    fn terminal_close_fixture() -> (Uuid, Value, [u8; 32]) {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use serde_json::json;
+
+        let conversation_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let actor_device = "22222222-2222-4222-8222-222222222222";
+        // `.example` alone is a reserved TLD that DID validation rejects.
+        let actor = "did:web:terminal-admin.example.com";
+        let device_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let device_public = device_key.verifying_key().to_bytes();
+        let key_id = crate::chat_protocol::validation::ed25519_key_id(&device_public).unwrap();
+        let prior = json!({
+            "conversationId": conversation_id,
+            "generation": 0,
+            "stateVersion": 4,
+            "groupId": STANDARD.encode([1; 32]),
+            "epoch": 3,
+            "groupContextHash": STANDARD.encode([2; 32]),
+            "confirmationTag": STANDARD.encode([3; 32]),
+            "lifecycle": "active",
+        });
+        let mut retired = prior.clone();
+        retired["stateVersion"] = json!(5);
+        retired["lifecycle"] = json!("superseded");
+        let body = json!({
+            "$type": "blue.catbird.chat.defs#conversationCloseBody",
+            "signatureDomain": "CATBIRD-CHAT-CLOSE\u{0}",
+            "actorDid": actor,
+            "actorDeviceId": actor_device,
+            "keyId": key_id.as_str(),
+            "authGeneration": 3,
+            "signedAt": "2026-11-03T00:00:00.000Z",
+            "idempotencyKey": "33333333-3333-4333-8333-333333333333",
+            "transitionId": "44444444-4444-4444-8444-444444444444",
+            "conversationKind": "group",
+            "prior": prior,
+            "retired": retired,
+        });
+        let mut signed: Value = serde_json::from_slice(
+            &crate::sim_hooks::sign_sim_chat_body(body, &device_key).unwrap(),
+        )
+        .unwrap();
+        // Sequenced entries present the wrapper signature as lexicon bytes.
+        signed["signature"] = json!({ "$bytes": signed["signature"].clone() });
+        let entry = json!({
+            "$type": "blue.catbird.chat.defs#conversationCloseEntry",
+            "conversationId": conversation_id,
+            "entryId": "55555555-5555-4555-8555-555555555555",
+            "seq": 10,
+            "receivedAt": "2026-11-03T00:00:01.000Z",
+            "signedRequest": signed,
+            "tombstone": {
+                "conversationId": conversation_id,
+                "conversationKind": "group",
+                "retired": retired,
+                "closedByDid": actor,
+                "closedByDeviceId": actor_device,
+                "terminalSeq": 10,
+                "closedAt": "2026-11-03T00:00:01.000Z",
+            },
+        });
+        (conversation_id, entry, device_public)
+    }
+
+    #[test]
+    fn terminal_close_authority_is_deterministic_and_binds_the_exact_group_close() {
+        use serde_json::json;
+
+        let (conversation_id, entry, device_public) = terminal_close_fixture();
+        crate::chat_protocol::transcript::decode_and_verify_control_entry(
+            &serde_json::to_vec(&entry).unwrap(),
+            &device_public,
+        )
+        .unwrap();
+        let key = SigningKey::from_slice(&[7; 32]).unwrap();
+        let signer = I13ReceiptSigner::new(key.clone(), "did:web:sequencer.example".to_string());
+        let proof = signer
+            .sign_terminal_close_authority(conversation_id, &entry)
+            .unwrap();
+        assert_eq!(
+            proof,
+            signer
+                .sign_terminal_close_authority(conversation_id, &entry)
+                .unwrap()
+        );
+        let wire = serde_json::to_vec(&proof).unwrap();
+        let decoded: TerminalCloseAuthority = serde_json::from_slice(&wire).unwrap();
+        decoded
+            .verify(
+                &signer.verifying_key(),
+                signer.sequencer_did(),
+                conversation_id,
+                &entry,
+            )
+            .unwrap();
+        assert_eq!(proof.actor_auth_generation, 3);
+        assert_eq!(
+            proof.final_roster_sha256,
+            terminal_close_roster_sha256(&proof.actor_did)
+        );
+        let other_id = Uuid::parse_str("66666666-6666-4666-8666-666666666666").unwrap();
+        assert!(proof
+            .verify(
+                &signer.verifying_key(),
+                signer.sequencer_did(),
+                other_id,
+                &entry
+            )
+            .is_err());
+        assert!(proof
+            .verify(
+                &signer.verifying_key(),
+                "did:web:other.example",
+                conversation_id,
+                &entry
+            )
+            .is_err());
+        let other_key = SigningKey::from_slice(&[8; 32]).unwrap();
+        assert!(proof
+            .verify(
+                other_key.verifying_key(),
+                signer.sequencer_did(),
+                conversation_id,
+                &entry
+            )
+            .is_err());
+
+        for (path, value) in [
+            ("/seq", json!(11)),
+            (
+                "/signedRequest/body/actorDid",
+                json!("did:web:attacker.example.com"),
+            ),
+            ("/signedRequest/body/actorDeviceId", json!(other_id)),
+            ("/signedRequest/body/keyId", json!("different-key")),
+            ("/signedRequest/body/authGeneration", json!(4)),
+            ("/signedRequest/body/transitionId", json!(other_id)),
+            ("/signedRequest/body/prior/stateVersion", json!(3)),
+            ("/signedRequest/body/retired/stateVersion", json!(6)),
+            ("/tombstone/closedByDid", json!("did:web:attacker.example")),
+        ] {
+            let mut changed = entry.clone();
+            *changed.pointer_mut(path).unwrap() = value;
+            assert!(
+                proof
+                    .verify(
+                        &signer.verifying_key(),
+                        signer.sequencer_did(),
+                        conversation_id,
+                        &changed
+                    )
+                    .is_err(),
+                "{path}"
+            );
+        }
+        for (field, value) in [
+            ("sequencerDid", json!("did:web:other.example")),
+            ("conversationId", json!(other_id)),
+            ("closeEntrySha256", json!(vec![0_u8; 32])),
+            ("finalRosterSha256", json!(vec![0_u8; 32])),
+            ("actorDid", json!("did:web:attacker.example")),
+            ("actorDeviceId", json!(other_id)),
+            ("actorKeyId", json!("different-key")),
+            ("actorAuthGeneration", json!(4)),
+            ("keyId", json!("did:web:sequencer.example#atproto")),
+            ("signature", json!(vec![0_u8; 64])),
+        ] {
+            let mut changed: Value = serde_json::from_slice(&wire).unwrap();
+            changed[field] = value;
+            let changed: TerminalCloseAuthority = serde_json::from_value(changed).unwrap();
+            assert!(
+                changed
+                    .verify(
+                        &signer.verifying_key(),
+                        signer.sequencer_did(),
+                        conversation_id,
+                        &entry
+                    )
+                    .is_err(),
+                "{field}"
+            );
+        }
+        let mut cross_protocol = proof;
+        cross_protocol.signature = ReceiptSigner::new(key, signer.sequencer_did().to_string())
+            .sign_receipt(&conversation_id.to_string(), 3, 0, b"commit")
+            .signature;
+        assert!(cross_protocol
+            .verify(
+                &signer.verifying_key(),
+                signer.sequencer_did(),
+                conversation_id,
+                &entry
+            )
+            .is_err());
+
+        let mut direct = entry.clone();
+        direct["signedRequest"]["body"]["conversationKind"] = json!("direct");
+        assert!(signer
+            .sign_terminal_close_authority(conversation_id, &direct)
+            .is_err());
+        assert!(signer
+            .sign_terminal_close_authority(other_id, &entry)
+            .is_err());
+    }
 
     fn pem(key: &SigningKey) -> String {
         key.to_pkcs8_pem(LineEnding::LF)
@@ -1111,5 +1637,109 @@ mod tests {
     fn result_bytes_for_receipt_rejects_unknown_method_and_malformed_json() {
         assert!(result_bytes_for_receipt("blue.catbird.mlsDS.unknown", b"{}").is_err());
         assert!(result_bytes_for_receipt(SUBMIT_COMMIT_NSID, b"not json").is_err());
+    }
+
+    #[test]
+    fn an_account_deletion_authority_binds_every_field_of_its_canonical_entry() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use serde_json::json;
+
+        const SEQUENCER: &str = "did:web:sequencer.example.com";
+        const CONVERSATION: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const ENTRY: &str = "33333333-3333-4333-8333-333333333333";
+        let signer = I13ReceiptSigner::new(
+            SigningKey::from_slice(&[7; 32]).unwrap(),
+            SEQUENCER.to_string(),
+        );
+        let key = signer.verifying_key();
+        let deletion = AccountDeletion {
+            sequencer_did: SEQUENCER.to_string(),
+            conversation_id: Uuid::parse_str(CONVERSATION).unwrap(),
+            deleted_did: "did:web:deleted.example.com".to_string(),
+            seq: 12,
+            entry_id: Uuid::parse_str(ENTRY).unwrap(),
+            deleted_at: "2026-11-03T12:00:00.123Z".parse().unwrap(),
+        };
+        let mut expected = b"catbird-mls-account-deletion-v1\0".to_vec();
+        for field in [
+            SEQUENCER,
+            CONVERSATION,
+            "did:web:deleted.example.com",
+            "12",
+            ENTRY,
+            "2026-11-03T12:00:00.123Z",
+        ] {
+            expected.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            expected.extend_from_slice(field.as_bytes());
+        }
+        assert_eq!(deletion.signing_bytes(), expected);
+
+        let authority = signer.sign_account_deletion(&deletion).unwrap();
+        assert_eq!(authority, signer.sign_account_deletion(&deletion).unwrap());
+        assert_eq!(authority.key_id, format!("{SEQUENCER}#mls-receipt-1"));
+        authority.verify(&key, &deletion).unwrap();
+        let entry = deletion.entry(&authority);
+        assert_eq!(
+            entry["sequencerAuthority"]["signature"]["$bytes"],
+            STANDARD.encode(&authority.signature)
+        );
+        assert_eq!(
+            AccountDeletion::from_entry(&entry).unwrap(),
+            (deletion.clone(), authority.clone())
+        );
+
+        // Every bound field, altered after signing.
+        for edit in [
+            (|d: &mut AccountDeletion| d.sequencer_did = "did:web:other.example.com".into())
+                as fn(&mut AccountDeletion),
+            |d| d.conversation_id = Uuid::new_v4(),
+            |d| d.deleted_did = "did:web:other.example.com".into(),
+            |d| d.seq += 1,
+            |d| d.entry_id = Uuid::new_v4(),
+            |d| d.deleted_at += chrono::TimeDelta::milliseconds(1),
+        ] {
+            let mut changed = deletion.clone();
+            edit(&mut changed);
+            assert!(authority.verify(&key, &changed).is_err(), "{changed:?}");
+        }
+        // Another key id, another sequencer's key, or the high-S twin.
+        let mut other_method = authority.clone();
+        other_method.key_id = format!("{SEQUENCER}#atproto");
+        assert!(other_method.verify(&key, &deletion).is_err());
+        let other_key = SigningKey::from_slice(&[8; 32]).unwrap();
+        assert!(authority
+            .verify(other_key.verifying_key(), &deletion)
+            .is_err());
+        let (r, s) = Signature::from_slice(&authority.signature)
+            .unwrap()
+            .split_scalars();
+        let mut high_s = authority.clone();
+        high_s.signature = Signature::from_scalars(r, -s).unwrap().to_bytes().to_vec();
+        assert!(high_s.verify(&key, &deletion).is_err());
+        let mut foreign = deletion.clone();
+        foreign.sequencer_did = "did:web:other.example.com".into();
+        assert!(signer.sign_account_deletion(&foreign).is_err());
+
+        // Only the exact canonical entry parses.
+        for edit in [
+            (|e: &mut Value| e["receivedAt"] = json!("2026-11-03T12:00:00.123+00:00"))
+                as fn(&mut Value),
+            |e| e["receivedAt"] = json!("2026-11-03T12:00:00Z"),
+            |e| e["conversationId"] = json!(CONVERSATION.to_uppercase()),
+            |e| e["seq"] = json!(0),
+            |e| e["$type"] = json!("blue.catbird.chat.defs#applicationEntry"),
+            |e| e["signature"] = json!(STANDARD.encode([0; 64])),
+            |e| {
+                e.as_object_mut().unwrap().remove("sequencerAuthority");
+            },
+            |e| {
+                let bare = e["sequencerAuthority"]["signature"]["$bytes"].clone();
+                e["sequencerAuthority"]["signature"] = bare;
+            },
+        ] {
+            let mut changed = entry.clone();
+            edit(&mut changed);
+            assert!(AccountDeletion::from_entry(&changed).is_err(), "{changed}");
+        }
     }
 }

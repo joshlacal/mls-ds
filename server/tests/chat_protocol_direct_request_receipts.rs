@@ -1,6 +1,7 @@
 //! Dedicated receipt configuration and durable rotation trust checks.
 #![allow(dead_code)]
 pub use catbird_server::chat_protocol::direct_request_transcript;
+pub use catbird_server::sim_hooks;
 #[path = "common/chat_protocol.rs"]
 pub mod chat_protocol_baseline;
 mod common {
@@ -113,7 +114,12 @@ pub mod model;
 
 #[tokio::test]
 async fn variable_authority_direct_request_receipt_signer_persists_and_verifies() {
-    let pool = common::direct_request_database::setup().await;
+    // The receipt-key registry is immutable and holds one deployment's issuer
+    // history. Another authority's row in the shared request database would
+    // permanently fail every later chat.catbird.blue startup check, so this
+    // second deployment gets its own database.
+    let disposable = common::fresh_db::fresh_fully_migrated_db("chat_receipts_").await;
+    let pool = disposable.connect(2).await;
     let receipt_key = SigningKey::from_bytes((&[55; 32]).into()).unwrap();
     let service_key = SigningKey::from_bytes((&[56; 32]).into()).unwrap();
     let receipt_pem = receipt_key.to_pkcs8_pem(LineEnding::LF).unwrap();

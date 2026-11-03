@@ -52,7 +52,7 @@ use encrypted_requests::{
     request_database_url, reviewed_request_migrations, seed_service_device, signed_mls_request,
     validate_request_test_database_url, HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
 };
-use live_direct_request::{publish_request_variant, PublishedRequestFixture};
+use live_direct_request::publish_request_variant;
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -209,6 +209,7 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
     let iphone_intro = f.bob_engine.decrypt_direct_request(&f.welcome_input)?;
     let DirectRequestIntroductionResult::Ready {
         plaintext: iphone_pt,
+        ..
     } = &iphone_intro
     else {
         anyhow::bail!("Bob-iPhone intro not ready");
@@ -227,7 +228,10 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
     sibling.engine.process_direct_request(&ipad_welcome_input)?;
     assert_eq!(sibling.engine.epoch(&group)?, epoch);
     let ipad_intro = sibling.engine.decrypt_direct_request(&ipad_welcome_input)?;
-    let DirectRequestIntroductionResult::Ready { plaintext: ipad_pt } = &ipad_intro else {
+    let DirectRequestIntroductionResult::Ready {
+        plaintext: ipad_pt, ..
+    } = &ipad_intro
+    else {
         anyhow::bail!("Bob-iPad intro not ready");
     };
     let ipad_intro_text = protocol::decode_direct_request_introduction(ipad_pt)?["text"]
@@ -615,10 +619,7 @@ async fn ipados_ios_second_device_every_row_branches() -> anyhow::Result<()> {
         String::from_utf8_lossy(&close_bytes)
     );
 
-    encrypted_requests::assert_closed_conversation_wiped(
-        f.conversation_id,
-        Some(f.request_id),
-    )?;
+    encrypted_requests::assert_closed_conversation_wiped(f.conversation_id, Some(f.request_id))?;
 
     // Alice was offline for the close. Operational history is gone, but her
     // frozen close-event entitlement still exposes the authenticated terminal
@@ -644,8 +645,19 @@ async fn ipados_ios_second_device_every_row_branches() -> anyhow::Result<()> {
         String::from_utf8_lossy(&peer_bytes)
     );
     let peer_page: Value = serde_json::from_slice(&peer_bytes)?;
-    assert_eq!(peer_page["entries"], json!([closed_response["result"]["entry"]]));
-    assert_eq!(peer_page["entries"][0]["signedRequest"], close_signed);
+    assert_eq!(
+        peer_page["entries"],
+        json!([closed_response["result"]["entry"]])
+    );
+    // Lexicon `{"$bytes"}` read presentation, normalized to the signed form.
+    assert_eq!(
+        protocol::normalize_read_presentation(
+            &serde_json::to_vec(&peer_page["entries"][0]["signedRequest"])?,
+            "signedConversationClose",
+            false,
+        )?,
+        close_signed
+    );
     assert_eq!(peer_page["hasMore"], false);
 
     // A new signed close is not an idempotent replay. It cannot recreate the
@@ -685,10 +697,7 @@ async fn ipados_ios_second_device_every_row_branches() -> anyhow::Result<()> {
         replay_bytes, close_bytes,
         "late exact replay returns the byte-identical retained completion"
     );
-    encrypted_requests::assert_closed_conversation_wiped(
-        f.conversation_id,
-        Some(f.request_id),
-    )?;
+    encrypted_requests::assert_closed_conversation_wiped(f.conversation_id, Some(f.request_id))?;
 
     println!("ipados_ios_second_device: decline/block monotonicity verified");
     Ok(())

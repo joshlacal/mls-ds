@@ -542,6 +542,43 @@ fn declaration_success_and_structured_record_not_found_are_exact() {
     assert!(parse_declaration_response(&actor, 200, duplicate.as_bytes()).is_err());
 }
 
+/// A PDS that could not answer now decided nothing, whatever error page it
+/// returned: the status is classified before the body is parsed. Typed
+/// `RecordNotFound` absence and an unusable 404 body stay authoritative.
+#[test]
+fn declaration_status_is_classified_before_the_body_is_parsed() {
+    let actor = did(3);
+    let html = b"<html><body>503 Service Temporarily Unavailable</body></html>".as_slice();
+    for status in [302, 429, 500, 502, 503, 504] {
+        assert_eq!(
+            parse_declaration_response(&actor, status, html),
+            Err(AuthorityError::Unavailable),
+            "consent declaration answering {status}"
+        );
+        assert_eq!(
+            parse_chat_declaration_response(&actor, status, html),
+            Err(AuthorityError::Unavailable),
+            "chat declaration answering {status}"
+        );
+    }
+    let not_found = br#"{"error":"RecordNotFound"}"#.as_slice();
+    assert!(parse_declaration_response(&actor, 404, not_found)
+        .unwrap()
+        .is_absent());
+    assert_eq!(
+        parse_chat_declaration_response(&actor, 400, not_found),
+        Ok(None)
+    );
+    assert_eq!(
+        parse_declaration_response(&actor, 404, html),
+        Err(AuthorityError::Malformed)
+    );
+    assert_eq!(
+        parse_chat_declaration_response(&actor, 404, html),
+        Err(AuthorityError::Malformed)
+    );
+}
+
 #[test]
 fn declaration_cid_must_be_a_canonical_parsed_cid() {
     let actor = did(3);

@@ -10,9 +10,13 @@
 #![allow(dead_code)]
 
 mod common;
+pub use catbird_server::sim_hooks;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/read_projection.rs"]
+mod read_projection;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
@@ -3057,6 +3061,68 @@ fn make_leave_request_body(
     (wrapper, signed_bytes)
 }
 
+/// `actor`'s signed policy transition adding a pending member at `prior`.
+#[allow(clippy::too_many_arguments)]
+fn make_policy_body(
+    convo_id: Uuid,
+    transition_id: Uuid,
+    actor: &TestActor,
+    group_id: &[u8],
+    state_version: i64,
+    epoch: i64,
+    group_context_hash: &[u8],
+    confirmation_tag: &[u8],
+    now: DateTime<Utc>,
+) -> (Value, Vec<u8>) {
+    let coordinate = |state_version: i64| {
+        json!({
+            "conversationId": convo_id.to_string(),
+            "generation": 0,
+            "stateVersion": state_version,
+            "groupId": STANDARD.encode(group_id),
+            "epoch": epoch,
+            "groupContextHash": STANDARD.encode(group_context_hash),
+            "confirmationTag": STANDARD.encode(confirmation_tag),
+            "lifecycle": "active"
+        })
+    };
+    let unsigned = json!({
+        "$type": "blue.catbird.chat.defs#policyTransitionBody",
+        "signatureDomain": "CATBIRD-CHAT-POLICY\u{0}",
+        "transitionId": transition_id.to_string(),
+        "actorDid": actor.did,
+        "actorDeviceId": actor.device_id.to_string(),
+        "keyId": actor.key_id,
+        "authGeneration": 1,
+        "prior": coordinate(state_version),
+        "next": coordinate(state_version + 1),
+        "participantChanges": [{
+            "$type": "blue.catbird.chat.defs#addParticipant",
+            "userDid": random_did(),
+            "status": "pending",
+            "role": "member",
+            "invitationProvenance": {
+                "invitedByDid": actor.did,
+                "invitedByDeviceId": actor.device_id.to_string(),
+                "invitationTransitionId": transition_id.to_string(),
+            },
+        }],
+        "idempotencyKey": transition_id.to_string(),
+        "signedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+
+    let mut wrapper = json!({
+        "body": unsigned,
+        "signature": STANDARD.encode([0u8; 64]),
+    });
+    let unsigned_bytes = serde_json::to_vec(&wrapper).unwrap();
+    let mutation = decode_canonical_signed_mutation(&unsigned_bytes).unwrap();
+    let sig: ed25519_dalek::Signature = actor.signing_key.sign(mutation.transcript_bytes());
+    wrapper["signature"] = json!(STANDARD.encode(sig.to_bytes()));
+    let signed_bytes = serde_json::to_vec(&wrapper).unwrap();
+    (wrapper, signed_bytes)
+}
+
 fn make_device_revocation_body(
     actor: &TestActor,
     target_device_id: Uuid,
@@ -4556,6 +4622,93 @@ async fn test_submit_commit_router_rejects_mock_and_corrupted_bytes() {
         receipt_count, 0,
         "rejected mock commit must not leave delivery receipt"
     );
+}
+
+/// `submitCommit` forwards only Commits. A member's signed policy transition,
+/// which a sequencer does sequence when relayed (`relayGroupMutation`), is
+/// refused by its kind before any operation claim, receipt or entry.
+#[tokio::test]
+async fn test_submit_commit_router_refuses_a_policy_transition() {
+    let harness = TestHarness::new("commit-policy").await;
+    let now = Utc::now();
+    let (convo_id, _, _, alice, _bob, group_id, committed_hash, committed_tag, _, _) =
+        seed_corpus_conversation_at_added(&harness.pool, &harness.sender_ds_did, None, now).await;
+    let transition_id = Uuid::new_v4();
+    let (_, signed_req_bytes) = make_policy_body(
+        convo_id,
+        transition_id,
+        &alice,
+        &group_id,
+        3,
+        1,
+        &committed_hash,
+        &committed_tag,
+        now,
+    );
+    let delivery_id = Uuid::new_v4();
+    let header = ValidatedEnvelopeHeader {
+        protocol_version: "1".to_string(),
+        delivery_id,
+        conversation_id: convo_id,
+        sender_ds_did: harness.sender_ds_did.clone(),
+        receiver_ds_did: LOCAL_DS_DID.to_string(),
+        sequencer_did: LOCAL_DS_DID.to_string(),
+        sequencer_term: 1,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap(),
+        payload_sha256: [0u8; 32],
+    };
+    let digest = compute_commit_envelope_digest(&header, &signed_req_bytes).unwrap();
+    let body = json!({
+        "header": make_envelope_header_json(
+            delivery_id,
+            convo_id,
+            &harness.sender_ds_did,
+            LOCAL_DS_DID,
+            LOCAL_DS_DID,
+            1,
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            &digest,
+        ),
+        "signedRequestBytes": { "$bytes": STANDARD.encode(&signed_req_bytes) },
+    });
+    let entries = || {
+        let pool = harness.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM chat.entries WHERE conversation_id = $1",
+            )
+            .bind(convo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let before = entries().await;
+
+    let jwt = harness.mint_jwt(SUBMIT_COMMIT_NSID);
+    let (status, response, _) = harness
+        .send_json("/xrpc/blue.catbird.mlsDS.submitCommit", Some(&jwt), &body)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response:?}");
+    assert!(
+        response["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("got PolicyTransition")),
+        "refused by its kind: {response:?}"
+    );
+    let (claims, receipts): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM chat.operation_claims WHERE operation_id = $1), \
+                (SELECT count(*) FROM chat.federation_delivery_receipts WHERE delivery_id = $2)",
+    )
+    .bind(transition_id)
+    .bind(delivery_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!((claims, receipts, entries().await), (0, 0, before));
 }
 
 // =============================================================================
@@ -12973,20 +13126,9 @@ async fn test_reconciliation_mismatched_accepted_payload_sha256_overlap_fails_be
     .await;
 }
 
-// Encrypted-requests: transcript.rs test modules reference read_projection.
+// Compile the actual canonical encoder used by transcript.rs's request-view
+// tests. An empty-byte stand-in cannot exercise its round-trip contract.
 mod chat_protocol {
-    pub mod read_projection {
-        pub struct DummyCanonical;
-        impl DummyCanonical {
-            pub fn bytes(&self) -> &[u8] {
-                &[]
-            }
-        }
-        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
-            _value: &T,
-            _schema: &str,
-        ) -> Result<DummyCanonical, String> {
-            Ok(DummyCanonical)
-        }
-    }
+    pub(crate) use crate::read_projection;
+    pub use catbird_server::chat_protocol::direct_request_transcript;
 }

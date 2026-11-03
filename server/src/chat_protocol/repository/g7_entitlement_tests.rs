@@ -41,8 +41,8 @@ mod chat_protocol {
         const LOCK_KEY_SQL: &str = r#"
             SELECT key_id, signing_public_key, revoked_at
               FROM chat.device_keys
-             WHERE user_did = $1 AND device_id = $2
-             FOR UPDATE
+             WHERE user_did = $1 AND device_id = $2 AND enrollment_auth_generation <= $3
+             ORDER BY enrollment_auth_generation DESC LIMIT 1 FOR UPDATE
         "#;
 
         #[derive(FromRow)]
@@ -191,6 +191,7 @@ mod chat_protocol {
             let key: Option<KeyRow> = sqlx::query_as(LOCK_KEY_SQL)
                 .bind(did)
                 .bind(device_id)
+                .bind(device.auth_generation)
                 .fetch_optional(&mut **transaction)
                 .await
                 .expect("ordered device-key FOR UPDATE lock");
@@ -1638,20 +1639,13 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
 // Re-pinned 2026-10-04 for the main + encrypted-requests line merge: the
 // helper is main's file plus encrypted-requests' fresh-database migration
 // retry/advisory lock and clock-anchored seeds.
+// Re-pinned 2026-11-04 for `58d38d8f` ("mls-ds: Add Option A SpaceHost, Push
+// Gateway client, and D1/3A group & Space relays"), whose only change to the
+// helper was its rustfmt pass: `rustfmt --edition 2021` of the previously
+// pinned bytes (33877d5f…) is byte-identical to the new bytes, so the seed's
+// token stream is unchanged. The guard had stayed red from that commit on.
 const FROZEN_EXECUTOR_SEED_SHA256: &str =
-    "33877d5fc1031e88e36ba5b191976442527d3e2f5691c377f487230f5db182b4";
-// Re-pinned 2026-08-15 for finding 3 fix (b): `load_reset_request_hydration_rows`
-// admits the ratified `revoked` status and selects `terminal_revocation_id`,
-// `select_reset_terminal` gained the revocation arm (and now checks the
-// revocation column on every arm, mirroring the DB shape check), and
-// `graph_digest_reset` encodes the fifth status. Taken from POST-rustfmt bytes.
-// Re-pinned for the clean cutover's fail-closed routing and locked-hydration
-// repository changes.
-// Re-pinned 2026-11-02 for federated group KeyPackage export reservation in
-// `hydrate_locked_available_recovery_package_at_coordinate` (post-rustfmt bytes).
-// An unexplained mismatch here still means core.rs drifted.
-const SEALED_REPOSITORY_CORE_SHA256: &str =
-    "ae77b36f65eae4fb2970f38e213a08cba5a16ef211b467722c869d7dd3ddbea3";
+    "5c4207acd7123bae8d5a2fe04f41404b41da40de30c59c98063ab0cc85b3bb4c";
 
 #[test]
 fn frozen_executor_seed_helper_is_byte_identical_to_the_sealed_baseline() {
@@ -1664,13 +1658,246 @@ fn frozen_executor_seed_helper_is_byte_identical_to_the_sealed_baseline() {
     );
 }
 
-#[test]
-fn production_repository_core_is_byte_identical_to_the_sealed_baseline() {
-    assert_eq!(
-        hex::encode(Sha256::digest(include_bytes!("core.rs"))),
-        SEALED_REPOSITORY_CORE_SHA256,
-        "src/chat_protocol/repository/core.rs must stay byte-identical to the sealed baseline"
+// Behavioral replacement for the obsolete whole-file core.rs hash: exercise
+// the reviewed manifest and the actual row-lock/lease allocation contract.
+#[tokio::test]
+async fn recovery_package_allocation_supports_manifest_and_excludes_live_group_exports_until_expiry(
+) {
+    use super::core::{
+        hydrate_locked_available_recovery_package, hydrate_locked_conversation_head,
+        RecoveryPackageHydrationError,
+    };
+    use executor_seed::genuine_terminal_fixture::{
+        build_genuine_invitee_key_package, AcceptanceInvitee,
+    };
+
+    let (pool, _database) = common::fresh_db::fresh_clean_protocol_db("chat_freshdb_", 4).await;
+    let missing_tables: bool = sqlx::query_scalar(
+        "SELECT to_regclass('chat.group_key_package_exports') IS NULL \
+            AND to_regclass('chat.group_transport_entry_recipients') IS NULL \
+            AND to_regclass('chat.conversation_close_terminal_entries') IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        missing_tables,
+        "the pinned manifest must not silently acquire later tables"
     );
+    let ledger_count: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        ledger_count as usize,
+        common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST.len()
+    );
+
+    let conversation_id = Uuid::new_v4();
+    let graph = executor_seed::seed_hydratable_genuine_creation_graph(&pool, conversation_id).await;
+    // The owner's recovery KeyPackage is owner-scoped, so a lease exported for
+    // one group also withholds it from recovery in another. That is where an
+    // allocation can wait on the exporter's package lock: a contender in the
+    // leased conversation itself queues earlier, on the lease's foreign-key
+    // share of the head row its own head lock needs.
+    let contender_conversation = Uuid::new_v4();
+    executor_seed::seed_hydratable_genuine_creation_graph(&pool, contender_conversation).await;
+    let entry = executor_seed::build_real_corpus_creation_entry(*conversation_id.as_bytes());
+    assert_eq!(entry.actor_did, graph.creator_did);
+    assert_eq!(entry.actor_device_id, graph.creator_device_id);
+    let owner = AcceptanceInvitee {
+        did: entry.actor_did.clone(),
+        device_id: entry.actor_device_id,
+        key_id: entry.actor_key_id.clone(),
+        signing_key: entry.signing_key(),
+        participant_period_id: Uuid::new_v4(),
+    };
+    let now = DateTime::<Utc>::from_timestamp(
+        executor_seed::corpus_manifest().evaluation_unix_seconds as i64 + 60,
+        0,
+    )
+    .unwrap();
+    let (reference, wrapper, not_before, not_after) = build_genuine_invitee_key_package(
+        &owner,
+        now,
+        now - chrono::Duration::hours(1),
+        now + chrono::Duration::hours(1),
+    );
+    executor_seed::seed_genuine_key_package_at(
+        &pool,
+        &owner.did,
+        owner.device_id,
+        &owner.key_id,
+        &reference,
+        &wrapper,
+        not_before,
+        not_after,
+        now,
+    )
+    .await;
+
+    let request_id = Uuid::new_v4();
+    let mut tx = pool.begin().await.unwrap();
+    let head = hydrate_locked_conversation_head(&mut tx, conversation_id, now)
+        .await
+        .unwrap();
+    let coordinate = *head.prior_coordinate().unwrap();
+    let package = hydrate_locked_available_recovery_package(
+        &mut tx,
+        &head,
+        request_id,
+        &owner.did,
+        owner.device_id,
+        &owner.key_id,
+        1,
+        coordinate,
+    )
+    .await
+    .expect("ordinary recovery works without post-manifest export schema");
+    assert_eq!(package.key_package_ref(), &reference);
+    assert_eq!(package.wrapper_bytes(), wrapper);
+    assert!(super::close_terminal::retained_close_entry_for_device(
+        &mut tx,
+        Uuid::new_v4(),
+        &owner.did,
+        owner.device_id,
+    )
+    .await
+    .unwrap()
+    .is_none());
+    tx.rollback().await.unwrap();
+
+    seed_b_auth_device(&pool).await;
+    let denied = super::entry_read::get_entries_for_admission(
+        &pool,
+        real_read_admission(&pool, "blue.catbird.chat.getEntries").await,
+        Uuid::new_v4(),
+        0,
+        1,
+    )
+    .await
+    .err()
+    .expect("absent optional transport/terminal tables grant no read authority");
+    assert!(matches!(
+        denied,
+        super::entry_read::EntryReadFacadeError::ConversationNotFound
+    ));
+
+    // Install only the explicit feature under test after proving the exact
+    // pinned catalog; this is not an unrecorded expansion of the manifest gate.
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/20261102000002_group_key_package_exports.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut exporter = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT key_package_ref FROM chat.key_packages WHERE key_package_ref=$1 FOR UPDATE",
+    )
+    .bind(reference.as_slice())
+    .fetch_one(&mut *exporter)
+    .await
+    .unwrap();
+    let expires_at = now + chrono::Duration::minutes(5);
+    sqlx::query(
+        "INSERT INTO chat.group_key_package_exports \
+         (key_package_ref,conversation_id,recovery_request_id,sequencer_did,expires_at) \
+         VALUES($1,$2,$3,'did:web:sequencer.example.com',$4)",
+    )
+    .bind(reference.as_slice())
+    .bind(conversation_id)
+    .bind(request_id)
+    .bind(expires_at)
+    .execute(&mut *exporter)
+    .await
+    .unwrap();
+
+    let contender_pool = pool.clone();
+    let contender_owner = owner.clone();
+    let (ready, started) = tokio::sync::oneshot::channel();
+    let mut contender = tokio::spawn(async move {
+        let mut tx = contender_pool.begin().await.unwrap();
+        let head = hydrate_locked_conversation_head(&mut tx, contender_conversation, now)
+            .await
+            .unwrap();
+        ready.send(()).unwrap();
+        let result = hydrate_locked_available_recovery_package(
+            &mut tx,
+            &head,
+            Uuid::new_v4(),
+            &contender_owner.did,
+            contender_owner.device_id,
+            &contender_owner.key_id,
+            1,
+            *head.prior_coordinate().unwrap(),
+        )
+        .await;
+        tx.rollback().await.unwrap();
+        assert!(
+            matches!(result, Err(RecoveryPackageHydrationError::PackageMissing)),
+            "a lease committed while allocation waits must exclude the package"
+        );
+    });
+    started.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut contender)
+            .await
+            .is_err(),
+        "a real competing allocation must wait for the exporter's package lock"
+    );
+    exporter.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), contender)
+        .await
+        .unwrap()
+        .unwrap();
+
+    for (at, id, permitted) in [
+        (now, Uuid::new_v4(), false),
+        (now, request_id, true),
+        (expires_at, Uuid::new_v4(), true),
+    ] {
+        let mut tx = pool.begin().await.unwrap();
+        let head = hydrate_locked_conversation_head(&mut tx, conversation_id, at)
+            .await
+            .unwrap();
+        let result = hydrate_locked_available_recovery_package(
+            &mut tx,
+            &head,
+            id,
+            &owner.did,
+            owner.device_id,
+            &owner.key_id,
+            1,
+            *head.prior_coordinate().unwrap(),
+        )
+        .await;
+        if permitted {
+            assert_eq!(
+                result
+                    .expect("same-request reuse or expired lease")
+                    .key_package_ref(),
+                &reference
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(RecoveryPackageHydrationError::PackageMissing)
+            ));
+        }
+        tx.rollback().await.unwrap();
+    }
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
+            .bind(reference.as_slice())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "available",
+        "an export lease never consumes the package"
+    );
+    pool.close().await;
 }
 
 const PRODUCTION_HYDRATOR_SIGNATURE: &str = concat!(
@@ -2294,6 +2521,8 @@ const B_AUTH_READ_AUTHORITY_TYPES: &[&str] = &[
     "VerifiedReadAdmission",
     "ReadAdmissionBinding",
     "GetDevicesReadAdmission",
+    // `0da3a11a` ("chat: Add exact historical device key lookup").
+    "GetDeviceKeyReadAdmission",
     "GetOwnDevicesReadAdmission",
     "ReadAdmissionAttempt",
     "ReadLockCoordinates",
@@ -3427,6 +3656,13 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
 
     // The exhaustive method surface of the read-authority types. Anything not
     // in this list is a new seam and fails the guard.
+    //
+    // Re-pinned 2026-11-04 for `0da3a11a` ("chat: Add exact historical device
+    // key lookup"), which added the getDeviceKey endpoint's closed one-attempt
+    // budget inside this section: `into_get_device_key_read_admission` plus a
+    // second `into_attempt` (on `GetDeviceKeyReadAdmission`). The guard had
+    // stayed red from that commit on. Each `into_attempt` is listed once per
+    // declaration so the exact count below still catches a third.
     const ALLOWED_METHODS: &[&str] = &[
         // The two FREE functions of the section: the private canonical
         // thumbprint decoder and the single seal entry point. Neither is a
@@ -3436,7 +3672,9 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
         // Methods.
         "fn into_closed_endpoint_binding(",
         "fn into_get_devices_read_admission(",
+        "fn into_get_device_key_read_admission(",
         "fn into_get_own_devices_read_admission(",
+        "fn into_attempt(",
         "fn into_attempt(",
         "fn into_attempts(",
         "fn from_repository_lock(",
@@ -3504,8 +3742,8 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     );
     assert_eq!(
         found.len(),
-        12,
-        "the read section declares exactly twelve functions"
+        14,
+        "the read section declares exactly fourteen functions"
     );
     for allowed in ALLOWED_METHODS {
         assert!(
@@ -4041,7 +4279,7 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
         "exactly one B-read inventory seam definition"
     );
     // The seam methods live OUTSIDE the sealed read-section window (after the
-    // pre-existing JWT types), so the twelve-function filter above still sees
+    // pre-existing JWT types), so the fourteen-function filter above still sees
     // exactly the sealed B-auth surface. This placement is asserted absolutely:
     // the seam banner sits strictly after the window's terminal anchor.
     let read_section_start = B_AUTH_DPOP_SOURCE
@@ -4057,7 +4295,7 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     assert!(
         seam_start > window_end,
         "the B-read seam methods must lie OUTSIDE the sealed B-auth read-section \
-         window so the twelve-function surface stays unchanged"
+         window so the fourteen-function surface stays unchanged"
     );
     // Source guards per amendment §4: the two seam methods are the ONLY
     // `ReadAdmissionAttempt` mints for B-read endpoints, the budgets have no
@@ -4206,11 +4444,20 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     );
 }
 
-/// Clean-cutover pins after removing the legacy device-directory and view APIs.
+/// Exact pins for the reviewed current surface. The former directory pin was
+/// 188bfafac0 (2026-08-28), before the September request/recovery pool split,
+/// pool hints, historical key lookup and remote-lease exclusion. 7b1f093b4
+/// removed the obsolete push-token writer; 7cac0f89c routed hint time through
+/// the trusted clock. Task-4 R1 selects the latest activation at/before the
+/// device generation: migration 20261103000002 uniquely binds each activation,
+/// and selecting it before checking revocation prevents historical-key fallback.
+/// The former view pin was 841fe50487 (2026-08-20); c9f01bb72 only added the
+/// generated `direct_request_key_pool: None` field. Both complete files remain
+/// byte-pinned, so any further change still requires review.
 const B_AUTH_DEVICE_DIRECTORY_SHA256: &str =
-    "e7118078b3490d4483f37bf7b7506914ec6dfd7595a2d8974c0798b0d2231ec7";
+    "9fb7a0b025e57f7f1111249b12644b1ea652b69ec1d193f2fd2ce5bb0176da66";
 const B_AUTH_DEVICE_VIEWS_SHA256: &str =
-    "12a2bbe6eb78dd459880b8e314b648b353ce0ea4c64101a5bc9fe992c6af708d";
+    "4785ce8c99b1127bac2f30647e92c5eeadc05fff5dd2f00a20f64e04d883c980";
 
 // ---------------------------------------------------------------------------
 // 4-7. Ignored Tokio database cases, class `commit-write`. Task B6 runs these.
@@ -4993,11 +5240,39 @@ fn assert_attempt_minting_sites() {
                 .expect("GetOwnDevices conversion terminates");
         &B_AUTH_DPOP_SOURCE[start..end]
     };
+    // `0da3a11a` ("chat: Add exact historical device key lookup") added the
+    // getDeviceKey conversion: one attempt, bound to its literal endpoint and
+    // the canonical read method, taking only `self`.
+    let get_device_key_conversion = {
+        let start = B_AUTH_DPOP_SOURCE
+            .find("pub(in crate::chat_protocol) fn into_get_device_key_read_admission(")
+            .expect("exact GetDeviceKey conversion");
+        let end = start
+            + B_AUTH_DPOP_SOURCE[start..]
+                .find("\n    }\n")
+                .expect("GetDeviceKey conversion terminates");
+        &B_AUTH_DPOP_SOURCE[start..end]
+    };
+    assert!(
+        get_device_key_conversion.starts_with(concat!(
+            "pub(in crate::chat_protocol) fn into_get_device_key_read_admission(\n",
+            "        self,\n",
+            "    ) -> Result<GetDeviceKeyReadAdmission, ReadAdmissionBindingError> {",
+        )) && get_device_key_conversion.contains("\"blue.catbird.chat.getDeviceKey\",")
+            && get_device_key_conversion.contains("READ_ENDPOINT_CANONICAL_METHOD"),
+        "the getDeviceKey conversion owns its closed endpoint and method"
+    );
+    assert_eq!(
+        count_occurrences(get_device_key_conversion, "ReadAdmissionAttempt {"),
+        1,
+        "the getDeviceKey conversion mints exactly one"
+    );
     let minted_in_conversions = count_occurrences(get_devices_conversion, "ReadAdmissionAttempt {")
+        + count_occurrences(get_device_key_conversion, "ReadAdmissionAttempt {")
         + count_occurrences(get_own_devices_conversion, "ReadAdmissionAttempt {");
     assert_eq!(
-        minted_in_conversions, 4,
-        "one attempt for getDevices plus exactly three for getOwnDevices"
+        minted_in_conversions, 5,
+        "one attempt each for getDevices and getDeviceKey plus exactly three for getOwnDevices"
     );
     assert_eq!(
         count_occurrences(get_devices_conversion, "ReadAdmissionAttempt {"),
@@ -5047,23 +5322,28 @@ fn assert_attempt_minting_sites() {
     // remaining whole-file occurrences are named individually, so a new minting
     // site anywhere in the module fails this assertion instead of hiding in a
     // slack total.
-    let non_minting: &[&str] = &[
-        "pub(in crate::chat_protocol) struct ReadAdmissionAttempt {",
-        "fn into_attempt(self) -> ReadAdmissionAttempt {",
-        "impl ReadAdmissionAttempt {",
+    // `into_attempt` is declared once per one-attempt budget (getDevices and
+    // getDeviceKey).
+    let non_minting: &[(&str, usize)] = &[
+        (
+            "pub(in crate::chat_protocol) struct ReadAdmissionAttempt {",
+            1,
+        ),
+        ("fn into_attempt(self) -> ReadAdmissionAttempt {", 2),
+        ("impl ReadAdmissionAttempt {", 1),
     ];
-    for occurrence in non_minting {
+    for (occurrence, expected) in non_minting {
         assert_eq!(
             count_occurrences(B_AUTH_DPOP_SOURCE, occurrence),
-            1,
-            "the non-minting occurrence `{occurrence}` must appear exactly once"
+            *expected,
+            "the non-minting occurrence `{occurrence}` must appear exactly {expected} time(s)"
         );
     }
     assert_eq!(
         count_occurrences(B_AUTH_DPOP_SOURCE, "ReadAdmissionAttempt {"),
-        minted_in_conversions + minted_in_seams + non_minting.len(),
-        "the whole-file count must be exactly the eight minting literals plus \
-     the declaration, the return type, and the impl line — a fifth minting \
+        minted_in_conversions + minted_in_seams + non_minting.iter().map(|(_, n)| n).sum::<usize>(),
+        "the whole-file count must be exactly the nine minting literals plus \
+     the declaration, the two return types, and the impl line — another minting \
      site would show up here"
     );
 }
@@ -9568,7 +9848,6 @@ async fn pending_invitations_authorize_state_only_for_group_and_direct() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated gate database"]
 async fn replicated_group_entries_require_exact_device_grants() {
     let (pool, _guard) = b_auth_pool().await;
     let conversation_id = Uuid::new_v4();
@@ -9641,4 +9920,133 @@ async fn replicated_group_entries_require_exact_device_grants() {
         denied,
         super::entry_read::EntryReadFacadeError::ConversationNotFound
     ));
+}
+
+#[test]
+fn replicated_entry_merge_never_resurrects_pruned_ciphertext_from_either_copy() {
+    let full = json!({
+        "seq": 4,
+        "signedRequest": { "body": { "applicationMessage": { "bytes": "ciphertext" } } },
+        "sequencerReceipt": { "sequencerDid": "did:web:sequencer.example.com" },
+    });
+    let pruned = json!({
+        "seq": 4,
+        "payloadPruned": true,
+        "sequencerReceipt": full["sequencerReceipt"].clone(),
+    });
+    assert!(
+        super::entry_read::replicated_entry_supersedes_local(Some(&full), &pruned),
+        "a pruned replica overrides a stale local copy even when it has an I13 receipt"
+    );
+    assert!(
+        !super::entry_read::replicated_entry_supersedes_local(Some(&pruned), &full),
+        "an unpruned replica never restores ciphertext already pruned locally"
+    );
+    let mut pruned_without_receipt = pruned.clone();
+    pruned_without_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt");
+    assert!(!super::entry_read::replicated_entry_supersedes_local(
+        Some(&pruned_without_receipt),
+        &full
+    ));
+    assert!(!super::entry_read::replicated_entry_supersedes_local(
+        Some(&full),
+        &full
+    ));
+    let mut mirrored_without_receipt = full.clone();
+    mirrored_without_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt");
+    assert!(super::entry_read::replicated_entry_supersedes_local(
+        Some(&mirrored_without_receipt),
+        &full
+    ));
+    assert!(super::entry_read::replicated_entry_supersedes_local(
+        None, &full
+    ));
+}
+
+#[tokio::test]
+async fn remote_terminal_evidence_survives_an_empty_local_audience() {
+    let (pool, _database) = executor_seed::setup().await;
+    let conversation_id = Uuid::new_v4();
+    let graph = executor_seed::seed_hydratable_genuine_creation_graph(&pool, conversation_id).await;
+    let creation = executor_seed::build_real_corpus_creation_entry(*conversation_id.as_bytes());
+    let close = executor_seed::build_real_close_entry(&creation);
+    let entry: serde_json::Value = serde_json::from_slice(&close.public_row_json).unwrap();
+    let source = "did:web:sequencer.example.com";
+    let key = p256::ecdsa::SigningKey::from_bytes((&[0x61_u8; 32]).into()).unwrap();
+    let signer = crate::federation::receipt::I13ReceiptSigner::from_signing_key_for_test(
+        source.to_owned(),
+        key.clone(),
+    );
+    let authority = signer
+        .sign_terminal_close_authority(conversation_id, &entry)
+        .unwrap();
+    authority
+        .verify(key.verifying_key(), source, conversation_id, &entry)
+        .unwrap();
+    let proof = serde_json::to_vec(&authority).unwrap();
+    let at: DateTime<Utc> = close.received_at.parse().unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let position = super::close_terminal::append_remote_close_event(
+        &mut tx,
+        conversation_id,
+        source,
+        Some(&proof),
+        "group",
+        2,
+        &[],
+        &entry,
+        at,
+    )
+    .await
+    .unwrap()
+    .expect("even an empty eligible audience retains the authenticated close");
+    let retained: (String, Vec<u8>) = sqlx::query_as(
+        "SELECT source_ds_did,source_authority_bytes FROM chat.conversation_close_terminal_entries \
+         WHERE event_position=$1",
+    ).bind(position).fetch_one(&mut *tx).await.unwrap();
+    assert_eq!(retained, (source.to_owned(), proof.clone()));
+    let audience_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.event_recipients WHERE event_position=$1")
+            .bind(position)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(audience_count, 0);
+    assert!(
+        super::close_terminal::retained_close_entry_for_device(
+            &mut tx,
+            conversation_id,
+            &graph.creator_did,
+            graph.creator_device_id,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "retained evidence does not grant an absent audience read access"
+    );
+    assert!(
+        super::close_terminal::append_remote_close_event(
+            &mut tx,
+            conversation_id,
+            source,
+            Some(&proof),
+            "group",
+            2,
+            &[],
+            &entry,
+            at,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "only identical redelivery returns no new event"
+    );
+    tx.commit().await.unwrap();
+    pool.close().await;
 }

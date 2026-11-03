@@ -1,62 +1,134 @@
-# Self-Hosting `mls-ds` (Clean-Slate Spaces & Post-Quantum Edition)
+# Self-hosting `mls-ds`
 
-`mls-ds` is an open, federated MLS Delivery Service and Option A Conversation Space Authority/Host (`atproto#5187`). Any operator can run a self-hosted `mls-ds` instance identified by either `did:web` or `did:plc` and federate seamlessly with `did:web:chat.catbird.blue` and third-party PDSes (including `Swan`).
+`mls-ds` is Catbird's federated MLS delivery service (DS). Each account names one home DS in its PDS record `blue.catbird.chat.declaration/self`, and that account's clients talk only to that home. Homes reach each other through authenticated server-to-server (S2S) calls under `blue.catbird.mlsDS.*`. The DS keeps operational delivery state only. Message history, message keys and media live in each user's ATProto Space on their own PDS.
 
-## 1. Zero-Content Data Line (`G6` / `I14`)
+## Status
 
-A clean-slate `mls-ds` stores **zero long-term user message history, Labyrinth archive records, or encrypted media blobs**:
+- **Last seal (R0):** bookmark `clean-slate-2026-10-31`, mls-ds `d5f6993c`, 129 SQL migrations.
+- **This document:** the Task 4 fix-round R1 provisional commits on top of the bookmark, which are **unsealed**; their final gates have not all passed. R1 adds the cross-home ACK relay and prune notices, the signed account-deletion relay, C33 transport control entries, C33 opening pruning, the remote-group membership index, federated KeyPackage reservations, transport-home direct-request wakes, direct-request route answers, and migrations `20261103000001` through `20261104000011` (142 SQL migrations in total).
+- **Migrations are held.** The clean-slate work has run them only against local disposable and guarded test databases. Do not apply them to a production database until R1 is sealed and the production migration is separately authorized. See [server/migrations/README.md](server/migrations/README.md).
+- **Database:** PostgreSQL 16.
 
-- User message history (`blue.catbird.labyrinth.msgEntry`), Labyrinth key envelopes (`blue.catbird.labyrinth.mek`), and encrypted media/avatar blobs live exclusively inside each user's ATProto Spaces (`com.atproto.space.*`) on their own Spaces-capable PDS (`#atproto_pds` + `#atproto_kem`).
-- `mls-ds` stores only transient operational MLS delivery state (`chat.entries`), device leaf & post-quantum `X-Wing` KeyPackages (`chat.devices`, `chat.key_packages` with `>= 35d` direct-request lifetime for `C33`), Labyrinth head metadata (`labyrinth.epoch_heads`, `labyrinth.device_keys`, `labyrinth.otc_sessions`), and Option A Space authority metadata (`chat.conversation_spaces`, `chat.conversation_space_writers`, `chat.space_credential_jtis`).
-- Once every active participant device that can still fetch a `seq` acknowledges it via `blue.catbird.chat.acknowledgeEntries` (or after the `30d` TTL), `mls-ds` nulls `chat.entries.payload_json` while keeping sequence numbers contiguous (`payloadPruned = true`). A removed device can fetch only control entries, so it never holds a payload back. A home DS that mirrors a remote group waits only for its own devices; the sequencer prunes its copy separately.
+## 1. Roles
 
-## 2. Server Identity (`did:web` or `did:plc`)
+- **Home.** Every client request goes to the account's home. The home enrolls the account's devices and holds their KeyPackages and Push Gateway bindings. It relays to the right DS anything that belongs elsewhere. No client enrolls on, or publishes KeyPackages to, another DS.
+- **Group sequencer.** The DS that created a group sequences it. It verifies each actor's device signature, assigns the `seq`, and signs the `I13` receipt. Every other participant's home keeps a mirror that only the sequencer's `deliverGroupEntry` stream writes.
+- **C33 coordinator and transport-only home.** A direct conversation between accounts on two homes is sequenced by the home whose normalized DID sorts first. The other home is transport-only: it stores the coordinator's entries and keeps no seq chain of its own.
+- **Space authority.** The sequencing DS is the Space authority and Space host for its conversations' Spaces (section 7).
 
-Configure `SERVICE_DID` and `SELF_ENDPOINT`:
+## 2. Identity and keys
 
-- **`did:web` example:**
-  - `SERVICE_DID=did:web:chat.example.org`
-  - `SELF_ENDPOINT=https://chat.example.org`
-  - Serve `/.well-known/did.json` advertising `#atproto` (ES256 P-256 verification method for Space credentials and Push Gateway JWTs), `#catbird_receipt` (`I13` sequencer receipt verification method), and service `#atproto_mls` (`AtprotoMlsDeliveryService` at `https://chat.example.org`).
-- **`did:plc` example:**
-  - `SERVICE_DID=did:plc:<24-char-plc-id>`
-  - `SELF_ENDPOINT=https://chat.example.org`
-  - Publish `#atproto`, `#catbird_receipt`, and `#atproto_mls` in the PLC directory (`PLC_DIRECTORY_URL`, default `https://plc.directory`).
+A release build counts as production unless `APP_ENV` (or `ENVIRONMENT`, `RUST_ENV`, `DEPLOY_ENV`) names `dev`, `development`, `test`, `testing` or `staging`. Production refuses to start without `SERVICE_DID` and `REDIS_ENCRYPTION_KEY`, or with `ALLOW_UNSAFE_AUTH` or `FEDERATION_ALLOW_INSECURE_HTTP` set. The server reads no `REDIS_URL`.
 
-Users advertise their chosen home `mls-ds` in `blue.catbird.chat.declaration/self` on their PDS.
+| Variable | Purpose |
+|---|---|
+| `SERVICE_DID` | `did:web` or `did:plc` of this DS. |
+| `SELF_ENDPOINT` | Public HTTPS origin. Required when `SERVICE_DID` is not a resolvable `did:web`. |
+| `SIGNING_KEY_PEM` | P-256 PKCS#8 key behind `#atproto`. Signs S2S service-auth JWTs, ACK relays, prune notices, deletion relays and Push Gateway JWTs. With federation enabled, production refuses to start without it. Without it, every effect that owes a signed relay or notice rolls back with `SignerUnavailable`. `SIGNING_KEY_PATH` or `SIGNING_KEY_FILE` can supply the service-auth key from a file, but the relay and notice signer reads only `SIGNING_KEY_PEM`. |
+| `SPACE_HOST_SIGNING_KEY_PEM` | Optional. Replaces `SIGNING_KEY_PEM` for the Space host and the Push Gateway client. |
+| `RECEIPT_SIGNING_KEY_PEM` | A separate P-256 key behind `{SERVICE_DID}#mls-receipt-1`. Signs `I13` `sequencerReceipt`s, a group close's `closeAuthority`, and `accountDeletedEntry.sequencerAuthority`. Without it the DS refuses C33 publications, group closes owed to remote homes, and account deletions that owe an `accountDeletedEntry`. |
+| `CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM`, `CHAT_REQUEST_RECEIPT_DID_DOCUMENT_JSON` | Direct-request receipts under `#chat-request-receipt-<hex SHA-256 of the compressed key>`. Required when `CHAT_DIRECT_REQUESTS_ENABLED` is set. The key must differ from `SIGNING_KEY_PEM`. |
+| `CHAT_CUTOVER_ENABLED`, `CHAT_CURSOR_KEY_ID`, `CHAT_CURSOR_SEALING_SECRET`, `CHAT_SUBSCRIPTION_ENDPOINT` | The `blue.catbird.chat.*` runtime. Cutover requires the cursor key ID and sealing secret (canonical base64url, 32 bytes each) and the `subscribeEvents` WebSocket URL. Startup checks the stored protocol fence and exits on a mismatch. |
+| `DATABASE_URL`, `DATABASE_MAX_CONNECTIONS` | Defaults `postgres://localhost/catbird` and `90`. Startup runs pending migrations unless `SKIP_MIGRATIONS` is set; see the migrations README before any production start. |
 
-## 3. Option A Conversation Space Authority & Host (`com.atproto.space.*`)
+Publish these in the DS's DID document. A `did:plc` DS publishes them through PLC operations.
 
-Every sequencing `mls-ds` automatically hosts the Space Authority and Space Host endpoints for conversations it sequences (`at://{authority_did}/space/blue.catbird.labyrinth.conversation/{conversation_id}-{generation}`):
+- `#atproto`: P-256 `Multikey` for `SIGNING_KEY_PEM`.
+- `#mls-receipt-1`: P-256 `Multikey` for `RECEIPT_SIGNING_KEY_PEM`.
+- `#chat-request-receipt-<hex>`: when direct requests are enabled.
+- Service `#atproto_mls` of type `AtprotoMLSDeliveryService` (exact spelling) with the HTTPS endpoint. Peers resolve a C33 home only through this entry.
 
-- `GET /xrpc/com.atproto.space.getSpaceCredential` — exchanges a 60-second single-use PDS delegation JWT (`atproto-space-delegation+jwt`) for a 10-minute PoP-bound `atproto-space-credential+jwt` (`status = 'active'` members only, local or federated).
-- `GET /xrpc/com.atproto.space.listRepos` — returns all conversation writers (`status IN ('active', 'left', 'removed')`) in ascending `spaceRev` order while excluding unaccepted `C33` direct-request targets and deleted accounts.
-- `GET /xrpc/com.atproto.space.getSpace` — returns Space metadata and latest `spaceRev`.
-- `POST /xrpc/com.atproto.space.notifyWrite` — records monotonic writer `spaceRev` heads (`status = 'active'` only) and fans out to registered syncers.
-- `POST /xrpc/com.atproto.space.removeWriter`, `registerNotify`, `unregisterNotify`.
-- Post-commit revocation & closure webhooks (`notifyCredentialRevoked`, `notifySpaceDeleted`) fan out asynchronously with DNS-pinned SSRF protection (`M-F04`).
+`RECEIPT_ISSUANCE_MODE=issue` (with `RECEIPT_VERIFICATION_METHOD={SERVICE_DID}#mls-receipt-1` and `RECEIPT_DID_DOCUMENT_JSON`) also makes the DS serve that document at its `did:web` path (`/.well-known/did.json` or `/<path>/did.json`).
 
-Set `SIGNING_KEY_PEM` (or `SPACE_HOST_SIGNING_KEY_PEM`) to the PKCS#8 PEM corresponding to your `SERVICE_DID#atproto` P-256 key.
+A user's `blue.catbird.chat.declaration/self` names the home: `deliveryService` is the DS's bare DID and `protocolVersion` is `"1"` or `"2"`. C33 reads only this live declaration and fails closed without it. Other lookups try, in order: a fresh cache entry (`ENDPOINT_CACHE_TTL`, 3,600 s), the user's DID document `#atproto_mls` service, this declaration, a legacy profile record, an expired cache entry, and `DEFAULT_DS_DID`/`DEFAULT_DS_ENDPOINT`. If a live step could not answer now (the PLC directory, a `did:web` host or the PDS unreachable or answering 5xx/429, or a temporary DNS failure) and no expired entry exists, the lookup fails retryably instead of falling back to the default DS; a malformed document or record still decides.
 
-## 4. `D1` Cross-Server Group Relay & `3A` Stateless Space Relays
+## 3. Federation and peer policy
 
-Clients talk **only** to their own home `mls-ds`:
+Federation is on only when `FEDERATION_ENABLED=true` and `FEDERATION_MODE` is `allowlist` or `open_intelligent` (alias `open`). The default mode is `off`. The outbound queue and reconciliation workers start only when federation is on and `SIGNING_KEY_PEM` is set.
 
-- **`D1` Group Mutations:** When a member homed on `ds-b` sends to a group sequenced on `ds-a`, `ds-b` relays via `/xrpc/blue.catbird.mlsDS.relayGroupMutation` (`15 MiB` symmetric body limit, `M-F11`), `ds-a` sequences and attaches an `I13` ES256 `sequencerReceipt`, and `ds-a` fans out `/xrpc/blue.catbird.mlsDS.deliverGroupEntry` to each remote member's home `mls-ds`.
-- **`3A` Stateless Space Relays:** Clients call `/xrpc/blue.catbird.chat.relaySpaceCredential` and `/xrpc/blue.catbird.chat.relaySpaceRead` on their home `mls-ds` (under existing OAuth + DPoP auth) to mint remote Space credentials and read `com.atproto.space.{listRepos,getRecord,listRecords,getBlob,listBlobs,getRepo}` from remote writer PDSes without browser CORS or third-party OAuth audience sprawl. Both relays write **zero** operational rows on the home `mls-ds` and preserve `Atproto-Space-Mac` end-to-end.
+Peers live in `federation_peers` with status `pending`, `allow`, `suspend` or `block`:
 
-## 5. `D2` Authenticated Push Gateway Architecture
+- **Outbound:** every S2S call to a peer requires `allow`, in every mode. Two homes federate only after each records the other as `allow`.
+- **Inbound:** `allow` is admitted in every mode. `pending` is admitted only in `open_intelligent`, which auto-provisions an unknown caller as `pending` (trust −100, 60 requests per minute; `FEDERATION_PENDING_MAX_REQUESTS_PER_MINUTE`, capped at 600). `off` and `allowlist` reject unknown callers. `suspend` and `block` are always rejected.
+- **Automatic suspension:** after 25 rejected requests, 10 invalid tokens, or a trust score at or below −200 (`FEDERATION_AUTO_SUSPEND_*`), or when the risk tier reaches `FEDERATION_AUTO_QUARANTINE_MIN_RISK_TIER` (default `critical`; tiers and rate multipliers are `FEDERATION_RISK_*`).
+- **Administration:** `getFederationPeers`, `upsertFederationPeer`, `deleteFederationPeer`, `getFederationMode` and `setFederationMode`. Callers must be listed in `FEDERATION_ADMIN_DIDS`.
 
-`mls-ds` holds **zero APNs `.p8` or FCM service-account keys** and **zero raw device push tokens**:
+S2S authentication: an outbound call carries an ES256 service JWT signed with `#atproto`, with `iss` = this DS, `aud` = the target's bare DID, `lxm` = the exact method, a unique `jti`, and a 120 s lifetime. The receiver checks the signature against the caller's `#atproto` key, the `lxm`, and `jti` replay (`JTI_TTL_SECONDS`, default 360), then applies inbound peer policy. Group routes also accept an HMAC from `FEDERATION_GROUP_RELAY_HMAC_SECRET` in place of the JWT; peer policy still applies.
 
-1. Each client registers its raw APNs/FCM token with its app distributor's Push Gateway (`blue.catbird.push.registerKey`, e.g., `nest` for official Catbird builds) and receives an opaque `pushKey`.
-2. The device registers `{gatewayUrl, appId, pushKey}` with its home `mls-ds` via `blue.catbird.chat.registerPushGateway` (`CATBIRD-CHAT-PUSH-GATEWAY\0` Ed25519 device signature).
-3. On local entry arrival, the home `mls-ds` signs a `#atproto` ES256 service JWT (`lxm = "blue.catbird.push.deliver"`) and POSTs a zero-metadata `wakePayload` (inline `ciphertext` iff `<= 2,200` bytes per `I12`) over DNS-pinned HTTPS `:443`. On `410 Gone` (`PushTokenGone`), `mls-ds` prunes the stale binding immediately.
+One federation gate covers both directions. While `FEDERATION_EMERGENCY_KILL_SWITCH` is on (unset or `0`/`false`/`off`/`no` means off; any other value, including empty, means on) or the effective mode is `off` (the runtime override from `setFederationMode`, else `FEDERATION_MODE`):
 
-## 6. Local Multi-DS Smoke Stack
+- Every inbound peer route answers `503 FederationDisabled`, which peers retry: the original DS routes (`deliverMessage`, `deliverWelcome`, `submitCommit`, `fetchKeyPackage` GET, `getConvoDigest`, `getConvoEvents`, `transferSequencer`), the direct-request S2S routes, the group, membership, Labyrinth-directory, ACK, prune-notice, deletion and control routes, and `healthCheck`. Authentication failures stay `401`. The federation admin routes stay reachable, and the local Space host routes (`com.atproto.space.*`) are not gated.
+- Outbound dispatch pauses before claiming queued rows, so durable relays keep their status and retry count and are sent once the gate reopens. A row already claimed when the gate closes goes back to pending with its retry count unchanged. Reconciliation passes are skipped. Inline group relays to a sequencer are not attempted, and every other inline DS-to-DS call (direct-request coordinator and home calls, `submitCommit` forwarding, membership relays) is refused before any DNS lookup or connection with a retryable `FederationDisabled` error. Any durable row behind that call stays queued.
+- A client request that needs one of those calls decided nothing: `createConversation` or `submitTransition` adding a member of another home, or a transition forwarded to a group's remote sequencer, answers the endpoint's declared retryable `RelationshipPolicyUnavailable` (`503`, `Retry-After: 5`), with nothing sent and nothing stored, and the same signed request succeeds once the gate reopens. The same answer covers a peer home or sequencer that is unreachable or answers 5xx/429, a participant home whose resolution could not complete (section 2), and a member's PDS that could not list its device keys now (unreachable, 5xx/429, a temporary DNS failure). A member's home answers its `resolveGroupDevices` caller `503` when its own lookup could not answer, so the caller retries too. A refusal (untrusted peer, a malformed DID document or device record, an invalid or unauthorized device directory, the sequencer's 4xx) keeps its terminal code, and authentication failures stay `401`. This DS's own store failing while it stages the member is a storage failure (`500`).
 
-Use `docker-compose.federation.yml` to boot two federated `mls-ds` instances (`ds-a` on `:3001`, `ds-b` on `:3002`), isolated PostgreSQL 16 instances, and a Spaces-enabled `Swan` PDS (`:2583`):
+- **Error contract.** Every federation dependency failure is classified by its type, never by its message text. On client endpoints a source that could not answer now (closed gate, unreachable or timed-out peer, a 5xx or 429 answer, a temporary DNS failure, a relationship source that could not answer) is `503` with `Retry-After: 5`: the endpoint's declared `RelationshipPolicyUnavailable`, else `CapacityUnavailable` (now `503`, was `400`), else a code-less `InternalServerError` body. This DS's own store failing is `500` without a retry hint. A refusal keeps its declared 4xx. On peer routes a permanent failure is a 4xx (a resolution that cannot succeed is `404`, an unsupported authority `400`), an outage `502`/`503`, this DS's store `500`; peers treat 429 as retryable too. A caller whose DID document cannot be fetched now gets `503` with `Retry-After: 5`, not a 400/401. Durable queues (the outbound queue, the federation outbox, group fan-out, push wakes) retry a transient or storage failure without an attempt limit (wakes still expire after 24 h) and dead-letter only a permanent answer. An ordered delivery that arrives before its predecessor answers `409` with error `PredecessorMissing` (or `deliverMessage`'s `SequenceConflict` with `reasonCode: "predecessor_missing"`), and only those typed fields keep it queued.
 
-```bash
-docker compose -f docker-compose.federation.yml up --build
-```
+Inbound peer policy uses the same effective mode. The original DS and direct-request routes also apply per-peer rate limits (`FEDERATION_RATE_LIMIT_*`, `429` when exceeded).
+
+## 4. Groups across homes (`D1`)
+
+- **Writes.** A client sends to its own home. For a group sequenced elsewhere, the home relays with `relayGroupMutation` (15 MiB). The sequencer verifies the actor's device signature, sequences the entry, and in the same transaction queues `deliverGroupEntry` to every remote member's home. A relayed send must come from the participant's home, for an active member device with an unrevoked current key at the signed authentication generation.
+- **Ordering.** The outbound queue sends the lowest pending entry first for each conversation and target home. An entry in flight blocks its successors. Failures back off `5 × 2^n` seconds, capped at 300 s; a transient or storage failure retries without a limit, and a permanent rejection stops the delivery. The receiving home stores each entry once by `(conversation_id, seq)`. An identical redelivery is a duplicate; a different entry at that `seq` is a conflict (`500`).
+- **One stream.** Remote homes receive every group entry, application entries included, only through `deliverGroupEntry`. Groups queue no `deliverMessage` and no federated `deliverWelcome`.
+- **Lock order.** `deliverGroupEntry` locks the local device rows it references `FOR KEY SHARE`, in canonical order, before the conversation row. Readers take device rows before a conversation head, so both sides lock in the same order.
+- **Mirror projection.** A home's mirror bootstraps from a verified prefix and admits verified membership suffixes in source order. A mismatching overlap is quarantined. A mirror cannot replay history that holds a generic Commit, metadata change, removal, role policy, reset, leave or close, so an account that joins after such history is tracked in `chat.remote_group_memberships` instead (R1). The scoped inventory session's identity includes those rows and the device's pending Welcome markers, so an invitation starts a new 15-minute inventory session rather than serving the pre-invite snapshot.
+- **Reads.** `getConversationState` for a remote group relays to the sequencer (`getGroupConversationState`). A C33 transport-only home relays to its coordinator the same way. If the sequencer is unreachable, a current mirror member gets the home's mirror; an index-only member, or a home with no mirror, gets `503` with `Retry-After: 5`. The last `getPendingWelcomes` page adds the device's Welcomes read through `getGroupPendingWelcomes`; a sequencer that cannot answer leaves its items out of that page rather than failing the whole inventory.
+- **Relayed errors.** The sequencer's 4xx protocol errors (`StaleCoordinates`, `KeyPackageUnavailable`, `NotAuthorized` and others) reach the client unchanged. An unknown 4xx becomes `InvalidRequest`. An unreachable sequencer, a 429 or a 5xx returns the endpoint's declared retryable code (`RelationshipPolicyUnavailable`, or `CapacityUnavailable` for Welcome dispositions) with a 5 s retry. Relayed acceptances and transitions use this process's configured relationship authority; when the new member's relationship sources (DID document, declaration, graph) cannot answer now, the sequencer answers `503 RelationshipPolicyUnavailable` too, and an unusable relationship answer stays `400 InvalidRequest`.
+- **Relayed adds.** Before sequencing a relayed add of a member from a third home, the sequencer stages that member's devices from the member's home and checks them against the member's PDS. If that home, PDS or (when the member's home is not cached) PLC directory cannot answer now (its gate is closed, it is unreachable, it answers 5xx or 429, or its host does not resolve), the sequencer answers `503 RelationshipPolicyUnavailable` and stores nothing, so the client gets the same 5 s retry. If the sequencer's own store fails while staging or sequencing, it answers `500 InternalServerError`, which the relaying home also turns into that retry. A refusal (from that home, a malformed record, or a PDS not authorizing the device) stays `403 NotAuthorized` between homes and reaches the client as `401 NotAuthorized`.
+
+## 5. Direct conversations across homes (`C33`)
+
+- The coordinator is the home whose normalized DID sorts first, whichever side sends. The transport-only home relays its account's operations to the coordinator (`prepareDirectRequest`, `publishDirectRequest`, `deliverAcceptance`, `relaySendMessage`). It receives the coordinator's entries through the ordered S2S queue (`deliverDirectRequest`, `deliverAcceptanceEntry`, `deliverMessageEntry`, `deliverTransportControlEntry`), and a close on the `deliverGroupEntry` stream.
+- A publication requires the signed `archiveCommitment` of the encrypted opening; it is bound into the application AAD. The opening `#directRequestEntry` keeps both its `I13` `sequencerReceipt` and its `publicationReceipt` (`$type` `blue.catbird.chat.defs#signedDirectRequestReceipt`) on local and federated reads.
+- Publication requires a KeyPackage and grant with at least 605,400 s (7 days 10 minutes) left. The schema allows direct-request KeyPackages up to 45 days 1 hour (recovery packages: 30 days 1 hour), so clients can mint packages that last at least 35 days.
+- If the recipient's home cannot be resolved and its declaration names another DS, `prepareDirectRequest` refuses before selecting any KeyPackage, with a signed, replayable `directRequestRejectedReceipt` (`RecipientAuthorityUnsupported`). An unreadable declaration is `RequestPolicyDenied`. A request is never downgraded to legacy federation delivery.
+- Unanswered requests expire after 30 days.
+
+## 6. Retention and pruning (`G6`, `I14`)
+
+The DS keeps: entries it sequences (`chat.entries`); transport copies of entries sequenced elsewhere (`chat.direct_request_transport_entries`); devices and KeyPackages (`chat.devices`, `chat.key_packages`); Labyrinth epoch heads (`labyrinth.epoch_heads`, `labyrinth.epoch_head_floors`, and 7-day `labyrinth.operations` idempotency); Space authority state (`chat.conversation_spaces`, `chat.conversation_space_writers`, `chat.conversation_space_syncers`, `chat.space_credential_jtis`, `chat.space_delegation_jtis`); and Push Gateway bindings (`chat.push_gateway_bindings`).
+
+- **ACK prune.** A device acknowledges with `blue.catbird.chat.acknowledgeEntries`. An application entry loses its ciphertext once every active, non-dormant device that can still fetch it has acknowledged it; a removed device reads only control entries. The prune nulls `accepted_payload_bytes` and `signed_request_bytes` and sets `payload_pruned_at`. It erases the matching `chat.message_sends` payload and the `sendMessage` receipt payload in the same transaction. `seq`, digests, signature and the `I13` receipt stay, and reads return `payloadPruned: true`.
+- **Across homes (R1).** The sequencer waits for every home's devices. A home records a device's ACK locally and relays the device's watermark to the sequencer (`relayEntryAck`, signed with the home's `#atproto` key). A mirror or transport-only home waits only for its own devices. Each sequencer prune queues, in its transaction, a signed `notifyEntriesPruned` (at most 1,000 seqs each) to every home the entries were fanned out to, and that home prunes exactly those seqs.
+- **30-day ceiling.** The expiry sweeper runs only with `CHAT_CUTOVER_ENABLED` (`CHAT_EXPIRY_SWEEP_INTERVAL_SECS`, default 60; `CHAT_EXPIRY_SWEEP_BATCH`, default 128). It prunes application ciphertext 30 days after `received_at` and transport copies 30 days after `created_at`, acknowledged or not. It also erases completed idempotency payloads and C33 openings. A sequencer batch whose prune notice cannot be signed rolls back and keeps its ciphertext. It deletes a sender home's direct-request route that no pair coordinator answered an hour after the home recorded it.
+- **C33 opening (R1).** The opening's ciphertext is pruned once every device that can still read it has acknowledged it, when its sender's account is deleted, when the request expires, and at the 30-day ceiling. The digests, the sender signature, both receipts, and a redacted entry stay.
+- **Dormancy.** Devices inactive for 60 days are marked dormant and no longer hold a prune back.
+
+## 7. Close and account deletion
+
+- **Close.** `blue.catbird.chat.closeConversation` records the signed terminal entry and calls `chat.wipe_closed_conversation_operational_rows` in the same transaction. The close is queued to every remote home in that transaction: to group homes with a `closeAuthority` signed by `#mls-receipt-1`, and to a C33 peer's transport-only home on the same stream. Each home verifies the close and wipes its own rows. Only the terminal entry and immutable evidence remain. See [docs/SPACE_CONVERSATION_STORAGE.md](docs/SPACE_CONVERSATION_STORAGE.md).
+- **Account deletion (R1).** `blue.catbird.labyrinth.deleteAccountData` runs at the account's home in one transaction. In conversations this DS sequences, it sequences a signed `accountDeletedEntry` and prunes the account's ciphertext, and the prune queues signed notices. For conversations sequenced elsewhere it queues a signed `relayAccountDeletion` to each sequencer. For a C33 pair it coordinates, it queues the entry to the peer's transport-only home as `deliverTransportControlEntry`. It also deletes the account's push bindings and Space writer rows, revokes its Space credentials, and purges its epoch-head chain. It refuses with `503 SignerUnavailable` if it owes a signature it cannot make, and with `503 PeerHomeUnavailable` if a C33 peer's home does not resolve; nothing commits, and the client retries.
+- **Verifying a delivered close or deletion.** A home that cannot fetch the sequencer's `#mls-receipt-1` key, or resolve the closing actor's home or current key, right now (an unreachable PLC or host, a 5xx/429, a temporary DNS failure) answers `deliverGroupEntry` with `503`, so the sequencer keeps that ordered delivery queued; a key or proof that does not verify stays `403`.
+
+## 8. Space authority, host and relays (`3A`)
+
+The Space host mounts only when `SERVICE_DID` and a P-256 key (`SPACE_HOST_SIGNING_KEY_PEM`, else `SIGNING_KEY_PEM`) are configured. A conversation Space is `at://{authority DID}/space/blue.catbird.labyrinth.conversation/{conversation_id}-{generation}`; its authority is the sequencing DS.
+
+| Route | Contract |
+|---|---|
+| `POST com.atproto.space.getSpaceCredential` | Body `{space, credentialKid, delegationToken}`. The delegation (`atproto-space-delegation+jwt`) lives at most 60 s, is single-use, is issued by the member to `{authority}#atproto_pds`, and carries no `cnf`. Only `active` participants qualify, local or federated. Returns a 600 s `atproto-space-credential+jwt` with `cnf.kid` = `credentialKid` (a P-256 `did:key`). |
+| `GET listRepos`, `GET getSpace`, `POST registerNotify`, `POST unregisterNotify` | `Authorization: Atproto-Space-Credential <JWT>` plus an RFC 9421 proof-of-possession signature and `Atproto-Space-Audience`. `listRepos` returns writers in ascending `spaceRev` and excludes pending C33 targets; notify registrations expire after 24 h. |
+| `POST notifyWrite`, `POST removeWriter` | Service JWT from the writer (or, for `removeWriter`, the authority). `notifyWrite` takes a strictly increasing TID `repoRev` no more than 300 s in the future and returns a monotonic `spaceRev`. |
+
+Credential revocation (`notifyCredentialRevoked`) and Space deletion (`notifySpaceDeleted`) notices go out after commit, best-effort, over DNS-pinned HTTPS with no redirects and a 10 s timeout (`M-F04`).
+
+Clients reach remote Spaces through their home with two relays. Both take the account's service-auth JWT and an active `actorDeviceId`, and accept bodies up to 64 KiB.
+
+- `blue.catbird.chat.relaySpaceCredential` takes `{actorDeviceId, authorityDid, space, delegationToken, cnfKey}`, all required. `space` must be exactly `at://{authorityDid}/space/{spaceType}/{skey}`; `at-space://` and Space record URIs are rejected. `delegationToken` is the user's PDS `getDelegationToken` JWT: `sub` is `space`, `aud` is `{authorityDid}#atproto_pds`, it carries no `cnf`, lives at most 60 s, and is single-use at the authority. `cnfKey` is the client's P-256 `did:key`. The home POSTs JSON `{space, credentialKid, delegationToken}` to the authority's `getSpaceCredential`, so the token never goes in a URL. It verifies the returned credential's issuer, Space, `cnf.kid` and expiry against the authority's `#atproto` key, and derives `expiresAt` from the signed `exp`.
+- `blue.catbird.chat.relaySpaceRead` takes `{actorDeviceId, targetDid, nsid, credential, spaceAudience, signatureInput, signature}` plus optional `query` and `wantMac`, and forwards one GET from the allowlist `listRepos`, `getSpace`, `listRecords`, `getRecord`, `listRepoOps`, `getLatestCommit`, `getRepo`, `getBlob`. It returns the upstream status below 500 with the raw body and the upstream `Atproto-Space-Mac` header unchanged; an upstream 5xx becomes `UpstreamError`.
+
+Neither relay writes Space or conversation rows. With `ENFORCE_JTI` on (the default), authentication still records the JWT's `jti`.
+
+## 9. Push wakes (`D2`)
+
+`mls-ds` holds no APNs or FCM credentials and no raw device tokens.
+
+1. The client registers its native token with its app's Push Gateway (`blue.catbird.push.registerKey`) and receives an opaque `pushKey`.
+2. The device registers `{gatewayUrl, appId, pushKey}` with its home through `blue.catbird.chat.registerPushGateway`, signed with its Ed25519 device key over `CATBIRD-CHAT-PUSH-GATEWAY\0`. The URL must be `https://…/xrpc/blue.catbird.push.deliver`.
+3. Wakes are POSTs to `blue.catbird.push.deliver` with an ES256 service JWT (`aud` `did:web:<gateway host>`, `lxm` `blue.catbird.push.deliver`, 60 s, bound to the body hash) and a 10 s timeout. `wakeKind` is `applicationMessage`, `controlTransition`, `welcome` or `directRequest`. An entry wake carries coordinates and inlines the ciphertext only when it is at most 2,200 bytes. A sequencer wakes its local recipients after sequencing; a remote home wakes its devices after `deliverGroupEntry`. A `410 Gone` deletes the binding.
+4. **Direct-request wakes** require `CHAT_REQUEST_PUSH_ENABLED=1` together with cutover, `SERVICE_DID` and a Space-host key. They carry coordinates only. They come from a durable queue: the coordinator's publication outbox row, or, for a recipient on a transport-only home, that home's `deliverDirectRequest` inbox row (`chat.direct_request_transport_wakes`, R1). Before each attempt the worker re-checks that the request is still pending and importable and that the device is active. It then reads the pair's block relationships live from `public.api.bsky.app` (`app.bsky.graph.getRelationships`); any block in either direction, direct or by list, settles the work with no wake. If that read fails, the attempt is retried. Retries back off up to 2,560 s and stop after 10 failures or 24 hours.
+
+## 10. Local stacks
+
+- `docker compose -f docker-compose.federation.yml up --build` boots two homes from empty PostgreSQL 16 databases with deterministic test identities from `e2e-tests/fixtures`: `ds1` (`did:web:ds1.catbird.blue`, `127.0.0.1:3001`, database `catbird` on `:5433`) and `ds2` (`did:plc:dsbfederationlocal24char`, `127.0.0.1:3002`, database `catbird` on `:5434`); each home has its own PostgreSQL container, and the database is named `catbird` because migration `20250101000000` grants on that name. Both run the test-support `federation-test` image with `APP_ENV=test` and `FEDERATION_MODE=allowlist`, set `CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED` for their disposable databases, and issue sequencer and I13 receipts with a dedicated `#mls-receipt-1` key that each DID document publishes. DID resolution stays inside the stack. Each home runs the e2e HTTPS DID fixture on its loopback, serving the `did:web` documents and the `did:plc` document (as `plc.directory`), and `REQUEST_FIXTURE_DID_HOSTS`, `REQUEST_FIXTURE_DID_PORT` and `REQUEST_FIXTURE_DID_CA_PEM` send those hosts there. The server installs that resolver only when `APP_ENV=test`. Its CA is created per stack, and its private key is deleted once the certificate is signed. Every identity stays resolvable for the life of the stack. A one-shot `peer-fixtures` service records each home as an allowed `federation_peers` row of the other. `down -v` discards the databases and the CA. It runs no PDS; Swan has its own interop lab.
+- The two-home test harness is the e2e target `federation_spaces_full_cutover`. It runs two `clean_slate_federation_fixture` processes, each with a fresh PostgreSQL database, against loopback mock PDSes and a mock Push Gateway. Commands are in [server/README.md](server/README.md#tests). It is part of the open R1 gate.

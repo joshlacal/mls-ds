@@ -18,7 +18,14 @@ if [ -z "$DATABASE_URL" ]; then
 fi
 
 echo "Running database migrations..."
-echo "Database: ${DATABASE_URL%%\?*}"  # Hide password in output
+# Print host, port and database only. Anything that does not parse as a plain
+# postgres:// URL (key=value strings, IPv6, odd passwords) is not printed at all.
+TARGET_RE='^postgres(ql)?://([^@/]*@)?([^:/?#@]+)(:[0-9]+)?(/[^?#@]*)?([?#].*)?$'
+if [[ "$DATABASE_URL" =~ $TARGET_RE ]]; then
+    echo "Database: ${BASH_REMATCH[3]}${BASH_REMATCH[4]}${BASH_REMATCH[5]}"
+else
+    echo "Database: (not shown)"
+fi
 
 # Check if sqlx-cli is installed
 if ! command -v sqlx &> /dev/null; then

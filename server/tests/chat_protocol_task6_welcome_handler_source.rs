@@ -31,11 +31,20 @@ fn welcome_handler_is_an_operation_only_one_transaction_compositor() {
         .rfind("transaction\n        .commit()")
         .expect("commit");
     assert!(admission < begin && begin < prepare && prepare < facade && facade < commit);
+    // The index-only relay answers before any local transaction exists.
+    let relay = handler
+        .find("crate::federation::group_relay::try_relay_index_only_welcome(")
+        .expect("federation-sealed index-only relay");
+    assert!(admission < relay && relay < begin);
 
     assert!(handler.contains("WelcomeTerminalTransactionOutcome::Replay"));
-    assert!(handler.contains("context::replay_response(&response)"));
+    assert!(handler.contains("context::replay_response(endpoint, &response)"));
     assert!(handler.contains("WelcomeTerminalTransactionOutcome::Prepared"));
     assert!(handler.contains("WelcomeTerminalTransactionOutcome::Classified"));
+    assert!(handler.contains("WelcomeTerminalFacadeError::FreshRejection(response)"));
+    // Indentation-insensitive: the rollback arm's nesting is not the contract.
+    let compact = handler.split_whitespace().collect::<String>();
+    assert!(compact.contains("transaction.rollback()"));
     assert_eq!(handler.matches(".complete(&mut transaction").count(), 2);
     assert_eq!(handler.matches(".commit()").count(), 1);
     assert!(!handler.contains("serde_json"));
@@ -46,12 +55,20 @@ fn welcome_handler_is_an_operation_only_one_transaction_compositor() {
 #[test]
 fn welcome_handler_returns_facade_sealed_wire_material_verbatim() {
     let handler = block(SOURCE, "async fn handle(", "fn welcome_failure(");
+    // Five sealed exits: the federation-sealed index-only relay (remote late
+    // join R), the transport-inbox Welcome, and the three facade responses.
     assert_eq!(
         handler.matches("context::canonical_json_response(").count(),
+        5
+    );
+    assert_eq!(handler.matches("response.status()").count(), 3);
+    assert_eq!(handler.matches("response.as_bytes().to_vec()").count(), 3);
+    assert_eq!(
+        handler
+            .matches("context::canonical_json_response(endpoint, 200, resp_bytes)")
+            .count(),
         2
     );
-    assert_eq!(handler.matches("response.status()").count(), 2);
-    assert_eq!(handler.matches("response.as_bytes().to_vec()").count(), 2);
     assert!(!handler.contains("serde_json"));
     assert!(!handler.contains("StatusCode::OK"));
 }

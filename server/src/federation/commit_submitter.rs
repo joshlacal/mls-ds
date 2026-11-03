@@ -58,6 +58,8 @@ impl RemoteCommitSubmitter {
         expected_accepted_payload_sha256: [u8; 32],
         expected_outer_entry_fingerprint: [u8; 32],
     ) -> Result<VerifiedSubmitCommit, FederationError> {
+        // A closed federation gate refuses before any resolution or DNS lookup.
+        peer_policy::ensure_federation_open()?;
         let destination = self
             .resolver
             .resolve_ds_destination_uncached(sequencer_ds_did)
@@ -94,6 +96,9 @@ impl RemoteCommitSubmitter {
             Err(OutboundError::ResolutionFailed { did, kind }) => {
                 return Err(FederationError::ResolutionFailed { did, kind });
             }
+            Err(OutboundError::FederationDisabled { reason }) => {
+                return Err(FederationError::FederationDisabled { reason });
+            }
             Err(e) => {
                 return Err(FederationError::InvalidEnvelope {
                     reason: e.to_string(),
@@ -112,12 +117,7 @@ impl RemoteCommitSubmitter {
             .auth_middleware
             .resolve_did(receipt.receiver_ds_did.as_str())
             .await
-            .map_err(|e| FederationError::AuthFailed {
-                reason: format!(
-                    "failed to resolve receiver DID {}: {e}",
-                    receipt.receiver_ds_did.as_str()
-                ),
-            })?;
+            .map_err(|error| receipt_key_lookup_failure(receipt.receiver_ds_did.as_str(), error))?;
 
         let verifying_key = crate::auth::select_verification_method(&did_doc, Some("#atproto"))
             .and_then(crate::auth::extract_p256_key_from_vm)
@@ -250,5 +250,55 @@ impl RemoteCommitSubmitter {
             submit_transition_response_bytes,
             federation_response_bytes: resp.response_bytes,
         })
+    }
+}
+
+/// The sequencer's receipt key could not be looked up. A DID document that
+/// could not be fetched now decided nothing about the commit, so the identical
+/// submit may retry (retryable `ResolutionFailed`); any other lookup failure
+/// leaves the receipt unauthenticated (`AuthFailed`).
+fn receipt_key_lookup_failure(
+    receiver_did: &str,
+    error: crate::auth::AuthError,
+) -> FederationError {
+    let reason = format!("failed to resolve receiver DID {receiver_did}: {error}");
+    if error.is_retryable() {
+        FederationError::ResolutionFailed {
+            did: receiver_did.to_owned(),
+            kind: super::ResolutionFailureKind::Transient(reason),
+        }
+    } else {
+        FederationError::AuthFailed { reason }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DQ.G22: a receipt key the sequencer's DID document could not supply now
+    /// is retryable (the client's `submitTransition` answers 503 + Retry-After
+    /// through `ChatFailure::unavailable`), never `AuthFailed` (401); a
+    /// permanent lookup failure stays `AuthFailed`.
+    #[test]
+    fn a_receipt_key_lookup_that_could_not_answer_is_retryable() {
+        let did = "did:web:sequencer.example.com";
+        let transient = receipt_key_lookup_failure(
+            did,
+            crate::auth::AuthError::DidResolutionUnavailable("connect timed out".into()),
+        );
+        assert!(
+            matches!(transient, FederationError::ResolutionFailed { .. })
+                && transient.is_retryable(),
+            "{transient:?}"
+        );
+        let permanent = receipt_key_lookup_failure(
+            did,
+            crate::auth::AuthError::DidResolutionFailed("HTTP 404".into()),
+        );
+        assert!(
+            matches!(permanent, FederationError::AuthFailed { .. }),
+            "{permanent:?}"
+        );
     }
 }

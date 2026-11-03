@@ -644,3 +644,374 @@ async fn two_outbox_workers_never_double_claim() {
         "no outbox row is claimed by both workers"
     );
 }
+
+// ===========================================================================
+// Sub-boundary 3 — closeConversation vs acceptConversation of one request.
+// ===========================================================================
+
+/// The e2e C20 close-wins arm (`e2e-tests/tests/encrypted_request_c14_c20.rs`)
+/// on real PostgreSQL sessions: a `closeConversation` queued on the
+/// conversation head before an `acceptConversation` of the same pending
+/// request. The close runs through the production router; the accept side is
+/// its exact lock prefix (`direct_request_preparation::admit_request`:
+/// operation, request budget, then principal/device/key), then its head lock.
+/// The close's wipe debits that budget, so the close must hold it before its
+/// own identity locks: the accept then queues on the budget and finds the
+/// conversation wiped. Taken first at the wipe, after the identity locks the
+/// accept waits on, it closes a cycle and PostgreSQL aborts one side (40P01).
+#[cfg(all(feature = "test-support", feature = "sim"))]
+mod close_racing_accept {
+    use std::{sync::Arc, time::Duration};
+
+    use axum::http::StatusCode;
+    use serde_json::json;
+    use sqlx::{PgPool, Postgres, Transaction};
+    use tokio::task::JoinHandle;
+    use uuid::Uuid;
+
+    use crate::{
+        chat_protocol::{
+            repository::prelude::{
+                lock_direct_request_identity_scope, lock_direct_request_operation_set,
+            },
+            test_support::{seed_genuine_pending_direct_request, sign_mutation_json_for_test},
+        },
+        common::{fresh_db::fresh_fully_migrated_db, http_acceptance as http},
+        sim_hooks::{scope_sim_ds, QueuedTaskSpawner, SimDsHooks},
+    };
+
+    /// `did`'s device with a service-auth key, declaring no home.
+    async fn device(did: &str, device_id: Uuid) -> http::Device {
+        let signing = http::random_p256();
+        let jwk = http::public_jwk(&signing);
+        let device = http::Device {
+            did: did.to_owned(),
+            device_id,
+            jkt: http::jwk_thumbprint(&jwk),
+            signing,
+            jwk,
+        };
+        http::cache_device_did(&device).await;
+        device
+    }
+
+    async fn backend_pid(transaction: &mut Transaction<'_, Postgres>) -> i32 {
+        sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **transaction)
+            .await
+            .unwrap()
+    }
+
+    /// Wait until `sessions` sessions of this database wait on `holder`,
+    /// directly or behind one another; `false` once `task` finished instead.
+    async fn queued<T>(pool: &PgPool, holder: i32, sessions: i64, task: &JoinHandle<T>) -> bool {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "WITH RECURSIVE w(pid) AS ( \
+                         SELECT pid FROM pg_stat_activity \
+                          WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid)) \
+                         UNION SELECT a.pid FROM pg_stat_activity a \
+                          JOIN w ON w.pid = ANY(pg_blocking_pids(a.pid))) \
+                     SELECT count(*) FROM w",
+                )
+                .bind(holder)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if waiting >= sessions {
+                    return true;
+                }
+                if task.is_finished() {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the session neither queued nor finished")
+    }
+
+    #[tokio::test]
+    async fn a_close_queued_first_holds_the_request_budget_before_its_identity_locks() {
+        let db = fresh_fully_migrated_db(super::CONCURRENCY_DB_PREFIX).await;
+        let pool = db.connect(8).await;
+        http::ensure_fence(&pool).await;
+        let request = seed_genuine_pending_direct_request(&pool)
+            .await
+            .expect("a genuinely published pending request");
+        let router = http::router_for_authenticated_acceptance_with(pool.clone(), |runtime| {
+            runtime.with_spawner(Arc::new(QueuedTaskSpawner::new()))
+        })
+        .await;
+        let hooks = Arc::new(SimDsHooks {
+            service_did: "did:web:chat.catbird.blue".into(),
+            self_endpoint: "https://chat.catbird.blue".into(),
+            signing_key_pem: None,
+            group_relay_hmac_secret: None,
+            http_transport: Arc::new(|_| {
+                Box::pin(async { Err("unexpected close network request".into()) })
+            }),
+            dns_resolver: Arc::new(|_| Err("unexpected close DNS".into())),
+            retain_application_ciphertext: false,
+        });
+        let (sender, sender_device, key_id, seed) = request.sender_identity();
+        let (recipient, recipient_device, ..) = request.recipient_identity();
+        let closer = device(&sender, sender_device).await;
+        // The recipient's document declares no home: the close owes no C33 fan-out.
+        device(&recipient, recipient_device).await;
+        let prior = request.coordinate().clone();
+        let mut retired = prior.clone();
+        retired["stateVersion"] = json!(prior["stateVersion"].as_u64().unwrap() + 1);
+        retired["lifecycle"] = json!("superseded");
+        let transition = Uuid::new_v4();
+        let signed = sign_mutation_json_for_test(
+            &json!({
+                "$type": "blue.catbird.chat.defs#conversationCloseBody",
+                "signatureDomain": "CATBIRD-CHAT-CLOSE\u{0}",
+                "transitionId": transition,
+                "idempotencyKey": transition,
+                "actorDid": sender,
+                "actorDeviceId": sender_device,
+                "keyId": key_id,
+                "authGeneration": 1,
+                "conversationKind": "direct",
+                "prior": prior,
+                "retired": retired,
+                "signedAt": chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            }),
+            &ed25519_dalek::SigningKey::from_bytes(&seed),
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&json!({ "signedRequest": signed })).unwrap();
+
+        // The e2e barrier: a third session holds the head both transactions lock.
+        let mut barrier = pool.begin().await.unwrap();
+        let barrier_pid = backend_pid(&mut barrier).await;
+        sqlx::query("SELECT 1 FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE")
+            .bind(request.conversation_id)
+            .execute(&mut *barrier)
+            .await
+            .unwrap();
+        let close = tokio::spawn(scope_sim_ds(hooks, async move {
+            let close =
+                http::unsigned_json_request(&closer, "blue.catbird.chat.closeConversation", body);
+            http::send(router, close).await
+        }));
+        if !queued(&pool, barrier_pid, 1, &close).await {
+            panic!(
+                "the close finished without queuing on the head: {:?}",
+                close.await
+            );
+        }
+        let (pid_sender, pid_receiver) = tokio::sync::oneshot::channel();
+        let accept = tokio::spawn({
+            let (pool, request_id, conversation_id) =
+                (pool.clone(), request.request_id, request.conversation_id);
+            let accounts = [recipient.clone(), sender.clone()];
+            async move {
+                let mut transaction = pool.begin().await?;
+                let _ = pid_sender.send(backend_pid(&mut transaction).await);
+                lock_direct_request_operation_set(&mut transaction, request_id, &[Uuid::new_v4()])
+                    .await?;
+                lock_direct_request_identity_scope(&mut transaction, &accounts).await?;
+                let head: Option<String> = sqlx::query_scalar(
+                    "SELECT lifecycle FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE",
+                )
+                .bind(conversation_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                transaction.rollback().await?;
+                Ok::<_, sqlx::Error>(head)
+            }
+        });
+        let accept_pid = pid_receiver.await.unwrap();
+        if !queued(&pool, barrier_pid, 2, &accept).await {
+            panic!("the accept finished without queuing: {:?}", accept.await);
+        }
+        let accept_waits_in: String =
+            sqlx::query_scalar("SELECT query FROM pg_stat_activity WHERE pid = $1")
+                .bind(accept_pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        barrier.rollback().await.unwrap();
+        let (status, reply) = close.await.unwrap();
+        let accepted = accept.await.unwrap();
+        assert!(
+            status == StatusCode::OK
+                && accept_waits_in.contains("chat.direct_request_budget")
+                && matches!(accepted, Ok(None)),
+            "a close queued before an accept must hold the request budget before its identity \
+             locks: close={status} {reply}; the accept waited in `{accept_waits_in}`, then saw \
+             head={accepted:?}"
+        );
+    }
+}
+
+/// An `acceptConversation` whose admission loses a lock wait (here the global
+/// request budget a request operation holds, under `lock_timeout`) failed in
+/// storage, not authentication: it must surface as the endpoint's storage
+/// failure (`DirectAcceptanceError::Database` → `ChatFailure::storage`), never as
+/// the terminal `InvalidSignature` (401) a client would stop retrying on.
+#[cfg(all(feature = "test-support", feature = "sim"))]
+mod accept_admission_contention {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use ed25519_dalek::Signer as _;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use crate::{
+        auth::VerifiedServicePrincipal,
+        chat_protocol::{
+            direct_request_transcript::{direct_request_signing_bytes, DirectRequestKind},
+            relationship_policy::{
+                fixed_production_relationship_policy_config, RelationshipAuthority,
+            },
+            repository::{
+                acceptance::{accept_direct_request, DirectAcceptanceError},
+                direct_request_receipts::DirectRequestReceiptSigner,
+            },
+            test_support::{seed_genuine_pending_direct_request, DeterministicTestTransport},
+        },
+        common::fresh_db::fresh_fully_migrated_db,
+    };
+
+    fn pem(key: &p256::ecdsa::SigningKey) -> String {
+        use p256::pkcs8::EncodePrivateKey as _;
+        p256::SecretKey::from_slice(&key.to_bytes())
+            .unwrap()
+            .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_accept_admission_lock_timeout_is_a_storage_failure_not_invalid_signature() {
+        let db = fresh_fully_migrated_db(super::CONCURRENCY_DB_PREFIX).await;
+        let pool = db.connect(4).await;
+        let request = seed_genuine_pending_direct_request(&pool)
+            .await
+            .expect("a genuinely published pending request");
+        let (recipient, device, key_id, seed) = request.recipient_identity();
+        // The recipient's exact signed acceptance of the published head.
+        let (generation, version, group_id, epoch, context_hash, tag): (
+            i64,
+            i64,
+            Vec<u8>,
+            i64,
+            Vec<u8>,
+            Vec<u8>,
+        ) = sqlx::query_as(
+            "SELECT c.current_generation, c.current_state_version, s.group_id, s.epoch, \
+                    s.group_context_hash, s.confirmation_tag \
+               FROM chat.conversations c JOIN chat.generation_states s \
+                 ON s.conversation_id = c.conversation_id AND s.generation = c.current_generation \
+                AND s.state_version = c.current_state_version \
+              WHERE c.conversation_id = $1",
+        )
+        .bind(request.conversation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (invitation, inviter, inviter_device): (Uuid, String, Uuid) = sqlx::query_as(
+            "SELECT invitation_transition_id, created_by_did, created_by_device_id \
+               FROM chat.participants \
+              WHERE conversation_id = $1 AND user_did = $2 AND current_membership",
+        )
+        .bind(request.conversation_id)
+        .bind(&recipient)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let prior = json!({
+            "conversationId": request.conversation_id,
+            "generation": generation,
+            "stateVersion": version,
+            "groupId": STANDARD.encode(group_id),
+            "epoch": epoch,
+            "groupContextHash": STANDARD.encode(context_hash),
+            "confirmationTag": STANDARD.encode(tag),
+            "lifecycle": "active",
+        });
+        let mut next = prior.clone();
+        next["stateVersion"] = json!(version + 1);
+        let transition = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let body = json!({
+            "$type": "blue.catbird.chat.defs#directRequestAcceptanceBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-ACCEPT\u{0}",
+            "protocolVersion": "2",
+            "actorDid": recipient,
+            "actorDeviceId": device,
+            "keyId": key_id,
+            "authGeneration": 1,
+            "transitionId": transition,
+            "requestId": request.request_id,
+            "prior": prior,
+            "next": next,
+            "invitationProvenance": {
+                "invitationTransitionId": invitation,
+                "invitedByDid": inviter,
+                "invitedByDeviceId": inviter_device,
+            },
+            "idempotencyKey": transition,
+            "signedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        });
+        let message = direct_request_signing_bytes(
+            DirectRequestKind::Accept,
+            &serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        let signature = ed25519_dalek::SigningKey::from_bytes(&seed).sign(&message);
+        let raw = serde_json::to_vec(&json!({
+            "body": body,
+            "signature": STANDARD.encode(signature.to_bytes()),
+        }))
+        .unwrap();
+        let principal = VerifiedServicePrincipal::for_federated_s2s(
+            &recipient,
+            "blue.catbird.chat.acceptConversation",
+        );
+        let receipt_key = p256::ecdsa::SigningKey::from_slice(&[21; 32]).unwrap();
+        let service_key = p256::ecdsa::SigningKey::from_slice(&[22; 32]).unwrap();
+        let document = crate::identity::did_doc::build_direct_request_receipt_did_document(
+            "did:web:chat.catbird.blue",
+            receipt_key.verifying_key(),
+        );
+        let signer = DirectRequestReceiptSigner::configured(
+            &pem(&receipt_key),
+            &pem(&service_key),
+            &serde_json::to_string(&document).unwrap(),
+        )
+        .unwrap();
+        let policy = RelationshipAuthority::new(
+            fixed_production_relationship_policy_config().unwrap(),
+            DeterministicTestTransport,
+        );
+
+        // Another request operation holds the global request budget.
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT singleton FROM chat.direct_request_budget WHERE singleton FOR UPDATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL lock_timeout = '200ms'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let outcome = accept_direct_request(&mut tx, &principal, &raw, &signer, &policy, now).await;
+        tx.rollback().await.unwrap();
+        holder.rollback().await.unwrap();
+        assert!(
+            matches!(
+                &outcome,
+                Err(DirectAcceptanceError::Database(sqlx::Error::Database(error)))
+                    if error.code().as_deref() == Some("55P03")
+            ),
+            "a lock timeout in accept admission is a storage failure: {outcome:?}"
+        );
+    }
+}

@@ -312,6 +312,8 @@ const LOCK_READ_DEVICE_KEY_SQL: &str = r#"
     SELECT key_id, signing_public_key, revoked_at
       FROM chat.device_keys
      WHERE user_did = $1 AND device_id = $2
+       AND enrollment_auth_generation <= $3
+     ORDER BY enrollment_auth_generation DESC LIMIT 1
      FOR UPDATE
 "#;
 
@@ -427,6 +429,7 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
     let key: Option<LockedReadRequesterKeyRow> = sqlx::query_as(LOCK_READ_DEVICE_KEY_SQL)
         .bind(&lock_did)
         .bind(lock_device_id)
+        .bind(device.auth_generation)
         .fetch_optional(&mut **tx)
         .await
         .map_err(|_| ReadAuthorityError::Storage)?;
@@ -2117,24 +2120,4 @@ pub(crate) async fn inventory_authorities(
     // attempt.
     revalidate_fence_after_heads(tx, &fence).await?;
     Ok(authorities.into_boxed_slice())
-}
-
-#[cfg(test)]
-impl LockedReadDeviceAuthority {
-    pub(in crate::chat_protocol) fn for_test(
-        user_did: String,
-        device_id: uuid::Uuid,
-        jkt: Option<String>,
-        auth_generation: u64,
-    ) -> Self {
-        Self {
-            txid: 0,
-            user_did,
-            device_id,
-            jkt,
-            auth_generation,
-            active_key_id: String::new(),
-            device_row_sha256: [0; 32],
-        }
-    }
 }

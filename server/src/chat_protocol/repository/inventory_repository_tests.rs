@@ -1515,8 +1515,17 @@ fn page_item_response_and_session_byte_ceilings_fail_closed_at_the_exact_limits(
         .expect("the D-2 facade body terminates")
         .0;
     assert!(facade.contains("transaction.rollback().await"));
-    assert!(facade.contains("Err(InventoryRepositoryError::SnapshotConflict)"));
-    assert!(facade.contains("continue"));
+    // Only a moved head retries: its arm rolls back and falls through to the
+    // next attempt; every other error rolls back and returns.
+    let retry_arm = facade
+        .split_once("Err(InventoryRepositoryError::SnapshotConflict) => {")
+        .expect("the D-2 facade retries a moved head")
+        .1
+        .split_once('}')
+        .expect("the retry arm terminates")
+        .0;
+    assert!(retry_arm.contains("transaction.rollback().await"));
+    assert!(!retry_arm.contains("return"));
     for write in [
         "INSERT INTO chat.inventory_sessions(",
         "INSERT INTO chat.inventory_conversation_items(",

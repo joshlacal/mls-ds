@@ -107,7 +107,9 @@ fn canonical_lock_projection_requires_only_the_actor_key() {
     assert!(block
         .contains("authority.repository_receipt().operation_id() != Some(operation.operation_id)"));
     assert!(!block.contains("scope.identities.iter().any"));
-    assert!(block.contains("let actor_key = locked_keys"));
+    assert!(block.contains(
+        "let actor_key = LockedCanonicalKeyProjection::at_generation(\n        &locked_keys,\n        actor_did,\n        actor_device_id,\n        actor.auth_generation,\n    )\n    .filter(|row| row.key_id == mutation.key_id().as_str())"
+    ));
     assert!(block.contains("actor_key.revoked_at.is_some()"));
 
     let prelude_source = include_str!("../../src/chat_protocol/repository/prelude.rs");
@@ -459,10 +461,9 @@ fn scope_signing_key_lookup_is_exact_and_has_no_broad_raw_key_escape() {
         .expect("unterminated opaque-scope exact signing-key lookup")
         .0;
     for dimension in [
-        "key.user_did() == did",
-        "key.device_id() == device_id",
+        "LockedCanonicalKeyProjection::at_generation(",
+        "at_generation(\n            &self.keys,\n            did,\n            device_id,\n            enrollment_auth_generation,\n        )",
         "key.key_id() == key_id",
-        "key.enrollment_auth_generation() == enrollment_auth_generation",
         "key.signing_public_key()",
     ] {
         assert!(
@@ -470,6 +471,18 @@ fn scope_signing_key_lookup_is_exact_and_has_no_broad_raw_key_escape() {
             "opaque signing-key lookup omitted exact tuple dimension: {dimension}"
         );
     }
+    for dimension in [
+        "key.user_did == did",
+        "key.device_id == device_id",
+        "key.enrollment_auth_generation <= auth_generation",
+        ".max_by_key(|key| key.enrollment_auth_generation)",
+    ] {
+        assert!(
+            key_projection.contains(dimension),
+            "missing temporal key dimension: {dimension}"
+        );
+    }
+    assert!(!key_projection.contains(".filter(|key| key.revoked_at"));
 
     assert!(key_projection.contains("fn signing_public_key(&self) -> &[u8]"));
     assert!(!key_projection.contains("pub(super) fn signing_public_key(&self) -> &[u8]"));

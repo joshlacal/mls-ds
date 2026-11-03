@@ -22,11 +22,16 @@ impl Drop for AbortPendingTask {
     }
 }
 
-async fn single_connection_pool(deadlock_timeout: &str) -> Result<(PgPool, i32), String> {
-    let url = std::env::var("TEST_DATABASE_URL").map_err(|e| e.to_string())?;
+async fn single_connection_pool(
+    proof_pool: &PgPool,
+    deadlock_timeout: &str,
+) -> Result<(PgPool, i32), String> {
+    // The gated proof database itself, never a re-read TEST_DATABASE_URL: that
+    // names the shared target, which these connections would reach past
+    // `require_local_owned_gate` (Main ruling 2026-11-04).
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .connect(&url)
+        .connect_with((*proof_pool.connect_options()).clone())
         .await
         .map_err(|e| e.to_string())?;
     // These pools belong only to this test. Let the writer detect the old
@@ -123,8 +128,8 @@ pub(super) async fn run_request_inventory_concurrency(pool: &PgPool) -> Result<(
         Sha256::digest([]).into(),
     )
     .map_err(|e| format!("inventory request: {e:?}"))?;
-    let (writer_pool, writer_pid) = single_connection_pool("50ms").await?;
-    let (reader_pool, reader_pid) = single_connection_pool("5s").await?;
+    let (writer_pool, writer_pid) = single_connection_pool(pool, "50ms").await?;
+    let (reader_pool, reader_pid) = single_connection_pool(pool, "5s").await?;
     let mut pin = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("SELECT 1 FROM chat.conversations WHERE conversation_id=$1 FOR UPDATE")
         .bind(fixture.conversation_id)

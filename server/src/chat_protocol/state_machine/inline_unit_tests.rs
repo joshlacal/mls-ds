@@ -1043,7 +1043,15 @@ mod direct_request_history_tests {
         } else {
             &wrapper["body"]["prior"]["conversationId"]
         };
-        let entry = json!({"$type":format!("blue.catbird.chat.defs#{kind}"),"entryId":"00000000-0000-4000-8000-000000000009","conversationId":conversation,"seq":seq,"signedRequest":wrapper,"receivedAt":"2026-09-19T12:00:00.000Z"});
+        let entry = if kind == "directRequestEntry" {
+            crate::chat_protocol::direct_request_transcript::signed_opening_entry_for_test(
+                &wrapper,
+                seq,
+                "2026-09-19T12:00:00.000Z",
+            )
+        } else {
+            json!({"$type":format!("blue.catbird.chat.defs#{kind}"),"entryId":"00000000-0000-4000-8000-000000000009","conversationId":conversation,"seq":seq,"signedRequest":wrapper,"receivedAt":"2026-09-19T12:00:00.000Z"})
+        };
         let row = serde_json::to_vec(&entry).unwrap();
         let signed = serde_json::to_vec(&wrapper).unwrap();
         // Dedicated admission remains mandatory; historical kinds are never v1 mutations.
@@ -1100,6 +1108,106 @@ mod direct_request_history_tests {
                 assert!(!validate_transition_evidence(&tampered));
             }
         }
+    }
+    #[test]
+    fn pruned_opening_hydrates_the_same_publication_without_its_ciphertext() {
+        use crate::chat_protocol::repository::direct_request_opening::{
+            pruned_opening_entry, redacted_opening_entry,
+        };
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let (whole, row, _) = hydrate(publication_body(&key), "directRequestEntry", &key, 1, true);
+        let entry: Value = serde_json::from_slice(&row).unwrap();
+        let ciphertext = STANDARD
+            .decode(
+                entry["signedRequest"]["body"]["artifacts"]["initialCiphertext"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let redacted = redacted_opening_entry(&entry).unwrap();
+        assert_eq!(
+            redacted["signedRequest"]["body"]["artifacts"]["initialCiphertext"],
+            json!(STANDARD.encode(Sha256::digest(&ciphertext)))
+        );
+        let authority = HistoricalRehydrationAuthority::new(
+            *uuid::Uuid::parse_str(entry["conversationId"].as_str().unwrap())
+                .unwrap()
+                .as_bytes(),
+            2,
+        )
+        .unwrap();
+        let authority_of = |evidence: &TransitionEvidence| {
+            let a = evidence.authority.clone().unwrap();
+            (
+                a.kind,
+                a.actor,
+                a.key_id,
+                a.auth_generation,
+                a.signed_at,
+                a.request_digest,
+                a.signature,
+            )
+        };
+        let pruned = authority
+            .hydrate_pruned_direct_request_opening(
+                serde_json::to_vec(&redacted).unwrap(),
+                key.verifying_key().as_bytes(),
+                whole.authority.as_ref().unwrap().request_digest,
+                whole.outer_entry_fingerprint,
+            )
+            .unwrap()
+            .into_transition()
+            .unwrap();
+        assert!(validate_transition_evidence(&pruned));
+        assert_eq!(pruned.body_binding, whole.body_binding);
+        assert_eq!(
+            (
+                pruned.seq,
+                pruned.transition_id,
+                pruned.outer_entry_fingerprint,
+                pruned.received_at
+            ),
+            (
+                whole.seq,
+                whole.transition_id,
+                whole.outer_entry_fingerprint,
+                whole.received_at
+            )
+        );
+        assert_eq!(authority_of(&pruned), authority_of(&whole));
+        assert_eq!(pruned.server_fields_dag_cbor, whole.server_fields_dag_cbor);
+        // Only the redacted form hydrates without a signature, and only its exact key.
+        let reject = |row: &Value, key: &[u8]| {
+            authority
+                .hydrate_pruned_direct_request_opening(
+                    serde_json::to_vec(row).unwrap(),
+                    key,
+                    whole.authority.as_ref().unwrap().request_digest,
+                    whole.outer_entry_fingerprint,
+                )
+                .is_err()
+        };
+        assert!(reject(&entry, key.verifying_key().as_bytes()));
+        assert!(reject(
+            &redacted,
+            SigningKey::from_bytes(&[8; 32]).verifying_key().as_bytes()
+        ));
+        let mut short = redacted.clone();
+        short["signedRequest"]["body"]["artifacts"]["initialCiphertext"] =
+            json!(STANDARD.encode([1u8; 31]));
+        assert!(reject(&short, key.verifying_key().as_bytes()));
+        // The served pruned shape is exactly the retained receipts, no signed request.
+        let mut served = pruned_opening_entry(&redacted);
+        assert_eq!(served["sequencerReceipt"], entry["sequencerReceipt"]);
+        assert_eq!(served["publicationReceipt"], entry["publicationReceipt"]);
+        crate::chat_protocol::direct_request_transcript::present_read_presentation(
+            "conversationEntry",
+            &mut served,
+        )
+        .unwrap();
+        assert_eq!(served["payloadPruned"], true);
+        assert!(served.get("signedRequest").is_none());
+        assert_eq!(served["seq"], 1);
     }
     #[test]
     fn direct_request_history_binds_metadata_pending_leaves_and_recipient_acceptance() {

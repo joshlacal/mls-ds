@@ -58,27 +58,46 @@ pub async fn resolve_pair_coordinator(
     sender_did: &str,
     recipient_did: &str,
 ) -> Result<CanonicalPairCoordinator, FederationError> {
-    let self_did = crate::identity::service_did();
-    let self_endpoint = crate::identity::self_endpoint();
-    let default_ds = std::env::var("DEFAULT_DS_ENDPOINT").ok();
-    let cache_ttl: u64 = std::env::var("ENDPOINT_CACHE_TTL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3600);
-
-    let http = super::resolver::build_resolver_http_client();
-
-    let resolver = DsResolver::with_default_endpoint(
-        pool.clone(),
-        http,
-        self_did,
-        self_endpoint,
-        default_ds,
-        cache_ttl,
-    );
+    let resolver = pair_resolver(pool);
 
     let sender_home = resolver.resolve_authoritative_ds(sender_did).await?;
     let recipient_home = resolver.resolve_authoritative_ds(recipient_did).await?;
+    Ok(pair_coordinator(&resolver, sender_home, recipient_home))
+}
+
+/// [`resolve_pair_coordinator`] for `prepareDirectRequest` (C33). The sender's
+/// home must resolve. A recipient whose home does not is placed on this
+/// authority's canonical path and its resolution error returned, so the caller
+/// can keep an undeclared recipient or durably refuse an unusable declaration.
+pub async fn resolve_prepare_pair_coordinator(
+    pool: &DbPool,
+    sender_did: &str,
+    recipient_did: &str,
+) -> Result<(CanonicalPairCoordinator, Option<FederationError>), FederationError> {
+    let resolver = pair_resolver(pool);
+
+    let sender_home = resolver.resolve_authoritative_ds(sender_did).await?;
+    let (recipient_home, unresolved) = match resolver.resolve_authoritative_ds(recipient_did).await
+    {
+        Ok(home) => (home, None),
+        Err(error) => (
+            resolver
+                .resolve_authority_ds_endpoint(resolver.self_did())
+                .await?,
+            Some(error),
+        ),
+    };
+    Ok((
+        pair_coordinator(&resolver, sender_home, recipient_home),
+        unresolved,
+    ))
+}
+
+fn pair_coordinator(
+    resolver: &DsResolver,
+    sender_home: DsEndpoint,
+    recipient_home: DsEndpoint,
+) -> CanonicalPairCoordinator {
     let sender_home_did = canonical_did(&sender_home.did).to_string();
     let recipient_home_did = canonical_did(&recipient_home.did).to_string();
 
@@ -92,14 +111,72 @@ pub async fn resolve_pair_coordinator(
     let is_sender_home = resolver.is_self(&sender_home_did);
     let is_recipient_home = resolver.is_self(&recipient_home_did);
 
-    Ok(CanonicalPairCoordinator {
+    CanonicalPairCoordinator {
         sender_home,
         recipient_home,
         coordinator_did,
         is_coordinator,
         is_sender_home,
         is_recipient_home,
-    })
+    }
+}
+
+fn pair_resolver(pool: &DbPool) -> DsResolver {
+    let cache_ttl: u64 = std::env::var("ENDPOINT_CACHE_TTL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    DsResolver::with_default_endpoint(
+        pool.clone(),
+        super::resolver::build_resolver_http_client(),
+        crate::identity::service_did(),
+        crate::identity::self_endpoint(),
+        std::env::var("DEFAULT_DS_ENDPOINT").ok(),
+        cache_ttl,
+    )
+}
+
+/// The coordinator a C33 transport-only home recorded for its pair, resolved
+/// from that delivery service's own DID document under this DS's peer policy,
+/// never re-derived from both parties' declarations: a deleted party's is
+/// typically gone.
+pub async fn resolve_recorded_coordinator(
+    pool: &DbPool,
+    coordinator_did: &str,
+) -> Result<DsEndpoint, FederationError> {
+    let resolver = pair_resolver(pool);
+    let coordinator = resolver
+        .resolve_authority_ds_endpoint(coordinator_did)
+        .await?;
+    if !resolver.is_self(&coordinator.did) {
+        super::peer_policy::enforce_outbound_peer_policy(pool, &coordinator.did).await?;
+    }
+    Ok(coordinator)
+}
+
+/// Whether `did` has an `accountDeletedEntry` sequenced here in `conversation_id`.
+/// A C33 coordinator delivers none of that conversation's later entries to such a
+/// party's home, and decides so before resolving that home: a deleted account's
+/// declaration is typically gone.
+// `pub`: repository/acceptance.rs calls it, and the integration harness compiles that
+// file into its own crate against this one.
+pub async fn account_deleted_in<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    conversation_id: Uuid,
+    did: &str,
+) -> Result<bool, sqlx::Error> {
+    // Every control entry has a NULL `message_id`, so `entries_message_idx`
+    // skips the conversation's applications.
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.entries \
+          WHERE conversation_id = $1 AND message_id IS NULL \
+            AND entry_kind = 'blue.catbird.chat.defs#accountDeletedEntry' \
+            AND actor_did = $2)",
+    )
+    .bind(conversation_id)
+    .bind(did)
+    .fetch_one(executor)
+    .await
 }
 
 /// Durable, verifiable pair fence conflict classifications.
@@ -140,6 +217,9 @@ impl std::fmt::Display for PairFenceConflict {
 ///
 /// Verifies across all local and federated repository state that no active,
 /// pending, or finalized pair already exists under another coordinator or conflicting attempt.
+/// A sender home's outbound route binds its pair once the coordinator answered it; a route no
+/// coordinator answered binds only until `binding_expires_at`, when no preparation its signed
+/// prepare could produce is still live.
 pub async fn check_pair_owner_fence(
     tx: &mut Transaction<'_, Postgres>,
     actor_did: &str,
@@ -223,6 +303,7 @@ pub async fn check_pair_owner_fence(
             FROM chat.direct_request_outbound_routes o \
             WHERE ((o.actor_did = $1 AND o.recipient_did = $2) OR (o.actor_did = $2 AND o.recipient_did = $1)) \
               AND o.request_id <> $3 \
+              AND (o.binding_expires_at IS NULL OR o.binding_expires_at > $6) \
               AND NOT EXISTS ( \
                   SELECT 1 FROM chat.direct_request_lifecycle l \
                   WHERE l.request_id = o.request_id \
@@ -416,6 +497,50 @@ pub struct DeliverMessageEntryInput {
 // Outbound S2S Operations
 // ---------------------------------------------------------------------------
 
+/// A relayed direct-request call's failure, by class. The peer's own HTTP
+/// answer keeps its status, so its 4xx stays a refusal. A closed gate, a
+/// destination that cannot resolve now or no connection is retryable; a
+/// destination or answer no retry cures (an invalid or blocked URL, NXDOMAIN,
+/// a malformed response) is a refusal.
+fn relay_error(
+    endpoint: &str,
+    method: &str,
+    error: super::outbound::OutboundError,
+) -> FederationError {
+    use super::outbound::OutboundError as E;
+    match error {
+        E::RemoteError {
+            status: 400,
+            error_name: Some(error_name),
+            ..
+        } if error_name == "BlockedRelationship" => FederationError::BlockedRelationship,
+        E::RemoteError { status, body, .. } => FederationError::RemoteError { status, body },
+        E::ResolutionFailed { did, kind } => FederationError::ResolutionFailed { did, kind },
+        E::FederationDisabled { reason } => FederationError::FederationDisabled { reason },
+        error if error.is_retryable() => FederationError::DsUnreachable {
+            endpoint: endpoint.to_owned(),
+            reason: format!("{method}: {error}"),
+        },
+        error => FederationError::InvalidRequest(format!("{method} failed: {error}")),
+    }
+}
+
+/// `enqueue_c33_in_tx` at an S2S coordinator: a full outbound queue decided
+/// nothing, so it is the retryable 503; a peer-policy refusal, a conflicting
+/// replay and this database keep their own answers.
+fn queue_full_unavailable(error: FederationError) -> FederationError {
+    match error {
+        FederationError::OutboundQueuePeerCapExceeded { .. }
+        | FederationError::OutboundQueueConvoPeerCapExceeded { .. } => {
+            FederationError::RemoteError {
+                status: 503,
+                body: error.to_string(),
+            }
+        }
+        other => other,
+    }
+}
+
 pub async fn reserve_remote_recipient_bootstrap(
     pool: &DbPool,
     endpoint: &str,
@@ -501,15 +626,12 @@ pub async fn reserve_remote_recipient_bootstrap(
             &input,
         )
         .await
-        .map_err(|e| FederationError::RemoteError {
-            status: 502,
-            body: format!("reserveRecipientBootstrap RPC failed: {e}"),
-        })?;
-    let output: ReserveRecipientBootstrapOutput =
-        serde_json::from_value(resp).map_err(|e| FederationError::RemoteError {
-            status: 502,
-            body: format!("malformed reserveRecipientBootstrap response: {e}"),
-        })?;
+        .map_err(|e| relay_error(endpoint, "reserveRecipientBootstrap", e))?;
+    let output: ReserveRecipientBootstrapOutput = serde_json::from_value(resp).map_err(|e| {
+        FederationError::InvalidRequest(format!(
+            "malformed reserveRecipientBootstrap response: {e}"
+        ))
+    })?;
     Ok(output.selected_devices)
 }
 pub async fn release_remote_recipient_bootstrap(
@@ -547,10 +669,7 @@ pub async fn release_remote_recipient_bootstrap(
             &input,
         )
         .await
-        .map_err(|error| FederationError::RemoteError {
-            status: 502,
-            body: format!("releaseRecipientBootstrap failed: {error}"),
-        })?;
+        .map_err(|e| relay_error(endpoint, "releaseRecipientBootstrap", e))?;
     Ok(())
 }
 
@@ -574,15 +693,7 @@ pub async fn relay_prepare_direct_request(
             &payload,
         )
         .await
-        .map_err(|e| match e {
-            crate::federation::outbound::OutboundError::RemoteError { status, body, .. } => {
-                FederationError::RemoteError { status, body }
-            }
-            other => FederationError::RemoteError {
-                status: 502,
-                body: format!("relay prepareDirectRequest failed: {other}"),
-            },
-        })
+        .map_err(|e| relay_error(endpoint, "prepareDirectRequest", e))
 }
 
 pub async fn relay_publish_direct_request(
@@ -601,15 +712,7 @@ pub async fn relay_publish_direct_request(
             &payload,
         )
         .await
-        .map_err(|e| match e {
-            crate::federation::outbound::OutboundError::RemoteError { status, body, .. } => {
-                FederationError::RemoteError { status, body }
-            }
-            other => FederationError::RemoteError {
-                status: 502,
-                body: format!("relay publishDirectRequest failed: {other}"),
-            },
-        })
+        .map_err(|e| relay_error(endpoint, "publishDirectRequest", e))
 }
 
 pub async fn deliver_direct_request_to_peer(
@@ -627,10 +730,7 @@ pub async fn deliver_direct_request_to_peer(
             &payload,
         )
         .await
-        .map_err(|e| FederationError::RemoteError {
-            status: 502,
-            body: format!("deliverDirectRequest failed: {e}"),
-        })?;
+        .map_err(|e| relay_error(endpoint, "deliverDirectRequest", e))?;
     Ok(())
 }
 
@@ -649,18 +749,9 @@ pub async fn relay_acceptance_to_coordinator(
             &payload,
         )
         .await
-        .map_err(|e| match e {
-            crate::federation::outbound::OutboundError::RemoteError { status, body, .. } => {
-                FederationError::RemoteError { status, body }
-            }
-            other => FederationError::RemoteError {
-                status: 502,
-                body: format!("deliverAcceptance failed: {other}"),
-            },
-        })?;
-    serde_json::from_value(resp).map_err(|e| FederationError::RemoteError {
-        status: 502,
-        body: format!("malformed deliverAcceptance response: {e}"),
+        .map_err(|e| relay_error(endpoint, "deliverAcceptance", e))?;
+    serde_json::from_value(resp).map_err(|e| {
+        FederationError::InvalidRequest(format!("malformed deliverAcceptance response: {e}"))
     })
 }
 
@@ -679,10 +770,7 @@ pub async fn deliver_acceptance_entry_to_peer(
             &payload,
         )
         .await
-        .map_err(|e| FederationError::RemoteError {
-            status: 502,
-            body: format!("deliverAcceptanceEntry failed: {e}"),
-        })?;
+        .map_err(|e| relay_error(endpoint, "deliverAcceptanceEntry", e))?;
     Ok(())
 }
 
@@ -701,15 +789,7 @@ pub async fn relay_message_to_coordinator(
             &payload,
         )
         .await
-        .map_err(|e| match e {
-            crate::federation::outbound::OutboundError::RemoteError { status, body, .. } => {
-                FederationError::RemoteError { status, body }
-            }
-            other => FederationError::RemoteError {
-                status: 502,
-                body: format!("relaySendMessage failed: {other}"),
-            },
-        })
+        .map_err(|e| relay_error(endpoint, "relaySendMessage", e))
 }
 
 pub async fn deliver_message_entry_to_peer(
@@ -727,10 +807,7 @@ pub async fn deliver_message_entry_to_peer(
             &payload,
         )
         .await
-        .map_err(|e| FederationError::RemoteError {
-            status: 502,
-            body: format!("deliverMessageEntry failed: {e}"),
-        })?;
+        .map_err(|e| relay_error(endpoint, "deliverMessageEntry", e))?;
     Ok(())
 }
 
@@ -756,10 +833,7 @@ pub async fn relay_get_outcome(
             &params,
         )
         .await
-        .map_err(|e| FederationError::RemoteError {
-            status: 502,
-            body: format!("getDirectRequestOutcome relay failed: {e}"),
-        })
+        .map_err(|e| relay_error(endpoint, "getDirectRequestOutcome", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -788,6 +862,28 @@ pub(crate) async fn resolve_remote_recipient_device_keys(
         ));
     }
     Ok(keys)
+}
+
+/// The key `key_id` names among `actor_did`'s PDS-authorized device keys, or
+/// `None` when its PDS answered without it (rotated after commit: the lease's
+/// retained proof decides). A failed lookup is returned typed, retryable while
+/// the PDS cannot answer, and never read as an empty key set.
+pub(super) async fn live_actor_key(
+    resolver: &DsResolver,
+    actor_did: &str,
+    key_id: &str,
+) -> Result<Option<Vec<u8>>, FederationError> {
+    Ok(resolver
+        .resolve_authorized_device_keys(actor_did)
+        .await?
+        .into_iter()
+        .find(|k| {
+            URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == key_id
+                || STANDARD.encode(k) == key_id
+                || crate::chat_protocol::validation::ed25519_key_id(k)
+                    .map(|id| id.as_str() == key_id)
+                    .unwrap_or(false)
+        }))
 }
 
 /// Stage remote recipient device packages using authority resolved before the transaction.
@@ -1043,46 +1139,6 @@ pub async fn stage_remote_recipient_devices(
             ));
         }
 
-        let existing_device: Option<(String, i64)> = sqlx::query_as(
-            "SELECT status, auth_generation FROM chat.devices WHERE user_did = $1 AND device_id = $2"
-        )
-        .bind(&b.owner_did)
-        .bind(b.owner_device_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-        if let Some((status, gen)) = existing_device {
-            if status != "active" {
-                return Err(FederationError::Forbidden(
-                    "recipient device is not active".into(),
-                ));
-            }
-            if b.auth_generation < gen {
-                return Err(FederationError::InvalidRequest(
-                    "device auth_generation rollback".into(),
-                ));
-            }
-        }
-
-        let existing_key: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT signing_public_key FROM chat.device_keys WHERE user_did = $1 AND device_id = $2 AND key_id = $3"
-        )
-        .bind(&b.owner_did)
-        .bind(b.owner_device_id)
-        .bind(&b.owner_key_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-        if let Some(existing_pk) = existing_key {
-            if existing_pk != pub_key_bytes {
-                return Err(FederationError::InvalidRequest(
-                    "device signing public key mismatch with existing key".into(),
-                ));
-            }
-        }
-
         if valid_pkg.key_package_ref() != expected_key_ref.as_slice() {
             return Err(FederationError::InvalidRequest(
                 "KeyPackage ref mismatch".into(),
@@ -1111,48 +1167,17 @@ pub async fn stage_remote_recipient_devices(
             ));
         }
 
-        // 6. Stage into coordinator DB
-        sqlx::query(
-            "INSERT INTO chat.principals (user_did, created_at) \
-             VALUES ($1, $2) \
-             ON CONFLICT (user_did) DO NOTHING",
+        // Use the same immutable activation history as group directory staging.
+        super::group_relay::stage_verified_remote_device(
+            tx,
+            &b.owner_did,
+            b.owner_device_id,
+            &b.owner_key_id,
+            b.auth_generation,
+            &pub_key_bytes,
+            now,
         )
-        .bind(&b.owner_did)
-        .bind(now)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-        sqlx::query(
-            "INSERT INTO chat.devices (user_did, device_id, device_name, status, dpop_jkt, auth_generation, capabilities, created_at, updated_at) \
-             VALUES ($1, $2, 'federated-device', 'active', NULL, $3, chat.protocol_capabilities(), $4, $4) \
-             ON CONFLICT (user_did, device_id) DO UPDATE SET \
-                auth_generation = GREATEST(chat.devices.auth_generation, EXCLUDED.auth_generation), \
-                updated_at = EXCLUDED.updated_at \
-             WHERE chat.devices.status = 'active'"
-        )
-        .bind(&b.owner_did)
-        .bind(b.owner_device_id)
-        .bind(b.auth_generation)
-        .bind(now)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-        sqlx::query(
-            "INSERT INTO chat.device_keys (user_did, device_id, key_id, signing_public_key, enrollment_auth_generation, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (user_did, device_id, key_id) DO NOTHING"
-        )
-        .bind(&b.owner_did)
-        .bind(b.owner_device_id)
-        .bind(&b.owner_key_id)
-        .bind(&pub_key_bytes)
-        .bind(b.auth_generation)
-        .bind(now)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
+        .await?;
 
         sqlx::query(
             "INSERT INTO chat.direct_request_capabilities (owner_did, owner_device_id, owner_key_id, auth_generation, revision, enabled, protocol_version, signed_publication, publication_digest, updated_at) \
@@ -1454,7 +1479,14 @@ pub async fn local_reserve_recipient_bootstrap(
            JOIN chat.direct_request_capabilities c ON c.owner_did = p.owner_did AND c.owner_device_id = p.owner_device_id \
            JOIN chat.direct_request_grants g ON g.key_package_ref = p.key_package_ref \
           WHERE l.request_id = $1 AND l.recipient_did = $2 \
-            AND l.status = 'active' AND l.expires_at > $3"
+            AND l.status = 'active' AND l.expires_at > $3 \
+            AND d.status='active' AND d.revoked_at IS NULL AND k.revoked_at IS NULL \
+            AND p.owner_auth_generation=d.auth_generation \
+            AND k.enrollment_auth_generation<=d.auth_generation \
+            AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer \
+                WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+                  AND newer.enrollment_auth_generation>k.enrollment_auth_generation \
+                  AND newer.enrollment_auth_generation<=d.auth_generation)"
     )
     .bind(input.request_id)
     .bind(&input.recipient_did)
@@ -1669,6 +1701,11 @@ pub async fn local_reserve_recipient_bootstrap(
             AND d.status = 'active' \
             AND k.revoked_at IS NULL \
             AND p.owner_auth_generation = d.auth_generation \
+            AND k.enrollment_auth_generation<=d.auth_generation \
+            AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer \
+                WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+                  AND newer.enrollment_auth_generation>k.enrollment_auth_generation \
+                  AND newer.enrollment_auth_generation<=d.auth_generation) \
             AND c.enabled AND c.protocol_version = '2' AND c.auth_generation = d.auth_generation AND c.owner_key_id = k.key_id \
             AND g.revoked_at IS NULL AND g.auth_generation = d.auth_generation \
             AND g.protocol_version = '2' AND g.profile = 'encryptedIntroduction1' AND g.expires_at >= $2 \
@@ -1844,8 +1881,14 @@ pub async fn ingest_remote_direct_request_delivery(
     pool: &DbPool,
     _sse: Option<&Arc<SseState>>,
     requester_ds: &str,
-    input: DeliverDirectRequestInput,
+    mut input: DeliverDirectRequestInput,
 ) -> Result<(), FederationError> {
+    input.entry = crate::chat_protocol::direct_request_transcript::normalize_read_presentation(
+        &serde_json::to_vec(&input.entry).map_err(FederationError::Json)?,
+        "directRequestEntry",
+        true,
+    )
+    .map_err(|_| FederationError::InvalidProof)?;
     let actor_did = input
         .entry
         .pointer("/signedRequest/body/actorDid")
@@ -2063,22 +2106,13 @@ pub async fn ingest_remote_direct_request_delivery(
                 "coordinator receipt signature verification failed: {e:?}"
             ))
         })?;
+    let i13_public_key = resolver
+        .resolve_i13_receipt_key(&coord.coordinator_did)
+        .await?;
 
-    // 3. Verify actor signature: live PDS or commit-time proof (M-F04: HTTP before tx)
-    let authorized_keys = resolver
-        .resolve_authorized_device_keys(actor_did)
-        .await
-        .unwrap_or_default();
-    let matching_key = authorized_keys
-        .iter()
-        .find(|k| {
-            URL_SAFE_NO_PAD.encode(Sha256::digest(k)) == key_id
-                || STANDARD.encode(k) == key_id
-                || crate::chat_protocol::validation::ed25519_key_id(k)
-                    .map(|id| id.as_str() == key_id)
-                    .unwrap_or(false)
-        })
-        .cloned();
+    // 3. Verify actor signature: live PDS or commit-time proof (M-F04: HTTP before tx).
+    // Only a PDS that answered without the key defers to the lease's retained proof.
+    let matching_key = live_actor_key(&resolver, actor_did, key_id).await?;
 
     let mut tx = pool
         .begin()
@@ -2143,6 +2177,14 @@ pub async fn ingest_remote_direct_request_delivery(
     .map_err(|e| {
         FederationError::InvalidRequest(format!("actor signature verification failed: {e:?}"))
     })?;
+    crate::chat_protocol::direct_request_transcript::verify_direct_request_opening_receipt(
+        &verified_pub,
+        &input.entry,
+        &verified_receipt,
+        &coord.coordinator_did,
+        &i13_public_key,
+    )
+    .map_err(|_| FederationError::InvalidProof)?;
     let publication_body = verified_pub.body();
     let signed_welcome = publication_body
         .pointer("/artifacts/welcome/opaqueWelcome")
@@ -2222,32 +2264,6 @@ pub async fn ingest_remote_direct_request_delivery(
         ));
     }
 
-    if let Some(entry_hash_b64) = verified_receipt
-        .body()
-        .pointer("/receipt/entryHash")
-        .and_then(|v| v.as_str())
-    {
-        let expected_hash = STANDARD
-            .decode(entry_hash_b64)
-            .map_err(|_| FederationError::InvalidRequest("invalid receipt entry hash".into()))?;
-        let mut untagged_entry = input.entry.clone();
-        untagged_entry
-            .as_object_mut()
-            .ok_or_else(|| FederationError::InvalidRequest("invalid canonical entry".into()))?
-            .remove("$type");
-        let untagged_bytes = serde_json::to_vec(&untagged_entry).map_err(FederationError::Json)?;
-        let actual_hash =
-            crate::chat_protocol::direct_request_transcript::direct_request_entry_hash(
-                &untagged_bytes,
-            )
-            .map_err(|_| FederationError::InvalidRequest("invalid canonical entry hash".into()))?;
-        if expected_hash != actual_hash {
-            return Err(FederationError::InvalidRequest(
-                "receipt entryHash does not match canonical entry".into(),
-            ));
-        }
-    }
-
     // 5. Validate deliveries and provenance
     if input.deliveries.is_empty() {
         return Err(FederationError::InvalidRequest(
@@ -2283,8 +2299,10 @@ pub async fn ingest_remote_direct_request_delivery(
     }
 
     // 6. Check existing inbox for idempotent replay
+    // Replays compare the digest frozen at insert, so a pruned opening (O7)
+    // still recognizes its duplicate and is never restored.
     let existing_inbox: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
-        "SELECT full_welcome_sha256, request_entry \
+        "SELECT full_welcome_sha256, request_entry_sha256 \
          FROM chat.direct_request_transport_inbox \
          WHERE request_id = $1",
     )
@@ -2294,8 +2312,9 @@ pub async fn ingest_remote_direct_request_delivery(
     .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     if !existing_inbox.is_empty() {
-        for (stored_hash, stored_entry) in &existing_inbox {
-            if stored_hash != &full_welcome_sha256 || stored_entry != &request_entry_bytes {
+        let request_entry_sha256 = Sha256::digest(&request_entry_bytes).to_vec();
+        for (stored_hash, stored_entry_sha256) in &existing_inbox {
+            if stored_hash != &full_welcome_sha256 || stored_entry_sha256 != &request_entry_sha256 {
                 return Err(FederationError::CommitConflict {
                     convo_id: input.conversation_id.to_string(),
                     current_epoch: 0,
@@ -2377,13 +2396,23 @@ pub async fn ingest_remote_direct_request_delivery(
         let rec_device_id = Uuid::parse_str(d["recipientDeviceId"].as_str().unwrap()).unwrap();
         let prov_bytes = serde_json::to_vec(&d["provenance"]).map_err(FederationError::Json)?;
 
+        // Explicit id: inventory session identity hashes delivery_id, so a DB-random
+        // default would break byte-identical sim replay (random in production too).
+        let delivery_id = crate::sim_hooks::mint_entry_uuid_v4(
+            b"chat.direct_request_transport_inbox",
+            &[
+                &input.request_id.as_bytes()[..],
+                &rec_device_id.as_bytes()[..],
+            ],
+        );
         sqlx::query(
             "INSERT INTO chat.direct_request_transport_inbox ( \
                 request_id, conversation_id, first_message_id, coordinator_did, \
                 sender_did, sender_device_id, recipient_did, recipient_device_id, \
                 request_entry, signed_publication, full_welcome, full_welcome_sha256, \
-                provenance, publication_receipt, import_until, status, created_at, updated_at \
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $16) \
+                provenance, publication_receipt, import_until, status, created_at, updated_at, \
+                delivery_id \
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $16, $17) \
             ON CONFLICT (request_id, recipient_device_id) DO NOTHING"
         )
         .bind(input.request_id)
@@ -2402,6 +2431,7 @@ pub async fn ingest_remote_direct_request_delivery(
         .bind(&publication_receipt_bytes)
         .bind(import_until)
         .bind(now)
+        .bind(delivery_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;
@@ -2440,39 +2470,21 @@ pub async fn ingest_remote_direct_request_delivery(
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or(input.request_id);
 
-    let res = sqlx::query(
-        "INSERT INTO chat.direct_request_transport_entries ( \
-            conversation_id, seq, entry_id, entry_bytes, created_at \
-         ) VALUES ($1, $2, $3, $4, $5) \
-         ON CONFLICT (conversation_id, seq) DO NOTHING",
+    let stored = crate::chat_protocol::repository::delivery::insert_transport_entry(
+        &mut tx,
+        input.conversation_id,
+        seq,
+        entry_id,
+        &request_entry_bytes,
+        now,
     )
-    .bind(input.conversation_id)
-    .bind(seq)
-    .bind(entry_id)
-    .bind(&request_entry_bytes)
-    .bind(now)
-    .execute(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-    if res.rows_affected() == 0 {
-        let existing: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT entry_bytes FROM chat.direct_request_transport_entries WHERE conversation_id = $1 AND seq = $2"
-        )
-        .bind(input.conversation_id)
-        .bind(seq)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-        if let Some(bytes) = existing {
-            if bytes != request_entry_bytes {
-                return Err(FederationError::CommitConflict {
-                    convo_id: input.conversation_id.to_string(),
-                    current_epoch: 0,
-                });
-            }
-        }
+    if stored == crate::chat_protocol::repository::delivery::TransportEntryInsert::Conflict {
+        return Err(FederationError::CommitConflict {
+            convo_id: input.conversation_id.to_string(),
+            current_epoch: 0,
+        });
     }
 
     tx.commit()
@@ -2601,9 +2613,12 @@ pub async fn ingest_remote_acceptance_entry(
         )));
     }
 
+    // The opening entry, or once its ciphertext was pruned its redacted entry (O7):
+    // the signed coordinates are the same in both.
     let intro_bytes: Vec<u8> = sqlx::query_scalar(
-        "SELECT entry_bytes FROM chat.direct_request_transport_entries \
-         WHERE conversation_id=$1 AND seq=1",
+        "SELECT COALESCE(request_entry, redacted_request_entry) \
+           FROM chat.direct_request_transport_inbox \
+          WHERE conversation_id=$1 ORDER BY delivery_id LIMIT 1",
     )
     .bind(conversation_id)
     .fetch_one(pool)
@@ -2649,39 +2664,21 @@ pub async fn ingest_remote_acceptance_entry(
         .map_err(|e| FederationError::InvalidRequest(format!("invalid entryId UUID: {e}")))?;
     let entry_bytes = serde_json::to_vec(entry).map_err(FederationError::Json)?;
 
-    let res = sqlx::query(
-        "INSERT INTO chat.direct_request_transport_entries ( \
-            conversation_id, seq, entry_id, entry_bytes, created_at \
-         ) VALUES ($1, $2, $3, $4, $5) \
-         ON CONFLICT (conversation_id, seq) DO NOTHING",
+    let stored = crate::chat_protocol::repository::delivery::insert_transport_entry(
+        &mut tx,
+        conversation_id,
+        seq,
+        entry_id,
+        &entry_bytes,
+        now,
     )
-    .bind(conversation_id)
-    .bind(seq)
-    .bind(entry_id)
-    .bind(&entry_bytes)
-    .bind(now)
-    .execute(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-    if res.rows_affected() == 0 {
-        let existing: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT entry_bytes FROM chat.direct_request_transport_entries WHERE conversation_id = $1 AND seq = $2"
-        )
-        .bind(conversation_id)
-        .bind(seq)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-        if let Some(bytes) = existing {
-            if bytes != entry_bytes {
-                return Err(FederationError::CommitConflict {
-                    convo_id: conversation_id.to_string(),
-                    current_epoch: 0,
-                });
-            }
-        }
+    if stored == crate::chat_protocol::repository::delivery::TransportEntryInsert::Conflict {
+        return Err(FederationError::CommitConflict {
+            convo_id: conversation_id.to_string(),
+            current_epoch: 0,
+        });
     }
 
     tx.commit()
@@ -2794,25 +2791,73 @@ pub async fn ingest_remote_message_entry(
         )));
     }
 
-    let predecessor_bytes: Vec<u8> = sqlx::query_scalar(
-        "SELECT COALESCE( \
-           (SELECT entry_bytes FROM chat.direct_request_transport_entries WHERE conversation_id=$1 AND seq=$2), \
-           (SELECT accepted_payload_bytes FROM chat.entries WHERE conversation_id=$1 AND seq=$2))"
+    // The sequencer's previous entry must already be stored here: a gap is
+    // retried. Control entries, such as `accountDeletedEntry`, carry no
+    // coordinates, so the prior is compared against the nearest preceding entry
+    // that does: a transition's `next`, or an application's `prior`, read from
+    // its immutable signed metadata once its ciphertext is pruned. Signed
+    // requests carry NUL escapes PostgreSQL JSON rejects, so both are parsed here.
+    let contiguous: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_transport_entries \
+                        WHERE conversation_id = $1 AND seq = $2) \
+             OR EXISTS(SELECT 1 FROM chat.entries WHERE conversation_id = $1 AND seq = $2)",
     )
     .bind(conversation_id)
     .bind(seq - 1)
     .fetch_one(pool)
     .await
-    .map_err(|_| FederationError::InvalidRequest("missing signed predecessor entry".into()))?;
-    let predecessor: Value =
-        serde_json::from_slice(&predecessor_bytes).map_err(FederationError::Json)?;
-    let prior = signed_message.pointer("/body/prior");
-    let prior_entry = if seq == 3 {
-        predecessor.pointer("/signedRequest/body/next")
-    } else {
-        predecessor.pointer("/signedRequest/body/prior")
+    .map_err(|e| FederationError::Storage(e.to_string()))?;
+    if !contiguous {
+        return Err(FederationError::PredecessorMissing {
+            reason: "missing signed predecessor entry".into(),
+        });
+    }
+    let mut before = seq;
+    let predecessor_prior = loop {
+        let stored: Option<(i64, Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT s.seq, COALESCE(t.entry_bytes, e.accepted_payload_bytes), \
+                    (to_jsonb(t)->>'application_metadata_bytes')::bytea \
+               FROM (SELECT max(seq) AS seq FROM ( \
+                       SELECT seq FROM chat.direct_request_transport_entries \
+                        WHERE conversation_id = $1 AND seq < $2 \
+                       UNION ALL \
+                       SELECT seq FROM chat.entries WHERE conversation_id = $1 AND seq < $2 \
+                     ) earlier) s \
+               LEFT JOIN chat.direct_request_transport_entries t \
+                 ON t.conversation_id = $1 AND t.seq = s.seq \
+               LEFT JOIN chat.entries e ON e.conversation_id = $1 AND e.seq = s.seq \
+              WHERE s.seq IS NOT NULL",
+        )
+        .bind(conversation_id)
+        .bind(before)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
+        let Some((at, payload, metadata)) = stored else {
+            break None;
+        };
+        let coordinate = match (metadata, payload) {
+            (Some(metadata), _) => serde_json::from_slice::<Value>(&metadata)
+                .map_err(FederationError::Json)?
+                .pointer("/body/prior")
+                .cloned(),
+            (None, Some(payload)) => {
+                let stored: Value =
+                    serde_json::from_slice(&payload).map_err(FederationError::Json)?;
+                stored
+                    .pointer("/signedRequest/body/next")
+                    .or_else(|| stored.pointer("/signedRequest/body/prior"))
+                    .cloned()
+            }
+            (None, None) => None,
+        };
+        if coordinate.is_some() {
+            break coordinate;
+        }
+        before = at;
     };
-    if prior.is_none() || prior != prior_entry {
+    let prior = signed_message.pointer("/body/prior");
+    if prior.is_none() || prior != predecessor_prior.as_ref() {
         return Err(FederationError::InvalidRequest(
             "message coordinates differ from retained predecessor".into(),
         ));
@@ -2834,39 +2879,21 @@ pub async fn ingest_remote_message_entry(
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    let res = sqlx::query(
-        "INSERT INTO chat.direct_request_transport_entries ( \
-            conversation_id, seq, entry_id, entry_bytes, created_at \
-         ) VALUES ($1, $2, $3, $4, $5) \
-         ON CONFLICT (conversation_id, seq) DO NOTHING",
+    let stored = crate::chat_protocol::repository::delivery::insert_transport_entry(
+        &mut tx,
+        conversation_id,
+        seq,
+        entry_id,
+        &entry_bytes,
+        crate::sim_hooks::current_utc(),
     )
-    .bind(conversation_id)
-    .bind(seq)
-    .bind(entry_id)
-    .bind(&entry_bytes)
-    .bind(crate::sim_hooks::current_utc())
-    .execute(&mut *tx)
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-    if res.rows_affected() == 0 {
-        let existing: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT entry_bytes FROM chat.direct_request_transport_entries WHERE conversation_id = $1 AND seq = $2"
-        )
-        .bind(conversation_id)
-        .bind(seq)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-        if let Some(bytes) = existing {
-            if bytes != entry_bytes {
-                return Err(FederationError::CommitConflict {
-                    convo_id: conversation_id.to_string(),
-                    current_epoch: 0,
-                });
-            }
-        }
+    if stored == crate::chat_protocol::repository::delivery::TransportEntryInsert::Conflict {
+        return Err(FederationError::CommitConflict {
+            convo_id: conversation_id.to_string(),
+            current_epoch: 0,
+        });
     }
 
     tx.commit()
@@ -3062,27 +3089,13 @@ pub async fn coordinator_prepare_direct_request(
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    // Acquire transaction advisory lock for the unordered participant pair
-    if let Err(e) = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+    // Acquire transaction advisory lock for the unordered participant pair. A
+    // database failure decides nothing: any reservation stays for the identical retry.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(&pair_lock_key)
         .execute(&mut *tx)
         .await
-    {
-        tx.rollback()
-            .await
-            .map_err(|error| FederationError::Storage(error.to_string()))?;
-        if reserved_remote_devices.is_some() {
-            let _ = release_remote_recipient_bootstrap(
-                pool,
-                &coord.recipient_home.endpoint,
-                &coord.recipient_home.did,
-                request_id,
-                recipient_did,
-            )
-            .await;
-        }
-        return Err(FederationError::Storage(e.to_string()));
-    }
+        .map_err(|e| FederationError::Storage(e.to_string()))?;
 
     if let Some(conflict) = check_pair_owner_fence(
         &mut tx,
@@ -3148,10 +3161,13 @@ pub async fn coordinator_prepare_direct_request(
                 signer,
                 runtime.relationship_authority().as_ref(),
                 now,
+                None,
             )
             .await
+            // A source that could not answer now, or this database, decided
+            // nothing; only a refusal is the definitive conflict.
             .map_err(|error| FederationError::RemoteError {
-                status: 409,
+                status: if error.is_transient() { 503 } else { 409 },
                 body: format!("prepare replay rejected: {error:?}"),
             })?;
         let rejected = matches!(&result,
@@ -3185,124 +3201,32 @@ pub async fn coordinator_prepare_direct_request(
     }
 
     if let Some((device_id, ref key_id, auth_gen, ref pub_key)) = verified_sender_key {
-        let existing_device: Option<(String, i64)> = sqlx::query_as(
-            "SELECT status, auth_generation FROM chat.devices WHERE user_did = $1 AND device_id = $2"
+        if let Err(error) = super::group_relay::stage_verified_remote_device(
+            &mut tx,
+            actor_did,
+            device_id,
+            key_id.as_str(),
+            auth_gen,
+            pub_key,
+            now,
         )
-        .bind(actor_did)
-        .bind(device_id)
-        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-        if let Some((status, gen)) = existing_device {
-            if status != "active" {
-                tx.rollback()
-                    .await
-                    .map_err(|error| FederationError::Storage(error.to_string()))?;
-                if reserved_remote_devices.is_some() {
-                    let _ = release_remote_recipient_bootstrap(
-                        pool,
-                        &coord.recipient_home.endpoint,
-                        &coord.recipient_home.did,
-                        request_id,
-                        recipient_did,
-                    )
-                    .await;
-                }
-                return Err(FederationError::Forbidden(
-                    "sender device is not active".into(),
-                ));
+        {
+            tx.rollback()
+                .await
+                .map_err(|error| FederationError::Storage(error.to_string()))?;
+            if reserved_remote_devices.is_some() {
+                let _ = release_remote_recipient_bootstrap(
+                    pool,
+                    &coord.recipient_home.endpoint,
+                    &coord.recipient_home.did,
+                    request_id,
+                    recipient_did,
+                )
+                .await;
             }
-            if auth_gen < gen {
-                tx.rollback()
-                    .await
-                    .map_err(|error| FederationError::Storage(error.to_string()))?;
-                if reserved_remote_devices.is_some() {
-                    let _ = release_remote_recipient_bootstrap(
-                        pool,
-                        &coord.recipient_home.endpoint,
-                        &coord.recipient_home.did,
-                        request_id,
-                        recipient_did,
-                    )
-                    .await;
-                }
-                return Err(FederationError::InvalidRequest(
-                    "sender device auth_generation rollback".into(),
-                ));
-            }
+            return Err(error);
         }
-
-        let existing_key: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT signing_public_key FROM chat.device_keys WHERE user_did = $1 AND device_id = $2 AND key_id = $3"
-        )
-        .bind(actor_did)
-        .bind(device_id)
-        .bind(key_id.as_str())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-        if let Some(existing_pk) = existing_key {
-            if &existing_pk != pub_key {
-                tx.rollback()
-                    .await
-                    .map_err(|error| FederationError::Storage(error.to_string()))?;
-                if reserved_remote_devices.is_some() {
-                    let _ = release_remote_recipient_bootstrap(
-                        pool,
-                        &coord.recipient_home.endpoint,
-                        &coord.recipient_home.did,
-                        request_id,
-                        recipient_did,
-                    )
-                    .await;
-                }
-                return Err(FederationError::InvalidRequest(
-                    "sender signing key mismatch with existing coordinator key".into(),
-                ));
-            }
-        }
-
-        sqlx::query(
-            "INSERT INTO chat.principals (user_did, created_at) VALUES ($1, $2) ON CONFLICT (user_did) DO NOTHING"
-        )
-        .bind(actor_did)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-        sqlx::query(
-            "INSERT INTO chat.devices (user_did, device_id, device_name, status, dpop_jkt, auth_generation, capabilities, created_at, updated_at) \
-             VALUES ($1, $2, 'federated-sender', 'active', NULL, $3, chat.protocol_capabilities(), $4, $4) \
-             ON CONFLICT (user_did, device_id) DO UPDATE SET \
-                auth_generation = GREATEST(chat.devices.auth_generation, EXCLUDED.auth_generation), \
-                updated_at = EXCLUDED.updated_at \
-             WHERE chat.devices.status = 'active'"
-        )
-        .bind(actor_did)
-        .bind(device_id)
-        .bind(auth_gen)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-        sqlx::query(
-            "INSERT INTO chat.device_keys (user_did, device_id, key_id, signing_public_key, enrollment_auth_generation, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (user_did, device_id, key_id) DO NOTHING"
-        )
-        .bind(actor_did)
-        .bind(device_id)
-        .bind(key_id.as_str())
-        .bind(pub_key)
-        .bind(auth_gen)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FederationError::Storage(e.to_string()))?;
     }
 
     let signer = runtime
@@ -3349,6 +3273,7 @@ pub async fn coordinator_prepare_direct_request(
             signer,
             runtime.relationship_authority().as_ref(),
             now,
+            None,
         )
         .await
         {
@@ -3357,7 +3282,11 @@ pub async fn coordinator_prepare_direct_request(
                 tx.rollback()
                     .await
                     .map_err(|error| FederationError::Storage(error.to_string()))?;
-                if reserved_remote_devices.is_some() {
+                // An unavailable source or this database decided nothing: the
+                // reservation stays for the identical retry, and the sender home
+                // reports the 503 as retryable.
+                let transient = e.is_transient();
+                if reserved_remote_devices.is_some() && !transient {
                     release_remote_recipient_bootstrap(
                         pool,
                         &coord.recipient_home.endpoint,
@@ -3368,7 +3297,7 @@ pub async fn coordinator_prepare_direct_request(
                     .await?;
                 }
                 return Err(FederationError::RemoteError {
-                    status: 400,
+                    status: if transient { 503 } else { 400 },
                     body: format!("prepare_direct_request error: {e:?}"),
                 });
             }
@@ -3582,7 +3511,7 @@ pub async fn coordinator_publish_direct_request(
         )
         .await
         .map_err(|e| FederationError::RemoteError {
-            status: 400,
+            status: if e.is_transient() { 503 } else { 400 },
             body: format!("prepare_publication error: {e:?}"),
         })?;
 
@@ -3593,11 +3522,12 @@ pub async fn coordinator_publish_direct_request(
                 &mut tx,
                 *ready,
                 signer,
+                runtime.i13_receipt_signer(),
                 runtime.relationship_authority().as_ref(),
             )
             .await
             .map_err(|e| FederationError::RemoteError {
-                status: 400,
+                status: if e.is_transient() { 503 } else { 400 },
                 body: format!("execute_publication error: {e:?}"),
             })?
         }
@@ -3606,16 +3536,34 @@ pub async fn coordinator_publish_direct_request(
     let mut receipt: Value =
         serde_json::from_slice(&receipt_bytes).map_err(FederationError::Json)?;
     receipt["$type"] = json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
+    if receipt
+        .pointer("/body/receipt/$type")
+        .and_then(Value::as_str)
+        != Some("blue.catbird.chat.defs#directRequestPublishedReceipt")
+    {
+        tx.commit()
+            .await
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        return Ok(json!({"outcome":receipt}));
+    }
 
-    let entry_row: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT accepted_payload_bytes FROM chat.entries WHERE transition_id = $1",
-    )
-    .bind(request_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| FederationError::Storage(e.to_string()))?;
-
-    let entry_val: Option<Value> = entry_row.and_then(|b| serde_json::from_slice(&b).ok());
+    let (entry_val, opening_pruned) =
+        crate::chat_protocol::repository::direct_request_opening::coordinator_opening_response(
+            &mut *tx, request_id,
+        )
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?
+        .ok_or_else(|| {
+            FederationError::Invariant("published request lacks opening entry".into())
+        })?;
+    if opening_pruned {
+        // A duplicate publish after the opening's ciphertext was pruned (O7) is
+        // recognized by its digest-bound receipt; the opening is never delivered again.
+        tx.commit()
+            .await
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+        return Ok(json!({"outcome":receipt,"entry":entry_val}));
+    }
 
     let deliveries = signed_req
         .pointer("/body/artifacts/welcome/deliveries")
@@ -3634,20 +3582,16 @@ pub async fn coordinator_publish_direct_request(
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    let (full_welcome_b64, signed_pub_val) = if let Some((welcome, signed_pub)) = pub_row {
-        (
-            Some(STANDARD.encode(&welcome)),
-            serde_json::from_slice(&signed_pub).ok(),
-        )
-    } else {
-        (None, None)
-    };
+    let (welcome, signed_pub) = pub_row
+        .ok_or_else(|| FederationError::Invariant("published request lacks artifacts".into()))?;
+    let full_welcome_b64 = Some(STANDARD.encode(&welcome));
+    let signed_pub_val = Some(serde_json::from_slice(&signed_pub).map_err(FederationError::Json)?);
 
     let deliver_input = DeliverDirectRequestInput {
         request_id,
         conversation_id,
         first_message_id,
-        entry: entry_val.clone().unwrap_or(json!({})),
+        entry: entry_val.clone(),
         deliveries,
         publication_receipt: receipt.clone(),
         coordinator_did: coord.coordinator_did.clone(),
@@ -3669,7 +3613,8 @@ pub async fn coordinator_publish_direct_request(
             &deliver_input.conversation_id.to_string(),
             "",
         )
-        .await?;
+        .await
+        .map_err(queue_full_unavailable)?;
     }
 
     tx.commit()
@@ -3688,11 +3633,7 @@ pub async fn coordinator_publish_direct_request(
         }
     }
 
-    let mut response = json!({ "outcome": receipt });
-    if let Some(entry) = entry_val {
-        response["entry"] = entry;
-    }
-    Ok(response)
+    Ok(json!({"outcome":receipt,"entry":entry_val}))
 }
 
 /// Coordinator execution for acceptDirectRequest relayed from recipient home DS.
@@ -3780,9 +3721,23 @@ pub async fn coordinator_accept_direct_request(
         now,
     )
     .await
-    .map_err(|e| FederationError::RemoteError {
-        status: 400,
-        body: format!("accept_direct_request error: {e:?}"),
+    .map_err(|error| {
+        use crate::chat_protocol::repository::{
+            acceptance::DirectAcceptanceError as E, direct_request_retention::RetentionError as R,
+        };
+        match error {
+            E::Database(error) | E::Retention(R::Database(error)) => {
+                FederationError::Database(error)
+            }
+            E::PolicySourceUnavailable => FederationError::RelationshipPolicyUnavailable {
+                reason: "acceptance relationship source could not answer".into(),
+            },
+            E::Blocked => FederationError::BlockedRelationship,
+            error => FederationError::RemoteError {
+                status: 400,
+                body: format!("accept_direct_request error: {error:?}"),
+            },
+        }
     })?;
 
     let entry_row: Option<Vec<u8>> = sqlx::query_scalar(
@@ -3823,7 +3778,8 @@ pub async fn coordinator_accept_direct_request(
             &conversation_id.to_string(),
             "",
         )
-        .await?;
+        .await
+        .map_err(queue_full_unavailable)?;
     }
 
     tx.commit()
@@ -3946,29 +3902,53 @@ pub async fn coordinator_handle_message(
         peer.unwrap_or_default()
     };
 
-    // 3. Authenticate that requester_ds is the authoritative home DS of actor_did
-    let coord = resolve_pair_coordinator(pool, actor_did, &peer_did).await?;
-    if !coord.is_coordinator {
-        return Err(FederationError::Forbidden(
-            "Local node is not coordinator".into(),
-        ));
-    }
-    if canonical_did(&coord.sender_home.did) != canonical_did(requester_ds) {
+    // 3. Authenticate that requester_ds is the authoritative home DS of actor_did.
+    // A peer deleted here is owed nothing and its declaration is typically gone:
+    // sequencing the pair's conversation is then this DS's evidence that it
+    // coordinates the pair, and only the actor's declared home is resolved.
+    let coord = if account_deleted_in(pool, conversation_id, &peer_did)
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?
+    {
+        None
+    } else {
+        let coord = resolve_pair_coordinator(pool, actor_did, &peer_did).await?;
+        if !coord.is_coordinator {
+            return Err(FederationError::Forbidden(
+                "Local node is not coordinator".into(),
+            ));
+        }
+        Some(coord)
+    };
+    let sender_home = match &coord {
+        Some(coord) => coord.sender_home.did.clone(),
+        None => {
+            pair_resolver(pool)
+                .resolve_authoritative_ds(actor_did)
+                .await?
+                .did
+        }
+    };
+    if canonical_did(&sender_home) != canonical_did(requester_ds) {
         return Err(FederationError::AuthFailed {
             reason: format!(
-                "Requester {requester_ds} is not actor {actor_did} home DS {}",
-                coord.sender_home.did
+                "Requester {requester_ds} is not actor {actor_did} home DS {sender_home}"
             ),
         });
     }
 
     // 4. Verify active device key on coordinator & mutation signature
     let key_row: Option<(Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT k.signing_public_key, k.enrollment_auth_generation \
+        "SELECT k.signing_public_key, d.auth_generation \
          FROM chat.device_keys k \
          JOIN chat.devices d ON d.user_did = k.user_did AND d.device_id = k.device_id \
          WHERE k.user_did = $1 AND k.device_id = $2 AND k.key_id = $3 \
-           AND k.revoked_at IS NULL AND d.status = 'active' AND d.auth_generation = k.enrollment_auth_generation"
+           AND k.revoked_at IS NULL AND d.status='active' AND d.revoked_at IS NULL \
+           AND k.enrollment_auth_generation<=d.auth_generation \
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer \
+                WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+                  AND newer.enrollment_auth_generation>k.enrollment_auth_generation \
+                  AND newer.enrollment_auth_generation<=d.auth_generation)",
     )
     .bind(actor_did)
     .bind(actor_device_id)
@@ -3992,6 +3972,11 @@ pub async fn coordinator_handle_message(
     .map_err(|e| {
         FederationError::InvalidRequest(format!("mutation signature verification failed: {e:?}"))
     })?;
+    if verified.auth_generation() != auth_generation as u64 {
+        return Err(FederationError::Forbidden(
+            "stale authentication generation".into(),
+        ));
+    }
 
     // 5. Validate application message and AAD from projection
     let projection = match verified.projection() {
@@ -4088,7 +4073,18 @@ pub async fn coordinator_handle_message(
     .await
     .map_err(|e| FederationError::Storage(e.to_string()))?
     .ok_or_else(|| FederationError::NotFound("conversation head not found".into()))?;
-    let existing_send: Option<(String, Option<i64>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    // A deleted peer's home gets none of this conversation's later entries.
+    let deliver_to_peer = !peer_did.is_empty()
+        && peer_did != actor_did
+        && !account_deleted_in(&mut *tx, conversation_id, &peer_did)
+            .await
+            .map_err(|e| FederationError::Storage(e.to_string()))?;
+    let self_did = crate::identity::service_did();
+    let peer_home = coord
+        .as_ref()
+        .map(|coord| &coord.recipient_home)
+        .filter(|home| deliver_to_peer && canonical_did(&home.did) != canonical_did(&self_did));
+    let existing_send: Option<(String, Option<i64>, Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
         "SELECT status, accepted_entry_seq, request_digest, outcome_bytes \
          FROM chat.message_sends \
          WHERE conversation_id = $1 AND message_id = $2",
@@ -4107,6 +4103,25 @@ pub async fn coordinator_handle_message(
             });
         }
         if status == "accepted" {
+            // A pruned send (O7) replays as its entry exactly as `getEntries`
+            // serves it, `payloadPruned`: the accepted outcome, with no
+            // ciphertext left to redeliver.
+            let Some(outcome_bytes) = outcome_bytes else {
+                let entry = crate::chat_protocol::repository::entry_read::sent_application_entry(
+                    &mut tx,
+                    conversation_id,
+                    message_id,
+                    &stored_digest,
+                )
+                .await
+                .map_err(|e| FederationError::Storage(e.to_string()))?
+                .ok_or_else(|| {
+                    FederationError::Invariant("accepted message entry is missing".into())
+                })?;
+                return Ok(
+                    crate::chat_protocol::repository::entry_read::accepted_send_outcome(entry),
+                );
+            };
             let mut resp_val: Value =
                 serde_json::from_slice(&outcome_bytes).map_err(FederationError::Json)?;
             tx.commit()
@@ -4119,19 +4134,18 @@ pub async fn coordinator_handle_message(
             })?;
             response_entry["$type"] = json!("blue.catbird.chat.defs#applicationEntry");
             let response_entry = response_entry.clone();
-            let self_did = crate::identity::service_did();
-            if !peer_did.is_empty() && peer_did != actor_did {
-                let (target_endpoint, target_did) = (
-                    coord.recipient_home.endpoint.as_str(),
-                    coord.recipient_home.did.as_str(),
-                );
-                if canonical_did(target_did) != canonical_did(&self_did) {
-                    let deliver_payload = DeliverMessageEntryInput {
-                        conversation_id,
-                        entry: response_entry,
-                    };
-                    deliver_message_entry_to_peer(target_endpoint, target_did, deliver_payload)
-                        .await?;
+            if let Some(home) = peer_home {
+                let deliver_payload = DeliverMessageEntryInput {
+                    conversation_id,
+                    entry: response_entry,
+                };
+                // The send is committed and its delivery queued: a failed
+                // redrive leaves that queue to deliver it, and the replay
+                // still answers the accepted send.
+                if let Err(error) =
+                    deliver_message_entry_to_peer(&home.endpoint, &home.did, deliver_payload).await
+                {
+                    warn!(%error, %conversation_id, "replayed send's delivery redrive failed");
                 }
             }
 
@@ -4294,7 +4308,7 @@ pub async fn coordinator_handle_message(
     head_binding.update(head_state_version.to_be_bytes());
     head_binding.update(next_seq.to_be_bytes());
     head_binding.update(&head_gch);
-    crate::chat_protocol::repository::relationship::verify_federated_send_policy(
+    let allowed = crate::chat_protocol::repository::relationship::verify_federated_send_policy(
         &mut tx,
         actor_did,
         &peer_did,
@@ -4303,12 +4317,23 @@ pub async fn coordinator_handle_message(
         runtime.relationship_authority().as_ref(),
     )
     .await
-    .map_err(|error| match error {
-        crate::chat_protocol::repository::relationship::RelationshipConsumptionError::PolicyDenied =>
-            FederationError::Forbidden("blocked by relationship policy".into()),
-        crate::chat_protocol::repository::relationship::RelationshipConsumptionError::InvalidWitness =>
-            FederationError::InvalidProof,
+    .map_err(|error| {
+        use crate::chat_protocol::repository::relationship::RelationshipRepositoryError as R;
+        match error {
+            R::Database(error) => FederationError::Database(error),
+            // A source that could not answer now, or this DS's relationship
+            // authority unconfigured, decided nothing.
+            error @ (R::Unavailable | R::InvalidAuthorityConfiguration(_)) => {
+                FederationError::RelationshipPolicyUnavailable {
+                    reason: format!("federated send policy: {error:?}"),
+                }
+            }
+            R::InvalidProjection => FederationError::InvalidProof,
+        }
     })?;
+    if !allowed {
+        return Err(FederationError::BlockedRelationship);
+    }
 
     // 11. Build verified entry and commit send
     let trusted_instant = crate::chat_protocol::validation::TrustedRequestInstant::capture()
@@ -4486,30 +4511,27 @@ pub async fn coordinator_handle_message(
         response_entry["sequencerReceipt"] = rcpt.clone();
     }
 
-    let self_did = crate::identity::service_did();
     let deliver_payload = DeliverMessageEntryInput {
         conversation_id,
         entry: response_entry.clone(),
     };
     let queue_id = format!("msg-delivery-{conversation_id}-{seq}");
 
-    if !peer_did.is_empty() && peer_did != actor_did {
-        if canonical_did(&coord.recipient_home.did) != canonical_did(&self_did) {
-            let payload_bytes =
-                serde_json::to_vec(&deliver_payload).map_err(FederationError::Json)?;
-            crate::federation::queue::enqueue_c33_in_tx(
-                pool,
-                &mut tx,
-                &queue_id,
-                &coord.recipient_home.did,
-                &coord.recipient_home.endpoint,
-                "blue.catbird.mlsDS.deliverMessageEntry",
-                &payload_bytes,
-                &conversation_id.to_string(),
-                "",
-            )
-            .await?;
-        }
+    if let Some(home) = peer_home {
+        let payload_bytes = serde_json::to_vec(&deliver_payload).map_err(FederationError::Json)?;
+        crate::federation::queue::enqueue_c33_in_tx(
+            pool,
+            &mut tx,
+            &queue_id,
+            &home.did,
+            &home.endpoint,
+            "blue.catbird.mlsDS.deliverMessageEntry",
+            &payload_bytes,
+            &conversation_id.to_string(),
+            "",
+        )
+        .await
+        .map_err(queue_full_unavailable)?;
     }
 
     tx.commit()
@@ -4561,17 +4583,11 @@ pub async fn coordinator_handle_message(
         }
     }
 
-    if !peer_did.is_empty() && peer_did != actor_did {
-        if canonical_did(&coord.recipient_home.did) != canonical_did(&self_did) {
-            if let Ok(()) = deliver_message_entry_to_peer(
-                &coord.recipient_home.endpoint,
-                &coord.recipient_home.did,
-                deliver_payload,
-            )
-            .await
-            {
-                let _ = crate::federation::queue::mark_delivered_by_id(pool, &queue_id).await;
-            }
+    if let Some(home) = peer_home {
+        if let Ok(()) =
+            deliver_message_entry_to_peer(&home.endpoint, &home.did, deliver_payload).await
+        {
+            let _ = crate::federation::queue::mark_delivered_by_id(pool, &queue_id).await;
         }
     }
     let mut out = json!({ "entry": response_entry });
@@ -4674,18 +4690,22 @@ pub async fn coordinator_get_outcome(
             std::env::var("DEFAULT_DS_ENDPOINT").ok(),
             3600,
         );
-        let actor_home = resolver.resolve_authoritative_ds(&actor_did).await.ok();
-        let rec_home = resolver.resolve_authoritative_ds(&recipient_did).await.ok();
-        let home_matches = actor_home
-            .as_ref()
-            .is_some_and(|h| canonical_did(&h.did) == canonical_did(requester_ds))
-            || rec_home
-                .as_ref()
-                .is_some_and(|h| canonical_did(&h.did) == canonical_did(requester_ds));
+        // Either party's declared home may read it. A home that could not be
+        // resolved now, or this database, decided nothing: that failure is the
+        // answer, never an authentication refusal.
+        let mut home_matches = false;
+        let mut undecided = None;
+        for did in [&actor_did, &recipient_did] {
+            match resolver.resolve_authoritative_ds(did).await {
+                Ok(home) => home_matches |= canonical_did(&home.did) == canonical_did(requester_ds),
+                Err(error) if error.is_retryable() => undecided = Some(error),
+                Err(_) => {}
+            }
+        }
         if !home_matches {
-            return Err(FederationError::AuthFailed {
+            return Err(undecided.unwrap_or_else(|| FederationError::AuthFailed {
                 reason: format!("Requester {requester_ds} is not authorized for outcome of request {request_id}"),
-            });
+            }));
         }
     }
 
@@ -4718,23 +4738,23 @@ pub async fn coordinator_get_outcome(
         )
         .await
         .map_err(|e| FederationError::RemoteError {
-            status: 400,
+            status: if e.is_transient() { 503 } else { 400 },
             body: format!("get_direct_request_outcome error: {e:?}"),
         })?;
 
     let outcome_val = match result {
         crate::chat_protocol::repository::direct_request_preparation::DirectRequestResult::Keys(bytes) => {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+            serde_json::from_slice(&bytes).map_err(FederationError::Json)?
         }
         crate::chat_protocol::repository::direct_request_preparation::DirectRequestResult::Unknown(id) => {
             json!({"$type":"blue.catbird.chat.defs#directRequestUnknownOutcome","requestId":id.to_string()})
         }
         crate::chat_protocol::repository::direct_request_preparation::DirectRequestResult::Prepared(bytes) => {
-            let prep: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            let prep: Value = serde_json::from_slice(&bytes).map_err(FederationError::Json)?;
             json!({"$type":"blue.catbird.chat.defs#directRequestPreparedOutcome","preparation":prep})
         }
         crate::chat_protocol::repository::direct_request_preparation::DirectRequestResult::Terminal(bytes) => {
-            let mut val: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            let mut val: Value = serde_json::from_slice(&bytes).map_err(FederationError::Json)?;
             val["$type"] = json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
             val
         }
@@ -4743,16 +4763,27 @@ pub async fn coordinator_get_outcome(
         .await
         .map_err(|e| FederationError::Storage(e.to_string()))?;
 
-    let entry_row: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT accepted_payload_bytes FROM chat.entries WHERE transition_id = $1",
-    )
-    .bind(request_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-
-    let entry_val: Option<Value> = entry_row.and_then(|b| serde_json::from_slice(&b).ok());
+    let entry_val =
+        crate::chat_protocol::repository::direct_request_opening::coordinator_opening_response(
+            &mut *pool
+                .acquire()
+                .await
+                .map_err(|e| FederationError::Storage(e.to_string()))?,
+            request_id,
+        )
+        .await
+        .map_err(|e| FederationError::Storage(e.to_string()))?
+        .map(|(entry, _)| entry);
+    if outcome_val
+        .pointer("/body/receipt/$type")
+        .and_then(Value::as_str)
+        == Some("blue.catbird.chat.defs#directRequestPublishedReceipt")
+        && entry_val.is_none()
+    {
+        return Err(FederationError::Invariant(
+            "published outcome lacks opening evidence".into(),
+        ));
+    }
     let mut resp = json!({ "outcome": outcome_val });
     if let Some(entry) = entry_val {
         resp["entry"] = entry;

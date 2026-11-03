@@ -276,13 +276,14 @@ pub fn direct_request_application_aad(
     context_hash: &[u8; 32],
     coordinates_json: &[u8],
     message_id: &str,
+    archive_commitment: &[u8; 32],
 ) -> Result<Vec<u8>> {
     project(coordinates_json, "conversationCoordinates", false)?;
     let coordinate: Value = serde_json::from_slice(coordinates_json).map_err(error)?;
     aad(
         b"CATBIRD-DIRECT-REQUEST-APPLICATION-AAD\0",
         "directRequestApplicationAad",
-        json!({"protocolVersion":"2","contextHash":STANDARD.encode(context_hash),"coordinates":coordinate,"messageId":message_id}),
+        json!({"protocolVersion":"2","contextHash":STANDARD.encode(context_hash),"coordinates":coordinate,"messageId":message_id,"archiveCommitment":STANDARD.encode(archive_commitment)}),
     )
 }
 fn aad(domain: &[u8], name: &str, value: Value) -> Result<Vec<u8>> {
@@ -486,6 +487,182 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn c33_opening_requires_authentic_i13_and_binds_canonical_archive_commitment() {
+        use ed25519_dalek::Signer;
+        let fixture = vectors();
+        let mut body = fixture["signed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "Publish")
+            .unwrap()["body"]
+            .clone();
+        let actor = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        // The schema-shape vector's keyId is the thumbprint of an all-zero
+        // placeholder key; bind it to the key signing here, as every signing
+        // test over these vectors does.
+        body["keyId"] =
+            Value::String(URL_SAFE_NO_PAD.encode(Sha256::digest(actor.verifying_key().as_bytes())));
+        let bytes = direct_request_signing_bytes(
+            DirectRequestKind::Publish,
+            &serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        let publication =
+            json!({"body":body,"signature":STANDARD.encode(actor.sign(&bytes).to_bytes())});
+        let verified = verify_signed_request(
+            DirectRequestKind::Publish,
+            &serde_json::to_vec(&publication).unwrap(),
+            actor.verifying_key().as_bytes(),
+        )
+        .unwrap();
+        let entry = signed_opening_entry_for_test(&publication, 1, "2026-09-19T12:00:00.000Z");
+        let golden = fixture["signed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["outcome"] == "Published")
+            .unwrap();
+        assert_eq!(
+            entry["sequencerReceipt"],
+            golden["body"]["receipt"]["sequencerReceipt"]
+        );
+        let nonce: [u8; 32] = STANDARD
+            .decode(
+                fixture["openingArchiveFixture"]["frameNonceBase64"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let payload = fixture["openingArchiveFixture"]["canonicalPayloadUtf8"]
+            .as_str()
+            .unwrap()
+            .as_bytes();
+        let commitment = labyrinth_protocol::receipt::compute_archive_commitment(&nonce, payload);
+        assert_eq!(body["archiveCommitment"], STANDARD.encode(commitment));
+        let mut changed_nonce = nonce;
+        changed_nonce[0] ^= 1;
+        assert_ne!(
+            commitment,
+            labyrinth_protocol::receipt::compute_archive_commitment(&changed_nonce, payload)
+        );
+        assert_ne!(
+            commitment,
+            labyrinth_protocol::receipt::compute_archive_commitment(&nonce, b"changed payload")
+        );
+        let receipt_key = STANDARD
+            .decode(
+                fixture["openingArchiveFixture"]["sequencerPublicKeyBase64"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let outcome_key = p256::ecdsa::SigningKey::from_slice(&[9; 32]).unwrap();
+        let outcome = verify_signed_request(
+            DirectRequestKind::Outcome,
+            &serde_json::to_vec(&entry["publicationReceipt"]).unwrap(),
+            outcome_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
+        )
+        .unwrap();
+        let authority = "did:web:chat.catbird.blue";
+        verify_direct_request_opening_receipt(&verified, &entry, &outcome, authority, &receipt_key)
+            .unwrap();
+        let mut presented = entry.clone();
+        present_read_presentation("directRequestEntry", &mut presented).unwrap();
+        verify_direct_request_opening_receipt(
+            &verified,
+            &presented,
+            &outcome,
+            authority,
+            &receipt_key,
+        )
+        .unwrap();
+        for field in ["sequencerReceipt", "publicationReceipt"] {
+            let mut changed = entry.clone();
+            changed.as_object_mut().unwrap().remove(field);
+            assert!(verify_direct_request_opening_receipt(
+                &verified,
+                &changed,
+                &outcome,
+                authority,
+                &receipt_key
+            )
+            .is_err());
+        }
+        for field in entry["sequencerReceipt"].as_object().unwrap().keys() {
+            let mut changed = entry.clone();
+            changed["sequencerReceipt"][field] = json!("tampered");
+            assert!(
+                verify_direct_request_opening_receipt(
+                    &verified,
+                    &changed,
+                    &outcome,
+                    authority,
+                    &receipt_key
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        // A genuine outcome signature must never substitute for the independent I13 signature.
+        let mut forged = entry.clone();
+        let mut signature = STANDARD
+            .decode(forged["sequencerReceipt"]["signature"].as_str().unwrap())
+            .unwrap();
+        signature[0] ^= 1;
+        forged["sequencerReceipt"]["signature"] = json!(STANDARD.encode(signature));
+        forged["publicationReceipt"]["body"]["receipt"]["sequencerReceipt"] =
+            forged["sequencerReceipt"].clone();
+        let bytes = direct_request_signing_bytes(
+            DirectRequestKind::Outcome,
+            &serde_json::to_vec(&forged["publicationReceipt"]["body"]).unwrap(),
+        )
+        .unwrap();
+        let signature: p256::ecdsa::Signature = outcome_key.sign(&bytes);
+        let signature = signature.normalize_s().unwrap_or(signature);
+        forged["publicationReceipt"]["signature"] = json!(STANDARD.encode(signature.to_bytes()));
+        let forged_outcome = verify_signed_request(
+            DirectRequestKind::Outcome,
+            &serde_json::to_vec(&forged["publicationReceipt"]).unwrap(),
+            outcome_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(verify_direct_request_opening_receipt(
+            &verified,
+            &forged,
+            &forged_outcome,
+            authority,
+            &receipt_key
+        )
+        .is_err());
+        let mut missing = body.clone();
+        missing.as_object_mut().unwrap().remove("archiveCommitment");
+        assert!(direct_request_signing_bytes(
+            DirectRequestKind::Publish,
+            &serde_json::to_vec(&missing).unwrap()
+        )
+        .is_err());
+        let mut missing = entry["publicationReceipt"]["body"].clone();
+        missing["receipt"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sequencerReceipt");
+        assert!(direct_request_signing_bytes(
+            DirectRequestKind::Outcome,
+            &serde_json::to_vec(&missing).unwrap()
+        )
+        .is_err());
     }
 }
 
@@ -924,6 +1101,168 @@ pub fn direct_request_entry_hash(raw_entry: &[u8]) -> Result<[u8; 32]> {
     Ok(Sha256::digest(bytes).into())
 }
 
+/// Verify the independent I13 proof and its exact sender-signed opening binding.
+/// The signed publication outcome also authenticates the receipt's generation.
+pub fn verify_direct_request_opening_receipt(
+    publication: &VerifiedDirectRequest,
+    entry: &Value,
+    outcome: &VerifiedDirectRequest,
+    sequencer_did: &str,
+    receipt_public_key: &[u8],
+) -> Result<()> {
+    if publication.kind() != DirectRequestKind::Publish
+        || outcome.kind() != DirectRequestKind::Outcome
+    {
+        return Err(error("opening proof kind"));
+    }
+    let entry = normalize_read_presentation(
+        &serde_json::to_vec(entry).map_err(error)?,
+        "directRequestEntry",
+        true,
+    )?;
+    let body = publication.body();
+    let published = &outcome.body()["receipt"];
+    let receipt = &entry["sequencerReceipt"];
+    let instant = chrono::DateTime::parse_from_rfc3339(
+        entry["receivedAt"]
+            .as_str()
+            .ok_or_else(|| error("opening receivedAt"))?,
+    )
+    .map_err(error)?;
+    if published["$type"] != "blue.catbird.chat.defs#directRequestPublishedReceipt"
+        || published["sequencerReceipt"] != *receipt
+        || entry["publicationReceipt"]["body"] != *outcome.body()
+        || entry["publicationReceipt"]["signature"] != STANDARD.encode(outcome.signature())
+        || published["preparationRequestDigest"] != body["preparationRequestDigest"]
+        || published["requestKind"] != "publish"
+        || published["coordinates"] != body["next"]
+        || published["requestId"] != body["requestId"]
+        || published["requestDigest"] != STANDARD.encode(publication.request_digest())
+        || published["conversationId"] != body["conversationId"]
+        || published["firstMessageId"] != body["firstMessageId"]
+        || published["actorDid"] != body["actorDid"]
+        || published["actorDeviceId"] != body["actorDeviceId"]
+        || published["actorKeyId"] != body["keyId"]
+        || published["authGeneration"] != body["authGeneration"]
+        || published["recordedAt"] != entry["receivedAt"]
+        || entry["conversationId"] != body["conversationId"]
+        || entry["entryId"] != body["firstMessageId"]
+        || entry["signedRequest"]["body"] != *publication.body()
+        || entry["signedRequest"]["signature"] != STANDARD.encode(publication.signature())
+        || receipt["conversationId"] != entry["conversationId"]
+        || receipt["entryId"] != entry["entryId"]
+        || receipt["seq"] != entry["seq"]
+        || receipt["groupId"] != body["next"]["groupId"]
+        || receipt["epoch"] != body["next"]["epoch"]
+        || receipt["generation"] != body["next"]["generation"]
+        || receipt["senderDid"] != body["actorDid"]
+        || receipt["senderDeviceId"] != body["actorDeviceId"]
+        || receipt["archiveCommitment"] != body["archiveCommitment"]
+        || receipt["issuedAtMs"].as_i64() != Some(instant.timestamp_millis())
+        || receipt["sequencerDid"].as_str() != Some(sequencer_did)
+        || outcome.body()["authorityDid"].as_str() != Some(sequencer_did)
+    {
+        return Err(error("opening sequencer receipt binding"));
+    }
+    let text = |field: &str| receipt[field].as_str().ok_or_else(|| error("receipt text"));
+    let binary = |field: &str| STANDARD.decode(text(field)?).map_err(error);
+    let number = |field: &str| {
+        receipt[field]
+            .as_u64()
+            .ok_or_else(|| error("receipt integer"))
+    };
+    let signed = labyrinth_protocol::receipt::SignedSequencerReceipt {
+        payload: labyrinth_protocol::receipt::SequencerReceiptPayload {
+            sequencer_did: text("sequencerDid")?.to_owned(),
+            conversation_id: text("conversationId")?.to_owned(),
+            group_id: binary("groupId")?,
+            epoch: number("epoch")?,
+            sender_device_did_url: format!("{}#{}", text("senderDid")?, text("senderDeviceId")?),
+            entry_id: text("entryId")?.to_owned(),
+            archive_commitment: binary("archiveCommitment")?
+                .try_into()
+                .map_err(|_| error("commitment length"))?,
+            seq: number("seq")?,
+            issued_at_ms: instant.timestamp_millis(),
+        },
+        key_id: text("kid")?.to_owned(),
+        signature: binary("signature")?
+            .try_into()
+            .map_err(|_| error("receipt signature length"))?,
+    };
+    let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(receipt_public_key).map_err(error)?;
+    labyrinth_protocol::receipt::verify_sequencer_receipt(&key, sequencer_did, &signed)
+        .map_err(error)
+}
+
+#[cfg(test)]
+pub(crate) fn signed_opening_entry_for_test(
+    publication: &Value,
+    seq: u64,
+    received_at: &str,
+) -> Value {
+    use p256::ecdsa::signature::Signer;
+    let body = &publication["body"];
+    let authority = "did:web:chat.catbird.blue";
+    let outcome_key = p256::ecdsa::SigningKey::from_slice(&[9; 32]).unwrap();
+    let i13_key = p256::ecdsa::SigningKey::from_slice(&[11; 32]).unwrap();
+    let group = STANDARD
+        .decode(body["next"]["groupId"].as_str().unwrap())
+        .unwrap();
+    let commitment: [u8; 32] = STANDARD
+        .decode(body["archiveCommitment"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let signed = labyrinth_protocol::receipt::sign_sequencer_receipt(
+        &i13_key,
+        &labyrinth_protocol::receipt::expected_receipt_key_id(authority),
+        &labyrinth_protocol::receipt::SequencerReceiptPayload {
+            sequencer_did: authority.into(),
+            conversation_id: body["conversationId"].as_str().unwrap().into(),
+            group_id: group,
+            epoch: body["next"]["epoch"].as_u64().unwrap(),
+            sender_device_did_url: format!(
+                "{}#{}",
+                body["actorDid"].as_str().unwrap(),
+                body["actorDeviceId"].as_str().unwrap()
+            ),
+            entry_id: body["firstMessageId"].as_str().unwrap().into(),
+            archive_commitment: commitment,
+            seq,
+            issued_at_ms: chrono::DateTime::parse_from_rfc3339(received_at)
+                .unwrap()
+                .timestamp_millis(),
+        },
+    )
+    .unwrap();
+    let receipt = json!({"conversationId":signed.payload.conversation_id,"generation":body["next"]["generation"],"groupId":STANDARD.encode(&signed.payload.group_id),"epoch":signed.payload.epoch,"entryId":signed.payload.entry_id,"seq":signed.payload.seq,"senderDid":body["actorDid"],"senderDeviceId":body["actorDeviceId"],"archiveCommitment":STANDARD.encode(signed.payload.archive_commitment),"issuedAtMs":signed.payload.issued_at_ms,"sequencerDid":signed.payload.sequencer_did,"kid":signed.key_id,"signature":STANDARD.encode(signed.signature)});
+    let digest = Sha256::digest(
+        direct_request_signing_bytes(
+            DirectRequestKind::Publish,
+            &serde_json::to_vec(body).unwrap(),
+        )
+        .unwrap(),
+    );
+    let key_id = direct_request_receipt_key_id(
+        outcome_key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes(),
+    )
+    .unwrap();
+    let outcome = json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":authority,"keyId":key_id,"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":body["requestId"],"requestDigest":STANDARD.encode(digest),"recordedAt":received_at,"conversationId":body["conversationId"],"firstMessageId":body["firstMessageId"],"coordinates":body["next"],"preparationRequestDigest":body["preparationRequestDigest"],"actorDid":body["actorDid"],"actorDeviceId":body["actorDeviceId"],"actorKeyId":body["keyId"],"authGeneration":body["authGeneration"],"requestKind":"publish","sequencerReceipt":receipt}});
+    let bytes = direct_request_signing_bytes(
+        DirectRequestKind::Outcome,
+        &serde_json::to_vec(&outcome).unwrap(),
+    )
+    .unwrap();
+    let signature: p256::ecdsa::Signature = outcome_key.sign(&bytes);
+    let signature = signature.normalize_s().unwrap_or(signature);
+    let outcome = json!({"$type":"blue.catbird.chat.defs#signedDirectRequestReceipt","body":outcome,"signature":STANDARD.encode(signature.to_bytes())});
+    json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":body["firstMessageId"],"conversationId":body["conversationId"],"seq":seq,"signedRequest":publication,"receivedAt":received_at,"sequencerReceipt":receipt,"publicationReceipt":outcome})
+}
+
 /// Host JSON is validated before encryption. Plaintext is canonical DAG-CBOR;
 /// unlike signing projections, UUIDs/DIDs in this application object stay text.
 pub fn encode_direct_request_introduction(raw_host_json: &[u8]) -> Result<Vec<u8>> {
@@ -1097,8 +1436,8 @@ mod preparation_publication_binding_tests {
         )
         .unwrap();
         let authority = p256::ecdsa::SigningKey::from_slice(&[9; 32]).unwrap();
-        let public = authority.verifying_key().to_encoded_point(true);
-        let mut preparation = json!({"protocolVersion":"2","requestId":publication["requestId"],"firstMessageId":publication["firstMessageId"],"conversationId":publication["conversationId"],"recipientDid":publication["recipientDid"],"origin":publication["origin"],"profile":publication["profile"],"creator":{"actorDid":publication["actorDid"],"actorDeviceId":publication["actorDeviceId"],"keyId":publication["keyId"],"authGeneration":publication["authGeneration"]},"selectedDevices":[{"actorDid":grant["actorDid"],"actorDeviceId":grant["actorDeviceId"],"keyId":grant["keyId"],"authGeneration":grant["authGeneration"],"keyPackage":{"framing":"mlsMessage","contentType":"keyPackage","bytes":STANDARD.encode([1;8]),"sha256":STANDARD.encode(Sha256::digest([1;8])),"keyPackageRef":grant["keyPackageRef"]},"grant":signed_grant}],"preparedAt":"2026-09-19T12:00:00.000Z","leaseExpiresAt":"2026-09-19T12:05:00.000Z","minimumImportUntil":"2026-09-26T12:05:00.000Z","preparationRequestDigest":publication["preparationRequestDigest"],"authorityDid":"did:web:chat.catbird.blue","receiptKeyId":direct_request_receipt_key_id(public.as_bytes()).unwrap()});
+        let public_key = authority.verifying_key().to_encoded_point(true);
+        let mut preparation = json!({"protocolVersion":"2","requestId":publication["requestId"],"firstMessageId":publication["firstMessageId"],"conversationId":publication["conversationId"],"recipientDid":publication["recipientDid"],"origin":publication["origin"],"profile":publication["profile"],"creator":{"actorDid":publication["actorDid"],"actorDeviceId":publication["actorDeviceId"],"keyId":publication["keyId"],"authGeneration":publication["authGeneration"]},"selectedDevices":[{"actorDid":grant["actorDid"],"actorDeviceId":grant["actorDeviceId"],"keyId":grant["keyId"],"authGeneration":grant["authGeneration"],"keyPackage":{"framing":"mlsMessage","contentType":"keyPackage","bytes":STANDARD.encode([1;8]),"sha256":STANDARD.encode(Sha256::digest([1;8])),"keyPackageRef":grant["keyPackageRef"]},"grant":signed_grant}],"preparedAt":"2026-09-19T12:00:00.000Z","leaseExpiresAt":"2026-09-19T12:05:00.000Z","minimumImportUntil":"2026-09-26T12:05:00.000Z","preparationRequestDigest":publication["preparationRequestDigest"],"authorityDid":"did:web:chat.catbird.blue","receiptKeyId":direct_request_receipt_key_id(public_key.as_bytes()).unwrap()});
         let bytes =
             direct_request_preparation_signing_bytes(&serde_json::to_vec(&preparation).unwrap())
                 .unwrap();
@@ -1108,7 +1447,7 @@ mod preparation_publication_binding_tests {
         preparation["preparationSignature"] = json!(STANDARD.encode(signature.to_bytes()));
         let preparation = verify_direct_request_preparation(
             &serde_json::to_vec(&preparation).unwrap(),
-            public.as_bytes(),
+            public_key.as_bytes(),
         )
         .unwrap();
         publication["preparationDigest"] = preparation["preparationDigest"].clone();

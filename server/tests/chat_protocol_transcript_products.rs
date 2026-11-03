@@ -1,22 +1,16 @@
+pub use catbird_server::sim_hooks;
+// Compile the actual canonical encoder used by transcript.rs's request-view
+// tests. An empty-byte stand-in cannot exercise its round-trip contract.
 mod chat_protocol {
-    pub mod read_projection {
-        pub struct DummyCanonical;
-        impl DummyCanonical {
-            pub fn bytes(&self) -> &[u8] {
-                &[]
-            }
-        }
-        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
-            _value: &T,
-            _schema: &str,
-        ) -> Result<DummyCanonical, String> {
-            Ok(DummyCanonical)
-        }
-    }
+    pub(crate) use crate::read_projection;
+    pub use catbird_server::chat_protocol::direct_request_transcript;
 }
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/read_projection.rs"]
+mod read_projection;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;

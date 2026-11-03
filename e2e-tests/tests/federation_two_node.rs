@@ -262,6 +262,7 @@ fn application_aad(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_creation_body_with_invitee(
     convo_id: Uuid,
     entry_id: Uuid,
@@ -376,6 +377,7 @@ fn make_creation_body_with_invitee(
     (wrapper, signed_bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_acceptance_body(
     convo_id: Uuid,
     transition_id: Uuid,
@@ -442,6 +444,7 @@ fn make_acceptance_body(
     (wrapper, signed_bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_leaf_recovery_fulfillment_body(
     convo_id: Uuid,
     transition_id: Uuid,
@@ -691,6 +694,7 @@ fn make_commit_body(
     (wrapper, signed_bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_message_body(
     convo_id: Uuid,
     message_id: Uuid,
@@ -1055,7 +1059,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     let (alice_enroll_wrapper, _) =
         make_device_enrollment_body(&alice, vec![alice_kp_val.clone()], Uuid::new_v4(), now);
     let alice_enroll_jwt = alice.mint_chat_jwt(
-        &cluster,
+        cluster,
         &cluster.ds1_service_did,
         "blue.catbird.chat.enrollDevice",
     );
@@ -1074,7 +1078,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     let (bob_enroll_wrapper_ds1, _) =
         make_device_enrollment_body(&bob, vec![bob_kp_val.clone()], Uuid::new_v4(), now);
     let bob_enroll_jwt_ds1 = bob.mint_chat_jwt(
-        &cluster,
+        cluster,
         &cluster.ds1_service_did,
         "blue.catbird.chat.enrollDevice",
     );
@@ -1093,7 +1097,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     let (bob_enroll_wrapper_ds2, _) =
         make_device_enrollment_body(&bob, vec![bob_kp_val], Uuid::new_v4(), now);
     let bob_enroll_jwt_ds2 = bob.mint_chat_jwt(
-        &cluster,
+        cluster,
         &cluster.ds2_service_did,
         "blue.catbird.chat.enrollDevice",
     );
@@ -1112,7 +1116,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     let (alice_enroll_wrapper_ds2, _) =
         make_device_enrollment_body(&alice, vec![alice_kp_val], Uuid::new_v4(), now);
     let alice_enroll_jwt_ds2 = alice.mint_chat_jwt(
-        &cluster,
+        cluster,
         &cluster.ds2_service_did,
         "blue.catbird.chat.enrollDevice",
     );
@@ -1171,7 +1175,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         now,
     );
     let create_jwt = alice.mint_chat_jwt(
-        &cluster,
+        cluster,
         &cluster.ds1_service_did,
         "blue.catbird.chat.createConversation",
     );
@@ -1201,7 +1205,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         now,
     );
     let acc_jwt = bob.mint_chat_jwt(
-        &cluster,
+        cluster,
         &cluster.ds1_service_did,
         "blue.catbird.chat.acceptConversation",
     );
@@ -1261,7 +1265,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         now,
     );
     let fulfill_jwt = alice.mint_chat_jwt(
-        &cluster,
+        cluster,
         &cluster.ds1_service_did,
         "blue.catbird.chat.submitTransition",
     );
@@ -1309,7 +1313,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         "DS2 semantic table content must be unchanged on exact replay"
     );
     let _welcome_receipt_at = wait_for_signed_receipt(
-        &cluster,
+        cluster,
         &ds1_pg,
         DELIVER_WELCOME_NSID,
         convo_id,
@@ -1343,7 +1347,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         now,
     );
     let msg1_jwt = alice.mint_chat_jwt(
-        &cluster,
+        cluster,
         &cluster.ds1_service_did,
         "blue.catbird.chat.sendMessage",
     );
@@ -1386,7 +1390,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     );
 
     let _message_receipt_at = wait_for_signed_receipt(
-        &cluster,
+        cluster,
         &ds1_pg,
         DELIVER_MESSAGE_NSID,
         convo_id,
@@ -1462,7 +1466,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         Utc::now(),
     );
     let commit_jwt = bob.mint_chat_jwt(
-        &cluster,
+        cluster,
         &cluster.ds2_service_did,
         "blue.catbird.chat.submitTransition",
     );
@@ -1476,7 +1480,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     .await?;
     tracing::info!(?commit_res, "Remote commit accepted through DS2");
     let commit_receipt_at = wait_for_signed_receipt(
-        &cluster,
+        cluster,
         &ds2_pg,
         SUBMIT_COMMIT_NSID,
         convo_id,
@@ -1561,7 +1565,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         Utc::now(),
     );
     let msg2_jwt = alice.mint_chat_jwt(
-        &cluster,
+        cluster,
         &cluster.ds1_service_did,
         "blue.catbird.chat.sendMessage",
     );

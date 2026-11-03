@@ -1,6 +1,6 @@
 // Repository-owned `getEntries` read composition.
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
@@ -11,6 +11,89 @@ use crate::chat_protocol::{
     read_authority::{self, EntryReadAuthority, ReadAuthorityError},
     read_projection::encode_canonical_generated_chat_json_v1,
 };
+use crate::federation::receipt::{AccountDeletion, AccountDeletionAuthority};
+
+/// `chat.entries.server_fields_bytes` of an `accountDeletedEntry` (DAG-CBOR): what its
+/// signed entry holds beyond the row, so every read rebuilds exactly what was signed.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AccountDeletedServerFields {
+    pub(crate) deleted_did: String,
+    pub(crate) sequencer_did: String,
+    pub(crate) sequencer_authority: AccountDeletionAuthority,
+}
+
+impl AccountDeletedServerFields {
+    /// The signed entry of the row `(conversation_id, seq, entry_id, received_at)`.
+    pub(crate) fn entry(
+        self,
+        conversation_id: Uuid,
+        seq: i64,
+        entry_id: Uuid,
+        received_at: DateTime<Utc>,
+    ) -> Value {
+        AccountDeletion {
+            sequencer_did: self.sequencer_did,
+            conversation_id,
+            deleted_did: self.deleted_did,
+            seq,
+            entry_id,
+            deleted_at: received_at,
+        }
+        .entry(&self.sequencer_authority)
+    }
+}
+
+// A home's standing in its sequencer-authenticated remote-group membership
+// index (`chat.remote_group_memberships`, written by the federation layer).
+/// A home's read standing for `user_did` in remote group `conversation_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteGroupStanding {
+    /// No index row: the clean graph alone decides.
+    Untracked,
+    /// A pending or active member the clean graph also lists.
+    CleanMember,
+    /// A pending or active member only the index knows.
+    IndexOnly,
+    /// Removed, left or deleted: it reads nothing here.
+    Removed,
+}
+
+/// Classify `user_did` in `conversation_id` without failing on a pinned
+/// schema that predates the index.
+pub(crate) async fn remote_group_standing(
+    executor: &mut sqlx::PgConnection,
+    conversation_id: Uuid,
+    user_did: &str,
+) -> Result<RemoteGroupStanding, sqlx::Error> {
+    let indexed: bool =
+        sqlx::query_scalar("SELECT to_regclass('chat.remote_group_memberships') IS NOT NULL")
+            .fetch_one(&mut *executor)
+            .await?;
+    if !indexed {
+        return Ok(RemoteGroupStanding::Untracked);
+    }
+    let row: Option<(String, bool)> = sqlx::query_as(
+        "SELECT m.status, EXISTS(SELECT 1 FROM chat.participants p \
+                 WHERE p.conversation_id = m.conversation_id AND p.user_did = m.user_did \
+                   AND p.current_membership) \
+           FROM chat.remote_group_memberships m \
+           JOIN chat.conversations c \
+             ON c.conversation_id = m.conversation_id AND c.kind = 'group' AND c.is_remote \
+            AND c.sequencer_ds = m.sequencer_did \
+          WHERE m.conversation_id = $1 AND m.user_did = $2",
+    )
+    .bind(conversation_id)
+    .bind(user_did)
+    .fetch_optional(&mut *executor)
+    .await?;
+    Ok(match row {
+        None => RemoteGroupStanding::Untracked,
+        Some((status, _)) if status == "removed" => RemoteGroupStanding::Removed,
+        Some((_, true)) => RemoteGroupStanding::CleanMember,
+        Some((_, false)) => RemoteGroupStanding::IndexOnly,
+    })
+}
 
 #[derive(Debug)]
 pub(crate) enum EntryReadFacadeError {
@@ -84,14 +167,30 @@ async fn read_entries_in_transaction(
             tracing::error!("lock_read_device_authority_once failed: {:?}", e);
             map_authority_error(e)
         })?;
-    let is_local_convo: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id = $1)",
-    )
-    .bind(conversation_id)
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(|_| EntryReadFacadeError::Storage)?;
-    if !is_local_convo {
+    let (is_local_convo, has_group_grants, has_transport_inbox): (bool, bool, bool) =
+        sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id = $1), \
+                to_regclass('chat.group_transport_entry_recipients') IS NOT NULL, \
+                to_regclass('chat.direct_request_transport_inbox') IS NOT NULL",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|_| EntryReadFacadeError::Storage)?;
+    // A remote group member only the home's index knows reads exactly its
+    // per-entry transport grants; a removed index member reads nothing.
+    let standing = if is_local_convo {
+        remote_group_standing(&mut **transaction, conversation_id, device.user_did())
+            .await
+            .map_err(|_| EntryReadFacadeError::Storage)?
+    } else {
+        RemoteGroupStanding::Untracked
+    };
+    if standing == RemoteGroupStanding::Removed {
+        return Err(EntryReadFacadeError::ConversationNotFound);
+    }
+    let index_only = standing == RemoteGroupStanding::IndexOnly;
+    if !is_local_convo || index_only {
         let actor_did = device.user_did().to_owned();
         let actor_device_uuid = device.device_id();
         let inbox_opt: Option<(
@@ -101,20 +200,24 @@ async fn read_entries_in_transaction(
             String,
             Uuid,
             chrono::DateTime<Utc>,
-        )> = sqlx::query_as(
-            "SELECT status, sender_did, sender_device_id, recipient_did, recipient_device_id, import_until \
-             FROM chat.direct_request_transport_inbox \
-             WHERE conversation_id = $1 \
-               AND ((recipient_did = $2 AND recipient_device_id = $3) \
-                    OR (sender_did = $2 AND sender_device_id = $3)) \
-             LIMIT 1",
-        )
-        .bind(conversation_id)
-        .bind(&actor_did)
-        .bind(actor_device_uuid)
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(|_| EntryReadFacadeError::Storage)?;
+        )> = if has_transport_inbox && !index_only {
+            sqlx::query_as(
+                "SELECT status, sender_did, sender_device_id, recipient_did, recipient_device_id, import_until \
+                 FROM chat.direct_request_transport_inbox \
+                 WHERE conversation_id = $1 \
+                   AND ((recipient_did = $2 AND recipient_device_id = $3) \
+                        OR (sender_did = $2 AND sender_device_id = $3)) \
+                 LIMIT 1",
+            )
+            .bind(conversation_id)
+            .bind(&actor_did)
+            .bind(actor_device_uuid)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| EntryReadFacadeError::Storage)?
+        } else {
+            None
+        };
 
         let is_transport_inbox = inbox_opt.is_some();
         if let Some((
@@ -148,16 +251,20 @@ async fn read_entries_in_transaction(
                 return Err(EntryReadFacadeError::ConversationNotFound);
             }
         } else {
-            let has_replicated_group: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM chat.group_transport_entry_recipients \
-                  WHERE conversation_id = $1 AND user_did = $2 AND device_id = $3)",
-            )
-            .bind(conversation_id)
-            .bind(&actor_did)
-            .bind(actor_device_uuid)
-            .fetch_one(&mut **transaction)
-            .await
-            .map_err(|_| EntryReadFacadeError::Storage)?;
+            let has_replicated_group = if has_group_grants {
+                sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM chat.group_transport_entry_recipients \
+                      WHERE conversation_id = $1 AND user_did = $2 AND device_id = $3)",
+                )
+                .bind(conversation_id)
+                .bind(&actor_did)
+                .bind(actor_device_uuid)
+                .fetch_one(&mut **transaction)
+                .await
+                .map_err(|_| EntryReadFacadeError::Storage)?
+            } else {
+                false
+            };
             if !has_replicated_group {
                 // After the I14 close wipe, a device in the close event's frozen
                 // audience still receives the authenticated terminal entry.
@@ -192,24 +299,31 @@ async fn read_entries_in_transaction(
             }
         }
 
-        let stored_entries: Vec<Vec<u8>> = sqlx::query_scalar(
+        // A C33 inbox is already exact-device authorized above and predates
+        // group grants. Never parse a query naming the optional grant table on
+        // that path; group transport always requires a persisted device grant.
+        let sql = if is_transport_inbox {
+            "SELECT entry_bytes FROM chat.direct_request_transport_entries \
+             WHERE conversation_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT $3"
+        } else {
             "SELECT e.entry_bytes FROM chat.direct_request_transport_entries e \
+              JOIN chat.group_transport_entry_recipients r \
+                ON r.conversation_id = e.conversation_id AND r.seq = e.seq \
              WHERE e.conversation_id = $1 AND e.seq > $2 \
-               AND ($4 OR EXISTS( \
-                   SELECT 1 FROM chat.group_transport_entry_recipients r \
-                    WHERE r.conversation_id = e.conversation_id AND r.seq = e.seq \
-                      AND r.user_did = $5 AND r.device_id = $6)) \
-             ORDER BY e.seq ASC LIMIT $3",
-        )
-        .bind(conversation_id)
-        .bind(after_seq as i64)
-        .bind(limit + 1)
-        .bind(is_transport_inbox)
-        .bind(&actor_did)
-        .bind(actor_device_uuid)
-        .fetch_all(&mut **transaction)
-        .await
-        .map_err(|_| EntryReadFacadeError::Storage)?;
+               AND r.user_did = $4 AND r.device_id = $5 \
+             ORDER BY e.seq ASC LIMIT $3"
+        };
+        let mut query = sqlx::query_scalar(sql)
+            .bind(conversation_id)
+            .bind(after_seq as i64)
+            .bind(limit + 1);
+        if !is_transport_inbox {
+            query = query.bind(&actor_did).bind(actor_device_uuid);
+        }
+        let stored_entries: Vec<Vec<u8>> = query
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(|_| EntryReadFacadeError::Storage)?;
 
         let has_more = stored_entries.len() > limit as usize;
         let entries: Vec<Value> = stored_entries
@@ -311,7 +425,7 @@ async fn read_entries_in_transaction(
     .fetch_one(&mut **transaction)
     .await
     .map_err(|_| EntryReadFacadeError::Storage)?;
-    if is_remote_convo {
+    if is_remote_convo && has_group_grants {
         let replicated_rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
             "SELECT e.seq, e.entry_bytes FROM chat.direct_request_transport_entries e \
               JOIN chat.group_transport_entry_recipients r \
@@ -339,17 +453,9 @@ async fn read_entries_in_transaction(
                 let Ok(seq_u64) = u64::try_from(seq_i64) else {
                     continue;
                 };
-                // Mirrored rows lack the sequencer receipt that the replicated
-                // entry carries; serve the replicated entry for those seqs.
-                let local_has_receipt = by_seq
-                    .get(&seq_u64)
-                    .map(|local| local.get("sequencerReceipt").is_some());
-                if local_has_receipt == Some(true) {
-                    continue;
-                }
                 let mut val: Value =
                     serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
-                if local_has_receipt == Some(false) && val.get("sequencerReceipt").is_none() {
+                if !replicated_entry_supersedes_local(by_seq.get(&seq_u64), &val) {
                     continue;
                 }
                 if val.get("$type").is_none() {
@@ -415,6 +521,60 @@ async fn read_entries_in_transaction(
     Ok(CanonicalEntriesResponse { response_bytes })
 }
 
+pub(super) fn replicated_entry_supersedes_local(local: Option<&Value>, replicated: &Value) -> bool {
+    // Ciphertext pruning is terminal in either copy. A late full-payload
+    // replica must not resurrect a pruned local entry, or vice versa.
+    if replicated.get("payloadPruned").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    local.is_none_or(|entry| {
+        entry.get("payloadPruned").and_then(Value::as_bool) != Some(true)
+            && entry.get("sequencerReceipt").is_none()
+            && replicated.get("sequencerReceipt").is_some()
+    })
+}
+
+/// The application entry the send `(conversation_id, message_id, request_digest)`
+/// appended, exactly as `getEntries` serves it: `payloadPruned` without
+/// `signedRequest` once its ciphertext is pruned (O7). `None` when no entry
+/// holds that send.
+pub(crate) async fn sent_application_entry(
+    connection: &mut sqlx::PgConnection,
+    conversation_id: Uuid,
+    message_id: Uuid,
+    request_digest: &[u8],
+) -> Result<Option<Value>, sqlx::Error> {
+    let row: Option<DeliveredEntryRow> = sqlx::query_as(
+        "SELECT conversation_id, seq, entry_id, entry_kind, signed_request_bytes, \
+                request_digest, signature, server_fields_bytes, outer_entry_fingerprint, \
+                payload_pruned_at, sequencer_receipt_bytes, received_at \
+           FROM chat.entries \
+          WHERE conversation_id = $1 AND message_id = $2 AND request_digest = $3 \
+            AND entry_kind = $4",
+    )
+    .bind(conversation_id)
+    .bind(message_id)
+    .bind(request_digest)
+    .bind(delivery::APPLICATION_ENTRY_KIND)
+    .fetch_optional(&mut *connection)
+    .await?;
+    row.as_ref()
+        .map(entry_json)
+        .transpose()
+        .map_err(|_| sqlx::Error::Protocol("stored application entry cannot be served".into()))
+}
+
+/// `sendMessage`'s accepted outcome for its served `entry`: `{entry,
+/// sequencerReceipt}`, the I13 receipt repeated as a first response carries it.
+pub(crate) fn accepted_send_outcome(entry: Value) -> Value {
+    let receipt = entry.get("sequencerReceipt").cloned();
+    let mut outcome = json!({ "entry": entry });
+    if let Some(receipt) = receipt {
+        outcome["sequencerReceipt"] = receipt;
+    }
+    outcome
+}
+
 fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
     let is_direct_request_entry = matches!(
         row.entry_kind.as_str(),
@@ -453,6 +613,48 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
             obj["sequencerReceipt"] = rcpt;
         }
         obj
+    } else if row.entry_kind == "blue.catbird.chat.defs#directRequestEntry" {
+        // The frozen opening includes both the I13 receipt and its signed
+        // publication outcome. Reconstructing from the mutation alone drops
+        // that evidence and prevents a recipient from authenticating Welcome.
+        // Once its ciphertext is pruned the retained redacted row still carries
+        // both receipts verbatim, served without `signedRequest` (O7).
+        let retained = if row.payload_pruned_at.is_some() {
+            row.pruned_payload_bytes.as_deref()
+        } else {
+            row.accepted_payload_bytes.as_deref()
+        }
+        .ok_or(EntryReadFacadeError::Invariant)?;
+        let retained: Value =
+            serde_json::from_slice(retained).map_err(|_| EntryReadFacadeError::Invariant)?;
+        if retained.get("$type").and_then(Value::as_str) != Some(row.entry_kind.as_str())
+            || retained
+                .get("entryId")
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                != Some(row.entry_id)
+            || retained
+                .get("conversationId")
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                != Some(row.conversation_id)
+            || retained.get("seq").and_then(Value::as_i64) != Some(row.seq)
+            || retained
+                .get("publicationReceipt")
+                .and_then(Value::as_object)
+                .is_none()
+            || retained
+                .get("sequencerReceipt")
+                .and_then(Value::as_object)
+                .is_none()
+        {
+            return Err(EntryReadFacadeError::Invariant);
+        }
+        if row.payload_pruned_at.is_some() {
+            super::direct_request_opening::pruned_opening_entry(&retained)
+        } else {
+            retained
+        }
     } else if is_direct_request_entry {
         let signed_bytes = row
             .signed_request_bytes
@@ -469,30 +671,10 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
             "signedRequest": signed_request,
         })
     } else if row.entry_kind == "blue.catbird.chat.defs#accountDeletedEntry" {
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct AccountDeletedFields {
-            deleted_did: String,
-            sequencer_did: String,
-            #[serde(default, with = "serde_bytes")]
-            signature: Option<Vec<u8>>,
-        }
-        let fields: AccountDeletedFields = serde_ipld_dagcbor::from_slice(&row.server_fields_bytes)
-            .map_err(|_| EntryReadFacadeError::Invariant)?;
-        let mut obj = json!({
-            "$type": row.entry_kind,
-            "conversationId": row.conversation_id.hyphenated().to_string(),
-            "deletedDid": fields.deleted_did,
-            "entryId": row.entry_id.hyphenated().to_string(),
-            "receivedAt": row.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-            "seq": row.seq,
-            "sequencerDid": fields.sequencer_did,
-        });
-        if let Some(sig) = fields.signature {
-            use base64::{engine::general_purpose::STANDARD, Engine as _};
-            obj["signature"] = json!(STANDARD.encode(sig));
-        }
-        obj
+        // Exactly the entry its sequencer signed, `sequencerAuthority` included.
+        serde_ipld_dagcbor::from_slice::<AccountDeletedServerFields>(&row.server_fields_bytes)
+            .map_err(|_| EntryReadFacadeError::Invariant)?
+            .entry(row.conversation_id, row.seq, row.entry_id, row.received_at)
     } else {
         let signed_bytes = row
             .signed_request_bytes
@@ -511,6 +693,12 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
         serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant)?
     };
     if is_direct_request_entry {
+        if row.entry_kind == "blue.catbird.chat.defs#directRequestAcceptanceEntry" {
+            if let Some(receipt) = &row.sequencer_receipt_bytes {
+                entry["sequencerReceipt"] =
+                    serde_json::from_slice(receipt).map_err(|_| EntryReadFacadeError::Invariant)?;
+            }
+        }
         // Encrypted-request entries echo their retained signed wrapper; the
         // encrypted-requests presentation bridge emits their declared bytes as
         // lexicon `{"$bytes"}` at read time only.
@@ -593,6 +781,7 @@ mod tests {
             seq: 2,
             entry_id,
             entry_kind: "blue.catbird.chat.defs#leaveCancellationEntry".to_string(),
+            accepted_payload_bytes: None,
             signed_request_bytes: Some(signed_request_bytes),
             request_digest: Sha256::digest(canonical.transcript_bytes()).to_vec(),
             signature: signature.to_vec(),
@@ -600,6 +789,7 @@ mod tests {
             outer_entry_fingerprint: vec![0x11; 32],
             payload_pruned_at: None,
             sequencer_receipt_bytes: None,
+            pruned_payload_bytes: None,
             received_at: "2026-08-20T12:00:01.000Z".parse().unwrap(),
         };
 
@@ -682,6 +872,7 @@ mod tests {
             seq: 2,
             entry_id: Uuid::parse_str("51515151-5151-4151-9151-515151515151").unwrap(),
             entry_kind: delivery::APPLICATION_ENTRY_KIND.to_owned(),
+            accepted_payload_bytes: None,
             signed_request_bytes: Some(serde_json::to_vec(&signed_request).unwrap()),
             request_digest: vec![0x11; 32],
             signature: vec![0x22; 64],
@@ -689,6 +880,7 @@ mod tests {
             outer_entry_fingerprint: vec![0x33; 32],
             payload_pruned_at: None,
             sequencer_receipt_bytes: None,
+            pruned_payload_bytes: None,
             received_at: "2026-07-22T12:34:56.000Z".parse().unwrap(),
         };
 

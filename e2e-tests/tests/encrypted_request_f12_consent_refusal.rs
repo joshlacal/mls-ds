@@ -2,6 +2,7 @@
 //! every signed ordinary mutation endpoint called while a direct request is
 //! pending returns a typed HTTP 400 (never 500) and leaves the durable graph
 //! byte-identical. Conversation-scoped endpoints return `ConversationNotAccepted`.
+//! The blob routes the clean-slate cutover removed are absent (404, no write).
 #![allow(dead_code, unused_imports)]
 
 #[path = "support/encrypted_requests.rs"]
@@ -98,7 +99,7 @@ fn psql_cmd(sql: &str) -> anyhow::Result<String> {
 fn durable_comprehensive(
     f: &live_direct_request::PublishedRequestFixture,
 ) -> anyhow::Result<String> {
-    let (r, c, a, b) = (f.request_id, f.conversation_id, &f.alice.did, &f.bob.did);
+    let (r, c) = (f.request_id, f.conversation_id);
     psql_cmd(&format!(
         r#"SELECT jsonb_build_object(
       'conversation',(SELECT to_jsonb(x) FROM chat.conversations x WHERE conversation_id='{c}'),
@@ -110,8 +111,6 @@ fn durable_comprehensive(
       'participants',(SELECT jsonb_agg(to_jsonb(p) ORDER BY user_did) FROM chat.participants p WHERE conversation_id='{c}'),
       'entries',(SELECT jsonb_agg(to_jsonb(e) ORDER BY seq) FROM chat.entries e WHERE conversation_id='{c}'),
       'transitions',(SELECT jsonb_agg(to_jsonb(t) ORDER BY transition_id) FROM chat.transitions t WHERE conversation_id='{c}'),
-      'blobs',(SELECT count(*) FROM chat.blobs WHERE owner_did IN ('{a}', '{b}')),
-      'blobBindings',(SELECT count(*) FROM chat.blob_bindings WHERE conversation_id='{c}'),
       'resets',(SELECT count(*) FROM chat.reset_requests WHERE conversation_id='{c}'),
       'recoveries',(SELECT count(*) FROM chat.leaf_recovery_requests WHERE conversation_id='{c}')
     )::text"#
@@ -464,7 +463,10 @@ async fn f12_pending_direct_request_consent_refusal_returns_typed_400_and_no_wri
         "cancelLeafRecovery must produce no write"
     );
 
-    // 4.7 prepareBlobUpload
+    // 4.7 prepareBlobUpload / 4.8 deleteBlob: the clean-slate cutover removed
+    // server blob storage (migration 20261031200001 drops chat.blobs and
+    // chat.blob_bindings), so both routes are absent: a signed call is 404 and
+    // writes nothing.
     let alice_blob_prep = signed_ordinary(
         alice_engine,
         &alice_identity,
@@ -487,34 +489,6 @@ async fn f12_pending_direct_request_consent_refusal_returns_typed_400_and_no_wri
             "signedAt": canonical_now()
         }),
     )?;
-    let (status, resp_bytes) = f
-        .alice
-        .post(
-            &f.client,
-            &f.server.base_url,
-            "blue.catbird.chat.prepareBlobUpload",
-            &json!({"signedRequest": alice_blob_prep}),
-            true,
-        )
-        .await?;
-    assert_eq!(
-        status,
-        reqwest::StatusCode::BAD_REQUEST,
-        "prepareBlobUpload must return 400 Bad Request, got {status}: {}",
-        String::from_utf8_lossy(&resp_bytes)
-    );
-    let resp: Value = serde_json::from_slice(&resp_bytes)?;
-    assert_eq!(
-        resp["error"], "ConversationNotAccepted",
-        "prepareBlobUpload must return ConversationNotAccepted: {resp}"
-    );
-    assert_eq!(
-        durable_comprehensive(&f)?,
-        before,
-        "prepareBlobUpload must produce no write"
-    );
-
-    // 4.8 deleteBlob
     let alice_delete_blob = signed_ordinary(
         alice_engine,
         &alice_identity,
@@ -530,42 +504,39 @@ async fn f12_pending_direct_request_consent_refusal_returns_typed_400_and_no_wri
             "signedAt": canonical_now()
         }),
     )?;
-    let (status, resp_bytes) = f
-        .alice
-        .post(
-            &f.client,
-            &f.server.base_url,
-            "blue.catbird.chat.deleteBlob",
-            &json!({"signedRequest": alice_delete_blob}),
-            true,
-        )
-        .await?;
-    assert_eq!(
-        status,
-        reqwest::StatusCode::BAD_REQUEST,
-        "deleteBlob must return 400 Bad Request, got {status}: {}",
-        String::from_utf8_lossy(&resp_bytes)
-    );
-    let resp: Value = serde_json::from_slice(&resp_bytes)?;
-    // Nothing can be bound into a pending conversation (send/prepare refused), so an
-    // unbound/unknown blob has no conversation to gate. Before this fix the gate
-    // queried the nonexistent chat.blobs.conversation_id column and every
-    // deleteBlob returned HTTP 500.
-    assert_eq!(
-        resp["error"], "BlobNotFound",
-        "deleteBlob must return a typed code, never 500: {resp}"
-    );
-    assert_eq!(
-        durable_comprehensive(&f)?,
-        before,
-        "deleteBlob must produce no write"
-    );
+    for (nsid, signed) in [
+        ("blue.catbird.chat.prepareBlobUpload", alice_blob_prep),
+        ("blue.catbird.chat.deleteBlob", alice_delete_blob),
+    ] {
+        let (status, resp_bytes) = f
+            .alice
+            .post(
+                &f.client,
+                &f.server.base_url,
+                nsid,
+                &json!({"signedRequest": signed}),
+                true,
+            )
+            .await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::NOT_FOUND,
+            "removed {nsid} route must be absent, got {status}: {}",
+            String::from_utf8_lossy(&resp_bytes)
+        );
+        assert_eq!(
+            durable_comprehensive(&f)?,
+            before,
+            "{nsid} must produce no write"
+        );
+    }
 
-    // Final check: the whole refusal barrage leaves the durable graph byte-identical.
+    // Final check: the whole refusal barrage and the absent blob routes leave
+    // the durable graph byte-identical.
     assert_eq!(
         durable_comprehensive(&f)?,
         before,
-        "all eight refusal cases must leave database state byte-identical"
+        "all refusal cases must leave database state byte-identical"
     );
 
     Ok(())

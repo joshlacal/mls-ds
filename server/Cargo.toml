@@ -186,6 +186,13 @@ name = "federation_fixture_cli"
 path = "tests/federation_fixture_cli.rs"
 required-features = ["test-support"]
 
+# Seeds DID documents through `AuthMiddleware::cache_did_document`, a
+# test-only trust seam absent from production builds.
+[[test]]
+name = "federation_fixture_auth_profile"
+path = "tests/federation_fixture_auth_profile.rs"
+required-features = ["test-support"]
+
 [[test]]
 name = "chat_send_message_routing"
 path = "tests/chat_send_message_routing.rs"
@@ -238,6 +245,16 @@ required-features = ["test-support"]
 name = "federation_group_and_space_relay"
 path = "tests/federation_group_and_space_relay.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "federation_dispatch_pause"
+path = "tests/federation_dispatch_pause.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "deterministic_server_clock_test"
+path = "tests/deterministic_server_clock_test.rs"
+required-features = ["sim"]
 
 [features]
 default = ["namespace-bluecatbird", "server-bin"]

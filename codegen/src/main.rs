@@ -85,10 +85,11 @@ fn inline_bytes_alias_refs(lexicon_dir: &Path) -> Result<usize, Box<dyn std::err
     let aliases: BTreeMap<String, Value> = documents
         .values()
         .flat_map(|document| {
-            document.defs.iter().filter_map(|(name, schema)| {
-                (schema.get("type").and_then(Value::as_str) == Some("bytes"))
-                    .then(|| (format!("{}#{name}", document.id), schema.clone()))
-            })
+            document
+                .defs
+                .iter()
+                .filter(|(_, schema)| schema.get("type").and_then(Value::as_str) == Some("bytes"))
+                .map(|(name, schema)| (format!("{}#{name}", document.id), schema.clone()))
         })
         .collect();
     let mut inlined = 0usize;

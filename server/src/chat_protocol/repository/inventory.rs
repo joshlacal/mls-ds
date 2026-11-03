@@ -755,6 +755,11 @@ pub(crate) async fn lock_inventory_session(
           JOIN chat.device_keys AS device_key
             ON device_key.user_did = device.user_did
            AND device_key.device_id = device.device_id
+           AND device_key.enrollment_auth_generation<=device.auth_generation
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=device_key.user_did AND newer.device_id=device_key.device_id
+                  AND newer.enrollment_auth_generation>device_key.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=device.auth_generation)
          WHERE device.user_did = $1
            AND device.device_id = $2
          FOR UPDATE OF device, device_key
@@ -2447,6 +2452,11 @@ pub(crate) async fn create_device_inventory_session(
           JOIN chat.device_keys AS device_key
             ON device_key.user_did = device.user_did
            AND device_key.device_id = device.device_id
+           AND device_key.enrollment_auth_generation<=device.auth_generation
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=device_key.user_did AND newer.device_id=device_key.device_id
+                  AND newer.enrollment_auth_generation>device_key.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=device.auth_generation)
          WHERE device.user_did = $1
            AND device.device_id = $2
          FOR UPDATE OF device, device_key
@@ -2747,6 +2757,8 @@ const LOCK_READ_REQUESTER_DEVICE_KEY_SQL: &str = r#"
       FROM chat.device_keys AS device_key
      WHERE device_key.user_did = $1
        AND device_key.device_id = $2
+       AND device_key.enrollment_auth_generation <= $3
+     ORDER BY device_key.enrollment_auth_generation DESC LIMIT 1
      FOR UPDATE
 "#;
 
@@ -2841,6 +2853,7 @@ async fn lock_and_verify_read_requester(
     let key: Option<LockedReadRequesterKeyRow> = sqlx::query_as(LOCK_READ_REQUESTER_DEVICE_KEY_SQL)
         .bind(&lock_did)
         .bind(lock_device_id)
+        .bind(device.auth_generation)
         .fetch_optional(&mut **transaction)
         .await
         .map_err(|e| {
@@ -4717,15 +4730,18 @@ fn verify_presented_successor(
 }
 
 /// One fresh serve vs. deterministic replay outcome, with the served page's
-/// has-more verdict (the final-page CAS depends on it).
+/// has-more verdict (the final-page CAS depends on it) and the receipt's own
+/// `served_at` (the instant the consumption trigger binds the CAS to).
 enum ServedPageOutcome {
     Fresh {
         response: CanonicalInventoryResponse,
         has_more: bool,
+        served_at: DateTime<Utc>,
     },
     Replayed {
         response: CanonicalInventoryResponse,
         has_more: bool,
+        served_at: DateTime<Utc>,
     },
 }
 
@@ -4743,6 +4759,12 @@ impl ServedPageOutcome {
     fn has_more(&self) -> bool {
         match self {
             Self::Fresh { has_more, .. } | Self::Replayed { has_more, .. } => *has_more,
+        }
+    }
+
+    fn served_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Fresh { served_at, .. } | Self::Replayed { served_at, .. } => *served_at,
         }
     }
 }
@@ -4847,6 +4869,7 @@ async fn serve_page_receipt(
             Ok(ServedPageOutcome::Fresh {
                 response,
                 has_more: page.has_more,
+                served_at,
             })
         }
         Err(InventoryRepositoryError::Database(ref error)) if is_unique_violation(error) => {
@@ -5003,9 +5026,12 @@ async fn replay_served_receipt(
     if response_sha256 != canonical_response_sha256 {
         return Err(InventoryRepositoryError::RaceOrReuse);
     }
-    let _ = served_at;
     let response = CanonicalInventoryResponse::checked(response_bytes, response_sha256)?;
-    Ok(ServedPageOutcome::Replayed { response, has_more })
+    Ok(ServedPageOutcome::Replayed {
+        response,
+        has_more,
+        served_at,
+    })
 }
 
 /// The initial-page arm of the facade: serve the deterministic initial receipt
@@ -5034,7 +5060,10 @@ pub(crate) async fn serve_initial_inventory_page(
     // repeats it). Multi-page domains reach the CAS through
     // `complete_inventory_page`.
     if outcome.is_fresh() && !outcome.has_more() {
-        let served_at = current_whole_second(transaction).await?;
+        // The CAS records the final receipt's own serve instant: the
+        // consumption trigger requires exactly that receipt `served_at`, and
+        // a second clock read can fall in the next whole second.
+        let served_at = outcome.served_at();
         consume_final_page(transaction, &row, served_at, request.domain().page_domain()).await?;
     }
     Ok(outcome.into_response())
@@ -5158,9 +5187,11 @@ async fn create_inventory_snapshot_attempt(
     );
     let generation_session_id = generation.session_uuid(namespace);
     // Encrypted-requests scoping: a protocol-version-scoped read gets its own
-    // session identity bound to the generation, the exact canonical filter and
-    // (for v2) the device's current remote transport-inbox state, because
-    // remote inbox deliveries never advance this authority's chat.events head.
+    // session identity bound to the generation, the exact canonical filter,
+    // (for v2) the device's current remote transport-inbox state, and the
+    // account's remote-group index plus this device's pending-Welcome markers,
+    // because neither remote inbox nor remote group deliveries ever advance
+    // this authority's chat.events head.
     let scoped = request.supported_protocol_versions.is_some();
     let mut inventory_session_id = if scoped {
         let mut digest = Sha256::new();
@@ -5189,6 +5220,13 @@ async fn create_inventory_snapshot_attempt(
                 digest.update(status.as_bytes());
             }
         }
+        remote_group_session_digest(
+            transaction,
+            device.user_did(),
+            device.device_id(),
+            &mut digest,
+        )
+        .await?;
         let bytes: [u8; 32] = digest.finalize().into();
         let mut id: [u8; 16] = bytes[..16].try_into().expect("fixed digest prefix");
         id[6] = (id[6] & 0x0f) | 0x40;
@@ -5290,6 +5328,60 @@ async fn create_inventory_snapshot_attempt(
     .await
 }
 
+/// The scoped session digest's remote-group arm: the account's
+/// sequencer-authenticated index rows `(conversation, status, evidence seq)`
+/// and this device's pending-Welcome markers, each in a stable order. An
+/// account with neither keeps its session identity; a pinned schema that
+/// predates the index contributes nothing.
+async fn remote_group_session_digest(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_did: &str,
+    device_id: Uuid,
+    digest: &mut Sha256,
+) -> Result<(), InventoryRepositoryError> {
+    let indexed: bool =
+        sqlx::query_scalar("SELECT to_regclass('chat.remote_group_memberships') IS NOT NULL")
+            .fetch_one(&mut **transaction)
+            .await?;
+    if !indexed {
+        return Ok(());
+    }
+    let memberships: Vec<(Uuid, String, i64)> = sqlx::query_as(
+        "SELECT conversation_id, status, evidence_seq FROM chat.remote_group_memberships \
+         WHERE user_did = $1 ORDER BY conversation_id",
+    )
+    .bind(user_did)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if !memberships.is_empty() {
+        digest.update(b"CATBIRD-REMOTE-GROUP-SESSION\0");
+    }
+    for (conversation_id, status, evidence_seq) in memberships {
+        digest.update(conversation_id.as_bytes());
+        digest.update(status.as_bytes());
+        digest.update([0]);
+        digest.update(evidence_seq.to_be_bytes());
+    }
+    let welcomes: Vec<(Uuid, Uuid, i64)> = sqlx::query_as(
+        "SELECT conversation_id, welcome_id, evidence_seq \
+           FROM chat.remote_group_pending_welcomes \
+          WHERE user_did = $1 AND device_id = $2 ORDER BY conversation_id, welcome_id",
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if !welcomes.is_empty() {
+        digest.update(b"CATBIRD-REMOTE-GROUP-WELCOMES\0");
+    }
+    for (conversation_id, welcome_id, evidence_seq) in welcomes {
+        digest.update(conversation_id.as_bytes());
+        digest.update(welcome_id.as_bytes());
+        digest.update(evidence_seq.to_be_bytes());
+    }
+    Ok(())
+}
+
 /// `blue.catbird.chat.getConversations` (and the no-cursor Welcomes/recovery
 /// reads) — the ONE production inventory facade.
 ///
@@ -5344,10 +5436,11 @@ pub(crate) async fn create_inventory_snapshot_and_first_page(
                 await_inventory_publication(response.not_before).await?;
                 return Ok(response.canonical);
             }
-            Err(InventoryRepositoryError::SnapshotConflict)
-            | Err(InventoryRepositoryError::ReadAdmission(_))
-            | Err(InventoryRepositoryError::ReadAuthority(_)) => {
-                continue;
+            // Only a moved head is retryable. Read admission and authority
+            // failures are deterministic: retrying them would only hide the
+            // semantic error behind `RetryCeiling`.
+            Err(InventoryRepositoryError::SnapshotConflict) => {
+                let _ = transaction.rollback().await;
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -5547,7 +5640,7 @@ pub(crate) async fn complete_inventory_page(
         // The final receipt was served by THIS transaction: perform the exact
         // one-way consumption CAS; a second consumer or changed durable
         // session field affects zero rows and fails closed.
-        let served_at = current_whole_second(transaction).await?;
+        let served_at = outcome.served_at();
         consume_final_page(transaction, &row, served_at, request.domain().page_domain()).await?;
     }
     Ok(outcome.into_response())
@@ -6086,7 +6179,7 @@ pub(crate) async fn load_remote_transport_conversation_source(
         "SELECT delivery_id, request_id, conversation_id, first_message_id, \
                 coordinator_did, sender_did, sender_device_id, \
                 recipient_did, recipient_device_id, \
-                request_entry, signed_publication, full_welcome, full_welcome_sha256, \
+                signed_publication, redacted_request_entry, full_welcome, full_welcome_sha256, \
                 provenance, publication_receipt, import_until, status, \
                 acceptance_proof, acceptance_outcome \
            FROM chat.direct_request_transport_inbox \
@@ -6108,33 +6201,44 @@ pub(crate) async fn load_remote_transport_conversation_source(
     let sender_device_id: Uuid = row.try_get("sender_device_id")?;
     let recipient_did: String = row.try_get("recipient_did")?;
     let recipient_device_id: Uuid = row.try_get("recipient_device_id")?;
-    let signed_pub_bytes: Vec<u8> = row.try_get("signed_publication")?;
+    let signed_pub_bytes: Option<Vec<u8>> = row.try_get("signed_publication")?;
+    let redacted_entry: Option<Vec<u8>> = row.try_get("redacted_request_entry")?;
     let provenance_bytes: Vec<u8> = row.try_get("provenance")?;
     let status: String = row.try_get("status")?;
     let acceptance_proof: Option<Vec<u8>> = row.try_get("acceptance_proof")?;
 
-    let signed_val: Value = serde_json::from_slice(&signed_pub_bytes)
-        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    // Once the opening ciphertext was pruned (O7) the redacted entry's publication
+    // keeps every other signed field; it was verified before it was stored.
+    let signed_val: Value = match (&signed_pub_bytes, &redacted_entry) {
+        (Some(bytes), _) => serde_json::from_slice(bytes)
+            .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
+        (None, Some(redacted)) => serde_json::from_slice::<Value>(redacted)
+            .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?["signedRequest"]
+            .clone(),
+        (None, None) => return Err(InventoryRepositoryError::DurableRowInvalid),
+    };
     let body = &signed_val["body"];
 
-    let sender_key: Vec<u8> = sqlx::query_scalar(
-        "SELECT sender_signing_key FROM chat.direct_request_remote_leases \
-          WHERE request_id = $1 AND recipient_did = $2 AND owner_device_id = $3 \
-            AND sender_signing_key IS NOT NULL LIMIT 1",
-    )
-    .bind(request_id)
-    .bind(&recipient_did)
-    .bind(recipient_device_id)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+    if let Some(signed_pub_bytes) = &signed_pub_bytes {
+        let sender_key: Vec<u8> = sqlx::query_scalar(
+            "SELECT sender_signing_key FROM chat.direct_request_remote_leases \
+              WHERE request_id = $1 AND recipient_did = $2 AND owner_device_id = $3 \
+                AND sender_signing_key IS NOT NULL LIMIT 1",
+        )
+        .bind(request_id)
+        .bind(&recipient_did)
+        .bind(recipient_device_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
 
-    let verified_pub = crate::chat_protocol::direct_request_transcript::verify_signed_request(
-        crate::chat_protocol::direct_request_transcript::DirectRequestKind::Publish,
-        &signed_pub_bytes,
-        &sender_key,
-    )
-    .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+        crate::chat_protocol::direct_request_transcript::verify_signed_request(
+            crate::chat_protocol::direct_request_transcript::DirectRequestKind::Publish,
+            signed_pub_bytes,
+            &sender_key,
+        )
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    }
 
     let next = &body["next"];
     let state_version = if status == "accepted" {
@@ -6200,9 +6304,13 @@ pub(crate) async fn load_remote_transport_conversation_source(
     {
         Some(k) => k,
         None => sqlx::query_scalar(
-            "SELECT key_id FROM chat.device_keys \
-              WHERE user_did = $1 AND device_id = $2 AND revoked_at IS NULL \
-              ORDER BY created_at DESC LIMIT 1",
+            "SELECT k.key_id FROM chat.device_keys k JOIN chat.devices d USING(user_did,device_id) \
+              WHERE k.user_did=$1 AND k.device_id=$2 AND k.revoked_at IS NULL \
+                AND k.enrollment_auth_generation<=d.auth_generation \
+                AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer \
+                    WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+                      AND newer.enrollment_auth_generation>k.enrollment_auth_generation \
+                      AND newer.enrollment_auth_generation<=d.auth_generation)",
         )
         .bind(&recipient_did)
         .bind(recipient_device_id)
@@ -6372,7 +6480,7 @@ pub(crate) async fn load_remote_transport_conversation_source(
         },
         1,
         invitation,
-        &verified_pub,
+        body,
     )
     .map_err(InventoryRepositoryError::Projection)?;
 
@@ -6652,6 +6760,38 @@ async fn retained_welcome_sources(
         sources.push((row.welcome_id, source));
     }
     Ok(sources)
+}
+
+/// The exact device's pending Welcome views in one conversation, projected and
+/// encoded exactly as `getPendingWelcomes` serves them, for the read a remote
+/// group member's home relays to this sequencer.
+pub(crate) async fn pending_welcome_views_for_conversation(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    user_did: &str,
+    device_id: Uuid,
+) -> Result<Vec<serde_json::Value>, InventoryRepositoryError> {
+    let conversation = conversation_id.to_string();
+    let mut views = Vec::new();
+    for (_, source) in retained_welcome_sources(transaction, user_did, device_id, None).await? {
+        let dto = super::super::read_projection::welcome_view(&source)
+            .map_err(InventoryRepositoryError::Projection)?;
+        let canonical = super::super::read_projection::encode_canonical_generated_chat_json_v1(
+            &dto,
+            "blue.catbird.chat.defs#welcomeView",
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        let view: serde_json::Value = serde_json::from_slice(canonical.bytes())
+            .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
+        if view
+            .get("conversationId")
+            .and_then(serde_json::Value::as_str)
+            == Some(conversation.as_str())
+        {
+            views.push(view);
+        }
+    }
+    Ok(views)
 }
 
 #[derive(Debug, FromRow)]
@@ -7195,12 +7335,12 @@ pub(crate) async fn read_device_key_for_admission(
     guard_protected_query(&lock)?;
     // Target keys are immutable, including after revocation; acquiring target
     // device locks here would invert the established requester lock order.
-    let public =
+    let public_key =
         super::device_directory::read_immutable_candidate_key(&mut tx, owner, device, key_id)
             .await
             .map_err(|_| DeviceKeyReadError::Storage)?;
-    let public = public.ok_or(DeviceKeyReadError::NotFound)?;
-    let derived = super::super::validation::ed25519_key_id(&public)
+    let public_key = public_key.ok_or(DeviceKeyReadError::NotFound)?;
+    let derived = super::super::validation::ed25519_key_id(&public_key)
         .map_err(|_| DeviceKeyReadError::Invariant)?;
     if derived.as_str() != key_id {
         return Err(DeviceKeyReadError::Invariant);
@@ -7213,7 +7353,7 @@ pub(crate) async fn read_device_key_for_admission(
                 .map_err(|_| DeviceKeyReadError::Invariant)?,
             device_id: jacquard_common::deps::smol_str::SmolStr::from(device.to_string()),
             key_id: jacquard_common::deps::smol_str::SmolStr::from(key_id),
-            signature_public_key: jacquard_common::deps::bytes::Bytes::from(public),
+            signature_public_key: jacquard_common::deps::bytes::Bytes::from(public_key),
             extra_data: None,
         };
     let response = serde_json::to_vec(&output).map_err(|_| DeviceKeyReadError::Invariant)?;

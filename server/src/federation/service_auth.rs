@@ -1,6 +1,6 @@
-use chrono::Utc;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use p256::ecdsa::SigningKey;
+use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::pkcs8::DecodePrivateKey;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -23,9 +23,13 @@ pub struct ServiceAuthClaims {
 /// Signs outbound DS-to-DS requests with service JWTs.
 pub struct ServiceAuthClient {
     self_did: String,
-    encoding_key: EncodingKey,
-    algorithm: Algorithm,
+    signing_key: ServiceSigningKey,
     key_id: Option<String>,
+}
+
+enum ServiceSigningKey {
+    Es256(SigningKey),
+    SharedSecret(EncodingKey),
 }
 
 impl ServiceAuthClient {
@@ -35,31 +39,27 @@ impl ServiceAuthClient {
         pem: &[u8],
         key_id: Option<String>,
     ) -> Result<Self, FederationError> {
-        validate_es256_pem(pem)?;
-
-        let encoding_key =
-            EncodingKey::from_ec_pem(pem).map_err(|e| FederationError::ConfigError {
-                reason: format!("Invalid ES256 PEM key: {e}"),
-            })?;
+        let signing_key = parse_es256_pem(pem)?;
         Ok(Self {
             self_did,
-            encoding_key,
-            algorithm: Algorithm::ES256,
+            signing_key: ServiceSigningKey::Es256(signing_key),
             key_id,
         })
     }
 
-    /// Create from raw ES256 private key bytes (DER).
+    /// Create from an ES256 PKCS#8 private key (DER).
     pub fn from_es256_der(
         self_did: String,
         der: &[u8],
         key_id: Option<String>,
     ) -> Result<Self, FederationError> {
-        let encoding_key = EncodingKey::from_ec_der(der);
+        let signing_key =
+            SigningKey::from_pkcs8_der(der).map_err(|e| FederationError::ConfigError {
+                reason: format!("Invalid ES256 DER key: {e}"),
+            })?;
         Ok(Self {
             self_did,
-            encoding_key,
-            algorithm: Algorithm::ES256,
+            signing_key: ServiceSigningKey::Es256(signing_key),
             key_id,
         })
     }
@@ -68,8 +68,7 @@ impl ServiceAuthClient {
     pub fn from_shared_secret(self_did: String, secret: &[u8]) -> Self {
         Self {
             self_did,
-            encoding_key: EncodingKey::from_secret(secret),
-            algorithm: Algorithm::HS256,
+            signing_key: ServiceSigningKey::SharedSecret(EncodingKey::from_secret(secret)),
             key_id: None,
         }
     }
@@ -94,16 +93,44 @@ impl ServiceAuthClient {
             jti: jti.to_string(),
         };
 
-        let mut header = Header::new(self.algorithm);
+        let mut header = Header::new(match &self.signing_key {
+            ServiceSigningKey::Es256(_) => Algorithm::ES256,
+            ServiceSigningKey::SharedSecret(_) => Algorithm::HS256,
+        });
         if let Some(ref kid) = self.key_id {
             header.kid = Some(kid.clone());
         }
 
-        let token = encode(&header, &claims, &self.encoding_key).map_err(|e| {
-            FederationError::AuthFailed {
-                reason: format!("JWT encoding failed: {e}"),
+        let token = match &self.signing_key {
+            ServiceSigningKey::Es256(signing_key) => {
+                let header =
+                    serde_json::to_vec(&header).map_err(|e| FederationError::AuthFailed {
+                        reason: format!("JWT encoding failed: {e}"),
+                    })?;
+                let payload =
+                    serde_json::to_vec(&claims).map_err(|e| FederationError::AuthFailed {
+                        reason: format!("JWT encoding failed: {e}"),
+                    })?;
+                let signing_input = format!(
+                    "{}.{}",
+                    URL_SAFE_NO_PAD.encode(header),
+                    URL_SAFE_NO_PAD.encode(payload)
+                );
+                // RFC 6979 derives a secure nonce from the secret key and message.
+                // Unlike seeded RNG signing, this is safe in production too.
+                let signature: Signature = signing_key.sign(signing_input.as_bytes());
+                let signature = signature.normalize_s().unwrap_or(signature);
+                format!(
+                    "{signing_input}.{}",
+                    URL_SAFE_NO_PAD.encode(signature.to_bytes())
+                )
             }
-        })?;
+            ServiceSigningKey::SharedSecret(key) => {
+                encode(&header, &claims, key).map_err(|e| FederationError::AuthFailed {
+                    reason: format!("JWT encoding failed: {e}"),
+                })?
+            }
+        };
 
         debug!(target_did, method, jti = %claims.jti, "Signed service auth request");
         Ok(token)
@@ -119,7 +146,7 @@ impl ServiceAuthClient {
     }
 }
 
-fn validate_es256_pem(pem: &[u8]) -> Result<(), FederationError> {
+fn parse_es256_pem(pem: &[u8]) -> Result<SigningKey, FederationError> {
     const MAX_PEM_BYTES: usize = 16 * 1024;
 
     if pem.is_empty() {
@@ -149,14 +176,78 @@ fn validate_es256_pem(pem: &[u8]) -> Result<(), FederationError> {
 
     SigningKey::from_pkcs8_pem(pem_str).map_err(|e| FederationError::ConfigError {
         reason: format!("Invalid ES256 PEM key: {e}"),
-    })?;
-
-    Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+    use std::sync::Arc;
+
+    #[test]
+    fn es256_tokens_replay_with_rfc6979_and_verify_with_standard_jwt_decoder() {
+        use crate::sim_hooks::{with_ds_clock, ManualDsClock};
+
+        let key = SigningKey::from_slice(&[7; 32]).unwrap();
+        let pem = key.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let der = key.to_pkcs8_der().unwrap();
+        let public_pem = key
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let client = ServiceAuthClient::from_es256_pem(
+            "did:web:sender.example".to_string(),
+            pem.as_bytes(),
+            Some("#atproto".to_string()),
+        )
+        .unwrap();
+        let der_client = ServiceAuthClient::from_es256_der(
+            "did:web:sender.example".to_string(),
+            der.as_bytes(),
+            Some("#atproto".to_string()),
+        )
+        .unwrap();
+        let now = chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        let clock = Arc::new(ManualDsClock::new(now));
+        let sign = || {
+            client
+                .sign_request(
+                    "did:web:target.example",
+                    "blue.catbird.mlsDS.deliverMessage",
+                )
+                .unwrap()
+        };
+        let first = with_ds_clock(clock.clone(), sign);
+        let second = with_ds_clock(clock.clone(), sign);
+        assert_ne!(first, second, "replay IDs must remain unique within a run");
+        clock.reset_counters();
+        assert_eq!(with_ds_clock(clock, sign), first);
+        assert_eq!(
+            with_ds_clock(Arc::new(ManualDsClock::new(now)), || {
+                der_client
+                    .sign_request(
+                        "did:web:target.example",
+                        "blue.catbird.mlsDS.deliverMessage",
+                    )
+                    .unwrap()
+            }),
+            first
+        );
+        let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
+        validation.validate_exp = false;
+        validation.set_audience(&["did:web:target.example"]);
+        let decoded = jsonwebtoken::decode::<ServiceAuthClaims>(
+            &first,
+            &jsonwebtoken::DecodingKey::from_ec_pem(public_pem.as_bytes()).unwrap(),
+            &validation,
+        )
+        .unwrap();
+        assert_eq!(decoded.header.kid.as_deref(), Some("#atproto"));
+        assert_eq!(decoded.claims.iat, now.timestamp());
+        assert_eq!(decoded.claims.exp, now.timestamp() + 120);
+        assert_eq!(decoded.claims.lxm, "blue.catbird.mlsDS.deliverMessage");
+    }
 
     #[test]
     fn test_shared_secret_sign_request() {

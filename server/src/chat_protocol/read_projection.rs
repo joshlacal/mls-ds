@@ -1370,13 +1370,12 @@ impl CheckedParticipantView {
         status: &str,
         leaf_count: i64,
         invitation: Option<CheckedInvitationProvenance>,
-        publication: &crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest,
+        publication: &serde_json::Value,
     ) -> Result<Self, ProjectionError> {
-        use crate::chat_protocol::direct_request_transcript::DirectRequestKind;
         if status != PARTICIPANT_STATUS_PENDING || leaf_count == 0 {
             return Self::new(user_did, role, status, leaf_count, invitation);
         }
-        let body = publication.body();
+        let body = publication;
         let included = body["artifacts"]["welcome"]["deliveries"]
             .as_array()
             .map(|rows| {
@@ -1385,7 +1384,7 @@ impl CheckedParticipantView {
                     .count()
             })
             .unwrap_or(0);
-        if publication.kind() != DirectRequestKind::Publish
+        if body["$type"] != "blue.catbird.chat.defs#directRequestPublicationBody"
             || body["recipientDid"].as_str() != Some(user_did)
             || included as i64 != leaf_count
             || role != MEMBER_ROLE_ADMIN

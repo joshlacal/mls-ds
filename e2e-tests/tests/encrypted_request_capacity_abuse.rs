@@ -217,10 +217,7 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
         status, OK,
         "real closeConversation of published B: {closed}"
     );
-    encrypted_requests::assert_closed_conversation_wiped(
-        b.conversation_id,
-        Some(b.request_id),
-    )?;
+    encrypted_requests::assert_closed_conversation_wiped(b.conversation_id, Some(b.request_id))?;
     assert_eq!(budget()?.0, 0, "closed request holds no pending capacity");
     assert_eq!(
         budget()?.1,
@@ -319,10 +316,7 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
 
     // Close has already wiped B and released its full charge. The later
     // sweeper must not recreate either operational artifacts or accounting.
-    encrypted_requests::assert_closed_conversation_wiped(
-        b.conversation_id,
-        Some(b.request_id),
-    )?;
+    encrypted_requests::assert_closed_conversation_wiped(b.conversation_id, Some(b.request_id))?;
     assert_eq!(
         scalar(&format!(
             "SELECT (terminal_response_sha256 IS NOT NULL AND status='published')::text FROM chat.direct_request_attempts WHERE request_id='{}'",
@@ -365,10 +359,7 @@ async fn published_request_expires_after_30_days_and_terminal_artifacts_prune_af
         released_a >= 4 * 1_048_576 && released_a < charge_a,
         "A reclaim {released_a} of {charge_a}"
     );
-    assert_eq!(
-        retained_end,
-        retained_before_prune - released_a
-    );
+    assert_eq!(retained_end, retained_before_prune - released_a);
 
     // Post-prune replay is fenced: the outcome is still the retained signed
     // expiry receipt, and replaying the original publish mints nothing.

@@ -715,7 +715,8 @@ pub trait DnsResolver: Clone + Send + Sync + 'static {
 /// builds contain only the hardened public-network variant. A `test-support`
 /// build may install one process-wide, exact-host HTTPS fixture before runtime
 /// construction; its distinct source profile prevents locally collected
-/// evidence from being confused with production-network evidence.
+/// evidence from being confused with production-network evidence. The
+/// synthetic allow-all variants exist only in `test-support` and `sim` builds.
 #[derive(Clone)]
 pub(crate) enum ProductionRelationshipTransport {
     Public(ReqwestPinnedTransport<SystemDnsResolver>),
@@ -725,8 +726,18 @@ pub(crate) enum ProductionRelationshipTransport {
     #[cfg(feature = "test-support")]
     FederationAllowAll,
     /// Deterministic offline allow-all transport for the simulation harness.
+    #[cfg(any(test, feature = "test-support", feature = "sim"))]
     SimAllowAll,
+    /// [`Self::SimAllowAll`] unless a test sets its fault, which then answers
+    /// every public request.
+    #[cfg(any(test, feature = "test-support"))]
+    SimFault(SimSourceFault),
 }
+
+/// What a [`ProductionRelationshipTransport::SimFault`] source answers every
+/// public request while a test sets it: an unreachable source or a response.
+#[cfg(any(test, feature = "test-support"))]
+pub type SimSourceFault = Arc<Mutex<Option<Result<PublicResponse, TransportError>>>>;
 
 #[async_trait]
 impl PublicTransport for ProductionRelationshipTransport {
@@ -737,7 +748,13 @@ impl PublicTransport for ProductionRelationshipTransport {
             Self::TestHttps(transport) => transport.get(request).await,
             #[cfg(feature = "test-support")]
             Self::FederationAllowAll => federation_allow_all_response(&request),
+            #[cfg(any(test, feature = "test-support", feature = "sim"))]
             Self::SimAllowAll => federation_allow_all_response(&request),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::SimFault(fault) => {
+                let answer = fault.lock().unwrap().clone();
+                answer.unwrap_or_else(|| federation_allow_all_response(&request))
+            }
         }
     }
 }
@@ -1358,10 +1375,8 @@ pub fn parse_declaration_response(
     if !validate_bare_did(recipient) {
         return Err(AuthorityError::Malformed);
     }
-    let value = strict_json(bytes)?;
-    let root = object(&value)?;
     if status != 200 {
-        require_record_not_found(status, root)?;
+        require_record_not_found(status, bytes)?;
         return Ok(DeclarationRecord {
             incoming: IncomingPolicy::Following,
             group: IncomingPolicy::Following,
@@ -1369,6 +1384,8 @@ pub fn parse_declaration_response(
             cid: None,
         });
     }
+    let value = strict_json(bytes)?;
+    let root = object(&value)?;
     reject_unknown(root, &["uri", "cid", "value"])?;
     let expected_uri = format!("at://{recipient}/{DECLARATION_COLLECTION}/{DECLARATION_RKEY}");
     if required_string(root, "uri")? != expected_uri {
@@ -1415,11 +1432,15 @@ pub fn parse_declaration_response(
 }
 
 /// A non-200 getRecord response is absence only when it is exactly the
-/// PDS's typed `RecordNotFound`; every other status is unavailability.
-fn require_record_not_found(status: u16, root: &Map<String, Value>) -> Result<(), AuthorityError> {
+/// PDS's typed `RecordNotFound`; every other status is unavailability. The
+/// status decides before the body is parsed, so an overloaded PDS's HTML
+/// 503 page is a source that could not answer, never a malformed record.
+fn require_record_not_found(status: u16, bytes: &[u8]) -> Result<(), AuthorityError> {
     if status != 400 && status != 404 {
         return Err(AuthorityError::Unavailable);
     }
+    let value = strict_json(bytes)?;
+    let root = object(&value)?;
     reject_unknown(root, &["error", "message"])?;
     if required_string(root, "error")? != "RecordNotFound" {
         return Err(AuthorityError::Unavailable);
@@ -1445,12 +1466,12 @@ pub fn parse_chat_declaration_response(
     if !validate_bare_did(recipient) {
         return Err(AuthorityError::Malformed);
     }
-    let value = strict_json(bytes)?;
-    let root = object(&value)?;
     if status != 200 {
-        require_record_not_found(status, root)?;
+        require_record_not_found(status, bytes)?;
         return Ok(None);
     }
+    let value = strict_json(bytes)?;
+    let root = object(&value)?;
     reject_unknown(root, &["uri", "cid", "value"])?;
     let expected_uri = format!("at://{recipient}/{CHAT_DECLARATION_COLLECTION}/{DECLARATION_RKEY}");
     if required_string(root, "uri")? != expected_uri {
@@ -1828,6 +1849,9 @@ pub struct TrafficProjection {
 pub struct ProjectionRefreshFailure {
     started_at: DateTime<Utc>,
     failure_count: usize,
+    /// Every failure was a source that could not answer now; none gave an
+    /// unusable authoritative answer.
+    unavailable: bool,
 }
 
 /// Linear persistence authority retained by a freshly collected projection.
@@ -2060,6 +2084,16 @@ impl ProjectionRefreshFailure {
         Self {
             started_at,
             failure_count: failure_count.max(1),
+            unavailable: false,
+        }
+    }
+
+    /// `failures` failed fetches, `unavailable` of them only because their
+    /// source could not answer now (unreachable, rate-limited or oversized).
+    fn from_sources(started_at: DateTime<Utc>, failures: usize, unavailable: usize) -> Self {
+        Self {
+            unavailable: failures == unavailable,
+            ..Self::new(started_at, failures)
         }
     }
 
@@ -2069,6 +2103,11 @@ impl ProjectionRefreshFailure {
 
     pub fn failure_count(&self) -> usize {
         self.failure_count
+    }
+
+    /// Nothing was decided: a later refresh may succeed.
+    pub fn is_unavailable(&self) -> bool {
+        self.unavailable
     }
 }
 
@@ -3080,16 +3119,21 @@ pub struct RelationshipAuthority<T: PublicTransport> {
     source_identity: [u8; 32],
 }
 
-/// The production build has exactly the audited pinned transport. The
-/// `test-support` build can instead select an explicit, synthetic federation
-/// transport for the container E2E suite.
-#[cfg(not(feature = "test-support"))]
-pub(crate) type ProductionRelationshipAuthority =
-    RelationshipAuthority<ProductionRelationshipTransport>;
-#[cfg(feature = "test-support")]
+/// The production build has exactly the audited pinned transport; only
+/// `test-support` and `sim` builds can select a synthetic allow-all transport.
 pub(crate) type ProductionRelationshipAuthority =
     RelationshipAuthority<ProductionRelationshipTransport>;
 
+/// Stops compiling a production build if another transport leaks out of its
+/// feature gate.
+#[cfg(not(any(test, feature = "test-support", feature = "sim")))]
+fn production_relationship_transport_is_only_public(transport: &ProductionRelationshipTransport) {
+    match transport {
+        ProductionRelationshipTransport::Public(_) => {}
+    }
+}
+
+#[cfg(any(test, feature = "test-support", feature = "sim"))]
 fn federation_allow_all_response(request: &PublicGet) -> Result<PublicResponse, TransportError> {
     let path = request.url.path();
     if path == /* did-web-test */ "/.well-known/did.json" {
@@ -3356,9 +3400,7 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
             ))
             .await?;
         ensure_body_cap(&did_response, self.config.max_response_bytes)?;
-        if did_response.status != 200 {
-            return Err(AuthorityError::Unavailable);
-        }
+        did_document_status(did_response.status)?;
         let did_digest = sha256(&did_response.body);
         let pds = parse_did_document_service(recipient, &did_response.body)?;
         let record_url = declaration_record_url(&pds.origin, recipient, DECLARATION_COLLECTION)?;
@@ -3401,9 +3443,7 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
             ))
             .await?;
         ensure_body_cap(&did_response, self.config.max_response_bytes)?;
-        if did_response.status != 200 {
-            return Err(AuthorityError::Unavailable);
-        }
+        did_document_status(did_response.status)?;
         let pds = parse_did_document_service(recipient, &did_response.body)?;
         let record_response = self
             .send_public(PublicGet::new(
@@ -3455,12 +3495,35 @@ impl ProductionRelationshipAuthority {
         ))
     }
 
+    #[cfg(any(test, feature = "test-support", feature = "sim"))]
     pub(crate) fn sim_allow_all() -> Result<Self, RelationshipPolicyConfigError> {
         Ok(Self::from_parts(
             fixed_production_relationship_policy_config()?,
             ProductionRelationshipTransport::SimAllowAll,
             b"catbird-sim-allow-all/v1",
         ))
+    }
+
+    /// [`Self::sim_allow_all`] whose sources answer `fault` while a test sets it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn sim_fault(fault: SimSourceFault) -> Result<Self, RelationshipPolicyConfigError> {
+        Ok(Self::from_parts(
+            fixed_production_relationship_policy_config()?,
+            ProductionRelationshipTransport::SimFault(fault),
+            b"catbird-sim-allow-all/v1",
+        ))
+    }
+
+    /// The offline allow-all authority a deterministic simulation clock runs
+    /// against. Always `None` in production builds.
+    pub(crate) fn for_deterministic_clock(
+        clock: &dyn crate::sim_hooks::DsClock,
+    ) -> Option<Result<Self, RelationshipPolicyConfigError>> {
+        #[cfg(any(test, feature = "test-support", feature = "sim"))]
+        if clock.is_deterministic() {
+            return Some(Self::sim_allow_all());
+        }
+        None
     }
 }
 
@@ -3530,6 +3593,27 @@ fn ensure_body_cap(response: &PublicResponse, cap: usize) -> Result<(), Authorit
     } else {
         Ok(())
     }
+}
+
+/// A DID document that is not found (404) or tombstoned (410) is an
+/// authoritative, unusable answer; any other non-200 status is a source that
+/// could not answer now.
+fn did_document_status(status: u16) -> Result<(), AuthorityError> {
+    match status {
+        200 => Ok(()),
+        404 | 410 => Err(AuthorityError::Malformed),
+        _ => Err(AuthorityError::Unavailable),
+    }
+}
+
+/// Whether a source failure decided nothing: the source could not answer now
+/// (unreachable, rate-limited or oversized), as opposed to answering with an
+/// unusable record.
+pub(crate) fn source_unavailable(error: AuthorityError) -> bool {
+    matches!(
+        error,
+        AuthorityError::Unavailable | AuthorityError::Capacity
+    )
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -3644,6 +3728,7 @@ async fn collect_admission_projection_with_kind<T: PublicTransport, C: Projectio
     let deadline = Instant::now() + source.config.total_deadline;
     let mut declarations = Vec::new();
     let mut failures = 0_usize;
+    let mut unavailable = 0_usize;
 
     // Recipient chains are independent and run concurrently, while DID
     // resolution and the declaration request remain strictly ordered inside
@@ -3692,10 +3777,13 @@ async fn collect_admission_projection_with_kind<T: PublicTransport, C: Projectio
                     evidence_kind,
                 });
             }
-            Err(_) => failures += 1,
+            Err(error) => {
+                failures += 1;
+                unavailable += usize::from(source_unavailable(error));
+            }
         }
     }
-    let (graph_batches, graph_failures) = collect_graph_evidence(
+    let (graph_batches, graph_failures, graph_unavailable) = collect_graph_evidence(
         source,
         clock,
         projection_id,
@@ -3707,8 +3795,13 @@ async fn collect_admission_projection_with_kind<T: PublicTransport, C: Projectio
     )
     .await;
     failures += graph_failures;
+    unavailable += graph_unavailable;
     if failures != 0 {
-        return Err(ProjectionRefreshFailure::new(started_at, failures));
+        return Err(ProjectionRefreshFailure::from_sources(
+            started_at,
+            failures,
+            unavailable,
+        ));
     }
     let Some(completed_at) = canonicalize_persisted_time(clock.now()) else {
         return Err(ProjectionRefreshFailure::new(started_at, 1));
@@ -3787,7 +3880,7 @@ async fn collect_block_projection_with_kind<T: PublicTransport, C: ProjectionClo
     let projection_id = Uuid::new_v4();
     let mut next_fetch_revision_value = 1;
     let deadline = Instant::now() + source.config.total_deadline;
-    let (graph_batches, failures) = collect_graph_evidence(
+    let (graph_batches, failures, unavailable) = collect_graph_evidence(
         source,
         clock,
         projection_id,
@@ -3799,7 +3892,11 @@ async fn collect_block_projection_with_kind<T: PublicTransport, C: ProjectionClo
     )
     .await;
     if failures != 0 {
-        return Err(ProjectionRefreshFailure::new(started_at, failures));
+        return Err(ProjectionRefreshFailure::from_sources(
+            started_at,
+            failures,
+            unavailable,
+        ));
     }
     let Some(completed_at) = canonicalize_persisted_time(clock.now()) else {
         return Err(ProjectionRefreshFailure::new(started_at, 1));
@@ -3875,7 +3972,7 @@ async fn collect_traffic_projection_with_kind<T: PublicTransport, C: ProjectionC
     let projection_id = Uuid::new_v4();
     let mut next_fetch_revision_value = 1;
     let deadline = Instant::now() + source.config.total_deadline;
-    let (graph_batches, failures) = collect_graph_evidence(
+    let (graph_batches, failures, unavailable) = collect_graph_evidence(
         source,
         clock,
         projection_id,
@@ -3887,7 +3984,11 @@ async fn collect_traffic_projection_with_kind<T: PublicTransport, C: ProjectionC
     )
     .await;
     if failures != 0 {
-        return Err(ProjectionRefreshFailure::new(started_at, failures));
+        return Err(ProjectionRefreshFailure::from_sources(
+            started_at,
+            failures,
+            unavailable,
+        ));
     }
     let Some(completed_at) = canonicalize_persisted_time(clock.now()) else {
         return Err(ProjectionRefreshFailure::new(started_at, 1));
@@ -3929,7 +4030,7 @@ async fn collect_graph_evidence<T: PublicTransport, C: ProjectionClock>(
     evidence_kind: EvidenceKind,
     projection_revision: u64,
     next_fetch_revision_value: &mut u64,
-) -> (Vec<GraphBatchEvidence>, usize) {
+) -> (Vec<GraphBatchEvidence>, usize, usize) {
     let results = join_all(requests.into_iter().map(|request| async move {
         let result = source.graph(&request, deadline).await;
         (request, result)
@@ -3937,6 +4038,7 @@ async fn collect_graph_evidence<T: PublicTransport, C: ProjectionClock>(
     .await;
     let mut evidence = Vec::with_capacity(results.len());
     let mut failures = 0;
+    let mut unavailable = 0;
     for (request, result) in results {
         match result {
             Ok((relationships, request_digest, response_digest)) => {
@@ -3962,10 +4064,13 @@ async fn collect_graph_evidence<T: PublicTransport, C: ProjectionClock>(
                     evidence_kind,
                 });
             }
-            Err(_) => failures += 1,
+            Err(error) => {
+                failures += 1;
+                unavailable += usize::from(source_unavailable(error));
+            }
         }
     }
-    (evidence, failures)
+    (evidence, failures, unavailable)
 }
 
 fn collection_window_valid(started_at: DateTime<Utc>, completed_at: DateTime<Utc>) -> bool {

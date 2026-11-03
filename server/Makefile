@@ -1,4 +1,4 @@
-.PHONY: help build run test clean deploy backup restore health-check logs
+.PHONY: help build run test clean deploy reset-dev-db backup restore health-check logs
 
 # Default target
 help:
@@ -12,13 +12,12 @@ help:
 	@echo "test               - Run tests"
 	@echo "clean              - Clean build artifacts"
 	@echo "deploy             - Build and deploy (preserve data)"
-	@echo "deploy-fresh       - Deploy with fresh database"
+	@echo "reset-dev-db       - Drop, recreate and migrate a local compose database (URL=...)"
 	@echo "migrate            - Run database migrations"
 	@echo "backup             - Backup database"
 	@echo "restore            - Restore database from backup"
 	@echo "health-check       - Check server health"
 	@echo "logs               - View logs"
-	@echo "clear-db           - Clear all database data"
 
 # Build release binary
 build:
@@ -52,10 +51,6 @@ clean:
 deploy:
 	./deploy-update.sh
 
-# Deploy fresh (wipe data)
-deploy-fresh:
-	./deploy-fresh.sh
-
 # Run migrations
 migrate:
 	./scripts/run-migrations.sh
@@ -79,13 +74,9 @@ health-check:
 logs:
 	sudo journalctl -u catbird-mls-server -f
 
-# Clear database
-clear-db:
-	./scripts/clear-db.sh
-
-# Clear database (no confirmation)
-clear-db-fast:
-	./scripts/clear-db-fast.sh
+# Drop, recreate and migrate a local compose database; refuses any other target
+reset-dev-db:
+	./scripts/reset-dev-db.sh "$(URL)"
 
 # Status
 status:

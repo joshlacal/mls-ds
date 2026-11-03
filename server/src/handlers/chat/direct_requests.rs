@@ -24,6 +24,7 @@ fn failure(endpoint: ChatEndpoint, error: DirectRequestStoreError) -> ChatFailur
     tracing::warn!(%error, endpoint = endpoint.nsid(), "direct request repository failure");
     let code = match error {
         DirectRequestStoreError::Database(_) => return ChatFailure::storage(endpoint),
+        DirectRequestStoreError::Unavailable => return unavailable(endpoint, &error),
         DirectRequestStoreError::ForeignTransaction | DirectRequestStoreError::InvalidReceipt => {
             return ChatFailure::invariant(endpoint)
         }
@@ -44,7 +45,100 @@ fn failure(endpoint: ChatEndpoint, error: DirectRequestStoreError) -> ChatFailur
     };
     ChatFailure::protocol(endpoint, code)
 }
-fn output(result: DirectRequestResult, endpoint: ChatEndpoint) -> Result<Vec<u8>, ChatFailure> {
+/// A source the request depends on could not answer now: the pair
+/// coordinator, the recipient's home, or a declaration, key or authority
+/// lookup (closed federation gate, connect or timeout, 5xx, 429). That decides
+/// nothing: the endpoint's declared retryable `CapacityUnavailable`, 503 with
+/// a 5 s retry. Only an authoritative answer refuses.
+pub(super) fn unavailable(endpoint: ChatEndpoint, error: &impl std::fmt::Debug) -> ChatFailure {
+    tracing::warn!(
+        ?error,
+        endpoint = endpoint.nsid(),
+        "direct request source unavailable"
+    );
+    ChatFailure::unavailable(endpoint)
+}
+/// A dependency's failure, by type. This DS's own store failing is a storage
+/// failure, matched first: `FederationError::is_retryable` holds for
+/// `Database`. A source that could not answer now is [`unavailable`]; only an
+/// authoritative answer is `refused`.
+pub(super) fn dependency_failure(
+    endpoint: ChatEndpoint,
+    error: crate::federation::FederationError,
+    refused: impl FnOnce(&crate::federation::FederationError) -> ChatFailure,
+) -> ChatFailure {
+    match error {
+        crate::federation::FederationError::Database(_)
+        | crate::federation::FederationError::Storage(_) => {
+            tracing::error!(%error, endpoint = endpoint.nsid(), "direct request dependency storage failure");
+            ChatFailure::storage(endpoint)
+        }
+        error if error.is_retryable() => unavailable(endpoint, &error),
+        error => {
+            tracing::warn!(%error, endpoint = endpoint.nsid(), "direct request dependency refused");
+            refused(&error)
+        }
+    }
+}
+/// The recipient home's key authority. Its refusal, or a recipient PDS that
+/// authorizes no device key, is `RecipientKeysUnavailable`.
+fn recipient_keys_failure(
+    endpoint: ChatEndpoint,
+    error: crate::federation::FederationError,
+) -> ChatFailure {
+    dependency_failure(endpoint, error, |_| {
+        failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable)
+    })
+}
+/// The pair's coordinator, or a home it is resolved from, for `prepare` and
+/// the relayed `getDirectRequestOutcome`. Its authoritative refusal is
+/// `RecipientAuthorityUnsupported` for an absent, unsupported or unauthorized
+/// authority and `RequestPolicyDenied` otherwise.
+fn coordinator_failure(
+    endpoint: ChatEndpoint,
+    error: crate::federation::FederationError,
+) -> ChatFailure {
+    dependency_failure(endpoint, error, |error| {
+        failure(
+            endpoint,
+            match error {
+                crate::federation::FederationError::Unsupported(_)
+                | crate::federation::FederationError::AuthFailed { .. }
+                | crate::federation::FederationError::EndpointNotFound { .. } => {
+                    DirectRequestStoreError::RecipientAuthorityUnsupported
+                }
+                _ => DirectRequestStoreError::PolicyDenied,
+            },
+        )
+    })
+}
+/// C33: a recipient whose home did not resolve is classified by its own
+/// declaration. Absence keeps the canonical path (no keys there is
+/// `RecipientKeysUnavailable`), a declared authority other than this one is
+/// unsupported, and a malformed declaration is denied. A declaration that
+/// could not be read now, or a declared home whose resolution failed
+/// transiently, decides nothing: `Unavailable` records no refusal, and an
+/// attempt already recorded still replays.
+fn recipient_authority_refusal(
+    declared: Result<Option<String>, crate::chat_protocol::relationship_policy::AuthorityError>,
+    unresolved: &crate::federation::FederationError,
+    self_did: &str,
+) -> Option<DirectRequestStoreError> {
+    match declared {
+        Ok(None) => None,
+        Ok(Some(authority)) if crate::identity::dids_equivalent(&authority, self_did) => None,
+        Ok(Some(_)) if unresolved.is_retryable() => Some(DirectRequestStoreError::Unavailable),
+        Ok(Some(_)) => Some(DirectRequestStoreError::RecipientAuthorityUnsupported),
+        Err(error) if crate::chat_protocol::relationship_policy::source_unavailable(error) => {
+            Some(DirectRequestStoreError::Unavailable)
+        }
+        Err(_) => Some(DirectRequestStoreError::PolicyDenied),
+    }
+}
+pub(super) fn output(
+    result: DirectRequestResult,
+    endpoint: ChatEndpoint,
+) -> Result<Vec<u8>, ChatFailure> {
     let mut payload = match result {
         DirectRequestResult::Keys(bytes) => return Ok(bytes),
         DirectRequestResult::Unknown(id) => {
@@ -60,6 +154,12 @@ fn output(result: DirectRequestResult, endpoint: ChatEndpoint) -> Result<Vec<u8>
             value
         }
     };
+    payload = crate::chat_protocol::direct_request_transcript::normalize_read_presentation(
+        &serde_json::to_vec(&payload).map_err(|_| ChatFailure::invariant(endpoint))?,
+        "directRequestOutcome",
+        true,
+    )
+    .map_err(|_| ChatFailure::invariant(endpoint))?;
     // Outcomes and mutation receipts echo retained bare-base64 signed bytes;
     // present them as lexicon `{"$bytes":…}` at response time only.
     crate::chat_protocol::direct_request_transcript::present_read_presentation(
@@ -183,7 +283,12 @@ async fn mutate(
                AND d.auth_generation = $4 \
                AND d.status = 'active' \
                AND d.revoked_at IS NULL \
-               AND k.revoked_at IS NULL",
+               AND k.revoked_at IS NULL \
+               AND k.enrollment_auth_generation<=d.auth_generation \
+               AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer \
+                    WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+                      AND newer.enrollment_auth_generation>k.enrollment_auth_generation \
+                      AND newer.enrollment_auth_generation<=d.auth_generation)",
         )
         .bind(actor_did)
         .bind(actor_device_id)
@@ -204,28 +309,38 @@ async fn mutate(
             failure(endpoint, DirectRequestStoreError::IdentityConflict)
         })?;
 
-        crate::chat_protocol::direct_request_transcript::verify_signed_request(
+        let verified = crate::chat_protocol::direct_request_transcript::verify_signed_request(
             crate::chat_protocol::direct_request_transcript::DirectRequestKind::Prepare,
             envelope.signed_request.get().as_bytes(),
             &signing_public_key,
         )
         .map_err(|_| failure(endpoint, DirectRequestStoreError::InvalidSignature))?;
 
-        let coord = crate::federation::canonical_relay::resolve_pair_coordinator(
-            pool,
-            actor_did,
-            recipient_did,
-        )
-        .await
-        .map_err(|e| match e {
-            crate::federation::FederationError::Unsupported(_)
-            | crate::federation::FederationError::AuthFailed { .. }
-            | crate::federation::FederationError::EndpointNotFound { .. } => failure(
-                endpoint,
-                DirectRequestStoreError::RecipientAuthorityUnsupported,
+        let (coord, unresolved_recipient) =
+            crate::federation::canonical_relay::resolve_prepare_pair_coordinator(
+                pool,
+                actor_did,
+                recipient_did,
+            )
+            .await
+            .map_err(|error| coordinator_failure(endpoint, error))?;
+        let authority_refusal = match unresolved_recipient {
+            // This DS's own store failing while resolving the recipient's home
+            // decided nothing about it, whatever its declaration says.
+            Some(
+                error @ (crate::federation::FederationError::Database(_)
+                | crate::federation::FederationError::Storage(_)),
+            ) => return Err(coordinator_failure(endpoint, error)),
+            Some(unresolved) => recipient_authority_refusal(
+                runtime
+                    .relationship_authority()
+                    .recipient_chat_authority(recipient_did)
+                    .await,
+                &unresolved,
+                &crate::identity::service_did(),
             ),
-            _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
-        })?;
+            None => None,
+        };
         if !coord.is_sender_home {
             return Err(ChatFailure::protocol(
                 endpoint,
@@ -233,7 +348,16 @@ async fn mutate(
             ));
         }
 
-        if !coord.is_coordinator {
+        // This preflight is advisory; the pair-locked transaction rechecks the attempt.
+        // An attempt recorded here (such as a durable refusal) replays here.
+        let has_existing_attempt: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)",
+        )
+        .bind(request_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+        if !coord.is_coordinator && !has_existing_attempt {
             let mut route_tx = pool
                 .begin()
                 .await
@@ -285,16 +409,23 @@ async fn mutate(
             {
                 return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
             }
-            let route: Option<uuid::Uuid> = sqlx::query_scalar(
+            // An unanswered route binds the pair until no preparation made from
+            // these signed bytes could still be live; an identical retry, which
+            // derives the same instant, never moves it.
+            let binding_expires_at = requests::latest_preparation_expiry(&verified)
+                .map_err(|error| failure(endpoint, error))?;
+            // `xmin` is the row version this transaction writes: inserting the
+            // route or, for an identical concurrent prepare, rewriting it.
+            let Some(route_version): Option<String> = sqlx::query_scalar(
                 "INSERT INTO chat.direct_request_outbound_routes \
-                    (request_id, actor_did, actor_device_id, recipient_did, coordinator_did, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
+                    (request_id, actor_did, actor_device_id, recipient_did, coordinator_did, created_at, binding_expires_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (request_id) DO UPDATE SET request_id=EXCLUDED.request_id \
                  WHERE chat.direct_request_outbound_routes.actor_did=EXCLUDED.actor_did \
                    AND chat.direct_request_outbound_routes.actor_device_id=EXCLUDED.actor_device_id \
                    AND chat.direct_request_outbound_routes.recipient_did=EXCLUDED.recipient_did \
                    AND chat.direct_request_outbound_routes.coordinator_did=EXCLUDED.coordinator_did \
-                 RETURNING request_id",
+                 RETURNING xmin::text",
             )
             .bind(request_id)
             .bind(actor_did)
@@ -302,12 +433,13 @@ async fn mutate(
             .bind(recipient_did)
             .bind(&coord.coordinator_did)
             .bind(observed_at)
+            .bind(binding_expires_at)
             .fetch_optional(&mut *route_tx)
             .await
-            .map_err(|_| ChatFailure::storage(endpoint))?;
-            if route.is_none() {
+            .map_err(|_| ChatFailure::storage(endpoint))?
+            else {
                 return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict));
-            }
+            };
             route_tx
                 .commit()
                 .await
@@ -322,31 +454,86 @@ async fn mutate(
                 }
             });
 
-            let outcome = crate::federation::canonical_relay::relay_prepare_direct_request(
+            let relayed = crate::federation::canonical_relay::relay_prepare_direct_request(
                 coord.coordinator_endpoint(),
                 &coord.coordinator_did,
                 &relay_payload,
             )
-            .await
-            .map_err(|e| match e {
-                crate::federation::FederationError::RemoteError { status: 409, .. } => {
-                    failure(endpoint, DirectRequestStoreError::IdentityConflict)
+            .await;
+            if let Err(error) = &relayed {
+                if error.is_retryable() {
+                    // Withdraw the route (and quota slot) only if this attempt
+                    // inserted it and no identical concurrent prepare has written
+                    // it since: that prepare's relay may have been answered. The
+                    // identical retry records it again, and a coordinator that did
+                    // apply a timed-out relay replays its answer to that retry.
+                    if !existing {
+                        let mut cleanup_tx = pool
+                            .begin()
+                            .await
+                            .map_err(|_| ChatFailure::storage(endpoint))?;
+                        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                            .bind(&pair_lock_key)
+                            .execute(&mut *cleanup_tx)
+                            .await
+                            .map_err(|_| ChatFailure::storage(endpoint))?;
+                        sqlx::query(
+                            "DELETE FROM chat.direct_request_outbound_routes \
+                             WHERE request_id=$1 AND xmin::text=$2",
+                        )
+                        .bind(request_id)
+                        .bind(&route_version)
+                        .execute(&mut *cleanup_tx)
+                        .await
+                        .map_err(|_| ChatFailure::storage(endpoint))?;
+                        cleanup_tx
+                            .commit()
+                            .await
+                            .map_err(|_| ChatFailure::storage(endpoint))?;
+                    }
+                    return Err(unavailable(endpoint, error));
                 }
-                _ => failure(endpoint, DirectRequestStoreError::PolicyDenied),
-            })?;
+            }
+            // The coordinator answered, or the relay failed for a reason no
+            // retry cures: from now on the route binds the pair permanently. The
+            // upsert restores a route the sweep deleted while this relay was in
+            // flight.
+            sqlx::query(
+                "INSERT INTO chat.direct_request_outbound_routes \
+                    (request_id, actor_did, actor_device_id, recipient_did, coordinator_did, created_at, answered_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT (request_id) DO UPDATE \
+                    SET answered_at=COALESCE(chat.direct_request_outbound_routes.answered_at, EXCLUDED.answered_at), \
+                        binding_expires_at=NULL \
+                 WHERE chat.direct_request_outbound_routes.actor_did=EXCLUDED.actor_did \
+                   AND chat.direct_request_outbound_routes.actor_device_id=EXCLUDED.actor_device_id \
+                   AND chat.direct_request_outbound_routes.recipient_did=EXCLUDED.recipient_did \
+                   AND chat.direct_request_outbound_routes.coordinator_did=EXCLUDED.coordinator_did",
+            )
+            .bind(request_id)
+            .bind(actor_did)
+            .bind(actor_device_id)
+            .bind(recipient_did)
+            .bind(&coord.coordinator_did)
+            .bind(observed_at)
+            .bind(crate::sim_hooks::current_utc())
+            .execute(pool)
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
+            let outcome = match relayed {
+                Ok(outcome) => outcome,
+                Err(crate::federation::FederationError::RemoteError { status: 409, .. }) => {
+                    return Err(failure(endpoint, DirectRequestStoreError::IdentityConflict))
+                }
+                Err(_) => return Err(failure(endpoint, DirectRequestStoreError::PolicyDenied)),
+            };
             let bytes =
                 serde_json::to_vec(&outcome).map_err(|_| ChatFailure::invariant(endpoint))?;
             return Ok(context::json_ok(bytes));
         } else {
-            // This preflight is advisory; the pair-locked transaction rechecks the attempt.
             // Reservation and PDS authority resolution must not hold a pool connection.
-            let has_existing_attempt: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1)",
-            )
-            .bind(request_id)
-            .fetch_one(pool)
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))?;
+            // A recipient home or key source that cannot answer now leaves the pending
+            // reservation intent in place: the identical retry resumes that reservation.
             let remote_bootstrap = if !has_existing_attempt && !coord.is_recipient_home {
                 let authorized_keys =
                     crate::federation::canonical_relay::resolve_remote_recipient_device_keys(
@@ -354,9 +541,7 @@ async fn mutate(
                         recipient_did,
                     )
                     .await
-                    .map_err(|_| {
-                        failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable)
-                    })?;
+                    .map_err(|error| recipient_keys_failure(endpoint, error))?;
                 let devices =
                     crate::federation::canonical_relay::reserve_remote_recipient_bootstrap(
                         pool,
@@ -368,10 +553,7 @@ async fn mutate(
                         Some(parsed_req.clone()),
                     )
                     .await
-                    .map_err(|error| {
-                        tracing::error!(?error, "reserve_remote_recipient_bootstrap failed");
-                        failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable)
-                    })?;
+                    .map_err(|error| recipient_keys_failure(endpoint, error))?;
                 Some((devices, authorized_keys))
             } else {
                 None
@@ -424,10 +606,7 @@ async fn mutate(
                                 now,
                             )
                             .await
-                            .map_err(|error| {
-                                tracing::error!(?error, "stage_remote_recipient_devices failed");
-                                failure(endpoint, DirectRequestStoreError::RecipientKeysUnavailable)
-                            })?;
+                            .map_err(|error| recipient_keys_failure(endpoint, error))?;
                         }
                     }
                     let result = requests::prepare_direct_request(
@@ -437,6 +616,7 @@ async fn mutate(
                         signer,
                         runtime.relationship_authority().as_ref(),
                         now,
+                        authority_refusal,
                     )
                     .await
                     .map_err(|error| failure(endpoint, error))?;
@@ -463,10 +643,11 @@ async fn mutate(
             .await;
 
             // A concurrent Prepared replay shares the same idempotent remote lease.
-            // Only terminal outcomes or failed new attempts release it, after tx completion.
+            // Only terminal outcomes or refused new attempts release it, after tx
+            // completion; a transient failure keeps it for the identical retry.
             let release_remote = match &operation {
                 Ok((_, release)) => *release,
-                Err(_) => remote_bootstrap.is_some(),
+                Err(error) => remote_bootstrap.is_some() && !error.is_transient(),
             };
             if release_remote && !coord.is_recipient_home {
                 crate::federation::canonical_relay::release_remote_recipient_bootstrap(
@@ -477,7 +658,11 @@ async fn mutate(
                     recipient_did,
                 )
                 .await
-                .map_err(|_| ChatFailure::storage(endpoint))?;
+                // A home that could not answer now is retryable: the identical
+                // retry replays this outcome and releases again.
+                .map_err(|error| {
+                    dependency_failure(endpoint, error, |_| ChatFailure::storage(endpoint))
+                })?;
             }
             let (bytes, _) = operation?;
             return Ok(context::json_ok(bytes));
@@ -607,7 +792,7 @@ pub(super) async fn outcome(
                 &recipient_did,
             )
             .await
-            .map_err(|_| ChatFailure::storage(endpoint))?;
+            .map_err(|error| coordinator_failure(endpoint, error))?;
             if !coord.is_sender_home || coord.is_coordinator {
                 return Err(ChatFailure::invariant(endpoint));
             }
@@ -632,11 +817,10 @@ pub(super) async fn outcome(
             .await
             .map_err(|_| ChatFailure::storage(endpoint))?;
             if let Some(receipt_bytes) = existing {
-                let receipt: serde_json::Value = serde_json::from_slice(&receipt_bytes)
-                    .map_err(|_| ChatFailure::invariant(endpoint))?;
-                let bytes = serde_json::to_vec(&serde_json::json!({"outcome": receipt}))
-                    .map_err(|_| ChatFailure::invariant(endpoint))?;
-                return Ok(context::json_ok(bytes));
+                return Ok(context::json_ok(output(
+                    DirectRequestResult::Terminal(receipt_bytes),
+                    endpoint,
+                )?));
             }
 
             let result = crate::federation::canonical_relay::relay_get_outcome(
@@ -646,10 +830,7 @@ pub(super) async fn outcome(
                 device,
             )
             .await
-            .map_err(|error| {
-                tracing::warn!(?error, "Coordinator outcome unavailable");
-                ChatFailure::storage(endpoint)
-            })?;
+            .map_err(|error| coordinator_failure(endpoint, error))?;
 
             let outcome_val = result.get("outcome").unwrap_or(&result);
             let receipt_type = outcome_val
@@ -700,12 +881,10 @@ pub(super) async fn outcome(
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
         if let Some(receipt) = recipient_receipt {
-            let receipt: serde_json::Value =
-                serde_json::from_slice(&receipt).map_err(|_| ChatFailure::invariant(endpoint))?;
-            return Ok(context::json_ok(
-                serde_json::to_vec(&serde_json::json!({"outcome":receipt}))
-                    .map_err(|_| ChatFailure::invariant(endpoint))?,
-            ));
+            return Ok(context::json_ok(output(
+                DirectRequestResult::Terminal(receipt),
+                endpoint,
+            )?));
         }
         let mut tx = pool.begin().await.map_err(|error| {
             tracing::error!(%error, "get_direct_request_outcome pool.begin failed");
@@ -724,5 +903,230 @@ pub(super) async fn outcome(
     match run(&pool, &runtime, &headers, query.as_deref()).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{chat_protocol::relationship_policy::AuthorityError, federation::FederationError};
+
+    /// Only the recipient's own authoritative answer refuses: a declaration
+    /// that could not be read now, or a declared home whose resolution failed
+    /// transiently, is the retryable `CapacityUnavailable` and records nothing.
+    #[test]
+    fn unresolved_recipient_is_refused_only_by_its_own_declaration() {
+        const SELF: &str = "did:web:chat.catbird.blue";
+        const PEER: &str = "did:web:chat.federated-peer.org";
+        let absent = FederationError::Unsupported("chat declaration record absent".into());
+        let unreachable = FederationError::RemoteError {
+            status: 503,
+            body: String::new(),
+        };
+        for unresolved in [&absent, &unreachable] {
+            assert!(recipient_authority_refusal(Ok(None), unresolved, SELF).is_none());
+            assert!(recipient_authority_refusal(Ok(Some(SELF.into())), unresolved, SELF).is_none());
+            assert!(matches!(
+                recipient_authority_refusal(Err(AuthorityError::Malformed), unresolved, SELF),
+                Some(DirectRequestStoreError::PolicyDenied)
+            ));
+            for error in [AuthorityError::Unavailable, AuthorityError::Capacity] {
+                assert!(matches!(
+                    recipient_authority_refusal(Err(error), unresolved, SELF),
+                    Some(DirectRequestStoreError::Unavailable)
+                ));
+            }
+        }
+        assert!(matches!(
+            recipient_authority_refusal(Ok(Some(PEER.into())), &absent, SELF),
+            Some(DirectRequestStoreError::RecipientAuthorityUnsupported)
+        ));
+        assert!(matches!(
+            recipient_authority_refusal(Ok(Some(PEER.into())), &unreachable, SELF),
+            Some(DirectRequestStoreError::Unavailable)
+        ));
+
+        let retry = failure(
+            ChatEndpoint::PrepareDirectRequest,
+            DirectRequestStoreError::Unavailable,
+        );
+        assert_eq!(
+            retry.code(),
+            Some(ChatProtocolErrorCode::CapacityUnavailable)
+        );
+        assert!(retry.is_transient());
+        let response = retry.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
+    }
+
+    /// The status, `Retry-After` hint and error name `failure` reaches the
+    /// client with.
+    async fn answer(failure: ChatFailure) -> (axum::http::StatusCode, Option<String>, String) {
+        let response = failure.into_response();
+        let retry_after = response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .map(|value| value.to_str().unwrap().to_owned());
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        (
+            status,
+            retry_after,
+            body["error"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// A dependency of prepare, publish or outcome is answered by type. This
+    /// DS's own store failing is 500 with no retry hint, though `Database` is
+    /// `is_retryable`; a source that could not answer now is 503
+    /// `CapacityUnavailable` with `Retry-After: 5`; only an authoritative
+    /// answer refuses: the recipient's key authority with
+    /// `RecipientKeysUnavailable`, the pair's coordinator with
+    /// `RecipientAuthorityUnsupported` or `RequestPolicyDenied`.
+    #[tokio::test]
+    async fn a_dependency_failure_is_answered_by_its_type() {
+        use crate::chat_protocol::error::ChatEndpoint::{
+            GetDirectRequestOutcome, PrepareDirectRequest, PublishDirectRequest,
+        };
+        use crate::federation::ResolutionFailureKind;
+        use axum::http::StatusCode;
+        let storage = || {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                "InternalServerError".to_owned(),
+            )
+        };
+        let unavailable = || {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("5".to_owned()),
+                "CapacityUnavailable".to_owned(),
+            )
+        };
+        let refused = |code: &str| (StatusCode::BAD_REQUEST, None, code.to_owned());
+        let stored = || {
+            [
+                FederationError::Database(sqlx::Error::PoolTimedOut),
+                FederationError::Storage("reservation intent check failed".into()),
+            ]
+        };
+        let transient = || {
+            [
+                FederationError::FederationDisabled {
+                    reason: "gate closed".into(),
+                },
+                FederationError::DsUnreachable {
+                    endpoint: "https://coordinator.example.com".into(),
+                    reason: "connection refused".into(),
+                },
+                FederationError::RemoteError {
+                    status: 429,
+                    body: String::new(),
+                },
+                FederationError::ResolutionFailed {
+                    did: "did:web:peer.example.com".into(),
+                    kind: ResolutionFailureKind::Timeout("deadline".into()),
+                },
+            ]
+        };
+
+        for endpoint in [
+            PrepareDirectRequest,
+            PublishDirectRequest,
+            GetDirectRequestOutcome,
+        ] {
+            for error in stored() {
+                let failure = dependency_failure(endpoint, error, |_| unreachable!());
+                assert_eq!(answer(failure).await, storage(), "{endpoint:?}");
+            }
+            for error in transient() {
+                let failure = dependency_failure(endpoint, error, |_| unreachable!());
+                assert_eq!(answer(failure).await, unavailable(), "{endpoint:?}");
+            }
+        }
+
+        for endpoint in [PrepareDirectRequest, GetDirectRequestOutcome] {
+            for error in stored() {
+                assert_eq!(
+                    answer(coordinator_failure(endpoint, error)).await,
+                    storage()
+                );
+            }
+            for error in transient() {
+                assert_eq!(
+                    answer(coordinator_failure(endpoint, error)).await,
+                    unavailable()
+                );
+            }
+            for (error, code) in [
+                (
+                    FederationError::Unsupported("chat declaration record absent".into()),
+                    "RecipientAuthorityUnsupported",
+                ),
+                (
+                    FederationError::AuthFailed {
+                        reason: "peer DS is not allowlisted".into(),
+                    },
+                    "RecipientAuthorityUnsupported",
+                ),
+                (
+                    FederationError::RemoteError {
+                        status: 401,
+                        body: String::new(),
+                    },
+                    "RequestPolicyDenied",
+                ),
+                (
+                    FederationError::ResolutionFailed {
+                        did: "did:web:peer.example.com".into(),
+                        kind: ResolutionFailureKind::InvalidDeclaration(
+                            "no deliveryService".into(),
+                        ),
+                    },
+                    "RequestPolicyDenied",
+                ),
+            ] {
+                assert_eq!(
+                    answer(coordinator_failure(endpoint, error)).await,
+                    refused(code),
+                    "{endpoint:?}"
+                );
+            }
+        }
+
+        for error in stored() {
+            assert_eq!(
+                answer(recipient_keys_failure(PrepareDirectRequest, error)).await,
+                storage()
+            );
+        }
+        for error in transient() {
+            assert_eq!(
+                answer(recipient_keys_failure(PrepareDirectRequest, error)).await,
+                unavailable()
+            );
+        }
+        for error in [
+            FederationError::Forbidden("recipient PDS authorizes no MLS device keys".into()),
+            FederationError::RemoteError {
+                status: 404,
+                body: String::new(),
+            },
+        ] {
+            assert_eq!(
+                answer(recipient_keys_failure(PrepareDirectRequest, error)).await,
+                refused("RecipientKeysUnavailable")
+            );
+        }
     }
 }

@@ -21,9 +21,11 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
     now: chrono::DateTime<chrono::Utc>,
     endpoint: ChatEndpoint,
 ) -> Result<serde_json::Value, ChatFailure> {
-    // 1. Fast local idempotent replay check: if mirror already exists on sender home
-    let existing: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
-        "SELECT publication_receipt, signed_publication \
+    // 1. Fast local idempotent replay check: if mirror already exists on sender home.
+    // A mirror whose opening ciphertext was pruned (O7) keeps only its digest.
+    type MirrorReplay = (Vec<u8>, Option<Vec<u8>>, Vec<u8>);
+    let existing: Option<MirrorReplay> = sqlx::query_as(
+        "SELECT publication_receipt, signed_publication, signed_publication_sha256 \
          FROM chat.direct_request_transport_inbox \
          WHERE request_id = $1 AND sender_did = $2 AND sender_device_id = $3 \
          LIMIT 1",
@@ -35,11 +37,24 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
     .await
     .map_err(|_| ChatFailure::storage(endpoint))?;
 
-    if let Some((receipt_bytes, signed_bytes)) = existing {
+    if let Some((receipt_bytes, signed_bytes, signed_sha256)) = existing {
         if let Some(client_signed) = client_signed_pub {
-            let stored_signed: serde_json::Value = serde_json::from_slice(&signed_bytes)
-                .map_err(|_| ChatFailure::invariant(endpoint))?;
-            if &stored_signed != client_signed {
+            let same = match signed_bytes {
+                Some(signed_bytes) => {
+                    &serde_json::from_slice::<serde_json::Value>(&signed_bytes)
+                        .map_err(|_| ChatFailure::invariant(endpoint))?
+                        == client_signed
+                }
+                None => {
+                    Sha256::digest(
+                        serde_json::to_vec(client_signed)
+                            .map_err(|_| ChatFailure::invariant(endpoint))?,
+                    )
+                    .as_slice()
+                        == signed_sha256.as_slice()
+                }
+            };
+            if !same {
                 return Err(ChatFailure::protocol(
                     endpoint,
                     ChatProtocolErrorCode::IdempotencyConflict,
@@ -49,17 +64,36 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
         let mut receipt: serde_json::Value =
             serde_json::from_slice(&receipt_bytes).map_err(|_| ChatFailure::invariant(endpoint))?;
         receipt["$type"] = serde_json::json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
+        let mut receipt =
+            crate::chat_protocol::direct_request_transcript::normalize_read_presentation(
+                &serde_json::to_vec(&receipt).map_err(|_| ChatFailure::invariant(endpoint))?,
+                "directRequestOutcome",
+                true,
+            )
+            .map_err(|_| ChatFailure::invariant(endpoint))?;
+        crate::chat_protocol::direct_request_transcript::present_read_presentation(
+            "directRequestOutcome",
+            &mut receipt,
+        )
+        .map_err(|_| ChatFailure::invariant(endpoint))?;
         return Ok(receipt);
     }
 
     // 2. Fail closed if necessary entry artifact is missing
-    let Some(entry_val) = entry else {
+    let Some(entry) = entry else {
         tracing::error!("published outcome lacks required entry artifact");
         return Err(ChatFailure::protocol(
             endpoint,
             ChatProtocolErrorCode::InvalidRequest,
         ));
     };
+    let entry_val = crate::chat_protocol::direct_request_transcript::normalize_read_presentation(
+        &serde_json::to_vec(entry).map_err(|_| ChatFailure::invariant(endpoint))?,
+        "directRequestEntry",
+        true,
+    )
+    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    let entry_val = &entry_val;
 
     let signed_req_val = match client_signed_pub {
         Some(signed) => {
@@ -166,13 +200,7 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
     let receipt_public_key = resolver
         .resolve_coordinator_receipt_key(pool, receipt_authority_did, receipt_key_id)
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to resolve coordinator receipt key: {e:?}");
-            ChatFailure::protocol(
-                endpoint,
-                ChatProtocolErrorCode::RelationshipPolicyUnavailable,
-            )
-        })?;
+        .map_err(|error| key_failure(endpoint, ChatProtocolErrorCode::InvalidSignature, error))?;
 
     let receipt_bytes =
         serde_json::to_vec(receipt_val).map_err(|_| ChatFailure::invariant(endpoint))?;
@@ -194,73 +222,44 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
 
-    let local_signer: Option<(Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT k.signing_public_key, d.auth_generation FROM chat.device_keys k \
-         JOIN chat.devices d ON d.user_did=k.user_did AND d.device_id=k.device_id \
-         WHERE k.user_did=$1 AND k.device_id=$2 AND k.key_id=$3 \
-           AND k.revoked_at IS NULL AND d.revoked_at IS NULL AND d.status='active' \
-           AND k.enrollment_auth_generation=d.auth_generation",
+    let (signer_public_key, auth_generation) = crate::federation::group_relay::active_device_key(
+        pool,
+        actor_did,
+        actor_device_id,
+        signer_key_id,
     )
-    .bind(actor_did)
-    .bind(actor_device_id)
-    .bind(signer_key_id)
-    .fetch_optional(pool)
     .await
-    .map_err(|_| ChatFailure::storage(endpoint))?;
-
-    let (signer_public_key, auth_generation) = match local_signer {
-        Some((key, gen)) => (key, Some(gen)),
-        None => {
-            let authorized = resolver
-                .resolve_authorized_device_keys(actor_did)
-                .await
-                .map_err(|e| {
-                    tracing::error!("failed to resolve actor device keys from PDS: {e:?}");
-                    ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
-                })?;
-            let matching = authorized
-                .into_iter()
-                .find(|k| {
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(k))
-                        == signer_key_id
-                })
-                .ok_or_else(|| {
-                    tracing::error!("sender device key {signer_key_id} not authorized by PDS");
-                    ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
-                })?;
-            (matching, None)
-        }
-    };
+    .map_err(|error| key_failure(endpoint, ChatProtocolErrorCode::NotAuthorized, error))?;
 
     let signed_pub_bytes =
         serde_json::to_vec(signed_req_val).map_err(|_| ChatFailure::invariant(endpoint))?;
-
     let verified_pub = crate::chat_protocol::direct_request_transcript::verify_signed_request(
         crate::chat_protocol::direct_request_transcript::DirectRequestKind::Publish,
         &signed_pub_bytes,
         &signer_public_key,
     )
-    .map_err(|e| {
-        tracing::error!("sender signed publication verification failed: {e:?}");
-        ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidSignature)
-    })?;
-
+    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidSignature))?;
     if verified_pub.actor_did() != Some(actor_did)
         || verified_pub.actor_device_id() != Some(actor_device_id.to_string().as_str())
+        || verified_pub.auth_generation() != Some(auth_generation as u64)
     {
         return Err(ChatFailure::protocol(
             endpoint,
             ChatProtocolErrorCode::NotAuthorized,
         ));
     }
-    if let Some(auth_gen) = auth_generation {
-        if verified_pub.auth_generation() != Some(auth_gen as u64) {
-            return Err(ChatFailure::protocol(
-                endpoint,
-                ChatProtocolErrorCode::NotAuthorized,
-            ));
-        }
-    }
+    let i13_public_key = resolver
+        .resolve_i13_receipt_key(&coord.coordinator_did)
+        .await
+        .map_err(|error| key_failure(endpoint, ChatProtocolErrorCode::InvalidSignature, error))?;
+    crate::chat_protocol::direct_request_transcript::verify_direct_request_opening_receipt(
+        &verified_pub,
+        entry_val,
+        &verified_receipt,
+        &coord.coordinator_did,
+        &i13_public_key,
+    )
+    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidSignature))?;
 
     // 6. Cross-binding verifications: receipt to publication and entry
     let receipt_req_digest_b64 = verified_receipt
@@ -325,61 +324,27 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
         .and_then(|v| v.as_str())
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
         .ok_or_else(|| ChatFailure::invariant(endpoint))?;
+    let entry_seq = entry_val["seq"]
+        .as_i64()
+        .ok_or_else(|| ChatFailure::invariant(endpoint))?;
     if entry_val.get("conversationId").and_then(|v| v.as_str())
         != Some(conversation_id.to_string().as_str())
-        || entry_val.get("seq").and_then(|v| v.as_i64()) != Some(1)
+        || entry_val.get("seq").and_then(|v| v.as_u64()).is_none()
         || entry_val.get("signedRequest") != Some(signed_req_val)
     {
         return Err(ChatFailure::invariant(endpoint));
     }
 
-    if let Some(entry_hash_b64) = verified_receipt
-        .body()
-        .pointer("/receipt/entryHash")
-        .and_then(|v| v.as_str())
-    {
-        let expected_hash = base64::engine::general_purpose::STANDARD
-            .decode(entry_hash_b64)
-            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-        let mut untagged = entry_val.clone();
-        if let Some(obj) = untagged.as_object_mut() {
-            obj.remove("$type");
-            obj.remove("publicationReceipt");
-        }
-        let untagged_bytes =
-            serde_json::to_vec(&untagged).map_err(|_| ChatFailure::invariant(endpoint))?;
-        let actual_hash =
-            crate::chat_protocol::direct_request_transcript::direct_request_entry_hash(
-                &untagged_bytes,
-            )
-            .map_err(|_| ChatFailure::invariant(endpoint))?;
-        if expected_hash != actual_hash {
-            tracing::error!("receipt entryHash does not match entry");
-            return Err(ChatFailure::protocol(
-                endpoint,
-                ChatProtocolErrorCode::InvalidRequest,
-            ));
-        }
-    }
-
     // 7. Materialize canonical entry and transport inbox rows (one per recipient device)
-    let mut entry_to_store = entry_val.clone();
-    if entry_to_store.get("$type").is_none() {
-        entry_to_store["$type"] = serde_json::json!("blue.catbird.chat.defs#directRequestEntry");
-    }
-    if entry_to_store.get("publicationReceipt").is_none() {
-        entry_to_store["publicationReceipt"] = receipt_val.clone();
-    }
     let entry_bytes =
-        serde_json::to_vec(&entry_to_store).map_err(|_| ChatFailure::invariant(endpoint))?;
+        serde_json::to_vec(entry_val).map_err(|_| ChatFailure::invariant(endpoint))?;
 
-    let import_until = receipt_val
-        .pointer("/receipt/importUntil")
-        .or_else(|| signed_req_val.pointer("/body/importUntil"))
+    let import_until = signed_req_val
+        .pointer("/body/importUntil")
         .and_then(|v| v.as_str())
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|| now + chrono::Duration::days(30));
+        .ok_or_else(|| ChatFailure::invariant(endpoint))?;
 
     let mut tx = pool.begin().await.map_err(|e| {
         tracing::error!("sender home pool.begin failed: {e}");
@@ -403,13 +368,20 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
 
         inserted_recipient_devices += 1;
 
+        // Explicit id: inventory session identity hashes delivery_id, so a DB-random
+        // default would break byte-identical sim replay (random in production too).
+        let delivery_id = crate::sim_hooks::mint_entry_uuid_v4(
+            b"chat.direct_request_transport_inbox",
+            &[&request_id.as_bytes()[..], &rec_device_id.as_bytes()[..]],
+        );
         let inserted = sqlx::query(
             "INSERT INTO chat.direct_request_transport_inbox ( \
                 request_id, conversation_id, first_message_id, coordinator_did, \
                 sender_did, sender_device_id, recipient_did, recipient_device_id, \
                 request_entry, signed_publication, full_welcome, full_welcome_sha256, \
-                provenance, publication_receipt, import_until, status, created_at, updated_at \
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $16) \
+                provenance, publication_receipt, import_until, status, created_at, updated_at, \
+                delivery_id \
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $16, $17) \
             ON CONFLICT (request_id, recipient_device_id) DO NOTHING",
         )
         .bind(request_id)
@@ -428,6 +400,7 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
         .bind(&receipt_bytes)
         .bind(import_until)
         .bind(now)
+        .bind(delivery_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -436,8 +409,8 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
         })?;
 
         if inserted.rows_affected() == 0 {
-            let (existing_signed, existing_receipt): (Vec<u8>, Vec<u8>) = sqlx::query_as(
-                "SELECT signed_publication, publication_receipt \
+            let (existing_sha256, existing_receipt): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+                "SELECT signed_publication_sha256, publication_receipt \
                  FROM chat.direct_request_transport_inbox WHERE request_id=$1 AND recipient_device_id=$2",
             )
             .bind(request_id)
@@ -445,7 +418,9 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
             .fetch_one(&mut *tx)
             .await
             .map_err(|_| ChatFailure::storage(endpoint))?;
-            if existing_signed != signed_pub_bytes || existing_receipt != receipt_bytes {
+            if existing_sha256.as_slice() != Sha256::digest(&signed_pub_bytes).as_slice()
+                || existing_receipt != receipt_bytes
+            {
                 return Err(ChatFailure::protocol(
                     endpoint,
                     ChatProtocolErrorCode::IdempotencyConflict,
@@ -461,38 +436,24 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
         ));
     }
 
-    let entry_inserted = sqlx::query(
-        "INSERT INTO chat.direct_request_transport_entries ( \
-            conversation_id, seq, entry_id, entry_bytes, created_at \
-         ) VALUES ($1, 1, $2, $3, $4) \
-         ON CONFLICT (conversation_id, seq) DO NOTHING",
+    let stored = crate::chat_protocol::repository::delivery::insert_transport_entry(
+        &mut tx,
+        conversation_id,
+        entry_seq,
+        entry_id,
+        &entry_bytes,
+        now,
     )
-    .bind(conversation_id)
-    .bind(entry_id)
-    .bind(&entry_bytes)
-    .bind(now)
-    .execute(&mut *tx)
     .await
     .map_err(|e| {
         tracing::error!("sender home insert transport entry failed: {e}");
         ChatFailure::storage(endpoint)
     })?;
-
-    if entry_inserted.rows_affected() == 0 {
-        let existing: Vec<u8> = sqlx::query_scalar(
-            "SELECT entry_bytes FROM chat.direct_request_transport_entries \
-             WHERE conversation_id=$1 AND seq=1",
-        )
-        .bind(conversation_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| ChatFailure::storage(endpoint))?;
-        if existing != entry_bytes {
-            return Err(ChatFailure::protocol(
-                endpoint,
-                ChatProtocolErrorCode::IdempotencyConflict,
-            ));
-        }
+    if stored == crate::chat_protocol::repository::delivery::TransportEntryInsert::Conflict {
+        return Err(ChatFailure::protocol(
+            endpoint,
+            ChatProtocolErrorCode::IdempotencyConflict,
+        ));
     }
 
     tx.commit().await.map_err(|e| {
@@ -510,4 +471,93 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
     .map_err(|_| ChatFailure::invariant(endpoint))?;
 
     Ok(return_receipt)
+}
+
+/// A key the mirror is verified against could not be looked up. By type (see
+/// `direct_requests::dependency_failure`): this DS's own store failing is a
+/// storage failure, a source that could not answer now the endpoint's
+/// retryable `CapacityUnavailable`, and only an authoritative answer the
+/// declared `refused`. `RelationshipPolicyUnavailable` is declared by neither
+/// publish nor outcome.
+fn key_failure(
+    endpoint: ChatEndpoint,
+    refused: ChatProtocolErrorCode,
+    error: crate::federation::FederationError,
+) -> ChatFailure {
+    crate::handlers::chat::direct_requests::dependency_failure(endpoint, error, |_| {
+        ChatFailure::protocol(endpoint, refused)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::federation::{FederationError, ResolutionFailureKind};
+    use axum::{http::StatusCode, response::IntoResponse as _};
+
+    /// The receipt, I13 and sender device keys of the mirror, on publish and
+    /// outcome: this DS's store is 500, a DID document or home that could not
+    /// answer now 503 `CapacityUnavailable` with `Retry-After: 5`, and an
+    /// authoritative refusal the declared `InvalidSignature` or
+    /// `NotAuthorized`.
+    #[tokio::test]
+    async fn a_mirror_key_lookup_failure_is_answered_by_its_type() {
+        for endpoint in [
+            ChatEndpoint::PublishDirectRequest,
+            ChatEndpoint::GetDirectRequestOutcome,
+        ] {
+            for refused in [
+                ChatProtocolErrorCode::InvalidSignature,
+                ChatProtocolErrorCode::NotAuthorized,
+            ] {
+                for (error, status, retry_after, name) in [
+                    (
+                        FederationError::Database(sqlx::Error::PoolTimedOut),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        None,
+                        "InternalServerError",
+                    ),
+                    (
+                        FederationError::ResolutionFailed {
+                            did: "did:web:coordinator.example.com".into(),
+                            kind: ResolutionFailureKind::DnsTemporary("SERVFAIL".into()),
+                        },
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Some("5"),
+                        "CapacityUnavailable",
+                    ),
+                    (
+                        FederationError::NotFound("receipt key not in the DID document".into()),
+                        StatusCode::UNAUTHORIZED,
+                        None,
+                        refused.as_str(),
+                    ),
+                    (
+                        FederationError::Forbidden(
+                            "device key is not current at its authoritative home".into(),
+                        ),
+                        StatusCode::UNAUTHORIZED,
+                        None,
+                        refused.as_str(),
+                    ),
+                ] {
+                    let response = key_failure(endpoint, refused, error).into_response();
+                    assert_eq!(response.status(), status, "{endpoint:?} {name}");
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(axum::http::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok()),
+                        retry_after,
+                        "{endpoint:?} {name}"
+                    );
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["error"], name, "{endpoint:?}");
+                }
+            }
+        }
+    }
 }

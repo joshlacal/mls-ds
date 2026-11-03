@@ -58,7 +58,7 @@ pub fn space_host_router(runtime: Arc<SpaceHostRuntime>) -> Router {
     Router::new()
         .route(
             "/xrpc/com.atproto.space.getSpaceCredential",
-            get(ClockScoped(get_space_credential)),
+            post(ClockScoped(get_space_credential)),
         )
         .route(
             "/xrpc/com.atproto.space.listRepos",
@@ -406,13 +406,24 @@ async fn authenticate_service_jwt(
     Ok(crate::identity::canonical_did(iss).to_string())
 }
 
+/// Lexicon procedure input for `com.atproto.space.getSpaceCredential`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetSpaceCredentialInput {
+    space: String,
+    credential_kid: String,
+    delegation_token: Option<String>,
+}
+
 async fn get_space_credential(
     State(runtime): State<Arc<SpaceHostRuntime>>,
-    Query(params): Query<BTreeMap<String, String>>,
+    body: Bytes,
 ) -> Response {
-    let Some(space_uri) = params.get("space").map(String::as_str) else {
-        return xrpc_err(StatusCode::BAD_REQUEST, "InvalidRequest", "missing space");
+    let input: GetSpaceCredentialInput = match serde_json::from_slice(&body) {
+        Ok(input) => input,
+        Err(e) => return xrpc_err(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()),
     };
+    let space_uri = input.space.as_str();
     let parsed_space = match SpaceUri::parse(space_uri) {
         Ok(s) => s,
         Err(e) => return xrpc_err(StatusCode::BAD_REQUEST, "InvalidSpaceUri", e.to_string()),
@@ -430,22 +441,12 @@ async fn get_space_credential(
         Err(resp) => return resp,
     };
 
-    let Some(credential_kid) = params
-        .get("credentialKid")
-        .or_else(|| params.get("cnfKey"))
-        .map(String::as_str)
-    else {
-        return xrpc_err(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "missing credentialKid",
-        );
-    };
+    let credential_kid = input.credential_kid.as_str();
     if let Err(e) = decode_p256_did_key(credential_kid) {
         return xrpc_err(StatusCode::BAD_REQUEST, "InvalidDidKey", e.to_string());
     }
 
-    let Some(delegation_jwt) = params.get("delegationToken").map(String::as_str) else {
+    let Some(delegation_jwt) = input.delegation_token.as_deref() else {
         return xrpc_err(
             StatusCode::FORBIDDEN,
             "Forbidden",
@@ -550,7 +551,7 @@ async fn get_space_credential(
         );
     }
 
-    let cred_jti = Uuid::new_v4().to_string();
+    let cred_jti = runtime.mint_credential_jti(space_uri, &del_claims.iss);
     let exp_sec = now_sec + CREDENTIAL_DEFAULT_LIFETIME_SECS;
     let exp_dt = Utc
         .timestamp_opt(exp_sec as i64, 0)

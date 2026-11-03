@@ -76,15 +76,20 @@ async fn handle(
     // post-state checks occur under this one caller-owned transaction.
     let admission =
         context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
-    crate::federation::group_relay::try_relay_home_group_operation(
+    // A Welcome the home's index relays from the sequencer has no local
+    // mailbox row: the federation layer seals the sequencer's disposition as
+    // the whole answer, and this boundary forwards those bytes verbatim.
+    if let Some(resp_bytes) = crate::federation::group_relay::try_relay_index_only_welcome(
         pool,
         admission.subject(),
         admission.device_id(),
-        endpoint.nsid(),
+        endpoint,
         body,
     )
-    .await
-    .map_err(|error| error.into_failure(endpoint))?;
+    .await?
+    {
+        return context::canonical_json_response(endpoint, 200, resp_bytes);
+    }
     execute_admitted(pool, admission, endpoint, body).await
 }
 
@@ -118,9 +123,24 @@ pub(crate) async fn execute_admitted(
         let operation = prelude::prepare_signed_operation(&mut transaction, admission)
             .await
             .map_err(|error| context::operation_prelude_failure(endpoint, error))?;
-        let outcome = welcome_terminal::prepare_welcome_terminal(&mut transaction, operation)
-            .await
-            .map_err(|error| welcome_failure(endpoint, error))?;
+        let outcome =
+            match welcome_terminal::prepare_welcome_terminal(&mut transaction, operation).await {
+                Ok(outcome) => outcome,
+                Err(WelcomeTerminalFacadeError::FreshRejection(response)) => {
+                    // A fresh semantic rejection must not retain the generic
+                    // operation claim. Its wire material is sealed by the facade.
+                    transaction
+                        .rollback()
+                        .await
+                        .map_err(|_| ChatFailure::storage(endpoint))?;
+                    return context::canonical_json_response(
+                        endpoint,
+                        response.status(),
+                        response.as_bytes().to_vec(),
+                    );
+                }
+                Err(error) => return Err(welcome_failure(endpoint, error)),
+            };
 
         match outcome {
             WelcomeTerminalTransactionOutcome::Replay { response, .. } => {
@@ -174,8 +194,6 @@ fn welcome_failure(endpoint: ChatEndpoint, error: WelcomeTerminalFacadeError) ->
     use WelcomeTerminalFacadeError as E;
 
     match error {
-        E::FreshMissing => ChatFailure::protocol(endpoint,C::WelcomeNotFound),
-        E::FreshTerminal => ChatFailure::protocol(endpoint, if endpoint == ChatEndpoint::AcknowledgeWelcome { C::AcknowledgementConflict } else { C::RejectionConflict }),
         E::Retention(crate::chat_protocol::repository::direct_request_retention::RetentionError::Database(_)) => ChatFailure::storage(endpoint),
         E::Retention(_) => ChatFailure::protocol_with_retry(endpoint, C::CapacityUnavailable, Some(30)),
         E::InvalidRequest => ChatFailure::protocol(endpoint, C::InvalidRequest),
@@ -188,11 +206,6 @@ fn welcome_failure(endpoint: ChatEndpoint, error: WelcomeTerminalFacadeError) ->
         | E::ExecutionHydration(
             crate::chat_protocol::repository::execution_context::ExecutionContextHydrationError::Database(_),
         ) => ChatFailure::storage(endpoint),
-        E::Aggregate(
-            crate::chat_protocol::repository::core::ConversationStateHydrationError::Head(
-                crate::chat_protocol::repository::core::ConversationHeadHydrationError::ConversationMissing,
-            ),
-        ) => ChatFailure::protocol(endpoint, C::WelcomeNotFound),
         E::Aggregate(crate::chat_protocol::repository::core::ConversationStateHydrationError::ReadSetMismatch) => {
             match endpoint {
                 ChatEndpoint::AcknowledgeWelcome => {
@@ -204,7 +217,8 @@ fn welcome_failure(endpoint: ChatEndpoint, error: WelcomeTerminalFacadeError) ->
                 _ => ChatFailure::invariant(endpoint),
             }
         }
-        E::Aggregate(_)
+        E::FreshRejection(_)
+        | E::Aggregate(_)
         | E::WelcomeLock(_)
         | E::StateMachine(_)
         | E::ExecutionHydration(_)

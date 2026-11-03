@@ -245,7 +245,7 @@ pub(in crate::chat_protocol::state_machine) fn coordinate_only_successor(
     ))
 }
 
-pub(in crate::chat_protocol::state_machine) fn retired_coordinate(
+pub(crate) fn retired_coordinate(
     prior: &PublicGroupSnapshotCoordinate,
 ) -> Result<PublicGroupSnapshotCoordinate, StateMachineError> {
     let state_version = prior

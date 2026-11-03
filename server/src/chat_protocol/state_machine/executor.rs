@@ -252,8 +252,8 @@ pub(crate) struct SpineArtifacts {
 }
 
 /// Per-opened-leaf columns absent from `LeafHydrationRow`: the leaf's key id
-/// and `member_devices.leaf_auth_generation` (sourced from
-/// `chat.device_keys.enrollment_auth_generation`).
+/// and `member_devices.leaf_auth_generation` (the applicable device authentication
+/// generation; the latest eligible immutable key activation selects its key).
 #[derive(Clone, Debug)]
 pub(crate) struct LeafPersistenceColumns {
     pub(crate) device: DeviceIdentity,

@@ -10,14 +10,26 @@
 -- Sealed _sqlx_migrations modes:
 --   1. Pre-cutover: 75 migrations through 20260824000001 (52 chat tables)
 --   2. Post-c855:   84 migrations through 20260828000005 (53 chat tables)
+--   3. Clean-slate: the current full catalog -- the frozen 84 plus every later migration
+--      (clean-slate consolidation 20261031200001 onward) -- with its exact chat tables and
+--      views, sealed in the GENERATED CLEAN-SLATE SEAL block below. Never edit that block by
+--      hand: after any migration change, re-seal it from server/ with the suite's environment
+--      (TEST_DATABASE_URL, CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED):
+--        CLEAN_CHAT_PREFLIGHT_RESEAL=write cargo test --offline --test clean_chat_empty_preflight \
+--          -- --ignored --exact reseal_clean_slate_catalog
+--      then review the diff and re-run tests/clean_chat_empty_preflight.rs. The 75/84 seals are
+--      frozen and never regenerated.
 --
 -- Requirements:
 --   - Exactly one sealed migration catalog matches with dirty=false.
---   - Exact chat schema table set (3 infrastructure + 49 or 50 semantic tables).
+--   - Exact chat schema relation set: 3 infrastructure + 49 or 50 semantic tables; clean-slate:
+--     4 infrastructure tables + every other sealed table (all semantic) + the sealed views.
 --   - Infrastructure initialized:
 --       * chat.protocol_instances: exactly 1 row (singleton=true, v1, UUIDv4)
 --       * chat.event_retention: exactly 1 row (bound to protocol singleton, floor=0)
 --       * chat.operation_claim_completeness_cutover: exactly 1 row (singleton=true, count=0)
+--       * chat.direct_request_budget (clean-slate): exactly 1 row (singleton=true,
+--         pending_bytes=0, retained_bytes=0)
 --   - Every semantic chat table contains zero rows.
 --   - Public transport tables (federation_outbox, outbound_queue, federation_sync_state)
 --     exist, have text-compatible identifier columns, and contain zero Clean Chat
@@ -43,9 +55,12 @@ DECLARE
     v_semantic_table TEXT;
     v_row_count BIGINT;
     v_col_type TEXT;
+    v_pending_bytes BIGINT;
+    v_retained_bytes BIGINT;
     v_uuid_pattern TEXT := '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
 
-    -- Expected migrations: version, description, sha384_hex (84 total)
+    -- Expected migrations: version, description, sha384_hex (84 total, frozen; clean-slate
+    -- appends the generated v_clean_slate_* tail)
     v_expected_versions BIGINT[] := ARRAY[
         20250101000000::BIGINT,
         20251125000001::BIGINT,
@@ -305,7 +320,7 @@ DECLARE
         'f8f4da493f6a3bf6261d2e09d6706ec6b4a395511a1eed6c5a557b5bb119b6f04aeabd9d3514db984e5e695894fe2fb1',
         'cae43253509fd13c468a741f360d1371e0d9a099a67ed951c683b23fb98960861e2d00ed3522d341ff026801f86059a2'
     ];
-    -- Base semantic tables (49 tables present in both modes)
+    -- Base semantic tables (49 tables present in the pre-cutover and post-c855 modes)
     v_base_semantic_tables TEXT[] := ARRAY[
         'principals',
         'devices',
@@ -358,8 +373,294 @@ DECLARE
         'service_auth_admissions'
     ];
 
+    -- BEGIN GENERATED CLEAN-SLATE SEAL
+    -- 58 migrations after 20260828000005 (142 total, max 20261104000011); chat tables: 91; chat views: 1.
+    v_clean_slate_versions BIGINT[] := ARRAY[
+        20260905000001::BIGINT,
+        20260907000001::BIGINT,
+        20260919000001::BIGINT,
+        20260919000002::BIGINT,
+        20260919000003::BIGINT,
+        20260919000004::BIGINT,
+        20260919000005::BIGINT,
+        20260919000006::BIGINT,
+        20260919000007::BIGINT,
+        20260919000008::BIGINT,
+        20260919000009::BIGINT,
+        20260919000010::BIGINT,
+        20260919000011::BIGINT,
+        20260919000012::BIGINT,
+        20260919000013::BIGINT,
+        20260919000014::BIGINT,
+        20260919000015::BIGINT,
+        20260919000016::BIGINT,
+        20260919000017::BIGINT,
+        20260919000018::BIGINT,
+        20260919000019::BIGINT,
+        20260919000021::BIGINT,
+        20260919000022::BIGINT,
+        20260919000023::BIGINT,
+        20260919000024::BIGINT,
+        20260919000025::BIGINT,
+        20261004000001::BIGINT,
+        20261004100001::BIGINT,
+        20261004100002::BIGINT,
+        20261004100003::BIGINT,
+        20261004100004::BIGINT,
+        20261004100005::BIGINT,
+        20261004100006::BIGINT,
+        20261004100007::BIGINT,
+        20261004100008::BIGINT,
+        20261004100009::BIGINT,
+        20261023000001::BIGINT,
+        20261025000001::BIGINT,
+        20261031100001::BIGINT,
+        20261031200001::BIGINT,
+        20261031200002::BIGINT,
+        20261031200003::BIGINT,
+        20261102000001::BIGINT,
+        20261102000002::BIGINT,
+        20261102000003::BIGINT,
+        20261103000001::BIGINT,
+        20261103000002::BIGINT,
+        20261103000003::BIGINT,
+        20261103000004::BIGINT,
+        20261103000010::BIGINT,
+        20261104000001::BIGINT,
+        20261104000002::BIGINT,
+        20261104000005::BIGINT,
+        20261104000006::BIGINT,
+        20261104000007::BIGINT,
+        20261104000008::BIGINT,
+        20261104000010::BIGINT,
+        20261104000011::BIGINT
+    ];
+    v_clean_slate_descriptions TEXT[] := ARRAY[
+        'chat historical recovery package mapping',
+        'chat direct pending inventory',
+        'direct request preparation',
+        'direct request publication',
+        'direct request lifecycle',
+        'direct request welcome delivery',
+        'direct request budget release',
+        'direct request attempt null fences',
+        'direct request publication integrity',
+        'direct request lifecycle fences',
+        'direct request acceptance claims',
+        'direct request retained artifacts',
+        'direct request lifecycle slots',
+        'direct request welcome slot digest',
+        'direct request signed json projection',
+        'direct request nul comparison',
+        'direct request entry identity',
+        'direct request push bindings',
+        'direct request push outbox',
+        'fix direct request lifecycle close fence',
+        'variable receipt authority keys',
+        'direct request capacity abuse fix',
+        'federated transport inbox',
+        'expired federated lease release',
+        'c33 coordinator hardening',
+        'federated inventory conversation items',
+        'reconcile conversation identity whitelist',
+        'labyrinth mailbox and directory',
+        'labyrinth threads',
+        'labyrinth orf and attachments',
+        'labyrinth device binding',
+        'labyrinth attachment refs v2',
+        'labyrinth retention',
+        'labyrinth blob gc pin',
+        'labyrinth lookup indexes',
+        'labyrinth review2 hardening',
+        'labyrinth space references',
+        'generated transition wrapper kind',
+        'labyrinth security hardening',
+        'clean slate spaces only',
+        'space host operational state',
+        'fix wipe closed conversation operational rows',
+        'group transport entry recipients',
+        'group key package exports',
+        'conversation close terminal entries',
+        'remote application ciphertext pruning',
+        'remote device key history',
+        'remote close authority',
+        'federated key package reservations',
+        'direct request opening pruning',
+        'remote group memberships',
+        'direct request opening pruned bytes',
+        'idempotency payload erasure',
+        'direct request transport wakes',
+        'drop request push bindings',
+        'queued copy conversation indexes',
+        'wipe returns whole retained charge',
+        'direct request route answers'
+    ];
+    v_clean_slate_checksums TEXT[] := ARRAY[
+        'a66f9dc9bd5f8f1cb3da0f3ddfcb64c08fc068de39602891e584c86cdbaebd1de2d29b6bb46959155496639ad12f9c5d',
+        '82708d24b2deb72452ebdaf28749aa86ed95075f7ed920c4cc5526962e2ae9f9d8561a5029fc853ba654564d76ef63f1',
+        'd4d3527aa77b8fe91d8d754f72290b682571cc6731866d72c059f10d4b2f7cf8ef629069737addeedaabd6f6eee682ca',
+        '7fda0b09fcdef20e4da2e1701f6a56c12f636f7881b46e2f6e249cb0d5fc2aa63c734dc07cbb543169398253e29cec9e',
+        'c51bc3851c68556437867249e163fd320fd792f62401695df1c5e9182aa5141687c5e193fdb9d11a37d7ff6be3811572',
+        'a93682f234ab1c2efdf98d6da51c444d89d750a224b67117f65e34045d54e6ada28c69858433bfc93be70c8e4b7827c4',
+        '0c2e4c2b2b5f3fe662e5d91ae85969825ac932ad708e4840cfa3f426414462d678547e49e481ff9eeda531f40828fad0',
+        '871e44752b1f8e35a684589ada95e2bdfdf88c667c6e371bdbae15f8ff2e6bb513fbc369b74bc4bd9244c6e693f9ac4c',
+        '6f6192cd5d620becadd5bcd47cb38e50b30ab999ea7c3c410804a527bcb23aaa10f3913098211ce072cafdb6591af6db',
+        '64dcfb75a6adc3ed3509cdb6e439ff745813286e7baad2b0ad3c71bc5722694eef13bd4e12e048636e5c27a2964e65d0',
+        'c1210eb15ecc821c380acd4fbc3fff471d6b42304d38f60f6c6acb9e7b91f233421e32ce18d99802b9e6fdd050d72e9a',
+        '598aea96b9a02d6c3c24937e81929c14496cdb24698dd8be9a091609c8d40975f5957242a5a81aeeedab2cb79cb36288',
+        '158cee3681184afb77ba824c3357717f945027d93ba75c33b1f5d5cc568d6098e33b0874a5465a6d76cbca72a2d604bf',
+        'dbe9835b66cba3edd3c21ca1756ae1ee2b13a8c0fbb67fea3dc3b1f754bc5eca90d7a36fff1ff10c6ad568f52eb3312d',
+        'd8170f613b3c2c2fc087b8ab7c5f24d15dd4379ba3605048390beccbdecdd85a525f5d70c3b340d98d053c543d924156',
+        '2f47a3019d459b7989f544773da035e10914af95b85ad553afd70e84367189085a3c8507b7314bfa84d4cc4335a1d8b8',
+        '157cac50d04bd77388897fe386acd915ece5046c40923dec21675726ed091ac5b709691664a57241f67c8415e73cf29d',
+        '483aee1650f60a488d2a6498c11e4ce229906889ca1a655c37f080fefccf610bc4f552b06a63719ff471f95c060360f8',
+        '813c165f4e1739fb81d1cd26b2e1cea505745b1df77d22d6ca4882ba44bf2a9446a0929be20320e04a22c93e2bdc380b',
+        'db45c270c4f162078319724213518f3d3186ab5883ff75729e253663874738a001fa61af41791065eeca2f8c76bc1974',
+        'dc201702f4e21d124b664a81d8cc60105d92c2ba7fa9e7fe3ea8523e4a091adfc54b0f57663efab00cb46815cf6029ea',
+        '5b6d18e3f9a43bccf357ee37f0df7b322d956369fb55cd036fbbbdb4e63f5c291730ac10885b6de511a697cb365939ca',
+        '392d0137456574b46aeb05d71fdd6a9084bc364c102fa206f64a48c26441355fad52b3568386b5574aa8bedc15882e5a',
+        'f8b78fd5368f0d9521ec0498f14aaf7f928be8ca4cef35c7e794aac7ed72970a7337e348675ab9eaf873351df3c5b0c5',
+        'ebc8d84f7b7ad0dd3005fb268956f52a4b9c8bea8134ae5fdeee94fda232e222d816dbbbf16a45d7420f3a5099a7c5e7',
+        'c8cd858bc6805485334ad90e96673123b215591282f9625c55e2315a624430f77460fdda0e444a61abffe45433f0a9b1',
+        '10579dbb921d3e024a5bdc6ac221e1906d381375849a127da3b3784dc36630d0e50ff624485464d04d66b1a10e074a53',
+        '78413b0611149fe8b7208d065ea455d05cef061ee2f213030bc41a70ee96739928dcdc126d550c0f6898dbf6e95c74c3',
+        '0c57cba0d98367123234c154be7e6d1f26a304aff48b34ea192d2698f0f564629ac15ad6b5e32237c12d1aecc9e46b04',
+        '118124f987ae00db52e938aaa627a14721becb8ceda48bd4aa0dbfe799cc0004f3120c7297c1956db3b772a3f1413764',
+        'c5f6e9627a9ff1fb5d2da93c17a73dcef74679d57a5c3d7cf12e86f45c814d8e9e45797b2547abaa37621e99f39ac50e',
+        '2dcc30aeebbe4d2de63ef0b794beef8a9958665f6df391011b56515c963cce6cec89c0c60e7e357bb54a32d4e9be12c4',
+        'b7ce72e7f162c626695739dbf5a62c6eb59126c95629e24c6c5c94857f0638f1e29c6f71a7eac5a2798e6b820e2a7b53',
+        'e3efe50d180d6250c722918628ed7334cde492246460f18dc92ca6ebc2a3ae7b43f5be9dfdb35a341439f7f25994f740',
+        '0e5908d59cbe9758b1de17fb06aefff6461c3592df05a3493012d892b23ef0d045476b14d97b41a895c52c896a672f54',
+        '990321ab67d1bb32f19e5f98cb1647f7c6267663b91b69d922efacb50a5fac3c1c384724c8c10ba18bf6afc7b02ce61f',
+        '1011321e3d877785ecb846e84a44d347d6478e6ecaa015b2aa0833f571eb6a784eb8cc1c2e69bfe6aaf9efa6f3ec0748',
+        'ab163acf42140744e86c5892e434068f14c31830e396e38ed07d814d4ca4936c6f7c348ec92bfa7993b4acbe525db983',
+        'e21a41990ae1234c2b438fc69011636037a7bd83ace728c30afafb2b16ab4e22221cd1215638ac3348d8336e99402051',
+        '9680fd2643b146edb6168f68d39ed3f164429243a4777273a89e63cbb081bfc9847eba4fecef998ee102766d09d1a829',
+        '7b332d3e52efd64bafd7275c078dff9bd06769582f811974639f35600afcbb9988eb17c8783acb57f66cbcfa8c1a1dbe',
+        '4853b31de7c5960b546089db2128d2c9095ac661734ba8991b484b5a4bedb8420ee70bb063d8642278a362ca23bab96f',
+        '918fb25c2c7c6826ae18eed9c38241efee20d27214e7c42dce5fdcccd7a02adcc73af45f0aa69747aa1e2ecfe40f2195',
+        '17d3d172e4c8340a80f2677fac9387ae69c8210a3cf4c4a9bc6d08375a99ac1fbf78488f891a114bc96da3b56d300554',
+        '3b32d6d3b3dab9d0f785d48d8b9a1b352e7c5329ff3697bcf83fc00744fe91edf4b1763243e4a17dbab885c344c57e30',
+        '466647e8460b4adc227121657ec018efaf3090418738a70c696810171a9f38cf69e80eacf8886310ecfd8829bc5ce733',
+        '91b930f69cace280a19491183245f1f9a8264ef29d764ed140eab1b51620711ecaf27c23dda653e90d7ae76d7ea6d403',
+        'be9da0be3ad629454e6a9bb363d62da4dc57039ec23ea14d10fc9e23fd1c97f36ab3fc89484208c12aded25709c1ee6c',
+        'eae9b35f98c3ed6bc1317f6cee98b48826088fd84177dc4db00212b603c787771f2418ad441a1444f12013cd9498efd0',
+        'bd09b55f977c4f553dd73b7acef87070998e705166b3c9d1ba3fd10a546d7a2810f78ca238d300de220ec748edfdaf39',
+        '83b71d0b116da7807a4ee1238d44b91407fdaf561c3b1b0315cfd757f7803b78d992517fd55d32a3cffbff535a9a5e42',
+        '60334191b8c21241f5d8b437f060dad185d27258dda758c476412074fdd44500992a8dd5e1f2ac365ce2d4b468734213',
+        '101b2b1d966f50650a5edc27f303d91b44b2282124a91e2d9ae7782f19cf4ceb8b674d3fef5d0aa45a0d388ade50382e',
+        '98d111c435d605aefc99581798b4a904e3f000081cf904788e1b6b78f0e8bf1b525b941396b0955cf71e36b79c63e4b4',
+        '9a8a8aa3209fe676c70d7c84eac3b00b57e480513809228f3b3df8c4204efba0ee9e8c281f97a65709d0d259c43a37a0',
+        '4f815c232b88a8ff6b7b885288926493d24ce3ec418445fbd52f4bdc60dfda7f0021ca96c3f92c14ede138cd66bc75c1',
+        '2683e751903eadd28ba7b7df9a2d43a7eb10c62fb5a6bf644582dcc92565ddca85b0cccd1e7efcefcbb7f9d2f3880a8b',
+        '6a8bce9ce6af92567d62820ca40464860a14b56b47d72f91f51649b1e98ea095ce9ea233258b7cc7cbf26e379516617d'
+    ];
+    v_clean_slate_tables TEXT[] := ARRAY[
+        'application_intervals',
+        'application_schedule_terminal_proofs',
+        'conversation_close_terminal_entries',
+        'conversation_space_syncers',
+        'conversation_space_writers',
+        'conversation_spaces',
+        'conversations',
+        'device_entry_acks',
+        'device_inventory_items',
+        'device_inventory_sessions',
+        'device_keys',
+        'device_revocations',
+        'devices',
+        'direct_request_acceptance_claims',
+        'direct_request_attempts',
+        'direct_request_budget',
+        'direct_request_capabilities',
+        'direct_request_decision_slots',
+        'direct_request_device_deliveries',
+        'direct_request_expiry_receipts',
+        'direct_request_grants',
+        'direct_request_key_publications',
+        'direct_request_lifecycle',
+        'direct_request_lifecycle_reserves',
+        'direct_request_outbound_routes',
+        'direct_request_pending_releases',
+        'direct_request_publications',
+        'direct_request_push_event_recipients',
+        'direct_request_push_events',
+        'direct_request_receipt_keys',
+        'direct_request_remote_leases',
+        'direct_request_reservation_intents',
+        'direct_request_reserved_remote_packages',
+        'direct_request_retained_charges',
+        'direct_request_retained_releases',
+        'direct_request_retired_packages',
+        'direct_request_selected_devices',
+        'direct_request_transport_entries',
+        'direct_request_transport_inbox',
+        'direct_request_transport_wakes',
+        'direct_request_welcome_outcomes',
+        'direct_request_welcome_slots',
+        'dpop_replays',
+        'entries',
+        'entry_recipients',
+        'event_cursor_receipts',
+        'event_recipients',
+        'event_retention',
+        'events',
+        'federated_key_package_reservations',
+        'federation_delivery_receipts',
+        'generation_states',
+        'generations',
+        'group_key_package_exports',
+        'group_transport_entry_recipients',
+        'idempotency_records',
+        'inventory_conversation_items',
+        'inventory_page_receipts',
+        'inventory_recovery_items',
+        'inventory_sessions',
+        'inventory_welcome_items',
+        'key_package_reservations',
+        'key_packages',
+        'leaf_recovery_requests',
+        'leave_requests',
+        'member_devices',
+        'message_sends',
+        'metadata_snapshots',
+        'operation_claim_completeness_cutover',
+        'operation_claims',
+        'outbox',
+        'participants',
+        'principals',
+        'protocol_instances',
+        'push_gateway_bindings',
+        'recovery_work_items',
+        'relationship_projection_declarations',
+        'relationship_projection_relationships',
+        'relationship_projection_revision_allocations',
+        'relationship_projection_snapshots',
+        'remote_group_memberships',
+        'remote_group_pending_welcomes',
+        'reset_requests',
+        'service_auth_admissions',
+        'space_credential_jtis',
+        'space_delegation_jtis',
+        'subscription_tickets',
+        'transitions',
+        'welcome_bundles',
+        'welcome_deliveries',
+        'welcome_dispositions'
+    ];
+    v_clean_slate_views TEXT[] := ARRAY[
+        'direct_request_effective_budget'
+    ];
+    -- END GENERATED CLEAN-SLATE SEAL
+
+    -- Infrastructure tables: exact-state checks in section 4, excluded from the semantic
+    -- emptiness scan. Clean-slate adds chat.direct_request_budget (reviewed, not generated):
+    -- every other sealed clean-slate table is semantic.
+    v_infrastructure_tables TEXT[] := ARRAY['protocol_instances', 'event_retention', 'operation_claim_completeness_cutover'];
+
     v_expected_semantic_tables TEXT[];
     v_expected_all_tables TEXT[];
+    v_expected_views TEXT[] := '{}';
 
     -- Public transport tables scanned for Clean Chat identifiers: (table, id column)
     v_transport_targets TEXT[] := ARRAY[
@@ -403,9 +704,17 @@ BEGIN
         v_mode := 'pre-cutover';
     ELSIF v_mig_count = 84 AND v_max_version = 20260828000005 THEN
         v_mode := 'post-c855';
+    ELSIF v_mig_count = cardinality(v_expected_versions) + cardinality(v_clean_slate_versions)
+      AND v_max_version = v_clean_slate_versions[cardinality(v_clean_slate_versions)] THEN
+        v_mode := 'clean-slate';
+        v_expected_versions := v_expected_versions || v_clean_slate_versions;
+        v_expected_descriptions := v_expected_descriptions || v_clean_slate_descriptions;
+        v_expected_checksums := v_expected_checksums || v_clean_slate_checksums;
     ELSE
-        RAISE EXCEPTION 'preflight failed: unrecognized _sqlx_migrations catalog (count=%, max_version=%; expected count=75 max=20260824000001 or count=84 max=20260828000005)',
-            v_mig_count, v_max_version;
+        RAISE EXCEPTION 'preflight failed: unrecognized _sqlx_migrations catalog (count=%, max_version=%; expected count=75 max=20260824000001, count=84 max=20260828000005, or clean-slate count=% max=%)',
+            v_mig_count, v_max_version,
+            cardinality(v_expected_versions) + cardinality(v_clean_slate_versions),
+            v_clean_slate_versions[cardinality(v_clean_slate_versions)];
     END IF;
 
     -- Verify exact migrations in order
@@ -448,12 +757,21 @@ BEGIN
     -- -------------------------------------------------------------------------
     IF v_mode = 'pre-cutover' THEN
         v_expected_semantic_tables := v_base_semantic_tables;
-    ELSE
+    ELSIF v_mode = 'post-c855' THEN
         v_expected_semantic_tables := array_append(v_base_semantic_tables, 'federation_delivery_receipts');
+    ELSE
+        v_infrastructure_tables := array_append(v_infrastructure_tables, 'direct_request_budget');
+        v_expected_semantic_tables := ARRAY(
+            SELECT sealed.relname
+            FROM unnest(v_clean_slate_tables) WITH ORDINALITY AS sealed(relname, ordinal)
+            WHERE sealed.relname <> ALL (v_infrastructure_tables)
+            ORDER BY sealed.ordinal
+        );
+        v_expected_views := v_clean_slate_views;
     END IF;
 
-    -- All expected tables = 3 infrastructure + semantic tables
-    v_expected_all_tables := ARRAY['protocol_instances', 'event_retention', 'operation_claim_completeness_cutover'] || v_expected_semantic_tables;
+    -- All expected tables = infrastructure + semantic tables
+    v_expected_all_tables := v_infrastructure_tables || v_expected_semantic_tables;
 
     -- Check for missing expected tables
     FOREACH v_expected_table IN ARRAY v_expected_all_tables
@@ -471,6 +789,22 @@ BEGIN
         END IF;
     END LOOP;
 
+    -- Check for missing expected views (clean-slate seals its views; the other modes have none)
+    FOREACH v_expected_table IN ARRAY v_expected_views
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'chat'
+              AND c.relname = v_expected_table
+              AND c.relkind = 'v'
+        ) THEN
+            RAISE EXCEPTION 'preflight failed: missing expected view chat.% in % mode',
+                v_expected_table, v_mode;
+        END IF;
+    END LOOP;
+
     -- Check for unexpected extra relations in chat schema (tables, views, matviews, foreign tables, partitioned tables)
     FOR v_rec IN
         SELECT c.relname, c.relkind
@@ -479,7 +813,8 @@ BEGIN
         WHERE n.nspname = 'chat'
           AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
     LOOP
-        IF v_rec.relkind IS DISTINCT FROM 'r' OR NOT (v_rec.relname = ANY(v_expected_all_tables)) THEN
+        IF NOT ((v_rec.relkind = 'r' AND v_rec.relname = ANY(v_expected_all_tables))
+             OR (v_rec.relkind = 'v' AND v_rec.relname = ANY(v_expected_views))) THEN
             RAISE EXCEPTION 'preflight failed: unexpected relation chat.% (relkind=%) in % mode',
                 v_rec.relname, v_rec.relkind, v_mode;
         END IF;
@@ -492,9 +827,9 @@ BEGIN
     WHERE n.nspname = 'chat'
       AND c.relkind IN ('r', 'p', 'v', 'm', 'f');
 
-    IF v_table_count IS DISTINCT FROM cardinality(v_expected_all_tables) THEN
+    IF v_table_count IS DISTINCT FROM cardinality(v_expected_all_tables) + cardinality(v_expected_views) THEN
         RAISE EXCEPTION 'preflight failed: chat schema table count mismatch in % mode: got %, expected %',
-            v_mode, v_table_count, cardinality(v_expected_all_tables);
+            v_mode, v_table_count, cardinality(v_expected_all_tables) + cardinality(v_expected_views);
     END IF;
 
     -- -------------------------------------------------------------------------
@@ -558,6 +893,27 @@ BEGIN
 
     IF v_completeness_count IS DISTINCT FROM 0 THEN
         RAISE EXCEPTION 'preflight failed: chat.operation_claim_completeness_cutover legacy_receipt_count must be 0, got %', v_completeness_count;
+    END IF;
+
+    -- 4d. chat.direct_request_budget (clean-slate only)
+    IF v_mode = 'clean-slate' THEN
+        SELECT COUNT(*) INTO v_row_count FROM chat.direct_request_budget;
+        IF v_row_count IS DISTINCT FROM 1 THEN
+            RAISE EXCEPTION 'preflight failed: chat.direct_request_budget must contain exactly 1 row, found %', v_row_count;
+        END IF;
+
+        SELECT singleton, pending_bytes, retained_bytes
+        INTO v_singleton, v_pending_bytes, v_retained_bytes
+        FROM chat.direct_request_budget;
+
+        IF v_singleton IS DISTINCT FROM TRUE THEN
+            RAISE EXCEPTION 'preflight failed: chat.direct_request_budget singleton column must be TRUE';
+        END IF;
+
+        IF v_pending_bytes IS DISTINCT FROM 0 OR v_retained_bytes IS DISTINCT FROM 0 THEN
+            RAISE EXCEPTION 'preflight failed: chat.direct_request_budget must be zero (pending_bytes=%, retained_bytes=%)',
+                v_pending_bytes, v_retained_bytes;
+        END IF;
     END IF;
 
     -- -------------------------------------------------------------------------

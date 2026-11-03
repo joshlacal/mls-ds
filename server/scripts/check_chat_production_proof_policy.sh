@@ -105,10 +105,8 @@ fi
 shipping_paths=(
   "$REPO_DIR/.github/workflows"
   "$REPO_DIR/deploy.sh"
-  "$REPO_DIR/docker-compose.yml"
   "$SERVER_DIR/Dockerfile"
   "$SERVER_DIR/catbird-mls-server.service"
-  "$SERVER_DIR/deploy-fresh.sh"
   "$SERVER_DIR/deploy-update.sh"
   "$SERVER_DIR/deploy.sh"
   "$SERVER_DIR/scripts/deploy.sh"

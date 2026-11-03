@@ -216,8 +216,12 @@ async fn schema_valid_nested_publication_mutations_fail_before_graph_effects() -
             )
             .await?;
         let response: Value = serde_json::from_slice(&raw)?;
-        let expected = if matches!(path, "/actorDid" | "/actorDeviceId") {
-            "PreparationConflict"
+        // The publish handler authenticates before any identity-conflict check
+        // (since f38efd4b0): the signer key is the authenticated principal's
+        // key named by the body's actorDeviceId/keyId (none → NotAuthorized),
+        // then the signature over the body must verify (→ InvalidSignature).
+        let expected = if matches!(path, "/actorDeviceId" | "/keyId") {
+            "NotAuthorized"
         } else {
             "InvalidSignature"
         };
@@ -252,7 +256,7 @@ async fn schema_valid_nested_publication_mutations_fail_before_graph_effects() -
     anyhow::ensure!(receipt == f.receipt, "valid control changed receipt");
     anyhow::ensure!(durable_graph(&f)? == graph, "valid control changed graph");
     f.bob_engine.process_direct_request(&f.welcome_input)?;
-    let DirectRequestIntroductionResult::Ready { plaintext } =
+    let DirectRequestIntroductionResult::Ready { plaintext, .. } =
         f.bob_engine.decrypt_direct_request(&f.welcome_input)?
     else {
         anyhow::bail!("valid control intro unavailable")

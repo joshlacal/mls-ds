@@ -607,11 +607,14 @@ impl DsResolver {
     /// Ordering (ADR-010 D2): self → fresh cache → `#atproto_mls` DID-document
     /// service entry → `blue.catbird.chat.declaration` repo record →
     /// `blue.catbird.chat.profile` legacy repo record →
-    /// expired-cache degraded mode → default DS → not found.
+    /// expired-cache degraded mode → a live path's retryable failure →
+    /// default DS → not found.
     ///
     /// An unexpired cache row counts as "fresh resolution" (the TTL defines
     /// freshness); expired rows are only consulted in degraded mode after all
-    /// live resolution paths have failed.
+    /// live resolution paths have failed. A live path that could not answer
+    /// now (`FederationError::is_retryable`) wins over the default DS and over
+    /// "not found", so an outage stays retryable.
     pub async fn resolve(&self, user_did: &str) -> Result<DsEndpoint, FederationError> {
         let (result, outcome) = self.resolve_with_outcome(user_did).await;
         // D2 telemetry: exactly one structured event per resolution exit, with
@@ -652,19 +655,28 @@ impl DsResolver {
             return Ok(cached);
         }
 
+        // A live path that could not answer now decided nothing (see `resolve`).
+        let mut unavailable = None;
+
         // `#atproto_mls` service entry in the user's DID document
-        if let Ok(endpoint) = self.resolve_from_did_doc(user_did).await {
-            return Ok(endpoint);
+        match self.resolve_from_did_doc(user_did).await {
+            Ok(endpoint) => return Ok(endpoint),
+            Err(e) if e.is_retryable() && unavailable.is_none() => unavailable = Some(e),
+            Err(_) => {}
         }
 
         // Declaration record (blue.catbird.chat.declaration/self)
-        if let Ok(endpoint) = self.resolve_from_declaration(user_did).await {
-            return Ok(endpoint);
+        match self.resolve_from_declaration(user_did).await {
+            Ok(endpoint) => return Ok(endpoint),
+            Err(e) if e.is_retryable() && unavailable.is_none() => unavailable = Some(e),
+            Err(_) => {}
         }
 
         // Profile record fallback (blue.catbird.chat.profile)
-        if let Ok(endpoint) = self.resolve_from_repo(user_did).await {
-            return Ok(endpoint);
+        match self.resolve_from_repo(user_did).await {
+            Ok(endpoint) => return Ok(endpoint),
+            Err(e) if e.is_retryable() && unavailable.is_none() => unavailable = Some(e),
+            Err(_) => {}
         }
 
         // Degraded mode
@@ -672,12 +684,14 @@ impl DsResolver {
             return Ok(cached);
         }
 
-        Err(FederationError::ResolutionFailed {
-            did: user_did.to_string(),
-            kind: ResolutionFailureKind::ServiceMissing(format!(
-                "Could not resolve delivery service for user {user_did}"
-            )),
-        })
+        Err(
+            unavailable.unwrap_or_else(|| FederationError::ResolutionFailed {
+                did: user_did.to_string(),
+                kind: ResolutionFailureKind::ServiceMissing(format!(
+                    "Could not resolve delivery service for user {user_did}"
+                )),
+            }),
+        )
     }
 
     async fn resolve_with_outcome(
@@ -712,6 +726,13 @@ impl DsResolver {
             Err(e) => return (Err(e), "hard_failure"),
         }
 
+        // A live path that could not answer now (the PLC or PDS unreachable,
+        // a temporary DNS failure, a 5xx/429) decided nothing. When no path
+        // resolves and no cached row is left, the first such error is the
+        // answer: settling on the default DS would write a routing decision
+        // the user's own records may contradict.
+        let mut unavailable = None;
+
         // `#atproto_mls` service entry in the user's DID document (ADR-010 D1)
         match self.resolve_from_did_doc(user_did).await {
             Ok(endpoint) => {
@@ -722,6 +743,9 @@ impl DsResolver {
             }
             Err(e) => {
                 debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "DID-document #atproto_mls resolution failed, trying declaration record");
+                if e.is_retryable() && unavailable.is_none() {
+                    unavailable = Some(e);
+                }
             }
         }
 
@@ -735,6 +759,9 @@ impl DsResolver {
             }
             Err(e) => {
                 debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "Declaration record resolution failed, trying legacy profile record");
+                if e.is_retryable() && unavailable.is_none() {
+                    unavailable = Some(e);
+                }
             }
         }
 
@@ -748,6 +775,9 @@ impl DsResolver {
             }
             Err(e) => {
                 debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "Repo profile resolution failed, trying fallback");
+                if e.is_retryable() && unavailable.is_none() {
+                    unavailable = Some(e);
+                }
             }
         }
 
@@ -767,6 +797,10 @@ impl DsResolver {
             Err(e) => {
                 debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "Expired-cache lookup failed");
             }
+        }
+
+        if let Some(e) = unavailable {
+            return (Err(e), "transient_failure");
         }
 
         // Fallback to default DS (ACTOR default ONLY)
@@ -1210,14 +1244,19 @@ impl DsResolver {
         }
 
         // Try resolving the DS's DID document for #atproto_mls service (exact type AtprotoMLSDeliveryService only)
-        if let Ok(doc) = self.fetch_did_document(&canonical_ds).await {
-            if let Some(endpoint) =
-                extract_service(&doc, "atproto_mls", Some("AtprotoMLSDeliveryService"))
-            {
-                self.validate_remote_url(endpoint).await?;
-                return Ok(endpoint.to_string());
+        let unavailable = match self.fetch_did_document(&canonical_ds).await {
+            Ok(doc) => {
+                if let Some(endpoint) =
+                    extract_service(&doc, "atproto_mls", Some("AtprotoMLSDeliveryService"))
+                {
+                    self.validate_remote_url(endpoint).await?;
+                    return Ok(endpoint.to_string());
+                }
+                None
             }
-        }
+            // A document that could not be fetched now decided nothing.
+            Err(e) => e.is_retryable().then_some(e),
+        };
 
         // Fall back to direct did:web service endpoint derivation
         if let Some(derived) = did_web_service_endpoint(&canonical_ds) {
@@ -1225,12 +1264,14 @@ impl DsResolver {
             return Ok(derived);
         }
 
-        Err(FederationError::ResolutionFailed {
-            did: ds_did.to_string(),
-            kind: ResolutionFailureKind::ServiceMissing(format!(
-                "Could not resolve DS DID {ds_did} to an HTTPS endpoint"
-            )),
-        })
+        Err(
+            unavailable.unwrap_or_else(|| FederationError::ResolutionFailed {
+                did: ds_did.to_string(),
+                kind: ResolutionFailureKind::ServiceMissing(format!(
+                    "Could not resolve DS DID {ds_did} to an HTTPS endpoint"
+                )),
+            }),
+        )
     }
 
     /// Resolve DS endpoint from the user's declaration record (blue.catbird.chat.declaration).
@@ -1439,13 +1480,25 @@ impl DsResolver {
                         pds_endpoint.trim_end_matches('/')
                     );
 
+                    // A page the PDS could not serve now (unreachable, a 5xx or
+                    // 429, a temporary DNS failure) keeps its retryable kind;
+                    // only a malformed listing is refused.
                     collect_authoritative_device_key_pages(
+                        did,
                         move |cursor| {
                             let resolver = resolver.clone();
                             let base_url = base_url.clone();
                             let did = did_owned.clone();
                             async move {
-                                let mut parsed_url = url::Url::parse(&base_url).map_err(|_| ())?;
+                                let mut parsed_url =
+                                    url::Url::parse(&base_url).map_err(|error| {
+                                        FederationError::ResolutionFailed {
+                                            did: did.clone(),
+                                            kind: ResolutionFailureKind::InvalidUrl(
+                                                error.to_string(),
+                                            ),
+                                        }
+                                    })?;
                                 {
                                     let mut query = parsed_url.query_pairs_mut();
                                     query.append_pair("repo", did.as_str());
@@ -1458,37 +1511,40 @@ impl DsResolver {
 
                                 let destination = resolver
                                     .resolve_endpoint_destination(parsed_url.as_str())
-                                    .await
-                                    .map_err(|_| ())?;
+                                    .await?;
                                 let response = send_hardened_resolution_request(
                                     &destination,
                                     deadline,
                                     did.as_str(),
                                     "PDS device-record page",
                                 )
-                                .await
-                                .map_err(|_| ())?;
+                                .await?;
 
-                                if !response.status().is_success() {
-                                    return Err(());
+                                let status = response.status();
+                                if !status.is_success() {
+                                    return Err(FederationError::ResolutionFailed {
+                                        did,
+                                        kind: ResolutionFailureKind::HttpStatus {
+                                            status: status.as_u16(),
+                                            message: format!(
+                                                "PDS device-record page returned status {status}"
+                                            ),
+                                        },
+                                    });
                                 }
-                                decode_json_bounded(
+                                decode_resolution_json(
                                     response,
-                                    ResponseBodyBudget::new(PROFILE_OR_DEVICE_MAX_BYTES, deadline),
+                                    PROFILE_OR_DEVICE_MAX_BYTES,
+                                    deadline,
+                                    did.as_str(),
+                                    "PDS device-record page",
                                 )
                                 .await
-                                .map_err(|_| ())
                             }
                         },
                         deadline,
                     )
                     .await
-                    .map_err(|_| FederationError::ResolutionFailed {
-                        did: did.to_string(),
-                        kind: ResolutionFailureKind::InvalidPayload(
-                            "PDS device-record pagination was incomplete".to_string(),
-                        ),
-                    })
                 }
             },
             deadline,
@@ -1583,6 +1639,42 @@ impl DsResolver {
         )))
     }
 
+    /// Resolve only the independent I13 method owned by the authoritative sequencer.
+    pub async fn resolve_i13_receipt_key(
+        &self,
+        sequencer_did: &str,
+    ) -> Result<Vec<u8>, FederationError> {
+        let doc = self.fetch_did_document(sequencer_did).await?;
+        let method_id = labyrinth_protocol::receipt::expected_receipt_key_id(sequencer_did);
+        let method = doc["verificationMethod"]
+            .as_array()
+            .and_then(|methods| {
+                methods
+                    .iter()
+                    .find(|method| method["id"].as_str() == Some(method_id.as_str()))
+            })
+            .ok_or(FederationError::InvalidProof)?;
+        let (_, key) = multibase::decode(
+            method["publicKeyMultibase"]
+                .as_str()
+                .ok_or(FederationError::InvalidProof)?,
+        )
+        .map_err(|_| FederationError::InvalidProof)?;
+        if key.len() != 35 || key[..2] != [0x80, 0x24] {
+            return Err(FederationError::InvalidProof);
+        }
+        let verifying_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key[2..])
+            .map_err(|_| FederationError::InvalidProof)?;
+        super::receipt::validate_receipt_did_document_for_service(
+            &serde_json::to_string(&doc).map_err(FederationError::Json)?,
+            sequencer_did,
+            &verifying_key,
+            None,
+        )
+        .map_err(|_| FederationError::InvalidProof)?;
+        Ok(key[2..].to_vec())
+    }
+
     /// Resolve the authoritative Delivery Service for a user from their live
     /// `blue.catbird.chat.declaration/self` record (encrypted direct requests,
     /// C33). Unlike [`Self::resolve`], this never consults the cache, the DID
@@ -1604,6 +1696,8 @@ impl DsResolver {
 
         let pds_endpoint = match self.resolve_did_to_pds(&canonical_user).await {
             Ok(pds) => pds,
+            // A DID document that could not be fetched now decides nothing.
+            Err(e) if e.is_retryable() => return Err(e),
             Err(e) => {
                 debug!(
                     did = %crate::crypto::redact_for_log(&canonical_user),
@@ -1947,14 +2041,24 @@ where
     .map_err(|_| ())
 }
 
+/// Every authorized key across the PDS's device-record pages. A page fetch
+/// keeps its own typed failure; a malformed, oversized or cycling listing is
+/// `InvalidPayload`, and the overall deadline is a retryable `Timeout`.
 async fn collect_authoritative_device_key_pages<Fetch, FetchFuture>(
+    did: &str,
     mut fetch_page: Fetch,
     deadline: tokio::time::Instant,
-) -> Result<Vec<Vec<u8>>, ()>
+) -> Result<Vec<Vec<u8>>, FederationError>
 where
     Fetch: FnMut(Option<String>) -> FetchFuture,
-    FetchFuture: Future<Output = Result<serde_json::Value, ()>>,
+    FetchFuture: Future<Output = Result<serde_json::Value, FederationError>>,
 {
+    let invalid = || FederationError::ResolutionFailed {
+        did: did.to_string(),
+        kind: ResolutionFailureKind::InvalidPayload(
+            "PDS device-record pagination is invalid".to_string(),
+        ),
+    };
     tokio::time::timeout_at(deadline, async move {
         let mut cursor = None;
         let mut seen_cursors = HashSet::new();
@@ -1966,32 +2070,42 @@ where
             let records = body
                 .get("records")
                 .and_then(serde_json::Value::as_array)
-                .ok_or(())?;
+                .ok_or_else(invalid)?;
             if records.len() > AUTHORITY_PAGE_SIZE {
-                return Err(());
+                return Err(invalid());
             }
-            record_count = record_count.checked_add(records.len()).ok_or(())?;
+            record_count = record_count
+                .checked_add(records.len())
+                .ok_or_else(invalid)?;
             if record_count > MAX_AUTHORITY_RECORDS {
-                return Err(());
+                return Err(invalid());
             }
-            authorized_keys.extend(parse_authoritative_device_keys(&body)?);
+            authorized_keys.extend(parse_authoritative_device_keys(&body).map_err(|()| invalid())?);
 
             match body.get("cursor") {
                 None => return Ok(authorized_keys),
                 Some(value) => {
-                    let next_cursor = value.as_str().filter(|value| !value.is_empty()).ok_or(())?;
+                    let next_cursor = value
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(invalid)?;
                     if !seen_cursors.insert(next_cursor.to_string()) {
-                        return Err(());
+                        return Err(invalid());
                     }
                     cursor = Some(next_cursor.to_string());
                 }
             }
         }
 
-        Err(())
+        Err(invalid())
     })
     .await
-    .map_err(|_| ())?
+    .map_err(|_| FederationError::ResolutionFailed {
+        did: did.to_string(),
+        kind: ResolutionFailureKind::Timeout(
+            "PDS device authority resolution exceeded its deadline".to_string(),
+        ),
+    })?
 }
 
 fn parse_authoritative_device_keys(body: &serde_json::Value) -> Result<Vec<Vec<u8>>, ()> {
@@ -3042,11 +3156,26 @@ mod tests {
         assert_eq!(parse_authoritative_device_keys(&body), Ok(Vec::new()));
     }
 
+    /// A malformed, oversized or cycling device listing is a refusal.
+    fn assert_invalid_listing(result: Result<Vec<Vec<u8>>, FederationError>) {
+        assert!(
+            matches!(
+                &result,
+                Err(FederationError::ResolutionFailed {
+                    kind: ResolutionFailureKind::InvalidPayload(_),
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn authoritative_pagination_retains_ed25519_key_from_second_page() {
         let requested_cursors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let cursors = requested_cursors.clone();
         let keys = collect_authoritative_device_key_pages(
+            "did:plc:test",
             move |cursor| {
                 cursors.lock().expect("cursor lock").push(cursor.clone());
                 std::future::ready(match cursor.as_deref() {
@@ -3065,23 +3194,80 @@ mod tests {
                     Some("page-2") => Ok(serde_json::json!({
                         "records": [authoritative_record(&[0x42; 32])]
                     })),
-                    _ => Err(()),
+                    _ => Err(FederationError::NotFound("unexpected cursor".into())),
                 })
             },
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
 
-        assert_eq!(keys, Ok(vec![vec![0x42; 32]]));
+        assert_eq!(keys.expect("both pages are valid"), vec![vec![0x42; 32]]);
         assert_eq!(
             *requested_cursors.lock().expect("cursor lock"),
             vec![None, Some("page-2".to_string())]
         );
     }
 
+    /// A page the PDS could not serve now keeps its retryable kind; a page it
+    /// refuses (404) stays permanent.
+    #[tokio::test]
+    async fn authoritative_pagination_keeps_a_page_outage_retryable() {
+        for (kind, retryable) in [
+            (
+                ResolutionFailureKind::HttpStatus {
+                    status: 503,
+                    message: "PDS unavailable".into(),
+                },
+                true,
+            ),
+            (
+                ResolutionFailureKind::HttpStatus {
+                    status: 429,
+                    message: "PDS rate limited".into(),
+                },
+                true,
+            ),
+            (
+                ResolutionFailureKind::ConnectionFailed("PDS unreachable".into()),
+                true,
+            ),
+            (
+                ResolutionFailureKind::DnsTemporary("PDS host SERVFAIL".into()),
+                true,
+            ),
+            (
+                ResolutionFailureKind::HttpStatus {
+                    status: 404,
+                    message: "repo not found".into(),
+                },
+                false,
+            ),
+        ] {
+            let result = collect_authoritative_device_key_pages(
+                "did:plc:test",
+                |_| {
+                    std::future::ready(Err::<serde_json::Value, _>(
+                        FederationError::ResolutionFailed {
+                            did: "did:plc:test".into(),
+                            kind: kind.clone(),
+                        },
+                    ))
+                },
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+            assert_eq!(
+                result.expect_err("the page failed").is_retryable(),
+                retryable,
+                "{kind:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn authoritative_pagination_rejects_non_progressing_cursor() {
         let result = collect_authoritative_device_key_pages(
+            "did:plc:test",
             |_| {
                 std::future::ready(Ok(serde_json::json!({
                     "records": [],
@@ -3091,12 +3277,13 @@ mod tests {
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
-        assert!(result.is_err());
+        assert_invalid_listing(result);
     }
 
     #[tokio::test]
     async fn authoritative_pagination_rejects_repeated_cursor_cycle() {
         let result = collect_authoritative_device_key_pages(
+            "did:plc:test",
             |cursor| {
                 std::future::ready(Ok(serde_json::json!({
                     "records": [],
@@ -3110,7 +3297,7 @@ mod tests {
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
-        assert!(result.is_err());
+        assert_invalid_listing(result);
     }
 
     #[tokio::test]
@@ -3118,6 +3305,7 @@ mod tests {
         let page_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = page_counter.clone();
         let page_limit = collect_authoritative_device_key_pages(
+            "did:plc:test",
             move |_| {
                 let page = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::future::ready(Ok(serde_json::json!({
@@ -3128,13 +3316,14 @@ mod tests {
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
-        assert!(page_limit.is_err());
+        assert_invalid_listing(page_limit);
     }
 
     #[tokio::test]
     async fn authoritative_pagination_rejects_record_limit_overflow() {
         let records = vec![authoritative_record(&[0x41; 32]); MAX_AUTHORITY_RECORDS + 1];
         let record_limit = collect_authoritative_device_key_pages(
+            "did:plc:test",
             move |_| {
                 let records = records.clone();
                 std::future::ready(Ok(serde_json::json!({
@@ -3144,13 +3333,14 @@ mod tests {
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
-        assert!(record_limit.is_err());
+        assert_invalid_listing(record_limit);
     }
 
     #[tokio::test]
     async fn authoritative_pagination_rejects_101_records_in_one_page() {
         let records = vec![authoritative_record(&[0x41; 32]); AUTHORITY_PAGE_SIZE + 1];
         let result = collect_authoritative_device_key_pages(
+            "did:plc:test",
             move |_| {
                 let records = records.clone();
                 std::future::ready(Ok(serde_json::json!({ "records": records })))
@@ -3159,7 +3349,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        assert_invalid_listing(result);
     }
 
     #[tokio::test]
@@ -3168,6 +3358,7 @@ mod tests {
         let counter = page_counter.clone();
         let records = vec![authoritative_record(&[0x41; 32]); AUTHORITY_PAGE_SIZE];
         let result = collect_authoritative_device_key_pages(
+            "did:plc:test",
             move |_| {
                 let page = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let cursor = (page + 1 < MAX_AUTHORITY_PAGES).then(|| format!("page-{}", page + 1));
@@ -3195,11 +3386,21 @@ mod tests {
     #[tokio::test]
     async fn authoritative_pagination_enforces_overall_deadline() {
         let result = collect_authoritative_device_key_pages(
-            |_| std::future::pending::<Result<serde_json::Value, ()>>(),
+            "did:plc:test",
+            |_| std::future::pending::<Result<serde_json::Value, FederationError>>(),
             tokio::time::Instant::now() + Duration::from_millis(1),
         )
         .await;
-        assert!(result.is_err());
+        assert!(
+            matches!(
+                &result,
+                Err(FederationError::ResolutionFailed {
+                    kind: ResolutionFailureKind::Timeout(_),
+                    ..
+                })
+            ),
+            "a PDS too slow to answer decided nothing: {result:?}"
+        );
     }
     #[tokio::test]
     async fn authorized_device_pagination_revalidates_every_page_destination() {
@@ -4003,6 +4204,97 @@ mod tests {
         assert!(matches!(
             result,
             Err(FederationError::EndpointNotFound { .. })
+        ));
+    }
+
+    /// Every destination fails with `kind`, as when the PLC directory or a
+    /// host cannot be reached (or does not exist).
+    fn resolver_whose_hosts_fail(pool: PgPool, kind: ResolutionFailureKind) -> DsResolver {
+        DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            Some((
+                "did:web:default-ds.example.com".to_string(),
+                "https://default-ds.example.com".to_string(),
+            )),
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |target: &str| {
+            let error = FederationError::ResolutionFailed {
+                did: target.to_string(),
+                kind: kind.clone(),
+            };
+            Some(Box::pin(async move { Err(error) }))
+        }))
+    }
+
+    /// An actor whose DID document cannot be fetched now (PLC outage, a
+    /// temporary DNS failure) resolves to that retryable failure, never to
+    /// the default DS or "not found"; a host that does not exist decides as
+    /// before.
+    #[tokio::test]
+    async fn test_resolve_outage_stays_retryable_instead_of_default() {
+        let (pool, _db) = setup_cache_test_pool().await;
+        let did = "did:plc:resolveoutageaaaaaaaaaaa";
+        let outage = resolver_whose_hosts_fail(
+            pool.clone(),
+            ResolutionFailureKind::DnsTemporary("SERVFAIL".into()),
+        );
+        let (result, outcome) = outage.resolve_with_outcome(did).await;
+        assert_eq!(outcome, "transient_failure");
+        assert!(result
+            .expect_err("an outage resolves nothing")
+            .is_retryable());
+        assert!(outage
+            .resolve_uncached(did)
+            .await
+            .expect_err("an outage resolves nothing")
+            .is_retryable());
+
+        let missing =
+            resolver_whose_hosts_fail(pool, ResolutionFailureKind::DnsNxdomain("NXDOMAIN".into()));
+        let (result, outcome) = missing.resolve_with_outcome(did).await;
+        assert_eq!(outcome, "default_fallback");
+        assert_eq!(
+            result.expect("default fallback").endpoint,
+            "https://default-ds.example.com"
+        );
+        assert!(matches!(
+            missing.resolve_uncached(did).await,
+            Err(FederationError::ResolutionFailed {
+                kind: ResolutionFailureKind::ServiceMissing(_),
+                ..
+            })
+        ));
+    }
+
+    /// A `did:plc` delivery service whose document cannot be fetched now has
+    /// no `did:web` derivation to fall back on: the outage stays retryable.
+    #[tokio::test]
+    async fn test_ds_did_document_outage_stays_retryable() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/nonexistent_resolver_test")
+            .expect("lazy pool");
+        let ds = "did:plc:dsdocumentoutageaaaaaaa";
+        let outage = resolver_whose_hosts_fail(
+            pool.clone(),
+            ResolutionFailureKind::ConnectionFailed("PLC unreachable".into()),
+        );
+        assert!(outage
+            .resolve_ds_did_to_endpoint(ds)
+            .await
+            .expect_err("an outage resolves nothing")
+            .is_retryable());
+        let missing =
+            resolver_whose_hosts_fail(pool, ResolutionFailureKind::DnsNxdomain("NXDOMAIN".into()));
+        assert!(matches!(
+            missing.resolve_ds_did_to_endpoint(ds).await,
+            Err(FederationError::ResolutionFailed {
+                kind: ResolutionFailureKind::ServiceMissing(_),
+                ..
+            })
         ));
     }
 

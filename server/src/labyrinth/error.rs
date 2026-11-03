@@ -101,14 +101,16 @@ impl LabyrinthError {
         )
     }
 
-    /// The conversation's sequencer DS could not be reached (or federation
-    /// is not configured here).
+    /// The DS a read is relayed to, or the route to it, could not answer now
+    /// (or federation is not configured here): nothing was decided, so the
+    /// identical read may retry in 5 s.
     pub fn relay_unavailable() -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "RelayUnavailable",
-            "the conversation's sequencer DS could not be reached",
+            "the authoritative DS could not be reached",
         )
+        .with_retry_after(5)
     }
 
     pub fn internal() -> Self {

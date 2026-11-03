@@ -10,7 +10,9 @@
 //!
 //! Controls verify that:
 //! - Canonical authority recipient is prepared normally (then cancelled to release).
-//! - Missing declaration (RecordNotFound) keeps `RecipientKeysUnavailable`.
+//! - A declared recipient without request keys keeps `RecipientKeysUnavailable`.
+//! - Missing declaration (RecordNotFound) is refused by consent with
+//!   `RequestPolicyDenied`, never as `RecipientAuthorityUnsupported`.
 //! - Malformed/unreadable declaration fails closed with `RequestPolicyDenied`.
 #![allow(dead_code)]
 
@@ -230,10 +232,16 @@ struct Rig {
 async fn rig(identities: &[&ServiceIdentity]) -> anyhow::Result<Rig> {
     let authority = connect_guarded_request_database(5).await?;
     anyhow::ensure!(authority.additive_migrations == reviewed_request_migrations().len());
-    let documents = identities
+    let mut documents = identities
         .iter()
         .map(|id| (id.did.clone(), id.did_document()))
         .collect::<Vec<_>>();
+    // Resolve the unpeered control authoritatively; an absent DNS answer is a
+    // retryable outage and must not be mistaken for a permanent refusal.
+    documents.push((
+        FOREIGN_AUTHORITY.to_owned(),
+        json!({"id": FOREIGN_AUTHORITY}),
+    ));
     let https = HttpsDidFixture::start(HttpsDidFixture::reserve_port()?, &documents)?;
     let server = ShippingServerFixture::start(&https)?;
     Ok(Rig {
@@ -423,19 +431,29 @@ fn receipt(response: &Value, key: &[u8]) -> anyhow::Result<(String, Option<Strin
 /// service is refused at preparation with the typed signed
 /// `RecipientAuthorityUnsupported` receipt; no lease, no package reservation,
 /// no publication/conversation/Welcome. Controls: the same recipient declaring
-/// the canonical authority is prepared normally (then cancelled to release),
-/// and an undeclared recipient without keys keeps `RecipientKeysUnavailable`.
+/// the canonical authority is prepared normally (then cancelled to release), a
+/// declared recipient without keys keeps `RecipientKeysUnavailable`, and an
+/// undeclared recipient is refused by consent, never as unsupported authority.
 async fn router_refuses_foreign_recipient_before_any_lease() -> anyhow::Result<()> {
     let run = Uuid::new_v4().simple().to_string();
-    let (alice_id, bob_id, carol_id) = (
+    let (alice_id, bob_id, carol_id, dave_id) = (
         identity("alice", &run),
         identity("bob", &run),
         identity("carol", &run),
+        identity("dave", &run),
     );
-    let rig = rig(&[&alice_id, &bob_id, &carol_id]).await?;
+    let rig = rig(&[&alice_id, &bob_id, &carol_id, &dave_id]).await?;
+    // Control 2b's recipient publishes no chat declaration at all.
+    std::fs::remove_file(
+        rig.https
+            .root
+            .join("_policy/catbirdDeclaration")
+            .join(quote(&dave_id.did)),
+    )?;
     let alice = Account::new(alice_id, "c33-alice")?;
     let bob = Account::new(bob_id, "c33-bob")?;
     let carol = Account::new(carol_id, "c33-carol")?;
+    let dave = Account::new(dave_id, "c33-dave")?;
     publish_keys(&rig, &bob).await?;
     assert_eq!(
         available_request_packages(bob.did())?,
@@ -508,12 +526,29 @@ async fn router_refuses_foreign_recipient_before_any_lease() -> anyhow::Result<(
         "control lease released by signed cancel: {released}"
     );
 
-    // Control 2: a recipient with no chat declaration at all (fixture answers
-    // the typed RecordNotFound) and no request keys keeps the pre-existing
-    // RecipientKeysUnavailable refusal: absence never becomes "unsupported".
+    // Control 2a: a canonically declared recipient with no request keys keeps
+    // the pre-existing RecipientKeysUnavailable refusal.
     let keyless = prepare(&rig, &alice, carol.did()).await?;
     let (_, keyless_code, _) = receipt(&keyless.response, &rig.server.receipt_public_key)?;
     assert_eq!(keyless_code.as_deref(), Some("RecipientKeysUnavailable"));
+    assert_eq!(
+        attempt_footprint(keyless.request_id, keyless.conversation_id)?,
+        "rejected|0|0|0|0|0|0",
+        "keyless refusal is terminal: no lease, selection or publication"
+    );
+
+    // Control 2b: a recipient with no chat declaration at all (fixture answers
+    // the typed RecordNotFound) is refused by consent — an absent declaration
+    // admits nobody (relationship_policy: absent → IncomingPolicy::None) — and
+    // absence never becomes "unsupported" authority.
+    let undeclared = prepare(&rig, &alice, dave.did()).await?;
+    let (_, undeclared_code, _) = receipt(&undeclared.response, &rig.server.receipt_public_key)?;
+    assert_eq!(undeclared_code.as_deref(), Some("RequestPolicyDenied"));
+    assert_eq!(
+        attempt_footprint(undeclared.request_id, undeclared.conversation_id)?,
+        "rejected|0|0|0|0|0|0",
+        "undeclared refusal is terminal: no lease, selection or publication"
+    );
 
     // Control 3: an unreadable/malformed chat declaration (non-public DID)
     // fails closed like the consent declaration read, never as "unsupported"

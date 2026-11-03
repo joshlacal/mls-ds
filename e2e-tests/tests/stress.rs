@@ -236,7 +236,7 @@ async fn stress_many_convos() {
         let welcome = TestUser::random_bytes(256);
         let t = Instant::now();
         let convo = main_user
-            .create_convo(&[other.did.clone()], Some(&welcome))
+            .create_convo(std::slice::from_ref(&other.did), Some(&welcome))
             .await
             .unwrap_or_else(|e| panic!("create convo {i}: {e}"));
         create_latencies.push(t.elapsed());

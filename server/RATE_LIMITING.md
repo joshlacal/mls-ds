@@ -1,353 +1,52 @@
-# Rate Limiting Implementation
+# Rate limiting
 
-This document describes the comprehensive rate limiting system implemented for the Catbird MLS Server.
+`catbird-server` throttles requests at three points. Every limit is an in-process token bucket: each server process keeps its own buckets, and a restart resets them. A throttled request gets `429` with a `Retry-After` header. The code is in `src/middleware/rate_limit.rs` and `src/auth.rs`.
 
-## Overview
+## 1. Per client IP, before authentication
 
-The server implements **two-tier rate limiting** to prevent abuse and DoS attacks:
+`rate_limit_middleware` charges every request to its client IP.
 
-1. **Per-IP Rate Limiting** (fallback for unauthenticated requests)
-2. **Per-DID Endpoint-Specific Rate Limiting** (for authenticated requests)
+- `RATE_LIMIT_IP_PER_MINUTE` (default 300) is the refill rate. `IP_RATE_BURST` (default: the larger of that value and 60) is the bucket size.
+- The client IP is the TCP peer address. Only when the peer is inside `TRUSTED_PROXY_CIDRS` does the server read `CF-Connecting-IP`, then the right-most untrusted `X-Forwarded-For` hop, then `X-Real-IP`. The default trusted ranges are loopback and private: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `::1/128` and `fc00::/7`.
+- The response body is `{"error":"RateLimitExceeded", ...}`.
+- `RATE_LIMIT_IP_MAX_KEYS` (100,000) and `RATE_LIMIT_BUCKET_TTL_SECONDS` (600) bound the bucket cache.
 
-## Architecture
+## 2. Per account, after authentication
 
-### 1. Per-IP Rate Limiting (Unauthenticated)
-
-**Purpose**: Protect against brute force attacks, preflight spam, and invalid token flooding.
-
-**Implementation**: `server/src/middleware/rate_limit.rs`
-
-**Default Limits**:
-- 60 requests per minute per IP address
-- Burst capacity: 6 requests (10% of per-minute limit)
-- Window: 60 seconds (sliding)
-
-**Headers Checked** (in order of precedence):
-1. `X-Forwarded-For` (proxy/load balancer)
-2. `CF-Connecting-IP` (Cloudflare)
-3. `X-Real-IP` (Nginx)
-
-**Configuration**:
-```bash
-# .env
-RATE_LIMIT_IP_PER_MINUTE=60      # Requests per minute per IP
-IP_RATE_BURST=6                   # Burst capacity
-```
+A `blue.catbird.chat.*` call first verifies the account's service-auth JWT, then charges two buckets for the issuer DID:
 
-### 2. Per-DID Endpoint-Specific Rate Limiting (Authenticated)
+- `AUTH_RATE_LIMIT_PER_SECOND` (default 100, with a burst of one tenth of that), shared by all endpoints.
+- A per-endpoint minute quota. Several variable names predate the clean-slate endpoint names.
 
-**Purpose**: Prevent abuse from authenticated users with different limits for different operations.
+| Endpoint | Variable | Default per minute |
+|---|---|---:|
+| `enrollDevice` | `RATE_LIMIT_DEVICE_AUTH_BINDING` | 10 |
+| `sendMessage` | `RATE_LIMIT_SEND_MESSAGE` | 100 |
+| `getEntries`, `getConversations`, `getConversationState` | `RATE_LIMIT_GET_MESSAGES` | 500 |
+| `publishTyping` | `RATE_LIMIT_UPDATE_CURSOR` | 300 |
+| `replenishKeyPackages` | `RATE_LIMIT_PUBLISH_KEY_PACKAGE` | 50 |
+| `createConversation` | `RATE_LIMIT_CREATE_CONVO` | 5 |
+| every other endpoint | `RATE_LIMIT_DID_DEFAULT` | 200 |
 
-**Implementation**: Integrated into `server/src/auth.rs` AuthUser extractor
-
-**Endpoint-Specific Quotas** (per DID per minute):
+`RATE_LIMIT_DID_MAX_KEYS` (300,000) and `RATE_LIMIT_DID_BUCKET_TTL_SECONDS` (900) bound this cache.
 
-| Endpoint | Limit | Rationale |
-|----------|-------|-----------|
-| `sendMessage` | 100/min | High frequency messaging |
-| `publishKeyPackage` | 20/min | Batch key package uploads |
-| `addMembers` | 10/min | Admin operations |
-| `removeMember` | 10/min | Admin operations |
-| `createConvo` | 5/min | Expensive database operations |
-| `reportMember` | 5/min | Prevent report spam |
-| Default | 200/min | Other operations |
+## 3. Per calling DS
 
-**Configuration**:
-```bash
-# .env
-RATE_LIMIT_SEND_MESSAGE=100
-RATE_LIMIT_PUBLISH_KEY_PACKAGE=20
-RATE_LIMIT_ADD_MEMBERS=10
-RATE_LIMIT_CREATE_CONVO=5
-RATE_LIMIT_REPORT_MEMBER=5
-RATE_LIMIT_DID_DEFAULT=200
-```
+The original S2S routes (`deliverMessage`, `deliverWelcome`, `submitCommit`, GET `fetchKeyPackage`, `getConvoDigest`, `getConvoEvents`, `transferSequencer`) and the C33 direct-request S2S routes charge the calling DS:
 
-### 3. Space Authority Policy Calls
+| Route | Variable | Default per minute |
+|---|---|---:|
+| `deliverMessage` | `FEDERATION_RATE_LIMIT_DELIVER_MESSAGE` | 240 |
+| `deliverWelcome` | `FEDERATION_RATE_LIMIT_DELIVER_WELCOME` | 120 |
+| `submitCommit` | `FEDERATION_RATE_LIMIT_SUBMIT_COMMIT` | 120 |
+| `fetchKeyPackage` | `FEDERATION_RATE_LIMIT_FETCH_KEY_PACKAGE` | 120 |
+| `transferSequencer` | `FEDERATION_RATE_LIMIT_TRANSFER_SEQUENCER` | 30 |
+| any other route | `FEDERATION_RATE_LIMIT_DEFAULT` | 180 |
 
-`blue.catbird.labyrinth.getSpaceMembership` and `deleteSpaceGeneration` are called by one Space authority DID (Swan) on behalf of every user, so they skip the per-DID quotas above. Each `(authority, user)` pair has its own bucket, under a larger per-authority ceiling for each endpoint. `deleteSpaceGeneration` names no user and uses only the ceiling. Throttling returns `429 RateLimited` with `Retry-After`. A failure to resolve the authority's DID document returns `503 DidResolutionFailed`. A rejected token stays `401`.
+A limit set on the peer's `federation_peers` row, scaled by its risk tier, replaces these defaults (see [../SELF_HOSTING.md](../SELF_HOSTING.md#3-federation-and-peer-policy)). The group, ACK, prune-notice, deletion and control routes are not charged here; peer policy alone gates them. `RATE_LIMIT_FEDERATION_MAX_KEYS` (100,000) and `RATE_LIMIT_FEDERATION_BUCKET_TTL_SECONDS` (900) bound this cache.
 
-The authority also sends every user's calls from one egress address, so these two paths skip the general per-IP bucket of section 1 as well. Otherwise one user's calls would spend that bucket for every other user. Instead each `(client IP, path)` pair has its own pre-auth bucket, which defaults to the per-authority ceiling, so that ceiling is reachable. The bucket still bounds unauthenticated calls, which resolve the issuer DID before the signature is checked. It returns `429 RateLimitExceeded` with `Retry-After`. Setting `RATE_LIMIT_SPACE_AUTHORITY_IP_PER_MINUTE` below the per-authority ceiling caps the authority's total rate at that value instead.
+## Housekeeping and tests
 
-```bash
-# .env
-RATE_LIMIT_SPACE_AUTHORITY_PER_USER=300       # per authority and user per minute
-RATE_LIMIT_SPACE_AUTHORITY_PER_MINUTE=6000    # per authority and endpoint, all users
-# RATE_LIMIT_SPACE_AUTHORITY_IP_PER_MINUTE=   # pre-auth, per client IP and path; defaults to the line above
-RATE_LIMIT_SPACE_AUTHORITY_MAX_KEYS=300000    # max distinct keys kept in each of the two caches
-RATE_LIMIT_SPACE_AUTHORITY_BUCKET_TTL_SECONDS=900
-```
+A background task evicts idle buckets from the IP, account and peer caches every 5 minutes. The limiter's unit tests live in `src/middleware/rate_limit.rs`. The Space-authority limiter and its `RATE_LIMIT_SPACE_AUTHORITY_*` settings were removed with `getSpaceMembership` and `deleteSpaceGeneration`.
 
-## Technical Details
-
-### Token Bucket Algorithm
-
-Both rate limiters use a **token bucket** algorithm with:
-- Automatic refilling based on elapsed time
-- Burst capacity for handling request spikes
-- Memory-efficient sliding window implementation
-
-**Key Features**:
-- Lock-free reads (uses `RwLock` with optimized read paths)
-- Automatic cleanup of stale buckets (every 5 minutes)
-- Configurable via environment variables
-
-### Rate Limit Flow
-
-#### Unauthenticated Requests
-```
-Request → rate_limit_middleware → IP extraction → Token bucket check
-                                                    ↓
-                                                  Allowed? → Continue
-                                                    ↓
-                                               Rate limited? → 429 + Retry-After
-```
-
-#### Authenticated Requests
-```
-Request → rate_limit_middleware (IP check) → auth extractor → JWT validation
-                                                                ↓
-                                                            DID extraction
-                                                                ↓
-                                                    Endpoint-specific check
-                                                                ↓
-                                                            Allowed? → Handler
-                                                                ↓
-                                                        Rate limited? → 429
-```
-
-## Response Headers
-
-When rate limited, the server returns:
-- **Status Code**: `429 Too Many Requests`
-- **Header**: `Retry-After: <seconds>` - Time until request quota refreshes
-
-Example:
-```http
-HTTP/1.1 429 Too Many Requests
-Retry-After: 42
-Content-Length: 0
-```
-
-## Memory Management
-
-### Cleanup Workers
-
-The server spawns background tasks to prevent memory leaks:
-
-**DID Rate Limiter Cleanup** (`main.rs`):
-- Runs every 5 minutes
-- Removes buckets not accessed in the last 10 minutes
-- Prevents unbounded memory growth from one-time users
-
-**IP Rate Limiter Cleanup** (built-in):
-- Automatic cleanup on bucket access
-- No separate worker needed
-
-### Memory Footprint
-
-Each rate limit bucket consumes approximately:
-- 48 bytes (bucket metadata)
-- 24 bytes (HashMap key)
-- **Total**: ~72 bytes per active DID:endpoint or IP
-
-**Example**: 10,000 active users × 5 endpoints = 50,000 buckets × 72 bytes = **3.6 MB**
-
-## Testing
-
-### Automated Test Suite
-
-Run the comprehensive test suite:
-```bash
-cd server
-./test_rate_limiting.sh
-```
-
-**Without authentication** (tests IP-based limits only):
-```bash
-SERVER_URL=http://localhost:8080 ./test_rate_limiting.sh
-```
-
-**With authentication** (tests DID-based limits):
-```bash
-SERVER_URL=http://localhost:8080 \
-TEST_JWT="your-jwt-token-here" \
-./test_rate_limiting.sh
-```
-
-### Manual Testing
-
-#### Test Per-IP Limits (60/min)
-```bash
-# Should see 429 after ~60 requests
-for i in {1..70}; do
-    curl -s -w "%{http_code}\n" http://localhost:8080/health | tail -1
-done | grep -c "429"
-```
-
-#### Test Per-DID sendMessage Limit (100/min)
-```bash
-# Should see 429 after ~100 requests
-JWT="your-jwt-token"
-for i in {1..110}; do
-    curl -s -w "%{http_code}\n" \
-        -H "Authorization: Bearer $JWT" \
-        -X POST \
-        -H "Content-Type: application/json" \
-        -d '{"convoId":"test","message":"test"}' \
-        http://localhost:8080/xrpc/blue.catbird.mls.sendMessage | tail -1
-done | grep -c "429"
-```
-
-#### Test Per-DID createConvo Limit (5/min)
-```bash
-# Should see 429 after ~5 requests
-JWT="your-jwt-token"
-for i in {1..10}; do
-    curl -s -w "%{http_code}\n" \
-        -H "Authorization: Bearer $JWT" \
-        -X POST \
-        -H "Content-Type: application/json" \
-        -d '{"name":"test","didList":["did:plc:test1"]}' \
-        http://localhost:8080/xrpc/blue.catbird.mls.createConvo | tail -1
-done | grep -c "429"
-```
-
-## Production Considerations
-
-### Tuning for Production
-
-**High-Traffic Environments**:
-```bash
-# Increase limits for high-volume legitimate users
-RATE_LIMIT_SEND_MESSAGE=200
-RATE_LIMIT_DID_DEFAULT=400
-```
-
-**Security-Focused Environments**:
-```bash
-# Stricter limits to prevent abuse
-RATE_LIMIT_IP_PER_MINUTE=30
-RATE_LIMIT_CREATE_CONVO=3
-RATE_LIMIT_REPORT_MEMBER=3
-```
-
-### Behind a Load Balancer
-
-Ensure the load balancer forwards client IPs:
-- **Nginx**: `proxy_set_header X-Real-IP $remote_addr;`
-- **Cloudflare**: Automatically sets `CF-Connecting-IP`
-- **AWS ALB**: `X-Forwarded-For` header included
-
-### Monitoring
-
-**Key Metrics to Monitor**:
-1. Rate of 429 responses (by endpoint)
-2. Average `Retry-After` values
-3. Memory usage of rate limiter buckets
-4. Cleanup task execution time
-
-**Logging**:
-```bash
-# Check rate limit warnings
-sudo journalctl -u catbird-mls-server | grep "rate limit exceeded"
-
-# Check cleanup task
-sudo journalctl -u catbird-mls-server | grep "Rate limiter cleanup"
-```
-
-## Security Considerations
-
-### IP Spoofing Prevention
-
-The middleware checks headers in order of trustworthiness:
-1. Trusted proxy headers (`X-Forwarded-For`, `CF-Connecting-IP`)
-2. Fallback to connection IP
-3. Never trusts client-provided custom headers
-
-### DID Verification
-
-DID-based rate limiting only applies **after JWT validation**:
-1. JWT signature verified against DID document
-2. Claims validated (exp, aud, lxm, jti)
-3. Only then is the DID used for rate limiting
-
-This prevents attackers from bypassing limits by forging DIDs.
-
-### Attack Scenarios Covered
-
-| Attack Type | Protection |
-|-------------|------------|
-| Brute force auth | Per-IP limits on auth endpoints |
-| Token flooding | Per-IP limits for invalid tokens |
-| Message spam | Per-DID sendMessage limits |
-| Conversation spam | Per-DID createConvo limits |
-| Report spam | Per-DID reportMember limits |
-| Membership churn | Per-DID addMembers/removeMember limits |
-| DDoS (unauthenticated) | Per-IP global limits |
-| DDoS (authenticated) | Per-DID endpoint-specific limits |
-
-## Implementation Files
-
-- **`server/src/middleware/rate_limit.rs`**: Core rate limiting logic
-- **`server/src/auth.rs`**: DID-based rate limit integration (line 645-658)
-- **`server/src/main.rs`**: Cleanup worker initialization (line 132-143)
-- **`server/test_rate_limiting.sh`**: Automated test suite
-- **`server/RATE_LIMITING.md`**: This documentation
-
-## Troubleshooting
-
-### Rate Limits Not Working
-
-1. Check if middleware is registered in `main.rs`:
-   ```rust
-   .layer(axum::middleware::from_fn(middleware::rate_limit::rate_limit_middleware))
-   ```
-
-2. Verify environment variables are loaded:
-   ```bash
-   cat .env | grep RATE_LIMIT
-   ```
-
-3. Check logs for rate limit warnings:
-   ```bash
-   sudo journalctl -u catbird-mls-server | grep -i "rate limit"
-   ```
-
-### False Positives
-
-If legitimate users are being rate limited:
-
-1. **Check if behind proxy**: Ensure `X-Forwarded-For` is set correctly
-2. **Increase limits**: Adjust environment variables
-3. **Check burst capacity**: May need higher burst for request spikes
-
-### Memory Growth
-
-If rate limiter memory grows unbounded:
-
-1. Verify cleanup task is running:
-   ```bash
-   sudo journalctl -u catbird-mls-server | grep "Rate limiter cleanup"
-   ```
-
-2. Check cleanup frequency (default: 5 minutes)
-3. Reduce max_age for bucket retention (default: 10 minutes)
-
-## Future Enhancements
-
-Potential improvements for future versions:
-
-1. **Redis-backed rate limiting** for multi-instance deployments
-2. **Per-user quotas** stored in database (override defaults)
-3. **Rate limit exemptions** for verified/premium users
-4. **Dynamic rate limits** based on server load
-5. **Rate limit analytics** dashboard
-6. **Gradual backoff** instead of hard cutoffs
-7. **Whitelisting** for trusted IPs/DIDs
-
-## References
-
-- Token Bucket Algorithm: https://en.wikipedia.org/wiki/Token_bucket
-- Axum Middleware: https://docs.rs/axum/latest/axum/middleware/
-- HTTP 429 Status Code: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
+`test_rate_limiting.sh` checks a running server: the per-IP bucket on `/health` (set `IP_BURST` to the server's `IP_RATE_BURST`, default 300) and, when `TEST_JWT_CMD` names a command that prints a fresh service-auth JWT for a given NSID, the `sendMessage`, `createConversation` and `replenishKeyPackages` account quotas. The account checks need `CHAT_CUTOVER_ENABLED`. It exits non-zero when a check sees no `429`.

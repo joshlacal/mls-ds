@@ -77,6 +77,68 @@ async fn handle_inner(
 
         let parsed_req: serde_json::Value = serde_json::from_str(envelope.request.get())
             .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+        // Authenticate the signed acceptance before reading any state it names
+        // (pending, deleted or unknown conversations): a request this DS cannot
+        // verify is `InvalidSignature`, exactly as the coordinator's admission
+        // answers it, and discloses nothing.
+        let unverified =
+            || ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidSignature);
+        let device_id = parsed_req
+            .pointer("/body/actorDeviceId")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .ok_or_else(unverified)?;
+        let key_id = parsed_req
+            .pointer("/body/keyId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(unverified)?;
+        let device_key: Option<(Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT k.signing_public_key, d.auth_generation FROM chat.device_keys k \
+             JOIN chat.devices d ON d.user_did=k.user_did AND d.device_id=k.device_id \
+             WHERE k.user_did=$1 AND k.device_id=$2 AND k.key_id=$3 \
+               AND k.revoked_at IS NULL AND d.revoked_at IS NULL AND d.status='active' \
+               AND k.enrollment_auth_generation<=d.auth_generation \
+               AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer \
+                    WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+                      AND newer.enrollment_auth_generation>k.enrollment_auth_generation \
+                      AND newer.enrollment_auth_generation<=d.auth_generation)",
+        )
+        .bind(principal.did())
+        .bind(device_id)
+        .bind(key_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+        let (public_key, generation) = device_key.ok_or_else(unverified)?;
+        let verified = crate::chat_protocol::direct_request_transcript::verify_signed_request(
+            crate::chat_protocol::direct_request_transcript::DirectRequestKind::Accept,
+            envelope.request.get().as_bytes(),
+            &public_key,
+        )
+        .map_err(|_| unverified())?;
+        if verified.actor_did() != Some(principal.did())
+            || verified.actor_device_id() != Some(device_id.to_string().as_str())
+            || verified.auth_generation() != Some(generation as u64)
+        {
+            return Err(unverified());
+        }
+        let request_id_str = parsed_req
+            .pointer("/body/requestId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
+        let request_id = uuid::Uuid::parse_str(request_id_str)
+            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+        let transition_id_str = parsed_req
+            .pointer("/body/transitionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
+        let transition_id = uuid::Uuid::parse_str(transition_id_str)
+            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+
         let convo_id_str = parsed_req["body"]["prior"]["conversationId"]
             .as_str()
             .unwrap_or_default();
@@ -111,88 +173,32 @@ async fn handle_inner(
             ));
         };
 
-        let coord = crate::federation::canonical_relay::resolve_pair_coordinator(
+        let parties = [creator.as_str(), principal.did()];
+        let coord = match crate::federation::canonical_relay::resolve_pair_coordinator(
             pool,
             creator,
             principal.did(),
         )
         .await
-        .map_err(|_| {
-            ChatFailure::protocol(
-                endpoint,
-                ChatProtocolErrorCode::RelationshipPolicyUnavailable,
-            )
-        })?;
-        if !coord.is_coordinator {
-            let device_id = parsed_req
-                .pointer("/body/actorDeviceId")
-                .and_then(|v| v.as_str())
-                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                .ok_or_else(|| {
-                    ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
-                })?;
-            let key_id = parsed_req
-                .pointer("/body/keyId")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-                })?;
-            let request_id_str = parsed_req
-                .pointer("/body/requestId")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-                })?;
-            let request_id = uuid::Uuid::parse_str(request_id_str).map_err(|_| {
-                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-            })?;
-            let transition_id_str = parsed_req
-                .pointer("/body/transitionId")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-                })?;
-            let transition_id = uuid::Uuid::parse_str(transition_id_str).map_err(|_| {
-                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-            })?;
-
-            let device_key: Option<(Vec<u8>, i64)> = sqlx::query_as(
-                "SELECT k.signing_public_key, d.auth_generation FROM chat.device_keys k \
-                 JOIN chat.devices d ON d.user_did=k.user_did AND d.device_id=k.device_id \
-                 WHERE k.user_did=$1 AND k.device_id=$2 AND k.key_id=$3 \
-                   AND k.revoked_at IS NULL AND d.revoked_at IS NULL AND d.status='active' \
-                   AND k.enrollment_auth_generation=d.auth_generation",
-            )
-            .bind(principal.did())
-            .bind(device_id)
-            .bind(key_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))?;
-            let (public_key, generation) = device_key.ok_or_else(|| {
-                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
-            })?;
-            let verified = crate::chat_protocol::direct_request_transcript::verify_signed_request(
-                crate::chat_protocol::direct_request_transcript::DirectRequestKind::Accept,
-                envelope.request.get().as_bytes(),
-                &public_key,
-            )
-            .map_err(|_| {
-                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidSignature)
-            })?;
-            if verified.actor_did() != Some(principal.did())
-                || verified.actor_device_id() != Some(device_id.to_string().as_str())
-                || verified.auth_generation() != Some(generation as u64)
-            {
-                return Err(ChatFailure::protocol(
-                    endpoint,
-                    ChatProtocolErrorCode::NotAuthorized,
-                ));
+        {
+            Ok(coord) => coord,
+            Err(error) => {
+                // A deleted account's declaration is typically gone: the deletion
+                // this DS holds is the final answer.
+                if party_deleted(pool, endpoint, conversation_id, parties).await? {
+                    return Err(ChatFailure::protocol(
+                        endpoint,
+                        ChatProtocolErrorCode::InvitationNotPending,
+                    ));
+                }
+                return Err(coordinator_failure(endpoint, "pair coordinator", &error));
             }
-
+        };
+        if !coord.is_coordinator {
             if is_inbox {
                 let inbox_rows: Vec<TransportInboxRow> = sqlx::query_as(
-                    "SELECT recipient_device_id, request_id, status, request_entry, \
+                    "SELECT recipient_device_id, request_id, status, \
+                            COALESCE(request_entry, redacted_request_entry) AS request_entry, \
                             acceptance_outcome, acceptance_proof, import_until \
                      FROM chat.direct_request_transport_inbox \
                      WHERE conversation_id=$1 AND recipient_did=$2",
@@ -234,6 +240,14 @@ async fn handle_inner(
                 .map_err(|_| ChatFailure::storage(endpoint))?;
 
                 let any_accepted = inbox_rows.iter().any(|r| r.status == "accepted");
+                // A request not accepted here whose party's deletion reached this
+                // transport-only home is final; its seq 2 holds that deletion.
+                if !any_accepted && party_deleted(pool, endpoint, conversation_id, parties).await? {
+                    return Err(ChatFailure::protocol(
+                        endpoint,
+                        ChatProtocolErrorCode::InvitationNotPending,
+                    ));
+                }
 
                 if existing_entry_bytes.is_some() || any_accepted {
                     let old_signed_request = if let Some(entry_bytes) = &existing_entry_bytes {
@@ -377,13 +391,7 @@ async fn handle_inner(
                 payload,
             )
             .await
-            .map_err(|e| {
-                tracing::error!("relay_acceptance_to_coordinator failed: {:?}", e);
-                ChatFailure::protocol(
-                    endpoint,
-                    ChatProtocolErrorCode::RelationshipPolicyUnavailable,
-                )
-            })?;
+            .map_err(|error| coordinator_failure(endpoint, "relayed acceptance", &error))?;
 
             // Verify coordinator acceptance proof and entry before commit
             let proof_receipt = output
@@ -465,12 +473,8 @@ async fn handle_inner(
             let authority_key = resolver
                 .resolve_coordinator_receipt_key(pool, &coord.coordinator_did, key_id_receipt)
                 .await
-                .map_err(|e| {
-                    tracing::error!("Failed to resolve coordinator receipt key: {e:?}");
-                    ChatFailure::protocol(
-                        endpoint,
-                        ChatProtocolErrorCode::RelationshipPolicyUnavailable,
-                    )
+                .map_err(|error| {
+                    coordinator_failure(endpoint, "coordinator receipt key", &error)
                 })?;
 
             let proof_bytes = serde_json::to_vec(&output.acceptance_proof)
@@ -586,37 +590,23 @@ async fn handle_inner(
 
                 let entry_bytes = serde_json::to_vec(&output.entry)
                     .map_err(|_| ChatFailure::invariant(endpoint))?;
-                let inserted = sqlx::query(
-                    "INSERT INTO chat.direct_request_transport_entries ( \
-                        conversation_id, seq, entry_id, entry_bytes, created_at \
-                     ) VALUES ($1, $2, $3, $4, $5) \
-                     ON CONFLICT (conversation_id, seq) DO NOTHING",
+                let stored = crate::chat_protocol::repository::delivery::insert_transport_entry(
+                    &mut tx,
+                    conversation_id,
+                    2,
+                    transition_id,
+                    &entry_bytes,
+                    crate::sim_hooks::current_utc(),
                 )
-                .bind(conversation_id)
-                .bind(2i64)
-                .bind(transition_id)
-                .bind(&entry_bytes)
-                .bind(crate::sim_hooks::current_utc())
-                .execute(&mut *tx)
                 .await
                 .map_err(|_| ChatFailure::storage(endpoint))?;
-
-                if inserted.rows_affected() == 0 {
-                    let existing: Vec<u8> = sqlx::query_scalar(
-                        "SELECT entry_bytes FROM chat.direct_request_transport_entries \
-                         WHERE conversation_id=$1 AND seq=$2",
-                    )
-                    .bind(conversation_id)
-                    .bind(2i64)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|_| ChatFailure::storage(endpoint))?;
-                    if existing != entry_bytes {
-                        return Err(ChatFailure::protocol(
-                            endpoint,
-                            ChatProtocolErrorCode::IdempotencyConflict,
-                        ));
-                    }
+                if stored
+                    == crate::chat_protocol::repository::delivery::TransportEntryInsert::Conflict
+                {
+                    return Err(ChatFailure::protocol(
+                        endpoint,
+                        ChatProtocolErrorCode::IdempotencyConflict,
+                    ));
                 }
                 tx.commit().await.map_err(|e| {
                     tracing::error!("accept_conversation tx.commit failed: {e}");
@@ -678,6 +668,8 @@ async fn handle_inner(
                     ChatFailure::protocol(endpoint, C::InvitationNotPending)
                 }
                 E::StaleCoordinates => ChatFailure::protocol(endpoint, C::StaleCoordinates),
+                E::Blocked => ChatFailure::protocol(endpoint, C::BlockedRelationship),
+                E::PolicySourceUnavailable => ChatFailure::unavailable(endpoint),
                 E::PolicyUnavailable => {
                     ChatFailure::protocol(endpoint, C::RelationshipPolicyUnavailable)
                 }
@@ -716,6 +708,8 @@ async fn handle_inner(
                 )
                 .await
             {
+                // Committed: the acceptance stands, and its durable queue row
+                // delivers this entry once the sender's home answers.
                 tracing::warn!(
                     ?error,
                     "Failed to deliver acceptance entry to peer, queueing for retry"
@@ -736,7 +730,6 @@ async fn handle_inner(
                 .execute(pool)
                 .await
                 .map_err(|_| ChatFailure::storage(endpoint))?;
-                return Err(ChatFailure::storage(endpoint));
             }
         }
 
@@ -804,11 +797,9 @@ pub(crate) async fn execute_admitted<
         .commit()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
+    // Committed with its queued fan-out; the queue retries a failed send.
     if let Some(fanout) = fanout {
-        fanout
-            .deliver(pool, None)
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))?;
+        let _ = fanout.deliver(pool, None).await;
     }
     Ok(response)
 }
@@ -843,7 +834,17 @@ fn acceptance_failure(endpoint: ChatEndpoint, error: AcceptanceFacadeError) -> C
             }
             _ => ChatFailure::invariant(endpoint),
         },
-        E::Relationship(_) => ChatFailure::invariant(endpoint),
+        E::Relationship(error) => {
+            use crate::chat_protocol::repository::relationship::RelationshipRepositoryError as R;
+            match error {
+                R::Database(_) => ChatFailure::storage(endpoint),
+                // A relationship source that could not answer now decided nothing.
+                R::Unavailable => ChatFailure::unavailable(endpoint),
+                R::InvalidProjection | R::InvalidAuthorityConfiguration(_) => {
+                    ChatFailure::invariant(endpoint)
+                }
+            }
+        }
         E::StateMachine(S::StaleCoordinates) => {
             ChatFailure::protocol(endpoint, C::StaleCoordinates)
         }
@@ -863,6 +864,38 @@ fn acceptance_failure(endpoint: ChatEndpoint, error: AcceptanceFacadeError) -> C
     }
 }
 
+/// A federation step of a direct acceptance failed: resolving the pair's
+/// coordinator, relaying to it, or resolving its receipt key. This DS's store
+/// failing is storage; a closed gate, or a coordinator, home or resolver that
+/// could not answer now, decided nothing; a coordinator that refused, or one
+/// that cannot be routed or verified, is a refusal.
+fn coordinator_failure(
+    endpoint: ChatEndpoint,
+    stage: &'static str,
+    error: &crate::federation::FederationError,
+) -> ChatFailure {
+    use crate::federation::FederationError as F;
+    use ChatProtocolErrorCode as C;
+    tracing::error!(
+        stage,
+        ?error,
+        "direct request acceptance federation failure"
+    );
+    match error {
+        F::Database(_) | F::Storage(_) => ChatFailure::storage(endpoint),
+        error if error.is_retryable() => ChatFailure::unavailable(endpoint),
+        F::BlockedRelationship => ChatFailure::protocol(endpoint, C::BlockedRelationship),
+        F::RemoteError { status: 409, .. } => ChatFailure::protocol(endpoint, C::StaleCoordinates),
+        F::RemoteError {
+            status: 400 | 404 | 422,
+            ..
+        }
+        | F::InvalidRequest(_)
+        | F::InvalidEnvelope { .. } => ChatFailure::protocol(endpoint, C::InvalidRequest),
+        _ => ChatFailure::protocol(endpoint, C::NotAuthorized),
+    }
+}
+
 fn log_direct_acceptance_storage_error(stage: &'static str, error: &sqlx::Error) {
     use sha2::{Digest, Sha256};
     let database = error.as_database_error();
@@ -878,4 +911,155 @@ fn log_direct_acceptance_storage_error(stage: &'static str, error: &sqlx::Error)
             .unwrap_or_else(|| "none".into()),
         "direct request acceptance database failure"
     );
+}
+
+/// Whether this DS holds an `accountDeletedEntry` of either of `parties` in
+/// `conversation_id`: sequenced here, or a transport-only home's copy.
+async fn party_deleted(
+    pool: &DbPool,
+    endpoint: ChatEndpoint,
+    conversation_id: uuid::Uuid,
+    parties: [&str; 2],
+) -> Result<bool, ChatFailure> {
+    let mut read = pool
+        .begin()
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    let deletions = crate::chat_protocol::repository::conversation::load_account_deletions(
+        &mut read,
+        conversation_id,
+    )
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+    Ok(deletions
+        .iter()
+        .any(|deletion| parties.contains(&deletion.deleted_did.as_str())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat_protocol::{
+        error::ErrorExposure, repository::relationship::RelationshipRepositoryError as R,
+    };
+    use crate::federation::FederationError;
+    use axum::http::{header::RETRY_AFTER, StatusCode};
+
+    fn wire(failure: ChatFailure) -> (StatusCode, Option<String>, Option<ChatProtocolErrorCode>) {
+        let code = failure.code();
+        let response = failure.into_response();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .map(|value| value.to_str().unwrap().to_owned());
+        (response.status(), retry_after, code)
+    }
+
+    /// A group acceptance's relationship source that could not answer now is
+    /// the declared retryable answer, and this DS's store failing is storage.
+    #[test]
+    fn group_acceptance_relationship_failures_keep_their_class() {
+        let endpoint = ChatEndpoint::AcceptConversation;
+        assert_eq!(
+            wire(acceptance_failure(
+                endpoint,
+                AcceptanceFacadeError::Relationship(R::Unavailable)
+            )),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("5".to_owned()),
+                Some(ChatProtocolErrorCode::RelationshipPolicyUnavailable)
+            )
+        );
+        let stored = acceptance_failure(
+            endpoint,
+            AcceptanceFacadeError::Relationship(R::Database(sqlx::Error::PoolTimedOut)),
+        );
+        assert!(matches!(stored.exposure(), ErrorExposure::StorageFailure));
+        assert_eq!(
+            wire(stored),
+            (StatusCode::INTERNAL_SERVER_ERROR, None, None)
+        );
+    }
+
+    /// A relayed direct acceptance's federation step: this DS's store failing
+    /// is storage, a source that could not answer now is retryable, and a
+    /// definitive answer is a refusal (never a 503 without a retry hint).
+    #[test]
+    fn direct_acceptance_federation_failures_keep_their_class() {
+        let endpoint = ChatEndpoint::AcceptConversation;
+        let unavailable = Some(ChatProtocolErrorCode::RelationshipPolicyUnavailable);
+        let remote = |status| FederationError::RemoteError {
+            status,
+            body: String::new(),
+        };
+        for (error, expected) in [
+            (
+                FederationError::Database(sqlx::Error::PoolTimedOut),
+                (StatusCode::INTERNAL_SERVER_ERROR, None, None),
+            ),
+            (
+                remote(503),
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Some("5".to_owned()),
+                    unavailable,
+                ),
+            ),
+            (
+                FederationError::BlockedRelationship,
+                (
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    Some(ChatProtocolErrorCode::BlockedRelationship),
+                ),
+            ),
+            (
+                remote(429),
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Some("5".to_owned()),
+                    unavailable,
+                ),
+            ),
+            (
+                remote(404),
+                (
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    Some(ChatProtocolErrorCode::InvalidRequest),
+                ),
+            ),
+            (
+                remote(409),
+                (
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    Some(ChatProtocolErrorCode::StaleCoordinates),
+                ),
+            ),
+            (
+                remote(403),
+                (
+                    StatusCode::UNAUTHORIZED,
+                    None,
+                    Some(ChatProtocolErrorCode::NotAuthorized),
+                ),
+            ),
+            (
+                FederationError::InvalidProof,
+                (
+                    StatusCode::UNAUTHORIZED,
+                    None,
+                    Some(ChatProtocolErrorCode::NotAuthorized),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                wire(coordinator_failure(endpoint, "test", &error)),
+                expected,
+                "{error:?}"
+            );
+        }
+    }
 }

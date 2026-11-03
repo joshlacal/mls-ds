@@ -42,13 +42,13 @@ pub(crate) mod device_directory;
 #[cfg(any(test, feature = "test-support"))]
 pub mod device_directory;
 
+pub(crate) mod direct_request_opening;
+
 #[allow(dead_code)]
 pub(crate) mod direct_request_preparation;
 
 #[allow(dead_code)]
 pub(crate) mod direct_request_publication;
-
-pub(crate) mod direct_request_push;
 
 #[allow(dead_code)]
 pub mod direct_request_receipts;
@@ -177,8 +177,6 @@ pub mod welcome_terminal;
 
 pub(crate) mod direct_request_lifecycle;
 
-pub(crate) mod push_binding;
-
 pub(crate) mod transport_welcome;
 
 pub(crate) mod close_terminal;
@@ -193,12 +191,24 @@ mod conversation_substrate_tests;
 #[cfg(test)]
 #[path = "delivery/read_tests.rs"]
 mod delivery_read_tests;
+#[cfg(all(test, feature = "test-support"))]
+#[path = "delivery/remote_pruning_tests.rs"]
+mod delivery_remote_pruning_tests;
+#[cfg(all(test, feature = "test-support", feature = "sim"))]
+#[path = "direct_request_opening/tests.rs"]
+pub(crate) mod direct_request_opening_tests;
 #[cfg(test)]
 mod g7_entitlement_tests;
+#[cfg(all(test, feature = "test-support", feature = "sim"))]
+#[path = "delivery/idempotency_erasure_tests.rs"]
+mod idempotency_erasure_tests;
 #[cfg(test)]
 mod inventory_repository_tests;
 #[cfg(test)]
 mod inventory_tests;
+#[cfg(test)]
+#[path = "key_packages/federated_reservation_tests.rs"]
+mod key_package_federated_reservation_tests;
 #[cfg(test)]
 #[path = "recovery/tests.rs"]
 mod recovery_tests;

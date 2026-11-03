@@ -31,12 +31,11 @@ use atproto_spaces::tokens::{
 };
 use axum::Router;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use p256::ecdsa::{
     signature::Signer, Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
 };
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 use crate::{push_gateway::ssrf::validate_https_url_with_resolver, storage::DbPool};
 
@@ -76,6 +75,13 @@ struct CachedDidEntry {
     verifying_key: SpaceVerifyingKey,
     endpoint_url: String,
     fetched_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SimCachedDidEntry {
+    verifying_key: SpaceVerifyingKey,
+    endpoint_url: String,
+    fetched_at: DateTime<Utc>,
 }
 
 pub struct SpaceHostRuntime {
@@ -147,6 +153,18 @@ impl SpaceHostRuntime {
                 ),
             );
         }
+    }
+
+    fn mint_credential_jti(&self, space_uri: &str, writer_did: &str) -> String {
+        crate::sim_hooks::mint_outbound_jti_uuid_v4(
+            b"space_host.credential",
+            &[
+                self.authority_did().as_bytes(),
+                space_uri.as_bytes(),
+                writer_did.as_bytes(),
+            ],
+        )
+        .to_string()
     }
 
     pub fn mint_credential(
@@ -232,8 +250,33 @@ impl SpaceHostRuntime {
             return Ok((vk, ep, true));
         }
 
+        let sim_clock = crate::sim_hooks::active_scoped_clock()
+            .filter(|clock| clock.is_deterministic())
+            .or_else(|| {
+                self.clock
+                    .is_deterministic()
+                    .then(|| Arc::clone(&self.clock))
+            });
         if !force_refresh {
-            if let Some(cached) = self
+            if let Some(clock) = &sim_clock {
+                let cached = clock
+                    .simulation_counters()
+                    .expect("deterministic clocks own simulation counters")
+                    .space_did_cache
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(self.authority_did())
+                    .and_then(|cache| cache.get(&bare_did))
+                    .cloned();
+                if let Some(cached) = cached {
+                    if (clock.now_utc() - cached.fetched_at)
+                        .to_std()
+                        .is_ok_and(|age| age < Duration::from_secs(300))
+                    {
+                        return Ok((cached.verifying_key, cached.endpoint_url, false));
+                    }
+                }
+            } else if let Some(cached) = self
                 .did_cache
                 .read()
                 .ok()
@@ -296,7 +339,24 @@ impl SpaceHostRuntime {
             .or_else(|| extract_service_endpoint(&doc, "#atproto_sync"))
             .unwrap_or_default();
 
-        if let Ok(mut guard) = self.did_cache.write() {
+        if let Some(clock) = sim_clock {
+            clock
+                .simulation_counters()
+                .expect("deterministic clocks own simulation counters")
+                .space_did_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(self.authority_did().to_string())
+                .or_default()
+                .insert(
+                    bare_did,
+                    SimCachedDidEntry {
+                        verifying_key: vk.clone(),
+                        endpoint_url: ep.clone(),
+                        fetched_at: clock.now_utc(),
+                    },
+                );
+        } else if let Ok(mut guard) = self.did_cache.write() {
             guard.insert(
                 bare_did,
                 CachedDidEntry {
@@ -433,4 +493,171 @@ pub(crate) fn decode_tid_micros(tid: &str) -> Option<u64> {
         val = (val << 5) | digit;
     }
     Some(val >> 10)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim_hooks::{with_ds_clock, ManualDsClock};
+
+    #[tokio::test]
+    async fn space_credential_jtis_and_tokens_replay_per_clock() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1/unused_space_credential_test")
+            .unwrap();
+        let runtime = SpaceHostRuntime::new(
+            pool,
+            SpaceHostConfig::new(
+                "did:web:authority.example".to_string(),
+                P256SigningKey::from_slice(&[3; 32]).unwrap(),
+            ),
+        );
+        let now = DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        let clock = Arc::new(ManualDsClock::new(now));
+        let space_uri =
+            "at://did:web:authority.example/space/blue.catbird.labyrinth.conversation/test-0";
+        let credential_kid = atproto_spaces::kem::encode_p256_did_key(&p256::PublicKey::from(
+            runtime.config.signing_key.verifying_key(),
+        ));
+        let mint = || {
+            let claims = SpaceTokenClaims {
+                iss: runtime.authority_did().to_string(),
+                sub: space_uri.to_string(),
+                aud: None,
+                iat: now.timestamp() as u64,
+                exp: now.timestamp() as u64 + 600,
+                jti: runtime.mint_credential_jti(space_uri, "did:web:writer.example"),
+                cnf_kid: Some(credential_kid.clone()),
+            };
+            let jwt = runtime.mint_credential(&claims).unwrap();
+            (claims.jti, jwt)
+        };
+        let baseline = with_ds_clock(clock.clone(), mint);
+        assert_ne!(with_ds_clock(clock.clone(), mint), baseline);
+        clock.reset_counters();
+        assert_eq!(with_ds_clock(clock, mint), baseline);
+        assert_eq!(
+            with_ds_clock(Arc::new(ManualDsClock::new(now)), mint),
+            baseline
+        );
+        let verified = runtime
+            .verify_space_token_send(
+                SpaceTokenKind::Credential,
+                &baseline.1,
+                now.timestamp() as u64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(verified.jti, baseline.0);
+    }
+
+    #[cfg(feature = "sim")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn did_resolution_http_calls_are_isolated_per_run_and_follow_sim_ttl() {
+        use crate::sim_hooks::{scope_ds_clock, scope_sim_ds, SimDsHooks};
+
+        const TARGET: &str = "did:web:scoped-space-cache.example";
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1/unused_space_cache_test")
+            .unwrap();
+        let runtime = Arc::new(SpaceHostRuntime::new(
+            pool,
+            SpaceHostConfig::new(
+                "did:web:authority.example".to_string(),
+                P256SigningKey::from_slice(&[3; 32]).unwrap(),
+            ),
+        ));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let spawn_run = |key_byte: u8| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                let clock = Arc::new(ManualDsClock::new(
+                    DateTime::from_timestamp(1_600_000_000, 0).unwrap(),
+                ));
+                let key = P256SigningKey::from_slice(&[key_byte; 32]).unwrap();
+                let endpoint = format!("https://writer-{key_byte}.example");
+                let document = serde_json::to_vec(&json!({
+                    "id": TARGET,
+                    "verificationMethod": [{
+                        "id": "#atproto",
+                        "type": "Multikey",
+                        "controller": TARGET,
+                        "publicKeyMultibase": crate::identity::did_doc::encode_p256_multikey(key.verifying_key()),
+                    }],
+                    "service": [{
+                        "id": "#atproto_pds",
+                        "type": "AtprotoPersonalDataServer",
+                        "serviceEndpoint": endpoint,
+                    }],
+                }))
+                .unwrap();
+                let calls = Arc::new(AtomicU64::new(0));
+                let transport_calls = Arc::clone(&calls);
+                let hooks = Arc::new(SimDsHooks {
+                    service_did: runtime.authority_did().to_string(),
+                    self_endpoint: "https://authority.example".to_string(),
+                    signing_key_pem: None,
+                    group_relay_hmac_secret: None,
+                    http_transport: Arc::new(move |_| {
+                        transport_calls.fetch_add(1, Ordering::SeqCst);
+                        let body = document.clone();
+                        Box::pin(async move {
+                            Ok(http::Response::builder()
+                                .header("content-type", "application/json")
+                                .body(body)
+                                .unwrap())
+                        })
+                    }),
+                    dns_resolver: Arc::new(|_| Ok(vec!["93.184.216.34".parse().unwrap()])),
+                    retain_application_ciphertext: false,
+                });
+                scope_ds_clock(
+                    clock.clone(),
+                    scope_sim_ds(hooks, async {
+                        let auth = crate::auth::shared_auth_middleware();
+                        barrier.wait().await;
+                        for _ in 0..2 {
+                            let doc = auth.resolve_did(TARGET).await.unwrap();
+                            assert_eq!(doc.service.unwrap()[0].service_endpoint, endpoint);
+                            let (_, ep, _) =
+                                runtime.resolve_did_entry(TARGET, false).await.unwrap();
+                            assert_eq!(ep, endpoint);
+                        }
+                        assert_eq!(calls.load(Ordering::SeqCst), 2, "one miss per cache");
+                        tokio::task::yield_now().await;
+                        let (_, ep, _) = runtime.resolve_did_entry(TARGET, false).await.unwrap();
+                        assert_eq!(
+                            ep, endpoint,
+                            "another worker must not replace this run's key"
+                        );
+                        assert_eq!(calls.load(Ordering::SeqCst), 2);
+                        clock.advance(chrono::TimeDelta::seconds(300));
+                        auth.resolve_did(TARGET).await.unwrap();
+                        runtime.resolve_did_entry(TARGET, false).await.unwrap();
+                        assert_eq!(
+                            calls.load(Ordering::SeqCst),
+                            4,
+                            "sim time expires both caches"
+                        );
+                        runtime.resolve_did_entry(TARGET, true).await.unwrap();
+                        assert_eq!(
+                            calls.load(Ordering::SeqCst),
+                            5,
+                            "forced key refresh still resolves"
+                        );
+                        clock.reset_counters();
+                        auth.resolve_did(TARGET).await.unwrap();
+                        runtime.resolve_did_entry(TARGET, false).await.unwrap();
+                        assert_eq!(calls.load(Ordering::SeqCst), 7, "reset starts cold");
+                    }),
+                )
+                .await;
+            })
+        };
+        let (first, second) = tokio::join!(spawn_run(5), spawn_run(7));
+        first.unwrap();
+        second.unwrap();
+        assert!(runtime.did_cache.read().unwrap().is_empty());
+    }
 }

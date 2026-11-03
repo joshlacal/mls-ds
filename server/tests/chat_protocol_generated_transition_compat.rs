@@ -2,6 +2,7 @@
 //! Frozen signing products remain independent of the representation adapter.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+pub use catbird_server::sim_hooks;
 // Follow the established signing-vector target: compile the actual private
 // authority source and its real canonical encoder, without widening the
 // production API or substituting an encoder stub.

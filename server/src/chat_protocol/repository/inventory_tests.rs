@@ -3831,6 +3831,78 @@ async fn production_empty_initial_pages_allow_alternate_limit_after_consumption(
     );
 }
 
+/// A wall clock that moves one whole second forward on every read, so no two
+/// clock reads inside one serve share a whole second.
+struct SecondPerReadClock(std::sync::Mutex<DateTime<Utc>>);
+
+impl crate::sim_hooks::DsClock for SecondPerReadClock {
+    fn now_utc(&self) -> DateTime<Utc> {
+        let mut now = self.0.lock().expect("clock lock");
+        *now += Duration::seconds(1);
+        *now
+    }
+}
+
+/// The final-page consumption CAS records the served receipt's own instant:
+/// the consumption trigger requires `receipt.served_at = *_consumed_at`, and
+/// a loaded serve can straddle a whole-second boundary (e2e
+/// labyrinth_live_orchestrator: getConversations 500, SQLSTATE 23514).
+#[tokio::test]
+async fn final_page_consumption_uses_the_served_receipt_instant_across_a_second_boundary() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let fence = ensure_fence(&pool).await;
+    let now = whole_second(clock_now(&pool).await);
+    let device = seed_device_with_key(&pool, now).await;
+    let session_id = Uuid::new_v4();
+    let mut random = DeterministicRandom::new(0xC1E1);
+    seed_session_via_create_shape(
+        &pool,
+        &fence,
+        &device,
+        session_id,
+        now,
+        now + Duration::minutes(15),
+        &mut random,
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    let clock: std::sync::Arc<dyn crate::sim_hooks::DsClock> =
+        std::sync::Arc::new(SecondPerReadClock(std::sync::Mutex::new(now)));
+    let request = conversations_request(100);
+    let mut tx = pool.begin().await.expect("begin the final serve");
+    crate::sim_hooks::scope_ds_clock(
+        clock,
+        repository::inventory::serve_initial_inventory_page(
+            &mut tx,
+            Some(paging_device(&device)),
+            session_id,
+            &request,
+            &fence.sealer,
+            &mut random,
+        ),
+    )
+    .await
+    .expect("a final page served across a whole-second boundary consumes its domain");
+    tx.commit().await.expect("commit the final serve");
+
+    let served_at: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT served_at FROM chat.inventory_page_receipts \
+         WHERE inventory_session_id = $1 AND domain = 'conversations' AND has_more = FALSE",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the served final receipt");
+    assert_eq!(
+        conversations_consumed_state(&pool, session_id).await,
+        (true, Some(served_at)),
+        "the CAS records the final receipt's served_at"
+    );
+}
+
 /// Final-review fix-round coverage (C-1/C-2): the PRODUCTION paging
 /// entrypoints — `serve_initial_inventory_page`,
 /// `issue_next_inventory_page_cursor`, `complete_inventory_page`, and through
@@ -4787,7 +4859,10 @@ use common::http_acceptance as http;
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_drift() {
-    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
+    // Private fully migrated DB: the HTTP stack reads later-migration DDL the
+    // shared target only carries by contamination (Main ruling 2026-11-04).
+    let database = crate::common::fresh_db::fresh_fully_migrated_db("chat_inventory_http_").await;
+    let pool = database.connect(4).await;
     http::ensure_fence(&pool).await;
     let device = http::seed_device(&pool).await;
     let router = http::router_for_authenticated_acceptance(pool.clone()).await;
@@ -4854,7 +4929,9 @@ async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_dr
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn http_inventory_rejects_exact_device_when_session_auth_generation_is_stale() {
-    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
+    // Private fully migrated DB (Main ruling 2026-11-04), as above.
+    let database = crate::common::fresh_db::fresh_fully_migrated_db("chat_inventory_http_").await;
+    let pool = database.connect(4).await;
     let fence = ensure_fence(&pool).await;
     let device = http::seed_device(&pool).await;
     let session_device = SessionDevice {
@@ -4946,7 +5023,9 @@ async fn http_inventory_rejects_exact_device_when_session_auth_generation_is_sta
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn http_inventory_bootstrap_round_trip_emitter_to_all_consumers_end_to_end() {
-    let pool = crate::common::chat_protocol::setup_chat_protocol_db(4).await;
+    // Private fully migrated DB (Main ruling 2026-11-04), as above.
+    let database = crate::common::fresh_db::fresh_fully_migrated_db("chat_inventory_http_").await;
+    let pool = database.connect(4).await;
     let fence = ensure_fence(&pool).await;
     let device = http::seed_device(&pool).await;
     let session_device = SessionDevice {

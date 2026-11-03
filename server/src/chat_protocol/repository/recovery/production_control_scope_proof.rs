@@ -237,6 +237,8 @@ pub(super) async fn run_control_close_historical_scope(pool: &PgPool) -> Result<
             &mut tx,
             prepared,
             &relationship,
+            None,
+            crate::chat_protocol::repository::submit_transition::RemoteCommitPreflightOutcome::NotRemoteOrDeferred,
         )
         .await
         .map_err(|e| format!("execute real signed Remove: {e:?}"))?;
@@ -274,6 +276,8 @@ pub(super) async fn run_control_close_historical_scope(pool: &PgPool) -> Result<
             &mut tx,
             prepared,
             &relationship,
+            None,
+            crate::chat_protocol::repository::submit_transition::RemoteCommitPreflightOutcome::NotRemoteOrDeferred,
         )
         .await
         .map_err(|e| format!("execute later signed policy: {e:?}"))?;

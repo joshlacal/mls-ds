@@ -23,6 +23,7 @@ use crate::chat_protocol::{
     validation::{CanonicalHttpMethod, CanonicalUuidV4},
     OsSecureRandom,
 };
+use crate::federation::group_relay::{append_relayed_inventory_items, RemoteInventory};
 use crate::storage::DbPool;
 
 use super::{context, errors::ChatFailure, runtime::ChatRuntime};
@@ -103,7 +104,7 @@ async fn serve(
     let parsed = QueryParams::parse(query, domain)
         .map_err(|error| ChatFailure::protocol(endpoint, error))?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(endpoint))?;
-    let admission = context::admit_unsigned_read(
+    let (admission, subject) = context::admit_unsigned_read_for_subject(
         pool,
         runtime,
         endpoint,
@@ -155,7 +156,27 @@ async fn serve(
         );
         map_repository_error(endpoint, error)
     })?;
-    Ok(context::json_ok(response.into_bytes()))
+    // Remote groups whose sequencer alone can describe this device's
+    // membership are relayed after the inventory transaction, on the final page.
+    let relayed = match domain {
+        InventoryDomain::Conversations => Some(RemoteInventory::Conversations),
+        InventoryDomain::Welcomes => Some(RemoteInventory::Welcomes),
+        InventoryDomain::Recovery => None,
+    };
+    let bytes = match (relayed, Uuid::parse_str(&parsed.actor_device_id)) {
+        (Some(inventory), Ok(device_id)) => {
+            append_relayed_inventory_items(
+                pool,
+                &subject,
+                device_id,
+                inventory,
+                response.into_bytes(),
+            )
+            .await
+        }
+        _ => response.into_bytes(),
+    };
+    Ok(context::json_ok(bytes))
 }
 
 struct QueryParams {

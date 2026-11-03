@@ -307,13 +307,23 @@ mod welcome_terminal_facade_contract {
         assert!(
             compact_apply.contains("let Self { plan, completion, material, response, } = self;")
         );
+        // Re-pinned 2026-11-04 for `02d7eeed9` ("mls-ds: checkpoint deployed
+        // recovery and binary stream source"), which threaded the claimed
+        // scope's event lock into the executor: preparation now also takes the
+        // `event_scope` derived from the completion's exact scope authority.
+        // The guard had stayed red from that commit on.
+        let event_scope = apply
+            .find("let event_scope = completion.scope_authority.event_lock_scope();")
+            .expect("missing exact Welcome event scope from the claimed scope authority");
         let prepare_execution = apply
-            .find("let prepared = prepare_welcome_terminal_execution(transaction, &plan).await?;")
+            .find(
+                "let prepared = prepare_welcome_terminal_execution(transaction, &plan, &event_scope).await?;",
+            )
             .expect("missing exact Welcome executor preparation");
         let apply_execution = apply
             .find("let applied = apply_prepared_welcome_terminal_execution(prepared).await?;")
             .expect("missing exact Welcome executor application");
-        assert!(prepare_execution < apply_execution);
+        assert!(event_scope < prepare_execution && prepare_execution < apply_execution);
 
         let applied = compact_code(source_item(
             source,
@@ -346,6 +356,332 @@ mod welcome_terminal_facade_contract {
             !complete_code.contains("FOR UPDATE") && !complete_literals.contains("FOR UPDATE"),
             "Welcome facade uses forbidden post-head SQL lock"
         );
+    }
+}
+
+/// Real recipient-signed `acknowledgeWelcome`/`rejectWelcome` on a genuinely
+/// published request (production keys → prepare → publish), through the real
+/// admission and handler composition, against a second PostgreSQL session's
+/// row locks. Lock order: operation → principal/device/key scope →
+/// conversation head/aggregate → mutable delivery.
+mod direct_request_welcome_locks {
+    use crate::chat_protocol::{
+        error::ChatEndpoint,
+        repository::core::hydrate_locked_conversation_state,
+        test_support::{seed_genuine_pending_direct_request, GenuinePendingDirectRequest},
+    };
+    use axum::response::IntoResponse as _;
+    use sqlx::PgPool;
+    use std::time::Duration;
+
+    struct Published {
+        _db: crate::common::fresh_db::DisposableDatabase,
+        pool: PgPool,
+        request: GenuinePendingDirectRequest,
+    }
+
+    async fn published() -> Published {
+        let db = crate::common::fresh_db::fresh_fully_migrated_db("chat_welcome_terminal_").await;
+        let pool = db.connect(8).await;
+        let request = seed_genuine_pending_direct_request(&pool)
+            .await
+            .expect("genuinely published direct request");
+        Published {
+            _db: db,
+            pool,
+            request,
+        }
+    }
+
+    /// The recipient's signed terminal, admitted for real, in the handler's
+    /// one-transaction composition (status, body).
+    async fn spawn_terminal(
+        published: &Published,
+        reject: bool,
+    ) -> tokio::task::JoinHandle<(u16, String)> {
+        let (admission, body) = published
+            .request
+            .admit_welcome_terminal(&published.pool, reject)
+            .await
+            .expect("real recipient Welcome admission");
+        let endpoint = if reject {
+            ChatEndpoint::RejectWelcome
+        } else {
+            ChatEndpoint::AcknowledgeWelcome
+        };
+        let pool = published.pool.clone();
+        tokio::spawn(async move {
+            let response = crate::handlers::chat::execute_federated_group_welcome(
+                &pool, admission, endpoint, &body,
+            )
+            .await
+            .unwrap_or_else(|failure| failure.into_response());
+            let status = response.status().as_u16();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("Welcome response body");
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        })
+    }
+
+    async fn backend_pid(holder: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> i32 {
+        sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **holder)
+            .await
+            .unwrap()
+    }
+
+    /// PostgreSQL's own wait graph: is any session waiting on `holder`?
+    async fn blocks_anyone(pool: &PgPool, holder: i32) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+              WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(holder)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn terminal_status(published: &Published) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT status FROM chat.direct_request_welcome_outcomes \
+              WHERE request_id = $1 AND recipient_did = $2 AND recipient_device_id = $3",
+        )
+        .bind(published.request.request_id)
+        .bind(&published.request.recipient_did)
+        .bind(published.request.recipient_device_id)
+        .fetch_optional(&published.pool)
+        .await
+        .unwrap()
+    }
+
+    fn expected_status(reject: bool) -> &'static str {
+        if reject {
+            "rejected"
+        } else {
+            "acknowledged"
+        }
+    }
+
+    /// A second session holds the delivery row exactly as an inventory FK check
+    /// does, then asks for the conversation head: the order opposite to the
+    /// facade's. The terminal takes the head and must never wait on the
+    /// delivery, so the two can neither deadlock nor stall each other.
+    async fn delivery_holder_then_head(reject: bool) {
+        let published = published().await;
+        let mut holder = published.pool.begin().await.unwrap();
+        let holder_pid = backend_pid(&mut holder).await;
+        sqlx::query(
+            "SELECT 1 FROM chat.direct_request_device_deliveries \
+              WHERE request_id = $1 AND owner_did = $2 AND owner_device_id = $3 FOR KEY SHARE",
+        )
+        .bind(published.request.request_id)
+        .bind(&published.request.recipient_did)
+        .bind(published.request.recipient_device_id)
+        .fetch_one(&mut *holder)
+        .await
+        .expect("the recipient's exact delivery row");
+        let terminal = spawn_terminal(&published, reject).await;
+        // Not a timer: the terminal either finishes or waits on the holder.
+        let waited_on_delivery = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if terminal.is_finished() {
+                    return false;
+                }
+                if blocks_anyone(&published.pool, holder_pid).await {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the Welcome terminal neither finished nor waited");
+        let head =
+            sqlx::query("SELECT 1 FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE")
+                .bind(published.request.conversation_id)
+                .execute(&mut *holder)
+                .await;
+        let _ = holder.rollback().await;
+        let (status, body) = terminal.await.unwrap();
+        assert!(
+            !waited_on_delivery && head.is_ok() && status == 200,
+            "the Welcome terminal must not lock the delivery row after the head: \
+             waited on the delivery holder={waited_on_delivery}, holder's head lock={head:?}, \
+             terminal={status} {body}"
+        );
+        assert_eq!(
+            terminal_status(&published).await.as_deref(),
+            Some(expected_status(reject))
+        );
+    }
+
+    /// A second session holds the canonical conversation head: the terminal's
+    /// only conversation lock waits on it and completes once it is released.
+    async fn waits_on_the_canonical_head(reject: bool) {
+        let published = published().await;
+        let at = sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            .fetch_one(&published.pool)
+            .await
+            .unwrap();
+        let mut holder = published.pool.begin().await.unwrap();
+        let holder_pid = backend_pid(&mut holder).await;
+        let _aggregate =
+            hydrate_locked_conversation_state(&mut holder, published.request.conversation_id, at)
+                .await
+                .expect("the holder locks the canonical aggregate");
+        let terminal = spawn_terminal(&published, reject).await;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !blocks_anyone(&published.pool, holder_pid).await {
+                assert!(
+                    !terminal.is_finished(),
+                    "the terminal skipped the held head"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the terminal waits on the canonical head");
+        holder.rollback().await.unwrap();
+        let (status, body) = tokio::time::timeout(Duration::from_secs(60), terminal)
+            .await
+            .expect("the terminal finishes once the head is released")
+            .unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            terminal_status(&published).await.as_deref(),
+            Some(expected_status(reject))
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_never_waits_on_a_delivery_row_held_before_the_head() {
+        delivery_holder_then_head(false).await;
+    }
+
+    #[tokio::test]
+    async fn rejection_never_waits_on_a_delivery_row_held_before_the_head() {
+        delivery_holder_then_head(true).await;
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_waits_on_the_canonical_head() {
+        waits_on_the_canonical_head(false).await;
+    }
+
+    #[tokio::test]
+    async fn rejection_waits_on_the_canonical_head() {
+        waits_on_the_canonical_head(true).await;
+    }
+}
+
+/// The request CAS is serialized only by the caller's own aggregate lock. An
+/// aggregate another transaction holds, or one of another conversation,
+/// serializes nothing for this Welcome and must be refused before any effect;
+/// the same inputs under their own aggregate are terminal. Lib-only: the
+/// chat-protocol harness path-includes `welcome_terminal.rs` without the
+/// genuine request fixture.
+mod direct_request_welcome_binding {
+    use crate::chat_protocol::{
+        repository::{
+            core::hydrate_locked_conversation_state,
+            welcome_terminal::{
+                direct_request_welcome_terminal, parse_welcome_request, WelcomeCanonicalMaterial,
+                WelcomeTerminalFacadeError,
+            },
+        },
+        test_support::seed_genuine_pending_direct_request,
+    };
+    use chrono::{DateTime, Utc};
+    use sqlx::{Postgres, Transaction};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    async fn direct_terminal_rows(tx: &mut Transaction<'_, Postgres>, request_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM chat.direct_request_welcome_outcomes WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(&mut **tx)
+        .await
+        .unwrap()
+    }
+
+    async fn foreign_aggregate_is_refused(foreign_transaction: bool) {
+        let db = crate::common::fresh_db::fresh_fully_migrated_db("chat_welcome_terminal_").await;
+        let pool = db.connect(4).await;
+        let target = seed_genuine_pending_direct_request(&pool).await.unwrap();
+        let locked = if foreign_transaction {
+            target.conversation_id
+        } else {
+            seed_genuine_pending_direct_request(&pool)
+                .await
+                .unwrap()
+                .conversation_id
+        };
+        let mutation = target.verified_welcome_terminal(false).unwrap();
+        let parsed = parse_welcome_request(&mutation).unwrap();
+        let at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let mut owner = pool.begin().await.unwrap();
+        let foreign = hydrate_locked_conversation_state(&mut owner, locked, at)
+            .await
+            .unwrap();
+        let mut separate = pool.begin().await.unwrap();
+        let tx = if foreign_transaction {
+            &mut separate
+        } else {
+            &mut owner
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            direct_request_welcome_terminal(tx, &foreign, &parsed, &mutation, at, true),
+        )
+        .await
+        .expect("a foreign aggregate must be refused, not waited on");
+        assert!(
+            matches!(outcome, Err(WelcomeTerminalFacadeError::InvalidRequest)),
+            "{} aggregate: {outcome:?}",
+            if foreign_transaction {
+                "another transaction's"
+            } else {
+                "another conversation's"
+            }
+        );
+        assert_eq!(direct_terminal_rows(tx, target.request_id).await, 0);
+        separate.rollback().await.unwrap();
+        owner.rollback().await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let own = hydrate_locked_conversation_state(&mut tx, target.conversation_id, at)
+            .await
+            .unwrap();
+        let outcome =
+            direct_request_welcome_terminal(&mut tx, &own, &parsed, &mutation, at, true).await;
+        assert!(
+            matches!(
+                &outcome,
+                Ok(Some((WelcomeCanonicalMaterial::Acknowledged { welcome_id, .. }, ..)))
+                    if *welcome_id == target.request_id
+            ),
+            "own aggregate: {outcome:?}"
+        );
+        assert_eq!(direct_terminal_rows(&mut tx, target.request_id).await, 1);
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_request_terminal_refuses_an_aggregate_another_transaction_holds() {
+        foreign_aggregate_is_refused(true).await;
+    }
+
+    #[tokio::test]
+    async fn direct_request_terminal_refuses_another_conversations_aggregate() {
+        foreign_aggregate_is_refused(false).await;
     }
 }
 

@@ -11,11 +11,12 @@ use uuid::Uuid;
 
 use crate::chat_protocol::relationship_policy::{
     AdmissionOperation, AdmissionRequest, AllocatedProjectionRevisionGuard, HttpRelationshipSource,
-    PolicyDenial, ProjectionClock, ProjectionOperationScope, ProjectionScope, PublicGet,
-    PublicResponse, PublicTransport, RelationshipPolicyConfig, RelationshipPolicyConfigInput,
-    TrafficGraphScope, TransportError, TrustedRelationshipPersistenceInstant,
-    HARD_MAX_REQUEST_BURST, HARD_MAX_REQUEST_RATE, MAX_ADMISSION_GRAPH_CALLS,
-    MAX_ADMISSION_SOURCE_CALLS, MAX_DECLARATION_HTTP_CALLS, MAX_TRAFFIC_GRAPH_CALLS,
+    PolicyDenial, ProductionRelationshipAuthority, ProjectionClock, ProjectionOperationScope,
+    ProjectionScope, PublicGet, PublicResponse, PublicTransport, RelationshipPolicyConfig,
+    RelationshipPolicyConfigInput, SimSourceFault, TrafficGraphScope, TransportError,
+    TrustedRelationshipPersistenceInstant, HARD_MAX_REQUEST_BURST, HARD_MAX_REQUEST_RATE,
+    MAX_ADMISSION_GRAPH_CALLS, MAX_ADMISSION_SOURCE_CALLS, MAX_DECLARATION_HTTP_CALLS,
+    MAX_TRAFFIC_GRAPH_CALLS,
 };
 use crate::chat_protocol::repository::core::{
     LockedConversationHeadGuard, LockedConversationStateGuard, LockedDirectConversationLookupGuard,
@@ -26,8 +27,9 @@ use crate::chat_protocol::repository::relationship::{
     load_fallback_traffic_projection, persist_relationship_projection, persist_traffic_projection,
     seal_acceptance_fallback_scope, seal_direct_creation_fallback_scope,
     seal_group_creation_fallback_scope, seal_pending_add_fallback_scope,
-    seal_recovery_fallback_scope, seal_traffic_fallback_scope, LockedRelationshipFallbackScope,
-    LockedTrafficFallbackScope,
+    seal_recovery_fallback_scope, seal_traffic_fallback_scope, verify_direct_request_wake_policy,
+    verify_federated_send_policy, LockedRelationshipFallbackScope, LockedTrafficFallbackScope,
+    RelationshipRepositoryError,
 };
 use crate::chat_protocol::state_machine::{
     ConversationKind, ConversationState, DeviceIdentity, LockedRegistrationProjection,
@@ -1342,4 +1344,246 @@ async fn burned_unused_revision_below_high_water_cannot_be_persisted() {
     .await
     .unwrap();
     assert!(!residue);
+}
+
+/// What a live relationship source answers every public request: a source
+/// that could not answer now decided nothing; a malformed answer is unusable.
+fn live_source_answers() -> [(Result<PublicResponse, TransportError>, bool, &'static str); 4] {
+    [
+        (Err(TransportError::Network), true, "unreachable"),
+        (
+            Ok(PublicResponse::new(503, b"<html>busy</html>".to_vec())),
+            true,
+            "answering 503",
+        ),
+        (
+            Ok(PublicResponse::new(429, Vec::new())),
+            true,
+            "answering 429",
+        ),
+        (
+            Ok(PublicResponse::new(200, b"{}".to_vec())),
+            false,
+            "answering a malformed body",
+        ),
+    ]
+}
+
+fn assert_classified(error: Option<RelationshipRepositoryError>, unavailable: bool, what: &str) {
+    let error = error.expect("a failed source never yields usable evidence");
+    let classified = if unavailable {
+        matches!(error, RelationshipRepositoryError::Unavailable)
+    } else {
+        matches!(error, RelationshipRepositoryError::InvalidProjection)
+    };
+    assert!(classified, "{what}: {error:?}");
+}
+
+/// Block-only and traffic collection classify their sources exactly like
+/// admission, so a repository caller can tell an outage from a refusal.
+#[tokio::test]
+async fn live_collection_failures_convert_to_typed_repository_errors() {
+    let fault = SimSourceFault::default();
+    let authority = ProductionRelationshipAuthority::sim_fault(fault.clone()).unwrap();
+    let members = roster(3);
+    for (answer, unavailable, how) in live_source_answers() {
+        *fault.lock().unwrap() = Some(answer);
+        let admission = relationship_policy::collect_admission_projection(
+            &authority,
+            &StepClock::new(),
+            AllocatedProjectionRevisionGuard::for_test(7),
+            ProjectionOperationScope::Creation,
+            admission_request(),
+        )
+        .await
+        .err();
+        assert_classified(
+            admission.map(Into::into),
+            unavailable,
+            &format!("admission source {how}"),
+        );
+        let block = relationship_policy::collect_block_projection(
+            &authority,
+            &StepClock::new(),
+            AllocatedProjectionRevisionGuard::for_test(7),
+            ProjectionOperationScope::RecoveryReservation,
+            members.clone(),
+        )
+        .await
+        .err();
+        assert_classified(
+            block.map(Into::into),
+            unavailable,
+            &format!("block-only source {how}"),
+        );
+        let traffic = relationship_policy::collect_traffic_projection(
+            &authority,
+            &StepClock::new(),
+            AllocatedProjectionRevisionGuard::for_test(7),
+            members[0].clone(),
+            members.clone(),
+        )
+        .await
+        .err();
+        assert_classified(
+            traffic.map(Into::into),
+            unavailable,
+            &format!("traffic source {how}"),
+        );
+    }
+    // A DID document its directory does not know is an authoritative answer.
+    *fault.lock().unwrap() = Some(Ok(PublicResponse::new(404, Vec::new())));
+    let unknown = relationship_policy::collect_admission_projection(
+        &authority,
+        &StepClock::new(),
+        AllocatedProjectionRevisionGuard::for_test(7),
+        ProjectionOperationScope::Creation,
+        admission_request(),
+    )
+    .await
+    .err();
+    assert_classified(unknown.map(Into::into), false, "unknown DID document");
+}
+
+/// Every repository caller that collects live relationship evidence answers a
+/// source outage as `Unavailable` and a malformed answer as unusable evidence.
+#[tokio::test]
+#[ignore = "root fresh-database authorization required"]
+async fn repository_callers_answer_a_live_source_outage_as_unavailable() {
+    let db = crate::common::fresh_db::fresh_fully_migrated_db("chat_rel_outage_").await;
+    let pool = db.connect(2).await;
+    let members = roster(3);
+    persist_principal_read_set(&pool, &members).await;
+    let fault = SimSourceFault::default();
+    let authority = ProductionRelationshipAuthority::sim_fault(fault.clone()).unwrap();
+    for (answer, unavailable, how) in live_source_answers() {
+        *fault.lock().unwrap() = Some(answer);
+        let mut tx = pool.begin().await.unwrap();
+        let (creation, _) = lock_creation_scope(&mut tx, &members).await;
+        let error = load_fallback_relationship_projection(&mut tx, creation, &authority)
+            .await
+            .err();
+        assert_classified(error, unavailable, &format!("admission loader, {how}"));
+        let (transaction_id, locked, read_set_digest) =
+            lock_principal_read_set(&mut tx, &members, b"recovery").await;
+        let recovery = LockedRelationshipFallbackScope::from_locked_read_set_for_test(
+            transaction_id,
+            ProjectionOperationScope::RecoveryReservation,
+            ProjectionScope::BlockOnly(
+                relationship_policy::plan_block_only_graph(&locked)
+                    .unwrap()
+                    .scope,
+            ),
+            read_set_digest,
+        );
+        let error = load_fallback_relationship_projection(&mut tx, recovery, &authority)
+            .await
+            .err();
+        assert_classified(error, unavailable, &format!("block-only loader, {how}"));
+        let (traffic, _) = lock_traffic_scope(&mut tx, &members).await;
+        let error = load_fallback_traffic_projection(&mut tx, traffic, &authority)
+            .await
+            .err();
+        assert_classified(error, unavailable, &format!("traffic loader, {how}"));
+        let error = verify_direct_request_wake_policy(
+            &mut tx,
+            &members[0],
+            &members[1],
+            [0x11; 32],
+            [0x22; 32],
+            &authority,
+        )
+        .await
+        .err();
+        assert_classified(error, unavailable, &format!("wake policy, {how}"));
+        let error = verify_federated_send_policy(
+            &mut tx,
+            &members[0],
+            &members[1],
+            [0x33; 32],
+            [0x44; 32],
+            &authority,
+        )
+        .await
+        .err();
+        assert_classified(error, unavailable, &format!("federated send, {how}"));
+        tx.rollback().await.unwrap();
+    }
+}
+
+/// The live-evidence verifiers keep an allowed pair (`Ok(true)`), an evaluated
+/// block (`Ok(false)`) and this server's own store failing distinct.
+#[tokio::test]
+#[ignore = "root fresh-database authorization required"]
+async fn policy_verifiers_keep_allow_block_and_store_failure_distinct() {
+    let db = crate::common::fresh_db::fresh_fully_migrated_db("chat_rel_verdict_").await;
+    let pool = db.connect(2).await;
+    let members = roster(2);
+    let mut tx = pool.begin().await.unwrap();
+    let allowed = verify_direct_request_wake_policy(
+        &mut tx,
+        &members[0],
+        &members[1],
+        [0x11; 32],
+        [0x22; 32],
+        &authority(),
+    )
+    .await;
+    assert!(matches!(allowed, Ok(true)), "wake: {allowed:?}");
+    tx.rollback().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let blocked = verify_direct_request_wake_policy(
+        &mut tx,
+        &members[0],
+        &members[1],
+        [0x11; 32],
+        [0x22; 32],
+        &blocked_authority(),
+    )
+    .await;
+    assert!(matches!(blocked, Ok(false)), "wake: {blocked:?}");
+    tx.rollback().await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let allowed = verify_federated_send_policy(
+        &mut tx,
+        &members[0],
+        &members[1],
+        [0x33; 32],
+        [0x44; 32],
+        &authority(),
+    )
+    .await;
+    assert!(matches!(allowed, Ok(true)), "federated send: {allowed:?}");
+    let blocked = verify_federated_send_policy(
+        &mut tx,
+        &members[0],
+        &members[1],
+        [0x33; 32],
+        [0x44; 32],
+        &blocked_authority(),
+    )
+    .await;
+    assert!(matches!(blocked, Ok(false)), "federated send: {blocked:?}");
+    tx.rollback().await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1/0")
+        .execute(&mut *tx)
+        .await
+        .expect_err("abort the transaction");
+    let failed = verify_federated_send_policy(
+        &mut tx,
+        &members[0],
+        &members[1],
+        [0x33; 32],
+        [0x44; 32],
+        &authority(),
+    )
+    .await;
+    assert!(
+        matches!(failed, Err(RelationshipRepositoryError::Database(_))),
+        "federated send: {failed:?}"
+    );
+    tx.rollback().await.unwrap();
 }

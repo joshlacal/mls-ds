@@ -79,6 +79,90 @@ pub async fn lock_delivery_id(
     Ok(())
 }
 
+/// This store failing in a federated operation's prelude, directly or in its
+/// authorization check, is `Database` (the peer's retryable 5xx); any other
+/// prelude failure is the envelope's.
+fn prelude_failure(error: PreludeError, context: &str) -> FederationError {
+    match error {
+        PreludeError::Database(error)
+        | PreludeError::Authorization(auth::AuthRepositoryError::Database(error)) => {
+            FederationError::Database(error)
+        }
+        error => FederationError::InvalidEnvelope {
+            reason: format!("{context}: {error:?}"),
+        },
+    }
+}
+
+/// This store failing at any depth of a conversation hydration is `Database`.
+fn hydration_failure(error: super::core::ConversationStateHydrationError) -> FederationError {
+    use super::core::{
+        ConversationHeadHydrationError as Head, ConversationStateHydrationError as State,
+        IntervalHydrationError as Intervals, LeafHydrationError as Leaves,
+        MetadataHydrationError as Metadata, ParticipantHydrationError as Participants,
+        ProducerHydrationError as Producer, PublicStateHydrationError as PublicState,
+        RecoveryHydrationError as Recovery, ResetLeaveHydrationError as ResetLeave,
+        TerminalProofHydrationError as TerminalProofs, WelcomeHydrationError as Welcomes,
+    };
+    match error {
+        State::Database(error)
+        | State::Head(Head::Database(error))
+        | State::PublicState(PublicState::Database(error))
+        | State::Producer(Producer::Database(error))
+        | State::Metadata(Metadata::Database(error))
+        | State::Participants(Participants::Database(error))
+        | State::Leaves(Leaves::Database(error))
+        | State::Intervals(Intervals::Database(error))
+        | State::RecoveryWork(Recovery::Database(error))
+        | State::ResetWork(ResetLeave::Database(error))
+        | State::LeaveWork(ResetLeave::Database(error))
+        | State::Welcomes(Welcomes::Database(error))
+        | State::TerminalProofs(TerminalProofs::Database(error)) => {
+            FederationError::Database(error)
+        }
+        error => FederationError::InvalidEnvelope {
+            reason: format!("hydrate_locked_conversation_state error: {error:?}"),
+        },
+    }
+}
+
+/// This store failing while hydrating terminal recovery packages is `Database`.
+fn terminal_packages_failure(error: SubmitTransitionFacadeError) -> FederationError {
+    use super::core::{
+        RecoveryHydrationError as Recovery, RecoveryPackageHydrationError as Package,
+    };
+    match error {
+        SubmitTransitionFacadeError::Database(error)
+        | SubmitTransitionFacadeError::RecoveryPackage(Package::Database(error))
+        | SubmitTransitionFacadeError::RecoveryPackage(Package::Recovery(Recovery::Database(
+            error,
+        ))) => FederationError::Database(error),
+        error => FederationError::InvalidEnvelope {
+            reason: format!("hydrate_terminal_recovery_packages error: {error:?}"),
+        },
+    }
+}
+
+/// This store failing while applying a planned transition is `Database`.
+fn execution_failure(error: crate::chat_protocol::state_machine::ExecutorError) -> FederationError {
+    use super::transition::TransitionRepositoryError as Transition;
+    use crate::chat_protocol::state_machine::ExecutorError as Executor;
+    match error {
+        Executor::Transition(Transition::Database(error))
+        | Executor::Delivery(DeliveryRepositoryError::Database(error))
+        | Executor::HydrationDatabase(error)
+        | Executor::TransactionIdentity(error)
+        | Executor::SavepointBegin(error)
+        | Executor::SavepointRelease(error)
+        | Executor::SavepointRollback {
+            rollback: error, ..
+        } => FederationError::Database(error),
+        error => FederationError::InvalidEnvelope {
+            reason: format!("apply_prepared_submit_transition_execution error: {error:?}"),
+        },
+    }
+}
+
 /// Acquire only the canonical operation advisory lock from a decoded candidate.
 /// This mints no request/operation admission and makes no replay decision. The
 /// original authenticated arbitration below reacquires this same transaction
@@ -667,11 +751,16 @@ pub async fn deliver_welcome_mailbox(
 
     let key_row: Option<(Vec<u8>, i64)> = sqlx::query_as(
         r#"
-        SELECT dk.signing_public_key, dk.enrollment_auth_generation
+        SELECT dk.signing_public_key, d.auth_generation
           FROM chat.device_keys dk
           JOIN chat.devices d ON d.user_did = dk.user_did AND d.device_id = dk.device_id
          WHERE dk.user_did = $1 AND dk.device_id = $2 AND dk.key_id = $3
            AND dk.revoked_at IS NULL AND d.status = 'active' AND d.revoked_at IS NULL
+           AND dk.enrollment_auth_generation<=d.auth_generation
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=dk.user_did AND newer.device_id=dk.device_id
+                  AND newer.enrollment_auth_generation>dk.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=d.auth_generation)
          FOR UPDATE
         "#,
     )
@@ -916,6 +1005,18 @@ pub(crate) async fn prepare_federated_operation(
     ))
 }
 
+/// The transitions a sequencer sequences for another home: `submitCommit`
+/// forwards only Commits (its own guard); `relayGroupMutation` relays these.
+fn is_relayable_transition(kind: SignedMutationKind) -> bool {
+    matches!(
+        kind,
+        SignedMutationKind::CommitTransition
+            | SignedMutationKind::PolicyTransition
+            | SignedMutationKind::MetadataTransition
+            | SignedMutationKind::LeaveCommitFulfillment
+    )
+}
+
 fn federated_operation_binding(
     admission: &crate::chat_protocol::state_machine::FederatedOperationAdmission,
     mutation: &VerifiedSignedMutation,
@@ -930,7 +1031,7 @@ fn federated_operation_binding(
     if mutation.actor_did().as_str() != admission.actor_did()
         || mutation.request_digest() != admission.mutation_request_digest()
         || mutation.signature() != admission.mutation_signature()
-        || mutation.kind().type_id() != "blue.catbird.chat.defs#commitTransitionBody"
+        || !is_relayable_transition(mutation.kind())
     {
         return Err(PreludeError::ClaimIntegrity);
     }
@@ -1069,14 +1170,10 @@ pub async fn deliver_message_replication(
         true,
     )
     .await
-    .map_err(|error| FederationError::InvalidEnvelope {
-        reason: format!("delivery lock scope discovery failed: {error:?}"),
-    })?;
+    .map_err(|error| prelude_failure(error, "delivery lock scope discovery failed"))?;
     let event_scope = prelude::lock_conversation_event_scope(tx, &candidate_scope)
         .await
-        .map_err(|error| FederationError::InvalidEnvelope {
-            reason: format!("delivery lock acquisition failed: {error:?}"),
-        })?;
+        .map_err(|error| prelude_failure(error, "delivery lock acquisition failed"))?;
 
     // 1. Lock conversation and verify remote mailbox routing and exact term.
     let convo_row: Option<(bool, Option<String>, i64, i64, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
@@ -1168,9 +1265,7 @@ pub async fn deliver_message_replication(
         true,
     )
     .await
-    .map_err(|error| FederationError::InvalidEnvelope {
-        reason: format!("delivery lock scope recheck failed: {error:?}"),
-    })?;
+    .map_err(|error| prelude_failure(error, "delivery lock scope recheck failed"))?;
     let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **tx)
         .await
@@ -1295,11 +1390,16 @@ pub async fn deliver_message_replication(
 
     let key_row: Option<(Vec<u8>, i64)> = sqlx::query_as(
         r#"
-        SELECT dk.signing_public_key, dk.enrollment_auth_generation
+        SELECT dk.signing_public_key, d.auth_generation
           FROM chat.device_keys dk
           JOIN chat.devices d ON d.user_did = dk.user_did AND d.device_id = dk.device_id
          WHERE dk.user_did = $1 AND dk.device_id = $2 AND dk.key_id = $3
            AND dk.revoked_at IS NULL AND d.status = 'active' AND d.revoked_at IS NULL
+           AND dk.enrollment_auth_generation<=d.auth_generation
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=dk.user_did AND newer.device_id=dk.device_id
+                  AND newer.enrollment_auth_generation>dk.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=d.auth_generation)
          FOR UPDATE
         "#,
     )
@@ -1410,8 +1510,21 @@ pub async fn deliver_message_replication(
     if !matches!(aad_protocol_version, Some(CanonicalValueRef::Text("1")))
         || aad_convo != Some(header.conversation_id)
         || aad_msg != Some(message_id)
-        || aad_gen != current_generation
     {
+        return Err(FederationError::InvalidEnvelope {
+            reason: "invalid AAD coordinate".to_string(),
+        });
+    }
+    // A message from a later generation than this mailbox holds waits for the
+    // predecessor transition the ordered stream retries ahead of it.
+    if aad_gen > current_generation {
+        return Err(FederationError::PredecessorMissing {
+            reason: format!(
+                "predecessor transition missing: message generation {aad_gen} is ahead of this mailbox's {current_generation}"
+            ),
+        });
+    }
+    if aad_gen != current_generation {
         return Err(FederationError::InvalidEnvelope {
             reason: "invalid AAD coordinate".to_string(),
         });
@@ -1459,6 +1572,16 @@ pub async fn deliver_message_replication(
                 Some(CanonicalValueRef::Text("active"))
             )
         {
+            if prior_convo == Some(header.conversation_id)
+                && prior_gen == current_generation
+                && prior_sv > convo_state_version
+            {
+                return Err(FederationError::PredecessorMissing {
+                    reason: format!(
+                        "predecessor transition missing: message prior stateVersion {prior_sv} is ahead of this mailbox's {convo_state_version}"
+                    ),
+                });
+            }
             return Err(FederationError::DeliveryConflict {
                 reason: "prior coordinate in AAD does not match current conversation state"
                     .to_string(),
@@ -1543,8 +1666,11 @@ pub async fn deliver_message_replication(
     if seq_exists {
         let is_exact = compare_exact_application_entry(tx, &send, locator.seq)
             .await
-            .map_err(|e| FederationError::SequenceConflict {
-                reason: format!("exact compare failed: {e:?}"),
+            .map_err(|e| match e {
+                DeliveryRepositoryError::Database(e) => FederationError::Database(e),
+                e => FederationError::SequenceConflict {
+                    reason: format!("exact compare failed: {e:?}"),
+                },
             })?;
         if !is_exact {
             return Err(FederationError::SequenceConflict {
@@ -1555,6 +1681,21 @@ pub async fn deliver_message_replication(
             });
         }
     } else {
+        let next_entry_seq: i64 = sqlx::query_scalar(
+            "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id = $1",
+        )
+        .bind(header.conversation_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(FederationError::Database)?;
+        if locator.seq as i64 > next_entry_seq {
+            return Err(FederationError::PredecessorMissing {
+                reason: format!(
+                    "predecessor entry missing: seq {} is ahead of this mailbox's next seq {next_entry_seq}",
+                    locator.seq
+                ),
+            });
+        }
         // The shared prelude remains the only operation-claim writer.
         let claim_res = prelude::insert_operation_claim_record(
             tx,
@@ -1636,8 +1777,11 @@ pub async fn deliver_message_replication(
 
         append_exact_application_entry(tx, &send, locator.seq)
             .await
-            .map_err(|e| FederationError::SequenceConflict {
-                reason: format!("append_exact_application_entry failed: {e:?}"),
+            .map_err(|e| match e {
+                DeliveryRepositoryError::Database(e) => FederationError::Database(e),
+                e => FederationError::SequenceConflict {
+                    reason: format!("append_exact_application_entry failed: {e:?}"),
+                },
             })?;
 
         event_position = Some(
@@ -1779,15 +1923,11 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
             true,
         )
         .await
-        .map_err(|error| FederationError::InvalidEnvelope {
-            reason: format!("event lock scope discovery failed: {error:?}"),
-        })?;
+        .map_err(|error| prelude_failure(error, "event lock scope discovery failed"))?;
         Some(
             prelude::lock_conversation_event_scope(tx, &scope)
                 .await
-                .map_err(|error| FederationError::InvalidEnvelope {
-                    reason: format!("event lock acquisition failed: {error:?}"),
-                })?,
+                .map_err(|error| prelude_failure(error, "event lock acquisition failed"))?,
         )
     } else {
         None
@@ -1925,14 +2065,19 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         });
     }
 
-    // Fetch actor signing public key and enrollment generation, checking device is active and unrevoked
+    // Fetch the current signing key and exact device authentication generation.
     let key_row: Option<(Vec<u8>, i64)> = sqlx::query_as(
         r#"
-        SELECT dk.signing_public_key, dk.enrollment_auth_generation
+        SELECT dk.signing_public_key, d.auth_generation
           FROM chat.device_keys dk
           JOIN chat.devices d ON d.user_did = dk.user_did AND d.device_id = dk.device_id
          WHERE dk.user_did = $1 AND dk.device_id = $2 AND dk.key_id = $3
            AND dk.revoked_at IS NULL AND d.status = 'active' AND d.revoked_at IS NULL
+           AND dk.enrollment_auth_generation<=d.auth_generation
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=dk.user_did AND newer.device_id=dk.device_id
+                  AND newer.enrollment_auth_generation>dk.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=d.auth_generation)
          FOR UPDATE
         "#,
     )
@@ -1981,9 +2126,7 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         .map_err(FederationError::Database)?;
     let aggregate = super::core::hydrate_locked_conversation_state(tx, header.conversation_id, now)
         .await
-        .map_err(|e| FederationError::InvalidEnvelope {
-            reason: format!("hydrate_locked_conversation_state error: {e:?}"),
-        })?;
+        .map_err(hydration_failure)?;
     let hydration = HydrationAuthority::from_locked_conversation(&aggregate).map_err(|e| {
         FederationError::InvalidEnvelope {
             reason: format!("HydrationAuthority::from_locked_conversation error: {e:?}"),
@@ -2039,9 +2182,7 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
 
     let terminal_packages = hydrate_terminal_recovery_packages(tx, &aggregate)
         .await
-        .map_err(|e| FederationError::InvalidEnvelope {
-            reason: format!("hydrate_terminal_recovery_packages error: {e:?}"),
-        })?;
+        .map_err(terminal_packages_failure)?;
 
     let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.submitTransition").map_err(|e| {
         FederationError::InvalidEnvelope {
@@ -2065,16 +2206,13 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         &signed_request_bytes,
     )
     .await
-    .map_err(|e| FederationError::InvalidEnvelope {
-        reason: format!("federated operation arbitration failed: {e:?}"),
-    })? {
+    .map_err(|e| prelude_failure(e, "federated operation arbitration failed"))?
+    {
         FederatedOperationArbitration::First(reservation) => {
             let binding = reservation.binding().clone();
             claim_federated_operation(tx, reservation)
                 .await
-                .map_err(|e| FederationError::InvalidEnvelope {
-                    reason: format!("federated operation claim failed: {e:?}"),
-                })?;
+                .map_err(|e| prelude_failure(e, "federated operation claim failed"))?;
             Some(binding)
         }
         FederatedOperationArbitration::Replay(response) => {
@@ -2241,15 +2379,18 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         &event_scope,
     )
     .await
-    .map_err(|e| FederationError::InvalidEnvelope {
-        reason: format!("prepare_submit_transition_execution error: {e:?}"),
+    .map_err(|e| match e {
+        super::execution_context::ExecutionContextHydrationError::Database(e) => {
+            FederationError::Database(e)
+        }
+        e => FederationError::InvalidEnvelope {
+            reason: format!("prepare_submit_transition_execution error: {e:?}"),
+        },
     })?;
 
     let applied = apply_prepared_submit_transition_execution(prepared_execution)
         .await
-        .map_err(|e| FederationError::InvalidEnvelope {
-            reason: format!("apply_prepared_submit_transition_execution error: {e:?}"),
-        })?;
+        .map_err(execution_failure)?;
 
     validate_applied_transition(
         &applied,
@@ -2325,9 +2466,7 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
                 current_epoch: 0,
             }
         }
-        other => FederationError::InvalidEnvelope {
-            reason: format!("federated operation completion failed: {other:?}"),
-        },
+        other => prelude_failure(other, "federated operation completion failed"),
     })?;
 
     insert_delivery_receipt(tx, &output.receipt, &source_locator, &response_bytes).await?;
@@ -2346,18 +2485,17 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
     routing: Option<crate::chat_protocol::federation_routing::ParticipantRoutingIntent>,
     relationship_authority: &RelationshipAuthority<T>,
 ) -> Result<Vec<u8>, FederationError> {
+    // This store failing decided nothing: each typed store failure below stays
+    // `Database` (the relay answers 5xx); every other failure is the request's.
+    use super::core::InvitationQuotaHydrationError as Quota;
+    use super::execution_context::ExecutionContextHydrationError as Context;
+    use super::relationship::RelationshipRepositoryError as Relationship;
     let canonical = decode_canonical_signed_mutation(&signed_request_bytes).map_err(|e| {
         FederationError::InvalidEnvelope {
             reason: format!("invalid signed mutation: {e}"),
         }
     })?;
-    if !matches!(
-        canonical.kind(),
-        SignedMutationKind::CommitTransition
-            | SignedMutationKind::PolicyTransition
-            | SignedMutationKind::MetadataTransition
-            | SignedMutationKind::LeaveCommitFulfillment
-    ) {
+    if !is_relayable_transition(canonical.kind()) {
         return Err(FederationError::InvalidEnvelope {
             reason: format!(
                 "unsupported relayed submitTransition kind: {:?}",
@@ -2385,14 +2523,10 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
         true,
     )
     .await
-    .map_err(|error| FederationError::InvalidEnvelope {
-        reason: format!("event lock scope discovery failed: {error:?}"),
-    })?;
+    .map_err(|error| prelude_failure(error, "event lock scope discovery failed"))?;
     let event_scope = prelude::lock_conversation_event_scope(tx, &scope)
         .await
-        .map_err(|error| FederationError::InvalidEnvelope {
-            reason: format!("event lock acquisition failed: {error:?}"),
-        })?;
+        .map_err(|error| prelude_failure(error, "event lock acquisition failed"))?;
 
     let convo_row: Option<(bool, Option<String>, i64)> = sqlx::query_as(
         "SELECT is_remote, sequencer_ds, sequencer_term \
@@ -2476,11 +2610,16 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
     }
 
     let key_row: Option<(Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT dk.signing_public_key, dk.enrollment_auth_generation \
+        "SELECT dk.signing_public_key, d.auth_generation \
            FROM chat.device_keys dk \
            JOIN chat.devices d ON d.user_did = dk.user_did AND d.device_id = dk.device_id \
           WHERE dk.user_did = $1 AND dk.device_id = $2 AND dk.key_id = $3 \
             AND dk.revoked_at IS NULL AND d.status = 'active' AND d.revoked_at IS NULL \
+            AND dk.enrollment_auth_generation<=d.auth_generation \
+            AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer \
+                WHERE newer.user_did=dk.user_did AND newer.device_id=dk.device_id \
+                  AND newer.enrollment_auth_generation>dk.enrollment_auth_generation \
+                  AND newer.enrollment_auth_generation<=d.auth_generation) \
           FOR UPDATE",
     )
     .bind(actor_did)
@@ -2536,9 +2675,7 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
         .map_err(FederationError::Database)?;
     let aggregate = super::core::hydrate_locked_conversation_state(tx, conversation_id, now)
         .await
-        .map_err(|e| FederationError::InvalidEnvelope {
-            reason: format!("hydrate_locked_conversation_state error: {e:?}"),
-        })?;
+        .map_err(hydration_failure)?;
     let hydration = HydrationAuthority::from_locked_conversation(&aggregate).map_err(|e| {
         FederationError::InvalidEnvelope {
             reason: format!("HydrationAuthority::from_locked_conversation error: {e:?}"),
@@ -2593,9 +2730,7 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
         })?;
     let terminal_packages = hydrate_terminal_recovery_packages(tx, &aggregate)
         .await
-        .map_err(|e| FederationError::InvalidEnvelope {
-            reason: format!("hydrate_terminal_recovery_packages error: {e:?}"),
-        })?;
+        .map_err(terminal_packages_failure)?;
     let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.submitTransition").map_err(|e| {
         FederationError::InvalidEnvelope {
             reason: format!("invalid endpoint nsid: {e}"),
@@ -2614,16 +2749,13 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
     let operation_binding =
         match prepare_federated_operation(tx, &admission, &mutation, &signed_request_bytes)
             .await
-            .map_err(|e| FederationError::InvalidEnvelope {
-                reason: format!("federated operation arbitration failed: {e:?}"),
-            })? {
+            .map_err(|e| prelude_failure(e, "federated operation arbitration failed"))?
+        {
             FederatedOperationArbitration::First(reservation) => {
                 let binding = reservation.binding().clone();
                 claim_federated_operation(tx, reservation)
                     .await
-                    .map_err(|e| FederationError::InvalidEnvelope {
-                        reason: format!("federated operation claim failed: {e:?}"),
-                    })?;
+                    .map_err(|e| prelude_failure(e, "federated operation claim failed"))?;
                 binding
             }
             FederatedOperationArbitration::Replay(response) => {
@@ -2674,6 +2806,10 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
                 reason: format!("transition authorization failed: {e:?}"),
             }
         }
+        // A relationship policy refusal, as the local transition answers it.
+        crate::chat_protocol::state_machine::StateMachineError::InvalidPolicyAuthority => {
+            FederationError::BlockedRelationship
+        }
         other => FederationError::InvalidEnvelope {
             reason: format!("transition planning failed: {other:?}"),
         },
@@ -2692,8 +2828,11 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
         SignedMutationKind::PolicyTransition if parsed.add_principals.is_empty() => {
             let quota = hydrate_locked_invitation_quota(tx, &actor_did_owned, &[], now)
                 .await
-                .map_err(|e| FederationError::InvalidEnvelope {
-                    reason: format!("invitation quota hydration failed: {e:?}"),
+                .map_err(|e| match e {
+                    Quota::Database(e) => FederationError::Database(e),
+                    e => FederationError::InvalidEnvelope {
+                        reason: format!("invitation quota hydration failed: {e:?}"),
+                    },
                 })?;
             let no_admission =
                 seal_non_add_policy_no_pending_admission(&aggregate, &quota, &registration)
@@ -2716,8 +2855,11 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
             let quota =
                 hydrate_locked_invitation_quota(tx, &actor_did_owned, &parsed.add_principals, now)
                     .await
-                    .map_err(|e| FederationError::InvalidEnvelope {
-                        reason: format!("invitation quota hydration failed: {e:?}"),
+                    .map_err(|e| match e {
+                        Quota::Database(e) => FederationError::Database(e),
+                        e => FederationError::InvalidEnvelope {
+                            reason: format!("invitation quota hydration failed: {e:?}"),
+                        },
                     })?;
             let fallback_scope = seal_pending_add_fallback_scope(&aggregate, &quota, &registration)
                 .map_err(|e| FederationError::InvalidEnvelope {
@@ -2726,8 +2868,18 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
             let (relationship, relationship_decision) =
                 load_fallback_relationship_projection(tx, fallback_scope, relationship_authority)
                     .await
-                    .map_err(|e| FederationError::InvalidEnvelope {
-                        reason: format!("relationship projection failed: {e:?}"),
+                    .map_err(|e| match e {
+                        Relationship::Database(e) => FederationError::Database(e),
+                        // A source that could not answer now, or this DS's
+                        // relationship authority unconfigured, decided nothing.
+                        e @ (Relationship::Unavailable
+                        | Relationship::InvalidAuthorityConfiguration(_)) => {
+                            FederationError::RelationshipPolicyUnavailable {
+                                reason: format!("relationship projection failed: {e:?}"),
+                            }
+                        }
+                        // Unusable evidence refuses, as the local transition does.
+                        Relationship::InvalidProjection => FederationError::BlockedRelationship,
                     })?
                     .ok_or_else(|| FederationError::InvalidEnvelope {
                         reason: "missing relationship projection".to_string(),
@@ -2771,14 +2923,15 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
         &event_scope,
     )
     .await
-    .map_err(|e| FederationError::InvalidEnvelope {
-        reason: format!("prepare_submit_transition_execution error: {e:?}"),
+    .map_err(|e| match e {
+        Context::Database(e) => FederationError::Database(e),
+        e => FederationError::InvalidEnvelope {
+            reason: format!("prepare_submit_transition_execution error: {e:?}"),
+        },
     })?;
     let applied = apply_prepared_submit_transition_execution(prepared_execution)
         .await
-        .map_err(|e| FederationError::InvalidEnvelope {
-            reason: format!("apply_prepared_submit_transition_execution error: {e:?}"),
-        })?;
+        .map_err(execution_failure)?;
     validate_applied_transition(
         &applied,
         expected_entry_id,
@@ -2807,9 +2960,7 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
                 current_epoch: aggregate.state().coordinate().epoch() as i32,
             }
         }
-        other => FederationError::InvalidEnvelope {
-            reason: format!("federated operation completion failed: {other:?}"),
-        },
+        other => prelude_failure(other, "federated operation completion failed"),
     })?;
 
     Ok(response_bytes)
@@ -3315,5 +3466,23 @@ mod tests {
             "delivery_id must match fixed test vector exactly"
         );
         assert_eq!(delivery_id.get_version_num(), 4, "must be UUIDv4");
+    }
+
+    #[test]
+    fn only_the_four_relayable_transitions_are_federated_operations() {
+        use SignedMutationKind as K;
+        let relayable: Vec<_> = SignedMutationKind::ALL
+            .into_iter()
+            .filter(|kind| is_relayable_transition(*kind))
+            .collect();
+        assert_eq!(
+            relayable,
+            [
+                K::CommitTransition,
+                K::PolicyTransition,
+                K::MetadataTransition,
+                K::LeaveCommitFulfillment,
+            ]
+        );
     }
 }

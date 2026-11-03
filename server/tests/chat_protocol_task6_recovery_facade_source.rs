@@ -95,7 +95,9 @@ fn handler_safe_facade_consumes_first_or_replay_and_never_commits() {
         "PreparedSignedOperationState::Replay",
         "validate_recovery_operation_replay(",
         "PreparedSignedOperationState::First",
-        "prepare_actor_prelude(",
+        // adcc1d575 (2026-09-07) replaced the actor-only prelude for request
+        // and cancellation with event-scope discovery + identity-scope prelude.
+        "discover_recovery_event_scope(",
         "discover_recovery_fulfillment_terminal_scope(",
         "prepare_identity_scope_prelude(",
         "prepare_recovery_request_authority(",
@@ -109,6 +111,7 @@ fn handler_safe_facade_consumes_first_or_replay_and_never_commits() {
             "missing facade stage: {required}"
         );
     }
+    assert!(!facade.contains("prepare_actor_prelude("));
     assert!(!facade.contains(".commit("));
     assert!(!facade.contains("COMMIT"));
 }

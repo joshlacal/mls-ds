@@ -357,6 +357,7 @@ fn sync_device_key_policy(root: &Path, did: &str, key: &[u8]) {
 fn ds_did_document(did: &str, server_url: &str, seed_byte: u8) -> Result<(Value, Vec<u8>, String)> {
     let receipt_key = SigningKey::from_bytes((&[seed_byte; 32]).into())?;
     let service_key = SigningKey::from_bytes((&[seed_byte + 1; 32]).into())?;
+    let sequencer_receipt_key = SigningKey::from_bytes((&[seed_byte + 2; 32]).into())?;
     let receipt_point = receipt_key.verifying_key().to_encoded_point(true);
     let receipt_key_id = format!(
         "{}#chat-request-receipt-{}",
@@ -366,6 +367,13 @@ fn ds_did_document(did: &str, server_url: &str, seed_byte: u8) -> Result<(Value,
 
     let mut multikey = vec![0x80, 0x24];
     multikey.extend_from_slice(receipt_point.as_bytes());
+    let mut sequencer_multikey = vec![0x80, 0x24];
+    sequencer_multikey.extend_from_slice(
+        sequencer_receipt_key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes(),
+    );
 
     let service_point = service_key.verifying_key().to_encoded_point(false);
     let service_jwk = json!({
@@ -389,6 +397,12 @@ fn ds_did_document(did: &str, server_url: &str, seed_byte: u8) -> Result<(Value,
                 "controller": did,
                 "type": "Multikey",
                 "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, multikey)
+            },
+            {
+                "id": format!("{did}#mls-receipt-1"),
+                "controller": did,
+                "type": "Multikey",
+                "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, sequencer_multikey)
             }
         ],
         "service": [{
@@ -485,6 +499,7 @@ fn spawn_server_fixture(
     let self_endpoint = format!("http://127.0.0.1:{port}");
     let receipt_key = SigningKey::from_bytes((&[seed_byte; 32]).into())?;
     let service_key = SigningKey::from_bytes((&[seed_byte + 1; 32]).into())?;
+    let sequencer_receipt_key = SigningKey::from_bytes((&[seed_byte + 2; 32]).into())?;
     let cursor_key_id = psql_value(
         db_url,
         "SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE",
@@ -520,6 +535,10 @@ fn spawn_server_fixture(
         .env(
             "CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM",
             receipt_key.to_pkcs8_pem(LineEnding::LF)?.as_str(),
+        )
+        .env(
+            "RECEIPT_SIGNING_KEY_PEM",
+            sequencer_receipt_key.to_pkcs8_pem(LineEnding::LF)?.as_str(),
         )
         .env(
             "SIGNING_KEY_PEM",
@@ -1538,8 +1557,8 @@ async fn main() -> Result<()> {
     let db1_url = format!("postgresql://127.0.0.1:5432/{db1_name}");
     let db2_url = format!("postgresql://127.0.0.1:5432/{db2_name}");
 
-    let _db1 = create_database_clone(&template_db, &db1_name)?;
-    let _db2 = create_database_clone(&template_db, &db2_name)?;
+    let _db1 = create_database_clone(template_db, &db1_name)?;
+    let _db2 = create_database_clone(template_db, &db2_name)?;
     prepare_dedicated_federation_database(&db1_url)?;
     prepare_dedicated_federation_database(&db2_url)?;
 

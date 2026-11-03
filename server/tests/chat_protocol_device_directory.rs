@@ -10,10 +10,13 @@
 //!
 //! Each case runs inside one transaction with same-tx read-back and is then
 //! ROLLED BACK — key packages in terminal states rely on DEFERRABLE INITIALLY
-//! DEFERRED FKs that never fire because the transaction never commits. The
-//! clean-chat database is never truncated.
+//! DEFERRED FKs that never fire because the transaction never commits.
 //!
-//! Run against the dedicated clean-chat database:
+//! Each case owns a private, fully migrated database: the projection reads
+//! later-migration DDL (`chat.key_packages.usage_scope`, 20260919000001) that the
+//! reviewed exact manifest of the shared clean-chat target does not install (Main
+//! ruling 2026-11-04). The shared target is used only as the validated
+//! maintenance literal:
 //!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
 //!   cargo test --test chat_protocol_device_directory -- --test-threads=1
@@ -22,7 +25,9 @@
 
 mod common;
 
-pub use catbird_server::{auth, crypto, federation, handlers, identity, sqlx_jacquard, util};
+pub use catbird_server::{
+    auth, crypto, federation, handlers, identity, sim_hooks, sqlx_jacquard, util,
+};
 
 #[path = "common/chat_protocol_harness.rs"]
 mod chat_protocol;
@@ -41,6 +46,12 @@ use repository::device_directory::{list_own_device_views, read_device_view};
 
 fn digest32(seed: &str) -> Vec<u8> {
     Sha256::digest(seed.as_bytes()).to_vec()
+}
+
+/// Private fully migrated database for one case; bind the guard for the test.
+async fn directory_pool() -> (PgPool, common::fresh_db::DisposableDatabase) {
+    let database = common::fresh_db::fresh_fully_migrated_db("chat_devdirectory_").await;
+    (database.connect(4).await, database)
 }
 
 async fn clock(tx: &mut Transaction<'_, Postgres>) -> DateTime<Utc> {
@@ -188,7 +199,7 @@ async fn seed_kp(tx: &mut Transaction<'_, Postgres>, device: &Device, seed: &str
 
 #[tokio::test]
 async fn read_device_view_returns_fields_and_status_only_counts() {
-    let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (pool, _database) = directory_pool().await;
     let mut tx = pool.begin().await.expect("begin");
     let device = seed_device(
         &mut tx,
@@ -234,7 +245,7 @@ async fn read_device_view_returns_fields_and_status_only_counts() {
 
 #[tokio::test]
 async fn read_device_view_absent_device_is_none() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (pool, _database) = directory_pool().await;
     let mut tx = pool.begin().await.expect("begin");
     let view = read_device_view(&mut tx, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", Uuid::new_v4())
         .await
@@ -244,7 +255,7 @@ async fn read_device_view_absent_device_is_none() {
 
 #[tokio::test]
 async fn list_own_device_views_returns_active_and_revoked_in_order() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (pool, _database) = directory_pool().await;
     let mut tx = pool.begin().await.expect("begin");
     let did = "did:plc:cccccccccccccccccccccccc";
     let first = seed_device(&mut tx, did, "own-a", "active", true).await;

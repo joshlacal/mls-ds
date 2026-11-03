@@ -143,6 +143,8 @@ def start(a):
     url = f"postgresql://127.0.0.1:{a.port}/{a.db}"
     psql(url, "-c", "CREATE EXTENSION IF NOT EXISTS pgcrypto")
     psql(url, "-c", SQLX_LEDGER)
+    psql(url, "-f", str(MIGRATIONS.parent / "tests" / "common" / "fixtures" /
+                       "direct_request_federation_cache.sql"))
     ledger_sql = ("SELECT version,description,success,encode(checksum,'hex') "
                   "FROM public._sqlx_migrations ORDER BY version")
     shared = psql(SHARED_URL, "-c", ledger_sql)

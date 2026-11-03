@@ -33,7 +33,8 @@
           "required": [
             "state",
             "pendingResetRequests",
-            "pendingLeaveRequests"
+            "pendingLeaveRequests",
+            "accountDeletions"
           ],
           "properties": {
             "state": {
@@ -57,6 +58,16 @@
               },
               "minLength": 0,
               "maxLength": 100
+            },
+            "accountDeletions": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "blue.catbird.chat.defs#accountDeletedEntry"
+              },
+              "minLength": 0,
+              "maxLength": 100,
+              "description": "Every accountDeletedEntry of this conversation in ascending seq, each exactly as sequenced with its sequencerAuthority. The sequencer, a group mirror and a C33 transport home serve it to any authenticated device of a current member DID, including a device that is not yet an MLS member and holds no entry entitlement, and to no one else. It survives ciphertext pruning. Clients verify each sequencerAuthority with the sequencer's #mls-receipt-1 key before hiding deletedDid's restored history."
             },
             "pendingLeafRecoveryRequests": {
               "type": "array",

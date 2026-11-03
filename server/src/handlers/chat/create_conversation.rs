@@ -15,6 +15,7 @@ use crate::{
         repository::{
             creation::{self, CreationFacadeError},
             prelude::PreludeError,
+            relationship::RelationshipRepositoryError,
         },
         state_machine::StateMachineError,
     },
@@ -68,11 +69,14 @@ async fn handle_inner(
                 ?err,
                 "createConversation participant routing resolution failed"
             );
-            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
+            context::routing_failure(endpoint, &err)
         })?;
         crate::federation::group_relay::stage_remote_group_participants(pool, &routes)
             .await
-            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized))?;
+            .map_err(|err| {
+                tracing::warn!(?err, "createConversation remote participant staging failed");
+                context::remote_member_failure(endpoint, &err)
+            })?;
         Some(
             crate::chat_protocol::federation_routing::ConversationRoutingIntent::local_creation(
                 routes,
@@ -113,11 +117,9 @@ async fn handle_inner(
         .commit()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
+    // Committed with its queued fan-out; the queue retries a failed send.
     if let Some(fanout) = fanout {
-        fanout
-            .deliver(pool, None)
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))?;
+        let _ = fanout.deliver(pool, None).await;
     }
     Ok(response)
 }
@@ -125,6 +127,7 @@ async fn handle_inner(
 fn creation_failure(endpoint: ChatEndpoint, error: CreationFacadeError) -> ChatFailure {
     use ChatProtocolErrorCode as C;
     use CreationFacadeError as E;
+    use RelationshipRepositoryError as R;
     use StateMachineError as S;
 
     match error {
@@ -153,10 +156,15 @@ fn creation_failure(endpoint: ChatEndpoint, error: CreationFacadeError) -> ChatF
             _ => ChatFailure::protocol(endpoint, C::InvitationLimitReached),
         },
         E::Relationship(error) => match error {
-            crate::chat_protocol::repository::relationship::RelationshipRepositoryError::Database(_) => {
-                ChatFailure::storage(endpoint)
+            R::Database(_) => ChatFailure::storage(endpoint),
+            // A relationship source that could not answer now decided nothing.
+            R::Unavailable => ChatFailure::unavailable(endpoint),
+            R::InvalidAuthorityConfiguration(_) => {
+                ChatFailure::protocol(endpoint, C::RelationshipPolicyUnavailable)
             }
-            _ => ChatFailure::invariant(endpoint),
+            // Unusable evidence or a drifted scope witness. The evaluated
+            // refusal is `S::InvalidPolicyAuthority` (BlockedRelationship).
+            R::InvalidProjection => ChatFailure::invariant(endpoint),
         },
         E::StateMachine(S::InvalidPolicyAuthority) => {
             ChatFailure::protocol(endpoint, C::BlockedRelationship)
@@ -193,8 +201,9 @@ fn creation_failure(endpoint: ChatEndpoint, error: CreationFacadeError) -> ChatF
 mod tests {
     use super::*;
     use crate::chat_protocol::error::ChatProtocolErrorCode;
+    use crate::chat_protocol::relationship_policy::RelationshipPolicyConfigError;
     use crate::chat_protocol::repository::core::CreationHeadHydrationError;
-    use axum::http::StatusCode;
+    use axum::http::{header::RETRY_AFTER, StatusCode};
     use serde_json::json;
 
     #[tokio::test]
@@ -223,5 +232,41 @@ mod tests {
                 "message": "ConversationAlreadyExists"
             })
         );
+    }
+
+    /// A relationship source that could not answer now decided nothing: 503
+    /// with a retry hint. This server's store failing is a 500 and a fixed
+    /// configuration fault keeps its unhinted code. Unusable evidence or a
+    /// drifted witness is not the evaluated refusal and stays an invariant.
+    #[test]
+    fn relationship_failures_keep_outage_store_and_invariant_distinct() {
+        use RelationshipRepositoryError as R;
+        let wire = |error| {
+            let failure = creation_failure(
+                ChatEndpoint::CreateConversation,
+                CreationFacadeError::Relationship(error),
+            );
+            let response = failure.into_response();
+            (
+                response.status().as_u16(),
+                response.headers().contains_key(RETRY_AFTER),
+                failure.code().map(ChatProtocolErrorCode::as_str),
+            )
+        };
+        assert_eq!(
+            wire(R::Unavailable),
+            (503, true, Some("RelationshipPolicyUnavailable"))
+        );
+        assert_eq!(
+            wire(R::Database(sqlx::Error::PoolTimedOut)),
+            (500, false, None)
+        );
+        assert_eq!(
+            wire(R::InvalidAuthorityConfiguration(
+                RelationshipPolicyConfigError::InvalidLimit,
+            )),
+            (503, false, Some("RelationshipPolicyUnavailable"))
+        );
+        assert_eq!(wire(R::InvalidProjection), (500, false, None));
     }
 }

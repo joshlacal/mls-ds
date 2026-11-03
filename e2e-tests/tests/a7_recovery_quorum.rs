@@ -22,10 +22,10 @@
 //!      into epoch_authenticators.
 //!   2. User1 calls reportRecoveryFailure with a valid authenticator.
 //!      Expect { recorded: true, autoResetTriggered: false,
-//!               failureCount: 1, memberCount: 3 }.
+//!      failureCount: 1, memberCount: 3 }.
 //!   3. User2 calls reportRecoveryFailure with a valid authenticator.
 //!      Expect { recorded: true, autoResetTriggered: true,
-//!               failureCount: 2, memberCount: 3 }.
+//!      failureCount: 2, memberCount: 3 }.
 //!      Server emits GroupResetEvent via SSE.
 //!   4. Bonus: user without authenticator → reason=missing_authenticator;
 //!      vote not counted, rate-limit slot not consumed.

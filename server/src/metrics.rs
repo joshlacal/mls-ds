@@ -140,7 +140,7 @@ impl MetricsRecorder {
         );
         metrics::describe_counter!(
             "ds_resolve_outcome_total",
-            "Total number of DS resolution exits, labeled by outcome (self | cache_fresh | did_doc | profile_record | cache_stale_degraded | default_fallback | hard_failure)"
+            "Total number of DS resolution exits, labeled by outcome (self | cache_fresh | did_doc | declaration | profile_record | cache_stale_degraded | transient_failure | default_fallback | hard_failure)"
         );
 
         // Fan-out failure metrics

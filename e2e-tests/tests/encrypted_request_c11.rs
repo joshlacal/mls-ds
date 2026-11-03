@@ -287,6 +287,12 @@ async fn run_resolver() -> anyhow::Result<()> {
 
     let credentials = MockCredentials::new();
     credentials.set_request_authority_document(authority_doc);
+    // The actor's repository-published device key (its PDS record), read from
+    // the reopened store's own identity.
+    let actor_key = ctx
+        .identity_public_key(format!("{actor_did}#{actor_device}"))
+        .map_err(|error| anyhow::anyhow!("actor public key: {error}"))?;
+    credentials.set_authorized_device_keys(&actor_did, vec![actor_key]);
     credentials
         .store_device_uuid(&actor_did, &actor_device)
         .await
@@ -661,7 +667,7 @@ async fn c11_committed_publication_lost_response_resolves_after_process_restart(
     // 6. The recipient decrypts the durable (never regenerated) introduction.
     let welcome = f.welcome_input(durable.bootstrap.clone(), &receipt)?;
     f.bob_engine.process_direct_request(&welcome)?;
-    let DirectRequestIntroductionResult::Ready { plaintext } =
+    let DirectRequestIntroductionResult::Ready { plaintext, .. } =
         f.bob_engine.decrypt_direct_request(&welcome)?
     else {
         anyhow::bail!("introduction must be ready for Bob")

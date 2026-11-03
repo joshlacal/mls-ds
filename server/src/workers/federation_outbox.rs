@@ -35,6 +35,8 @@ use super::{
     cleanup_dead_rows, record_failure, try_reclaim, CLAIM_BATCH_SIZE, DEAD_ROWS_MAX_AGE,
     POLL_INTERVAL,
 };
+use crate::chat_protocol::repository::delivery::QUEUED_COPY_OF_PRUNED_ENTRY_SQL;
+use crate::federation::FederationError;
 use crate::identity::canonical_did;
 const TABLE_NAME: &str = "federation_outbox";
 
@@ -59,8 +61,8 @@ pub struct FederationOutboxRow {
 /// 2. Claim up to [`CLAIM_BATCH_SIZE`] due `pending` rows in a single tx
 ///    (`FOR UPDATE SKIP LOCKED`), flipping them to `in_flight`.
 /// 3. Dispatch each claimed row.
-/// 4. On success: `mark_done`. On failure: `record_failure` (which
-///    transitions to `pending` with backoff or `dead` if exhausted).
+/// 4. On success: `mark_done`. On failure: `record_failure` (a peer-policy
+///    denial is `dead`; anything else goes back to `pending` with backoff).
 pub async fn run_federation_outbox_worker(pool: PgPool) {
     info!(
         poll_interval_secs = POLL_INTERVAL.as_secs(),
@@ -84,7 +86,7 @@ pub async fn run_federation_outbox_worker(pool: PgPool) {
 /// Execute one production `federation_outbox` handoff iteration:
 /// reclaim stuck `in_flight` leases, purge expired `dead` rows, claim up to `limit`
 /// due `pending` rows, and atomically hand each row off to `outbound_queue` (or
-/// record retry backoff / `dead` on failure).
+/// record retry backoff, or `dead` for a peer-policy denial).
 pub async fn process_federation_outbox_tick(
     pool: &PgPool,
     limit: i64,
@@ -111,14 +113,23 @@ pub async fn process_federation_outbox_tick(
             }
             Err(e) => {
                 let err_msg = format!("{e:#}");
+                // A peer-policy denial is permanent. This DS's own storage
+                // failing, or the peer's queue being full now, decided
+                // nothing: the job is retried however long that takes.
+                let permanent = !(e.is_retryable()
+                    || matches!(
+                        e,
+                        FederationError::OutboundQueuePeerCapExceeded { .. }
+                            | FederationError::OutboundQueueConvoPeerCapExceeded { .. }
+                    ));
                 match record_failure(
                     pool,
                     TABLE_NAME,
                     &row.id,
                     row.claim_token,
                     row.attempts,
-                    row.created_at,
                     &err_msg,
+                    permanent,
                 )
                 .await
                 {
@@ -147,8 +158,8 @@ pub async fn process_federation_outbox_tick(
 }
 
 /// Claim up to `limit` due `pending` rows, flipping them to `in_flight`
-/// in the same transaction. Returns the claimed rows for the caller to
-/// dispatch.
+/// in the same transaction. Returns the claimed rows, in `(next_attempt_at,
+/// id)` order, for the caller to dispatch in that order.
 ///
 /// Uses `FOR UPDATE SKIP LOCKED` so that horizontally-scaled workers
 /// don't double-claim a row. Without `SKIP LOCKED`, two replicas calling
@@ -181,16 +192,23 @@ pub async fn claim_due_rows(
     let claim_token =
         crate::sim_hooks::mint_entry_uuid_v4(b"federation_outbox.claim", &[ids[0].as_bytes()]);
 
+    // Neither `RETURNING` nor `ANY` keeps the candidates' order: carry it.
     let rows: Vec<FederationOutboxRow> = sqlx::query_as(
-        "UPDATE federation_outbox \
-         SET status = 'in_flight', \
-             claim_token = $2, \
-             claim_expires_at = $4 + make_interval(secs => $3), \
-             updated_at = $4 \
-         WHERE id = ANY($1) \
-         RETURNING id, conversation_id, delivery_event_id, target_service_did, \
-                   method, payload, payload_sha256, envelope_version, \
-                   attempts, created_at, claim_token",
+        "WITH claimed AS ( \
+             UPDATE federation_outbox q \
+                SET status = 'in_flight', \
+                    claim_token = $2, \
+                    claim_expires_at = $4 + make_interval(secs => $3), \
+                    updated_at = $4 \
+               FROM unnest($1::text[]) WITH ORDINALITY AS c(id, ord) \
+              WHERE q.id = c.id \
+             RETURNING c.ord, q.id, q.conversation_id, q.delivery_event_id, \
+                       q.target_service_did, q.method, q.payload, q.payload_sha256, \
+                       q.envelope_version, q.attempts, q.created_at, q.claim_token \
+         ) \
+         SELECT id, conversation_id, delivery_event_id, target_service_did, method, payload, \
+                payload_sha256, envelope_version, attempts, created_at, claim_token \
+         FROM claimed ORDER BY ord",
     )
     .bind(&ids)
     .bind(claim_token)
@@ -207,7 +225,7 @@ pub async fn claim_due_rows(
 pub async fn handoff_to_outbound_queue(
     pool: &PgPool,
     row: &FederationOutboxRow,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), FederationError> {
     let now = crate::sim_hooks::current_utc();
     let mut tx = pool.begin().await?;
 
@@ -225,8 +243,7 @@ pub async fn handoff_to_outbound_queue(
             &mut tx,
             &canonical_target_ds_did,
         )
-        .await
-        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+        .await?;
 
         let (per_peer_cap, per_convo_cap) =
             crate::federation::queue::current_pending_caps_from_env();
@@ -238,8 +255,7 @@ pub async fn handoff_to_outbound_queue(
             per_peer_cap,
             per_convo_cap,
         )
-        .await
-        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+        .await?;
 
         sqlx::query(
             "INSERT INTO outbound_queue \
@@ -259,19 +275,30 @@ pub async fn handoff_to_outbound_queue(
         .await?;
     }
     // 2. Mark source federation_outbox row as 'done' in the SAME transaction!
-    let updated = sqlx::query(
-        "UPDATE federation_outbox \
-         SET status = 'done', updated_at = $3, last_error = NULL \
-         WHERE id = $1 AND ($2::uuid IS NULL OR claim_token = $2)",
-    )
+    //    A job of an entry already pruned leaves no row behind: its
+    //    `outbound_queue` copy is the one still to be sent (O7).
+    let updated: i64 = sqlx::query_scalar(&format!(
+        "WITH gone AS ( \
+             DELETE FROM federation_outbox q \
+              WHERE q.id = $1 AND ($2::uuid IS NULL OR q.claim_token = $2) \
+                AND {QUEUED_COPY_OF_PRUNED_ENTRY_SQL} \
+             RETURNING 1 \
+         ), kept AS ( \
+             UPDATE federation_outbox q SET status = 'done', updated_at = $3, last_error = NULL \
+              WHERE q.id = $1 AND ($2::uuid IS NULL OR q.claim_token = $2) \
+                AND NOT {QUEUED_COPY_OF_PRUNED_ENTRY_SQL} \
+             RETURNING 1 \
+         ) \
+         SELECT (SELECT count(*) FROM gone) + (SELECT count(*) FROM kept)"
+    ))
     .bind(&row.id)
     .bind(row.claim_token)
     .bind(now)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
 
-    if updated.rows_affected() == 0 {
-        return Err(sqlx::Error::RowNotFound);
+    if updated == 0 {
+        return Err(FederationError::Database(sqlx::Error::RowNotFound));
     }
 
     tx.commit().await?;
@@ -347,4 +374,141 @@ pub async fn drain_federation_outbox(
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
+    use super::*;
+    use crate::sim_hooks::{current_utc, scope_ds_clock, ManualDsClock};
+    use crate::workers::reclaim_stuck_in_flight;
+    use std::sync::Arc;
+
+    async fn insert_job(pool: &PgPool, id: &str, due: DateTime<Utc>) {
+        sqlx::query(
+            "INSERT INTO federation_outbox (id, conversation_id, target_service_did, payload, \
+                 status, next_attempt_at, created_at, updated_at) \
+             VALUES ($1, $1, 'did:web:peer.example.com', $2, 'pending', $3, $3, $3)",
+        )
+        .bind(id)
+        .bind(b"{}".as_slice())
+        .bind(due)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Jobs due at one instant claim, and so hand off, in `(next_attempt_at,
+    /// id)` order whatever their rows' history. Retry resets here write the
+    /// tied jobs in reverse id order and the job due first holds the largest
+    /// id: claimed rows handed back in `RETURNING` order fail. A claim takes
+    /// only unclaimed jobs (a locked one is skipped), and an expired lease
+    /// re-claims the same order under a new token.
+    #[tokio::test]
+    async fn equal_deadline_jobs_claim_in_deadline_then_id_order_across_reset_history() {
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 2, 1).await;
+        let t0 = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let clock = Arc::new(ManualDsClock::new(t0));
+        scope_ds_clock(clock.clone(), async {
+            let ids = |rows: &[FederationOutboxRow]| {
+                rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>()
+            };
+            for id in ["job-a", "job-b", "job-c"] {
+                insert_job(&pool, id, t0).await;
+            }
+            let first = claim_due_rows(&pool, 10).await.unwrap();
+            assert_eq!(ids(&first), ["job-a", "job-b", "job-c"]);
+            // Each handoff fails at once, the last first: equal deadlines,
+            // written in reverse id order.
+            for row in first.iter().rev() {
+                let stored = record_failure(
+                    &pool,
+                    TABLE_NAME,
+                    &row.id,
+                    row.claim_token,
+                    row.attempts,
+                    "transient",
+                    false,
+                )
+                .await
+                .unwrap();
+                assert_eq!(stored, "pending");
+            }
+            // A job falls due first, under the largest id, written last.
+            insert_job(&pool, "job-z", t0 + chrono::TimeDelta::seconds(4)).await;
+            clock.advance(chrono::TimeDelta::seconds(5));
+            let now = current_utc();
+
+            // A rival worker holds `job-a`: a claim skips it.
+            let mut rival = pool.begin().await.unwrap();
+            sqlx::query("SELECT 1 FROM federation_outbox WHERE id = 'job-a' FOR UPDATE")
+                .execute(&mut *rival)
+                .await
+                .unwrap();
+            let skipped = claim_due_rows(&pool, 2).await.unwrap();
+            assert_eq!(ids(&skipped), ["job-z", "job-b"]);
+            rival.rollback().await.unwrap();
+            let rest = claim_due_rows(&pool, 10).await.unwrap();
+            assert_eq!(ids(&rest), ["job-a", "job-c"]);
+            assert!(
+                claim_due_rows(&pool, 10).await.unwrap().is_empty(),
+                "every job is in flight"
+            );
+
+            // Each claim leases its jobs for 120 s under one token of its own.
+            let (s, r) = (skipped[0].claim_token, rest[0].claim_token);
+            assert!(s.is_some() && r.is_some() && s != r);
+            let lease = Some(now + chrono::TimeDelta::seconds(120));
+            let leases: Vec<(String, String, Option<Uuid>, Option<DateTime<Utc>>)> =
+                sqlx::query_as(
+                    "SELECT id, status, claim_token, claim_expires_at FROM federation_outbox \
+                     ORDER BY id",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            let in_flight = |id: &str, token| (id.to_owned(), "in_flight".to_owned(), token, lease);
+            assert_eq!(
+                leases,
+                [
+                    in_flight("job-a", r),
+                    in_flight("job-b", s),
+                    in_flight("job-c", r),
+                    in_flight("job-z", s),
+                ]
+            );
+
+            // The leases expire together and reset every job once more.
+            clock.advance(chrono::TimeDelta::seconds(119));
+            assert_eq!(reclaim_stuck_in_flight(&pool, TABLE_NAME).await.unwrap(), 0);
+            clock.advance(chrono::TimeDelta::seconds(1));
+            assert_eq!(reclaim_stuck_in_flight(&pool, TABLE_NAME).await.unwrap(), 4);
+            let replayed = claim_due_rows(&pool, 10).await.unwrap();
+            assert_eq!(ids(&replayed), ["job-z", "job-a", "job-b", "job-c"]);
+            let token = replayed[0].claim_token;
+            assert!(replayed.iter().all(|row| row.claim_token == token));
+            assert!(token != s && token != r);
+
+            // An expired claim settles nothing.
+            let late = &skipped[0];
+            let stored = record_failure(
+                &pool,
+                TABLE_NAME,
+                &late.id,
+                late.claim_token,
+                late.attempts,
+                "late",
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(stored, "stale");
+        })
+        .await;
+    }
 }

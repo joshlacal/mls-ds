@@ -280,19 +280,21 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         "del-jti-sender-1",
         now_sec,
     );
-    let cred_uri = format!(
-        "/xrpc/com.atproto.space.getSpaceCredential?space={}&credentialKid={}&delegationToken={}",
-        urlencoding::encode(&space_uri),
-        urlencoding::encode(&sender_kid),
-        urlencoding::encode(&sender_del),
-    );
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("GET")
-                .uri(&cred_uri)
-                .body(Body::empty())
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "space": space_uri,
+                        "credentialKid": sender_kid,
+                        "delegationToken": sender_del,
+                    }))
+                    .unwrap(),
+                ))
                 .unwrap(),
         )
         .await
@@ -312,9 +314,17 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         .clone()
         .oneshot(
             Request::builder()
-                .method("GET")
-                .uri(&cred_uri)
-                .body(Body::empty())
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "space": space_uri,
+                        "credentialKid": sender_kid,
+                        "delegationToken": sender_del,
+                    }))
+                    .unwrap(),
+                ))
                 .unwrap(),
         )
         .await
@@ -340,19 +350,21 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         "del-jti-recip-1",
         now_sec,
     );
-    let recip_cred_uri = format!(
-        "/xrpc/com.atproto.space.getSpaceCredential?space={}&credentialKid={}&delegationToken={}",
-        urlencoding::encode(&space_uri),
-        urlencoding::encode(&recip_kid),
-        urlencoding::encode(&recip_del),
-    );
     let recip_resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("GET")
-                .uri(&recip_cred_uri)
-                .body(Body::empty())
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "space": space_uri,
+                        "credentialKid": recip_kid,
+                        "delegationToken": recip_del,
+                    }))
+                    .unwrap(),
+                ))
                 .unwrap(),
         )
         .await
@@ -404,19 +416,21 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         "del-jti-pending-1",
         now_sec,
     );
-    let pending_uri = format!(
-        "/xrpc/com.atproto.space.getSpaceCredential?space={}&credentialKid={}&delegationToken={}",
-        urlencoding::encode(&pending_space_uri),
-        urlencoding::encode(&recip_kid),
-        urlencoding::encode(&pending_del),
-    );
     let pending_resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("GET")
-                .uri(&pending_uri)
-                .body(Body::empty())
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "space": pending_space_uri,
+                        "credentialKid": recip_kid,
+                        "delegationToken": pending_del,
+                    }))
+                    .unwrap(),
+                ))
                 .unwrap(),
         )
         .await
@@ -526,19 +540,21 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         "del-jti-charlie-1",
         now_sec,
     );
-    let charlie_cred_uri = format!(
-        "/xrpc/com.atproto.space.getSpaceCredential?space={}&credentialKid={}&delegationToken={}",
-        urlencoding::encode(&space_uri),
-        urlencoding::encode(&charlie_kid),
-        urlencoding::encode(&charlie_del),
-    );
     let charlie_cred_resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("GET")
-                .uri(&charlie_cred_uri)
-                .body(Body::empty())
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "space": space_uri,
+                        "credentialKid": charlie_kid,
+                        "delegationToken": charlie_del,
+                    }))
+                    .unwrap(),
+                ))
                 .unwrap(),
         )
         .await
@@ -611,19 +627,21 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         "del-jti-charlie-after-rem",
         now_sec,
     );
-    let charlie_after_uri = format!(
-        "/xrpc/com.atproto.space.getSpaceCredential?space={}&credentialKid={}&delegationToken={}",
-        urlencoding::encode(&space_uri),
-        urlencoding::encode(&charlie_kid),
-        urlencoding::encode(&charlie_del_after),
-    );
     let charlie_after_resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("GET")
-                .uri(&charlie_after_uri)
-                .body(Body::empty())
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "space": space_uri,
+                        "credentialKid": charlie_kid,
+                        "delegationToken": charlie_del_after,
+                    }))
+                    .unwrap(),
+                ))
                 .unwrap(),
         )
         .await
@@ -747,9 +765,17 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     assert_eq!(recip_rev_resp.status(), StatusCode::UNAUTHORIZED);
 
     // 5. Account deletion (delete_account_data_with_conversations) removes writer from Space!
-    delete_account_data_with_conversations(&pool, charlie_did, Utc::now())
-        .await
-        .unwrap();
+    delete_account_data_with_conversations(
+        &pool,
+        charlie_did,
+        Utc::now(),
+        Some(&catbird_server::federation::receipt::I13ReceiptSigner::new(
+            P256SigningKey::random(&mut OsRng),
+            authority_did.to_owned(),
+        )),
+    )
+    .await
+    .unwrap();
 
     let list_after_del_headers = build_signed_space_headers(
         &sender_pop,

@@ -18,10 +18,12 @@ pub(super) async fn run_inventory_lock_order(pool: &PgPool) -> Result<(), String
         (&b, &a)
     };
     let admission = admit_read(pool, second, "blue.catbird.chat.getOwnDevices", &at).await?;
-    let url = std::env::var("TEST_DATABASE_URL").map_err(|e| e.to_string())?;
+    // The gated proof database itself, never a re-read TEST_DATABASE_URL: that
+    // names the shared target, which this second connection would reach past
+    // `require_local_owned_gate` (Main ruling 2026-11-04).
     let reader_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .connect(&url)
+        .connect_with((*pool.connect_options()).clone())
         .await
         .map_err(|e| e.to_string())?;
     let reader_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")

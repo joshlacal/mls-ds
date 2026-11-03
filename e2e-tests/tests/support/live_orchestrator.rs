@@ -25,6 +25,9 @@ pub mod mock_storage;
 use mock_credentials::MockCredentials;
 use mock_storage::MockStorage;
 
+/// One forwarded exchange: (NSID, request body, status, response body).
+type Exchange = (String, Option<Vec<u8>>, u16, Vec<u8>);
+
 pub struct LiveApiClient {
     service: crate::encrypted_requests::ServiceIdentity,
     client: reqwest::Client,
@@ -32,8 +35,8 @@ pub struct LiveApiClient {
     /// Recipient packages the test obtained out of band; the router has no
     /// ordinary package-claim read.
     key_packages: Vec<catbird_mls::orchestrator::KeyPackageRef>,
-    /// Every forwarded exchange (NSID, request body, status, response body), in order.
-    exchanges: std::sync::Mutex<Vec<(String, Option<Vec<u8>>, u16, Vec<u8>)>>,
+    /// Every forwarded exchange, in order.
+    exchanges: std::sync::Mutex<Vec<Exchange>>,
 }
 
 impl LiveApiClient {
@@ -437,16 +440,22 @@ pub type LiveOrchestrator =
     MLSOrchestrator<MockStorage, LiveApiClient, MockCredentials, MLSContext>;
 
 /// An initialized orchestrator for `service`'s exact device over `context`,
-/// trusting the fixture's published receipt authority document.
+/// trusting the fixture's published receipt authority document. Its credential
+/// store answers each account's repository-published device keys, the only
+/// first-contact device authority the core accepts.
 pub async fn live_orchestrator(
     context: Arc<MLSContext>,
     service: &crate::encrypted_requests::ServiceIdentity,
     client: &reqwest::Client,
     base_url: &str,
     receipt_authority_document: Vec<u8>,
+    authorized_device_keys: &[(&str, Vec<Vec<u8>>)],
 ) -> anyhow::Result<LiveOrchestrator> {
     let credentials = MockCredentials::new();
     credentials.set_request_authority_document(receipt_authority_document);
+    for (did, keys) in authorized_device_keys {
+        credentials.set_authorized_device_keys(did, keys.clone());
+    }
     live_orchestrator_with_credentials(context, service, client, base_url, credentials).await
 }
 

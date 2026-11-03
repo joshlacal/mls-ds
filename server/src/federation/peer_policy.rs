@@ -154,6 +154,26 @@ pub fn inbound_emergency_kill_switch_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// The federation gate: the emergency kill switch and the effective
+/// (runtime-override or env) mode. Every inbound peer route family
+/// (`enforce_ds_request_security`, group relay `verify_s2s_caller`,
+/// `healthCheck`) answers a closed gate with a retryable 503, not an auth
+/// failure. Outbound dispatch (`OutboundQueue::process_pending_batch`, group
+/// fan-out `drain_stream`) pauses before claiming, so durable rows stay
+/// pending with their retry counts and resume once the gate reopens.
+pub fn ensure_federation_open() -> Result<(), FederationError> {
+    let reason = if inbound_emergency_kill_switch_enabled() {
+        "Federation emergency kill switch is enabled"
+    } else if !FederationMode::effective().allows_remote_traffic() {
+        "Federation mode is off"
+    } else {
+        return Ok(());
+    };
+    Err(FederationError::FederationDisabled {
+        reason: reason.to_string(),
+    })
+}
+
 fn parse_open_intelligent_pending_limit(raw: Option<&str>) -> i32 {
     raw.and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(OPEN_INTELLIGENT_PENDING_MAX_REQUESTS_DEFAULT)
@@ -492,7 +512,7 @@ pub async fn enforce_inbound_peer_policy(
     ds_did: &str,
 ) -> Result<PeerPolicy, FederationError> {
     let ds_did = canonical_did(ds_did);
-    let mode = FederationMode::from_env();
+    let mode = FederationMode::effective();
     let row: Option<(String, Option<i32>, i32, i64, i64)> = sqlx::query_as(
         "SELECT status, max_requests_per_minute, trust_score, \
                  rejected_request_count, invalid_token_count \

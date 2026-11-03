@@ -6,6 +6,8 @@ FROM rust:1-bookworm AS builder
 WORKDIR /build
 
 COPY --from=catbird-atproto / /catbird-atproto
+# server/Cargo.toml: labyrinth-protocol = { path = "../../labyrinth/labyrinth-protocol" }
+COPY --from=labyrinth-protocol / /labyrinth/labyrinth-protocol
 
 # Cache dependencies by copying manifests first
 COPY Cargo.toml Cargo.lock* ./

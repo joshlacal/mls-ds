@@ -14,10 +14,12 @@ use crate::{
     chat_protocol::{
         error::{ChatEndpoint, ChatProtocolErrorCode},
         repository::{
+            delivery, entry_read,
             message_delivery::{self, MessageDeliveryError},
             prelude::{self, PreparedChatAdmission},
         },
     },
+    federation::{group_relay::GroupRelayError, FederationError},
     storage::DbPool,
 };
 
@@ -111,15 +113,17 @@ async fn send(
         .bind(convo_id)
         .fetch_optional(pool)
         .await
-        .ok()
-        .flatten();
+        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
         let is_local_convo = local_convo.is_some();
 
-        if let Some((ref kind, true, Some(ref seq_ds))) = local_convo {
-            if kind == "group"
-                && runtime.resolver().is_some()
-                && crate::federation::FederationMode::effective().allows_remote_traffic()
-            {
+        if let Some((kind, true, Some(seq_ds))) = &local_convo {
+            // Only its sequencer sequences a remote group: a closed gate decided
+            // nothing, and never falls through to the local path.
+            if kind == "group" {
+                crate::federation::peer_policy::ensure_federation_open()
+                    .map_err(|error| GroupRelayError::from_local(error).into_failure(ENDPOINT))?;
+            }
+            if kind == "group" && runtime.resolver().is_some() {
                 let secret = crate::federation::group_relay::configured_group_relay_hmac_secret();
                 let can_authenticate_s2s = secret.is_some()
                     || crate::federation::canonical_relay::configured_s2s_signing_key_pem().is_ok();
@@ -148,7 +152,9 @@ async fn send(
                     let dest = resolver
                         .resolve_ds_destination_uncached(seq_ds)
                         .await
-                        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+                        .map_err(|error| {
+                            GroupRelayError::from_local(error).into_failure(ENDPOINT)
+                        })?;
                     let out = crate::federation::group_relay::relay_group_mutation_to_sequencer(
                         dest.url.as_str(),
                         &crate::identity::service_did(),
@@ -171,8 +177,9 @@ async fn send(
                     if let Some(obj) = entry.as_object_mut() {
                         obj.remove("$type");
                     }
-                    let response_bytes = serde_json::to_vec(&serde_json::json!({ "entry": entry }))
-                        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+                    let response_bytes =
+                        serde_json::to_vec(&entry_read::accepted_send_outcome(entry))
+                            .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
                     return context::canonical_json_response(ENDPOINT, 200, response_bytes);
                 }
             }
@@ -238,15 +245,15 @@ async fn send(
             })?;
 
             // Entitlement check by owner and device before LIMIT 1
-            let inbox_info: Option<(String, String, Option<uuid::Uuid>, String, uuid::Uuid, String)> = sqlx::query_as(
-                "SELECT coordinator_did, sender_did, sender_device_id, recipient_did, recipient_device_id, status \
+            let inbox_info: Option<(String, String)> = sqlx::query_as(
+                "SELECT coordinator_did, status \
                  FROM chat.direct_request_transport_inbox \
                  WHERE conversation_id = $1 \
                    AND ( \
                      (recipient_did = $2 AND recipient_device_id = $3) \
-                     OR (sender_did = $2 AND (sender_device_id IS NULL OR sender_device_id = $3)) \
+                     OR (sender_did = $2 AND sender_device_id = $3) \
                    ) \
-                 LIMIT 1"
+                 LIMIT 1",
             )
             .bind(convo_id)
             .bind(actor_did)
@@ -255,15 +262,7 @@ async fn send(
             .await
             .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
-            let Some((
-                coord_did,
-                sender_did,
-                sender_device_id,
-                recipient_did,
-                recipient_device_id,
-                status,
-            )) = inbox_info
-            else {
+            let Some((coord_did, status)) = inbox_info else {
                 return Err(ChatFailure::protocol(
                     ENDPOINT,
                     ChatProtocolErrorCode::NotEntitled,
@@ -277,61 +276,88 @@ async fn send(
                     ChatProtocolErrorCode::ConversationNotAccepted,
                 ));
             }
-            // Stable idempotent retry check: if message already committed, return cached entry
-            let message_id_str = signed_req
+            // A stored send replays as the entry `getEntries` serves here: once
+            // pruned (O7), its `payloadPruned` projection, with no ciphertext.
+            let message_id = signed_req
                 .pointer("/body/messageId")
-                .and_then(|v| v.as_str());
-            if let Some(msg_id_str) = message_id_str {
-                let existing_entries: Vec<Vec<u8>> = sqlx::query_scalar(
-                    "SELECT entry_bytes FROM chat.direct_request_transport_entries \
-                     WHERE conversation_id = $1 \
-                     ORDER BY seq DESC",
-                )
-                .bind(convo_id)
-                .fetch_all(pool)
-                .await
-                .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-
-                for e_bytes in existing_entries {
-                    if let Ok(mut entry_val) = serde_json::from_slice::<serde_json::Value>(&e_bytes)
-                    {
-                        if entry_val
-                            .pointer("/signedRequest/body/messageId")
-                            .and_then(|v| v.as_str())
-                            == Some(msg_id_str)
-                        {
-                            if entry_val.get("signedRequest") != Some(signed_req) {
-                                return Err(ChatFailure::protocol(
-                                    ENDPOINT,
-                                    ChatProtocolErrorCode::IdempotencyConflict,
-                                ));
-                            }
-                            entry_val
-                                .as_object_mut()
-                                .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?
-                                .remove("$type");
-                            let resp_val = serde_json::json!({ "entry": entry_val });
-                            let response_bytes = serde_json::to_vec(&resp_val)
-                                .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-                            return context::canonical_json_response(ENDPOINT, 200, response_bytes);
-                        }
-                    }
-                }
-            }
-
-            // Resolve coordinator using the conversation participants (sender_did, recipient_did)
-            let coord = crate::federation::canonical_relay::resolve_pair_coordinator(
-                pool,
-                &sender_did,
-                &recipient_did,
+                .and_then(|value| value.as_str())
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .ok_or_else(|| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
+            // Signed requests carry NUL escapes PostgreSQL JSON rejects: compare the
+            // insert-captured digest, and parse rows without evidence (stored before
+            // migration 20261103000001, or older schemas) here instead.
+            let has_replay_evidence: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_attribute \
+                  WHERE attrelid = 'chat.direct_request_transport_entries'::regclass \
+                    AND attname = 'application_message_id' AND NOT attisdropped)",
             )
+            .fetch_one(pool)
             .await
             .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-            if crate::identity::canonical_did(&coord.coordinator_did)
-                != crate::identity::canonical_did(&coord_did)
-            {
-                return Err(ChatFailure::invariant(ENDPOINT));
+            let request_sha256 = delivery::signed_request_sha256(signed_req)
+                .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+            let candidates: Vec<(Vec<u8>, Option<uuid::Uuid>, Option<Vec<u8>>)> =
+                if has_replay_evidence {
+                    sqlx::query_as(
+                        "SELECT entry_bytes, application_message_id, application_request_sha256 \
+                           FROM chat.direct_request_transport_entries \
+                          WHERE conversation_id = $1 \
+                            AND (application_message_id = $2 OR evidence_pending) \
+                          ORDER BY seq DESC",
+                    )
+                    .bind(convo_id)
+                    .bind(message_id)
+                    .fetch_all(pool)
+                    .await
+                } else {
+                    sqlx::query_as(
+                        "SELECT entry_bytes, NULL::uuid, NULL::bytea \
+                           FROM chat.direct_request_transport_entries \
+                          WHERE conversation_id = $1 ORDER BY seq DESC",
+                    )
+                    .bind(convo_id)
+                    .fetch_all(pool)
+                    .await
+                }
+                .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+            for (entry_bytes, stored_message, stored_request) in candidates {
+                let (stored_message, stored_request) = match (stored_message, stored_request) {
+                    (Some(message), Some(request)) => (message, request),
+                    _ => match delivery::transport_application_evidence(&entry_bytes) {
+                        Ok(Some(evidence)) => (evidence.message_id, evidence.request_sha256),
+                        _ => continue,
+                    },
+                };
+                if stored_message != message_id {
+                    continue;
+                }
+                if stored_request != request_sha256 {
+                    return Err(ChatFailure::protocol(
+                        ENDPOINT,
+                        ChatProtocolErrorCode::IdempotencyConflict,
+                    ));
+                }
+                let mut entry: serde_json::Value = serde_json::from_slice(&entry_bytes)
+                    .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+                entry
+                    .as_object_mut()
+                    .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?
+                    .remove("$type");
+                let response_bytes = serde_json::to_vec(&entry_read::accepted_send_outcome(entry))
+                    .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+                return context::canonical_json_response(ENDPOINT, 200, response_bytes);
             }
+
+            // The coordinator this inbox recorded for the pair, never re-derived
+            // from both parties' declarations: a deleted party's is typically gone.
+            let coordinator =
+                crate::federation::canonical_relay::resolve_recorded_coordinator(pool, &coord_did)
+                    .await
+                    .map_err(|error| {
+                        c33_failure("Failed to resolve the pair's recorded coordinator", &error)
+                    })?;
 
             let relay_payload = crate::federation::canonical_relay::RelaySendMessageInput {
                 conversation_id: convo_id,
@@ -339,30 +365,28 @@ async fn send(
             };
 
             let result = crate::federation::canonical_relay::relay_message_to_coordinator(
-                coord.coordinator_endpoint(),
+                &coordinator.endpoint,
                 &coord_did,
                 relay_payload,
             )
             .await
-            .map_err(|e| {
-                tracing::error!("relay_message_to_coordinator failed: {:?}", e);
-                ChatFailure::storage(ENDPOINT)
-            })?;
+            .map_err(|error| c33_failure("relay_message_to_coordinator failed", &error))?;
 
             let entry = result
                 .get("entry")
                 .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
-            if entry.get("signedRequest") != Some(signed_req) {
-                return Err(ChatFailure::invariant(ENDPOINT));
+            // A pruned send's replay (O7) carries the coordinator's `payloadPruned`
+            // projection: the accepted outcome, with no ciphertext to store here.
+            if entry.get("payloadPruned") != Some(&serde_json::Value::Bool(true)) {
+                if entry.get("signedRequest") != Some(signed_req) {
+                    return Err(ChatFailure::invariant(ENDPOINT));
+                }
+                crate::federation::canonical_relay::ingest_remote_message_entry(
+                    pool, None, &coord_did, convo_id, entry,
+                )
+                .await
+                .map_err(|error| c33_failure("Invalid coordinator application entry", &error))?;
             }
-            crate::federation::canonical_relay::ingest_remote_message_entry(
-                pool, None, &coord_did, convo_id, entry,
-            )
-            .await
-            .map_err(|error| {
-                tracing::error!(?error, "Invalid coordinator application entry");
-                ChatFailure::storage(ENDPOINT)
-            })?;
 
             let mut result = result;
             result["entry"]
@@ -385,13 +409,20 @@ async fn send(
     match prepared {
         PreparedChatAdmission::Replay(replay) => {
             let replay_bytes = replay.response_bytes().to_vec();
-            let group_fanout = match serde_json::from_slice::<serde_json::Value>(&replay_bytes) {
-                Ok(val) => {
-                    crate::federation::group_fanout::prepare_group_entry_fanout(&mut tx, &val)
+            let replayed = serde_json::from_slice::<serde_json::Value>(&replay_bytes).ok();
+            // A pruned send (O7) replays its accepted entry without ciphertext:
+            // nothing is left to fan out or redeliver. It was pruned only once
+            // its audience acknowledged it, it expired, or its sender was deleted.
+            let pruned = replayed
+                .as_ref()
+                .is_some_and(|value| value["entry"]["payloadPruned"] == true);
+            let group_fanout = match replayed.as_ref().filter(|_| !pruned) {
+                Some(val) => {
+                    crate::federation::group_fanout::prepare_group_entry_fanout(&mut tx, val)
                         .await
                         .map_err(|_| ChatFailure::storage(ENDPOINT))?
                 }
-                Err(_) => None,
+                None => None,
             };
             let response = context::replay_response(ENDPOINT, &replay)?;
             tx.commit()
@@ -400,11 +431,13 @@ async fn send(
             if let Some(fanout) = group_fanout {
                 runtime.spawn_post_commit_group_entry_fanout(pool, fanout);
             }
-            let actor_did = signed_req
-                .pointer("/body/actorDid")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            deliver_message_entry_to_remote_peers(pool, actor_did, &replay_bytes).await?;
+            if !pruned {
+                let actor_did = signed_req
+                    .pointer("/body/actorDid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                deliver_message_entry_to_remote_peers(pool, actor_did, &replay_bytes).await?;
+            }
             Ok(response)
         }
         PreparedChatAdmission::First(first) => {
@@ -527,13 +560,26 @@ async fn deliver_message_entry_to_remote_peers(
         if crate::identity::canonical_did(other_did) == crate::identity::canonical_did(actor_did) {
             continue;
         }
+        // A deleted party's home gets none of this conversation's later entries.
+        if crate::federation::canonical_relay::account_deleted_in(pool, convo_id, other_did)
+            .await
+            .map_err(|_| ChatFailure::storage(ENDPOINT))?
+        {
+            continue;
+        }
         let coord = crate::federation::canonical_relay::resolve_pair_coordinator(
             pool, actor_did, other_did,
         )
         .await
-        .map_err(|error| {
-            tracing::error!(?error, "Failed to resolve application entry peer");
-            ChatFailure::storage(ENDPOINT)
+        .map_err(|error| match error {
+            // The send is committed: a refusal cannot undo it, so a peer that
+            // cannot be routed stays an internal failure (store and transient
+            // failures keep their class).
+            ref error if !error.is_retryable() && !matches!(error, FederationError::Storage(_)) => {
+                tracing::error!(?error, "Failed to resolve application entry peer");
+                ChatFailure::invariant(ENDPOINT)
+            }
+            error => c33_failure("Failed to resolve application entry peer", &error),
         })?;
         let (target_endpoint, target_did) = if coord.is_coordinator {
             (
@@ -561,6 +607,8 @@ async fn deliver_message_entry_to_remote_peers(
         )
         .await
         {
+            // Committed: the send stands, and its durable queue row delivers
+            // this entry once the peer answers.
             tracing::warn!(
                 ?error,
                 "Failed to deliver application entry to peer, queueing for retry"
@@ -581,10 +629,43 @@ async fn deliver_message_entry_to_remote_peers(
             .execute(pool)
             .await
             .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-            return Err(ChatFailure::storage(ENDPOINT));
         }
     }
     Ok(())
+}
+
+/// A C33 step of this send failed: resolving or relaying to the pair's
+/// coordinator, ingesting its entry, or resolving a peer's home. This DS's
+/// store failing is storage; a closed gate, or a coordinator, home or resolver
+/// that could not answer now, decided nothing. A coordinator that refused, or
+/// one that cannot be routed or verified, is a refusal.
+fn c33_failure(stage: &'static str, error: &FederationError) -> ChatFailure {
+    use ChatProtocolErrorCode as C;
+    tracing::error!(?error, "{stage}");
+    match error {
+        FederationError::Database(_) | FederationError::Storage(_) => {
+            ChatFailure::storage(ENDPOINT)
+        }
+        error if error.is_retryable() => ChatFailure::unavailable(ENDPOINT),
+        FederationError::BlockedRelationship => {
+            ChatFailure::protocol(ENDPOINT, C::BlockedRelationship)
+        }
+        FederationError::RemoteError { status: 409, .. } => {
+            ChatFailure::protocol(ENDPOINT, C::StaleCoordinates)
+        }
+        FederationError::RemoteError { status: 404, .. }
+        | FederationError::ConversationNotFound { .. } => {
+            ChatFailure::protocol(ENDPOINT, C::ConversationNotFound)
+        }
+        FederationError::RemoteError {
+            status: 400 | 422, ..
+        }
+        | FederationError::InvalidRequest(_)
+        | FederationError::InvalidEnvelope { .. } => {
+            ChatFailure::protocol(ENDPOINT, C::InvalidRequest)
+        }
+        _ => ChatFailure::protocol(ENDPOINT, C::NotAuthorized),
+    }
 }
 
 fn map_failure(error: MessageDeliveryError) -> ChatFailure {
@@ -614,6 +695,7 @@ fn map_failure(error: MessageDeliveryError) -> ChatFailure {
         MessageDeliveryError::RelationshipPolicyUnavailable => {
             ChatFailure::protocol(ENDPOINT, C::RelationshipPolicyUnavailable)
         }
+        MessageDeliveryError::RelationshipSourceUnavailable => ChatFailure::unavailable(ENDPOINT),
         MessageDeliveryError::BlockedRelationship => {
             ChatFailure::protocol(ENDPOINT, C::BlockedRelationship)
         }
@@ -655,6 +737,65 @@ mod tests {
         assert_eq!(
             failure.code(),
             Some(ChatProtocolErrorCode::StaleCoordinates)
+        );
+    }
+
+    /// A C33 step of a send: this DS's store failing is storage, a source
+    /// that could not answer now is retryable, and a definitive refusal is a
+    /// declared 4xx without retry.
+    #[test]
+    fn c33_failures_keep_their_class() {
+        use axum::http::{header::RETRY_AFTER, StatusCode};
+        for (error, status, retry_after) in [
+            (
+                FederationError::Database(sqlx::Error::PoolTimedOut),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+            ),
+            (
+                FederationError::DsUnreachable {
+                    endpoint: "https://peer.example.com".into(),
+                    reason: "unreachable".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("5"),
+            ),
+            (
+                FederationError::RemoteError {
+                    status: 429,
+                    body: String::new(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("5"),
+            ),
+            (
+                FederationError::Unsupported("no declaration".into()),
+                StatusCode::UNAUTHORIZED,
+                None,
+            ),
+            (
+                FederationError::RemoteError {
+                    status: 409,
+                    body: String::new(),
+                },
+                StatusCode::BAD_REQUEST,
+                None,
+            ),
+        ] {
+            let response = c33_failure("test", &error).into_response();
+            assert_eq!(response.status(), status, "{error:?}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                retry_after,
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            c33_failure("test", &FederationError::BlockedRelationship).code(),
+            Some(ChatProtocolErrorCode::BlockedRelationship)
         );
     }
 }

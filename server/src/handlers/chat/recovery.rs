@@ -139,7 +139,11 @@ fn recovery_failure(endpoint: ChatEndpoint, error: RecoveryRepositoryError) -> C
         }
         E::RecoveryMissing => ChatFailure::protocol(endpoint, C::LeafRecoveryNotFound),
         E::PackageUnavailable => ChatFailure::protocol(endpoint, C::KeyPackageUnavailable),
-        E::RelationshipUnavailable | E::Relationship(R::InvalidAuthorityConfiguration(_)) => {
+        // A relationship source that could not answer now decided nothing.
+        E::RelationshipUnavailable | E::Relationship(R::Unavailable) => {
+            ChatFailure::unavailable(endpoint)
+        }
+        E::Relationship(R::InvalidAuthorityConfiguration(_)) => {
             ChatFailure::protocol(endpoint, C::RelationshipPolicyUnavailable)
         }
         E::Relationship(R::InvalidProjection) => {
@@ -220,5 +224,57 @@ fn map_recovery_state_machine_error(
         | S::LeaveAlreadyPending
         | S::InvalidServerTime => ChatFailure::protocol(endpoint, C::InvalidRequest),
         S::InvariantViolation | S::InvalidHydrationAuthority => ChatFailure::invariant(endpoint),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat_protocol::relationship_policy::RelationshipPolicyConfigError;
+    use axum::http::header::RETRY_AFTER;
+
+    /// Status, `Retry-After` presence and declared code of one failure.
+    fn wire(
+        endpoint: ChatEndpoint,
+        error: RecoveryRepositoryError,
+    ) -> (u16, bool, Option<&'static str>) {
+        let failure = recovery_failure(endpoint, error);
+        let response = failure.into_response();
+        (
+            response.status().as_u16(),
+            response.headers().contains_key(RETRY_AFTER),
+            failure.code().map(ChatProtocolErrorCode::as_str),
+        )
+    }
+
+    /// Requesting and fulfilling recovery: a relationship source that could
+    /// not answer now decided nothing (503 with a retry hint); this server's
+    /// store failing is a 500; a fixed configuration fault keeps its unhinted
+    /// code; unusable evidence stays the declared refusal.
+    #[test]
+    fn relationship_failures_keep_outage_store_and_refusal_distinct() {
+        use RecoveryRepositoryError as E;
+        use RelationshipRepositoryError as R;
+        for endpoint in [
+            ChatEndpoint::RequestLeafRecovery,
+            ChatEndpoint::SubmitTransition,
+        ] {
+            let outage = (503, true, Some("RelationshipPolicyUnavailable"));
+            assert_eq!(wire(endpoint, E::Relationship(R::Unavailable)), outage);
+            assert_eq!(wire(endpoint, E::RelationshipUnavailable), outage);
+            let store = E::Relationship(R::Database(sqlx::Error::PoolTimedOut));
+            assert_eq!(wire(endpoint, store), (500, false, None));
+            let configuration = E::Relationship(R::InvalidAuthorityConfiguration(
+                RelationshipPolicyConfigError::InvalidLimit,
+            ));
+            assert_eq!(
+                wire(endpoint, configuration),
+                (503, false, Some("RelationshipPolicyUnavailable"))
+            );
+            assert_eq!(
+                wire(endpoint, E::Relationship(R::InvalidProjection)),
+                (400, false, Some("BlockedRelationship"))
+            );
+        }
     }
 }

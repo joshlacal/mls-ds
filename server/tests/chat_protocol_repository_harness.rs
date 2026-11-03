@@ -196,8 +196,12 @@ fn every_documented_chat_database_test_requires_activation_approval() {
         );
     }
 
+    // 19 → 8: F29 (2026-09-24) moved ten documented suites in-crate
+    // (auth_repository, concurrency, delivery_read, inventory,
+    // relationship_repository, reset_repository, reset_wedge, rollback,
+    // ticket, transition_repository) and 7b1f093b4 removed chat_protocol_blobs.
     assert_eq!(
-        documented_database_tests, 19,
+        documented_database_tests, 8,
         "unexpected documented chat database test inventory"
     );
 }

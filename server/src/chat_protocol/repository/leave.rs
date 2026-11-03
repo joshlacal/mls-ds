@@ -54,6 +54,8 @@ pub(crate) enum LeaveFacadeError {
     MissingMutation,
     UnsupportedMutation,
     InvalidCanonicalMaterial,
+    /// A close's idempotency key is not its transition id.
+    IdempotencyKeyMismatch,
     Prelude(PreludeError),
     Conversation(ConversationStateHydrationError),
     StateMachine(StateMachineError),
@@ -398,6 +400,14 @@ impl ParsedMutation {
             VerifiedMutationProjection::ConversationClose(v) => v.body(),
             _ => return Err(LeaveFacadeError::UnsupportedMutation),
         };
+        // A close is one signed transition: as `parse_submit_transition` binds
+        // every other one, its idempotency key is its transition id, the one id
+        // a pending request's close decision slot names it by.
+        if mutation.kind() == SignedMutationKind::ConversationClose
+            && uuid_field(&body, "idempotencyKey")? != uuid_field(&body, "transitionId")?
+        {
+            return Err(LeaveFacadeError::IdempotencyKeyMismatch);
+        }
         let conversation_id = if mutation.kind() == SignedMutationKind::LeaveCancellation {
             uuid_field(&body, "conversationId")?
         } else {

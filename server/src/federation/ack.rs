@@ -5,7 +5,6 @@
 //! The originating DS can later verify the ack using the receiver's
 //! public verifying key.
 
-use chrono::Utc;
 use p256::ecdsa::{signature::Signer, signature::Verifier, Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey;
 use serde::{Deserialize, Serialize};
@@ -84,7 +83,7 @@ impl AckSigner {
         epoch: i32,
         sequencer_term: u64,
     ) -> DeliveryAck {
-        let acked_at = Utc::now().timestamp();
+        let acked_at = crate::sim_hooks::current_utc().timestamp();
         let canonical = canonical_bytes(
             message_id,
             convo_id,
@@ -162,6 +161,29 @@ mod tests {
         let sk = SigningKey::random(&mut rand::thread_rng());
         let vk = VerifyingKey::from(&sk);
         (sk, vk)
+    }
+
+    #[test]
+    fn acknowledgement_time_and_signature_follow_the_scoped_clock() {
+        use crate::sim_hooks::{with_ds_clock, ManualDsClock};
+        use std::sync::Arc;
+
+        let key = SigningKey::from_slice(&[3; 32]).unwrap();
+        let signer = AckSigner::new(key, "did:web:receiver.example".to_string());
+        let now = chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        let first = Arc::new(ManualDsClock::new(now));
+        let second = Arc::new(ManualDsClock::new(now));
+        let sign = || signer.sign_ack("message", "conversation", 4, 2);
+        let baseline = with_ds_clock(first.clone(), sign);
+        let replay = with_ds_clock(second, sign);
+        assert_eq!(baseline.acked_at, now.timestamp());
+        assert_eq!(baseline.signature, replay.signature);
+        assert!(baseline.verify(&signer.verifying_key()));
+        first.advance(chrono::TimeDelta::seconds(1));
+        let advanced = with_ds_clock(first, sign);
+        assert_eq!(advanced.acked_at, now.timestamp() + 1);
+        assert_ne!(advanced.signature, baseline.signature);
+        assert!(advanced.verify(&signer.verifying_key()));
     }
 
     #[test]

@@ -122,7 +122,7 @@ async fn live_orchestrator_send_accepts_the_presented_echo_of_its_signed_request
         .context("live create_group")?;
     let cid = created.conversation_id.clone();
     orchestrator
-        .add_members(&cid, &[bob.did.clone()])
+        .add_members(&cid, std::slice::from_ref(&bob.did))
         .await
         .context("live add_members through submitTransition")?;
     // Bob's real orchestrator accepts the invitation (acceptConversation's

@@ -359,6 +359,11 @@ async fn lock_actor(
           FROM chat.devices AS d
           JOIN chat.device_keys AS dk
             ON dk.user_did=d.user_did AND dk.device_id=d.device_id
+           AND dk.enrollment_auth_generation<=d.auth_generation
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=dk.user_did AND newer.device_id=dk.device_id
+                  AND newer.enrollment_auth_generation>dk.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=d.auth_generation)
          WHERE d.user_did=$1 AND d.device_id=$2
          FOR SHARE OF d,dk
         "#,
@@ -971,9 +976,14 @@ async fn opened_leaf_columns(
             .ok_or(ExecutionContextHydrationError::PeriodMismatch)?;
         let row: Option<(String, i64, Vec<u8>)> = sqlx::query_as(
             r#"
-            SELECT key_id,enrollment_auth_generation,signing_public_key
-              FROM chat.device_keys
-             WHERE user_did=$1 AND device_id=$2
+            SELECT k.key_id,d.auth_generation,k.signing_public_key
+              FROM chat.device_keys k JOIN chat.devices d USING(user_did,device_id)
+             WHERE k.user_did=$1 AND k.device_id=$2
+               AND k.enrollment_auth_generation<=d.auth_generation
+               AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                    WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id
+                      AND newer.enrollment_auth_generation>k.enrollment_auth_generation
+                      AND newer.enrollment_auth_generation<=d.auth_generation)
              FOR SHARE
             "#,
         )

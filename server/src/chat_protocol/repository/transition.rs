@@ -2334,7 +2334,7 @@ pub(crate) async fn terminalize_recovery_triple(
 //
 // A device revocation is a global authority op: one signed `revokeDevice`
 // inserts an immutable `chat.device_revocations` row and revokes the target's
-// registration (`chat.devices` active -> revoked + its single `chat.device_keys`
+// registration (`chat.devices` active -> revoked + its current `chat.device_keys`
 // row). The `terminal_revocation_id` FKs on the work tables
 // (`key_packages` / `key_package_reservations` / `leaf_recovery_requests`) point
 // at the `device_revocations` row, and the DEFERRED
@@ -2462,12 +2462,21 @@ pub(crate) async fn cas_registration_revoke(
          WHERE user_did = $1
            AND device_id = $2
            AND revoked_at IS NULL
+           AND enrollment_auth_generation <= $5
+           AND NOT EXISTS (
+               SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=chat.device_keys.user_did
+                  AND newer.device_id=chat.device_keys.device_id
+                  AND newer.enrollment_auth_generation>chat.device_keys.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=$5
+           )
         "#,
     )
     .bind(&revoke.target_did)
     .bind(revoke.target_device_id)
     .bind(revoke.revoked_at)
     .bind(revoke.revocation_id)
+    .bind(revoke.expected_auth_generation)
     .execute(&mut **transaction)
     .await?;
     if key.rows_affected() != 1 {

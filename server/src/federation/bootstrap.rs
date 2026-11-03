@@ -6,7 +6,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    outbound::OutboundClient,
+    errors::FederationError,
+    outbound::{OutboundClient, OutboundError},
     peer_policy,
     reconciliation::{
         fetch_discovery_payload, query_remote_digest, query_remote_events, StrictCleanRemoteEvent,
@@ -54,6 +55,38 @@ pub enum RemotePrefixBootstrapError {
     Conflict,
     #[error("database operation failed")]
     Database,
+    /// The sequencer, a resolver or a participant's home could not answer
+    /// now; nothing was decided.
+    #[error("bootstrap source could not answer now")]
+    Unavailable,
+}
+
+impl RemotePrefixBootstrapError {
+    /// Decided nothing: a source that could not answer now, or a sequencer
+    /// snapshot that moved while it was fetched. This DS's own `Database`
+    /// failure is matched separately.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Unavailable | Self::MovingSnapshot)
+    }
+}
+
+/// A resolution or peer-policy failure: this store failing, a resolver that
+/// could not answer now, or a refusal.
+fn resolution_failure(error: &FederationError) -> RemotePrefixBootstrapError {
+    match error {
+        FederationError::Database(_) => RemotePrefixBootstrapError::Database,
+        error if error.is_retryable() => RemotePrefixBootstrapError::Unavailable,
+        _ => RemotePrefixBootstrapError::Resolution,
+    }
+}
+
+/// A sequencer query that could not answer now, or one it refused.
+fn query_failure(error: OutboundError) -> RemotePrefixBootstrapError {
+    if error.is_retryable() {
+        RemotePrefixBootstrapError::Unavailable
+    } else {
+        RemotePrefixBootstrapError::Query
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,23 +358,34 @@ pub async fn fetch_remote_prefix_admission(
 
     peer_policy::enforce_outbound_peer_policy(pool, selector.configured_sequencer_did())
         .await
-        .map_err(|_| RemotePrefixBootstrapError::PeerDenied)?;
+        .map_err(|error| match error {
+            FederationError::Database(_) => RemotePrefixBootstrapError::Database,
+            _ => RemotePrefixBootstrapError::PeerDenied,
+        })?;
 
     let destination = resolver
         .resolve_ds_destination_uncached(selector.configured_sequencer_did())
         .await
-        .map_err(|_| RemotePrefixBootstrapError::Resolution)?;
+        .map_err(|error| resolution_failure(&error))?;
 
-    let discovery_payload = fetch_discovery_payload(&destination).await;
-    if !target_supports_capability(
-        CAPABILITY_RECONCILIATION_V1,
-        None,
-        discovery_payload.as_ref(),
-    ) || !target_supports_capability(
-        CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1,
-        None,
-        discovery_payload.as_ref(),
-    ) {
+    // A discovery fetch that could not complete now decided nothing; any
+    // other failure, or a payload without both capabilities, is definitive.
+    let discovery_payload = fetch_discovery_payload(&destination)
+        .await
+        .map_err(|error| {
+            if error.is_retryable() {
+                RemotePrefixBootstrapError::Unavailable
+            } else {
+                RemotePrefixBootstrapError::MissingCapability
+            }
+        })?;
+    if !target_supports_capability(CAPABILITY_RECONCILIATION_V1, None, Some(&discovery_payload))
+        || !target_supports_capability(
+            CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1,
+            None,
+            Some(&discovery_payload),
+        )
+    {
         return Err(RemotePrefixBootstrapError::MissingCapability);
     }
 
@@ -351,7 +395,7 @@ pub async fn fetch_remote_prefix_admission(
         .map_err(|_| RemotePrefixBootstrapError::ServiceAuth)?;
     let opening_digest = query_remote_digest(outbound, &destination, &digest_token, &convo_id_str)
         .await
-        .map_err(|_| RemotePrefixBootstrapError::Query)?;
+        .map_err(query_failure)?;
 
     if opening_digest.convo_id != convo_id_str {
         return Err(RemotePrefixBootstrapError::InvalidDigest);
@@ -397,7 +441,7 @@ pub async fn fetch_remote_prefix_admission(
             limit,
         )
         .await
-        .map_err(|_| RemotePrefixBootstrapError::Query)?;
+        .map_err(query_failure)?;
         page_count = page_count
             .checked_add(1)
             .ok_or(RemotePrefixBootstrapError::PrefixTooLarge)?;
@@ -474,7 +518,7 @@ pub async fn fetch_remote_prefix_admission(
         .map_err(|_| RemotePrefixBootstrapError::ServiceAuth)?;
     let closing_digest = query_remote_digest(outbound, &destination, &closing_token, &convo_id_str)
         .await
-        .map_err(|_| RemotePrefixBootstrapError::Query)?;
+        .map_err(query_failure)?;
 
     if closing_digest.convo_id != opening_digest.convo_id
         || canonical_did(&closing_digest.sequencer_ds_did)
@@ -530,7 +574,18 @@ pub async fn fetch_remote_prefix_admission(
             &unique_dids,
         )
         .await
-        .map_err(|_| RemotePrefixBootstrapError::Resolution)?;
+        .map_err(|error| {
+            use crate::chat_protocol::federation_routing::FederationRoutingError;
+            match error {
+                FederationRoutingError::ResolutionFailed { source, .. }
+                | FederationRoutingError::UntrustedPeer { source, .. } => {
+                    resolution_failure(&source)
+                }
+                FederationRoutingError::DriftDetected { .. } => {
+                    RemotePrefixBootstrapError::Resolution
+                }
+            }
+        })?;
 
     let local_dids: Vec<&str> = participant_routes
         .iter()

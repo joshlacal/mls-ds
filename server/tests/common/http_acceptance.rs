@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::future::Future;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 use axum::{body::Body, extract::FromRef, http::Request, Router};
 use base64::{
@@ -230,7 +230,7 @@ pub async fn ensure_fence(pool: &DbPool) {
 
 /// Build the route harness with the pre-cutover fence held by default.
 pub async fn router(pool: DbPool) -> Router {
-    build_router_with_options(pool, false, None, false).await
+    build_router_with_options(pool, false, |runtime| runtime).await
 }
 
 /// The named authenticated acceptance cases exercise routes gated behind the
@@ -238,26 +238,62 @@ pub async fn router(pool: DbPool) -> Router {
 /// the process-level value is restored to the explicit pre-cutover value
 /// immediately afterward.
 pub async fn router_for_authenticated_acceptance(pool: DbPool) -> Router {
-    build_router_with_options(pool, true, None, false).await
+    build_router_with_options(pool, true, |runtime| runtime).await
 }
 
 pub async fn router_for_authenticated_acceptance_with_i13(
     pool: DbPool,
     i13_signer: catbird_server::federation::receipt::I13ReceiptSigner,
 ) -> Router {
-    build_router_with_options(pool, true, Some(i13_signer), false).await
+    build_router_with_options(pool, true, |runtime| {
+        runtime.with_i13_receipt_signer(i13_signer)
+    })
+    .await
 }
 
 pub async fn router_for_authenticated_acceptance_strict_reads(pool: DbPool) -> Router {
-    build_router_with_options(pool, true, None, true).await
+    build_router_with_options(pool, true, |runtime| {
+        runtime.with_require_signed_reads(true)
+    })
+    .await
+}
+
+/// [`router_for_authenticated_acceptance`] serving the runtime `customize` returns.
+pub async fn router_for_authenticated_acceptance_with(
+    pool: DbPool,
+    customize: impl FnOnce(ChatRuntime) -> ChatRuntime,
+) -> Router {
+    build_router_with_options(pool, true, customize).await
+}
+
+/// [`router_for_authenticated_acceptance_with`] after the runtime's startup
+/// check, which readies a configured direct-request receipt authority.
+pub async fn router_for_validated_acceptance_with(
+    pool: DbPool,
+    customize: impl FnOnce(ChatRuntime) -> ChatRuntime,
+) -> Router {
+    let state = acceptance_state(pool, true, customize).await;
+    state
+        .runtime
+        .validate_protocol_fence(&state.pool)
+        .await
+        .expect("clean-chat startup check");
+    chat_router::<TestState>().with_state(state)
 }
 
 async fn build_router_with_options(
     pool: DbPool,
     cutover_enabled: bool,
-    i13_signer: Option<catbird_server::federation::receipt::I13ReceiptSigner>,
-    require_signed_reads: bool,
+    customize: impl FnOnce(ChatRuntime) -> ChatRuntime,
 ) -> Router {
+    chat_router::<TestState>().with_state(acceptance_state(pool, cutover_enabled, customize).await)
+}
+
+async fn acceptance_state(
+    pool: DbPool,
+    cutover_enabled: bool,
+    customize: impl FnOnce(ChatRuntime) -> ChatRuntime,
+) -> TestState {
     let key_id: String = sqlx::query_scalar(
         "SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE",
     )
@@ -285,26 +321,23 @@ async fn build_router_with_options(
     };
     catbird_server::auth::cache_test_did_document(doc).await;
 
-    static ENV: Once = Once::new();
+    // Every call re-sets the whole environment the runtime reads: other tests in
+    // the same process (e.g. adversarial_challenger_m4_tests) set different Nest
+    // keys or remove the cursor secret after building their own runtime, so a
+    // set-once environment made every later runtime here fail or verify the
+    // wrong key. A panic in one caller must not poison the lock for the rest.
     static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK.lock().expect("env lock");
-    ENV.call_once(|| {
-        let point = nest_key().verifying_key().to_encoded_point(false);
-        std::env::set_var("CHAT_NEST_ISSUER", ISSUER);
-        std::env::set_var("CHAT_NEST_AUDIENCE", AUDIENCE);
-        std::env::set_var("CHAT_NEST_KEY_ID", NEST_KEY_ID);
-        std::env::set_var("CHAT_NEST_VERIFYING_KEY", STANDARD.encode(point.as_bytes()));
-        std::env::set_var("CHAT_INSTANCE_ID", CHAT_INSTANCE);
-        std::env::set_var("CHAT_EXTERNAL_BASE", EXTERNAL_BASE);
-        std::env::set_var(
-            "CHAT_CURSOR_SEALING_SECRET",
-            URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
-        );
-        std::env::set_var(
-            "CHAT_SUBSCRIPTION_ENDPOINT",
-            "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
-        );
-    });
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("CHAT_NEST_ISSUER", ISSUER);
+    std::env::set_var("CHAT_NEST_AUDIENCE", AUDIENCE);
+    std::env::set_var("CHAT_NEST_KEY_ID", NEST_KEY_ID);
+    std::env::set_var("CHAT_NEST_VERIFYING_KEY", STANDARD.encode(point.as_bytes()));
+    std::env::set_var("CHAT_INSTANCE_ID", CHAT_INSTANCE);
+    std::env::set_var("CHAT_EXTERNAL_BASE", EXTERNAL_BASE);
+    std::env::set_var(
+        "CHAT_CURSOR_SEALING_SECRET",
+        URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
+    );
     std::env::set_var("CHAT_CURSOR_KEY_ID", key_id);
     std::env::set_var(
         "CHAT_SUBSCRIPTION_ENDPOINT",
@@ -314,23 +347,16 @@ async fn build_router_with_options(
         "CHAT_CUTOVER_ENABLED",
         if cutover_enabled { "1" } else { "0" },
     );
-    let mut runtime = ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("runtime");
-    if let Some(i13) = i13_signer {
-        runtime = runtime.with_i13_receipt_signer(i13);
-    }
-    if require_signed_reads {
-        runtime = runtime.with_require_signed_reads(true);
-    }
-    let runtime = Arc::new(runtime);
+    let runtime = Arc::new(customize(
+        ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("runtime"),
+    ));
     std::env::set_var("CHAT_CUTOVER_ENABLED", "0");
-    chat_router::<TestState>().with_state(TestState { pool, runtime })
+    TestState { pool, runtime }
 }
 
+/// The audience the server under test verifies (`SERVICE_DID` when set).
 fn current_audience() -> String {
-    format!(
-        "{}#atproto_mls",
-        catbird_server::identity::service_did_base()
-    )
+    catbird_server::auth::expected_mls_service_ref()
 }
 
 pub fn unsigned_request(device: &Device, nsid: &str, method: &str, query: &str) -> Request<Body> {
@@ -383,7 +409,8 @@ pub fn unsigned_get_request(device: &Device, nsid: &str, raw_query: &str) -> Req
 }
 
 pub fn unsigned_json_request(device: &Device, nsid: &str, body: Vec<u8>) -> Request<Body> {
-    let now = chrono::Utc::now().timestamp();
+    // A scoped DS clock is the server's clock: mint the token against it.
+    let now = catbird_server::sim_hooks::current_utc().timestamp();
     let aud = current_audience();
     let token = sign_jwt(
         serde_json::json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto", device.did)}),

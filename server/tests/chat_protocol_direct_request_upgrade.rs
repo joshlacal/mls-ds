@@ -12,6 +12,7 @@ fn fresh_ciphertext_cannot_be_rebound_to_a_legacy_prior_or_other_conversation() 
     let read = |name: &str| std::fs::read(root.join(name)).unwrap();
     let original: Value = serde_json::from_slice(&read("context.json")).unwrap();
     let next: Value = serde_json::from_slice(&read("coordinates.json")).unwrap();
+    let archive_commitment: [u8; 32] = read("archive-commitment.bin").try_into().unwrap();
     let commit = wire::validate_public_commit(&read("add.mls"), 1_048_576).unwrap();
     let app = wire::validate_private_application(&read("application.mls"), 98304).unwrap();
     let original_hash =
@@ -38,7 +39,8 @@ fn fresh_ciphertext_cannot_be_rebound_to_a_legacy_prior_or_other_conversation() 
         transcript::direct_request_application_aad(
             &hash,
             &read("coordinates.json"),
-            original["firstMessageId"].as_str().unwrap()
+            original["firstMessageId"].as_str().unwrap(),
+            &archive_commitment,
         )
         .unwrap()
     );
@@ -51,7 +53,8 @@ fn fresh_ciphertext_cannot_be_rebound_to_a_legacy_prior_or_other_conversation() 
         transcript::direct_request_application_aad(
             &hash,
             &read("coordinates.json"),
-            original["firstMessageId"].as_str().unwrap()
+            original["firstMessageId"].as_str().unwrap(),
+            &archive_commitment,
         )
         .unwrap()
     );

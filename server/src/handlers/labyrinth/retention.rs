@@ -50,9 +50,18 @@ pub async fn delete_account_data(
         async {
             let adm = admit_procedure(&pool, &rt, "deleteAccountData", &headers, &bytes).await?;
             let EmptyIn {} = body(&bytes)?;
+            // Peer homes resolve over HTTP, so before the transaction opens (M-F04).
+            let c33_peers = repo::resolve_c33_peer_homes(&pool, &adm.did).await?;
             let mut w = begin_write!(&pool, adm);
             let (caller, at) = (w.caller.clone(), w.instant);
-            let sequenced = repo::purge_account(&mut w.tx, &caller.did, at).await?;
+            let sequenced = repo::purge_account(
+                &mut w.tx,
+                &caller.did,
+                at,
+                rt.i13_receipt_signer(),
+                &c33_peers,
+            )
+            .await?;
             let resp = w.finish_write(to_bytes(&json!({}))?).await?;
             if sequenced > 0 {
                 rt.notify_events();

@@ -42,6 +42,7 @@ pub(crate) struct VerifiedBootstrap {
     publication_digest: [u8; 32],
     import_until: u64,
     total_bytes: usize,
+    archive_commitment: [u8; 32],
 }
 impl VerifiedBootstrap {
     pub(crate) fn final_state(&self) -> &ActivePublicState {
@@ -55,6 +56,9 @@ impl VerifiedBootstrap {
     }
     pub(crate) fn total_bytes(&self) -> usize {
         self.total_bytes
+    }
+    pub(crate) fn archive_commitment(&self) -> &[u8; 32] {
+        &self.archive_commitment
     }
 }
 fn bytes(value: &Value) -> Result<Vec<u8>, BootstrapError> {
@@ -307,10 +311,12 @@ pub(crate) fn verify_bootstrap(
         }
     }
     let app = wire::validate_private_application(&application, 98304).map_err(public)?;
+    let archive_commitment = hash(&b["archiveCommitment"])?;
     let app_aad = transcript::direct_request_application_aad(
         &context_hash,
         &serde_json::to_vec(&b["next"]).map_err(|_| BootstrapError::Binding)?,
         text(b, "firstMessageId")?,
+        &archive_commitment,
     )
     .map_err(|_| BootstrapError::Binding)?;
     if app.group_id() != next.group_id() || app.epoch() != next.epoch() || app.aad() != app_aad {
@@ -357,6 +363,7 @@ pub(crate) fn verify_bootstrap(
         publication_digest: *signed.request_digest(),
         import_until: until,
         total_bytes,
+        archive_commitment,
     })
 }
 
@@ -381,6 +388,7 @@ mod tests {
             let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
             let ctx: Value = serde_json::from_slice(&read("context.json")).unwrap();
             let next: Value = serde_json::from_slice(&read("coordinates.json")).unwrap();
+            let archive_commitment: [u8; 32] = read("archive-commitment.bin").try_into().unwrap();
             let times: Value = serde_json::from_slice(&read("lifetimes.json")).unwrap();
             let now = times["now"].as_u64().unwrap();
             let until = times["minimumImportUntil"].as_u64().unwrap();
@@ -441,6 +449,7 @@ mod tests {
             let metadata_snapshot = json!({"coordinate":metadata_coord,"originTransitionId":ctx["requestId"],"metadataVersion":1,"nonce":STANDARD.encode(read("metadata-nonce.bin")),"ciphertext":STANDARD.encode(&metadata),"ciphertextSha256":STANDARD.encode(Sha256::digest(&metadata)),"ciphertextSize":metadata.len(),"authorProof":{"authorDid":ctx["actorDid"],"authorDeviceId":ctx["actorDeviceId"],"authorKeyId":ctx["actorKeyId"],"signaturePublicKey":STANDARD.encode(&actor_key),"authGenerationAtOrigin":1,"originTransitionId":ctx["requestId"],"originSeq":1,"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"}});
             let artifacts = json!({"genesisGroupInfo":artifact("genesis.mls","groupInfo"),"addCommit":artifact("add.mls","publicMessageCommit"),"finalGroupInfo":artifact("final.mls","groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&welcome),"sha256":STANDARD.encode(Sha256::digest(&welcome)),"deliveries":deliveries},"metadataSnapshot":metadata_snapshot,"initialCiphertext":STANDARD.encode(read("application.mls"))});
             let mut body = json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\u{0}","protocolVersion":"2","actorDid":ctx["actorDid"],"actorDeviceId":ctx["actorDeviceId"],"keyId":ctx["actorKeyId"],"authGeneration":1,"requestId":ctx["requestId"],"firstMessageId":ctx["firstMessageId"],"conversationId":ctx["conversationId"],"recipientDid":ctx["recipientDid"],"origin":ctx["origin"],"profile":"encryptedIntroduction1","preparationDigest":ctx["preparationDigest"],"preparationRequestDigest":STANDARD.encode([43u8;32]),"contextHash":STANDARD.encode(context_hash),"next":next,"importUntil":format_time(until),"artifacts":artifacts,"idempotencyKey":Uuid::new_v4().to_string(),"signedAt":format_time(now)});
+            body["archiveCommitment"] = json!(STANDARD.encode(archive_commitment));
             // Exercise the durable preparation/publication comparison with the
             // actual selected package references and real bootstrap artifacts.
             // This projection is not an authority-signed preparation: signature
@@ -529,6 +538,7 @@ mod tests {
                         ("/firstMessageId".into(), alternate_uuid.clone()),
                         ("/conversationId".into(), alternate_uuid.clone()),
                         ("/contextHash".into(), alternate_hash.clone()),
+                        ("/archiveCommitment".into(), alternate_hash.clone()),
                     ];
                     for (prefix, fields) in [
                         (
@@ -680,6 +690,7 @@ mod tests {
                                 &context_hash,
                                 &serde_json::to_vec(&body["next"]).unwrap(),
                                 body["firstMessageId"].as_str().unwrap(),
+                                &archive_commitment,
                             )
                             .unwrap(),
                         ),

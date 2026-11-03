@@ -1,18 +1,20 @@
 //! Integration tests for Clean Chat zero-state preflight gate.
 //!
-//! Tests both pre-cutover (75 migrations, max 20260824000001) and
-//! post-migration (84 migrations, max 20260828000005) modes against disposable
-//! PostgreSQL databases.
+//! Tests the frozen pre-cutover (75 migrations, max 20260824000001) and post-c855 (84
+//! migrations, max 20260828000005) modes through filtered migrators, and the clean-slate mode
+//! (the full current `./migrations` catalog, sealed by `reseal_clean_slate_catalog`) against
+//! disposable PostgreSQL databases.
 //!
 //! Verifies:
-//!   - GREEN exact pre-cutover and post-migration modes.
+//!   - GREEN exact pre-cutover, post-c855, and clean-slate modes.
 //!   - Strict read-only verification (explicit READ ONLY transaction, zero mutations, row snapshots preserved).
 //!   - GREEN on legacy non-UUID rows in public transport tables.
-//!   - RED on infrastructure anomalies and NULL drift.
+//!   - RED on infrastructure anomalies and NULL drift (including clean-slate chat.direct_request_budget).
 //!   - RED on dirty semantic tables: devices (independently without principal), key_packages,
 //!     generation_states, relationship_projection_relationships, relationship_projection_declarations,
-//!     transitions, entries, welcome_bundles, outbox, conversations, federation_delivery_receipts.
-//!   - RED on migration catalog / checksum / dirty / count drift.
+//!     transitions, entries, welcome_bundles, outbox, conversations, federation_delivery_receipts
+//!     (post-c855 and clean-slate).
+//!   - RED on migration catalog / checksum (frozen and generated entries) / dirty / count drift.
 //!   - RED on unexpected or missing tables / views in chat schema.
 //!   - RED on Clean Chat lowercase UUIDv4 rows in federation_outbox, outbound_queue,
 //!     federation_sync_state across all reachable statuses in both post-migration and pre-cutover modes.
@@ -87,36 +89,53 @@ impl<'s> MigrationSource<'s> for MigrationSliceSource {
     }
 }
 
-/// Set up a disposable database with pre-cutover migrations (75 migrations up to 20260824000001).
-async fn setup_pre_cutover_db() -> (PgPool, DisposableDatabase) {
-    let full_migrator = sqlx::migrate!("./migrations");
-    let pre_cutover_entries: Vec<Migration> = full_migrator
+/// Highest version of the frozen post-c855 seal; every later migration is in the script's
+/// generated clean-slate tail.
+const POST_C855_MAX_VERSION: i64 = 20260828000005;
+
+/// Set up a disposable database with exactly the `./migrations` entries at or below `max_version`.
+async fn setup_sealed_prefix_db(
+    max_version: i64,
+    expected_count: usize,
+) -> (PgPool, DisposableDatabase) {
+    let entries: Vec<Migration> = sqlx::migrate!("./migrations")
         .migrations
         .iter()
-        .filter(|m| m.version <= 20260824000001)
+        .filter(|m| m.version <= max_version)
         .cloned()
         .collect();
     assert_eq!(
-        pre_cutover_entries.len(),
-        75,
-        "pre-cutover catalog must contain exactly 75 migrations"
+        entries.len(),
+        expected_count,
+        "sealed catalog through {max_version} must contain exactly {expected_count} migrations"
     );
-    let migrator = Migrator::new(MigrationSliceSource(pre_cutover_entries))
+    let migrator = Migrator::new(MigrationSliceSource(entries))
         .await
-        .expect("build pre-cutover migrator");
+        .expect("build sealed-prefix migrator");
 
     setup_db(migrator).await
 }
 
-/// Set up a disposable database with post-migration migrations (all 84 migrations).
+/// Set up a disposable database with pre-cutover migrations (75 migrations up to 20260824000001).
+async fn setup_pre_cutover_db() -> (PgPool, DisposableDatabase) {
+    setup_sealed_prefix_db(20260824000001, 75).await
+}
+
+/// Set up a disposable database with post-c855 migrations (84 migrations up to 20260828000005).
+async fn setup_post_c855_db() -> (PgPool, DisposableDatabase) {
+    setup_sealed_prefix_db(POST_C855_MAX_VERSION, 84).await
+}
+
+/// Set up a disposable database with every migration in `./migrations` (clean-slate mode). It must
+/// pass the preflight before a test perturbs it, so no RED test can pass on a stale seal.
 async fn setup_post_migration_db() -> (PgPool, DisposableDatabase) {
-    let migrator = sqlx::migrate!("./migrations");
-    assert_eq!(
-        migrator.migrations.len(),
-        84,
-        "post-migration catalog must contain exactly 84 migrations"
+    let (pool, database) = setup_db(sqlx::migrate!("./migrations")).await;
+    run_preflight(&pool).await.expect(
+        "pristine clean-slate database must pass the preflight; after a migration change re-seal \
+         with `CLEAN_CHAT_PREFLIGHT_RESEAL=write cargo test --offline --test \
+         clean_chat_empty_preflight -- --ignored --exact reseal_clean_slate_catalog`",
     );
-    setup_db(migrator).await
+    (pool, database)
 }
 
 /// Execute the preflight SQL gate.
@@ -181,6 +200,17 @@ async fn test_preflight_passes_on_pristine_post_migration_database() {
     assert!(
         result.is_ok(),
         "preflight must pass on pristine post-migration database: {:?}",
+        result.err()
+    );
+}
+
+#[tokio::test]
+async fn test_preflight_passes_on_pristine_post_c855_database() {
+    let (pool, _db) = setup_post_c855_db().await;
+    let result = run_preflight(&pool).await;
+    assert!(
+        result.is_ok(),
+        "preflight must pass on pristine post-c855 database: {:?}",
         result.err()
     );
 }
@@ -707,6 +737,44 @@ async fn test_preflight_fails_when_completeness_cutover_legacy_receipt_count_is_
     );
 }
 
+#[tokio::test]
+async fn test_preflight_fails_when_direct_request_budget_is_not_zero_state() {
+    for (drift_sql, expected) in [
+        (
+            "UPDATE chat.direct_request_budget SET pending_bytes = 1;",
+            "chat.direct_request_budget must be zero (pending_bytes=1, retained_bytes=0)",
+        ),
+        (
+            "ALTER TABLE chat.direct_request_budget ALTER COLUMN retained_bytes DROP NOT NULL;
+             UPDATE chat.direct_request_budget SET retained_bytes = NULL;",
+            "chat.direct_request_budget must be zero (pending_bytes=0, retained_bytes=<NULL>)",
+        ),
+        (
+            "ALTER TABLE chat.direct_request_budget DROP CONSTRAINT direct_request_budget_singleton_check;
+             UPDATE chat.direct_request_budget SET singleton = FALSE;",
+            "chat.direct_request_budget singleton column must be TRUE",
+        ),
+        (
+            "DELETE FROM chat.direct_request_budget;",
+            "chat.direct_request_budget must contain exactly 1 row, found 0",
+        ),
+    ] {
+        let (pool, _db) = setup_post_migration_db().await;
+        sqlx::raw_sql(drift_sql)
+            .execute(&pool)
+            .await
+            .expect("drift chat.direct_request_budget");
+
+        let err = run_preflight(&pool)
+            .await
+            .expect_err(&format!("preflight must fail after `{drift_sql}`"));
+        assert!(
+            err.to_string().contains(expected),
+            "unexpected error for `{drift_sql}`: {err}"
+        );
+    }
+}
+
 // =============================================================================
 // Negative / RED Tests: Dirty Semantic Tables (Explicit Step 1 Set)
 // =============================================================================
@@ -951,31 +1019,39 @@ async fn test_preflight_fails_when_conversations_table_is_dirty() {
 
 #[tokio::test]
 async fn test_preflight_fails_when_federation_delivery_receipts_is_dirty() {
-    let (pool, _db) = setup_post_migration_db().await;
-    let insert_sql = format!(
-        "INSERT INTO chat.federation_delivery_receipts (
-            delivery_id, endpoint_nsid, conversation_id, sender_ds_did, receiver_ds_did,
-            sequencer_did, sequencer_term, envelope_sha256, result_sha256,
-            source_entry_id, source_entry_seq, source_entry_fingerprint,
-            response_bytes, response_sha256, receipt_signature, completed_at
-        ) VALUES (
-            '{deliv_id}', 'blue.catbird.mlsDS.deliverMessage', '{convo_id}',
-            'did:web:sender.example.com', 'did:web:receiver.example.com', 'did:web:seq.example.com', 1,
-            decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex'),
-            decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex'),
-            '{entry_id}', 1,
-            decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex'),
-            decode('01020304', 'hex'),
-            decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex'),
-            decode('00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 'hex'),
-            clock_timestamp()
-        );",
-        deliv_id = Uuid::new_v4(),
-        convo_id = Uuid::new_v4(),
-        entry_id = Uuid::new_v4()
-    );
+    // Added by the post-c855 seal and still semantic in clean-slate: dirty is RED in both.
+    for post_c855 in [true, false] {
+        let (pool, _db) = if post_c855 {
+            setup_post_c855_db().await
+        } else {
+            setup_post_migration_db().await
+        };
+        let insert_sql = format!(
+            "INSERT INTO chat.federation_delivery_receipts (
+                delivery_id, endpoint_nsid, conversation_id, sender_ds_did, receiver_ds_did,
+                sequencer_did, sequencer_term, envelope_sha256, result_sha256,
+                source_entry_id, source_entry_seq, source_entry_fingerprint,
+                response_bytes, response_sha256, receipt_signature, completed_at
+            ) VALUES (
+                '{deliv_id}', 'blue.catbird.mlsDS.deliverMessage', '{convo_id}',
+                'did:web:sender.example.com', 'did:web:receiver.example.com', 'did:web:seq.example.com', 1,
+                decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex'),
+                decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex'),
+                '{entry_id}', 1,
+                decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex'),
+                decode('01020304', 'hex'),
+                decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex'),
+                decode('00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 'hex'),
+                clock_timestamp()
+            );",
+            deliv_id = Uuid::new_v4(),
+            convo_id = Uuid::new_v4(),
+            entry_id = Uuid::new_v4()
+        );
 
-    assert_dirty_semantic_table_rejected(&pool, "federation_delivery_receipts", &insert_sql).await;
+        assert_dirty_semantic_table_rejected(&pool, "federation_delivery_receipts", &insert_sql)
+            .await;
+    }
 }
 
 // =============================================================================
@@ -1002,18 +1078,24 @@ async fn test_preflight_fails_on_dirty_unsuccessful_migration() {
 
 #[tokio::test]
 async fn test_preflight_fails_on_checksum_mismatch() {
-    let (pool, _db) = setup_post_migration_db().await;
-    sqlx::query("UPDATE public._sqlx_migrations SET checksum = decode('000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 'hex') WHERE version = 20260828000001;")
-        .execute(&pool)
-        .await
-        .expect("corrupt checksum");
+    // One frozen post-c855 entry and one entry from the generated clean-slate tail.
+    for version in [20260828000001_i64, 20261031200001] {
+        let (pool, _db) = setup_post_migration_db().await;
+        sqlx::query("UPDATE public._sqlx_migrations SET checksum = decode('000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 'hex') WHERE version = $1;")
+            .bind(version)
+            .execute(&pool)
+            .await
+            .expect("corrupt checksum");
 
-    let result = run_preflight(&pool).await;
-    let err = result.expect_err("preflight must fail on checksum mismatch");
-    assert!(
-        err.to_string().contains("migration checksum mismatch"),
-        "unexpected error: {err}"
-    );
+        let result = run_preflight(&pool).await;
+        let err = result.expect_err("preflight must fail on checksum mismatch");
+        assert!(
+            err.to_string().contains(&format!(
+                "migration checksum mismatch for version {version}"
+            )),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1099,6 +1181,24 @@ async fn test_preflight_fails_on_unexpected_view_in_chat_schema() {
     assert!(
         err.to_string()
             .contains("unexpected relation chat.unauthorized_view (relkind=v)"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_preflight_fails_on_missing_view_in_chat_schema() {
+    let (pool, _db) = setup_post_migration_db().await;
+    sqlx::query("DROP VIEW chat.direct_request_effective_budget;")
+        .execute(&pool)
+        .await
+        .expect("drop sealed view");
+
+    let result = run_preflight(&pool).await;
+    let err = result.expect_err("preflight must fail on missing sealed view in chat schema");
+    assert!(
+        err.to_string().contains(
+            "missing expected view chat.direct_request_effective_budget in clean-slate mode"
+        ),
         "unexpected error: {err}"
     );
 }
@@ -1385,4 +1485,142 @@ async fn test_preflight_fails_when_public_transport_identifier_column_type_is_no
             .contains("column federation_sync_state.convo_id in public.federation_sync_state is not text-compatible (type=int4)"),
         "unexpected error: {err}"
     );
+}
+
+// =============================================================================
+// Clean-slate seal generator
+// =============================================================================
+
+const SEAL_BEGIN: &str = "    -- BEGIN GENERATED CLEAN-SLATE SEAL\n";
+const SEAL_END: &str = "    -- END GENERATED CLEAN-SLATE SEAL\n";
+
+/// SQL string literal.
+fn sql_text(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// One `name TYPE := ARRAY[...]` declaration of the generated seal block.
+fn sealed_array(name: &str, sql_type: &str, items: &[String]) -> String {
+    if items.is_empty() {
+        return format!("    {name} {sql_type} := ARRAY[]::{sql_type};\n");
+    }
+    format!(
+        "    {name} {sql_type} := ARRAY[\n        {}\n    ];\n",
+        items.join(",\n        ")
+    )
+}
+
+/// Re-seal tool for the clean-slate mode of `scripts/assert_clean_chat_empty.sql`. After any
+/// migration change run, from `server/` with this suite's environment:
+///
+/// `CLEAN_CHAT_PREFLIGHT_RESEAL=write cargo test --offline --test clean_chat_empty_preflight -- --ignored --exact reseal_clean_slate_catalog`
+///
+/// It rewrites only the GENERATED CLEAN-SLATE SEAL block: every migration after the frozen
+/// post-c855 seal (version, description, sha384 as sqlx records them) plus the exact chat tables
+/// and views of a freshly migrated database. Review the diff, then re-run this suite. Without
+/// `CLEAN_CHAT_PREFLIGHT_RESEAL=write` it only checks that the sealed block is current.
+#[tokio::test]
+#[ignore = "re-seal tool: run explicitly after a migration change"]
+async fn reseal_clean_slate_catalog() {
+    let migrator = sqlx::migrate!("./migrations");
+    let applied: Vec<(i64, String, String)> = migrator
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+        .map(|m| {
+            (
+                m.version,
+                m.description.to_string(),
+                hex::encode(m.checksum.as_ref()),
+            )
+        })
+        .collect();
+    let frozen = applied.partition_point(|(version, ..)| *version <= POST_C855_MAX_VERSION);
+    assert_eq!(
+        frozen, 84,
+        "the frozen post-c855 seal must stay the first 84 migrations"
+    );
+    let tail = &applied[frozen..];
+    let last_version = applied.last().expect("at least one migration").0;
+
+    let (pool, _db) = setup_db(migrator).await;
+    let relations: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.relname::text, c.relkind::text
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'chat' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+         ORDER BY c.relname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read clean-slate chat relations");
+    let (mut tables, mut views) = (Vec::new(), Vec::new());
+    for (relname, relkind) in relations {
+        match relkind.as_str() {
+            "r" => tables.push(sql_text(&relname)),
+            "v" => views.push(sql_text(&relname)),
+            other => panic!(
+                "chat.{relname} has relkind={other}; the preflight seals only tables and views"
+            ),
+        }
+    }
+
+    let block = [
+        SEAL_BEGIN.to_owned(),
+        format!(
+            "    -- {} migrations after {POST_C855_MAX_VERSION} ({} total, max {last_version}); chat tables: {}; chat views: {}.\n",
+            tail.len(),
+            applied.len(),
+            tables.len(),
+            views.len()
+        ),
+        sealed_array(
+            "v_clean_slate_versions",
+            "BIGINT[]",
+            &tail
+                .iter()
+                .map(|(version, ..)| format!("{version}::BIGINT"))
+                .collect::<Vec<_>>(),
+        ),
+        sealed_array(
+            "v_clean_slate_descriptions",
+            "TEXT[]",
+            &tail
+                .iter()
+                .map(|(_, description, _)| sql_text(description))
+                .collect::<Vec<_>>(),
+        ),
+        sealed_array(
+            "v_clean_slate_checksums",
+            "TEXT[]",
+            &tail
+                .iter()
+                .map(|(.., checksum)| sql_text(checksum))
+                .collect::<Vec<_>>(),
+        ),
+        sealed_array("v_clean_slate_tables", "TEXT[]", &tables),
+        sealed_array("v_clean_slate_views", "TEXT[]", &views),
+        SEAL_END.to_owned(),
+    ]
+    .concat();
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/assert_clean_chat_empty.sql"
+    );
+    let script = std::fs::read_to_string(path).expect("read preflight script");
+    let start = script.find(SEAL_BEGIN).expect("seal begin marker");
+    let end = start + script[start..].find(SEAL_END).expect("seal end marker") + SEAL_END.len();
+    if std::env::var("CLEAN_CHAT_PREFLIGHT_RESEAL").as_deref() == Ok("write") {
+        std::fs::write(
+            path,
+            format!("{}{block}{}", &script[..start], &script[end..]),
+        )
+        .expect("write re-sealed preflight script");
+    } else {
+        assert!(
+            script[start..end] == block,
+            "clean-slate seal is stale; re-seal with CLEAN_CHAT_PREFLIGHT_RESEAL=write (see this \
+             test's doc). Expected block:\n{block}"
+        );
+    }
 }

@@ -184,6 +184,7 @@ pub mod wire;
 ))]
 #[doc(hidden)]
 pub mod production_proof {
+    pub use super::repository::recovery::production_composition_proof::is_disposable_proof_database;
     pub use super::repository::recovery::production_composition_proof::run_creation_with_enrolled_sibling;
     pub use super::repository::recovery::production_composition_proof::run_inventory_lock_order;
     pub use super::repository::recovery::production_composition_proof::run_request_inventory_concurrency;

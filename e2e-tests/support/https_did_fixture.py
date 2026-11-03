@@ -62,33 +62,21 @@ class DidHandler(http.server.SimpleHTTPRequestHandler):
             if rkey != "self" or repo != f"did:web:{host}":
                 self.send_error(400)
                 return
-            if collection == "blue.catbird.chat.declaration":
-                # Catbird chat-authority declaration: absent unless a test
-                # installs _policy/catbirdDeclaration/<did>.
-                value = policy_override("catbirdDeclaration", repo)
-                if value is None:
-                    self.send_json({"error": "RecordNotFound"}, status=400)
-                else:
-                    cid = make_cid(json.dumps(value, sort_keys=True).encode())
-                    self.send_json({
-                        "uri": f"at://{repo}/blue.catbird.chat.declaration/self",
-                        "cid": cid,
-                        "value": value
-                    })
-                return
-            if collection != "chat.bsky.actor.declaration":
+            if collection != "blue.catbird.chat.declaration":
                 self.send_error(400)
                 return
-            value = policy_override("declaration", repo) or {
-                "$type": "chat.bsky.actor.declaration",
-                "allowIncoming": "all"
-            }
-            cid = make_cid(json.dumps(value, sort_keys=True).encode())
-            self.send_json({
-                "uri": f"at://{repo}/chat.bsky.actor.declaration/self",
-                "cid": cid,
-                "value": value
-            })
+            # Catbird chat declaration: absent unless _policy/catbirdDeclaration/<did>
+            # exists (HttpsDidFixture::start writes one per served party).
+            value = policy_override("catbirdDeclaration", repo)
+            if value is None:
+                self.send_json({"error": "RecordNotFound"}, status=400)
+            else:
+                cid = make_cid(json.dumps(value, sort_keys=True).encode())
+                self.send_json({
+                    "uri": f"at://{repo}/blue.catbird.chat.declaration/self",
+                    "cid": cid,
+                    "value": value
+                })
             return
         if parsed.path == "/xrpc/app.bsky.graph.getRelationships":
             actor = query.get("actor", [""])[0]

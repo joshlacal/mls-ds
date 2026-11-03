@@ -9,7 +9,7 @@
 //! 6. Remote Welcome import and introduction decryption by recipient on home DS.
 //! 7. Acceptance relayed to coordinator, committed at seq 2 with coordinator's signed commit receipt.
 //! 8. Bi-directional reply: recipient replies with real MLS encryption, entry synchronized across nodes, both decrypt plaintext.
-//! 9. Contended opposite-direction prepares (20 ms stagger after barrier) converge on one direct; losing lease is inactive.
+//! 9. Contended opposite-direction prepares (queued FIFO on the coordinator's pair lock) converge on one direct; losing lease is inactive.
 //! 10. Zero legacy fallback: verify no legacy table interaction and one canonical DB graph.
 //! 11. Lost-peer and lost-client-response retry preserve single Welcome/package consumption.
 //! 12. Recipient getEntries seq=2 acceptance entry hashes to the returned acceptance proof entry.
@@ -128,17 +128,17 @@ fn create_database_clone(source: &str, target: &str) -> anyhow::Result<Dedicated
 }
 
 fn bootstrap_federation_tables(db_url: &str) -> anyhow::Result<()> {
-    // The guarded chat template deliberately omits the older public federation schema.
+    // Reviewed chat migrations can already supply these tables in the template.
     psql_on(
         db_url,
-        "CREATE TABLE ds_endpoints( \
+        "CREATE TABLE IF NOT EXISTS ds_endpoints( \
             did TEXT PRIMARY KEY, endpoint TEXT NOT NULL, supported_cipher_suites TEXT, \
             resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
             expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '1 hour')",
     )?;
     psql_on(
         db_url,
-        "CREATE TABLE outbound_queue( \
+        "CREATE TABLE IF NOT EXISTS outbound_queue( \
             id TEXT PRIMARY KEY, target_ds_did TEXT NOT NULL, target_endpoint TEXT NOT NULL, \
             method TEXT NOT NULL, payload BYTEA NOT NULL, convo_id TEXT NOT NULL, \
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
@@ -218,6 +218,7 @@ fn ds_did_document(
 ) -> anyhow::Result<(Value, Vec<u8>, String)> {
     let receipt_key = SigningKey::from_bytes((&[seed_byte; 32]).into())?;
     let service_key = SigningKey::from_bytes((&[seed_byte + 1; 32]).into())?;
+    let sequencer_receipt_key = SigningKey::from_bytes((&[seed_byte + 2; 32]).into())?;
     let receipt_point = receipt_key.verifying_key().to_encoded_point(true);
     let receipt_key_id = format!(
         "{}#chat-request-receipt-{}",
@@ -227,6 +228,13 @@ fn ds_did_document(
 
     let mut multikey = vec![0x80, 0x24];
     multikey.extend_from_slice(receipt_point.as_bytes());
+    let mut sequencer_multikey = vec![0x80, 0x24];
+    sequencer_multikey.extend_from_slice(
+        sequencer_receipt_key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes(),
+    );
 
     let service_point = service_key.verifying_key().to_encoded_point(false);
     let service_jwk = json!({
@@ -250,6 +258,12 @@ fn ds_did_document(
                 "controller": did,
                 "type": "Multikey",
                 "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, multikey)
+            },
+            {
+                "id": format!("{did}#mls-receipt-1"),
+                "controller": did,
+                "type": "Multikey",
+                "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, sequencer_multikey)
             }
         ],
         "service": [{
@@ -276,6 +290,7 @@ pub struct FederatedAuthorityServer {
     pub base_url: String,
     pub database_url: String,
     pub receipt_public_key: Vec<u8>,
+    pub sequencer_receipt_public_key: Vec<u8>,
     pub receipt_key_id: String,
     pub receipt_document: Vec<u8>,
     _child: FixtureChild,
@@ -337,6 +352,7 @@ impl FederatedAuthorityServer {
 
         let receipt_key = SigningKey::from_bytes((&[seed_byte; 32]).into())?;
         let service_key = SigningKey::from_bytes((&[seed_byte + 1; 32]).into())?;
+        let sequencer_receipt_key = SigningKey::from_bytes((&[seed_byte + 2; 32]).into())?;
 
         // The cloned database's immutable protocol identity must match the runtime.
         let cursor_key_id = psql_value(
@@ -387,6 +403,12 @@ impl FederatedAuthorityServer {
                     .as_str(),
             )
             .env(
+                "RECEIPT_SIGNING_KEY_PEM",
+                sequencer_receipt_key
+                    .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
+                    .as_str(),
+            )
+            .env(
                 "SIGNING_KEY_PEM",
                 service_key
                     .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
@@ -422,6 +444,11 @@ impl FederatedAuthorityServer {
             base_url,
             database_url: db_url,
             receipt_public_key,
+            sequencer_receipt_public_key: sequencer_receipt_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
             receipt_key_id,
             receipt_document,
             _child: FixtureChild(child),
@@ -437,6 +464,7 @@ impl FederatedAuthorityServer {
     ) -> anyhow::Result<()> {
         let receipt_key = SigningKey::from_bytes((&[seed_byte; 32]).into())?;
         let service_key = SigningKey::from_bytes((&[seed_byte + 1; 32]).into())?;
+        let sequencer_receipt_key = SigningKey::from_bytes((&[seed_byte + 2; 32]).into())?;
         let cursor_key_id = psql_value(
             &self.database_url,
             "SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE",
@@ -478,6 +506,12 @@ impl FederatedAuthorityServer {
             .env(
                 "CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM",
                 receipt_key
+                    .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
+                    .as_str(),
+            )
+            .env(
+                "RECEIPT_SIGNING_KEY_PEM",
+                sequencer_receipt_key
                     .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
                     .as_str(),
             )
@@ -1045,6 +1079,8 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
             authority_import_until: 4_000_000_000,
             preparation_request_digest: *verified_prepare.request_digest(),
             receipt_authority_key: server_a.receipt_public_key.clone(),
+            sequencer_did: server_a.did.clone(),
+            sequencer_receipt_authority_key: server_a.sequencer_receipt_public_key.clone(),
             text: "Hello from Alice over Catbird MLS Federation".into(),
             invitation: None,
             metadata: GroupMetadataV1 {
@@ -1053,6 +1089,7 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
                 description: String::new(),
                 avatar_blob_locator: None,
                 avatar_content_type: None,
+                space_avatar: None,
             },
         })?;
 
@@ -1065,6 +1102,7 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     publish_body["preparationRequestDigest"] =
         json!(STANDARD.encode(verified_prepare.request_digest()));
     publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
+    publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
     publish_body["next"] = bootstrap.coordinates.clone();
     publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
         bootstrap.import_until as i64,
@@ -1507,9 +1545,10 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         .iter()
         .find(|entry| entry["seq"] == 1)
         .context("signed introduction absent from recipient home")?;
-    anyhow::ensure!(
-        introduction_entry.get("publicationReceipt").is_none(),
-        "recipient entry must not carry a field absent from the signed directRequestEntry lexicon"
+    assert!(introduction_entry["sequencerReceipt"].is_object());
+    assert_eq!(
+        introduction_entry["publicationReceipt"]["$type"],
+        "blue.catbird.chat.defs#signedDirectRequestReceipt"
     );
     let remote_publication = introduction_entry["signedRequest"].clone();
     let (status, bytes) = bob
@@ -1527,6 +1566,19 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         String::from_utf8_lossy(&bytes)
     );
     let remote_receipt = serde_json::from_slice::<Value>(&bytes)?["outcome"].clone();
+    assert_eq!(introduction_entry["publicationReceipt"], remote_receipt);
+    assert_eq!(
+        introduction_entry["publicationReceipt"]["body"]["receipt"]["sequencerReceipt"],
+        introduction_entry["sequencerReceipt"]
+    );
+    assert_eq!(
+        introduction_entry["sequencerReceipt"]["entryId"],
+        remote_publication["body"]["firstMessageId"]
+    );
+    assert_eq!(
+        introduction_entry["sequencerReceipt"]["seq"],
+        introduction_entry["seq"]
+    );
     anyhow::ensure!(
         remote_publication.is_object() && remote_receipt.is_object(),
         "recipient home omitted signed publication or coordinator receipt: {introduction_entry}"
@@ -1602,6 +1654,10 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         metadata_nonce: wire_bytes(&artifacts["metadataSnapshot"]["nonce"])?,
         metadata_ciphertext: wire_bytes(&artifacts["metadataSnapshot"]["ciphertext"])?,
         initial_ciphertext: wire_bytes(&artifacts["initialCiphertext"])?,
+        archive_commitment: wire_bytes(&publication["archiveCommitment"])?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid delivered archive commitment"))?,
+        opening: None,
     };
     let welcome_input = DirectRequestWelcomeInput {
         bootstrap: delivered_bootstrap,
@@ -1612,6 +1668,7 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         published_receipt: serde_json::to_vec(&remote_receipt)?,
         receipt_authority_did: server_a.did.clone(),
         receipt_authority_key: server_a.receipt_public_key.clone(),
+        sequencer_receipt_authority_key: server_a.sequencer_receipt_public_key.clone(),
         preparation_request_digest: wire_bytes(&publication["preparationRequestDigest"])?
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid preparation digest"))?,
@@ -1619,7 +1676,7 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
 
     bob.engine.process_direct_request(&welcome_input)?;
     let decrypted = bob.engine.decrypt_direct_request(&welcome_input)?;
-    let DirectRequestIntroductionResult::Ready { plaintext } = decrypted else {
+    let DirectRequestIntroductionResult::Ready { plaintext, .. } = decrypted else {
         anyhow::bail!("Bob introduction decryption not ready");
     };
     let introduction = protocol::decode_direct_request_introduction(&plaintext)?;
@@ -2129,7 +2186,9 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     assert_eq!(psql_count(&server_a.database_url, &pair_attempts)?, 1);
     assert_eq!(psql_count(&server_b.database_url, &pair_attempts)?, 0);
     // Sender-home routes are bounded even when the coordinator rejects the
-    // attempt; a retained request ID remains replayable at the limit.
+    // attempt; a retained request ID remains replayable at the limit. The
+    // nineteen filler routes stand for other requests server A answered, so
+    // each binds the pair to it permanently.
     assert_eq!(
         psql_count(
             &server_b.database_url,
@@ -2144,8 +2203,9 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         &server_b.database_url,
         &format!(
             "INSERT INTO chat.direct_request_outbound_routes \
-             (request_id, actor_did, actor_device_id, recipient_did, coordinator_did) \
-             SELECT gen_random_uuid(), '{}', '{}', '{}', '{}' FROM generate_series(1,19)",
+             (request_id, actor_did, actor_device_id, recipient_did, coordinator_did, created_at, answered_at) \
+             SELECT gen_random_uuid(), '{}', '{}', '{}', '{}', now(), now() \
+             FROM generate_series(1,19)",
             dana.svc.did, dana.svc.device_id, charlie.svc.did, server_a.did,
         ),
     )?;
@@ -2159,7 +2219,8 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
             true,
         )
         .await?;
-    assert_eq!(cap_status, StatusCode::BAD_REQUEST);
+    // Capacity is a retryable refusal, so the client contract is HTTP 503.
+    assert_eq!(cap_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         serde_json::from_slice::<Value>(&cap_bytes)?["error"],
         "CapacityUnavailable"
@@ -2549,16 +2610,50 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         bob_prepare_body.clone(),
     )?;
 
-    // Synchronize concurrent submission through a tokio Barrier
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    // Deterministic contention without sleeps: a separate session holds the
+    // coordinator's pair lock (the advisory key both prepare paths take on
+    // DS-A), Alice's prepare queues behind it, then Bob's relayed prepare, and
+    // the lock is released. PostgreSQL grants advisory-lock waiters in arrival
+    // order, so Alice's preparation owns the pair and Bob's is fenced. (A
+    // timing lead cannot order them: Alice's coordinator path reserves at DS-B
+    // before it takes the pair lock, Bob's relayed prepare does not.)
+    let (did_low, did_high) = if alice.svc.did <= bob.svc.did {
+        (&alice.svc.did, &bob.svc.did)
+    } else {
+        (&bob.svc.did, &alice.svc.did)
+    };
+    let (pair_lock, pair_connection) =
+        tokio_postgres::connect(&server_a.database_url, tokio_postgres::NoTls).await?;
+    let pair_connection = tokio::spawn(pair_connection);
+    let pair_key = format!("chat-direct-request-pair:{did_low}:{did_high}");
+    pair_lock
+        .execute(
+            "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+            &[&pair_key],
+        )
+        .await?;
+    let pair_waiters = "SELECT count(*) FROM pg_locks l JOIN pg_database d ON d.oid=l.database \
+                        WHERE d.datname=current_database() AND l.locktype='advisory' AND NOT l.granted";
+    let wait_for_waiters = |count: i64| {
+        let url = server_a.database_url.clone();
+        async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while psql_count(&url, pair_waiters)? < count {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "pair-lock waiter {count} never queued"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            anyhow::Ok(())
+        }
+    };
     let alice_task = {
-        let gate = barrier.clone();
         let svc = alice.svc.clone();
         let client = client.clone();
         let home = server_a.base_url.clone();
         let signed = alice_prepare_signed.clone();
         tokio::spawn(async move {
-            gate.wait().await;
             svc.post(
                 &client,
                 &home,
@@ -2569,15 +2664,13 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
             .await
         })
     };
+    wait_for_waiters(1).await?;
     let bob_task = {
-        let gate = barrier.clone();
         let svc = bob.svc.clone();
         let client = client.clone();
         let home = server_b.base_url.clone();
         let signed = bob_prepare_signed.clone();
         tokio::spawn(async move {
-            gate.wait().await;
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             svc.post(
                 &client,
                 &home,
@@ -2588,8 +2681,17 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
             .await
         })
     };
+    wait_for_waiters(2).await?;
+    pair_lock
+        .execute(
+            "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+            &[&pair_key],
+        )
+        .await?;
 
     let (alice_prep_res, bob_prep_res) = tokio::try_join!(alice_task, bob_task)?;
+    drop(pair_lock);
+    pair_connection.abort();
     let (alice_prep_status, alice_prep_bytes) = alice_prep_res?;
     let (bob_prep_status, bob_prep_bytes) = bob_prep_res?;
 
@@ -2617,7 +2719,7 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     );
     anyhow::ensure!(
         alice_prepared,
-        "fault-injection continuation requires Alice on DS-A to win this staggered race"
+        "the first-queued Alice on DS-A must win the FIFO-ordered pair lock"
     );
 
     // The losing preparation must not retain an active remote lease.
@@ -2750,6 +2852,8 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
             authority_import_until: 4_000_000_000,
             preparation_request_digest: *verified_prepare.request_digest(),
             receipt_authority_key: server_a.receipt_public_key.clone(),
+            sequencer_did: server_a.did.clone(),
+            sequencer_receipt_authority_key: server_a.sequencer_receipt_public_key.clone(),
             text: "Converged authoritative direct request".into(),
             invitation: None,
             metadata: GroupMetadataV1 {
@@ -2758,6 +2862,7 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
                 description: String::new(),
                 avatar_blob_locator: None,
                 avatar_content_type: None,
+                space_avatar: None,
             },
         })?;
 
@@ -2770,6 +2875,7 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     publish_body["preparationRequestDigest"] =
         json!(STANDARD.encode(verified_prepare.request_digest()));
     publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
+    publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
     publish_body["next"] = bootstrap.coordinates.clone();
     publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
         bootstrap.import_until as i64,
@@ -3103,6 +3209,11 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         .iter()
         .find(|entry| entry["seq"] == 1)
         .context("signed introduction entry seq 1 must be present for Bob Dev 1")?;
+    assert!(introduction_entry["sequencerReceipt"].is_object());
+    assert_eq!(
+        introduction_entry["publicationReceipt"]["$type"],
+        "blue.catbird.chat.defs#signedDirectRequestReceipt"
+    );
 
     let remote_publication = introduction_entry["signedRequest"].clone();
     let (outcome_status, outcome_bytes) = bob
@@ -3116,6 +3227,19 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         .await?;
     assert_eq!(outcome_status, StatusCode::OK);
     let remote_receipt = serde_json::from_slice::<Value>(&outcome_bytes)?["outcome"].clone();
+    assert_eq!(introduction_entry["publicationReceipt"], remote_receipt);
+    assert_eq!(
+        introduction_entry["publicationReceipt"]["body"]["receipt"]["sequencerReceipt"],
+        introduction_entry["sequencerReceipt"]
+    );
+    assert_eq!(
+        introduction_entry["sequencerReceipt"]["entryId"],
+        remote_publication["body"]["firstMessageId"]
+    );
+    assert_eq!(
+        introduction_entry["sequencerReceipt"]["seq"],
+        introduction_entry["seq"]
+    );
 
     let wire_bytes = |value: &Value| -> anyhow::Result<Vec<u8>> {
         Ok(STANDARD.decode(
@@ -3162,6 +3286,10 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         initial_ciphertext: wire_bytes(
             &remote_publication["body"]["artifacts"]["initialCiphertext"],
         )?,
+        archive_commitment: wire_bytes(&remote_publication["body"]["archiveCommitment"])?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid delivered archive commitment"))?,
+        opening: None,
     };
 
     let welcome_input = DirectRequestWelcomeInput {
@@ -3173,6 +3301,7 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         published_receipt: serde_json::to_vec(&remote_receipt)?,
         receipt_authority_did: server_a.did.clone(),
         receipt_authority_key: server_a.receipt_public_key.clone(),
+        sequencer_receipt_authority_key: server_a.sequencer_receipt_public_key.clone(),
         preparation_request_digest: wire_bytes(
             &remote_publication["body"]["preparationRequestDigest"],
         )?
@@ -3187,7 +3316,7 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         .engine
         .decrypt_direct_request(&welcome_input)
         .context("recipient native introduction decrypt")?;
-    let DirectRequestIntroductionResult::Ready { plaintext } = decrypted else {
+    let DirectRequestIntroductionResult::Ready { plaintext, .. } = decrypted else {
         anyhow::bail!("Bob introduction decryption failed: not ready");
     };
     let introduction = protocol::decode_direct_request_introduction(&plaintext)

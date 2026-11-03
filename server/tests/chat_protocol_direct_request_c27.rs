@@ -12,7 +12,7 @@
 //! capacity refusal preserving a published Welcome) are in
 //! `e2e-tests/tests/encrypted_request_c27.rs`.
 #![allow(dead_code)]
-pub use catbird_server::{auth, chat_protocol};
+pub use catbird_server::{auth, chat_protocol, sim_hooks};
 #[path = "common/chat_protocol.rs"]
 pub mod chat_protocol_baseline;
 mod common {

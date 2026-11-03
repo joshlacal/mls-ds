@@ -1,114 +1,250 @@
-# Catbird MLS Delivery Service — 2-DS Clean-Slate Federation & Spaces Topology
-# Exercises:
-# - Two independent DS authorities (`ds-a` as `did:web`, `ds-b` as `did:plc`)
-# - `Swan` Spaces PDS + `bluesky-social/atproto#5187` reference Spaces PDS containers
-# - Option A Conversation Space Authority & Space Host (`com.atproto.space.*` on `ds-a` & `ds-b`)
-# - `D1` Cross-Server Group Mutation Relay (`relayGroupMutation` / `deliverGroupEntry`)
-# - `3A` Stateless Home-`mls-ds` Space Relays (`relaySpaceCredential` / `relaySpaceRead`)
-# - `D2` Authenticated Push Gateway Wakes (`blue.catbird.push.deliver`, zero APNs/FCM keys on `mls-ds`)
-# - Zero-Content Transient Delivery (`G6` / `I14`: zero long-term message or media retention on `mls-ds`)
+# Catbird MLS delivery service: local two-home clean-slate federation stack.
+#
+#   docker compose -f docker-compose.federation.yml up --build
+#   docker compose -f docker-compose.federation.yml down -v   # discards databases and fixture CA
+#
+# Each `up` after `down -v` starts from empty databases. Every identity is a
+# deterministic test fixture from e2e-tests/fixtures; no production key,
+# secret or database is used.
+#
+#   ds1  http://127.0.0.1:3001  did:web:ds1.catbird.blue          local user did:web:alice.catbird.blue
+#   ds2  http://127.0.0.1:3002  did:plc:dsbfederationlocal24char  local user did:web:bob.catbird.blue
+#   PostgreSQL 16, one container per home, each with database catbird (the
+#   database migration 20250101000000 grants on): ds1 on 127.0.0.1:5433
+#   (cluster_name catbird-federation-ds1), ds2 on 127.0.0.1:5434
+#   (catbird-federation-ds2). server/scripts/reset-dev-db.sh resets only a
+#   server that reports one of those cluster names.
+#
+# DID resolution never leaves the stack. `did-fixture-init` lays out the DID
+# documents and issues a TLS certificate for ds1.catbird.blue, alice/bob and
+# plc.directory from a fresh CA whose private key it then deletes. Each home
+# runs the existing e2e HTTPS DID fixture (e2e-tests/support/https_did_fixture.py)
+# on its own loopback, and the REQUEST_FIXTURE_DID_* settings send those hosts
+# there, trusting only that CA. Every document stays resolvable for the life of
+# the stack, through the same JWT and DID checks production runs.
+#
+# The homes run the test-support `federation-test` image with APP_ENV=test,
+# which the fixture resolver, the chat-fence initializer and the allow-all
+# relationship authority all require; the production image has none of them.
+# Each home issues signed sequencer and I13 receipts with a dedicated
+# #mls-receipt-1 key published in its DID document. Startup applies every
+# migration, including the gated 20260728000004, because
+# CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED is set for these disposable databases
+# only. Once everything is healthy, `peer-fixtures` records each home as an
+# allowed `federation_peers` row of the other, which FEDERATION_MODE=allowlist
+# requires.
+#
+# Limits: no PDS runs here (Swan has its own interop lab,
+# ../Swan/interop/compose.sh), so Space-host calls and device-record lookups
+# have nothing to reach. Builds need ../catbird-atproto and ../labyrinth beside
+# this checkout.
+
+x-ds-build: &ds-build
+  context: .
+  dockerfile: server/Dockerfile
+  target: federation-test
+  additional_contexts:
+    catbird-atproto: ../catbird-atproto
+    labyrinth-protocol: ../labyrinth/labyrinth-protocol
+
+x-ds-environment: &ds-environment
+  APP_ENV: test
+  SERVER_HOST: 0.0.0.0
+  SERVER_PORT: "3001"
+  RUST_LOG: "${RUST_LOG:-info}"
+  CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: handlers-and-legacy-apis-sealed
+  CHAT_CUTOVER_ENABLED: "true"
+  CHAT_REQUIRE_SIGNED_READS: "true"
+  CHAT_CURSOR_KEY_ID: ERERERERERERERERERERERERERERERERERERERERERE
+  CHAT_CURSOR_SEALING_SECRET: IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI
+  LABYRINTH_ENABLED: "true"
+  FEDERATION_ENABLED: "true"
+  FEDERATION_MODE: allowlist
+  FEDERATION_ALLOW_INSECURE_HTTP: "true"
+  FEDERATION_CAPABILITIES: baseline,reconciliation-v1,canonical-prefix-bootstrap-v1
+  FEDERATION_TEST_INITIALIZE_CHAT_FENCE: "true"
+  FEDERATION_TEST_ALLOW_ALL_RELATIONSHIPS: "true"
+  REQUEST_FIXTURE_DID_HOSTS: &did-fixture-hosts ds1.catbird.blue,alice.catbird.blue,bob.catbird.blue,plc.directory
+  REQUEST_FIXTURE_DID_PORT: "8443"
+  REQUEST_FIXTURE_DID_CA_PEM: /did-fixture/tls/ca.pem
+  DID_RESOLUTION_HOST_ALLOWLIST: *did-fixture-hosts
+  RECEIPT_ISSUANCE_MODE: issue
+
+# The server reads these keys and its receipt DID document from the environment;
+# load them from the fixture files named by the *_FILE settings, or exit.
+x-ds-command: &ds-command
+  - /bin/sh
+  - -c
+  - >-
+    SIGNING_KEY_PEM="$$(cat "$$SIGNING_KEY_FILE")" &&
+    RECEIPT_SIGNING_KEY_PEM="$$(cat "$$RECEIPT_SIGNING_KEY_FILE")" &&
+    RECEIPT_DID_DOCUMENT_JSON="$$(cat "$$RECEIPT_DID_DOCUMENT_FILE")" &&
+    export SIGNING_KEY_PEM RECEIPT_SIGNING_KEY_PEM RECEIPT_DID_DOCUMENT_JSON &&
+    exec catbird-server
+
+x-ds-healthcheck: &ds-healthcheck
+  test: ["CMD-SHELL", "curl -sf http://localhost:3001/health/ready >/dev/null && curl -sf http://localhost:3001/xrpc/blue.catbird.mlsDS.healthCheck >/dev/null"]
+  interval: 5s
+  timeout: 5s
+  retries: 30
+  start_period: 15s
+
+x-postgres-healthcheck: &postgres-healthcheck
+  test: ["CMD-SHELL", "pg_isready -U catbird -d $${POSTGRES_DB}"]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+
+# One per home: it shares that home's network namespace, so the fixture hosts
+# resolve to its loopback.
+x-did-resolver: &did-resolver
+  image: python:3.12-slim
+  depends_on:
+    did-fixture-init:
+      condition: service_completed_successfully
+  volumes:
+    - did-fixture:/did-fixture:ro
+    - ./e2e-tests/support/https_did_fixture.py:/https_did_fixture.py:ro
+  command: ["python3", "/https_did_fixture.py", "/did-fixture/root", "/did-fixture/tls/server.pem", "/did-fixture/tls/server-key.pem", "8443"]
+  healthcheck:
+    test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8443), 2)"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
 
 services:
-  postgres-a:
+  did-fixture-init:
+    image: python:3.12-slim
+    volumes:
+      - ./e2e-tests/fixtures:/fixtures:ro
+      - did-fixture:/did-fixture
+    entrypoint: ["/bin/sh", "-ec"]
+    # One argument: the whole script is the `sh -ec` operand.
+    command:
+      - |
+        root=/did-fixture/root
+        mkdir -p /did-fixture/tls "$$root/ds1.catbird.blue/.well-known" "$$root/alice.catbird.blue/.well-known" "$$root/bob.catbird.blue/.well-known" "$$root/plc.directory"
+        cp /fixtures/ds1-local-did.json "$$root/ds1.catbird.blue/.well-known/did.json"
+        cp /fixtures/alice-did.json "$$root/alice.catbird.blue/.well-known/did.json"
+        cp /fixtures/bob-did.json "$$root/bob.catbird.blue/.well-known/did.json"
+        cp /fixtures/ds2-plc-did.json "$$root/plc.directory/did:plc:dsbfederationlocal24char"
+        cd /did-fixture/tls
+        if [ ! -s server.pem ]; then
+          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=Catbird local federation DID fixture CA" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" -keyout ca-key.pem -out ca.pem
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=did-fixture.catbird.blue" -keyout server-key.pem -out server.csr
+          printf 'subjectAltName=DNS:ds1.catbird.blue,DNS:alice.catbird.blue,DNS:bob.catbird.blue,DNS:plc.directory\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' > server.ext
+          openssl x509 -req -days 3650 -sha256 -set_serial 1 -in server.csr -CA ca.pem -CAkey ca-key.pem -extfile server.ext -out leaf.pem
+          cat leaf.pem ca.pem > server.pem
+          rm -f ca-key.pem server.csr server.ext leaf.pem
+        fi
+        chmod 0644 ca.pem server.pem
+    restart: "no"
+
+  postgres-ds1:
     image: postgres:16-alpine
+    command: ["postgres", "-c", "cluster_name=catbird-federation-ds1"]
     environment:
       POSTGRES_USER: catbird
       POSTGRES_PASSWORD: catbird_dev_password
-      POSTGRES_DB: mls_ds_a
+      POSTGRES_DB: catbird
     ports:
-      - "5433:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U catbird -d mls_ds_a"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+      - "127.0.0.1:5433:5432"
+    healthcheck: *postgres-healthcheck
 
-  postgres-b:
+  postgres-ds2:
     image: postgres:16-alpine
+    command: ["postgres", "-c", "cluster_name=catbird-federation-ds2"]
     environment:
       POSTGRES_USER: catbird
       POSTGRES_PASSWORD: catbird_dev_password
-      POSTGRES_DB: mls_ds_b
+      POSTGRES_DB: catbird
     ports:
-      - "5434:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U catbird -d mls_ds_b"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+      - "127.0.0.1:5434:5432"
+    healthcheck: *postgres-healthcheck
 
-  swan-pds:
-    build:
-      context: ../Swan
-      dockerfile: Dockerfile
-    environment:
-      PDS_HOSTNAME: swan.federation.catbird.blue
-      PDS_PORT: "2583"
-      PDS_SPACES_ENABLED: "true"
-    ports:
-      - "2583:2583"
-
-  atproto-spaces-pds:
-    image: "${ATPROTO_SPACES_PDS_IMAGE:-ghcr.io/bluesky-social/pds:spaces-5187}"
-    environment:
-      PDS_HOSTNAME: spaces-ref.federation.catbird.blue
-      PDS_PORT: "2584"
-      PDS_SPACES_ENABLED: "true"
-    ports:
-      - "2584:2584"
-
-  ds-a:
-    build:
-      context: .
-      dockerfile: server/Dockerfile
+  ds1:
+    build: *ds-build
+    command: *ds-command
     depends_on:
-      postgres-a:
+      postgres-ds1:
+        condition: service_healthy
+      did-fixture-init:
+        condition: service_completed_successfully
+    volumes:
+      - did-fixture:/did-fixture:ro
+    environment:
+      <<: *ds-environment
+      DATABASE_URL: postgresql://catbird:catbird_dev_password@postgres-ds1:5432/catbird
+      SERVICE_DID: did:web:ds1.catbird.blue
+      SELF_ENDPOINT: http://ds1:3001
+      DEFAULT_DS_DID: did:plc:dsbfederationlocal24char
+      DEFAULT_DS_ENDPOINT: http://ds2:3001
+      FEDERATION_TEST_LOCAL_USER_DIDS: did:web:alice.catbird.blue
+      SIGNING_KEY_FILE: /app/fixtures/ds1-key.pem
+      RECEIPT_SIGNING_KEY_FILE: /app/fixtures/ds1-receipt-key.pem
+      RECEIPT_DID_DOCUMENT_FILE: /app/fixtures/ds1-local-did.json
+      RECEIPT_VERIFICATION_METHOD: "did:web:ds1.catbird.blue#mls-receipt-1"
+      CHAT_SUBSCRIPTION_ENDPOINT: wss://ds1.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents
+    ports:
+      - "127.0.0.1:3001:3001"
+    healthcheck: *ds-healthcheck
+
+  ds2:
+    build: *ds-build
+    command: *ds-command
+    depends_on:
+      postgres-ds2:
+        condition: service_healthy
+      did-fixture-init:
+        condition: service_completed_successfully
+    volumes:
+      - did-fixture:/did-fixture:ro
+    environment:
+      <<: *ds-environment
+      DATABASE_URL: postgresql://catbird:catbird_dev_password@postgres-ds2:5432/catbird
+      SERVICE_DID: did:plc:dsbfederationlocal24char
+      SELF_ENDPOINT: http://ds2:3001
+      DEFAULT_DS_DID: did:web:ds1.catbird.blue
+      DEFAULT_DS_ENDPOINT: http://ds1:3001
+      FEDERATION_TEST_LOCAL_USER_DIDS: did:web:bob.catbird.blue
+      SIGNING_KEY_FILE: /app/fixtures/ds2-key.pem
+      RECEIPT_SIGNING_KEY_FILE: /app/fixtures/ds2-receipt-key.pem
+      RECEIPT_DID_DOCUMENT_FILE: /app/fixtures/ds2-plc-did.json
+      RECEIPT_VERIFICATION_METHOD: "did:plc:dsbfederationlocal24char#mls-receipt-1"
+      CHAT_SUBSCRIPTION_ENDPOINT: wss://ds2.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents
+    ports:
+      - "127.0.0.1:3002:3001"
+    healthcheck: *ds-healthcheck
+
+  did-resolver-ds1:
+    <<: *did-resolver
+    network_mode: "service:ds1"
+
+  did-resolver-ds2:
+    <<: *did-resolver
+    network_mode: "service:ds2"
+
+  peer-fixtures:
+    image: postgres:16-alpine
+    depends_on:
+      ds1:
+        condition: service_healthy
+      ds2:
+        condition: service_healthy
+      did-resolver-ds1:
+        condition: service_healthy
+      did-resolver-ds2:
         condition: service_healthy
     environment:
-      APP_ENV: development
-      SERVER_HOST: 0.0.0.0
-      SERVER_PORT: "3001"
-      DATABASE_URL: postgresql://catbird:catbird_dev_password@postgres-a:5432/mls_ds_a
-      SERVICE_DID: "${DS_A_SERVICE_DID:-did:web:ds-a.federation.catbird.blue}"
-      SELF_ENDPOINT: "${DS_A_SELF_ENDPOINT:-https://ds-a.federation.catbird.blue}"
-      CHAT_CUTOVER_ENABLED: "true"
-      CHAT_REQUIRE_SIGNED_READS: "true"
-      LABYRINTH_ENABLED: "true"
-      FEDERATION_ENABLED: "true"
-      FEDERATION_MODE: open_intelligent
-      CHAT_SUBSCRIPTION_ENDPOINT: wss://ds-a.federation.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents
-      SIGNING_KEY_PEM: "${DS_A_SIGNING_KEY_PEM:-dev-placeholder-ds-a-signing-key}"
-      SPACE_HOST_SIGNING_KEY_PEM: "${DS_A_SIGNING_KEY_PEM:-dev-placeholder-ds-a-signing-key}"
-      RECEIPT_SIGNING_KEY_PEM: "${DS_A_RECEIPT_SIGNING_KEY_PEM:-dev-placeholder-ds-a-receipt-key}"
-      CHAT_CURSOR_KEY_ID: "${DS_A_CURSOR_KEY_ID:-ERERERERERERERERERERERERERERERERERERERERERE}"
-      CHAT_CURSOR_SEALING_SECRET: "${DS_A_CURSOR_SEALING_SECRET:-IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI}"
-    ports:
-      - "3001:3001"
+      PGUSER: catbird
+      PGPASSWORD: catbird_dev_password
+    entrypoint: ["/bin/sh", "-ec"]
+    # One argument: the whole script is the `sh -ec` operand.
+    command:
+      - |
+        psql -h postgres-ds1 -d catbird -v ON_ERROR_STOP=1 -c "INSERT INTO federation_peers (ds_did, status) VALUES ('did:plc:dsbfederationlocal24char', 'allow') ON CONFLICT (ds_did) DO UPDATE SET status = 'allow'"
+        psql -h postgres-ds2 -d catbird -v ON_ERROR_STOP=1 -c "INSERT INTO federation_peers (ds_did, status) VALUES ('did:web:ds1.catbird.blue', 'allow') ON CONFLICT (ds_did) DO UPDATE SET status = 'allow'"
+    restart: "no"
 
-  ds-b:
-    build:
-      context: .
-      dockerfile: server/Dockerfile
-    depends_on:
-      postgres-b:
-        condition: service_healthy
-    environment:
-      APP_ENV: development
-      SERVER_HOST: 0.0.0.0
-      SERVER_PORT: "3002"
-      DATABASE_URL: postgresql://catbird:catbird_dev_password@postgres-b:5432/mls_ds_b
-      SERVICE_DID: "${DS_B_SERVICE_DID:-did:plc:dsbfederationlocal24char}"
-      SELF_ENDPOINT: "${DS_B_SELF_ENDPOINT:-https://ds-b.federation.catbird.blue}"
-      CHAT_CUTOVER_ENABLED: "true"
-      CHAT_REQUIRE_SIGNED_READS: "true"
-      LABYRINTH_ENABLED: "true"
-      FEDERATION_ENABLED: "true"
-      FEDERATION_MODE: open_intelligent
-      CHAT_SUBSCRIPTION_ENDPOINT: wss://ds-b.federation.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents
-      SIGNING_KEY_PEM: "${DS_B_SIGNING_KEY_PEM:-dev-placeholder-ds-b-signing-key}"
-      SPACE_HOST_SIGNING_KEY_PEM: "${DS_B_SIGNING_KEY_PEM:-dev-placeholder-ds-b-signing-key}"
-      RECEIPT_SIGNING_KEY_PEM: "${DS_B_RECEIPT_SIGNING_KEY_PEM:-dev-placeholder-ds-b-receipt-key}"
-      CHAT_CURSOR_KEY_ID: "${DS_B_CURSOR_KEY_ID:-ERERERERERERERERERERERERERERERERERERERERERE}"
-      CHAT_CURSOR_SEALING_SECRET: "${DS_B_CURSOR_SEALING_SECRET:-IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI}"
-    ports:
-      - "3002:3002"
+volumes:
+  did-fixture:

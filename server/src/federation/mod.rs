@@ -117,6 +117,14 @@ fn federation_mode_override() -> &'static RwLock<Option<FederationMode>> {
     MODE_OVERRIDE.get_or_init(|| RwLock::new(None))
 }
 
+/// Open federation (allowlist) as an operator's `setFederationMode` does.
+/// Tests that drive peer routes or outbound dispatch call this explicitly;
+/// the gate in `peer_policy::ensure_federation_open` has no test bypass.
+#[cfg(any(test, feature = "test-support"))]
+pub fn open_federation_for_test() {
+    FederationMode::set_runtime_override(Some(FederationMode::Allowlist));
+}
+
 pub const CAPABILITY_BASELINE: &str = "baseline";
 pub const CAPABILITY_RECONCILIATION_V1: &str = "reconciliation-v1";
 pub const CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1: &str = "canonical-prefix-bootstrap-v1";

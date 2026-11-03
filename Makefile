@@ -17,19 +17,14 @@ help:
 build:
 	@echo "Building server..."
 	cd server && cargo build
-	@echo "Building MLS FFI..."
-	cd mls-ffi && cargo build
 
 build-release:
 	@echo "Building release..."
 	cd server && cargo build --release
-	cd mls-ffi && cargo build --release
 
 test:
 	@echo "Running server tests..."
 	cd server && cargo test
-	@echo "Running FFI tests..."
-	cd mls-ffi && cargo test
 
 run:
 	@echo "Starting server..."
@@ -42,17 +37,14 @@ deploy:
 clean:
 	@echo "Cleaning..."
 	cd server && cargo clean
-	cd mls-ffi && cargo clean
 
 fmt:
 	@echo "Formatting code..."
 	cd server && cargo fmt
-	cd mls-ffi && cargo fmt
 
 lint:
 	@echo "Running clippy..."
 	cd server && cargo clippy -- -D warnings
-	cd mls-ffi && cargo clippy -- -D warnings
 
 check-codegen-guardrails:
 	@./server/scripts/check_codegen_guardrails.sh
@@ -83,14 +75,5 @@ status:
 
 logs:
 	sudo journalctl -u catbird-mls-server -f
-
-# iOS targets
-build-ios-sim:
-	@echo "Building FFI for iOS simulator..."
-	cd mls-ffi && cargo build --release --target x86_64-apple-ios
-
-build-ios-device:
-	@echo "Building FFI for iOS device..."
-	cd mls-ffi && cargo build --release --target aarch64-apple-ios
 
 all: build test

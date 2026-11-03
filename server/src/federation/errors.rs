@@ -3,6 +3,14 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
+/// The `reasonCode` of a `deliverMessage` that arrived before its predecessor
+/// (`FederationError::PredecessorMissing`).
+pub const PREDECESSOR_MISSING_REASON: &str = "predecessor_missing";
+/// The error name an ordered S2S delivery without a Lexicon (`deliverGroupEntry`,
+/// `deliverMessageEntry`, `deliverTransportControlEntry`) answers, 409, when it
+/// arrived before its predecessor.
+pub const PREDECESSOR_MISSING_ERROR: &str = "PredecessorMissing";
+
 #[derive(Debug, thiserror::Error)]
 pub enum FederationError {
     #[error("DS endpoint not found for DID {did}")]
@@ -31,6 +39,23 @@ pub enum FederationError {
 
     #[error("Service auth failed: {reason}")]
     AuthFailed { reason: String },
+
+    /// The emergency kill switch or the effective federation mode refuses
+    /// inbound federation. Retryable, so peers keep durable relays queued.
+    #[error("Federation ingress disabled: {reason}")]
+    FederationDisabled { reason: String },
+
+    /// A relationship-policy source (DID document, PDS declaration or graph)
+    /// could not answer now, or this DS's relationship authority is not
+    /// configured. Nothing was decided: the identical request may retry.
+    #[error("Relationship policy unavailable: {reason}")]
+    RelationshipPolicyUnavailable { reason: String },
+
+    /// The relationship policy refuses the operation (a block, or evidence
+    /// that cannot admit it): the declared `BlockedRelationship` refusal a
+    /// local request answers, never an authentication failure.
+    #[error("Blocked by relationship policy")]
+    BlockedRelationship,
 
     #[error("Sequencer transfer failed: {reason}")]
     TransferFailed { reason: String },
@@ -93,6 +118,13 @@ pub enum FederationError {
     #[error("Federation sequence conflict: {reason}")]
     SequenceConflict { reason: String },
 
+    /// An ordered delivery arrived before its predecessor: it applies once the
+    /// predecessor does. On the wire it is the declared `SequenceConflict`
+    /// (409) with `reasonCode: "predecessor_missing"`, the typed field a sender
+    /// keeps the delivery queued by.
+    #[error("Federation predecessor missing: {reason}")]
+    PredecessorMissing { reason: String },
+
     #[error("Unauthorized participant DS: {reason}")]
     UnauthorizedParticipantDs { reason: String },
 
@@ -141,17 +173,28 @@ impl FederationError {
             Self::CommitConflict { .. }
             | Self::TermStale { .. }
             | Self::DeliveryConflict { .. }
-            | Self::SequenceConflict { .. } => StatusCode::CONFLICT,
+            | Self::SequenceConflict { .. }
+            | Self::PredecessorMissing { .. } => StatusCode::CONFLICT,
             Self::NotSequencer { .. }
             | Self::UnauthorizedParticipantDs { .. }
             | Self::UnauthorizedRecipient { .. } => StatusCode::FORBIDDEN,
             Self::AuthFailed { .. } => StatusCode::UNAUTHORIZED,
+            Self::FederationDisabled { .. } | Self::RelationshipPolicyUnavailable { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::InvalidProof
             | Self::InvalidCommitFraming { .. }
             | Self::InvalidEnvelope { .. }
-            | Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            | Self::InvalidRequest(_)
+            | Self::BlockedRelationship => StatusCode::BAD_REQUEST,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
-            Self::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
+            // Permanent: a peer retrying would get the same answer.
+            Self::Unsupported(_) => StatusCode::BAD_REQUEST,
+            Self::ResolutionFailed {
+                kind: ResolutionFailureKind::InvalidConfiguration(_),
+                ..
+            } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ResolutionFailed { kind, .. } if !kind.is_retryable() => StatusCode::NOT_FOUND,
             Self::DsUnreachable { .. } | Self::ResolutionFailed { .. } | Self::Http(_) => {
                 StatusCode::BAD_GATEWAY
             }
@@ -178,6 +221,9 @@ impl FederationError {
             Self::NotSequencer { .. } => "NotSequencer",
             Self::TermStale { .. } => "TermStale",
             Self::AuthFailed { .. } => "Unauthorized",
+            Self::FederationDisabled { .. } => "FederationDisabled",
+            Self::RelationshipPolicyUnavailable { .. } => "RelationshipPolicyUnavailable",
+            Self::BlockedRelationship => "BlockedRelationship",
             Self::TransferFailed { .. } => "TransferFailed",
             Self::RemoteError { .. } => "RemoteError",
             Self::ResolutionFailed { .. } => "ResolutionFailed",
@@ -189,7 +235,7 @@ impl FederationError {
             Self::InvalidEnvelope { .. } => "InvalidEnvelope",
             Self::MailboxNotProvisioned { .. } => "MailboxNotProvisioned",
             Self::DeliveryConflict { .. } => "DeliveryConflict",
-            Self::SequenceConflict { .. } => "SequenceConflict",
+            Self::SequenceConflict { .. } | Self::PredecessorMissing { .. } => "SequenceConflict",
             Self::UnauthorizedParticipantDs { .. } => "UnauthorizedParticipantDs",
             Self::UnauthorizedRecipient { .. } => "UnauthorizedRecipient",
             Self::SignerUnavailable => "SignerUnavailable",
@@ -211,6 +257,9 @@ impl FederationError {
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::AuthFailed { .. } => "auth_failed",
+            Self::FederationDisabled { .. } => "federation_disabled",
+            Self::RelationshipPolicyUnavailable { .. } => "relationship_policy_unavailable",
+            Self::BlockedRelationship => "blocked_relationship",
             Self::NotSequencer { .. } => "not_sequencer",
             Self::TermStale { .. } => "term_stale",
             Self::CommitConflict { .. } | Self::ConversationNotFound { .. } => "conflict",
@@ -220,6 +269,7 @@ impl FederationError {
             Self::MailboxNotProvisioned { .. } => "mailbox_not_provisioned",
             Self::DeliveryConflict { .. } => "delivery_conflict",
             Self::SequenceConflict { .. } => "sequence_conflict",
+            Self::PredecessorMissing { .. } => PREDECESSOR_MISSING_REASON,
             Self::UnauthorizedParticipantDs { .. } => "unauthorized_participant_ds",
             Self::UnauthorizedRecipient { .. } => "unauthorized_recipient",
             Self::SignerUnavailable => "signer_unavailable",
@@ -237,7 +287,9 @@ impl FederationError {
 
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::DsUnreachable { .. } => true,
+            Self::DsUnreachable { .. }
+            | Self::FederationDisabled { .. }
+            | Self::RelationshipPolicyUnavailable { .. } => true,
             Self::Http(err) => {
                 err.is_timeout()
                     || err.is_connect()
@@ -404,6 +456,10 @@ mod tests {
             FederationError::AuthFailed { reason: "x".into() }.status_code(),
             StatusCode::UNAUTHORIZED
         );
+        let disabled = FederationError::FederationDisabled { reason: "x".into() };
+        assert_eq!(disabled.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(disabled.reason_code(), "federation_disabled");
+        assert!(disabled.is_retryable());
         assert_eq!(
             FederationError::InvalidProof.status_code(),
             StatusCode::BAD_REQUEST
@@ -416,14 +472,44 @@ mod tests {
             .status_code(),
             StatusCode::BAD_GATEWAY
         );
+        // A permanent resolution failure is definitive for the peer; one that
+        // could not answer now stays retryable; this DS's own configuration
+        // is its own failure.
+        let resolution = |kind| FederationError::ResolutionFailed {
+            did: "x".into(),
+            kind,
+        };
         assert_eq!(
-            FederationError::ResolutionFailed {
-                did: "x".into(),
-                kind: ResolutionFailureKind::Permanent("y".into()),
-            }
+            resolution(ResolutionFailureKind::Permanent("y".into())).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            resolution(ResolutionFailureKind::DnsNxdomain("y".into())).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            resolution(ResolutionFailureKind::DnsTemporary("y".into())).status_code(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            resolution(ResolutionFailureKind::HttpStatus {
+                status: 429,
+                message: "y".into()
+            })
             .status_code(),
             StatusCode::BAD_GATEWAY
         );
+        assert_eq!(
+            resolution(ResolutionFailureKind::InvalidConfiguration("y".into())).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            FederationError::Unsupported("x".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        let unavailable = FederationError::RelationshipPolicyUnavailable { reason: "x".into() };
+        assert_eq!(unavailable.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(unavailable.is_retryable());
         assert_eq!(
             FederationError::TransferFailed { reason: "x".into() }.status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
@@ -465,6 +551,24 @@ mod tests {
             FederationError::Invariant("x".into()).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// A delivery ahead of its predecessor keeps `deliverMessage`'s declared
+    /// name and carries the typed `reasonCode` its sender retries by.
+    #[tokio::test]
+    async fn predecessor_missing_is_a_typed_sequence_conflict() {
+        let error = FederationError::PredecessorMissing {
+            reason: "seq 3 ahead of 1".into(),
+        };
+        assert_eq!(error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(error.reason_code(), PREDECESSOR_MISSING_REASON);
+        let response = error.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "SequenceConflict");
+        assert_eq!(body["reasonCode"], PREDECESSOR_MISSING_REASON);
     }
 
     #[test]

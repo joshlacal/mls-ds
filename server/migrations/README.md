@@ -1,30 +1,13 @@
-# Database Migrations
+# Database migrations
 
-This directory contains SQL migrations for the Catbird MLS Server database schema.
+SQL migrations for `catbird-server`, applied in version order by SQLx (`sqlx::migrate!("./migrations")`). They are forward-only: there are no `.down.sql` files, and a migration that has been applied anywhere is never edited.
 
-## Migration Files
+## Status
 
-Migrations are executed in order by filename:
-
-1. **20240101000001_create_conversations.sql**
-   - Creates `conversations` table
-   - Indexes: creator_did, created_at
-
-2. **20240101000002_create_members.sql**
-   - Creates `members` table
-   - Indexes: member_did, left_at (partial), active members, unread counts
-
-3. **20240101000003_create_messages.sql**
-   - Creates `messages` table
-   - Indexes: convo+sent_at, sender, epoch, pagination
-
-4. **20240101000004_create_key_packages.sql**
-   - Creates `key_packages` table
-   - Indexes: unique constraint, available packages (partial)
-
-5. **20240101000005_create_blobs.sql**
-   - Creates `blobs` table
-   - Indexes: uploader, conversation, uploaded_at, size
+- The R0 seal (bookmark `clean-slate-2026-10-31`, mls-ds `d5f6993c`) has 129 migrations, ending at `20261102000003_conversation_close_terminal_entries.sql`.
+- The unsealed Task 4 R1 provisional commits add thirteen, for 142: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010` and `000011`. Their contracts are in the sections below.
+- **Held.** These migrations have run only against local disposable and guarded test databases. Do not apply them to a production database until R1 is sealed and the production migration is separately authorized. Server startup applies pending migrations, so the hold also covers starting this tree against a production database.
+- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 142 migrations ending at `20261104000011` (91 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
 
 ## Clean-Chat Operation Claim Rollout
 
@@ -178,49 +161,32 @@ Setting the GUC on some other pooled connection does not authorize the
 migration. Automatic startup migration must likewise inject the value into the
 connection that actually executes `00004`.
 
-## Running Migrations
+## Running migrations
 
-### Using sqlx-cli
+Production application is held (see [Status](#status)). On local and test databases:
 
-```bash
-# Install sqlx-cli if not already installed
-cargo install sqlx-cli --no-default-features --features postgres
-
-# Set database URL
-export DATABASE_URL=postgres://localhost/catbird
-
-# Run all pending migrations
-sqlx migrate run
-
-# Revert last migration
-sqlx migrate revert
-
-# Show migration status
-sqlx migrate info
-```
-
-### Programmatically
-
-Migrations run automatically on server startup via:
-
-```rust
-use catbird_server::db::init_db_default;
-
-let pool = init_db_default().await?;
-// Migrations are applied automatically
-```
-
-## Creating New Migrations
+- **Server startup** (`db::init_db_default`) repairs the ten April 2026 legacy version rows, then applies every pending migration. Setting `SKIP_MIGRATIONS` to any value skips both. Startup sets the activation GUC only when `CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed`; otherwise a fresh database commits every migration before `20260728000004` and then stops on it. An applied version missing from this directory also stops startup.
+- **`../scripts/run-migrations.sh [DATABASE_URL]`** (`make migrate`) installs `sqlx-cli` if needed and applies `../scripts/repair-2026-04-migration-versions.sql` when `_sqlx_migrations` exists. If `20260728000004` is still pending, it refuses before applying anything unless `CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed` is set, and then runs `sqlx migrate run` with the GUC scoped to that one connection. Its log line shows only the target host, port and database, never credentials or query parameters.
+- **By hand:**
 
 ```bash
-# Create a new migration file
-sqlx migrate add <migration_name>
-
-# Example
-sqlx migrate add add_user_preferences
-
-# This creates: migrations/YYYYMMDDHHMMSS_add_user_preferences.sql
+PGOPTIONS="-c chat.operation_claim_activation_approved=handlers-and-legacy-apis-sealed" \
+  sqlx migrate run --database-url "$DATABASE_URL"
+sqlx migrate info --database-url "$DATABASE_URL"
 ```
+
+## Creating new migrations
+
+```bash
+sqlx migrate add <migration_name>   # creates migrations/YYYYMMDDHHMMSS_<migration_name>.sql
+```
+
+In the same change:
+
+1. Use the 14-digit version form (below).
+2. Add the file and its SQLx SHA-384 to `reviewed_request_migrations()` in `../tests/common/direct_request_migrations.rs`. That shared manifest rejects any migration at or after `20261004000001` it does not list.
+3. Reseal the clean-slate preflight catalog (see [Status](#status)).
+4. Document the migration's contract in this README.
 
 ## Migration Best Practices
 
@@ -262,63 +228,34 @@ sqlx maintains a `_sqlx_migrations` table to track applied migrations:
 SELECT * FROM _sqlx_migrations ORDER BY version;
 ```
 
-## Rollback Strategy
+## Rollback strategy
 
-To revert changes:
+There are no down migrations, and `sqlx migrate revert` does not apply here. Undo a change with a new forward migration. Where a data-preserving reverse script was reviewed, it lives in `../scripts/` (for example `rollback-20260905000001-chat-historical-recovery-package-mapping.sql`). `../scripts/rollback.sh` restores the previous binary only, never the schema.
 
-```bash
-# Revert last migration
-sqlx migrate revert
+## Development and production
 
-# Or create a new migration to undo changes
-sqlx migrate add revert_feature_x
-```
-
-## Development vs Production
-
-### Development
-
-```bash
-export DATABASE_URL=postgres://localhost/catbird_dev
-sqlx migrate run
-```
-
-### Production
-
-```bash
-export DATABASE_URL=postgres://user:pass@prod-db/catbird?sslmode=require
-sqlx migrate run
-```
-
-Always test migrations in staging before production!
+Development and test databases can be dropped and recreated (below). Production migration is held (see [Status](#status)): do not run any command in this README against a production database until it is authorized.
 
 ## Troubleshooting
 
-### Migration fails midway
+### A migration fails midway
 
-If a migration fails, manually check the database state and either:
-1. Fix the issue and re-run
-2. Manually mark the migration as complete in `_sqlx_migrations`
+Each migration runs in its own transaction, so a failure leaves the earlier migrations committed and the failing one unapplied. Fix the cause and run again. Never insert, delete or rewrite `_sqlx_migrations` rows by hand; a checksum mismatch needs a separately reviewed forward decision (see `20260728000004` above).
 
-### Reset database (development only)
+### `20260728000004` refuses with SQLSTATE 55000
 
-```bash
-# Drop and recreate database
-sqlx database drop
-sqlx database create
-sqlx migrate run
-```
+The migrating connection lacks the activation GUC. See [Authorizing migration `20260728000004`](#authorizing-migration-20260728000004).
 
-### Check migration status
+### Reset a development database
 
 ```bash
-sqlx migrate info
+sqlx database drop --database-url "$DATABASE_URL"
+sqlx database create --database-url "$DATABASE_URL"
+PGOPTIONS="-c chat.operation_claim_activation_approved=handlers-and-legacy-apis-sealed" \
+  sqlx migrate run --database-url "$DATABASE_URL"
 ```
 
-Output shows:
-- Applied migrations (✓)
-- Pending migrations (✗)
-- Migration checksums
+`../scripts/reset-dev-db.sh <URL>` (`make reset-dev-db URL=...`) runs the same three steps for the local federation stack's databases only (`catbird` on `localhost` or `127.0.0.1` port `5433` or `5434`, whose server reports `cluster_name` `catbird-federation-ds1` or `catbird-federation-ds2`) and refuses any other target. `sqlx migrate info` lists applied and pending migrations with their checksums.
 
 ## Index Creation
 
@@ -334,11 +271,11 @@ CREATE INDEX CONCURRENTLY idx_name ON table(column);
 
 Note: sqlx migrations run in transactions, so `CONCURRENTLY` requires special handling.
 
-## See Also
+## See also
 
-- [DATABASE_SCHEMA.md](../DATABASE_SCHEMA.md) - Complete schema documentation
-- [DB_USAGE_EXAMPLES.md](../DB_USAGE_EXAMPLES.md) - Usage examples
-- [sqlx documentation](https://docs.rs/sqlx/)
+- [../../SELF_HOSTING.md](../../SELF_HOSTING.md): operator guide and current status.
+- [../README.md](../README.md): routes, workers and test commands.
+- [SQLx `migrate!`](https://docs.rs/sqlx/latest/sqlx/macro.migrate.html)
 
 ## Generated transition wrapper compatibility
 
@@ -384,11 +321,15 @@ a short request-bound home lease so concurrent recovery cannot select that
 still-available package before the accepted prefix is mirrored. These leases
 cascade on conversation deletion and are removed on close.
 
-The real fulfillment/outbox path delivers the Welcome to the home mailbox.
-`getPendingWelcomes`, `acknowledgeWelcome`, and `acknowledgeEntries` stay at the
-home endpoint; acknowledgements also relay to the sequencer, while local
-mailbox dispositions and watermarks remain durable at home. No client needs to
-enroll its device or publish KeyPackages on another DS.
+A group's remote homes receive every entry, application entries included, only
+through the sequencer's ordered `deliverGroupEntry` stream; groups queue no
+`deliverMessage` or federated `deliverWelcome` (direct and C33 conversations
+keep both). A home's verified prefix provisions a Welcome from the fulfillment
+itself, and a member the prefix cannot reach reads its Welcome through the
+sequencer (below). `getPendingWelcomes`, `acknowledgeWelcome`, and
+`acknowledgeEntries` stay at the home endpoint; acknowledgements also relay to
+the sequencer, while local mailbox dispositions and watermarks remain durable at
+home. No client needs to enroll its device or publish KeyPackages on another DS.
 
 The sequencer sends every control entry to the home of each remote participant
 that is still waiting for its first leaf, whether it is invited or has already
@@ -401,9 +342,11 @@ Once every local participant has a leaf, the home stores replicated entries
 without further membership catch-up. For `getConversationState` on a remote
 group, the home relays the read to the sequencer over S2S
 `getGroupConversationState`, so the roster, coordinates, and `sequencerDid` stay
-current across commits, metadata changes, and removals. The sequencer applies
-its own read authority, and the home serves its mirror only when the sequencer
-is unreachable.
+current across commits, metadata changes, and removals. A C33 transport-only
+home relays the read to its pair's coordinator the same way. The sequencer
+applies its own read authority, and its rejections pass through. Only when it is
+unreachable does a home serve its mirror; a home with no mirror fails the read
+retryably.
 
 Relayed group operations keep the sequencer's answer. This covers membership
 operations, `sendMessage`, and `submitTransition`. Any 4xx protocol rejection,
@@ -416,11 +359,40 @@ declared retryable code: `RelationshipPolicyUnavailable`, or
 neither, so it returns an internal error.
 
 Historical mirroring still supports only creation, add-only policy, acceptance,
-recovery fulfillment, and application entries. If the sequencer's history past
-the home's mirror contains a generic Commit, metadata change, removal or role
-policy, reset, leave, or close, the mirror's `getConversations` inventory state
-stays at the earlier coordinate; a pending invitee that signs acceptance from
-inventory rather than `getConversationState` hits `StaleCoordinates`.
+recovery fulfillment, and application entries, so a mirror whose source history
+holds a generic Commit, metadata change, removal or role policy, reset, leave,
+or close cannot admit an account that joins later.
+`20261104000001_remote_group_memberships.sql` adds the home's remote-group
+membership index for that case. The home's `deliverGroupEntry` handler writes it
+only for accounts homed here, only from the mirror's stored sequencer, only
+after the control entry verifies under its actor's key at the exact signed
+authentication generation, and only in sequence order: an invitation (creation
+or add policy) records `pending`, the account's acceptance `active`, a removal
+or the sequencer's `accountDeletedEntry` `removed`, and a recovery fulfillment
+the pending Welcome of the exact device it names. A close wipe and the
+account's own deletion delete its rows; the deletion first relays to each
+indexed sequencer. An index member the clean graph lacks is served from the
+sequencer: the final `getConversations` page appends its relayed
+`getGroupConversationState` view, and the final `getPendingWelcomes` page its
+device's Welcomes read over S2S `getGroupPendingWelcomes` (the sequencer checks
+the caller is the account's home and the account a current participant homed
+there). Pages are capped at the 100-item lexicon bound. Its replicated entries
+are read through their per-entry grants, which admit active local devices of
+pending or active index members, and its exported KeyPackage requires the same
+standing. A removed index member reads nothing: no grants, entry reads,
+KeyPackage exports, or relayed Welcomes. While the sequencer is unreachable,
+`getConversationState` fails retryably for an index-only member instead of
+serving a mirror that does not list it.
+
+A remote invitation changes no local `chat.events` head, so the scoped inventory
+session identity also digests the account's `remote_group_memberships` rows
+`(conversation_id, status, evidence_seq)` and the device's
+`remote_group_pending_welcomes` rows, in a stable order. An index change
+therefore starts a new 15-minute inventory session instead of serving the
+pre-invite snapshot; an account with no rows keeps its session identity.
+`deliverGroupEntry` locks the local device rows its grants and Welcome markers
+reference (`FOR KEY SHARE`, ordered by DID bytes, then device UUID bytes) before
+the conversation row, which is the order readers use.
 
 Two-DS simulations configure a dedicated request receipt signer on each
 `ChatRuntime` using the sim-only `with_request_receipt_keys` builder before
@@ -438,7 +410,199 @@ the exact endpoint/query claim, and serves its live epoch chain or device roster
 Local replicated keys never substitute for the remote subject's current roster;
 no home database connection remains held during federation I/O.
 
-Group federation uses ordinary DS-to-DS service-auth tokens: `aud` is the target's
-canonical bare DID, and `lxm` is the exact `blue.catbird.mlsDS.*` method. The
-`#atproto_mls` audience belongs to client AppView authentication, not these S2S
-tokens.
+Outbound group federation uses DS-to-DS service-auth tokens: `aud` is the
+target's canonical bare DID, `lxm` is the exact `blue.catbird.mlsDS.*` method,
+and the lifetime is 120 s. A receiver also accepts the short-lived (at most 60 s)
+profile addressed to its `#atproto_mls` service, or an HMAC from
+`FEDERATION_GROUP_RELAY_HMAC_SECRET`; every path then applies inbound peer
+policy.
+
+## Remote ciphertext pruning and device key history
+
+`20261103000001_remote_application_ciphertext_pruning.sql` extends `I14` to
+`chat.direct_request_transport_entries`. Acknowledgements are durable on both
+group mirrors and transport-only C33 homes. An application waits for its frozen
+local audience's active, non-dormant devices, then loses its ciphertext in both
+transport and mirrored entry storage in one transaction. Independently, the
+30-day expiry sweep prunes every transport copy this home stored more than 30
+days ago, acknowledged or not. Its original digest, signature-bearing metadata,
+sequence and `I13` receipt remain immutable. Pruned reads use
+`payloadPruned: true`; duplicate delivery cannot restore bytes.
+
+Signed requests end their signature domains in `\u0000`, which PostgreSQL
+`json`/`jsonb` reject, so the migration and its triggers never parse entry JSON.
+The single Rust writer derives the message id, request digest, metadata,
+prior generation and pruned projection; SQL only digests raw bytes and allows
+exactly one prune to that captured projection. Rows stored before the migration
+carry `evidence_pending` until the sweep records their evidence once.
+
+`20261103000010_direct_request_opening_pruning.sql` extends this to the C33
+opening: the published direct request's `initialCiphertext`. Once every frozen
+device that can still read the opening acknowledged its seq, or its sender's
+account is deleted, each home drops every copy. The coordinator nulls the entry,
+the publication transition and the publication row's signed publication, request
+entry and initial ciphertext in one transaction, and drops a queued delivery. A
+transport-only home prunes the opening's transport entry to the projection
+captured at insert and trades each inbox row's opening for a redacted entry.
+Digests, the sender signature, both receipts and that redacted entry (the
+ciphertext replaced by its SHA-256) stay; triggers allow exactly one prune and
+no restore. Reads serve `{…, payloadPruned: true}` without `signedRequest`.
+Coordinator hydration binds the redacted body to the coordinator's own signed
+publication receipt, since the sender signature cannot be re-verified.
+
+The same prune also runs, irreversibly and with the same evidence, when the
+coordinator expires the request (in the expiry transaction), at the 30-day
+ceiling on both homes, and from a transport-only home's periodic sweep once no
+device can import or read the opening any more (the ACK rule with an empty
+audience). A close wipes every row of the conversation on each home.
+`20261104000002_direct_request_opening_pruned_bytes.sql` records the bytes an
+opening prune clears from its publication row (`opening_pruned_bytes`, set by
+trigger in the prune's own update and never changed), and the terminal prune
+adds them to its release, so an early prune no longer leaks retained capacity.
+`20261104000010_wipe_returns_whole_retained_charge.sql` corrects the close
+wipe's budget accounting. `chat.direct_request_budget.retained_bytes` carries
+each retained charge whole and a terminal prune only appends its release, which
+`chat.direct_request_effective_budget` subtracts. The wipe deletes a request's
+charge together with its release, so it now takes the whole charge off the
+counter; taking `charged - released` off left every released byte counted.
+
+`20261104000005_idempotency_payload_erasure.sql` extends O7 to operation
+receipts. A `sendMessage` receipt in `chat.idempotency_records` holds its
+message's ciphertext in `accepted_request_bytes`, `signing_transcript_bytes` and
+`response_bytes`; it is the only receipt endpoint that does (`publishDirectRequest`
+keeps no row there, and its signed outcome receipt holds digests and the I13
+receipt only). Every prune of that ciphertext on this DS nulls the three columns
+and sets `payload_erased_at` in the same transaction: an ACK, sequencer-notice or
+30-day prune of the application entry, a close wipe, and the sender's account
+deletion (all of its receipts here). The 30-day sweep also erases every receipt
+completed before the ceiling, including one whose entry an older release pruned.
+The digests, signature, status, event position, JKTs and operation claim stay; the
+claim mapping checks an erased receipt against its claim's stored digests and kind.
+Erasure is one-way: the table's trigger allows exactly that change, never a
+restore or a receipt inserted already erased. An erased receipt still matches
+its request by the digests and signature it keeps: the same signed send replays
+as its accepted outcome, the entry exactly as `getEntries` serves it
+(`payloadPruned`, no `signedRequest`) with its I13 receipt, and executes nothing;
+another request under its key is refused with `IdempotencyConflict`.
+The P8 `retain_application_ciphertext` plant keeps receipts as well.
+
+The same application-entry prune drops the entry's queued copies that nothing
+sends again: every `outbound_queue` row delivered, failed or dead and every
+`federation_outbox` job done, failed or dead whose payload names (`"entryId"`) a
+pruned entry. A copy still pending or in flight stays whole until it settles: no
+receiver accepts a pruned copy (`deliverGroupEntry` and C33 `deliverMessageEntry`
+need the signed request, a legacy `deliverMessage` envelope binds its bytes), and
+dropping it would break the home's seq contiguity or the predecessor its later
+deliveries require. Its settle (delivered, failed, dead, or an outbox job handed
+off) then deletes it rather than keeping it for `cleanup_old`. An opening's
+queued `deliverDirectRequest` goes with the opening, which no later delivery
+needs.
+`20261104000008_queued_copy_conversation_indexes.sql` restores the outbound
+queue's conversation index (dropped by `20260824000005`) and gives the federation
+outbox one, so those prunes and every close wipe find a conversation's rows
+without scanning the queues.
+
+`20261103000004_federated_key_package_reservations.sql` backs GET
+`blue.catbird.mlsDS.fetchKeyPackage`. One transaction locks the recipient's
+principal, then its authorized devices, then one recovery KeyPackage with
+`SKIP LOCKED`, which is the order recovery, enrollment, replenishment and
+direct requests use. The package becomes `reserved` with a
+`chat.federated_key_package_reservations` row naming the requesting DS, so it
+never returns to the pool. The reservation mapping accepts that row in place
+of an active recovery reservation.
+
+`20261103000002_remote_device_key_history.sql` preserves old signing keys when a
+remote device advances its authentication generation. The current key is the
+latest activation at or before that generation; a revoked key is never skipped
+in favor of an older key. Changed-key activation appends history, while a
+same-key rebind advances the device generation without rewriting key evidence.
+Historical foreign keys remain valid, and device revocation remains terminal.
+
+## Authenticated remote terminal closes
+
+`20261103000003_remote_close_authority.sql` retains the source DS and its terminal
+authority proof alongside the immutable signed close entry. Before any terminal
+append or wipe, the receiver requires the stored remote sequencer, or the
+retained C33 coordinator and logical participant pair, plus the actor's active
+device and current signing generation. Unknown conversation IDs are rejected
+without creating terminal evidence.
+
+A group close also carries `DeliverGroupEntryRequest.closeAuthority`, signed
+with the sequencer's dedicated `#mls-receipt-1` key. The source derives it only
+after the real close has checked the sole remaining active administrator. The
+proof binds the exact close entry and final roster digest, allowing a removed
+home with an intentionally stale mirror to authenticate the close without
+fetching post-removal history. Terminal evidence survives an empty local
+audience. Only the identical entry from the retained source is an idempotent
+redelivery after the operational wipe; an existing event alone grants no new
+close authority. The transition ID comes from the verified signed body.
+
+All group S2S credentials pass inbound peer policy. Relayed application sends
+also bind the caller to the participant's home and require an active exact
+member device, an unrevoked current key, and the signed authentication generation.
+
+## Direct-request wakes (D2)
+
+A device registers its Push Gateway with `blue.catbird.chat.registerPushGateway`
+(`chat.push_gateway_bindings`: opaque `pushKey` and `gatewayUrl`, no native
+token). Only the device's home DS wakes it, with `blue.catbird.push.deliver`
+`wakeKind=directRequest` carrying coordinates only. A coordinator publication
+already commits its durable wake as the `chat.outbox` notification row mapped
+by `chat.direct_request_push_events`.
+`20261104000006_direct_request_transport_wakes.sql` gives a transport-only
+recipient home the same: each `deliverDirectRequest` inbox row enqueues one
+`chat.direct_request_transport_wakes` row (outbox lease/retry shape) by trigger
+in its insert transaction, and a replayed delivery inserts nothing. Inbox rows
+that predate the migration are never woken.
+`20261104000007_drop_request_push_bindings.sql` drops `chat.request_push_bindings`
+(`updatePushToken`'s token-hash bindings) and its guard function: nothing wrote
+or read it, and device revocation no longer deletes from it.
+The wake worker's eligibility and live block checks, and its retry limits, are
+in [../../SELF_HOSTING.md](../../SELF_HOSTING.md#9-push-wakes-d2).
+
+## Direct-request route answers
+
+`20261104000011_direct_request_route_answers.sql` adds `answered_at` and
+`binding_expires_at` to `chat.direct_request_outbound_routes`, the route a
+sender home records before relaying `prepareDirectRequest` to a remote pair
+coordinator.
+
+- **Unanswered.** The home records the route with `answered_at` NULL and
+  `binding_expires_at` set from the signed prepare it authenticated: its
+  `signedAt`, plus the 300 seconds a coordinator still admits it
+  (`require_fresh_at`), plus the 300-second preparation lease. No preparation
+  made from those bytes can be live after that instant. An identical retry
+  never changes the value. `check_pair_owner_fence` lets such a route bind its
+  pair only while `now < binding_expires_at`.
+- **Answered.** When the coordinator answers, or the relay fails for a reason
+  no retry cures, the home sets `answered_at` and clears `binding_expires_at`:
+  NULL means the route binds its pair permanently. `publishDirectRequest`
+  records its route only after an answer, already answered.
+
+A check constraint keeps exactly one of the two columns set. Existing routes
+recorded no answer and bound their pairs permanently, so the migration marks
+them answered (`answered_at = created_at`); none is left unanswered. Every
+route still counts toward the 20-per-hour route quota by `created_at`. The
+expiry sweeper deletes an unanswered route an hour after `created_at`, using
+the partial index on unanswered rows; it never deletes an answered route.
+
+## Credential and opening evidence contracts
+
+Space credential relays use standard upstream POST JSON
+`{space, credentialKid, delegationToken}`. They verify the returned credential's
+authority, Space, proof-of-possession key and expiry before deriving the home
+response's `expiresAt`; delegation tokens never appear in the URL.
+
+C33 publication requires the signed `archiveCommitment` for the encrypted
+canonical opening frame. The initial entry retains both its genuine `I13`
+`sequencerReceipt` and tagged `publicationReceipt`, including on local and
+federated reads. The dedicated receipt signer is required; the coordinator's
+request-outcome signer and service-auth key are not substitutes.
+
+## Scoped simulation identity caches
+
+Deterministic server clocks own their DID caches as well as generated IDs and
+timestamps. Seed DID documents inside `scope_ds_clock` after schema/counter
+reset, including both service DIDs in a two-DS run. A shared authentication
+middleware instance does not share those scoped caches. Production clocks,
+entropy and ordinary cache behavior remain unchanged.

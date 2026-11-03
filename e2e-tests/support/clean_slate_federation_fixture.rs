@@ -28,7 +28,8 @@ use catbird_server::{
         },
         test_support::{
             seed_clean_slate_active_zero_leaf_member_for_test,
-            seed_clean_slate_application_fixture, seed_clean_slate_expired_direct_request_fixture,
+            seed_clean_slate_application_fixture_unsealed,
+            seed_clean_slate_expired_direct_request_fixture,
             seed_clean_slate_remove_zero_leaf_member_for_test, sign_mutation_json_for_test,
         },
     },
@@ -42,6 +43,7 @@ use catbird_server::{
     },
     handlers::{
         chat::{chat_router, ChatRuntime},
+        ds::{get_convo_digest, get_convo_events, health_check},
         labyrinth::labyrinth_router,
     },
     identity::did_doc::{
@@ -303,11 +305,14 @@ async fn admin_seed_group_fixture(
         None => None,
     };
 
-    let fixture = match seed_clean_slate_application_fixture(
+    // Unsealed: this DS's own relationship authority collects the traffic evidence on the
+    // seeded sender's first send, as in production.
+    let fixture = match seed_clean_slate_application_fixture_unsealed(
         &state.pool,
         input.direct,
         &input.recipient_service_did,
         commitment,
+        None,
     )
     .await
     {
@@ -1884,7 +1889,14 @@ async fn admin_delete_account(
     State(state): State<CleanSlateServerState>,
     Json(input): Json<DeleteAccountInput>,
 ) -> impl IntoResponse {
-    match delete_account_data_with_conversations(&state.pool, &input.did, Utc::now()).await {
+    match delete_account_data_with_conversations(
+        &state.pool,
+        &input.did,
+        Utc::now(),
+        state.runtime.i13_receipt_signer(),
+    )
+    .await
+    {
         Ok(sequenced) => (
             StatusCode::OK,
             Json(json!({ "deleted": true, "sequencedAccountDeletedEntries": sequenced })),
@@ -2092,6 +2104,12 @@ async fn main() -> Result<()> {
     std::env::set_var("FEDERATION_TEST_ALLOW_ALL_RELATIONSHIPS", "true");
     std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
     std::env::set_var("FEDERATION_MODE", "open");
+    // As `docker-compose.federation.yml` configures each DS: a remote home bootstraps a group
+    // mirror only from a sequencer that advertises reconciliation and prefix bootstrap.
+    std::env::set_var(
+        "FEDERATION_CAPABILITIES",
+        "baseline,reconciliation-v1,canonical-prefix-bootstrap-v1",
+    );
 
     let resolver = Arc::new(DsResolver::with_default_endpoint(
         pool.clone(),
@@ -2149,25 +2167,46 @@ async fn main() -> Result<()> {
         serde_json::from_value(did_doc.clone()).context("parse self DidDocument")?;
     cache_test_did_document(self_cached_doc).await;
 
-    let mut well_known_router = Router::new();
-    if let Some(path) = did_web_document_path(&service_did) {
-        let doc_arc = Arc::new(did_doc.clone());
-        well_known_router = well_known_router.route(
-            &path,
-            get(move || {
-                let d = doc_arc.clone();
-                async move { Json((*d).clone()) }
-            }),
-        );
-    }
+    // A did:web serves its document at its method path. The Space relays' test
+    // override (`register_test_space_relay_target`) reads every authority's
+    // `#atproto` key from `{base}/.well-known/did.json`, so a did:plc DS serves it
+    // there too.
+    let did_doc_path =
+        did_web_document_path(&service_did).unwrap_or_else(|| "/.well-known/did.json".to_string());
+    let doc_arc = Arc::new(did_doc.clone());
+    let well_known_router = Router::new().route(
+        &did_doc_path,
+        get(move || {
+            let d = doc_arc.clone();
+            async move { Json((*d).clone()) }
+        }),
+    );
 
-    let group_relay = group_relay_router(GroupRelayState::for_test_with_push(
-        pool.clone(),
-        service_did.clone(),
-        s2s_secret.as_bytes(),
-        Some(Arc::new(i13_signer)),
-        Some(push_client),
-    ));
+    let group_relay = group_relay_router(
+        GroupRelayState::for_test_with_push(
+            pool.clone(),
+            service_did.clone(),
+            s2s_secret.as_bytes(),
+            Some(Arc::new(i13_signer)),
+            Some(push_client),
+        )
+        .with_relationship_authority_of(&runtime),
+    );
+
+    // A remote home provisions its group mirror from the sequencer's discovery and
+    // reconciliation reads (`federation::group_membership::bootstrap_home_group`), mounted as in
+    // production's `blue.catbird.mlsDS.*` router.
+    let reconciliation_router = Router::new()
+        .route("/xrpc/blue.catbird.mlsDS.healthCheck", get(health_check))
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
+            get(get_convo_digest),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
+            get(get_convo_events),
+        )
+        .with_state(pool.clone());
 
     let state = CleanSlateServerState {
         pool: pool.clone(),
@@ -2240,6 +2279,7 @@ async fn main() -> Result<()> {
         .merge(labyrinth_router::<CleanSlateServerState>().with_state(state))
         .merge(space_host_router(space_host))
         .merge(group_relay)
+        .merge(reconciliation_router)
         .merge(admin_router);
 
     println!(

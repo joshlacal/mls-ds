@@ -344,9 +344,11 @@ async fn publication_artifact_topup_and_capacity_rejection_are_atomic() {
     .fetch_one(&mut *tx)
     .await
     .unwrap();
+    // F1 (5adcb7285d / migration 21): publication retires the entire
+    // preparation-only pending reservation; only retained bytes are topped up.
     assert_eq!(
         after,
-        (before.0 + MAX_BUNDLE_BYTES, before.1 + MAX_BUNDLE_BYTES)
+        (before.0 - MAX_BUNDLE_BYTES, before.1 + MAX_BUNDLE_BYTES)
     );
     let charge: i64 = sqlx::query_scalar(
         "SELECT charged_bytes FROM chat.direct_request_retained_charges WHERE request_id=$1",

@@ -2349,6 +2349,7 @@ struct RevocationPackageRow {
     usage_scope: String,
     conversation_id: Option<Uuid>,
     request_id: Option<Uuid>,
+    federated: bool,
 }
 
 async fn hydrate_locked_revocation_packages(
@@ -2361,7 +2362,20 @@ async fn hydrate_locked_revocation_packages(
     if live_transaction_id != target.transaction_id() {
         return Err(RevocationScopeHydrationError::GuardInvariant);
     }
-    let rows: Vec<RevocationPackageRow> = sqlx::query_as(
+    // GET fetchKeyPackage reserves a recovery package for a remote DS without
+    // a conversation (20261103000004). Older pinned schemas lack the table.
+    let has_federated: bool = sqlx::query_scalar(
+        "SELECT to_regclass('chat.federated_key_package_reservations') IS NOT NULL",
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+    let federated_column = if has_federated {
+        "EXISTS(SELECT 1 FROM chat.federated_key_package_reservations f \
+                 WHERE f.key_package_ref=kp.key_package_ref)"
+    } else {
+        "FALSE"
+    };
+    let rows: Vec<RevocationPackageRow> = sqlx::query_as(&format!(
         r#"
         SELECT kp.key_package_ref,
                kp.wrapper_sha256,
@@ -2371,7 +2385,8 @@ async fn hydrate_locked_revocation_packages(
                kp.status,
                kp.usage_scope,
                r.conversation_id,
-               r.recovery_request_id AS request_id
+               r.recovery_request_id AS request_id,
+               {federated_column} AS federated
           FROM chat.key_packages kp
           LEFT JOIN chat.key_package_reservations r
             ON r.key_package_ref=kp.key_package_ref
@@ -2384,7 +2399,7 @@ async fn hydrate_locked_revocation_packages(
          ORDER BY kp.key_package_ref
          FOR UPDATE OF kp
         "#,
-    )
+    ))
     .bind(target.target_did())
     .bind(target.target_device_id())
     .fetch_all(&mut **transaction)
@@ -2407,13 +2422,20 @@ async fn hydrate_locked_revocation_packages(
             row.usage_scope.as_str(),
             row.conversation_id,
             row.request_id,
+            row.federated,
         ) {
-            ("available", _, None, None) => LockedRecoveryPackageStatus::Available,
-            ("reserved", _, Some(_), Some(_)) => LockedRecoveryPackageStatus::Reserved,
+            ("available", _, None, None, false) => LockedRecoveryPackageStatus::Available,
+            ("reserved", _, Some(_), Some(_), false) => LockedRecoveryPackageStatus::Reserved,
             // Request-scope packages held by a direct-request preparation or
             // retired by a keys disable/unusable sweep have no recovery
             // reservation; revocation still retires them (Reserved -> Revoked).
-            ("reserved", "direct-request", None, None) => LockedRecoveryPackageStatus::Reserved,
+            ("reserved", "direct-request", None, None, false) => {
+                LockedRecoveryPackageStatus::Reserved
+            }
+            // A recovery package handed to a remote DS is owner-scoped: its
+            // federated reservation names no conversation, and revocation
+            // retires it the same way (Reserved -> Revoked).
+            ("reserved", "recovery", None, None, true) => LockedRecoveryPackageStatus::Reserved,
             _ => return Err(RevocationScopeHydrationError::FanoutMismatch),
         };
         let digest = revocation_package_guard_digest(
@@ -3551,7 +3573,15 @@ async fn hydrate_locked_available_recovery_package_at_coordinate(
         return Err(RecoveryPackageHydrationError::ReadSetMismatch);
     }
     let claimed_at = head.locked_at();
-    let row: Option<LockedAvailableRecoveryPackageRow> = sqlx::query_as(
+    let (has_exports, has_usage_scope): (bool, bool) = sqlx::query_as(
+        "SELECT to_regclass('chat.group_key_package_exports') IS NOT NULL, \
+                EXISTS(SELECT 1 FROM information_schema.columns \
+                        WHERE table_schema = 'chat' AND table_name = 'key_packages' \
+                          AND column_name = 'usage_scope')",
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+    let mut selection_sql = String::from(
         r#"
         SELECT
             kp.key_package_ref,
@@ -3576,34 +3606,65 @@ async fn hydrate_locked_available_recovery_package_at_coordinate(
           AND kp.owner_key_id = $3
           AND kp.owner_auth_generation = $4
           AND kp.status = 'available'
-          AND kp.usage_scope = 'recovery'
           AND kp.not_before < $5
           AND kp.created_at <= $5
           AND $5 < kp.not_after
+        "#,
+    );
+    if has_usage_scope {
+        selection_sql.push_str(" AND kp.usage_scope = 'recovery'");
+    }
+    if has_exports {
+        selection_sql.push_str(
+            r#"
           AND NOT EXISTS (
               SELECT 1 FROM chat.group_key_package_exports exported
                WHERE exported.key_package_ref = kp.key_package_ref
                  AND exported.expires_at > $5
-                 AND exported.recovery_request_id <> $6
+                 AND (exported.recovery_request_id <> $6 OR exported.conversation_id <> $7)
           )
         ORDER BY EXISTS (
             SELECT 1 FROM chat.group_key_package_exports exported
              WHERE exported.key_package_ref = kp.key_package_ref
                AND exported.recovery_request_id = $6
+               AND exported.conversation_id = $7
         ) DESC, kp.created_at, kp.key_package_ref
-        LIMIT 1
-        FOR UPDATE OF kp
-        "#,
-    )
-    .bind(target_did)
-    .bind(target_device_id)
-    .bind(target_key_id)
-    .bind(target_auth_generation)
-    .bind(claimed_at)
-    .bind(request_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
+            "#,
+        );
+    } else {
+        selection_sql.push_str(" ORDER BY kp.created_at, kp.key_package_ref");
+    }
+    selection_sql.push_str(" LIMIT 1 FOR UPDATE OF kp");
+    let mut selection = sqlx::query_as::<_, LockedAvailableRecoveryPackageRow>(&selection_sql)
+        .bind(target_did)
+        .bind(target_device_id)
+        .bind(target_key_id)
+        .bind(target_auth_generation)
+        .bind(claimed_at);
+    if has_exports {
+        selection = selection.bind(request_id).bind(head.conversation_id());
+    }
+    let row = selection.fetch_optional(&mut **transaction).await?;
     let row = row.ok_or(RecoveryPackageHydrationError::PackageMissing)?;
+    if has_exports {
+        // The selecting statement may have waited on an exporter's package
+        // lock while its lease was still uncommitted. Recheck under a fresh
+        // READ COMMITTED snapshot before minting any package authority.
+        let leased_elsewhere: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat.group_key_package_exports \
+              WHERE key_package_ref = $1 AND expires_at > $2 \
+                AND (recovery_request_id <> $3 OR conversation_id <> $4))",
+        )
+        .bind(&row.key_package_ref)
+        .bind(claimed_at)
+        .bind(request_id)
+        .bind(head.conversation_id())
+        .fetch_one(&mut **transaction)
+        .await?;
+        if leased_elsewhere {
+            return Err(RecoveryPackageHydrationError::PackageMissing);
+        }
+    }
     if row.status != "available"
         || row.owner_did != target_did
         || row.owner_device_id != target_device_id
@@ -4817,12 +4878,25 @@ pub(crate) async fn load_historical_control_evidence(
     conversation_id: Uuid,
     transition_id: Uuid,
 ) -> Result<PersistedControlAuthority, ControlEvidenceLoadError> {
-    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    type EvidenceRow = (
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+    );
+    // A pruned opening's redacted row is named only through `to_jsonb`, so older
+    // acceptance manifests without the column still parse this statement.
+    let row: Option<EvidenceRow> = sqlx::query_as(
         r#"
         SELECT
             e.accepted_payload_bytes,
             e.signed_request_bytes,
-            dk.signing_public_key, e.outer_entry_fingerprint
+            dk.signing_public_key, e.outer_entry_fingerprint,
+            CASE WHEN e.accepted_payload_bytes IS NULL
+                 THEN (to_jsonb(e) ->> 'pruned_payload_bytes')::bytea END,
+            e.request_digest
         FROM chat.entries e
         JOIN chat.device_keys dk
           ON dk.user_did = e.actor_did
@@ -4837,8 +4911,42 @@ pub(crate) async fn load_historical_control_evidence(
     .fetch_optional(&mut **transaction)
     .await?;
 
-    let (public_row_json, raw_signed_wrapper, signing_public_key, stored_fingerprint) =
-        row.ok_or(ControlEvidenceLoadError::EntryMissing)?;
+    let (
+        public_row_json,
+        raw_signed_wrapper,
+        signing_public_key,
+        stored_fingerprint,
+        pruned,
+        digest,
+    ) = row.ok_or(ControlEvidenceLoadError::EntryMissing)?;
+    let (public_row_json, raw_signed_wrapper) = match (public_row_json, raw_signed_wrapper, pruned)
+    {
+        (Some(public_row_json), Some(raw_signed_wrapper), None) => {
+            (public_row_json, raw_signed_wrapper)
+        }
+        (None, None, Some(redacted)) => {
+            let invalid = || ControlEvidenceLoadError::InvalidEvidence;
+            let digest: [u8; 32] = digest.try_into().map_err(|_| invalid())?;
+            let fingerprint: [u8; 32] = stored_fingerprint.try_into().map_err(|_| invalid())?;
+            verify_pruned_direct_request_opening(
+                transaction,
+                conversation_id,
+                transition_id,
+                &redacted,
+                &digest,
+            )
+            .await?;
+            return authority
+                .hydrate_pruned_direct_request_opening(
+                    redacted,
+                    &signing_public_key,
+                    digest,
+                    fingerprint,
+                )
+                .map_err(|_| invalid());
+        }
+        _ => return Err(ControlEvidenceLoadError::InvalidEvidence),
+    };
 
     let decoded = super::super::transcript::decode_and_verify_control_entry(
         &public_row_json,
@@ -4883,8 +4991,7 @@ async fn verify_direct_request_durable_proof(
     actor_key: &[u8],
 ) -> Result<(), ControlEvidenceLoadError> {
     use super::super::direct_request_transcript::{
-        verify_direct_request_acceptance_proof, verify_direct_request_preparation,
-        verify_signed_request, DirectRequestKind,
+        verify_direct_request_acceptance_proof, verify_signed_request, DirectRequestKind,
     };
     use serde_json::Value;
     let invalid = || ControlEvidenceLoadError::InvalidEvidence;
@@ -4909,55 +5016,27 @@ async fn verify_direct_request_durable_proof(
         .ok_or_else(invalid)?
         .remove("$type");
     if publication {
-        let (prepare_bytes, terminal_bytes, stored_signed, stored_entry): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
-            "SELECT a.prepare_response,a.terminal_response,p.signed_publication,p.request_entry FROM chat.direct_request_attempts a JOIN chat.direct_request_publications p USING(request_id) WHERE a.request_id=$1 AND p.conversation_id=$2 AND a.status='published'")
+        let (stored_signed, stored_entry): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT p.signed_publication,p.request_entry FROM chat.direct_request_publications p WHERE p.request_id=$1 AND p.conversation_id=$2 AND p.opening_pruned_at IS NULL AND p.pruned_at IS NULL")
             .bind(request).bind(conversation_id).fetch_optional(&mut **tx).await?.ok_or_else(invalid)?;
         if request != transition_id || stored_signed != signed_bytes || stored_entry != row_bytes {
             return Err(invalid());
         }
-        let prepare: Value = serde_json::from_slice(&prepare_bytes).map_err(|_| invalid())?;
-        let key = historical_request_receipt_key(
+        verify_publication_receipts(
             tx,
-            prepare["receiptKeyId"].as_str().ok_or_else(invalid)?,
+            conversation_id,
+            request,
+            &row,
+            body,
+            verified.request_digest(),
         )
         .await?;
-        let prepare =
-            verify_direct_request_preparation(&prepare_bytes, &key).map_err(|_| invalid())?;
-        if !super::super::direct_request_transcript::direct_request_preparation_matches_publication(
-            &prepare, body,
-        ) {
-            return Err(invalid());
-        }
-        let terminal: Value = serde_json::from_slice(&terminal_bytes).map_err(|_| invalid())?;
-        let key = historical_request_receipt_key(
-            tx,
-            terminal["body"]["keyId"].as_str().ok_or_else(invalid)?,
-        )
-        .await?;
-        let terminal = verify_signed_request(DirectRequestKind::Outcome, &terminal_bytes, &key)
-            .map_err(|_| invalid())?;
-        let receipt = &terminal.body()["receipt"];
-        if receipt["$type"] != "blue.catbird.chat.defs#directRequestPublishedReceipt"
-            || receipt["requestId"] != body["requestId"]
-            || receipt["coordinates"] != body["next"]
-            || receipt["firstMessageId"] != body["firstMessageId"]
-            || receipt["requestDigest"].as_str()
-                != Some(
-                    base64::engine::general_purpose::STANDARD
-                        .encode(verified.request_digest())
-                        .as_str(),
-                )
-            || receipt["preparationRequestDigest"] != body["preparationRequestDigest"]
-            || receipt["actorDid"] != body["actorDid"]
-            || receipt["actorDeviceId"] != body["actorDeviceId"]
-            || receipt["actorKeyId"] != body["keyId"]
-            || receipt["authGeneration"] != body["authGeneration"]
-        {
-            return Err(invalid());
-        }
     } else {
-        let (proof_bytes, publication_bytes, sender_key): (Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
-            "SELECT l.acceptance_proof,p.signed_publication,k.signing_public_key FROM chat.direct_request_lifecycle l JOIN chat.direct_request_publications p USING(request_id) JOIN chat.device_keys k ON k.user_did=p.actor_did AND k.device_id=p.actor_device_id AND k.key_id=p.actor_key_id WHERE l.request_id=$1 AND p.conversation_id=$2 AND l.consent IN ('accepted','closed') AND l.accepted_at IS NOT NULL AND l.acceptance_proof IS NOT NULL")
+        // A pruned opening keeps only its redacted body here; its own hydration
+        // binds that body to the coordinator's signed receipts.
+        type AcceptanceRow = (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>, Vec<u8>);
+        let (proof_bytes, publication_bytes, redacted_opening, sender_key): AcceptanceRow = sqlx::query_as(
+            "SELECT l.acceptance_proof,p.signed_publication,CASE WHEN p.signed_publication IS NULL THEN (SELECT (to_jsonb(e) ->> 'pruned_payload_bytes')::bytea FROM chat.entries e WHERE e.conversation_id=p.conversation_id AND e.transition_id=p.request_id) END,k.signing_public_key FROM chat.direct_request_lifecycle l JOIN chat.direct_request_publications p USING(request_id) JOIN chat.device_keys k ON k.user_did=p.actor_did AND k.device_id=p.actor_device_id AND k.key_id=p.actor_key_id WHERE l.request_id=$1 AND p.conversation_id=$2 AND l.consent IN ('accepted','closed') AND l.accepted_at IS NOT NULL AND l.acceptance_proof IS NOT NULL")
             .bind(request).bind(conversation_id).fetch_optional(&mut **tx).await?.ok_or_else(invalid)?;
         let proof: Value = serde_json::from_slice(&proof_bytes).map_err(|_| invalid())?;
         let key = historical_request_receipt_key(
@@ -4969,20 +5048,149 @@ async fn verify_direct_request_durable_proof(
         .await?;
         let proof = verify_direct_request_acceptance_proof(&proof_bytes, &key, actor_key)
             .map_err(|_| invalid())?;
-        let publication =
-            verify_signed_request(DirectRequestKind::Publish, &publication_bytes, &sender_key)
-                .map_err(|_| invalid())?;
+        let publication = match (publication_bytes, redacted_opening) {
+            (Some(bytes), _) => {
+                verify_signed_request(DirectRequestKind::Publish, &bytes, &sender_key)
+                    .map_err(|_| invalid())?
+                    .body()
+                    .clone()
+            }
+            (None, Some(redacted)) => serde_json::from_slice::<Value>(&redacted)
+                .map_err(|_| invalid())?["signedRequest"]["body"]
+                .clone(),
+            (None, None) => return Err(invalid()),
+        };
         if proof["entry"] != untagged
             || body["transitionId"].as_str() != Some(transition_id.to_string().as_str())
-            || body["requestId"] != publication.body()["requestId"]
-            || body["actorDid"] != publication.body()["recipientDid"]
-            || body["prior"]["conversationId"] != publication.body()["next"]["conversationId"]
-            || body["prior"]["generation"] != publication.body()["next"]["generation"]
+            || body["requestId"] != publication["requestId"]
+            || body["actorDid"] != publication["recipientDid"]
+            || body["prior"]["conversationId"] != publication["next"]["conversationId"]
+            || body["prior"]["generation"] != publication["next"]["generation"]
         {
             return Err(invalid());
         }
     }
     Ok(())
+}
+
+/// The coordinator's own signed preparation and published receipts bind an
+/// opening's signed body and its frozen row, whether whole or redacted (O7).
+async fn verify_publication_receipts(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    request: Uuid,
+    row: &serde_json::Value,
+    body: &serde_json::Value,
+    request_digest: &[u8],
+) -> Result<(), ControlEvidenceLoadError> {
+    use super::super::direct_request_transcript::{
+        verify_direct_request_preparation, verify_signed_request, DirectRequestKind,
+    };
+    use serde_json::Value;
+    let invalid = || ControlEvidenceLoadError::InvalidEvidence;
+    let (prepare_bytes, terminal_bytes): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT a.prepare_response,a.terminal_response FROM chat.direct_request_attempts a JOIN chat.direct_request_publications p USING(request_id) WHERE a.request_id=$1 AND p.conversation_id=$2 AND a.status='published'")
+        .bind(request).bind(conversation_id).fetch_optional(&mut **tx).await?.ok_or_else(invalid)?;
+    let prepare: Value = serde_json::from_slice(&prepare_bytes).map_err(|_| invalid())?;
+    let key =
+        historical_request_receipt_key(tx, prepare["receiptKeyId"].as_str().ok_or_else(invalid)?)
+            .await?;
+    let prepare = verify_direct_request_preparation(&prepare_bytes, &key).map_err(|_| invalid())?;
+    if !super::super::direct_request_transcript::direct_request_preparation_matches_publication(
+        &prepare, body,
+    ) {
+        return Err(invalid());
+    }
+    let terminal: Value = serde_json::from_slice(&terminal_bytes).map_err(|_| invalid())?;
+    let key =
+        historical_request_receipt_key(tx, terminal["body"]["keyId"].as_str().ok_or_else(invalid)?)
+            .await?;
+    let terminal = verify_signed_request(DirectRequestKind::Outcome, &terminal_bytes, &key)
+        .map_err(|_| invalid())?;
+    let receipt = &terminal.body()["receipt"];
+    if receipt["$type"] != "blue.catbird.chat.defs#directRequestPublishedReceipt"
+        || row["publicationReceipt"]["body"] != *terminal.body()
+        || row["publicationReceipt"]["signature"]
+            != base64::engine::general_purpose::STANDARD.encode(terminal.signature())
+        || row["sequencerReceipt"] != receipt["sequencerReceipt"]
+        || row["entryId"] != body["firstMessageId"]
+        || row["sequencerReceipt"]["entryId"] != row["entryId"]
+        || row["sequencerReceipt"]["seq"] != row["seq"]
+        || row["sequencerReceipt"]["conversationId"] != body["conversationId"]
+        || row["sequencerReceipt"]["groupId"] != body["next"]["groupId"]
+        || row["sequencerReceipt"]["epoch"] != body["next"]["epoch"]
+        || row["sequencerReceipt"]["generation"] != body["next"]["generation"]
+        || row["sequencerReceipt"]["senderDid"] != body["actorDid"]
+        || row["sequencerReceipt"]["senderDeviceId"] != body["actorDeviceId"]
+        || row["sequencerReceipt"]["archiveCommitment"] != body["archiveCommitment"]
+        || receipt["requestId"] != body["requestId"]
+        || receipt["coordinates"] != body["next"]
+        || receipt["firstMessageId"] != body["firstMessageId"]
+        || receipt["requestDigest"].as_str()
+            != Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(request_digest)
+                    .as_str(),
+            )
+        || receipt["preparationRequestDigest"] != body["preparationRequestDigest"]
+        || receipt["actorDid"] != body["actorDid"]
+        || receipt["actorDeviceId"] != body["actorDeviceId"]
+        || receipt["actorKeyId"] != body["keyId"]
+        || receipt["authGeneration"] != body["authGeneration"]
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// A pruned opening (O7) keeps a redacted row whose body differs from the signed
+/// one only by `initialCiphertext`, now that ciphertext's SHA-256 as frozen in the
+/// publication row. The sender signature over the erased bytes cannot be
+/// re-verified, so the retained digests and the coordinator's own signed
+/// receipts bind the redacted body instead.
+async fn verify_pruned_direct_request_opening(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    transition_id: Uuid,
+    redacted_row: &[u8],
+    request_digest: &[u8; 32],
+) -> Result<(), ControlEvidenceLoadError> {
+    use base64::Engine as _;
+    use serde_json::Value;
+    let invalid = || ControlEvidenceLoadError::InvalidEvidence;
+    let row: Value = serde_json::from_slice(redacted_row).map_err(|_| invalid())?;
+    let body = &row["signedRequest"]["body"];
+    let request =
+        Uuid::parse_str(body["requestId"].as_str().ok_or_else(invalid)?).map_err(|_| invalid())?;
+    let placeholder = base64::engine::general_purpose::STANDARD
+        .decode(
+            body["artifacts"]["initialCiphertext"]
+                .as_str()
+                .ok_or_else(invalid)?,
+        )
+        .map_err(|_| invalid())?;
+    let bound: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_publications p \
+            JOIN chat.entries e ON e.conversation_id = p.conversation_id AND e.transition_id = p.request_id \
+           WHERE p.request_id = $1 AND p.conversation_id = $2 \
+             AND (p.opening_pruned_at IS NOT NULL OR p.pruned_at IS NOT NULL) \
+             AND p.initial_ciphertext_sha256 = $3 \
+             AND p.request_entry_sha256 = e.accepted_payload_sha256 \
+             AND p.publication_digest = $4 AND e.request_digest = $4)",
+    )
+    .bind(request)
+    .bind(conversation_id)
+    .bind(&placeholder)
+    .bind(request_digest.as_slice())
+    .fetch_one(&mut **tx)
+    .await?;
+    if request != transition_id
+        || row["$type"] != "blue.catbird.chat.defs#directRequestEntry"
+        || !bound
+    {
+        return Err(invalid());
+    }
+    verify_publication_receipts(tx, conversation_id, request, &row, body, request_digest).await
 }
 
 async fn historical_request_receipt_key(

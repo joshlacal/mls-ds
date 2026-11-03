@@ -1,7 +1,7 @@
 //! Database authority tests for durable attempts. These test storage primitives,
 //! not HTTP admission, relationship fetching, receipt signing or MLS crypto.
 #![allow(dead_code)]
-pub use catbird_server::{auth, chat_protocol};
+pub use catbird_server::{auth, chat_protocol, sim_hooks};
 #[path = "common/chat_protocol.rs"]
 pub mod chat_protocol_baseline;
 mod common {

@@ -47,6 +47,7 @@ pub enum AuthError {
     TokenExpired,
     InvalidDid(String),
     DidResolutionFailed(String),
+    DidResolutionUnavailable(String),
     InvalidSignature,
     RateLimitExceeded,
     MissingVerificationMethod,
@@ -258,7 +259,8 @@ All authentication errors are mapped to appropriate HTTP status codes:
 | `InvalidToken` | 401 | JWT validation failed |
 | `TokenExpired` | 401 | Token past expiration |
 | `InvalidDid` | 400 | Malformed DID |
-| `DidResolutionFailed` | 400 | Cannot fetch DID doc |
+| `DidResolutionFailed` | 400 | DID authority refused (4xx), document malformed, or host blocked |
+| `DidResolutionUnavailable` | 503 + `Retry-After: 5` | DID doc could not be fetched now (DNS, connect, timeout, authority 5xx/429); `is_retryable()` |
 | `InvalidSignature` | 401 | Signature mismatch |
 | `RateLimitExceeded` | 429 | Too many requests |
 

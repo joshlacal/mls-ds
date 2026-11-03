@@ -12,11 +12,14 @@
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
 //!   cargo test --test chat_protocol_create_conversation_handlers -- --test-threads=1
 mod common;
-pub use catbird_server::{auth, crypto};
+pub use catbird_server::{auth, crypto, sim_hooks};
 
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/read_projection.rs"]
+mod read_projection;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
@@ -240,6 +243,32 @@ async fn send_raw(router: Router, request: Request<Body>) -> (StatusCode, Vec<u8
         .await
         .expect("collect response body");
     (status, bytes.to_vec())
+}
+
+/// Production installs every migration (`db::init_db`), so handler proofs pin
+/// the exact full catalog in order: versions, descriptions, success, checksums.
+async fn assert_exact_full_catalog_ledger(pool: &DbPool) {
+    let ledger: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, description, success, checksum FROM public._sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read migration ledger on fresh database");
+    let catalog: Vec<(i64, String, bool, Vec<u8>)> = sqlx::migrate!("./migrations")
+        .iter()
+        .map(|m| {
+            (
+                m.version,
+                m.description.to_string(),
+                true,
+                m.checksum.to_vec(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ledger, catalog,
+        "fresh database ledger must be the exact full migration catalog"
+    );
 }
 
 fn post_empty(nsid: &str) -> Request<Body> {
@@ -753,37 +782,9 @@ async fn create_conversation_cutover_enabled_missing_auth_returns_not_authorized
 
 #[tokio::test]
 async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_replays() {
-    let (pool, _disposable) =
-        common::fresh_db::fresh_clean_protocol_db("chat_convhandlers_", 4).await;
-    let ledger_rows: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
-        "SELECT version, description, success, checksum FROM public._sqlx_migrations ORDER BY version",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("read clean-chat migration ledger on fresh database");
-
-    assert_eq!(
-        ledger_rows.len(),
-        common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST.len(),
-        "fresh database ledger must contain exact reviewed migration manifest"
-    );
-    for (entry, row) in common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST
-        .iter()
-        .zip(ledger_rows.iter())
-    {
-        assert_eq!(row.0, entry.migration.version, "version matches");
-        assert_eq!(
-            &row.1,
-            entry.migration.description.as_ref(),
-            "description matches"
-        );
-        assert!(row.2, "migration succeeded");
-        assert_eq!(
-            row.3.as_slice(),
-            entry.migration.checksum.as_ref(),
-            "checksum matches"
-        );
-    }
+    let database = common::fresh_db::fresh_fully_migrated_db("chat_convhandlers_").await;
+    let pool = database.connect(4).await;
+    assert_exact_full_catalog_ledger(&pool).await;
 
     let trusted_at: DateTime<Utc> =
         sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
@@ -1101,8 +1102,9 @@ async fn exercise_generated_transition_handler(origin: GeneratedTransitionOrigin
         origin.name(),
         artifacts.display()
     );
-    let (pool, _disposable) =
-        common::fresh_db::fresh_clean_protocol_db("chat_convhandlers_", 4).await;
+    // Handler proofs run on the full catalog production installs (`db::init_db`).
+    let _disposable = common::fresh_db::fresh_fully_migrated_db("chat_convhandlers_").await;
+    let pool = _disposable.connect(4).await;
     let trusted_at: DateTime<Utc> =
         sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
             .fetch_one(&pool)
@@ -1428,37 +1430,9 @@ async fn generated_swift_transition_handlers_preserve_raw_persistence_replay_and
 
 #[tokio::test]
 async fn submit_transition_policy_add_against_production_router_replays_byte_identically() {
-    let (pool, _disposable) =
-        common::fresh_db::fresh_clean_protocol_db("chat_convhandlers_", 4).await;
-    let ledger_rows: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
-        "SELECT version, description, success, checksum FROM public._sqlx_migrations ORDER BY version",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("read clean-chat migration ledger on fresh database");
-
-    assert_eq!(
-        ledger_rows.len(),
-        common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST.len(),
-        "fresh database ledger must contain exact reviewed migration manifest"
-    );
-    for (entry, row) in common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST
-        .iter()
-        .zip(ledger_rows.iter())
-    {
-        assert_eq!(row.0, entry.migration.version, "version matches");
-        assert_eq!(
-            &row.1,
-            entry.migration.description.as_ref(),
-            "description matches"
-        );
-        assert!(row.2, "migration succeeded");
-        assert_eq!(
-            row.3.as_slice(),
-            entry.migration.checksum.as_ref(),
-            "checksum matches"
-        );
-    }
+    let database = common::fresh_db::fresh_fully_migrated_db("chat_convhandlers_").await;
+    let pool = database.connect(4).await;
+    assert_exact_full_catalog_ledger(&pool).await;
 
     let trusted_at: DateTime<Utc> =
         sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
@@ -2056,20 +2030,9 @@ async fn submit_transition_negative_corrupted_signature_returns_invalid_signatur
     );
 }
 
-// Encrypted-requests: transcript.rs test modules reference read_projection.
+// Compile the actual canonical encoder used by transcript.rs's request-view
+// tests. An empty-byte stand-in cannot exercise its round-trip contract.
 mod chat_protocol {
-    pub mod read_projection {
-        pub struct DummyCanonical;
-        impl DummyCanonical {
-            pub fn bytes(&self) -> &[u8] {
-                &[]
-            }
-        }
-        pub fn encode_canonical_generated_chat_json_v1<T: serde::Serialize>(
-            _value: &T,
-            _schema: &str,
-        ) -> Result<DummyCanonical, String> {
-            Ok(DummyCanonical)
-        }
-    }
+    pub(crate) use crate::read_projection;
+    pub use catbird_server::chat_protocol::direct_request_transcript;
 }

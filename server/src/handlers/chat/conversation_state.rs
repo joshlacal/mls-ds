@@ -53,7 +53,8 @@ async fn get_conversation_state(
         &actor_device_id,
     )
     .await?;
-    // A remote group's roster and coordinates belong to its sequencer.
+    // A remote group's roster and coordinates belong to its sequencer, and a
+    // C33 pair's to its coordinator when this DS homes the pair's sender only.
     if let Ok(device_id) = uuid::Uuid::parse_str(&actor_device_id) {
         use crate::federation::group_relay::{try_relay_group_state, GroupRelayError};
         match try_relay_group_state(pool, &subject, device_id, conversation_id).await {
@@ -62,7 +63,37 @@ async fn get_conversation_state(
             Err(GroupRelayError::Rejected(code)) => {
                 return Err(ChatFailure::protocol(ENDPOINT, code));
             }
-            Err(error) => {
+            Err(GroupRelayError::Internal(_)) => return Err(ChatFailure::storage(ENDPOINT)),
+            Err(error @ GroupRelayError::Unavailable(_)) => {
+                // Only a group mirror the member is current in has state to
+                // fall back on: an index-only member's roster and deletion
+                // evidence are the sequencer's, and a C33 sender's home holds
+                // no leaf authority for the peer's devices.
+                let mut conn = pool
+                    .acquire()
+                    .await
+                    .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+                use crate::chat_protocol::repository::entry_read::{
+                    remote_group_standing, RemoteGroupStanding,
+                };
+                let standing = remote_group_standing(&mut conn, conversation_id, &subject)
+                    .await
+                    .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+                let mirrored: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id = $1)",
+                )
+                .bind(conversation_id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+                if standing == RemoteGroupStanding::IndexOnly || !mirrored {
+                    tracing::warn!(
+                        ?error,
+                        "sequencer state read unavailable without a home mirror"
+                    );
+                    // The sequencer decided nothing: the identical read retries.
+                    return Err(ChatFailure::unavailable(ENDPOINT));
+                }
                 tracing::warn!(
                     ?error,
                     "sequencer state read unavailable; serving the home mirror"

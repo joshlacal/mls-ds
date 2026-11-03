@@ -215,10 +215,14 @@ async fn create_legacy_direct(f: &Fixture) -> anyhow::Result<Uuid> {
         &f.client,
         &f.server.base_url,
         f.server.receipt_document.clone(),
+        &[
+            (f.alice.id.did.as_str(), vec![f.alice.public.clone()]),
+            (f.bob.id.did.as_str(), vec![f.bob.public.clone()]),
+        ],
     )
     .await?;
     let view = orchestrator
-        .create_group("", Some(&[f.bob.id.did.clone()]), None)
+        .create_group("", Some(std::slice::from_ref(&f.bob.id.did)), None)
         .await
         .context("legacy createConversation")?;
     orchestrator.shutdown().await;
@@ -478,6 +482,10 @@ async fn capable_orchestrator(
     use catbird_mls::orchestrator::CredentialStore as _;
     let credentials = MockCredentials::new();
     credentials.set_request_authority_document(f.server.receipt_document.clone());
+    // Both accounts' repository-published device keys (their PDS records).
+    for account in [&f.alice, &f.bob] {
+        credentials.set_authorized_device_keys(&account.id.did, vec![account.public.clone()]);
+    }
     credentials
         .store_device_uuid(&party.id.did, &party.id.device_id.to_string())
         .await?;
@@ -788,6 +796,8 @@ async fn prepare_upgrade(
             authority_import_until: import_until,
             preparation_request_digest: *verified_prepare.request_digest(),
             receipt_authority_key: f.server.receipt_public_key.clone(),
+            sequencer_did: "did:web:chat.catbird.blue".into(),
+            sequencer_receipt_authority_key: f.server.sequencer_receipt_public_key.clone(),
             text: "Upgraded legacy introduction".into(),
             invitation: None,
             metadata: GroupMetadataV1 {
@@ -796,6 +806,7 @@ async fn prepare_upgrade(
                 description: String::new(),
                 avatar_blob_locator: None,
                 avatar_content_type: None,
+                space_avatar: None,
             },
         })?;
     let b = &journal.bootstrap;
@@ -806,6 +817,7 @@ async fn prepare_upgrade(
     body["preparationDigest"] = preparation["preparationDigest"].clone();
     body["preparationRequestDigest"] = json!(STANDARD.encode(verified_prepare.request_digest()));
     body["contextHash"] = json!(STANDARD.encode(b.context_hash));
+    body["archiveCommitment"] = json!(STANDARD.encode(b.archive_commitment));
     body["next"] = b.coordinates.clone();
     body["importUntil"] = json!(chrono::DateTime::from_timestamp(b.import_until as i64, 0)
         .context("importUntil")?
@@ -1204,16 +1216,27 @@ async fn competing(l: &Legacy, leg: RaceLeg) -> anyhow::Result<(&'static str, Va
             }))?}),
         ),
         RaceLeg::SecondUpgrade => {
-            // A second upgrade of the same legacy head cannot even be prepared
-            // while the first preparation is live.
+            // A second upgrade of the same legacy head is refused by the
+            // pair-owner fence while the first preparation is live: the plain
+            // PreparationConflict error, before any attempt for the pair.
+            let pair_attempts = format!(
+                "SELECT count(*) FROM chat.direct_request_attempts WHERE actor_did='{}' AND recipient_did='{}'",
+                f.alice.id.did, f.bob.id.did
+            );
+            let attempts_before = db(&pair_attempts)?;
             let refused = match prepare_upgrade(f, l.cid, l.origin.clone(), l.next_seq).await {
                 Ok(_) => anyhow::bail!("second concurrent upgrade preparation was admitted"),
                 Err(error) => format!("{error:#}"),
             };
             println!("second concurrent upgrade preparation refused: {refused}");
             anyhow::ensure!(
-                refused.contains("no live preparation"),
+                refused
+                    == r#"prepare 400 Bad Request: {"error":"PreparationConflict","message":"PreparationConflict"}"#,
                 "unexpected refusal {refused}"
+            );
+            anyhow::ensure!(
+                db(&pair_attempts)? == attempts_before,
+                "the fenced second upgrade wrote an attempt"
             );
             // The race is then the same signed publication delivered twice at once.
             ("blue.catbird.chat.publishDirectRequest", Value::Null)
@@ -1272,7 +1295,10 @@ async fn race(leg: RaceLeg, label: &str) -> anyhow::Result<&'static str> {
     println!("[{label}] head {after}");
     if matches!(leg, RaceLeg::Close) && c_status == reqwest::StatusCode::OK {
         encrypted_requests::assert_closed_conversation_wiped(cid, None)?;
-        assert!(after.is_null(), "[{label}] close removes the operational head");
+        assert!(
+            after.is_null(),
+            "[{label}] close removes the operational head"
+        );
     } else {
         assert_eq!(
             legacy_rows(cid)?,
@@ -1299,9 +1325,7 @@ async fn race(leg: RaceLeg, label: &str) -> anyhow::Result<&'static str> {
         return Ok("singlePublication");
     }
     let upgrade_won = receipt_kind(&upgrade_receipt).0 == PUBLISHED;
-    let competitor_won = match leg {
-        _ => c_status == reqwest::StatusCode::OK,
-    };
+    let competitor_won = c_status == reqwest::StatusCode::OK;
     assert!(
         upgrade_won ^ competitor_won,
         "[{label}] exactly one authoritative winner (upgrade {upgrade_won}, competitor {competitor_won})"
@@ -1365,7 +1389,10 @@ async fn race(leg: RaceLeg, label: &str) -> anyhow::Result<&'static str> {
             "acceptConversation"
         }
         (RaceLeg::Close, false) => {
-            assert!(after.is_null(), "[{label}] close removes the operational head");
+            assert!(
+                after.is_null(),
+                "[{label}] close removes the operational head"
+            );
             "closeConversation"
         }
         (RaceLeg::Reset, false) => {
@@ -1527,7 +1554,7 @@ async fn c24_retained_old_client_and_capable_scoped_reader() -> anyhow::Result<(
     // for a conversation it created itself through the real client path.
     let (reader, store, reader_log) = capable_orchestrator(&f, &f.alice, true).await?;
     let view = reader
-        .create_group("", Some(&[f.bob.id.did.clone()]), None)
+        .create_group("", Some(std::slice::from_ref(&f.bob.id.did)), None)
         .await
         .context("capable reader createConversation")?;
     let cid = Uuid::parse_str(&view.conversation_id)?;
@@ -1823,7 +1850,10 @@ async fn controlled(leg: RaceLeg, order: Order, label: &str) -> anyhow::Result<S
     );
     if matches!(leg, RaceLeg::Close) && c_status == reqwest::StatusCode::OK {
         encrypted_requests::assert_closed_conversation_wiped(cid, None)?;
-        assert!(after.is_null(), "[{label}] close removes the operational head");
+        assert!(
+            after.is_null(),
+            "[{label}] close removes the operational head"
+        );
     } else {
         assert_eq!(
             legacy_rows(cid)?,

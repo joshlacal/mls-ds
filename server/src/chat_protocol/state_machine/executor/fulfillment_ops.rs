@@ -573,11 +573,21 @@ pub(in crate::chat_protocol::state_machine::executor) async fn apply_leaf_recove
         }
     };
 
-    if is_local || historical_write_authority.is_some() {
+    // A group's remote home serves its member's Welcome from the sequencer's
+    // own delivery row (relayed read) or from its verified historical prefix;
+    // only direct conversations deliver Welcomes into the home's mailbox.
+    let is_group: bool = sqlx::query_scalar(
+        "SELECT kind = 'group' FROM chat.conversations WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|e| ExecutorError::Delivery(DeliveryRepositoryError::Database(e)))?;
+    if is_local || historical_write_authority.is_some() || is_group {
         tracing::debug!(
             conversation_id = %crate::crypto::redact_for_log(&conversation_id.hyphenated().to_string()),
             recipient_did = %crate::crypto::redact_for_log(&recipient_did_str),
-            "welcome emission: recipient is local participant or historical reconstruction, skipping remote federation enqueue"
+            "welcome emission: local, historical or group recipient, skipping remote federation enqueue"
         );
     } else {
         let target_ds_did = ds_did_opt.unwrap();

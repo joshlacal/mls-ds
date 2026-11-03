@@ -17,6 +17,7 @@ fn run_named(leaves: usize, name: &str) {
     let read = |name: &str| std::fs::read(directory.join(name)).unwrap();
     let ctx: Value = serde_json::from_slice(&read("context.json")).unwrap();
     let next: Value = serde_json::from_slice(&read("coordinates.json")).unwrap();
+    let archive_commitment: [u8; 32] = read("archive-commitment.bin").try_into().unwrap();
     let lifetime: Value = serde_json::from_slice(&read("lifetimes.json")).unwrap();
     let hash = |value: &Value| -> [u8; 32] {
         STANDARD
@@ -125,7 +126,8 @@ fn run_named(leaves: usize, name: &str) {
         transcript::direct_request_application_aad(
             &context_hash,
             &read("coordinates.json"),
-            ctx["firstMessageId"].as_str().unwrap()
+            ctx["firstMessageId"].as_str().unwrap(),
+            &archive_commitment,
         )
         .unwrap()
     );

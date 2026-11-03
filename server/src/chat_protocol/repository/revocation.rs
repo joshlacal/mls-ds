@@ -283,19 +283,6 @@ impl AppliedDeviceRevocationMutation {
             .execute(&mut **transaction)
             .await?;
         }
-        let has_req_push: bool =
-            sqlx::query_scalar("SELECT to_regclass('chat.request_push_bindings') IS NOT NULL")
-                .fetch_one(&mut **transaction)
-                .await?;
-        if has_req_push {
-            sqlx::query(
-                "DELETE FROM chat.request_push_bindings WHERE user_did = $1 AND device_id = $2",
-            )
-            .bind(&target_did)
-            .bind(target_device_id)
-            .execute(&mut **transaction)
-            .await?;
-        }
         complete_operation(
             transaction,
             &self.authority,
@@ -918,6 +905,11 @@ async fn prepare_device_revocation_replay(
           JOIN chat.device_keys device_key
             ON device_key.user_did=device.user_did
            AND device_key.device_id=device.device_id
+           AND device_key.enrollment_auth_generation<=device.auth_generation
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=device_key.user_did AND newer.device_id=device_key.device_id
+                  AND newer.enrollment_auth_generation>device_key.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=device.auth_generation)
          WHERE device.user_did=$1 AND device.device_id=$2
          FOR UPDATE OF device,device_key
         "#,

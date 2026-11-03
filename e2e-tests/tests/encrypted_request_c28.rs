@@ -36,7 +36,7 @@ use catbird_mls::{
         },
         MlsCryptoContext,
     },
-    GroupInvitationReference, MLSError,
+    MLSError,
 };
 use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, request_database_url,
@@ -225,7 +225,7 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
         .context("create target group")?;
     let target_cid = created.conversation_id.clone();
     alice_orchestrator
-        .add_members(&target_cid, &[bob.did.clone()])
+        .add_members(&target_cid, std::slice::from_ref(&bob.did))
         .await
         .context("add bob as pending invitee")?;
 
@@ -311,6 +311,34 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
         &serde_json::to_vec(&signed_prepare)?,
         &alice_public,
     )?;
+    // Same derivation as the shared fixture: the import authority is the
+    // earliest selected grant expiry, which must cover the preparation floor.
+    // (The floor itself is only `prepare time + 7 d + 300 s`; publication
+    // re-checks against its own time, so the floor alone goes stale.)
+    let minimum_import_until = chrono::DateTime::parse_from_rfc3339(
+        snapshot["minimumImportUntil"]
+            .as_str()
+            .context("minimumImportUntil")?,
+    )?
+    .timestamp();
+    let authority_import_until = selected
+        .iter()
+        .map(|device| {
+            Ok(chrono::DateTime::parse_from_rfc3339(
+                device["grant"]["body"]["expiresAt"]
+                    .as_str()
+                    .context("grant expiresAt")?,
+            )?
+            .timestamp())
+        })
+        .collect::<anyhow::Result<Vec<i64>>>()?
+        .into_iter()
+        .min()
+        .context("no selected devices")?;
+    anyhow::ensure!(
+        authority_import_until >= minimum_import_until,
+        "selected grant expires before preparation import floor"
+    );
 
     // 5. Alice bootstraps the 1:1 request group carrying the invitation note
     let context = json!({
@@ -342,16 +370,11 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
             .iter()
             .map(|d| decode_pkg(d, "keyPackageRef"))
             .collect::<anyhow::Result<_>>()?,
-        authority_import_until: u64::try_from(
-            chrono::DateTime::parse_from_rfc3339(
-                snapshot["minimumImportUntil"]
-                    .as_str()
-                    .context("minimumImportUntil")?,
-            )?
-            .timestamp(),
-        )?,
+        authority_import_until: u64::try_from(authority_import_until)?,
         preparation_request_digest: *verified_prepare.request_digest(),
         receipt_authority_key: server.receipt_public_key.clone(),
+        sequencer_did: "did:web:chat.catbird.blue".into(),
+        sequencer_receipt_authority_key: server.sequencer_receipt_public_key.clone(),
         text: "Please join our group chat".into(),
         invitation: Some(invitation_ref.clone()),
         metadata: GroupMetadataV1 {
@@ -360,6 +383,7 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
             description: String::new(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            space_avatar: None,
         },
     })?;
     let b = &journal.bootstrap;
@@ -372,6 +396,7 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
     body["preparationDigest"] = snapshot["preparationDigest"].clone();
     body["preparationRequestDigest"] = json!(STANDARD.encode(verified_prepare.request_digest()));
     body["contextHash"] = json!(STANDARD.encode(b.context_hash));
+    body["archiveCommitment"] = json!(STANDARD.encode(b.archive_commitment));
     body["next"] = b.coordinates.clone();
     body["importUntil"] = json!(chrono::DateTime::from_timestamp(b.import_until as i64, 0)
         .context("import timestamp")?
@@ -564,7 +589,7 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
         .context("outcome")?
         .remove("$type");
     let welcome_input = DirectRequestWelcomeInput {
-        bootstrap: b.clone(),
+        bootstrap: encrypted_requests::recipient_bootstrap(b),
         local_identity: bob_identity.as_bytes().to_vec(),
         local_package_ref: bob_package_ref.clone(),
         publication_request: exact_publication.clone(),
@@ -572,11 +597,12 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
         published_receipt: serde_json::to_vec(&normalized_receipt)?,
         receipt_authority_did: "did:web:chat.catbird.blue".into(),
         receipt_authority_key: server.receipt_public_key.clone(),
+        sequencer_receipt_authority_key: server.sequencer_receipt_public_key.clone(),
         preparation_request_digest: *verified_prepare.request_digest(),
     };
     bob_engine.process_direct_request(&welcome_input)?;
     let decrypted = bob_engine.decrypt_direct_request(&welcome_input)?;
-    let DirectRequestIntroductionResult::Ready { plaintext } = decrypted else {
+    let DirectRequestIntroductionResult::Ready { plaintext, .. } = decrypted else {
         anyhow::bail!("recipient introduction unavailable")
     };
     let intro = protocol::decode_direct_request_introduction(&plaintext)?;

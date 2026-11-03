@@ -33,7 +33,8 @@ use catbird_mls::{
 use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
     request_database_url, reviewed_request_migrations, seed_service_device, signed_mls_request,
-    validate_request_test_database_url, HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
+    validate_request_test_database_url, write_chat_declaration, HttpsDidFixture, ServiceIdentity,
+    ShippingServerFixture,
 };
 
 #[path = "support/live_direct_request.rs"]
@@ -167,12 +168,9 @@ fn set_recipient_view(
     set_policy(root, &["relationship", recipient, inviter], &row)
 }
 
+/// Consent reads `allowIncoming` from the recipient's Catbird chat declaration.
 fn set_incoming(root: &Path, recipient: &str, incoming: &str) -> anyhow::Result<()> {
-    set_policy(
-        root,
-        &["declaration", recipient],
-        &json!({"$type":"chat.bsky.actor.declaration","allowIncoming":incoming}),
-    )
+    write_chat_declaration(root, recipient, incoming)
 }
 
 fn record_uri(owner: &str, collection: &str) -> String {
@@ -453,6 +451,8 @@ fn build_publication(
             authority_import_until,
             preparation_request_digest: prep.prepare_digest,
             receipt_authority_key: rig.server.receipt_public_key.clone(),
+            sequencer_did: "did:web:chat.catbird.blue".into(),
+            sequencer_receipt_authority_key: rig.server.sequencer_receipt_public_key.clone(),
             text: "C08/C09 encrypted first contact".into(),
             invitation: None,
             metadata: GroupMetadataV1 {
@@ -461,6 +461,7 @@ fn build_publication(
                 description: String::new(),
                 avatar_blob_locator: None,
                 avatar_content_type: None,
+                space_avatar: None,
             },
         })?;
     let bootstrap = journal.bootstrap.clone();
@@ -471,6 +472,7 @@ fn build_publication(
     body["preparationDigest"] = preparation["preparationDigest"].clone();
     body["preparationRequestDigest"] = json!(STANDARD.encode(prep.prepare_digest));
     body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
+    body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
     body["next"] = bootstrap.coordinates.clone();
     body["importUntil"] = json!(
         chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
@@ -1382,7 +1384,7 @@ async fn c09_live_snapshot_includes_every_deliverable_device_and_ignores_unrelat
         ),
     ] {
         let input = DirectRequestWelcomeInput {
-            bootstrap: bootstrap.clone(),
+            bootstrap: encrypted_requests::recipient_bootstrap(&bootstrap),
             local_identity: identity.as_bytes().to_vec(),
             local_package_ref: package_ref,
             publication_request: publication_request.clone(),
@@ -1390,10 +1392,11 @@ async fn c09_live_snapshot_includes_every_deliverable_device_and_ignores_unrelat
             published_receipt: serde_json::to_vec(&published)?,
             receipt_authority_did: "did:web:chat.catbird.blue".into(),
             receipt_authority_key: rig.server.receipt_public_key.clone(),
+            sequencer_receipt_authority_key: rig.server.sequencer_receipt_public_key.clone(),
             preparation_request_digest: prep.prepare_digest,
         };
         engine.process_direct_request(&input)?;
-        let DirectRequestIntroductionResult::Ready { plaintext } =
+        let DirectRequestIntroductionResult::Ready { plaintext, .. } =
             engine.decrypt_direct_request(&input)?
         else {
             anyhow::bail!("{identity}: introduction unavailable")

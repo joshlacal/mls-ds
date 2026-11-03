@@ -270,6 +270,53 @@ impl HistoricalRehydrationAuthority {
         )?;
         Ok(evidence)
     }
+
+    /// Production loader entry point for a coordinator's `directRequestEntry`
+    /// whose opening ciphertext was pruned (O7). The redacted row keeps every
+    /// signed field except the ciphertext, which it replaces by that ciphertext's
+    /// SHA-256, so the publication binds the same coordinates, recipient, devices
+    /// and metadata as before. The sender signature over the erased bytes cannot
+    /// be re-verified: the caller has bound the redacted body to the sequencer's
+    /// own signed publication receipt and supplies the row's immutable request
+    /// digest and outer fingerprint. Same conversation and strict `seq < head`
+    /// bounds as every other historical control entry.
+    #[allow(dead_code)]
+    pub(crate) fn hydrate_pruned_direct_request_opening(
+        &self,
+        redacted_row_json: Vec<u8>,
+        historical_public_key: &[u8],
+        request_digest: [u8; 32],
+        outer_entry_fingerprint: [u8; 32],
+    ) -> Result<PersistedControlAuthority, StateMachineError> {
+        let entry = crate::chat_protocol::transcript::decode_pruned_direct_request_entry(
+            &redacted_row_json,
+            historical_public_key,
+            request_digest,
+            outer_entry_fingerprint,
+        )
+        .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        if entry.conversation_id().as_bytes() != &self.expected_conversation_id
+            || entry.seq() >= self.head_next_entry_seq
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let evidence = historical_transition_evidence(&entry, &self.expected_conversation_id)?;
+        PersistedControlRow::new(
+            redacted_row_json,
+            entry
+                .mutation()
+                .accepted_wrapper_bytes()
+                .ok_or(StateMachineError::InvalidHydrationAuthority)?
+                .to_vec(),
+            entry.outer_control_projection().to_vec(),
+            entry
+                .server_fields_dag_cbor()
+                .map_err(|_| StateMachineError::InvalidHydrationAuthority)?,
+            outer_entry_fingerprint,
+            evidence.durable_row_digest,
+        )?;
+        Ok(PersistedControlAuthority::Transition(evidence))
+    }
 }
 
 /// Head-binding-free duplicate of `HydrationAuthority::signed_request`

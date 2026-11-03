@@ -12,11 +12,6 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 
-use super::super::request_push::{
-    envelope_signing_bytes, RequestPushEligibilityBody, RequestPushEventBody,
-    SignedInternalEnvelope, REQUEST_PUSH_ELIGIBILITY_DOMAIN, REQUEST_PUSH_EVENT_DOMAIN,
-};
-
 pub const REQUEST_RECEIPT_AUTHORITY: &str = "did:web:chat.catbird.blue";
 
 pub struct DirectRequestReceiptSigner {
@@ -48,15 +43,16 @@ impl DirectRequestReceiptSigner {
         if signing_key.verifying_key() == service_key.verifying_key() {
             return Err("request receipt key must differ from service-auth key".into());
         }
-        let public = signing_key.verifying_key().to_encoded_point(true);
+        let public_key = signing_key.verifying_key().to_encoded_point(true);
         let document: Value =
             serde_json::from_str(document).map_err(|_| "invalid receipt DID document")?;
         let doc_id = document["id"]
             .as_str()
             .ok_or("missing receipt authority DID in document")?;
         let authority_did = doc_id.to_owned();
-        let key_id = direct_request_receipt_key_id_for_authority(&authority_did, public.as_bytes())
-            .map_err(|e| e.to_string())?;
+        let key_id =
+            direct_request_receipt_key_id_for_authority(&authority_did, public_key.as_bytes())
+                .map_err(|e| e.to_string())?;
         let methods = document["verificationMethod"]
             .as_array()
             .ok_or("missing receipt verification methods")?;
@@ -97,7 +93,7 @@ impl DirectRequestReceiptSigner {
                 return Err("duplicate receipt method".into());
             }
         }
-        if published_keys.get(&key_id).map(Vec::as_slice) != Some(public.as_bytes()) {
+        if published_keys.get(&key_id).map(Vec::as_slice) != Some(public_key.as_bytes()) {
             return Err("active receipt method is not published".into());
         }
         Ok(Self {
@@ -184,9 +180,9 @@ mod tests {
     }
     fn document(keys: &[&SigningKey]) -> String {
         let methods=keys.iter().map(|key|{
-            let public=key.verifying_key().to_encoded_point(true);
-            let mut multikey=vec![0x80,0x24];multikey.extend_from_slice(public.as_bytes());
-            serde_json::json!({"id":direct_request_receipt_key_id(public.as_bytes()).unwrap(),"controller":REQUEST_RECEIPT_AUTHORITY,"type":"Multikey","publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)})
+            let public_key=key.verifying_key().to_encoded_point(true);
+            let mut multikey=vec![0x80,0x24];multikey.extend_from_slice(public_key.as_bytes());
+            serde_json::json!({"id":direct_request_receipt_key_id(public_key.as_bytes()).unwrap(),"controller":REQUEST_RECEIPT_AUTHORITY,"type":"Multikey","publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)})
         }).collect::<Vec<_>>();
         serde_json::json!({"id":REQUEST_RECEIPT_AUTHORITY,"verificationMethod":methods}).to_string()
     }
@@ -256,237 +252,6 @@ mod tests {
     }
 
     #[test]
-    fn request_push_domains_are_distinct_and_sign_exact_base64url_body_bytes() {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        use chrono::{Duration, SecondsFormat, Utc};
-        use p256::ecdsa::signature::Verifier;
-        use uuid::Uuid;
-
-        let receipt = key(41);
-        let service = key(42);
-        let pem = receipt.to_pkcs8_pem(LineEnding::LF).unwrap();
-        let service_pem = service.to_pkcs8_pem(LineEnding::LF).unwrap();
-        let signer = DirectRequestReceiptSigner::configured(
-            pem.as_str(),
-            service_pem.as_str(),
-            &document(&[&receipt]),
-        )
-        .unwrap();
-        let event = Uuid::new_v4();
-        let request = Uuid::new_v4();
-        let conversation = Uuid::new_v4();
-        let first = Uuid::new_v4();
-        let device = Uuid::new_v4();
-        let now = Utc::now();
-        let payload = super::super::super::request_push::request_push_event_payload_digest(
-            event,
-            request,
-            conversation,
-            first,
-            "did:web:alice.example.org",
-            "did:web:bob.example.org",
-            &[device],
-        )
-        .unwrap();
-        let envelope = signer
-            .seal_request_push_event(RequestPushEventBody {
-                protocol_version: 1,
-                authority_did: REQUEST_RECEIPT_AUTHORITY.into(),
-                key_id: signer.key_id().into(),
-                event_id: event.to_string(),
-                request_id: request.to_string(),
-                conversation_id: conversation.to_string(),
-                first_message_id: first.to_string(),
-                sender_did: "did:web:alice.example.org".into(),
-                recipient_did: "did:web:bob.example.org".into(),
-                recipient_device_ids: vec![device.to_string()],
-                payload_digest: URL_SAFE_NO_PAD.encode(payload),
-                issued_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-                expires_at: (now + Duration::seconds(30))
-                    .to_rfc3339_opts(SecondsFormat::Millis, true),
-            })
-            .unwrap();
-        let body = URL_SAFE_NO_PAD.decode(&envelope.body).unwrap();
-        let signature =
-            Signature::from_slice(&URL_SAFE_NO_PAD.decode(&envelope.signature).unwrap()).unwrap();
-        assert!(signature.normalize_s().is_none());
-        let event_bytes = envelope_signing_bytes(REQUEST_PUSH_EVENT_DOMAIN, &body).unwrap();
-        receipt
-            .verifying_key()
-            .verify(&event_bytes, &signature)
-            .unwrap();
-        let wrong_domain = envelope_signing_bytes(REQUEST_PUSH_ELIGIBILITY_DOMAIN, &body).unwrap();
-        assert!(receipt
-            .verifying_key()
-            .verify(&wrong_domain, &signature)
-            .is_err());
-    }
-
-    /// F2: the eligibility decision instant comes from PostgreSQL. A database
-    /// clock ten minutes away from this process must still seal (it used to be
-    /// judged against `Utc::now()` and fail as an internal 500), while a window
-    /// that is wrong relative to that same instant is still refused.
-    #[test]
-    fn eligibility_envelope_is_judged_on_its_database_decision_instant() {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        use chrono::{Duration, SecondsFormat, Utc};
-        use uuid::Uuid;
-
-        let receipt = key(41);
-        let service = key(42);
-        let pem = receipt.to_pkcs8_pem(LineEnding::LF).unwrap();
-        let service_pem = service.to_pkcs8_pem(LineEnding::LF).unwrap();
-        let signer = DirectRequestReceiptSigner::configured(
-            pem.as_str(),
-            service_pem.as_str(),
-            &document(&[&receipt]),
-        )
-        .unwrap();
-        let body =
-            |checked: chrono::DateTime<Utc>, lifetime: Duration| RequestPushEligibilityBody {
-                protocol_version: 1,
-                authority_did: REQUEST_RECEIPT_AUTHORITY.into(),
-                key_id: signer.key_id().into(),
-                event_id: Uuid::new_v4().to_string(),
-                request_id: Uuid::new_v4().to_string(),
-                recipient_did: "did:web:bob.example.org".into(),
-                device_id: Uuid::new_v4().to_string(),
-                provider: "apns".into(),
-                registration_id: Uuid::new_v4().to_string(),
-                token_generation: 1,
-                binding_digest: URL_SAFE_NO_PAD.encode([3_u8; 32]),
-                target_key_id: URL_SAFE_NO_PAD.encode([7_u8; 32]),
-                device_auth_generation: 1,
-                conversation_id: Uuid::new_v4().to_string(),
-                first_message_id: Uuid::new_v4().to_string(),
-                sender_did: "did:web:alice.example.org".into(),
-                eligible: true,
-                checked_at: checked.to_rfc3339_opts(SecondsFormat::Millis, true),
-                expires_at: (checked + lifetime).to_rfc3339_opts(SecondsFormat::Millis, true),
-            };
-        for skew in [Duration::minutes(10), Duration::minutes(-10)] {
-            let database_now = Utc::now() + skew;
-            signer
-                .seal_request_push_eligibility(
-                    body(database_now, Duration::seconds(5)),
-                    database_now,
-                )
-                .expect("eligibility at the database decision instant seals despite host skew");
-            assert!(signer
-                .seal_request_push_eligibility(
-                    body(database_now, Duration::seconds(6)),
-                    database_now
-                )
-                .is_err());
-        }
-    }
-
-    #[test]
-    fn deterministic_request_push_interoperability_vector() {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        use p256::ecdsa::signature::Verifier;
-        use uuid::Uuid;
-
-        let receipt = key(41);
-        let service = key(42);
-        let pem = receipt.to_pkcs8_pem(LineEnding::LF).unwrap();
-        let service_pem = service.to_pkcs8_pem(LineEnding::LF).unwrap();
-        let authority_document = document(&[&receipt]);
-        let signer = DirectRequestReceiptSigner::configured(
-            pem.as_str(),
-            service_pem.as_str(),
-            &authority_document,
-        )
-        .unwrap();
-        let event = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
-        let request = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
-        let conversation = Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap();
-        let first = Uuid::parse_str("00000000-0000-4000-8000-000000000004").unwrap();
-        let device = Uuid::parse_str("00000000-0000-4000-8000-000000000005").unwrap();
-        let registration = Uuid::parse_str("00000000-0000-4000-8000-000000000006").unwrap();
-        let payload = super::super::super::request_push::request_push_event_payload_digest(
-            event,
-            request,
-            conversation,
-            first,
-            "did:web:alice.example.org",
-            "did:web:bob.example.org",
-            &[device],
-        )
-        .unwrap();
-        let event_body = RequestPushEventBody {
-            protocol_version: 1,
-            authority_did: REQUEST_RECEIPT_AUTHORITY.into(),
-            key_id: signer.key_id().into(),
-            event_id: event.to_string(),
-            request_id: request.to_string(),
-            conversation_id: conversation.to_string(),
-            first_message_id: first.to_string(),
-            sender_did: "did:web:alice.example.org".into(),
-            recipient_did: "did:web:bob.example.org".into(),
-            recipient_device_ids: vec![device.to_string()],
-            payload_digest: URL_SAFE_NO_PAD.encode(payload),
-            issued_at: "2026-09-19T12:00:00.000Z".into(),
-            expires_at: "2026-09-19T12:00:30.000Z".into(),
-        };
-        let eligibility_body = RequestPushEligibilityBody {
-            protocol_version: 1,
-            authority_did: REQUEST_RECEIPT_AUTHORITY.into(),
-            key_id: signer.key_id().into(),
-            event_id: event.to_string(),
-            request_id: request.to_string(),
-            recipient_did: "did:web:bob.example.org".into(),
-            device_id: device.to_string(),
-            provider: "apns".into(),
-            registration_id: registration.to_string(),
-            token_generation: 7,
-            binding_digest: URL_SAFE_NO_PAD.encode([7; 32]),
-            target_key_id: URL_SAFE_NO_PAD.encode([8; 32]),
-            device_auth_generation: 3,
-            conversation_id: conversation.to_string(),
-            first_message_id: first.to_string(),
-            sender_did: "did:web:alice.example.org".into(),
-            eligible: true,
-            checked_at: "2026-09-19T12:00:01.000Z".into(),
-            expires_at: "2026-09-19T12:00:06.000Z".into(),
-        };
-        let encode = |body: Vec<u8>, domain: &[u8]| {
-            let signature = signer.sign(&envelope_signing_bytes(domain, &body).unwrap());
-            let parsed = Signature::from_slice(&signature).unwrap();
-            assert!(parsed.normalize_s().is_none());
-            receipt
-                .verifying_key()
-                .verify(&envelope_signing_bytes(domain, &body).unwrap(), &parsed)
-                .unwrap();
-            SignedInternalEnvelope {
-                body: URL_SAFE_NO_PAD.encode(body),
-                signature: URL_SAFE_NO_PAD.encode(signature),
-            }
-        };
-        let event_envelope = encode(
-            serde_json::to_vec(&event_body).unwrap(),
-            REQUEST_PUSH_EVENT_DOMAIN,
-        );
-        let eligibility_envelope = encode(
-            serde_json::to_vec(&eligibility_body).unwrap(),
-            REQUEST_PUSH_ELIGIBILITY_DOMAIN,
-        );
-        let vector = serde_json::json!({
-            "version": 1,
-            "authorityDidDocument": serde_json::from_str::<Value>(&authority_document).unwrap(),
-            "compressedP256PublicKeyHex": hex::encode(receipt.verifying_key().to_encoded_point(true).as_bytes()),
-            "keyId": signer.key_id(),
-            "eventDomainBase64url": URL_SAFE_NO_PAD.encode(REQUEST_PUSH_EVENT_DOMAIN),
-            "eligibilityDomainBase64url": URL_SAFE_NO_PAD.encode(REQUEST_PUSH_ELIGIBILITY_DOMAIN),
-            "event": {"body": event_body, "envelope": event_envelope},
-            "eligibility": {"body": eligibility_body, "envelope": eligibility_envelope}
-        });
-        println!(
-            "REQUEST_PUSH_VECTOR={}",
-            serde_json::to_string(&vector).unwrap()
-        );
-    }
-    #[test]
     fn variable_configured_authority_signer_signs_and_verifies_own_authority() {
         use super::super::super::direct_request_transcript::verify_signed_request;
         let receipt = key(21);
@@ -495,11 +260,11 @@ mod tests {
         let service_pem = service.to_pkcs8_pem(LineEnding::LF).unwrap();
         let authority = "did:web:federated-node.example.org";
 
-        let public = receipt.verifying_key().to_encoded_point(true);
+        let public_key = receipt.verifying_key().to_encoded_point(true);
         let mut multikey = vec![0x80, 0x24];
-        multikey.extend_from_slice(public.as_bytes());
+        multikey.extend_from_slice(public_key.as_bytes());
         let key_id =
-            direct_request_receipt_key_id_for_authority(authority, public.as_bytes()).unwrap();
+            direct_request_receipt_key_id_for_authority(authority, public_key.as_bytes()).unwrap();
         let methods = vec![serde_json::json!({
             "id": key_id,
             "controller": authority,
@@ -545,7 +310,7 @@ mod tests {
         let verified = verify_signed_request(
             DirectRequestKind::Outcome,
             sealed.bytes(),
-            public.as_bytes(),
+            public_key.as_bytes(),
         )
         .unwrap();
         assert_eq!(verified.body()["authorityDid"], authority);
@@ -599,53 +364,5 @@ impl DirectRequestReceiptSigner {
             &direct_request_signing_bytes(DirectRequestKind::AcceptanceCommit, body)
                 .map_err(|e| e.to_string())?,
         ))
-    }
-
-    /// The event envelope is a wall-clock bearer between two services: the
-    /// worker stamps `issuedAt` from this host's clock and Nest judges it
-    /// against its own clock (like a JWT `iat`). No database time is involved,
-    /// so validating against the same host clock here is the intended
-    /// semantics.
-    pub(crate) fn seal_request_push_event(
-        &self,
-        body: RequestPushEventBody,
-    ) -> Result<SignedInternalEnvelope, String> {
-        body.validate(chrono::Utc::now())
-            .map_err(|e| e.to_string())?;
-        self.seal_internal_push_body(body, REQUEST_PUSH_EVENT_DOMAIN)
-    }
-
-    /// `checked_at` is the eligibility decision's database clock sample, so the
-    /// envelope window is judged at that same instant; a process wall clock
-    /// skewed from PostgreSQL would reject a correct positive or negative.
-    pub(crate) fn seal_request_push_eligibility(
-        &self,
-        body: RequestPushEligibilityBody,
-        checked_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<SignedInternalEnvelope, String> {
-        body.validate(checked_at).map_err(|e| e.to_string())?;
-        self.seal_internal_push_body(body, REQUEST_PUSH_ELIGIBILITY_DOMAIN)
-    }
-
-    fn seal_internal_push_body<T: serde::Serialize>(
-        &self,
-        body: T,
-        domain: &[u8],
-    ) -> Result<SignedInternalEnvelope, String> {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine as _;
-        let body = serde_json::to_vec(&body).map_err(|_| "invalid request push body")?;
-        let value: Value =
-            serde_json::from_slice(&body).map_err(|_| "invalid request push JSON")?;
-        if value["authorityDid"].as_str() != Some(self.authority_did())
-            || value["keyId"].as_str() != Some(self.key_id())
-        {
-            return Err("request push receipt authority mismatch".into());
-        }
-        let signing = envelope_signing_bytes(domain, &body).map_err(|e| e.to_string())?;
-        Ok(SignedInternalEnvelope {
-            body: URL_SAFE_NO_PAD.encode(&body),
-            signature: URL_SAFE_NO_PAD.encode(self.sign(&signing)),
-        })
     }
 }

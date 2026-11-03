@@ -19,7 +19,10 @@ use uuid::Uuid;
 use super::{delivery, prelude::ScopeBoundBusinessAuthority};
 use crate::chat_protocol::{
     relationship_policy::{PublicTransport, RelationshipAuthority},
-    state_machine::HydrationAuthority,
+    state_machine::{
+        FederatedOperationAdmission, HydrationAuthority, LockedRegistrationProjection,
+        StateMachineError,
+    },
     transcript::{self, CanonicalValueRef, VerifiedSignedMutation},
     validation::CanonicalUuidV4,
 };
@@ -35,6 +38,8 @@ pub(crate) enum MessageDeliveryError {
     DeviceNotLeaf,
     RecipientNotReady,
     RelationshipPolicyUnavailable,
+    /// A relationship source could not answer now: nothing was decided.
+    RelationshipSourceUnavailable,
     BlockedRelationship,
     RateLimited,
     BlobNotFound,
@@ -307,38 +312,95 @@ async fn require_relationship_policy<T: PublicTransport>(
     coordinate: Coordinate,
     relationship_authority: &RelationshipAuthority<T>,
 ) -> Result<(), MessageDeliveryError> {
-    let aggregate = super::core::hydrate_locked_conversation_state(
+    require_traffic_policy(
         tx,
         coordinate.conversation_id,
         authority.trusted_instant(),
+        relationship_authority,
+        |hydration| hydration.locked_registration_from_scope_authority(authority),
     )
     .await
+}
+
+/// [`send`]'s traffic check for a group application send its member's home
+/// `caller_ds` relayed here: the actor is `mutation`'s verified signer, bound
+/// to this transaction, which already locked the head and that member's
+/// device. The caller writes nothing before it passes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn require_relayed_traffic_policy<T: PublicTransport>(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    caller_ds: &str,
+    mutation: &VerifiedSignedMutation,
+    message_id: Uuid,
+    entry_id: Uuid,
+    signed_bytes: &[u8],
+    trusted_now: DateTime<Utc>,
+    relationship_authority: &RelationshipAuthority<T>,
+) -> Result<(), MessageDeliveryError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **tx)
+        .await?;
+    let admission = FederatedOperationAdmission::seal(
+        mutation.actor_did().clone(),
+        mutation.actor_device_id().clone(),
+        mutation.key_id().clone(),
+        *mutation.historical_public_key(),
+        mutation.auth_generation(),
+        trusted_now,
+        transaction_id,
+        crate::identity::canonical_did(caller_ds).to_owned(),
+        conversation_id,
+        entry_id,
+        Sha256::digest(signed_bytes).into(),
+        message_id,
+        "blue.catbird.chat.sendMessage".to_owned(),
+        *mutation.request_digest(),
+        *mutation.signature(),
+    )
     .map_err(|error| {
-        tracing::error!(?error, "traffic conversation hydration failed");
+        tracing::error!(?error, "relayed traffic admission failed");
         MessageDeliveryError::RelationshipPolicyUnavailable
     })?;
+    require_traffic_policy(
+        tx,
+        conversation_id,
+        trusted_now,
+        relationship_authority,
+        |hydration| hydration.locked_registration_from_federated_admission(&admission),
+    )
+    .await
+}
+
+/// The traffic relationship check of the actor `registration` binds, over the
+/// conversation whose head this transaction locked: a block is
+/// `BlockedRelationship`.
+async fn require_traffic_policy<T: PublicTransport>(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    locked_at: DateTime<Utc>,
+    relationship_authority: &RelationshipAuthority<T>,
+    registration: impl FnOnce(
+        &HydrationAuthority,
+    ) -> Result<LockedRegistrationProjection, StateMachineError>,
+) -> Result<(), MessageDeliveryError> {
+    let aggregate = super::core::hydrate_locked_conversation_state(tx, conversation_id, locked_at)
+        .await
+        .map_err(hydration_failure)?;
     let hydration = HydrationAuthority::from_locked_conversation(&aggregate).map_err(|error| {
         tracing::error!(?error, "traffic hydration authority failed");
         MessageDeliveryError::RelationshipPolicyUnavailable
     })?;
-    let registration = hydration
-        .locked_registration_from_scope_authority(authority)
-        .map_err(|error| {
-            tracing::error!(?error, "traffic registration authority failed");
-            MessageDeliveryError::RelationshipPolicyUnavailable
-        })?;
+    let registration = registration(&hydration).map_err(|error| {
+        tracing::error!(?error, "traffic registration authority failed");
+        MessageDeliveryError::RelationshipPolicyUnavailable
+    })?;
     let fallback = super::relationship::seal_traffic_fallback_scope(&aggregate, &registration)
-        .map_err(|error| {
-            tracing::error!(?error, "traffic fallback scope sealing failed");
-            MessageDeliveryError::RelationshipPolicyUnavailable
-        })?;
+        .map_err(relationship_failure)?;
     let (projection, decision) =
         super::relationship::load_fallback_traffic_projection(tx, fallback, relationship_authority)
             .await
-            .map_err(|error| {
-                tracing::error!(?error, "traffic fallback loading failed");
-                MessageDeliveryError::RelationshipPolicyUnavailable
-            })?
+            .map_err(relationship_failure)?
             .ok_or(MessageDeliveryError::RelationshipPolicyUnavailable)?;
     super::relationship::consume_locked_traffic_projection(
         &projection,
@@ -355,6 +417,57 @@ async fn require_relationship_policy<T: PublicTransport>(
             MessageDeliveryError::RelationshipPolicyUnavailable
         }
     })
+}
+
+/// The traffic check's conversation hydration failed. This DS's store failing,
+/// at any depth, is storage; anything else leaves the policy unevaluated.
+fn hydration_failure(error: super::core::ConversationStateHydrationError) -> MessageDeliveryError {
+    use super::core::{
+        ConversationHeadHydrationError as Head, ConversationStateHydrationError as State,
+        IntervalHydrationError as Intervals, LeafHydrationError as Leaves,
+        MetadataHydrationError as Metadata, ParticipantHydrationError as Participants,
+        ProducerHydrationError as Producer, PublicStateHydrationError as PublicState,
+        RecoveryHydrationError as Recovery, ResetLeaveHydrationError as ResetLeave,
+        TerminalProofHydrationError as TerminalProofs, WelcomeHydrationError as Welcomes,
+    };
+    match error {
+        State::Database(error)
+        | State::Head(Head::Database(error))
+        | State::PublicState(PublicState::Database(error))
+        | State::Producer(Producer::Database(error))
+        | State::Metadata(Metadata::Database(error))
+        | State::Participants(Participants::Database(error))
+        | State::Leaves(Leaves::Database(error))
+        | State::Intervals(Intervals::Database(error))
+        | State::RecoveryWork(Recovery::Database(error))
+        | State::ResetWork(ResetLeave::Database(error))
+        | State::LeaveWork(ResetLeave::Database(error))
+        | State::Welcomes(Welcomes::Database(error))
+        | State::TerminalProofs(TerminalProofs::Database(error)) => {
+            MessageDeliveryError::Database(error)
+        }
+        error => {
+            tracing::error!(?error, "traffic conversation hydration failed");
+            MessageDeliveryError::RelationshipPolicyUnavailable
+        }
+    }
+}
+
+/// Sealing or loading the traffic projection failed. This DS's store failing
+/// is storage; a source that could not answer now decided nothing; anything
+/// else leaves the policy unevaluated.
+fn relationship_failure(
+    error: super::relationship::RelationshipRepositoryError,
+) -> MessageDeliveryError {
+    use super::relationship::RelationshipRepositoryError as R;
+    match error {
+        R::Database(error) => MessageDeliveryError::Database(error),
+        R::Unavailable => MessageDeliveryError::RelationshipSourceUnavailable,
+        error @ (R::InvalidProjection | R::InvalidAuthorityConfiguration(_)) => {
+            tracing::error!(?error, "traffic relationship policy could not be evaluated");
+            MessageDeliveryError::RelationshipPolicyUnavailable
+        }
+    }
 }
 
 fn validate_application_message(
@@ -647,7 +760,10 @@ pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
                 _ => MessageDeliveryError::Invariant,
             })?;
     }
-    if !head.is_remote {
+    // A group's remote homes receive every entry, application ones included,
+    // through the ordered `deliverGroupEntry` stream its handler queues; only
+    // direct conversations replicate applications through `deliverMessage`.
+    if !head.is_remote && head.kind != "group" {
         let _ =
             crate::chat_protocol::repository::federation::enqueue_clean_federation_message_jobs(
                 tx,
@@ -778,6 +894,43 @@ mod tests {
         assert!(matches!(
             admit_typing(conversation, typing, did, device, false, now),
             Err(MessageDeliveryError::RateLimited)
+        ));
+    }
+
+    /// The traffic check's own store failing, at any hydration depth or while
+    /// loading its projection, is storage; a relationship source that could
+    /// not answer now is its own retryable failure.
+    #[test]
+    fn traffic_policy_failures_keep_their_class() {
+        use super::super::core::{
+            ConversationHeadHydrationError as Head, ConversationStateHydrationError as State,
+            ParticipantHydrationError as Participants,
+        };
+        use super::super::relationship::RelationshipRepositoryError as R;
+        for error in [
+            State::Head(Head::Database(sqlx::Error::PoolTimedOut)),
+            State::Participants(Participants::Database(sqlx::Error::PoolTimedOut)),
+        ] {
+            assert!(matches!(
+                hydration_failure(error),
+                MessageDeliveryError::Database(_)
+            ));
+        }
+        assert!(matches!(
+            hydration_failure(State::ReadSetMismatch),
+            MessageDeliveryError::RelationshipPolicyUnavailable
+        ));
+        assert!(matches!(
+            relationship_failure(R::Database(sqlx::Error::PoolTimedOut)),
+            MessageDeliveryError::Database(_)
+        ));
+        assert!(matches!(
+            relationship_failure(R::Unavailable),
+            MessageDeliveryError::RelationshipSourceUnavailable
+        ));
+        assert!(matches!(
+            relationship_failure(R::InvalidProjection),
+            MessageDeliveryError::RelationshipPolicyUnavailable
         ));
     }
 }

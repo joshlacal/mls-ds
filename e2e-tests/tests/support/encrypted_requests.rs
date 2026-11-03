@@ -9,12 +9,20 @@
 
 #![allow(dead_code)]
 
+#[path = "../../../server/tests/common/direct_request_migrations.rs"]
+mod request_migrations;
+pub use request_migrations::{
+    assert_current_migration_frontier, reviewed_auth_replay_prerequisite, reviewed_baseline,
+    reviewed_migrations, reviewed_prerequisites, reviewed_request_migrations, BaselineMigration,
+    FEDERATION_CACHE_SCHEMA,
+};
+
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{LazyLock, Mutex, OnceLock},
 };
 
 use anyhow::{bail, Context, Result};
@@ -23,6 +31,7 @@ use base64::{
     Engine as _,
 };
 use catbird_mls::chat_v2::transcript::direct_request::{self as protocol, DirectRequestKind};
+use catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestBootstrap;
 use mls_e2e_tests::mls_engine::MlsEngine;
 use p256::{
     ecdsa::{signature::Signer as _, Signature, SigningKey},
@@ -54,6 +63,11 @@ const SERVICE_AUTH_MIGRATION_VERSION: i64 = 20260820000001;
 const SERVICE_AUTH_MIGRATION_DESCRIPTION: &str = "chat service auth admissions";
 
 static DATABASE_SETUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// The HTTPS fixture PDS root serving each DID (`HttpsDidFixture::start`), so
+/// that enrolling a device through `seed_service_device` also publishes its
+/// PDS device record, as a real client's enrollment does.
+static FIXTURE_PDS_ROOTS: LazyLock<Mutex<HashMap<String, PathBuf>>> =
+    LazyLock::new(Default::default);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FaultBoundary {
@@ -110,94 +124,6 @@ impl DeterministicFaultTransport {
         self.checkpoint(FaultBoundary::AfterCommittedResponse)?;
         Ok(response)
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct BaselineMigration {
-    pub filename: &'static str,
-    pub version: i64,
-    pub description: &'static str,
-    pub reviewed_sha384: &'static str,
-    pub sql: &'static str,
-}
-
-macro_rules! baseline {
-    ($version:literal, $description:literal, $filename:literal, $sha384:literal) => {
-        BaselineMigration {
-            filename: $filename,
-            version: $version,
-            description: $description,
-            reviewed_sha384: $sha384,
-            sql: include_str!(concat!("../../../server/migrations/", $filename)),
-        }
-    };
-}
-
-pub fn reviewed_baseline() -> [BaselineMigration; 14] {
-    [
-        baseline!(20260722000001, "chat protocol core", "20260722000001_chat_protocol_core.sql", "dd48feea7beafae59fbc11516e8c1ae91382b356b80366056f71d2493c10923bd39ff0739fe08cb4b0452b0ec82132ff"),
-        baseline!(20260722000002, "chat protocol delivery", "20260722000002_chat_protocol_delivery.sql", "86952763aaeb8f4cf8a8a18dd5d022a5357d450193e265a18da5a771513b9d4c7c8408bad27c4f4ba3b712b41b80e504"),
-        baseline!(20260722000003, "chat protocol blobs", "20260722000003_chat_protocol_blobs.sql", "310101886f60d3a663ee5df829bbc86a96a45e23adee754220d3b06fd74acfd708d23a138124872a5177244d3e14e8eb"),
-        baseline!(20260725000001, "prepare welcome provenance backfill", "20260725000001_prepare_welcome_provenance_backfill.sql", "3f3d1660193bc37aa8c9876e636a4918f59404f0e055f509b9a67158b6028d947adc299c4d776a693bf8b75e647d90a8"),
-        baseline!(20260725000002, "refine welcome provenance quarantine", "20260725000002_refine_welcome_provenance_quarantine.sql", "8dd0a595288182e2c36aed67d7155138a0817deb5d236dd1eaea50f066a90d7949f60c0de6bff5c9e8bd28e4a1c50de2"),
-        baseline!(20260726000001, "welcome supersession provenance", "20260726000001_welcome_supersession_provenance.sql", "78c31ff78db5b8889fb00cb7024186a0f048975fc7a059c667e326162e3f338396d9760143367c9206802d21269484f4"),
-        baseline!(20260726000002, "restore welcome provenance deferred triggers", "20260726000002_restore_welcome_provenance_deferred_triggers.sql", "1b29d045575aea2552ac10bdb61451662d51bca5afa75827e030e5dd859eee0d1664e12a69ecea9692e0fadb2a8df4af"),
-        baseline!(20260726000003, "finalize welcome provenance triggers", "20260726000003_finalize_welcome_provenance_triggers.sql", "8bd956b8383bea542c6d591ae7721b92b898cb07e49b503131bedfbb511937147766569bcd2b23da11b226decffec495"),
-        baseline!(20260728000001, "chat operation claims", "20260728000001_chat_operation_claims.sql", "fd71f2eb5235226371f113b5738b752b27e901b72810e9ec1e1f201e979606e0b09a16be087103e4146b4fb9f8bdff8f"),
-        baseline!(20260728000002, "exact operation claim mutation kind", "20260728000002_exact_operation_claim_mutation_kind.sql", "a5c0225818e350415e0ad3a88c5016d621a75bb64563f97023de9d27498cf113d8ef9d95c98621036c15ac3398dbee17"),
-        baseline!(20260728000003, "defer operation claim principal fk", "20260728000003_defer_operation_claim_principal_fk.sql", "d42c64d98f6af2042ecf5d08b925aaadae01efcd7d1f6d1887c5485e0862d80304bb9ba54506a1876eba54b505d4114a"),
-        baseline!(20260728000004, "activate operation claim completeness", "20260728000004_activate_operation_claim_completeness.sql", "7de97f6f84a9cfcbf535b990b5aec87930450cf6661c7d8cf11920bdf53fd0fe94623e9ed222a8eeb562c1ee596c5bd6"),
-        baseline!(20260729000001, "chat g7 inventory entitlement", "20260729000001_chat_g7_inventory_entitlement.sql", "2c00fc11f1d96b79c3c86320e769d70d52fecb477a8a2bc351151fd2d01e3d4c5df19cbf7a3ac482edbe16a33a0dd60e"),
-        baseline!(20260730000001, "reset request revocation terminal", "20260730000001_reset_request_revocation_terminal.sql", "36ea55abb2cc644213fad4edd21df3e3ee10e680d63e714a22193eaf483fb022cf76106bf79fdd8a4ba1c285eb64d28b"),
-    ]
-}
-
-pub fn reviewed_request_migrations() -> [BaselineMigration; 43] {
-    [
-        baseline!(20260919000001, "direct request preparation", "20260919000001_direct_request_preparation.sql", "d4d3527aa77b8fe91d8d754f72290b682571cc6731866d72c059f10d4b2f7cf8ef629069737addeedaabd6f6eee682ca"),
-        baseline!(20260919000002, "direct request publication", "20260919000002_direct_request_publication.sql", "7fda0b09fcdef20e4da2e1701f6a56c12f636f7881b46e2f6e249cb0d5fc2aa63c734dc07cbb543169398253e29cec9e"),
-        baseline!(20260919000003, "direct request lifecycle", "20260919000003_direct_request_lifecycle.sql", "c51bc3851c68556437867249e163fd320fd792f62401695df1c5e9182aa5141687c5e193fdb9d11a37d7ff6be3811572"),
-        baseline!(20260919000004, "direct request welcome delivery", "20260919000004_direct_request_welcome_delivery.sql", "a93682f234ab1c2efdf98d6da51c444d89d750a224b67117f65e34045d54e6ada28c69858433bfc93be70c8e4b7827c4"),
-        baseline!(20260919000005, "direct request budget release", "20260919000005_direct_request_budget_release.sql", "0c2e4c2b2b5f3fe662e5d91ae85969825ac932ad708e4840cfa3f426414462d678547e49e481ff9eeda531f40828fad0"),
-        baseline!(20260919000006, "direct request attempt null fences", "20260919000006_direct_request_attempt_null_fences.sql", "871e44752b1f8e35a684589ada95e2bdfdf88c667c6e371bdbae15f8ff2e6bb513fbc369b74bc4bd9244c6e693f9ac4c"),
-        baseline!(20260919000007, "direct request publication integrity", "20260919000007_direct_request_publication_integrity.sql", "6f6192cd5d620becadd5bcd47cb38e50b30ab999ea7c3c410804a527bcb23aaa10f3913098211ce072cafdb6591af6db"),
-        baseline!(20260919000008, "direct request lifecycle fences", "20260919000008_direct_request_lifecycle_fences.sql", "64dcfb75a6adc3ed3509cdb6e439ff745813286e7baad2b0ad3c71bc5722694eef13bd4e12e048636e5c27a2964e65d0"),
-        baseline!(20260919000009, "direct request acceptance claims", "20260919000009_direct_request_acceptance_claims.sql", "c1210eb15ecc821c380acd4fbc3fff471d6b42304d38f60f6c6acb9e7b91f233421e32ce18d99802b9e6fdd050d72e9a"),
-        baseline!(20260919000010, "direct request retained artifacts", "20260919000010_direct_request_retained_artifacts.sql", "598aea96b9a02d6c3c24937e81929c14496cdb24698dd8be9a091609c8d40975f5957242a5a81aeeedab2cb79cb36288"),
-        baseline!(20260919000011, "direct request lifecycle slots", "20260919000011_direct_request_lifecycle_slots.sql", "158cee3681184afb77ba824c3357717f945027d93ba75c33b1f5d5cc568d6098e33b0874a5465a6d76cbca72a2d604bf"),
-        baseline!(20260919000012, "direct request welcome slot digest", "20260919000012_direct_request_welcome_slot_digest.sql", "dbe9835b66cba3edd3c21ca1756ae1ee2b13a8c0fbb67fea3dc3b1f754bc5eca90d7a36fff1ff10c6ad568f52eb3312d"),
-        baseline!(20260919000013, "direct request signed json projection", "20260919000013_direct_request_signed_json_projection.sql", "d8170f613b3c2c2fc087b8ab7c5f24d15dd4379ba3605048390beccbdecdd85a525f5d70c3b340d98d053c543d924156"),
-        baseline!(20260919000014, "direct request nul comparison", "20260919000014_direct_request_nul_comparison.sql", "2f47a3019d459b7989f544773da035e10914af95b85ad553afd70e84367189085a3c8507b7314bfa84d4cc4335a1d8b8"),
-        baseline!(20260919000015, "direct request entry identity", "20260919000015_direct_request_entry_identity.sql", "157cac50d04bd77388897fe386acd915ece5046c40923dec21675726ed091ac5b709691664a57241f67c8415e73cf29d"),
-        baseline!(20260919000016, "direct request push bindings", "20260919000016_direct_request_push_bindings.sql", "483aee1650f60a488d2a6498c11e4ce229906889ca1a655c37f080fefccf610bc4f552b06a63719ff471f95c060360f8"),
-        baseline!(20260919000017, "direct request push outbox", "20260919000017_direct_request_push_outbox.sql", "813c165f4e1739fb81d1cd26b2e1cea505745b1df77d22d6ca4882ba44bf2a9446a0929be20320e04a22c93e2bdc380b"),
-        baseline!(20260919000018, "fix direct request lifecycle close fence", "20260919000018_fix_direct_request_lifecycle_close_fence.sql", "db45c270c4f162078319724213518f3d3186ab5883ff75729e253663874738a001fa61af41791065eeca2f8c76bc1974"),
-        baseline!(20260919000019, "variable receipt authority keys", "20260919000019_variable_receipt_authority_keys.sql", "dc201702f4e21d124b664a81d8cc60105d92c2ba7fa9e7fe3ea8523e4a091adfc54b0f57663efab00cb46815cf6029ea"),
-        baseline!(20260919000021, "direct request capacity abuse fix", "20260919000021_direct_request_capacity_abuse_fix.sql", "5b6d18e3f9a43bccf357ee37f0df7b322d956369fb55cd036fbbbdb4e63f5c291730ac10885b6de511a697cb365939ca"),
-        baseline!(20260919000022, "federated transport inbox", "20260919000022_federated_transport_inbox.sql", "392d0137456574b46aeb05d71fdd6a9084bc364c102fa206f64a48c26441355fad52b3568386b5574aa8bedc15882e5a"),
-        baseline!(20260919000023, "expired federated lease release", "20260919000023_expired_federated_lease_release.sql", "f8b78fd5368f0d9521ec0498f14aaf7f928be8ca4cef35c7e794aac7ed72970a7337e348675ab9eaf873351df3c5b0c5"),
-        baseline!(20260919000024, "C33 coordinator hardening", "20260919000024_c33_coordinator_hardening.sql", "ebc8d84f7b7ad0dd3005fb268956f52a4b9c8bea8134ae5fdeee94fda232e222d816dbbbf16a45d7420f3a5099a7c5e7"),
-        baseline!(20260919000025, "federated inventory conversation items", "20260919000025_federated_inventory_conversation_items.sql", "c8cd858bc6805485334ad90e96673123b215591282f9625c55e2315a624430f77460fdda0e444a61abffe45433f0a9b1"),
-        baseline!(20261004000001, "reconcile conversation identity whitelist", "20261004000001_reconcile_conversation_identity_whitelist.sql", "10579dbb921d3e024a5bdc6ac221e1906d381375849a127da3b3784dc36630d0e50ff624485464d04d66b1a10e074a53"),
-        baseline!(20261004100001, "labyrinth mailbox and directory", "20261004100001_labyrinth_mailbox_and_directory.sql", "78413b0611149fe8b7208d065ea455d05cef061ee2f213030bc41a70ee96739928dcdc126d550c0f6898dbf6e95c74c3"),
-        baseline!(20261004100002, "labyrinth threads", "20261004100002_labyrinth_threads.sql", "0c57cba0d98367123234c154be7e6d1f26a304aff48b34ea192d2698f0f564629ac15ad6b5e32237c12d1aecc9e46b04"),
-        baseline!(20261004100003, "labyrinth orf and attachments", "20261004100003_labyrinth_orf_and_attachments.sql", "118124f987ae00db52e938aaa627a14721becb8ceda48bd4aa0dbfe799cc0004f3120c7297c1956db3b772a3f1413764"),
-        baseline!(20261004100004, "labyrinth device binding", "20261004100004_labyrinth_device_binding.sql", "c5f6e9627a9ff1fb5d2da93c17a73dcef74679d57a5c3d7cf12e86f45c814d8e9e45797b2547abaa37621e99f39ac50e"),
-        baseline!(20261004100005, "labyrinth attachment refs v2", "20261004100005_labyrinth_attachment_refs_v2.sql", "2dcc30aeebbe4d2de63ef0b794beef8a9958665f6df391011b56515c963cce6cec89c0c60e7e357bb54a32d4e9be12c4"),
-        baseline!(20261004100006, "labyrinth retention", "20261004100006_labyrinth_retention.sql", "b7ce72e7f162c626695739dbf5a62c6eb59126c95629e24c6c5c94857f0638f1e29c6f71a7eac5a2798e6b820e2a7b53"),
-        baseline!(20261004100007, "labyrinth blob gc pin", "20261004100007_labyrinth_blob_gc_pin.sql", "e3efe50d180d6250c722918628ed7334cde492246460f18dc92ca6ebc2a3ae7b43f5be9dfdb35a341439f7f25994f740"),
-        baseline!(20261004100008, "labyrinth lookup indexes", "20261004100008_labyrinth_lookup_indexes.sql", "0e5908d59cbe9758b1de17fb06aefff6461c3592df05a3493012d892b23ef0d045476b14d97b41a895c52c896a672f54"),
-        baseline!(20261004100009, "labyrinth review2 hardening", "20261004100009_labyrinth_review2_hardening.sql", "990321ab67d1bb32f19e5f98cb1647f7c6267663b91b69d922efacb50a5fac3c1c384724c8c10ba18bf6afc7b02ce61f"),
-        baseline!(20261023000001, "labyrinth space references", "20261023000001_labyrinth_space_references.sql", "1011321e3d877785ecb846e84a44d347d6478e6ecaa015b2aa0833f571eb6a784eb8cc1c2e69bfe6aaf9efa6f3ec0748"),
-        baseline!(20261025000001, "generated transition wrapper kind", "20261025000001_generated_transition_wrapper_kind.sql", "ab163acf42140744e86c5892e434068f14c31830e396e38ed07d814d4ca4936c6f7c348ec92bfa7993b4acbe525db983"),
-        baseline!(20261031100001, "labyrinth security hardening", "20261031100001_labyrinth_security_hardening.sql", "e21a41990ae1234c2b438fc69011636037a7bd83ace728c30afafb2b16ab4e22221cd1215638ac3348d8336e99402051"),
-        baseline!(20261031200001, "clean slate spaces only", "20261031200001_clean_slate_spaces_only.sql", "9680fd2643b146edb6168f68d39ed3f164429243a4777273a89e63cbb081bfc9847eba4fecef998ee102766d09d1a829"),
-        baseline!(20261031200002, "space host operational state", "20261031200002_space_host_operational_state.sql", "7b332d3e52efd64bafd7275c078dff9bd06769582f811974639f35600afcbb9988eb17c8783acb57f66cbcfa8c1a1dbe"),
-        baseline!(20261031200003, "fix wipe closed conversation operational rows", "20261031200003_fix_wipe_closed_conversation_operational_rows.sql", "4853b31de7c5960b546089db2128d2c9095ac661734ba8991b484b5a4bedb8420ee70bb063d8642278a362ca23bab96f"),
-        baseline!(20261102000001, "group transport entry recipients", "20261102000001_group_transport_entry_recipients.sql", "918fb25c2c7c6826ae18eed9c38241efee20d27214e7c42dce5fdcccd7a02adcc73af45f0aa69747aa1e2ecfe40f2195"),
-        baseline!(20261102000002, "group key package exports", "20261102000002_group_key_package_exports.sql", "17d3d172e4c8340a80f2677fac9387ae69c8210a3cf4c4a9bc6d08375a99ac1fbf78488f891a114bc96da3b56d300554"),
-        baseline!(20261102000003, "conversation close terminal entries", "20261102000003_conversation_close_terminal_entries.sql", "3b32d6d3b3dab9d0f785d48d8b9a1b352e7c5329ff3697bcf83fc00744fe91edf4b1763243e4a17dbab885c344c57e30"),
-    ]
 }
 
 /// The only alternatives to the shared guarded database, each dedicated to
@@ -272,54 +198,6 @@ pub fn route_to_dedicated_database(url: &str) -> Result<()> {
         "request harness already routed to {routed}; cannot reroute to {url}"
     );
     Ok(())
-}
-
-fn reviewed_send_message_prerequisite() -> BaselineMigration {
-    baseline!(20260816000001, "enable send message operation claims", "20260816000001_enable_send_message_operation_claims.sql", "ae9cc21dd145c3608a57e1f96654b67d53709dba17e3f347758aa8b93830c725d380230751d83f85c497132b8669a30e")
-}
-
-fn reviewed_inventory_gc_prerequisite() -> BaselineMigration {
-    baseline!(20260821000001, "fix expired inventory session gc", "20260821000001_fix_expired_inventory_session_gc.sql", "42790274fbeb43bce44aa9638d23328223042933af03e6453a0c8c3640b9bcf236d0bc0b8cd76e1e5d846be7c6bfc78a")
-}
-
-fn reviewed_pending_inventory_prerequisite() -> BaselineMigration {
-    baseline!(20260907000001, "chat direct pending inventory", "20260907000001_chat_direct_pending_inventory.sql", "82708d24b2deb72452ebdaf28749aa86ed95075f7ed920c4cc5526962e2ae9f9d8561a5029fc853ba654564d76ef63f1")
-}
-
-fn reviewed_service_auth_prerequisite() -> BaselineMigration {
-    baseline!(20260820000001, "chat service auth admissions", "20260820000001_chat_service_auth_admissions.sql", "2e8cb6bf47498402e56ba5c2fc753114c1d46e0767c98aa243c47993eb4f51a84de89469a8ae9af6bfac751ddadd18ac")
-}
-
-fn reviewed_legacy_dpop_prerequisite() -> BaselineMigration {
-    baseline!(20260820000002, "chat nullable legacy dpop jkt", "20260820000002_chat_nullable_legacy_dpop_jkt.sql", "d1914c731e0fbf81f5b0a9bf9cd77c12f2943fd940c36b9a351b1156b5ca09b55f2b4b44c6810012b4377f6ac283955d")
-}
-
-fn reviewed_performance_indices_prerequisite() -> BaselineMigration {
-    baseline!(20260824000001, "chat performance indices", "20260824000001_chat_performance_indices.sql", "e5f3f169724d2afc84043d80057bf9e494fbc9ad617ced0feaebb469d1be68788e7c19e19a67fb36296b85ee803139e0")
-}
-
-/// Every reviewed prerequisite between the immutable baseline and the request
-/// migrations, in production version order. The guarded ledger prefix must
-/// match this exact sequence.
-pub fn reviewed_prerequisites() -> [BaselineMigration; 16] {
-    [
-        reviewed_send_message_prerequisite(),
-        reviewed_service_auth_prerequisite(),
-        reviewed_legacy_dpop_prerequisite(),
-        reviewed_inventory_gc_prerequisite(),
-        reviewed_performance_indices_prerequisite(),
-        baseline!(20260824000002, "chat actor ds mapping", "20260824000002_chat_actor_ds_mapping.sql", "57b80b7f4e753c12bd97553fc8308b4eb04f9f2e39809cc32ed2b65337319721d73c31d9acf33b3c8c64c8f516d60c31"),
-        baseline!(20260824000003, "chat federation routing", "20260824000003_chat_federation_routing.sql", "0a70985a3b5811483791911b6ae3b9d0ebd0fbcd9fc53363e65c59ca1c71a1cbd2a74fc02e87ba22dd0321c7f30713e6"),
-        baseline!(20260824000004, "chat federation delivery receipts", "20260824000004_chat_federation_delivery_receipts.sql", "37ce660ad4630345dfdb0c106631b8926b2d2dfed0780210c072825e3a93f6455ba16a017ffdaaba243afe4c83f5f222"),
-        baseline!(20260824000005, "chat federation outbox retry", "20260824000005_chat_federation_outbox_retry.sql", "6d20fd054646d7da6de338b9ae27fea7c81a19569dfebc6231de5bc23bc79ca9aa22ab790cead55d82b06846f81dd799"),
-        baseline!(20260828000001, "chat historical bootstrap quota", "20260828000001_chat_historical_bootstrap_quota.sql", "c063fd2991cb28ce6947c587f11e2316bb5e02587873d86e89ff74476f880796c63ca1a90064f70c10fe7ed7cc0eb293"),
-        baseline!(20260828000002, "chat historical bootstrap application", "20260828000002_chat_historical_bootstrap_application.sql", "7095f7c32b74c6660fcf8c03610ee88c8db5330639088a907fc996a20d7f47f948ca43ff64cef014a1107bf9626c0013"),
-        baseline!(20260828000003, "chat historical bootstrap cutoff validate", "20260828000003_chat_historical_bootstrap_cutoff_validate.sql", "4e2387ebf31369278e1504a8e00e548a0fd80eafc2adb5a461c01ceab30be2bd84e841eba12a366f51f5a1b1617a3917"),
-        baseline!(20260828000004, "chat device push tokens", "20260828000004_chat_device_push_tokens.sql", "f8f4da493f6a3bf6261d2e09d6706ec6b4a395511a1eed6c5a557b5bb119b6f04aeabd9d3514db984e5e695894fe2fb1"),
-        baseline!(20260828000005, "fix inventory session gc scoping", "20260828000005_fix_inventory_session_gc_scoping.sql", "cae43253509fd13c468a741f360d1371e0d9a099a67ed951c683b23fb98960861e2d00ed3522d341ff026801f86059a2"),
-        baseline!(20260905000001, "chat historical recovery package mapping", "20260905000001_chat_historical_recovery_package_mapping.sql", "a66f9dc9bd5f8f1cb3da0f3ddfcb64c08fc068de39602891e584c86cdbaebd1de2d29b6bb46959155496639ad12f9c5d"),
-        reviewed_pending_inventory_prerequisite(),
-    ]
 }
 
 fn validate_reviewed_baseline_source() -> Result<()> {
@@ -426,71 +304,21 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
         "SELECT coalesce(json_agg(json_build_object('version',version,'description',description,'success',success,'checksum',encode(checksum,'hex')) ORDER BY version),'[]'::json)::text FROM public._sqlx_migrations",
     )?)
     .context("decode encrypted-request migration ledger")?;
-    let baseline = reviewed_baseline();
+    let expected: Vec<_> = reviewed_migrations().collect();
     anyhow::ensure!(
-        ledger.len() >= baseline.len(),
-        "migration ledger lost reviewed baseline rows"
-    );
-    for (actual, expected) in ledger.iter().take(14).zip(baseline.iter()) {
-        anyhow::ensure!(
-            actual.version == expected.version,
-            "reviewed baseline version drift"
-        );
-        anyhow::ensure!(
-            actual.description == expected.description,
-            "reviewed baseline description drift"
-        );
-        anyhow::ensure!(
-            actual.success,
-            "reviewed baseline contains a failed migration"
-        );
-        anyhow::ensure!(
-            actual.checksum == hex::encode(Sha384::digest(expected.sql.as_bytes())),
-            "reviewed baseline checksum drift"
-        );
-    }
-    let prerequisites = reviewed_prerequisites();
-    anyhow::ensure!(
-        ledger.len() >= baseline.len() + prerequisites.len(),
-        "migration ledger lost reviewed prerequisite rows"
-    );
-    for (actual, expected) in ledger[baseline.len()..].iter().zip(prerequisites.iter()) {
-        anyhow::ensure!(
-            actual.version == expected.version
-                && actual.description == expected.description
-                && actual.success
-                && actual.checksum == expected.reviewed_sha384,
-            "reviewed prerequisite ledger drift at {}",
-            expected.version
-        );
-    }
-    let expected_request = reviewed_request_migrations();
-    let actual_request = &ledger[baseline.len() + prerequisites.len()..];
-    anyhow::ensure!(
-        actual_request.len() == expected_request.len(),
+        ledger.len() == expected.len(),
         "request migration ledger count drift: expected {}, found {}",
-        expected_request.len(),
-        actual_request.len()
+        expected.len(),
+        ledger.len()
     );
-    for (row, expected) in actual_request.iter().zip(expected_request.iter()) {
+    for (row, expected) in ledger.iter().zip(&expected) {
         anyhow::ensure!(
-            row.version == expected.version,
-            "request migration version drift"
-        );
-        anyhow::ensure!(
-            row.description == expected.description,
-            "request migration description drift at {}",
-            row.version
-        );
-        anyhow::ensure!(
-            row.success,
-            "request additive migration {} failed",
-            row.version
-        );
-        anyhow::ensure!(
-            row.checksum == expected.reviewed_sha384,
-            "request migration checksum drift at {}",
-            row.version
+            row.version == expected.version
+                && row.description == expected.description
+                && row.success
+                && row.checksum == expected.reviewed_sha384,
+            "reviewed request migration ledger drift at {}",
+            expected.version
         );
     }
     Ok(DatabaseAuthority {
@@ -499,7 +327,7 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
         owner,
         server_address,
         baseline_migrations: 14,
-        additive_migrations: actual_request.len(),
+        additive_migrations: reviewed_request_migrations().len(),
     })
 }
 
@@ -508,7 +336,16 @@ fn install_auth_replay_prerequisite() -> Result<()> {
         hex::encode(Sha384::digest(AUTH_JTI_MIGRATION.as_bytes())) == AUTH_JTI_MIGRATION_SHA384,
         "canonical auth JTI migration checksum drift"
     );
-    psql_exec(AUTH_JTI_MIGRATION)?;
+    let auth_replay = reviewed_auth_replay_prerequisite();
+    let installed = psql_query(&format!(
+        "SELECT EXISTS(SELECT 1 FROM public._sqlx_migrations WHERE version={})",
+        auth_replay.version
+    ))?;
+    if installed.trim() == "f" {
+        apply_migration(&auth_replay)?;
+    } else {
+        psql_exec(AUTH_JTI_MIGRATION)?;
+    }
     anyhow::ensure!(
         psql_query("SELECT to_regclass('public.auth_jti_nonce')::text")?.trim() == "auth_jti_nonce",
         "canonical auth JTI replay store is unavailable"
@@ -582,6 +419,10 @@ struct InstalledMigration {
 }
 
 fn install_or_validate_reviewed_baseline() -> Result<()> {
+    assert_current_migration_frontier(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../server/migrations"
+    )));
     validate_reviewed_baseline_source()?;
     validate_reviewed_request_sources()?;
     let ledger_exists = psql_query(
@@ -608,6 +449,7 @@ fn install_or_validate_reviewed_baseline() -> Result<()> {
         }
     }
 
+    psql_exec(FEDERATION_CACHE_SCHEMA)?;
     for migration in reviewed_prerequisites() {
         anyhow::ensure!(
             hex::encode(Sha384::digest(migration.sql.as_bytes())) == migration.reviewed_sha384,
@@ -643,7 +485,7 @@ fn apply_migration(migration: &BaselineMigration) -> Result<()> {
     psql_exec(&script).with_context(|| format!("apply {}", migration.filename))
 }
 
-fn psql_query(sql: &str) -> Result<String> {
+pub fn psql_query(sql: &str) -> Result<String> {
     let output = Command::new("psql")
         .args([
             "-X",
@@ -798,9 +640,8 @@ pub struct ServerSnapshot {
 pub struct PushAuthSnapshot {
     pub device_auth_generation: i64,
     pub key_enrollment_auth_generation: i64,
-    pub registration_id: Uuid,
-    pub token_generation: i64,
-    pub binding_digest_hex: String,
+    /// The device's whole `chat.push_gateway_bindings` row (D2), as JSON.
+    pub gateway_binding: Value,
     pub service_jti_rows: usize,
     pub chat_admission_rows: usize,
 }
@@ -949,6 +790,13 @@ impl HttpsDidFixture {
             let directory = root.join(host).join(".well-known");
             std::fs::create_dir_all(&directory)?;
             std::fs::write(directory.join("did.json"), serde_json::to_vec(document)?)?;
+            // Every served party has published its chat declaration, as an
+            // enrolled account does; tests override or delete the file.
+            write_chat_declaration(&root, did, "all")?;
+            FIXTURE_PDS_ROOTS
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fixture PDS registry poisoned"))?
+                .insert(did.clone(), root.clone());
         }
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("support/https_did_fixture.py");
         let mut child = Command::new("python3")
@@ -1218,7 +1066,16 @@ pub fn seed_service_device(identity: &ServiceIdentity, mls_public_key: &[u8]) ->
          ON CONFLICT(user_did,device_id,key_id) DO NOTHING; COMMIT;",
         did = identity.did,
         device = identity.device_id,
-    ))
+    ))?;
+    let root = FIXTURE_PDS_ROOTS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("fixture PDS registry poisoned"))?
+        .get(&identity.did)
+        .cloned();
+    match root {
+        Some(root) => publish_device_key(&root, &identity.did, mls_public_key),
+        None => Ok(()),
+    }
 }
 
 fn jwk_thumbprint(jwk: &Value) -> Result<String> {
@@ -1269,6 +1126,69 @@ pub fn canonical_future(days: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// Publish `did`'s `blue.catbird.chat.declaration/self` on the HTTPS fixture
+/// PDS rooted at `root`, homed on the fixture DS. Prepare resolves both
+/// parties' homes from this record and consent reads its `allowIncoming`;
+/// without it a party has no home (`RecipientAuthorityUnsupported`) and
+/// `following` consent.
+pub fn write_chat_declaration(root: &Path, did: &str, allow_incoming: &str) -> Result<()> {
+    let directory = root.join("_policy/catbirdDeclaration");
+    std::fs::create_dir_all(&directory)?;
+    std::fs::write(
+        directory.join(did.replace(':', "%3A")),
+        serde_json::to_vec(&json!({
+            "$type": "blue.catbird.chat.declaration",
+            "protocolVersion": "1",
+            "allowIncoming": allow_incoming,
+            "deliveryService": "did:web:chat.catbird.blue",
+            "createdAt": canonical_now()
+        }))?,
+    )?;
+    Ok(())
+}
+
+/// The Welcome bootstrap a recipient core reconstructs from the publication
+/// (catbird-mls `direct_request_receive::bootstrap`): the sender's bootstrap
+/// without its sender-only opening capture, which a recipient never holds.
+/// The core's cached Welcome import is keyed to its exact input, so a device
+/// the fixture imports natively must be given what the core itself imports.
+pub fn recipient_bootstrap(sender: &DirectRequestBootstrap) -> DirectRequestBootstrap {
+    DirectRequestBootstrap {
+        opening: None,
+        ..sender.clone()
+    }
+}
+
+/// Append `key` to `did`'s `blue.catbird.chat.device` records (listRecords) on
+/// the HTTPS fixture PDS rooted at `root`: the repository authorization of the
+/// account's MLS signature keys.
+fn publish_device_key(root: &Path, did: &str, key: &[u8]) -> Result<()> {
+    let directory = root.join("_policy/deviceKeys");
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(did.replace(':', "%3A"));
+    let mut published: Value = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({"records": []}),
+        Err(error) => return Err(error.into()),
+    };
+    let encoded = STANDARD.encode(key);
+    let records = published["records"]
+        .as_array_mut()
+        .context("published device records")?;
+    if !records
+        .iter()
+        .any(|record| record["value"]["mlsSignaturePublicKey"]["$bytes"] == encoded)
+    {
+        records.push(json!({"value": {
+            "algorithm": "ed25519",
+            "mlsSignaturePublicKey": {"$bytes": encoded},
+            "createdAt": canonical_now()
+        }}));
+    }
+    std::fs::write(path, serde_json::to_vec(&published)?)?;
+    Ok(())
+}
+
 pub fn request_database_snapshot(request_id: Uuid) -> Result<ServerSnapshot> {
     let row = psql_query(&format!(
         "SELECT \
@@ -1315,7 +1235,10 @@ pub fn assert_closed_conversation_wiped(
            AND (c.column_name IN ('conversation_id','convo_id') {request_filter})",
         request_id.map(|id| id.to_string()).unwrap_or_default(),
     ))?;
-    anyhow::ensure!(!statements.trim().is_empty(), "operational schema is missing");
+    anyhow::ensure!(
+        !statements.trim().is_empty(),
+        "operational schema is missing"
+    );
     let residue = psql_query(&format!(
         "SELECT source||'='||row_count FROM ({}) residue WHERE row_count<>0 ORDER BY source",
         statements.trim(),
@@ -1337,42 +1260,33 @@ pub fn assert_closed_conversation_wiped(
     Ok(())
 }
 
-pub fn push_auth_snapshot(identity: &ServiceIdentity, provider: &str) -> Result<PushAuthSnapshot> {
-    anyhow::ensure!(
-        provider
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'-'),
-        "push provider is not canonical"
-    );
+pub fn push_auth_snapshot(identity: &ServiceIdentity) -> Result<PushAuthSnapshot> {
     let row = psql_query(&format!(
-        "SELECT d.auth_generation,k.enrollment_auth_generation,b.registration_id,b.token_generation,encode(b.binding_digest,'hex'), \
+        "SELECT d.auth_generation,k.enrollment_auth_generation,to_jsonb(b), \
           (SELECT count(*) FROM auth_jti_nonce WHERE issuer_did='{did}'), \
           (SELECT count(*) FROM chat.service_auth_admissions WHERE issuer_did='{did}') \
          FROM chat.devices d \
          JOIN chat.device_keys k USING(user_did,device_id) \
-         JOIN chat.request_push_bindings b USING(user_did,device_id) \
-         WHERE d.user_did='{did}' AND d.device_id='{device}' AND b.provider='{provider}'",
+         JOIN chat.push_gateway_bindings b USING(user_did,device_id) \
+         WHERE d.user_did='{did}' AND d.device_id='{device}'",
         did = identity.did,
         device = identity.device_id,
     ))?;
     let fields = row.trim().split('\t').collect::<Vec<_>>();
-    anyhow::ensure!(fields.len() == 7, "unexpected push auth snapshot");
+    anyhow::ensure!(fields.len() == 5, "unexpected push auth snapshot");
     Ok(PushAuthSnapshot {
         device_auth_generation: fields[0].parse()?,
         key_enrollment_auth_generation: fields[1].parse()?,
-        registration_id: Uuid::parse_str(fields[2])?,
-        token_generation: fields[3].parse()?,
-        binding_digest_hex: fields[4].to_owned(),
-        service_jti_rows: fields[5].parse()?,
-        chat_admission_rows: fields[6].parse()?,
+        gateway_binding: serde_json::from_str(fields[2])?,
+        service_jti_rows: fields[3].parse()?,
+        chat_admission_rows: fields[4].parse()?,
     })
 }
 
-/// Process-local test configuration; deliberately has no Debug implementation.
+/// Targeted D2 wake run: the fixture drives exactly this publication's push
+/// event through the production worker once `trigger_path` exists and writes
+/// the outcome to `result_path`.
 pub struct PushFixtureConfig {
-    pub listen_port: u16,
-    pub event_url: String,
-    pub eligibility_bearer: String,
     pub event_id: Uuid,
     pub trigger_path: PathBuf,
     pub result_path: PathBuf,
@@ -1389,12 +1303,19 @@ pub struct ShippingServerFixture {
     pub base_url: String,
     pub receipt_document: Vec<u8>,
     pub receipt_public_key: Vec<u8>,
+    pub sequencer_receipt_public_key: Vec<u8>,
+    /// Compressed P-256 `#atproto` key the fixture DS signs service JWTs and
+    /// D2 Push Gateway wakes with (`SIGNING_KEY_PEM`).
+    pub service_public_key: Vec<u8>,
     _process: FixtureProcess,
 }
 
 impl ShippingServerFixture {
     pub fn start(https: &HttpsDidFixture) -> Result<Self> {
-        Self::start_configured(https, None, None)
+        Self::start_configured(https, None, None, true)
+    }
+    pub fn start_without_sequencer_receipts(https: &HttpsDidFixture) -> Result<Self> {
+        Self::start_configured(https, None, None, false)
     }
     pub fn start_with_client_runtime(
         https: &HttpsDidFixture,
@@ -1413,21 +1334,20 @@ impl ShippingServerFixture {
                 && endpoint.path() == "/xrpc/blue.catbird.chat.subscribeEvents",
             "client runtime subscription endpoint must be canonical chat.catbird.blue wss subscribeEvents URL"
         );
-        Self::start_configured(https, None, Some(subscription_endpoint))
+        Self::start_configured(https, None, Some(subscription_endpoint), true)
     }
     pub fn start_with_push(https: &HttpsDidFixture, push: &PushFixtureConfig) -> Result<Self> {
         anyhow::ensure!(
-            push.listen_port != 0
-                && push.trigger_path.is_absolute()
-                && push.result_path.is_absolute(),
-            "push listen port must be nonzero and trigger/result paths absolute"
+            push.trigger_path.is_absolute() && push.result_path.is_absolute(),
+            "push trigger/result paths must be absolute"
         );
-        Self::start_configured(https, Some(push), None)
+        Self::start_configured(https, Some(push), None, true)
     }
     fn start_configured(
         https: &HttpsDidFixture,
         push: Option<&PushFixtureConfig>,
         subscription_endpoint: Option<&str>,
+        issue_sequencer_receipts: bool,
     ) -> Result<Self> {
         let binary = required_file(REQUEST_SERVER_FIXTURE_BINARY_ENV)?;
         anyhow::ensure!(
@@ -1437,6 +1357,8 @@ impl ShippingServerFixture {
         );
         let receipt = SigningKey::from_bytes((&[41_u8; 32]).into())?;
         let service = SigningKey::from_bytes((&[42_u8; 32]).into())?;
+        let sequencer_receipt = SigningKey::from_bytes((&[43_u8; 32]).into())?;
+        let sequencer_receipt_point = sequencer_receipt.verifying_key().to_encoded_point(true);
         let receipt_point = receipt.verifying_key().to_encoded_point(true);
         let receipt_key_id = protocol::direct_request_receipt_key_id(receipt_point.as_bytes())?;
         let retained_keys: Value = serde_json::from_str(&psql_query(
@@ -1476,26 +1398,36 @@ impl ShippingServerFixture {
                 "publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)
             }));
         }
+        let mut sequencer_multikey = vec![0x80, 0x24];
+        sequencer_multikey.extend_from_slice(sequencer_receipt_point.as_bytes());
+        methods.push(json!({
+            "id":"did:web:chat.catbird.blue#mls-receipt-1",
+            "controller":"did:web:chat.catbird.blue",
+            "type":"Multikey",
+            "publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,sequencer_multikey)
+        }));
         let receipt_document = serde_json::to_vec(&json!({
             "id":"did:web:chat.catbird.blue",
             "verificationMethod":methods
         }))?;
-        let cursor_key_id = URL_SAFE_NO_PAD.encode([0xC1_u8; 32]);
+        let fixture_cursor_key_id = URL_SAFE_NO_PAD.encode([0xC1_u8; 32]);
         psql_exec(&format!(
             "BEGIN; \
              INSERT INTO chat.protocol_instances(singleton,protocol_version,protocol_instance_id,cursor_key_id) \
-             VALUES(TRUE,'1','00000000-0000-4000-8000-000000000001','{cursor_key_id}') \
+             VALUES(TRUE,'1','00000000-0000-4000-8000-000000000001','{fixture_cursor_key_id}') \
              ON CONFLICT(singleton) DO NOTHING; \
              INSERT INTO chat.event_retention(protocol_instance_id,retained_floor,updated_at) \
              SELECT protocol_instance_id,0,clock_timestamp() FROM chat.protocol_instances WHERE singleton=TRUE \
              ON CONFLICT(protocol_instance_id) DO NOTHING; COMMIT;",
         ))?;
-        anyhow::ensure!(
+        // The server test harness may have initialized this immutable fence
+        // first. Like http_acceptance.rs, bind the fixture's synthetic A5
+        // sealing secret to the stored key id instead of trying to rotate it.
+        // The shipping runtime still validates that exact database fence.
+        let cursor_key_id =
             psql_query("SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE")?
                 .trim()
-                == cursor_key_id,
-            "guarded database cursor fence differs from fixture key"
-        );
+                .to_owned();
         let mut command = Command::new(binary);
         command
             .env("TEST_DATABASE_URL", request_database_url())
@@ -1521,6 +1453,10 @@ impl ShippingServerFixture {
                 receipt.to_pkcs8_pem(LineEnding::LF)?.as_str(),
             )
             .env(
+                "RECEIPT_SIGNING_KEY_PEM",
+                sequencer_receipt.to_pkcs8_pem(LineEnding::LF)?.as_str(),
+            )
+            .env(
                 "SIGNING_KEY_PEM",
                 service.to_pkcs8_pem(LineEnding::LF)?.as_str(),
             )
@@ -1534,17 +1470,11 @@ impl ShippingServerFixture {
             )
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        if !issue_sequencer_receipts {
+            command.env_remove("RECEIPT_SIGNING_KEY_PEM");
+        }
         if let Some(push) = push {
             command
-                .env(
-                    "REQUEST_FIXTURE_LISTEN",
-                    format!("127.0.0.1:{}", push.listen_port),
-                )
-                .env("REQUEST_FIXTURE_PUSH_EVENT_URL", &push.event_url)
-                .env(
-                    "REQUEST_FIXTURE_PUSH_ELIGIBILITY_BEARER",
-                    &push.eligibility_bearer,
-                )
                 .env("REQUEST_FIXTURE_PUSH_EVENT_ID", push.event_id.to_string())
                 .env("REQUEST_FIXTURE_PUSH_TRIGGER", &push.trigger_path)
                 .env("REQUEST_FIXTURE_PUSH_RESULT", &push.result_path);
@@ -1560,6 +1490,12 @@ impl ShippingServerFixture {
             base_url,
             receipt_document,
             receipt_public_key: receipt_point.as_bytes().to_vec(),
+            sequencer_receipt_public_key: sequencer_receipt_point.as_bytes().to_vec(),
+            service_public_key: service
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
             _process: FixtureProcess { child },
         })
     }

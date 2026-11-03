@@ -860,7 +860,7 @@ async fn ciphertext_and_aad_mutations_fail_at_recipient_before_acceptance() -> a
         .bob_engine
         .decrypt_direct_request(&control.welcome_input)?;
     match &control_result {
-        DirectRequestIntroductionResult::Ready { plaintext } => {
+        DirectRequestIntroductionResult::Ready { plaintext, .. } => {
             let text = String::from_utf8_lossy(plaintext);
             anyhow::ensure!(
                 text.contains("Real encrypted first contact"),

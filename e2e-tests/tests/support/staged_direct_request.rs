@@ -160,6 +160,19 @@ impl Drop for StagedRequest {
 /// Keys publication, preparation, native bootstrap and durable journal record
 /// through the shipping router; the publish request itself is left to the case.
 pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
+    stage_request_configured(label, true).await
+}
+
+pub async fn stage_request_without_sequencer_receipts(
+    label: &str,
+) -> anyhow::Result<StagedRequest> {
+    stage_request_configured(label, false).await
+}
+
+async fn stage_request_configured(
+    label: &str,
+    issue_sequencer_receipts: bool,
+) -> anyhow::Result<StagedRequest> {
     connect_guarded_request_database(5).await?;
     let run = Uuid::new_v4().simple().to_string();
     let alice = ServiceIdentity::new(format!("did:web:alice-{run}.request-fixture.catbird.blue"));
@@ -186,7 +199,11 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
     let bob_public = bob_engine.identity_public_key(&bob_identity)?;
     seed_service_device(&alice, &alice_public)?;
     seed_service_device(&bob, &bob_public)?;
-    let server = ShippingServerFixture::start(&https)?;
+    let server = if issue_sequencer_receipts {
+        ShippingServerFixture::start(&https)?
+    } else {
+        ShippingServerFixture::start_without_sequencer_receipts(&https)?
+    };
     let client = reqwest::Client::builder().build()?;
 
     let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
@@ -339,6 +356,8 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
             authority_import_until,
             preparation_request_digest: *verified_prepare.request_digest(),
             receipt_authority_key: server.receipt_public_key.clone(),
+            sequencer_did: "did:web:chat.catbird.blue".into(),
+            sequencer_receipt_authority_key: server.sequencer_receipt_public_key.clone(),
             text: "Real encrypted first contact".into(),
             invitation: None,
             metadata: GroupMetadataV1 {
@@ -347,6 +366,7 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
                 description: String::new(),
                 avatar_blob_locator: None,
                 avatar_content_type: None,
+                space_avatar: None,
             },
         })
         .map_err(|error| anyhow::anyhow!("prepare_direct_request_bootstrap: {error}"))?;
@@ -358,6 +378,7 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
     body["preparationDigest"] = preparation["preparationDigest"].clone();
     body["preparationRequestDigest"] = json!(STANDARD.encode(verified_prepare.request_digest()));
     body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
+    body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
     body["next"] = bootstrap.coordinates.clone();
     body["importUntil"] = json!(
         chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
@@ -429,6 +450,7 @@ pub async fn stage_request(label: &str) -> anyhow::Result<StagedRequest> {
         cancellation_requested: false,
         projection_completed: false,
         previous_attempts: Vec::new(),
+        retry_not_before_ms: None,
     };
     sender
         .compare_exchange_direct_request_intent(&draft_id, None, &intent.encode()?)
@@ -526,7 +548,7 @@ impl StagedRequest {
         receipt: &Value,
     ) -> anyhow::Result<DirectRequestWelcomeInput> {
         Ok(DirectRequestWelcomeInput {
-            bootstrap,
+            bootstrap: super::encrypted_requests::recipient_bootstrap(&bootstrap),
             local_identity: self.bob_identity.as_bytes().to_vec(),
             local_package_ref: self.bob_package_ref.clone(),
             publication_request: serde_json::to_vec(&self.publication)?,
@@ -534,6 +556,7 @@ impl StagedRequest {
             published_receipt: serde_json::to_vec(receipt)?,
             receipt_authority_did: "did:web:chat.catbird.blue".into(),
             receipt_authority_key: self.server.receipt_public_key.clone(),
+            sequencer_receipt_authority_key: self.server.sequencer_receipt_public_key.clone(),
             preparation_request_digest: self.preparation_request_digest,
         })
     }

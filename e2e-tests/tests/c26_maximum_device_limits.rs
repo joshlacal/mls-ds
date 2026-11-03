@@ -389,6 +389,8 @@ async fn prepare_and_build(
         authority_import_until: u64::MAX,
         preparation_request_digest: *verified_prepare.request_digest(),
         receipt_authority_key: ds.receipt_public_key.clone(),
+        sequencer_did: "did:web:chat.catbird.blue".into(),
+        sequencer_receipt_authority_key: ds.sequencer_receipt_public_key.clone(),
         text: text.into(),
         invitation: None,
         metadata: GroupMetadataV1 {
@@ -397,6 +399,7 @@ async fn prepare_and_build(
             description: String::new(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            space_avatar: None,
         },
     })?;
     let bootstrap = &journal.bootstrap;
@@ -409,6 +412,7 @@ async fn prepare_and_build(
     publish_body["preparationRequestDigest"] =
         json!(STANDARD.encode(verified_prepare.request_digest()));
     publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
+    publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
     publish_body["next"] = bootstrap.coordinates.clone();
     publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
         bootstrap.import_until as i64,

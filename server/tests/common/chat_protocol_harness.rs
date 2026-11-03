@@ -98,12 +98,12 @@ pub mod repository {
     pub mod device_directory;
     #[path = "../../../server/src/chat_protocol/repository/direct_request_lifecycle.rs"]
     pub mod direct_request_lifecycle;
+    #[path = "../../../server/src/chat_protocol/repository/direct_request_opening.rs"]
+    pub mod direct_request_opening;
     #[path = "../../../server/src/chat_protocol/repository/direct_request_preparation.rs"]
     pub mod direct_request_preparation;
     #[path = "../../../server/src/chat_protocol/repository/direct_request_publication.rs"]
     pub mod direct_request_publication;
-    #[path = "../../../server/src/chat_protocol/repository/direct_request_push.rs"]
-    pub mod direct_request_push;
     #[path = "../../../server/src/chat_protocol/repository/direct_request_receipts.rs"]
     pub mod direct_request_receipts;
     #[path = "../../../server/src/chat_protocol/repository/direct_request_retention.rs"]
@@ -126,8 +126,6 @@ pub mod repository {
     pub mod message_event;
     #[path = "../../../server/src/chat_protocol/repository/prelude.rs"]
     pub mod prelude;
-    #[path = "../../../server/src/chat_protocol/repository/push_binding.rs"]
-    pub mod push_binding;
     #[path = "../../../server/src/chat_protocol/repository/recovery.rs"]
     pub mod recovery;
     #[path = "../../../server/src/chat_protocol/repository/relationship.rs"]

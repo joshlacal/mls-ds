@@ -20,6 +20,7 @@
 //! - real core sync (`MLSOrchestrator::ingest_authenticated_inventory_snapshot`)
 //!   over the exact server pages, with and without one unknown inventory item
 //!   next to the valid ones. The observed behaviour is recorded as-is.
+//!
 //! Every published request is accepted at the end (capacity hygiene).
 
 #![allow(dead_code, unused_imports)]
@@ -253,6 +254,8 @@ async fn publish(w: &World, sender: usize) -> anyhow::Result<Published> {
             authority_import_until,
             preparation_request_digest: *verified.request_digest(),
             receipt_authority_key: w.server.receipt_public_key.clone(),
+            sequencer_did: "did:web:chat.catbird.blue".into(),
+            sequencer_receipt_authority_key: w.server.sequencer_receipt_public_key.clone(),
             text: format!("C25 introduction {sender}"),
             invitation: None,
             metadata: GroupMetadataV1 {
@@ -261,6 +264,7 @@ async fn publish(w: &World, sender: usize) -> anyhow::Result<Published> {
                 description: String::new(),
                 avatar_blob_locator: None,
                 avatar_content_type: None,
+                space_avatar: None,
             },
         })?;
     let b = &journal.bootstrap;
@@ -271,6 +275,7 @@ async fn publish(w: &World, sender: usize) -> anyhow::Result<Published> {
     body["preparationDigest"] = snapshot["preparationDigest"].clone();
     body["preparationRequestDigest"] = json!(STANDARD.encode(verified.request_digest()));
     body["contextHash"] = json!(STANDARD.encode(b.context_hash));
+    body["archiveCommitment"] = json!(STANDARD.encode(b.archive_commitment));
     body["next"] = b.coordinates.clone();
     body["importUntil"] = json!(chrono::DateTime::from_timestamp(b.import_until as i64, 0)
         .context("import")?
@@ -401,10 +406,7 @@ async fn world() -> anyhow::Result<World> {
 async fn accept_all(w: &World) -> anyhow::Result<()> {
     let mut refused = Vec::new();
     for p in &w.published {
-        if w.accepted
-            .lock()
-            .map_or(false, |g| g.contains(&p.request_id))
-        {
+        if w.accepted.lock().is_ok_and(|g| g.contains(&p.request_id)) {
             continue;
         }
         if let Err(error) = accept_one(w, p).await {
@@ -420,10 +422,7 @@ async fn accept_all(w: &World) -> anyhow::Result<()> {
 }
 
 async fn accept_one(w: &World, p: &Published) -> anyhow::Result<()> {
-    if w.accepted
-        .lock()
-        .map_or(false, |g| g.contains(&p.request_id))
-    {
+    if w.accepted.lock().is_ok_and(|g| g.contains(&p.request_id)) {
         return Ok(());
     }
     let s = &w.senders[p.sender];
@@ -779,6 +778,9 @@ impl WsConnection {
                         })?;
                         return Ok(value);
                     }
+                    // ATProto subscription message: a DAG-CBOR header map
+                    // ({op, t}) then the DAG-CBOR body, in one binary frame.
+                    0x2 => return decode_subscription_frame(&payload),
                     0x8 => {
                         anyhow::bail!("WebSocket received close frame");
                     }
@@ -823,6 +825,52 @@ impl WsConnection {
         let _ = self.stream.write_all(&close_frame).await;
         let _ = self.stream.shutdown().await;
     }
+}
+
+#[derive(serde::Deserialize)]
+struct FrameHeader {
+    op: i64,
+    t: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventEnvelopeFrame {
+    previous_cursor: String,
+    cursor: String,
+    payload: EventPayloadFrame,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventPayloadFrame {
+    #[serde(rename = "$type")]
+    kind: String,
+    conversation_id: Option<String>,
+}
+
+/// Decode one binary subscription message into the fields this case asserts:
+/// the header's union discriminator, both cursors and the payload identity.
+fn decode_subscription_frame(frame: &[u8]) -> anyhow::Result<Value> {
+    let mut reader = std::io::Cursor::new(frame);
+    let header: FrameHeader = serde_ipld_dagcbor::de::from_reader_once(&mut reader)
+        .context("subscription frame header")?;
+    anyhow::ensure!(header.op == 1, "subscription frame op {}", header.op);
+    if header.t != "blue.catbird.chat.defs#eventEnvelope" {
+        return Ok(json!({ "$type": header.t }));
+    }
+    let body: EventEnvelopeFrame = serde_ipld_dagcbor::de::from_reader_once(&mut reader)
+        .context("subscription event envelope body")?;
+    anyhow::ensure!(
+        reader.position() as usize == frame.len(),
+        "trailing bytes after the subscription frame body"
+    );
+    Ok(json!({
+        "$type": header.t,
+        "previousCursor": body.previous_cursor,
+        "cursor": body.cursor,
+        "payload": {"$type": body.payload.kind, "conversationId": body.payload.conversation_id},
+    }))
 }
 
 async fn subscribe_upgrade(w: &World, cursor: &str, ticket: &str) -> anyhow::Result<WsConnection> {
@@ -1349,12 +1397,17 @@ async fn scenario(w: std::sync::Arc<World>) -> anyhow::Result<Vec<String>> {
         "$type":"blue.catbird.chat.defs#conversationInventoryFutureVariant","conversationId":unknown
     }));
     poisoned.conversation_pages[0] = serde_json::to_vec(&page)?;
+    let authorized_keys = std::iter::once(&w.owner)
+        .chain(&w.senders)
+        .map(|party| (party.svc.did.as_str(), vec![party.public.clone()]))
+        .collect::<Vec<_>>();
     let orch = live_orchestrator::live_orchestrator(
         w.owner.engine.context(),
         &w.owner.svc,
         &w.client,
         &w.server.base_url,
         w.server.receipt_document.clone(),
+        &authorized_keys,
     )
     .await?;
     // (a) Empty device: nothing is applied.

@@ -9,11 +9,10 @@
 //! 1. Create a dedicated loopback database `catbird_direct_requests_fault_<16 hex>`.
 //! 2. Install pre-request baseline ledger in strict production version order:
 //!    - 14 baseline migrations (reviewed checksums verified)
-//!    - 6 prerequisites (20260816000001, 20260820000001, 20260820000002,
-//!      20260821000001, 20260824000001, 20260907000001)
-//!    - public.auth_jti_nonce replay table
-//!    - 17 additive migrations (20260919000001–000017)
-//!    - Full 37-migration ledger validated in public._sqlx_migrations.
+//!    - 16 reviewed prerequisites, with the shared federation-cache precondition
+//!    - public.auth_jti_nonce replay table and ledger row
+//!    - every additive migration in the shared request manifest
+//!    - The full reviewed ledger validated in public._sqlx_migrations.
 //! 3. Route test harness to the dedicated DB and connect authority.
 //! 4. Create v2 request histories through the live shipping router:
 //!    - Request 1: published, previewed, and accepted by Bob (acceptance history).
@@ -30,8 +29,9 @@
 //!      * Accepted outcome (getDirectRequestOutcome) returns accepted receipt.
 //!      * Accepted entries (getEntries) returns introduction message.
 //! 7. Build and run pre-change baseline server (revision c9fd0c5f85610de70b5d083bfec2c597cba5b247):
-//!    - Assert standard startup migration check REFUSES against the v2 DB with exact failure:
-//!      "migration 20260919000001 was previously applied but is missing in the resolved migrations".
+//!    - Assert standard startup migration check REFUSES against the v2 DB with the exact sqlx
+//!      failure for the lowest ledger version absent from that revision's `server/migrations`:
+//!      "migration <version> was previously applied but is missing in the resolved migrations".
 //!    - Assert SKIP_MIGRATIONS=1 run has no direct request endpoints.
 //! 8. Drop dedicated database cleanly.
 
@@ -68,9 +68,53 @@ use std::{
 use uuid::Uuid;
 
 #[path = "support/live_direct_request.rs"]
-mod live_direct_request;
+pub mod live_direct_request;
 
 const MAINTENANCE_URL: &str = "postgresql://127.0.0.1:5432/postgres";
+/// The pre-change server revision built at `/tmp/catbird-server-baseline-c34`.
+const BASELINE_REVISION: &str = "c9fd0c5f85610de70b5d083bfec2c597cba5b247";
+
+/// sqlx refuses at the first applied version its embedded set lacks: the
+/// lowest ledger version absent from the baseline tree's `server/migrations`.
+fn first_version_unknown_to_baseline(dedicated_url: &str) -> Result<i64> {
+    let tree = Command::new("git")
+        .args([
+            "-C",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
+            "ls-tree",
+            "--name-only",
+            BASELINE_REVISION,
+            "server/migrations/",
+        ])
+        .output()?;
+    anyhow::ensure!(
+        tree.status.success(),
+        "list baseline migrations: {}",
+        String::from_utf8_lossy(&tree.stderr)
+    );
+    let baseline = String::from_utf8(tree.stdout)?
+        .lines()
+        .filter_map(|path| {
+            path.rsplit('/')
+                .next()?
+                .split_once('_')?
+                .0
+                .parse::<i64>()
+                .ok()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    anyhow::ensure!(!baseline.is_empty(), "baseline tree lists no migrations");
+    db_query(
+        dedicated_url,
+        "SELECT version FROM public._sqlx_migrations ORDER BY version",
+    )?
+    .lines()
+    .map(str::parse::<i64>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|version| !baseline.contains(version))
+    .context("the v2 ledger holds no version the baseline lacks")
+}
 
 fn maintenance(sql: &str) -> Result<()> {
     let output = Command::new("psql")
@@ -181,10 +225,12 @@ fn start_reader_server(
         "fixture binary missing at {}",
         binary.display()
     );
+    let sequencer_receipt = SigningKey::from_bytes((&[43_u8; 32]).into())?;
 
     let mut command = Command::new(&binary);
     command
         .env("TEST_DATABASE_URL", dedicated_url)
+        .env("SERVICE_DID", "did:web:chat.catbird.blue")
         .env("REQUEST_FIXTURE_DID_HOSTS", https.hosts.join(","))
         .env("REQUEST_FIXTURE_DID_PORT", https.port.to_string())
         .env("REQUEST_FIXTURE_DID_CA_PEM", &https.ca_pem)
@@ -201,6 +247,10 @@ fn start_reader_server(
             "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents",
         )
         .env("CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM", receipt_pem)
+        .env(
+            "RECEIPT_SIGNING_KEY_PEM",
+            sequencer_receipt.to_pkcs8_pem(LineEnding::LF)?.as_str(),
+        )
         .env("SIGNING_KEY_PEM", service_pem)
         .env("CHAT_REQUEST_RECEIPT_DID_DOCUMENT_JSON", receipt_document)
         .env("RUST_LOG", "warn")
@@ -242,6 +292,7 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         &dedicated_url,
         "CREATE TABLE public._sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)",
     )?;
+    apply_verified_migration(&dedicated_url, &reviewed_auth_replay_prerequisite())?;
 
     // 1b. Install 14 baseline migrations (everything before 20260816000001)
     let baseline = reviewed_baseline();
@@ -252,8 +303,12 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
     }
 
     // 1c. Install the shared reviewed prerequisites in production version order.
+    db_exec(&dedicated_url, FEDERATION_CACHE_SCHEMA)?;
     let prerequisites = reviewed_prerequisites();
-    println!("C34: Installing {} reviewed prerequisite migrations in production order...", prerequisites.len());
+    println!(
+        "C34: Installing {} reviewed prerequisite migrations in production order...",
+        prerequisites.len()
+    );
     for migration in &prerequisites {
         apply_verified_migration(&dedicated_url, migration)?;
     }
@@ -264,7 +319,6 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         actual_auth_sha, AUTH_JTI_SHA384,
         "auth_jti_nonce checksum drift"
     );
-    db_exec(&dedicated_url, AUTH_JTI_SQL)?;
     let jti_table = db_query(
         &dedicated_url,
         "SELECT to_regclass('public.auth_jti_nonce')::text",
@@ -286,11 +340,11 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         &dedicated_url,
         "SELECT coalesce(json_agg(json_build_object('version',version,'description',description,'success',success,'checksum',encode(checksum,'hex')) ORDER BY version),'[]'::json)::text FROM public._sqlx_migrations",
     )?)?;
-    let expected_total_migrations = baseline.len() + prerequisites.len() + additive.len();
+    let expected_total_migrations = 1 + baseline.len() + prerequisites.len() + additive.len();
     assert_eq!(
         ledger_rows.len(),
         expected_total_migrations,
-        "ledger must contain exactly {expected_total_migrations} migrations ({} baseline + {} prerequisites + {} additive)",
+        "ledger must contain exactly {expected_total_migrations} migrations (auth replay + {} baseline + {} prerequisites + {} additive)",
         baseline.len(),
         prerequisites.len(),
         additive.len()
@@ -319,7 +373,7 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
     // Step 2: Create v2 request histories through the live router
     // =========================================================================
     println!("C34: Creating Request 1 (accepted history)...");
-    let mut fixture1 = live_direct_request::publish_request(true).await?;
+    let fixture1 = live_direct_request::publish_request(true).await?;
     let req1_id = fixture1.request_id;
     let req1_convo_id = fixture1.conversation_id;
 
@@ -368,7 +422,7 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
 
     // Create Request 2: left in pending state (preview / pending history)
     println!("C34: Creating Request 2 (pending published history)...");
-    let mut fixture2 = live_direct_request::publish_request(false).await?;
+    let fixture2 = live_direct_request::publish_request(false).await?;
     let req2_id = fixture2.request_id;
     let req2_convo_id = fixture2.conversation_id;
     let req2_context_hash = fixture2.welcome_input.bootstrap.context_hash;
@@ -733,10 +787,12 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
     let stderr_str = String::from_utf8_lossy(&output.stderr);
     let combined_refusal = format!("{stdout_str}\n{stderr_str}");
 
-    let expected_refusal_phrase =
-        "migration 20260919000001 was previously applied but is missing in the resolved migrations";
+    let expected_refusal_phrase = format!(
+        "migration {} was previously applied but is missing in the resolved migrations",
+        first_version_unknown_to_baseline(&dedicated_url)?
+    );
     assert!(
-        combined_refusal.contains(expected_refusal_phrase),
+        combined_refusal.contains(&expected_refusal_phrase),
         "refusal output must contain exact migration check failure. Got:\n{combined_refusal}"
     );
     assert!(

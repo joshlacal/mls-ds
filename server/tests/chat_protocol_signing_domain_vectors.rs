@@ -41,6 +41,7 @@
 //! Regeneration rewrites the fixture from the current server code. If a value
 //! moves, that is a protocol change to explain, not a diff to accept.
 
+pub use catbird_server::sim_hooks;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
@@ -91,10 +92,10 @@ const CANONICAL_SOURCE_LEXICON_SHA256: &str =
     "3d5d867d9b651fc22e119cb6011262740e3308f127efbf87742850ecded6d639";
 // The frozen vectors retain their original provenance. Separately pin the
 // current canonical contract, which also contains the direct-request domains.
-const CURRENT_SOURCE_LEXICON_REVISION: &str = "f102084efb5c7d9ae22d40995eb6ea7b87d74b72";
-const CURRENT_SOURCE_CORPUS_REVISION: &str = "f102084efb5c7d9ae22d40995eb6ea7b87d74b72";
+const CURRENT_SOURCE_LEXICON_REVISION: &str = "0f4f58a27d161c35cf7dcc1072a570660a7fbb0f";
+const CURRENT_SOURCE_CORPUS_REVISION: &str = "0f4f58a27d161c35cf7dcc1072a570660a7fbb0f";
 const CURRENT_SOURCE_LEXICON_SHA256: &str =
-    "a2e783d38ababcb5e7572c0b4b95d7db9a8d50427a2aeca28db279bfaca0da5d";
+    "eb3af0eb332f4ea28d99b97f83aface8e7409d456b69be0d19b4bcb9f108c8ad";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures

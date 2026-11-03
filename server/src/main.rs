@@ -112,6 +112,35 @@ fn is_production_environment() -> bool {
     }
 }
 
+/// Point DID resolution for `REQUEST_FIXTURE_DID_HOSTS` at the loopback HTTPS
+/// fixture on `REQUEST_FIXTURE_DID_PORT`, trusting only the CA in
+/// `REQUEST_FIXTURE_DID_CA_PEM`: the seam `encrypted_request_server_fixture`
+/// installs. Only the transport changes; every JWT and DID check still runs.
+/// Refuses unless `APP_ENV=test`.
+#[cfg(feature = "test-support")]
+fn install_test_https_did_resolver_from_env() -> Result<(), String> {
+    let Ok(hosts) = std::env::var("REQUEST_FIXTURE_DID_HOSTS") else {
+        return Ok(());
+    };
+    if std::env::var("APP_ENV").as_deref() != Ok("test") {
+        return Err("REQUEST_FIXTURE_DID_HOSTS is only permitted when APP_ENV=test".to_owned());
+    }
+    let hosts: Vec<String> = hosts
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let port = std::env::var("REQUEST_FIXTURE_DID_PORT")
+        .map_err(|_| "REQUEST_FIXTURE_DID_PORT is required".to_owned())?
+        .parse::<u16>()
+        .map_err(|_| "REQUEST_FIXTURE_DID_PORT is not a port number".to_owned())?;
+    let ca_path = std::env::var("REQUEST_FIXTURE_DID_CA_PEM")
+        .map_err(|_| "REQUEST_FIXTURE_DID_CA_PEM is required".to_owned())?;
+    let ca = std::fs::read(&ca_path).map_err(|e| format!("read {ca_path}: {e}"))?;
+    auth::install_test_https_did_resolver(&hosts, port, &ca)
+}
+
 #[cfg(feature = "test-support")]
 async fn init_federation_test_chat_fence(pool: &sqlx::PgPool) -> Result<(), String> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -580,7 +609,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Load offline test DID document fixtures if configured (strictly gated to APP_ENV=test)
+    // Offline DID fixtures (strictly gated to APP_ENV=test). Install the HTTPS
+    // fixture resolver first so seeded documents land in its cache.
+    #[cfg(feature = "test-support")]
+    if let Err(e) = install_test_https_did_resolver_from_env() {
+        panic!("Failed to install the test HTTPS DID resolver: {e}");
+    }
     #[cfg(feature = "test-support")]
     if let Err(e) = auth::load_test_did_fixtures_from_env().await {
         panic!("Failed to load test DID document fixtures: {e}");
@@ -1078,7 +1112,8 @@ async fn main() -> anyhow::Result<()> {
                 .cloned()
                 .map(Arc::new),
             app_state.chat_runtime.push_gateway_client().cloned(),
-        ),
+        )
+        .with_relationship_authority_of(&app_state.chat_runtime),
     ));
 
     let chat_router =

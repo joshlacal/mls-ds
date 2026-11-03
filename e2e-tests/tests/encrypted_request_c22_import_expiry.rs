@@ -330,7 +330,7 @@ async fn c22_expired_unimported_device_is_unavailable_while_imported_sibling_and
     // Device 1 imports within the deadline, decrypts the preview, and ACKs.
     f.bob_engine.process_direct_request(&f.welcome_input)?;
     let preview = f.bob_engine.decrypt_direct_request(&f.welcome_input)?;
-    let DirectRequestIntroductionResult::Ready { plaintext } = &preview else {
+    let DirectRequestIntroductionResult::Ready { plaintext, .. } = &preview else {
         anyhow::bail!("imported device preview must be ready: {preview:?}");
     };
     let text = protocol::decode_direct_request_introduction(plaintext)?["text"].clone();
@@ -394,14 +394,29 @@ async fn c22_expired_unimported_device_is_unavailable_while_imported_sibling_and
             .as_str()
             .context("groupId")?,
     )?;
-    // The shared-core projection the app renders for the expired device.
+    // The shared-core projection the app renders for the expired device. Each
+    // credential store answers the accounts' repository-published device keys.
     let receipt_document = f.server.receipt_document.clone();
+    let alice_engine = f.alice_engine.as_ref().context("Alice engine")?;
+    let alice_key = live_direct_request::directory_key(&f, &f.alice, alice_engine).await?;
+    let bob_key = live_direct_request::directory_key(&f, &f.bob, &f.bob_engine).await?;
+    let sibling_key =
+        live_direct_request::directory_key(&f, &sibling.service, &sibling.engine).await?;
+    let authorized_keys = [
+        (f.alice.did.clone(), vec![alice_key]),
+        (f.bob.did.clone(), vec![bob_key, sibling_key]),
+    ];
+    let authorized_keys = authorized_keys
+        .iter()
+        .map(|(did, keys)| (did.as_str(), keys.clone()))
+        .collect::<Vec<_>>();
     let sibling_client = live_orchestrator::live_orchestrator(
         sibling.engine.context(),
         &sibling.service,
         &f.client,
         &f.server.base_url,
         receipt_document.clone(),
+        &authorized_keys,
     )
     .await?;
     let expired_view = sibling_client
@@ -474,6 +489,7 @@ async fn c22_expired_unimported_device_is_unavailable_while_imported_sibling_and
         &client,
         &base_url,
         receipt_document,
+        &authorized_keys,
     )
     .await?;
     let retained_view = bob_client

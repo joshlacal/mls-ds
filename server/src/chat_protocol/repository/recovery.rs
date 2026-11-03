@@ -277,8 +277,13 @@ pub(crate) const LOCK_RECOVERY_EXPIRY_DEVICE_SQL: &str = r#"
 
 pub(crate) const LOCK_RECOVERY_EXPIRY_KEY_SQL: &str = r#"
     SELECT signing_public_key,enrollment_auth_generation,revoked_at
-      FROM chat.device_keys
+      FROM chat.device_keys k
      WHERE user_did=$1 AND device_id=$2 AND key_id=$3
+       AND enrollment_auth_generation <= $4
+       AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+            WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id
+              AND newer.enrollment_auth_generation>k.enrollment_auth_generation
+              AND newer.enrollment_auth_generation<=$4)
      FOR UPDATE
 "#;
 
@@ -3248,7 +3253,23 @@ pub mod production_composition_proof {
             .await
     }
 
-    const PROOF_DATABASE: &str = "catbird_chat_protocol_test_20260722";
+    /// Proofs write fixtures, so they run only on a private database the test
+    /// harness minted under its reserved proof prefix (`tests/common/fresh_db.rs`
+    /// `PRODUCTION_PROOF_DB_PREFIX`): exactly `chat_proof_` plus 32 lowercase hex
+    /// digits. Fail-closed, with no fallback to the shared clean-chat target
+    /// (Main ruling 2026-11-04).
+    const PROOF_DATABASE_PREFIX: &str = "chat_proof_";
+
+    #[doc(hidden)]
+    pub fn is_disposable_proof_database(name: &str) -> bool {
+        name.strip_prefix(PROOF_DATABASE_PREFIX)
+            .is_some_and(|suffix| {
+                suffix.len() == 32
+                    && suffix
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            })
+    }
 
     async fn require_local_owned_gate(pool: &PgPool) -> Result<(), String> {
         let (database, user, owner, address): (String, String, String, Option<String>) =
@@ -3260,7 +3281,7 @@ pub mod production_composition_proof {
             .fetch_one(pool)
             .await
             .map_err(|error| format!("inspect production-proof database: {error}"))?;
-        if database != PROOF_DATABASE
+        if !is_disposable_proof_database(&database)
             || user != owner
             || !address.as_deref().is_none_or(|value| {
                 matches!(value, "127.0.0.1" | "127.0.0.1/32" | "::1" | "::1/128")
@@ -5868,11 +5889,12 @@ pub(crate) async fn prepare_recovery_expiry_authority(
             .bind(&locator.requester_did)
             .bind(locator.requester_device_id)
             .bind(&locator.requester_key_id)
+            .bind(locator.requester_auth_generation)
             .fetch_optional(&mut **transaction)
             .await?;
     let (signing_public_key, enrollment_auth_generation, key_revoked_at) =
         key.ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
-    if enrollment_auth_generation != locator.requester_auth_generation
+    if enrollment_auth_generation > locator.requester_auth_generation
         || signing_public_key.len() != 32
     {
         return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
@@ -6172,19 +6194,19 @@ async fn reverify_scoped_request(
     scope: &ScopeBoundBusinessAuthority,
     request: &RecoveryRequestRow,
 ) -> Result<Vec<u8>, RecoveryRepositoryError> {
-    let locked_key = scope
-        .keys()
-        .iter()
-        .find(|row| {
-            row.user_did() == request.requester_did
-                && row.device_id() == request.requester_device_id
-                && row.key_id() == request.requester_key_id
-                && row.enrollment_auth_generation() == request.requester_auth_generation
-                && row
-                    .revoked_at()
-                    .is_none_or(|revoked_at| revoked_at >= request.requested_at)
-        })
-        .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+    let locked_key = super::auth::LockedCanonicalKeyProjection::at_generation(
+        scope.keys(),
+        &request.requester_did,
+        request.requester_device_id,
+        request.requester_auth_generation,
+    )
+    .filter(|row| {
+        row.key_id() == request.requester_key_id
+            && row
+                .revoked_at()
+                .is_none_or(|revoked_at| revoked_at >= request.requested_at)
+    })
+    .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
     // The prelude already owns this row lock. This projection acquires no new
     // lock; it retrieves the bytes needed to reverify the retained signed row.
     let signing_public_key: Vec<u8> = sqlx::query_scalar(
@@ -7322,11 +7344,14 @@ fn validate_scope_contains_requester(
                 row.revoked_at(),
             )
     });
-    let key = scope.keys().iter().any(|row| {
-        row.user_did() == request.requester_did
-            && row.device_id() == request.requester_device_id
-            && row.key_id() == request.requester_key_id
-            && row.enrollment_auth_generation() == request.requester_auth_generation
+    let key = super::auth::LockedCanonicalKeyProjection::at_generation(
+        scope.keys(),
+        &request.requester_did,
+        request.requester_device_id,
+        request.requester_auth_generation,
+    )
+    .is_some_and(|row| {
+        row.key_id() == request.requester_key_id
             && requester_key_liveness_matches(
                 classification,
                 request.requested_at,

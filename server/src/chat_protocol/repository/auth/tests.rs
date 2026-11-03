@@ -641,7 +641,7 @@ async fn seed_registered_device(pool: &sqlx::PgPool) {
             user_did, device_id, key_id, signing_public_key,
             enrollment_auth_generation, created_at
         ) VALUES ($1,$2,$3,$4,1,$5::timestamptz)
-        ON CONFLICT (user_did, device_id) DO NOTHING
+        ON CONFLICT (user_did, device_id, key_id) DO NOTHING
         "#,
     )
     .bind(REGISTERED_DID)

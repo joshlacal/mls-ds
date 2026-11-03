@@ -2856,16 +2856,14 @@ fn seal_pending_reset(
                 && candidate.device_id() == row.requester_device_id
         })
         .ok_or(ResetRepositoryError::MissingDevice)?;
-    let key = scope
-        .keys()
-        .iter()
-        .find(|candidate| {
-            candidate.user_did() == row.requester_did
-                && candidate.device_id() == row.requester_device_id
-                && candidate.key_id() == row.requester_key_id
-                && candidate.enrollment_auth_generation() == row.requester_auth_generation
-        })
-        .ok_or(ResetRepositoryError::MissingDeviceKey)?;
+    let key = super::auth::LockedCanonicalKeyProjection::at_generation(
+        scope.keys(),
+        &row.requester_did,
+        row.requester_device_id,
+        row.requester_auth_generation,
+    )
+    .filter(|candidate| candidate.key_id() == row.requester_key_id)
+    .ok_or(ResetRepositoryError::MissingDeviceKey)?;
     // Finding 3: this comparison is what made a pending row unsealable — and so
     // the whole conversation unresettable — once its requester was revoked or
     // rebound. It stays exactly as strict for every live use, including all of
@@ -2873,7 +2871,6 @@ fn seal_pending_reset(
     // to the recorded authority re-verified below instead.
     if binding == ResetAuthorityBinding::Live
         && (device.auth_generation() != row.requester_auth_generation
-            || key.enrollment_auth_generation() != row.requester_auth_generation
             || device.status() != "active"
             || device.revoked_at().is_some()
             || key.revoked_at().is_some())

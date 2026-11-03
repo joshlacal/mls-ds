@@ -2074,7 +2074,9 @@ pub(in crate::chat_protocol::state_machine::executor) mod metadata_executor_test
         feature = "chat-protocol-production-proof",
         not(feature = "server-bin")
     ))]
-    pub(super) fn run_production_semantic_proof() -> Result<(), String> {
+    pub(in crate::chat_protocol::state_machine::executor) fn run_production_semantic_proof(
+    ) -> Result<(), String> {
+        use crate::chat_protocol::transcript::canonical_metadata_avatar_blob_aad;
         let avatar_aad = canonical_metadata_avatar_blob_aad(
             uuid(0x51),
             uuid(0x52),

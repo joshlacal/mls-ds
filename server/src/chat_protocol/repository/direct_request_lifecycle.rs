@@ -136,14 +136,15 @@ mod tests {
 
 /// Reconstruct the v2 request view only from retained signed publication and
 /// signed acceptance proof. Neither current membership nor a device leaf can
-/// upgrade account consent.
+/// upgrade account consent. Returns the signed publication body, verified or,
+/// once its opening ciphertext was pruned, the retained redacted body.
 pub(crate) async fn load_request_projection(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
     requester_did: &str,
 ) -> Result<
     Option<(
-        crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest,
+        serde_json::Value,
         catbird_atproto::generated::blue_catbird::chat::DirectRequestState,
     )>,
     super::inventory::InventoryRepositoryError,
@@ -163,16 +164,26 @@ pub(crate) async fn load_request_projection(
     if protocol.as_deref() != Some("2") {
         return Ok(None);
     }
-    let row = sqlx::query("SELECT p.signed_publication,p.request_id,p.recipient_did,k.signing_public_key,l.consent,l.acceptance_proof FROM chat.direct_request_publications p JOIN chat.device_keys k ON k.user_did=p.actor_did AND k.device_id=p.actor_device_id AND k.key_id=p.actor_key_id LEFT JOIN chat.direct_request_lifecycle l USING(request_id) WHERE p.conversation_id=$1 ORDER BY p.generation DESC LIMIT 1")
+    let row = sqlx::query("SELECT p.signed_publication,p.request_id,p.recipient_did,k.signing_public_key,l.consent,l.acceptance_proof,CASE WHEN p.signed_publication IS NULL AND p.pruned_at IS NULL THEN (SELECT e.pruned_payload_bytes FROM chat.entries e WHERE e.conversation_id=p.conversation_id AND e.transition_id=p.request_id) END AS pruned_opening FROM chat.direct_request_publications p JOIN chat.device_keys k ON k.user_did=p.actor_did AND k.device_id=p.actor_device_id AND k.key_id=p.actor_key_id LEFT JOIN chat.direct_request_lifecycle l USING(request_id) WHERE p.conversation_id=$1 ORDER BY p.generation DESC LIMIT 1")
         .bind(conversation_id).fetch_optional(&mut **tx).await?.ok_or(E::InvalidMaterialization)?;
     let signed: Option<Vec<u8>> = row.try_get("signed_publication")?;
-    let Some(signed) = signed else {
-        return Ok(None);
+    let pruned: Option<Vec<u8>> = row.try_get("pruned_opening")?;
+    let body = match (signed, pruned) {
+        (Some(signed), _) => {
+            let key: Vec<u8> = row.try_get("signing_public_key")?;
+            verify_signed_request(DirectRequestKind::Publish, &signed, &key)
+                .map_err(|_| E::InvalidMaterialization)?
+                .body()
+                .clone()
+        }
+        // A pruned opening's retained entry keeps every signed field but the
+        // erased ciphertext (O7); hydration binds it to the signed receipts.
+        (None, Some(redacted)) => serde_json::from_slice::<Value>(&redacted)
+            .map_err(|_| E::InvalidMaterialization)?["signedRequest"]["body"]
+            .clone(),
+        (None, None) => return Ok(None),
     };
-    let key: Vec<u8> = row.try_get("signing_public_key")?;
-    let publication = verify_signed_request(DirectRequestKind::Publish, &signed, &key)
-        .map_err(|_| E::InvalidMaterialization)?;
-    let body = publication.body();
+    let body = &body;
     if body["conversationId"].as_str() != Some(conversation_id.to_string().as_str())
         || body["requestId"].as_str()
             != Some(row.try_get::<Uuid, _>("request_id")?.to_string().as_str())
@@ -241,7 +252,7 @@ pub(crate) async fn load_request_projection(
         false,
     )
     .map_err(|_| E::InvalidMaterialization)?;
-    Ok(Some((publication, view)))
+    Ok(Some((body.clone(), view)))
 }
 
 pub(crate) async fn pending_request_welcomes(
@@ -254,16 +265,16 @@ pub(crate) async fn pending_request_welcomes(
     use serde_json::{json, Value};
     use sqlx::Row;
     let observed_at = crate::sim_hooks::current_utc();
-    let rows=sqlx::query("SELECT p.request_id,p.conversation_id,p.request_entry,p.signed_publication,p.full_welcome,p.full_welcome_sha256,d.provenance FROM chat.direct_request_device_deliveries d JOIN chat.direct_request_publications p USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id LEFT JOIN chat.direct_request_welcome_outcomes o ON o.request_id=d.request_id AND o.recipient_did=d.owner_did AND o.recipient_device_id=d.owner_device_id WHERE d.owner_did=$1 AND d.owner_device_id=$2 AND d.import_until>$3 AND o.request_id IS NULL AND c.lifecycle='active' AND c.current_generation=p.generation ORDER BY p.request_id")
+    let rows=sqlx::query("SELECT p.request_id,p.conversation_id,COALESCE(p.request_entry,(SELECT e.pruned_payload_bytes FROM chat.entries e WHERE e.conversation_id=p.conversation_id AND e.transition_id=p.request_id)) AS request_entry,p.full_welcome,p.full_welcome_sha256,d.provenance FROM chat.direct_request_device_deliveries d JOIN chat.direct_request_publications p USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id LEFT JOIN chat.direct_request_welcome_outcomes o ON o.request_id=d.request_id AND o.recipient_did=d.owner_did AND o.recipient_device_id=d.owner_device_id WHERE d.owner_did=$1 AND d.owner_device_id=$2 AND d.import_until>$3 AND o.request_id IS NULL AND c.lifecycle='active' AND c.current_generation=p.generation ORDER BY p.request_id")
         .bind(user_did).bind(device_id).bind(observed_at).fetch_all(&mut **tx).await?;
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
         let request_id: Uuid = row.try_get("request_id")?;
+        // The opening entry, or once its ciphertext was pruned its redacted entry:
+        // seq and signed coordinates are the same in both.
         let entry: Value = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("request_entry")?)
             .map_err(|_| E::InvalidMaterialization)?;
-        let publication: Value =
-            serde_json::from_slice(&row.try_get::<Vec<u8>, _>("signed_publication")?)
-                .map_err(|_| E::InvalidMaterialization)?;
+        let publication = &entry["signedRequest"];
         let provenance: Value = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("provenance")?)
             .map_err(|_| E::InvalidMaterialization)?;
         let view = json!({"$type":"blue.catbird.chat.defs#directRequestWelcomeView","welcomeId":request_id,"conversationId":row.try_get::<Uuid,_>("conversation_id")?,"transitionSeq":entry["seq"],"coordinates":publication["body"]["next"],"status":"pending","opaqueWelcome":STANDARD.encode(row.try_get::<Vec<u8>,_>("full_welcome")?),"sha256":STANDARD.encode(row.try_get::<Vec<u8>,_>("full_welcome_sha256")?),"recipientDid":user_did,"recipientDeviceId":device_id,"provenance":provenance});
@@ -283,21 +294,25 @@ pub(crate) async fn pending_request_welcomes(
         ));
     }
     let inbox_rows = sqlx::query(
-        "SELECT delivery_id, request_id, conversation_id, request_entry, signed_publication, full_welcome, full_welcome_sha256, provenance \
+        "SELECT delivery_id, request_id, conversation_id, \
+                COALESCE(request_entry, redacted_request_entry) AS request_entry, \
+                full_welcome, full_welcome_sha256, provenance \
          FROM chat.direct_request_transport_inbox \
          WHERE recipient_did = $1 AND recipient_device_id = $2 \
            AND status = 'pending' \
            AND import_until > $3 \
-         ORDER BY request_id"
+         ORDER BY request_id",
     )
-    .bind(user_did).bind(device_id).bind(observed_at).fetch_all(&mut **tx).await?;
+    .bind(user_did)
+    .bind(device_id)
+    .bind(observed_at)
+    .fetch_all(&mut **tx)
+    .await?;
     for row in inbox_rows {
         let request_id: Uuid = row.try_get("request_id")?;
         let entry: Value = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("request_entry")?)
             .map_err(|_| E::InvalidMaterialization)?;
-        let publication: Value =
-            serde_json::from_slice(&row.try_get::<Vec<u8>, _>("signed_publication")?)
-                .map_err(|_| E::InvalidMaterialization)?;
+        let publication = &entry["signedRequest"];
         let provenance: Value = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("provenance")?)
             .map_err(|_| E::InvalidMaterialization)?;
         let view = json!({"$type":"blue.catbird.chat.defs#directRequestWelcomeView","welcomeId":request_id,"conversationId":row.try_get::<Uuid,_>("conversation_id")?,"transitionSeq":entry["seq"],"coordinates":publication["body"]["next"],"status":"pending","opaqueWelcome":STANDARD.encode(row.try_get::<Vec<u8>,_>("full_welcome")?),"sha256":STANDARD.encode(row.try_get::<Vec<u8>,_>("full_welcome_sha256")?),"recipientDid":user_did,"recipientDeviceId":device_id,"provenance":provenance});

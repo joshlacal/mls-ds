@@ -11,26 +11,16 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use catbird_mls::{
-    chat_v2::transcript::{
-        decode_strict_json,
-        direct_request::{self as protocol, DirectRequestKind},
-        project_signed_body, SignedMutationKind, SigningTranscript,
-    },
-    metadata::GroupMetadataV1,
-    orchestrator::direct_request_bootstrap::{
-        metadata_coordinate, DirectRequestBootstrapInput, DirectRequestIntroductionResult,
-        DirectRequestWelcomeInput,
-    },
+use catbird_mls::chat_v2::transcript::{
+    decode_strict_json,
+    direct_request::{self as protocol, DirectRequestKind},
+    project_signed_body, SignedMutationKind, SigningTranscript,
 };
 use encrypted_requests::{
-    canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
-    request_database_url, reviewed_request_migrations, seed_service_device, signed_mls_request,
-    validate_request_test_database_url, HttpsDidFixture, ServiceIdentity, ShippingServerFixture,
+    canonical_future, canonical_now, connect_guarded_request_database, request_database_url,
+    reviewed_request_migrations, seed_service_device, signed_mls_request, HttpsDidFixture,
+    ServiceIdentity, ShippingServerFixture,
 };
-
-#[path = "support/live_direct_request.rs"]
-mod live_direct_request;
 
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};

@@ -37,6 +37,7 @@ services:
       target: federation-test
       additional_contexts:
         catbird-atproto: ../../catbird-atproto
+        labyrinth-protocol: ../../labyrinth/labyrinth-protocol
     depends_on:
       ds1-postgres:
         condition: service_healthy
@@ -119,6 +120,7 @@ services:
       target: federation-test
       additional_contexts:
         catbird-atproto: ../../catbird-atproto
+        labyrinth-protocol: ../../labyrinth/labyrinth-protocol
     depends_on:
       ds2-postgres:
         condition: service_healthy

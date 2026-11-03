@@ -28,17 +28,56 @@ fn encode(value: &Value) -> Result<Vec<u8>, DeliveryRepositoryError> {
 async fn insert_attachment(
     transaction: &mut Transaction<'_, Postgres>,
     event_position: i64,
+    source_ds_did: Option<&str>,
+    source_authority_bytes: Option<&[u8]>,
     entry: &Value,
 ) -> Result<(), DeliveryRepositoryError> {
     let bytes = encode(entry)?;
-    sqlx::query(
+    let statement = if source_ds_did.is_some() {
+        "INSERT INTO chat.conversation_close_terminal_entries \
+             (event_position, entry_bytes, entry_sha256, source_ds_did, source_authority_bytes) \
+         VALUES ($1, $2, $3, $4, $5)"
+    } else {
         "INSERT INTO chat.conversation_close_terminal_entries \
              (event_position, entry_bytes, entry_sha256) \
-         VALUES ($1, $2, $3)",
+         VALUES ($1, $2, $3)"
+    };
+    let mut insert = sqlx::query(statement)
+        .bind(event_position)
+        .bind(&bytes)
+        .bind(Sha256::digest(&bytes).to_vec());
+    if let Some(source) = source_ds_did {
+        insert = insert.bind(source).bind(source_authority_bytes);
+    }
+    insert.execute(&mut **transaction).await?;
+    Ok(())
+}
+
+/// Lock the global direct-request budget that `conversation_id`'s wipe debits
+/// (`chat.wipe_closed_conversation_operational_rows` releases the retained
+/// charges of its publication and transport-inbox requests) where every
+/// request operation takes it: after the operation lock and before the
+/// principal/device/key prefix (`direct_request_lock.rs`). First taken at the
+/// wipe, after the close's identity and head locks, it closes a cycle with an
+/// `acceptConversation` that holds the budget and waits on those (40P01). Any
+/// retained charge locks: a superset of the wipe's `gross_retained > 0`.
+pub(crate) async fn lock_wipe_request_budget(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT budget.singleton FROM chat.direct_request_budget budget \
+          WHERE budget.singleton AND EXISTS ( \
+              SELECT 1 FROM chat.direct_request_retained_charges charge \
+               WHERE charge.request_id IN ( \
+                   SELECT request_id FROM chat.direct_request_publications \
+                    WHERE conversation_id = $1 \
+                   UNION ALL \
+                   SELECT request_id FROM chat.direct_request_transport_inbox \
+                    WHERE conversation_id = $1)) \
+            FOR UPDATE OF budget",
     )
-    .bind(event_position)
-    .bind(&bytes)
-    .bind(Sha256::digest(&bytes).to_vec())
+    .bind(conversation_id)
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -64,16 +103,19 @@ pub(crate) async fn attach_local_close_entry(
     .bind(conversation_id.hyphenated().to_string())
     .fetch_one(&mut **transaction)
     .await?;
-    insert_attachment(transaction, event_position, entry).await
+    insert_attachment(transaction, event_position, None, None, entry).await
 }
 
 /// Append this home's `conversationClosed` event for a verified remote close,
-/// addressed to the delivered recipient devices registered here, and attach the
-/// signed close entry. Returns `None` when no delivered device is local or the
-/// same close entry was already recorded (a redelivered fan-out).
+/// addressed only to the caller-authenticated local audience, and retain the
+/// signed entry plus its source sequencer/proof. An empty audience still needs
+/// terminal evidence so the operational wipe can complete. `None` means only
+/// that the same close entry was already recorded (a redelivered fan-out).
 pub(crate) async fn append_remote_close_event(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
+    source_ds_did: &str,
+    source_authority_bytes: Option<&[u8]>,
     conversation_kind: &str,
     terminal_seq: i64,
     recipient_devices: &[(String, Uuid)],
@@ -93,16 +135,20 @@ pub(crate) async fn append_remote_close_event(
         .get("entryId")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let already_recorded: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM chat.conversation_close_terminal_entries terminal \
+    // The signed entry carries a NUL-terminated signature domain that
+    // PostgreSQL JSON rejects, so its entryId is compared here.
+    let recorded: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT terminal.entry_bytes FROM chat.conversation_close_terminal_entries terminal \
            JOIN chat.events event USING (event_position) \
-          WHERE convert_from(event.payload_bytes, 'UTF8')::jsonb->>'conversationId' = $1 \
-            AND convert_from(terminal.entry_bytes, 'UTF8')::jsonb->>'entryId' = $2)",
+          WHERE convert_from(event.payload_bytes, 'UTF8')::jsonb->>'conversationId' = $1",
     )
     .bind(conversation_id.hyphenated().to_string())
-    .bind(entry_id)
-    .fetch_one(&mut **transaction)
+    .fetch_all(&mut **transaction)
     .await?;
+    let already_recorded = recorded.iter().any(|bytes| {
+        serde_json::from_slice::<Value>(bytes)
+            .is_ok_and(|recorded| recorded.get("entryId").and_then(Value::as_str) == Some(entry_id))
+    });
     if already_recorded {
         return Ok(None);
     }
@@ -126,9 +172,6 @@ pub(crate) async fn append_remote_close_event(
             .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
     });
     audience.dedup();
-    if audience.is_empty() {
-        return Ok(None);
-    }
 
     let protocol_instance_id: Uuid = sqlx::query_scalar(
         "SELECT protocol_instance_id FROM chat.protocol_instances WHERE singleton FOR SHARE",
@@ -191,7 +234,14 @@ pub(crate) async fn append_remote_close_event(
         created_at,
     )
     .await?;
-    insert_attachment(transaction, event_position, entry).await?;
+    insert_attachment(
+        transaction,
+        event_position,
+        Some(source_ds_did),
+        source_authority_bytes,
+        entry,
+    )
+    .await?;
     Ok(Some(event_position))
 }
 
@@ -203,6 +253,14 @@ pub(crate) async fn retained_close_entry_for_device(
     user_did: &str,
     device_id: Uuid,
 ) -> Result<Option<Value>, DeliveryRepositoryError> {
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT to_regclass('chat.conversation_close_terminal_entries') IS NOT NULL",
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !table_exists {
+        return Ok(None);
+    }
     let bytes: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT terminal.entry_bytes \
            FROM chat.event_recipients recipient \

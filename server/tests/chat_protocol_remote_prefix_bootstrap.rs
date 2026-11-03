@@ -95,6 +95,7 @@ fn configure_security_env() {
     std::env::set_var("ENFORCE_LXM", "true");
     std::env::set_var("ENFORCE_JTI", "true");
     std::env::set_var("JTI_TTL_SECONDS", "120");
+    catbird_server::federation::open_federation_for_test();
 }
 
 async fn setup_test_db() -> Option<(PgPool, common::fresh_db::DisposableDatabase)> {
@@ -206,7 +207,7 @@ async fn seed_revoked_device(pool: &PgPool, did: &str, device_id: Uuid, created_
             sqlx::query(
                 "INSERT INTO chat.device_keys(user_did, device_id, key_id, signing_public_key, enrollment_auth_generation, created_at) \
                  VALUES($1, $2, $3, $4, 1, $5) \
-                 ON CONFLICT (user_did, device_id) DO NOTHING",
+                 ON CONFLICT (user_did, device_id, key_id) DO NOTHING",
             )
             .bind(did)
             .bind(device_id)
@@ -3427,6 +3428,17 @@ fn corpus_evaluation_instant(offset_millis: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(millis).unwrap()
 }
 
+/// Fresh two-leaf fixtures run OpenMLS `add_members`, which validates the added
+/// KeyPackage lifetime against the host clock, not a supplied instant. The
+/// 30-day package lifetime cap cannot span both the frozen corpus instant and
+/// today, so these fixtures anchor their timeline one hour before this process
+/// first asks. Frozen-corpus tests keep `corpus_evaluation_instant`.
+fn dynamic_fixture_instant(offset_millis: i64) -> DateTime<Utc> {
+    static ANCHOR_SECONDS: std::sync::LazyLock<i64> =
+        std::sync::LazyLock::new(|| Utc::now().timestamp() - 3_600);
+    DateTime::from_timestamp_millis(*ANCHOR_SECONDS * 1_000 + offset_millis).unwrap()
+}
+
 fn random_plc_did() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut bytes = Uuid::new_v4().as_bytes().to_vec();
@@ -4305,12 +4317,12 @@ async fn historical_planners_positive_pipeline_succeeds_with_zero_side_effects()
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let creation_time = corpus_evaluation_instant(1_000);
-    let policy_time = corpus_evaluation_instant(2_000);
-    let acceptance_time = corpus_evaluation_instant(3_000);
-    let fulfillment_time = corpus_evaluation_instant(4_000);
+    let creation_time = dynamic_fixture_instant(1_000);
+    let policy_time = dynamic_fixture_instant(2_000);
+    let acceptance_time = dynamic_fixture_instant(3_000);
+    let fulfillment_time = dynamic_fixture_instant(4_000);
 
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
     seed_protocol_instance(&pool).await;
 
     let (bob_device_identity, bob_did) = fresh_bob();
@@ -4979,7 +4991,7 @@ async fn historical_application_send_mirroring_violates_xor_constraint() {
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
 
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
@@ -5075,7 +5087,7 @@ async fn cutoff_integrity_and_immutability() {
         return;
     };
 
-    let now = corpus_evaluation_instant(1_000);
+    let now = dynamic_fixture_instant(1_000);
     seed_protocol_instance(&pool).await;
 
     // 1-3. The cutoff shape check rejects a local conversation, seq 0, and any
@@ -5114,7 +5126,7 @@ async fn cutoff_integrity_and_immutability() {
 
     // 4. A genuinely bootstrapped remote conversation cannot change its birth cutoff.
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
     seed_approved_peer(&pool, sequencer_did).await;
     let fixture =
         build_full_5_event_prefix_fixture(Uuid::new_v4(), sequencer_did, actor_created_at);
@@ -5293,11 +5305,11 @@ fn build_full_5_event_prefix_fixture(
     sequencer_did: &str,
     actor_created_at: DateTime<Utc>,
 ) -> FullTestPrefixFixture {
-    let creation_time = corpus_evaluation_instant(1_000);
-    let policy_time = corpus_evaluation_instant(2_000);
-    let acceptance_time = corpus_evaluation_instant(3_000);
-    let fulfillment_time = corpus_evaluation_instant(4_000);
-    let app_time = corpus_evaluation_instant(5_000);
+    let creation_time = dynamic_fixture_instant(1_000);
+    let policy_time = dynamic_fixture_instant(2_000);
+    let acceptance_time = dynamic_fixture_instant(3_000);
+    let fulfillment_time = dynamic_fixture_instant(4_000);
+    let app_time = dynamic_fixture_instant(5_000);
 
     let (bob_device_identity, bob_did) = fresh_bob();
     let bob_device = Uuid::from_bytes(*bob_device_identity.device_id());
@@ -5641,7 +5653,7 @@ async fn prepare_bootstrap_toctou_case() -> Option<(
 )> {
     let (pool, db_guard) = setup_test_db().await?;
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
     let fixture =
@@ -5669,7 +5681,7 @@ async fn bootstrap_remote_prefix_positive_apply_succeeds_with_all_checks() {
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
 
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
@@ -5971,7 +5983,7 @@ async fn bootstrap_remote_prefix_positive_apply_succeeds_with_all_checks() {
         catbird_server::chat_protocol::repository::remote_prefix::test_support::test_hydrated_graph_summary(
             &mut tx,
             fixture.convo_id,
-            corpus_evaluation_instant(5_000),
+            dynamic_fixture_instant(5_000),
         )
         .await
         .expect("applied mailbox must hydrate");
@@ -6002,7 +6014,7 @@ async fn bootstrap_rollback_on_corrupt_event_2_leaves_zero_database_rows() {
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
 
@@ -6037,7 +6049,7 @@ async fn bootstrap_rollback_on_corrupt_application_tail_leaves_zero_database_row
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
 
@@ -6072,12 +6084,15 @@ async fn bootstrap_closed_grammar_rejects_invalid_event_sequences() {
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
 
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
 
     let fixture = build_full_5_event_prefix_fixture(convo_id, sequencer_did, actor_created_at);
+    // The reducer locks every signer and prospective principal before its
+    // grammar check; register them so that check is what rejects each case.
+    seed_full_test_authority(&pool, &fixture, actor_created_at).await;
 
     let selector =
         RemotePrefixBootstrapSelector::new(convo_id, sequencer_did.to_string(), 0).unwrap();
@@ -6230,7 +6245,7 @@ async fn bootstrap_absent_bootstraps_serialize_cleanly() {
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
 
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
@@ -6473,7 +6488,7 @@ async fn bootstrap_exact_replay_produces_zero_database_writes() {
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
 
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
@@ -6570,7 +6585,7 @@ async fn bootstrap_exact_replay_produces_zero_database_writes() {
         &alice_signing_key,
         &fixture.actor_public_key,
         &fixture.committed_coordinate,
-        corpus_evaluation_instant(6_000),
+        dynamic_fixture_instant(6_000),
     );
 
     let mut hasher6 = CleanConvoDigestHasher::new();
@@ -6616,7 +6631,7 @@ async fn bootstrap_exact_replay_produces_zero_database_writes() {
         "lastSeq": 6,
         "eventCount": 6,
         "digestSha256": hex::encode(digest_sha256_6),
-        "generatedAt": corpus_evaluation_instant(6_000).to_rfc3339_opts(SecondsFormat::Millis, true),
+        "generatedAt": dynamic_fixture_instant(6_000).to_rfc3339_opts(SecondsFormat::Millis, true),
     });
 
     let mut events6 = fixture.events.clone();
@@ -6673,7 +6688,7 @@ async fn bootstrap_conflict_and_quarantine_classification_matrix() {
     };
 
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
 
@@ -6689,6 +6704,8 @@ async fn bootstrap_conflict_and_quarantine_classification_matrix() {
     ] {
         let fixture =
             build_full_5_event_prefix_fixture(Uuid::new_v4(), sequencer_did, actor_created_at);
+        // Registered signers pass the lock prelude, so the routing check decides.
+        seed_full_test_authority(&pool, &fixture, actor_created_at).await;
         let admission = test_admission_from_events(&fixture, fixture.events.clone());
         let mut tx = pool.begin().await.unwrap();
         sqlx::query(
@@ -6921,7 +6938,7 @@ async fn test_hostile_network_admission_matrix() {
     };
 
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
 
@@ -7753,13 +7770,13 @@ async fn test_hostile_reducer_authority_single_field_mutations() {
                 invitation_id,
                 prior,
                 Some((key_package_ref, key_package_wrapper)),
-                corpus_evaluation_instant(3_000),
+                dynamic_fixture_instant(3_000),
             );
             event
         };
         let rebuild_fulfillment =
             |acceptance: &RealAcceptanceEntry, commit: Vec<u8>, welcome: Vec<u8>| {
-                let fulfillment_time = corpus_evaluation_instant(4_000);
+                let fulfillment_time = dynamic_fixture_instant(4_000);
                 let signed_at = fulfillment_time.to_rfc3339_opts(SecondsFormat::Millis, true);
                 let fulfillment =
                     genuine_terminal_fixture::build_genuine_add_fulfillment_entry_with_bytes(
@@ -7796,7 +7813,7 @@ async fn test_hostile_reducer_authority_single_field_mutations() {
                 let other_fixture = build_full_5_event_prefix_fixture(
                     Uuid::new_v4(),
                     &fixture.sequencer_did,
-                    corpus_evaluation_instant(0) - chrono::Duration::hours(1),
+                    dynamic_fixture_instant(0) - chrono::Duration::hours(1),
                 );
                 events[1] = other_fixture.events[1].clone();
             }
@@ -7847,7 +7864,7 @@ async fn test_hostile_reducer_authority_single_field_mutations() {
             }
             "predating_received_at" => {
                 // Set event 2 received_at to 2 hours before creation
-                let predating = corpus_evaluation_instant(0) - chrono::Duration::hours(2);
+                let predating = dynamic_fixture_instant(0) - chrono::Duration::hours(2);
                 events[1]["receivedAt"] =
                     json!(predating.to_rfc3339_opts(SecondsFormat::Millis, true));
                 events[1]["createdAt"] =
@@ -7895,7 +7912,7 @@ async fn test_hostile_reducer_authority_single_field_mutations() {
                 // Target GroupInfo: corrupt the genesis group info bytes in event 1
                 let bad_creation_ev = build_corrupted_group_info_creation_event(
                     fixture.convo_id,
-                    corpus_evaluation_instant(1_000),
+                    dynamic_fixture_instant(1_000),
                 );
                 events[0] = bad_creation_ev;
             }
@@ -7914,9 +7931,9 @@ async fn test_hostile_reducer_authority_single_field_mutations() {
                     fixture.convo_id,
                     fixture.add_transition_id,
                     fixture.invitee.clone(),
-                    corpus_evaluation_instant(1_000),
-                    corpus_evaluation_instant(3_000),
-                    corpus_evaluation_instant(4_000),
+                    dynamic_fixture_instant(1_000),
+                    dynamic_fixture_instant(3_000),
+                    dynamic_fixture_instant(4_000),
                     fixture.pkg_not_before,
                     fixture.pkg_not_after,
                 );
@@ -8016,7 +8033,7 @@ async fn test_bootstrap_deterministic_ids_across_two_disposable_databases() {
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
 
     seed_approved_peer(&pool1, sequencer_did).await;
     seed_protocol_instance(&pool1).await;
@@ -8171,7 +8188,7 @@ async fn test_bootstrap_concurrent_conflicting_prefixes_never_mix_rows() {
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
 
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
@@ -8292,7 +8309,7 @@ async fn test_bootstrap_sticky_quarantine_preserves_timestamp_and_semantic_immut
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
 
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;
@@ -8400,7 +8417,7 @@ async fn test_bootstrap_injected_serialization_failure_and_deadlock_never_quaran
 
     let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:sequencer.catbird.blue";
-    let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
 
     seed_approved_peer(&pool, sequencer_did).await;
     seed_protocol_instance(&pool).await;

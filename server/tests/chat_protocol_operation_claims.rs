@@ -8,7 +8,7 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256, Sha384};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -22,6 +22,130 @@ fn rust_sources_under(directory: &Path, sources: &mut Vec<std::path::PathBuf>) {
             sources.push(path);
         }
     }
+}
+
+/// One `mod name;` item: its declaring file, name, `#[path]` value, and
+/// whether a `cfg(test)` or `cfg(all(test, …))` attribute gates it.
+struct ModuleItem {
+    file: PathBuf,
+    name: String,
+    path: Option<String>,
+    test_gated: bool,
+}
+
+fn module_items(file: &Path) -> Vec<ModuleItem> {
+    let source = std::fs::read_to_string(file).expect("read Rust source");
+    let mut items = Vec::new();
+    let mut attributes = String::new();
+    for line in source.lines().map(str::trim) {
+        let unclosed = attributes
+            .matches('[')
+            .count()
+            .saturating_sub(attributes.matches(']').count());
+        if unclosed > 0 || line.starts_with("#[") {
+            attributes.push_str(line);
+            continue;
+        }
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if let Some((visibility, name)) = line
+            .strip_suffix(';')
+            .and_then(|item| item.rsplit_once("mod "))
+        {
+            if visibility.is_empty() || visibility.starts_with("pub") {
+                items.push(ModuleItem {
+                    file: file.to_path_buf(),
+                    name: name.to_owned(),
+                    path: attributes
+                        .split_once("#[path = \"")
+                        .and_then(|(_, rest)| rest.split_once('"'))
+                        .map(|(path, _)| path.to_owned()),
+                    test_gated: attributes.contains("cfg(test)")
+                        || attributes.contains("cfg(all(test"),
+                });
+            }
+        }
+        attributes.clear();
+    }
+    items
+}
+
+/// Canonical paths of the `sources` compiled only under `cfg(test)`: reached
+/// from a test-gated `mod` item, and not from a crate root through ungated
+/// ones. A file no `mod` item names (an `include!`d one) counts as production.
+fn test_only_sources(sources: &[PathBuf]) -> BTreeSet<PathBuf> {
+    let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+    let items = sources
+        .iter()
+        .flat_map(|file| module_items(file))
+        .collect::<Vec<_>>();
+    // A file loaded through `#[path]` resolves its own modules like a `mod.rs`.
+    let path_loaded = items
+        .iter()
+        .filter_map(|item| canonical(&item.file.parent()?.join(item.path.as_ref()?)))
+        .collect::<BTreeSet<_>>();
+    let edges = items
+        .iter()
+        .filter_map(|item| {
+            let from = canonical(&item.file)?;
+            let directory = item.file.parent()?;
+            // An item naming no file (one quoted in a string) adds no edge, and
+            // a spurious test-gated edge cannot exempt a file a crate root reaches.
+            let to = match &item.path {
+                Some(path) => canonical(&directory.join(path))?,
+                None => {
+                    let stem = item.file.file_stem()?;
+                    let base = if ["mod", "lib", "main"].iter().any(|root| stem == *root)
+                        || path_loaded.contains(&from)
+                    {
+                        directory.to_path_buf()
+                    } else {
+                        directory.join(stem)
+                    };
+                    [
+                        base.join(format!("{}.rs", item.name)),
+                        base.join(&item.name).join("mod.rs"),
+                    ]
+                    .iter()
+                    .find_map(|candidate| canonical(candidate))?
+                }
+            };
+            Some((from, to, item.test_gated))
+        })
+        .collect::<Vec<_>>();
+    let closure = |mut reached: BTreeSet<PathBuf>, through_test_gates: bool| loop {
+        let before = reached.len();
+        for (from, to, test_gated) in &edges {
+            if (through_test_gates || !test_gated) && reached.contains(from) {
+                reached.insert(to.clone());
+            }
+        }
+        if reached.len() == before {
+            break reached;
+        }
+    };
+    let roots = sources
+        .iter()
+        .filter(|path| {
+            path.ends_with("src/lib.rs")
+                || path.ends_with("src/main.rs")
+                || path
+                    .parent()
+                    .is_some_and(|parent| parent.ends_with("src/bin"))
+        })
+        .filter_map(|path| canonical(path))
+        .collect();
+    let production = closure(roots, false);
+    let tested = closure(
+        edges
+            .iter()
+            .filter(|edge| edge.2)
+            .map(|edge| edge.1.clone())
+            .collect(),
+        true,
+    );
+    tested.difference(&production).cloned().collect()
 }
 
 #[test]
@@ -296,6 +420,10 @@ fn completeness_activation_drains_writers_and_preserves_only_bounded_legacy_orph
     let source_root = manifest.join("src");
     let mut sources = Vec::new();
     rust_sources_under(&source_root, &mut sources);
+    // Writers are counted in production modules: a `cfg(test)` module may seed
+    // receipts and claims directly.
+    let test_only = test_only_sources(&sources);
+    sources.retain(|path| !test_only.contains(&std::fs::canonicalize(path).unwrap()));
     let relative_writer_paths = sources
         .iter()
         .filter_map(|path| {

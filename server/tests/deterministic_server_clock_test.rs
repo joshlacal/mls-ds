@@ -4,7 +4,7 @@
 use std::{
     path::PathBuf,
     sync::{Arc, Once},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use axum::{
@@ -1147,11 +1147,17 @@ async fn execute_request(router: &Router, label: &str, request: Request<Body>) -
 
 async fn execute_scenario_run(
     router: &Router,
-    clock: &ManualDsClock,
+    clock: &Arc<ManualDsClock>,
     t0: DateTime<Utc>,
     scenario: &PreparedScenario,
 ) -> Vec<(String, Vec<u8>)> {
     clock.reset_counters();
+    clock.set_utc(t0);
+    scope_ds_clock(clock.clone(), async {
+        seed_sim_did_document(scenario.alice.did_document()).await;
+        seed_sim_did_document(scenario.bob_primary.did_document()).await;
+    })
+    .await;
     let mut outputs = Vec::with_capacity(scenario.steps.len() + 6);
     for step in &scenario.steps {
         clock.set_utc(t0 + TimeDelta::milliseconds(step.clock_offset_ms));
@@ -1425,10 +1431,8 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
     });
 
     let scenario = build_deterministic_scenario(t0);
-    seed_sim_did_document(scenario.alice.did_document()).await;
-    seed_sim_did_document(scenario.bob_primary.did_document()).await;
 
-    // Warm schema reset plan before Run 1 so Run 1 -> Run 2 measures steady-state truncation.
+    // Warm the schema reset plan before Run 1 so the Run 1 -> Run 2 reset is the steady state.
     reset_sim_postgres_schema(sim_db.pool())
         .await
         .expect("initial reset_sim_postgres_schema");
@@ -1472,16 +1476,10 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
         "SSE typing event must broadcast once drain_next runs"
     );
 
-    // --- Fast Schema + In-Memory Cache Reset (`< 25 ms` on `max_connections(1)`) ---
-    let reset_started = Instant::now();
-    reset_sim_postgres_schema(sim_db.pool())
-        .await
-        .expect("reset_sim_postgres_schema between Run 1 and Run 2");
-    let reset_elapsed = reset_started.elapsed();
-    println!(
-        "[deterministic_server_clock_test] steady-state reset_sim_postgres_schema elapsed: {:?}",
-        reset_elapsed
-    );
+    // --- Schema + in-memory cache reset between runs ---
+    // Deterministic evidence, not a wall-clock budget: the reset finishes without
+    // advancing paused Tokio time and returns the single pooled connection.
+    assert_reset_without_virtual_time_advance(sim_db.pool(), "steady-state run 1 -> run 2").await;
     // --- Run 2 (exact same clock schedule, JTIs, idempotency keys, and signed bytes) ---
     let run2 = execute_scenario_run(&router, &clock, t0, &scenario).await;
     assert_eq!(spawner.labels(), vec!["chat.post_commit.device_revoked"]);
@@ -1591,11 +1589,6 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
         &signed_receipt,
     )
     .expect("ES256 sequencerReceipt must verify cryptographically");
-
-    assert!(
-        reset_elapsed < Duration::from_millis(25),
-        "steady-state reset_sim_postgres_schema took {reset_elapsed:?}, expected < 25ms"
-    );
 
     sim_db.cleanup().await.expect("drop disposable sim DB");
 }

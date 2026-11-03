@@ -2,7 +2,7 @@
 
 This debug-only launcher lets installed development clients exercise the real delivery-service router with synthetic local sessions and identities. It starts the existing guarded PostgreSQL/service fixture, a strict synthetic DID/PDS facade, and a loopback TLS gateway. Client MLS keys remain client-owned; the gateway retains synthetic service-JWT signing keys only in memory. This is a local qualification tool, not a replacement login service or permission to activate production requests.
 
-Governing plan: [encrypted message requests](../../docs/superpowers/plans/2026-09-19-encrypted-message-requests.md). Coordinate the guarded database window with the integration steward before starting; stop the launcher before releasing that window.
+Governing plan: workspace `docs/superpowers/plans/2026-09-19-encrypted-message-requests.md` (outside this repository). Coordinate the guarded database window with the integration steward before starting; stop the launcher before releasing that window. The two-home federation suites are separate; their commands are in [../server/README.md](../server/README.md#tests).
 
 ## Build and start
 
@@ -29,6 +29,36 @@ For an isolated C33 recipient-authority refusal, add `"foreign_bob_authority": t
 To exercise first-response loss in the same local foreign-authority path, also set `"withhold_first_foreign_prepare_response": true`. The gateway forwards the first successful, typed `RecipientAuthorityUnsupported` prepare to the actual service, then returns a synthetic 503 **only** for that first response; exact retry receives the signed service replay. This flag is rejected unless `foreign_bob_authority` is true. It changes neither the signed request nor the service's database state, and must not be used as evidence of a production transport fault.
 
 For installed-client wire evidence, gateway stderr prints `fixture-xrpc-path-only` and a quoted XRPC path (capped at 256 bytes); it never logs query strings, authentication headers, or request bodies. Keep only these lines in a bounded case receipt, and remove the synthetic fixture afterward.
+
+## Guarded test database and subscription authority
+
+The server direct-request tests and e2e harness share
+`postgresql://127.0.0.1:5432/catbird_direct_requests_test_20260919`.
+Both use `server/tests/common/direct_request_migrations.rs`: 14 baseline
+migrations, 16 prerequisites, the 56 request and current-schema migrations
+through `20261104000011`, and the auth-JTI replay migration (87 in all). Either
+harness can run first.
+Each validates the reviewed SQL checksums and rejects any current migration
+file absent from the shared manifest; the server still rejects unknown applied
+versions. The harness also creates the federation endpoint cache
+required by the actor-to-DS migration, without installing legacy conversations.
+Update the shared manifest when the reviewed migration set changes, not a
+separate harness-specific prefix. Back up or clone this shared database before
+running a migration that removes data.
+The shipping fixture uses the existing immutable cursor-key ID when server
+tests initialized the fence first; it never rotates that fence. Both harnesses
+use the same synthetic sealing secret, and shipping startup still checks the
+runtime against the stored protocol identity.
+
+`subscribeEvents` uses commit notifications for immediate delivery and a 250 ms
+idle fallback for exact-device, protocol and inventory-expiry revalidation.
+Notifications are local to a server process; they cannot replace the database
+authority check. The 30-second transport heartbeat neither extends an inventory
+session nor writes a cursor receipt. Its actual-upgrade regressions are mounted
+in the server lib as `heartbeat_transport_tests` with `test-support`.
+Each heartbeat connection uses a reaped `chat_heartbeat_<UUID>` database from
+the existing full-migration helper, so whole-table immutability assertions
+remain valid while other lib runs execute concurrently.
 
 ## Public manifest and protected sessions
 

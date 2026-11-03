@@ -515,10 +515,8 @@ pub(crate) enum WelcomeTerminalTransactionOutcome {
 
 #[derive(Debug, Error)]
 pub(crate) enum WelcomeTerminalFacadeError {
-    #[error("request Welcome is already terminal for another operation")]
-    FreshTerminal,
-    #[error("request Welcome not found for this device or conversation")]
-    FreshMissing,
+    #[error("fresh Welcome request rejected without retaining an operation claim")]
+    FreshRejection(WelcomeCanonicalResponse),
     #[error(transparent)]
     Retention(#[from] super::direct_request_retention::RetentionError),
     #[error("Welcome request body is out of domain")]
@@ -592,8 +590,31 @@ async fn prepare_first_welcome_terminal(
         return Err(WelcomeTerminalFacadeError::InvalidRequest);
     }
 
+    let aggregate = match hydrate_locked_conversation_state(
+        transaction,
+        parsed.conversation_id,
+        trusted_datetime,
+    )
+    .await
+    {
+        Ok(aggregate) => aggregate,
+        Err(ConversationStateHydrationError::Head(
+            super::core::ConversationHeadHydrationError::ConversationMissing,
+        )) => {
+            return Err(WelcomeTerminalFacadeError::FreshRejection(
+                canonical_welcome_response(
+                    parsed.endpoint,
+                    &WelcomeCanonicalMaterial::WelcomeNotFound {
+                        welcome_id: parsed.welcome_id,
+                    },
+                )?,
+            ))
+        }
+        Err(error) => return Err(error.into()),
+    };
     let (authority, prelude) = match try_prepare_direct_request_welcome_terminal(
         transaction,
+        &aggregate,
         authority,
         &parsed,
         &mutation,
@@ -607,12 +628,6 @@ async fn prepare_first_welcome_terminal(
     };
     let trusted_instant = authority.trusted_instant();
 
-    let aggregate = hydrate_locked_conversation_state(
-        transaction,
-        parsed.conversation_id,
-        trusted_instant.datetime(),
-    )
-    .await?;
     let classification =
         match lock_welcome_terminal(transaction, &aggregate, parsed.welcome_id).await {
             Ok(classification) => classification,
@@ -724,6 +739,7 @@ async fn prepare_completed_welcome_replay(
             .await?;
     let direct = direct_request_welcome_terminal(
         transaction,
+        &aggregate,
         &parsed,
         authority.mutation(),
         trusted_instant,
@@ -1100,7 +1116,7 @@ fn reverify_scope_mutation(
     Ok(verified)
 }
 
-struct ParsedWelcomeRequest {
+pub(super) struct ParsedWelcomeRequest {
     endpoint: WelcomeEndpoint,
     operation_endpoint: WelcomeOperationEndpoint,
     operation_id: Uuid,
@@ -1120,7 +1136,7 @@ struct ParsedWelcomeCoordinate {
     confirmation_tag: [u8; 32],
 }
 
-fn parse_welcome_request(
+pub(super) fn parse_welcome_request(
     mutation: &VerifiedSignedMutation,
 ) -> Result<ParsedWelcomeRequest, WelcomeTerminalFacadeError> {
     let (endpoint, operation_endpoint, body) = match mutation.projection() {
@@ -1426,6 +1442,12 @@ fn canonical_welcome_response(
         }
         _ => return Err(WelcomeTerminalFacadeError::ReplayPostState),
     };
+    seal_welcome_response((status, value))
+}
+
+fn seal_welcome_response(
+    (status, value): (i32, serde_json::Value),
+) -> Result<WelcomeCanonicalResponse, WelcomeTerminalFacadeError> {
     let bytes =
         serde_json::to_vec(&value).map_err(|_| WelcomeTerminalFacadeError::ReplayPostState)?;
     let sha256 = Sha256::digest(&bytes).into();
@@ -1581,6 +1603,32 @@ mod tests {
     }
 
     #[test]
+    fn fresh_rejection_responses_preserve_missing_and_endpoint_conflict_semantics() {
+        for (endpoint, conflict_code) in [
+            (WelcomeEndpoint::Acknowledge, "AcknowledgementConflict"),
+            (WelcomeEndpoint::Reject, "RejectionConflict"),
+        ] {
+            let missing = canonical_welcome_response(
+                endpoint,
+                &WelcomeCanonicalMaterial::WelcomeNotFound {
+                    welcome_id: welcome_id(),
+                },
+            )
+            .unwrap();
+            let conflict = seal_welcome_response(protocol_error_response(conflict_code)).unwrap();
+            for (response, code) in [(missing, "WelcomeNotFound"), (conflict, conflict_code)] {
+                assert_eq!(response.status(), 400);
+                let value: serde_json::Value = serde_json::from_slice(response.as_bytes()).unwrap();
+                assert_eq!(value, json!({ "error": code, "message": code }));
+                assert_eq!(
+                    response.sha256(),
+                    &<[u8; 32]>::from(Sha256::digest(response.as_bytes()))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn replay_post_state_seal_covers_expected_response_and_terminal_facts() {
         let mut proof = WelcomeReplayPostStateProof::from_locked_facts(
             "41".to_owned(),
@@ -1609,6 +1657,7 @@ mod tests {
 
 async fn try_prepare_direct_request_welcome_terminal(
     transaction: &mut Transaction<'_, Postgres>,
+    aggregate: &LockedConversationStateGuard,
     authority: VerifiedChatDeviceRequest,
     parsed: &ParsedWelcomeRequest,
     mutation: &VerifiedSignedMutation,
@@ -1625,7 +1674,8 @@ async fn try_prepare_direct_request_welcome_terminal(
     WelcomeTerminalFacadeError,
 > {
     let Some((material, _, _, _)) =
-        direct_request_welcome_terminal(transaction, parsed, mutation, trusted_at, true).await?
+        direct_request_welcome_terminal(transaction, aggregate, parsed, mutation, trusted_at, true)
+            .await?
     else {
         return Ok(Err((authority, prelude)));
     };
@@ -1665,8 +1715,16 @@ async fn try_prepare_direct_request_welcome_terminal(
 /// Exact-device request Welcome CAS. Publication provenance is immutable and
 /// acceptance never supersedes this historical coordinate. No peer event is
 /// produced, and neither expiry nor rejection changes account consent.
-async fn direct_request_welcome_terminal(
+///
+/// The canonical prelude and aggregate lock must already be held, just as for
+/// ordinary Welcome terminalization (core::lock_welcome_terminal). The head
+/// serializes close/reset and every Welcome outcome writer. Delivery identity
+/// and import_until are immutable; only provenance may be pruned, which this
+/// query does not read. Locking that row adds no authority and would needlessly
+/// conflict with inventory's delivery FK checks.
+pub(super) async fn direct_request_welcome_terminal(
     tx: &mut Transaction<'_, Postgres>,
+    aggregate: &LockedConversationStateGuard,
     parsed: &ParsedWelcomeRequest,
     mutation: &VerifiedSignedMutation,
     now: DateTime<Utc>,
@@ -1682,7 +1740,15 @@ async fn direct_request_welcome_terminal(
 > {
     use serde_json::Value;
     use sqlx::Row;
-    let row=sqlx::query("SELECT d.import_until,p.signed_publication,p.request_entry,p.publication_digest,p.generation,c.current_generation,c.lifecycle,c.closed_at,c.close_transition_id,o.status,o.terminal_at,o.signed_request_bytes,o.request_digest,slot.operation_id AS retained_operation_id FROM chat.direct_request_device_deliveries d JOIN chat.direct_request_publications p USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id LEFT JOIN chat.direct_request_welcome_outcomes o ON o.request_id=d.request_id AND o.recipient_did=d.owner_did AND o.recipient_device_id=d.owner_device_id LEFT JOIN chat.direct_request_welcome_slots slot ON slot.request_id=d.request_id AND slot.recipient_did=d.owner_did AND slot.recipient_device_id=d.owner_device_id WHERE d.request_id=$1 AND d.owner_did=$2 AND d.owner_device_id=$3 AND p.conversation_id=$4 FOR UPDATE OF c,d")
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **tx)
+        .await?;
+    if aggregate.head().transaction_id() != transaction_id
+        || aggregate.head().conversation_id() != parsed.conversation_id
+    {
+        return Err(WelcomeTerminalFacadeError::InvalidRequest);
+    }
+    let row=sqlx::query("SELECT d.import_until,COALESCE(p.request_entry,(SELECT e.pruned_payload_bytes FROM chat.entries e WHERE e.conversation_id=p.conversation_id AND e.transition_id=p.request_id)) AS request_entry,p.publication_digest,p.generation,c.current_generation,c.lifecycle,c.closed_at,c.close_transition_id,o.status,o.terminal_at,o.signed_request_bytes,o.request_digest,slot.operation_id AS retained_operation_id FROM chat.direct_request_device_deliveries d JOIN chat.direct_request_publications p USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id LEFT JOIN chat.direct_request_welcome_outcomes o ON o.request_id=d.request_id AND o.recipient_did=d.owner_did AND o.recipient_device_id=d.owner_device_id LEFT JOIN chat.direct_request_welcome_slots slot ON slot.request_id=d.request_id AND slot.recipient_did=d.owner_did AND slot.recipient_device_id=d.owner_device_id WHERE d.request_id=$1 AND d.owner_did=$2 AND d.owner_device_id=$3 AND p.conversation_id=$4")
         .bind(parsed.welcome_id).bind(mutation.actor_did().as_str()).bind(Uuid::from_bytes(*mutation.actor_device_id().as_bytes())).bind(parsed.conversation_id)
         .fetch_optional(&mut **tx).await?;
     let Some(row) = row else {
@@ -1692,7 +1758,17 @@ async fn direct_request_welcome_terminal(
         let request_scope:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.direct_request_publications WHERE request_id=$1) OR (EXISTS(SELECT 1 FROM chat.direct_request_publications WHERE conversation_id=$2) AND NOT EXISTS(SELECT 1 FROM chat.welcome_bundles w JOIN chat.welcome_deliveries d USING(welcome_id) WHERE w.welcome_id=$1 AND w.conversation_id=$2 AND d.recipient_did=$3 AND d.recipient_device_id=$4))")
             .bind(parsed.welcome_id).bind(parsed.conversation_id).bind(mutation.actor_did().as_str()).bind(Uuid::from_bytes(*mutation.actor_device_id().as_bytes())).fetch_one(&mut **tx).await?;
         if request_scope {
-            return Err(WelcomeTerminalFacadeError::FreshMissing);
+            if !first {
+                return Err(WelcomeTerminalFacadeError::ReplayPostState);
+            }
+            return Err(WelcomeTerminalFacadeError::FreshRejection(
+                canonical_welcome_response(
+                    parsed.endpoint,
+                    &WelcomeCanonicalMaterial::WelcomeNotFound {
+                        welcome_id: parsed.welcome_id,
+                    },
+                )?,
+            ));
         }
         return Ok(None);
     };
@@ -1706,7 +1782,12 @@ async fn direct_request_welcome_terminal(
     {
         // The caller returns an error and rolls back the freshly claimed
         // generic operation. Only the original completed ID can replay.
-        return Err(WelcomeTerminalFacadeError::FreshTerminal);
+        return Err(WelcomeTerminalFacadeError::FreshRejection(
+            seal_welcome_response(protocol_error_response(match parsed.endpoint {
+                WelcomeEndpoint::Acknowledge => "AcknowledgementConflict",
+                WelcomeEndpoint::Reject => "RejectionConflict",
+            }))?,
+        ));
     }
     if !first && original != Some(parsed.operation_id) {
         return Err(WelcomeTerminalFacadeError::ReplayPostState);
@@ -1733,11 +1814,11 @@ async fn direct_request_welcome_terminal(
     } else {
         now
     };
-    let publication: Value =
-        serde_json::from_slice(&row.try_get::<Vec<u8>, _>("signed_publication")?)
-            .map_err(|_| WelcomeTerminalFacadeError::InvalidRequest)?;
+    // The opening entry, or once its ciphertext was pruned its redacted entry (O7):
+    // seq and signed coordinates are the same in both.
     let entry: Value = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("request_entry")?)
         .map_err(|_| WelcomeTerminalFacadeError::InvalidRequest)?;
+    let publication = &entry["signedRequest"];
     let raw = mutation
         .accepted_wrapper_bytes()
         .ok_or(WelcomeTerminalFacadeError::InvalidRequest)?;

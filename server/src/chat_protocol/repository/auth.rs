@@ -493,7 +493,7 @@ pub(crate) async fn preflight_completed_response(
     admission: &SignedOperationAdmission,
 ) -> Result<Option<CompletedResponsePreflight>, AuthRepositoryError> {
     let operation_id = admission.operation_id()?;
-    let row: Option<(Vec<u8>, i32, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    let row: Option<(Vec<u8>, i32, Option<Vec<u8>>, Vec<u8>)> = sqlx::query_as(
         "SELECT request_digest, completed_status, response_bytes, response_sha256
            FROM chat.idempotency_records
           WHERE principal_did = $1 AND endpoint_nsid = $2 AND operation_id = $3",
@@ -506,6 +506,8 @@ pub(crate) async fn preflight_completed_response(
     let Some((request_digest, status, response_bytes, response_sha256)) = row else {
         return Ok(None);
     };
+    // An erased receipt (O7) keeps no response to replay; its operation stays spent.
+    let response_bytes = response_bytes.ok_or(AuthRepositoryError::IdempotencyConflict)?;
     if request_digest.as_slice() != admission.canonical.request_digest()
         || response_sha256.as_slice() != Sha256::digest(&response_bytes).as_slice()
     {
@@ -969,14 +971,17 @@ impl ::core::fmt::Debug for LockedDeviceAuthority {
     }
 }
 
+/// A completed receipt. Its three payload columns are `None` once erased (O7,
+/// migration 20261104000005); an erased receipt matches its request by the
+/// digest and signature it keeps, and replays as its accepted, pruned entry.
 #[derive(Debug, FromRow)]
 struct IdempotencyRow {
     request_digest: Vec<u8>,
-    accepted_request_bytes: Vec<u8>,
-    signing_transcript_bytes: Vec<u8>,
+    accepted_request_bytes: Option<Vec<u8>>,
+    signing_transcript_bytes: Option<Vec<u8>>,
     signature: Option<Vec<u8>>,
     completed_status: i32,
-    response_bytes: Vec<u8>,
+    response_bytes: Option<Vec<u8>>,
     response_sha256: Vec<u8>,
     event_position: Option<i64>,
     historical_jkt: Option<String>,
@@ -995,8 +1000,8 @@ pub(crate) struct CompletedResponsePreflight {
 #[derive(Debug, FromRow)]
 struct IdempotencyBindingRow {
     request_digest: Vec<u8>,
-    accepted_request_bytes: Vec<u8>,
-    signing_transcript_bytes: Vec<u8>,
+    accepted_request_bytes: Option<Vec<u8>>,
+    signing_transcript_bytes: Option<Vec<u8>>,
     signature: Option<Vec<u8>>,
     historical_jkt: Option<String>,
     current_jkt: Option<String>,
@@ -1569,6 +1574,23 @@ impl LockedCanonicalDeviceProjection {
 }
 
 impl LockedCanonicalKeyProjection {
+    /// Enrollment records are immutable activations. Rebinding may keep a key;
+    /// a later activation replaces it without rewriting historical proofs.
+    pub(crate) fn at_generation<'a>(
+        keys: &'a [Self],
+        did: &str,
+        device_id: Uuid,
+        auth_generation: i64,
+    ) -> Option<&'a Self> {
+        keys.iter()
+            .filter(|key| {
+                key.user_did == did
+                    && key.device_id == device_id
+                    && key.enrollment_auth_generation <= auth_generation
+            })
+            .max_by_key(|key| key.enrollment_auth_generation)
+    }
+
     pub(crate) fn user_did(&self) -> &str {
         &self.user_did
     }
@@ -1658,15 +1680,14 @@ impl LockedCanonicalAuthorityScope {
         key_id: &str,
         enrollment_auth_generation: i64,
     ) -> Option<&[u8]> {
-        self.keys
-            .iter()
-            .find(|key| {
-                key.user_did() == did
-                    && key.device_id() == device_id
-                    && key.key_id() == key_id
-                    && key.enrollment_auth_generation() == enrollment_auth_generation
-            })
-            .map(|key| key.signing_public_key())
+        LockedCanonicalKeyProjection::at_generation(
+            &self.keys,
+            did,
+            device_id,
+            enrollment_auth_generation,
+        )
+        .filter(|key| key.key_id() == key_id)
+        .map(|key| key.signing_public_key())
     }
 
     pub(super) fn actor_projected_signing_public_key(&self) -> Option<&[u8]> {
@@ -1902,14 +1923,14 @@ pub(super) async fn lock_canonical_business_authority_scope(
     let mutation = authority
         .mutation()
         .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
-    let actor_key = locked_keys
-        .iter()
-        .find(|row| {
-            row.user_did == actor_did
-                && row.device_id == actor_device_id
-                && row.key_id == mutation.key_id().as_str()
-        })
-        .ok_or(AuthRepositoryError::DeviceKeyMissing)?;
+    let actor_key = LockedCanonicalKeyProjection::at_generation(
+        &locked_keys,
+        actor_did,
+        actor_device_id,
+        actor.auth_generation,
+    )
+    .filter(|row| row.key_id == mutation.key_id().as_str())
+    .ok_or(AuthRepositoryError::DeviceKeyMissing)?;
     let signing_key_sha256: [u8; 32] = Sha256::digest(&actor_key.signing_public_key).into();
     let requested_generation = i64::try_from(mutation.auth_generation())
         .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
@@ -2290,18 +2311,19 @@ pub(crate) async fn recheck_existing_business_authority_for_test(
         r#"
         SELECT key_id,signing_public_key,enrollment_auth_generation,revoked_at
           FROM chat.device_keys
-         WHERE user_did=$1 AND device_id=$2
-         ORDER BY convert_to(key_id,'UTF8')
+         WHERE user_did=$1 AND device_id=$2 AND enrollment_auth_generation <= $3
+         ORDER BY enrollment_auth_generation DESC LIMIT 1
          FOR UPDATE
         "#,
     )
     .bind(subject)
     .bind(device_id)
+    .bind(device.auth_generation)
     .fetch_all(&mut **transaction)
     .await?;
     let mut eligible = None;
     for (key_id, signing_public_key, enrollment_auth_generation, revoked_at) in keys {
-        if revoked_at.is_some() || enrollment_auth_generation != device.auth_generation {
+        if revoked_at.is_some() || enrollment_auth_generation > device.auth_generation {
             continue;
         }
         let canonical = KeyThumbprint::parse(&key_id)
@@ -2925,8 +2947,9 @@ async fn completed_request_material_matches_without_response(
         return Ok(false);
     };
     if row.request_digest.as_slice() != material.request_digest
-        || row.accepted_request_bytes != material.accepted_request_bytes
-        || row.signing_transcript_bytes != material.signing_transcript_bytes
+        || row.accepted_request_bytes.as_deref() != Some(material.accepted_request_bytes.as_slice())
+        || row.signing_transcript_bytes.as_deref()
+            != Some(material.signing_transcript_bytes.as_slice())
         || row.signature.as_deref() != Some(material.signature.as_slice())
         || !completed_replay_jkt_shape(
             pre_replay.endpoint().as_str(),
@@ -2965,27 +2988,70 @@ async fn completed_replay(
         return Ok(None);
     };
 
-    if !exact_request_material_matches(material, &row)
-        || !completed_replay_jkt_matches(pre_replay, material, &row)
-    {
+    // An erased receipt (O7) keeps its digests and signature, not its bytes:
+    // the same signed send replays as its accepted, pruned entry.
+    let same_request = match row.response_bytes {
+        Some(_) => exact_request_material_matches(material, &row),
+        None => erased_request_material_matches(material, &row),
+    };
+    if !same_request || !completed_replay_jkt_matches(pre_replay, material, &row) {
         return Err(AuthRepositoryError::IdempotencyConflict);
     }
 
+    let Some(response_bytes) = row.response_bytes else {
+        let response_bytes = erased_send_outcome(transaction, material).await?;
+        return Ok(Some(CompletedIdempotentResponse {
+            status: row.completed_status,
+            response_sha256: Sha256::digest(&response_bytes).into(),
+            response_bytes,
+            event_position: row.event_position,
+            completed_at: row.completed_at,
+        }));
+    };
     let digest: [u8; 32] = row
         .response_sha256
         .as_slice()
         .try_into()
         .map_err(|_| AuthRepositoryError::CorruptIdempotencyRecord)?;
-    if Sha256::digest(&row.response_bytes).as_slice() != digest {
+    if Sha256::digest(&response_bytes).as_slice() != digest {
         return Err(AuthRepositoryError::CorruptIdempotencyRecord);
     }
     Ok(Some(CompletedIdempotentResponse {
         status: row.completed_status,
-        response_bytes: row.response_bytes,
+        response_bytes,
         response_sha256: digest,
         event_position: row.event_position,
         completed_at: row.completed_at,
     }))
+}
+
+/// The outcome a `sendMessage` whose receipt was erased (O7) replays, never a
+/// re-execution: the entry it appended exactly as `getEntries` serves it, in
+/// `sendMessage`'s output shape. Only `sendMessage` receipts are ever erased.
+async fn erased_send_outcome(
+    transaction: &mut Transaction<'_, Postgres>,
+    material: &RequestMaterial,
+) -> Result<Vec<u8>, AuthRepositoryError> {
+    let conversation_id =
+        serde_json::from_slice::<serde_json::Value>(&material.accepted_request_bytes)
+            .ok()
+            .and_then(|request| {
+                Uuid::parse_str(request.pointer("/body/prior/conversationId")?.as_str()?).ok()
+            })
+            .ok_or(AuthRepositoryError::CorruptIdempotencyRecord)?;
+    let mut entry = super::entry_read::sent_application_entry(
+        transaction,
+        conversation_id,
+        material.operation_id,
+        &material.request_digest,
+    )
+    .await?
+    .ok_or(AuthRepositoryError::CorruptIdempotencyRecord)?;
+    if let Some(entry) = entry.as_object_mut() {
+        entry.remove("$type");
+    }
+    serde_json::to_vec(&super::entry_read::accepted_send_outcome(entry))
+        .map_err(|_| AuthRepositoryError::CorruptIdempotencyRecord)
 }
 
 /// Loads exact completed material and validates the current or retained
@@ -3341,14 +3407,26 @@ fn completed_replay_jkt_shape(
     exact_shape && proof_shape
 }
 
+/// False for an erased receipt: it keeps no bytes to match.
 fn exact_request_material_matches(material: &RequestMaterial, row: &IdempotencyRow) -> bool {
     row.request_digest.as_slice() == material.request_digest.as_slice()
-        && row.accepted_request_bytes.as_slice() == material.accepted_request_bytes.as_slice()
-        && row.signing_transcript_bytes.as_slice() == material.signing_transcript_bytes.as_slice()
+        && row.accepted_request_bytes.as_deref() == Some(material.accepted_request_bytes.as_slice())
+        && row.signing_transcript_bytes.as_deref()
+            == Some(material.signing_transcript_bytes.as_slice())
         && row
             .signature
             .as_deref()
             .is_some_and(|value| value == material.signature.as_slice())
+}
+
+/// An erased receipt keeps no request bytes: it is the same signed request
+/// exactly when its retained request digest and signature are.
+fn erased_request_material_matches(material: &RequestMaterial, row: &IdempotencyRow) -> bool {
+    row.accepted_request_bytes.is_none()
+        && row.signing_transcript_bytes.is_none()
+        && row.response_bytes.is_none()
+        && row.request_digest.as_slice() == material.request_digest.as_slice()
+        && row.signature.as_deref() == Some(material.signature.as_slice())
 }
 
 async fn lock_existing_authority(
@@ -3395,12 +3473,14 @@ async fn lock_device_and_key(
         r#"
         SELECT key_id, signing_public_key, revoked_at
         FROM chat.device_keys
-        WHERE user_did = $1 AND device_id = $2
+        WHERE user_did = $1 AND device_id = $2 AND enrollment_auth_generation <= $3
+        ORDER BY enrollment_auth_generation DESC LIMIT 1
         FOR UPDATE
         "#,
     )
     .bind(subject)
     .bind(device_id)
+    .bind(device.auth_generation)
     .fetch_optional(&mut **transaction)
     .await?;
     let key = key.ok_or(AuthRepositoryError::DeviceKeyMissing)?;
@@ -3991,11 +4071,11 @@ mod tests {
     fn completed_row(material: &RequestMaterial) -> IdempotencyRow {
         IdempotencyRow {
             request_digest: material.request_digest.to_vec(),
-            accepted_request_bytes: material.accepted_request_bytes.clone(),
-            signing_transcript_bytes: material.signing_transcript_bytes.clone(),
+            accepted_request_bytes: Some(material.accepted_request_bytes.clone()),
+            signing_transcript_bytes: Some(material.signing_transcript_bytes.clone()),
             signature: Some(material.signature.to_vec()),
             completed_status: 200,
-            response_bytes: b"response".to_vec(),
+            response_bytes: Some(b"response".to_vec()),
             response_sha256: Sha256::digest(b"response").to_vec(),
             event_position: None,
             historical_jkt: material.historical_jkt.clone(),
@@ -4135,7 +4215,7 @@ mod tests {
         let mut row = completed_row(&material);
         assert!(exact_request_material_matches(&material, &row));
 
-        row.accepted_request_bytes.push(b' ');
+        row.accepted_request_bytes.as_mut().unwrap().push(b' ');
         assert!(!exact_request_material_matches(&material, &row));
         row = completed_row(&material);
         row.request_digest[0] ^= 1;
@@ -4143,6 +4223,38 @@ mod tests {
         row = completed_row(&material);
         row.signature.as_mut().unwrap()[0] ^= 1;
         assert!(!exact_request_material_matches(&material, &row));
+        // An erased receipt keeps its digest and signature but no exact bytes.
+        row = completed_row(&material);
+        row.accepted_request_bytes = None;
+        row.signing_transcript_bytes = None;
+        row.response_bytes = None;
+        assert!(!exact_request_material_matches(&material, &row));
+    }
+
+    #[test]
+    fn an_erased_receipt_matches_only_its_retained_digest_and_signature() {
+        let material = material();
+        let erased = || {
+            let mut row = completed_row(&material);
+            row.accepted_request_bytes = None;
+            row.signing_transcript_bytes = None;
+            row.response_bytes = None;
+            row
+        };
+        assert!(erased_request_material_matches(&material, &erased()));
+        let mut row = erased();
+        row.request_digest[0] ^= 1;
+        assert!(!erased_request_material_matches(&material, &row));
+        let mut row = erased();
+        row.signature.as_mut().unwrap()[0] ^= 1;
+        assert!(!erased_request_material_matches(&material, &row));
+        row.signature = None;
+        assert!(!erased_request_material_matches(&material, &row));
+        // A held receipt is matched only by its exact bytes.
+        assert!(!erased_request_material_matches(
+            &material,
+            &completed_row(&material)
+        ));
     }
 
     #[test]

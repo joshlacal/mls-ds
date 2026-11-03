@@ -3,10 +3,12 @@
 //!   pending) or via the group-note path (a second publication carrying a
 //!   group-invitation reference) — both refused with no new conversation,
 //!   Welcome, entry or delivery;
-//! - capacity refusal (live pair quota → CapacityUnavailable) never evicts the
+//! - a second live first send for the pair is refused by the pair-owner fence
+//!   (PreparationConflict, no attempt or reservation) and never evicts the
 //!   existing published history, and the original Welcome stays importable;
 //! - the only pending-capacity release for a published request is a consent
 //!   transition (acceptance here), which writes exactly its published charge.
+//!
 //! Repository-level quota/budget clauses: server/tests/chat_protocol_direct_request_c27.rs.
 #![allow(dead_code, unused_imports)]
 #[path = "support/encrypted_requests.rs"]
@@ -282,6 +284,8 @@ async fn alice_publishes_with_note(
         )?,
         preparation_request_digest: *verified.request_digest(),
         receipt_authority_key: f.server.receipt_public_key.clone(),
+        sequencer_did: "did:web:chat.catbird.blue".into(),
+        sequencer_receipt_authority_key: f.server.sequencer_receipt_public_key.clone(),
         text: "Second introduction smuggled with a group note".into(),
         invitation: Some(note),
         metadata: GroupMetadataV1 {
@@ -290,6 +294,7 @@ async fn alice_publishes_with_note(
             description: String::new(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            space_avatar: None,
         },
     })?;
     let b = &journal.bootstrap;
@@ -300,6 +305,7 @@ async fn alice_publishes_with_note(
     body["preparationDigest"] = snapshot["preparationDigest"].clone();
     body["preparationRequestDigest"] = json!(STANDARD.encode(verified.request_digest()));
     body["contextHash"] = json!(STANDARD.encode(b.context_hash));
+    body["archiveCommitment"] = json!(STANDARD.encode(b.archive_commitment));
     body["next"] = b.coordinates.clone();
     body["importUntil"] = json!(chrono::DateTime::from_timestamp(b.import_until as i64, 0)
         .context("import")?
@@ -458,8 +464,9 @@ async fn c27_live_no_second_introduction_and_capacity_refusal_preserve_history(
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{refused}");
     assert_eq!(refused["error"], "ConversationNotAccepted", "{refused}");
 
-    // Capacity refusal: one live preparation holds the pair; the next is
-    // refused with CapacityUnavailable and evicts nothing.
+    // Pair-owner fence: one live preparation holds the pair; the next first
+    // send for the pair is refused with the plain PreparationConflict error
+    // before any request row, reservation or capacity charge, and evicts nothing.
     let third = alice_prepares(&f).await?;
     assert_eq!(
         third.response.0,
@@ -475,19 +482,30 @@ async fn c27_live_no_second_introduction_and_capacity_refusal_preserve_history(
     let fourth = alice_prepares(&f).await?;
     assert_eq!(
         fourth.response.0,
-        reqwest::StatusCode::OK,
+        reqwest::StatusCode::BAD_REQUEST,
         "{}",
         fourth.response.1
     );
     assert_eq!(
-        fourth
-            .response
-            .1
-            .pointer("/outcome/body/receipt/code")
-            .and_then(Value::as_str),
-        Some("CapacityUnavailable"),
-        "{}",
-        fourth.response.1
+        fourth.response.1,
+        json!({"error":"PreparationConflict","message":"PreparationConflict"})
+    );
+    assert_eq!(
+        psql(&format!(
+            "SELECT (SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{0}')||'|'||\
+                    (SELECT count(*) FROM chat.direct_request_selected_devices WHERE request_id='{0}')",
+            fourth.request_id
+        ))?,
+        "0|0",
+        "the fenced prepare writes no attempt and reserves no package"
+    );
+    assert_eq!(
+        psql(&format!(
+            "SELECT status FROM chat.direct_request_attempts WHERE request_id='{}'",
+            third.request_id
+        ))?,
+        "prepared",
+        "the pair owner's live lease is untouched"
     );
     assert_eq!(durable(&f)?, before, "second introduction, refused send and capacity refusal leave the published history byte-identical");
 
@@ -522,7 +540,7 @@ async fn c27_live_no_second_introduction_and_capacity_refusal_preserve_history(
 
     // The original Welcome is still importable and decrypts the original intro.
     f.bob_engine.process_direct_request(&f.welcome_input)?;
-    let DirectRequestIntroductionResult::Ready { plaintext } =
+    let DirectRequestIntroductionResult::Ready { plaintext, .. } =
         f.bob_engine.decrypt_direct_request(&f.welcome_input)?
     else {
         anyhow::bail!("original introduction unavailable after refusals")

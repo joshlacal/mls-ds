@@ -353,7 +353,10 @@ async fn stream(
                 }
                 _ => {}
             },
-            _ = runtime.wait_for_events_or_timeout(Duration::from_secs(15)) => {}
+            // Notifications accelerate delivery, but cannot replace the idle
+            // authority check: expiry and revocation on another DS do not notify
+            // this runtime. Keep the exact-device lock/expiry fence prompt.
+            _ = runtime.wait_for_events_or_timeout(Duration::from_millis(250)) => {}
         }
     }
 }

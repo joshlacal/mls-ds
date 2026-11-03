@@ -396,8 +396,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 **Database connection failed:**
 ```bash
-# Ensure PostgreSQL is running
-docker-compose up -d postgres
+# Start PostgreSQL 16 (database catbird on 127.0.0.1:5433), from the repository root
+docker compose -f docker-compose.federation.yml up -d postgres-ds1
 ```
 
 **Tests timing out:**

@@ -114,8 +114,19 @@ pub(crate) enum DirectRequestStoreError {
     IncludedAuthorityChanged,
     #[error("request receipt or snapshot is invalid")]
     InvalidReceipt,
+    /// A recipient declaration, key or authority source could not answer now.
+    /// Nothing was decided or recorded; the identical request may retry.
+    #[error("request authority source temporarily unavailable")]
+    Unavailable,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+}
+
+impl DirectRequestStoreError {
+    /// Decided nothing: an unavailable source or this server's own database.
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(self, Self::Unavailable | Self::Database(_))
+    }
 }
 
 /// Exact attempt identity. Construction is private to this repository module;
@@ -367,6 +378,11 @@ async fn select_devices(
           JOIN chat.direct_request_grants g ON g.key_package_ref=p.key_package_ref
          WHERE p.owner_did IN ($1,$2) AND (p.owner_did,p.owner_device_id)<>($1,$3)
            AND d.status='active' AND k.revoked_at IS NULL AND p.owner_auth_generation=d.auth_generation
+           AND k.enrollment_auth_generation<=d.auth_generation
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id
+                  AND newer.enrollment_auth_generation>k.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=d.auth_generation)
            AND c.enabled AND c.protocol_version='2' AND c.auth_generation=d.auth_generation AND c.owner_key_id=k.key_id
            AND g.revoked_at IS NULL AND g.auth_generation=d.auth_generation
            AND g.protocol_version='2' AND g.profile='encryptedIntroduction1' AND g.expires_at >= $4
@@ -483,6 +499,11 @@ async fn validate_selected_authority(
         SELECT EXISTS(SELECT 1 FROM chat.direct_request_selected_devices s
           LEFT JOIN chat.devices d ON d.user_did=s.owner_did AND d.device_id=s.owner_device_id
           LEFT JOIN chat.device_keys k ON k.user_did=s.owner_did AND k.device_id=s.owner_device_id
+            AND k.enrollment_auth_generation<=d.auth_generation
+            AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id
+                  AND newer.enrollment_auth_generation>k.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=d.auth_generation)
           LEFT JOIN chat.direct_request_capabilities c ON c.owner_did=s.owner_did AND c.owner_device_id=s.owner_device_id
           LEFT JOIN chat.direct_request_grants g ON g.grant_id=s.grant_id
           LEFT JOIN chat.key_packages p ON p.key_package_ref=s.key_package_ref

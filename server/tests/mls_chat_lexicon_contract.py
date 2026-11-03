@@ -1313,6 +1313,18 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
     assert queried_dids["format"] == "did"
     assert queried_dids["minLength"] == 12 and queried_dids["maxLength"] == 261
 
+    # The home relays exactly what atproto-spaces and the native client enforce.
+    space_credential = endpoint_input(endpoint_document(documents, "relaySpaceCredential"))
+    assert required(space_credential) == {"actorDeviceId", "authorityDid", "space", "delegationToken", "cnfKey"}
+    credential_fields = space_credential["properties"]
+    assert credential_fields["space"]["format"] == "space-ref"
+    assert credential_fields["space"]["description"].startswith("Exactly at://{authorityDid}/space/{spaceType}/{skey}.")
+    assert credential_fields["delegationToken"]["maxLength"] == 8192  # atproto-spaces MAX_COMPACT_JWT_BYTES
+    delegation = credential_fields["delegationToken"]["description"]
+    for clause in ("sub is exactly space", "aud is {authorityDid}#atproto_pds", "no cnf claim", "at most 60 seconds"):
+        assert clause in delegation, f"relaySpaceCredential delegation contract missing: {clause}"
+    assert "P-256 did:key" in credential_fields["cnfKey"]["description"]
+
     refs = {
         "enrollDevice": "signedDeviceEnrollment",
         "replenishKeyPackages": "signedKeyPackageReplenishment",
@@ -4093,6 +4105,21 @@ class ChatLexiconContractTests(unittest.TestCase):
             misplaced_welcome_ordering[f"{PREFIX}.defs.json"]["defs"]["transitionManifest"]["description"]
         )
         cases.append(("transition ordering prose misplaced on Welcome view", misplaced_welcome_ordering))
+
+        credential_input = lambda documents: documents[f"{PREFIX}.relaySpaceCredential.json"]["defs"]["main"]["input"]["schema"]
+        optional_pop_key = copy.deepcopy(self.canonical)
+        credential_input(optional_pop_key)["required"].remove("cnfKey")
+        cases.append(("optional Space credential PoP key", optional_pop_key))
+
+        at_space_scheme = copy.deepcopy(self.canonical)
+        credential_input(at_space_scheme)["properties"]["space"]["description"] = "Canonical at-space:// or at://.../space/... URI."
+        cases.append(("at-space:// Space reference", at_space_scheme))
+
+        cnf_bound_delegation = copy.deepcopy(self.canonical)
+        credential_input(cnf_bound_delegation)["properties"]["delegationToken"]["description"] = (
+            "Single-use PDS delegation JWT bound to the client's ephemeral cnf.jkt / did:key."
+        )
+        cases.append(("cnf-bound delegation token", cnf_bound_delegation))
 
         for label, documents in cases:
             with self.subTest(label=label), self.assertRaises((AssertionError, KeyError)):

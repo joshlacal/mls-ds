@@ -121,10 +121,13 @@ impl OutboundClient {
         }
     }
 
+    /// Every send obtains its client here or from `build_pinned_client`, so
+    /// both refuse a closed federation gate before any resolution or connect.
     async fn pinned_client_for_endpoint(
         &self,
         endpoint: &str,
     ) -> Result<(reqwest::Client, url::Url), OutboundError> {
+        ensure_federation_open()?;
         #[cfg(test)]
         if endpoint.starts_with("http://127.0.0.1:") {
             let parsed =
@@ -134,17 +137,10 @@ impl OutboundClient {
                 })?;
             return Ok((self.http.clone(), parsed));
         }
-        let parsed =
-            validate_endpoint_url(endpoint).map_err(|e| OutboundError::ConnectionFailed {
-                endpoint: REMOTE_DS.to_string(),
-                reason: format!("endpoint URL validation failed: {e}"),
-            })?;
-        let (host, addrs) = resolve_and_pin_destination(&parsed).await.map_err(|e| {
-            OutboundError::ConnectionFailed {
-                endpoint: REMOTE_DS.to_string(),
-                reason: format!("destination address validation failed: {e}"),
-            }
-        })?;
+        let parsed = validate_endpoint_url(endpoint).map_err(destination_error)?;
+        let (host, addrs) = resolve_and_pin_destination(&parsed)
+            .await
+            .map_err(destination_error)?;
         let client =
             get_or_build_pinned_client(&host, &addrs, self.connect_timeout, self.request_timeout)
                 .await
@@ -276,13 +272,14 @@ impl OutboundClient {
             .await
             .map_err(|error| map_ordinary_body_error(error, method))
         } else {
-            let (body, predecessor_reason) = parse_error_response(resp, deadline).await;
+            let (body, reason_code, error_name) = parse_error_response(resp, deadline).await;
             Err(OutboundError::RemoteError {
                 status: status.as_u16(),
                 body,
                 endpoint: destination.host.clone(),
                 method: method.to_string(),
-                predecessor_reason,
+                reason_code,
+                error_name,
             })
         }
     }
@@ -339,6 +336,7 @@ impl OutboundClient {
         &self,
         destination: &ValidatedRemoteDestination,
     ) -> Result<Client, OutboundError> {
+        ensure_federation_open()?;
         super::resolver::build_pinned_client(
             &destination.host,
             &destination.addrs,
@@ -361,6 +359,31 @@ impl OutboundClient {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn ensure_federation_open() -> Result<(), OutboundError> {
+    if let Err(super::FederationError::FederationDisabled { reason }) =
+        super::peer_policy::ensure_federation_open()
+    {
+        return Err(OutboundError::FederationDisabled { reason });
+    }
+    Ok(())
+}
+
+/// The endpoint's typed validation or address-resolution failure: an invalid
+/// URL, NXDOMAIN or an SSRF/allowlist block stays permanent, and only a
+/// resolution that could not answer now (DNS temporary or timeout) retries.
+fn destination_error(error: super::FederationError) -> OutboundError {
+    match error {
+        super::FederationError::ResolutionFailed { did, kind } => {
+            OutboundError::ResolutionFailed { did, kind }
+        }
+        other => OutboundError::AuthorityResolutionFailed {
+            endpoint: REMOTE_DS.to_string(),
+            retryable: other.is_retryable(),
+            reason: other.to_string(),
+        },
+    }
+}
 
 fn timeout_error(method: &str) -> OutboundError {
     OutboundError::Timeout {
@@ -428,13 +451,14 @@ async fn parse_response(
         ds_response.response_bytes = bytes.to_vec();
         Ok(ds_response)
     } else {
-        let (body, predecessor_reason) = parse_error_response(resp, deadline).await;
+        let (body, reason_code, error_name) = parse_error_response(resp, deadline).await;
         Err(OutboundError::RemoteError {
             status: status.as_u16(),
             body,
             endpoint: REMOTE_DS.to_string(),
             method: method.to_string(),
-            predecessor_reason,
+            reason_code,
+            error_name,
         })
     }
 }
@@ -459,18 +483,19 @@ async fn decode_raw_json_response(
         .await
         .map_err(|error| map_ordinary_body_error(error, method))
     } else {
-        let (body, predecessor_reason) = parse_error_response(resp, deadline).await;
+        let (body, reason_code, error_name) = parse_error_response(resp, deadline).await;
         Err(OutboundError::RemoteError {
             status: status.as_u16(),
             body,
             endpoint: endpoint.to_string(),
             method: method.to_string(),
-            predecessor_reason,
+            reason_code,
+            error_name,
         })
     }
 }
 
-fn map_ordinary_body_error(error: OutboundBodyError, method: &str) -> OutboundError {
+pub(crate) fn map_ordinary_body_error(error: OutboundBodyError, method: &str) -> OutboundError {
     match error {
         OutboundBodyError::DeadlineExceeded => timeout_error(method),
         OutboundBodyError::ReadFailed(source) => {
@@ -524,7 +549,10 @@ pub enum OutboundError {
         body: String,
         endpoint: String,
         method: String,
-        predecessor_reason: Option<String>,
+        /// The JSON body's declared `reasonCode`, when it is an identifier.
+        reason_code: Option<String>,
+        /// The JSON body's declared XRPC `error` name, when it is an identifier.
+        error_name: Option<String>,
     },
 
     #[error("Invalid response from remote DS: {reason}")]
@@ -535,28 +563,24 @@ pub enum OutboundError {
         did: String,
         kind: super::errors::ResolutionFailureKind,
     },
+
+    /// The federation gate is closed; nothing was sent. Retry once it reopens.
+    #[error("Federation is disabled: {reason}")]
+    FederationDisabled { reason: String },
 }
 
 impl OutboundError {
     /// Whether this error is transient and the request should be retried.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::ConnectionFailed { .. } | Self::Timeout { .. } | Self::RequestFailed { .. } => {
-                true
-            }
+            Self::ConnectionFailed { .. }
+            | Self::Timeout { .. }
+            | Self::RequestFailed { .. }
+            | Self::FederationDisabled { .. } => true,
             Self::AuthorityResolutionFailed { retryable, .. } => *retryable,
             Self::RemoteError { status, .. } => *status >= 500 || *status == 429,
             Self::InvalidResponse { .. } => false,
             Self::ResolutionFailed { kind, .. } => kind.is_retryable(),
-        }
-    }
-
-    pub fn predecessor_reason(&self) -> Option<&str> {
-        match self {
-            Self::RemoteError {
-                predecessor_reason, ..
-            } => predecessor_reason.as_deref(),
-            _ => None,
         }
     }
 }
@@ -564,7 +588,6 @@ impl OutboundError {
 #[derive(Debug, Deserialize)]
 struct ErrorResponseBody {
     error: Option<String>,
-    message: Option<String>,
     #[serde(rename = "reasonCode")]
     reason_code: Option<String>,
 }
@@ -572,7 +595,7 @@ struct ErrorResponseBody {
 async fn parse_error_response(
     resp: reqwest::Response,
     deadline: Instant,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, Option<String>) {
     let declared_bytes = resp.content_length();
     let budget = ResponseBodyBudget::new(ERROR_RESPONSE_MAX_BYTES, deadline);
     match collect_bounded(resp, budget).await {
@@ -582,8 +605,20 @@ async fn parse_error_response(
                 observed_at_least_bytes: bytes.len(),
                 truncated: false,
             };
-            let predecessor_reason = parse_predecessor_reason(&bytes);
-            (summary.to_string(), predecessor_reason)
+            // Only bounded identifiers survive: a peer's declared name or
+            // reason code is matched, never its free text.
+            let declared = |value: Option<String>, allowed: fn(u8) -> bool| {
+                value.filter(|value| (1..=64).contains(&value.len()) && value.bytes().all(allowed))
+            };
+            let (error, reason_code) = serde_json::from_slice::<ErrorResponseBody>(&bytes)
+                .map_or((None, None), |parsed| (parsed.error, parsed.reason_code));
+            (
+                summary.to_string(),
+                declared(reason_code, |byte| {
+                    byte.is_ascii_alphanumeric() || byte == b'_'
+                }),
+                declared(error, |byte| byte.is_ascii_alphanumeric()),
+            )
         }
         Err(err) => {
             let summary = match err {
@@ -609,34 +644,9 @@ async fn parse_error_response(
                     truncated: false,
                 },
             };
-            (summary.to_string(), None)
+            (summary.to_string(), None, None)
         }
     }
-}
-
-fn parse_predecessor_reason(bytes: &[u8]) -> Option<String> {
-    if let Ok(parsed) = serde_json::from_slice::<ErrorResponseBody>(bytes) {
-        if let Some(msg) = parsed.message.filter(|s| is_predecessor_error_text(s)) {
-            return Some(msg);
-        }
-        if let Some(code) = parsed.reason_code.filter(|s| is_predecessor_error_text(s)) {
-            return Some(code);
-        }
-        if let Some(err) = parsed.error.filter(|s| is_predecessor_error_text(s)) {
-            return Some(err);
-        }
-    }
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        if is_predecessor_error_text(text) {
-            let snippet = text.chars().take(128).collect::<String>();
-            return Some(snippet);
-        }
-    }
-    None
-}
-
-fn is_predecessor_error_text(s: &str) -> bool {
-    s.to_ascii_lowercase().contains("predecessor")
 }
 
 #[cfg(test)]
@@ -682,6 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_procedure_and_typed_query_responses_succeed() {
+        crate::federation::open_federation_for_test();
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
             &route,
@@ -705,6 +716,7 @@ mod tests {
     }
     #[tokio::test]
     async fn declared_procedure_body_over_one_mib_is_rejected() {
+        crate::federation::open_federation_for_test();
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
             &route,
@@ -735,6 +747,7 @@ mod tests {
 
     #[tokio::test]
     async fn chunked_typed_query_body_over_one_mib_is_rejected() {
+        crate::federation::open_federation_for_test();
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
             &route,
@@ -765,6 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn declared_raw_json_query_body_over_one_mib_is_rejected() {
+        crate::federation::open_federation_for_test();
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
             &route,
@@ -795,6 +809,7 @@ mod tests {
 
     #[tokio::test]
     async fn raw_json_query_headers_and_body_share_one_deadline() {
+        crate::federation::open_federation_for_test();
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
             &route,
@@ -821,6 +836,7 @@ mod tests {
     }
     #[tokio::test]
     async fn procedure_headers_and_body_share_one_deadline() {
+        crate::federation::open_federation_for_test();
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
             &route,
@@ -848,6 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_success_preserves_status_and_retryability_without_body_content() {
+        crate::federation::open_federation_for_test();
         const CANARY: &str = "bearer=canary-token cookie=canary-cookie";
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
@@ -881,6 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_bounded_json_has_sanitized_invalid_response() {
+        crate::federation::open_federation_for_test();
         const CANARY: &str = "malformed-canary-secret";
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
@@ -996,7 +1014,8 @@ mod tests {
                     body: "".into(),
                     endpoint: "x".into(),
                     method: "y".into(),
-                    predecessor_reason: None,
+                    reason_code: None,
+                    error_name: None,
                 }
                 .is_retryable(),
                 "status {status} should be retryable"
@@ -1011,7 +1030,8 @@ mod tests {
             body: "rate limited".into(),
             endpoint: "x".into(),
             method: "y".into(),
-            predecessor_reason: None,
+            reason_code: None,
+            error_name: None,
         }
         .is_retryable());
     }
@@ -1025,7 +1045,8 @@ mod tests {
                     body: "".into(),
                     endpoint: "x".into(),
                     method: "y".into(),
-                    predecessor_reason: None,
+                    reason_code: None,
+                    error_name: None,
                 }
                 .is_retryable(),
                 "status {status} should NOT be retryable"
@@ -1051,7 +1072,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_success_400_with_predecessor_preserves_typed_reason_and_sanitizes_body() {
+    async fn non_success_400_keeps_declared_identifiers_and_sanitizes_body() {
+        crate::federation::open_federation_for_test();
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
             &route,
@@ -1072,9 +1094,16 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(
-            error.predecessor_reason(),
-            Some("missing signed predecessor entry")
+        assert!(
+            matches!(
+                &error,
+                OutboundError::RemoteError {
+                    reason_code: Some(code),
+                    error_name: Some(name),
+                    ..
+                } if code == "invalid_request" && name == "InvalidRequest"
+            ),
+            "{error:?}"
         );
         assert!(!error.is_retryable());
         assert!(!error
@@ -1084,6 +1113,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_post_does_not_follow_redirect_to_private_sink() {
+        crate::federation::open_federation_for_test();
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1132,6 +1162,7 @@ mod tests {
     }
     #[tokio::test]
     async fn procedure_rejects_307_redirect_to_private_target_without_following() {
+        crate::federation::open_federation_for_test();
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
             &route,
@@ -1166,6 +1197,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_rejects_308_redirect_to_private_target_without_following() {
+        crate::federation::open_federation_for_test();
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
             &route,
@@ -1195,6 +1227,7 @@ mod tests {
 
     #[tokio::test]
     async fn raw_json_query_rejects_307_redirect_to_private_target() {
+        crate::federation::open_federation_for_test();
         let route = format!("/xrpc/{TEST_METHOD}");
         let router = Router::new().route(
             &route,
@@ -1222,8 +1255,11 @@ mod tests {
         assert!(!error.is_retryable());
     }
 
+    /// A blocked destination is refused before any connect, and permanently:
+    /// no retry reaches it, so it is never the retryable connection failure.
     #[tokio::test]
     async fn outbound_fails_closed_on_private_ip_target_without_connecting() {
+        crate::federation::open_federation_for_test();
         let client = OutboundClient::new(1, 1);
         for private_target in [
             "https://10.0.0.1:8443",
@@ -1240,14 +1276,38 @@ mod tests {
                 .unwrap_err();
 
             assert!(
-                matches!(error, OutboundError::ConnectionFailed { .. }),
-                "expected ConnectionFailed for {private_target}, got {error:?}"
+                matches!(
+                    error,
+                    OutboundError::ResolutionFailed {
+                        kind: super::super::errors::ResolutionFailureKind::SsrfBlocked(_),
+                        ..
+                    }
+                ),
+                "expected SsrfBlocked for {private_target}, got {error:?}"
             );
+            assert!(!error.is_retryable(), "{private_target}");
         }
+        // An endpoint that is not a URL at all is just as permanent.
+        let error = client
+            .call_procedure_json("not a url", TEST_METHOD, "token", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OutboundError::ResolutionFailed {
+                    kind: super::super::errors::ResolutionFailureKind::InvalidUrl(_),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.is_retryable());
     }
 
     #[tokio::test]
     async fn pinned_query_connects_only_to_validated_addresses() {
+        crate::federation::open_federation_for_test();
         use axum::http::HeaderMap;
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1346,6 +1406,7 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_query_rejects_http_redirects() {
+        crate::federation::open_federation_for_test();
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 

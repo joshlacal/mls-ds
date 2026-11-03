@@ -86,7 +86,45 @@ async fn c12_unknown_to_cancelled_tombstone_blocks_late_prepare_and_publish() ->
         "tombstone is the durable receipt"
     );
 
-    // Late prepare of the same request returns the tombstone, reserves nothing.
+    // While A's preparation lease is live, the pair-owner fence refuses every
+    // other first send for the pair before the request store is consulted: the
+    // late prepare gets the plain PreparationConflict error and changes nothing.
+    let (status, fenced) = post(&s, PREPARE_NSID, &prepare_b).await?;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{fenced}");
+    assert_eq!(
+        fenced,
+        json!({"error":"PreparationConflict","message":"PreparationConflict"})
+    );
+    assert_eq!(
+        stored_terminal(b)?,
+        tombstone,
+        "fenced late prepare leaves the tombstone"
+    );
+    assert_eq!(
+        db_query(&format!(
+            "SELECT status FROM chat.direct_request_attempts WHERE request_id='{}'",
+            s.request_id
+        ))?,
+        "prepared",
+        "the pair owner's live lease is untouched"
+    );
+
+    // Release the staged request A through the real cancel RPC.
+    let (status, released) = post(
+        &s,
+        CANCEL_NSID,
+        &signed_cancel(&s, s.request_id, &s.preparation_request_digest)?,
+    )
+    .await?;
+    assert_eq!(status, OK, "{released}");
+    assert_eq!(
+        verified_receipt(&s, &released)?["$type"],
+        "blue.catbird.chat.defs#directRequestCancelledReceipt"
+    );
+    assert_eq!(stored_terminal(s.request_id)?.0, "cancelled");
+
+    // With no live pair owner, the late prepare of the same request returns the
+    // tombstone and reserves nothing.
     let (status, late_prepare) = post(&s, PREPARE_NSID, &prepare_b).await?;
     assert_eq!(status, OK, "{late_prepare}");
     assert_eq!(
@@ -124,20 +162,6 @@ async fn c12_unknown_to_cancelled_tombstone_blocks_late_prepare_and_publish() ->
         "0|0|0",
         "no reservation, publication or conversation for the tombstoned request"
     );
-
-    // Release the staged request A through the real cancel RPC.
-    let (status, released) = post(
-        &s,
-        CANCEL_NSID,
-        &signed_cancel(&s, s.request_id, &s.preparation_request_digest)?,
-    )
-    .await?;
-    assert_eq!(status, OK, "{released}");
-    assert_eq!(
-        verified_receipt(&s, &released)?["$type"],
-        "blue.catbird.chat.defs#directRequestCancelledReceipt"
-    );
-    assert_eq!(stored_terminal(s.request_id)?.0, "cancelled");
     println!(
         "C12 tombstone request {b}: cancel/late-prepare/late-publish share one cancelled receipt"
     );
@@ -239,10 +263,7 @@ async fn c12_barrier_publish_first_cancel_returns_committed_identity_and_withdra
         closed["result"]["tombstone"].is_object(),
         "close returns the tombstone: {closed}"
     );
-    encrypted_requests::assert_closed_conversation_wiped(
-        s.conversation_id,
-        Some(s.request_id),
-    )?;
+    encrypted_requests::assert_closed_conversation_wiped(s.conversation_id, Some(s.request_id))?;
     assert_eq!(
         stored_terminal(s.request_id)?,
         ("published".to_owned(), Some(untyped_outcome(&published)?)),

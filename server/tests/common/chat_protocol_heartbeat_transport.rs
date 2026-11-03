@@ -1,7 +1,9 @@
-//! Actual upgraded subscribeEvents transport regression against an owned local database.
-//! Run only with --features test-support and the dedicated heartbeat TEST_DATABASE_URL.
-//! The stage owner prepares the schema; this test verifies every ledger checksum and
-//! never migrates, truncates, or reads any other database.
+//! Actual upgraded subscribeEvents transport regression against a disposable database.
+//! Runs with --features test-support using the shared fresh-DB harness, which
+//! requires the exact loopback gate URL and activation approval. Each connection
+//! owns its fully migrated database until every whole-table snapshot is checked;
+//! concurrent lib runs cannot write these rows. No shared database is migrated,
+//! truncated, or reset.
 #![cfg(feature = "test-support")]
 #![allow(dead_code)]
 
@@ -16,7 +18,7 @@ use chrono::{DateTime, Duration, Timelike, Utc};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256, Sha384};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use std::{collections::BTreeMap, time::Duration as StdDuration};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -32,35 +34,18 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-const TEST_DATABASE: &str = "catbird_chat_protocol_test_20260905_heartbeat";
+use crate::common::fresh_db::{fresh_fully_migrated_db, DisposableDatabase};
+
 static SERIAL: Mutex<()> = Mutex::const_new(());
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-async fn owned_database() -> PgPool {
-    let connection =
-        std::env::var("TEST_DATABASE_URL").expect("explicit dedicated TEST_DATABASE_URL required");
-    let parsed = url::Url::parse(&connection).expect("parse test database URL");
-    assert!(matches!(parsed.scheme(), "postgres" | "postgresql"));
-    assert_eq!(
-        parsed.host_str(),
-        Some("127.0.0.1"),
-        "heartbeat test requires IPv4 loopback"
-    );
-    assert_eq!(parsed.path(), format!("/{TEST_DATABASE}"));
-    assert!(
-        parsed.query().is_none(),
-        "connection overrides are not allowed"
-    );
-    let pool = PgPoolOptions::new()
-        .max_connections(6)
-        .acquire_timeout(StdDuration::from_secs(10))
-        .connect(&connection)
-        .await
-        .expect("connect to owned heartbeat database");
-    let (database, loopback, owner): (String, bool, bool) = sqlx::query_as(
+async fn owned_database() -> (PgPool, DisposableDatabase) {
+    let database = fresh_fully_migrated_db("chat_heartbeat_").await;
+    let pool = database.connect(6).await;
+    let (actual_database, loopback, owner): (String, bool, bool) = sqlx::query_as(
         "SELECT current_database(), inet_server_addr() = '127.0.0.1'::inet, datdba = (SELECT oid FROM pg_roles WHERE rolname = current_user) FROM pg_database WHERE datname = current_database()"
     ).fetch_one(&pool).await.expect("verify actual database identity");
-    assert_eq!(database, TEST_DATABASE);
+    assert_eq!(actual_database, database.name());
     assert!(loopback && owner, "test requires the local database owner");
 
     let mut expected = BTreeMap::new();
@@ -78,16 +63,24 @@ async fn owned_database() -> PgPool {
             )
             .is_none());
     }
+    // Re-pinned 2026-11-04 from 85 (the inventory at `02d7eeed9`, "mls-ds:
+    // checkpoint deployed recovery and binary stream source"): 44 migrations
+    // were added by the commits in `02d7eeed9..d5f6993c` (first `0ff1d22f1`,
+    // "chat: let an invited direct recipient discover its own invitation";
+    // last `d5f6993c`, "mls-ds: Add federated group handoff, terminal close
+    // retention, …") and 13 by Task 4 (20261103000001-04, 20261103000010,
+    // 20261104000001-02, 20261104000005-08, 20261104000010-11). The guard had stayed red since the first of them;
+    // the disposable fixture must still match this exact stage inventory.
     assert_eq!(
         expected.len(),
-        85,
+        142,
         "exact deployed stage migration inventory"
     );
     let applied: Vec<(i64, bool, Vec<u8>)> =
         sqlx::query_as("SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await
-            .expect("read dedicated migration ledger");
+            .expect("read disposable migration ledger");
     assert_eq!(applied.len(), expected.len());
     for (version, success, checksum) in applied {
         assert!(success, "migration {version} must be successful");
@@ -98,7 +91,7 @@ async fn owned_database() -> PgPool {
         );
     }
     http::ensure_fence(&pool).await;
-    pool
+    (pool, database)
 }
 
 async fn clock_now(pool: &PgPool) -> DateTime<Utc> {
@@ -367,10 +360,11 @@ struct Connection {
     session: SessionFixture,
     socket: ClientSocket,
     server: RunningServer,
+    database: DisposableDatabase,
 }
 
 async fn connect(lifetime: Duration) -> Connection {
-    let pool = owned_database().await;
+    let (pool, database) = owned_database().await;
     let device = http::seed_device(&pool).await;
     let now = clock_now(&pool).await;
     let session = seed_session(
@@ -437,6 +431,7 @@ async fn connect(lifetime: Duration) -> Connection {
         session,
         socket,
         server,
+        database,
     }
 }
 
@@ -521,6 +516,7 @@ async fn upgraded_handler_heartbeats_survive_polling_and_control_traffic_without
         device,
         mut socket,
         server,
+        database: _database,
         ..
     } = connect(Duration::minutes(10)).await;
     let before = durable_snapshot(&pool).await;
@@ -632,6 +628,7 @@ async fn upgraded_handler_stops_at_inventory_expiry_without_heartbeat_extending_
         mut socket,
         server,
         session,
+        database: _database,
         ..
     } = connect(Duration::seconds(6)).await;
     let before = durable_snapshot(&pool).await;
@@ -773,6 +770,7 @@ async fn upgraded_handler_stops_when_its_exact_device_is_revoked() {
         device,
         mut socket,
         server,
+        database: _database,
         ..
     } = connect(Duration::minutes(10)).await;
     let before = durable_snapshot(&pool).await;

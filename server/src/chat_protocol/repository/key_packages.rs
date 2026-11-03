@@ -96,12 +96,19 @@ pub(crate) async fn publish_key_packages(
         JOIN chat.devices d
           ON d.user_did = k.user_did AND d.device_id = k.device_id
         WHERE k.user_did = $1 AND k.device_id = $2 AND k.key_id = $3
+          AND d.auth_generation = $4
+          AND k.enrollment_auth_generation <= d.auth_generation
+          AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+              WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id
+                AND newer.enrollment_auth_generation>k.enrollment_auth_generation
+                AND newer.enrollment_auth_generation<=d.auth_generation)
         FOR UPDATE OF d, k
         "#,
     )
     .bind(owner.user_did)
     .bind(owner.device_id)
     .bind(owner.key_id)
+    .bind(owner.auth_generation)
     .fetch_optional(&mut **transaction)
     .await?;
     let (status, revoked_at) = guard.ok_or(KeyPackageRepositoryError::OwnerKeyMissing)?;
@@ -159,6 +166,97 @@ pub(crate) async fn publish_key_packages(
         }
     }
     Ok(packages.len() as u64)
+}
+
+/// Reserve one recovery KeyPackage of `owner_did` for an authorized remote DS
+/// (GET `blue.catbird.mlsDS.fetchKeyPackage`) inside the caller's transaction.
+/// Locks follow the canonical principal -> device -> package order of
+/// enrollment, replenishment, recovery and direct requests, so the deferred
+/// mapping's principal lock at commit is already held. Only a device whose
+/// current key is in `authorized_signing_keys` qualifies; a package under a live
+/// group export lease is left to its pending acceptance. Returns the wrapper and
+/// its SHA-256, or `None` when nothing is available.
+pub(crate) async fn reserve_federated_key_package(
+    transaction: &mut Transaction<'_, Postgres>,
+    owner_did: &str,
+    requester_ds_did: &str,
+    authorized_signing_keys: &[Vec<u8>],
+    now: DateTime<Utc>,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, sqlx::Error> {
+    let principal: Option<String> =
+        sqlx::query_scalar("SELECT user_did FROM chat.principals WHERE user_did = $1 FOR UPDATE")
+            .bind(owner_did)
+            .fetch_optional(&mut **transaction)
+            .await?;
+    if principal.is_none() {
+        return Ok(None);
+    }
+    let devices: Vec<(Uuid, String, i64)> = sqlx::query_as(
+        r#"
+        SELECT d.device_id, k.key_id, d.auth_generation
+        FROM chat.devices d
+        JOIN chat.device_keys k ON k.user_did = d.user_did AND k.device_id = d.device_id
+        WHERE d.user_did = $1 AND d.status = 'active' AND d.revoked_at IS NULL
+          AND k.revoked_at IS NULL AND k.signing_public_key = ANY($2)
+          AND k.enrollment_auth_generation <= d.auth_generation
+          AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+              WHERE newer.user_did = k.user_did AND newer.device_id = k.device_id
+                AND newer.enrollment_auth_generation > k.enrollment_auth_generation
+                AND newer.enrollment_auth_generation <= d.auth_generation)
+        ORDER BY uuid_send(d.device_id)
+        FOR SHARE OF d
+        "#,
+    )
+    .bind(owner_did)
+    .bind(authorized_signing_keys)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let device_ids: Vec<Uuid> = devices.iter().map(|device| device.0).collect();
+    let key_ids: Vec<&str> = devices.iter().map(|device| device.1.as_str()).collect();
+    let generations: Vec<i64> = devices.iter().map(|device| device.2).collect();
+    let candidate: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        r#"
+        SELECT p.key_package_ref, p.wrapper_bytes, p.wrapper_sha256
+        FROM chat.key_packages p
+        JOIN unnest($2::uuid[], $3::text[], $4::bigint[]) AS d(device_id, key_id, auth_generation)
+          ON p.owner_device_id = d.device_id AND p.owner_key_id = d.key_id
+         AND p.owner_auth_generation = d.auth_generation
+        WHERE p.owner_did = $1 AND p.usage_scope = 'recovery' AND p.status = 'available'
+          AND p.not_before < $5 AND $5 < p.not_after
+          AND NOT EXISTS(SELECT 1 FROM chat.group_key_package_exports e
+              WHERE e.key_package_ref = p.key_package_ref AND e.expires_at > $5)
+        ORDER BY p.created_at, p.key_package_ref
+        LIMIT 1
+        FOR UPDATE OF p SKIP LOCKED
+        "#,
+    )
+    .bind(owner_did)
+    .bind(&device_ids)
+    .bind(&key_ids)
+    .bind(&generations)
+    .bind(now)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some((key_package_ref, wrapper_bytes, wrapper_sha256)) = candidate else {
+        return Ok(None);
+    };
+    sqlx::query(
+        "UPDATE chat.key_packages SET status = 'reserved' \
+          WHERE key_package_ref = $1 AND status = 'available'",
+    )
+    .bind(&key_package_ref)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO chat.federated_key_package_reservations \
+             (key_package_ref, requester_ds_did, reserved_at) VALUES ($1, $2, $3)",
+    )
+    .bind(&key_package_ref)
+    .bind(requester_ds_did)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(Some((wrapper_bytes, wrapper_sha256)))
 }
 
 fn unix_to_timestamptz(secs: u64) -> Result<DateTime<Utc>, KeyPackageRepositoryError> {

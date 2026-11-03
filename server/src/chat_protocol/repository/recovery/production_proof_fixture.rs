@@ -575,6 +575,7 @@ struct TwoMemberFixtureOptions<'a> {
     application_message_id: Option<Uuid>,
     archive_commitment: Option<[u8; 32]>,
     recipient_service_did: Option<&'a str>,
+    sender_service_did: Option<&'a str>,
     sequencer_service_did: Option<&'a str>,
 }
 
@@ -2000,6 +2001,7 @@ pub(super) async fn seed_application_routing_fixture(
         None,
         recipient_service_did,
         sequencer_service_did,
+        None,
     )
     .await
 }
@@ -2014,6 +2016,7 @@ pub(super) async fn seed_application_routing_fixture_with_commitment(
     archive_commitment: Option<[u8; 32]>,
     recipient_service_did: &str,
     sequencer_service_did: Option<&str>,
+    sender_service_did: Option<&str>,
 ) -> Result<DurableRecoveryFulfillmentFixture, String> {
     seed_two_member_fixture(
         pool,
@@ -2026,6 +2029,7 @@ pub(super) async fn seed_application_routing_fixture_with_commitment(
             application_message_id: Some(message_id),
             archive_commitment,
             recipient_service_did: Some(recipient_service_did),
+            sender_service_did,
             sequencer_service_did,
             ..TwoMemberFixtureOptions::default()
         },
@@ -2244,8 +2248,8 @@ async fn seed_two_member_fixture(
             .execute(&mut *transaction).await
             .map_err(|error| format!("insert valid Recovery state {state_kind}: {error}"))?;
     }
-    sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,current_membership,created_at) VALUES($1,$2,$3,'active',$4,$5,$6,$7,$8,true,$6)"#)
-        .bind(requester_participant_period_id).bind(conversation_id).bind(&requester.did).bind("admin").bind(creation.transition_id).bind(at).bind(&requester.did).bind(requester.device_id)
+    sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,current_membership,created_at,ds_did) VALUES($1,$2,$3,'active',$4,$5,$6,$7,$8,true,$6,$9)"#)
+        .bind(requester_participant_period_id).bind(conversation_id).bind(&requester.did).bind("admin").bind(creation.transition_id).bind(at).bind(&requester.did).bind(requester.device_id).bind(options.sender_service_did)
         .execute(&mut *transaction).await.map_err(|error| format!("insert Recovery requester participant: {error}"))?;
     sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,invitation_entry_id,invited_at,acceptance_transition_id,acceptance_entry_id,accepted_at,current_membership,created_at,ds_did) VALUES($1,$2,$3,'active',$11,$4,$5,$6,$7,$4,$8,$5,$9,$10,$5,true,$5,$12)"#)
         .bind(fulfiller_participant_period_id).bind(conversation_id).bind(&fulfiller.did).bind(creation.transition_id).bind(at).bind(&requester.did).bind(requester.device_id).bind(creation.entry_id).bind(acceptance.transition_id).bind(acceptance.entry_id).bind(fulfiller_role).bind(options.recipient_service_did)
@@ -3155,4 +3159,186 @@ pub(super) fn build_c33_two_leaf_artifacts(
         kp_wrapper,
         kp_init_key,
     ))
+}
+
+/// One recipient device's real request-only KeyPackage (as published through
+/// `publishDirectRequestKeys`), living past the publication horizon.
+pub(super) fn build_direct_request_key_package(
+    identity: &FixtureIdentity,
+    at: DateTime<Utc>,
+) -> Result<(KeyPackage, Vec<u8>, [u8; 32]), String> {
+    let provider = openmls_libcrux_crypto::Provider::new()
+        .map_err(|e| format!("direct-request KeyPackage provider: {e:?}"))?;
+    let signer = SignatureKeyPair::from_raw(
+        XWING_CIPHERSUITE.signature_algorithm(),
+        identity.signing_key.to_bytes().to_vec(),
+        identity.signing_public_key().to_vec(),
+    );
+    signer
+        .store(provider.storage())
+        .map_err(|e| format!("store direct-request KeyPackage signer: {e:?}"))?;
+    let credential = format!("{}#{}", identity.did, identity.device_id).into_bytes();
+    let lifetime = Lifetime::init(
+        u64::try_from((at - chrono::Duration::minutes(5)).timestamp())
+            .map_err(|_| "negative direct-request KeyPackage lifetime".to_owned())?,
+        u64::try_from((at + chrono::Duration::days(36)).timestamp())
+            .map_err(|_| "negative direct-request KeyPackage lifetime".to_owned())?,
+    );
+    let package = KeyPackage::builder()
+        .key_package_lifetime(lifetime)
+        .leaf_node_capabilities(exact_mls_capabilities())
+        .build(
+            XWING_CIPHERSUITE,
+            &provider,
+            &signer,
+            CredentialWithKey {
+                credential: BasicCredential::new(credential.clone()).into(),
+                signature_key: identity.signing_public_key().to_vec().into(),
+            },
+        )
+        .map_err(|e| format!("build direct-request KeyPackage: {e:?}"))?
+        .key_package()
+        .clone();
+    let wrapper = MlsMessageOut::from(package.clone())
+        .tls_serialize_detached()
+        .map_err(|e| format!("serialize direct-request KeyPackage: {e:?}"))?;
+    let validated = crate::chat_protocol::wire::validate_direct_request_key_package(
+        &wrapper,
+        KeyPackageValidationPolicy {
+            expected_basic_credential: &credential,
+            expected_signature_key: &identity.signing_public_key(),
+            now_unix_seconds: u64::try_from(at.timestamp())
+                .map_err(|_| "negative direct-request clock".to_owned())?,
+            max_bytes: MAX_KEY_PACKAGE_WIRE_BYTES,
+        },
+    )
+    .map_err(|e| format!("validate direct-request KeyPackage: {e:?}"))?;
+    Ok((package, wrapper, *validated.key_package_ref()))
+}
+
+/// The public MLS bootstrap a real sender client publishes for one request:
+/// genesis, the add commit bound to the request context, the final GroupInfo,
+/// the Welcome, and the first application message bound to `next`.
+pub(super) struct DirectRequestBootstrapArtifacts {
+    pub(super) genesis_group_info: Vec<u8>,
+    pub(super) add_commit: Vec<u8>,
+    pub(super) final_group_info: Vec<u8>,
+    pub(super) welcome: Vec<u8>,
+    pub(super) initial_ciphertext: Vec<u8>,
+    pub(super) next: Value,
+}
+
+pub(super) fn build_direct_request_bootstrap(
+    actor: &FixtureIdentity,
+    package: KeyPackage,
+    conversation_id: Uuid,
+    context_hash: &[u8; 32],
+    first_message_id: Uuid,
+    archive_commitment: &[u8; 32],
+    at: DateTime<Utc>,
+) -> Result<DirectRequestBootstrapArtifacts, String> {
+    use crate::chat_protocol::direct_request_transcript::{
+        direct_request_application_aad, direct_request_commit_aad,
+    };
+    let provider = openmls_libcrux_crypto::Provider::new()
+        .map_err(|e| format!("direct-request sender provider: {e:?}"))?;
+    let signer = SignatureKeyPair::from_raw(
+        XWING_CIPHERSUITE.signature_algorithm(),
+        actor.signing_key.to_bytes().to_vec(),
+        actor.signing_public_key().to_vec(),
+    );
+    signer
+        .store(provider.storage())
+        .map_err(|e| format!("store direct-request sender signer: {e:?}"))?;
+    let config = MlsGroupCreateConfig::builder()
+        .ciphersuite(XWING_CIPHERSUITE)
+        .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .use_ratchet_tree_extension(true)
+        .capabilities(exact_mls_capabilities())
+        .lifetime(Lifetime::init(
+            u64::try_from((at - chrono::Duration::minutes(5)).timestamp())
+                .map_err(|_| "negative direct-request sender lifetime".to_owned())?,
+            u64::try_from((at + chrono::Duration::days(8)).timestamp())
+                .map_err(|_| "negative direct-request sender lifetime".to_owned())?,
+        ))
+        .build();
+    let group_id: [u8; 32] = Sha256::digest(
+        [
+            b"CATBIRD-DIRECT-REQUEST-WELCOME-FIXTURE\0".as_ref(),
+            conversation_id.as_bytes(),
+        ]
+        .concat(),
+    )
+    .into();
+    let mut group = MlsGroup::new_with_group_id(
+        &provider,
+        &signer,
+        &config,
+        GroupId::from_slice(&group_id),
+        CredentialWithKey {
+            credential: BasicCredential::new(
+                format!("{}#{}", actor.did, actor.device_id).into_bytes(),
+            )
+            .into(),
+            signature_key: actor.signing_public_key().to_vec().into(),
+        },
+    )
+    .map_err(|e| format!("create direct-request group: {e:?}"))?;
+    let genesis_group_info = group
+        .export_group_info(provider.crypto(), &signer, true)
+        .map_err(|e| format!("export direct-request genesis: {e:?}"))?
+        .tls_serialize_detached()
+        .map_err(|e| format!("serialize direct-request genesis: {e:?}"))?;
+    group.set_aad(
+        direct_request_commit_aad(context_hash)
+            .map_err(|e| format!("direct-request commit AAD: {e:?}"))?,
+    );
+    let (commit, welcome, group_info) = group
+        .add_members(&provider, &signer, &[package])
+        .map_err(|e| format!("direct-request add: {e:?}"))?;
+    let add_commit = commit
+        .tls_serialize_detached()
+        .map_err(|e| format!("serialize direct-request add: {e:?}"))?;
+    let welcome = welcome
+        .tls_serialize_detached()
+        .map_err(|e| format!("serialize direct-request Welcome: {e:?}"))?;
+    group
+        .merge_pending_commit(&provider)
+        .map_err(|e| format!("merge direct-request add: {e:?}"))?;
+    let group_info = group_info.ok_or_else(|| "direct-request add has no GroupInfo".to_owned())?;
+    let group_context = group_info
+        .group_context()
+        .tls_serialize_detached()
+        .map_err(|e| format!("serialize direct-request group context: {e:?}"))?;
+    let final_group_info = MlsMessageOut::from(group_info)
+        .tls_serialize_detached()
+        .map_err(|e| format!("serialize direct-request final GroupInfo: {e:?}"))?;
+    let next = coordinate_json(&coordinate_from_merged_group(
+        &group,
+        &group_context,
+        conversation_id,
+        1,
+    )?);
+    group.set_aad(
+        direct_request_application_aad(
+            context_hash,
+            &serde_json::to_vec(&next).map_err(|e| e.to_string())?,
+            &first_message_id.to_string(),
+            archive_commitment,
+        )
+        .map_err(|e| format!("direct-request application AAD: {e:?}"))?,
+    );
+    let initial_ciphertext = group
+        .create_message(&provider, &signer, b"genuine direct-request opening")
+        .map_err(|e| format!("direct-request opening: {e:?}"))?
+        .tls_serialize_detached()
+        .map_err(|e| format!("serialize direct-request opening: {e:?}"))?;
+    Ok(DirectRequestBootstrapArtifacts {
+        genesis_group_info,
+        add_commit,
+        final_group_info,
+        welcome,
+        initial_ciphertext,
+        next,
+    })
 }

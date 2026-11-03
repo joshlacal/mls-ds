@@ -229,11 +229,11 @@ pub async fn accept_before_both_recipient_imports() -> anyhow::Result<()> {
         engine.process_direct_request(input)?;
         assert_eq!(engine.epoch(&group)?, epoch);
         let preview = engine.decrypt_direct_request(input)?;
-        let DirectRequestIntroductionResult::Ready { plaintext } = &preview else {
+        let DirectRequestIntroductionResult::Ready { plaintext, .. } = &preview else {
             anyhow::bail!("recipient introduction unavailable after account acceptance");
         };
         assert_eq!(
-            protocol::decode_direct_request_introduction(&plaintext)?["text"],
+            protocol::decode_direct_request_introduction(plaintext)?["text"],
             "Real encrypted first contact"
         );
         assert_eq!(engine.decrypt_direct_request(input)?, preview);

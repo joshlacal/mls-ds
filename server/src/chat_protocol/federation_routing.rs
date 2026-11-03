@@ -20,14 +20,19 @@ use crate::federation::resolver::DsResolver;
 
 #[derive(Debug, Error)]
 pub enum FederationRoutingError {
-    #[error("participant DS resolution failed for DID '{did}': {reason}")]
-    ResolutionFailed { did: String, reason: String },
+    #[error("participant DS resolution failed for DID '{did}': {source}")]
+    ResolutionFailed {
+        did: String,
+        source: crate::federation::FederationError,
+    },
 
-    #[error("participant DS '{ds_did}' for DID '{did}' is not trusted: {reason}")]
+    /// Outbound peer policy refused the participant's DS (`AuthFailed`), or
+    /// this DS's policy store failed (`Database`).
+    #[error("participant DS '{ds_did}' for DID '{did}' is not trusted: {source}")]
     UntrustedPeer {
         did: String,
         ds_did: String,
-        reason: String,
+        source: crate::federation::FederationError,
     },
 
     #[error(
@@ -144,9 +149,9 @@ where
             RoutingResolution::Cached => resolver.resolve(did).await,
             RoutingResolution::Uncached => resolver.resolve_uncached(did).await,
         };
-        let endpoint = resolved.map_err(|err| FederationRoutingError::ResolutionFailed {
+        let endpoint = resolved.map_err(|source| FederationRoutingError::ResolutionFailed {
             did: did.to_string(),
-            reason: err.to_string(),
+            source,
         })?;
 
         if endpoint.did == self_did {
@@ -154,10 +159,10 @@ where
         } else {
             peer_policy::enforce_outbound_peer_policy(pool, &endpoint.did)
                 .await
-                .map_err(|err| FederationRoutingError::UntrustedPeer {
+                .map_err(|source| FederationRoutingError::UntrustedPeer {
                     did: did.to_string(),
                     ds_did: endpoint.did.clone(),
-                    reason: err.to_string(),
+                    source,
                 })?;
             routes.insert(did.to_string(), Some(endpoint.did));
         }

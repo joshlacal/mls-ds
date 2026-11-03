@@ -52,41 +52,34 @@ async fn mint_two_party_fallbacks(pool: &sqlx::PgPool) {
     .expect("mint production two-party Recovery fallbacks");
 }
 
-/// Gate-only fixture seeder, not a proof.
+/// A private proof database holding one production-valid *due* open Recovery
+/// request, for the scheduler-shaped proofs below.
 ///
-/// The eleven scheduler-shaped proofs below require one production-valid *due*
-/// open Recovery request. `seed_durable_recovery_fixture` deliberately refuses
-/// to open one; only a production runner may make, authorize, and commit that
-/// client request. This does exactly that, three times, through
-/// `commit_open_recovery_request`. Each committed request carries the real
-/// `min(trusted + 5 minutes, package.not_after)` expiry, so it becomes due by
-/// the real clock — nothing edits a row to manufacture dueness.
-///
-/// Run this, wait for the printed `due at` instant to pass, then run the
-/// scheduler proofs.
-#[tokio::test]
-#[ignore = "gate-only fixture seeder; run explicitly, then wait out the real 5-minute Recovery TTL"]
-async fn seed_due_recovery_fixtures() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
-    for _ in 0..3 {
-        mint_singleton_fallback(&pool).await;
-        let request_id =
-            catbird_server::chat_protocol::production_proof::commit_open_recovery_request(&pool)
-                .await
-                .expect("commit durable production Recovery request");
-        let (requested_at, expires_at): (
-            chrono::DateTime<chrono::Utc>,
-            chrono::DateTime<chrono::Utc>,
-        ) = sqlx::query_as(
-            "SELECT requested_at,expires_at FROM chat.leaf_recovery_requests \
-              WHERE recovery_request_id=$1",
-        )
-        .bind(request_id)
-        .fetch_one(&pool)
-        .await
-        .expect("read committed Recovery request expiry");
-        println!("seeded open Recovery request {request_id} requested_at={requested_at} due at={expires_at}");
+/// `seed_durable_recovery_fixture` deliberately refuses to open one; only a
+/// production runner may make, authorize, and commit that client request, so
+/// this commits it through `commit_open_recovery_request` and then waits out its
+/// real `min(trusted + 5 minutes, package.not_after)` expiry — nothing edits a
+/// row to manufacture dueness. Each proof owns its database (Main ruling
+/// 2026-11-04), so the fixture is no longer seeded into, and found again in, the
+/// shared gate database.
+async fn due_recovery_pool() -> (sqlx::PgPool, common::fresh_db::DisposableDatabase) {
+    let (pool, database) = common::fresh_db::fresh_proof_pool(2).await;
+    mint_singleton_fallback(&pool).await;
+    let request_id =
+        catbird_server::chat_protocol::production_proof::commit_open_recovery_request(&pool)
+            .await
+            .expect("commit durable production Recovery request");
+    let expires_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT expires_at FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read committed Recovery request expiry");
+    if let Ok(remaining) = (expires_at - chrono::Utc::now()).to_std() {
+        tokio::time::sleep(remaining + std::time::Duration::from_secs(1)).await;
     }
+    (pool, database)
 }
 
 #[test]
@@ -201,10 +194,75 @@ fn welcome_expiry_owns_only_its_dedicated_terminal_context_family() {
         .expect("Welcome terminal context-family semantic proof");
 }
 
+/// The proof gate is fail-closed: only `chat_proof_` plus exactly 32 lowercase
+/// hex digits, never the shared clean-chat target (Main ruling 2026-11-04).
+#[test]
+fn proof_gate_accepts_only_disposable_proof_database_names() {
+    use catbird_server::chat_protocol::production_proof::is_disposable_proof_database;
+
+    assert!(is_disposable_proof_database(
+        "chat_proof_0123456789abcdef0123456789abcdef"
+    ));
+    for refused in [
+        "catbird_chat_protocol_test_20260722",
+        "chat_proof_",
+        "chat_proof_0123456789abcdef0123456789abcde",
+        "chat_proof_0123456789abcdef0123456789abcdef0",
+        "chat_proof_0123456789ABCDEF0123456789abcdef",
+        "chat_proof_0123456789abcdef0123456789abcdeg",
+        "chat_proof_0123456789abcdef-123456789abcdef",
+        "chat_prooff0123456789abcdef0123456789abcdef",
+        "xchat_proof_0123456789abcdef0123456789abcdef",
+        "chat_proofgate_0123456789abcdef0123456789abcdef",
+        "chat_freshdb_0123456789abcdef0123456789abcdef",
+    ] {
+        assert!(
+            !is_disposable_proof_database(refused),
+            "proof gate accepted {refused:?}"
+        );
+    }
+}
+
+/// A real proof entry refuses a live, owned, loopback database whose name is not
+/// a proof database, before writing anything.
 #[tokio::test]
-#[ignore = "needs a seeded+aged due Recovery fixture: run seed_due_recovery_fixtures, wait out the real 5-minute TTL, and confirm your row is the newest open+due one in the shared gate DB (due_request_id takes ORDER BY requested_at DESC)"]
+async fn proof_gate_refuses_a_non_proof_database_before_any_write() {
+    async fn chat_rows(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT coalesce(sum((xpath('/row/c/text()', query_to_xml(format(
+                 'SELECT count(*) AS c FROM %I.%I', table_schema, table_name),
+                 false, true, '')))[1]::text::bigint), 0)::bigint
+               FROM information_schema.tables
+              WHERE table_schema = 'chat' AND table_type = 'BASE TABLE'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("count chat rows")
+    }
+
+    let database = common::fresh_db::fresh_fully_migrated_db("chat_proofgate_").await;
+    let pool = database.connect(2).await;
+    let before = chat_rows(&pool).await;
+    let error = catbird_server::chat_protocol::production_proof::mint_singleton_recovery_reservation_fallback(
+        &pool,
+        &fresh_plc_did(),
+    )
+    .await
+    .expect_err("the proof gate must refuse a non-proof database");
+    assert!(
+        error.starts_with(&format!(
+            "refusing Recovery production proof on database={:?}",
+            database.name()
+        )),
+        "unexpected refusal: {error}"
+    );
+    assert_eq!(chat_rows(&pool).await, before, "refused proof wrote rows");
+}
+
+#[tokio::test]
+#[ignore = "slow: waits out the real 5-minute Recovery TTL of its own due fixture"]
 async fn recovery_scheduler_expiry_runs_through_the_real_production_facade() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = due_recovery_pool().await;
     catbird_server::chat_protocol::production_proof::run_scheduler_expiry_lifecycle(&pool)
         .await
         .expect("real production scheduler Recovery lifecycle");
@@ -222,79 +280,79 @@ async fn recovery_scheduler_expiry_runs_through_the_real_production_facade() {
 #[tokio::test]
 #[ignore = "blocked: metadata-ciphertext aggregate drift is NOT rejected by the executor prewrite (public-snapshot drift is) - needs triage"]
 async fn recovery_aggregate_graph_drift_rejects_prewrite_with_zero_residue() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = due_recovery_pool().await;
     catbird_server::chat_protocol::production_proof::run_aggregate_graph_drift_negative(&pool)
         .await
         .expect("aggregate graph drift negative");
 }
 
 #[tokio::test]
-#[ignore = "needs a seeded+aged due Recovery fixture: run seed_due_recovery_fixtures, wait out the real 5-minute TTL, and confirm your row is the newest open+due one in the shared gate DB (due_request_id takes ORDER BY requested_at DESC)"]
+#[ignore = "slow: waits out the real 5-minute Recovery TTL of its own due fixture"]
 async fn recovery_public_snapshot_drift_rejects_prewrite_with_zero_residue() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = due_recovery_pool().await;
     catbird_server::chat_protocol::production_proof::run_public_snapshot_drift_negative(&pool)
         .await
         .expect("public snapshot drift negative");
 }
 
 #[tokio::test]
-#[ignore = "needs a seeded+aged due Recovery fixture: run seed_due_recovery_fixtures, wait out the real 5-minute TTL, and confirm your row is the newest open+due one in the shared gate DB (due_request_id takes ORDER BY requested_at DESC)"]
+#[ignore = "slow: waits out the real 5-minute Recovery TTL of its own due fixture"]
 async fn recovery_foreign_transaction_rejects_prewrite_with_zero_residue() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = due_recovery_pool().await;
     catbird_server::chat_protocol::production_proof::run_foreign_transaction_negative(&pool)
         .await
         .expect("foreign transaction negative");
 }
 
 #[tokio::test]
-#[ignore = "needs a seeded+aged due Recovery fixture: run seed_due_recovery_fixtures, wait out the real 5-minute TTL, and confirm your row is the newest open+due one in the shared gate DB (due_request_id takes ORDER BY requested_at DESC)"]
+#[ignore = "slow: waits out the real 5-minute Recovery TTL of its own due fixture"]
 async fn recovery_request_row_drift_rejects_prewrite_with_zero_residue() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = due_recovery_pool().await;
     catbird_server::chat_protocol::production_proof::run_request_row_drift_negative(&pool)
         .await
         .expect("request full-row drift negative");
 }
 
 #[tokio::test]
-#[ignore = "needs a seeded+aged due Recovery fixture: run seed_due_recovery_fixtures, wait out the real 5-minute TTL, and confirm your row is the newest open+due one in the shared gate DB (due_request_id takes ORDER BY requested_at DESC)"]
+#[ignore = "slow: waits out the real 5-minute Recovery TTL of its own due fixture"]
 async fn recovery_reservation_row_drift_rejects_prewrite_with_zero_residue() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = due_recovery_pool().await;
     catbird_server::chat_protocol::production_proof::run_reservation_row_drift_negative(&pool)
         .await
         .expect("reservation full-row drift negative");
 }
 
 #[tokio::test]
-#[ignore = "needs a seeded+aged due Recovery fixture: run seed_due_recovery_fixtures, wait out the real 5-minute TTL, and confirm your row is the newest open+due one in the shared gate DB (due_request_id takes ORDER BY requested_at DESC)"]
+#[ignore = "slow: waits out the real 5-minute Recovery TTL of its own due fixture"]
 async fn recovery_package_row_drift_rejects_prewrite_with_zero_residue() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = due_recovery_pool().await;
     catbird_server::chat_protocol::production_proof::run_package_row_drift_negative(&pool)
         .await
         .expect("package full-row drift negative");
 }
 
 #[tokio::test]
-#[ignore = "needs a seeded+aged due Recovery fixture: run seed_due_recovery_fixtures, wait out the real 5-minute TTL, and confirm your row is the newest open+due one in the shared gate DB (due_request_id takes ORDER BY requested_at DESC)"]
+#[ignore = "slow: waits out the real 5-minute Recovery TTL of its own due fixture"]
 async fn recovery_prepared_graph_can_be_abandoned_without_writes() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = due_recovery_pool().await;
     catbird_server::chat_protocol::production_proof::run_prepare_abandon_negative(&pool)
         .await
         .expect("prepare-abandon negative");
 }
 
 #[tokio::test]
-#[ignore = "needs a seeded+aged due Recovery fixture: run seed_due_recovery_fixtures, wait out the real 5-minute TTL, and confirm your row is the newest open+due one in the shared gate DB (due_request_id takes ORDER BY requested_at DESC)"]
+#[ignore = "slow: waits out the real 5-minute Recovery TTL of its own due fixture"]
 async fn recovery_terminal_head_cas_failure_rolls_back_prior_writes() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = due_recovery_pool().await;
     catbird_server::chat_protocol::production_proof::run_terminal_head_cas_rollback_negative(&pool)
         .await
         .expect("late exact head-CAS rollback negative");
 }
 
 #[tokio::test]
-#[ignore = "needs a seeded+aged due Recovery fixture: run seed_due_recovery_fixtures, wait out the real 5-minute TTL, and confirm your row is the newest open+due one in the shared gate DB (due_request_id takes ORDER BY requested_at DESC)"]
+#[ignore = "slow: waits out the real 5-minute Recovery TTL of its own due fixture"]
 async fn recovery_postwrite_cancellation_rolls_back_savepoint() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = due_recovery_pool().await;
     catbird_server::chat_protocol::production_proof::run_postwrite_cancellation_rollback_negative(
         &pool,
     )
@@ -303,9 +361,9 @@ async fn recovery_postwrite_cancellation_rolls_back_savepoint() {
 }
 
 #[tokio::test]
-#[ignore = "needs a seeded+aged due Recovery fixture: run seed_due_recovery_fixtures, wait out the real 5-minute TTL, and confirm your row is the newest open+due one in the shared gate DB (due_request_id takes ORDER BY requested_at DESC)"]
+#[ignore = "slow: waits out the real 5-minute Recovery TTL of its own due fixture"]
 async fn recovery_postwrite_panic_rolls_back_savepoint() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = due_recovery_pool().await;
     catbird_server::chat_protocol::production_proof::run_postwrite_panic_rollback_negative(&pool)
         .await
         .expect("post-write panic rollback negative");
@@ -313,7 +371,7 @@ async fn recovery_postwrite_panic_rolls_back_savepoint() {
 
 #[tokio::test]
 async fn recovery_client_request_runs_through_real_auth_prelude_apply_and_completion() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = common::fresh_db::fresh_proof_pool(2).await;
     mint_singleton_fallback(&pool).await;
     catbird_server::chat_protocol::production_proof::run_request_leaf_recovery_happy_path(&pool)
         .await
@@ -322,7 +380,7 @@ async fn recovery_client_request_runs_through_real_auth_prelude_apply_and_comple
 
 #[tokio::test]
 async fn recovery_client_operation_claim_drift_rejects_before_executor_writes() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = common::fresh_db::fresh_proof_pool(2).await;
     mint_singleton_fallback(&pool).await;
     catbird_server::chat_protocol::production_proof::run_request_leaf_recovery_operation_claim_drift_negative(&pool)
         .await
@@ -331,7 +389,7 @@ async fn recovery_client_operation_claim_drift_rejects_before_executor_writes() 
 
 #[tokio::test]
 async fn recovery_client_scope_drift_rejects_before_executor_writes() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = common::fresh_db::fresh_proof_pool(2).await;
     mint_singleton_fallback(&pool).await;
     catbird_server::chat_protocol::production_proof::run_request_leaf_recovery_scope_drift_negative(
         &pool,
@@ -342,7 +400,7 @@ async fn recovery_client_scope_drift_rejects_before_executor_writes() {
 
 #[tokio::test]
 async fn recovery_client_completion_mismatch_rolls_back_applied_business_writes() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = common::fresh_db::fresh_proof_pool(2).await;
     mint_singleton_fallback(&pool).await;
     catbird_server::chat_protocol::production_proof::run_request_leaf_recovery_completion_rollback_negative(&pool)
         .await
@@ -360,7 +418,7 @@ async fn recovery_client_completion_mismatch_rolls_back_applied_business_writes(
 #[tokio::test]
 #[ignore = "blocked on a contradictory precondition in require_terminal_delta (expects before.package_status == \"available\"; a cancellable request holds \"reserved\")"]
 async fn recovery_client_cancellation_runs_through_real_auth_prelude_apply_and_completion() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = common::fresh_db::fresh_proof_pool(2).await;
     mint_singleton_fallback(&pool).await;
     catbird_server::chat_protocol::production_proof::run_leaf_recovery_cancellation_happy_path(
         &pool,
@@ -388,7 +446,7 @@ async fn recovery_client_cancellation_runs_through_real_auth_prelude_apply_and_c
 #[tokio::test]
 #[ignore = "blocked: force_due_boundary writes an expires_at inconsistent with recovery_expiry(received_at, package_not_after), so the aggregate fails validate_recovery_work"]
 async fn recovery_client_cancellation_due_for_expiry_orders_expiry_before_client_error() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = common::fresh_db::fresh_proof_pool(2).await;
     mint_singleton_fallback(&pool).await;
     catbird_server::chat_protocol::production_proof::run_leaf_recovery_cancellation_due_for_expiry_ordering(&pool)
         .await
@@ -406,7 +464,7 @@ async fn recovery_client_cancellation_due_for_expiry_orders_expiry_before_client
 #[tokio::test]
 #[ignore = "blocked: production emits +2 events/outbox rows where the proof asserts +1, and 1 welcomeAvailable recipient where it asserts 2"]
 async fn recovery_client_fulfillment_runs_through_real_auth_prelude_apply_and_completion() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = common::fresh_db::fresh_proof_pool(2).await;
     mint_two_party_fallbacks(&pool).await;
     catbird_server::chat_protocol::production_proof::run_leaf_recovery_fulfillment_happy_path(
         &pool,
@@ -420,7 +478,7 @@ async fn recovery_client_fulfillment_runs_through_real_auth_prelude_apply_and_co
 #[tokio::test]
 #[ignore = "blocked: force_due_boundary writes an expires_at inconsistent with recovery_expiry(received_at, package_not_after), so the aggregate fails validate_recovery_work"]
 async fn recovery_client_fulfillment_due_for_expiry_orders_expiry_before_client_error() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (pool, _database) = common::fresh_db::fresh_proof_pool(2).await;
     mint_two_party_fallbacks(&pool).await;
     catbird_server::chat_protocol::production_proof::run_leaf_recovery_fulfillment_due_for_expiry_ordering(&pool)
         .await

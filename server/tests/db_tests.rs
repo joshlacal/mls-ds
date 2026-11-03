@@ -216,7 +216,9 @@ fn is_line_comment(line: &str) -> bool {
 /// tests, so adopting them is the point of the test rather than an isolation
 /// leak. Exempting them was an explicit decision (2026-10-04 line merge);
 /// do NOT rewrite them onto `fresh_db`, and do NOT add entries without the same
-/// justification.
+/// justification. Exception (Main ruling 2026-11-04): the two Recovery
+/// production proofs that opened extra connections from `TEST_DATABASE_URL` now
+/// reuse their gated private proof database, so their entries were removed.
 ///
 /// Each entry is `(path relative to src/, first line marker)`. Only lines at or
 /// after the first line containing the marker are exempt (`""` = whole file,
@@ -228,14 +230,6 @@ const REVIEWED_GATE_DB_TEST_EXEMPTIONS: &[(&str, &str)] = &[
         "",
     ),
     ("chat_protocol/repository/delivery/read_tests.rs", ""),
-    (
-        "chat_protocol/repository/recovery/production_inventory_lock_proof.rs",
-        "",
-    ),
-    (
-        "chat_protocol/repository/recovery/production_recovery_inventory_proof.rs",
-        "",
-    ),
     ("chat_protocol/repository/reset/tests.rs", ""),
     ("chat_protocol/repository/rollback_tests.rs", ""),
     ("chat_protocol/repository/ticket/tests.rs", ""),
@@ -325,7 +319,8 @@ fn init_db_is_only_reachable_from_targets_that_mint_their_own_database() {
         "common/fresh_db.rs",
         "db_tests.rs",
         "chat_protocol_remote_prefix_bootstrap.rs",
-        "federation_hostile_peers.rs",
+        // federation_hostile_peers.rs was deleted with its approval left
+        // behind by 7b1f093b4 (2026-10-31); a re-added caller must be re-reviewed.
         "migration_repair_smoke.rs",
     ];
 

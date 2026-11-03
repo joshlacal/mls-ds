@@ -5,12 +5,13 @@ use std::time::Duration;
 use super::envelope::{
     verify_receipt, DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID,
 };
-use super::errors::FederationError;
+use super::errors::{FederationError, PREDECESSOR_MISSING_ERROR, PREDECESSOR_MISSING_REASON};
 use super::outbound::{DsResponse, OutboundClient, OutboundError};
 use super::peer_policy;
 use super::receipt::result_bytes_for_receipt;
 use super::resolver::{DsResolver, ValidatedRemoteDestination};
 use crate::auth::AuthMiddleware;
+use crate::chat_protocol::repository::delivery::QUEUED_COPY_OF_PRUNED_ENTRY_SQL;
 use crate::identity::{canonical_did, dids_equivalent, service_did_base};
 use catbird_atproto::generated::blue_catbird::mlsDS::FederationReceiptV1;
 use chrono::{DateTime, Utc};
@@ -438,7 +439,13 @@ impl OutboundQueue {
         self.enforce_pending_caps(&canonical_target_ds_did, convo_id, payload.len(), &policy)
             .await?;
 
-        let id = ulid::Ulid::new().to_string();
+        let id = crate::sim_hooks::mint_outbound_queue_ulid(&[
+            canonical_target_ds_did.as_bytes(),
+            method.as_bytes(),
+            convo_id.as_bytes(),
+            payload,
+        ])
+        .to_string();
         let initial_delay_secs: f64 = 5.0;
 
         sqlx::query(
@@ -587,113 +594,7 @@ impl OutboundQueue {
     // -- Batch processing -------------------------------------------------------
 
     pub async fn claim_due_batch(&self, limit: i64) -> Result<Vec<QueueItem>, sqlx::Error> {
-        let now = crate::sim_hooks::current_utc();
-        let mut tx = self.pool.begin().await?;
-
-        // Head-of-line ordering from the encrypted-requests line: at most one
-        // live item per (conversation, target DS) is eligible, and an in-flight
-        // head blocks its successors so claim fencing cannot reorder delivery.
-        let candidates: Vec<(String,)> = sqlx::query_as(
-            "WITH heads AS ( \
-                 SELECT DISTINCT ON (CASE WHEN convo_id = '' THEN id ELSE convo_id END, target_ds_did) \
-                     id, status, next_retry_at \
-                 FROM outbound_queue \
-                 WHERE status IN ('pending', 'in_flight') \
-                 ORDER BY (CASE WHEN convo_id = '' THEN id ELSE convo_id END), target_ds_did, \
-                     CASE \
-                         WHEN method = 'blue.catbird.mlsDS.deliverDirectRequest' THEN 1 \
-                         WHEN method = 'blue.catbird.mlsDS.deliverAcceptanceEntry' THEN 2 \
-                         WHEN method = 'blue.catbird.mlsDS.deliverMessageEntry' THEN \
-                             COALESCE( \
-                                 (substring(encode(payload, 'escape') from '\"seq\"[[:space:]]*:[[:space:]]*([0-9]+)'))::bigint, \
-                                 (substring(id from '-([0-9]+)$'))::bigint, \
-                                 9223372036854775807 \
-                             ) \
-                         ELSE NULL \
-                     END ASC NULLS LAST, \
-                     created_at ASC, id ASC \
-             ) \
-             SELECT q.id FROM outbound_queue q \
-             WHERE q.id IN (SELECT id FROM heads WHERE status = 'pending' AND next_retry_at <= $2) \
-             ORDER BY q.next_retry_at ASC \
-             LIMIT $1 \
-             FOR UPDATE SKIP LOCKED",
-        )
-        .bind(limit)
-        .bind(now)
-        .fetch_all(&mut *tx)
-        .await?;
-
-        if candidates.is_empty() {
-            tx.commit().await?;
-            return Ok(Vec::new());
-        }
-
-        let ids: Vec<String> = candidates.into_iter().map(|(id,)| id).collect();
-        let claim_token =
-            crate::sim_hooks::mint_entry_uuid_v4(b"outbound_queue.claim", &[ids[0].as_bytes()]);
-        let lease_secs = 120.0;
-
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            Vec<u8>,
-            String,
-            i32,
-            i32,
-            Option<Vec<u8>>,
-            i32,
-            Option<Uuid>,
-        )> = sqlx::query_as(
-            "UPDATE outbound_queue \
-             SET status = 'in_flight', \
-                 claim_token = $2, \
-                 claim_expires_at = $4 + make_interval(secs => $3) \
-             WHERE id = ANY($1) \
-             RETURNING id, target_ds_did, target_endpoint, method, payload, convo_id, \
-                       retry_count, max_retries, payload_sha256, envelope_version, claim_token",
-        )
-        .bind(&ids)
-        .bind(claim_token)
-        .bind(lease_secs)
-        .bind(now)
-        .fetch_all(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        Ok(rows
-            .into_iter()
-            .map(
-                |(
-                    id,
-                    target_ds_did,
-                    target_endpoint,
-                    method,
-                    payload,
-                    convo_id,
-                    retry_count,
-                    max_retries,
-                    payload_sha256,
-                    envelope_version,
-                    claim_token,
-                )| QueueItem {
-                    id,
-                    target_ds_did,
-                    target_endpoint,
-                    method,
-                    payload,
-                    convo_id,
-                    retry_count,
-                    max_retries,
-                    payload_sha256,
-                    envelope_version,
-                    claim_token,
-                },
-            )
-            .collect())
+        claim_due_heads(&self.pool, limit, None).await
     }
 
     pub async fn reclaim_stuck_in_flight(&self) -> Result<u64, sqlx::Error> {
@@ -714,6 +615,11 @@ impl OutboundQueue {
         outbound: &OutboundClient,
         auth_sign: &(dyn Fn(&str, &str) -> Result<String, String> + Send + Sync),
     ) -> Result<usize, sqlx::Error> {
+        // A closed federation gate pauses dispatch before any claim or send:
+        // due rows keep their status, retry count and due time.
+        if peer_policy::ensure_federation_open().is_err() {
+            return Ok(0);
+        }
         let _ = self.reclaim_stuck_in_flight().await;
         let items = self.claim_due_batch(10).await?;
         let count = items.len();
@@ -725,8 +631,13 @@ impl OutboundQueue {
 
     // -- Single item processing -------------------------------------------------
 
+    /// Settle a failed attempt. One that decided nothing (a peer, transport or
+    /// resolver that could not answer now, or this DS's own storage) is
+    /// retried with backoff however often it recurs: an ordered successor
+    /// would otherwise overtake a lost item, and a lost relay is never resent.
+    /// A permanent refusal ends the item now.
     async fn handle_failure(&self, item: &QueueItem, error_msg: &str, is_transient: bool) {
-        if is_transient && (is_c33_method(&item.method) || item.retry_count < item.max_retries) {
+        if is_transient {
             let delay = backoff_delay(item.retry_count);
             warn!(
                 queue_id = %item.id,
@@ -745,22 +656,99 @@ impl OutboundQueue {
                 )
                 .await;
         } else {
-            if is_transient {
-                warn!(
-                    queue_id = %item.id,
-                    retries = item.retry_count,
-                    error = %error_msg,
-                    "Transient failure exceeded max retries, marking dead"
-                );
-            } else {
-                warn!(
-                    queue_id = %item.id,
-                    error = %error_msg,
-                    "Permanent hostile failure, marking dead immediately (no resend)"
-                );
-            }
+            warn!(
+                queue_id = %item.id,
+                error = %error_msg,
+                "Permanent failure, marking dead immediately (no resend)"
+            );
             let _ = self.mark_dead(&item.id, item.claim_token, error_msg).await;
         }
+    }
+
+    /// Recheck `item`'s outbound peer policy immediately before a send. A
+    /// denial cancels delivery; this DS's own peer table failing decided
+    /// nothing, so the item is retried.
+    async fn peer_policy_allows(&self, item: &QueueItem) -> bool {
+        match peer_policy::enforce_outbound_peer_policy(&self.pool, &item.target_ds_did).await {
+            Ok(_) => true,
+            Err(FederationError::Database(error)) => {
+                self.handle_failure(item, &format!("Peer policy lookup failed: {error}"), true)
+                    .await;
+                false
+            }
+            Err(error) => {
+                warn!(
+                    queue_id = %item.id,
+                    target_ds = %item.target_ds_did,
+                    %error,
+                    "Peer policy denied outbound delivery for queued item; cancelling delivery"
+                );
+                let _ = self
+                    .mark_failed(
+                        &item.id,
+                        item.claim_token,
+                        &format!("Peer policy denied: {error}"),
+                    )
+                    .await;
+                false
+            }
+        }
+    }
+
+    /// Why a legacy delivery ACK does not prove `item` delivered, and whether
+    /// that is transient. Only a receiver key lookup that could not answer now
+    /// is retried; a mismatched binding, a missing key or an invalid signature
+    /// is a permanent answer.
+    async fn legacy_ack_failure(
+        &self,
+        item: &QueueItem,
+        ack: &super::ack::DeliveryAck,
+        expected_sequencer_term: Option<u64>,
+    ) -> Option<(String, bool)> {
+        if !dids_equivalent(&ack.receiver_ds_did, &item.target_ds_did)
+            || ack.convo_id != item.convo_id
+            || expected_sequencer_term.is_some_and(|term| ack.sequencer_term != term)
+        {
+            return Some((
+                format!(
+                    "Delivery ACK field mismatch: receiverDsDid {}, convoId {}, sequencerTerm {}",
+                    ack.receiver_ds_did, ack.convo_id, ack.sequencer_term
+                ),
+                false,
+            ));
+        }
+        let did_doc = match self.auth_middleware.resolve_did(&ack.receiver_ds_did).await {
+            Ok(doc) => doc,
+            Err(error) => {
+                return Some((
+                    format!("DID resolution failed for {}: {error}", ack.receiver_ds_did),
+                    error.is_retryable(),
+                ))
+            }
+        };
+        match crate::auth::extract_p256_key(&did_doc) {
+            Some(key) if ack.verify(&key) => None,
+            Some(_) => Some(("Delivery ACK signature invalid".to_string(), false)),
+            None => Some((
+                format!("No P-256 verification key for {}", ack.receiver_ds_did),
+                false,
+            )),
+        }
+    }
+
+    /// A closed federation gate is not a delivery attempt: the claimed item
+    /// goes back to pending with its retry count unchanged.
+    async fn defer_for_closed_gate(&self, item: &QueueItem, reason: &str) {
+        let delay = backoff_delay(item.retry_count);
+        warn!(
+            queue_id = %item.id,
+            next_retry_secs = delay.as_secs(),
+            reason,
+            "Federation gate closed; deferring without consuming an attempt"
+        );
+        let _ = self
+            .schedule_retry(&item.id, item.claim_token, item.retry_count, reason, delay)
+            .await;
     }
 
     pub async fn process_item(
@@ -769,60 +757,28 @@ impl OutboundQueue {
         outbound: &OutboundClient,
         auth_sign: &(dyn Fn(&str, &str) -> Result<String, String> + Send + Sync),
     ) {
+        if let Err(e) = peer_policy::ensure_federation_open() {
+            self.defer_for_closed_gate(item, &e.to_string()).await;
+            return;
+        }
         // 1. Recheck peer policy immediately before send; denial stops/cancels delivery
-        if let Err(e) =
-            peer_policy::enforce_outbound_peer_policy(&self.pool, &item.target_ds_did).await
-        {
-            warn!(
-                queue_id = %item.id,
-                target_ds = %item.target_ds_did,
-                error = %e,
-                "Peer policy denied outbound delivery for queued item; cancelling delivery"
-            );
-            let _ = self
-                .mark_failed(
-                    &item.id,
-                    item.claim_token,
-                    &format!("Peer policy denied: {e}"),
-                )
-                .await;
+        if !self.peer_policy_allows(item).await {
             return;
         }
 
         // 2. Revalidate and resolve pinned destination on every retry
         let destination = match self.resolve_target_destination(item).await {
             Ok(dest) => dest,
-            Err(e)
-                if e.is_retryable()
-                    && (is_c33_method(&item.method) || item.retry_count < item.max_retries) =>
-            {
-                let delay = backoff_delay(item.retry_count);
-                warn!(
-                    queue_id = %item.id,
-                    target_ds = %item.target_ds_did,
-                    retry = item.retry_count + 1,
-                    next_retry_secs = delay.as_secs(),
-                    error = %e,
-                    "Retryable destination resolution failure, scheduling next attempt"
-                );
-                let _ = self
-                    .schedule_retry(
-                        &item.id,
-                        item.claim_token,
-                        item.retry_count + 1,
-                        &e.to_string(),
-                        delay,
-                    )
-                    .await;
+            Err(e) if e.is_retryable() => {
+                self.handle_failure(item, &e.to_string(), true).await;
                 return;
             }
             Err(e) => {
                 error!(
                     queue_id = %item.id,
                     target_ds = %item.target_ds_did,
-                    retries = item.retry_count,
                     error = %e,
-                    "Non-retryable destination resolution failure or max retries exceeded"
+                    "Non-retryable destination resolution failure"
                 );
                 let _ = self
                     .mark_failed(&item.id, item.claim_token, &e.to_string())
@@ -859,22 +815,7 @@ impl OutboundQueue {
         let expected_sequencer_term = extract_expected_sequencer_term(&item.method, &body);
 
         // 3. Recheck peer policy immediately before call_procedure_pinned after resolution and token prep
-        if let Err(e) =
-            peer_policy::enforce_outbound_peer_policy(&self.pool, &item.target_ds_did).await
-        {
-            warn!(
-                queue_id = %item.id,
-                target_ds = %item.target_ds_did,
-                error = %e,
-                "Peer policy denied outbound delivery immediately before procedure call; cancelling delivery"
-            );
-            let _ = self
-                .mark_failed(
-                    &item.id,
-                    item.claim_token,
-                    &format!("Peer policy denied: {e}"),
-                )
-                .await;
+        if !self.peer_policy_allows(item).await {
             return;
         }
 
@@ -889,6 +830,9 @@ impl OutboundQueue {
                 );
 
                 if is_clean_endpoint {
+                    // A clean endpoint's success carries its signed receipt; an
+                    // answer without one (or with one that does not parse) is
+                    // malformed, and resending it gets the same answer.
                     let Some(receipt) = resp.clean_receipt() else {
                         warn!(
                             queue_id = %item.id,
@@ -899,7 +843,7 @@ impl OutboundQueue {
                         self.handle_failure(
                             item,
                             "Clean federation response missing FederationReceiptV1",
-                            true,
+                            false,
                         )
                         .await;
                         return;
@@ -913,11 +857,7 @@ impl OutboundQueue {
                     {
                         Ok(doc) => doc,
                         Err(e) => {
-                            let is_transient = matches!(
-                                e,
-                                crate::auth::AuthError::DidResolutionFailed(_)
-                                    | crate::auth::AuthError::RateLimitExceeded { .. }
-                            );
+                            let is_transient = e.is_retryable();
                             warn!(queue_id = %item.id, error = %e, "Failed to resolve receiver DID");
                             self.handle_failure(
                                 item,
@@ -1101,52 +1041,25 @@ impl OutboundQueue {
                         }
                     }
                 } else if resp.accepted {
-                    // Legacy delivery ack verification
-                    if let Some(ref ack) = resp.ack {
-                        let fields_valid = ack.receiver_ds_did == item.target_ds_did
-                            && ack.convo_id == item.convo_id
-                            && expected_sequencer_term
-                                .map(|term| ack.sequencer_term == term)
-                                .unwrap_or(true);
-                        if !fields_valid {
-                            warn!(
-                                queue_id = %item.id,
-                                expected_ds = %item.target_ds_did,
-                                got_ds = %ack.receiver_ds_did,
-                                "Delivery ACK field mismatch — possible forgery"
-                            );
-                        } else if let Ok(did_doc) =
-                            self.auth_middleware.resolve_did(&ack.receiver_ds_did).await
+                    // A legacy delivery ACK, when present, must bind to this
+                    // item and verify before the item counts as delivered.
+                    if let Some(ack) = &resp.ack {
+                        if let Some((error_msg, is_transient)) = self
+                            .legacy_ack_failure(item, ack, expected_sequencer_term)
+                            .await
                         {
-                            if let Some(verifying_key) = crate::auth::extract_p256_key(&did_doc) {
-                                if !ack.verify(&verifying_key) {
-                                    warn!(
-                                        queue_id = %item.id,
-                                        receiver_ds = %ack.receiver_ds_did,
-                                        "Delivery ACK signature invalid"
-                                    );
-                                }
-                            }
+                            warn!(queue_id = %item.id, error = %error_msg, "Delivery ACK rejected");
+                            self.handle_failure(item, &error_msg, is_transient).await;
+                            return;
                         }
                     }
                     let _ = self.mark_delivered(&item.id, item.claim_token).await;
-                } else if resp
-                    .reason_code
-                    .as_deref()
-                    .or(resp.message.as_deref())
-                    .map(is_predecessor_error)
-                    .unwrap_or(false)
-                    || resp
-                        .error
-                        .as_deref()
-                        .map(is_predecessor_error)
-                        .unwrap_or(false)
-                {
+                } else if is_predecessor_gap(resp.error.as_deref(), resp.reason_code.as_deref()) {
                     let reason = resp
                         .reason_code
                         .as_deref()
                         .or(resp.message.as_deref())
-                        .unwrap_or("predecessor missing");
+                        .unwrap_or(PREDECESSOR_MISSING_REASON);
                     let delay = backoff_delay(item.retry_count);
                     warn!(
                         queue_id = %item.id,
@@ -1178,12 +1091,8 @@ impl OutboundQueue {
                     let _ = self.mark_failed(&item.id, item.claim_token, &reason).await;
                 }
             }
-            Err(e) if is_outbound_predecessor_error(&e) => {
+            Err(e) if is_outbound_predecessor_gap(&e) => {
                 let delay = backoff_delay(item.retry_count);
-                let reason = e
-                    .predecessor_reason()
-                    .map(|r| r.to_string())
-                    .unwrap_or_else(|| e.to_string());
                 warn!(
                     queue_id = %item.id,
                     retry = item.retry_count,
@@ -1192,8 +1101,62 @@ impl OutboundQueue {
                     "Predecessor missing on remote DS; scheduling retry without exhausting"
                 );
                 let _ = self
-                    .schedule_retry(&item.id, item.claim_token, item.retry_count, &reason, delay)
+                    .schedule_retry(
+                        &item.id,
+                        item.claim_token,
+                        item.retry_count,
+                        &format!("{PREDECESSOR_MISSING_ERROR}: {e}"),
+                        delay,
+                    )
                     .await;
+            }
+            Err(OutboundError::RemoteError {
+                status: 404,
+                error_name,
+                ..
+            }) if is_signed_relay(&item.method) || is_c33_close(&item.method, &body) => {
+                // A home's ACK or account-deletion relay targets the
+                // conversation's sequencer, its authority: that sequencer
+                // declaring ConversationNotFound at its DID-resolved endpoint
+                // is authenticated absence. A prune notice, C33 control entry
+                // or C33 close targets a home, whose declared absence counts
+                // only when this DS's own records show it never exchanged an
+                // entry of the conversation with that home. Any other 404 is
+                // retried.
+                let declared_absent = error_name.as_deref() == Some("ConversationNotFound");
+                let absence_authenticated = if matches!(
+                    item.method.as_str(),
+                    RELAY_ENTRY_ACK_NSID | RELAY_ACCOUNT_DELETION_NSID
+                ) {
+                    declared_absent
+                        && item.target_endpoint.is_empty()
+                        && self.target_sequences_conversation(item).await
+                } else {
+                    declared_absent && !self.exchanged_entries_with_target(item).await
+                };
+                if absence_authenticated {
+                    warn!(
+                        queue_id = %item.id,
+                        target_ds = %item.target_ds_did,
+                        "Target authenticated its absence; signed relay is moot"
+                    );
+                    let _ = self
+                        .mark_failed(
+                            &item.id,
+                            item.claim_token,
+                            "ConversationNotFound: authenticated absence",
+                        )
+                        .await;
+                } else {
+                    let error = format!(
+                        "HTTP 404 ({}) from a target that may hold the conversation",
+                        error_name.as_deref().unwrap_or("undeclared")
+                    );
+                    self.handle_failure(item, &error, true).await;
+                }
+            }
+            Err(OutboundError::FederationDisabled { reason }) => {
+                self.defer_for_closed_gate(item, &reason).await;
             }
             Err(e) if e.is_retryable() => {
                 self.handle_failure(item, &e.to_string(), true).await;
@@ -1222,13 +1185,19 @@ impl OutboundQueue {
                 .await
             {
                 Ok(ep) => ep,
-                Err(_) => self
+                Err(primary) => match self
                     .resolver
                     .resolve_authoritative_ds(&canonical_target_ds_did)
                     .await
-                    .map_err(|error| {
-                        Self::outbound_error_from_federation_error(&error, &item.target_ds_did)
-                    })?,
+                {
+                    Ok(ep) => ep,
+                    Err(fallback) => {
+                        return Err(Self::outbound_error_from_federation_error(
+                            &undecided_lookup(primary, fallback),
+                            &item.target_ds_did,
+                        ))
+                    }
+                },
             };
             if canonical_did(&endpoint_info.did) != canonical_target_ds_did {
                 return Err(OutboundError::AuthorityResolutionFailed {
@@ -1283,9 +1252,10 @@ impl OutboundQueue {
                         error = %e,
                         "resolve_endpoint_destination failed"
                     );
-                    if !e.is_retryable() || last_error.is_none() {
-                        last_error = Some(e);
-                    }
+                    last_error = Some(match last_error {
+                        Some(first) => undecided_lookup(first, e),
+                        None => e,
+                    });
                 }
             }
         }
@@ -1303,7 +1273,8 @@ impl OutboundQueue {
         ))
     }
 
-    fn outbound_error_from_federation_error(
+    /// Map a resolution failure onto the outbound error the queue classifies.
+    pub(crate) fn outbound_error_from_federation_error(
         err: &FederationError,
         target_ds: &str,
     ) -> OutboundError {
@@ -1319,7 +1290,8 @@ impl OutboundQueue {
                 body: body.clone(),
                 endpoint: target_ds.to_string(),
                 method: "resolve".to_string(),
-                predecessor_reason: None,
+                reason_code: None,
+                error_name: None,
             },
             FederationError::Http(e) => {
                 if e.is_timeout() {
@@ -1338,7 +1310,8 @@ impl OutboundQueue {
                         body: e.to_string(),
                         endpoint: target_ds.to_string(),
                         method: "resolve".to_string(),
-                        predecessor_reason: None,
+                        reason_code: None,
+                        error_name: None,
                     }
                 } else {
                     OutboundError::RequestFailed {
@@ -1380,16 +1353,52 @@ impl OutboundQueue {
         id: &str,
         claim_token: Option<Uuid>,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE outbound_queue \
-             SET status = 'delivered', claim_token = NULL, claim_expires_at = NULL \
-             WHERE id = $1 AND ($2::uuid IS NULL OR claim_token = $2)",
+        mark_item_delivered(&self.pool, id, claim_token).await
+    }
+
+    /// Whether this DS's durable records show it exchanged an entry of `item`'s
+    /// conversation with its target: a participant homed there, or a mirror or
+    /// C33 inbox that target sequences. Unreadable records count as an exchange.
+    async fn exchanged_entries_with_target(&self, item: &QueueItem) -> bool {
+        let Ok(conversation_id) = Uuid::parse_str(&item.convo_id) else {
+            return true;
+        };
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat.participants \
+                            WHERE conversation_id = $1 AND split_part(ds_did, '#', 1) = $2) \
+                 OR EXISTS(SELECT 1 FROM chat.conversations \
+                            WHERE conversation_id = $1 AND split_part(sequencer_ds, '#', 1) = $2) \
+                 OR EXISTS(SELECT 1 FROM chat.direct_request_transport_inbox \
+                            WHERE conversation_id = $1 \
+                              AND split_part(coordinator_did, '#', 1) = $2)",
         )
-        .bind(id)
-        .bind(claim_token)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        .bind(conversation_id)
+        .bind(canonical_did(&item.target_ds_did))
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(true)
+    }
+
+    /// Whether this DS's durable records name `item`'s target as the sequencer
+    /// of its conversation: a remote mirror's sequencer or a C33 inbox's
+    /// coordinator. Unreadable records name no sequencer.
+    async fn target_sequences_conversation(&self, item: &QueueItem) -> bool {
+        let Ok(conversation_id) = Uuid::parse_str(&item.convo_id) else {
+            return false;
+        };
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat.conversations \
+                            WHERE conversation_id = $1 AND is_remote \
+                              AND split_part(sequencer_ds, '#', 1) = $2) \
+                 OR EXISTS(SELECT 1 FROM chat.direct_request_transport_inbox \
+                            WHERE conversation_id = $1 \
+                              AND split_part(coordinator_did, '#', 1) = $2)",
+        )
+        .bind(conversation_id)
+        .bind(canonical_did(&item.target_ds_did))
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false)
     }
     pub async fn persist_receipt_and_mark_delivered(
         &self,
@@ -1401,17 +1410,7 @@ impl OutboundQueue {
 
         store_federation_receipt_conn(&mut *tx, receipt, response_bytes).await?;
 
-        let result = sqlx::query(
-            "UPDATE outbound_queue \
-             SET status = 'delivered', claim_token = NULL, claim_expires_at = NULL \
-             WHERE id = $1 AND ($2::uuid IS NULL OR claim_token = $2)",
-        )
-        .bind(&item.id)
-        .bind(item.claim_token)
-        .execute(&mut *tx)
-        .await?;
-
-        if result.rows_affected() == 0 {
+        if !settle_item(&mut *tx, &item.id, item.claim_token, "delivered", None).await? {
             return Ok(false);
         }
 
@@ -1425,17 +1424,7 @@ impl OutboundQueue {
         claim_token: Option<Uuid>,
         error_msg: &str,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE outbound_queue \
-             SET status = 'failed', last_error = $2, claim_token = NULL, claim_expires_at = NULL \
-             WHERE id = $1 AND ($3::uuid IS NULL OR claim_token = $3)",
-        )
-        .bind(id)
-        .bind(error_msg)
-        .bind(claim_token)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        settle_item(&self.pool, id, claim_token, "failed", Some(error_msg)).await
     }
 
     pub async fn mark_dead(
@@ -1444,17 +1433,7 @@ impl OutboundQueue {
         claim_token: Option<Uuid>,
         error_msg: &str,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE outbound_queue \
-             SET status = 'dead', last_error = $2, claim_token = NULL, claim_expires_at = NULL \
-             WHERE id = $1 AND ($3::uuid IS NULL OR claim_token = $3)",
-        )
-        .bind(id)
-        .bind(error_msg)
-        .bind(claim_token)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        mark_item_dead(&self.pool, id, claim_token, error_msg).await
     }
 
     pub async fn schedule_retry(
@@ -1465,22 +1444,7 @@ impl OutboundQueue {
         error_msg: &str,
         delay: Duration,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE outbound_queue \
-             SET status = 'pending', retry_count = $2, last_error = $3, \
-                 next_retry_at = $6 + make_interval(secs => $4), \
-                 claim_token = NULL, claim_expires_at = NULL \
-             WHERE id = $1 AND ($5::uuid IS NULL OR claim_token = $5)",
-        )
-        .bind(id)
-        .bind(new_count)
-        .bind(error_msg)
-        .bind(delay.as_secs() as f64)
-        .bind(claim_token)
-        .bind(crate::sim_hooks::current_utc())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        schedule_item_retry(&self.pool, id, claim_token, new_count, error_msg, delay).await
     }
     // -- Maintenance ------------------------------------------------------------
 
@@ -1532,6 +1496,280 @@ impl OutboundQueue {
             total: row.3,
         })
     }
+}
+
+const DELIVER_GROUP_ENTRY_NSID: &str = "blue.catbird.mlsDS.deliverGroupEntry";
+const RELAY_ENTRY_ACK_NSID: &str = "blue.catbird.mlsDS.relayEntryAck";
+const RELAY_ACCOUNT_DELETION_NSID: &str = "blue.catbird.mlsDS.relayAccountDeletion";
+const DELIVER_TRANSPORT_CONTROL_ENTRY_NSID: &str =
+    "blue.catbird.mlsDS.deliverTransportControlEntry";
+
+/// Signed home relays, prune notices and C33 control entries: a 404 drops them
+/// only on authenticated absence.
+fn is_signed_relay(method: &str) -> bool {
+    matches!(
+        method,
+        RELAY_ENTRY_ACK_NSID
+            | RELAY_ACCOUNT_DELETION_NSID
+            | DELIVER_TRANSPORT_CONTROL_ENTRY_NSID
+            | "blue.catbird.mlsDS.notifyEntriesPruned"
+    )
+}
+
+/// A C33 pair's close for the peer's transport-only home. Only a close reaches
+/// a direct pair's home through `deliverGroupEntry`.
+fn is_c33_close(method: &str, body: &serde_json::Value) -> bool {
+    method == DELIVER_GROUP_ENTRY_NSID
+        && body
+            .pointer("/entry/signedRequest/body/conversationKind")
+            .and_then(serde_json::Value::as_str)
+            == Some("direct")
+}
+
+/// One `(conversation, target DS)` stream whose head may be claimed when it
+/// carries `method`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StreamHead<'a> {
+    pub(crate) convo_id: &'a str,
+    pub(crate) target_ds_did: &'a str,
+    pub(crate) method: &'a str,
+}
+
+/// [`claim_due_heads`]'s candidate select: `$1` limit, `$2` now, `$3`/`$4` an
+/// optional stream (conversation, target DS), `$5` its method. `heads` is the
+/// statement's snapshot, but the row lock rechecks only `q`'s own predicates
+/// against a row a rival claim committed since: `q` itself must still be
+/// pending and due, or a head already in flight is claimed and sent again.
+/// Streams due at one instant order by `id`: without it a tie follows the rows'
+/// physical order, which their retry and lease history decides.
+pub(crate) const CLAIM_DUE_HEADS_SQL: &str = "WITH heads AS ( \
+         SELECT DISTINCT ON (CASE WHEN convo_id = '' THEN id ELSE convo_id END, target_ds_did) \
+             id, status, next_retry_at, method \
+         FROM outbound_queue \
+         WHERE status IN ('pending', 'in_flight') \
+           AND ($3::text IS NULL OR (convo_id = $3 AND target_ds_did = $4)) \
+         ORDER BY (CASE WHEN convo_id = '' THEN id ELSE convo_id END), target_ds_did, \
+             CASE \
+                 WHEN method = 'blue.catbird.mlsDS.deliverDirectRequest' THEN 1 \
+                 WHEN method = 'blue.catbird.mlsDS.deliverAcceptanceEntry' THEN 2 \
+                 WHEN method IN ('blue.catbird.mlsDS.deliverMessageEntry', \
+                                 'blue.catbird.mlsDS.deliverMessage') THEN \
+                     COALESCE( \
+                         (substring(encode(payload, 'escape') from '\"seq\"[[:space:]]*:[[:space:]]*([0-9]+)'))::bigint, \
+                         (substring(id from '-([0-9]+)$'))::bigint, \
+                         9223372036854775807 \
+                     ) \
+                 WHEN method = 'blue.catbird.mlsDS.deliverGroupEntry' THEN \
+                     COALESCE( \
+                         (substring(id from '^group-entry-[0-9a-f-]{36}-([0-9]+)-'))::bigint, \
+                         9223372036854775807 \
+                     ) \
+                 WHEN method = 'blue.catbird.mlsDS.deliverTransportControlEntry' THEN \
+                     COALESCE( \
+                         (substring(id from '-([0-9]+)$'))::bigint, \
+                         9223372036854775807 \
+                     ) \
+                 ELSE NULL \
+             END ASC NULLS LAST, \
+             created_at ASC, id ASC \
+     ) \
+     SELECT q.id FROM outbound_queue q \
+     WHERE q.status = 'pending' AND q.next_retry_at <= $2 \
+       AND q.id IN (SELECT id FROM heads WHERE status = 'pending' AND next_retry_at <= $2 \
+                      AND ($5::text IS NULL OR method = $5)) \
+     ORDER BY q.next_retry_at ASC, q.id ASC \
+     LIMIT $1 \
+     FOR UPDATE SKIP LOCKED";
+
+/// Claim due heads of every stream, or only `stream`'s head.
+///
+/// Head-of-line ordering from the encrypted-requests line: at most one live item
+/// per (conversation, target DS) is eligible, and an in-flight head blocks its
+/// successors so claim fencing cannot reorder delivery. Sequenced streams order
+/// by `seq`, never by an id's text (9 < 10). Heads return, and so dispatch, in
+/// candidate order `(next_retry_at, id)`. No transaction spans the send.
+pub(crate) async fn claim_due_heads(
+    pool: &PgPool,
+    limit: i64,
+    stream: Option<StreamHead<'_>>,
+) -> Result<Vec<QueueItem>, sqlx::Error> {
+    let now = crate::sim_hooks::current_utc();
+    let mut tx = pool.begin().await?;
+    let candidates: Vec<(String,)> = sqlx::query_as(CLAIM_DUE_HEADS_SQL)
+        .bind(limit)
+        .bind(now)
+        .bind(stream.map(|s| s.convo_id))
+        .bind(stream.map(|s| s.target_ds_did))
+        .bind(stream.map(|s| s.method))
+        .fetch_all(&mut *tx)
+        .await?;
+
+    if candidates.is_empty() {
+        tx.commit().await?;
+        return Ok(Vec::new());
+    }
+
+    let ids: Vec<String> = candidates.into_iter().map(|(id,)| id).collect();
+    let claim_token =
+        crate::sim_hooks::mint_entry_uuid_v4(b"outbound_queue.claim", &[ids[0].as_bytes()]);
+    let lease_secs = 120.0;
+
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Vec<u8>,
+        String,
+        i32,
+        i32,
+        Option<Vec<u8>>,
+        i32,
+        Option<Uuid>,
+    )> = sqlx::query_as(
+        // Neither `RETURNING` nor `ANY` keeps the candidates' order: carry it.
+        "WITH claimed AS ( \
+             UPDATE outbound_queue q \
+                SET status = 'in_flight', \
+                    claim_token = $2, \
+                    claim_expires_at = $4 + make_interval(secs => $3) \
+               FROM unnest($1::text[]) WITH ORDINALITY AS c(id, ord) \
+              WHERE q.id = c.id \
+             RETURNING c.ord, q.id, q.target_ds_did, q.target_endpoint, q.method, q.payload, \
+                       q.convo_id, q.retry_count, q.max_retries, q.payload_sha256, \
+                       q.envelope_version, q.claim_token \
+         ) \
+         SELECT id, target_ds_did, target_endpoint, method, payload, convo_id, \
+                retry_count, max_retries, payload_sha256, envelope_version, claim_token \
+         FROM claimed ORDER BY ord",
+    )
+    .bind(&ids)
+    .bind(claim_token)
+    .bind(lease_secs)
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                target_ds_did,
+                target_endpoint,
+                method,
+                payload,
+                convo_id,
+                retry_count,
+                max_retries,
+                payload_sha256,
+                envelope_version,
+                claim_token,
+            )| QueueItem {
+                id,
+                target_ds_did,
+                target_endpoint,
+                method,
+                payload,
+                convo_id,
+                retry_count,
+                max_retries,
+                payload_sha256,
+                envelope_version,
+                claim_token,
+            },
+        )
+        .collect())
+}
+
+/// Complete a claimed item. A delivered group entry leaves no row behind: its
+/// ciphertext stays only where ACK, expiry and close pruning reach it.
+pub(crate) async fn mark_item_delivered(
+    pool: &PgPool,
+    id: &str,
+    claim_token: Option<Uuid>,
+) -> Result<bool, sqlx::Error> {
+    settle_item(pool, id, claim_token, "delivered", None).await
+}
+
+/// End a claimed item that met a permanent refusal; nothing resends it.
+pub(crate) async fn mark_item_dead(
+    pool: &PgPool,
+    id: &str,
+    claim_token: Option<Uuid>,
+    error_msg: &str,
+) -> Result<bool, sqlx::Error> {
+    settle_item(pool, id, claim_token, "dead", Some(error_msg)).await
+}
+
+/// Settle claimed row `id` as `status` (`delivered`, `failed` or `dead`),
+/// recording `last_error` when given; returns whether its claim matched. A
+/// delivered group entry leaves no row behind, and nor does any copy of an
+/// entry whose payload is already pruned: nothing sends it again, and its prune
+/// kept it whole only because it was still to be sent (O7,
+/// [`QUEUED_COPY_OF_PRUNED_ENTRY_SQL`]).
+async fn settle_item<'e, E>(
+    executor: E,
+    id: &str,
+    claim_token: Option<Uuid>,
+    status: &str,
+    last_error: Option<&str>,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    let dropped =
+        format!("(($3 = 'delivered' AND q.method = $5) OR {QUEUED_COPY_OF_PRUNED_ENTRY_SQL})");
+    let completed: i64 = sqlx::query_scalar(&format!(
+        "WITH gone AS ( \
+             DELETE FROM outbound_queue q \
+              WHERE q.id = $1 AND ($2::uuid IS NULL OR q.claim_token = $2) AND {dropped} \
+             RETURNING 1 \
+         ), kept AS ( \
+             UPDATE outbound_queue q \
+                SET status = $3, last_error = COALESCE($4, q.last_error), \
+                    claim_token = NULL, claim_expires_at = NULL \
+              WHERE q.id = $1 AND ($2::uuid IS NULL OR q.claim_token = $2) AND NOT {dropped} \
+             RETURNING 1 \
+         ) \
+         SELECT (SELECT count(*) FROM gone) + (SELECT count(*) FROM kept)"
+    ))
+    .bind(id)
+    .bind(claim_token)
+    .bind(status)
+    .bind(last_error)
+    .bind(DELIVER_GROUP_ENTRY_NSID)
+    .fetch_one(executor)
+    .await?;
+    Ok(completed > 0)
+}
+
+pub(crate) async fn schedule_item_retry(
+    pool: &PgPool,
+    id: &str,
+    claim_token: Option<Uuid>,
+    new_count: i32,
+    error_msg: &str,
+    delay: Duration,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE outbound_queue \
+         SET status = 'pending', retry_count = $2, last_error = $3, \
+             next_retry_at = $6 + make_interval(secs => $4), \
+             claim_token = NULL, claim_expires_at = NULL \
+         WHERE id = $1 AND ($5::uuid IS NULL OR claim_token = $5)",
+    )
+    .bind(id)
+    .bind(new_count)
+    .bind(error_msg)
+    .bind(delay.as_secs() as f64)
+    .bind(claim_token)
+    .bind(crate::sim_hooks::current_utc())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Enqueue a C33 delivery item within an existing PostgreSQL transaction.
@@ -1698,15 +1936,9 @@ pub async fn enqueue_c33_in_tx(
 
 /// Mark an outbound queue item as delivered by ID using a connection pool.
 pub async fn mark_delivered_by_id(pool: &PgPool, id: &str) -> Result<(), FederationError> {
-    sqlx::query(
-        "UPDATE outbound_queue \
-         SET status = 'delivered', claim_token = NULL, claim_expires_at = NULL \
-         WHERE id = $1",
-    )
-    .bind(id)
-    .execute(pool)
-    .await
-    .map_err(FederationError::Database)?;
+    settle_item(pool, id, None, "delivered", None)
+        .await
+        .map_err(FederationError::Database)?;
     Ok(())
 }
 
@@ -2081,35 +2313,40 @@ fn is_c33_method(method: &str) -> bool {
         "blue.catbird.mlsDS.deliverDirectRequest"
             | "blue.catbird.mlsDS.deliverAcceptanceEntry"
             | "blue.catbird.mlsDS.deliverMessageEntry"
+            | DELIVER_TRANSPORT_CONTROL_ENTRY_NSID
     )
 }
 
-fn is_predecessor_error(err_str: &str) -> bool {
-    let lower = err_str.to_ascii_lowercase();
-    lower.contains("predecessor")
+/// A receiver still missing an earlier entry of the stream answers a typed
+/// gap: error `PredecessorMissing` (a lexicon-less ordered S2S delivery) or
+/// reasonCode `predecessor_missing` (`deliverMessage`'s `SequenceConflict`).
+/// It is retried in order without consuming an attempt; no message text is
+/// read.
+pub(crate) fn is_predecessor_gap(error_name: Option<&str>, reason_code: Option<&str>) -> bool {
+    error_name == Some(PREDECESSOR_MISSING_ERROR) || reason_code == Some(PREDECESSOR_MISSING_REASON)
 }
 
-fn is_outbound_predecessor_error(err: &OutboundError) -> bool {
-    if let Some(reason) = err.predecessor_reason() {
-        return is_predecessor_error(reason);
-    }
-    match err {
-        OutboundError::RemoteError {
-            body,
-            predecessor_reason,
-            ..
-        } => {
-            predecessor_reason
-                .as_deref()
-                .map(is_predecessor_error)
-                .unwrap_or(false)
-                || is_predecessor_error(body)
-        }
-        _ => false,
+/// [`is_predecessor_gap`] of a peer's non-success answer.
+pub(crate) fn is_outbound_predecessor_gap(error: &OutboundError) -> bool {
+    matches!(
+        error,
+        OutboundError::RemoteError { error_name, reason_code, .. }
+            if is_predecessor_gap(error_name.as_deref(), reason_code.as_deref())
+    )
+}
+
+/// Two lookups of one destination both failed. One that could not answer now
+/// decided nothing, so the destination stays undecided (retried) instead of
+/// refused by the other's permanent answer.
+fn undecided_lookup(first: FederationError, fallback: FederationError) -> FederationError {
+    if first.is_retryable() && !fallback.is_retryable() {
+        first
+    } else {
+        fallback
     }
 }
 
-fn backoff_delay(retry_count: i32) -> Duration {
+pub(crate) fn backoff_delay(retry_count: i32) -> Duration {
     let base = 5u64;
     let delay = base.saturating_mul(2u64.saturating_pow(retry_count as u32));
     Duration::from_secs(delay.min(300))
@@ -2145,38 +2382,73 @@ mod tests {
         assert!(is_c33_method("blue.catbird.mlsDS.deliverDirectRequest"));
         assert!(is_c33_method("blue.catbird.mlsDS.deliverAcceptanceEntry"));
         assert!(is_c33_method("blue.catbird.mlsDS.deliverMessageEntry"));
+        assert!(is_c33_method(DELIVER_TRANSPORT_CONTROL_ENTRY_NSID));
+        assert!(is_signed_relay(DELIVER_TRANSPORT_CONTROL_ENTRY_NSID));
         assert!(!is_c33_method("blue.catbird.mlsDS.deliverMessage"));
         assert!(!is_c33_method("blue.catbird.mls.sendMessage"));
     }
 
+    /// Only the typed fields mark a predecessor gap: a permanent conflict whose
+    /// text mentions a predecessor is no gap (DQ.G6).
     #[test]
-    fn predecessor_error_detection() {
-        assert!(is_predecessor_error("missing signed predecessor entry"));
-        assert!(is_predecessor_error("predecessor entry missing"));
-        assert!(is_predecessor_error("Predecessor chain mismatch"));
-        assert!(!is_predecessor_error("rate limited"));
-        assert!(!is_predecessor_error("invalid auth"));
+    fn predecessor_gaps_are_classified_by_typed_fields_only() {
+        fn remote(error_name: &str, reason_code: &str, body: &str) -> OutboundError {
+            OutboundError::RemoteError {
+                status: 409,
+                body: body.into(),
+                endpoint: "remote DS".into(),
+                method: DELIVER_MESSAGE_NSID.into(),
+                reason_code: Some(reason_code.into()),
+                error_name: Some(error_name.into()),
+            }
+        }
+        assert!(is_outbound_predecessor_gap(&remote(
+            PREDECESSOR_MISSING_ERROR,
+            "x",
+            ""
+        )));
+        assert!(is_outbound_predecessor_gap(&remote(
+            "SequenceConflict",
+            PREDECESSOR_MISSING_REASON,
+            ""
+        )));
+        assert!(!is_outbound_predecessor_gap(&remote(
+            "SequenceConflict",
+            "sequence_conflict",
+            "predecessor entry missing"
+        )));
+        assert!(!is_outbound_predecessor_gap(&remote(
+            "InvalidRequest",
+            "invalid_request",
+            "missing signed predecessor entry"
+        )));
+        assert!(!is_outbound_predecessor_gap(
+            &OutboundError::InvalidResponse {
+                reason: "predecessor".into()
+            }
+        ));
+        assert!(is_predecessor_gap(None, Some(PREDECESSOR_MISSING_REASON)));
+        assert!(!is_predecessor_gap(
+            Some("NotAuthorized"),
+            Some("predecessor")
+        ));
     }
 
+    /// A permanent fallback answer never overwrites a lookup that could not
+    /// answer now (DQ.G5): the destination stays undecided and is retried.
     #[test]
-    fn test_is_outbound_predecessor_error() {
-        let err_with_typed_reason = OutboundError::RemoteError {
-            status: 400,
-            body: "declared_bytes=None, observed_at_least_bytes=80, truncated=false".into(),
-            endpoint: "remote DS".into(),
-            method: "blue.catbird.mlsDS.deliverMessageEntry".into(),
-            predecessor_reason: Some("missing signed predecessor entry".into()),
+    fn an_undecided_lookup_survives_a_permanent_fallback() {
+        let transient = || FederationError::ResolutionFailed {
+            did: "did:web:peer.example".into(),
+            kind: crate::federation::ResolutionFailureKind::DnsTemporary("later".into()),
         };
-        assert!(is_outbound_predecessor_error(&err_with_typed_reason));
-
-        let err_without_predecessor = OutboundError::RemoteError {
-            status: 400,
-            body: "declared_bytes=None, observed_at_least_bytes=50, truncated=false".into(),
-            endpoint: "remote DS".into(),
-            method: "blue.catbird.mlsDS.deliverMessageEntry".into(),
-            predecessor_reason: None,
-        };
-        assert!(!is_outbound_predecessor_error(&err_without_predecessor));
+        let permanent = || FederationError::Unsupported("no declaration".into());
+        assert!(undecided_lookup(transient(), permanent()).is_retryable());
+        assert!(undecided_lookup(permanent(), transient()).is_retryable());
+        assert!(matches!(
+            undecided_lookup(permanent(), FederationError::NotFound("fallback".into())),
+            FederationError::NotFound(_)
+        ));
     }
 
     #[test]
@@ -2605,6 +2877,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_outbound_queue_stops_delivery_when_peer_policy_revoked_after_enqueue() {
+        crate::federation::open_federation_for_test();
         let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 2, 1).await;
         let peer_did = format!(
             "did:web:revoked-{}.example.com",
@@ -2684,6 +2957,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_outbound_queue_retries_on_injected_dns_temporary_and_timeout() {
+        crate::federation::open_federation_for_test();
         let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 2, 1).await;
 
         let peer_did = format!(
@@ -2785,6 +3059,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_outbound_queue_fails_immediately_on_injected_dns_nxdomain_permanent() {
+        crate::federation::open_federation_for_test();
         let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 2, 1).await;
 
         let peer_did = format!(
@@ -2880,6 +3155,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_outbound_queue_distinguishes_injected_http_status_codes() {
+        crate::federation::open_federation_for_test();
         let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 2, 1).await;
 
         let peer_did = format!(
@@ -3044,6 +3320,233 @@ mod tests {
 
         assert_eq!(status_404, "failed", "404 must fail immediately");
         assert_eq!(retry_count_404, 0, "Retry count must remain 0 for 404");
+    }
+
+    /// A direct conversation's `deliverMessage` stream is a seq-ordered head
+    /// stream: whatever its ids' text order, only the lowest pending seq is
+    /// claimable, its successor waits behind it, and a receiver's
+    /// predecessor-gap 409 retries without ever dead-lettering the stream.
+    #[tokio::test]
+    async fn deliver_message_streams_claim_their_lowest_seq_and_retry_gaps() {
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 2, 1).await;
+        let target = format!(
+            "did:web:ordered-{}.example.com",
+            uuid::Uuid::new_v4().as_simple()
+        );
+        let convo = uuid::Uuid::new_v4().to_string();
+        // The later seq has the smaller id and both share one created_at.
+        for (id, seq) in [("message-b", 9), ("message-a", 10)] {
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "header": {"sequencerTerm": 1},
+                "recipientDid": "did:plc:orderedrecipientaaaaaaaa",
+                "entryLocator": {"entryId": uuid::Uuid::new_v4(), "seq": seq},
+            }))
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, \
+                     convo_id, status, retry_count, max_retries, next_retry_at, created_at) \
+                 VALUES ($1, $2, '', $3, $4, $5, 'pending', 0, 5, \
+                         NOW() - INTERVAL '1 second', NOW() - INTERVAL '1 second')",
+            )
+            .bind(id)
+            .bind(&target)
+            .bind(DELIVER_MESSAGE_NSID)
+            .bind(&payload)
+            .bind(&convo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let ids = |items: Vec<QueueItem>| items.into_iter().map(|item| item.id).collect::<Vec<_>>();
+        let first = claim_due_heads(&pool, 10, None).await.unwrap();
+        assert_eq!(ids(first.clone()), ["message-b"], "seq 9 heads the stream");
+        assert!(
+            claim_due_heads(&pool, 10, None).await.unwrap().is_empty(),
+            "seq 10 waits behind in-flight 9"
+        );
+        assert!(
+            mark_item_delivered(&pool, &first[0].id, first[0].claim_token)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            ids(claim_due_heads(&pool, 10, None).await.unwrap()),
+            ["message-a"]
+        );
+
+        // A receiver still missing the predecessor answers a typed gap
+        // (`FederationError::PredecessorMissing`).
+        let gap = OutboundError::RemoteError {
+            status: 409,
+            body: "Federation predecessor missing".into(),
+            endpoint: "x".into(),
+            method: DELIVER_MESSAGE_NSID.into(),
+            reason_code: Some(PREDECESSOR_MISSING_REASON.into()),
+            error_name: Some("SequenceConflict".into()),
+        };
+        assert!(is_outbound_predecessor_gap(&gap));
+    }
+
+    async fn insert_due_message(
+        pool: &PgPool,
+        id: &str,
+        convo: &str,
+        seq: i64,
+        due: DateTime<Utc>,
+    ) {
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"entryLocator": {"seq": seq}})).unwrap();
+        sqlx::query(
+            "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, \
+                 convo_id, next_retry_at, created_at) \
+             VALUES ($1, 'did:web:ordered.example.com', '', $2, $3, $4, $5, $5)",
+        )
+        .bind(id)
+        .bind(DELIVER_MESSAGE_NSID)
+        .bind(payload)
+        .bind(convo)
+        .bind(due)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Streams due at one instant claim, and so dispatch, in `(next_retry_at,
+    /// id)` order whatever their rows' history. Retry resets here write the
+    /// tied heads in reverse id order, their stream keys sort the same way, and
+    /// the head due first holds the largest id: a tie broken by physical order,
+    /// or claimed rows handed back in `RETURNING` order, fails. A claim takes
+    /// only unclaimed heads (a locked head is skipped, its successor waits),
+    /// and an expired lease re-claims the same order under a new token.
+    #[tokio::test]
+    async fn equal_deadline_streams_claim_in_deadline_then_id_order_across_reset_history() {
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 3, 1).await;
+        let t0 = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let clock = Arc::new(crate::sim_hooks::ManualDsClock::new(t0));
+        crate::sim_hooks::scope_ds_clock(clock.clone(), async {
+            let ids =
+                |items: &[QueueItem]| items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+            // Four streams' heads, and a successor behind `item-a`.
+            for (id, convo, seq) in [
+                ("item-a", "stream-4", 1),
+                ("item-b", "stream-3", 1),
+                ("item-c", "stream-2", 1),
+                ("item-d", "stream-1", 1),
+                ("item-0", "stream-4", 2),
+            ] {
+                insert_due_message(&pool, id, convo, seq, t0).await;
+            }
+            let first = claim_due_heads(&pool, 10, None).await.unwrap();
+            assert_eq!(ids(&first), ["item-a", "item-b", "item-c", "item-d"]);
+            // Each fails at once and backs off one step, the last first: equal
+            // deadlines, written in reverse id order.
+            for item in first.iter().rev() {
+                assert!(schedule_item_retry(
+                    &pool,
+                    &item.id,
+                    item.claim_token,
+                    1,
+                    "transient",
+                    backoff_delay(0),
+                )
+                .await
+                .unwrap());
+            }
+            // A fifth stream falls due first, under the largest id, written last.
+            insert_due_message(
+                &pool,
+                "item-z",
+                "stream-5",
+                1,
+                t0 + chrono::TimeDelta::seconds(4),
+            )
+            .await;
+            clock.advance(chrono::TimeDelta::seconds(5));
+            let now = crate::sim_hooks::current_utc();
+
+            // A rival claim locks the first two candidates...
+            let mut rival = pool.begin().await.unwrap();
+            let locked: Vec<(String,)> = sqlx::query_as(CLAIM_DUE_HEADS_SQL)
+                .bind(2_i64)
+                .bind(now)
+                .bind(None::<&str>)
+                .bind(None::<&str>)
+                .bind(None::<&str>)
+                .fetch_all(&mut *rival)
+                .await
+                .unwrap();
+            assert_eq!(locked, [("item-z".to_owned(),), ("item-a".to_owned(),)]);
+            // ...so a claim skips them, and `item-0` still waits behind `item-a`.
+            let rest = claim_due_heads(&pool, 10, None).await.unwrap();
+            assert_eq!(ids(&rest), ["item-b", "item-c", "item-d"]);
+            rival.rollback().await.unwrap();
+            let held = claim_due_heads(&pool, 10, None).await.unwrap();
+            assert_eq!(ids(&held), ["item-z", "item-a"]);
+            assert!(
+                claim_due_heads(&pool, 10, None).await.unwrap().is_empty(),
+                "every head is in flight"
+            );
+
+            // Each claim leases its heads for 120 s under one token of its own.
+            let (h, r) = (held[0].claim_token, rest[0].claim_token);
+            assert!(h.is_some() && r.is_some() && h != r);
+            let lease = Some(now + chrono::TimeDelta::seconds(120));
+            let leases: Vec<(String, String, Option<Uuid>, Option<DateTime<Utc>>)> =
+                sqlx::query_as(
+                    "SELECT id, status, claim_token, claim_expires_at FROM outbound_queue \
+                     ORDER BY id",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            let in_flight = |id: &str, token| (id.to_owned(), "in_flight".to_owned(), token, lease);
+            assert_eq!(
+                leases,
+                [
+                    ("item-0".to_owned(), "pending".to_owned(), None, None),
+                    in_flight("item-a", h),
+                    in_flight("item-b", r),
+                    in_flight("item-c", r),
+                    in_flight("item-d", r),
+                    in_flight("item-z", h),
+                ]
+            );
+
+            // The leases expire together and reset every head once more.
+            let queue = OutboundQueue::new(
+                pool.clone(),
+                AuthMiddleware::new(),
+                Arc::new(DsResolver::new(
+                    pool.clone(),
+                    reqwest::Client::new(),
+                    "did:web:self.example.com".to_string(),
+                    "https://self.example.com".to_string(),
+                    None,
+                    3600,
+                )),
+            );
+            clock.advance(chrono::TimeDelta::seconds(119));
+            assert_eq!(queue.reclaim_stuck_in_flight().await.unwrap(), 0);
+            clock.advance(chrono::TimeDelta::seconds(1));
+            assert_eq!(queue.reclaim_stuck_in_flight().await.unwrap(), 5);
+            let replayed = claim_due_heads(&pool, 10, None).await.unwrap();
+            assert_eq!(
+                ids(&replayed),
+                ["item-z", "item-a", "item-b", "item-c", "item-d"]
+            );
+            let token = replayed[0].claim_token;
+            assert!(replayed.iter().all(|item| item.claim_token == token));
+            assert!(token != h && token != r);
+
+            // An expired claim settles nothing; the live one frees `item-0`.
+            assert!(!mark_item_delivered(&pool, "item-a", h).await.unwrap());
+            assert!(mark_item_delivered(&pool, "item-a", token).await.unwrap());
+            assert_eq!(
+                ids(&claim_due_heads(&pool, 10, None).await.unwrap()),
+                ["item-0"]
+            );
+        })
+        .await;
     }
 }
 

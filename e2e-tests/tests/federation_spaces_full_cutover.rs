@@ -11,42 +11,31 @@
 
 #![cfg(feature = "labyrinth")]
 
+#[allow(dead_code)]
+#[path = "support/native_spaces.rs"]
+mod native_spaces;
+
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    io::{BufRead as _, BufReader},
-    path::PathBuf,
-    process::{Child, Command, Stdio},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
-    },
-    time::Duration,
+    collections::BTreeSet,
+    sync::{atomic::Ordering, Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use aes_gcm::{
     aead::{Aead as _, KeyInit as _},
     Aes256Gcm, Nonce as AesNonce,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use atproto_spaces::{
-    http_signature::{sign_credential_request, verify_credential_request},
-    kem::{decapsulate_p256, encapsulate_p256, encode_p256_did_key},
-    mac::{
-        compute_commit_mac, format_commit_mac_header, format_want_mac_header,
-        parse_want_mac_header, verify_commit_mac, COMMIT_MAC_TYPE, SPACE_MAC_HEADER_NAME,
-        SPACE_WANT_MAC_HEADER_NAME,
-    },
-    tokens::{
-        mint_space_token, verify_space_token, SpaceKeyResolver, SpaceSigningKey, SpaceTokenClaims,
-        SpaceTokenKind, SpaceVerifyingKey,
-    },
+    http_signature::sign_credential_request,
+    kem::{encapsulate_p256, encode_p256_did_key},
+    mac::{format_want_mac_header, verify_commit_mac, COMMIT_MAC_TYPE, SPACE_MAC_HEADER_NAME},
+    tokens::{mint_space_token, SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind},
 };
 use axum::{
     body::Bytes as AxumBytes,
-    extract::{Query, State},
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{get, post, put},
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
+    routing::post,
     Json, Router,
 };
 use base64::{
@@ -56,9 +45,8 @@ use base64::{
 use bird_daemon::bot::{BotLlmResponder, FederatedBirdBot, FederatedBotConfig};
 use catbird_mls::{
     client::{
-        account_did_hash_hex, CatbirdMlsClient, CatbirdMlsClientConfig, PlatformHttpHeader,
-        PlatformHttpRequest, PlatformHttpResponse, PlatformKeyStore, PlatformTransport,
-        REQUIRED_LABYRINTH_OAUTH_SCOPES,
+        account_did_hash_hex, chat_wire::StoredArchivedReceipt, CatbirdMlsClient,
+        CatbirdMlsClientConfig, PlatformKeyStore, REQUIRED_LABYRINTH_OAUTH_SCOPES,
     },
     groups::{
         lifecycle::MemberRole,
@@ -78,20 +66,21 @@ use labyrinth::{
     device::DeviceSecrets, epoch::open_genesis, records::defs::EpochPublicDef,
     sign::TransportSigner,
 };
-use labyrinth_protocol::receipt::{verify_sequencer_receipt_sec1, SignedSequencerReceipt};
+use labyrinth_protocol::receipt::{
+    compute_archive_commitment, verify_sequencer_receipt_sec1, SignedSequencerReceipt,
+};
+use native_spaces::{
+    assert_authority_notified, mint_es256_service_jwt, p256_public_jwk, CleanSlateDsProcess,
+    ClientTransport, DidDirectory, MemoryKeyStore, SpacesPds,
+};
 use p256::{
-    ecdsa::{
-        signature::Verifier as _, Signature as P256Signature, SigningKey as P256SigningKey,
-        VerifyingKey as P256VerifyingKey,
-    },
-    pkcs8::{EncodePrivateKey as _, LineEnding},
+    ecdsa::{signature::Verifier as _, Signature as P256Signature, SigningKey as P256SigningKey},
     SecretKey as P256Secret,
 };
-use rand::RngCore;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
-use tokio_postgres::{Client as PgClient, NoTls};
+use tokio_postgres::Client as PgClient;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -142,83 +131,6 @@ fn build_push_gateway_transcript(
     Ok(out)
 }
 
-async fn pg_connect(url: &str) -> Result<PgClient> {
-    let (client, connection) = tokio_postgres::connect(url, NoTls)
-        .await
-        .with_context(|| format!("connect postgres {url}"))?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    Ok(client)
-}
-
-fn fixture_binary_path() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_target = manifest_dir
-        .parent()
-        .expect("mls-ds root")
-        .join("target/debug/clean_slate_federation_fixture");
-    assert!(
-        workspace_target.exists(),
-        "expected compiled clean_slate_federation_fixture at {}",
-        workspace_target.display()
-    );
-    workspace_target
-}
-
-fn pg_admin_url() -> String {
-    std::env::var("CLEAN_SLATE_PG_ADMIN_URL")
-        .unwrap_or_else(|_| "postgresql://127.0.0.1:5432/postgres".to_string())
-}
-
-fn p256_to_pem(sk: &P256SigningKey) -> String {
-    let secret = P256Secret::from_slice(&sk.to_bytes()).expect("p256 secret");
-    secret
-        .to_pkcs8_pem(LineEnding::LF)
-        .expect("pkcs8 pem")
-        .to_string()
-}
-
-fn p256_public_jwk(vk: &P256VerifyingKey) -> Value {
-    let pt = vk.to_encoded_point(false);
-    json!({
-        "kty": "EC",
-        "crv": "P-256",
-        "x": URL_SAFE_NO_PAD.encode(pt.x().expect("x")),
-        "y": URL_SAFE_NO_PAD.encode(pt.y().expect("y")),
-    })
-}
-
-fn mint_es256_service_jwt(sk: &P256SigningKey, iss: &str, aud: &str, lxm: &str) -> String {
-    let now = Utc::now().timestamp();
-    let hdr = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&json!({
-            "alg": "ES256",
-            "typ": "JWT",
-            "kid": format!("{iss}#atproto"),
-        }))
-        .unwrap(),
-    );
-    let claims = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&json!({
-            "iss": iss,
-            "aud": aud,
-            "lxm": lxm,
-            "iat": now,
-            "exp": now + 60,
-            "jti": Uuid::new_v4().to_string(),
-        }))
-        .unwrap(),
-    );
-    let signing_input = format!("{hdr}.{claims}");
-    let sig: P256Signature = sk.sign(signing_input.as_bytes());
-    let norm = sig.normalize_s().unwrap_or(sig);
-    format!(
-        "{signing_input}.{}",
-        URL_SAFE_NO_PAD.encode(norm.to_bytes())
-    )
-}
-
 fn compute_s2s_mac(caller_did: &str, target_did: &str, lxm: &str, body: &[u8]) -> String {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(S2S_SECRET).expect("hmac");
     mac.update(b"CATBIRD-S2S-GROUP-RELAY\0");
@@ -230,966 +142,6 @@ fn compute_s2s_mac(caller_did: &str, target_did: &str, lxm: &str, body: &[u8]) -
     mac.update(&[0]);
     mac.update(body);
     URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-}
-
-struct CleanSlateDsProcess {
-    db_name: String,
-    db_url: String,
-    service_did: String,
-    base_url: String,
-    signing_key: P256SigningKey,
-    receipt_key: P256SigningKey,
-    did_document: Value,
-    pool: PgClient,
-    child: Option<Child>,
-}
-
-impl CleanSlateDsProcess {
-    async fn spawn(service_did: &str) -> Result<Self> {
-        let admin_pool = pg_connect(&pg_admin_url())
-            .await
-            .context("connect postgres admin db")?;
-        let db_name = format!("clean_slate_fed_{}", Uuid::new_v4().simple());
-        admin_pool
-            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
-            .await
-            .with_context(|| format!("create database {db_name}"))?;
-
-        let db_url = format!("postgresql://127.0.0.1:5432/{db_name}");
-        let signing_key = P256SigningKey::random(&mut rand::rngs::OsRng);
-        let receipt_key = P256SigningKey::random(&mut rand::rngs::OsRng);
-
-        let mut child = Command::new(fixture_binary_path())
-            .env("APP_ENV", "test")
-            .env("TEST_DATABASE_URL", &db_url)
-            .env("SERVICE_DID", service_did)
-            .env("SIGNING_KEY_PEM", p256_to_pem(&signing_key))
-            .env("RECEIPT_SIGNING_KEY_PEM", p256_to_pem(&receipt_key))
-            .env(
-                "FEDERATION_GROUP_RELAY_HMAC_SECRET",
-                std::str::from_utf8(S2S_SECRET).unwrap(),
-            )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("spawn clean_slate_federation_fixture")?;
-
-        let stdout = child.stdout.take().context("capture child stdout")?;
-        let readiness_line = tokio::task::spawn_blocking(move || -> Result<String> {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            Ok(line)
-        })
-        .await??;
-
-        let ready: Value = serde_json::from_str(readiness_line.trim())
-            .with_context(|| format!("parse fixture readiness JSON: {readiness_line}"))?;
-        let base_url = ready["baseUrl"]
-            .as_str()
-            .context("missing baseUrl")?
-            .to_string();
-        let did_document = ready["didDocument"].clone();
-
-        let pool = pg_connect(&db_url).await.context("connect test pool")?;
-
-        Ok(Self {
-            db_name,
-            db_url,
-            service_did: service_did.to_string(),
-            base_url,
-            signing_key,
-            receipt_key,
-            did_document,
-            pool,
-            child: Some(child),
-        })
-    }
-}
-
-impl Drop for CleanSlateDsProcess {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        let db_name = self.db_name.clone();
-        let _ = std::thread::spawn(move || {
-            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                rt.block_on(async {
-                    if let Ok(admin) = pg_connect(&pg_admin_url()).await {
-                        let _ = admin
-                            .execute(
-                                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
-                                &[&db_name],
-                            )
-                            .await;
-                        let _ = admin
-                            .batch_execute(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
-                            .await;
-                    }
-                });
-            }
-        })
-        .join();
-    }
-}
-
-// ============================================================================
-// Loopback Spaces PDS (`Swan` profile & `bluesky-social/atproto#5187` profile)
-// ============================================================================
-
-#[derive(Clone)]
-struct InMemoryKeyResolver {
-    keys: Arc<RwLock<HashMap<String, SpaceVerifyingKey>>>,
-}
-
-impl InMemoryKeyResolver {
-    fn new() -> Self {
-        Self {
-            keys: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    fn insert(&self, did: &str, vk: &P256VerifyingKey) {
-        self.keys
-            .write()
-            .unwrap()
-            .insert(did.to_string(), SpaceVerifyingKey::P256(*vk));
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl SpaceKeyResolver for InMemoryKeyResolver {
-    async fn resolve_atproto_key(
-        &self,
-        did: &str,
-        _force_refresh: bool,
-    ) -> atproto_spaces::Result<SpaceVerifyingKey> {
-        let bare = did.split('#').next().unwrap_or(did);
-        self.keys
-            .read()
-            .unwrap()
-            .get(bare)
-            .cloned()
-            .ok_or_else(|| atproto_spaces::SpacesError::DidResolution(format!("unknown DID {did}")))
-    }
-}
-
-#[derive(Clone)]
-struct StoredSpaceRepoState {
-    rev: String,
-    data_cid: [u8; 32],
-    ops: Vec<Value>,
-}
-
-type SpaceBlobKey = (String, String, String);
-
-type AtprotoRecordKey = (String, String, String);
-
-#[derive(Clone)]
-struct LoopbackSpacesPdsState {
-    pds_did: String,
-    supports_spaces: bool,
-    resolver: InMemoryKeyResolver,
-    author_kem_secrets: Arc<RwLock<HashMap<String, P256Secret>>>,
-    staged_blobs: Arc<RwLock<HashMap<String, Vec<u8>>>>,
-    space_blobs: Arc<RwLock<HashMap<SpaceBlobKey, Vec<u8>>>>,
-    personal_spaces: Arc<RwLock<HashSet<String>>>,
-    repo_states: Arc<RwLock<HashMap<(String, String), StoredSpaceRepoState>>>,
-    revoked_jtis: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    deleted_spaces: Arc<RwLock<HashSet<String>>>,
-    tid_seq: Arc<AtomicUsize>,
-    atproto_records: Arc<RwLock<HashMap<AtprotoRecordKey, Value>>>,
-    did_documents: Arc<RwLock<HashMap<String, Value>>>,
-    account_signing_keys: Arc<RwLock<HashMap<String, P256SigningKey>>>,
-}
-
-struct LoopbackSpacesPds {
-    pds_did: String,
-    base_url: String,
-    signing_key: P256SigningKey,
-    state: LoopbackSpacesPdsState,
-}
-
-impl LoopbackSpacesPds {
-    async fn start(pds_did: &str, supports_spaces: bool, resolver: InMemoryKeyResolver) -> Self {
-        let signing_key = P256SigningKey::random(&mut rand::rngs::OsRng);
-        resolver.insert(pds_did, signing_key.verifying_key());
-
-        let state = LoopbackSpacesPdsState {
-            pds_did: pds_did.to_string(),
-            supports_spaces,
-            resolver,
-            author_kem_secrets: Arc::new(RwLock::new(HashMap::new())),
-            staged_blobs: Arc::new(RwLock::new(HashMap::new())),
-            space_blobs: Arc::new(RwLock::new(HashMap::new())),
-            personal_spaces: Arc::new(RwLock::new(HashSet::new())),
-            repo_states: Arc::new(RwLock::new(HashMap::new())),
-            revoked_jtis: Arc::new(RwLock::new(HashMap::new())),
-            deleted_spaces: Arc::new(RwLock::new(HashSet::new())),
-            tid_seq: Arc::new(AtomicUsize::new(1)),
-            atproto_records: Arc::new(RwLock::new(HashMap::new())),
-            did_documents: Arc::new(RwLock::new(HashMap::new())),
-            account_signing_keys: Arc::new(RwLock::new(HashMap::new())),
-        };
-
-        let app = Router::new()
-            .route("/xrpc/com.atproto.repo.uploadBlob", post(pds_upload_blob))
-            .route(
-                "/xrpc/com.atproto.repo.putRecord",
-                post(pds_repo_put_record),
-            )
-            .route("/xrpc/com.atproto.repo.getRecord", get(pds_repo_get_record))
-            .route(
-                "/xrpc/com.atproto.repo.listRecords",
-                get(pds_repo_list_records),
-            )
-            .route(
-                "/xrpc/com.atproto.identity.resolveDid",
-                get(pds_identity_resolve_did),
-            )
-            .route(
-                "/xrpc/com.atproto.server.getServiceAuth",
-                get(pds_server_get_service_auth),
-            )
-            .route(
-                "/xrpc/com.atproto.sync.getBlob",
-                get(pds_public_sync_get_blob),
-            )
-            .route(
-                "/xrpc/com.atproto.space.putSpace",
-                put(pds_put_space).post(pds_put_space),
-            )
-            .route("/xrpc/com.atproto.space.getSpace", get(pds_get_space))
-            .route(
-                "/xrpc/com.atproto.space.applyWrites",
-                post(pds_apply_writes),
-            )
-            .route(
-                "/xrpc/com.atproto.space.listRepoOps",
-                get(pds_list_repo_ops),
-            )
-            .route("/xrpc/com.atproto.space.getBlob", get(pds_space_get_blob))
-            .route(
-                "/xrpc/com.atproto.space.notifyCredentialRevoked",
-                post(pds_notify_credential_revoked),
-            )
-            .route(
-                "/xrpc/com.atproto.space.notifySpaceDeleted",
-                post(pds_notify_space_deleted),
-            )
-            .with_state(state.clone());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-
-        Self {
-            pds_did: pds_did.to_string(),
-            base_url: format!("http://{addr}"),
-            signing_key,
-            state,
-        }
-    }
-
-    fn register_writer_kem(&self, writer_did: &str) -> String {
-        let sk = P256Secret::random(&mut rand::rngs::OsRng);
-        let did_key = encode_p256_did_key(&sk.public_key());
-        self.state
-            .author_kem_secrets
-            .write()
-            .unwrap()
-            .insert(writer_did.to_string(), sk);
-        did_key
-    }
-
-    fn register_did_document(&self, did: &str, doc: Value) {
-        self.state
-            .did_documents
-            .write()
-            .unwrap()
-            .insert(did.to_string(), doc);
-    }
-
-    fn register_account_signing_key(&self, did: &str, sk: P256SigningKey) {
-        self.state.resolver.insert(did, sk.verifying_key());
-        let pub_jwk = p256_public_jwk(sk.verifying_key());
-        let doc = json!({
-            "@context": ["https://www.w3.org/ns/did/v1"],
-            "id": did,
-            "verificationMethod": [{
-                "id": format!("{did}#atproto"),
-                "type": "JsonWebKey2020",
-                "controller": did,
-                "publicKeyJwk": pub_jwk,
-            }],
-            "service": [{
-                "id": "#atproto_pds",
-                "type": "AtprotoPersonalDataServer",
-                "serviceEndpoint": self.base_url,
-            }],
-        });
-        self.state
-            .did_documents
-            .write()
-            .unwrap()
-            .insert(did.to_string(), doc);
-        self.state
-            .account_signing_keys
-            .write()
-            .unwrap()
-            .insert(did.to_string(), sk);
-    }
-}
-
-async fn pds_repo_put_record(
-    State(state): State<LoopbackSpacesPdsState>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Response {
-    let auth = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    if !auth.starts_with("Bearer ") {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "AuthMissing" })),
-        )
-            .into_response();
-    }
-    let repo = body["repo"].as_str().unwrap_or_default().to_string();
-    let collection = body["collection"].as_str().unwrap_or_default().to_string();
-    let rkey = body["rkey"].as_str().unwrap_or_default().to_string();
-    let record = body["record"].clone();
-    state
-        .atproto_records
-        .write()
-        .unwrap()
-        .insert((repo.clone(), collection.clone(), rkey.clone()), record);
-    let cid = format!(
-        "bafyrei{}",
-        hex::encode(&Sha256::digest(format!("{repo}/{collection}/{rkey}").as_bytes())[..16])
-    );
-    (
-        StatusCode::OK,
-        Json(json!({
-            "uri": format!("at://{repo}/{collection}/{rkey}"),
-            "cid": cid,
-        })),
-    )
-        .into_response()
-}
-
-async fn pds_repo_get_record(
-    State(state): State<LoopbackSpacesPdsState>,
-    Query(q): Query<BTreeMap<String, String>>,
-) -> Response {
-    let repo = q.get("repo").cloned().unwrap_or_default();
-    let collection = q.get("collection").cloned().unwrap_or_default();
-    let rkey = q.get("rkey").cloned().unwrap_or_default();
-    let Some(val) = state
-        .atproto_records
-        .read()
-        .unwrap()
-        .get(&(repo.clone(), collection.clone(), rkey.clone()))
-        .cloned()
-    else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "RecordNotFound" })),
-        )
-            .into_response();
-    };
-    let cid = format!(
-        "bafyrei{}",
-        hex::encode(&Sha256::digest(format!("{repo}/{collection}/{rkey}").as_bytes())[..16])
-    );
-    (
-        StatusCode::OK,
-        Json(json!({
-            "uri": format!("at://{repo}/{collection}/{rkey}"),
-            "cid": cid,
-            "value": val,
-        })),
-    )
-        .into_response()
-}
-
-async fn pds_repo_list_records(
-    State(state): State<LoopbackSpacesPdsState>,
-    Query(q): Query<BTreeMap<String, String>>,
-) -> Response {
-    let repo = q.get("repo").cloned().unwrap_or_default();
-    let collection = q.get("collection").cloned().unwrap_or_default();
-    let mut records = Vec::new();
-    for ((r, c, rk), val) in state.atproto_records.read().unwrap().iter() {
-        if r == &repo && c == &collection {
-            let cid = format!(
-                "bafyrei{}",
-                hex::encode(&Sha256::digest(format!("{r}/{c}/{rk}").as_bytes())[..16])
-            );
-            records.push(json!({
-                "uri": format!("at://{r}/{c}/{rk}"),
-                "cid": cid,
-                "value": val,
-            }));
-        }
-    }
-    (StatusCode::OK, Json(json!({ "records": records }))).into_response()
-}
-
-async fn pds_identity_resolve_did(
-    State(state): State<LoopbackSpacesPdsState>,
-    Query(q): Query<BTreeMap<String, String>>,
-) -> Response {
-    let did = q.get("did").cloned().unwrap_or_default();
-    let Some(doc) = state.did_documents.read().unwrap().get(&did).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "DidNotFound" })),
-        )
-            .into_response();
-    };
-    (StatusCode::OK, Json(json!({ "didDoc": doc }))).into_response()
-}
-
-async fn pds_server_get_service_auth(
-    State(state): State<LoopbackSpacesPdsState>,
-    headers: HeaderMap,
-    Query(q): Query<BTreeMap<String, String>>,
-) -> Response {
-    let auth = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    if !auth.starts_with("Bearer ") {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "AuthMissing" })),
-        )
-            .into_response();
-    }
-    let aud = q.get("aud").cloned().unwrap_or_default();
-    let lxm = q.get("lxm").cloned().unwrap_or_default();
-    let iss = q.get("iss").cloned().unwrap_or_default();
-    let Some(sk) = state
-        .account_signing_keys
-        .read()
-        .unwrap()
-        .get(&iss)
-        .cloned()
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({ "error": "UnknownIssuer", "message": format!("no signing key for {iss}") }),
-            ),
-        )
-            .into_response();
-    };
-    let token = mint_es256_service_jwt(&sk, &iss, &aud, &lxm);
-    (StatusCode::OK, Json(json!({ "token": token }))).into_response()
-}
-
-fn pds_not_supported() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "XRPCNotSupported",
-            "message": "ATProto Spaces not supported on legacy PDS"
-        })),
-    )
-        .into_response()
-}
-
-async fn pds_upload_blob(
-    State(state): State<LoopbackSpacesPdsState>,
-    headers: HeaderMap,
-    body: AxumBytes,
-) -> Response {
-    let auth = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    if !auth.starts_with("Bearer ") {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "AuthMissing" })),
-        )
-            .into_response();
-    }
-    let digest = Sha256::digest(&body);
-    let cid = format!("bafkrei{}", hex::encode(&digest[..16]));
-    state
-        .staged_blobs
-        .write()
-        .unwrap()
-        .insert(cid.clone(), body.to_vec());
-    let mime = headers
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream");
-    (
-        StatusCode::OK,
-        Json(json!({
-            "blob": {
-                "$type": "blob",
-                "ref": { "$link": cid },
-                "mimeType": mime,
-                "size": body.len(),
-            }
-        })),
-    )
-        .into_response()
-}
-
-async fn pds_public_sync_get_blob(State(_state): State<LoopbackSpacesPdsState>) -> Response {
-    // Gate 10 / Spec §6.1: `.staged` and `.space` blobs NEVER enter public blob storage!
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "error": "BlobNotFound",
-            "message": "staged and Space-scoped blobs are never served via com.atproto.sync.getBlob"
-        })),
-    )
-        .into_response()
-}
-
-async fn pds_put_space(
-    State(state): State<LoopbackSpacesPdsState>,
-    Json(body): Json<Value>,
-) -> Response {
-    if !state.supports_spaces {
-        return pds_not_supported();
-    }
-    let uri = body["space"]
-        .as_str()
-        .or_else(|| body["uri"].as_str())
-        .unwrap_or_default()
-        .to_string();
-    state.personal_spaces.write().unwrap().insert(uri.clone());
-    (StatusCode::OK, Json(json!({ "uri": uri }))).into_response()
-}
-
-async fn pds_get_space(
-    State(state): State<LoopbackSpacesPdsState>,
-    headers: HeaderMap,
-    Query(q): Query<BTreeMap<String, String>>,
-) -> Response {
-    if !state.supports_spaces {
-        return pds_not_supported();
-    }
-    let auth = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    if auth.is_empty() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "AuthMissing" })),
-        )
-            .into_response();
-    }
-    let space = q.get("space").cloned().unwrap_or_default();
-    if state.deleted_spaces.read().unwrap().contains(&space) {
-        return (StatusCode::GONE, Json(json!({ "error": "SpaceDeleted" }))).into_response();
-    }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "uri": space,
-            "personalExists": state.personal_spaces.read().unwrap().contains(&space),
-        })),
-    )
-        .into_response()
-}
-
-fn next_pds_tid(seq: &AtomicUsize) -> String {
-    const S32: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
-    let bump = seq.fetch_add(1, Ordering::SeqCst) as u64;
-    let micros = (Utc::now().timestamp().max(0) as u64)
-        .saturating_mul(1_000_000)
-        .saturating_add(bump);
-    let mut val = (micros << 10) & ((1_u64 << 63) - 1);
-    let mut chars = [b'2'; 13];
-    for idx in (0..13).rev() {
-        chars[idx] = S32[(val & 0x1f) as usize];
-        val >>= 5;
-    }
-    String::from_utf8(chars.to_vec()).unwrap()
-}
-
-async fn pds_apply_writes(
-    State(state): State<LoopbackSpacesPdsState>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Response {
-    if !state.supports_spaces {
-        return pds_not_supported();
-    }
-    let auth = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    if !auth.starts_with("Bearer ") {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "AuthMissing" })),
-        )
-            .into_response();
-    }
-
-    let space = body["space"].as_str().unwrap_or_default().to_string();
-    let repo = body["repo"].as_str().unwrap_or_default().to_string();
-    if state.deleted_spaces.read().unwrap().contains(&space) {
-        return (StatusCode::GONE, Json(json!({ "error": "SpaceDeleted" }))).into_response();
-    }
-
-    let writes = body["writes"].as_array().cloned().unwrap_or_default();
-    for w in &writes {
-        // Promote any referenced `.staged` blobs into `(space, repo, cid)` `.space` storage!
-        promote_blobs_in_value(&state, &space, &repo, w);
-    }
-
-    let rev = next_pds_tid(&state.tid_seq);
-    let commit_bytes = serde_json::to_vec(&json!({
-        "space": space,
-        "repo": repo,
-        "rev": rev,
-        "writes": writes,
-    }))
-    .unwrap();
-    let data_cid: [u8; 32] = Sha256::digest(&commit_bytes).into();
-
-    let mut repos = state.repo_states.write().unwrap();
-    let entry = repos
-        .entry((space.clone(), repo.clone()))
-        .or_insert_with(|| StoredSpaceRepoState {
-            rev: rev.clone(),
-            data_cid,
-            ops: Vec::new(),
-        });
-    entry.rev = rev.clone();
-    entry.data_cid = data_cid;
-    for w in writes {
-        entry.ops.push(w);
-    }
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "commit": {
-                "rev": rev,
-                "data": { "$bytes": STANDARD.encode(data_cid) },
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn promote_blobs_in_value(state: &LoopbackSpacesPdsState, space: &str, repo: &str, val: &Value) {
-    match val {
-        Value::Object(map) => {
-            if map.get("$type").and_then(Value::as_str) == Some("blob") {
-                if let Some(cid) = map
-                    .get("ref")
-                    .and_then(|r| r.get("$link"))
-                    .and_then(Value::as_str)
-                {
-                    if let Some(bytes) = state.staged_blobs.write().unwrap().remove(cid) {
-                        state.space_blobs.write().unwrap().insert(
-                            (space.to_string(), repo.to_string(), cid.to_string()),
-                            bytes,
-                        );
-                    }
-                }
-            }
-            for v in map.values() {
-                promote_blobs_in_value(state, space, repo, v);
-            }
-        }
-        Value::Array(arr) => {
-            for v in arr {
-                promote_blobs_in_value(state, space, repo, v);
-            }
-        }
-        _ => {}
-    }
-}
-
-#[allow(clippy::result_large_err)]
-async fn verify_pds_space_credential(
-    state: &LoopbackSpacesPdsState,
-    headers: &HeaderMap,
-    space: &str,
-) -> Result<SpaceTokenClaims, Response> {
-    if state.deleted_spaces.read().unwrap().contains(space) {
-        return Err((
-            StatusCode::GONE,
-            Json(json!({ "error": "SpaceDeleted", "message": "space deleted" })),
-        )
-            .into_response());
-    }
-
-    let Some(auth) = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "AuthMissing", "message": "missing Authorization" })),
-        )
-            .into_response());
-    };
-    let prefix = "atproto-space-credential ";
-    if auth.len() <= prefix.len() || !auth[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "InvalidSpaceCredential" })),
-        )
-            .into_response());
-    }
-    let cred_jwt = auth[prefix.len()..].trim();
-    let now_sec = Utc::now().timestamp().max(0) as u64;
-    let resolver = state.resolver.clone();
-    let claims = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(verify_space_token(
-            SpaceTokenKind::Credential,
-            cred_jwt,
-            &resolver,
-            now_sec,
-        ))
-    })
-    .map_err(|e| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "InvalidSpaceCredential", "message": e.to_string() })),
-        )
-            .into_response()
-    })?;
-
-    if claims.sub != space {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "Forbidden", "message": "credential sub mismatch" })),
-        )
-            .into_response());
-    }
-
-    if state
-        .revoked_jtis
-        .read()
-        .unwrap()
-        .get(space)
-        .is_some_and(|set| set.contains(&claims.jti))
-    {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": "CredentialRevoked",
-                "message": "credential jti revoked via notifyCredentialRevoked"
-            })),
-        )
-            .into_response());
-    }
-
-    let cnf_kid = claims.cnf_kid.as_deref().ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "InvalidSpaceCredential", "message": "missing cnf.kid" })),
-        )
-            .into_response()
-    })?;
-    let verified = verify_credential_request(headers, cnf_kid, now_sec).map_err(|e| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "BadSpaceSignature", "message": e.to_string() })),
-        )
-            .into_response()
-    })?;
-    if verified.audience_did != state.pds_did {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "BadSpaceSignature", "message": "audience mismatch" })),
-        )
-            .into_response());
-    }
-
-    Ok(claims)
-}
-
-async fn pds_list_repo_ops(
-    State(state): State<LoopbackSpacesPdsState>,
-    headers: HeaderMap,
-    Query(q): Query<BTreeMap<String, String>>,
-) -> Response {
-    if !state.supports_spaces {
-        return pds_not_supported();
-    }
-    let space = q.get("space").cloned().unwrap_or_default();
-    let repo = q.get("repo").cloned().unwrap_or_default();
-    if let Err(resp) = verify_pds_space_credential(&state, &headers, &space).await {
-        return resp;
-    }
-
-    let Some(repo_state) = state
-        .repo_states
-        .read()
-        .unwrap()
-        .get(&(space.clone(), repo.clone()))
-        .cloned()
-    else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "RepoNotFound" })),
-        )
-            .into_response();
-    };
-
-    let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(
-        "access-control-expose-headers",
-        HeaderValue::from_static("DPoP-Nonce, WWW-Authenticate, Atproto-Space-Mac"),
-    );
-
-    if let Some(want_mac) = headers
-        .get(SPACE_WANT_MAC_HEADER_NAME)
-        .and_then(|v| v.to_str().ok())
-    {
-        let Ok(key_share) = parse_want_mac_header(want_mac, COMMIT_MAC_TYPE) else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "BadSpaceMac" })),
-            )
-                .into_response();
-        };
-        let Some(author_sk) = state.author_kem_secrets.read().unwrap().get(&repo).cloned() else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "BadSpaceMac", "message": "missing author KEM key" })),
-            )
-                .into_response();
-        };
-        let Ok(shared_secret) = decapsulate_p256(&author_sk, &key_share) else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "BadSpaceMac" })),
-            )
-                .into_response();
-        };
-        let mac = compute_commit_mac(
-            &shared_secret,
-            &space,
-            &repo,
-            &repo_state.rev,
-            &repo_state.data_cid,
-        )
-        .unwrap();
-        let mac_hdr = format_commit_mac_header(&mac);
-        resp_headers.insert(
-            SPACE_MAC_HEADER_NAME,
-            HeaderValue::from_str(&mac_hdr).unwrap(),
-        );
-    }
-
-    (
-        StatusCode::OK,
-        resp_headers,
-        Json(json!({
-            "ops": repo_state.ops,
-            "commit": {
-                "ver": 1,
-                "repo": repo,
-                "space": space,
-                "rev": repo_state.rev,
-                "data": { "$bytes": STANDARD.encode(repo_state.data_cid) },
-            }
-        })),
-    )
-        .into_response()
-}
-
-async fn pds_space_get_blob(
-    State(state): State<LoopbackSpacesPdsState>,
-    headers: HeaderMap,
-    Query(q): Query<BTreeMap<String, String>>,
-) -> Response {
-    if !state.supports_spaces {
-        return pds_not_supported();
-    }
-    let space = q.get("space").cloned().unwrap_or_default();
-    let repo = q.get("repo").cloned().unwrap_or_default();
-    let cid = q.get("cid").cloned().unwrap_or_default();
-    if let Err(resp) = verify_pds_space_credential(&state, &headers, &space).await {
-        return resp;
-    }
-
-    let Some(bytes) = state
-        .space_blobs
-        .read()
-        .unwrap()
-        .get(&(space, repo, cid))
-        .cloned()
-    else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "BlobNotFound" })),
-        )
-            .into_response();
-    };
-
-    let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    resp_headers.insert(
-        "access-control-expose-headers",
-        HeaderValue::from_static("DPoP-Nonce, WWW-Authenticate, Atproto-Space-Mac"),
-    );
-    (StatusCode::OK, resp_headers, bytes).into_response()
-}
-
-async fn pds_notify_credential_revoked(
-    State(state): State<LoopbackSpacesPdsState>,
-    Json(body): Json<Value>,
-) -> Response {
-    let space = body["space"].as_str().unwrap_or_default().to_string();
-    let creds = body["credentials"].as_array().cloned().unwrap_or_default();
-    let mut guard = state.revoked_jtis.write().unwrap();
-    let set = guard.entry(space).or_default();
-    for c in creds {
-        if let Some(jti) = c["jti"].as_str() {
-            set.insert(jti.to_string());
-        }
-    }
-    (StatusCode::OK, Json(json!({}))).into_response()
-}
-
-async fn pds_notify_space_deleted(
-    State(state): State<LoopbackSpacesPdsState>,
-    Json(body): Json<Value>,
-) -> Response {
-    let space = body["space"].as_str().unwrap_or_default().to_string();
-    state.deleted_spaces.write().unwrap().insert(space.clone());
-    state
-        .space_blobs
-        .write()
-        .unwrap()
-        .retain(|(sp, _, _), _| sp != &space);
-    state
-        .repo_states
-        .write()
-        .unwrap()
-        .retain(|(sp, _), _| sp != &space);
-    (StatusCode::OK, Json(json!({}))).into_response()
 }
 
 // ============================================================================
@@ -1260,283 +212,6 @@ impl LoopbackPushGateway {
     }
 }
 
-// ============================================================================
-// D1 Client Transport Firewall (`FirewalledClientTransport`)
-// ============================================================================
-
-struct FirewalledClientTransport {
-    allowed_origins: Vec<String>,
-    http: reqwest::Client,
-    blocked_attempts: AtomicUsize,
-    chat_bearer_token: Mutex<Option<String>>,
-    auto_service_auth: Mutex<Option<(String, P256SigningKey, String)>>,
-}
-
-impl FirewalledClientTransport {
-    fn new(allowed_origins: Vec<String>) -> Self {
-        Self {
-            allowed_origins: allowed_origins
-                .into_iter()
-                .map(|u| u.trim_end_matches('/').to_string())
-                .collect(),
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(15))
-                .build()
-                .unwrap(),
-            blocked_attempts: AtomicUsize::new(0),
-            chat_bearer_token: Mutex::new(None),
-            auto_service_auth: Mutex::new(None),
-        }
-    }
-
-    fn set_chat_bearer_token(&self, token: String) {
-        *self.chat_bearer_token.lock().unwrap() = Some(token);
-    }
-
-    fn set_auto_service_auth(&self, iss_did: String, sk: P256SigningKey, home_ds_did: String) {
-        *self.auto_service_auth.lock().unwrap() = Some((iss_did, sk, home_ds_did));
-    }
-
-    fn assert_allowed(&self, url: &str) -> Result<()> {
-        let allowed = self
-            .allowed_origins
-            .iter()
-            .any(|origin| url.starts_with(origin));
-        if !allowed {
-            self.blocked_attempts.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("D1 client firewall blocked direct outbound request to {url}");
-        }
-        Ok(())
-    }
-
-    async fn post_json_with_headers(
-        &self,
-        url: &str,
-        headers: &[(&str, String)],
-        body: &Value,
-    ) -> Result<(u16, HeaderMap, Vec<u8>)> {
-        self.assert_allowed(url)?;
-        let mut req = self
-            .http
-            .post(url)
-            .header(CONTENT_TYPE, "application/json")
-            .json(body);
-        for (k, v) in headers {
-            req = req.header(*k, v);
-        }
-        let resp = req.send().await?;
-        let status = resp.status().as_u16();
-        let hdrs = resp.headers().clone();
-        let bytes = resp.bytes().await?.to_vec();
-        Ok((status, hdrs, bytes))
-    }
-
-    async fn get_with_headers(
-        &self,
-        url: &str,
-        headers: &[(&str, String)],
-    ) -> Result<(u16, HeaderMap, Vec<u8>)> {
-        self.assert_allowed(url)?;
-        let mut req = self.http.get(url);
-        for (k, v) in headers {
-            req = req.header(*k, v);
-        }
-        let resp = req.send().await?;
-        let status = resp.status().as_u16();
-        let hdrs = resp.headers().clone();
-        let bytes = resp.bytes().await?.to_vec();
-        Ok((status, hdrs, bytes))
-    }
-}
-
-impl PlatformTransport for FirewalledClientTransport {
-    fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
-        self.assert_allowed(&request.url)
-            .map_err(|e| MLSError::Internal(e.to_string()))?;
-        let http = self.http.clone();
-        let chat_bearer = self.chat_bearer_token.lock().unwrap().clone();
-        let auto_sa = self.auto_service_auth.lock().unwrap().clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| MLSError::Internal(e.to_string()))?;
-            rt.block_on(async move {
-                let method = reqwest::Method::from_bytes(request.method.as_bytes())
-                    .map_err(|e| MLSError::invalid_input(e.to_string()))?;
-                let mut builder = http.request(method, &request.url);
-                let mut has_auth = false;
-                for h in &request.headers {
-                    if h.name.eq_ignore_ascii_case("authorization") {
-                        has_auth = true;
-                    }
-                    builder = builder.header(&h.name, &h.value);
-                }
-                if !has_auth
-                    && (request.url.contains("/xrpc/com.atproto.space.applyWrites")
-                        || request.url.contains("/xrpc/com.atproto.repo.putRecord"))
-                {
-                    builder = builder.header("authorization", "Bearer sdk-pds-oauth");
-                } else if !has_auth && request.url.contains("/xrpc/blue.catbird.") {
-                    if let Some(tok) = chat_bearer {
-                        builder = builder.header("authorization", format!("Bearer {tok}"));
-                    } else if let Some((iss, sk, ds_did)) = auto_sa {
-                        if let Some(after_xrpc) = request.url.split("/xrpc/").nth(1) {
-                            let nsid = after_xrpc.split('?').next().unwrap_or(after_xrpc);
-                            let ds_base = ds_did.split('#').next().unwrap_or(&ds_did);
-                            let aud = format!("{ds_base}#atproto_mls");
-                            let tok = mint_es256_service_jwt(&sk, &iss, &aud, nsid);
-                            builder = builder.header("authorization", format!("Bearer {tok}"));
-                        }
-                    }
-                }
-                if let Some(b) = request.body {
-                    builder = builder.body(b);
-                }
-                let resp = builder
-                    .send()
-                    .await
-                    .map_err(|e| MLSError::Internal(e.to_string()))?;
-                let status = resp.status().as_u16();
-                let headers = resp
-                    .headers()
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        v.to_str().ok().map(|val| PlatformHttpHeader {
-                            name: k.as_str().to_string(),
-                            value: val.to_string(),
-                        })
-                    })
-                    .collect();
-                let body = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| MLSError::Internal(e.to_string()))?
-                    .to_vec();
-                Ok(PlatformHttpResponse {
-                    status,
-                    headers,
-                    body,
-                })
-            })
-        })
-        .join()
-        .map_err(|_| MLSError::Internal("transport panic".into()))?
-    }
-
-    fn connect_realtime_stream(&self, url: String, _cursor: Option<i64>) -> Result<(), MLSError> {
-        self.assert_allowed(&url)
-            .map_err(|e| MLSError::Internal(e.to_string()))
-    }
-
-    fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
-        Ok(())
-    }
-}
-
-struct MemoryKeyStore {
-    keys: Mutex<HashMap<String, Vec<u8>>>,
-    dpop: Mutex<HashMap<String, (String, i64)>>,
-}
-
-impl MemoryKeyStore {
-    fn new() -> Self {
-        Self {
-            keys: Mutex::new(HashMap::new()),
-            dpop: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl PushKeystore for MemoryKeyStore {
-    fn load_db_key(&self, account_did_hash: String) -> Result<Vec<u8>, MLSError> {
-        self.keys
-            .lock()
-            .unwrap()
-            .get(&format!("db:{account_did_hash}"))
-            .cloned()
-            .ok_or_else(|| MLSError::Internal(format!("missing db key for {account_did_hash}")))
-    }
-
-    fn load_signature_keypair(&self, key_id: String) -> Result<Option<Vec<u8>>, MLSError> {
-        Ok(self.keys.lock().unwrap().get(&key_id).cloned())
-    }
-
-    fn load_cached_chat_dpop_token(
-        &self,
-        account_did_hash: String,
-    ) -> Result<Option<String>, MLSError> {
-        let now_ms = Utc::now().timestamp_millis();
-        Ok(self
-            .dpop
-            .lock()
-            .unwrap()
-            .get(&account_did_hash)
-            .and_then(|(tok, exp)| (*exp > now_ms).then(|| tok.clone())))
-    }
-}
-
-impl PlatformKeyStore for MemoryKeyStore {
-    fn load_or_create_db_key(&self, account_did_hash: String) -> Result<Vec<u8>, MLSError> {
-        let mut g = self.keys.lock().unwrap();
-        Ok(g.entry(format!("db:{account_did_hash}"))
-            .or_insert_with(|| {
-                let mut k = vec![0u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut k);
-                k
-            })
-            .clone())
-    }
-
-    fn load_signature_keypair(&self, key_id: String) -> Result<Option<Vec<u8>>, MLSError> {
-        Ok(self.keys.lock().unwrap().get(&key_id).cloned())
-    }
-
-    fn store_signature_keypair(
-        &self,
-        key_id: String,
-        keypair_bytes: Vec<u8>,
-    ) -> Result<(), MLSError> {
-        self.keys.lock().unwrap().insert(key_id, keypair_bytes);
-        Ok(())
-    }
-
-    fn delete_account_keys(&self, account_did_hash: String) -> Result<(), MLSError> {
-        let mut g = self.keys.lock().unwrap();
-        g.remove(&format!("db:{account_did_hash}"));
-        g.remove(&format!("mls-signer:{account_did_hash}"));
-        self.dpop.lock().unwrap().remove(&account_did_hash);
-        Ok(())
-    }
-
-    fn load_cached_chat_dpop_token(
-        &self,
-        account_did_hash: String,
-    ) -> Result<Option<String>, MLSError> {
-        let now_ms = Utc::now().timestamp_millis();
-        Ok(self
-            .dpop
-            .lock()
-            .unwrap()
-            .get(&account_did_hash)
-            .and_then(|(tok, exp)| (*exp > now_ms).then(|| tok.clone())))
-    }
-
-    fn store_cached_chat_dpop_token(
-        &self,
-        account_did_hash: String,
-        token: String,
-        expires_at_ms: i64,
-    ) -> Result<(), MLSError> {
-        self.dpop
-            .lock()
-            .unwrap()
-            .insert(account_did_hash, (token, expires_at_ms));
-        Ok(())
-    }
-}
-
 struct Ed25519TransportSigner {
     sk: Ed25519SigningKey,
 }
@@ -1561,6 +236,25 @@ impl BotLlmResponder for DeterministicBirdResponder {
             text.len()
         ))
     }
+}
+
+/// `(entries, sends of message_id, next_entry_seq)` of a conversation `pool`'s DS sequences:
+/// everything an accepted application send changes.
+async fn send_footprint(
+    pool: &PgClient,
+    conversation_id: &Uuid,
+    message_id: &Uuid,
+) -> Result<(i64, i64, i64)> {
+    let row = pool
+        .query_one(
+            "SELECT (SELECT COUNT(*) FROM chat.entries WHERE conversation_id = $1), \
+                    (SELECT COUNT(*) FROM chat.message_sends \
+                      WHERE conversation_id = $1 AND message_id = $2), \
+                    (SELECT next_entry_seq FROM chat.conversations WHERE conversation_id = $1)",
+            &[conversation_id, message_id],
+        )
+        .await?;
+    Ok((row.get(0), row.get(1), row.get(2)))
 }
 
 async fn count_ds_operational_rows(pool: &PgClient) -> Result<i64> {
@@ -1592,29 +286,30 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     // Boot Topology: 2 Real `clean_slate_federation_fixture` Processes +
     // `Swan` PDS + `atproto#5187` Reference PDS + Legacy Non-Spaces PDS + Push Gateway
     // ========================================================================
-    let mut ds_a = CleanSlateDsProcess::spawn(DS_A_DID).await?;
-    let ds_b = CleanSlateDsProcess::spawn(DS_B_DID).await?;
+    let mut ds_a = CleanSlateDsProcess::spawn(DS_A_DID, S2S_SECRET).await?;
+    let ds_b = CleanSlateDsProcess::spawn(DS_B_DID, S2S_SECRET).await?;
 
-    let resolver = InMemoryKeyResolver::new();
-    resolver.insert(&ds_a.service_did, ds_a.signing_key.verifying_key());
-    resolver.insert(&ds_b.service_did, ds_b.signing_key.verifying_key());
+    // Every identity's DID document, as PLC / did:web would serve it to each PDS's resolveDid.
+    let directory = DidDirectory::new();
+    directory.publish(&ds_a.service_did, ds_a.did_document.clone());
+    directory.publish(&ds_b.service_did, ds_b.did_document.clone());
 
-    let swan_pds = LoopbackSpacesPds::start(
+    let swan_pds = SpacesPds::start(
         "did:web:swan.federation.catbird.blue",
         true,
-        resolver.clone(),
+        directory.clone(),
     )
     .await;
-    let ref_pds = LoopbackSpacesPds::start(
+    let ref_pds = SpacesPds::start(
         "did:web:spaces-ref.federation.catbird.blue",
         true,
-        resolver.clone(),
+        directory.clone(),
     )
     .await;
-    let legacy_pds = LoopbackSpacesPds::start(
+    let legacy_pds = SpacesPds::start(
         "did:web:legacy.federation.catbird.blue",
         false,
-        resolver.clone(),
+        directory.clone(),
     )
     .await;
     let push_gw = LoopbackPushGateway::start().await;
@@ -1661,53 +356,9 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             .send()
             .await?
             .error_for_status()?;
-        admin_http
-            .post(format!("{}/_test/clean-slate/register-did", ds.base_url))
-            .json(&json!({
-                "did": ds_a.service_did,
-                "p256Jwk": p256_public_jwk(ds_a.signing_key.verifying_key()),
-                "endpointUrl": ds_a.base_url,
-                "didDocument": ds_a.did_document,
-                "isDs": true,
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
-        admin_http
-            .post(format!("{}/_test/clean-slate/register-did", ds.base_url))
-            .json(&json!({
-                "did": ds_b.service_did,
-                "p256Jwk": p256_public_jwk(ds_b.signing_key.verifying_key()),
-                "endpointUrl": ds_b.base_url,
-                "didDocument": ds_b.did_document,
-                "isDs": true,
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
-        admin_http
-            .post(format!("{}/_test/clean-slate/register-did", ds.base_url))
-            .json(&json!({
-                "did": swan_pds.pds_did,
-                "p256Jwk": p256_public_jwk(swan_pds.signing_key.verifying_key()),
-                "endpointUrl": swan_pds.base_url,
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
-        admin_http
-            .post(format!("{}/_test/clean-slate/register-did", ds.base_url))
-            .json(&json!({
-                "did": ref_pds.pds_did,
-                "p256Jwk": p256_public_jwk(ref_pds.signing_key.verifying_key()),
-                "endpointUrl": ref_pds.base_url,
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
+        ds.register_ds(&admin_http, &ds_a).await?;
+        ds.register_ds(&admin_http, &ds_b).await?;
     }
-    swan_pds.register_did_document(&ds_a.service_did, ds_a.did_document.clone());
-    swan_pds.register_did_document(&ds_b.service_did, ds_b.did_document.clone());
 
     // ========================================================================
     // Scenario 1: Federated Enrollment (`did:web` + `did:plc`), `I15` Spaces Gate,
@@ -1720,7 +371,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .collect();
 
     // Negative `I15` check: account on `legacy_pds` (non-Spaces PDS) is cleanly blocked with zero KP upload
-    let legacy_transport = Arc::new(FirewalledClientTransport::new(vec![
+    let legacy_transport = Arc::new(ClientTransport::new(vec![
         ds_a.base_url.clone(),
         legacy_pds.base_url.clone(),
     ]));
@@ -1786,11 +437,6 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let bob_admin_did = seeded_b["senderDid"].as_str().unwrap().to_string();
     let bob_device_id = Uuid::parse_str(seeded_b["senderDeviceId"].as_str().unwrap())?;
     let bob_key_id = seeded_b["senderKeyId"].as_str().unwrap().to_string();
-    let bob_ed_seed: [u8; 32] = STANDARD
-        .decode(seeded_b["senderEd25519SeedB64"].as_str().unwrap())?
-        .try_into()
-        .unwrap();
-    let bob_ed_sk = Ed25519SigningKey::from_bytes(&bob_ed_seed);
 
     let alice_remote_did = seeded_b["recipientDid"].as_str().unwrap().to_string();
     let alice_device_id = Uuid::parse_str(seeded_b["recipientDeviceId"].as_str().unwrap())?;
@@ -1810,56 +456,31 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let bob_sdk_device_id = Uuid::new_v4();
     let bob_sdk_p256 = P256SigningKey::random(&mut rand::rngs::OsRng);
 
-    // Register P-256 `#atproto` DID keys + PDS endpoints for fixture & real-SDK accounts
+    // `#atproto` keys + PDS homes (OAuth sessions) for the fixture and real-SDK accounts
     let alice_p256 = P256SigningKey::random(&mut rand::rngs::OsRng);
     let bob_p256 = P256SigningKey::random(&mut rand::rngs::OsRng);
     let eve_p256 = P256SigningKey::random(&mut rand::rngs::OsRng);
-    resolver.insert(&alice_remote_did, alice_p256.verifying_key());
-    resolver.insert(&bob_admin_did, bob_p256.verifying_key());
-    resolver.insert(eve_did, eve_p256.verifying_key());
-
-    let alice_kem_did_key = swan_pds.register_writer_kem(&alice_remote_did);
-    let bob_kem_did_key = swan_pds.register_writer_kem(&bob_admin_did);
-    let eve_kem_did_key = ref_pds.register_writer_kem(eve_did);
-    swan_pds.register_writer_kem(&alice_sdk_did);
-    swan_pds.register_writer_kem(&bob_sdk_did);
-    swan_pds.register_account_signing_key(&alice_sdk_did, alice_sdk_p256.clone());
-    swan_pds.register_account_signing_key(&bob_sdk_did, bob_sdk_p256.clone());
+    let alice_kem_did_key =
+        swan_pds.add_account(&alice_remote_did, alice_p256.clone(), "alice-pds-oauth");
+    let bob_kem_did_key = swan_pds.add_account(&bob_admin_did, bob_p256.clone(), "bob-pds-oauth");
+    let eve_kem_did_key = ref_pds.add_account(eve_did, eve_p256.clone(), "eve-pds-oauth");
+    swan_pds.add_account(
+        &alice_sdk_did,
+        alice_sdk_p256.clone(),
+        "alice-sdk-pds-oauth",
+    );
+    swan_pds.add_account(&bob_sdk_did, bob_sdk_p256.clone(), "bob-sdk-pds-oauth");
 
     for ds in [&ds_a, &ds_b] {
         for (did, sk, pds_url) in [
-            (
-                alice_remote_did.as_str(),
-                &alice_p256,
-                swan_pds.base_url.as_str(),
-            ),
-            (
-                bob_admin_did.as_str(),
-                &bob_p256,
-                swan_pds.base_url.as_str(),
-            ),
-            (eve_did, &eve_p256, ref_pds.base_url.as_str()),
-            (
-                alice_sdk_did.as_str(),
-                &alice_sdk_p256,
-                swan_pds.base_url.as_str(),
-            ),
-            (
-                bob_sdk_did.as_str(),
-                &bob_sdk_p256,
-                swan_pds.base_url.as_str(),
-            ),
+            (alice_remote_did.as_str(), &alice_p256, &swan_pds.base_url),
+            (bob_admin_did.as_str(), &bob_p256, &swan_pds.base_url),
+            (eve_did, &eve_p256, &ref_pds.base_url),
+            (alice_sdk_did.as_str(), &alice_sdk_p256, &swan_pds.base_url),
+            (bob_sdk_did.as_str(), &bob_sdk_p256, &swan_pds.base_url),
         ] {
-            admin_http
-                .post(format!("{}/_test/clean-slate/register-did", ds.base_url))
-                .json(&json!({
-                    "did": did,
-                    "p256Jwk": p256_public_jwk(sk.verifying_key()),
-                    "endpointUrl": pds_url,
-                }))
-                .send()
-                .await?
-                .error_for_status()?;
+            ds.register_did(&admin_http, did, sk.verifying_key(), pds_url)
+                .await?;
         }
     }
 
@@ -1894,14 +515,16 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     }
 
     // Alice's D1-firewalled transport ONLY permits her home `ds-a` and her own `swan_pds`!
-    let alice_firewall = Arc::new(FirewalledClientTransport::new(vec![
+    let alice_firewall = Arc::new(ClientTransport::new(vec![
         ds_a.base_url.clone(),
         swan_pds.base_url.clone(),
     ]));
-    alice_firewall.set_auto_service_auth(
-        alice_sdk_did.clone(),
+    alice_firewall.set_account(
+        &alice_sdk_did,
         alice_sdk_p256.clone(),
-        DS_A_DID.to_string(),
+        DS_A_DID,
+        &swan_pds.base_url,
+        "alice-sdk-pds-oauth",
     );
 
     // Enroll Alice's `CatbirdMlsClient` (`MLS_256_XWING` + `D4` default-on Labyrinth) on `ds-a` + `swan_pds`
@@ -1951,15 +574,6 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         alice_enroll.mailbox_space_uri,
         format!("at://{alice_sdk_did}/space/blue.catbird.labyrinth.mailbox/self")
     );
-
-    let (put_space_status, _, _) = alice_firewall
-        .post_json_with_headers(
-            &format!("{}/xrpc/com.atproto.space.putSpace", swan_pds.base_url),
-            &[("authorization", "Bearer alice-pds-oauth".into())],
-            &json!({ "space": alice_enroll.mailbox_space_uri }),
-        )
-        .await?;
-    assert_eq!(put_space_status, 200);
 
     // Publish real signed `EpochPublic` (epoch 0) for Alice to `ds-a`'s `publishEpochHead` and verify via `getEpochHead` (`Gate 6`, `L-F01`)
     let alice_lab_secrets = DeviceSecrets::generate()?;
@@ -2055,6 +669,22 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         &format!("{DS_A_DID}#atproto_mls"),
         "blue.catbird.labyrinth.getEpochHead",
     );
+    // DS-A serves Alice's epoch head only from her authoritative home, resolved
+    // from her public chat declaration (an unresolvable home fails closed with
+    // RelayUnavailable); her PDS publishes one naming DS-A, as an enrolled
+    // account's does.
+    swan_pds.put_record(
+        &alice_remote_did,
+        "blue.catbird.chat.declaration",
+        "self",
+        json!({
+            "$type": "blue.catbird.chat.declaration",
+            "allowIncoming": "all",
+            "deliveryService": DS_A_DID,
+            "protocolVersion": "1",
+            "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        }),
+    );
     let (head_status, _, head_bytes) = alice_firewall
         .get_with_headers(
             &format!(
@@ -2112,14 +742,16 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     );
 
     // Step 1: Real-SDK federated enrollment (`alice_sdk` on `ds-a` `did:web` + `bob_sdk` on `ds-b` `did:plc`)
-    let bob_firewall = Arc::new(FirewalledClientTransport::new(vec![
+    let bob_firewall = Arc::new(ClientTransport::new(vec![
         ds_b.base_url.clone(),
         swan_pds.base_url.clone(),
     ]));
-    bob_firewall.set_auto_service_auth(
-        bob_sdk_did.clone(),
+    bob_firewall.set_account(
+        &bob_sdk_did,
         bob_sdk_p256.clone(),
-        DS_B_DID.to_string(),
+        DS_B_DID,
+        &swan_pds.base_url,
+        "bob-sdk-pds-oauth",
     );
     let bob_keystore = Arc::new(MemoryKeyStore::new());
     let bob_storage_root = temp_root.path().join("bob-sdk");
@@ -2154,14 +786,6 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         tokio::task::spawn_blocking(move || sdk.enroll_device(&sc)).await??
     };
     assert!(bob_enroll.labyrinth_backup_enabled);
-    let (put_bob_space_status, _, _) = bob_firewall
-        .post_json_with_headers(
-            &format!("{}/xrpc/com.atproto.space.putSpace", swan_pds.base_url),
-            &[("authorization", "Bearer bob-pds-oauth".into())],
-            &json!({ "space": bob_enroll.mailbox_space_uri }),
-        )
-        .await?;
-    assert_eq!(put_bob_space_status, 200);
 
     // Assert live PostgreSQL `chat.devices` + PDS `blue.catbird.chat.device` records exist for BOTH SDK clients (`ADR-009` / `I4`)
     let alice_dev_rows: i64 = ds_a
@@ -2188,32 +812,17 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         bob_dev_rows, 1,
         "bob_sdk.enroll_device must register active device on ds-b"
     );
-    assert!(
-        swan_pds
-            .state
-            .atproto_records
-            .read()
-            .unwrap()
-            .contains_key(&(
-                alice_sdk_did.clone(),
-                "blue.catbird.chat.device".to_string(),
-                alice_sdk_device_id.to_string(),
-            )),
-        "I4/ADR-009: alice_sdk.enroll_device must publish blue.catbird.chat.device record on PDS"
-    );
-    assert!(
-        swan_pds
-            .state
-            .atproto_records
-            .read()
-            .unwrap()
-            .contains_key(&(
-                bob_sdk_did.clone(),
-                "blue.catbird.chat.device".to_string(),
-                bob_sdk_device_id.to_string(),
-            )),
-        "I4/ADR-009: bob_sdk.enroll_device must publish blue.catbird.chat.device record on PDS"
-    );
+    for (did, device_id) in [
+        (&alice_sdk_did, alice_sdk_device_id),
+        (&bob_sdk_did, bob_sdk_device_id),
+    ] {
+        assert!(
+            swan_pds
+                .record(did, "blue.catbird.chat.device", &device_id.to_string())
+                .is_some(),
+            "I4/ADR-009: {did} enroll_device must publish blue.catbird.chat.device record on PDS"
+        );
+    }
 
     // Step 2: `alice_sdk` initiates a federated `C33` Direct Request to `bob_sdk_did` across `ds-a` -> `ds-b`
     let requested_convo_uuid = Uuid::new_v4().to_string();
@@ -2501,16 +1110,26 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let pair_coord_did = std::cmp::min(DS_A_DID, DS_B_DID);
     let fed_space_uri =
         format!("at://{pair_coord_did}/space/blue.catbird.labyrinth.conversation/{fed_convo_id}-0");
-    {
-        let repo_states = swan_pds.state.repo_states.read().unwrap();
-        let alice_space_ops = repo_states
-            .get(&(fed_space_uri.clone(), alice_sdk_did.clone()))
-            .expect("swan_pds must hold Alice's Conversation Space batch writes");
-        let bob_space_ops = repo_states
-            .get(&(fed_space_uri.clone(), bob_sdk_did.clone()))
-            .expect("swan_pds must hold Bob's Conversation Space batch writes");
-        assert!(!alice_space_ops.ops.is_empty());
-        assert!(!bob_space_ops.ops.is_empty());
+    use labyrinth::records::nsid;
+    for (did, mailbox) in [
+        (&alice_sdk_did, &alice_enroll.mailbox_space_uri),
+        (&bob_sdk_did, &bob_enroll.mailbox_space_uri),
+    ] {
+        assert!(
+            !swan_pds
+                .space_records(&fed_space_uri, did, nsid::BATCH)
+                .is_empty(),
+            "swan_pds must hold {did}'s Conversation Space batch writes"
+        );
+        // ds-b, the pair coordinator, is the Space authority.
+        assert_authority_notified(&ds_b, &swan_pds, &fed_space_uri, did).await?;
+        // The default-on archive enrolled this device in the account's personal mailbox Space.
+        assert!(
+            !swan_pds
+                .space_records(mailbox, did, nsid::DEVICE)
+                .is_empty(),
+            "{did}'s personal mailbox Space must hold its Labyrinth device"
+        );
     }
     assert_eq!(
         alice_firewall.blocked_attempts.load(Ordering::SeqCst),
@@ -2586,13 +1205,79 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         "D2: sequencing ds-b MUST hold zero push gateway bindings for remote member Alice"
     );
 
-    // Relay Bob's signed group application message over S2S `relayGroupMutation` to `ds-b` (`did:plc`)
-    let relay_req = json!({
+    // The sequencer accepts a relayed mutation only from the actor's own home: `ds-a` relaying
+    // `ds-b`-local Bob's genuine seeded send is refused, and the conversation is untouched.
+    let seeded_message_id = Uuid::parse_str(seeded_b["messageId"].as_str().unwrap())?;
+    let footprint_before = send_footprint(&ds_b.pool, &convo_id, &seeded_message_id).await?;
+    let bob_relay_bytes = serde_json::to_vec(&json!({
         "conversationId": convo_id,
         "endpoint": "blue.catbird.chat.sendMessage",
         "actorDid": bob_admin_did,
         "actorDeviceId": bob_device_id,
         "signedRequest": seeded_b["signedRequest"],
+    }))?;
+    let bob_relay_mac = compute_s2s_mac(
+        DS_A_DID,
+        DS_B_DID,
+        "blue.catbird.mlsDS.relayGroupMutation",
+        &bob_relay_bytes,
+    );
+    let bob_relay_resp = admin_http
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.relayGroupMutation",
+            ds_b.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .header("x-catbird-s2s-caller-did", DS_A_DID)
+        .header("x-catbird-s2s-target-did", DS_B_DID)
+        .header("x-catbird-s2s-mac", bob_relay_mac)
+        .body(bob_relay_bytes)
+        .send()
+        .await?;
+    assert_eq!(
+        bob_relay_resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "D1: ds-a must not relay a mutation for ds-b-local Bob"
+    );
+    let bob_refusal: Value = bob_relay_resp.json().await?;
+    assert_eq!(bob_refusal["error"], "NotAuthorized", "{bob_refusal}");
+    assert_eq!(
+        bob_refusal["message"], "caller is not the participant's home DS",
+        "{bob_refusal}"
+    );
+    assert_eq!(
+        send_footprint(&ds_b.pool, &convo_id, &seeded_message_id).await?,
+        footprint_before,
+        "D1: a refused relay must sequence nothing and record no send"
+    );
+
+    // Relay a member's signed group application message over S2S `relayGroupMutation` from the
+    // member's home DS to the sequencer `ds-b` (`did:plc`). A sequencer accepts a relayed
+    // mutation only from the actor's own home (`group_relay_security_tests::
+    // group_application_relay_checks_home_leaf_device_key_and_pruned_replay`): `ds-a` relays
+    // for Alice, whom it homes, never for `ds-b`-local Bob. The seeded send (its prior
+    // coordinates, AAD and opaque ciphertext) is re-signed as Alice's leaf device.
+    let mut alice_send_body = seeded_b["signedRequest"]["body"].clone();
+    alice_send_body["actorDid"] = json!(alice_remote_did);
+    alice_send_body["actorDeviceId"] = json!(alice_device_id);
+    alice_send_body["keyId"] = json!(alice_key_id);
+    let alice_signed_send: Value = admin_http
+        .post(format!("{}/_test/clean-slate/sign-mutation", ds_b.base_url))
+        .json(&json!({
+            "body": alice_send_body,
+            "ed25519SeedB64": STANDARD.encode(alice_ed_sk.to_bytes()),
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let relay_req = json!({
+        "conversationId": convo_id,
+        "endpoint": "blue.catbird.chat.sendMessage",
+        "actorDid": alice_remote_did,
+        "actorDeviceId": alice_device_id,
+        "signedRequest": alice_signed_send,
     });
     let relay_req_bytes = serde_json::to_vec(&relay_req)?;
     let relay_mac = compute_s2s_mac(
@@ -2613,8 +1298,15 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .body(relay_req_bytes)
         .send()
         .await?;
-    assert_eq!(relay_resp.status(), reqwest::StatusCode::OK);
-    let relay_out: Value = relay_resp.json().await?;
+    let relay_status = relay_resp.status();
+    let relay_body = relay_resp.bytes().await?;
+    assert_eq!(
+        relay_status,
+        reqwest::StatusCode::OK,
+        "relayGroupMutation: {}",
+        String::from_utf8_lossy(&relay_body)
+    );
+    let relay_out: Value = serde_json::from_slice(&relay_body)?;
     let sequenced_entry = relay_out["entry"].clone();
     let sequenced_seq = sequenced_entry["seq"].as_i64().unwrap();
     assert!(sequenced_seq >= 2);
@@ -2650,7 +1342,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .expect("I13: ES256 sequencerReceipt from did:plc ds-b MUST verify");
 
     // Stale-epoch conflict (`409 StaleCoordinates`) on `relayGroupMutation`
-    let mut stale_signed_req = seeded_b["signedRequest"].clone();
+    let mut stale_signed_req = alice_signed_send.clone();
     stale_signed_req["body"]["messageId"] = json!(Uuid::new_v4());
     stale_signed_req["body"]["prior"]["epoch"] = json!(999);
     let stale_body_val = stale_signed_req["body"].clone();
@@ -2658,7 +1350,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .post(format!("{}/_test/clean-slate/sign-mutation", ds_b.base_url))
         .json(&json!({
             "body": stale_body_val,
-            "ed25519SeedB64": STANDARD.encode(bob_ed_sk.to_bytes()),
+            "ed25519SeedB64": STANDARD.encode(alice_ed_sk.to_bytes()),
         }))
         .send()
         .await?
@@ -2668,8 +1360,8 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let stale_relay = json!({
         "conversationId": convo_id,
         "endpoint": "blue.catbird.chat.sendMessage",
-        "actorDid": bob_admin_did,
-        "actorDeviceId": bob_device_id,
+        "actorDid": alice_remote_did,
+        "actorDeviceId": alice_device_id,
         "signedRequest": stale_wrapped,
     });
     let stale_bytes = serde_json::to_vec(&stale_relay)?;
@@ -2697,71 +1389,194 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         "stale epoch relayed mutation must return 409 StaleCoordinates"
     );
 
-    // Fan out `deliverGroupEntry` from `ds-b` (`did:plc`) -> `ds-a` (`did:web`):
-    // 1) Small ciphertext (`<= 2,200` B) -> `deliveryMode == "inline"` with `ciphertext`
-    let deliver_small = json!({
-        "conversationId": convo_id,
-        "generation": 0,
-        "spaceUri": space_uri,
-        "recipientDids": [alice_remote_did],
-        "recipientDevices": [[alice_remote_did, alice_device_id]],
-        "entry": sequenced_entry,
-    });
-    let deliver_small_bytes = serde_json::to_vec(&deliver_small)?;
-    let deliver_small_mac = compute_s2s_mac(
-        DS_B_DID,
-        DS_A_DID,
-        "blue.catbird.mlsDS.deliverGroupEntry",
-        &deliver_small_bytes,
+    // A live federated group that `ds-b` sequences, with a member homed on `ds-a`. Bob's device
+    // creates it; `ds-b` delivers the membership entries that provision `ds-a`'s mirror, Alice's
+    // device joins through her home, and her send reaches the sequencer only through `ds-a`'s
+    // relay, then every member.
+    let relay_group_cid = Uuid::new_v4().to_string();
+    let relay_group = {
+        let sdk = bob_sdk.clone();
+        let cid = relay_group_cid.clone();
+        let peer = alice_sdk_did.clone();
+        tokio::task::spawn_blocking(move || {
+            sdk.create_group(
+                &cid,
+                DS_B_DID,
+                vec![peer],
+                Some("Federated Relay Group".into()),
+                None,
+            )
+        })
+        .await??
+    };
+    assert_eq!(relay_group.sequencer_did, DS_B_DID);
+    // Alice accepts, Bob fulfils her leaf recovery, Alice joins from the Welcome. `ds-b` delivers
+    // each of its local commits to `ds-a` after committing, so rounds repeat until her device holds
+    // the group.
+    let join_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        for sdk in [&alice_sdk, &bob_sdk, &alice_sdk] {
+            let sdk = sdk.clone();
+            tokio::task::spawn_blocking(move || sdk.sync()).await??;
+        }
+        let (sdk, cid) = (alice_sdk.clone(), relay_group_cid.clone());
+        if tokio::task::spawn_blocking(move || sdk.list_members(&cid))
+            .await?
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < join_deadline,
+            "D1: Alice's device must join the ds-b-sequenced group through her home ds-a"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    for sdk in [&alice_sdk, &bob_sdk] {
+        let (sdk, cid) = (sdk.clone(), relay_group_cid.clone());
+        let members: BTreeSet<String> = tokio::task::spawn_blocking(move || sdk.list_members(&cid))
+            .await??
+            .into_iter()
+            .collect();
+        assert_eq!(
+            members,
+            BTreeSet::from([alice_sdk_did.clone(), bob_sdk_did.clone()]),
+            "D1: both homes' members must hold the ds-b-sequenced group"
+        );
+    }
+    let relayed_id = Uuid::new_v4().to_string();
+    let relayed = {
+        let (sdk, cid, mid) = (
+            alice_sdk.clone(),
+            relay_group_cid.clone(),
+            relayed_id.clone(),
+        );
+        tokio::task::spawn_blocking(move || sdk.send_message(&cid, &mid, "Relayed by my home ds-a"))
+            .await??
+    };
+    // `I13`: the receipt Alice's device holds for the relayed send is `ds-b`'s ES256 receipt over
+    // the archive commitment of the exact frame she sent.
+    let queued = {
+        let (sdk, cid) = (alice_sdk.clone(), relay_group_cid.clone());
+        tokio::task::spawn_blocking(move || sdk.list_pending_labyrinth_queue(Some(&cid), 10))
+            .await??
+    };
+    let queued_send = queued
+        .iter()
+        .find(|q| q.message_id == relayed_id)
+        .expect("alice's relayed send must be queued for her archive");
+    let stored_rcpt: StoredArchivedReceipt = serde_json::from_str(
+        queued_send
+            .sequencer_receipt_json
+            .as_deref()
+            .expect("I13: the relayed send must carry ds-b's sequencer receipt"),
+    )?;
+    assert_eq!(stored_rcpt.sequencer_did, DS_B_DID);
+    assert_eq!(stored_rcpt.seq, relayed.seq as u64);
+    let frame_nonce: [u8; 32] = STANDARD
+        .decode(queued_send.frame_nonce_b64.as_deref().expect("frame nonce"))?
+        .try_into()
+        .expect("32-byte frame nonce");
+    let relayed_rcpt = stored_rcpt.to_labyrinth_archived()?;
+    assert_eq!(
+        relayed_rcpt.signed.payload.archive_commitment,
+        compute_archive_commitment(&frame_nonce, queued_send.labyrinth_frame_json.as_bytes()),
+        "I13: ds-b's receipt must sign the archive commitment of Alice's relayed frame"
     );
-    admin_http
-        .post(format!(
-            "{}/xrpc/blue.catbird.mlsDS.deliverGroupEntry",
-            ds_a.base_url
-        ))
-        .header(CONTENT_TYPE, "application/json")
-        .header("x-catbird-s2s-caller-did", DS_B_DID)
-        .header("x-catbird-s2s-target-did", DS_A_DID)
-        .header("x-catbird-s2s-mac", deliver_small_mac)
-        .body(deliver_small_bytes)
-        .send()
-        .await?
-        .error_for_status()?;
+    verify_sequencer_receipt_sec1(
+        &ds_b_rcpt_uncompressed,
+        DS_B_DID,
+        &SignedSequencerReceipt {
+            payload: relayed_rcpt.signed.payload,
+            key_id: relayed_rcpt.signed.key_id,
+            signature: relayed_rcpt.signed.signature,
+        },
+    )
+    .expect("I13: ds-b's receipt for the relayed send must verify");
+    {
+        let sdk = bob_sdk.clone();
+        tokio::task::spawn_blocking(move || sdk.sync()).await??;
+    }
+    let bob_group_msgs = {
+        let (sdk, cid) = (bob_sdk.clone(), relay_group_cid.clone());
+        tokio::task::spawn_blocking(move || sdk.list_messages(&cid, None, 50)).await??
+    };
+    assert!(
+        bob_group_msgs.iter().any(|m| m.message_id == relayed_id
+            && m.sender_did == alice_sdk_did
+            && m.seq == relayed.seq
+            && m.plaintext_json.contains("Relayed by my home ds-a")),
+        "D1: ds-b-local Bob must receive Alice's relayed send at its sequenced seq: {bob_group_msgs:?}"
+    );
 
-    // 2) Large ciphertext (`> 2,200` B) -> `deliveryMode == "fetch_required"` with `ciphertext == null`
-    let mut large_entry = sequenced_entry.clone();
-    large_entry["seq"] = json!(sequenced_seq + 1);
-    large_entry["entryId"] = json!(Uuid::new_v4());
-    large_entry["signedRequest"]["body"]["applicationMessage"]["bytes"] =
-        json!(STANDARD.encode(vec![0xAB_u8; 3000]));
-    let deliver_large = json!({
-        "conversationId": convo_id,
-        "generation": 0,
-        "spaceUri": space_uri,
-        "recipientDids": [alice_remote_did],
-        "recipientDevices": [[alice_remote_did, alice_device_id]],
-        "entry": large_entry,
-    });
-    let deliver_large_bytes = serde_json::to_vec(&deliver_large)?;
-    let deliver_large_mac = compute_s2s_mac(
-        DS_B_DID,
-        DS_A_DID,
-        "blue.catbird.mlsDS.deliverGroupEntry",
-        &deliver_large_bytes,
+    // `D2`: Alice's device registers its Push Gateway only at her home `ds-a`. `ds-b` delivers
+    // Bob's sends to `ds-a`, which wakes her gateway: inline ciphertext up to 2,200 B,
+    // fetch-required above.
+    let alice_sdk_pg = {
+        let (sdk, gw_url) = (alice_sdk.clone(), push_gw.canonical_https_url.clone());
+        tokio::task::spawn_blocking(move || {
+            sdk.build_signed_push_gateway_registration(
+                &gw_url,
+                "blue.catbird.ios",
+                "opaque-push-key-alice-sdk-0001",
+                true,
+            )
+        })
+        .await??
+    };
+    let alice_sdk_pg_jwt = mint_es256_service_jwt(
+        &alice_sdk_p256,
+        &alice_sdk_did,
+        &format!("{DS_A_DID}#atproto_mls"),
+        "blue.catbird.chat.registerPushGateway",
     );
     admin_http
         .post(format!(
-            "{}/xrpc/blue.catbird.mlsDS.deliverGroupEntry",
+            "{}/xrpc/blue.catbird.chat.registerPushGateway",
             ds_a.base_url
         ))
+        .header("authorization", format!("Bearer {alice_sdk_pg_jwt}"))
         .header(CONTENT_TYPE, "application/json")
-        .header("x-catbird-s2s-caller-did", DS_B_DID)
-        .header("x-catbird-s2s-target-did", DS_A_DID)
-        .header("x-catbird-s2s-mac", deliver_large_mac)
-        .body(deliver_large_bytes)
+        .body(alice_sdk_pg.request_json)
         .send()
         .await?
         .error_for_status()?;
+    let alice_sdk_bindings_on_ds_b: i64 = ds_b
+        .pool
+        .query_one(
+            "SELECT COUNT(*) FROM chat.push_gateway_bindings WHERE user_did = $1",
+            &[&alice_sdk_did],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        alice_sdk_bindings_on_ds_b, 0,
+        "D2: sequencing ds-b MUST hold zero push gateway bindings for remote member Alice"
+    );
+    assert!(
+        push_gw.wakes.lock().unwrap().is_empty(),
+        "D2: no wake may precede Bob's sends"
+    );
+    for (wake_count, text) in [
+        (1, "Hi Alice, from ds-b".to_string()),
+        (2, "x".repeat(3000)),
+    ] {
+        let (sdk, cid, mid) = (
+            bob_sdk.clone(),
+            relay_group_cid.clone(),
+            Uuid::new_v4().to_string(),
+        );
+        tokio::task::spawn_blocking(move || sdk.send_message(&cid, &mid, &text)).await??;
+        // `ds-b` delivers to remote homes after its commit; wait for this send's wake.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while push_gw.wakes.lock().unwrap().len() < wake_count {
+            assert!(
+                Instant::now() < deadline,
+                "D2: home ds-a must wake Alice's gateway for Bob's send #{wake_count}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 
     {
         let wakes = push_gw.wakes.lock().unwrap();
@@ -2811,7 +1626,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             );
             let raw = serde_json::to_string(&w.body)?;
             assert!(
-                !raw.contains(&bob_admin_did),
+                !raw.contains(&bob_sdk_did),
                 "D2: zero sender DID in push wake"
             );
             assert!(
@@ -2819,7 +1634,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
                 "D2: zero sender handle in push wake"
             );
             assert!(
-                !raw.contains("groupName"),
+                !raw.contains("groupName") && !raw.contains("Federated Relay Group"),
                 "D2: zero group title in push wake"
             );
         }
@@ -2901,8 +1716,9 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .await?;
     assert_eq!(staged_public_resp.status(), reqwest::StatusCode::NOT_FOUND);
 
-    // Promote Bob's avatar into Conversation Space on `swan_pds` + notify `ds-b` (`notifyWrite`)
-    let bob_apply: Value = admin_http
+    // Promote Bob's avatar into Conversation Space on `swan_pds`: the PDS commits it only after
+    // `ds-b`, the Space authority, accepts its service-authenticated `notifyWrite`.
+    admin_http
         .post(format!(
             "{}/xrpc/com.atproto.space.applyWrites",
             swan_pds.base_url
@@ -2923,30 +1739,8 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         }))
         .send()
         .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let bob_notify_jwt = mint_es256_service_jwt(
-        &bob_p256,
-        &bob_admin_did,
-        DS_B_DID,
-        "com.atproto.space.notifyWrite",
-    );
-    admin_http
-        .post(format!(
-            "{}/xrpc/com.atproto.space.notifyWrite",
-            ds_b.base_url
-        ))
-        .header("authorization", format!("Bearer {bob_notify_jwt}"))
-        .json(&json!({
-            "space": space_uri,
-            "repo": bob_admin_did,
-            "repoRev": bob_apply["commit"]["rev"],
-            "data": bob_apply["commit"]["data"],
-        }))
-        .send()
-        .await?
         .error_for_status()?;
+    assert_authority_notified(&ds_b, &swan_pds, &space_uri, &bob_admin_did).await?;
 
     // Gate 10: `.space` blob MUST STILL return 404 on public `com.atproto.sync.getBlob` AFTER promotion
     let promoted_public_resp = admin_http
@@ -2963,7 +1757,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         reqwest::StatusCode::NOT_FOUND
     );
 
-    // Eve uploads + promotes an attachment on `ref_pds` (`bluesky-social/atproto#5187`) and notifies `ds-b`
+    // Eve uploads + promotes an attachment on `ref_pds` (`bluesky-social/atproto#5187`), which notifies `ds-b`
     let eve_media_cipher = vec![0xEE_u8; 512];
     let eve_upload: Value = admin_http
         .post(format!(
@@ -2982,7 +1776,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .as_str()
         .unwrap()
         .to_string();
-    let eve_apply: Value = admin_http
+    admin_http
         .post(format!(
             "{}/xrpc/com.atproto.space.applyWrites",
             ref_pds.base_url
@@ -3003,30 +1797,8 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         }))
         .send()
         .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let eve_notify_jwt = mint_es256_service_jwt(
-        &eve_p256,
-        eve_did,
-        DS_B_DID,
-        "com.atproto.space.notifyWrite",
-    );
-    admin_http
-        .post(format!(
-            "{}/xrpc/com.atproto.space.notifyWrite",
-            ds_b.base_url
-        ))
-        .header("authorization", format!("Bearer {eve_notify_jwt}"))
-        .json(&json!({
-            "space": space_uri,
-            "repo": eve_did,
-            "repoRev": eve_apply["commit"]["rev"],
-            "data": eve_apply["commit"]["data"],
-        }))
-        .send()
-        .await?
         .error_for_status()?;
+    assert_authority_notified(&ds_b, &ref_pds, &space_uri, eve_did).await?;
 
     // Unauthenticated & outsider reads MUST be rejected (401 & 403)
     let unauth_blob = admin_http
@@ -3074,13 +1846,15 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         },
     )?;
     let outsider_cred_resp = admin_http
-        .get(format!(
-            "{}/xrpc/com.atproto.space.getSpaceCredential?space={}&delegationToken={}&credentialKid={}",
-            ds_b.base_url,
-            urlencoding::encode(&space_uri),
-            urlencoding::encode(&outsider_del),
-            urlencoding::encode(&outsider_cnf),
+        .post(format!(
+            "{}/xrpc/com.atproto.space.getSpaceCredential",
+            ds_b.base_url
         ))
+        .json(&json!({
+            "space": space_uri,
+            "credentialKid": outsider_cnf,
+            "delegationToken": outsider_del,
+        }))
         .send()
         .await?;
     assert_eq!(
@@ -3109,13 +1883,15 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         },
     )?;
     let eve_cred_json: Value = admin_http
-        .get(format!(
-            "{}/xrpc/com.atproto.space.getSpaceCredential?space={}&delegationToken={}&credentialKid={}",
-            ds_b.base_url,
-            urlencoding::encode(&space_uri),
-            urlencoding::encode(&eve_del),
-            urlencoding::encode(&eve_cnf),
+        .post(format!(
+            "{}/xrpc/com.atproto.space.getSpaceCredential",
+            ds_b.base_url
         ))
+        .json(&json!({
+            "space": space_uri,
+            "credentialKid": eve_cnf,
+            "delegationToken": eve_del,
+        }))
         .send()
         .await?
         .error_for_status()?
@@ -3123,25 +1899,20 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .await?;
     let eve_cred = eve_cred_json["credential"].as_str().unwrap().to_string();
 
-    // Verify Eve CAN read both `swan_pds` and `ref_pds` BEFORE removal
-    for (pds_did, pds_url, writer, cid) in [
+    // Verify Eve CAN read both `swan_pds` and `ref_pds` BEFORE removal: each presentation names
+    // the writer whose repo it reads (`Atproto-Space-Audience`).
+    for (pds_url, writer, cid) in [
         (
-            &swan_pds.pds_did,
             &swan_pds.base_url,
             bob_admin_did.as_str(),
             bob_avatar_cid.as_str(),
         ),
-        (
-            &ref_pds.pds_did,
-            &ref_pds.base_url,
-            eve_did,
-            eve_blob_cid.as_str(),
-        ),
+        (&ref_pds.base_url, eve_did, eve_blob_cid.as_str()),
     ] {
         let signed_hdrs = sign_credential_request(
             &eve_eph,
             &eve_cred,
-            pds_did,
+            writer,
             Utc::now().timestamp() as u64,
             &Uuid::new_v4().to_string(),
         )?;
@@ -3228,10 +1999,10 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             &[("authorization", format!("Bearer {bad_nsid_jwt}"))],
             &json!({
                 "actorDeviceId": alice_device_id.to_string(),
-                "targetDid": ref_pds.pds_did,
+                "targetDid": eve_did,
                 "nsid": "com.atproto.space.putRecord",
                 "credential": alice_cred,
-                "spaceAudience": ref_pds.pds_did,
+                "spaceAudience": eve_did,
                 "signatureInput": "sig1=()",
                 "signature": "sig1=:AA==:",
             }),
@@ -3339,13 +2110,15 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         },
     )?;
     let eve_remint_resp = admin_http
-        .get(format!(
-            "{}/xrpc/com.atproto.space.getSpaceCredential?space={}&delegationToken={}&credentialKid={}",
-            ds_b.base_url,
-            urlencoding::encode(&space_uri),
-            urlencoding::encode(&eve_remint_del),
-            urlencoding::encode(&eve_cnf),
+        .post(format!(
+            "{}/xrpc/com.atproto.space.getSpaceCredential",
+            ds_b.base_url
         ))
+        .json(&json!({
+            "space": space_uri,
+            "credentialKid": eve_cnf,
+            "delegationToken": eve_remint_del,
+        }))
         .send()
         .await?;
     assert_eq!(
@@ -3354,24 +2127,18 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         "Gate 10: removed member Eve re-minting getSpaceCredential MUST fail with 403 Forbidden"
     );
 
-    for (pds_did, pds_url, writer, cid) in [
+    for (pds_url, writer, cid) in [
         (
-            &swan_pds.pds_did,
             &swan_pds.base_url,
             bob_admin_did.as_str(),
             bob_avatar_cid.as_str(),
         ),
-        (
-            &ref_pds.pds_did,
-            &ref_pds.base_url,
-            eve_did,
-            eve_blob_cid.as_str(),
-        ),
+        (&ref_pds.base_url, eve_did, eve_blob_cid.as_str()),
     ] {
         let h1 = sign_credential_request(
             &eve_eph,
             &eve_cred,
-            pds_did,
+            writer,
             Utc::now().timestamp() as u64,
             &Uuid::new_v4().to_string(),
         )?;
@@ -3391,13 +2158,13 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         assert_eq!(
             evicted_blob.status(),
             reqwest::StatusCode::UNAUTHORIZED,
-            "Gate 10: removed member Eve's cached credential must fail with 401 on {pds_did}"
+            "Gate 10: removed member Eve's cached credential must fail with 401 on {pds_url} ({writer})"
         );
 
         let h2 = sign_credential_request(
             &eve_eph,
             &eve_cred,
-            pds_did,
+            writer,
             Utc::now().timestamp() as u64,
             &Uuid::new_v4().to_string(),
         )?;
@@ -3467,7 +2234,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let ops_pop = sign_credential_request(
         &alice_eph,
         &alice_cred,
-        &ref_pds.pds_did,
+        eve_did,
         Utc::now().timestamp() as u64,
         &Uuid::new_v4().to_string(),
     )?;
@@ -3483,7 +2250,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             &[("authorization", format!("Bearer {ops_jwt}"))],
             &json!({
                 "actorDeviceId": alice_device_id.to_string(),
-                "targetDid": ref_pds.pds_did,
+                "targetDid": eve_did,
                 "nsid": "com.atproto.space.listRepoOps",
                 "query": format!(
                     "space={}&repo={}",
@@ -3491,7 +2258,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
                     urlencoding::encode(eve_did)
                 ),
                 "credential": alice_cred,
-                "spaceAudience": ref_pds.pds_did,
+                "spaceAudience": eve_did,
                 "wantMac": want_mac_eve,
                 "signatureInput": ops_pop.signature_input,
                 "signature": ops_pop.signature,
@@ -3647,7 +2414,6 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         MemberRole::Admin,
         |setter_did, cid| {
             let swan_url = swan_pds.base_url.clone();
-            let swan_did = swan_pds.pds_did.clone();
             let sp = space_uri.clone();
             let cred = alice_cred.clone();
             let eph_bytes = alice_eph.to_bytes();
@@ -3657,7 +2423,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
                 let pop = sign_credential_request(
                     &eph,
                     &cred,
-                    &swan_did,
+                    &setter_did,
                     Utc::now().timestamp() as u64,
                     &Uuid::new_v4().to_string(),
                 )
@@ -3778,19 +2544,15 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     );
     let bird_did = "did:plc:birdaemonfederated24chrs";
     let bird_p256 = P256SigningKey::random(&mut rand::rngs::OsRng);
-    swan_pds.register_writer_kem(bird_did);
-    swan_pds.register_account_signing_key(bird_did, bird_p256.clone());
+    swan_pds.add_account(bird_did, bird_p256.clone(), "bird-pds-oauth");
     for ds in [&ds_a, &ds_b] {
-        admin_http
-            .post(format!("{}/_test/clean-slate/register-did", ds.base_url))
-            .json(&json!({
-                "did": bird_did,
-                "p256Jwk": p256_public_jwk(bird_p256.verifying_key()),
-                "endpointUrl": swan_pds.base_url,
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
+        ds.register_did(
+            &admin_http,
+            bird_did,
+            bird_p256.verifying_key(),
+            &swan_pds.base_url,
+        )
+        .await?;
     }
 
     let bird_bot = FederatedBirdBot::open_and_enroll_with_tokens(
@@ -3818,16 +2580,6 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .windows(2)
         .any(|w| w == [0x00, 0x4d]));
     assert!(bird_bot.enrollment_receipt().labyrinth_backup_enabled);
-    admin_http
-        .post(format!(
-            "{}/xrpc/com.atproto.space.putSpace",
-            swan_pds.base_url
-        ))
-        .bearer_auth("bird-pds-oauth")
-        .json(&json!({ "space": bird_bot.enrollment_receipt().mailbox_space_uri }))
-        .send()
-        .await?
-        .error_for_status()?;
 
     // 7a. Live federated group creation on `ds-b` with cross-DS participants (`alice_sdk_did` on `ds-a`, `bob_sdk_did` on `ds-b`)
     let bird_group_id = Uuid::new_v4().to_string();
@@ -3956,31 +2708,25 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             .error_for_status()?;
     }
 
-    // Sequence an applicationEntry on `ds-a`
-    let prune_send_req = json!({
-        "conversationId": prune_cid,
-        "endpoint": "blue.catbird.chat.sendMessage",
-        "actorDid": p_sender_did,
-        "actorDeviceId": p_sender_dev,
-        "signedRequest": prune_seed["signedRequest"],
-    });
-    let prune_send_bytes = serde_json::to_vec(&prune_send_req)?;
-    let prune_send_mac = compute_s2s_mac(
-        DS_B_DID,
-        DS_A_DID,
-        "blue.catbird.mlsDS.relayGroupMutation",
-        &prune_send_bytes,
+    // Sequence an applicationEntry on `ds-a`. Both seeded members are homed on `ds-a`, so the
+    // sender reaches the sequencer through its own home's `sendMessage`; no peer may relay a
+    // mutation for an actor it does not home.
+    let prune_send_jwt = mint_es256_service_jwt(
+        &p_sender_p256,
+        &p_sender_did,
+        &format!("{DS_A_DID}#atproto_mls"),
+        "blue.catbird.chat.sendMessage",
     );
     let prune_send_out: Value = admin_http
         .post(format!(
-            "{}/xrpc/blue.catbird.mlsDS.relayGroupMutation",
+            "{}/xrpc/blue.catbird.chat.sendMessage",
             ds_a.base_url
         ))
+        .header("authorization", format!("Bearer {prune_send_jwt}"))
         .header(CONTENT_TYPE, "application/json")
-        .header("x-catbird-s2s-caller-did", DS_B_DID)
-        .header("x-catbird-s2s-target-did", DS_A_DID)
-        .header("x-catbird-s2s-mac", prune_send_mac)
-        .body(prune_send_bytes)
+        .body(serde_json::to_vec(
+            &json!({"signedRequest": prune_seed["signedRequest"]}),
+        )?)
         .send()
         .await?
         .error_for_status()?
@@ -4053,7 +2799,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             format!("mls-signer:{rcpt_hash}"),
             p_rcpt_ed.to_bytes().to_vec(),
         )?;
-        let rcpt_transport = Arc::new(FirewalledClientTransport::new(vec![
+        let rcpt_transport = Arc::new(ClientTransport::new(vec![
             ds_a.base_url.clone(),
             swan_pds.base_url.clone(),
         ]));
@@ -4173,14 +2919,21 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         "G6/I14: chat.wipe_closed_conversation_operational_rows must wipe all operational entries"
     );
 
-    // Verify `swan_pds` and `ref_pds` received `notifySpaceDeleted` and now return `410 SpaceDeleted`
-    for pds_url in [&swan_pds.base_url, &ref_pds.base_url] {
+    // Verify `swan_pds` and `ref_pds` received the authority's `notifySpaceDeleted` and now return
+    // `410 SpaceDeleted` to their writers (Bob on `swan_pds`, Eve on `ref_pds`)
+    for (pds, token) in [(&swan_pds, "bob-pds-oauth"), (&ref_pds, "eve-pds-oauth")] {
+        assert!(
+            pds.space_deleted(&space_uri),
+            "{} kept the deleted Space",
+            pds.pds_did
+        );
         let del_resp = admin_http
             .get(format!(
-                "{pds_url}/xrpc/com.atproto.space.getSpace?space={}",
+                "{}/xrpc/com.atproto.space.getSpace?space={}",
+                pds.base_url,
                 urlencoding::encode(&space_uri)
             ))
-            .header("authorization", "Bearer check")
+            .bearer_auth(token)
             .send()
             .await?;
         assert_eq!(del_resp.status(), reqwest::StatusCode::GONE);

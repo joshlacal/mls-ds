@@ -236,9 +236,10 @@ fn dockerfile_enforces_production_and_fixture_stage_boundaries() {
     let content = std::fs::read_to_string(dockerfile_path)
         .expect("must read server/Dockerfile for stage boundary proof");
 
-    // 1. builder builds normal catbird-server
+    // 1. builder builds normal catbird-server (against Cargo.lock since
+    //    c4e5d8140 "enforce Cargo.lock in release image")
     assert!(
-        content.contains("cargo build --release -p catbird-server"),
+        content.contains("cargo build --locked --release -p catbird-server"),
         "builder stage must build production server"
     );
 

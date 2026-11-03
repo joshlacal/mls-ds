@@ -100,6 +100,74 @@ fn truthy_env_var(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PushGatewayOverride {
+    canonical_https_url: String,
+    loopback_http_url: String,
+}
+
+/// Test-only D2 routing (same hook as `clean_slate_federation_fixture`): the
+/// shipping SSRF validator never resolves fixture gateway hosts, so a test maps
+/// one exact canonical HTTPS gateway URL to its own loopback fake gateway.
+async fn register_push_override(
+    axum::Json(input): axum::Json<PushGatewayOverride>,
+) -> axum::http::StatusCode {
+    if !input.loopback_http_url.starts_with("http://127.0.0.1:") {
+        return axum::http::StatusCode::BAD_REQUEST;
+    }
+    catbird_server::push_gateway::ssrf::register_test_gateway_override(
+        &input.canonical_https_url,
+        input.loopback_http_url,
+    );
+    axum::http::StatusCode::OK
+}
+
+/// Drive one publication's wake through the production worker until it is
+/// terminal: an attempt the gateway deferred is retried once its durable
+/// backoff is due, exactly as the background worker would retry it.
+async fn drive_push_event(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    event_id: uuid::Uuid,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+    let mut deferred = Vec::new();
+    loop {
+        match catbird_server::workers::run_request_push_event_once_for_test(pool, runtime, event_id)
+            .await
+        {
+            Ok(run) if run.claimed == 1 => {
+                return serde_json::json!({
+                    "eventId": event_id,
+                    "ok": true,
+                    "claimed": run.claimed,
+                    "attempts": deferred.len() + 1,
+                    "woken": run.woken,
+                    "suppressed": run.suppressed == 1,
+                    "deferred": deferred,
+                });
+            }
+            // Nothing was due: either the event is not pending at all, or
+            // its retry backoff has not elapsed yet.
+            Ok(_) if deferred.is_empty() => {
+                return serde_json::json!({"eventId": event_id, "ok": false, "claimed": 0});
+            }
+            Ok(_) => {}
+            Err(error) => deferred.push(error),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return serde_json::json!({
+                "eventId": event_id,
+                "ok": false,
+                "error": "retry deadline",
+                "deferred": deferred,
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -146,19 +214,18 @@ async fn main() -> Result<()> {
         .connect(&database_url)
         .await
         .context("connect guarded request database")?;
-    let mut runtime =
-        ChatRuntime::from_env(Arc::new(SseState::new(64))).map_err(anyhow::Error::msg)?;
-    let push_event = match std::env::var("REQUEST_FIXTURE_PUSH_EVENT_URL") {
-        Ok(endpoint) => {
-            let bearer = std::env::var("REQUEST_FIXTURE_PUSH_ELIGIBILITY_BEARER")
-                .context("REQUEST_FIXTURE_PUSH_ELIGIBILITY_BEARER is required")?;
-            runtime = runtime
-                .with_test_request_push_loopback(&endpoint, &bearer)
-                .map_err(anyhow::Error::msg)?;
-            let event_id = std::env::var("REQUEST_FIXTURE_PUSH_EVENT_ID")
-                .context("REQUEST_FIXTURE_PUSH_EVENT_ID is required")?
+    let runtime = ChatRuntime::from_env(Arc::new(SseState::new(64))).map_err(anyhow::Error::msg)?;
+    // D2: the targeted worker signs with this DS's Push Gateway client
+    // (SERVICE_DID + SIGNING_KEY_PEM) and wakes the gateway each device
+    // registered through registerPushGateway.
+    let push_event = match std::env::var("REQUEST_FIXTURE_PUSH_EVENT_ID") {
+        Ok(event_id) => {
+            let event_id = event_id
                 .parse::<uuid::Uuid>()
                 .context("REQUEST_FIXTURE_PUSH_EVENT_ID is invalid")?;
+            let client = runtime.push_gateway_client().cloned().context(
+                "push fixture requires the Push Gateway client (SERVICE_DID, SIGNING_KEY_PEM)",
+            )?;
             let trigger = std::path::PathBuf::from(
                 std::env::var("REQUEST_FIXTURE_PUSH_TRIGGER")
                     .context("REQUEST_FIXTURE_PUSH_TRIGGER is required")?,
@@ -171,7 +238,7 @@ async fn main() -> Result<()> {
                 trigger.is_absolute() && result.is_absolute(),
                 "push fixture paths must be absolute"
             );
-            Some((event_id, trigger, result))
+            Some((event_id, client, trigger, result))
         }
         Err(_) => None,
     };
@@ -231,26 +298,13 @@ async fn main() -> Result<()> {
             queue.run_worker(outbound, auth_fn, shutdown).await;
         });
     }
-    if let Some((event_id, trigger, result)) = push_event {
+    if let Some((event_id, _client, trigger, result)) = push_event {
         let push_pool = pool.clone();
         let push_runtime = runtime.clone();
         tokio::spawn(async move {
             for _ in 0..9_000 {
                 if trigger.exists() {
-                    let outcome = catbird_server::workers::run_request_push_event_once_for_test(
-                        &push_pool,
-                        &push_runtime,
-                        event_id,
-                    )
-                    .await;
-                    let value = match outcome {
-                        Ok(claimed) => {
-                            serde_json::json!({"eventId":event_id,"claimed":claimed,"ok":claimed==1})
-                        }
-                        Err(error) => {
-                            serde_json::json!({"eventId":event_id,"ok":false,"error":error})
-                        }
-                    };
+                    let value = drive_push_event(&push_pool, &push_runtime, event_id).await;
                     let _ = std::fs::write(&result, serde_json::to_vec(&value).unwrap());
                     return;
                 }
@@ -290,6 +344,10 @@ async fn main() -> Result<()> {
     } else {
         chat_router::<FixtureState>()
     };
+    let router = router.route(
+        "/_test/request-fixture/register-push-override",
+        axum::routing::post(register_push_override),
+    );
     let app: Router = router.with_state(FixtureState {
         pool,
         runtime,

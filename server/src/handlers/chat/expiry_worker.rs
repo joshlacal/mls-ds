@@ -5,6 +5,7 @@
 //!   * OPEN `chat.leaf_recovery_requests` past `expires_at` (~5 min TTL)
 //!   * PENDING `chat.welcome_deliveries` past consumed KeyPackage `not_after`
 //!   * C33 direct-request preparations and published requests (`30d` expiry)
+//!   * sender-home outbound routes no pair coordinator answered (`1h`)
 
 use std::{sync::Arc, time::Duration};
 
@@ -12,7 +13,8 @@ use tokio::time::interval;
 
 use super::runtime::ChatRuntime;
 use crate::chat_protocol::repository::expiry_sweep::{
-    due_leaf_recovery_targets, due_welcome_delivery_targets, sweep_one_welcome, WelcomeSweepOutcome,
+    delete_unanswered_outbound_routes, due_leaf_recovery_targets, due_welcome_delivery_targets,
+    sweep_one_welcome, WelcomeSweepOutcome,
 };
 use crate::handlers::chat::recovery_scheduler::{expire_one, RecoveryExpiryServiceOutcome};
 use crate::storage::DbPool;
@@ -136,7 +138,7 @@ pub async fn run_chat_expiry_sweeper(pool: DbPool, runtime: Arc<ChatRuntime>) {
             Ok(_) => {}
             Err(error) => tracing::warn!(%error, "terminal direct request artifact pruning failed"),
         }
-        let now = chrono::Utc::now();
+        let now = crate::sim_hooks::current_utc();
         match crate::chat_protocol::repository::expiry_sweep::mark_inactive_devices(&pool, now)
             .await
         {
@@ -274,5 +276,72 @@ pub(crate) async fn run_sweep_cycle(
         }
     }
 
+    let now = crate::sim_hooks::current_utc();
+    match delete_unanswered_outbound_routes(pool, now, config.batch).await {
+        Ok(deleted) if deleted > 0 => {
+            tracing::info!(deleted, "deleted unanswered direct request routes")
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "unanswered direct request route sweep failed"),
+    }
+
     counts
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::*;
+    use crate::sim_hooks::{scope_ds_clock, ManualDsClock};
+    use chrono::{DateTime, Utc};
+    use uuid::Uuid;
+
+    /// One cycle of the worker deletes a sender-home route no pair coordinator
+    /// answered once it is an hour old, and keeps an answered route however old
+    /// and an unanswered route younger than an hour.
+    #[tokio::test]
+    async fn one_cycle_deletes_only_routes_left_unanswered_for_an_hour() {
+        let database =
+            crate::common::fresh_db::fresh_fully_migrated_db("chat_expiry_worker_").await;
+        let pool = database.connect(2).await;
+        let now = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+        let hour = chrono::Duration::hours(1);
+        // An unanswered route binds its pair until 600 s after its prepare was
+        // signed, here when it was recorded; an answered one binds permanently.
+        let binding = chrono::Duration::seconds(600);
+        let (stale, answered, younger) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let young = now - hour + chrono::Duration::milliseconds(1);
+        for (request_id, created_at, answered_at, binding_expires_at) in [
+            (stale, now - hour, None, Some(now - hour + binding)),
+            (answered, now - hour * 2, Some(now - hour * 2), None),
+            (younger, young, None, Some(young + binding)),
+        ] {
+            sqlx::query(
+                "INSERT INTO chat.direct_request_outbound_routes (request_id, actor_did, \
+                     actor_device_id, recipient_did, coordinator_did, created_at, answered_at, \
+                     binding_expires_at) \
+                 VALUES ($1, 'did:web:sender.example.com', $2, 'did:web:recipient.example.com', \
+                     'did:web:coordinator.example.com', $3, $4, $5)",
+            )
+            .bind(request_id)
+            .bind(Uuid::new_v4())
+            .bind(created_at)
+            .bind(answered_at)
+            .bind(binding_expires_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let clock = Arc::new(ManualDsClock::new(now));
+        let config = ChatExpirySweepConfig::default();
+        scope_ds_clock(clock, run_sweep_cycle(&pool, config)).await;
+
+        let kept: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT request_id FROM chat.direct_request_outbound_routes ORDER BY created_at",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kept, [answered, younger]);
+    }
 }

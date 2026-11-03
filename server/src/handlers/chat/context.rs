@@ -96,6 +96,8 @@ fn service_auth_failure(endpoint: ChatEndpoint, error: AuthError) -> ChatFailure
             Some(retry_after_secs),
         ),
         AuthError::Internal(_) => ChatFailure::storage(endpoint),
+        // The issuer's DID document could not be fetched now: nothing decided.
+        AuthError::DidResolutionUnavailable(_) => ChatFailure::unavailable(endpoint),
         _ => ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized),
     }
 }
@@ -470,6 +472,41 @@ pub(crate) fn operation_prelude_failure(
     }
 }
 
+/// Routing or staging a remote member did not complete. This server's store
+/// failing is storage; a closed federation gate, or a peer or resolver that
+/// could not answer now, decided nothing ([`ChatFailure::unavailable`]). Every
+/// other refusal (permanent resolution failure, invalid or unauthorized device
+/// directory, binding conflict) stays `NotAuthorized`.
+pub(crate) fn remote_member_failure(
+    endpoint: ChatEndpoint,
+    error: &crate::federation::FederationError,
+) -> ChatFailure {
+    match error {
+        crate::federation::FederationError::Database(_) => ChatFailure::storage(endpoint),
+        error if error.is_retryable() => ChatFailure::unavailable(endpoint),
+        _ => ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized),
+    }
+}
+
+/// [`remote_member_failure`] for participant routing, including its outbound
+/// peer policy: this store failing is storage, a policy refusing the peer
+/// (`AuthFailed`) stays `NotAuthorized`; routing drift is refused.
+pub(crate) fn routing_failure(
+    endpoint: ChatEndpoint,
+    error: &crate::chat_protocol::federation_routing::FederationRoutingError,
+) -> ChatFailure {
+    use crate::chat_protocol::federation_routing::FederationRoutingError;
+    match error {
+        FederationRoutingError::ResolutionFailed { source, .. }
+        | FederationRoutingError::UntrustedPeer { source, .. } => {
+            remote_member_failure(endpoint, source)
+        }
+        FederationRoutingError::DriftDetected { .. } => {
+            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +552,21 @@ mod tests {
         assert_eq!(failure.exposure(), ErrorExposure::StorageFailure);
         let resp = failure.into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // 3b. A DID document that could not be fetched now -> the endpoint's
+        // retryable answer (503, Retry-After: 5), never a refusal
+        let resp = service_auth_failure(
+            endpoint,
+            AuthError::DidResolutionUnavailable("PLC timeout".to_string()),
+        )
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
 
         // 4. All other variants -> NotAuthorized (401)
         let not_authorized_variants = vec![

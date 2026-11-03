@@ -58,11 +58,22 @@ fn welcome_facade_has_no_post_head_identity_reread_or_commit_escape() {
         "load_validated_completed_business_replay",
         "ExecutionContextArtifacts",
         ".commit(",
-        "SELECT ",
     ] {
         assert!(
             !SOURCE.contains(forbidden),
             "Welcome facade must not contain forbidden seam {forbidden}"
         );
     }
+    // The ordinary facade still composes repository-owned locks without SQL.
+    // C33's exact-device delivery/CAS lives below that boundary in this same
+    // repository file; it may read request rows, never reread identity keys.
+    let request_start = position(
+        SOURCE,
+        "async fn try_prepare_direct_request_welcome_terminal(",
+    );
+    assert!(!SOURCE[..request_start].contains("SELECT "));
+    let request = &SOURCE[request_start..];
+    assert!(!request.contains("chat.devices"));
+    assert!(!request.contains("chat.device_keys"));
+    assert!(SOURCE.contains("FreshRejection(WelcomeCanonicalResponse)"));
 }

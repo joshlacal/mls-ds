@@ -151,7 +151,7 @@ async fn committed_publication_replays_after_native_reopen_without_crypto_or_gra
         "replay mutated retained crypto, consumed packages, or publication graph"
     );
     f.bob_engine.process_direct_request(&f.welcome_input)?;
-    let DirectRequestIntroductionResult::Ready { plaintext } =
+    let DirectRequestIntroductionResult::Ready { plaintext, .. } =
         f.bob_engine.decrypt_direct_request(&f.welcome_input)?
     else {
         anyhow::bail!("intro unavailable")

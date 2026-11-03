@@ -33,11 +33,11 @@ use super::super::relationship_policy::{
     DatabaseAnchoredProjectionClock, DeclarationRecordEvidenceKind, EvidenceKind, IncomingPolicy,
     PersistedDeclarationEvidence, PersistedGraphRelationshipEvidence,
     PersistedRelationshipProjection, PersistedTrafficProjection, ProductionRelationshipTransport,
-    ProjectionOperationScope, ProjectionScope, PublicTransport, RelationshipAuthority,
-    RelationshipPolicyConfig, RelationshipPolicyConfigError, RelationshipProjection,
-    ReqwestPinnedTransport, SealedRelationshipProjection, SealedTrafficProjection,
-    SystemDnsResolver, TrafficGraphScope, TrafficProjection, TransportError,
-    TransportSecurityProfile, HARDENED_SOURCE_PROFILE_V1,
+    ProjectionOperationScope, ProjectionRefreshFailure, ProjectionScope, PublicTransport,
+    RelationshipAuthority, RelationshipPolicyConfig, RelationshipPolicyConfigError,
+    RelationshipProjection, ReqwestPinnedTransport, SealedRelationshipProjection,
+    SealedTrafficProjection, SystemDnsResolver, TrafficGraphScope, TrafficProjection,
+    TransportError, TransportSecurityProfile, HARDENED_SOURCE_PROFILE_V1,
 };
 #[cfg(feature = "test-support")]
 use super::super::relationship_policy::{
@@ -69,6 +69,10 @@ pub(crate) enum RelationshipRepositoryError {
     Database(sqlx::Error),
     InvalidProjection,
     InvalidAuthorityConfiguration(RelationshipPolicyConfigError),
+    /// Live relationship evidence could not be collected because a source
+    /// could not answer now. Nothing was decided; the identical request may
+    /// retry.
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -80,6 +84,18 @@ pub(crate) enum RelationshipConsumptionError {
 impl From<sqlx::Error> for RelationshipRepositoryError {
     fn from(error: sqlx::Error) -> Self {
         Self::Database(error)
+    }
+}
+
+/// A refresh that failed only because its sources could not answer now
+/// decided nothing; any other failed refresh left the evidence unusable.
+impl From<ProjectionRefreshFailure> for RelationshipRepositoryError {
+    fn from(failure: ProjectionRefreshFailure) -> Self {
+        if failure.is_unavailable() {
+            Self::Unavailable
+        } else {
+            Self::InvalidProjection
+        }
     }
 }
 
@@ -1479,9 +1495,8 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
                         req.clone(),
                     )
                     .await
-                    .map_err(|e| {
-                        tracing::error!("collect_admission_projection failed: {:?}", e);
-                        RelationshipRepositoryError::InvalidProjection
+                    .inspect_err(|error| {
+                        tracing::error!(?error, "collect_admission_projection failed")
                     })?,
                 ProjectionScope::BlockOnly(s) => authority
                     .collect_block_projection(
@@ -1491,9 +1506,8 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
                         s.members.clone(),
                     )
                     .await
-                    .map_err(|e| {
-                        tracing::error!("collect_block_projection failed: {:?}", e);
-                        RelationshipRepositoryError::InvalidProjection
+                    .inspect_err(|error| {
+                        tracing::error!(?error, "collect_block_projection failed")
                     })?,
             };
             let observation = observe_relationship_persistence(&clock);
@@ -1592,9 +1606,8 @@ pub(crate) async fn load_fallback_traffic_projection<T: PublicTransport>(
                     scope.members.clone(),
                 )
                 .await
-                .map_err(|error| {
-                    tracing::error!(?error, "collect_traffic_projection failed");
-                    RelationshipRepositoryError::InvalidProjection
+                .inspect_err(|error| {
+                    tracing::error!(?error, "collect_traffic_projection failed")
                 })?;
             let observation = observe_relationship_persistence(&clock);
             let sealed = live
@@ -2553,18 +2566,39 @@ pub(super) async fn verify_direct_request_policy<T: PublicTransport>(
     .map_err(|_| RelationshipRepositoryError::InvalidProjection)
 }
 
+/// An evaluated denial is a negative decision, not a failure; a decision guard
+/// that no longer matches its locked scope leaves the evidence unusable.
+fn evaluated_decision(
+    consumed: Result<(), RelationshipConsumptionError>,
+) -> Result<bool, RelationshipRepositoryError> {
+    match consumed {
+        Ok(()) => Ok(true),
+        Err(RelationshipConsumptionError::PolicyDenied) => Ok(false),
+        Err(RelationshipConsumptionError::InvalidWitness) => {
+            Err(RelationshipRepositoryError::InvalidProjection)
+        }
+    }
+}
+
 /// Recipient acceptance checks current bilateral blocks without reapplying
 /// incoming-request eligibility. The opaque witness carries locked service and
 /// device authority; the peer identity comes only from the immutable request.
+/// An evaluated block is `Ok(false)`; a source that could not answer now is
+/// `Unavailable` and this server's own store failing is `Database`.
 pub(super) async fn verify_direct_request_acceptance_policy<T: PublicTransport>(
     transaction: &mut Transaction<'_, Postgres>,
     witness: &super::direct_request_preparation::LockedDirectRequestAcceptance,
     authority: &RelationshipAuthority<T>,
-) -> Result<(), RelationshipRepositoryError> {
+) -> Result<bool, RelationshipRepositoryError> {
     witness
         .require_transaction(transaction)
         .await
-        .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
+        .map_err(|error| match error {
+            super::direct_request_preparation::DirectRequestStoreError::Database(error) => {
+                RelationshipRepositoryError::Database(error)
+            }
+            _ => RelationshipRepositoryError::InvalidProjection,
+        })?;
     let signed = witness.signed();
     let request_id = Uuid::parse_str(
         signed.body()["requestId"]
@@ -2602,28 +2636,34 @@ pub(super) async fn verify_direct_request_acceptance_policy<T: PublicTransport>(
         load_fallback_relationship_projection(transaction, make_scope()?, authority)
             .await?
             .ok_or(RelationshipRepositoryError::InvalidProjection)?;
-    consume_resealed_relationship_projection(
+    evaluated_decision(consume_resealed_relationship_projection(
         &projection,
         &decision,
         make_scope()?,
         &scope,
         authority,
         false,
-    )
-    .map_err(|_| RelationshipRepositoryError::InvalidProjection)
+    ))
 }
 
-/// Push eligibility never reads a cached/fallback projection. It collects a
-/// fresh bilateral block graph after the caller's complete mutable read set is
-/// locked, persists that exact live evidence, then consumes it under the same
-/// transaction-bound witness. Collection/storage failure remains retryable;
-/// an authenticated current block is a signed negative decision.
-pub(super) async fn verify_direct_request_push_policy<T: PublicTransport>(
+/// A direct-request wake never reads a cached/fallback projection. It collects
+/// a fresh bilateral block graph for the pair inside the wake's eligibility
+/// transaction, persists that exact live evidence, then consumes it under the
+/// same transaction. A source that could not answer now (`Unavailable`) or this
+/// server's own store failing (`Database`) decided nothing and is retryable;
+/// unusable evidence is `InvalidProjection`; an authenticated current block is
+/// a negative decision (`Ok(false)`).
+pub(crate) async fn verify_direct_request_wake_policy<T: PublicTransport>(
     transaction: &mut Transaction<'_, Postgres>,
-    witness: &super::direct_request_push::LockedDirectRequestPushEligibility,
+    sender: &str,
+    recipient: &str,
+    actor_digest: [u8; 32],
+    read_set_digest: [u8; 32],
     authority: &RelationshipAuthority<T>,
 ) -> Result<bool, RelationshipRepositoryError> {
-    let (transaction_id, sender, recipient, actor_digest, read_set_digest) = witness.parts();
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
     let mut roster = vec![sender.to_owned(), recipient.to_owned()];
     roster.sort();
     roster.dedup();
@@ -2634,18 +2674,17 @@ pub(super) async fn verify_direct_request_push_policy<T: PublicTransport>(
     );
     let make_scope = || {
         LockedRelationshipFallbackScope::from_locked_read_set(
-            transaction_id.to_owned(),
+            transaction_id.clone(),
             ProjectionOperationScope::DirectRequestPushEligibility,
             scope.clone(),
             actor_digest,
             read_set_digest,
         )
     };
-    require_witness_transaction(transaction, transaction_id).await?;
+    require_witness_transaction(transaction, &transaction_id).await?;
     let allocation = allocate_projection_revision(transaction).await?;
     // Collection stamps and the persistence observation share the database
-    // timebase of the post-lock decision below; a host-clock window would let
-    // any host-ahead skew fail `decision >= completed_at`.
+    // timebase of the post-lock decision below.
     let clock = anchor_projection_clock(&mut **transaction).await?;
     let projection = authority
         .collect_block_projection(
@@ -2654,32 +2693,28 @@ pub(super) async fn verify_direct_request_push_policy<T: PublicTransport>(
             ProjectionOperationScope::DirectRequestPushEligibility,
             roster,
         )
-        .await
-        .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
+        .await?;
     let persistence = observe_relationship_persistence(&clock);
     let sealed = projection
         .export_persisted(authority, &persistence)
         .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
     persist_relationship_projection(transaction, sealed).await?;
     let decision = observe_locked_relationship_decision(transaction, make_scope()?).await?;
-    match consume_resealed_relationship_projection(
+    evaluated_decision(consume_resealed_relationship_projection(
         &projection,
         &decision,
         make_scope()?,
         &scope,
         authority,
         false,
-    ) {
-        Ok(()) => Ok(true),
-        Err(RelationshipConsumptionError::PolicyDenied) => Ok(false),
-        Err(RelationshipConsumptionError::InvalidWitness) => {
-            Err(RelationshipRepositoryError::InvalidProjection)
-        }
-    }
+    ))
 }
 
 /// Reuse the production live AppView traffic graph for a coordinator-verified
 /// federated sender while its signed mutation and conversation head are locked.
+/// Any policy denial is a negative decision (`Ok(false)`); a graph source that
+/// could not answer now is `Unavailable` and this server's own store failing
+/// is `Database`, neither of which decided anything.
 pub(crate) async fn verify_federated_send_policy<T: PublicTransport>(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
@@ -2687,28 +2722,20 @@ pub(crate) async fn verify_federated_send_policy<T: PublicTransport>(
     authenticated_request_digest: [u8; 32],
     locked_head_digest: [u8; 32],
     authority: &RelationshipAuthority<T>,
-) -> Result<(), RelationshipConsumptionError> {
+) -> Result<bool, RelationshipRepositoryError> {
     let roster = vec![actor.to_owned(), peer.to_owned()];
     let scope = plan_traffic_graph(actor, &roster)
-        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?
+        .map_err(|_| RelationshipRepositoryError::InvalidProjection)?
         .scope;
     let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **tx)
-        .await
-        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
-    let revision = allocate_projection_revision(tx)
-        .await
-        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
-    let clock = anchor_projection_clock(&mut **tx)
-        .await
-        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+        .await?;
+    let revision = allocate_projection_revision(tx).await?;
+    let clock = anchor_projection_clock(&mut **tx).await?;
     let projection = authority
         .collect_traffic_projection(&clock, revision, actor.to_owned(), roster)
-        .await
-        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
-    let observed_at = observe_post_lock_time(tx)
-        .await
-        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+        .await?;
+    let observed_at = observe_post_lock_time(tx).await?;
     let decision = TrustedRelationshipDecisionInstant::from_locked_traffic_scope(
         transaction_id,
         scope,
@@ -2716,7 +2743,7 @@ pub(crate) async fn verify_federated_send_policy<T: PublicTransport>(
         locked_head_digest,
         observed_at,
     )
-    .ok_or(RelationshipConsumptionError::InvalidWitness)?;
-    consume_traffic_projection(&projection, authority, &decision)
-        .map_err(|_| RelationshipConsumptionError::PolicyDenied)
+    .ok_or(RelationshipRepositoryError::InvalidProjection)?;
+    let consumed = consume_traffic_projection(&projection, authority, &decision);
+    Ok(consumed.is_ok())
 }

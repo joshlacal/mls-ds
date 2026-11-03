@@ -24,6 +24,20 @@ pub(super) async fn run_creation_with_enrolled_sibling(pool: &PgPool) -> Result<
     let guard = crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard()
         .map_err(|e| format!("relationship guard: {e:?}"))?;
     let relationship = crate::chat_protocol::relationship_policy::ProductionRelationshipAuthority::from_startup_guard(guard);
+    // Same pre-transaction routing the createConversation handler resolves;
+    // with no federation resolver every participant is an explicit local route.
+    let principals = admission
+        .creation_participant_dids()
+        .map_err(|e| format!("creation participants: {e:?}"))?;
+    let routes = crate::chat_protocol::federation_routing::resolve_participant_routing(
+        pool,
+        None,
+        &principals,
+    )
+    .await
+    .map_err(|e| format!("creation routing: {e:?}"))?;
+    let routing =
+        crate::chat_protocol::federation_routing::ConversationRoutingIntent::local_creation(routes);
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     let prepared =
         crate::chat_protocol::repository::prelude::prepare_signed_operation(&mut tx, admission)
@@ -33,6 +47,7 @@ pub(super) async fn run_creation_with_enrolled_sibling(pool: &PgPool) -> Result<
         &mut tx,
         prepared,
         &relationship,
+        Some(routing),
     )
     .await
     .map_err(|e| format!("creation with sibling scope: {e:?}"))?;

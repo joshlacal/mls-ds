@@ -34,6 +34,16 @@ pub(crate) enum PublicationError {
     #[error("inconsistent publication storage authority")]
     Invariant,
 }
+impl PublicationError {
+    /// Decided nothing: an unavailable policy source or the database.
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            Self::Database(_) => true,
+            Self::Store(error) => error.is_transient(),
+            Self::Disabled | Self::Invariant => false,
+        }
+    }
+}
 pub(crate) enum PublicationPreparation {
     Terminal(Vec<u8>),
     Ready(Box<PreparedPublication>),
@@ -150,20 +160,19 @@ pub(crate) async fn prepare_publication<T: PublicTransport>(
         .await;
     }
     if let Err(error) = candidate.validate_policy(tx, policy).await {
-        match error {
-            DirectRequestStoreError::Database(error) => return Err(error.into()),
-            _ => {
-                return terminal(
-                    tx,
-                    candidate,
-                    signer,
-                    PublicationDisposition::Rejected,
-                    "directRequestRejectedReceipt",
-                    json!({"code":"RequestPolicyDenied"}),
-                )
-                .await
-            }
+        // An unavailable policy source or database decided nothing.
+        if error.is_transient() {
+            return Err(error.into());
         }
+        return terminal(
+            tx,
+            candidate,
+            signer,
+            PublicationDisposition::Rejected,
+            "directRequestRejectedReceipt",
+            json!({"code":"RequestPolicyDenied"}),
+        )
+        .await;
     }
     let b = candidate.signed().body();
     let actor = string(b, "actorDid")?;
@@ -358,11 +367,16 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     tx: &mut Transaction<'_, Postgres>,
     mut prepared: PreparedPublication,
     signer: &DirectRequestReceiptSigner,
+    i13_signer: Option<&crate::federation::receipt::I13ReceiptSigner>,
     policy: &RelationshipAuthority<T>,
 ) -> Result<Vec<u8>, PublicationError> {
+    let i13_signer = i13_signer.ok_or(PublicationError::Disabled)?;
+    if i13_signer.sequencer_did() != signer.authority_did() {
+        return Err(PublicationError::Disabled);
+    }
     prepared.require_transaction(tx).await?;
     if let Err(error) = prepared.candidate.validate_policy(tx, policy).await {
-        if let DirectRequestStoreError::Database(error) = error {
+        if error.is_transient() {
             return Err(error.into());
         }
         prepared.candidate.refresh_instant(tx).await?;
@@ -421,13 +435,37 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     let next = prepared.bootstrap.final_state().coordinate();
     let generation = next.generation() as i64;
     let final_state = prepared.bootstrap.final_state();
-    let entry_id = crate::sim_hooks::mint_entry_uuid_v4(
-        b"chat.publishDirectRequest",
-        &[convo.as_bytes(), &seq.to_be_bytes(), request.as_bytes()],
+    let entry_id = id(&b["firstMessageId"])?;
+    let i13_receipt = i13_signer
+        .sign_application_receipt(
+            &convo.to_string(),
+            next.group_id(),
+            next.epoch(),
+            actor,
+            &actor_device.to_string(),
+            &entry_id.to_string(),
+            prepared.bootstrap.archive_commitment(),
+            u64::try_from(seq).map_err(|_| PublicationError::Invariant)?,
+            now.timestamp_millis(),
+        )
+        .map_err(|_| PublicationError::Invariant)?;
+    let i13_receipt = crate::federation::receipt::I13ReceiptSigner::receipt_wire_json(
+        &i13_receipt,
+        next.generation(),
+        actor,
+        &actor_device.to_string(),
     );
+    let i13_receipt_bytes = encode(&i13_receipt)?;
+    // Seal the receipt while package reservations are still present. Every
+    // subsequent write is in this same transaction, so a failed effect also
+    // rolls this receipt back.
+    let receipt=signer.seal_outcome(json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":signer.authority_did(),"keyId":signer.key_id(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":b["requestId"],"requestDigest":STANDARD.encode(prepared.bootstrap.publication_digest()),"preparationRequestDigest":b["preparationRequestDigest"],"actorDid":actor,"actorDeviceId":actor_device.to_string(),"actorKeyId":actor_key,"authGeneration":auth,"requestKind":"publish","recordedAt":time(now),"conversationId":convo.to_string(),"firstMessageId":b["firstMessageId"],"coordinates":b["next"],"sequencerReceipt":i13_receipt}})).map_err(|_|PublicationError::Invariant)?;
+    let mut published_receipt: Value =
+        serde_json::from_slice(receipt.bytes()).map_err(|_| PublicationError::Invariant)?;
+    published_receipt["$type"] = json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
     let signed: Value =
         serde_json::from_slice(&signed_bytes).map_err(|_| PublicationError::Invariant)?;
-    let entry = json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":entry_id.to_string(),"conversationId":convo.to_string(),"seq":seq,"signedRequest":signed,"receivedAt":time(now)});
+    let entry = json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":entry_id.to_string(),"conversationId":convo.to_string(),"seq":seq,"signedRequest":signed,"receivedAt":time(now),"sequencerReceipt":i13_receipt,"publicationReceipt":published_receipt});
     let entry_bytes = encode(&entry)?;
     let mut untagged_entry = entry.clone();
     untagged_entry
@@ -439,7 +477,7 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     )
     .map_err(|_| PublicationError::Invariant)?;
     let server_fields = encode(
-        &json!({"entryId":entry_id.to_string(),"conversationId":convo.to_string(),"seq":seq,"receivedAt":time(now)}),
+        &json!({"entryId":entry_id.to_string(),"conversationId":convo.to_string(),"seq":seq,"receivedAt":time(now),"sequencerReceipt":i13_receipt,"publicationReceipt":published_receipt}),
     )?;
     let a = &b["artifacts"];
     let metadata = &a["metadataSnapshot"];
@@ -459,10 +497,6 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     )?;
     let import_until = DateTime::from_timestamp(prepared.bootstrap.import_until() as i64, 0)
         .ok_or(PublicationError::Invariant)?;
-    // Seal the receipt while package reservations are still present. Every
-    // subsequent write is in this same transaction, so a failed effect also
-    // rolls this receipt back.
-    let receipt=signer.seal_outcome(json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":signer.authority_did(),"keyId":signer.key_id(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":b["requestId"],"requestDigest":STANDARD.encode(prepared.bootstrap.publication_digest()),"preparationRequestDigest":b["preparationRequestDigest"],"actorDid":actor,"actorDeviceId":actor_device.to_string(),"actorKeyId":actor_key,"authGeneration":auth,"requestKind":"publish","recordedAt":time(now),"conversationId":convo.to_string(),"firstMessageId":b["firstMessageId"],"coordinates":b["next"]}})).map_err(|_|PublicationError::Invariant)?;
     let existing_charge = prepared.candidate.existing_artifact_bytes(tx).await?;
     let mut remaining_blobs = 0u64;
     let mut add_blob = |length: usize| -> Result<(), PublicationError> {
@@ -473,6 +507,7 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     };
     for blob in [
         server_fields.as_slice(),
+        i13_receipt_bytes.as_slice(),
         genesis_info.as_slice(),
         final_state.snapshot(),
         tree.bytes(),
@@ -616,8 +651,8 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     let metadata_id = Uuid::new_v4();
     sqlx::query("INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,prior_generation,prior_state_version,next_generation,next_state_version,retired_generation,retired_state_version,successor_generation,successor_state_version,metadata_snapshot_id,entry_seq,accepted_at) VALUES($1,$2,'directRequestPublication',$3,$4,$5,$6,'admin','active',$7,$8,$9,$10,$11,$12,$13,$14,1,$15,$16,$17,$18,$19,$20,$21)")
         .bind(request).bind(convo).bind(actor).bind(actor_device).bind(actor_key).bind(auth).bind(&signed_bytes).bind(&unsigned_body).bind(&transcript).bind(digest).bind(&signature).bind(prepared.prior.map(|p|p.generation() as i64)).bind(prepared.prior.map(|p|p.state_version() as i64)).bind(generation).bind(prepared.prior.map(|p|p.generation() as i64)).bind(prepared.prior.map(|p|p.state_version() as i64+1)).bind(prepared.prior.map(|_|generation)).bind(prepared.prior.map(|_|1i64)).bind(metadata_id).bind(seq).bind(now).execute(&mut **tx).await?;
-    sqlx::query("INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at) VALUES($1,$2,$3,'blue.catbird.chat.defs#directRequestEntry',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1,$16,$17)")
-        .bind(convo).bind(seq).bind(entry_id).bind(&entry_bytes).bind(Sha256::digest(&entry_bytes).as_slice()).bind(&signed_bytes).bind(digest).bind(&signature).bind(&server_fields).bind(fingerprint.as_slice()).bind(actor).bind(actor_device).bind(actor_key).bind(auth).bind(generation).bind(request).bind(now).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at,sequencer_receipt_bytes) VALUES($1,$2,$3,'blue.catbird.chat.defs#directRequestEntry',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1,$16,$17,$18)")
+        .bind(convo).bind(seq).bind(entry_id).bind(&entry_bytes).bind(Sha256::digest(&entry_bytes).as_slice()).bind(&signed_bytes).bind(digest).bind(&signature).bind(&server_fields).bind(fingerprint.as_slice()).bind(actor).bind(actor_device).bind(actor_key).bind(auth).bind(generation).bind(request).bind(now).bind(&i13_receipt_bytes).execute(&mut **tx).await?;
     // A successor entry also closes every predecessor device's schedule.
     // Keep intervalClose if a device is included again in the successor.
     sqlx::query("INSERT INTO chat.entry_recipients(conversation_id,seq,user_did,device_id,entitlement_kind) SELECT conversation_id,$2,recipient_did,recipient_device_id,'intervalClose' FROM chat.application_intervals WHERE conversation_id=$1 AND closing_transition_id=$3")

@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::{
-    outbound::OutboundClient,
+    outbound::{OutboundClient, OutboundError},
     peer_policy,
     resolver::{self, DsResolver, ValidatedRemoteDestination},
     CAPABILITY_RECONCILIATION_V1,
@@ -279,6 +279,10 @@ async fn run_once(
     auth_sign: &(dyn Fn(&str, &str) -> Result<String, String> + Send + Sync),
     self_did: &str,
 ) -> Result<(), String> {
+    // Paused while the federation gate is closed: no resolution or query runs.
+    if peer_policy::ensure_federation_open().is_err() {
+        return Ok(());
+    }
     if !super::local_supports_capability(CAPABILITY_RECONCILIATION_V1) {
         debug!(
             capability = CAPABILITY_RECONCILIATION_V1,
@@ -358,7 +362,16 @@ pub async fn reconcile_conversation(
         .resolve_ds_destination(sequencer_ds)
         .await
         .map_err(|e| format!("resolve sequencer destination failed: {e}"))?;
-    let discovery_payload = fetch_discovery_payload(&destination).await;
+    let discovery_payload = match fetch_discovery_payload(&destination).await {
+        Ok(payload) => Some(payload),
+        // A periodic sweep decides nothing on a failed discovery: the DID
+        // document's advertised capabilities still apply, and otherwise the
+        // next tick asks again.
+        Err(error) => {
+            debug!(%error, "healthCheck discovery failed; using advertised capabilities");
+            None
+        }
+    };
     if !super::target_supports_capability(
         CAPABILITY_RECONCILIATION_V1,
         endpoint.federation_capabilities.as_deref(),
@@ -385,19 +398,24 @@ pub async fn reconcile_conversation(
     )
     .await
 }
+/// The peer's `getConvoDigest` answer, its failure typed: a transport,
+/// timeout or 5xx/429 failure is retryable; a refusal or an undecodable
+/// answer (`InvalidResponse`) is permanent.
 pub(crate) async fn query_remote_digest(
     outbound: &OutboundClient,
     destination: &ValidatedRemoteDestination,
     token: &str,
     convo_id: &str,
-) -> Result<RemoteConvoDigest, String> {
+) -> Result<RemoteConvoDigest, OutboundError> {
     let json = outbound
         .call_query_json_pinned(destination, DIGEST_NSID, token, &[("convoId", convo_id)])
-        .await
-        .map_err(|e| format!("digest query failed: {e}"))?;
-    serde_json::from_value(json).map_err(|e| format!("invalid digest response: {e}"))
+        .await?;
+    serde_json::from_value(json).map_err(|e| OutboundError::InvalidResponse {
+        reason: format!("invalid digest response: {e}"),
+    })
 }
 
+/// [`query_remote_digest`] for one `getConvoEvents` page.
 pub(crate) async fn query_remote_events(
     outbound: &OutboundClient,
     destination: &ValidatedRemoteDestination,
@@ -405,7 +423,7 @@ pub(crate) async fn query_remote_events(
     convo_id: &str,
     after_seq: i64,
     limit: i64,
-) -> Result<RemoteConvoEvents, String> {
+) -> Result<RemoteConvoEvents, OutboundError> {
     let after_seq_s = after_seq.to_string();
     let limit_s = limit.to_string();
     let json = outbound
@@ -419,9 +437,10 @@ pub(crate) async fn query_remote_events(
                 ("limit", &limit_s),
             ],
         )
-        .await
-        .map_err(|e| format!("events query failed: {e}"))?;
-    serde_json::from_value(json).map_err(|e| format!("invalid events response: {e}"))
+        .await?;
+    serde_json::from_value(json).map_err(|e| OutboundError::InvalidResponse {
+        reason: format!("invalid events response: {e}"),
+    })
 }
 
 async fn reconcile_clean_conversation(
@@ -437,8 +456,11 @@ async fn reconcile_clean_conversation(
     // 1. Validate remote digest
     let digest_token = auth_sign(sequencer_ds, DIGEST_NSID)
         .map_err(|e| format!("failed to sign digest request: {e}"))?;
-    let remote_digest =
-        query_remote_digest(outbound, destination, &digest_token, &convo_id).await?;
+    // The sweep retries every failure on its next tick; its class only reads
+    // in the log here.
+    let remote_digest = query_remote_digest(outbound, destination, &digest_token, &convo_id)
+        .await
+        .map_err(|e| format!("digest query failed: {e}"))?;
 
     let stored_routing: Option<(bool, Option<String>, i64)> = sqlx::query_as(
         "SELECT is_remote, sequencer_ds, sequencer_term FROM chat.conversations WHERE conversation_id = $1",
@@ -585,7 +607,8 @@ async fn reconcile_clean_conversation(
             cursor,
             EVENTS_PAGE_LIMIT,
         )
-        .await?;
+        .await
+        .map_err(|e| format!("events query failed: {e}"))?;
 
         if page.events.is_empty() {
             return Err(format!(
@@ -936,20 +959,31 @@ async fn reconcile_clean_conversation(
     }
 }
 
+/// The peer's `healthCheck` discovery payload. A send or body read that could
+/// not finish now, or a 5xx/429, is retryable; any other status, a refused
+/// redirect, or an oversized or malformed body is a permanent answer. The
+/// body of a non-success answer is never read.
 pub(crate) async fn fetch_discovery_payload(
     destination: &ValidatedRemoteDestination,
-) -> Option<serde_json::Value> {
+) -> Result<serde_json::Value, OutboundError> {
     fetch_discovery_payload_with_timeout(destination, Duration::from_secs(10)).await
 }
 
 async fn fetch_discovery_payload_with_timeout(
     destination: &ValidatedRemoteDestination,
     timeout: Duration,
-) -> Option<serde_json::Value> {
-    let deadline = tokio::time::Instant::now().checked_add(timeout)?;
+) -> Result<serde_json::Value, OutboundError> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| OutboundError::Timeout {
+            endpoint: destination.host.clone(),
+            method: HEALTH_CHECK_NSID.to_owned(),
+        })?;
     let endpoint = destination.url.as_str().trim_end_matches('/');
     let url = format!("{}/xrpc/{}", endpoint, HEALTH_CHECK_NSID);
-    let parsed_url = url::Url::parse(&url).ok()?;
+    let parsed_url = url::Url::parse(&url).map_err(|e| OutboundError::InvalidResponse {
+        reason: format!("healthCheck discovery URL: {e}"),
+    })?;
     let discovery_dest = ValidatedRemoteDestination {
         url: parsed_url,
         host: destination.host.clone(),
@@ -962,16 +996,26 @@ async fn fetch_discovery_payload_with_timeout(
         "healthCheck discovery",
     )
     .await
-    .ok()?;
-    if !resp.status().is_success() {
-        return None;
+    .map_err(|error| {
+        super::queue::OutboundQueue::outbound_error_from_federation_error(&error, &destination.host)
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(OutboundError::RemoteError {
+            status: status.as_u16(),
+            body: String::new(),
+            endpoint: destination.host.clone(),
+            method: HEALTH_CHECK_NSID.to_owned(),
+            reason_code: None,
+            error_name: None,
+        });
     }
     decode_json_bounded(
         resp,
         ResponseBodyBudget::new(ORDINARY_DS_CONTROL_MAX_BYTES, deadline),
     )
     .await
-    .ok()
+    .map_err(|error| super::outbound::map_ordinary_body_error(error, HEALTH_CHECK_NSID))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1073,11 +1117,16 @@ pub(crate) async fn apply_remote_clean_events(
 
         let key_row: Option<(Vec<u8>, i64)> = sqlx::query_as(
             r#"
-            SELECT dk.signing_public_key, dk.enrollment_auth_generation
+            SELECT dk.signing_public_key, d.auth_generation
               FROM chat.device_keys dk
               JOIN chat.devices d ON d.user_did = dk.user_did AND d.device_id = dk.device_id
              WHERE dk.user_did = $1 AND dk.device_id = $2 AND dk.key_id = $3
                AND dk.revoked_at IS NULL AND d.status = 'active' AND d.revoked_at IS NULL
+               AND dk.enrollment_auth_generation<=d.auth_generation
+               AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                    WHERE newer.user_did=dk.user_did AND newer.device_id=dk.device_id
+                      AND newer.enrollment_auth_generation>dk.enrollment_auth_generation
+                      AND newer.enrollment_auth_generation<=d.auth_generation)
              FOR SHARE
             "#,
         )
@@ -1464,17 +1513,17 @@ mod tests {
         ))
         .await;
 
-        let discovery = fetch_discovery_payload(&endpoint).await;
-        assert_eq!(discovery, Some(expected));
+        let discovery = fetch_discovery_payload(&endpoint).await.unwrap();
+        assert_eq!(discovery, expected);
         assert!(crate::federation::target_supports_capability(
             CAPABILITY_RECONCILIATION_V1,
             None,
-            discovery.as_ref(),
+            Some(&discovery),
         ));
     }
 
     #[tokio::test]
-    async fn declared_discovery_body_over_one_mib_returns_none() {
+    async fn declared_discovery_body_over_one_mib_is_a_permanent_answer() {
         let body = json!({
             "capabilities": [CAPABILITY_RECONCILIATION_V1],
             "padding": "x".repeat(ORDINARY_DS_CONTROL_MAX_BYTES),
@@ -1496,11 +1545,14 @@ mod tests {
         ))
         .await;
 
-        assert_eq!(fetch_discovery_payload(&endpoint).await, None);
+        assert!(matches!(
+            fetch_discovery_payload(&endpoint).await,
+            Err(OutboundError::InvalidResponse { .. })
+        ));
     }
 
     #[tokio::test]
-    async fn chunked_discovery_body_over_one_mib_returns_none() {
+    async fn chunked_discovery_body_over_one_mib_is_a_permanent_answer() {
         let prefix = format!(r#"{{"capabilities":["{CAPABILITY_RECONCILIATION_V1}"],"padding":""#);
         let chunks = vec![
             Ok::<_, Infallible>(Bytes::from(prefix)),
@@ -1521,11 +1573,17 @@ mod tests {
         ))
         .await;
 
-        assert_eq!(fetch_discovery_payload(&endpoint).await, None);
+        assert!(matches!(
+            fetch_discovery_payload(&endpoint).await,
+            Err(OutboundError::InvalidResponse { .. })
+        ));
     }
 
+    /// DQ.G17: discovery keeps its class for bootstrap callers. A peer that
+    /// could not answer now is retryable, a malformed answer permanent; no
+    /// answer body reaches the error.
     #[tokio::test]
-    async fn non_success_and_malformed_discovery_keep_best_effort_none() {
+    async fn an_unavailable_discovery_is_retryable_and_a_malformed_one_permanent() {
         const CANARY: &str = "cookie=discovery-canary token=discovery-secret";
         let unavailable = spawn_discovery_server(Router::new().route(
             &format!("/xrpc/{HEALTH_CHECK_NSID}"),
@@ -1537,14 +1595,24 @@ mod tests {
             }),
         ))
         .await;
-        assert_eq!(fetch_discovery_payload(&unavailable).await, None);
+        let error = fetch_discovery_payload(&unavailable).await.unwrap_err();
+        assert!(
+            matches!(error, OutboundError::RemoteError { status: 503, .. }) && error.is_retryable(),
+            "{error}"
+        );
+        assert!(!error.to_string().contains(CANARY), "{error}");
 
         let malformed = spawn_discovery_server(Router::new().route(
             &format!("/xrpc/{HEALTH_CHECK_NSID}"),
             get(|| async { Body::from(format!(r#"{{"secret":"{CANARY}""#)) }),
         ))
         .await;
-        assert_eq!(fetch_discovery_payload(&malformed).await, None);
+        let error = fetch_discovery_payload(&malformed).await.unwrap_err();
+        assert!(
+            matches!(error, OutboundError::InvalidResponse { .. }) && !error.is_retryable(),
+            "{error}"
+        );
+        assert!(!error.to_string().contains(CANARY), "{error}");
     }
 
     #[tokio::test]
@@ -1567,9 +1635,11 @@ mod tests {
         ))
         .await;
 
-        assert_eq!(
-            fetch_discovery_payload_with_timeout(&endpoint, Duration::from_millis(70)).await,
-            None
+        assert!(
+            fetch_discovery_payload_with_timeout(&endpoint, Duration::from_millis(70))
+                .await
+                .is_err_and(|error| error.is_retryable()),
+            "a body past the shared deadline could not answer now"
         );
     }
 
@@ -1611,8 +1681,8 @@ mod tests {
             addrs: vec![addr],
         };
 
-        let discovery = fetch_discovery_payload(&destination).await;
-        assert_eq!(discovery, Some(expected));
+        let discovery = fetch_discovery_payload(&destination).await.unwrap();
+        assert_eq!(discovery, expected);
     }
 
     #[test]

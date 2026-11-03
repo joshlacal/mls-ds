@@ -478,15 +478,14 @@ impl HydrationAuthority {
         {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        let key = scope
-            .keys()
-            .iter()
-            .find(|candidate| {
-                candidate.user_did() == did.as_str()
-                    && candidate.device_id() == device_id
-                    && candidate.key_id() == key_id
-                    && candidate.enrollment_auth_generation() == auth_generation
-            })
+        let key =
+            crate::chat_protocol::repository::auth::LockedCanonicalKeyProjection::at_generation(
+                scope.keys(),
+                did.as_str(),
+                device_id,
+                auth_generation,
+            )
+            .filter(|candidate| candidate.key_id() == key_id)
             .ok_or(StateMachineError::InvalidHydrationAuthority)?;
         let signing_public_key = scope
             .signing_public_key_for(did.as_str(), device_id, key_id, auth_generation)

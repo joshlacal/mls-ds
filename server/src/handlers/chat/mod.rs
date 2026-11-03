@@ -35,7 +35,6 @@ mod recovery;
 mod recovery_scheduler;
 mod register_push_gateway;
 mod replenish_key_packages;
-pub(crate) mod request_push;
 mod reset;
 mod revoke_device;
 mod runtime;
@@ -54,7 +53,8 @@ pub use runtime::ChatRuntime;
 pub use subscribe_events::{parse_query as parse_subscribe_events_query, SubscribeEventsQuery};
 
 pub(crate) use accept_conversation::execute_admitted as execute_federated_group_acceptance;
-pub(crate) use acknowledge_entries::execute_for_principal as execute_federated_group_entries_ack;
+#[cfg(test)]
+pub(crate) use acknowledge_entries::execute_for_principal as acknowledge_entries_for_principal;
 pub(crate) use conversation_state::execute_federated_read as execute_federated_conversation_state_read;
 pub(crate) use welcome::execute_admitted as execute_federated_group_welcome;
 
@@ -396,12 +396,6 @@ where
         .route(
             &xrpc_path(ChatEndpoint::SubscribeEvents),
             sget(subscribe_events::handle),
-        )
-        .route(
-            "/internal/chat/request-push-eligibility",
-            spost(request_push::eligibility).layer(DefaultBodyLimit::max(
-                crate::chat_protocol::request_push::MAX_INTERNAL_BODY_BYTES,
-            )),
         )
         .route(
             "/xrpc/blue.catbird.mlsDS.reserveRecipientBootstrap",

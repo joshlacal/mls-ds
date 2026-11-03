@@ -1,182 +1,71 @@
-#!/bin/bash
-# Rate Limiting Test Script
-# Tests per-IP and per-DID endpoint-specific rate limits
+#!/usr/bin/env bash
+# Live check of the limits in RATE_LIMITING.md against a running catbird-server.
+#
+#   SERVER_URL    server base URL (default http://localhost:8080)
+#   IP_BURST      the server's IP_RATE_BURST (default 300, the server default)
+#   TEST_JWT_CMD  optional command, split on spaces, that prints a fresh
+#                 service-auth JWT for the blue.catbird.chat NSID passed as its
+#                 last argument. Every chat call needs its own jti and an exact
+#                 lxm, so one static token cannot spend a quota. The server must
+#                 have CHAT_CUTOVER_ENABLED set.
+#
+# The per-account checks run first: the per-IP check empties this client's IP
+# bucket. Exits non-zero when a check sees no 429.
 
-set -e
+set -euo pipefail
 
 SERVER_URL="${SERVER_URL:-http://localhost:8080}"
-TEST_DID="${TEST_DID:-did:plc:test123}"
-TEST_JWT="${TEST_JWT}"
+IP_BURST="${IP_BURST:-300}"
+TEST_JWT_CMD="${TEST_JWT_CMD:-}"
+failures=0
 
-echo "=========================================="
-echo "Rate Limiting Test Suite"
-echo "=========================================="
-echo "Server: $SERVER_URL"
-echo ""
+health_status() {
+    curl -s -o /dev/null -w '%{http_code}' "$SERVER_URL/health"
+}
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+chat_status() {
+    local token
+    # shellcheck disable=SC2086 # TEST_JWT_CMD is a command line
+    token="$($TEST_JWT_CMD "$1")"
+    curl -s -o /dev/null -w '%{http_code}' -X POST \
+        -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{}' \
+        "$SERVER_URL/xrpc/blue.catbird.chat.$1"
+}
 
-# Test 1: Per-IP Rate Limiting (Unauthenticated)
-echo -e "${YELLOW}Test 1: Per-IP Rate Limiting (60 req/min for unauthenticated)${NC}"
-echo "Sending 70 requests to health endpoint without auth..."
-
-success_count=0
-rate_limited_count=0
-
-for i in {1..70}; do
-    response=$(curl -s -w "\n%{http_code}" "$SERVER_URL/health" 2>/dev/null)
-    status_code=$(echo "$response" | tail -1)
-
-    if [ "$status_code" == "200" ]; then
-        ((success_count++))
-    elif [ "$status_code" == "429" ]; then
-        ((rate_limited_count++))
-        if [ $rate_limited_count -eq 1 ]; then
-            echo -e "${GREEN}✓ First rate limit hit at request $i${NC}"
-            retry_after=$(curl -s -I "$SERVER_URL/health" 2>/dev/null | grep -i "retry-after" | cut -d' ' -f2 | tr -d '\r')
-            if [ -n "$retry_after" ]; then
-                echo -e "${GREEN}✓ Retry-After header present: $retry_after seconds${NC}"
-            fi
+# check LABEL QUOTA MAX COMMAND...: run COMMAND (prints an HTTP status) up to
+# MAX times and pass at the first 429. MAX leaves room for the bucket refilling
+# while requests are sent.
+check() {
+    local label="$1" quota="$2" max="$3" i
+    shift 3
+    for ((i = 1; i <= max; i++)); do
+        if [ "$("$@")" = 429 ]; then
+            echo "✓ $label: first 429 at request $i (limit $quota)"
+            return 0
         fi
-    fi
+    done
+    echo "✗ $label: no 429 in $max requests (limit $quota)"
+    failures=$((failures + 1))
+    return 1
+}
 
-    # Brief delay to avoid overwhelming the server
-    sleep 0.01
-done
+echo "Rate limiting checks against $SERVER_URL"
 
-echo "Success: $success_count, Rate Limited: $rate_limited_count"
-
-if [ $rate_limited_count -gt 0 ]; then
-    echo -e "${GREEN}✓ Per-IP rate limiting is working${NC}"
+if [ -n "$TEST_JWT_CMD" ]; then
+    check "sendMessage per account" 100 220 chat_status sendMessage || true
+    check "createConversation per account" 5 30 chat_status createConversation || true
+    check "replenishKeyPackages per account" 50 120 chat_status replenishKeyPackages || true
 else
-    echo -e "${RED}✗ Per-IP rate limiting NOT working (no 429s received)${NC}"
+    echo "Skipping per-account checks: set TEST_JWT_CMD"
 fi
 
-echo ""
-
-# Test 2: Per-DID Endpoint-Specific Rate Limits (Authenticated)
-if [ -z "$TEST_JWT" ]; then
-    echo -e "${YELLOW}Skipping per-DID tests: TEST_JWT not provided${NC}"
-    echo "To test DID-based rate limits, set TEST_JWT environment variable"
-    echo "Example: export TEST_JWT='your-jwt-token-here'"
-else
-    echo -e "${YELLOW}Test 2: Per-DID Rate Limiting for sendMessage (100 req/min)${NC}"
-    echo "Sending 110 requests to sendMessage endpoint..."
-
-    success_count=0
-    rate_limited_count=0
-
-    for i in {1..110}; do
-        response=$(curl -s -w "\n%{http_code}" \
-            -H "Authorization: Bearer $TEST_JWT" \
-            -H "Content-Type: application/json" \
-            -X POST \
-            -d '{"convoId":"test123","message":"test"}' \
-            "$SERVER_URL/xrpc/blue.catbird.mls.sendMessage" 2>/dev/null)
-        status_code=$(echo "$response" | tail -1)
-
-        if [ "$status_code" == "200" ] || [ "$status_code" == "400" ]; then
-            ((success_count++))
-        elif [ "$status_code" == "429" ]; then
-            ((rate_limited_count++))
-            if [ $rate_limited_count -eq 1 ]; then
-                echo -e "${GREEN}✓ sendMessage rate limit hit at request $i${NC}"
-            fi
-        fi
-
-        sleep 0.01
-    done
-
-    echo "Success/Valid: $success_count, Rate Limited: $rate_limited_count"
-
-    if [ $rate_limited_count -gt 0 ] && [ $success_count -le 105 ]; then
-        echo -e "${GREEN}✓ sendMessage rate limiting is working (100/min)${NC}"
+if check "per IP (/health)" "$IP_BURST" $((IP_BURST * 2 + 20)) health_status; then
+    if curl -s -D - -o /dev/null "$SERVER_URL/health" | grep -qi '^retry-after:'; then
+        echo "✓ 429 carries Retry-After"
     else
-        echo -e "${RED}✗ sendMessage rate limiting may not be working correctly${NC}"
-    fi
-
-    echo ""
-
-    # Test 3: createConvo endpoint (5 req/min)
-    echo -e "${YELLOW}Test 3: Per-DID Rate Limiting for createConvo (5 req/min)${NC}"
-    echo "Sending 10 requests to createConvo endpoint..."
-
-    success_count=0
-    rate_limited_count=0
-
-    for i in {1..10}; do
-        response=$(curl -s -w "\n%{http_code}" \
-            -H "Authorization: Bearer $TEST_JWT" \
-            -H "Content-Type: application/json" \
-            -X POST \
-            -d '{"name":"test","didList":["did:plc:test1"]}' \
-            "$SERVER_URL/xrpc/blue.catbird.mls.createConvo" 2>/dev/null)
-        status_code=$(echo "$response" | tail -1)
-
-        if [ "$status_code" == "200" ] || [ "$status_code" == "400" ]; then
-            ((success_count++))
-        elif [ "$status_code" == "429" ]; then
-            ((rate_limited_count++))
-            if [ $rate_limited_count -eq 1 ]; then
-                echo -e "${GREEN}✓ createConvo rate limit hit at request $i${NC}"
-            fi
-        fi
-
-        sleep 0.01
-    done
-
-    echo "Success/Valid: $success_count, Rate Limited: $rate_limited_count"
-
-    if [ $rate_limited_count -gt 0 ] && [ $success_count -le 7 ]; then
-        echo -e "${GREEN}✓ createConvo rate limiting is working (5/min)${NC}"
-    else
-        echo -e "${RED}✗ createConvo rate limiting may not be working correctly${NC}"
-    fi
-
-    echo ""
-
-    # Test 4: publishKeyPackage endpoint (20 req/min)
-    echo -e "${YELLOW}Test 4: Per-DID Rate Limiting for publishKeyPackage (20 req/min)${NC}"
-    echo "Sending 25 requests to publishKeyPackage endpoint..."
-
-    success_count=0
-    rate_limited_count=0
-
-    for i in {1..25}; do
-        response=$(curl -s -w "\n%{http_code}" \
-            -H "Authorization: Bearer $TEST_JWT" \
-            -H "Content-Type: application/json" \
-            -X POST \
-            -d '{"keyPackages":["test"]}' \
-            "$SERVER_URL/xrpc/blue.catbird.mls.publishKeyPackage" 2>/dev/null)
-        status_code=$(echo "$response" | tail -1)
-
-        if [ "$status_code" == "200" ] || [ "$status_code" == "400" ]; then
-            ((success_count++))
-        elif [ "$status_code" == "429" ]; then
-            ((rate_limited_count++))
-            if [ $rate_limited_count -eq 1 ]; then
-                echo -e "${GREEN}✓ publishKeyPackage rate limit hit at request $i${NC}"
-            fi
-        fi
-
-        sleep 0.01
-    done
-
-    echo "Success/Valid: $success_count, Rate Limited: $rate_limited_count"
-
-    if [ $rate_limited_count -gt 0 ] && [ $success_count -le 22 ]; then
-        echo -e "${GREEN}✓ publishKeyPackage rate limiting is working (20/min)${NC}"
-    else
-        echo -e "${RED}✗ publishKeyPackage rate limiting may not be working correctly${NC}"
+        echo "✗ 429 without Retry-After"
+        failures=$((failures + 1))
     fi
 fi
 
-echo ""
-echo "=========================================="
-echo "Rate Limiting Test Suite Complete"
-echo "=========================================="
+[ "$failures" -eq 0 ]

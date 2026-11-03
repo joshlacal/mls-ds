@@ -31,7 +31,9 @@
 
 mod common;
 
-pub use catbird_server::{auth, crypto, federation, handlers, identity, sqlx_jacquard, util};
+pub use catbird_server::{
+    auth, crypto, federation, handlers, identity, sim_hooks, sqlx_jacquard, util,
+};
 
 #[path = "common/chat_protocol_harness.rs"]
 mod chat_protocol;
@@ -1974,11 +1976,13 @@ async fn existing_device_read_handlers_expose_no_raw_admission_or_receipt_detail
     // Deleting any single guard turns the sequence into … guard, protected,
     // protected … and fails here.
     const B4_GUARD_CALL: &str = "guard_protected_query(&lock)";
-    const B4_PROTECTED_QUERIES: [&str; 4] = [
+    const B4_PROTECTED_QUERIES: [&str; 5] = [
         "get_devices(transaction",
         "read_device_view(",
         "list_own_device_views(",
         "create_device_inventory_session(",
+        // `getDeviceKey` (`read_device_key_for_admission`).
+        "read_immutable_candidate_key(",
     ];
     let mut events: Vec<(usize, &'static str)> = Vec::new();
     let mut from = 0usize;
@@ -2078,7 +2082,9 @@ async fn existing_device_read_handlers_expose_no_raw_admission_or_receipt_detail
 
     // -- The sanitized facade vocabulary cannot carry data. -------------------
     // Every variant of the facade error is a unit variant, so no `Debug` render,
-    // log line, or panic message can print requester material.
+    // log line, or panic message can print requester material. The one exact
+    // exception is the session-cap retry hint: a bare number of seconds.
+    const B4_SCALAR_DATA_VARIANT: &str = "RateLimited { retry_after_secs: Option<u64> },";
     let error_at = b4_facade_section()
         .find("pub(crate) enum ExistingDeviceReadFacadeError")
         .expect("facade error enum");
@@ -2096,7 +2102,8 @@ async fn existing_device_read_handlers_expose_no_raw_admission_or_receipt_detail
     assert!(!variants.is_empty(), "facade error enum has no variants");
     for variant in &variants {
         assert!(
-            !variant.contains('(') && !variant.contains('{'),
+            *variant == B4_SCALAR_DATA_VARIANT
+                || (!variant.contains('(') && !variant.contains('{')),
             "facade error variant {variant:?} carries data — `Debug` could leak it"
         );
     }

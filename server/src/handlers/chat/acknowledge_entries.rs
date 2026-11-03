@@ -1,6 +1,8 @@
 //! `blue.catbird.chat.acknowledgeEntries` handler: monotonic per-device entry ACK
 //! watermark and immediate ciphertext pruning once all active non-dormant devices
-//! spanning an `applicationEntry` have acknowledged it (`I14`, `G6`).
+//! spanning an `applicationEntry` have acknowledged it (`I14`, `G6`). A home
+//! queues a signed `relayEntryAck` of each ACK for a conversation sequenced
+//! elsewhere, so the sequencer's prune also waits for the devices homed here.
 
 use std::sync::Arc;
 
@@ -11,7 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -128,16 +130,6 @@ pub(crate) async fn execute_for_principal(
         .await
         .map_err(|error| context::auth_repository_failure(ENDPOINT, error))?;
 
-    crate::federation::group_relay::try_relay_home_group_operation(
-        pool,
-        &actor_did,
-        input.actor_device_id,
-        ENDPOINT.nsid(),
-        body,
-    )
-    .await
-    .map_err(|error| error.into_failure(ENDPOINT))?;
-
     let mut tx = pool
         .begin()
         .await
@@ -151,38 +143,62 @@ pub(crate) async fn execute_for_principal(
         ));
     }
 
-    let convo_head: Option<(i64, bool)> = sqlx::query_as(
-        "SELECT next_entry_seq, is_remote FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE",
+    let convo_head: Option<(i64, bool, Option<String>)> = sqlx::query_as(
+        "SELECT next_entry_seq, is_remote, sequencer_ds FROM chat.conversations \
+          WHERE conversation_id = $1 FOR UPDATE",
     )
     .bind(input.conversation_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
-    let transport_inbox: Option<(String, String, Option<Uuid>, String, Uuid, DateTime<Utc>)> =
-        if convo_head.is_none() {
-            sqlx::query_as(
-                "SELECT status, sender_did, sender_device_id, recipient_did, recipient_device_id, import_until \
-                   FROM chat.direct_request_transport_inbox \
-                  WHERE conversation_id = $1 \
-                    AND (recipient_did = $2 OR sender_did = $2) \
-                  ORDER BY CASE \
-                    WHEN (recipient_did = $2 AND recipient_device_id = $3) \
-                      OR (sender_did = $2 AND sender_device_id = $3) THEN 0 \
-                    ELSE 1 \
-                  END \
-                  LIMIT 1 \
-                  FOR UPDATE",
-            )
-            .bind(input.conversation_id)
-            .bind(&actor_did)
-            .bind(input.actor_device_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|_| ChatFailure::storage(ENDPOINT))?
-        } else {
-            None
-        };
+    if convo_head.is_none() {
+        // Serialize every C33 device ACK on the same inbox rows, before locking
+        // the actor device. Otherwise simultaneous final ACKs can both miss the
+        // other's uncommitted watermark and leave ciphertext behind.
+        sqlx::query(
+            "SELECT delivery_id FROM chat.direct_request_transport_inbox \
+              WHERE conversation_id = $1 ORDER BY delivery_id FOR UPDATE",
+        )
+        .bind(input.conversation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+    }
+
+    type TransportInbox = (
+        String,
+        String,
+        Option<Uuid>,
+        String,
+        Uuid,
+        DateTime<Utc>,
+        String,
+    );
+    let transport_inbox: Option<TransportInbox> = if convo_head.is_none() {
+        sqlx::query_as(
+            "SELECT status, sender_did, sender_device_id, recipient_did, recipient_device_id, \
+                    import_until, coordinator_did \
+               FROM chat.direct_request_transport_inbox \
+              WHERE conversation_id = $1 \
+                AND (recipient_did = $2 OR sender_did = $2) \
+              ORDER BY CASE \
+                WHEN (recipient_did = $2 AND recipient_device_id = $3) \
+                  OR (sender_did = $2 AND sender_device_id = $3) THEN 0 \
+                ELSE 1 \
+              END \
+              LIMIT 1 \
+              FOR UPDATE",
+        )
+        .bind(input.conversation_id)
+        .bind(&actor_did)
+        .bind(input.actor_device_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| ChatFailure::storage(ENDPOINT))?
+    } else {
+        None
+    };
 
     if convo_head.is_none() && transport_inbox.is_none() {
         return Err(ChatFailure::protocol(
@@ -191,11 +207,19 @@ pub(crate) async fn execute_for_principal(
         ));
     }
 
-    let dev_row: Option<(String, i64, Option<i64>, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT d.status, d.auth_generation, dk.enrollment_auth_generation, dk.signing_public_key \
+    let dev_row: Option<(String, i64, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT d.status, d.auth_generation, dk.signing_public_key \
            FROM chat.devices d \
            LEFT JOIN chat.device_keys dk \
              ON dk.user_did = d.user_did AND dk.device_id = d.device_id AND dk.key_id = $3 \
+            AND dk.revoked_at IS NULL \
+            AND dk.enrollment_auth_generation <= d.auth_generation \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM chat.device_keys newer \
+                 WHERE newer.user_did = dk.user_did AND newer.device_id = dk.device_id \
+                   AND newer.enrollment_auth_generation > dk.enrollment_auth_generation \
+                   AND newer.enrollment_auth_generation <= d.auth_generation \
+            ) \
           WHERE d.user_did = $1 AND d.device_id = $2 \
           FOR UPDATE OF d",
     )
@@ -206,7 +230,7 @@ pub(crate) async fn execute_for_principal(
     .await
     .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
-    let Some((dev_status, dev_auth_gen, key_auth_gen, pubkey_opt)) = dev_row else {
+    let Some((dev_status, dev_auth_gen, pubkey_opt)) = dev_row else {
         return Err(ChatFailure::protocol(
             ENDPOINT,
             ChatProtocolErrorCode::DeviceNotRegistered,
@@ -224,7 +248,7 @@ pub(crate) async fn execute_for_principal(
             ChatProtocolErrorCode::DeviceNotRegistered,
         ));
     }
-    if dev_auth_gen != input.auth_generation || key_auth_gen != Some(dev_auth_gen) {
+    if dev_auth_gen != input.auth_generation {
         return Err(ChatFailure::protocol(
             ENDPOINT,
             ChatProtocolErrorCode::NotAuthorized,
@@ -241,7 +265,10 @@ pub(crate) async fn execute_for_principal(
         .verify(&transcript, &signature)
         .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidSignature))?;
 
-    let Some((next_entry_seq, is_remote)) = convo_head else {
+    // The DS sequencing a conversation held here only as a C33 inbox or a
+    // remote mirror; it waits for this ACK, so the ACK is relayed to it.
+    let mut sequencer = None;
+    if convo_head.is_none() {
         let (
             status,
             sender_did,
@@ -249,9 +276,11 @@ pub(crate) async fn execute_for_principal(
             recipient_did,
             recipient_device_id,
             import_until,
+            coordinator_did,
         ) = transport_inbox.ok_or_else(|| {
             ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::ConversationNotFound)
         })?;
+        sequencer = Some(coordinator_did);
         if status == "pending" {
             if now > import_until {
                 return Err(ChatFailure::protocol(
@@ -267,77 +296,48 @@ pub(crate) async fn execute_for_principal(
         }
         let device_matches = (actor_did == recipient_did
             && input.actor_device_id == recipient_device_id)
-            || (actor_did == sender_did
-                && !sender_device_id.is_some_and(|dev| dev != input.actor_device_id));
+            || (actor_did == sender_did && sender_device_id == Some(input.actor_device_id));
         if !device_matches {
             return Err(ChatFailure::protocol(
                 ENDPOINT,
                 ChatProtocolErrorCode::DeviceNotLeaf,
             ));
         }
+    }
 
-        sqlx::query(
-            "UPDATE chat.devices \
-                SET last_active_at = $3, dormant_at = NULL \
-              WHERE user_did = $1 AND device_id = $2",
-        )
-        .bind(&actor_did)
-        .bind(input.actor_device_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-
-        let transport_max: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq), 0) FROM chat.direct_request_transport_entries WHERE conversation_id = $1",
+    let is_leaf: bool = if convo_head.is_some() {
+        sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM chat.application_intervals \
+                  WHERE conversation_id = $1 AND generation = $2 \
+                    AND recipient_did = $3 AND recipient_device_id = $4 \
+                 UNION ALL \
+                 SELECT 1 FROM chat.member_devices \
+                  WHERE conversation_id = $1 AND generation = $2 \
+                    AND user_did = $3 AND device_id = $4 \
+             )",
         )
         .bind(input.conversation_id)
+        .bind(input.generation)
+        .bind(&actor_did)
+        .bind(input.actor_device_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-        if input.up_to_seq > transport_max.max(0) {
-            return Err(ChatFailure::protocol(
-                ENDPOINT,
-                ChatProtocolErrorCode::InvalidRequest,
-            ));
-        }
-
-        tx.commit()
-            .await
-            .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-
-        let out = serde_json::to_vec(&json!({
-            "acknowledgedSeq": input.up_to_seq,
-            "prunedCount": 0_i64,
-        }))
-        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-        return Ok(context::json_ok(out));
+        .map_err(|_| ChatFailure::storage(ENDPOINT))?
+    } else {
+        true // The exact C33 inbox device was authorized above.
     };
-
-    let is_leaf: bool = sqlx::query_scalar(
-        "SELECT EXISTS( \
-             SELECT 1 FROM chat.application_intervals \
-              WHERE conversation_id = $1 AND generation = $2 \
-                AND recipient_did = $3 AND recipient_device_id = $4 \
-             UNION ALL \
-             SELECT 1 FROM chat.member_devices \
-              WHERE conversation_id = $1 AND generation = $2 \
-                AND user_did = $3 AND device_id = $4 \
-         )",
-    )
-    .bind(input.conversation_id)
-    .bind(input.generation)
-    .bind(&actor_did)
-    .bind(input.actor_device_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|_| ChatFailure::storage(ENDPOINT))?;
     if !is_leaf {
         return Err(ChatFailure::protocol(
             ENDPOINT,
             ChatProtocolErrorCode::DeviceNotLeaf,
         ));
     }
+
+    let (next_entry_seq, is_remote, sequencer_ds) = convo_head.unwrap_or((1, true, None));
+    let sequencer = sequencer
+        .or(sequencer_ds.filter(|_| is_remote))
+        .filter(|did| !crate::identity::dids_equivalent(did, &crate::identity::service_did_base()));
 
     sqlx::query(
         "UPDATE chat.devices \
@@ -388,94 +388,66 @@ pub(crate) async fn execute_for_principal(
     .await
     .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
-    // A payload waits only for devices that can still fetch it: current members
-    // (a removed device reads only control entries) and, on a remote mirror,
-    // only devices homed here; the sequencer prunes its own copy. A mirror row
-    // without a local audience is never served, so it may go immediately.
-    let prunable_seqs: Vec<i64> = sqlx::query_scalar(
-        "SELECT e.seq \
-           FROM chat.entries e \
-          WHERE e.conversation_id = $1 \
-            AND e.generation = $2 \
-            AND e.seq <= $3 \
-            AND e.entry_kind = 'blue.catbird.chat.defs#applicationEntry' \
-            AND e.payload_pruned_at IS NULL \
-            AND ($4 OR EXISTS ( \
-                SELECT 1 \
-                  FROM chat.application_intervals ai \
-                  JOIN chat.devices d \
-                    ON d.user_did = ai.recipient_did \
-                   AND d.device_id = ai.recipient_device_id \
-                 WHERE ai.conversation_id = e.conversation_id \
-                   AND ai.generation = e.generation \
-                   AND ai.start_seq <= e.seq \
-                   AND (ai.terminal_seq IS NULL OR e.seq <= ai.terminal_seq) \
-                   AND d.status = 'active' \
-                   AND d.dormant_at IS NULL \
-            )) \
-            AND NOT EXISTS ( \
-                SELECT 1 \
-                  FROM chat.application_intervals ai \
-                  JOIN chat.devices d \
-                    ON d.user_did = ai.recipient_did \
-                   AND d.device_id = ai.recipient_device_id \
-                  LEFT JOIN chat.device_entry_acks ack \
-                    ON ack.conversation_id = ai.conversation_id \
-                   AND ack.user_did = ai.recipient_did \
-                   AND ack.device_id = ai.recipient_device_id \
-                 WHERE ai.conversation_id = e.conversation_id \
-                   AND ai.generation = e.generation \
-                   AND ai.start_seq <= e.seq \
-                   AND (ai.terminal_seq IS NULL OR e.seq <= ai.terminal_seq) \
-                   AND d.status = 'active' \
-                   AND d.dormant_at IS NULL \
-                   AND COALESCE(ack.acked_through_seq, 0) < e.seq \
-                   AND EXISTS ( \
-                       SELECT 1 FROM chat.application_intervals current_interval \
-                        WHERE current_interval.conversation_id = ai.conversation_id \
-                          AND current_interval.recipient_did = ai.recipient_did \
-                          AND current_interval.recipient_device_id = ai.recipient_device_id \
-                          AND current_interval.terminal_seq IS NULL \
-                   ) \
-                   AND (NOT $4 OR EXISTS ( \
-                       SELECT 1 FROM chat.participants p \
-                        WHERE p.conversation_id = ai.conversation_id \
-                          AND p.user_did = ai.recipient_did \
-                          AND p.ds_did IS NULL \
-                   )) \
-            ) \
-          ORDER BY e.seq ASC",
+    let pruned = delivery::prune_acknowledged_application_payloads(
+        &mut tx,
+        input.conversation_id,
+        input.generation,
+        acked_seq,
+        is_remote,
+        now,
     )
-    .bind(input.conversation_id)
-    .bind(input.generation)
-    .bind(acked_seq)
-    .bind(is_remote)
-    .fetch_all(&mut *tx)
     .await
     .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-
-    let mut pruned_count: i64 = 0;
-    for seq in prunable_seqs {
-        let did_prune =
-            delivery::prune_application_entry_payload(&mut tx, input.conversation_id, seq, now)
-                .await
-                .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-        if did_prune {
-            pruned_count += 1;
-        }
+    if !is_remote {
+        // Pruning here is authoritative: the group's mirrors follow it.
+        crate::federation::group_relay::enqueue_entries_pruned_notices(
+            &mut tx,
+            input.conversation_id,
+            input.generation,
+            &pruned,
+            now,
+        )
+        .await
+        .map_err(signed_relay_failure)?;
     }
-
-    let _ = Duration::seconds(1);
+    if let Some(sequencer) = sequencer {
+        crate::federation::group_relay::enqueue_entry_ack_relay(
+            &mut tx,
+            &sequencer,
+            input.conversation_id,
+            input.generation,
+            &actor_did,
+            input.actor_device_id,
+            acked_seq,
+            now,
+        )
+        .await
+        .map_err(signed_relay_failure)?;
+    }
     tx.commit()
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
     let out = serde_json::to_vec(&json!({
         "acknowledgedSeq": acked_seq,
-        "prunedCount": pruned_count,
+        "prunedCount": pruned.len(),
     }))
     .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     Ok(context::json_ok(out))
+}
+
+/// An ACK whose relay or prune notice this DS cannot sign commits nothing: the
+/// declared `CutoverRequired` says the service is not ready for it.
+fn signed_relay_failure(error: crate::federation::group_relay::SignedRelayError) -> ChatFailure {
+    match error {
+        crate::federation::group_relay::SignedRelayError::SignerUnavailable => {
+            tracing::error!("acknowledgeEntries refused: no S2S signing key for its relay");
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::CutoverRequired)
+        }
+        crate::federation::group_relay::SignedRelayError::Storage(_) => {
+            ChatFailure::storage(ENDPOINT)
+        }
+    }
 }
 
 fn decode_signature_field(value: &Value) -> Result<[u8; 64], ChatFailure> {

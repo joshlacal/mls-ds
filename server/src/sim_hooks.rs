@@ -11,6 +11,71 @@
 //! only on its guarded loopback simulation pool sessions. Transaction isolation
 //! and committed-row visibility are unchanged; server crash durability is outside
 //! this model.
+//!
+//! The simulation trust bypasses (DID-document seeding, the test DID, host and
+//! relationship resolvers, the sim DS identity/transport hooks, the forged-state
+//! seeders of `chat_protocol::test_support`, and the allow-all relationship
+//! authority) exist only in `sim` and `test-support` builds. Each probe below
+//! compiles there and must fail to compile in a production build.
+//!
+#![cfg_attr(
+    not(any(feature = "sim", feature = "test-support")),
+    doc = "```compile_fail,E0425"
+)]
+#![cfg_attr(any(feature = "sim", feature = "test-support"), doc = "```no_run")]
+//! let _ = catbird_server::sim_hooks::seed_sim_did_document;
+//! ```
+//!
+#![cfg_attr(
+    not(any(feature = "sim", feature = "test-support")),
+    doc = "```compile_fail,E0599"
+)]
+#![cfg_attr(any(feature = "sim", feature = "test-support"), doc = "```no_run")]
+//! let _ = catbird_server::auth::AuthMiddleware::cache_did_document;
+//! ```
+//!
+#![cfg_attr(
+    not(any(feature = "sim", feature = "test-support")),
+    doc = "```compile_fail,E0599"
+)]
+#![cfg_attr(any(feature = "sim", feature = "test-support"), doc = "```no_run")]
+//! let _ = catbird_server::handlers::chat::ChatRuntime::with_sim_allow_all_relationships;
+//! ```
+//!
+#![cfg_attr(not(feature = "sim"), doc = "```compile_fail,E0412")]
+#![cfg_attr(feature = "sim", doc = "```no_run")]
+//! let _: Option<catbird_server::sim_hooks::SimDsHooks> = None;
+//! ```
+//!
+#![cfg_attr(not(feature = "test-support"), doc = "```compile_fail,E0433")]
+#![cfg_attr(feature = "test-support", doc = "```no_run")]
+//! let _ = catbird_server::chat_protocol::test_support::seed_clean_slate_pending_direct_request_fixture;
+//! ```
+//!
+#![cfg_attr(not(feature = "test-support"), doc = "```compile_fail,E0425")]
+#![cfg_attr(feature = "test-support", doc = "```no_run")]
+//! let _ = catbird_server::auth::cache_test_did_document;
+//! ```
+//!
+#![cfg_attr(not(feature = "test-support"), doc = "```compile_fail,E0425")]
+#![cfg_attr(feature = "test-support", doc = "```no_run")]
+//! let _ = catbird_server::auth::load_test_did_fixtures_from_env;
+//! ```
+//!
+#![cfg_attr(not(feature = "test-support"), doc = "```compile_fail,E0425")]
+#![cfg_attr(feature = "test-support", doc = "```no_run")]
+//! let _ = catbird_server::auth::install_test_https_did_resolver;
+//! ```
+//!
+#![cfg_attr(not(feature = "test-support"), doc = "```compile_fail,E0425")]
+#![cfg_attr(feature = "test-support", doc = "```no_run")]
+//! let _ = catbird_server::federation::resolver::install_test_fixture_host_resolver;
+//! ```
+//!
+#![cfg_attr(not(feature = "test-support"), doc = "```compile_fail,E0425")]
+#![cfg_attr(feature = "test-support", doc = "```no_run")]
+//! let _ = catbird_server::handlers::chat::install_test_https_relationship_resolver;
+//! ```
 
 use std::{
     cell::RefCell,
@@ -220,7 +285,7 @@ pub trait DsClock: Send + Sync {
         self.now_utc().timestamp_millis()
     }
 
-    /// Counter state owned by this deterministic clock, never shared across workers.
+    /// Replay state owned by this deterministic clock, never shared across workers.
     fn simulation_counters(&self) -> Option<&DsClockCounters> {
         None
     }
@@ -230,6 +295,22 @@ pub trait DsClock: Send + Sync {
     fn is_deterministic(&self) -> bool {
         self.simulation_counters().is_some()
     }
+
+    /// When this clock began serving: process start for the wall clock.
+    fn started_at(&self) -> DateTime<Utc> {
+        *PROCESS_STARTED_AT
+    }
+}
+
+static PROCESS_STARTED_AT: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
+
+/// Whole seconds the active scoped clock has served (process uptime when unscoped).
+pub fn uptime_secs() -> i64 {
+    let (now, started) = match active_scoped_clock() {
+        Some(clock) => (clock.now_utc(), clock.started_at()),
+        None => (Utc::now(), *PROCESS_STARTED_AT),
+    };
+    (now - started).num_seconds().max(0)
 }
 
 /// Production wall-clock implementation delegating directly to [`Utc::now`].
@@ -246,13 +327,16 @@ impl DsClock for SystemDsClock {
     }
 }
 
-/// Replay sequences owned by a deterministic clock instance.
+/// Replay sequences and DID caches owned by a deterministic clock instance.
 #[derive(Debug, Default)]
 pub struct DsClockCounters {
     entry_uuid: AtomicU64,
     outbound_jti: AtomicU64,
     tid_micros: AtomicU64,
     entropy: AtomicU64,
+    pub(crate) auth_did_cache: RwLock<HashMap<String, crate::auth::CachedDidDoc>>,
+    pub(crate) space_did_cache:
+        RwLock<HashMap<String, HashMap<String, crate::space_host::SimCachedDidEntry>>>,
 }
 
 impl DsClockCounters {
@@ -261,12 +345,21 @@ impl DsClockCounters {
         self.outbound_jti.store(0, Ordering::SeqCst);
         self.tid_micros.store(0, Ordering::SeqCst);
         self.entropy.store(0, Ordering::SeqCst);
+        self.auth_did_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.space_did_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
 /// Manually controlled simulation clock with atomic/synchronized stepping.
 pub struct ManualDsClock {
     current: RwLock<DateTime<Utc>>,
+    started: DateTime<Utc>,
     counters: DsClockCounters,
 }
 
@@ -282,6 +375,7 @@ impl ManualDsClock {
     pub fn new(initial: DateTime<Utc>) -> Self {
         Self {
             current: RwLock::new(initial),
+            started: initial,
             counters: DsClockCounters::default(),
         }
     }
@@ -298,7 +392,7 @@ impl ManualDsClock {
             .unwrap_or(DateTime::<Utc>::MAX_UTC);
     }
 
-    /// Restart this worker's UUID, JTI, TID, and capability-entropy sequences.
+    /// Restart this worker's ID/entropy sequences and clear its DID caches.
     ///
     /// Call only between runs, after this clock's queued work has been drained.
     /// The current timestamp is unchanged; use [`Self::set_utc`] to rewind it.
@@ -319,6 +413,11 @@ impl DsClock for ManualDsClock {
 
     fn simulation_counters(&self) -> Option<&DsClockCounters> {
         Some(&self.counters)
+    }
+
+    /// The initial instant, so uptime replays from simulated time alone.
+    fn started_at(&self) -> DateTime<Utc> {
+        self.started
     }
 }
 
@@ -411,6 +510,18 @@ pub(crate) fn mint_outbound_jti_uuid_v4(domain: &[u8], parts: &[&[u8]]) -> Uuid 
         sequence,
         domain,
         parts,
+    )
+}
+
+/// Mint a queue ULID using scoped time/entropy in simulations, OS entropy in production.
+pub(crate) fn mint_outbound_queue_ulid(parts: &[&[u8]]) -> ulid::Ulid {
+    let Some(clock) = active_scoped_clock().filter(|clock| clock.is_deterministic()) else {
+        return ulid::Ulid::new();
+    };
+    let entropy = mint_entry_uuid_v4(b"outbound_queue.enqueue", parts);
+    ulid::Ulid::from_parts(
+        clock.now_millis().max(0) as u64,
+        u128::from_be_bytes(*entropy.as_bytes()),
     )
 }
 
@@ -736,23 +847,70 @@ async fn migrate_and_seed_sim_database(db_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// How long the I/O a [`drive_sim_io`] call awaits may go without progress (any wake)
+/// before the call declares it stuck.
+pub const SIM_IO_STALL_LIMIT: Duration = Duration::from_secs(120);
+
 /// Keep the paused Tokio driver from advancing pool timers while real PostgreSQL
-/// I/O is pending. This caller-owned loop has a real deadline, no spawned task,
-/// and no assumption that a released connection must become idle.
+/// I/O is pending. This caller-owned loop spawns no task and assumes nothing about
+/// when a released connection becomes idle.
+///
+/// Wall time never decides a result: host load only stretches real I/O, so a call
+/// waits as long as the I/O it awaits keeps progressing (waking it). I/O without a
+/// single wake for [`SIM_IO_STALL_LIMIT`] is stuck: the process aborts with that
+/// diagnosis rather than return or unwind, so a stall fails the run without ever
+/// producing or altering a trace.
 pub async fn drive_sim_io<F: Future>(future: F) -> F::Output {
-    let started = std::time::Instant::now();
-    tokio::pin!(future);
+    drive_sim_io_within(future, SIM_IO_STALL_LIMIT).await
+}
+
+async fn drive_sim_io_within<F: Future>(future: F, stall_limit: Duration) -> F::Output {
+    let progress = Arc::new(SimIoProgress::default());
+    let waker = std::task::Waker::from(Arc::clone(&progress));
+    let mut future = std::pin::pin!(future);
+    let mut seen = 0;
+    let mut idle_since = std::time::Instant::now();
     loop {
-        tokio::select! {
-            biased;
-            result = &mut future => return result,
-            () = tokio::task::yield_now() => {}
+        // Polled on every turn, woken or not; only the progress bookkeeping is extra.
+        if let std::task::Poll::Ready(output) = future
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+        {
+            return output;
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "simulation I/O exceeded its 10s real-time deadline"
-        );
+        let wakes = progress.0.load(Ordering::Acquire);
+        if wakes != seen {
+            seen = wakes;
+            idle_since = std::time::Instant::now();
+        } else if idle_since.elapsed() >= stall_limit {
+            sim_io_stalled(idle_since.elapsed(), stall_limit);
+        }
+        tokio::task::yield_now().await;
     }
+}
+
+/// Counts wakes of the I/O a [`drive_sim_io`] loop polls; the loop re-polls every turn,
+/// so a wake needs no task to reschedule.
+#[derive(Default)]
+struct SimIoProgress(AtomicU64);
+
+impl std::task::Wake for SimIoProgress {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[cold]
+fn sim_io_stalled(idle: Duration, limit: Duration) -> ! {
+    eprintln!(
+        "simulation I/O made no progress for {idle:?} (stall limit {limit:?}): the PostgreSQL \
+         I/O it awaits is stuck; aborting the process, which records no trace"
+    );
+    std::process::abort()
 }
 
 /// Create (if absent), migrate, and open a `max_connections(1)` worker pool for `db_name`.
@@ -1142,9 +1300,9 @@ async fn build_reset_sql_batch(conn: &mut PgConnection) -> sqlx::Result<String> 
 /// [`compact_sim_postgres_schema`] to compact explicitly. Compaction and the
 /// insufficient-privilege TRUNCATE fallback are not covered by the <25ms target.
 ///
-/// A scoped clock's counters reset after success. Outside [`scope_ds_clock`],
-/// call [`ManualDsClock::reset_counters`] separately. Process-global production
-/// caches and seeded DID documents are untouched; deterministic requests bypass
+/// A scoped clock's replay state resets after success. Outside [`scope_ds_clock`],
+/// call [`ManualDsClock::reset_counters`] separately. Production caches are untouched;
+/// re-seed simulation DID documents after a reset. Deterministic requests bypass
 /// the global replay/rate/typing fast paths.
 pub async fn reset_sim_postgres_schema(pool: &PgPool) -> sqlx::Result<()> {
     reset_sim_postgres_schema_inner(pool, false).await
@@ -1510,8 +1668,10 @@ pub async fn audit_live_catalog_timestamp_defaults(
 // 5. Simulation Actor & Transcript Signing Helpers (No `test-support` Feature Needed)
 // =============================================================================
 
-/// Seed a synthetic actor [`crate::auth::DidDocument`] into the server's DID cache for
-/// offline deterministic simulation without outbound PLC/HTTPS calls.
+/// Seed a synthetic actor [`crate::auth::DidDocument`] into the active clock's DID cache.
+/// Call inside [`scope_ds_clock`] to keep workers isolated; re-seed after resetting it.
+/// Absent from production builds.
+#[cfg(any(test, feature = "test-support", feature = "sim"))]
 pub async fn seed_sim_did_document(doc: crate::auth::DidDocument) {
     crate::auth::cache_sim_did_document(doc).await;
 }
@@ -1588,6 +1748,131 @@ mod tests {
         let first_jti = with_ds_clock(first, || mint_outbound_jti_uuid_v4(b"jti-stream", &[]));
         let second_jti = with_ds_clock(second, || mint_outbound_jti_uuid_v4(b"jti-stream", &[]));
         assert_eq!(first_jti, second_jti);
+    }
+
+    #[test]
+    fn outbound_queue_ulids_replay_with_scoped_time_and_independent_workers() {
+        fn draw(clock: Arc<ManualDsClock>) -> [ulid::Ulid; 2] {
+            with_ds_clock(clock, || {
+                [
+                    mint_outbound_queue_ulid(&[b"peer", b"method", b"convo"]),
+                    mint_outbound_queue_ulid(&[b"peer", b"method", b"convo"]),
+                ]
+            })
+        }
+        let now = DateTime::<Utc>::from_timestamp(1_600_000_000, 123_000_000).unwrap();
+        let clock = Arc::new(ManualDsClock::new(now));
+        let expected = draw(clock.clone());
+        assert_ne!(expected[0], expected[1]);
+        assert!(expected
+            .iter()
+            .all(|id| id.timestamp_ms() == now.timestamp_millis() as u64));
+        let worker = std::thread::spawn(move || draw(Arc::new(ManualDsClock::new(now))));
+        assert_eq!(worker.join().unwrap(), expected);
+        clock.reset_counters();
+        assert_eq!(draw(clock), expected);
+    }
+
+    #[test]
+    fn uptime_follows_the_scoped_clock_not_the_host() {
+        let clock = Arc::new(ManualDsClock::new(
+            DateTime::<Utc>::from_timestamp(1_600_000_000, 0).unwrap(),
+        ));
+        with_ds_clock(clock.clone(), || {
+            assert_eq!(uptime_secs(), 0);
+            std::thread::sleep(std::time::Duration::from_millis(1_100));
+            assert_eq!(uptime_secs(), 0, "host time never reaches a sim clock");
+            clock.advance(TimeDelta::seconds(5));
+            assert_eq!(uptime_secs(), 5);
+        });
+    }
+
+    /// Host load only stretches real I/O; it must never decide a run. I/O that keeps
+    /// progressing completes however long the whole call takes (the former 10 s
+    /// whole-call real-time deadline panicked here, so load alone failed runs).
+    #[test]
+    fn io_that_keeps_progressing_completes_however_long_the_call_takes() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = std::thread::spawn(move || {
+            for step in 0..11_u32 {
+                std::thread::sleep(Duration::from_secs(1));
+                let _ = tx.send(step);
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let last = runtime.block_on(drive_sim_io(async move {
+            let mut last = None;
+            while let Some(step) = rx.recv().await {
+                last = Some(step);
+            }
+            last
+        }));
+        sender.join().unwrap();
+        assert_eq!(last, Some(10));
+    }
+
+    const STALL_CHILD: &str = "CATBIRD_SIM_IO_STALL_CHILD";
+
+    /// Child half of `io_without_progress_aborts_the_process_with_its_diagnosis`; a no-op
+    /// unless that test runs it.
+    #[test]
+    #[ignore = "spawned by io_without_progress_aborts_the_process_with_its_diagnosis"]
+    fn stalled_io_child() {
+        if std::env::var_os(STALL_CHILD).is_none() {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(drive_sim_io_within(
+            std::future::pending::<()>(),
+            Duration::from_millis(200),
+        ));
+    }
+
+    /// Stuck I/O still fails: a call whose I/O never wakes it ends the process, loudly and
+    /// without unwinding into the run, once it has made no progress for the stall limit.
+    #[test]
+    fn io_without_progress_aborts_the_process_with_its_diagnosis() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sim_hooks::tests::stalled_io_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(STALL_CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(!child.status.success(), "stuck I/O returned: {stderr}");
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&child.status),
+            Some(6),
+            "stuck I/O must abort, not unwind: {stderr}"
+        );
+        assert!(
+            stderr.contains("simulation I/O made no progress"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn outbound_queue_ulids_use_production_time_and_entropy_without_a_sim_clock() {
+        let before = Utc::now().timestamp_millis() as u64;
+        let first = mint_outbound_queue_ulid(&[b"same-input"]);
+        let second = with_ds_clock(Arc::new(SystemDsClock), || {
+            mint_outbound_queue_ulid(&[b"same-input"])
+        });
+        let after = Utc::now().timestamp_millis() as u64;
+        assert!((before..=after).contains(&first.timestamp_ms()));
+        assert!((before..=after).contains(&second.timestamp_ms()));
+        assert_ne!(first.random(), second.random());
     }
 
     #[test]

@@ -34,7 +34,9 @@ const SERVICE_AUTH_MAX_LIFETIME_SECONDS: i64 = 60;
 const SERVICE_AUTH_FUTURE_IAT_LEEWAY_SECONDS: i64 = 60;
 
 use crate::identity::{canonical_did, did_web_document_url};
-use crate::util::outbound_body::{decode_json_bounded, ResponseBodyBudget, DID_DOCUMENT_MAX_BYTES};
+use crate::util::outbound_body::{
+    decode_json_bounded, OutboundBodyError, ResponseBodyBudget, DID_DOCUMENT_MAX_BYTES,
+};
 
 fn audience_matches_expected(claimed: &str, expected: &str) -> bool {
     claimed == expected || (expected.contains('#') && claimed == canonical_did(expected))
@@ -58,8 +60,15 @@ pub enum AuthError {
     #[error("Invalid DID format: {0}")]
     InvalidDid(String),
 
+    /// The DID's authority answered definitively (4xx, malformed or oversized
+    /// document) or local policy refuses its host: retrying changes nothing.
     #[error("Failed to resolve DID document: {0}")]
     DidResolutionFailed(String),
+
+    /// The DID document could not be fetched now (DNS, connect, deadline, body
+    /// read, or the authority's 5xx/429). Nothing was decided about the caller.
+    #[error("DID document temporarily unavailable: {0}")]
+    DidResolutionUnavailable(String),
 
     #[error("Invalid signature")]
     InvalidSignature,
@@ -92,6 +101,18 @@ pub enum AuthError {
     Internal(String),
 }
 
+impl AuthError {
+    /// The caller could not be authenticated *now* and nothing was decided:
+    /// the identical request may succeed later. `Internal` (this DS's own
+    /// replay-store failure) is a storage failure, not included here.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::DidResolutionUnavailable(_) | Self::RateLimitExceeded { .. }
+        )
+    }
+}
+
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         // ATProto-compatible error format: { "error": "ErrorName", "message": "Human-readable" }
@@ -110,6 +131,11 @@ impl IntoResponse for AuthError {
             AuthError::DidResolutionFailed(_) => (
                 StatusCode::BAD_REQUEST,
                 "DidResolutionFailed",
+                self.to_string(),
+            ),
+            AuthError::DidResolutionUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DidResolutionUnavailable",
                 self.to_string(),
             ),
             AuthError::InvalidSignature => (
@@ -174,12 +200,17 @@ impl IntoResponse for AuthError {
 
         let mut resp = (status, body).into_response();
 
-        // Attach Retry-After header for rate limit responses
-        if let AuthError::RateLimitExceeded { retry_after_secs } = &self {
-            if let Ok(val) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
-                resp.headers_mut()
-                    .insert(axum::http::header::RETRY_AFTER, val);
-            }
+        // Attach Retry-After header for retryable responses
+        let retry_after_secs = match &self {
+            AuthError::RateLimitExceeded { retry_after_secs } => Some(*retry_after_secs),
+            AuthError::DidResolutionUnavailable(_) => Some(5),
+            _ => None,
+        };
+        if let Some(retry_after_secs) = retry_after_secs {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(retry_after_secs),
+            );
         }
 
         resp
@@ -250,10 +281,7 @@ pub struct Service {
 #[derive(Debug, Clone)]
 pub struct CachedDidDoc {
     doc: DidDocument,
-    /// Insertion timestamp. Currently only consumed via Debug; kept as a future
-    /// hook for staleness assertions and cache-introspection logging.
-    /// TODO(phase-2.5-cleanup): wire into `/health/auth-cache` diagnostics or remove.
-    #[allow(dead_code)]
+    /// Insertion time used for simulation-clock TTL checks.
     cached_at: DateTime<Utc>,
 }
 
@@ -354,6 +382,7 @@ impl std::fmt::Debug for VerifiedGatewayBearer {
 #[derive(Clone)]
 pub struct AuthMiddleware {
     did_cache: Cache<String, CachedDidDoc>,
+    did_cache_ttl: Duration,
     rate_limiters:
         Arc<moka::sync::Cache<String, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>,
     http_client: reqwest::Client,
@@ -413,6 +442,7 @@ impl AuthMiddleware {
 
         Self {
             did_cache,
+            did_cache_ttl: Duration::from_secs(cache_ttl_seconds),
             rate_limiters: Arc::new(
                 moka::sync::Cache::builder()
                     .max_capacity(50_000)
@@ -802,7 +832,7 @@ impl AuthMiddleware {
         }
 
         // Check cache first
-        if let Some(cached) = self.did_cache.get(did).await {
+        if let Some(cached) = self.cached_did_document(did).await {
             debug!(
                 did = %crate::crypto::redact_for_log(did),
                 "DID document cache hit"
@@ -836,21 +866,56 @@ impl AuthMiddleware {
         resolution: Result<DidDocument, AuthError>,
     ) -> Result<DidDocument, AuthError> {
         let doc = resolution?;
-        let cached = CachedDidDoc {
-            doc: doc.clone(),
-            cached_at: crate::sim_hooks::current_utc(),
-        };
-        self.did_cache.insert(did.to_string(), cached).await;
+        self.insert_did_document(did.to_string(), doc.clone()).await;
 
         Ok(doc)
     }
 
+    /// Trust `doc` without resolving it. Absent from production builds.
+    #[cfg(any(test, feature = "test-support", feature = "sim"))]
     pub async fn cache_did_document(&self, doc: DidDocument) {
+        self.insert_did_document(doc.id.clone(), doc).await;
+    }
+
+    async fn cached_did_document(&self, did: &str) -> Option<CachedDidDoc> {
+        if let Some(clock) =
+            crate::sim_hooks::active_scoped_clock().filter(|clock| clock.is_deterministic())
+        {
+            let counters = clock
+                .simulation_counters()
+                .expect("deterministic clocks own simulation counters");
+            let cached = counters
+                .auth_did_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(did)
+                .cloned()?;
+            return (clock.now_utc() - cached.cached_at)
+                .to_std()
+                .is_ok_and(|age| age < self.did_cache_ttl)
+                .then_some(cached);
+        }
+        self.did_cache.get(did).await
+    }
+
+    async fn insert_did_document(&self, did: String, doc: DidDocument) {
         let cached = CachedDidDoc {
-            doc: doc.clone(),
+            doc,
             cached_at: crate::sim_hooks::current_utc(),
         };
-        self.did_cache.insert(doc.id.clone(), cached).await;
+        if let Some(clock) =
+            crate::sim_hooks::active_scoped_clock().filter(|clock| clock.is_deterministic())
+        {
+            clock
+                .simulation_counters()
+                .expect("deterministic clocks own simulation counters")
+                .auth_did_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(did, cached);
+        } else {
+            self.did_cache.insert(did, cached).await;
+        }
     }
 
     fn build_pinned_did_http_client(
@@ -865,7 +930,7 @@ impl AuthMiddleware {
             builder = builder.resolve_to_addrs(host, resolved_addrs);
         }
         builder.build().map_err(|e| {
-            AuthError::DidResolutionFailed(format!("failed to build pinned HTTP client: {e}"))
+            AuthError::DidResolutionUnavailable(format!("failed to build pinned HTTP client: {e}"))
         })
     }
 
@@ -1007,47 +1072,39 @@ impl AuthMiddleware {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.did_resolution_timeout)
             .ok_or_else(|| {
-                AuthError::DidResolutionFailed(
+                AuthError::DidResolutionUnavailable(
                     "DID resolution deadline could not be represented".to_string(),
                 )
             })?;
-        #[cfg(feature = "sim")]
-        if let Some(response) = crate::sim_hooks::intercept_sim_http(&request) {
-            let response = tokio::time::timeout_at(deadline, response)
-                .await
-                .map_err(|_| {
-                    AuthError::DidResolutionFailed("DID resolution deadline exceeded".to_string())
-                })?
-                .map_err(|error| {
-                    AuthError::DidResolutionFailed(format!(
+        // The simulation transport replaces only the send; both paths share the
+        // status check and the one bounded decoder below.
+        let sent = async move {
+            #[cfg(feature = "sim")]
+            if let Some(response) = crate::sim_hooks::intercept_sim_http(&request) {
+                return response.await.map_err(|error| {
+                    AuthError::DidResolutionUnavailable(format!(
                         "DID resolution request failed: {error}"
                     ))
-                })?;
-            if !response.status().is_success() {
-                return Err(AuthError::DidResolutionFailed(status_error(
-                    response.status(),
-                )));
+                });
             }
-            return decode_json_bounded(
-                response,
-                ResponseBodyBudget::new(DID_DOCUMENT_MAX_BYTES, deadline),
-            )
-            .await
-            .map_err(|error| {
-                AuthError::DidResolutionFailed(format!("Failed to parse DID document: {error}"))
-            });
-        }
-        let response = tokio::time::timeout_at(deadline, request.send())
+            request.send().await.map_err(map_did_request_error)
+        };
+        let response = tokio::time::timeout_at(deadline, sent)
             .await
             .map_err(|_| {
-                AuthError::DidResolutionFailed("DID resolution deadline exceeded".to_string())
-            })?
-            .map_err(map_did_request_error)?;
+                AuthError::DidResolutionUnavailable("DID resolution deadline exceeded".to_string())
+            })??;
 
-        if !response.status().is_success() {
-            return Err(AuthError::DidResolutionFailed(status_error(
-                response.status(),
-            )));
+        let status = response.status();
+        if !status.is_success() {
+            let reason = status_error(status);
+            // The authority's 5xx/429 decided nothing; any other status is its answer.
+            let retryable = status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS;
+            return Err(if retryable {
+                AuthError::DidResolutionUnavailable(reason)
+            } else {
+                AuthError::DidResolutionFailed(reason)
+            });
         }
 
         decode_json_bounded(
@@ -1055,8 +1112,16 @@ impl AuthMiddleware {
             ResponseBodyBudget::new(DID_DOCUMENT_MAX_BYTES, deadline),
         )
         .await
-        .map_err(|error| {
-            AuthError::DidResolutionFailed(format!("Failed to parse DID document: {error}"))
+        .map_err(|error| match error {
+            OutboundBodyError::DeadlineExceeded | OutboundBodyError::ReadFailed(_) => {
+                AuthError::DidResolutionUnavailable(format!("DID document read failed: {error}"))
+            }
+            OutboundBodyError::DeclaredTooLarge { .. }
+            | OutboundBodyError::StreamedTooLarge { .. }
+            | OutboundBodyError::LengthOverflow
+            | OutboundBodyError::InvalidJson(_) => {
+                AuthError::DidResolutionFailed(format!("Failed to parse DID document: {error}"))
+            }
         })
     }
     /// Check rate limit for a DID
@@ -1086,7 +1151,7 @@ fn map_did_request_error(error: reqwest::Error) -> AuthError {
         did_resolution_error_is_builder = error.is_builder(),
         "DID resolution HTTP request failed"
     );
-    AuthError::DidResolutionFailed("DID resolution HTTP request failed".into())
+    AuthError::DidResolutionUnavailable("DID resolution HTTP request failed".into())
 }
 
 impl Default for AuthMiddleware {
@@ -1248,13 +1313,16 @@ pub async fn cache_test_did_document(doc: DidDocument) {
     shared_auth_middleware_ref().cache_did_document(doc).await;
 }
 
+#[cfg(any(test, feature = "test-support", feature = "sim"))]
 pub(crate) async fn cache_sim_did_document(doc: DidDocument) {
     shared_auth_middleware_ref().cache_did_document(doc).await;
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub async fn get_cached_test_did_document_json(did: &str) -> Option<serde_json::Value> {
-    let cached = shared_auth_middleware_ref().did_cache.get(did).await?;
+    let cached = shared_auth_middleware_ref()
+        .cached_did_document(did)
+        .await?;
     serde_json::to_value(&cached.doc).ok()
 }
 pub fn is_test_fixture_host(host: &str) -> bool {
@@ -1522,12 +1590,14 @@ async fn validate_resolved_host_is_public(
         return Ok(vec![std::net::SocketAddr::new(ip, port)]);
     }
 
+    // getaddrinfo types no NXDOMAIN apart from a temporary failure, so a
+    // failed lookup decided nothing: retry rather than refuse the caller.
     let addrs: Vec<std::net::SocketAddr> = {
         #[cfg(feature = "sim")]
         if let Some(result) = crate::sim_hooks::intercept_sim_dns(host) {
             result
                 .map_err(|error| {
-                    AuthError::DidResolutionFailed(format!("DNS resolution failed: {error}"))
+                    AuthError::DidResolutionUnavailable(format!("DNS resolution failed: {error}"))
                 })?
                 .into_iter()
                 .map(|ip| std::net::SocketAddr::new(ip, port))
@@ -1535,14 +1605,18 @@ async fn validate_resolved_host_is_public(
         } else {
             tokio::net::lookup_host((host, port))
                 .await
-                .map_err(|e| AuthError::DidResolutionFailed(format!("DNS resolution failed: {e}")))?
+                .map_err(|e| {
+                    AuthError::DidResolutionUnavailable(format!("DNS resolution failed: {e}"))
+                })?
                 .collect()
         }
         #[cfg(not(feature = "sim"))]
         {
             tokio::net::lookup_host((host, port))
                 .await
-                .map_err(|e| AuthError::DidResolutionFailed(format!("DNS resolution failed: {e}")))?
+                .map_err(|e| {
+                    AuthError::DidResolutionUnavailable(format!("DNS resolution failed: {e}"))
+                })?
                 .collect()
         }
     };
@@ -1766,26 +1840,6 @@ pub(crate) async fn verify_mls_service_principal(
     pool: &crate::storage::DbPool,
     endpoint_nsid: &str,
 ) -> Result<VerifiedServicePrincipal, AuthError> {
-    verify_mls_service_principal_with(headers, pool, endpoint_nsid, true).await
-}
-
-/// [`verify_mls_service_principal`] without its per-issuer quotas. Only for a
-/// route that meters the verified principal itself: the Space authority
-/// policy routes, whose single issuer calls on behalf of every user.
-pub(crate) async fn verify_mls_service_principal_without_issuer_quota(
-    headers: &axum::http::HeaderMap,
-    pool: &crate::storage::DbPool,
-    endpoint_nsid: &str,
-) -> Result<VerifiedServicePrincipal, AuthError> {
-    verify_mls_service_principal_with(headers, pool, endpoint_nsid, false).await
-}
-
-async fn verify_mls_service_principal_with(
-    headers: &axum::http::HeaderMap,
-    pool: &crate::storage::DbPool,
-    endpoint_nsid: &str,
-    issuer_quota: bool,
-) -> Result<VerifiedServicePrincipal, AuthError> {
     let authorization = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -1800,15 +1854,13 @@ async fn verify_mls_service_principal_with(
     let now = crate::sim_hooks::current_utc().timestamp();
     let (issuer, iat) = validate_mls_service_claims(&claims, endpoint_nsid, now)?;
     enforce_standard_with_replay_store(&claims, endpoint_nsid, pool).await?;
-    if issuer_quota {
-        AUTH_MIDDLEWARE.check_rate_limit(issuer)?;
-        if let Err(retry_after) =
-            crate::middleware::rate_limit::DID_RATE_LIMITER.check_did_limit(issuer, endpoint_nsid)
-        {
-            return Err(AuthError::RateLimitExceeded {
-                retry_after_secs: retry_after,
-            });
-        }
+    AUTH_MIDDLEWARE.check_rate_limit(issuer)?;
+    if let Err(retry_after) =
+        crate::middleware::rate_limit::DID_RATE_LIMITER.check_did_limit(issuer, endpoint_nsid)
+    {
+        return Err(AuthError::RateLimitExceeded {
+            retry_after_secs: retry_after,
+        });
     }
 
     Ok(VerifiedServicePrincipal {
@@ -2064,6 +2116,105 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn did_caches_are_clock_local_across_workers_and_reset_with_the_run() {
+        use crate::sim_hooks::{scope_ds_clock, ManualDsClock};
+
+        let did = "did:web:scoped-auth-cache.test";
+        let document = |endpoint: &str| DidDocument {
+            id: did.to_string(),
+            verification_method: Vec::new(),
+            service: Some(vec![Service {
+                id: "#atproto_pds".to_string(),
+                service_type: "AtprotoPersonalDataServer".to_string(),
+                service_endpoint: endpoint.to_string(),
+            }]),
+        };
+        let middleware = Arc::new(AuthMiddleware::with_config(300, 100, 60));
+        middleware.cache_did_document(document("production")).await;
+        let t0 = DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        let first = Arc::new(ManualDsClock::new(t0));
+        let second = Arc::new(ManualDsClock::new(t0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let spawn_run = |clock: Arc<ManualDsClock>, endpoint: &'static str, reset: bool| {
+            let middleware = Arc::clone(&middleware);
+            let barrier = Arc::clone(&barrier);
+            let doc = document(endpoint);
+            tokio::spawn(scope_ds_clock(clock.clone(), async move {
+                let was_cold = middleware.cached_did_document(did).await.is_none();
+                middleware.cache_did_document(doc).await;
+                barrier.wait().await;
+                tokio::task::yield_now().await;
+                let cached = middleware.cached_did_document(did).await;
+                let production_cached = middleware.did_cache.get(did).await.is_some();
+                if reset {
+                    clock.reset_counters();
+                }
+                barrier.wait().await;
+                assert!(was_cold);
+                assert_eq!(
+                    cached.unwrap().doc.service.unwrap()[0].service_endpoint,
+                    endpoint
+                );
+                assert!(production_cached);
+                if reset {
+                    assert!(middleware.cached_did_document(did).await.is_none());
+                }
+                if !reset {
+                    assert!(middleware.cached_did_document(did).await.is_some());
+                    clock.advance(chrono::TimeDelta::seconds(300));
+                    assert!(middleware.cached_did_document(did).await.is_none());
+                }
+            }))
+        };
+        let (first, second) = tokio::join!(
+            spawn_run(first, "worker-a", true),
+            spawn_run(second, "worker-b", false),
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(
+            middleware.resolve_did(did).await.unwrap().service.unwrap()[0].service_endpoint,
+            "production"
+        );
+
+        // The process-wide middleware follows the same clock-owned storage path.
+        let shared_clock = Arc::new(ManualDsClock::new(t0));
+        scope_ds_clock(shared_clock.clone(), async {
+            cache_sim_did_document(document("shared-scoped")).await;
+            assert_eq!(
+                shared_auth_middleware()
+                    .resolve_did(did)
+                    .await
+                    .unwrap()
+                    .service
+                    .unwrap()[0]
+                    .service_endpoint,
+                "shared-scoped"
+            );
+        })
+        .await;
+        assert!(shared_auth_middleware_ref()
+            .did_cache
+            .get(did)
+            .await
+            .is_none());
+        scope_ds_clock(Arc::new(ManualDsClock::new(t0)), async {
+            assert!(shared_auth_middleware_ref()
+                .cached_did_document(did)
+                .await
+                .is_none());
+        })
+        .await;
+        scope_ds_clock(shared_clock, async {
+            assert!(shared_auth_middleware_ref()
+                .cached_did_document(did)
+                .await
+                .is_some());
+        })
+        .await;
+    }
 
     #[test]
     fn did_document_resolution_has_no_unbounded_success_collector() {
@@ -2323,6 +2474,8 @@ mod tests {
         let diagnostic = format!("{error:?} {error}");
         assert!(diagnostic.contains("deadline exceeded"));
         assert!(!diagnostic.contains(&url), "{diagnostic}");
+        // A read that ran out of time decided nothing about the caller.
+        assert!(error.is_retryable(), "{diagnostic}");
     }
 
     #[test]
@@ -2370,6 +2523,60 @@ mod tests {
             );
             assert!(started.elapsed() < Duration::from_secs(1));
         }
+    }
+
+    /// An authority that could not answer now (5xx, 429, or unreachable) decided
+    /// nothing about the caller: a retryable 503 with `Retry-After`. Its 4xx is
+    /// a definitive refusal.
+    #[tokio::test]
+    async fn did_document_outages_are_retryable_503_and_authority_refusals_stay_400() {
+        let middleware = did_test_middleware(Duration::from_secs(5));
+        for (status_line, retryable) in [
+            ("503 Service Unavailable", true),
+            ("429 Too Many Requests", true),
+            ("404 Not Found", false),
+            ("410 Gone", false),
+        ] {
+            let header =
+                format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let url = spawn_raw_http_response(vec![(Duration::ZERO, header.into_bytes())]).await;
+            let error = middleware
+                .send_and_decode_did_document(middleware.http_client.get(url), |status| {
+                    format!("authority returned {status}")
+                })
+                .await
+                .expect_err("non-success status");
+            assert_eq!(error.is_retryable(), retryable, "{status_line}");
+            let response = error.into_response();
+            let (status, retry_after) = if retryable {
+                (StatusCode::SERVICE_UNAVAILABLE, Some("5"))
+            } else {
+                (StatusCode::BAD_REQUEST, None)
+            };
+            assert_eq!(response.status(), status, "{status_line}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .map(|value| value.to_str().unwrap()),
+                retry_after,
+                "{status_line}"
+            );
+        }
+
+        let closed = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}/did.json", closed.local_addr().unwrap());
+        drop(closed);
+        let refused = middleware
+            .send_and_decode_did_document(middleware.http_client.get(url), |_| {
+                unreachable!("nothing listens")
+            })
+            .await
+            .expect_err("connection refused");
+        assert!(
+            matches!(refused, AuthError::DidResolutionUnavailable(_)),
+            "{refused}"
+        );
     }
 
     #[tokio::test]
@@ -3428,13 +3635,14 @@ mod tests {
 }
 
 #[cfg(test)]
-mod federation_fixture_tests {
+pub(crate) mod federation_fixture_tests {
     use super::*;
     use p256::ecdsa::SigningKey;
     use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
     use tokio::sync::Mutex;
 
-    pub(super) static TEST_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    /// Serializes every lib test that mutates process environment variables.
+    pub(crate) static TEST_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     struct EnvVarCleanup(&'static [&'static str]);
 

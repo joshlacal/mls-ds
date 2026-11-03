@@ -38,10 +38,6 @@ make migrate
 make deploy
 # or: ./deploy-update.sh
 
-# Fresh deploy (wipes database)
-make deploy-fresh
-# or: ./deploy-fresh.sh
-
 # Restart the server
 make restart
 # or: sudo systemctl restart catbird-mls-server
@@ -58,11 +54,9 @@ make status
 ### Database Operations
 
 ```bash
-# Clear all data (with confirmation)
-make clear-db
-
-# Clear all data (no confirmation)
-make clear-db-fast
+# Drop, recreate and migrate a local federation stack database (refuses anything else)
+CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
+  make reset-dev-db URL=postgresql://catbird:catbird_dev_password@localhost:5433/catbird
 
 # Backup database
 make backup

@@ -566,16 +566,15 @@ async fn publish_direct_keys(
     Ok(())
 }
 
-/// Real signed prepareDirectRequest from `sender` to `recipient_did`, then the
-/// sender's native engine builds the bootstrap and the signed publication.
-/// Returns (signed publication, request id, candidate conversation id).
-async fn prepare_direct_publication(
+/// One real signed prepareDirectRequest from `sender` to `recipient_did`.
+/// Returns (status, response, signed prepare, request id, first message id,
+/// candidate conversation id).
+async fn post_direct_prepare(
     f: &live_direct_request::PublishedRequestFixture,
     sender: &ServiceIdentity,
     engine: &MlsEngine,
     recipient_did: &str,
-    text: &str,
-) -> anyhow::Result<(Value, Uuid, Uuid)> {
+) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>, Value, Uuid, Uuid, Uuid)> {
     let identity = format!("{}#{}", sender.did, sender.device_id);
     let public = engine.identity_public_key(&identity)?;
     let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&public));
@@ -604,7 +603,7 @@ async fn prepare_direct_publication(
             "signedAt": canonical_now()
         }),
     )?;
-    let (prepare_status, prepare_body) = sender
+    let (status, body) = sender
         .post(
             &f.client,
             &f.server.base_url,
@@ -613,6 +612,24 @@ async fn prepare_direct_publication(
             true,
         )
         .await?;
+    Ok((status, body, prepare, request_id, first_msg_id, candidate))
+}
+
+/// Real signed prepareDirectRequest from `sender` to `recipient_did`, then the
+/// sender's native engine builds the bootstrap and the signed publication.
+/// Returns (signed publication, request id, candidate conversation id).
+async fn prepare_direct_publication(
+    f: &live_direct_request::PublishedRequestFixture,
+    sender: &ServiceIdentity,
+    engine: &MlsEngine,
+    recipient_did: &str,
+    text: &str,
+) -> anyhow::Result<(Value, Uuid, Uuid)> {
+    let identity = format!("{}#{}", sender.did, sender.device_id);
+    let public = engine.identity_public_key(&identity)?;
+    let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&public));
+    let (prepare_status, prepare_body, prepare, request_id, first_msg_id, candidate) =
+        post_direct_prepare(f, sender, engine, recipient_did).await?;
     anyhow::ensure!(
         prepare_status == reqwest::StatusCode::OK,
         "{} prepare failed {prepare_status}: {}",
@@ -701,6 +718,8 @@ async fn prepare_direct_publication(
         authority_import_until,
         preparation_request_digest: *verified_prepare.request_digest(),
         receipt_authority_key: f.server.receipt_public_key.clone(),
+        sequencer_did: "did:web:chat.catbird.blue".into(),
+        sequencer_receipt_authority_key: f.server.sequencer_receipt_public_key.clone(),
         text: text.into(),
         invitation: None,
         metadata: GroupMetadataV1 {
@@ -709,6 +728,7 @@ async fn prepare_direct_publication(
             description: String::new(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            space_avatar: None,
         },
     })?;
     let bootstrap = &journal.bootstrap;
@@ -719,6 +739,7 @@ async fn prepare_direct_publication(
     body["preparationDigest"] = prep_snapshot["preparationDigest"].clone();
     body["preparationRequestDigest"] = json!(STANDARD.encode(verified_prepare.request_digest()));
     body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
+    body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
     body["next"] = bootstrap.coordinates.clone();
     body["importUntil"] = json!(
         chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)
@@ -882,7 +903,7 @@ async fn c14_crossed_starts_yield_single_direct_and_existing_direct_receipt() ->
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn c14_concurrent_crossed_publications_barrier_one_direct() -> anyhow::Result<()> {
+async fn c14_crossed_first_sends_pair_owner_fence_one_direct() -> anyhow::Result<()> {
     // Registered pair; close the fixture's direct so neither side has one.
     let f = live_direct_request::publish_request(false).await?;
     release_by_close(&f).await?;
@@ -890,7 +911,7 @@ async fn c14_concurrent_crossed_publications_barrier_one_direct() -> anyhow::Res
     publish_direct_keys(&f, &f.alice, alice_engine, 1).await?;
     publish_direct_keys(&f, &f.bob, &f.bob_engine, 2).await?;
 
-    // Both sides prepare real candidates (A -> B and B -> A) before either publishes.
+    // Alice's first send prepares first and owns the pair (A -> B).
     let (a_pub, a_req, a_convo) = prepare_direct_publication(
         &f,
         &f.alice,
@@ -899,135 +920,93 @@ async fn c14_concurrent_crossed_publications_barrier_one_direct() -> anyhow::Res
         "Alice crossed start",
     )
     .await?;
-    let (b_pub, b_req, b_convo) =
-        prepare_direct_publication(&f, &f.bob, &f.bob_engine, &f.alice.did, "Bob crossed start")
-            .await?;
+    let alice_packages = format!(
+        "SELECT coalesce(string_agg(status,',' ORDER BY key_package_ref),'') FROM chat.key_packages WHERE owner_did='{}'",
+        f.alice.did
+    );
+    let a_attempt = format!(
+        "SELECT to_jsonb(a)::text FROM chat.direct_request_attempts a WHERE request_id='{a_req}'"
+    );
+    let (packages_before, a_before) = (psql_cmd(&alice_packages)?, psql_cmd(&a_attempt)?);
 
-    // Both publications queue behind a barrier holding the request budget and
-    // both principals' locks, then are released together.
-    let barrier = Barrier::hold(&[&f.alice.did, &f.bob.did])?;
-    let a_future = {
-        let (who, client, base, env) = (
-            f.alice.clone(),
-            f.client.clone(),
-            f.server.base_url.clone(),
-            json!({"signedRequest": a_pub.clone()}),
-        );
-        tokio::spawn(async move {
-            who.post(
-                &client,
-                &base,
-                "blue.catbird.chat.publishDirectRequest",
-                &env,
-                true,
-            )
-            .await
-        })
-    };
-    let b_future = {
-        let (who, client, base, env) = (
-            f.bob.clone(),
-            f.client.clone(),
-            f.server.base_url.clone(),
-            json!({"signedRequest": b_pub.clone()}),
-        );
-        tokio::spawn(async move {
-            who.post(
-                &client,
-                &base,
-                "blue.catbird.chat.publishDirectRequest",
-                &env,
-                true,
-            )
-            .await
-        })
-    };
-    let queued = barrier.wait_for_waiters(2).await?;
-    barrier.release()?;
-    let (a_status, a_bytes) = a_future.await??;
-    let (b_status, b_bytes) = b_future.await??;
+    // Bob's opposite-direction first send while Alice's lease is live is refused
+    // by the pair-owner fence (one pair owner across both directions, as C33
+    // requires): the plain PreparationConflict error, before any attempt,
+    // reservation or candidate conversation.
+    let (b_status, b_bytes, _, b_req, _, b_convo) =
+        post_direct_prepare(&f, &f.bob, &f.bob_engine, &f.alice.did).await?;
+    assert_eq!(
+        b_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&b_bytes)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b_bytes)?,
+        json!({"error":"PreparationConflict","message":"PreparationConflict"})
+    );
+    assert_eq!(
+        psql_cmd(&format!(
+            "SELECT (SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{b_req}')||'|'||\
+                    (SELECT count(*) FROM chat.direct_request_selected_devices WHERE request_id='{b_req}')||'|'||\
+                    (SELECT count(*) FROM chat.conversations WHERE conversation_id='{b_convo}')"
+        ))?,
+        "0|0|0",
+        "fenced opposite-direction prepare writes nothing"
+    );
+    assert_eq!(
+        psql_cmd(&alice_packages)?,
+        packages_before,
+        "no package of the pair owner reserved"
+    );
+    assert_eq!(
+        psql_cmd(&a_attempt)?,
+        a_before,
+        "the pair owner's lease is untouched"
+    );
+
+    // The pair owner publishes: exactly one active direct for the pair.
+    let (a_status, a_bytes) = f
+        .alice
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.publishDirectRequest",
+            &json!({"signedRequest": a_pub.clone()}),
+            true,
+        )
+        .await?;
     anyhow::ensure!(
         a_status == reqwest::StatusCode::OK,
         "Alice publish {a_status}: {}",
         String::from_utf8_lossy(&a_bytes)
     );
-    anyhow::ensure!(
-        b_status == reqwest::StatusCode::OK,
-        "Bob publish {b_status}: {}",
-        String::from_utf8_lossy(&b_bytes)
-    );
     let a_receipt =
         serde_json::from_slice::<Value>(&a_bytes)?["outcome"]["body"]["receipt"].clone();
-    let b_receipt =
-        serde_json::from_slice::<Value>(&b_bytes)?["outcome"]["body"]["receipt"].clone();
-    const PUBLISHED: &str = "blue.catbird.chat.defs#directRequestPublishedReceipt";
-    const EXISTING: &str = "blue.catbird.chat.defs#directRequestExistingDirectReceipt";
-    let alice_won = a_receipt["$type"] == PUBLISHED;
-    let (winner_convo, loser_convo, loser_req, loser_receipt, winner_pub) = if alice_won {
-        assert_eq!(
-            b_receipt["$type"], EXISTING,
-            "loser must get existing-direct receipt: {b_receipt}"
-        );
-        (a_convo, b_convo, b_req, &b_receipt, &a_pub)
-    } else {
-        assert_eq!(
-            b_receipt["$type"], PUBLISHED,
-            "exactly one publication must win: {a_receipt} / {b_receipt}"
-        );
-        assert_eq!(
-            a_receipt["$type"], EXISTING,
-            "loser must get existing-direct receipt: {a_receipt}"
-        );
-        (b_convo, a_convo, a_req, &a_receipt, &b_pub)
-    };
-    eprintln!(
-        "C14 concurrent crossed start: queued={queued} winner={}",
-        if alice_won { "alice" } else { "bob" }
-    );
     assert_eq!(
-        loser_receipt["conversationId"],
-        winner_convo.to_string(),
-        "loser receipt names the winner"
+        a_receipt["$type"], "blue.catbird.chat.defs#directRequestPublishedReceipt",
+        "the pair owner's publication wins: {a_receipt}"
     );
-    assert_eq!(
-        loser_receipt["requiresAcceptance"], true,
-        "loser is pending recipient; nothing silently accepted"
-    );
-
     let (did_low, did_high) = if f.alice.did < f.bob.did {
         (&f.alice.did, &f.bob.did)
     } else {
         (&f.bob.did, &f.alice.did)
     };
     assert_eq!(
-        psql_cmd(&format!("SELECT count(*) FROM chat.conversations WHERE kind='direct' AND lifecycle='active' AND direct_did_low='{did_low}' AND direct_did_high='{did_high}'"))?,
-        "1",
-        "exactly one active direct for the pair"
+        psql_cmd(&format!("SELECT string_agg(conversation_id::text,',') FROM chat.conversations WHERE kind='direct' AND lifecycle='active' AND direct_did_low='{did_low}' AND direct_did_high='{did_high}'"))?,
+        a_convo.to_string(),
+        "exactly one active direct for the pair: the owner's"
     );
     assert_eq!(
-        psql_cmd(&format!(
-            "SELECT count(*) FROM chat.conversations WHERE conversation_id='{loser_convo}'"
-        ))?,
-        "0",
-        "loser candidate not created"
-    );
-    assert_eq!(
-        psql_cmd(&format!(
-            "SELECT count(*) FROM chat.direct_request_publications WHERE request_id='{loser_req}'"
-        ))?,
-        "0",
-        "loser ciphertext not transplanted"
-    );
-    assert_eq!(
-        psql_cmd(&format!("SELECT count(*) FROM chat.transitions WHERE conversation_id='{winner_convo}' AND kind='directRequestAcceptance'"))?,
+        psql_cmd(&format!("SELECT count(*) FROM chat.transitions WHERE conversation_id='{a_convo}' AND kind='directRequestAcceptance'"))?,
         "0",
         "no acceptance recorded for the winner"
     );
 
     // Release capacity: close the winner through the real signed RPC.
-    let (close_env, _) = close_envelope(&f, alice_won, Some(winner_pub["body"]["next"].clone()))?;
-    let who = if alice_won { &f.alice } else { &f.bob };
-    let (close_status, close_bytes) = who
+    let (close_env, _) = close_envelope(&f, true, Some(a_pub["body"]["next"].clone()))?;
+    let (close_status, close_bytes) = f
+        .alice
         .post(
             &f.client,
             &f.server.base_url,
@@ -1426,7 +1405,9 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "Attachment bind send must leave graph unchanged"
     );
 
-    // 5. Blob upload preparation: prepareBlobUpload signed by Alice
+    // 5. Blob upload preparation: the clean-slate cutover removed server blob
+    // storage (migration 20261031200001), so the signed prepareBlobUpload by
+    // Alice reaches no route (404) and writes nothing.
     let alice_blob_prep = signed_ordinary(
         alice_engine,
         &alice_identity,
@@ -1461,11 +1442,10 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         .await?;
     assert_eq!(
         bp_status,
-        reqwest::StatusCode::BAD_REQUEST,
-        "Creator blob upload preparation must fail 400"
+        reqwest::StatusCode::NOT_FOUND,
+        "removed prepareBlobUpload route must be absent: {}",
+        String::from_utf8_lossy(&bp_bytes)
     );
-    let err: Value = serde_json::from_slice(&bp_bytes)?;
-    assert_eq!(err["error"], "ConversationNotAccepted");
     assert_eq!(
         durable_comprehensive(&f)?,
         before,
@@ -1764,7 +1744,7 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         "Recipient attachment bind send must leave graph unchanged"
     );
 
-    // 4. Blob upload preparation by Bob
+    // 4. Blob upload preparation by Bob: the removed route is absent (404).
     let bob_blob_prep = signed_ordinary(
         &f.bob_engine,
         &bob_identity,
@@ -1799,11 +1779,10 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         .await?;
     assert_eq!(
         b_bp_status,
-        reqwest::StatusCode::BAD_REQUEST,
-        "Recipient blob upload preparation must fail 400"
+        reqwest::StatusCode::NOT_FOUND,
+        "removed prepareBlobUpload route must be absent: {}",
+        String::from_utf8_lossy(&b_bp_bytes)
     );
-    let err: Value = serde_json::from_slice(&b_bp_bytes)?;
-    assert_eq!(err["error"], "ConversationNotAccepted");
     assert_eq!(
         durable_comprehensive(&f)?,
         before,
@@ -2021,12 +2000,16 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
         close_resp["result"]["tombstone"].is_object(),
         "Close response must contain tombstone"
     );
-    encrypted_requests::assert_closed_conversation_wiped(
-        f.conversation_id,
-        Some(f.request_id),
-    )?;
+    encrypted_requests::assert_closed_conversation_wiped(f.conversation_id, Some(f.request_id))?;
+    // The read presents bytes as lexicon `{"$bytes"}`; the schema-directed
+    // normalizer yields the bare form the client signed.
     assert_eq!(
-        close_resp["result"]["entry"]["signedRequest"], close_env["signedRequest"],
+        protocol::normalize_read_presentation(
+            &serde_json::to_vec(&close_resp["result"]["entry"]["signedRequest"])?,
+            "signedConversationClose",
+            false,
+        )?,
+        close_env["signedRequest"],
         "the retained terminal entry binds the exact authenticated close"
     );
 
@@ -2321,12 +2304,14 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
         "Close response must contain close entry"
     );
 
-    encrypted_requests::assert_closed_conversation_wiped(
-        f.conversation_id,
-        Some(f.request_id),
-    )?;
+    encrypted_requests::assert_closed_conversation_wiped(f.conversation_id, Some(f.request_id))?;
     assert_eq!(
-        close_resp["result"]["entry"]["signedRequest"], close_env["signedRequest"],
+        protocol::normalize_read_presentation(
+            &serde_json::to_vec(&close_resp["result"]["entry"]["signedRequest"])?,
+            "signedConversationClose",
+            false,
+        )?,
+        close_env["signedRequest"],
         "the retained terminal entry binds the exact authenticated close"
     );
 
@@ -2668,10 +2653,7 @@ async fn c20_close_racing_accept_close_wins() -> anyhow::Result<()> {
         "Loser accept gets InvitationNotPending"
     );
 
-    encrypted_requests::assert_closed_conversation_wiped(
-        f.conversation_id,
-        Some(f.request_id),
-    )?;
+    encrypted_requests::assert_closed_conversation_wiped(f.conversation_id, Some(f.request_id))?;
     release_by_close(&f).await?;
     Ok(())
 }
@@ -2907,10 +2889,7 @@ async fn c20_close_racing_recipient_welcome_import_one_outcome() -> anyhow::Resu
         "close must win: {close_status}: {}",
         String::from_utf8_lossy(&close_bytes)
     );
-    encrypted_requests::assert_closed_conversation_wiped(
-        f.conversation_id,
-        Some(f.request_id),
-    )?;
+    encrypted_requests::assert_closed_conversation_wiped(f.conversation_id, Some(f.request_id))?;
     if !ack_status.is_success() {
         assert_eq!(
             ack_status,

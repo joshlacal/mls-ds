@@ -2660,7 +2660,7 @@ macro_rules! control_entry_kinds {
             pub const ALL: [Self; control_entry_kinds!(@count $($variant),+)] = [$(Self::$variant),+];
             pub const fn type_id(self) -> &'static str { match self { $(Self::$variant => concat!("blue.catbird.chat.defs#", $entry)),+ } }
             pub const fn signed_kind(self) -> SignedMutationKind { match self { $(Self::$variant => SignedMutationKind::$signed),+ } }
-            const fn server_field(self) -> Option<&'static str> { match self { $(Self::$variant => $server),+ } }
+            const fn server_fields(self) -> &'static [&'static str] { match self { $(Self::$variant => $server),+ } }
             pub(crate) fn from_type_id(value: &str) -> Option<Self> { match value { $(concat!("blue.catbird.chat.defs#", $entry) => Some(Self::$variant)),+, _ => None } }
             pub(crate) fn from_signed_kind(value: SignedMutationKind) -> Option<Self> {
                 Self::ALL.into_iter().find(|kind| kind.signed_kind() == value)
@@ -2676,56 +2676,56 @@ control_entry_kinds!(
         DirectRequestPublication,
         "directRequestEntry",
         DirectRequestPublication,
-        None
+        &["publicationReceipt", "sequencerReceipt"]
     ),
     (
         DirectRequestAcceptance,
         "directRequestAcceptanceEntry",
         DirectRequestAcceptance,
-        None
+        &[]
     ),
-    (Commit, "commitEntry", CommitTransition, None),
-    (Policy, "policyEntry", PolicyTransition, None),
-    (Metadata, "metadataEntry", MetadataTransition, None),
-    (Creation, "creationEntry", Creation, None),
+    (Commit, "commitEntry", CommitTransition, &[]),
+    (Policy, "policyEntry", PolicyTransition, &[]),
+    (Metadata, "metadataEntry", MetadataTransition, &[]),
+    (Creation, "creationEntry", Creation, &[]),
     (
         ParticipantAcceptance,
         "participantAcceptanceEntry",
         ParticipantAcceptance,
-        Some("recovery")
+        &["recovery"]
     ),
     (
         ConversationClose,
         "conversationCloseEntry",
         ConversationClose,
-        Some("tombstone")
+        &["tombstone"]
     ),
-    (ResetRequest, "resetRequestEntry", ResetRequest, None),
+    (ResetRequest, "resetRequestEntry", ResetRequest, &[]),
     (
         ResetActivation,
         "resetActivationEntry",
         ResetActivation,
-        None
+        &[]
     ),
     (
         LeafRecoveryFulfillment,
         "leafRecoveryFulfillmentEntry",
         LeafRecoveryFulfillment,
-        None
+        &[]
     ),
-    (LeaveRequest, "leaveRequestEntry", LeaveRequest, None),
-    (ZeroLeafLeave, "zeroLeafLeaveEntry", ZeroLeafLeave, None),
+    (LeaveRequest, "leaveRequestEntry", LeaveRequest, &[]),
+    (ZeroLeafLeave, "zeroLeafLeaveEntry", ZeroLeafLeave, &[]),
     (
         LeaveCancellation,
         "leaveCancellationEntry",
         LeaveCancellation,
-        None
+        &[]
     ),
     (
         LeaveCommitFulfillment,
         "leaveCommitFulfillmentEntry",
         LeaveCommitFulfillment,
-        None
+        &[]
     ),
 );
 
@@ -2853,7 +2853,7 @@ pub struct CanonicalControlServerFields {
 
 impl CanonicalControlServerFields {
     pub fn empty(kind: ControlEntryKind) -> Result<Self, AuthPrimitiveError> {
-        if kind.server_field().is_some() {
+        if !kind.server_fields().is_empty() {
             return Err(AuthPrimitiveError::invalid(
                 "special control entry requires exact serverFields",
             ));
@@ -2970,6 +2970,20 @@ fn fixed_standard_bytes(
     Ok(decoded)
 }
 
+/// The closed lexicon schema of one server-authored field of a control row.
+fn server_field_schema(
+    kind: ControlEntryKind,
+    field: &str,
+) -> Result<&'static SchemaValue, AuthPrimitiveError> {
+    let entry = kind
+        .type_id()
+        .strip_prefix(TYPE_PREFIX)
+        .ok_or_else(|| AuthPrimitiveError::invalid("control entry namespace"))?;
+    definition(entry)?["properties"]
+        .get(field)
+        .ok_or_else(|| AuthPrimitiveError::invalid("unknown control server field"))
+}
+
 fn project_server_fields(
     kind: ControlEntryKind,
     raw: &RawJson,
@@ -2977,24 +2991,24 @@ fn project_server_fields(
     let RawJson::Object(values) = raw else {
         return Err(AuthPrimitiveError::invalid("serverFields object"));
     };
-    match kind.server_field() {
-        None if values.is_empty() => Ok(BTreeMap::new()),
-        None => Err(AuthPrimitiveError::invalid(
-            "ordinary control serverFields must be empty",
-        )),
-        Some(field) if values.len() == 1 && values.contains_key(field) => {
-            let definition_name = if field == "recovery" {
-                "leafRecoveryView"
-            } else {
-                "conversationCloseTombstone"
-            };
-            let projected = project_ref(definition_name, values.get(field).unwrap(), false)?;
-            Ok(BTreeMap::from([(field.to_owned(), projected)]))
-        }
-        Some(_) => Err(AuthPrimitiveError::invalid(
-            "special control serverFields set",
-        )),
+    let fields = kind.server_fields();
+    if values.len() != fields.len() || fields.iter().any(|field| !values.contains_key(*field)) {
+        return Err(AuthPrimitiveError::invalid(if fields.is_empty() {
+            "ordinary control serverFields must be empty"
+        } else {
+            "special control serverFields set"
+        }));
     }
+    fields
+        .iter()
+        .map(|field| {
+            let schema = server_field_schema(kind, field)?;
+            Ok((
+                (*field).to_owned(),
+                project_schema(schema, &values[*field], Some(field), false)?,
+            ))
+        })
+        .collect()
 }
 
 fn control_fingerprint_from_projection(
@@ -3453,46 +3467,31 @@ pub(crate) fn persisted_control_entry_response_json(
         return Err(AuthPrimitiveError::invalid("persisted control signed kind"));
     }
     let raw_server_fields = decode_canonical_raw_cbor(server_fields_bytes)?;
-    let server_fields = match kind.server_field() {
-        None => {
-            if !matches!(raw_server_fields, RawCbor::Map(ref fields) if fields.is_empty()) {
-                return Err(AuthPrimitiveError::invalid(
-                    "persisted control server fields",
-                ));
-            }
-            SchemaValue::Object(serde_json::Map::new())
-        }
-        Some(field) => {
-            let definition_name = if field == "recovery" {
-                "leafRecoveryView"
-            } else {
-                "conversationCloseTombstone"
-            };
-            let RawCbor::Map(fields) = &raw_server_fields else {
-                return Err(AuthPrimitiveError::invalid(
-                    "persisted control server fields",
-                ));
-            };
-            if fields.len() != 1 {
-                return Err(AuthPrimitiveError::invalid(
-                    "persisted control server fields",
-                ));
-            }
-            let field_value = fields
-                .get(field)
-                .ok_or_else(|| AuthPrimitiveError::invalid("persisted control server field"))?;
-            let raw = cbor_schema_to_raw_json(
-                definition(definition_name)?,
-                field_value,
-                Some(definition_name),
-                false,
-            )?;
-            SchemaValue::Object(serde_json::Map::from_iter([(
-                field.to_owned(),
-                raw_json_value(&raw),
-            )]))
-        }
+    let RawCbor::Map(raw_fields) = &raw_server_fields else {
+        return Err(AuthPrimitiveError::invalid(
+            "persisted control server fields",
+        ));
     };
+    let names = kind.server_fields();
+    if raw_fields.len() != names.len() {
+        return Err(AuthPrimitiveError::invalid(
+            "persisted control server fields",
+        ));
+    }
+    let mut server_fields = serde_json::Map::new();
+    for field in names {
+        let field_value = raw_fields
+            .get(*field)
+            .ok_or_else(|| AuthPrimitiveError::invalid("persisted control server field"))?;
+        let raw = cbor_schema_to_raw_json(
+            server_field_schema(kind, field)?,
+            field_value,
+            Some(field),
+            false,
+        )?;
+        server_fields.insert((*field).to_owned(), raw_json_value(&raw));
+    }
+    let server_fields = SchemaValue::Object(server_fields);
     let mut signed_request: SchemaValue = serde_json::from_slice(signed_request_bytes)
         .map_err(|_| AuthPrimitiveError::invalid("persisted control signed JSON"))?;
     if signed_request.get("$type").is_some() {
@@ -3584,10 +3583,18 @@ pub fn build_verified_control_entry(
     )
 }
 
-pub fn decode_and_verify_control_entry(
+/// Project a public control row and decode its signed mutation without verifying the
+/// signature. Returns the kind, the remaining row fields and the canonical mutation.
+fn decode_control_row(
     raw_json: &[u8],
-    historical_public_key: &[u8],
-) -> Result<VerifiedControlEntry, AuthPrimitiveError> {
+) -> Result<
+    (
+        ControlEntryKind,
+        BTreeMap<String, DagValue>,
+        CanonicalSignedMutation,
+    ),
+    AuthPrimitiveError,
+> {
     let raw = decode_raw_json(raw_json)?;
     let projected = project_ref("conversationEntry", &raw, false)?;
     let DagValue::Map(mut row) = projected else {
@@ -3599,15 +3606,10 @@ pub fn decode_and_verify_control_entry(
     };
     let kind = ControlEntryKind::from_type_id(&type_id)
         .ok_or_else(|| AuthPrimitiveError::invalid("application row is not control authority"))?;
-    let entry_id = take_uuid(&mut row, "entryId")?;
-    let conversation_id = take_uuid(&mut row, "conversationId")?;
-    let seq = take_integer(&mut row, "seq")?;
-    let received_at = take_timestamp(&mut row, "receivedAt")?;
-    let signed = match row.remove("signedRequest") {
+    let mut signed = match row.remove("signedRequest") {
         Some(DagValue::Map(value)) => value,
         _ => return Err(AuthPrimitiveError::invalid("control signedRequest")),
     };
-    let mut signed = signed;
     let body = match signed.remove("body") {
         Some(DagValue::Map(value)) => value,
         _ => return Err(AuthPrimitiveError::invalid("control signed body")),
@@ -3627,6 +3629,27 @@ pub fn decode_and_verify_control_entry(
             "control row/signed variant mismatch",
         ));
     }
+    Ok((kind, row, canonical))
+}
+
+/// The signed mutation of a public control row in its wire presentation, without
+/// signature verification. Callers bind fields of a row whose device signature is
+/// verified separately (`decode_and_verify_control_entry`).
+pub fn decode_control_entry_mutation_unverified(
+    raw_json: &[u8],
+) -> Result<CanonicalSignedMutation, AuthPrimitiveError> {
+    decode_control_row(raw_json).map(|(_, _, canonical)| canonical)
+}
+
+pub fn decode_and_verify_control_entry(
+    raw_json: &[u8],
+    historical_public_key: &[u8],
+) -> Result<VerifiedControlEntry, AuthPrimitiveError> {
+    let (kind, mut row, canonical) = decode_control_row(raw_json)?;
+    let entry_id = take_uuid(&mut row, "entryId")?;
+    let conversation_id = take_uuid(&mut row, "conversationId")?;
+    let seq = take_integer(&mut row, "seq")?;
+    let received_at = take_timestamp(&mut row, "receivedAt")?;
     let body_conversation = signed_body_conversation_id(&canonical)?;
     if body_conversation != &conversation_id {
         return Err(AuthPrimitiveError::invalid(
@@ -3635,11 +3658,11 @@ pub fn decode_and_verify_control_entry(
     }
     let mutation = verify_signed_mutation(canonical, historical_public_key)?;
     let mut server_fields = BTreeMap::new();
-    if let Some(field) = kind.server_field() {
+    for field in kind.server_fields() {
         let value = row
-            .remove(field)
+            .remove(*field)
             .ok_or_else(|| AuthPrimitiveError::invalid("missing special control server field"))?;
-        server_fields.insert(field.to_owned(), value);
+        server_fields.insert((*field).to_owned(), value);
     }
     if !row.is_empty() {
         return Err(AuthPrimitiveError::invalid("extra control row fields"));
@@ -3717,6 +3740,89 @@ pub fn rebind_persisted_control_entry(
     Ok(rebuilt)
 }
 
+/// A coordinator's `directRequestEntry` whose opening ciphertext was pruned (O7):
+/// `redacted_row_json` is the frozen row with
+/// `signedRequest.body.artifacts.initialCiphertext` replaced by that ciphertext's
+/// 32-byte SHA-256, every other byte unchanged. The sender signature cannot be
+/// re-verified without the erased bytes, so the original request digest and outer
+/// fingerprint come from the row's immutable columns, and the caller must first
+/// bind the redacted body to the sequencer's own signed publication receipt. The
+/// historical key still binds the body's key id.
+pub fn decode_pruned_direct_request_entry(
+    redacted_row_json: &[u8],
+    historical_public_key: &[u8],
+    request_digest: [u8; 32],
+    outer_fingerprint: [u8; 32],
+) -> Result<VerifiedControlEntry, AuthPrimitiveError> {
+    let (kind, mut row, from_row) = decode_control_row(redacted_row_json)?;
+    if kind != ControlEntryKind::DirectRequestPublication {
+        return Err(AuthPrimitiveError::invalid("pruned opening kind"));
+    }
+    let presented: SchemaValue = serde_json::from_slice(redacted_row_json)
+        .map_err(|_| AuthPrimitiveError::invalid("pruned opening JSON"))?;
+    let wrapper = serde_json::to_vec(&presented["signedRequest"])
+        .map_err(|_| AuthPrimitiveError::invalid("pruned opening wrapper"))?;
+    let mut canonical = decode_historical_signed_mutation(&wrapper)?;
+    if canonical.kind() != SignedMutationKind::DirectRequestPublication
+        || canonical.canonical_projection() != from_row.canonical_projection()
+        || canonical.signature() != from_row.signature()
+    {
+        return Err(AuthPrimitiveError::invalid(
+            "pruned opening row/wrapper splice",
+        ));
+    }
+    match map_value(
+        value_map(map_value(&canonical.body, "artifacts")?)?,
+        "initialCiphertext",
+    )? {
+        DagValue::Bytes(placeholder) if placeholder.len() == 32 => {}
+        _ => {
+            return Err(AuthPrimitiveError::invalid(
+                "pruned opening keeps no ciphertext digest",
+            ))
+        }
+    }
+    let historical_public_key: [u8; 32] = historical_public_key
+        .try_into()
+        .map_err(|_| AuthPrimitiveError::invalid("Ed25519 public key length"))?;
+    if &ed25519_key_id(&historical_public_key)? != canonical.key_id() {
+        return Err(AuthPrimitiveError::invalid("signed body key ID mismatch"));
+    }
+    canonical.transcript.request_digest = request_digest;
+    let mutation = VerifiedSignedMutation {
+        canonical,
+        historical_public_key,
+    };
+    let entry_id = take_uuid(&mut row, "entryId")?;
+    let conversation_id = take_uuid(&mut row, "conversationId")?;
+    let seq = take_integer(&mut row, "seq")?;
+    let received_at = take_timestamp(&mut row, "receivedAt")?;
+    let mut server_fields = BTreeMap::new();
+    for field in kind.server_fields() {
+        let value = row
+            .remove(*field)
+            .ok_or_else(|| AuthPrimitiveError::invalid("missing special control server field"))?;
+        server_fields.insert((*field).to_owned(), value);
+    }
+    if !row.is_empty() {
+        return Err(AuthPrimitiveError::invalid("extra control row fields"));
+    }
+    let mut entry = finish_verified_control_entry(
+        kind,
+        entry_id,
+        conversation_id,
+        seq,
+        received_at,
+        CanonicalControlServerFields {
+            kind,
+            fields: server_fields,
+        },
+        mutation,
+    )?;
+    entry.fingerprint.fingerprint = outer_fingerprint;
+    Ok(entry)
+}
+
 fn finish_verified_control_entry(
     kind: ControlEntryKind,
     entry_id: CanonicalUuidV4,
@@ -3774,7 +3880,7 @@ fn finish_verified_control_entry(
         kind,
         ControlEntryKind::DirectRequestPublication | ControlEntryKind::DirectRequestAcceptance
     ) {
-        let row = BTreeMap::from([
+        let mut row = BTreeMap::from([
             ("entryId".to_owned(), DagValue::Uuid(entry_id.clone())),
             (
                 "conversationId".to_owned(),
@@ -3799,6 +3905,9 @@ fn finish_verified_control_entry(
                 ])),
             ),
         ]);
+        // Publication rows carry their I13 and signed-outcome receipts as
+        // server fields; the write-time entry hash covers them.
+        row.extend(server_fields.clone());
         let canonical_projection = serde_ipld_dagcbor::to_vec(&DagMapRef(&row))
             .map_err(|_| AuthPrimitiveError::invalid("direct entry canonical encoding"))?;
         let domain: &[u8] = match kind {

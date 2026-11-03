@@ -27,8 +27,25 @@ use sha2::{Digest as _, Sha256};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use super::ssrf::validate_push_gateway_url;
+use super::ssrf::{validate_push_gateway_url, PushGatewaySsrfError};
 use crate::storage::DbPool;
+
+/// Why a wake dispatch stopped, by what a retry could change.
+#[derive(Debug, thiserror::Error)]
+pub enum PushDispatchError {
+    /// This DS's own database failed; nothing was decided.
+    #[error("push dispatch storage failed: {0}")]
+    Database(#[from] sqlx::Error),
+    /// A gateway, its DNS, or this DS's HTTP client could not answer now
+    /// (connect, timeout, 5xx, 429).
+    #[error("push gateway unavailable: {0}")]
+    Unavailable(String),
+    /// A permanent answer: the binding's gateway URL is invalid or unsafe,
+    /// the gateway refused the wake (another non-success status), or the
+    /// wake could not be encoded.
+    #[error("push gateway refused: {0}")]
+    Rejected(String),
+}
 
 fn hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -144,7 +161,7 @@ impl PushGatewayClient {
         pool: &DbPool,
         candidates: &[(String, Uuid)],
         wake: PushWakeDispatch,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, PushDispatchError> {
         if candidates.is_empty() {
             return Ok(0);
         }
@@ -174,8 +191,7 @@ impl PushGatewayClient {
             .bind(user_did)
             .bind(crate::sim_hooks::current_utc())
             .fetch_optional(pool)
-            .await
-            .map_err(|e| format!("query did_ds_mappings: {e}"))?;
+            .await?;
 
             if let Some(ds_did) = mapped_ds {
                 if crate::identity::canonical_did(&ds_did) != self.service_did {
@@ -192,15 +208,24 @@ impl PushGatewayClient {
             .bind(user_did)
             .bind(device_id)
             .fetch_optional(pool)
-            .await
-            .map_err(|e| format!("query push_gateway_bindings: {e}"))?;
+            .await?;
 
             let Some(binding) = binding else {
                 continue;
             };
 
-            let validated = validate_push_gateway_url(&binding.gateway_url)
-                .map_err(|e| format!("push gateway SSRF check failed: {e}"))?;
+            // ponytail: the SSRF resolver reports every DNS failure alike, so
+            // a gone host retries with a temporary one, bounded by the wake's
+            // own expiry; type its DNS kinds if that ever matters.
+            let validated =
+                validate_push_gateway_url(&binding.gateway_url).map_err(|error| match error {
+                    PushGatewaySsrfError::DnsResolutionFailed(_) => {
+                        PushDispatchError::Unavailable(format!("push gateway DNS: {error}"))
+                    }
+                    error => {
+                        PushDispatchError::Rejected(format!("push gateway SSRF check: {error}"))
+                    }
+                })?;
 
             let mut client_builder = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -209,7 +234,9 @@ impl PushGatewayClient {
                 client_builder =
                     client_builder.resolve_to_addrs(&validated.host, &validated.pinned_addrs);
             }
-            let http_client = client_builder.build().map_err(|e| e.to_string())?;
+            let http_client = client_builder
+                .build()
+                .map_err(|e| PushDispatchError::Unavailable(e.to_string()))?;
 
             let req_body = Deliver {
                 app_id: binding.app_id.clone().into(),
@@ -217,11 +244,14 @@ impl PushGatewayClient {
                 payload: payload.clone(),
                 extra_data: None,
             };
-            let body_bytes = serde_json::to_vec(&req_body).map_err(|e| e.to_string())?;
+            let body_bytes = serde_json::to_vec(&req_body)
+                .map_err(|e| PushDispatchError::Rejected(e.to_string()))?;
             let body_sha256 = hex_lower(&Sha256::digest(&body_bytes));
 
             let aud_did = format!("did:web:{}", validated.host);
-            let jwt = self.mint_deliver_jwt(&aud_did, &binding.gateway_url, &body_sha256)?;
+            let jwt = self
+                .mint_deliver_jwt(&aud_did, &binding.gateway_url, &body_sha256)
+                .map_err(PushDispatchError::Rejected)?;
 
             let resp = crate::sim_hooks::send_reqwest(
                 http_client
@@ -231,7 +261,9 @@ impl PushGatewayClient {
                     .body(body_bytes),
             )
             .await
-            .map_err(|e| format!("push gateway POST failed: {e}"))?;
+            .map_err(|e| {
+                PushDispatchError::Unavailable(format!("push gateway POST failed: {e}"))
+            })?;
 
             let status = resp.status();
             if status == reqwest::StatusCode::GONE {
@@ -242,15 +274,19 @@ impl PushGatewayClient {
                 .bind(binding.device_id)
                 .bind(&binding.push_key)
                 .execute(pool)
-                .await
-                .map_err(|e| format!("prune 410 push_gateway_bindings: {e}"))?;
+                .await?;
             } else if status.is_success() {
                 delivered += 1;
+            } else if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(PushDispatchError::Unavailable(format!(
+                    "push gateway returned status {}",
+                    status.as_u16()
+                )));
             } else {
-                return Err(format!(
+                return Err(PushDispatchError::Rejected(format!(
                     "push gateway returned unexpected status {}",
                     status.as_u16()
-                ));
+                )));
             }
         }
 
@@ -269,7 +305,7 @@ impl PreparedLocalWake {
         self,
         pool: &DbPool,
         client: &PushGatewayClient,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, PushDispatchError> {
         client
             .dispatch_for_local_recipients(pool, &self.candidates, self.wake)
             .await

@@ -106,17 +106,7 @@ pub async fn enforce_ds_request_security(
     endpoint_nsid: &str,
     sender_ds_did: Option<&str>,
 ) -> Result<DsSecurityContext, FederationError> {
-    if peer_policy::inbound_emergency_kill_switch_enabled() {
-        return Err(FederationError::AuthFailed {
-            reason: "Federation emergency kill switch is enabled".to_string(),
-        });
-    }
-
-    if !crate::federation::FederationMode::effective().allows_remote_traffic() {
-        return Err(FederationError::AuthFailed {
-            reason: "Federation mode is off".to_string(),
-        });
-    }
+    peer_policy::ensure_federation_open()?;
 
     validate_lxm(auth_user, endpoint_nsid)?;
     validate_ds_issuer(auth_user)?;

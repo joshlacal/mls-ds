@@ -35,7 +35,9 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const MAINTENANCE_URL: &str = "postgresql://127.0.0.1:5432/postgres";
-const PAUSE_MS: u64 = 700;
+/// Upper bound a faulting write holds its open transaction; the observer
+/// releases it as soon as it has inspected the committed state.
+const PAUSE_MS: u64 = 20_000;
 const MAX_WRITES: usize = 400;
 
 async fn psql_on(url: &str, sql: &str) -> anyhow::Result<String> {
@@ -89,7 +91,8 @@ impl Drop for DedicatedDatabase {
 const FAULT_SQL: &str = r#"
 CREATE SCHEMA c10_fault;
 CREATE TABLE c10_fault.control(singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
-  target integer NOT NULL DEFAULT 0, pause_ms integer NOT NULL DEFAULT 0);
+  target integer NOT NULL DEFAULT 0, pause_ms integer NOT NULL DEFAULT 0,
+  released boolean NOT NULL DEFAULT false);
 INSERT INTO c10_fault.control DEFAULT VALUES;
 CREATE FUNCTION c10_fault.count_write() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE armed integer; pause integer; seen integer;
@@ -99,7 +102,11 @@ BEGIN
     seen := coalesce(nullif(current_setting('c10_fault.seen', true), ''), '0')::integer + 1;
     PERFORM set_config('c10_fault.seen', seen::text, true);
     IF seen = armed THEN
-      PERFORM pg_sleep(pause / 1000.0);
+      -- Hold the open transaction until the observer releases it (bounded).
+      FOR i IN 1..greatest(pause / 10, 1) LOOP
+        EXIT WHEN (SELECT c.released FROM c10_fault.control c);
+        PERFORM pg_sleep(0.01);
+      END LOOP;
       RAISE EXCEPTION 'c10 injected fault at write % (% %.%)', seen, TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME;
     END IF;
   END IF;
@@ -205,7 +212,7 @@ async fn c10_every_publication_write_fault_leaves_no_partial_state_and_retry_com
     let started = Instant::now();
     for target in 1..=MAX_WRITES {
         psql(&format!(
-            "UPDATE c10_fault.control SET target={target}, pause_ms={PAUSE_MS}"
+            "UPDATE c10_fault.control SET target={target}, pause_ms={PAUSE_MS}, released=false"
         ))
         .await?;
         let mut transport = DeterministicFaultTransport::default();
@@ -222,11 +229,17 @@ async fn c10_every_publication_write_fault_leaves_no_partial_state_and_retry_com
                 if !sleeping.is_empty() {
                     let during =
                         observed_partial_state(request, conversation, &package_hex).await?;
+                    // Still the same open transaction: same backend, same xid.
+                    let mut fields = sleeping.splitn(3, '\t');
+                    let (pid, xid) = (
+                        fields.next().unwrap_or("0"),
+                        fields.next().unwrap_or_default(),
+                    );
                     let still = psql(&format!(
-                        "SELECT count(*) FROM pg_stat_activity WHERE pid={} AND wait_event='PgSleep'",
-                        sleeping.split('\t').next().unwrap_or("0")
+                        "SELECT count(*) FROM pg_stat_activity WHERE pid={pid} AND backend_xid::text='{xid}'"
                     ))
                     .await?;
+                    psql("UPDATE c10_fault.control SET released=true").await?;
                     return anyhow::Ok(Some((sleeping, during, still == "1")));
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -371,7 +384,7 @@ async fn c10_every_publication_write_fault_leaves_no_partial_state_and_retry_com
 
     let welcome = f.welcome_input(journal.bootstrap.clone(), &receipt)?;
     f.bob_engine.process_direct_request(&welcome)?;
-    let DirectRequestIntroductionResult::Ready { plaintext } =
+    let DirectRequestIntroductionResult::Ready { plaintext, .. } =
         f.bob_engine.decrypt_direct_request(&welcome)?
     else {
         anyhow::bail!("introduction must be ready for Bob")

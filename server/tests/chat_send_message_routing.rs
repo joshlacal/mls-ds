@@ -21,9 +21,13 @@ use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
 use std::{
     io::Write,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering::SeqCst},
+        Arc, Mutex,
+    },
     time::Duration,
 };
+use tower_util::ServiceExt as _;
 use tracing::instrument::WithSubscriber as _;
 use uuid::Uuid;
 
@@ -31,6 +35,7 @@ const NSID: &str = "blue.catbird.chat.sendMessage";
 const REMOTE_SERVICE: &str = "did:web:remote.routing.example.com";
 const DELIVER_MESSAGE: &str = "blue.catbird.mlsDS.deliverMessage";
 const DELIVER_ENTRY: &str = "blue.catbird.mlsDS.deliverMessageEntry";
+const DELIVER_GROUP_ENTRY: &str = "blue.catbird.mlsDS.deliverGroupEntry";
 
 #[derive(Clone, Default)]
 struct TraceCapture(Arc<Mutex<Vec<u8>>>);
@@ -227,6 +232,72 @@ async fn assert_single_application_and_job(pool: &PgPool, fixture: &ApplicationR
     assert_no_direct_delivery(pool, fixture).await;
 }
 
+/// Each queued delivery's stable identity; status and retry columns move while
+/// the post-commit sender retries the unreachable fixture home.
+async fn group_entry_deliveries(
+    pool: &PgPool,
+    fixture: &ApplicationRoutingFixture,
+) -> Vec<(String, String, String, Vec<u8>)> {
+    sqlx::query_as(
+        "SELECT id, method, target_ds_did, payload FROM outbound_queue \
+          WHERE convo_id=$1 ORDER BY id",
+    )
+    .bind(fixture.conversation_id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// A group application reaches its remote home only through the ordered
+/// `deliverGroupEntry` stream: one delivery for its seq, no `deliverMessage`.
+async fn assert_single_application_and_group_entry(
+    pool: &PgPool,
+    fixture: &ApplicationRoutingFixture,
+) {
+    let entries = application_entries(pool, fixture).await;
+    assert_eq!(entries.len(), 1, "exactly one accepted application entry");
+    assert_eq!(
+        entries[0].1, 4,
+        "application follows real Creation/Acceptance/Add history"
+    );
+    assert_eq!(
+        entries[0].2,
+        serde_json::to_vec(&fixture.signed_request).unwrap(),
+        "exact originally serialized signed-request bytes survive persistence"
+    );
+    assert!(
+        federation_jobs(pool, fixture).await.is_empty(),
+        "a group replicates no application through deliverMessage"
+    );
+    let deliveries = group_entry_deliveries(pool, fixture).await;
+    assert_eq!(
+        deliveries.len(),
+        1,
+        "exactly one ordered group-entry delivery"
+    );
+    let (id, method, target, payload) = &deliveries[0];
+    assert_eq!(
+        id,
+        &format!("group-entry-{}-4-{REMOTE_SERVICE}", fixture.conversation_id)
+    );
+    assert_eq!(method, DELIVER_GROUP_ENTRY);
+    assert_eq!(target, REMOTE_SERVICE);
+    let payload: Value = serde_json::from_slice(payload).unwrap();
+    assert_eq!(
+        payload["conversationId"],
+        fixture.conversation_id.to_string()
+    );
+    assert_eq!(payload["entry"]["seq"], 4);
+    assert_eq!(payload["entry"]["entryId"], entries[0].0.to_string());
+    assert!(
+        payload["recipientDids"]
+            .as_array()
+            .is_some_and(|dids| dids.iter().any(|did| did == &fixture.recipient_did)),
+        "the remote recipient is in the delivery's frozen audience: {payload}"
+    );
+    assert_no_direct_delivery(pool, fixture).await;
+}
+
 fn request_presentation_of_response(response: &Value) -> Value {
     let mut wrapper = response.clone();
     // Only the known byte fields of this attachment-free application may
@@ -273,7 +344,7 @@ fn request_presentation_of_response(response: &Value) -> Value {
 }
 
 #[tokio::test]
-async fn group_send_and_exact_replay_keep_one_ordinary_federation_job() {
+async fn group_send_and_exact_replay_keep_one_ordered_group_entry_delivery() {
     let (pool, _database, fixture, device, router) = setup(false).await;
     assert!(application_entries(&pool, &fixture).await.is_empty());
     assert!(federation_jobs(&pool, &fixture).await.is_empty());
@@ -299,9 +370,9 @@ async fn group_send_and_exact_replay_keep_one_ordinary_federation_job() {
     .unwrap();
     assert_eq!(returned.transcript_bytes(), sent.transcript_bytes());
     assert_eq!(returned.signature(), sent.signature());
-    assert_single_application_and_job(&pool, &fixture).await;
+    assert_single_application_and_group_entry(&pool, &fixture).await;
     let entries_before = application_entries(&pool, &fixture).await;
-    let jobs_before = federation_jobs(&pool, &fixture).await;
+    let deliveries_before = group_entry_deliveries(&pool, &fixture).await;
 
     let (status, replay, trace) = post_with_trace(&router, &device, &fixture.signed_request).await;
     assert_eq!(status, StatusCode::OK, "group replay response: {replay}");
@@ -314,13 +385,100 @@ async fn group_send_and_exact_replay_keep_one_ordinary_federation_job() {
         "same accepted entry on byte-identical body retry"
     );
     assert_eq!(application_entries(&pool, &fixture).await, entries_before);
-    assert_eq!(federation_jobs(&pool, &fixture).await, jobs_before);
+    assert!(federation_jobs(&pool, &fixture).await.is_empty());
+    assert_eq!(
+        group_entry_deliveries(&pool, &fixture).await,
+        deliveries_before,
+        "a replay queues no second delivery"
+    );
     assert_no_direct_delivery(&pool, &fixture).await;
 }
 
+/// Status, `Retry-After` and body of one send through `router`.
+async fn post_answer(
+    router: &Router,
+    device: &http::Device,
+    signed: &Value,
+) -> (StatusCode, Option<String>, Value) {
+    let request = http::unsigned_json_request(
+        device,
+        NSID,
+        serde_json::to_vec(&json!({"signedRequest": signed})).unwrap(),
+    );
+    let response = tokio::time::timeout(Duration::from_secs(20), router.clone().oneshot(request))
+        .await
+        .expect("sendMessage completed within its deadline")
+        .unwrap();
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        retry_after,
+        serde_json::from_slice(&body).unwrap_or(Value::Null),
+    )
+}
+
+/// `(status, Retry-After, error)` of an answer.
+fn answered(
+    answer: &(StatusCode, Option<String>, Value),
+) -> (StatusCode, Option<&str>, Option<&str>) {
+    (answer.0, answer.1.as_deref(), answer.2["error"].as_str())
+}
+
+/// The send decided nothing: its head, send, entry, operation and federation
+/// rows are exactly `before`.
+async fn assert_nothing_committed(
+    pool: &PgPool,
+    fixture: &ApplicationRoutingFixture,
+    before: &Value,
+    attempt: &str,
+) {
+    assert_eq!(
+        &business_snapshot(pool, fixture).await,
+        before,
+        "{attempt}: no head, send, entry or operation change"
+    );
+    assert!(
+        application_entries(pool, fixture).await.is_empty(),
+        "{attempt}"
+    );
+    assert!(federation_jobs(pool, fixture).await.is_empty(), "{attempt}");
+    assert!(
+        group_entry_deliveries(pool, fixture).await.is_empty(),
+        "{attempt}"
+    );
+}
+
+/// Only its sequencer sequences a remote group. Its replica's own read of the
+/// group failing is storage, not an unknown conversation. A closed federation
+/// gate, or a sequencer route that could not answer now, decided nothing:
+/// `RelationshipPolicyUnavailable` with `Retry-After: 5`, never the local
+/// path's `NotAuthorized`. A sequencer that cannot be routed is refused, and
+/// the replica's store failing while routing is storage. Nothing is committed
+/// or relayed; once the gate is open and the sequencer resolves, the identical
+/// send is relayed once and answered with the sequencer's entry.
 #[tokio::test]
-async fn remote_group_send_is_rejected_before_any_message_or_operation_is_committed() {
-    let (pool, _database, fixture, device, router) = setup_routing(false, true).await;
+async fn remote_group_send_is_only_ever_sequenced_by_its_sequencer() {
+    use catbird_server::federation::{
+        errors::{FederationError, ResolutionFailureKind},
+        resolver::{DsResolver, ValidatedRemoteDestination},
+        FederationMode,
+    };
+    #[derive(Clone, Copy)]
+    enum Route {
+        Unreachable,
+        Unroutable,
+        StoreFailing,
+        Resolves,
+    }
+    let (pool, _database, fixture, device, _) = setup_routing(false, true).await;
     let routing: (String, bool, Option<String>, i64) = sqlx::query_as(
         "SELECT kind,is_remote,sequencer_ds,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
     )
@@ -333,30 +491,205 @@ async fn remote_group_send_is_rejected_before_any_message_or_operation_is_commit
         ("group".to_owned(), true, Some(REMOTE_SERVICE.to_owned()), 4),
         "the immutable replica routing identity is seeded before admission"
     );
+
+    // The group's sequencer: counts relays and answers its sequenced entry.
+    let entry = json!({
+        "$type": "blue.catbird.chat.defs#applicationEntry",
+        "conversationId": fixture.conversation_id,
+        "entryId": Uuid::new_v4(),
+        "seq": 4,
+        "signedRequest": fixture.signed_request,
+        "receivedAt": "2026-11-05T00:00:00.000Z",
+    });
+    let relays = Arc::new(AtomicUsize::new(0));
+    let sequencer = Router::new().route(
+        "/xrpc/blue.catbird.mlsDS.relayGroupMutation",
+        axum::routing::post({
+            let (relays, entry) = (Arc::clone(&relays), entry.clone());
+            move || async move {
+                relays.fetch_add(1, SeqCst);
+                axum::Json(json!({ "entry": entry }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, sequencer).await.unwrap() });
+    // What resolving the sequencer answers.
+    let route = Arc::new(Mutex::new(Route::Unreachable));
+    let hook_route = Arc::clone(&route);
+    let resolver = DsResolver::new(
+        pool.clone(),
+        reqwest::Client::new(),
+        "did:web:chat.catbird.blue".to_owned(),
+        "https://chat.catbird.blue".to_owned(),
+        None,
+        300,
+    )
+    .with_destination_resolver_hook(Arc::new(move |did: &str| {
+        let (route, did) = (*hook_route.lock().unwrap(), did.to_owned());
+        Some(Box::pin(async move {
+            match route {
+                Route::Unreachable => Err(FederationError::DsUnreachable {
+                    endpoint: did,
+                    reason: "sequencer unreachable".to_owned(),
+                }),
+                Route::Unroutable => Err(FederationError::ResolutionFailed {
+                    did,
+                    kind: ResolutionFailureKind::DnsNxdomain("no such host".to_owned()),
+                }),
+                Route::StoreFailing => Err(FederationError::Database(sqlx::Error::PoolTimedOut)),
+                Route::Resolves => Ok(ValidatedRemoteDestination {
+                    url: format!("http://{address}").parse().unwrap(),
+                    host: address.ip().to_string(),
+                    addrs: vec![address],
+                }),
+            }
+        }))
+    }));
+    let router = http::router_for_authenticated_acceptance_with(pool.clone(), |runtime| {
+        runtime.with_resolver(Arc::new(resolver))
+    })
+    .await;
+    std::env::set_var(
+        "FEDERATION_GROUP_RELAY_HMAC_SECRET",
+        "send-routing-relay-secret",
+    );
     let before = business_snapshot(&pool, &fixture).await;
     assert!(before["sends"].is_null());
     assert!(before["claims"].is_null());
     assert!(before["receipts"].is_null());
+
+    let hidden = |from: &str, to: &str| {
+        format!("ALTER TABLE chat.conversations RENAME COLUMN {from} TO {to}")
+    };
+    sqlx::query(&hidden("sequencer_ds", "sequencer_ds_hidden"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let answer = post_answer(&router, &device, &fixture.signed_request).await;
+    sqlx::query(&hidden("sequencer_ds_hidden", "sequencer_ds"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        answered(&answer),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            None,
+            Some("InternalServerError")
+        ),
+        "replica's own read failing: {}",
+        answer.2
+    );
+    assert_nothing_committed(&pool, &fixture, &before, "replica's own read failing").await;
+
+    FederationMode::set_runtime_override(Some(FederationMode::Off));
     for _ in 0..2 {
-        // An exact repeat remains a rejected first admission: no completed
-        // receipt may be minted for an operation this replica cannot sequence.
-        let (status, response, trace) =
-            post_with_trace(&router, &device, &fixture.signed_request).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "remote group: {response}");
-        assert_eq!(response["error"], "NotAuthorized");
-        assert!(
-            !trace.contains("Failed to resolve application entry peer"),
-            "a remote group must not enter direct-request resolution: {trace}"
-        );
+        let answer = post_answer(&router, &device, &fixture.signed_request).await;
         assert_eq!(
-            business_snapshot(&pool, &fixture).await,
-            before,
-            "remote rejection must not advance the head or retain send/entry/operation rows"
+            answered(&answer),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("5"),
+                Some("RelationshipPolicyUnavailable")
+            ),
+            "gate closed: {}",
+            answer.2
         );
-        assert!(application_entries(&pool, &fixture).await.is_empty());
-        assert!(federation_jobs(&pool, &fixture).await.is_empty());
-        assert_no_direct_delivery(&pool, &fixture).await;
+        assert_nothing_committed(&pool, &fixture, &before, "gate closed").await;
     }
+
+    catbird_server::federation::open_federation_for_test();
+    for (answer_route, expected, attempt) in [
+        (
+            Route::Unreachable,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("5"),
+                Some("RelationshipPolicyUnavailable"),
+            ),
+            "sequencer unreachable",
+        ),
+        (
+            Route::Unroutable,
+            (StatusCode::UNAUTHORIZED, None, Some("NotAuthorized")),
+            "sequencer unroutable",
+        ),
+        (
+            Route::StoreFailing,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                Some("InternalServerError"),
+            ),
+            "replica's store failing while routing",
+        ),
+    ] {
+        *route.lock().unwrap() = answer_route;
+        let answer = post_answer(&router, &device, &fixture.signed_request).await;
+        assert_eq!(answered(&answer), expected, "{attempt}: {}", answer.2);
+        assert_nothing_committed(&pool, &fixture, &before, attempt).await;
+    }
+    assert_eq!(relays.load(SeqCst), 0, "nothing reached the sequencer");
+
+    *route.lock().unwrap() = Route::Resolves;
+    let (status, _, response) = post_answer(&router, &device, &fixture.signed_request).await;
+    FederationMode::set_runtime_override(None);
+    std::env::remove_var("FEDERATION_GROUP_RELAY_HMAC_SECRET");
+    assert_eq!(status, StatusCode::OK, "sequencer answering: {response}");
+    assert_eq!(relays.load(SeqCst), 1, "relayed once");
+    assert_eq!(response["entry"]["entryId"], entry["entryId"]);
+    assert_eq!(response["entry"]["seq"], 4);
+    assert_nothing_committed(&pool, &fixture, &before, "relayed").await;
+}
+
+/// A local send whose relationship source cannot answer now decided nothing:
+/// `RelationshipPolicyUnavailable` with `Retry-After: 5`, and nothing is
+/// committed. Once the source answers, the identical send is accepted.
+#[tokio::test]
+async fn local_send_is_retryable_while_its_relationship_source_cannot_answer() {
+    use catbird_server::chat_protocol::relationship_policy::{SimSourceFault, TransportError};
+    let (pool, _database, fixture, device, _) = setup(false).await;
+    let source = SimSourceFault::default();
+    let router = http::router_for_authenticated_acceptance_with(pool.clone(), {
+        let source = source.clone();
+        move |runtime| {
+            runtime
+                .with_sim_faulty_relationships(source)
+                .expect("the faulty relationship authority")
+        }
+    })
+    .await;
+    // No fresh fallback is cached: the send collects its traffic graph live.
+    sqlx::query("TRUNCATE chat.relationship_projection_snapshots CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before = business_snapshot(&pool, &fixture).await;
+
+    *source.lock().unwrap() = Some(Err(TransportError::Network));
+    let answer = post_answer(&router, &device, &fixture.signed_request).await;
+    assert_eq!(
+        answered(&answer),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("5"),
+            Some("RelationshipPolicyUnavailable")
+        ),
+        "relationship source unreachable: {}",
+        answer.2
+    );
+    assert_nothing_committed(&pool, &fixture, &before, "relationship source unreachable").await;
+
+    *source.lock().unwrap() = None;
+    let (status, _, response) = post_answer(&router, &device, &fixture.signed_request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "relationship source answering: {response}"
+    );
+    assert_single_application_and_group_entry(&pool, &fixture).await;
 }
 
 #[tokio::test]

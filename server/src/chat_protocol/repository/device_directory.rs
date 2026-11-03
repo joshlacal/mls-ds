@@ -22,9 +22,9 @@
 //     the `public` schema (handlers/mls_chat/get_key_packages.rs) and is NOT
 //     copied. Counts filter to the exact status literals so a future
 //     `key_packages` status can never silently inflate a live count.
-//   - The device's key is a per-device singleton: `chat.device_keys` PRIMARY KEY
-//     is `(user_did, device_id)` (core.sql:337), so the JOIN yields exactly one
-//     key row; there is no multi-key ambiguity.
+//   - A device's current key is its latest immutable activation at or before
+//     its current auth generation. Historical keys remain available to proofs,
+//     but never create duplicate device views or a fallback from a revoked key.
 //
 // Bounding for the getDevices path is NOT reimplemented here: the getDevices
 // handler reuses the certified `inventory::get_devices` verbatim (its
@@ -200,6 +200,11 @@ const SELECT_DEVICE_VIEW: &str = r#"
       JOIN chat.device_keys device_key
         ON device_key.user_did = device.user_did
        AND device_key.device_id = device.device_id
+       AND device_key.enrollment_auth_generation <= device.auth_generation
+       AND NOT EXISTS (SELECT 1 FROM chat.device_keys newer
+            WHERE newer.user_did=device_key.user_did AND newer.device_id=device_key.device_id
+              AND newer.enrollment_auth_generation>device_key.enrollment_auth_generation
+              AND newer.enrollment_auth_generation<=device.auth_generation)
 "#;
 
 /// The full `deviceView` projection for one device identified by its primary
@@ -268,6 +273,11 @@ pub(crate) async fn lock_active_revocation_device_view(
           JOIN chat.device_keys device_key
             ON device_key.user_did=device.user_did
            AND device_key.device_id=device.device_id
+           AND device_key.enrollment_auth_generation <= device.auth_generation
+           AND NOT EXISTS (SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=device_key.user_did AND newer.device_id=device_key.device_id
+                  AND newer.enrollment_auth_generation>device_key.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=device.auth_generation)
          WHERE device.user_did=$1
            AND device.device_id=$2
          FOR UPDATE OF device,device_key
@@ -601,6 +611,11 @@ pub(crate) async fn read_direct_request_pool_hint(
       FROM instant CROSS JOIN chat.direct_request_capabilities c
       JOIN chat.devices d ON d.user_did=c.owner_did AND d.device_id=c.owner_device_id
       JOIN chat.device_keys k ON k.user_did=d.user_did AND k.device_id=d.device_id
+        AND k.enrollment_auth_generation<=d.auth_generation
+        AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+          WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id
+            AND newer.enrollment_auth_generation>k.enrollment_auth_generation
+            AND newer.enrollment_auth_generation<=d.auth_generation)
       LEFT JOIN chat.key_packages p ON c.enabled AND d.status='active' AND k.revoked_at IS NULL
         AND c.auth_generation=d.auth_generation AND c.owner_key_id=k.key_id
         AND p.owner_did=c.owner_did AND p.owner_device_id=c.owner_device_id

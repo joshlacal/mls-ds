@@ -2580,11 +2580,14 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
         "A0 and schema setup must reuse the common reviewed migrator factory"
     );
 
+    // F29 (2026-09-24) moved suites in-crate, where they still reach the
+    // shared database through the `#[path]`-mounted `tests/common` helper, so
+    // the inventory spans `tests/` and `src/`; 7b1f093b4 (2026-10-31) deleted
+    // chat_protocol_blobs and chat_protocol_s3_lifecycle.
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut sources = Vec::new();
-    rust_sources(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"),
-        &mut sources,
-    );
+    rust_sources(&manifest_dir.join("tests"), &mut sources);
+    rust_sources(&manifest_dir.join("src"), &mut sources);
     let mut caller_targets = BTreeSet::new();
     let mut caller_occurrences = 0_usize;
     for path in sources {
@@ -2594,49 +2597,44 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
         caller_occurrences += occurrences;
         if occurrences > 0 && path != common_path && path != schema_path && path != g7_schema_path {
             caller_targets.insert(
-                path.file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .expect("UTF-8 integration-test target")
+                path.strip_prefix(manifest_dir)
+                    .ok()
+                    .and_then(|relative| relative.to_str())
+                    .expect("UTF-8 caller path under the server manifest")
                     .to_owned(),
             );
         }
     }
-    // Re-derived after removing the obsolete unbound-hydration fixture: the
-    // post-cutover tree has 258 setup calls. Four occurrences in this schema
-    // and three in the G7 schema are the authorized Amendment-3 calls, leaving
-    // 251 other fixed-target calls. This inventory catches unreviewed drift in
-    // which tests depend on the shared database.
+    // 184 setup calls: 65 under tests/ and 119 in-crate. Four occurrences in
+    // this schema and three in the G7 schema are the authorized Amendment-3
+    // calls, leaving 177 other fixed-target calls. This inventory catches
+    // unreviewed drift in which tests depend on the shared database. 210 → 184
+    // (Main ruling 2026-11-04): suites that read later-migration DDL left the
+    // shared target for private fully migrated databases — device_directory (3),
+    // production_cfg (20), and inventory_tests' three HTTP acceptance cases.
     assert_eq!(
-        caller_occurrences, 258,
+        caller_occurrences, 184,
         "fixed-target setup caller inventory changed"
     );
     assert_eq!(
         caller_occurrences
             .checked_sub(schema_amendment_3_occurrences.len() + 3)
             .expect("Amendment-3 setup delta cannot exceed the closed inventory"),
-        251,
+        177,
         "the seven authorized Amendment-3 occurrences must be the only inventory delta"
     );
     let expected_targets: BTreeSet<String> = [
-        "chat_protocol_blobs",
-        "chat_protocol_concurrency",
-        "chat_protocol_conversation_substrate",
-        "chat_protocol_create_conversation_handlers",
-        "chat_protocol_create_conversation_regression",
-        "chat_protocol_delivery",
-        "chat_protocol_delivery_read",
-        "chat_protocol_device_directory",
-        "chat_protocol_device_handlers",
-        "chat_protocol_inventory",
-        "chat_protocol_key_packages",
-        "chat_protocol_operation_claims",
-        "chat_protocol_production_cfg",
-        "chat_protocol_relationship_repository",
-        "chat_protocol_rollback",
-        "chat_protocol_s3_lifecycle",
-        "chat_protocol_ticket",
-        "chat_protocol_transition_repository",
-        "chat_protocol_welcome",
+        "src/chat_protocol/repository/conversation_substrate_tests.rs",
+        "src/chat_protocol/repository/inventory_tests.rs",
+        "src/chat_protocol/repository/relationship/tests.rs",
+        "src/chat_protocol/repository/transition/tests.rs",
+        "tests/chat_protocol_create_conversation_handlers.rs",
+        "tests/chat_protocol_create_conversation_regression.rs",
+        "tests/chat_protocol_delivery.rs",
+        "tests/chat_protocol_device_handlers.rs",
+        "tests/chat_protocol_key_packages.rs",
+        "tests/chat_protocol_operation_claims.rs",
+        "tests/chat_protocol_welcome.rs",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -4334,9 +4332,11 @@ fn validate_closed_complete_source_authority(
         .collect::<Vec<_>>();
     let top_level_function_digest =
         hex::encode(Sha256::digest(top_level_functions.join("\0").as_bytes()));
-    if top_level_functions.len() != 118
+    // 118 → 119 (Main ruling 2026-11-04): + exact_manifest_fixture_lacks_later_migration_ddl,
+    // the negative guard that the exact-manifest fixture lacks later-migration DDL.
+    if top_level_functions.len() != 119
         || top_level_function_digest
-            != "c565c586b50089c5ae4baf5e67cd4c4a93e0a3a3161ea3a23e70ff0b6a63c6b4"
+            != "9089b20a47046b7167092ab38fd558243ee2fcd11859abd981350688cc83b0ec"
     {
         return Err(format!(
             "top-level callable item inventory changed: count={} sha256={} names={:?}",
@@ -4617,7 +4617,9 @@ fn validate_closed_complete_source_authority(
         ));
         macro_cursor = body_close + 1;
     }
-    let expected_macro_definitions = ["reject_mutation|delimiter={}|82334..82715|depth=1|\
+    // 188bfafac (2026-08-28) moved this definition +44 bytes without
+    // re-pinning its span; all four content hashes are unchanged.
+    let expected_macro_definitions = ["reject_mutation|delimiter={}|82378..82759|depth=1|\
          module=<root>|\
          scope=a0_legacy_forward_reconcile_classifier_rejects_every_drift_dimension|\
          arms=[\"()->{}:matcher=$ field : ident , $ value : expr:\
@@ -9947,30 +9949,35 @@ fn canonical_legacy_receipt_set_digest_is_domain_separated_and_ordered() {
     );
 }
 
+/// Prefix of the exact-manifest databases the schema gates mint for themselves.
+const SCHEMA_DB_PREFIX: &str = "chat_schema_";
+
 #[tokio::test]
 async fn operation_claim_completeness_cutover_matches_durable_classification() {
-    let database_url =
-        std::env::var("TEST_DATABASE_URL").expect("live completeness proof requires exact target");
-    crate::common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
-        .expect("live completeness proof refuses a nonliteral target");
-    let mut connection = PgConnection::connect(&database_url)
+    // Main ruling 2026-11-04: the shared fixed target carries later-migration
+    // DDL, so this gate proves its own exact-manifest database, minted on the
+    // validated literal's loopback server, instead of adopting the shared one.
+    let (pool, database) =
+        crate::common::fresh_db::fresh_clean_protocol_db(SCHEMA_DB_PREFIX, 1).await;
+    let mut connection = pool
+        .acquire()
         .await
-        .expect("connect exact live completeness target");
+        .expect("acquire exact-manifest completeness connection");
     let (database_name, server_address, server_port): (String, Option<String>, Option<i32>) =
         sqlx::query_as("SELECT current_database(),host(inet_server_addr()),inet_server_port()")
-            .fetch_one(&mut connection)
+            .fetch_one(&mut *connection)
             .await
-            .expect("read live completeness target identity");
-    assert_eq!(database_name, TEST_DATABASE_NAME);
+            .expect("read exact-manifest completeness target identity");
+    assert_eq!(database_name, database.name());
     assert_eq!(server_address.as_deref(), Some("127.0.0.1"));
     assert_eq!(server_port, Some(5432));
-    a0_assert_exact_ledger(&mut connection).await;
-    a0_assert_post_clean_catalog(&mut connection).await;
+    a0_assert_exact_ledger(&mut *connection).await;
+    a0_assert_post_clean_catalog(&mut *connection).await;
     let evidence = crate::common::chat_protocol::validate_durable_operation_claim_completeness(
-        &mut connection,
+        &mut *connection,
     )
     .await
-    .expect("live durable operation-claim classification");
+    .expect("exact-manifest durable operation-claim classification");
     eprintln!(
         "CATBIRD_OPERATION_CLAIM_COMPLETENESS_V1 \
          legacy_receipt_count={} legacy_receipt_set_sha256={}",
@@ -9980,7 +9987,8 @@ async fn operation_claim_completeness_cutover_matches_durable_classification() {
     connection
         .close()
         .await
-        .expect("close live completeness connection");
+        .expect("close exact-manifest completeness connection");
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -10337,7 +10345,10 @@ async fn clean_chat_schema_preserves_all_core_invariants_and_receipt_table() {
 
 #[tokio::test]
 async fn clean_chat_schema_is_exact_and_validation_only() {
-    let pool = fresh_pool().await;
+    // Main ruling 2026-11-04: its own exact-manifest database, not the shared
+    // fixed target (which carries later-migration DDL).
+    let (pool, _database) =
+        crate::common::fresh_db::fresh_clean_protocol_db(SCHEMA_DB_PREFIX, 1).await;
     let mut connection = pool
         .acquire()
         .await
@@ -10358,4 +10369,85 @@ async fn clean_chat_schema_is_exact_and_validation_only() {
         .await
         .expect("close validation-only schema connection");
     pool.close().await;
+}
+
+/// Main ruling 2026-11-04: the exact-manifest fixture must not carry the later
+/// DDL a contaminated shared target did and production paths read. The probe
+/// is proven live: every piece of injected later DDL is reported.
+#[tokio::test]
+async fn exact_manifest_fixture_lacks_later_migration_ddl() {
+    async fn later_migration_ddl_present(connection: &mut PgConnection) -> Vec<&'static str> {
+        let mut present = Vec::new();
+        for (probe, query) in [
+            (
+                "chat.key_packages.usage_scope",
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'chat' AND table_name = 'key_packages' \
+                    AND column_name = 'usage_scope')",
+            ),
+            (
+                "chat.conversations.protocol_version",
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'chat' AND table_name = 'conversations' \
+                    AND column_name = 'protocol_version')",
+            ),
+            (
+                "chat.direct_request_*",
+                "SELECT EXISTS (SELECT 1 FROM pg_class c \
+                  JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE n.nspname = 'chat' AND starts_with(c.relname::text, 'direct_request_'))",
+            ),
+            (
+                "labyrinth schema",
+                "SELECT to_regnamespace('labyrinth') IS NOT NULL",
+            ),
+        ] {
+            let exists: bool = sqlx::query_scalar(query)
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap_or_else(|error| panic!("probe {probe}: {error}"));
+            if exists {
+                present.push(probe);
+            }
+        }
+        present
+    }
+
+    let (pool, _database) =
+        crate::common::fresh_db::fresh_clean_protocol_db(SCHEMA_DB_PREFIX, 1).await;
+    let mut connection = pool
+        .acquire()
+        .await
+        .expect("acquire exact-manifest probe connection");
+    assert_eq!(
+        later_migration_ddl_present(&mut connection).await,
+        Vec::<&str>::new(),
+        "the exact reviewed manifest must not carry later-migration DDL"
+    );
+    for (ddl, probe) in [
+        (
+            "ALTER TABLE chat.key_packages ADD COLUMN usage_scope TEXT",
+            "chat.key_packages.usage_scope",
+        ),
+        (
+            "ALTER TABLE chat.conversations ADD COLUMN protocol_version TEXT",
+            "chat.conversations.protocol_version",
+        ),
+        (
+            "CREATE TABLE chat.direct_request_attempts (request_id UUID PRIMARY KEY)",
+            "chat.direct_request_*",
+        ),
+        ("CREATE SCHEMA labyrinth", "labyrinth schema"),
+    ] {
+        sqlx::query(ddl)
+            .execute(&mut *connection)
+            .await
+            .unwrap_or_else(|error| panic!("inject {ddl}: {error}"));
+        assert!(
+            later_migration_ddl_present(&mut connection)
+                .await
+                .contains(&probe),
+            "the guard missed injected later-migration DDL: {ddl}"
+        );
+    }
 }

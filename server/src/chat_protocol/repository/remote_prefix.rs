@@ -175,6 +175,11 @@ impl<'borrow, 'conn> HistoricalPrefixAuthority<'borrow, 'conn> {
               JOIN chat.device_keys k
                 ON k.user_did = d.user_did AND k.device_id = d.device_id
              WHERE d.user_did = $1 AND d.device_id = $2 AND k.key_id = $3
+               AND k.enrollment_auth_generation<=d.auth_generation
+               AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                    WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id
+                      AND newer.enrollment_auth_generation>k.enrollment_auth_generation
+                      AND newer.enrollment_auth_generation<=d.auth_generation)
              FOR SHARE
             "#,
         )
@@ -200,7 +205,7 @@ impl<'borrow, 'conn> HistoricalPrefixAuthority<'borrow, 'conn> {
         }
         if dev_auth_gen < 1
             || dev_auth_gen != auth_gen_expected
-            || dev_auth_gen != key_enrollment_gen
+            || key_enrollment_gen > dev_auth_gen
             || user_did != actor_did
         {
             return Err(RemotePrefixBootstrapError::Authority);
@@ -876,7 +881,10 @@ pub(crate) async fn apply_remote_clean_prefix(
     // 2. Recheck outbound peer policy under transaction (FOR SHARE)
     peer_policy::enforce_outbound_peer_policy_tx(tx, &sequencer_did)
         .await
-        .map_err(|_| RemotePrefixBootstrapError::PeerDenied)?;
+        .map_err(|error| match error {
+            crate::federation::FederationError::Database(_) => RemotePrefixBootstrapError::Database,
+            _ => RemotePrefixBootstrapError::PeerDenied,
+        })?;
 
     // Lock one union across all historical steps, prospective participant DIDs,
     // retained Welcome recipients, and historical terminal recipients. Per-step

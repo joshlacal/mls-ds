@@ -32,6 +32,7 @@ use labyrinth_protocol::receipt::{verify_sequencer_receipt, SequencerReceiptPayl
 use p256::{ecdsa::SigningKey as P256SigningKey, pkcs8::EncodePrivateKey, SecretKey as P256Secret};
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 fn p256_pem(sk: &P256SigningKey) -> String {
@@ -394,6 +395,14 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
     assert_eq!(pruned_entry["payloadPruned"], true);
     assert!(pruned_entry.get("signedRequest").is_none());
     assert_eq!(pruned_entry["sequencerReceipt"]["sequencerDid"], self_did);
+    assert_c33_transport_only_home_prunes_application(
+        &pool,
+        &fixture,
+        &sender_dev,
+        &send_body["entry"],
+        receipt_json,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -530,6 +539,10 @@ async fn delete_account_data_sequences_account_deleted_entry_in_active_conversat
             &pool,
             &fixture.sender_did,
             Utc::now(),
+            Some(&I13ReceiptSigner::new(
+                http::random_p256(),
+                "did:web:chat.catbird.blue".to_owned(),
+            )),
         )
         .await
         .expect("delete_account_data_with_conversations");
@@ -577,4 +590,236 @@ async fn delete_account_data_sequences_account_deleted_entry_in_active_conversat
     let _ = URL_SAFE_NO_PAD;
     let _ = Request::builder().body(Body::empty());
     let _ = Router::<()>::new;
+}
+
+async fn assert_c33_transport_only_home_prunes_application(
+    source: &sqlx::PgPool,
+    fixture: &catbird_server::chat_protocol::test_support::CleanSlateApplicationFixture,
+    sender: &http::Device,
+    accepted_entry: &Value,
+    receipt: &Value,
+) {
+    let home_db = common::fresh_db::fresh_fully_migrated_db("chat_pruning_").await;
+    let home = home_db.connect(4).await;
+    http::ensure_fence(&home).await;
+    // This is a storage/ACK regression, not an opening-acceptance fixture. Copy
+    // the enrolled local sender; the other inbox device lives at another home.
+    // The application and I13 evidence below are the real sendMessage outcome.
+    for table in ["principals", "devices", "device_keys"] {
+        let rows: Vec<sqlx::types::Json<Value>> = sqlx::query_scalar(&format!(
+            "SELECT to_jsonb(source_row) FROM chat.{table} source_row WHERE user_did = $1"
+        ))
+        .bind(&fixture.sender_did)
+        .fetch_all(source)
+        .await
+        .unwrap();
+        for row in rows {
+            sqlx::query(&format!(
+                "INSERT INTO chat.{table} SELECT * FROM jsonb_populate_record(NULL::chat.{table}, $1)"
+            ))
+            .bind(row)
+            .execute(&home)
+            .await
+            .unwrap();
+        }
+    }
+    let control: Vec<u8> = sqlx::query_scalar(
+        "SELECT accepted_payload_bytes FROM chat.entries WHERE conversation_id = $1 AND seq = 3",
+    )
+    .bind(fixture.conversation_id)
+    .fetch_one(source)
+    .await
+    .unwrap();
+    let control_json: Value = serde_json::from_slice(&control).unwrap();
+    let welcome = control_json
+        .pointer("/signedRequest/body/manifest/welcomeBundle/opaqueWelcome")
+        .and_then(Value::as_str)
+        .expect("genuine native Welcome in fixture history");
+    let welcome = STANDARD.decode(welcome).unwrap();
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO chat.direct_request_transport_inbox \
+         (request_id, conversation_id, first_message_id, coordinator_did, sender_did, sender_device_id, \
+          recipient_did, recipient_device_id, request_entry, signed_publication, full_welcome, \
+          full_welcome_sha256, provenance, publication_receipt, import_until, status) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$11,$9,$12,$13,'accepted')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(fixture.conversation_id)
+    .bind(fixture.message_id)
+    .bind(catbird_server::identity::service_did_base())
+    .bind(&fixture.sender_did)
+    .bind(fixture.sender_device_id)
+    .bind(&fixture.recipient_did)
+    .bind(fixture.recipient_device_id)
+    .bind(&control)
+    .bind(&welcome)
+    .bind(Sha256::digest(&welcome).to_vec())
+    .bind(serde_json::to_vec(receipt).unwrap())
+    .bind(now + Duration::days(30))
+    .execute(&home)
+    .await
+    .unwrap();
+    let mut entry = accepted_entry.clone();
+    entry["$type"] = json!("blue.catbird.chat.defs#applicationEntry");
+    entry["sequencerReceipt"] = receipt.clone();
+    let original = serde_json::to_vec(&entry).unwrap();
+    let seq = entry["seq"].as_i64().unwrap();
+    let entry_id = Uuid::parse_str(entry["entryId"].as_str().unwrap()).unwrap();
+    assert!(
+        original.windows(6).any(|window| window == b"\\u0000"),
+        "the genuine signed request keeps its NUL-terminated domain"
+    );
+    assert_eq!(
+        catbird_server::chat_protocol::repository::delivery::insert_transport_entry(
+            &mut home.acquire().await.unwrap(),
+            fixture.conversation_id,
+            seq,
+            entry_id,
+            &original,
+            now,
+        )
+        .await
+        .unwrap(),
+        catbird_server::chat_protocol::repository::delivery::TransportEntryInsert::Inserted
+    );
+    let conversation_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations WHERE conversation_id = $1")
+            .bind(fixture.conversation_id)
+            .fetch_one(&home)
+            .await
+            .unwrap();
+    assert_eq!(conversation_count, 0, "C33 home must be transport-only");
+    let router = http::router_for_authenticated_acceptance(home.clone()).await;
+    let key = EdSigningKey::from_bytes(&fixture.sender_ed25519_seed);
+    let ack = sign_ack_entries_request(
+        fixture.sender_device_id,
+        &fixture.sender_key_id,
+        1,
+        &key,
+        fixture.conversation_id,
+        0,
+        seq,
+    );
+    for expected_pruned in [1_i64, 0] {
+        let (status, body) = http::send(
+            router.clone(),
+            http::unsigned_json_request(
+                sender,
+                "blue.catbird.chat.acknowledgeEntries",
+                serde_json::to_vec(&ack).unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "C33 ACK: {body}");
+        assert_eq!(body["acknowledgedSeq"], seq);
+        assert_eq!(body["prunedCount"], expected_pruned);
+    }
+    let watermark: i64 = sqlx::query_scalar(
+        "SELECT acked_through_seq FROM chat.device_entry_acks \
+          WHERE conversation_id = $1 AND user_did = $2 AND device_id = $3",
+    )
+    .bind(fixture.conversation_id)
+    .bind(&fixture.sender_did)
+    .bind(fixture.sender_device_id)
+    .fetch_one(&home)
+    .await
+    .unwrap();
+    assert_eq!(watermark, seq, "transport-only ACK must be durable");
+    let (digest, metadata, bytes, pruned): (Vec<u8>, Vec<u8>, Vec<u8>, bool) = sqlx::query_as(
+        "SELECT original_entry_sha256, application_metadata_bytes, entry_bytes, \
+                payload_pruned_at IS NOT NULL FROM chat.direct_request_transport_entries \
+          WHERE conversation_id = $1 AND seq = $2",
+    )
+    .bind(fixture.conversation_id)
+    .bind(seq)
+    .fetch_one(&home)
+    .await
+    .unwrap();
+    assert!(pruned);
+    assert_eq!(digest, Sha256::digest(&original).to_vec());
+    // The stored entry carries the presented (`$bytes`) form of the request.
+    let mut expected_metadata = entry["signedRequest"].clone();
+    expected_metadata["body"]["applicationMessage"]
+        .as_object_mut()
+        .unwrap()
+        .remove("bytes");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&metadata).unwrap(),
+        expected_metadata
+    );
+    let projection: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(projection["seq"], seq);
+    assert_eq!(projection["payloadPruned"], true);
+    assert_eq!(&projection["sequencerReceipt"], receipt);
+    assert!(projection.get("signedRequest").is_none());
+    let (status, page) = http::send(
+        router.clone(),
+        http::unsigned_get_request(
+            sender,
+            "blue.catbird.chat.getEntries",
+            &format!(
+                "actorDeviceId={}&conversationId={}&afterSeq={}&limit=50",
+                fixture.sender_device_id,
+                fixture.conversation_id,
+                seq - 1,
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "pruned C33 getEntries: {page}");
+    assert_eq!(page["entries"][0]["seq"], seq);
+    assert_eq!(page["entries"][0]["payloadPruned"], true);
+    assert_eq!(&page["entries"][0]["sequencerReceipt"], receipt);
+    assert!(page["entries"][0].get("signedRequest").is_none());
+    let (status, replay) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            sender,
+            "blue.catbird.chat.sendMessage",
+            serde_json::to_vec(&json!({"signedRequest": fixture.signed_request})).unwrap(),
+        ),
+    )
+    .await;
+    // The same signed send replays as its accepted outcome (binding contract):
+    // exactly the pruned entry `getEntries` serves here, with its I13 receipt.
+    assert_eq!(status, StatusCode::OK, "pruned retry: {replay}");
+    let mut served = page["entries"][0].clone();
+    served.as_object_mut().unwrap().remove("$type");
+    assert_eq!(
+        replay,
+        json!({ "entry": served, "sequencerReceipt": receipt }),
+        "pruned retry"
+    );
+    let mut changed_body = fixture.signed_request["body"].clone();
+    changed_body["signedAt"] =
+        json!((now + Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true));
+    let changed = catbird_server::chat_protocol::test_support::sign_mutation_json_for_test(
+        &changed_body,
+        &key,
+    )
+    .unwrap();
+    let (_, conflict) = http::send(
+        router,
+        http::unsigned_json_request(
+            sender,
+            "blue.catbird.chat.sendMessage",
+            serde_json::to_vec(&json!({"signedRequest": changed})).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        conflict["error"], "IdempotencyConflict",
+        "changed retry: {conflict}"
+    );
+    assert!(sqlx::query(
+        "UPDATE chat.direct_request_transport_entries SET entry_bytes = $3, payload_pruned_at = NULL \
+          WHERE conversation_id = $1 AND seq = $2",
+    )
+    .bind(fixture.conversation_id)
+    .bind(seq)
+    .bind(&original)
+    .execute(&home)
+    .await
+    .is_err());
 }

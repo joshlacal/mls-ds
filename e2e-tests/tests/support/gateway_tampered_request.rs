@@ -137,6 +137,15 @@ impl GatewaySender<'_> {
             .cloned()
             .with_context(|| format!("prepare returned no live preparation: {response}"))?;
         let document = self.receipt_document().await?;
+        let authority_document: Value = serde_json::from_slice(&document)?;
+        let sequencer_did = authority_document["id"]
+            .as_str()
+            .context("authority document DID")?;
+        let sequencer_receipt_key = catbird_mls::client::chat_wire::decode_p256_sec1_from_did_doc(
+            &document,
+            sequencer_did,
+            "#mls-receipt-1",
+        )?;
         let receipt_key = protocol::resolve_direct_request_receipt_key(
             &document,
             preparation["receiptKeyId"]
@@ -222,6 +231,8 @@ impl GatewaySender<'_> {
                 authority_import_until: u64::try_from(authority_import_until)?,
                 preparation_request_digest: *verified_prepare.request_digest(),
                 receipt_authority_key: receipt_key.clone(),
+                sequencer_did: sequencer_did.into(),
+                sequencer_receipt_authority_key: sequencer_receipt_key,
                 text: "Unverifiable introduction the recipient must never surface".into(),
                 invitation: None,
                 metadata: GroupMetadataV1 {
@@ -230,6 +241,7 @@ impl GatewaySender<'_> {
                     description: String::new(),
                     avatar_blob_locator: None,
                     avatar_content_type: None,
+                    space_avatar: None,
                 },
             })?;
         tamper_introduction_ciphertext(&mut journal.bootstrap)?;
@@ -242,6 +254,7 @@ impl GatewaySender<'_> {
         publish_body["preparationRequestDigest"] =
             json!(STANDARD.encode(verified_prepare.request_digest()));
         publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
+        publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
         publish_body["next"] = bootstrap.coordinates.clone();
         publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
             bootstrap.import_until as i64,

@@ -10,7 +10,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use url::Url;
 use zeroize::Zeroizing;
 
-use super::request_push::RequestPushConfig;
 use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
 use crate::chat_protocol::{relationship_policy::ProductionRelationshipAuthority, CursorSealer};
 
@@ -94,7 +93,7 @@ pub struct ChatRuntime {
     require_signed_reads: bool,
     ws_registry: Arc<std::sync::Mutex<WsRegistryState>>,
     events_notify: Arc<tokio::sync::Notify>,
-    request_push: Option<Arc<RequestPushConfig>>,
+    request_push_enabled: bool,
     requests_ready: std::sync::atomic::AtomicBool,
     relationship_authority: Arc<ProductionRelationshipAuthority>,
     sse_state: Arc<SseState>,
@@ -116,7 +115,7 @@ impl fmt::Debug for ChatRuntime {
             .debug_struct("ChatRuntime")
             .field("cutover_enabled", &self.cutover_enabled)
             .field("relationship_authority", &"fixed-production-authority")
-            .field("request_push_enabled", &self.request_push.is_some())
+            .field("request_push_enabled", &self.request_push_enabled)
             .field(
                 "i13_receipt_signer_configured",
                 &self.i13_receipt_signer.is_some(),
@@ -201,7 +200,6 @@ impl ChatRuntime {
         let request_producers_enabled = env_flag("CHAT_DIRECT_REQUESTS_ENABLED");
         let request_push_enabled = env_flag("CHAT_REQUEST_PUSH_ENABLED");
         let request_receipt_signer = if request_producers_enabled
-            || request_push_enabled
             || std::env::var_os("CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM").is_some()
         {
             if !cutover_enabled {
@@ -220,7 +218,6 @@ impl ChatRuntime {
         if request_push_enabled && !cutover_enabled {
             return Err("request push requires chat cutover".into());
         }
-        let request_push = RequestPushConfig::from_env(request_push_enabled)?;
         let require_signed_reads = env_flag("CHAT_REQUIRE_SIGNED_READS");
         let i13_receipt_signer = build_i13_receipt_signer_from_env()?;
         let space_host_config = crate::space_host::SpaceHostConfig::from_env();
@@ -230,6 +227,12 @@ impl ChatRuntime {
                 cfg.signing_key.clone(),
             ))
         });
+        if request_push_enabled && push_gateway_client.is_none() {
+            return Err(
+                "CHAT_REQUEST_PUSH_ENABLED requires the Push Gateway client (SERVICE_DID and SIGNING_KEY_PEM)"
+                    .into(),
+            );
+        }
         Ok(Self {
             cutover_enabled,
             request_producers_enabled,
@@ -238,7 +241,7 @@ impl ChatRuntime {
             require_signed_reads,
             ws_registry: Arc::new(std::sync::Mutex::new(WsRegistryState::default())),
             events_notify: Arc::new(tokio::sync::Notify::new()),
-            request_push,
+            request_push_enabled,
             requests_ready: std::sync::atomic::AtomicBool::new(false),
             relationship_authority,
             sse_state,
@@ -306,9 +309,25 @@ impl ChatRuntime {
 
     /// Configure an offline deterministic allow-all relationship authority for the
     /// simulation harness without modifying production `from_env` startup guards.
+    /// Absent from production builds.
+    #[cfg(any(test, feature = "test-support", feature = "sim"))]
     pub fn with_sim_allow_all_relationships(mut self) -> Result<Self, String> {
         self.relationship_authority = Arc::new(
             ProductionRelationshipAuthority::sim_allow_all()
+                .map_err(|e| format!("sim relationship authority rejected: {e:?}"))?,
+        );
+        Ok(self)
+    }
+
+    /// [`Self::with_sim_allow_all_relationships`] whose public sources answer
+    /// `fault` instead while a test sets it. Absent from production builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_sim_faulty_relationships(
+        mut self,
+        fault: crate::chat_protocol::relationship_policy::SimSourceFault,
+    ) -> Result<Self, String> {
+        self.relationship_authority = Arc::new(
+            ProductionRelationshipAuthority::sim_fault(fault)
                 .map_err(|e| format!("sim relationship authority rejected: {e:?}"))?,
         );
         Ok(self)
@@ -354,24 +373,6 @@ impl ChatRuntime {
         &self,
     ) -> Option<&Arc<crate::federation::commit_submitter::RemoteCommitSubmitter>> {
         self.commit_submitter.as_ref()
-    }
-
-    /// Test-support-only loopback injection for the real internal route and
-    /// outbox worker. It changes only the fixed peer transport; receipt keys,
-    /// protocol fence, database authority and policy checks remain production.
-    #[cfg(feature = "test-support")]
-    pub fn with_test_request_push_loopback(
-        mut self,
-        event_endpoint: &str,
-        canonical_eligibility_bearer: &str,
-    ) -> Result<Self, String> {
-        let endpoint =
-            Url::parse(event_endpoint).map_err(|_| "test request-push endpoint is invalid")?;
-        self.request_push = Some(RequestPushConfig::loopback_for_test(
-            endpoint,
-            canonical_eligibility_bearer,
-        )?);
-        Ok(self)
     }
 
     /// The global cutover gate (OQ-2). `pub` so the binary crate can decide, at
@@ -493,16 +494,17 @@ impl ChatRuntime {
             .flatten()
     }
 
+    /// Direct-request wakes run only with `CHAT_REQUEST_PUSH_ENABLED` and the
+    /// D2 Push Gateway client this DS signs `blue.catbird.push.deliver` with.
     pub fn request_push_enabled(&self) -> bool {
-        self.request_push.is_some()
-            && self
-                .requests_ready
-                .load(std::sync::atomic::Ordering::Acquire)
+        self.request_push_client().is_some()
     }
 
-    pub(crate) fn request_push_config(&self) -> Option<&Arc<RequestPushConfig>> {
-        self.request_push_enabled()
-            .then_some(self.request_push.as_ref())
+    pub(crate) fn request_push_client(
+        &self,
+    ) -> Option<&Arc<crate::push_gateway::client::PushGatewayClient>> {
+        self.request_push_enabled
+            .then_some(self.push_gateway_client.as_ref())
             .flatten()
     }
 
@@ -566,6 +568,14 @@ impl ChatRuntime {
         self.requests_ready
             .store(false, std::sync::atomic::Ordering::Release);
         Ok(self)
+    }
+
+    /// Enable request producers on a simulated node, as `CHAT_DIRECT_REQUESTS_ENABLED`
+    /// does for a process; they still wait for the validated receipt authority.
+    #[cfg(feature = "sim")]
+    pub fn with_request_producers(mut self) -> Self {
+        self.request_producers_enabled = true;
+        self
     }
 
     pub fn i13_receipt_signer(&self) -> Option<&crate::federation::receipt::I13ReceiptSigner> {
@@ -983,7 +993,9 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_fence_validation_fails_closed_without_a_cursor_sealer() {
-        let runtime = ChatRuntime::from_env(Arc::new(SseState::new(8))).unwrap();
+        let mut runtime = ChatRuntime::from_env(Arc::new(SseState::new(8))).unwrap();
+        // Sibling suites configure a process-wide sealer through the env.
+        runtime.cursor_sealer = None;
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://invalid/clean_chat")
             .unwrap();

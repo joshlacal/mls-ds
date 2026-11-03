@@ -115,12 +115,17 @@ async fn register(
 
     let key_row: Option<(Vec<u8>, Option<DateTime<Utc>>)> = sqlx::query_as(
         "SELECT signing_public_key, revoked_at \
-           FROM chat.device_keys \
-          WHERE user_did = $1 AND device_id = $2 AND key_id = $3",
+           FROM chat.device_keys k \
+          WHERE user_did=$1 AND device_id=$2 AND key_id=$3 AND enrollment_auth_generation<=$4 \
+            AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer \
+                WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+                  AND newer.enrollment_auth_generation>k.enrollment_auth_generation \
+                  AND newer.enrollment_auth_generation<=$4)",
     )
     .bind(&user_did)
     .bind(device_uuid)
     .bind(key_id)
+    .bind(current_auth_gen)
     .fetch_optional(pool)
     .await
     .map_err(|_| ChatFailure::storage(ENDPOINT))?;

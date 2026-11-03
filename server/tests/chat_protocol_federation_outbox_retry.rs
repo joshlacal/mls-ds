@@ -25,7 +25,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
 use catbird_server::auth::{
-    cache_test_did_document, AuthMiddleware, DidDocument, PublicKeyJwk, VerificationMethod,
+    cache_test_did_document, AuthMiddleware, DidDocument, VerificationMethod,
 };
 use catbird_server::chat_protocol::test_support::repository::{
     enqueue_clean_federation_message_jobs, enqueue_federated_welcome_job, AppendEntry,
@@ -107,24 +107,22 @@ async fn cache_peer_did_doc(
     peer_did: &str,
     verifying_key: &p256::ecdsa::VerifyingKey,
 ) {
-    let encoded_point = verifying_key.to_encoded_point(false);
-    let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoded_point.x().unwrap());
-    let y = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoded_point.y().unwrap());
-    let key_id = format!("{peer_did}#atproto_mls");
+    // Production P-256 DID keys are Multikey: p256-pub multicodec (0x80 0x24)
+    // over the compressed SEC1 point, base58btc multibase.
+    let mut multikey = vec![0x80, 0x24];
+    multikey.extend_from_slice(verifying_key.to_encoded_point(true).as_bytes());
+    // Receipts/service auth verify against the peer's `#atproto` method since
+    // 188bfafac; `#atproto_mls` is the DS *service* id, never a key.
+    let key_id = format!("{peer_did}#atproto");
 
     let doc = DidDocument {
         id: peer_did.to_string(),
         verification_method: vec![VerificationMethod {
             id: key_id,
-            key_type: "JsonWebKey".to_string(),
+            key_type: "Multikey".to_string(),
             controller: peer_did.to_string(),
-            public_key_multibase: None,
-            public_key_jwk: Some(PublicKeyJwk {
-                kty: "EC".to_string(),
-                crv: "P-256".to_string(),
-                x,
-                y: Some(y),
-            }),
+            public_key_multibase: Some(multibase::encode(multibase::Base::Base58Btc, multikey)),
+            public_key_jwk: None,
         }],
         service: None,
     };
@@ -1883,82 +1881,6 @@ async fn test_state_machine_creation_does_not_enqueue_synthetic_deliver_message(
 }
 
 #[tokio::test]
-async fn test_notification_outbox_reclaim_does_not_reference_claim_columns() {
-    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
-
-    let convo_id = Uuid::new_v4().to_string();
-    let stuck_id = Uuid::new_v4().to_string();
-    let fresh_id = Uuid::new_v4().to_string();
-
-    sqlx::query(
-        "INSERT INTO conversations (id, creator_did, group_id, created_at, updated_at) VALUES ($1, 'did:plc:ragtjsm2j2vknwk6zpkrhgah', 'group-1', NOW(), NOW()) ON CONFLICT DO NOTHING",
-    )
-    .bind(&convo_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "INSERT INTO delivery_events (id, conversation_id, seq, event_type, sender_did, idempotency_key, payload_json) VALUES ('evt-1', $1, 1, 'message', 'did:plc:ragtjsm2j2vknwk6zpkrhgah', 'idem-1', '{}'), ('evt-2', $1, 2, 'message', 'did:plc:ragtjsm2j2vknwk6zpkrhgah', 'idem-2', '{}') ON CONFLICT DO NOTHING",
-    )
-    .bind(&convo_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Row 1: in_flight and updated 10 minutes ago (stuck)
-    sqlx::query(
-        "INSERT INTO notification_outbox (
-            id, conversation_id, delivery_event_id, recipient_did, kind,
-            status, next_attempt_at, updated_at, created_at
-         ) VALUES ($1, $2, 'evt-1', 'did:plc:alice234567abcdefghijkl', 'sse', 'in_flight', NOW(), NOW() - INTERVAL '10 minutes', NOW() - INTERVAL '10 minutes')",
-    )
-    .bind(&stuck_id)
-    .bind(&convo_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Row 2: in_flight and updated just now (fresh)
-    sqlx::query(
-        "INSERT INTO notification_outbox (
-            id, conversation_id, delivery_event_id, recipient_did, kind,
-            status, next_attempt_at, updated_at, created_at
-         ) VALUES ($1, $2, 'evt-2', 'did:plc:bob2345678abcdefghijklm', 'sse', 'in_flight', NOW(), NOW(), NOW())",
-    )
-    .bind(&fresh_id)
-    .bind(&convo_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Reclaim stuck rows - must succeed without referencing non-existent claim_token / claim_expires_at columns
-    let reclaimed = catbird_server::workers::reclaim_stuck_in_flight(&pool, "notification_outbox")
-        .await
-        .unwrap();
-    assert_eq!(
-        reclaimed, 1,
-        "Exactly one stuck in_flight row should be reclaimed"
-    );
-
-    let status_stuck: String =
-        sqlx::query_scalar("SELECT status FROM notification_outbox WHERE id = $1")
-            .bind(&stuck_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(status_stuck, "pending", "Stuck row must revert to pending");
-
-    let status_fresh: String =
-        sqlx::query_scalar("SELECT status FROM notification_outbox WHERE id = $1")
-            .bind(&fresh_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(status_fresh, "in_flight", "Fresh row must remain in_flight");
-}
-
-#[tokio::test]
 async fn test_recovery_fulfillment_remote_welcome_creates_typed_outbox_job_and_rollback() {
     let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
@@ -3184,8 +3106,8 @@ async fn test_outbox_record_failure_with_stale_claim_token_does_not_mutate_recla
         &row_id,
         Some(token_a),
         0,
-        now,
         "stale-worker-error",
+        false,
     )
     .await
     .unwrap();
@@ -3220,8 +3142,8 @@ async fn test_outbox_record_failure_with_stale_claim_token_does_not_mutate_recla
         &row_id,
         Some(token_a),
         1,
-        now,
         "stale-worker-error-2",
+        true,
     )
     .await
     .unwrap();
@@ -4029,4 +3951,492 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_submit_com
         raw_http_bytes,
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Error classes (DQ.G3/G4/G5/G6/G7/G9/G10): a failure that decided nothing is
+// retried however often it recurs; only a permanent answer ends an item.
+// ---------------------------------------------------------------------------
+
+const NOTIFY_ENTRIES_PRUNED_NSID: &str = "blue.catbird.mlsDS.notifyEntriesPruned";
+
+/// A peer answering each POST with the next scripted `(status, body)`, then
+/// `200 {"accepted":true}`, counting what it served; and a resolver pinning
+/// every destination to it.
+async fn scripted_peer(
+    pool: &PgPool,
+    answers: Vec<(u16, serde_json::Value)>,
+) -> (Arc<DsResolver>, Arc<std::sync::atomic::AtomicUsize>) {
+    let answers = Arc::new(std::sync::Mutex::new(
+        answers
+            .into_iter()
+            .collect::<std::collections::VecDeque<_>>(),
+    ));
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = served.clone();
+    let app = axum::Router::new().fallback(axum::routing::post(move |_: axum::body::Bytes| {
+        let answers = answers.clone();
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = answers.lock().unwrap().pop_front();
+            let (status, body) = next.unwrap_or((200, serde_json::json!({"accepted": true})));
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let resolver = Arc::new(
+        DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+    (resolver, served)
+}
+
+async fn allow_peer(pool: &PgPool, peer_did: &str) {
+    sqlx::query(
+        "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+         VALUES ($1, 'allow', 100, NOW(), NOW()) \
+         ON CONFLICT (ds_did) DO UPDATE SET status = 'allow'",
+    )
+    .bind(peer_did)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Due queue item `id`, its own stream's head, `retry_count` attempts in.
+async fn insert_due_item(
+    pool: &PgPool,
+    id: &str,
+    target_ds_did: &str,
+    target_endpoint: &str,
+    method: &str,
+    retry_count: i32,
+) {
+    sqlx::query(
+        "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, \
+             convo_id, status, retry_count, max_retries, next_retry_at) \
+         VALUES ($1, $2, $3, $4, $5, $1, 'pending', $6, 5, NOW() - INTERVAL '1 second')",
+    )
+    .bind(id)
+    .bind(target_ds_did)
+    .bind(target_endpoint)
+    .bind(method)
+    .bind(b"{}".as_slice())
+    .bind(retry_count)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Claim the one due head `id` and run the production attempt on it.
+async fn attempt(queue: &OutboundQueue, id: &str) {
+    let claimed = queue.claim_due_batch(10).await.unwrap();
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        [id],
+        "exactly {id} is due"
+    );
+    let auth_sign = |_target: &str, _method: &str| Ok("test-token".to_string());
+    queue
+        .process_item(&claimed[0], &OutboundClient::new(2, 2), &auth_sign)
+        .await;
+}
+
+/// `(status, retry_count, last_error)` of queue row `id`.
+async fn queue_state(pool: &PgPool, id: &str) -> (String, i32, Option<String>) {
+    sqlx::query_as("SELECT status, retry_count, last_error FROM outbound_queue WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// DQ.G3: this DS's own peer table failing during the pre-send policy recheck
+/// decided nothing. The item stays pending with a retry, nothing is sent, and
+/// the identical retry delivers once the table answers again.
+#[tokio::test]
+async fn test_outbound_queue_peer_policy_lookup_failure_retries_and_identical_retry_delivers() {
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
+    ensure_federation_peers_table(&pool).await;
+    let peer_did = format!(
+        "did:web:policy-store-{}.example.com",
+        Uuid::new_v4().as_simple()
+    );
+    allow_peer(&pool, &peer_did).await;
+    let (resolver, served) = scripted_peer(&pool, Vec::new()).await;
+    let queue = OutboundQueue::new(pool.clone(), AuthMiddleware::new(), resolver);
+    let id = Uuid::new_v4().to_string();
+    insert_due_item(&pool, &id, &peer_did, "", NOTIFY_ENTRIES_PRUNED_NSID, 0).await;
+
+    sqlx::query("ALTER TABLE federation_peers RENAME TO federation_peers_offline")
+        .execute(&pool)
+        .await
+        .unwrap();
+    attempt(&queue, &id).await;
+    let (status, retry_count, last_error) = queue_state(&pool, &id).await;
+    assert_eq!(
+        (status.as_str(), retry_count),
+        ("pending", 1),
+        "a peer-table failure is retried, never failed: {last_error:?}"
+    );
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    sqlx::query("ALTER TABLE federation_peers_offline RENAME TO federation_peers")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE outbound_queue SET next_retry_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(&id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    attempt(&queue, &id).await;
+    assert_eq!(queue_state(&pool, &id).await.0, "delivered");
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// DQ.G4: a transient peer failure is retried whatever the attempt count and
+/// method (`deliverWelcome` used to dead-letter past `max_retries`); a peer's
+/// permanent 4xx is dead at once.
+#[tokio::test]
+async fn test_outbound_queue_transient_failure_past_max_retries_stays_pending_and_4xx_is_dead() {
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
+    ensure_federation_peers_table(&pool).await;
+    let peer_did = format!(
+        "did:web:retry-cap-{}.example.com",
+        Uuid::new_v4().as_simple()
+    );
+    allow_peer(&pool, &peer_did).await;
+    let (resolver, _served) = scripted_peer(
+        &pool,
+        vec![
+            (503, serde_json::json!({"error": "InternalServerError"})),
+            (400, serde_json::json!({"error": "InvalidRequest"})),
+        ],
+    )
+    .await;
+    let queue = OutboundQueue::new(pool.clone(), AuthMiddleware::new(), resolver);
+
+    let transient = Uuid::new_v4().to_string();
+    insert_due_item(&pool, &transient, &peer_did, "", DELIVER_WELCOME_NSID, 7).await;
+    attempt(&queue, &transient).await;
+    let (status, retry_count, _) = queue_state(&pool, &transient).await;
+    assert_eq!((status.as_str(), retry_count), ("pending", 8));
+
+    let permanent = Uuid::new_v4().to_string();
+    insert_due_item(
+        &pool,
+        &permanent,
+        &peer_did,
+        "",
+        NOTIFY_ENTRIES_PRUNED_NSID,
+        0,
+    )
+    .await;
+    attempt(&queue, &permanent).await;
+    let (status, retry_count, _) = queue_state(&pool, &permanent).await;
+    assert_eq!((status.as_str(), retry_count), ("dead", 0));
+}
+
+/// DQ.G5: a primary DID lookup that could not answer now is not overwritten
+/// by the stored endpoint's permanent answer: the item is retried, not failed.
+#[tokio::test]
+async fn test_outbound_queue_transient_primary_lookup_survives_permanent_stored_endpoint() {
+    use catbird_server::federation::{FederationError, ResolutionFailureKind};
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
+    ensure_federation_peers_table(&pool).await;
+    let peer_did = format!("did:web:lookup-{}.example.com", Uuid::new_v4().as_simple());
+    allow_peer(&pool, &peer_did).await;
+    let resolver = Arc::new(
+        DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(|target: &str| {
+            let error = FederationError::ResolutionFailed {
+                did: target.to_string(),
+                kind: if target.starts_with("did:") {
+                    ResolutionFailureKind::DnsTemporary("DID lookup could not answer".into())
+                } else {
+                    ResolutionFailureKind::DnsNxdomain("stored endpoint host is gone".into())
+                },
+            };
+            Some(Box::pin(async move { Err(error) }))
+        })),
+    );
+    let queue = OutboundQueue::new(pool.clone(), AuthMiddleware::new(), resolver);
+    let id = Uuid::new_v4().to_string();
+    insert_due_item(
+        &pool,
+        &id,
+        &peer_did,
+        "https://stored-endpoint.example.com",
+        NOTIFY_ENTRIES_PRUNED_NSID,
+        0,
+    )
+    .await;
+
+    attempt(&queue, &id).await;
+    let (status, retry_count, last_error) = queue_state(&pool, &id).await;
+    assert_eq!(
+        (status.as_str(), retry_count),
+        ("pending", 1),
+        "{last_error:?}"
+    );
+}
+
+/// DQ.G6: a predecessor gap is the typed `reasonCode` (or error name), never
+/// text. The gap retries without consuming an attempt; a permanent conflict
+/// whose message mentions a predecessor is dead.
+#[tokio::test]
+async fn test_outbound_queue_predecessor_gap_is_classified_by_typed_fields() {
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
+    ensure_federation_peers_table(&pool).await;
+    let peer_did = format!("did:web:gap-{}.example.com", Uuid::new_v4().as_simple());
+    allow_peer(&pool, &peer_did).await;
+    let (resolver, _served) = scripted_peer(
+        &pool,
+        vec![
+            (
+                409,
+                serde_json::json!({
+                    "error": "SequenceConflict",
+                    "reasonCode": "predecessor_missing",
+                    "message": "Federation predecessor missing: seq 10 is ahead of next seq 9",
+                }),
+            ),
+            (
+                409,
+                serde_json::json!({
+                    "error": "SequenceConflict",
+                    "reasonCode": "sequence_conflict",
+                    "message": "Federation sequence conflict: the predecessor holds other content",
+                }),
+            ),
+        ],
+    )
+    .await;
+    let queue = OutboundQueue::new(pool.clone(), AuthMiddleware::new(), resolver);
+
+    let gap = Uuid::new_v4().to_string();
+    insert_due_item(&pool, &gap, &peer_did, "", DELIVER_MESSAGE_NSID, 3).await;
+    attempt(&queue, &gap).await;
+    let (status, retry_count, _) = queue_state(&pool, &gap).await;
+    assert_eq!((status.as_str(), retry_count), ("pending", 3));
+
+    let conflict = Uuid::new_v4().to_string();
+    insert_due_item(&pool, &conflict, &peer_did, "", DELIVER_MESSAGE_NSID, 0).await;
+    attempt(&queue, &conflict).await;
+    assert_eq!(queue_state(&pool, &conflict).await.0, "dead");
+}
+
+/// DQ.G7: a clean endpoint's success without its signed receipt is
+/// malformed; resending it gets the same answer, so the item is dead.
+#[tokio::test]
+async fn test_outbound_queue_clean_success_without_receipt_is_dead() {
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
+    ensure_federation_peers_table(&pool).await;
+    let peer_did = format!(
+        "did:web:receiptless-{}.example.com",
+        Uuid::new_v4().as_simple()
+    );
+    allow_peer(&pool, &peer_did).await;
+    let (resolver, _served) =
+        scripted_peer(&pool, vec![(200, serde_json::json!({"accepted": true}))]).await;
+    let queue = OutboundQueue::new(pool.clone(), AuthMiddleware::new(), resolver);
+    let id = Uuid::new_v4().to_string();
+    insert_due_item(&pool, &id, &peer_did, "", DELIVER_MESSAGE_NSID, 0).await;
+
+    attempt(&queue, &id).await;
+    let (status, retry_count, last_error) = queue_state(&pool, &id).await;
+    assert_eq!(
+        (status.as_str(), retry_count),
+        ("dead", 0),
+        "{last_error:?}"
+    );
+}
+
+/// DQ.G9: a legacy ACK whose signature does not verify under the receiver's
+/// key, or that names another receiver, never marks its item delivered.
+#[tokio::test]
+async fn test_outbound_queue_invalid_legacy_ack_is_dead_not_delivered() {
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
+    ensure_federation_peers_table(&pool).await;
+    let peer_did = format!(
+        "did:web:legacy-ack-{}.example.com",
+        Uuid::new_v4().as_simple()
+    );
+    allow_peer(&pool, &peer_did).await;
+    let (_signer, verifying_key, _sk) = test_signer(&peer_did);
+    let auth_mw = AuthMiddleware::new();
+    cache_peer_did_doc(&auth_mw, &peer_did, &verifying_key).await;
+    let (forger, _, _) = test_signer(&peer_did);
+    let (elsewhere, _, _) = test_signer("did:web:elsewhere.example.com");
+    let (forged, unbound) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+    let (resolver, _served) = scripted_peer(
+        &pool,
+        vec![
+            (
+                200,
+                serde_json::json!({"accepted": true, "ack": forger.sign_ack(&forged, &forged, 0, 1)}),
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "accepted": true,
+                    "ack": elsewhere.sign_ack(&unbound, &unbound, 0, 1),
+                }),
+            ),
+        ],
+    )
+    .await;
+    let queue = OutboundQueue::new(pool.clone(), auth_mw, resolver);
+
+    insert_due_item(&pool, &forged, &peer_did, "", NOTIFY_ENTRIES_PRUNED_NSID, 0).await;
+    attempt(&queue, &forged).await;
+    let (status, _, last_error) = queue_state(&pool, &forged).await;
+    assert_eq!(status, "dead", "{last_error:?}");
+
+    insert_due_item(
+        &pool,
+        &unbound,
+        &peer_did,
+        "",
+        NOTIFY_ENTRIES_PRUNED_NSID,
+        0,
+    )
+    .await;
+    attempt(&queue, &unbound).await;
+    let (status, _, last_error) = queue_state(&pool, &unbound).await;
+    assert_eq!(status, "dead", "{last_error:?}");
+}
+
+async fn outbox_state(pool: &PgPool, id: &str) -> (String, i32) {
+    sqlx::query_as("SELECT status, attempts FROM federation_outbox WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// DQ.G10: a handoff failing on this DS's own storage stays pending however
+/// many attempts and hours it has taken, and the identical retry hands off
+/// once storage answers; a peer-policy denial is dead at once.
+#[tokio::test]
+async fn test_outbox_transient_handoff_never_dies_and_policy_denial_dies_at_once() {
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
+    ensure_federation_peers_table(&pool).await;
+    let allowed = format!(
+        "did:web:outbox-allowed-{}.example.com",
+        Uuid::new_v4().as_simple()
+    );
+    let blocked = format!(
+        "did:web:outbox-blocked-{}.example.com",
+        Uuid::new_v4().as_simple()
+    );
+    allow_peer(&pool, &allowed).await;
+    sqlx::query(
+        "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+         VALUES ($1, 'block', 0, NOW(), NOW())",
+    )
+    .bind(&blocked)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (stored, denied) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+    for (id, target) in [(&stored, &allowed), (&denied, &blocked)] {
+        sqlx::query(
+            "INSERT INTO federation_outbox (id, conversation_id, target_service_did, method, \
+                 payload, status, attempts, next_attempt_at, created_at, updated_at) \
+             VALUES ($1, $1, $2, $3, $4, 'pending', 9, NOW() - INTERVAL '1 second', \
+                     NOW() - INTERVAL '2 days', NOW())",
+        )
+        .bind(id)
+        .bind(target)
+        .bind(DELIVER_MESSAGE_NSID)
+        .bind(b"{}".as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION test_fail_outbound_insert() RETURNS trigger AS $$ \
+         BEGIN RAISE EXCEPTION 'injected outbound_queue insert failure'; END; \
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER inject_outbound_insert_failure BEFORE INSERT ON outbound_queue \
+         FOR EACH ROW EXECUTE FUNCTION test_fail_outbound_insert()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    catbird_server::workers::process_federation_outbox_tick(&pool, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        outbox_state(&pool, &stored).await,
+        ("pending".to_string(), 10)
+    );
+    assert_eq!(outbox_state(&pool, &denied).await, ("dead".to_string(), 10));
+
+    sqlx::query("DROP TRIGGER inject_outbound_insert_failure ON outbound_queue")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE federation_outbox SET next_attempt_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(&stored)
+    .execute(&pool)
+    .await
+    .unwrap();
+    catbird_server::workers::process_federation_outbox_tick(&pool, 10)
+        .await
+        .unwrap();
+    assert_eq!(outbox_state(&pool, &stored).await.0, "done");
+    let handed_off: i64 = sqlx::query_scalar("SELECT count(*) FROM outbound_queue WHERE id = $1")
+        .bind(&stored)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(handed_off, 1);
 }

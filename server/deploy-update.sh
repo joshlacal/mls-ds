@@ -9,7 +9,7 @@ set -e
 #   2. Restarts the systemd service
 #
 # Use this for production updates that need to preserve data.
-# Use deploy-fresh.sh if you need to wipe the database.
+# There is no production wipe; scripts/reset-dev-db.sh resets local compose databases only.
 # =============================================================================
 
 echo "╔════════════════════════════════════════════════════════════════╗"

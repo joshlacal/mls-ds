@@ -951,9 +951,15 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     };
     use base64::engine::general_purpose::STANDARD;
     use serde_json::{json, Value};
+    // A lost lock wait or connection is a storage failure, never authentication.
     let actor = super::direct_request_preparation::admit_acceptance(tx, principal, raw, now)
         .await
-        .map_err(|_| DirectAcceptanceError::InvalidSignature)?;
+        .map_err(|error| match error {
+            super::direct_request_preparation::DirectRequestStoreError::Database(error) => {
+                DirectAcceptanceError::Database(error)
+            }
+            _ => DirectAcceptanceError::InvalidSignature,
+        })?;
     actor
         .require_transaction(tx)
         .await
@@ -978,7 +984,7 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
         return Err(DirectAcceptanceError::Invariant);
     }
     let actor_device_id = uuid(&body["actorDeviceId"])?;
-    let head = sqlx::query("SELECT c.current_generation,c.current_state_version,c.next_entry_seq,c.lifecycle,c.protocol_version,s.group_id,s.epoch,s.group_context_hash,s.confirmation_tag,(octet_length(s.public_snapshot_bytes)::bigint+octet_length(s.tree_summary_bytes)::bigint) AS snapshot_tree_bytes,p.recipient_did,p.generation AS publication_generation FROM chat.conversations c JOIN chat.generation_states s ON s.conversation_id=c.conversation_id AND s.generation=c.current_generation AND s.state_version=c.current_state_version JOIN chat.direct_request_publications p ON p.conversation_id=c.conversation_id AND p.request_id=$2 WHERE c.conversation_id=$1 FOR UPDATE OF c")
+    let head = sqlx::query("SELECT c.current_generation,c.current_state_version,c.next_entry_seq,c.lifecycle,c.protocol_version,s.group_id,s.epoch,s.group_context_hash,s.confirmation_tag,(octet_length(s.public_snapshot_bytes)::bigint+octet_length(s.tree_summary_bytes)::bigint) AS snapshot_tree_bytes,p.actor_did,p.recipient_did,p.generation AS publication_generation FROM chat.conversations c JOIN chat.generation_states s ON s.conversation_id=c.conversation_id AND s.generation=c.current_generation AND s.state_version=c.current_state_version JOIN chat.direct_request_publications p ON p.conversation_id=c.conversation_id AND p.request_id=$2 WHERE c.conversation_id=$1 FOR UPDATE OF c")
         .bind(conversation_id).bind(request_id).fetch_optional(&mut **tx).await?.ok_or(DirectAcceptanceError::NotPending)?;
     if head.try_get::<String, _>("recipient_did")? != principal.did()
         || head.try_get::<String, _>("protocol_version")? != "2"
@@ -995,6 +1001,16 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
             != head.try_get::<i64, _>("current_generation")?
     {
         return Err(DirectAcceptanceError::NotPending);
+    }
+    // A party's sequenced deletion ends the request: its acceptance would land
+    // after the `accountDeletedEntry`, owed to the deleted party's home.
+    let requester: String = head.try_get("actor_did")?;
+    for did in [requester.as_str(), principal.did()] {
+        if crate::federation::canonical_relay::account_deleted_in(&mut **tx, conversation_id, did)
+            .await?
+        {
+            return Err(DirectAcceptanceError::NotPending);
+        }
     }
     let mut now: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("SELECT date_trunc('milliseconds', $1::timestamptz)")
@@ -1026,9 +1042,21 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     if body["invitationProvenance"] != provenance {
         return Err(DirectAcceptanceError::InvalidRequest);
     }
-    super::relationship::verify_direct_request_acceptance_policy(tx, &actor, policy)
+    let allowed = super::relationship::verify_direct_request_acceptance_policy(tx, &actor, policy)
         .await
-        .map_err(|_| DirectAcceptanceError::PolicyUnavailable)?;
+        .map_err(|error| {
+            use super::relationship::RelationshipRepositoryError as R;
+            match error {
+                R::Database(error) => DirectAcceptanceError::Database(error),
+                R::Unavailable => DirectAcceptanceError::PolicySourceUnavailable,
+                R::InvalidProjection | R::InvalidAuthorityConfiguration(_) => {
+                    DirectAcceptanceError::PolicyUnavailable
+                }
+            }
+        })?;
+    if !allowed {
+        return Err(DirectAcceptanceError::Blocked);
+    }
     // Policy resolution may perform I/O while the durable head remains locked.
     // Recheck first-execution freshness at the actual commit decision boundary.
     now = sqlx::query_scalar("SELECT date_trunc('milliseconds', $1::timestamptz)")
@@ -1218,6 +1246,12 @@ pub(crate) enum DirectAcceptanceError {
     NotPending,
     StaleCoordinates,
     Expired,
+    /// The pair's current relationship evaluated to a block.
+    Blocked,
+    /// A relationship source could not answer now: nothing was decided.
+    PolicySourceUnavailable,
+    /// The relationship policy could not be evaluated from what its sources
+    /// answered, or this DS's relationship authority is misconfigured.
     PolicyUnavailable,
     Invariant,
 }

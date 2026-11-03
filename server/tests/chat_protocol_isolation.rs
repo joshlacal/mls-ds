@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -77,11 +78,187 @@ fn collapsed_lowercase(source: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Top-level comma-separated terms of a compact `cfg` predicate list.
+fn top_level_terms(list: &str) -> Vec<&str> {
+    let (mut depth, mut start, mut terms) = (0, 0, Vec::new());
+    for (index, character) in list.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                terms.push(&list[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    terms.push(&list[start..]);
+    terms
+}
+
+/// `test`, or an `all(…)` with a top-level `test` term: never compiled outside tests.
+fn cfg_is_test_only(predicate: &str) -> bool {
+    predicate == "test"
+        || predicate
+            .strip_prefix("all(")
+            .and_then(|terms| terms.strip_suffix(')'))
+            .is_some_and(|terms| top_level_terms(terms).into_iter().any(cfg_is_test_only))
+}
+
+/// Out-of-line `mod name;` declarations in `file`: the mounted file and whether
+/// that mount is gated by a test-only `cfg`.
+fn module_mounts(file: &Path, source: &str) -> Vec<(PathBuf, bool)> {
+    let code = source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let dir = file.parent().expect("source file directory");
+    let stem = file
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("source file stem");
+    let child_dir = if matches!(stem, "mod" | "lib" | "main") {
+        dir.to_path_buf()
+    } else {
+        dir.join(stem)
+    };
+    let mut mounts = Vec::new();
+    let mut item_start = 0;
+    for (index, byte) in code.bytes().enumerate() {
+        if !matches!(byte, b';' | b'{' | b'}') {
+            continue;
+        }
+        let mut item = code[item_start..index].trim();
+        item_start = index + 1;
+        if byte != b';' {
+            continue;
+        }
+        let (mut cfg_test, mut path) = (false, None);
+        while let Some(attribute) = item.strip_prefix("#[") {
+            let mut depth = 1;
+            let Some(end) = attribute
+                .char_indices()
+                .find(|&(_, character)| {
+                    depth += match character {
+                        '[' => 1,
+                        ']' => -1,
+                        _ => 0,
+                    };
+                    depth == 0
+                })
+                .map(|(end, _)| end)
+            else {
+                break;
+            };
+            let compact: String = attribute[..end]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            if let Some(predicate) = compact
+                .strip_prefix("cfg(")
+                .and_then(|predicate| predicate.strip_suffix(')'))
+            {
+                cfg_test |= cfg_is_test_only(predicate);
+            }
+            if let Some(value) = compact.strip_prefix("path=") {
+                path = Some(value.trim_matches('"').to_owned());
+            }
+            item = attribute[end + 1..].trim_start();
+        }
+        let tokens: Vec<&str> = item.split_whitespace().collect();
+        let [visibility @ .., "mod", name] = tokens.as_slice() else {
+            continue;
+        };
+        if !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            || !visibility
+                .first()
+                .map_or(true, |token| token.starts_with("pub"))
+        {
+            continue;
+        }
+        let mounted = match path {
+            Some(path) => dir.join(path),
+            None if child_dir.join(format!("{name}.rs")).exists() => {
+                child_dir.join(format!("{name}.rs"))
+            }
+            None => child_dir.join(name).join("mod.rs"),
+        };
+        mounts.push((mounted, cfg_test));
+    }
+    mounts
+}
+
+/// Crate files whose every mount is test-only: a `cfg(test)`/`cfg(all(test, …))`
+/// declaration, or any declaration inside an already test-only file. Fails
+/// closed: a mount this parser cannot resolve (e.g. nested in an inline module)
+/// only removes an exemption, never adds one.
+fn cfg_test_only_module_files(src: &Path) -> BTreeSet<PathBuf> {
+    let mut mounts: BTreeMap<PathBuf, Vec<(PathBuf, bool)>> = BTreeMap::new();
+    for file in source_files(src)
+        .into_iter()
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("rs"))
+    {
+        let source = fs::read_to_string(&file).expect("read crate source for module mounts");
+        let declaring = fs::canonicalize(&file).expect("canonical declaring module");
+        for (mounted, cfg_test) in module_mounts(&file, &source) {
+            let Ok(mounted) = fs::canonicalize(&mounted) else {
+                continue;
+            };
+            mounts
+                .entry(mounted)
+                .or_default()
+                .push((declaring.clone(), cfg_test));
+        }
+    }
+    let mut test_only = BTreeSet::new();
+    loop {
+        let before = test_only.len();
+        for (file, declarations) in &mounts {
+            if declarations
+                .iter()
+                .all(|(declaring, cfg_test)| *cfg_test || test_only.contains(declaring))
+            {
+                test_only.insert(file.clone());
+            }
+        }
+        if test_only.len() == before {
+            return test_only;
+        }
+    }
+}
+
 #[test]
 fn clean_authority_has_no_legacy_namespace_or_repository_escape_hatch() {
-    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/chat_protocol");
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // F29 (2026-09-24) moved integration suites in-crate as cfg(test)-only
+    // modules; they read the sqlx ledger `public._sqlx_migrations` and
+    // `*-public.mls` corpus fixtures. Only files whose every mount is
+    // test-only are exempt, and only from "public."; production files and
+    // inline `#[cfg(test)] mod tests { … }` blocks stay fully guarded.
+    let test_only = cfg_test_only_module_files(&manifest_dir.join("src"));
+    let canonical = |relative: &str| {
+        fs::canonicalize(manifest_dir.join(relative)).expect("canonical classifier witness")
+    };
+    assert!(
+        test_only.contains(&canonical(
+            "src/chat_protocol/state_machine/executor_tests.rs"
+        )),
+        "mount classifier missed a cfg(test)-only suite"
+    );
+    assert!(
+        !test_only.contains(&canonical(
+            "src/chat_protocol/repository/direct_request_receipts.rs"
+        )),
+        "mount classifier exempted a production module"
+    );
+    let source_root = manifest_dir.join("src/chat_protocol");
     for path in source_files(&source_root) {
         let source = fs::read_to_string(&path).expect("read clean-chat source");
+        let test_only_file =
+            test_only.contains(&fs::canonicalize(&path).expect("canonical clean-chat source"));
         for forbidden in [
             "blue.catbird.mlsChat",
             "blue_catbird::mls_chat",
@@ -91,6 +268,9 @@ fn clean_authority_has_no_legacy_namespace_or_repository_escape_hatch() {
             "set_config('search_path'",
             "public.",
         ] {
+            if forbidden == "public." && test_only_file {
+                continue;
+            }
             assert!(
                 !source.contains(forbidden),
                 "{} contains forbidden legacy/isolation token {forbidden:?}",

@@ -14,12 +14,6 @@ echo "╚═══════════════════════�
 echo ""
 echo "Choose a deployment method:"
 echo ""
-echo "  1) Fresh Deploy (WIPE ALL DATA - for development/testing)"
-echo "     - Stops the server"
-echo "     - Clears the database"
-echo "     - Rebuilds binary"
-echo "     - ⚠️  WARNING: ALL DATA WILL BE LOST"
-echo ""
 echo "  2) Update Deploy (PRESERVE DATA - for production updates)"
 echo "     - Builds new binary"
 echo "     - Restarts the server"
@@ -37,16 +31,11 @@ echo ""
 echo "  0) Cancel"
 echo ""
 
-read -p "Enter choice [0-4]: " choice
+# Option 1 (Fresh Deploy) was removed: it wiped the production database. Keep
+# the remaining numbers so a habitual "1" now cancels instead of deploying.
+read -p "Enter choice [2-4, 0 to cancel]: " choice
 
 case $choice in
-    1)
-        echo ""
-        echo "═══════════════════════════════════════════════════════════════"
-        echo "Starting Fresh Deploy..."
-        echo "═══════════════════════════════════════════════════════════════"
-        exec ./deploy-fresh.sh
-        ;;
     2)
         echo ""
         echo "═══════════════════════════════════════════════════════════════"

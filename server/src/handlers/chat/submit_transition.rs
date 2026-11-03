@@ -85,12 +85,13 @@ async fn submit(
                     ?err,
                     "submitTransition participant routing resolution failed"
                 );
-                ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::NotAuthorized)
+                context::routing_failure(ENDPOINT, &err)
             })?;
             crate::federation::group_relay::stage_remote_group_participants(pool, &routes)
                 .await
-                .map_err(|_| {
-                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::NotAuthorized)
+                .map_err(|err| {
+                    tracing::warn!(?err, "submitTransition remote participant staging failed");
+                    context::remote_member_failure(ENDPOINT, &err)
                 })?;
             Some(crate::chat_protocol::federation_routing::ParticipantRoutingIntent::new(routes))
         } else {
@@ -293,6 +294,8 @@ fn submit_failure(
         E::Conversation(CS::State(s) | CS::Authority(s)) => {
             map_state_machine_error(mutation_kind, s)
         }
+        // A relationship source that could not answer now decided nothing.
+        E::Relationship(R::Unavailable) => ChatFailure::unavailable(ENDPOINT),
         E::Relationship(R::InvalidAuthorityConfiguration(_)) => {
             ChatFailure::protocol(ENDPOINT, C::RelationshipPolicyUnavailable)
         }
@@ -308,6 +311,10 @@ fn submit_failure(
         E::Federation(fed_error) => {
             tracing::warn!(?fed_error, "submitTransition remote federation error");
             match fed_error {
+                crate::federation::FederationError::Database(_) => ChatFailure::storage(ENDPOINT),
+                // A closed federation gate, an unreachable sequencer, or its
+                // 5xx/429 decided nothing: the same request may be retried.
+                error if error.is_retryable() => ChatFailure::unavailable(ENDPOINT),
                 crate::federation::FederationError::CommitConflict { .. }
                 | crate::federation::FederationError::DeliveryConflict { .. }
                 | crate::federation::FederationError::SequenceConflict { .. }
@@ -331,13 +338,25 @@ fn submit_failure(
                 | crate::federation::FederationError::RemoteError { status: 404, .. } => {
                     ChatFailure::protocol(ENDPOINT, C::ConversationNotFound)
                 }
-                crate::federation::FederationError::DsUnreachable { .. }
-                | crate::federation::FederationError::ResolutionFailed { .. }
-                | crate::federation::FederationError::SignerUnavailable
-                | crate::federation::FederationError::RemoteError { status: 503, .. } => {
-                    ChatFailure::protocol(ENDPOINT, C::RelationshipPolicyUnavailable)
+                // This DS's own signer or resolver configuration.
+                crate::federation::FederationError::ResolutionFailed {
+                    kind: crate::federation::ResolutionFailureKind::InvalidConfiguration(_),
+                    ..
                 }
-                crate::federation::FederationError::Database(_) => ChatFailure::storage(ENDPOINT),
+                | crate::federation::FederationError::SignerUnavailable
+                | crate::federation::FederationError::ConfigError { .. } => {
+                    ChatFailure::storage(ENDPOINT)
+                }
+                // The sequencer cannot be routed (a permanent resolution
+                // failure), as a participant home that cannot be routed.
+                crate::federation::FederationError::ResolutionFailed { .. }
+                | crate::federation::FederationError::EndpointNotFound { .. }
+                | crate::federation::FederationError::Unsupported(_) => {
+                    ChatFailure::protocol(ENDPOINT, C::NotAuthorized)
+                }
+                crate::federation::FederationError::RemoteError {
+                    status: 400..=499, ..
+                } => ChatFailure::protocol(ENDPOINT, C::InvalidRequest),
                 _ => ChatFailure::invariant(ENDPOINT),
             }
         }
@@ -400,5 +419,111 @@ fn map_state_machine_error(
         | S::LeaveAlreadyPending
         | S::InvalidServerTime => ChatFailure::protocol(ENDPOINT, C::InvalidRequest),
         S::InvariantViolation | S::InvalidHydrationAuthority => ChatFailure::invariant(ENDPOINT),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat_protocol::relationship_policy::RelationshipPolicyConfigError;
+    use axum::http::header::RETRY_AFTER;
+
+    /// Status, `Retry-After` presence and declared code of one failure.
+    fn wire(error: RelationshipRepositoryError) -> (u16, bool, Option<&'static str>) {
+        let failure = submit_failure(
+            SignedMutationKind::PolicyTransition,
+            SubmitTransitionFacadeError::Relationship(error),
+        );
+        let response = failure.into_response();
+        (
+            response.status().as_u16(),
+            response.headers().contains_key(RETRY_AFTER),
+            failure.code().map(ChatProtocolErrorCode::as_str),
+        )
+    }
+
+    /// A relationship source that could not answer now decided nothing: 503
+    /// with a retry hint. This server's store failing is a 500, a fixed
+    /// configuration fault keeps its unhinted code, and unusable evidence
+    /// stays the declared refusal.
+    #[test]
+    fn relationship_failures_keep_outage_store_and_refusal_distinct() {
+        use RelationshipRepositoryError as R;
+        assert_eq!(
+            wire(R::Unavailable),
+            (503, true, Some("RelationshipPolicyUnavailable"))
+        );
+        assert_eq!(
+            wire(R::Database(sqlx::Error::PoolTimedOut)),
+            (500, false, None)
+        );
+        assert_eq!(
+            wire(R::InvalidAuthorityConfiguration(
+                RelationshipPolicyConfigError::InvalidLimit,
+            )),
+            (503, false, Some("RelationshipPolicyUnavailable"))
+        );
+        assert_eq!(
+            wire(R::InvalidProjection),
+            (400, false, Some("BlockedRelationship"))
+        );
+    }
+
+    /// A transition forwarded to a remote sequencer: an outage is retryable,
+    /// this DS's own configuration is a 500, and a sequencer that cannot be
+    /// routed or refuses with any 4xx is a declared refusal, never a 503
+    /// without a retry hint or an internal error.
+    #[test]
+    fn forwarded_failures_keep_outage_local_fault_and_refusal_distinct() {
+        use crate::federation::{FederationError as F, ResolutionFailureKind as K};
+        let wire = |error: F| {
+            let failure = submit_failure(
+                SignedMutationKind::PolicyTransition,
+                SubmitTransitionFacadeError::Federation(error),
+            );
+            let response = failure.into_response();
+            (
+                response.status().as_u16(),
+                response.headers().contains_key(RETRY_AFTER),
+                failure.code().map(ChatProtocolErrorCode::as_str),
+            )
+        };
+        let resolution = |kind| F::ResolutionFailed {
+            did: "did:web:seq.example".into(),
+            kind,
+        };
+        assert_eq!(
+            wire(resolution(K::DnsTemporary("SERVFAIL".into()))),
+            (503, true, Some("RelationshipPolicyUnavailable"))
+        );
+        assert_eq!(
+            wire(resolution(K::ServiceMissing("no #atproto_mls".into()))),
+            (401, false, Some("NotAuthorized"))
+        );
+        assert_eq!(
+            wire(F::EndpointNotFound {
+                did: "did:web:seq.example".into()
+            }),
+            (401, false, Some("NotAuthorized"))
+        );
+        assert_eq!(
+            wire(resolution(K::InvalidConfiguration("client".into()))),
+            (500, false, None)
+        );
+        assert_eq!(wire(F::SignerUnavailable), (500, false, None));
+        assert_eq!(
+            wire(F::RemoteError {
+                status: 422,
+                body: String::new()
+            }),
+            (400, false, Some("InvalidRequest"))
+        );
+        assert_eq!(
+            wire(F::RemoteError {
+                status: 429,
+                body: String::new()
+            }),
+            (503, true, Some("RelationshipPolicyUnavailable"))
+        );
     }
 }

@@ -88,6 +88,7 @@ fn map_failure(error: MessageDeliveryError) -> ChatFailure {
         MessageDeliveryError::RelationshipPolicyUnavailable => {
             ChatFailure::protocol(ENDPOINT, C::RelationshipPolicyUnavailable)
         }
+        MessageDeliveryError::RelationshipSourceUnavailable => ChatFailure::unavailable(ENDPOINT),
         MessageDeliveryError::BlockedRelationship => {
             ChatFailure::protocol(ENDPOINT, C::BlockedRelationship)
         }
@@ -106,5 +107,33 @@ fn map_failure(error: MessageDeliveryError) -> ChatFailure {
         | MessageDeliveryError::BlobNotFound
         | MessageDeliveryError::BlobBindingConflict
         | MessageDeliveryError::Invariant => ChatFailure::invariant(ENDPOINT),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A typing check whose relationship source could not answer now is the
+    /// declared retryable answer (503, `Retry-After: 5`).
+    #[test]
+    fn relationship_source_unavailable_is_retryable() {
+        let failure = map_failure(MessageDeliveryError::RelationshipSourceUnavailable);
+        assert_eq!(
+            failure.code(),
+            Some(ChatProtocolErrorCode::RelationshipPolicyUnavailable)
+        );
+        let response = failure.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "5"
+        );
     }
 }

@@ -512,6 +512,25 @@ pub async fn expire_due_published_requests(
         .execute(&mut *tx)
         .await?;
 
+        // O7: an expired request's opening can never be imported, so every
+        // coordinator copy of its ciphertext goes in the expiry transaction.
+        let opening_seq: Option<i64> = sqlx::query_scalar(
+            "SELECT seq FROM chat.entries WHERE transition_id = $1 AND entry_kind = $2",
+        )
+        .bind(id)
+        .bind(super::direct_request_opening::DIRECT_REQUEST_ENTRY_KIND)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(seq) = opening_seq {
+            super::direct_request_opening::prune_coordinator_opening(
+                &mut tx,
+                conversation_id,
+                seq,
+                now,
+            )
+            .await?;
+        }
+
         tx.commit().await?;
         count += 1;
     }
@@ -545,15 +564,46 @@ pub async fn mark_inactive_devices(
     Ok(result.rows_affected())
 }
 
+/// Delete up to `limit` outbound routes no pair coordinator answered, an hour
+/// after they were recorded. Identical prepares that all failed transiently
+/// leave such a route; by then the hourly route quota no longer counts it, and
+/// the pair owner fence binds it only until its `binding_expires_at`. Answered
+/// routes, and every receipt, inbox and idempotency row, stay.
+pub async fn delete_unanswered_outbound_routes(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    limit: i64,
+) -> Result<u64, ExpirySweepError> {
+    let result = sqlx::query(
+        "DELETE FROM chat.direct_request_outbound_routes \
+          WHERE answered_at IS NULL \
+            AND request_id IN ( \
+                SELECT request_id FROM chat.direct_request_outbound_routes \
+                 WHERE answered_at IS NULL AND created_at <= $1 \
+                 ORDER BY created_at, request_id \
+                 LIMIT $2 \
+                   FOR UPDATE SKIP LOCKED)",
+    )
+    .bind(now - chrono::Duration::hours(1))
+    .bind(limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Hard 30-day ceiling sweep: prune any unpruned `applicationEntry` ciphertext older
 /// than 30 days while keeping contiguous `seq` skeletons and `sequencer_receipt_bytes`.
+/// A sequencer queues the same signed entries-pruned notices as an ACK prune in the
+/// same transaction; without its S2S signer it prunes nothing it would have to notify.
+/// A remote home's transport copy follows the same ceiling from when the home stored
+/// it, acknowledged or not, keeping its original digest, signed metadata and receipt.
 pub async fn prune_expired_application_payloads(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> Result<u64, ExpirySweepError> {
     let cutoff = now - chrono::Duration::days(30);
-    let targets: Vec<(Uuid, i64)> = sqlx::query_as(
-        "SELECT conversation_id, seq \
+    let targets: Vec<(Uuid, i64, i64)> = sqlx::query_as(
+        "SELECT conversation_id, generation, seq \
            FROM chat.entries \
           WHERE entry_kind = 'blue.catbird.chat.defs#applicationEntry' \
             AND payload_pruned_at IS NULL \
@@ -564,16 +614,104 @@ pub async fn prune_expired_application_payloads(
     .bind(cutoff)
     .fetch_all(pool)
     .await?;
+    let mut batches: std::collections::BTreeMap<(Uuid, i64), Vec<i64>> = Default::default();
+    for (conversation_id, generation, seq) in targets {
+        batches
+            .entry((conversation_id, generation))
+            .or_default()
+            .push(seq);
+    }
 
     let mut pruned = 0_u64;
-    for (conversation_id, seq) in targets {
+    for ((conversation_id, generation), mut seqs) in batches {
+        seqs.sort_unstable();
         let mut tx = pool.begin().await?;
-        let did_prune =
-            super::delivery::prune_application_entry_payload(&mut tx, conversation_id, seq, now)
+        let mut erased = Vec::with_capacity(seqs.len());
+        for seq in seqs {
+            if super::delivery::prune_application_entry_payload(&mut tx, conversation_id, seq, now)
                 .await
-                .map_err(|e| {
-                    ExpirySweepError::DirectRequest(format!("prune 30d payload: {e:?}"))
-                })?;
+                .map_err(|e| ExpirySweepError::DirectRequest(format!("prune 30d payload: {e:?}")))?
+            {
+                erased.push(seq);
+            }
+        }
+        match crate::federation::group_relay::enqueue_entries_pruned_notices(
+            &mut tx,
+            conversation_id,
+            generation,
+            &erased,
+            now,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(crate::federation::group_relay::SignedRelayError::SignerUnavailable) => {
+                tracing::error!(
+                    conversation_id = %crate::crypto::redact_for_log(&conversation_id.hyphenated().to_string()),
+                    "30d prune refused: no S2S signing key for its entries-pruned notice"
+                );
+                tx.rollback().await?;
+                continue;
+            }
+            Err(crate::federation::group_relay::SignedRelayError::Storage(error)) => {
+                return Err(ExpirySweepError::DirectRequest(format!(
+                    "queue 30d entries-pruned notice: {error}"
+                )));
+            }
+        }
+        tx.commit().await?;
+        pruned += erased.len() as u64;
+    }
+
+    // ponytail: 256 legacy rows per cycle; loop here if a large pre-migration backlog exists.
+    let legacy: Vec<(Uuid, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT conversation_id, seq, entry_bytes FROM chat.direct_request_transport_entries \
+          WHERE evidence_pending ORDER BY created_at, conversation_id, seq LIMIT 256",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut connection = pool.acquire().await?;
+    for (conversation_id, seq, entry_bytes) in legacy {
+        if let Err(error) = super::delivery::classify_legacy_transport_entry(
+            &mut connection,
+            conversation_id,
+            seq,
+            &entry_bytes,
+        )
+        .await
+        {
+            // A malformed legacy row keeps its bytes rather than gaining false evidence.
+            tracing::warn!(
+                conversation_id = %crate::crypto::redact_for_log(&conversation_id.hyphenated().to_string()),
+                seq,
+                %error,
+                "legacy transport entry left unclassified"
+            );
+        }
+    }
+    drop(connection);
+
+    let transport: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT conversation_id, seq FROM chat.direct_request_transport_entries \
+          WHERE application_message_id IS NOT NULL AND payload_pruned_at IS NULL \
+            AND created_at <= $1 \
+          ORDER BY created_at ASC, conversation_id ASC, seq ASC \
+          LIMIT 256",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+    for (conversation_id, seq) in transport {
+        let mut tx = pool.begin().await?;
+        let did_prune = super::delivery::prune_expired_transport_application_payload(
+            &mut tx,
+            conversation_id,
+            seq,
+            cutoff,
+            now,
+        )
+        .await
+        .map_err(|e| ExpirySweepError::DirectRequest(format!("prune 30d transport: {e:?}")))?;
         if did_prune {
             tx.commit().await?;
             pruned += 1;
@@ -581,6 +719,24 @@ pub async fn prune_expired_application_payloads(
             tx.rollback().await?;
         }
     }
+
+    // O7: no `sendMessage` receipt keeps its ciphertext past the ceiling either,
+    // including one whose entry a close wiped or an earlier release pruned. Not
+    // application payloads here; not counted.
+    let mut tx = pool.begin().await?;
+    super::delivery::erase_idempotency_payloads(
+        &mut tx,
+        super::delivery::ReceiptErasure::CompletedBy(cutoff),
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+
+    // O7: openings follow the same ceiling on both homes, and a transport-only
+    // home also drops an opening no device can import or read any more. They
+    // are not application payloads and are not counted here.
+    super::direct_request_opening::prune_expired_coordinator_openings(pool, cutoff, now).await?;
+    super::direct_request_opening::prune_due_transport_openings(pool, cutoff, now).await?;
     Ok(pruned)
 }
 
@@ -588,7 +744,8 @@ pub async fn prune_expired_application_payloads(
 /// and release their retained charge. The retained charge is additive over
 /// independently stored blobs plus the precharged lifecycle reserve, so the
 /// released amount is exactly (a) the bytes of the pruned publication and
-/// delivery-provenance columns, each of which the charge counted once, plus
+/// delivery-provenance columns, each of which the charge counted once, including
+/// the opening columns an earlier O7 prune cleared (`opening_pruned_bytes`), plus
 /// (b) the unconsumed lifecycle reserve: a terminal request can record no
 /// further decision, and every Welcome import window closed before this
 /// horizon (import_until <= publication + 7 days < terminal + 14 days).
@@ -649,7 +806,8 @@ pub async fn prune_terminal_request_artifacts(
                     + COALESCE(octet_length(p.full_welcome), 0)
                     + COALESCE(octet_length(p.initial_ciphertext), 0)
                     + COALESCE(octet_length(p.metadata_snapshot), 0)
-                    + COALESCE((SELECT sum(octet_length(d.provenance)) FROM chat.direct_request_device_deliveries d WHERE d.request_id = $1), 0))::bigint AS pruned_bytes,
+                    + COALESCE((SELECT sum(octet_length(d.provenance)) FROM chat.direct_request_device_deliveries d WHERE d.request_id = $1), 0)
+                    + COALESCE((to_jsonb(p) ->> 'opening_pruned_bytes')::bigint, 0))::bigint AS pruned_bytes,
                    GREATEST(0, r.decision_bytes + r.welcome_bytes_per_delivery * r.delivery_count
                     - COALESCE((SELECT sum(s.charged_bytes) FROM chat.direct_request_decision_slots s WHERE s.request_id = $1), 0)
                     - COALESCE((SELECT sum(w.charged_bytes) FROM chat.direct_request_welcome_slots w WHERE w.request_id = $1), 0))::bigint AS unused_reserve

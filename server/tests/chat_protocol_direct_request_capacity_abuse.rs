@@ -5,7 +5,7 @@
 //! with migration 20260919000021 installed.
 
 #![allow(dead_code)]
-pub use catbird_server::{auth, chat_protocol};
+pub use catbird_server::{auth, chat_protocol, sim_hooks};
 #[path = "common/chat_protocol.rs"]
 pub mod chat_protocol_baseline;
 mod common {
@@ -177,6 +177,10 @@ mod repository {
         }
 
         async fn isolated() -> Isolated {
+            // The reviewed source already includes migration 21. Cloning its
+            // schema and applying that non-idempotent DDL a second time fails.
+            let source = crate::common::direct_request_database::setup().await;
+            source.close().await;
             let name = format!(
                 "catbird_direct_requests_fault_{}",
                 &Uuid::new_v4().simple().to_string()[..16]
@@ -200,15 +204,6 @@ mod repository {
             assert!(clone.success(), "schema clone into {name}");
 
             let url = format!("postgresql://127.0.0.1:5432/{name}");
-            let migration_path = concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/migrations/20260919000021_direct_request_capacity_abuse_fix.sql"
-            );
-            let m21 = std::process::Command::new("psql")
-                .args(["-X", "-v", "ON_ERROR_STOP=1", &url, "-f", migration_path])
-                .status()
-                .unwrap();
-            assert!(m21.success(), "apply migration 21 on {name}");
 
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(8)

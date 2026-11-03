@@ -243,6 +243,90 @@ pub async fn seed_clean_slate_application_fixture(
     recipient_service_did: &str,
     archive_commitment: Option<[u8; 32]>,
 ) -> Result<CleanSlateApplicationFixture, String> {
+    seed_clean_slate_application_fixture_with_sender_home(
+        pool,
+        direct,
+        recipient_service_did,
+        archive_commitment,
+        None,
+    )
+    .await
+}
+
+/// Seed immutable participant home routing at insertion time, retaining the
+/// genuine signed membership history and native application fixture.
+pub async fn seed_clean_slate_application_fixture_with_sender_home(
+    pool: &sqlx::PgPool,
+    direct: bool,
+    recipient_service_did: &str,
+    archive_commitment: Option<[u8; 32]>,
+    sender_service_did: Option<&str>,
+) -> Result<CleanSlateApplicationFixture, String> {
+    seed_clean_slate_application_fixture_inner(
+        pool,
+        direct,
+        recipient_service_did,
+        archive_commitment,
+        sender_service_did,
+        None,
+        true,
+    )
+    .await
+}
+
+/// The clean-slate fixture as a running DS serves it: no traffic fallback is pre-sealed, so
+/// the sender's first send collects its relationship evidence through that DS's own
+/// configured authority, as in production. A seal from this fixture's routing transport is
+/// another source's evidence, which a DS with a different authority refuses to hydrate.
+/// `sender_service_did` routes the sender home as
+/// [`seed_clean_slate_application_fixture_with_sender_home`] does.
+pub async fn seed_clean_slate_application_fixture_unsealed(
+    pool: &sqlx::PgPool,
+    direct: bool,
+    recipient_service_did: &str,
+    archive_commitment: Option<[u8; 32]>,
+    sender_service_did: Option<&str>,
+) -> Result<CleanSlateApplicationFixture, String> {
+    seed_clean_slate_application_fixture_inner(
+        pool,
+        direct,
+        recipient_service_did,
+        archive_commitment,
+        sender_service_did,
+        None,
+        false,
+    )
+    .await
+}
+
+/// Genuine remote group mirror, exposing its actor keys for signed relay tests.
+pub async fn seed_remote_clean_slate_application_fixture(
+    pool: &sqlx::PgPool,
+    recipient_service_did: &str,
+    sequencer_service_did: &str,
+    archive_commitment: Option<[u8; 32]>,
+) -> Result<CleanSlateApplicationFixture, String> {
+    seed_clean_slate_application_fixture_inner(
+        pool,
+        false,
+        recipient_service_did,
+        archive_commitment,
+        None,
+        Some(sequencer_service_did),
+        true,
+    )
+    .await
+}
+
+async fn seed_clean_slate_application_fixture_inner(
+    pool: &sqlx::PgPool,
+    direct: bool,
+    recipient_service_did: &str,
+    archive_commitment: Option<[u8; 32]>,
+    sender_service_did: Option<&str>,
+    sequencer_service_did: Option<&str>,
+    seal_traffic: bool,
+) -> Result<CleanSlateApplicationFixture, String> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use chrono::SecondsFormat;
     use ed25519_dalek::Signer as _;
@@ -279,43 +363,46 @@ pub async fn seed_clean_slate_application_fixture(
             message_id,
             archive_commitment,
             recipient_service_did,
-            None,
+            sequencer_service_did,
+            sender_service_did,
         )
         .await?;
-    let authority = RelationshipAuthority::new(
-        fixed_production_relationship_policy_config()
-            .map_err(|error| format!("clean-slate relationship policy: {error:?}"))?,
-        transport,
-    );
-    let mut roster = vec![fixture.requester.did.clone(), fixture.fulfiller.did.clone()];
-    roster.sort();
-    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
-    let live_allocation = allocate_projection_revision(&mut tx)
-        .await
-        .map_err(|error| format!("clean-slate live allocation: {error:?}"))?;
-    let fallback_allocation = allocate_projection_revision(&mut tx)
-        .await
-        .map_err(|error| format!("clean-slate fallback allocation: {error:?}"))?;
-    let clock = anchor_projection_clock(&mut *tx)
-        .await
-        .map_err(|error| format!("clean-slate projection clock: {error}"))?;
-    let live = authority
-        .collect_traffic_projection(
-            &clock,
-            live_allocation,
-            fixture.requester.did.clone(),
-            roster,
-        )
-        .await
-        .map_err(|error| format!("clean-slate traffic collection: {error:?}"))?;
-    let observation = observe_relationship_persistence(&clock);
-    let fallback = live
-        .export_persisted_fallback(fallback_allocation, &authority, &observation)
-        .map_err(|error| format!("clean-slate traffic sealing: {error:?}"))?;
-    persist_traffic_projection(&mut tx, fallback)
-        .await
-        .map_err(|error| format!("clean-slate traffic persistence: {error:?}"))?;
-    tx.commit().await.map_err(|error| error.to_string())?;
+    if seal_traffic {
+        let authority = RelationshipAuthority::new(
+            fixed_production_relationship_policy_config()
+                .map_err(|error| format!("clean-slate relationship policy: {error:?}"))?,
+            transport,
+        );
+        let mut roster = vec![fixture.requester.did.clone(), fixture.fulfiller.did.clone()];
+        roster.sort();
+        let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+        let live_allocation = allocate_projection_revision(&mut tx)
+            .await
+            .map_err(|error| format!("clean-slate live allocation: {error:?}"))?;
+        let fallback_allocation = allocate_projection_revision(&mut tx)
+            .await
+            .map_err(|error| format!("clean-slate fallback allocation: {error:?}"))?;
+        let clock = anchor_projection_clock(&mut *tx)
+            .await
+            .map_err(|error| format!("clean-slate projection clock: {error}"))?;
+        let live = authority
+            .collect_traffic_projection(
+                &clock,
+                live_allocation,
+                fixture.requester.did.clone(),
+                roster,
+            )
+            .await
+            .map_err(|error| format!("clean-slate traffic collection: {error:?}"))?;
+        let observation = observe_relationship_persistence(&clock);
+        let fallback = live
+            .export_persisted_fallback(fallback_allocation, &authority, &observation)
+            .map_err(|error| format!("clean-slate traffic sealing: {error:?}"))?;
+        persist_traffic_projection(&mut tx, fallback)
+            .await
+            .map_err(|error| format!("clean-slate traffic persistence: {error:?}"))?;
+        tx.commit().await.map_err(|error| error.to_string())?;
+    }
 
     let application = fixture.application_messages.remove(0);
     let body = serde_json::json!({
@@ -414,6 +501,77 @@ pub async fn seed_clean_slate_expired_direct_request_fixture(
     pool: &sqlx::PgPool,
     signer: &super::repository::direct_request_receipts::DirectRequestReceiptSigner,
 ) -> Result<CleanSlateExpiredDirectRequestFixture, String> {
+    let actor = application_routing_fixture::FixtureIdentity::fresh(b"c33-expired-actor")?;
+    let recipient = application_routing_fixture::FixtureIdentity::fresh(b"c33-expired-recipient")?;
+    seed_published_direct_request(pool, signer, &actor, &recipient, chrono::Duration::days(31))
+        .await
+        .map(|(fixture, _)| fixture)
+}
+
+/// A live published `C33` request at its coordinator from `actor_did`, its
+/// active local sender, to the pending `recipient_did`, with both devices'
+/// signing keys and the conversation's current coordinate. Its publication is
+/// not genuinely signed, so the state machine cannot hydrate it.
+pub struct CleanSlatePendingDirectRequestFixture {
+    pub request_id: uuid::Uuid,
+    pub conversation_id: uuid::Uuid,
+    pub actor_did: String,
+    pub actor_device_id: uuid::Uuid,
+    pub actor_key_id: String,
+    pub actor_ed25519_seed: [u8; 32],
+    pub recipient_did: String,
+    pub recipient_device_id: uuid::Uuid,
+    pub recipient_key_id: String,
+    pub recipient_ed25519_seed: [u8; 32],
+    pub prior: serde_json::Value,
+}
+
+pub async fn seed_clean_slate_pending_direct_request_fixture(
+    pool: &sqlx::PgPool,
+    signer: &super::repository::direct_request_receipts::DirectRequestReceiptSigner,
+    actor_did: &str,
+    recipient_did: &str,
+) -> Result<CleanSlatePendingDirectRequestFixture, String> {
+    let actor = application_routing_fixture::FixtureIdentity::fresh_for_did(
+        actor_did,
+        b"c33-pending-actor",
+    )?;
+    let recipient = application_routing_fixture::FixtureIdentity::fresh_for_did(
+        recipient_did,
+        b"c33-pending-recipient",
+    )?;
+    let (published, prior) = seed_published_direct_request(
+        pool,
+        signer,
+        &actor,
+        &recipient,
+        chrono::Duration::minutes(1),
+    )
+    .await?;
+    Ok(CleanSlatePendingDirectRequestFixture {
+        request_id: published.request_id,
+        conversation_id: published.conversation_id,
+        actor_did: published.actor_did,
+        actor_device_id: actor.device_id,
+        actor_key_id: actor.key_id,
+        actor_ed25519_seed: actor.signing_key.to_bytes(),
+        recipient_did: published.recipient_did,
+        recipient_device_id: recipient.device_id,
+        recipient_key_id: recipient.key_id,
+        recipient_ed25519_seed: recipient.signing_key.to_bytes(),
+        prior,
+    })
+}
+
+/// `actor`'s published request to `recipient`, created `age` ago, and the
+/// conversation's current coordinate.
+async fn seed_published_direct_request(
+    pool: &sqlx::PgPool,
+    signer: &super::repository::direct_request_receipts::DirectRequestReceiptSigner,
+    actor: &application_routing_fixture::FixtureIdentity,
+    recipient: &application_routing_fixture::FixtureIdentity,
+    age: chrono::Duration,
+) -> Result<(CleanSlateExpiredDirectRequestFixture, serde_json::Value), String> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use chrono::{Duration, SecondsFormat};
     use sha2::{Digest as _, Sha256};
@@ -426,7 +584,7 @@ pub async fn seed_clean_slate_expired_direct_request_fixture(
             .fetch_one(pool)
             .await
             .map_err(|e| e.to_string())?;
-    let created_at = now_db - Duration::days(31);
+    let created_at = now_db - age;
     let prepared_at = created_at - Duration::seconds(10);
     let lease_expires_at = prepared_at + Duration::seconds(60);
     let import_until = created_at + Duration::days(30);
@@ -435,8 +593,6 @@ pub async fn seed_clean_slate_expired_direct_request_fixture(
 
     let trusted_past = super::validation::TrustedRequestInstant::from_datetime(prepared_at)
         .map_err(|e| format!("trusted instant: {e:?}"))?;
-    let actor = application_routing_fixture::FixtureIdentity::fresh(b"c33-expired-actor")?;
-    let recipient = application_routing_fixture::FixtureIdentity::fresh(b"c33-expired-recipient")?;
     application_routing_fixture::seed_identity(pool, &actor, &trusted_past).await?;
     application_routing_fixture::seed_identity(pool, &recipient, &trusted_past).await?;
 
@@ -1085,11 +1241,622 @@ pub async fn seed_clean_slate_expired_direct_request_fixture(
         .await
         .map_err(|e| format!("commit c33 expired publication fixture: {e}"))?;
 
-    Ok(CleanSlateExpiredDirectRequestFixture {
+    Ok((
+        CleanSlateExpiredDirectRequestFixture {
+            request_id,
+            conversation_id,
+            actor_did: actor.did.clone(),
+            recipient_did: recipient.did.clone(),
+        },
+        application_routing_fixture::coordinate_json(final_state.coordinate()),
+    ))
+}
+
+/// A genuinely published C33 request, driven through the production
+/// keys → prepare → publish repository pipeline: both devices' real keys, the
+/// recipient's real request KeyPackage and signed grant, the sender's real MLS
+/// bootstrap, the DS receipts and every row the publication executor writes.
+/// The recipient device still holds its pending request Welcome.
+pub(crate) struct GenuinePendingDirectRequest {
+    pub(crate) request_id: uuid::Uuid,
+    pub(crate) conversation_id: uuid::Uuid,
+    pub(crate) recipient_did: String,
+    pub(crate) recipient_device_id: uuid::Uuid,
+    recipient: application_routing_fixture::FixtureIdentity,
+    sender: application_routing_fixture::FixtureIdentity,
+    next: serde_json::Value,
+}
+
+impl GenuinePendingDirectRequest {
+    /// `(did, deviceId, keyId, Ed25519 seed)` of the sender's device.
+    pub(crate) fn sender_identity(&self) -> (String, uuid::Uuid, String, [u8; 32]) {
+        identity(&self.sender)
+    }
+
+    /// `(did, deviceId, keyId, Ed25519 seed)` of the recipient's device.
+    pub(crate) fn recipient_identity(&self) -> (String, uuid::Uuid, String, [u8; 32]) {
+        identity(&self.recipient)
+    }
+
+    /// The published conversation's current coordinate.
+    pub(crate) fn coordinate(&self) -> &serde_json::Value {
+        &self.next
+    }
+
+    /// The recipient device's own `acknowledgeWelcome`, or `rejectWelcome`
+    /// (`invalidWelcome`), naming the published request Welcome.
+    fn signed_welcome_terminal(
+        &self,
+        reject: bool,
+        signed_at: &str,
+    ) -> Result<application_routing_fixture::SignedRecoveryEnvelope, String> {
+        use super::transcript::SignedMutationKind;
+        let kind = if reject {
+            SignedMutationKind::WelcomeRejection
+        } else {
+            SignedMutationKind::WelcomeAcknowledgement
+        };
+        let mut body = serde_json::json!({
+            "$type": kind.type_id(),
+            "signatureDomain": String::from_utf8(kind.domain().to_vec()).map_err(|e| e.to_string())?,
+            "actorDid": self.recipient.did,
+            "actorDeviceId": self.recipient.device_id,
+            "keyId": self.recipient.key_id,
+            "authGeneration": 1,
+            "idempotencyKey": uuid::Uuid::new_v4(),
+            "signedAt": signed_at,
+            "welcomeId": self.request_id,
+            "transitionSeq": 1,
+            "coordinates": self.next,
+        });
+        if reject {
+            body["reason"] = serde_json::json!("invalidWelcome");
+        }
+        application_routing_fixture::sign_canonical_wrapper(&self.recipient, body, kind)
+    }
+
+    /// That request, verified against the recipient's own public key.
+    pub(crate) fn verified_welcome_terminal(
+        &self,
+        reject: bool,
+    ) -> Result<super::transcript::VerifiedSignedMutation, String> {
+        let trusted = super::validation::TrustedRequestInstant::capture()
+            .map_err(|e| format!("Welcome terminal instant: {e:?}"))?;
+        let envelope = self.signed_welcome_terminal(reject, trusted.as_str())?;
+        super::transcript::decode_and_verify_signed_mutation(
+            &envelope.raw_wrapper,
+            &self.recipient.signing_public_key(),
+        )
+        .map_err(|e| format!("verify Welcome terminal: {e:?}"))
+    }
+
+    /// That request admitted as the handler admits it: Nest JWT + DPoP
+    /// verification, replay consumption and the Ed25519 check against the
+    /// recipient's registered key. Returns the admission and the HTTP body.
+    pub(crate) async fn admit_welcome_terminal(
+        &self,
+        pool: &sqlx::PgPool,
+        reject: bool,
+    ) -> Result<(super::repository::auth::SignedOperationAdmission, Vec<u8>), String> {
+        let trusted = super::validation::TrustedRequestInstant::capture()
+            .map_err(|e| format!("Welcome terminal instant: {e:?}"))?;
+        let envelope = self.signed_welcome_terminal(reject, trusted.as_str())?;
+        let endpoint = if reject {
+            "blue.catbird.chat.rejectWelcome"
+        } else {
+            "blue.catbird.chat.acknowledgeWelcome"
+        };
+        let admission = application_routing_fixture::admit_lifecycle(
+            pool,
+            &self.recipient,
+            endpoint,
+            &envelope,
+            &trusted,
+        )
+        .await?;
+        let signed: serde_json::Value =
+            serde_json::from_slice(&envelope.raw_wrapper).map_err(|e| e.to_string())?;
+        let body = serde_json::to_vec(&serde_json::json!({ "signedRequest": signed }))
+            .map_err(|e| e.to_string())?;
+        Ok((admission, body))
+    }
+}
+
+fn identity(
+    identity: &application_routing_fixture::FixtureIdentity,
+) -> (String, uuid::Uuid, String, [u8; 32]) {
+    (
+        identity.did.clone(),
+        identity.device_id,
+        identity.key_id.clone(),
+        identity.signing_key.to_bytes(),
+    )
+}
+
+pub(crate) async fn seed_genuine_pending_direct_request(
+    pool: &sqlx::PgPool,
+) -> Result<GenuinePendingDirectRequest, String> {
+    seed_genuine_pending_direct_request_between(
+        pool,
+        application_routing_fixture::FixtureIdentity::fresh(b"genuine-direct-request-sender")?,
+        application_routing_fixture::FixtureIdentity::fresh(b"genuine-direct-request-recipient")?,
+    )
+    .await
+}
+
+/// [`seed_genuine_pending_direct_request`] from `sender_did` to `recipient_did`,
+/// so a federation test can declare the pair's homes.
+#[cfg(all(test, feature = "sim"))]
+pub(crate) async fn seed_genuine_pending_direct_request_for_pair(
+    pool: &sqlx::PgPool,
+    sender_did: &str,
+    recipient_did: &str,
+) -> Result<GenuinePendingDirectRequest, String> {
+    seed_genuine_pending_direct_request_between(
+        pool,
+        application_routing_fixture::FixtureIdentity::fresh_for_did(
+            sender_did,
+            b"genuine-direct-request-sender",
+        )?,
+        application_routing_fixture::FixtureIdentity::fresh_for_did(
+            recipient_did,
+            b"genuine-direct-request-recipient",
+        )?,
+    )
+    .await
+}
+
+/// `did`, seeded on `pool` with one device that published `packages` request
+/// KeyPackages and their grants, as its home holds them: the device's Ed25519
+/// public key and each package's ref.
+#[cfg(all(test, feature = "sim"))]
+pub(crate) async fn seed_published_request_keys(
+    pool: &sqlx::PgPool,
+    did: &str,
+    packages: usize,
+) -> Result<([u8; 32], Vec<[u8; 32]>), String> {
+    let identity = application_routing_fixture::FixtureIdentity::fresh_for_did(
+        did,
+        b"published-request-keys",
+    )?;
+    let registered = super::validation::TrustedRequestInstant::capture()
+        .map_err(|e| format!("registration instant: {e:?}"))?;
+    application_routing_fixture::seed_identity(pool, &identity, &registered).await?;
+    let published = publish_request_keys(pool, &identity, packages).await?;
+    Ok((
+        identity.signing_public_key(),
+        published.iter().map(|key| key.key_package_ref).collect(),
+    ))
+}
+
+/// One request KeyPackage a recipient device published with its grant.
+struct PublishedRequestKey {
+    package: openmls::prelude::KeyPackage,
+    key_package_ref: [u8; 32],
+    grant_id: uuid::Uuid,
+}
+
+/// `recipient`'s device publishes `count` request KeyPackages, each with its
+/// signed grant, through the production `publishDirectRequestKeys` path.
+async fn publish_request_keys(
+    pool: &sqlx::PgPool,
+    recipient: &application_routing_fixture::FixtureIdentity,
+    count: usize,
+) -> Result<Vec<PublishedRequestKey>, String> {
+    use super::direct_request_transcript::{direct_request_signing_bytes, DirectRequestKind};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use chrono::{Duration, SecondsFormat};
+    use ed25519_dalek::Signer as _;
+    use serde_json::{json, Value};
+    use sha2::{Digest as _, Sha256};
+    use uuid::Uuid;
+
+    let now = || {
+        super::validation::TrustedRequestInstant::capture()
+            .map(|instant| instant.datetime())
+            .map_err(|e| format!("request instant: {e:?}"))
+    };
+    let sign = |kind, body: Value| -> Result<Value, String> {
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+        let message = direct_request_signing_bytes(kind, &body_bytes)
+            .map_err(|e| format!("{kind:?}: {e}"))?;
+        let signature = STANDARD.encode(recipient.signing_key.sign(&message).to_bytes());
+        Ok(json!({ "body": body, "signature": signature }))
+    };
+    let at = now()?;
+    let signed_at = at.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let expires_at = (at + Duration::days(29)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let (mut published, mut keys) = (Vec::with_capacity(count), Vec::with_capacity(count));
+    for _ in 0..count {
+        let (package, bytes, key_package_ref) =
+            application_routing_fixture::build_direct_request_key_package(recipient, at)?;
+        let grant_id = Uuid::new_v4();
+        let grant = sign(
+            DirectRequestKind::Grant,
+            json!({
+                "$type": "blue.catbird.chat.defs#directRequestGrantBody",
+                "signatureDomain": "CATBIRD-DIRECT-REQUEST-GRANT\u{0}",
+                "protocolVersion": "2",
+                "actorDid": recipient.did,
+                "actorDeviceId": recipient.device_id,
+                "keyId": recipient.key_id,
+                "authGeneration": 1,
+                "grantId": grant_id,
+                "grantRevision": 1,
+                "purpose": "direct-request-bootstrap",
+                "profile": "encryptedIntroduction1",
+                "keyPackageRef": STANDARD.encode(key_package_ref),
+                "keyPackageSha256": STANDARD.encode(Sha256::digest(&bytes)),
+                "expiresAt": expires_at,
+                "idempotencyKey": grant_id,
+                "signedAt": signed_at,
+            }),
+        )?;
+        keys.push(json!({
+            "keyPackage": {
+                "framing": "mlsMessage",
+                "contentType": "keyPackage",
+                "bytes": STANDARD.encode(&bytes),
+                "sha256": STANDARD.encode(Sha256::digest(&bytes)),
+                "keyPackageRef": STANDARD.encode(key_package_ref),
+            },
+            "grant": grant,
+        }));
+        published.push(PublishedRequestKey {
+            package,
+            key_package_ref,
+            grant_id,
+        });
+    }
+    let publication = sign(
+        DirectRequestKind::Keys,
+        json!({
+            "$type": "blue.catbird.chat.defs#directRequestKeysPublicationBody",
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-KEYS\u{0}",
+            "protocolVersion": "2",
+            "actorDid": recipient.did,
+            "actorDeviceId": recipient.device_id,
+            "keyId": recipient.key_id,
+            "authGeneration": 1,
+            "revision": 1,
+            "enabled": true,
+            "keys": keys,
+            "idempotencyKey": Uuid::new_v4(),
+            "signedAt": signed_at,
+        }),
+    )?;
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    super::repository::direct_request_preparation::publish_direct_request_keys(
+        &mut tx,
+        &crate::auth::VerifiedServicePrincipal::for_federated_s2s(
+            &recipient.did,
+            "blue.catbird.chat.publishDirectRequestKeys",
+        ),
+        &serde_json::to_vec(&publication).map_err(|e| e.to_string())?,
+        now()?,
+    )
+    .await
+    .map_err(|e| format!("publish request keys: {e:?}"))?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(published)
+}
+
+async fn seed_genuine_pending_direct_request_between(
+    pool: &sqlx::PgPool,
+    actor: application_routing_fixture::FixtureIdentity,
+    recipient: application_routing_fixture::FixtureIdentity,
+) -> Result<GenuinePendingDirectRequest, String> {
+    use super::direct_request_transcript::{
+        direct_request_context_hash, direct_request_signing_bytes, verify_signed_request,
+        DirectRequestKind,
+    };
+    use super::repository::{
+        direct_request_preparation::{self as preparation, DirectRequestResult},
+        direct_request_publication::{self as publication, PublicationPreparation},
+        direct_request_receipts::DirectRequestReceiptSigner,
+    };
+    use application_routing_fixture::FixtureIdentity;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use chrono::{DateTime, Duration, SecondsFormat, Utc};
+    use ed25519_dalek::Signer as _;
+    use p256::pkcs8::EncodePrivateKey as _;
+    use serde_json::{json, Value};
+    use sha2::{Digest as _, Sha256};
+    use uuid::Uuid;
+
+    let es256 = |seed: u8| -> Result<(p256::ecdsa::SigningKey, String), String> {
+        let key = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).map_err(|e| e.to_string())?;
+        let pem = p256::SecretKey::from_slice(&key.to_bytes())
+            .map_err(|e| e.to_string())?
+            .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+            .map_err(|e| e.to_string())?
+            .to_string();
+        Ok((key, pem))
+    };
+    let (receipt_key, receipt_pem) = es256(21)?;
+    let (_, service_pem) = es256(22)?;
+    let (sequencer_key, _) = es256(23)?;
+    let document = crate::identity::did_doc::build_direct_request_receipt_did_document(
+        "did:web:chat.catbird.blue",
+        receipt_key.verifying_key(),
+    );
+    let signer = DirectRequestReceiptSigner::configured(
+        &receipt_pem,
+        &service_pem,
+        &serde_json::to_string(&document).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("request receipt signer: {e:?}"))?;
+    signer.validate_and_retain_keys(pool).await?;
+    let sequencer = crate::federation::receipt::I13ReceiptSigner::from_signing_key_for_test(
+        signer.authority_did().to_owned(),
+        sequencer_key,
+    );
+    let policy = RelationshipAuthority::new(
+        fixed_production_relationship_policy_config().map_err(|e| format!("{e:?}"))?,
+        DeterministicTestTransport,
+    );
+    // Publication appends its event to this instance's stream.
+    let cursor_key: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(vec![0x51_u8; 32])
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT INTO chat.protocol_instances(singleton,protocol_version,protocol_instance_id,cursor_key_id) \
+         VALUES(TRUE,'1',$1,$2) ON CONFLICT DO NOTHING",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&cursor_key)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("protocol instance: {e}"))?;
+    sqlx::query(
+        "INSERT INTO chat.event_retention(protocol_instance_id,retained_floor,updated_at) \
+         SELECT protocol_instance_id,0,clock_timestamp() FROM chat.protocol_instances \
+         ON CONFLICT DO NOTHING",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("event retention: {e}"))?;
+
+    let registered = super::validation::TrustedRequestInstant::capture()
+        .map_err(|e| format!("registration instant: {e:?}"))?;
+    application_routing_fixture::seed_identity(pool, &actor, &registered).await?;
+    application_routing_fixture::seed_identity(pool, &recipient, &registered).await?;
+    let now = || -> Result<DateTime<Utc>, String> {
+        super::validation::TrustedRequestInstant::capture()
+            .map(|instant| instant.datetime())
+            .map_err(|e| format!("request instant: {e:?}"))
+    };
+    let text = |instant: DateTime<Utc>| instant.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let sign = |identity: &FixtureIdentity, kind, body: &Value| -> Result<Vec<u8>, String> {
+        let body_bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+        let message = direct_request_signing_bytes(kind, &body_bytes)
+            .map_err(|e| format!("{kind:?}: {e}"))?;
+        let signature = STANDARD.encode(identity.signing_key.sign(&message).to_bytes());
+        serde_json::to_vec(&json!({ "body": body, "signature": signature }))
+            .map_err(|e| e.to_string())
+    };
+    let principal =
+        |did: &str, nsid: &str| crate::auth::VerifiedServicePrincipal::for_federated_s2s(did, nsid);
+
+    // 1. The recipient device publishes one request KeyPackage and its grant.
+    let PublishedRequestKey {
+        package,
+        key_package_ref: package_ref,
+        grant_id,
+    } = publish_request_keys(pool, &recipient, 1).await?.remove(0);
+
+    // 2. The sender prepares against that published capability.
+    let (request_id, conversation_id, first_message_id) =
+        (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let prepare_body = json!({
+        "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
+        "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\u{0}",
+        "protocolVersion": "2",
+        "actorDid": actor.did,
+        "actorDeviceId": actor.device_id,
+        "keyId": actor.key_id,
+        "authGeneration": 1,
+        "requestId": request_id,
+        "firstMessageId": first_message_id,
+        "conversationId": conversation_id,
+        "recipientDid": recipient.did,
+        "origin": { "$type": "blue.catbird.chat.defs#freshDirectOrigin" },
+        "profile": "encryptedIntroduction1",
+        "idempotencyKey": request_id,
+        "signedAt": text(now()?),
+    });
+    let prepare = sign(&actor, DirectRequestKind::Prepare, &prepare_body)?;
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let prepared = match preparation::prepare_direct_request(
+        &mut tx,
+        &principal(&actor.did, "blue.catbird.chat.prepareDirectRequest"),
+        &prepare,
+        &signer,
+        &policy,
+        now()?,
+        None,
+    )
+    .await
+    .map_err(|e| format!("prepare request: {e:?}"))?
+    {
+        DirectRequestResult::Prepared(bytes) => bytes,
+        DirectRequestResult::Terminal(bytes) => {
+            return Err(format!(
+                "preparation refused: {}",
+                String::from_utf8_lossy(&bytes)
+            ))
+        }
+        _ => return Err("preparation returned no preparation".to_owned()),
+    };
+    tx.commit().await.map_err(|e| e.to_string())?;
+    let snapshot: Value = serde_json::from_slice(&prepared).map_err(|e| e.to_string())?;
+    let selected: Vec<&Value> = snapshot["selectedDevices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|device| &device["keyPackage"]["keyPackageRef"])
+        .collect();
+    if selected != [&json!(STANDARD.encode(package_ref))] {
+        return Err(format!("preparation selected another audience: {snapshot}"));
+    }
+    let preparation_digest = snapshot["preparationDigest"].clone();
+
+    // 3. The sender client's MLS bootstrap for that exact preparation.
+    let context = json!({
+        "protocolVersion": "2",
+        "requestId": request_id,
+        "firstMessageId": first_message_id,
+        "conversationId": conversation_id,
+        "origin": prepare_body["origin"],
+        "actorDid": actor.did,
+        "actorDeviceId": actor.device_id,
+        "actorKeyId": actor.key_id,
+        "recipientDid": recipient.did,
+        "preparationDigest": preparation_digest,
+    });
+    let context_hash =
+        direct_request_context_hash(&serde_json::to_vec(&context).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("request context: {e}"))?;
+    let archive_commitment = [0x6d_u8; 32];
+    let at = now()?;
+    let bootstrap = application_routing_fixture::build_direct_request_bootstrap(
+        &actor,
+        package,
+        conversation_id,
+        &context_hash,
+        first_message_id,
+        &archive_commitment,
+        at,
+    )?;
+    // Whole seconds, past the seven-day import floor, inside the sender leaf.
+    let import_until = text(
+        DateTime::from_timestamp((at + Duration::days(7) + Duration::hours(1)).timestamp(), 0)
+            .ok_or_else(|| "import horizon".to_owned())?,
+    );
+    let artifact = |bytes: &[u8], content_type: &str| {
+        json!({
+            "framing": "mlsMessage",
+            "contentType": content_type,
+            "bytes": STANDARD.encode(bytes),
+            "sha256": STANDARD.encode(Sha256::digest(bytes)),
+        })
+    };
+    let mut metadata_coordinate = bootstrap.next.clone();
+    let fields = metadata_coordinate
+        .as_object_mut()
+        .ok_or_else(|| "published coordinate".to_owned())?;
+    fields.remove("stateVersion");
+    fields.remove("lifecycle");
+    fields.insert(
+        "conversationId".to_owned(),
+        json!(STANDARD.encode(conversation_id.as_bytes())),
+    );
+    let metadata = [0x5a_u8; 32];
+    let mut publish_body = prepare_body;
+    publish_body["$type"] = json!("blue.catbird.chat.defs#directRequestPublicationBody");
+    publish_body["signatureDomain"] = json!("CATBIRD-DIRECT-REQUEST-PUBLISH\u{0}");
+    publish_body["signedAt"] = json!(text(now()?));
+    publish_body["preparationDigest"] = preparation_digest.clone();
+    publish_body["preparationRequestDigest"] = json!(STANDARD.encode(
+        verify_signed_request(
+            DirectRequestKind::Prepare,
+            &prepare,
+            &actor.signing_public_key()
+        )
+        .map_err(|e| format!("prepare digest: {e}"))?
+        .request_digest()
+    ));
+    publish_body["contextHash"] = json!(STANDARD.encode(context_hash));
+    publish_body["archiveCommitment"] = json!(STANDARD.encode(archive_commitment));
+    publish_body["next"] = bootstrap.next.clone();
+    publish_body["importUntil"] = json!(import_until);
+    publish_body["artifacts"] = json!({
+        "genesisGroupInfo": artifact(&bootstrap.genesis_group_info, "groupInfo"),
+        "addCommit": artifact(&bootstrap.add_commit, "publicMessageCommit"),
+        "finalGroupInfo": artifact(&bootstrap.final_group_info, "groupInfo"),
+        "welcome": {
+            "opaqueWelcome": STANDARD.encode(&bootstrap.welcome),
+            "sha256": STANDARD.encode(Sha256::digest(&bootstrap.welcome)),
+            "deliveries": [{
+                "recipientDid": recipient.did,
+                "recipientDeviceId": recipient.device_id,
+                "provenance": {
+                    "requestId": request_id,
+                    "preparationDigest": preparation_digest,
+                    "contextHash": STANDARD.encode(context_hash),
+                    "grantId": grant_id,
+                    "grantRevision": 1,
+                    "keyPackageRef": STANDARD.encode(package_ref),
+                    "importUntil": import_until,
+                },
+            }],
+        },
+        "initialCiphertext": STANDARD.encode(&bootstrap.initial_ciphertext),
+        "metadataSnapshot": {
+            "coordinate": metadata_coordinate,
+            "originTransitionId": request_id,
+            "metadataVersion": 1,
+            "nonce": STANDARD.encode([0x52_u8; 12]),
+            "ciphertext": STANDARD.encode(metadata),
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(metadata)),
+            "ciphertextSize": metadata.len(),
+            "authorProof": {
+                "authorDid": actor.did,
+                "authorDeviceId": actor.device_id,
+                "authorKeyId": actor.key_id,
+                "signaturePublicKey": STANDARD.encode(actor.signing_public_key()),
+                "authGenerationAtOrigin": 1,
+                "originTransitionId": request_id,
+                "originSeq": 1,
+                "roleAtOrigin": "admin",
+                "deviceStatusAtOrigin": "active",
+            },
+        },
+    });
+    let signed_publication = sign(&actor, DirectRequestKind::Publish, &publish_body)?;
+
+    // 4. The production publication planner and executor, one transaction.
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let receipt = match publication::prepare_publication(
+        &mut tx,
+        &principal(&actor.did, "blue.catbird.chat.publishDirectRequest"),
+        &signed_publication,
+        &signer,
+        &policy,
+        now()?,
+        true,
+    )
+    .await
+    .map_err(|e| format!("plan publication: {e:?}"))?
+    {
+        PublicationPreparation::Ready(prepared) => {
+            publication::execute_publication(&mut tx, *prepared, &signer, Some(&sequencer), &policy)
+                .await
+                .map_err(|e| format!("execute publication: {e:?}"))?
+        }
+        PublicationPreparation::Terminal(bytes) => {
+            return Err(format!(
+                "publication refused: {}",
+                String::from_utf8_lossy(&bytes)
+            ))
+        }
+    };
+    let receipt: Value = serde_json::from_slice(&receipt).map_err(|e| e.to_string())?;
+    if receipt["body"]["receipt"]["$type"] != "blue.catbird.chat.defs#directRequestPublishedReceipt"
+    {
+        return Err(format!("publication rejected: {receipt}"));
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(GenuinePendingDirectRequest {
         request_id,
         conversation_id,
-        actor_did: actor.did,
-        recipient_did: recipient.did,
+        recipient_did: recipient.did.clone(),
+        recipient_device_id: recipient.device_id,
+        recipient,
+        sender: actor,
+        next: bootstrap.next,
     })
 }
 
@@ -1658,8 +2425,15 @@ pub struct DeterministicTestTransport;
 impl PublicTransport for DeterministicTestTransport {
     async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
         let path = request.url.path();
-        if path.starts_with("/did:plc:") {
-            let actor = path.trim_start_matches('/');
+        // A did:plc document from the directory, or a did:web one from its host.
+        let document = match path.strip_prefix("/did:plc:") {
+            Some(_) => Some(path.trim_start_matches('/').to_owned()),
+            None if path == /* did-web-test */ "/.well-known/did.json" => {
+                request.url.host_str().map(|host| format!("did:web:{host}"))
+            }
+            None => None,
+        };
+        if let Some(actor) = document {
             return Ok(PublicResponse::json(
                 200,
                 json!({

@@ -10,6 +10,7 @@ on:
       - 'e2e-tests/**'
       - 'lexicon/**'
       - '.github/workflows/mls-deploy.yml'
+      - 'docker-compose.federation.yml'
   pull_request:
     branches:
       - main
@@ -19,6 +20,7 @@ on:
       - 'e2e-tests/**'
       - 'lexicon/**'
       - '.github/workflows/mls-deploy.yml'
+      - 'docker-compose.federation.yml'
   workflow_dispatch:
     inputs:
       environment:
@@ -47,7 +49,7 @@ jobs:
     
     services:
       postgres:
-        image: postgres:15
+        image: postgres:16
         env:
           POSTGRES_PASSWORD: test_password
           POSTGRES_USER: catbird
@@ -75,11 +77,15 @@ jobs:
           df -h /
 
       - name: Clone pinned sibling repos
+        # server/ needs catbird-atproto and labyrinth; e2e-tests/ also needs
+        # catbird-mls and ../BIRDaemon (see "Run two-node federation lifecycle").
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach d6638bb5237e3d7bf9f6ac34d958fa2d61da2aad
+          git -C ../catbird-atproto checkout --detach 5dc4b0058dbee563a83c12c927a66a89dd84c71f
           git clone --filter=blob:none https://github.com/joshlacal/catbird-mls.git ../catbird-mls
-          git -C ../catbird-mls checkout --detach 40c46eaf76066c1a95e055fe61ef510e1c155a30
+          git -C ../catbird-mls checkout --detach 798ea4767c23f290034727da3dc31ba9e029bd9e
+          git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
+          git -C ../labyrinth checkout --detach 4c955a7656a5dba11301be7d2412729907a984c7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2026-03-27)
@@ -149,6 +155,11 @@ jobs:
           ./server/scripts/check_deploy_policy.sh
           ./server/scripts/check_chat_production_proof_policy.sh
 
+      - name: Verify operations script safety
+        # The local-only database reset guard, migration-log redaction, this
+        # workflow's test targets and features, and the federation compose fixtures.
+        run: python3 server/scripts/test_ops_safety.py
+
       - name: Install sqlx-cli
         run: |
           cargo install sqlx-cli --no-default-features --features postgres --locked
@@ -182,9 +193,12 @@ jobs:
           DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
           TEST_DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
         run: |
-          cargo test --test chat_protocol_signing_domain_vectors --test chat_protocol_route_inventory --test federation_fixture_auth_profile --test chat_protocol_generated_transition_compat --features namespace-bluecatbird,server-bin
+          cargo test --test chat_protocol_signing_domain_vectors --test chat_protocol_route_inventory --test federation_fixture_auth_profile --test chat_protocol_generated_transition_compat --features namespace-bluecatbird,server-bin,test-support
 
       - name: Run two-node federation lifecycle
+        # e2e-tests/Cargo.toml has a path dependency on ../BIRDaemon (since
+        # 2026-11-01). BIRDaemon has no published repository to clone yet, so
+        # this step fails at manifest load until it has one and is cloned above.
         working-directory: ./e2e-tests
         run: cargo test --locked --test federation_two_node -- --ignored --test-threads=1
 
@@ -268,9 +282,8 @@ jobs:
             --ignore RUSTSEC-2026-0221 \
             --ignore RUSTSEC-2026-0253
 
-  # N33: the `#[ignore]`-gated DB regression suites (WS-1.3 sequencer-CAS
-  # fences, the repaired N14 DB suites, the N32 actor single-flight race)
-  # only execute under `--include-ignored` with a live Postgres. Without
+  # N33: the `#[ignore]`-gated DB regressions in `db_tests` and the handler,
+  # Labyrinth and clock-determinism suites below only execute with a live Postgres. Without
   # this job they never run in CI and the regressions they pin can silently
   # return. Keep this job in the required-for-merge status checks for
   # `main`/`staging` (GitHub branch protection lists it as
@@ -284,7 +297,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:15
+        image: postgres:16
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_USER: anonymous
@@ -301,10 +314,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Clone pinned catbird-atproto sibling repo
+      - name: Clone pinned sibling repos
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach d6638bb5237e3d7bf9f6ac34d958fa2d61da2aad
+          git -C ../catbird-atproto checkout --detach 5dc4b0058dbee563a83c12c927a66a89dd84c71f
+          git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
+          git -C ../labyrinth checkout --detach 4c955a7656a5dba11301be7d2412729907a984c7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2026-03-27)
@@ -347,23 +362,8 @@ jobs:
         # --test-threads=1: db_tests serializes via a static lock; single-threaded
         # execution keeps the gate deterministic. Concurrency inside each test
         # (barriers/spawned tasks) is unaffected.
-        #
-        # --skip'd race_conditions cases are the documented stale-contract
-        # tests (AddMembers without commit no longer advances epoch /
-        # writes no commit row); they need a test-side MLS commit harness
-        # and are NOT DB-gated regressions:
-        #   - test_concurrent_add_members_no_duplicate_epochs
-        #   - test_out_of_order_commits_prevented
-        #   - test_mixed_operations_no_race_conditions
         run: |
-          cargo test \
-            --test sequencer_transfer_cas \
-            --test db_tests \
-            --test race_conditions \
-            -- --include-ignored --test-threads=1 \
-            --skip test_concurrent_add_members_no_duplicate_epochs \
-            --skip test_out_of_order_commits_prevented \
-            --skip test_mixed_operations_no_race_conditions
+          cargo test --test db_tests -- --include-ignored --test-threads=1
 
       - name: Run authenticated handler regressions
         working-directory: ./server
@@ -382,29 +382,46 @@ jobs:
           # frozen Swift serializer products run in the required pure target.
           cargo test --locked --no-default-features --features test-support --test chat_protocol_create_conversation_handlers generated_transition_handlers_preserve_raw_persistence_replay_and_canonical_reads -- --include-ignored --exact --test-threads=1
 
-      - name: Run Labyrinth Space integration tests
+      - name: Run Labyrinth integration tests
         working-directory: ./server
         env:
           DATABASE_URL: postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722
           TEST_DATABASE_URL: postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722
           CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: "handlers-and-legacy-apis-sealed"
-          SERVICE_DID: did:web:ci-mls.test
           RUST_LOG: info
           PGUSER: anonymous
         # Each case mints and drops its own disposable database from the
         # reviewed TEST_DATABASE_URL, so it needs this job's trust-auth
-        # service. The harness seeds chat fixtures under
-        # `session_replication_role = replica`, so it needs a role allowed to
-        # set that parameter: a superuser, or on PostgreSQL 15 and later a
+        # service. The directory and retention suites seed chat fixtures under
+        # `session_replication_role = replica` (tests/common/labyrinth_harness.rs),
+        # so they need a role allowed to set that parameter: a superuser, or a
         # role granted `SET ON PARAMETER session_replication_role`. The
         # reviewed URL names no user, so this step alone connects as the
         # service superuser `anonymous` through PGUSER; the earlier DB steps
         # still connect as the `runner` role, which is not a superuser and
         # has no such grant.
-        # The target requires the test-support feature. It runs after the
-        # handler regressions so a failure here does not skip them.
+        # The targets require the test-support feature. SERVICE_DID stays unset,
+        # as in the local gate: the harness and the account-deletion suite set
+        # their own. They run after the handler regressions so a failure here
+        # does not skip them.
         run: |
-          cargo test --locked --features test-support --test labyrinth_space
+          cargo test --locked --features test-support --test labyrinth_directory --test labyrinth_retention --test labyrinth_account_deletion
+
+      - name: Run deterministic server clock test
+        working-directory: ./server
+        env:
+          DATABASE_URL: postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722
+          TEST_DATABASE_URL: postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722
+          CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: "handlers-and-legacy-apis-sealed"
+          RUST_LOG: info
+          PGUSER: anonymous
+        # Required: replayed runs must produce identical signed outputs and
+        # sequencer receipts, and schema resets must not advance paused time.
+        # Its only real-time bound is a 10-second hang guard on schema reset,
+        # not a speed budget. Its disposable database takes the superuser reset
+        # path, as in the local gate.
+        run: |
+          cargo test --locked --features sim,test-support --test deterministic_server_clock_test
 
       - name: Preserve generated-transition handler receipts
         if: always()
@@ -435,10 +452,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Clone pinned catbird-atproto sibling repo
+      - name: Clone pinned sibling repos
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach d6638bb5237e3d7bf9f6ac34d958fa2d61da2aad
+          git -C ../catbird-atproto checkout --detach 5dc4b0058dbee563a83c12c927a66a89dd84c71f
+          git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
+          git -C ../labyrinth checkout --detach 4c955a7656a5dba11301be7d2412729907a984c7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
@@ -470,6 +489,7 @@ jobs:
           file: ./server/Dockerfile
           build-contexts: |
             catbird-atproto=../catbird-atproto
+            labyrinth-protocol=../labyrinth/labyrinth-protocol
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

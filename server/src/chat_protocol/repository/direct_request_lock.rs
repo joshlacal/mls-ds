@@ -150,6 +150,10 @@ pub(crate) async fn lock_direct_request_identity_scope(
         .bind(dids).fetch_all(&mut **transaction).await?;
     sqlx::query("SELECT user_did,device_id,key_id FROM chat.device_keys WHERE user_did=ANY($1) ORDER BY convert_to(user_did,'UTF8'),uuid_send(device_id),convert_to(key_id,'UTF8') FOR UPDATE")
         .bind(dids).fetch_all(&mut **transaction).await?;
-    sqlx::query_as("SELECT d.user_did,d.device_id,d.status,d.auth_generation,k.key_id,k.signing_public_key,k.revoked_at FROM chat.devices d JOIN chat.device_keys k USING(user_did,device_id) WHERE d.user_did=ANY($1) ORDER BY convert_to(d.user_did,'UTF8'),uuid_send(d.device_id)")
+    sqlx::query_as("SELECT d.user_did,d.device_id,d.status,d.auth_generation,k.key_id,k.signing_public_key,k.revoked_at FROM chat.devices d JOIN chat.device_keys k USING(user_did,device_id) \
+      WHERE d.user_did=ANY($1) AND k.enrollment_auth_generation<=d.auth_generation \
+        AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+          AND newer.enrollment_auth_generation>k.enrollment_auth_generation AND newer.enrollment_auth_generation<=d.auth_generation) \
+      ORDER BY convert_to(d.user_did,'UTF8'),uuid_send(d.device_id)")
         .bind(dids).fetch_all(&mut **transaction).await
 }

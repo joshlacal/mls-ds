@@ -97,7 +97,11 @@ const PENDING_LEAF_RECOVERIES_SQL: &str = r#"
            AND device.auth_generation = request.requester_auth_generation
            AND device_key.revoked_at IS NULL
            AND device_key.key_id = request.requester_key_id
-           AND device_key.enrollment_auth_generation = request.requester_auth_generation
+           AND device_key.enrollment_auth_generation <= request.requester_auth_generation
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=device_key.user_did AND newer.device_id=device_key.device_id
+                  AND newer.enrollment_auth_generation>device_key.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=request.requester_auth_generation)
          ORDER BY request.requested_at, request.recovery_request_id
          LIMIT 100
 "#;
@@ -470,9 +474,9 @@ mod tests {
         let recovery = project_recovery(source_row()).expect("recovery view");
         let expected_device = recovery.requester_device_id.to_string();
         let encoded =
-            super::super::canonical_conversation_state_response(&state, &[recovery], &[], &[])
+            super::super::canonical_conversation_state_response(&[], &state, &[recovery], &[], &[])
                 .expect("canonical response");
-        assert!(encoded.starts_with(br#"{"pendingLeafRecoveryRequests":["#));
+        assert!(encoded.starts_with(br#"{"accountDeletions":[],"pendingLeafRecoveryRequests":["#));
         let decoded: serde_json::Value = serde_json::from_slice(&encoded).expect("decode response");
         assert_eq!(
             decoded["pendingLeafRecoveryRequests"][0]["requesterDeviceId"],

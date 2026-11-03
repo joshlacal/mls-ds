@@ -24,17 +24,12 @@ use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, push_auth_snapshot,
     request_database_snapshot, reviewed_baseline, reviewed_request_migrations, seed_service_device,
     signed_mls_request, validate_request_test_database_url, DeterministicFaultTransport,
-    FaultBoundary, HttpsDidFixture, PushFixtureConfig, RequestRig, ServiceIdentity,
-    ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
+    FaultBoundary, HttpsDidFixture, RequestRig, ServiceIdentity, ShippingServerFixture,
+    REQUEST_TEST_DATABASE_URL,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{
-    io::Write as _,
-    process::{Command, Stdio},
-    time::Duration,
-};
 use uuid::Uuid;
 
 #[test]
@@ -104,6 +99,14 @@ fn reviewed_baseline_has_exactly_fourteen_ordered_entries() {
 }
 
 #[test]
+#[should_panic(expected = "unreviewed current migration")]
+fn request_migration_frontier_rejects_unlisted_current_sql() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("99991231000000_unreviewed.sql"), "").unwrap();
+    encrypted_requests::assert_current_migration_frontier(directory.path());
+}
+
+#[test]
 fn deterministic_fault_transport_fires_at_the_selected_occurrence() -> anyhow::Result<()> {
     let mut transport = DeterministicFaultTransport::default()
         .fail_on(FaultBoundary::AfterRequestBeforeResponse, 2)?;
@@ -156,7 +159,7 @@ async fn unavailable_request_handlers_fail_closed_instead_of_passing() -> anyhow
 }
 
 #[path = "support/live_direct_request.rs"]
-mod live_direct_request;
+pub mod live_direct_request;
 use live_direct_request::siblings;
 
 fn signed_ordinary(engine: &MlsEngine, identity: &str, body: Value) -> anyhow::Result<Value> {
@@ -331,10 +334,7 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
             ],
         )
         .await?;
-    encrypted_requests::assert_closed_conversation_wiped(
-        f.conversation_id,
-        Some(f.request_id),
-    )?;
+    encrypted_requests::assert_closed_conversation_wiped(f.conversation_id, Some(f.request_id))?;
     // Bob's frozen close-event entitlement survives the operational wipe,
     // without retaining application ciphertext or ordinary control history.
     assert_eq!(
@@ -391,10 +391,10 @@ async fn c01_f85_pending_direct_request_read_authority_and_isolation() -> anyhow
 async fn fresh_service_jwts_preserve_device_generation_and_replay_fails_closed(
 ) -> anyhow::Result<()> {
     const READ_NSID: &str = "blue.catbird.chat.getOwnDevices";
-    const PUSH_NSID: &str = "blue.catbird.chat.updatePushToken";
+    const PUSH_NSID: &str = live_direct_request::PUSH_GATEWAY_NSID;
 
     let fixture = live_direct_request::publish_request(false).await?;
-    let before = push_auth_snapshot(&fixture.bob, "apns")?;
+    let before = push_auth_snapshot(&fixture.bob)?;
     anyhow::ensure!(
         before.device_auth_generation == 1 && before.key_enrollment_auth_generation == 1,
         "fixture device did not retain acknowledged enrollment generation"
@@ -445,14 +445,12 @@ async fn fresh_service_jwts_preserve_device_generation_and_replay_fails_closed(
         "second authenticated read omitted the enrolled device"
     );
 
-    let after_fresh = push_auth_snapshot(&fixture.bob, "apns")?;
+    let after_fresh = push_auth_snapshot(&fixture.bob)?;
     anyhow::ensure!(
         after_fresh.device_auth_generation == before.device_auth_generation
             && after_fresh.key_enrollment_auth_generation == before.key_enrollment_auth_generation
-            && after_fresh.registration_id == before.registration_id
-            && after_fresh.token_generation == before.token_generation
-            && after_fresh.binding_digest_hex == before.binding_digest_hex,
-        "fresh account service JWTs changed device or push-binding authority"
+            && after_fresh.gateway_binding == before.gateway_binding,
+        "fresh account service JWTs changed device or push-gateway binding authority"
     );
     anyhow::ensure!(
         after_fresh.service_jti_rows == before.service_jti_rows + 2
@@ -475,28 +473,27 @@ async fn fresh_service_jwts_preserve_device_generation_and_replay_fails_closed(
         String::from_utf8_lossy(&replay_body)
     );
     anyhow::ensure!(
-        push_auth_snapshot(&fixture.bob, "apns")? == after_fresh,
+        push_auth_snapshot(&fixture.bob)? == after_fresh,
         "replayed service JTI changed durable authority rows"
     );
 
-    let invented_token = format!("invented-generation-{}", Uuid::new_v4().simple());
-    let mut invented_body: catbird_mls::atproto::blue_catbird::chat::PushRegistrationBody =
-        serde_json::from_value(fixture.push_registration_request["registration"]["body"].clone())?;
-    invented_body.auth_generation = before.device_auth_generation + 1;
-    invented_body.token_generation = before.token_generation + 1;
-    invented_body.token_sha256 = Sha256::digest(invented_token.as_bytes()).to_vec().into();
-    invented_body.signed_at = canonical_now().parse()?;
-    let transcript = catbird_mls::atproto::push_registration::transcript(&invented_body)?;
-    let bob_identity = format!("{}#{}", fixture.bob.did, fixture.bob.device_id);
-    let signature = fixture
-        .bob_engine
-        .sign_identity(&bob_identity, transcript)?;
-    let invented_registration = catbird_mls::atproto::blue_catbird::chat::SignedPushRegistration {
-        body: invented_body,
-        signature: signature.into(),
-        extra_data: None,
-    };
-    let invented_request = json!({"token":invented_token,"registration":invented_registration});
+    // D2 analogue of the legacy invented token generation: the same device
+    // signs its registered gateway with a rotated pushKey at an auth generation
+    // the DS never issued. registerPushGateway rejects a generation mismatch
+    // as NotAuthorized; the +1 JTI below proves the service JWT itself was
+    // admitted, so the refusal is the generation check, not authentication.
+    let invented_request = live_direct_request::signed_push_gateway_registration(
+        &fixture.bob,
+        &fixture.bob_engine,
+        before.device_auth_generation + 1,
+        fixture.push_registration_request["gatewayUrl"]
+            .as_str()
+            .context("fixture gateway URL")?,
+        fixture.push_registration_request["appId"]
+            .as_str()
+            .context("fixture gateway app ID")?,
+        &format!("invented-generation-{}", Uuid::new_v4().simple()),
+    )?;
     let invented = fixture
         .client
         .post(format!("{}/xrpc/{PUSH_NSID}", fixture.server.base_url))
@@ -507,20 +504,18 @@ async fn fresh_service_jwts_preserve_device_generation_and_replay_fails_closed(
     let invented_status = invented.status();
     let invented_response = invented.bytes().await?;
     anyhow::ensure!(
-        invented_status == reqwest::StatusCode::BAD_REQUEST
-            && String::from_utf8_lossy(&invented_response).contains("StaleAuthGeneration"),
+        invented_status == reqwest::StatusCode::UNAUTHORIZED
+            && String::from_utf8_lossy(&invented_response).contains("NotAuthorized"),
         "invented higher generation did not fail closed: {invented_status} {}",
         String::from_utf8_lossy(&invented_response)
     );
-    let after_invented = push_auth_snapshot(&fixture.bob, "apns")?;
+    let after_invented = push_auth_snapshot(&fixture.bob)?;
     anyhow::ensure!(
         after_invented.device_auth_generation == after_fresh.device_auth_generation
             && after_invented.key_enrollment_auth_generation
                 == after_fresh.key_enrollment_auth_generation
-            && after_invented.registration_id == after_fresh.registration_id
-            && after_invented.token_generation == after_fresh.token_generation
-            && after_invented.binding_digest_hex == after_fresh.binding_digest_hex,
-        "invented generation changed device or push-binding authority"
+            && after_invented.gateway_binding == after_fresh.gateway_binding,
+        "invented generation changed device or push-gateway binding authority"
     );
     anyhow::ensure!(
         after_invented.service_jti_rows == after_fresh.service_jti_rows + 1
@@ -546,151 +541,53 @@ async fn c02_accepted_future_signed_request_rehydrates_before_reply() -> anyhow:
     live_direct_request::accept_reply_offline(false, true).await
 }
 
-struct ChildGuard(Option<std::process::Child>);
+#[path = "support/paired_push.rs"]
+mod paired_push;
 
-impl ChildGuard {
-    fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.0.take().expect("child already consumed").wait()
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-async fn wait_json(path: &std::path::Path, timeout: Duration) -> anyhow::Result<Value> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Ok(bytes) = std::fs::read(path) {
-            return serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse paired artifact {}", path.display()));
-        }
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for paired artifact {}",
-            path.display()
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
+/// t16: the real DS worker wakes Bob's device through Nest's production D2
+/// gateway with the key Bob registered via `registerPushGateway`. Nest's
+/// provider fails the first wake and the DS's durable retry delivers the
+/// identical one; once the request is answered, nothing is woken at all.
 async fn run_t16_paired(expect_canonical_ineligible: bool) -> anyhow::Result<()> {
     let fixture = live_direct_request::publish_request(true).await?;
     if expect_canonical_ineligible {
         live_direct_request::accept_existing_fixture(&fixture).await?;
     }
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let ds_port = listener.local_addr()?.port();
-    drop(listener);
-
-    let run = Uuid::new_v4().simple().to_string();
-    let paired_dir = std::path::PathBuf::from(format!("/tmp/t16-paired-nest-{run}"));
-    std::fs::create_dir(&paired_dir)?;
-    let ready_path = paired_dir.join("nest-ready.json");
-    let nest_result_path = paired_dir.join("nest-result.json");
-    let nest_stdout = std::fs::File::create(paired_dir.join("nest.stdout.log"))?;
-    let nest_stderr = std::fs::File::create(paired_dir.join("nest.stderr.log"))?;
-    let eligibility_credential = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-    let eligibility_url =
-        format!("http://127.0.0.1:{ds_port}/internal/chat/request-push-eligibility");
-    let nest_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../nest/catbird")
-        .canonicalize()?;
-    let mut child = Command::new("cargo")
-        .args([
-            "test",
-            "--lib",
-            "services::push::request_events::paired_harness::live_ds_worker_to_nest",
-            "--",
-            "--exact",
-            "--ignored",
-            "--nocapture",
-        ])
-        .current_dir(nest_root)
-        .env("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
-        .env(
-            "CATBIRD_REQUEST_PUSH_TEST_DB",
-            "postgres://joshlacalamito@127.0.0.1:5432/catbird_request_push_test_20260919",
-        )
-        .env("CATBIRD_REQUEST_PUSH_PAIRED_DIR", &paired_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::from(nest_stdout))
-        .stderr(Stdio::from(nest_stderr))
-        .spawn()
-        .context("start paired Nest test process")?;
-    let stdin_fixture = json!({
-        "eventId": fixture.push_event_id.to_string(),
-        "recipientDid": fixture.bob.did,
-        "authorityDidDocument": serde_json::from_slice::<Value>(&fixture.server.receipt_document)?,
-        "eligibilityUrl": eligibility_url,
-        "eligibilityCredential": eligibility_credential,
-        "registrationRequest": fixture.push_registration_request,
-        "registrationAck": fixture.push_registration_ack,
-        "expectCanonicalIneligible": expect_canonical_ineligible,
-    });
-    child
-        .stdin
-        .take()
-        .context("paired Nest stdin unavailable")?
-        .write_all(&serde_json::to_vec(&stdin_fixture)?)?;
-    // Closing stdin bounds the one process-local fixture. The credential and
-    // synthetic token never enter a retained file or test output.
-    let nest = ChildGuard(Some(child));
-
-    let ready = wait_json(&ready_path, Duration::from_secs(180)).await?;
-    anyhow::ensure!(
-        ready["eventId"] == fixture.push_event_id.to_string(),
-        "Nest readiness event identity mismatch"
-    );
-    let trigger_path = paired_dir.join("ds-trigger");
-    let ds_result_path = paired_dir.join("ds-result.json");
-    let push = PushFixtureConfig {
-        listen_port: ds_port,
-        event_url: ready["ingressUrl"]
-            .as_str()
-            .context("Nest readiness lacks ingressUrl")?
-            .to_owned(),
-        eligibility_bearer: eligibility_credential,
-        event_id: fixture.push_event_id,
-        trigger_path: trigger_path.clone(),
-        result_path: ds_result_path.clone(),
-    };
-    let _push_server = ShippingServerFixture::start_with_push(&fixture._https, &push)?;
-    std::fs::write(&trigger_path, b"dispatch\n")?;
-
-    let ds_result = wait_json(&ds_result_path, Duration::from_secs(30)).await?;
-    anyhow::ensure!(
-        ds_result["ok"] == true
-            && ds_result["claimed"] == 1
-            && ds_result["eventId"] == fixture.push_event_id.to_string(),
-        "DS targeted worker did not complete exact ACK: {ds_result}"
-    );
-    let nest_result = wait_json(&nest_result_path, Duration::from_secs(180)).await?;
+    let outcome = paired_push::run(
+        &fixture,
+        "t16-paired-nest-",
+        "services::push::request_events::paired_harness::live_ds_worker_to_nest",
+        if expect_canonical_ineligible {
+            "canonical_ineligible"
+        } else {
+            "retry_after_provider_failure"
+        },
+        &["apns"],
+    )
+    .await?;
+    let (ds_result, nest_result) = (&outcome.ds, &outcome.nest);
     anyhow::ensure!(nest_result["eventId"] == fixture.push_event_id.to_string());
     if expect_canonical_ineligible {
+        anyhow::ensure!(ds_result["suppressed"] == true && ds_result["woken"] == 0);
         anyhow::ensure!(nest_result["status"] == "suppressed");
         anyhow::ensure!(nest_result["result"] == "canonical_ineligible");
         anyhow::ensure!(nest_result["apnsCalls"] == 0 && nest_result["fcmCalls"] == 0);
         anyhow::ensure!(nest_result["exactGenericPayloadVerified"] == false);
+        anyhow::ensure!(outcome.outbox == ("delivered".to_owned(), 0));
     } else {
+        anyhow::ensure!(ds_result["attempts"] == 2 && ds_result["woken"] == 1);
         anyhow::ensure!(nest_result["status"] == "delivered");
         anyhow::ensure!(nest_result["result"] == "provider_accepted");
         anyhow::ensure!(nest_result["apnsCalls"] == 2 && nest_result["fcmCalls"] == 0);
         anyhow::ensure!(nest_result["exactGenericPayloadVerified"] == true);
+        anyhow::ensure!(nest_result["stableIdentityVerified"] == true);
+        anyhow::ensure!(
+            outcome.outbox == ("delivered".to_owned(), 1),
+            "one durable retry, then terminal: {:?}",
+            outcome.outbox
+        );
     }
-
-    let status = tokio::task::spawn_blocking(move || nest.wait())
-        .await
-        .context("join Nest waiter")??;
-    anyhow::ensure!(
-        status.success(),
-        "paired Nest test process failed: {status}"
-    );
+    anyhow::ensure!(nest_result["tokenPrivacyVerified"] == true);
     Ok(())
 }
 
@@ -704,10 +601,50 @@ async fn t16_accepted_request_is_canonically_ineligible_before_provider() -> any
     run_t16_paired(true).await
 }
 
+/// A block placed after publication but before the wake drains stops the
+/// wake: the worker re-collects the pair's live block graph at wake time.
+#[tokio::test(flavor = "multi_thread")]
+async fn t16_block_after_publication_suppresses_the_wake() -> anyhow::Result<()> {
+    let fixture = live_direct_request::publish_request(true).await?;
+    let block = format!("at://{}/app.bsky.graph.block/3kwakeblock", fixture.bob.did);
+    for (actor, other, field) in [
+        (&fixture.bob.did, &fixture.alice.did, "blocking"),
+        (&fixture.alice.did, &fixture.bob.did, "blockedBy"),
+    ] {
+        let directory = fixture
+            ._https
+            .root
+            .join("_policy/relationship")
+            .join(actor.replace(':', "%3A"));
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join(other.replace(':', "%3A")),
+            serde_json::to_vec(&json!({ field: block }))?,
+        )?;
+    }
+    let outcome = paired_push::run(
+        &fixture,
+        "t16-paired-nest-",
+        "services::push::request_events::paired_harness::live_ds_worker_to_nest",
+        "canonical_ineligible",
+        &["apns"],
+    )
+    .await?;
+    anyhow::ensure!(
+        outcome.ds["suppressed"] == true && outcome.ds["woken"] == 0,
+        "a blocked pair was woken: {}",
+        outcome.ds
+    );
+    anyhow::ensure!(outcome.nest["status"] == "suppressed");
+    anyhow::ensure!(outcome.nest["apnsCalls"] == 0 && outcome.nest["fcmCalls"] == 0);
+    anyhow::ensure!(outcome.outbox == ("delivered".to_owned(), 0));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn c06_both_recipient_devices_import_same_welcome_after_account_acceptance(
 ) -> anyhow::Result<()> {
-    live_direct_request::accept_before_both_recipient_imports().await
+    siblings::accept_before_both_recipient_imports().await
 }
 
 #[tokio::test(flavor = "multi_thread")]

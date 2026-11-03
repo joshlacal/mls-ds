@@ -23,7 +23,12 @@ pub async fn current_chat_key_id(
         "SELECT k.key_id FROM chat.device_keys k \
            JOIN chat.devices d ON d.user_did = k.user_did AND d.device_id = k.device_id \
           WHERE k.user_did = $1 AND k.signing_public_key = $2 \
-            AND k.revoked_at IS NULL AND d.status = 'active'",
+            AND k.revoked_at IS NULL AND d.status='active' AND d.revoked_at IS NULL \
+            AND k.enrollment_auth_generation<=d.auth_generation \
+            AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer \
+                WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+                  AND newer.enrollment_auth_generation>k.enrollment_auth_generation \
+                  AND newer.enrollment_auth_generation<=d.auth_generation)",
     )
     .bind(did)
     .bind(key.as_slice())

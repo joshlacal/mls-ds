@@ -131,6 +131,37 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_space_host_",
     "chat_push_gw_",
     "chat_fed_relay_",
+    // `src/handlers/chat/expiry_worker.rs`
+    "chat_expiry_worker_",
+    // `src/chat_protocol/repository/key_packages/federated_reservation_tests.rs`
+    "chat_kpfetch_",
+    // `tests/chat_protocol_direct_request_receipts.rs`
+    "chat_receipts_",
+    // `src/federation/group_membership.rs` (`reenrollment_tests`)
+    "chat_remote_reenroll_",
+    "chat_remote_export_",
+    // `src/workers/request_push.rs`
+    "chat_request_push_",
+    // `tests/common/chat_protocol_heartbeat_transport.rs`
+    "chat_heartbeat_",
+    // `src/chat_protocol/repository/{conversation_substrate_tests,welcome_terminal}.rs`
+    "chat_welcome_terminal_",
+    // `tests/federation_dispatch_pause.rs`
+    "fed_dispatch_pause_",
+    // Main ruling 2026-11-04: suites that prove the exact reviewed manifest, or
+    // that read later-migration DDL, use private databases instead of the shared
+    // clean-chat target.
+    // `tests/chat_protocol_schema.rs` (exact-manifest gates)
+    "chat_schema_",
+    // `tests/chat_protocol_device_directory.rs`
+    "chat_devdirectory_",
+    // `src/chat_protocol/repository/inventory_tests.rs` (HTTP acceptance)
+    "chat_inventory_http_",
+    // the nine production-proof targets; see [`PRODUCTION_PROOF_DB_PREFIX`]
+    PRODUCTION_PROOF_DB_PREFIX,
+    // `tests/chat_protocol_production_cfg.rs`: a non-proof database the proof
+    // gate must refuse
+    "chat_proofgate_",
 ];
 
 /// Prefix used by [`crate::common::setup_test_db`], the shared legacy fixture
@@ -459,6 +490,41 @@ pub async fn fresh_fully_migrated_db(prefix: &str) -> DisposableDatabase {
     database
 }
 
+/// Prefix of the production-proof targets' private databases
+/// (`tests/chat_protocol_{concurrent_sends,control_event_scope,creation_scope,
+/// inventory_lock_order,leave_terminal_guards,production_cfg,
+/// recovery_inventory_concurrency,recovery_package_reuse,recovery_scope_builders}.rs`).
+/// The proof gate (`require_local_owned_gate` in
+/// `src/chat_protocol/repository/recovery.rs`) accepts only
+/// `chat_proof_<32 lowercase hex>`, so a proof never writes the shared target.
+pub const PRODUCTION_PROOF_DB_PREFIX: &str = "chat_proof_";
+
+/// Mint a private, fully migrated database for one production-proof case and
+/// open a pool onto it, with the runtime fence a booted server installs
+/// (`src/main.rs`): the protocol singleton and its zero-floor event retention
+/// row. Bind the returned guard for the whole test.
+pub async fn fresh_proof_pool(max_connections: u32) -> (PgPool, DisposableDatabase) {
+    let database = fresh_fully_migrated_db(PRODUCTION_PROOF_DB_PREFIX).await;
+    let pool = database.connect(max_connections).await;
+    sqlx::query(
+        "INSERT INTO chat.protocol_instances \
+         (singleton, protocol_version, protocol_instance_id, cursor_key_id, created_at) \
+         VALUES (TRUE, '1', $1, 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', clock_timestamp())",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("install the proof database's protocol singleton");
+    sqlx::query(
+        "INSERT INTO chat.event_retention (protocol_instance_id, retained_floor, updated_at) \
+         SELECT protocol_instance_id, 0, clock_timestamp() FROM chat.protocol_instances",
+    )
+    .execute(&pool)
+    .await
+    .expect("install the proof database's zero-floor event retention");
+    (pool, database)
+}
+
 /// Mint a disposable, fully migrated database and open a pool onto it through
 /// the production `db::init_db` path.
 ///
@@ -501,8 +567,8 @@ pub async fn fresh_legacy_pool(
     (pool, database)
 }
 
-/// Mint a disposable database carrying the full migration catalog with the
-/// reviewed clean-protocol ledger, and return a pool onto it.
+/// Mint a disposable database carrying exactly the reviewed clean-protocol
+/// manifest (schema and ledger), and return a pool onto it.
 pub async fn fresh_clean_protocol_db(
     prefix: &str,
     max_connections: u32,
@@ -521,24 +587,15 @@ pub async fn fresh_clean_protocol_db(
     .execute(&mut *migration_connection)
     .await
     .expect("authorize operation-claim activation on the migration connection");
-    let full_migrator = sqlx::migrate!("./migrations");
-    let migration_result = full_migrator.run_direct(&mut *migration_connection).await;
+    let migrator = crate::common::chat_protocol::reviewed_clean_protocol_migrator()
+        .await
+        .expect("validate the exact reviewed clean-protocol migration manifest");
+    let migration_result = migrator.run_direct(&mut *migration_connection).await;
     sqlx::query("RESET chat.operation_claim_activation_approved")
         .execute(&mut *migration_connection)
         .await
         .expect("reset operation-claim activation approval on the migration connection");
-    migration_result.expect("install the full migration catalog on the disposable database");
-
-    // Reduce public._sqlx_migrations to the exact reviewed entries
-    let versions: Vec<i64> = crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST
-        .iter()
-        .map(|entry| entry.migration.version)
-        .collect();
-    sqlx::query("DELETE FROM public._sqlx_migrations WHERE NOT (version = ANY($1))")
-        .bind(&versions)
-        .execute(&mut *migration_connection)
-        .await
-        .expect("reduce _sqlx_migrations to exact reviewed manifest entries");
+    migration_result.expect("install exactly the reviewed clean-protocol migration manifest");
 
     migration_connection
         .close()

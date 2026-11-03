@@ -593,7 +593,9 @@ pub(in crate::chat_protocol::state_machine::executor) async fn apply_close(
         &recipients,
     )
     .await?;
-    let event_positions = write_events(transaction, ctx, None).await?;
+    let mut chain = close_event_chain(ctx, effects, transition_id)?;
+    let event_positions =
+        write_events_with_cursor(transaction, ctx, Some(&mut chain), None).await?;
 
     // 10. Supersede prior-coordinate open work the close retired: an open
     //     leaf-recovery request (Open->Superseded) + its reservation
@@ -609,15 +611,17 @@ pub(in crate::chat_protocol::state_machine::executor) async fn apply_close(
     // write may intervene. The counts are reachable ONLY through this call, so the
     // fence cannot be dropped without breaking the build.
     let mut superseded = receipt.reconcile_into_counts(&partition)?;
-    superseded.welcomes = write_welcome_supersessions(
+    superseded.welcomes = write_welcome_supersessions_with_cursor(
         transaction,
         ctx,
         effects,
         WelcomeSupersessionCause::Transition {
             terminal_transition_id: transition_id,
         },
+        Some(&mut chain),
     )
     .await?;
+    chain.finish().map_err(ExecutorError::EventChain)?;
     let staled = write_prior_bound_staling(
         transaction,
         effects,
@@ -636,6 +640,67 @@ pub(in crate::chat_protocol::state_machine::executor) async fn apply_close(
         event_positions,
         successor_coordinate: plan.successor_coordinate().copied(),
     })
+}
+
+/// One device-global cursor over a close's events in write order: its
+/// `conversationClosed` event, then each prior-bound Welcome disposition as
+/// [`write_welcome_supersessions_with_cursor`] appends them. A superseded
+/// Welcome's recipient is also in the close's historical audience, so its
+/// disposition chains after the close event instead of sharing its tail.
+fn close_event_chain(
+    ctx: &ExecutionContext,
+    effects: &TransitionEffects,
+    transition_id: Uuid,
+) -> Result<EventChainCursor, ExecutorError> {
+    let mut events: Vec<&EventFanout> = ctx.events.iter().collect();
+    for change in effects.welcome_changes() {
+        let (Some(before), Some(after)) = (change.before(), change.after()) else {
+            continue;
+        };
+        if before.status() != WelcomeStatus::Pending
+            || !matches!(
+                after.status(),
+                WelcomeStatus::Superseded | WelcomeStatus::Expired
+            )
+        {
+            continue;
+        }
+        let welcome_id = Uuid::from_bytes(*after.welcome_id());
+        let disposition = ctx
+            .welcome_dispositions
+            .iter()
+            .find(|input| input.welcome_id == welcome_id)
+            .ok_or(ExecutorError::MissingContext(
+                "welcome disposition event for a superseded welcome",
+            ))?;
+        events.push(&disposition.event);
+    }
+    // Hydration read each device's tail once per event, before any was written.
+    let mut tails = BTreeMap::new();
+    for (device, _, predecessor) in events.iter().flat_map(|event| &event.recipients) {
+        if *tails.entry(device.clone()).or_insert(*predecessor) != *predecessor {
+            return Err(ExecutorError::InconsistentPlan(
+                "close events disagree on a device's chain tail",
+            ));
+        }
+    }
+    let slots: BTreeMap<_, _> = tails
+        .keys()
+        .cloned()
+        .zip(0..)
+        .map(|(device, slot)| (device, EventChainSlot(slot)))
+        .collect();
+    let schedule = events
+        .into_iter()
+        .map(|event| prepared_revocation_event_from_fanout(event, &slots))
+        .collect::<Result<Vec<_>, _>>()?;
+    EventChainCursor::new(
+        sha2::Sha256::digest(transition_id.as_bytes()).into(),
+        tails.keys().cloned().collect(),
+        tails.into_values().collect(),
+        schedule,
+    )
+    .map_err(ExecutorError::EventChain)
 }
 
 /// Apply a `reset request` edge: a non-mutating signed intent. It appends the

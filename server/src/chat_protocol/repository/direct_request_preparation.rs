@@ -80,7 +80,10 @@ mod signed_admission {
         }
         let device_id = uuid_field(body, "actorDeviceId")?;
         let public_key: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT signing_public_key FROM chat.device_keys WHERE user_did=$1 AND device_id=$2",
+            "SELECT k.signing_public_key FROM chat.device_keys k JOIN chat.devices d USING(user_did,device_id) \
+             WHERE k.user_did=$1 AND k.device_id=$2 AND k.enrollment_auth_generation<=d.auth_generation \
+               AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+                 AND newer.enrollment_auth_generation>k.enrollment_auth_generation AND newer.enrollment_auth_generation<=d.auth_generation)",
         )
         .bind(principal.did())
         .bind(device_id)
@@ -175,15 +178,33 @@ mod signed_admission {
     pub(super) fn require_fresh(actor: &LockedRequestActor) -> Result<(), DirectRequestStoreError> {
         require_fresh_at(actor, actor.now)
     }
+
+    /// A coordinator admits a signed request until its `signedAt` is this old.
+    const SIGNED_REQUEST_MAX_AGE_SECONDS: i64 = 300;
+
     pub(super) fn require_fresh_at(
         actor: &LockedRequestActor,
         now: DateTime<Utc>,
     ) -> Result<(), DirectRequestStoreError> {
         let signed_at = datetime_field(actor.signed.body(), "signedAt")?;
-        if signed_at < now - Duration::seconds(300) || signed_at > now + Duration::seconds(60) {
+        if signed_at < now - Duration::seconds(SIGNED_REQUEST_MAX_AGE_SECONDS)
+            || signed_at > now + Duration::seconds(60)
+        {
             return Err(DirectRequestStoreError::Expired);
         }
         Ok(())
+    }
+
+    /// The latest instant a preparation made from `signed`, a verified signed
+    /// prepare, could still be live: a coordinator admits it until its
+    /// `signedAt` is `SIGNED_REQUEST_MAX_AGE_SECONDS` old, and the preparation
+    /// it makes then holds its lease for `PREPARATION_TTL_SECONDS`.
+    pub(crate) fn latest_preparation_expiry(
+        signed: &VerifiedDirectRequest,
+    ) -> Result<DateTime<Utc>, DirectRequestStoreError> {
+        let signed_at = datetime_field(signed.body(), "signedAt")?;
+        let live_for = SIGNED_REQUEST_MAX_AGE_SECONDS + PREPARATION_TTL_SECONDS;
+        Ok(signed_at + Duration::seconds(live_for))
     }
 
     pub(super) async fn publish_request_keys(
@@ -316,6 +337,8 @@ mod signed_admission {
         Ok(response)
     }
 }
+
+pub(crate) use signed_admission::latest_preparation_expiry;
 
 /// T04 consumes this single-use transaction-bound witness, never a caller-built
 /// attempt identity. Completed replay is returned before timestamp/lease checks.
@@ -789,6 +812,8 @@ pub(crate) async fn prepare_direct_request<
     signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
     policy: &crate::chat_protocol::relationship_policy::RelationshipAuthority<T>,
     now: DateTime<Utc>,
+    // A recipient authority refusal the caller already decided (C33).
+    authority_refusal: Option<DirectRequestStoreError>,
 ) -> Result<DirectRequestResult, DirectRequestStoreError> {
     use crate::chat_protocol::{
         direct_request_transcript::DirectRequestKind,
@@ -897,19 +922,28 @@ pub(crate) async fn prepare_direct_request<
     };
     super::relationship::verify_direct_request_policy(tx, &witness, policy, quota_exceeded)
         .await
-        .map_err(|_| DirectRequestStoreError::PolicyDenied)?;
+        .map_err(policy_failure)?;
     // Atomic publication spans exactly one canonical authority. A recipient
     // whose public chat declaration names another delivery service has no
     // transaction here to join: refuse typed, before any package selection or
     // reservation, and never degrade to legacy federation delivery. An absent
-    // declaration keeps the canonical path; an unreadable one fails closed
-    // exactly like the consent declaration read above.
+    // declaration keeps the canonical path; an unusable one fails closed
+    // exactly like the consent declaration read above, and a source that
+    // cannot answer now decides nothing. A declared authority the caller could
+    // not federate with is refused here too, so the refusal is this attempt's
+    // signed, replayable terminal receipt.
+    if let Some(refusal) = authority_refusal {
+        return Err(refusal);
+    }
     match policy.recipient_chat_authority(&i.recipient_did).await {
         Ok(Some(authority)) => {
             crate::chat_protocol::validation::BareDid::parse(&authority)
                 .map_err(|_| DirectRequestStoreError::PolicyDenied)?;
         }
         Ok(None) => {}
+        Err(error) if crate::chat_protocol::relationship_policy::source_unavailable(error) => {
+            return Err(DirectRequestStoreError::Unavailable)
+        }
         Err(_) => return Err(DirectRequestStoreError::PolicyDenied),
     }
     let now = request_database_instant(tx).await?;
@@ -1143,7 +1177,22 @@ impl LockedDirectRequestPublication {
             recent >= 100 || pair_pending >= 5 || recipient_pending >= 100,
         )
         .await
-        .map_err(|_| DirectRequestStoreError::PolicyDenied)
+        .map_err(policy_failure)
+    }
+}
+
+/// Only an evaluated policy refuses. A source that could not answer now, or
+/// this server's own database, decided nothing and records no refusal.
+fn policy_failure(
+    error: super::relationship::RelationshipRepositoryError,
+) -> DirectRequestStoreError {
+    use super::relationship::RelationshipRepositoryError as R;
+    match error {
+        R::Unavailable => DirectRequestStoreError::Unavailable,
+        R::Database(error) => DirectRequestStoreError::Database(error),
+        R::InvalidProjection | R::InvalidAuthorityConfiguration(_) => {
+            DirectRequestStoreError::PolicyDenied
+        }
     }
 }
 

@@ -55,34 +55,8 @@ mod live_direct_request;
 #[path = "support/live_orchestrator.rs"]
 mod live_orchestrator;
 
+use live_direct_request::directory_key;
 use live_orchestrator::{live_orchestrator_with_credentials, mock_credentials::MockCredentials};
-
-/// A device's signing key as served by the live device directory.
-async fn directory_key(
-    f: &live_direct_request::PublishedRequestFixture,
-    owner: &ServiceIdentity,
-    engine: &MlsEngine,
-) -> anyhow::Result<Vec<u8>> {
-    let identity = format!("{}#{}", owner.did, owner.device_id);
-    let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(engine.identity_public_key(&identity)?));
-    let (status, body) = f
-        .alice
-        .get_device_key(
-            &f.client,
-            &f.server.base_url,
-            &owner.did,
-            owner.device_id,
-            &key_id,
-        )
-        .await?;
-    anyhow::ensure!(status == reqwest::StatusCode::OK, "getDeviceKey {status}");
-    let key: Value = serde_json::from_slice(&body)?;
-    Ok(STANDARD.decode(
-        key["signaturePublicKey"]["$bytes"]
-            .as_str()
-            .context("signaturePublicKey")?,
-    )?)
-}
 
 fn credentials(
     f: &live_direct_request::PublishedRequestFixture,
@@ -328,14 +302,25 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
         "no intro readable by acceptance"
     );
 
+    // Every device's credential store answers the accounts' repository-published
+    // device keys, as production reads them from the PDS; the directory keys
+    // for both accounts come from the live getDeviceKey RPC.
+    let alice_engine = f.alice_engine.as_ref().context("Alice engine")?;
+    let alice_key = directory_key(&f, &f.alice, alice_engine).await?;
+    let bob_key = directory_key(&f, &f.bob, &f.bob_engine).await?;
+    let late_key = directory_key(&f, &late.service, &late.engine).await?;
+    let keys = [
+        (f.alice.did.as_str(), vec![alice_key]),
+        (f.bob.did.as_str(), vec![bob_key, late_key]),
+    ];
+
     // 2. The projection the app renders for the late device is truthful.
-    let receipt_document = f.server.receipt_document.clone();
-    let late_client = live_orchestrator::live_orchestrator(
+    let late_client = live_orchestrator_with_credentials(
         late.engine.context(),
         &late.service,
         &f.client,
         &f.server.base_url,
-        receipt_document.clone(),
+        credentials(&f, &keys),
     )
     .await?;
     let late_view = late_client.refresh_request_preview(&conversation).await?;
@@ -375,12 +360,12 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
     let _ = reinstalled
         .context()
         .set_epoch_secret_storage(Box::new(MemoryEpochStore::default()));
-    let reinstalled_client = live_orchestrator::live_orchestrator(
+    let reinstalled_client = live_orchestrator_with_credentials(
         reinstalled.context(),
         &f.bob,
         &f.client,
         &f.server.base_url,
-        receipt_document.clone(),
+        credentials(&f, &keys),
     )
     .await?;
     let reinstalled_view = reinstalled_client
@@ -413,16 +398,7 @@ async fn c21_late_and_reinstalled_devices_get_no_request_keys_and_show_unavailab
         "fresh store cannot decrypt the introduction"
     );
 
-    // 4. Allowed post-acceptance recovery for the late device. Directory keys
-    //    for both accounts come from the live getDeviceKey RPC.
-    let alice_engine = f.alice_engine.as_ref().context("Alice engine")?;
-    let alice_key = directory_key(&f, &f.alice, alice_engine).await?;
-    let bob_key = directory_key(&f, &f.bob, &f.bob_engine).await?;
-    let late_key = directory_key(&f, &late.service, &late.engine).await?;
-    let keys = [
-        (f.alice.did.as_str(), vec![alice_key]),
-        (f.bob.did.as_str(), vec![bob_key, late_key]),
-    ];
+    // 4. Allowed post-acceptance recovery for the late device.
     let introductions_before = entry_kinds(&conversation)?;
     assert_eq!(
         recovery_rows(&conversation)?,

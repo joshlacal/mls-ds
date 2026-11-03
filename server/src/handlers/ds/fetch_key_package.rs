@@ -1,7 +1,7 @@
 use axum::{extract::State, Json};
 use base64::Engine;
 use serde_json::json;
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 use tracing::{debug, warn};
 
 use crate::{
@@ -11,117 +11,13 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsDS.fetchKeyPackage";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CleanFederationKeyPackageClaim {
-    Claimed(Vec<u8>, String),
-    RejectedCandidate,
-    Exhausted,
-}
-
-pub async fn claim_authorized_clean_key_package_candidate(
-    pool: &DbPool,
-    recipient_did: &str,
-    authoritative_keys: &[Vec<u8>],
-) -> Result<CleanFederationKeyPackageClaim, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-
-    let candidate: Option<(Vec<u8>, Vec<u8>, Vec<u8>, uuid::Uuid, String, chrono::DateTime<chrono::Utc>)> =
-        sqlx::query_as(
-            "SELECT key_package_ref, wrapper_bytes, wrapper_sha256, owner_device_id, owner_key_id, not_after \
-               FROM chat.key_packages \
-              WHERE owner_did = $1 \
-                AND status = 'available' \
-              ORDER BY created_at ASC, key_package_ref ASC \
-              LIMIT 1 \
-              FOR UPDATE SKIP LOCKED",
-        )
-        .bind(recipient_did)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-    let Some((kp_ref, wrapper_bytes, wrapper_sha256, owner_device_id, owner_key_id, not_after)) =
-        candidate
-    else {
-        tx.rollback().await.ok();
-        return Ok(CleanFederationKeyPackageClaim::Exhausted);
-    };
-
-    // Lock the device row before rechecking clock_timestamp() and key authorization.
-    let device_signing_key: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT k.signing_public_key \
-           FROM chat.devices d \
-           JOIN chat.device_keys k \
-             ON k.user_did = d.user_did \
-            AND k.device_id = d.device_id \
-          WHERE d.user_did = $1 \
-            AND d.device_id = $2 \
-            AND k.key_id = $3 \
-            AND d.status = 'active' \
-            AND d.revoked_at IS NULL \
-            AND k.revoked_at IS NULL \
-          FOR SHARE OF d",
-    )
-    .bind(recipient_did)
-    .bind(owner_device_id)
-    .bind(&owner_key_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let still_unexpired: bool = sqlx::query_scalar("SELECT $1::timestamptz > clock_timestamp()")
-        .bind(not_after)
-        .fetch_one(&mut *tx)
-        .await?;
-
-    if !still_unexpired {
-        sqlx::query(
-            "UPDATE chat.key_packages \
-                SET status = 'expired', terminal_at = not_after \
-              WHERE key_package_ref = $1 AND status = 'available'",
-        )
-        .bind(&kp_ref)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        return Ok(CleanFederationKeyPackageClaim::RejectedCandidate);
-    }
-
-    let key_is_authoritative = device_signing_key
-        .as_ref()
-        .is_some_and(|sig_key| authoritative_keys.iter().any(|k| k == sig_key));
-    if !key_is_authoritative {
-        tx.rollback().await.ok();
-        return Ok(CleanFederationKeyPackageClaim::Exhausted);
-    }
-
-    let updated = sqlx::query(
-        "UPDATE chat.key_packages \
-            SET status = 'reserved' \
-          WHERE key_package_ref = $1 \
-            AND status = 'available' \
-            AND not_after > clock_timestamp()",
-    )
-    .bind(&kp_ref)
-    .execute(&mut *tx)
-    .await?;
-
-    if updated.rows_affected() != 1 {
-        tx.rollback().await.ok();
-        return Ok(CleanFederationKeyPackageClaim::RejectedCandidate);
-    }
-
-    tx.commit().await?;
-    Ok(CleanFederationKeyPackageClaim::Claimed(
-        wrapper_bytes,
-        hex::encode(wrapper_sha256),
-    ))
-}
-
 async fn claim_current_authorized_key_package(
     pool: &DbPool,
     resolver: &crate::federation::DsResolver,
     recipient_did: &str,
+    requester_ds: &str,
 ) -> Result<Option<(Vec<u8>, String)>, FederationError> {
-    claim_current_authorized_key_package_with(pool, recipient_did, || {
+    claim_current_authorized_key_package_with(pool, recipient_did, requester_ds, || {
         resolver.resolve_authorized_device_keys(recipient_did)
     })
     .await
@@ -130,41 +26,54 @@ async fn claim_current_authorized_key_package(
 async fn claim_current_authorized_key_package_with<Resolve, ResolveFuture>(
     pool: &DbPool,
     recipient_did: &str,
-    mut resolve_authoritative_keys: Resolve,
+    requester_ds: &str,
+    resolve_authoritative_keys: Resolve,
 ) -> Result<Option<(Vec<u8>, String)>, FederationError>
 where
-    Resolve: FnMut() -> ResolveFuture,
-    ResolveFuture:
-        std::future::Future<Output = Result<Vec<Vec<u8>>, crate::federation::FederationError>>,
+    Resolve: FnOnce() -> ResolveFuture,
+    ResolveFuture: Future<Output = Result<Vec<Vec<u8>>, crate::federation::FederationError>>,
 {
-    loop {
-        let authoritative_keys = resolve_authoritative_keys().await.map_err(|_| {
-            warn!(
-                recipient = %redact_for_log(recipient_did),
-                "Authoritative device resolution failed for federated KeyPackage fetch"
-            );
-            FederationError::AuthFailed {
+    let authoritative_keys = resolve_authoritative_keys().await.map_err(|error| {
+        warn!(
+            recipient = %redact_for_log(recipient_did),
+            retryable = error.is_retryable(),
+            reason = error.reason_code(),
+            "Authoritative device resolution failed for federated KeyPackage fetch"
+        );
+        match error {
+            // This DS's own store, or an authority that could not answer now,
+            // decided nothing: its own 5xx keeps the requesting DS retrying.
+            FederationError::Database(_) | FederationError::Storage(_) => error,
+            error if error.is_retryable() => error,
+            _ => FederationError::AuthFailed {
                 reason: "recipient device authority is unavailable".to_string(),
-            }
-        })?;
-        if authoritative_keys.is_empty() {
-            return Err(FederationError::AuthFailed {
-                reason: "recipient has no authoritative MLS device".to_string(),
-            });
+            },
         }
-
-        match claim_authorized_clean_key_package_candidate(pool, recipient_did, &authoritative_keys)
-            .await
-            .map_err(|_| FederationError::ConfigError {
-                reason: "authorized KeyPackage claim failed".to_string(),
-            })? {
-            CleanFederationKeyPackageClaim::Claimed(bytes, hash) => {
-                return Ok(Some((bytes, hash)));
-            }
-            CleanFederationKeyPackageClaim::RejectedCandidate => continue,
-            CleanFederationKeyPackageClaim::Exhausted => return Ok(None),
-        }
+    })?;
+    if authoritative_keys.is_empty() {
+        return Err(FederationError::AuthFailed {
+            reason: "recipient has no authoritative MLS device".to_string(),
+        });
     }
+
+    let claim_failed = |_| FederationError::ConfigError {
+        reason: "authorized KeyPackage claim failed".to_string(),
+    };
+    let mut tx = pool.begin().await.map_err(claim_failed)?;
+    let reserved = crate::chat_protocol::repository::key_packages::reserve_federated_key_package(
+        &mut tx,
+        recipient_did,
+        requester_ds,
+        &authoritative_keys,
+        crate::sim_hooks::current_utc(),
+    )
+    .await
+    .map_err(claim_failed)?;
+    let Some((bytes, sha256)) = reserved else {
+        return Ok(None);
+    };
+    tx.commit().await.map_err(claim_failed)?;
+    Ok(Some((bytes, hex::encode(sha256))))
 }
 
 /// GET /xrpc/blue.catbird.mlsDS.fetchKeyPackage
@@ -243,7 +152,9 @@ pub async fn fetch_key_package(
             });
         }
 
-        match claim_current_authorized_key_package(&pool, &resolver, recipient_did).await? {
+        match claim_current_authorized_key_package(&pool, &resolver, recipient_did, &requester_ds)
+            .await?
+        {
             Some((key_package_data, key_package_hash)) => {
                 crate::metrics::record_key_package_claim("claimed");
                 debug!(
@@ -294,27 +205,77 @@ mod tests {
     #[tokio::test]
     async fn incomplete_authority_returns_auth_failed_without_touching_pool() {
         let pool = DbPool::connect_lazy("postgres://127.0.0.1:5432/unused").expect("lazy pool");
-        let result =
-            claim_current_authorized_key_package_with(&pool, "did:plc:w2incomplete", || async {
+        let result = claim_current_authorized_key_package_with(
+            &pool,
+            "did:plc:w2incomplete",
+            "did:web:requester.example.com",
+            || async {
                 Err(FederationError::ResolutionFailed {
                     did: String::new(),
                     kind: crate::federation::ResolutionFailureKind::InvalidPayload(
                         "pagination incomplete".to_string(),
                     ),
                 })
-            })
-            .await;
+            },
+        )
+        .await;
         assert!(matches!(result, Err(FederationError::AuthFailed { .. })));
     }
 
     #[tokio::test]
     async fn empty_authority_returns_auth_failed_without_touching_pool() {
         let pool = DbPool::connect_lazy("postgres://127.0.0.1:5432/unused").expect("lazy pool");
-        let result =
-            claim_current_authorized_key_package_with(&pool, "did:plc:w2empty", || async {
-                Ok(Vec::new())
-            })
-            .await;
+        let result = claim_current_authorized_key_package_with(
+            &pool,
+            "did:plc:w2empty",
+            "did:web:requester.example.com",
+            || async { Ok(Vec::new()) },
+        )
+        .await;
         assert!(matches!(result, Err(FederationError::AuthFailed { .. })));
+    }
+
+    /// A device authority that could not answer now, or this DS's own store,
+    /// decided nothing: the requesting DS gets this DS's retryable 5xx (its
+    /// own status: 502 for an authority page that answered 5xx, 503 for a
+    /// 503 relayed as such, 500 for the store), never the definitive 401, and
+    /// nothing is claimed.
+    #[tokio::test]
+    async fn an_authority_that_cannot_answer_now_is_a_retryable_5xx() {
+        use axum::http::StatusCode;
+        let pool = DbPool::connect_lazy("postgres://127.0.0.1:5432/unused").expect("lazy pool");
+        for (error, status) in [
+            (
+                FederationError::ResolutionFailed {
+                    did: String::new(),
+                    kind: crate::federation::ResolutionFailureKind::HttpStatus {
+                        status: 503,
+                        message: "PDS device-record page returned status 503".to_string(),
+                    },
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                FederationError::RemoteError {
+                    status: 503,
+                    body: String::new(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                FederationError::Database(sqlx::Error::PoolTimedOut),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let failed = claim_current_authorized_key_package_with(
+                &pool,
+                "did:plc:w2transient",
+                "did:web:requester.example.com",
+                move || async move { Err(error) },
+            )
+            .await
+            .expect_err("nothing is claimed");
+            assert_eq!(failed.status_code(), status, "{failed}");
+        }
     }
 }
