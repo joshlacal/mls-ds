@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::service_auth_fixture;
@@ -20,7 +20,7 @@ use tokio_postgres::NoTls;
 use uuid::Uuid;
 
 pub const DS1_DEFAULT_SERVICE_DID: &str = "did:web:ds1.catbird.blue";
-pub const DS2_DEFAULT_SERVICE_DID: &str = "did:web:ds2.catbird.blue";
+pub const DS2_DEFAULT_SERVICE_DID: &str = "did:plc:dsbfederationlocal24char";
 
 pub const DIGEST_ALLOWED_TABLES: &[&str] = &[
     "chat.conversations",
@@ -245,6 +245,57 @@ impl TwoNodeCluster {
         self.ds2_verifying_key
             .verify(message, &signature)
             .map_err(|e| anyhow::anyhow!("DS2 signature verification failed: {e}"))
+    }
+
+    /// Publish the PDS device listing consumed by production home-authority checks.
+    pub fn publish_device_records(
+        &self,
+        user_did: &str,
+        records: &serde_json::Value,
+    ) -> Result<()> {
+        use std::io::Write as _;
+
+        let repo_root = self.compose_file.parent().unwrap().parent().unwrap();
+        let policy_path = format!(
+            "/did-fixture/root/_policy/deviceKeys/{}",
+            user_did.replace(':', "%3A")
+        );
+        let mut child = Command::new("docker")
+            .args([
+                "compose",
+                "-p",
+                &self.compose_project,
+                "-f",
+                self.compose_file.to_str().unwrap(),
+                "run",
+                "--rm",
+                "-T",
+                "--no-deps",
+                "--entrypoint",
+                "python3",
+                "did-fixture-init",
+                "-c",
+                "from pathlib import Path; import sys; p=Path(sys.argv[1]); p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(sys.stdin.buffer.read())",
+                &policy_path,
+            ])
+            .current_dir(repo_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("start PDS device fixture writer")?;
+        child
+            .stdin
+            .take()
+            .context("PDS device fixture writer stdin")?
+            .write_all(&serde_json::to_vec(records)?)?;
+        let output = child.wait_with_output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "PDS device fixture writer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
     }
 
     /// Capture diagnostic snapshots (ps, logs, and database tables) on failure.

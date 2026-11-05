@@ -147,8 +147,9 @@ async fn queue_signed(
     sqlx::query(
         "INSERT INTO outbound_queue \
            (id, target_ds_did, target_endpoint, method, payload, convo_id, next_retry_at, created_at) \
-         VALUES ($1, $2, '', $3, $4, $5, $6, $6) \
-         ON CONFLICT (id) DO NOTHING",
+         SELECT $1, $2, '', $3, $4, $5, $6, $6 \
+          WHERE NOT EXISTS (SELECT 1 FROM outbound_queue WHERE id = $1) \
+         ON CONFLICT DO NOTHING",
     )
     .bind(id)
     .bind(target_did)

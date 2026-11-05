@@ -344,6 +344,10 @@ impl HistoricalPlanWitness {
             source_entry_id,
         }
     }
+
+    pub(in crate::chat_protocol::state_machine) fn allows_direct_welcome_creation(&self) -> bool {
+        self._witness.allows_direct_welcome_creation()
+    }
 }
 
 /// The device the transition's sealed authority names as actor.

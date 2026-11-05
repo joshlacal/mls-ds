@@ -68,6 +68,8 @@ pub const BACKOFF_CAP: Duration = Duration::from_secs(3600);
 /// Maximum age for dead outbox rows before being purged during periodic cleanup.
 /// Default: 7 days.
 pub const DEAD_ROWS_MAX_AGE: Duration = Duration::from_secs(7 * 86_400);
+/// Terminal-history partition maintenance cadence.
+pub const PARTITION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Visibility timeout for `in_flight` rows: if a row has been `in_flight`
 /// for longer than this, a follow-up tick reclaims it back to `pending`
@@ -244,21 +246,22 @@ async fn mark_done(pool: &PgPool, table: &str, row_id: &str) -> Result<(), sqlx:
     Ok(())
 }
 
-/// Clean up dead rows older than `max_age` from outbox tables.
-pub async fn cleanup_dead_rows(
+/// Maintain `federation_outbox` terminal-history partitions and return the
+/// number of whole monthly partitions dropped.
+pub async fn maintain_federation_outbox_partitions(
     pool: &PgPool,
-    table: &str,
     max_age: Duration,
 ) -> Result<u64, sqlx::Error> {
-    let now = crate::sim_hooks::current_utc();
-    let secs = max_age.as_secs() as f64;
-    let sql = format!(
-        "DELETE FROM {table} \
-         WHERE status = 'dead' \
-           AND (updated_at < $2 - make_interval(secs => $1) OR (updated_at IS NULL AND created_at < $2 - make_interval(secs => $1)))"
-    );
-    let result = sqlx::query(&sql).bind(secs).bind(now).execute(pool).await?;
-    Ok(result.rows_affected())
+    let dropped: i64 = sqlx::query_scalar(
+        "SELECT public.maintain_transport_partitions( \
+             'public.federation_outbox'::regclass, \
+             make_interval(secs => $1), $2)",
+    )
+    .bind(max_age.as_secs() as f64)
+    .bind(crate::sim_hooks::current_utc())
+    .fetch_one(pool)
+    .await?;
+    Ok(dropped as u64)
 }
 
 /// Convenience: log + ignore reclaim errors. The reclaim is a best-effort

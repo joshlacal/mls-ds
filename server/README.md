@@ -111,7 +111,7 @@ cargo test --features sim --test deterministic_server_clock_test
 cargo test --test clean_chat_empty_preflight
 ```
 
-`clean_chat_empty_preflight` runs `scripts/assert_clean_chat_empty.sql`, which accepts only a sealed migration catalog. The current seal is 142 migrations ending at `20261104000011`. After a migration change, reseal it from `server/`:
+`clean_chat_empty_preflight` runs `scripts/assert_clean_chat_empty.sql`, which accepts only a sealed migration catalog. The current seal is 143 migrations ending at `20261104000012`. After a migration change, reseal it from `server/`:
 
 ```sh
 CLEAN_CHAT_PREFLIGHT_RESEAL=write cargo test --offline --test clean_chat_empty_preflight -- --ignored --exact reseal_clean_slate_catalog
@@ -126,9 +126,17 @@ cargo build --locked --manifest-path server/Cargo.toml --features test-support -
 cargo test --manifest-path e2e-tests/Cargo.toml --features labyrinth --test federation_spaces_full_cutover
 ```
 
-It runs two `clean_slate_federation_fixture` processes from `target/debug/`, each over a fresh `clean_slate_fed_<hex>` database on `127.0.0.1:5432` (admin URL `CLEAN_SLATE_PG_ADMIN_URL`, default `postgresql://127.0.0.1:5432/postgres`), with loopback mock PDSes and a mock Push Gateway. The separate Docker lifecycle test `federation_two_node` is ignored by default; run it with `e2e-tests/federation-two-node-e2e.sh`, which uses `e2e-tests/docker-compose.federation.yml`. The local client gateway is documented in [../e2e-tests/CLIENT_RUNTIME_GATEWAY.md](../e2e-tests/CLIENT_RUNTIME_GATEWAY.md).
+It runs two `clean_slate_federation_fixture` processes from `target/debug/`, each over a fresh `clean_slate_fed_<hex>` database on `127.0.0.1:5432` (admin URL `CLEAN_SLATE_PG_ADMIN_URL`, default `postgresql://127.0.0.1:5432/postgres`), with loopback mock PDSes and a mock Push Gateway. The ignored Docker lifecycle test uses `e2e-tests/docker-compose.federation.yml` and the same deterministic `did:web` DS1 plus `did:plc` DS2 identity pair as the root local stack. It loads each service-auth and dedicated `#mls-receipt-1` key from its committed test fixture, resolves every DID and each user's DID-advertised PDS declaration through the loopback HTTPS fixture, leaves DS2 unprovisioned until the authenticated `deliverWelcome` worker fetches and binds the exact Direct prefix, verifies the signed `deliverWelcome`, `deliverMessage` and `submitCommit` receipt bodies and signer audiences, and requires `down --volumes` to leave no project container or volume:
 
-CI (`.github/workflows/mls-deploy.yml`) uses PostgreSQL 16 and runs a narrower set than the commands above: `--bins` unit tests, `chat_protocol_signing_domain_vectors`, `chat_protocol_route_inventory`, `federation_fixture_auth_profile` and `chat_protocol_generated_transition_compat`, the e2e `federation_two_node` lifecycle, the ignored `db_tests` cases, three handler regressions, `labyrinth_directory`, `labyrinth_retention` and `labyrinth_account_deletion`, and `deterministic_server_clock_test` (`sim`), all required. `scripts/test_ops_safety.py` checks the database reset guard, migration-log redaction, the test targets, features and filters of the workflow and the hostile gate, and the root federation compose fixtures.
+```sh
+CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test --locked --manifest-path e2e-tests/Cargo.toml --test federation_two_node -- --ignored --test-threads=1
+```
+
+`deliverWelcome` admits only the exact three-entry Direct opening (`Creation`, recipient `ParticipantAcceptance`, `LeafRecoveryFulfillment`). It applies that verified prefix and the Welcome mailbox receipt in one PostgreSQL transaction; the general remote-prefix path still rejects historical Direct conversations.
+
+`e2e-tests/federation-two-node-e2e.sh` is the shorter Compose readiness, peer-authentication and receipt-configuration smoke. The local client gateway is documented in [../e2e-tests/CLIENT_RUNTIME_GATEWAY.md](../e2e-tests/CLIENT_RUNTIME_GATEWAY.md).
+
+CI (`.github/workflows/mls-deploy.yml`) uses PostgreSQL 16 and runs a narrower set than the commands above: `--bins` unit tests, `chat_protocol_signing_domain_vectors`, `chat_protocol_route_inventory`, `federation_fixture_auth_profile` and `chat_protocol_generated_transition_compat`, the e2e `federation_two_node` lifecycle, the ignored `db_tests` cases, three handler regressions, `labyrinth_directory`, `labyrinth_retention` and `labyrinth_account_deletion`, and `deterministic_server_clock_test` (`sim`), all required. `scripts/test_ops_safety.py` checks the database reset guard, migration-log redaction, the test targets, features and filters of the workflow and hostile gate, and both federation Compose fixtures.
 
 ## Make targets
 

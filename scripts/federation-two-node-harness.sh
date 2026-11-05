@@ -29,7 +29,7 @@ export DS1_REDIS_PORT="${DS1_REDIS_PORT:-0}"
 export DS2_REDIS_PORT="${DS2_REDIS_PORT:-0}"
 
 export DS1_SERVICE_DID="${DS1_SERVICE_DID:-did:web:ds1.catbird.blue}"
-export DS2_SERVICE_DID="${DS2_SERVICE_DID:-did:web:ds2.catbird.blue}"
+export DS2_SERVICE_DID="${DS2_SERVICE_DID:-did:plc:dsbfederationlocal24char}"
 export DS1_SELF_ENDPOINT="${DS1_SELF_ENDPOINT:-http://ds1:3001}"
 export DS2_SELF_ENDPOINT="${DS2_SELF_ENDPOINT:-http://ds2:3001}"
 
@@ -275,6 +275,48 @@ check_signer_and_service_auth() {
   echo "✓ Cross-DS in-network call ds2 -> ds1 verified"
 }
 
+check_receipt_signers() {
+  local ds1_url="$1"
+  local served
+  served="$(curl -fsS "$ds1_url/.well-known/did.json")"
+  if ! python3 -c \
+    'import json, pathlib, sys; raise SystemExit(json.loads(sys.argv[2]) != json.loads(pathlib.Path(sys.argv[1]).read_text()))' \
+    "$FIXTURES_DIR/ds1-local-did.json" "$served"; then
+    echo "✗ DS1 did:web route did not serve the configured receipt DID document"
+    return 1
+  fi
+  echo "✓ DS1 served its configured #mls-receipt-1 DID document"
+
+  served="$(
+    compose exec -T ds2 curl -fsS --noproxy '*' \
+      --cacert /did-fixture/tls/ca.pem \
+      --resolve plc.directory:8443:127.0.0.1 \
+      "https://plc.directory:8443/did:plc:dsbfederationlocal24char"
+  )"
+  if ! python3 -c \
+    'import json, pathlib, sys; raise SystemExit(json.loads(sys.argv[2]) != json.loads(pathlib.Path(sys.argv[1]).read_text()))' \
+    "$FIXTURES_DIR/ds2-plc-did.json" "$served"; then
+    echo "✗ DS2 loopback did:plc resolver did not serve the configured receipt DID document"
+    return 1
+  fi
+  echo "✓ DS2 served its configured #mls-receipt-1 DID document through did:plc resolution"
+
+  local node
+  local logs
+  for node in ds1 ds2; do
+    logs="$(compose logs --no-color "$node" 2>&1)"
+    if [[ "$logs" != *"AckSigner initialized for delivery acknowledgments"* ]]; then
+      echo "✗ $node did not initialize its service-key delivery receipt signer"
+      return 1
+    fi
+    if [[ "$logs" != *"Dedicated receipt signer initialized"* ]]; then
+      echo "✗ $node did not initialize its dedicated sequencer receipt signer"
+      return 1
+    fi
+    echo "✓ $node initialized its delivery and dedicated receipt signers"
+  done
+}
+
 cmd_env() {
   cat <<ENV
 Harness defaults:
@@ -315,6 +357,7 @@ cmd_smoke() {
   check_federation_endpoint "DS2" "$ds2" "$DS2_SERVICE_DID"
 
   check_signer_and_service_auth "$ds1" "$ds2"
+  check_receipt_signers "$ds1"
 
   echo "Federation two-node signer-authenticated smoke checks passed"
 }
@@ -332,7 +375,15 @@ cmd_down() {
   require_project_name "down"
   echo "Stopping and tearing down federation harness project '$PROJECT_NAME'..."
   compose down --volumes --remove-orphans
-  echo "✓ Teardown complete"
+  local containers
+  local volumes
+  containers="$(compose ps -a -q)"
+  volumes="$(docker volume ls --filter "label=com.docker.compose.project=$PROJECT_NAME" -q)"
+  if [[ -n "$containers" ]] || [[ -n "$volumes" ]]; then
+    echo "✗ Teardown leaked containers or volumes for project '$PROJECT_NAME'"
+    return 1
+  fi
+  echo "✓ Teardown complete with zero project containers or volumes"
 }
 
 cmd_status() {
@@ -356,9 +407,9 @@ cmd_help() {
 Usage: $0 {up|down|status|smoke|logs|env|help}
 
 Commands:
-  up      Build and start DS1/DS2 containers with ephemeral ports, run signer-authenticated smoke (requires explicit project name)
-  down    Stop and remove containers, networks, volumes, and orphans (requires explicit project name)
-  smoke   Run readiness, health, signer, and service-auth checks against running containers (requires explicit project name)
+  up      Build/start did:web DS1 and did:plc DS2, then run peer and receipt smoke (requires explicit project name)
+  down    Stop/remove the project and fail if any container or volume remains (requires explicit project name)
+  smoke   Run readiness, peer service-auth and both receipt-signer checks (requires explicit project name)
   status  Show compose container status (requires explicit project name)
   logs    Show logs for ds1 and ds2 (requires explicit project name)
   env     Print current configuration environment

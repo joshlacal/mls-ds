@@ -716,8 +716,9 @@ async fn handle_inner(
                 );
                 sqlx::query(
                     "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, last_error, next_retry_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                     ON CONFLICT (id) DO NOTHING",
+                     SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
+                      WHERE NOT EXISTS (SELECT 1 FROM outbound_queue WHERE id = $1) \
+                     ON CONFLICT DO NOTHING",
                 )
                 .bind(format!("acceptance-delivery-{conversation_id}"))
                 .bind(&coord.sender_home.did)

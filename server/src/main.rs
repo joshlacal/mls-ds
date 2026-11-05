@@ -5,16 +5,10 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::should_implement_trait)]
 #![allow(deprecated)]
-// `dead_code` is load-bearing in the bin namespace because main.rs declares
-// `mod device_utils;` and `mod jobs;` which both duplicate the same source
-// files compiled into `lib.rs`. The bin-local copies expose the same items
-// but call only a subset (e.g. `parse_device_did` is only used by lib-side
-// handlers). Removing this allow requires either deleting the duplicate
-// `mod` declarations and routing main.rs through `catbird_server::*` (deep
-// refactor, breaks the bin/lib seam) or splitting the workers into a
-// bin-only crate.
-// TODO(phase-2.5-cleanup-bin-lib-dedup): collapse the bin/lib module
-// duplication so this allow can be retired.
+// `dead_code` remains load-bearing in the bin namespace because the bin and
+// library expose overlapping helpers while the bin calls only a subset.
+// TODO(phase-2.5-cleanup-bin-lib-dedup): collapse that overlap so this allow
+// can be retired.
 #![allow(dead_code)]
 
 #[cfg(debug_assertions)]
@@ -38,7 +32,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Import from library crate instead of re-declaring modules
 use catbird_server::{
-    auth, config, db, federation, handlers, health, jobs, metrics, middleware, realtime,
+    auth, config, db, federation, handlers, health, metrics, middleware, realtime,
     request_body_limit, workers, CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES,
     CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES, DEFAULT_REQUEST_BODY_LIMIT_BYTES,
     SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
@@ -896,12 +890,6 @@ async fn main() -> anyhow::Result<()> {
             .await;
         });
         tracing::info!("Clean-chat expiry sweeper worker started (cutover enabled)");
-
-        let dormant_pool = db_pool.clone();
-        tokio::spawn(async move {
-            jobs::run_mark_inactive_devices_worker(dormant_pool).await;
-        });
-        tracing::info!("Mark inactive devices worker started (60-day dormancy)");
 
         if chat_runtime.request_push_enabled() {
             let request_push_pool = db_pool.clone();

@@ -3030,8 +3030,11 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         let pub_rows = ds
             .pool
             .query(
-                "SELECT table_name FROM information_schema.tables \
-                  WHERE table_schema = 'public' ORDER BY table_name ASC",
+                "SELECT t.tablename FROM pg_tables t \
+                   JOIN pg_namespace n ON n.nspname = t.schemaname \
+                   JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.tablename \
+                  WHERE t.schemaname = 'public' AND NOT c.relispartition \
+                  ORDER BY t.tablename ASC",
                 &[],
             )
             .await?;

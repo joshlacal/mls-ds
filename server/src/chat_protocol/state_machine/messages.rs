@@ -61,7 +61,7 @@ impl HydrationAuthority {
             }) => (*kind, *next, manifest),
             _ => return Err(StateMachineError::InvalidHydrationAuthority),
         };
-        if kind != ConversationKind::Group {
+        if kind == ConversationKind::Direct && !witness.allows_direct_welcome_creation() {
             return Err(StateMachineError::InvalidCreation);
         }
         let creator_device = manifest.actor_leaf.clone();

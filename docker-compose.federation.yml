@@ -123,11 +123,13 @@ services:
     command:
       - |
         root=/did-fixture/root
-        mkdir -p /did-fixture/tls "$$root/ds1.catbird.blue/.well-known" "$$root/alice.catbird.blue/.well-known" "$$root/bob.catbird.blue/.well-known" "$$root/plc.directory"
+        mkdir -p /did-fixture/tls "$$root/ds1.catbird.blue/.well-known" "$$root/alice.catbird.blue/.well-known" "$$root/bob.catbird.blue/.well-known" "$$root/plc.directory" "$$root/_policy/catbirdDeclaration"
         cp /fixtures/ds1-local-did.json "$$root/ds1.catbird.blue/.well-known/did.json"
         cp /fixtures/alice-did.json "$$root/alice.catbird.blue/.well-known/did.json"
         cp /fixtures/bob-did.json "$$root/bob.catbird.blue/.well-known/did.json"
         cp /fixtures/ds2-plc-did.json "$$root/plc.directory/did:plc:dsbfederationlocal24char"
+        cp /fixtures/alice-chat-declaration.json "$$root/_policy/catbirdDeclaration/did%3Aweb%3Aalice.catbird.blue"
+        cp /fixtures/bob-chat-declaration.json "$$root/_policy/catbirdDeclaration/did%3Aweb%3Abob.catbird.blue"
         cd /did-fixture/tls
         if [ ! -s server.pem ]; then
           openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=Catbird local federation DID fixture CA" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" -keyout ca-key.pem -out ca.pem

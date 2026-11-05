@@ -25,7 +25,10 @@ async fn catalog_enforces_clean_slate_spaces_only_data_line() {
     let pool = database.connect(2).await;
 
     let public_tables: Vec<String> = sqlx::query_scalar(
-        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
+        "SELECT t.tablename FROM pg_tables t \
+           JOIN pg_namespace n ON n.nspname = t.schemaname \
+           JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.tablename \
+          WHERE t.schemaname = 'public' AND NOT c.relispartition ORDER BY t.tablename",
     )
     .fetch_all(&pool)
     .await

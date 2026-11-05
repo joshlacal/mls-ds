@@ -1,9 +1,62 @@
-# Two-node federation stack for clean-chat testing (Colima / Docker Compose).
+# Two-home federation stack for the ignored end-to-end lifecycle.
 #
-# Canonical Compose topology for DS1 and DS2 federated cluster.
-# References: docs/superpowers/plans/2026-08-24-clean-chat-federation-container.md
+# DS1 is did:web; DS2 is did:plc. Both resolve service and user DID documents
+# through the loopback HTTPS fixture and issue real signed federation receipts.
+
+x-ds-command: &ds-command
+  - /bin/sh
+  - -ec
+  - |
+    SIGNING_KEY_PEM="$$(cat "$$SIGNING_KEY_FILE")"
+    RECEIPT_SIGNING_KEY_PEM="$$(cat "$$RECEIPT_SIGNING_KEY_FILE")"
+    RECEIPT_DID_DOCUMENT_JSON="$$(cat "$$RECEIPT_DID_DOCUMENT_FILE")"
+    export SIGNING_KEY_PEM RECEIPT_SIGNING_KEY_PEM RECEIPT_DID_DOCUMENT_JSON
+    exec catbird-server
+
+x-did-resolver: &did-resolver
+  image: python:3.12-slim
+  depends_on:
+    did-fixture-init:
+      condition: service_completed_successfully
+  volumes:
+    - did-fixture:/did-fixture:ro
+    - ./support/https_did_fixture.py:/https_did_fixture.py:ro
+  command: ["python3", "/https_did_fixture.py", "/did-fixture/root", "/did-fixture/tls/server.pem", "/did-fixture/tls/server-key.pem", "8443"]
+  healthcheck:
+    test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8443), 2)"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
 
 services:
+  did-fixture-init:
+    image: python:3.12-slim
+    volumes:
+      - ./fixtures:/fixtures:ro
+      - did-fixture:/did-fixture
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        root=/did-fixture/root
+        mkdir -p /did-fixture/tls "$$root/ds1.catbird.blue/.well-known" "$$root/alice.catbird.blue/.well-known" "$$root/bob.catbird.blue/.well-known" "$$root/plc.directory" "$$root/_policy/catbirdDeclaration"
+        cp /fixtures/ds1-local-did.json "$$root/ds1.catbird.blue/.well-known/did.json"
+        cp /fixtures/alice-did.json "$$root/alice.catbird.blue/.well-known/did.json"
+        cp /fixtures/bob-did.json "$$root/bob.catbird.blue/.well-known/did.json"
+        cp /fixtures/ds2-plc-did.json "$$root/plc.directory/did:plc:dsbfederationlocal24char"
+        cp /fixtures/alice-chat-declaration.json "$$root/_policy/catbirdDeclaration/did%3Aweb%3Aalice.catbird.blue"
+        cp /fixtures/bob-chat-declaration.json "$$root/_policy/catbirdDeclaration/did%3Aweb%3Abob.catbird.blue"
+        cd /did-fixture/tls
+        if [ ! -s server.pem ]; then
+          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=Catbird two-home e2e DID fixture CA" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" -keyout ca-key.pem -out ca.pem
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=did-fixture.catbird.blue" -keyout server-key.pem -out server.csr
+          printf 'subjectAltName=DNS:ds1.catbird.blue,DNS:alice.catbird.blue,DNS:bob.catbird.blue,DNS:plc.directory\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' > server.ext
+          openssl x509 -req -days 3650 -sha256 -set_serial 1 -in server.csr -CA ca.pem -CAkey ca-key.pem -extfile server.ext -out leaf.pem
+          cat leaf.pem ca.pem > server.pem
+          rm -f ca-key.pem server.csr server.ext leaf.pem
+        fi
+        chmod 0644 ca.pem server.pem
+    restart: "no"
+
   ds1-postgres:
     image: postgres:16-bookworm
     environment:
@@ -38,11 +91,16 @@ services:
       additional_contexts:
         catbird-atproto: ../../catbird-atproto
         labyrinth-protocol: ../../labyrinth/labyrinth-protocol
+    command: *ds-command
     depends_on:
       ds1-postgres:
         condition: service_healthy
       ds1-redis:
         condition: service_healthy
+      did-fixture-init:
+        condition: service_completed_successfully
+    volumes:
+      - did-fixture:/did-fixture:ro
     environment:
       APP_ENV: "${APP_ENV:-test}"
       SERVER_PORT: "3001"
@@ -51,7 +109,7 @@ services:
       REDIS_URL: redis://ds1-redis:6379
       SERVICE_DID: "${DS1_SERVICE_DID:-did:web:ds1.catbird.blue}"
       SELF_ENDPOINT: "${DS1_SELF_ENDPOINT:-http://ds1:3001}"
-      DEFAULT_DS_DID: "${DS2_SERVICE_DID:-did:web:ds2.catbird.blue}"
+      DEFAULT_DS_DID: "${DS2_SERVICE_DID:-did:plc:dsbfederationlocal24char}"
       DEFAULT_DS_ENDPOINT: "${DS2_SELF_ENDPOINT:-http://ds2:3001}"
       FEDERATION_MODE: "${FEDERATION_MODE:-allowlist}"
       FEDERATION_ENABLED: "${FEDERATION_ENABLED:-true}"
@@ -67,11 +125,18 @@ services:
       RECONCILIATION_INTERVAL_SECS: "${RECONCILIATION_INTERVAL_SECS:-2}"
       OUTBOUND_TIMEOUT: "${DS1_OUTBOUND_TIMEOUT:-2}"
       OUTBOUND_CONNECT_TIMEOUT: "${OUTBOUND_CONNECT_TIMEOUT:-1}"
-      FEDERATION_ADMIN_DIDS: "${FEDERATION_ADMIN_DIDS:-did:web:ds1.catbird.blue,did:web:ds2.catbird.blue}"
+      FEDERATION_ADMIN_DIDS: "${FEDERATION_ADMIN_DIDS:-did:web:ds1.catbird.blue,did:plc:dsbfederationlocal24char}"
       ENFORCE_LXM: "${ENFORCE_LXM:-true}"
       ENFORCE_JTI: "${ENFORCE_JTI:-true}"
       SIGNING_KEY_FILE: "${DS1_SIGNING_KEY_FILE:-/app/fixtures/ds1-key.pem}"
-      TEST_DID_DOCUMENT_PATHS: "/app/fixtures/ds1-did.json,/app/fixtures/ds2-did.json,/app/fixtures/alice-did.json,/app/fixtures/bob-did.json"
+      RECEIPT_SIGNING_KEY_FILE: "${DS1_RECEIPT_SIGNING_KEY_FILE:-/app/fixtures/ds1-receipt-key.pem}"
+      RECEIPT_DID_DOCUMENT_FILE: /app/fixtures/ds1-local-did.json
+      RECEIPT_ISSUANCE_MODE: issue
+      RECEIPT_VERIFICATION_METHOD: "did:web:ds1.catbird.blue#mls-receipt-1"
+      REQUEST_FIXTURE_DID_HOSTS: ds1.catbird.blue,alice.catbird.blue,bob.catbird.blue,plc.directory
+      REQUEST_FIXTURE_DID_PORT: "8443"
+      REQUEST_FIXTURE_DID_CA_PEM: /did-fixture/tls/ca.pem
+      DID_RESOLUTION_HOST_ALLOWLIST: ds1.catbird.blue,alice.catbird.blue,bob.catbird.blue,plc.directory
       CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: "${CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED:-handlers-and-legacy-apis-sealed}"
       S3_ENDPOINT: "${S3_ENDPOINT:-http://ds1-blobstore:9000}"
       S3_ACCESS_KEY: "${S3_ACCESS_KEY:-catbird-minio-access}"
@@ -121,18 +186,23 @@ services:
       additional_contexts:
         catbird-atproto: ../../catbird-atproto
         labyrinth-protocol: ../../labyrinth/labyrinth-protocol
+    command: *ds-command
     depends_on:
       ds2-postgres:
         condition: service_healthy
       ds2-redis:
         condition: service_healthy
+      did-fixture-init:
+        condition: service_completed_successfully
+    volumes:
+      - did-fixture:/did-fixture:ro
     environment:
       APP_ENV: "${APP_ENV:-test}"
       SERVER_PORT: "3001"
       SERVER_HOST: "0.0.0.0"
       DATABASE_URL: postgres://catbird:catbird@ds2-postgres:5432/catbird
       REDIS_URL: redis://ds2-redis:6379
-      SERVICE_DID: "${DS2_SERVICE_DID:-did:web:ds2.catbird.blue}"
+      SERVICE_DID: "${DS2_SERVICE_DID:-did:plc:dsbfederationlocal24char}"
       SELF_ENDPOINT: "${DS2_SELF_ENDPOINT:-http://ds2:3001}"
       DEFAULT_DS_DID: "${DS1_SERVICE_DID:-did:web:ds1.catbird.blue}"
       DEFAULT_DS_ENDPOINT: "${DS1_SELF_ENDPOINT:-http://ds1:3001}"
@@ -150,11 +220,18 @@ services:
       RECONCILIATION_INTERVAL_SECS: "${RECONCILIATION_INTERVAL_SECS:-2}"
       OUTBOUND_TIMEOUT: "${DS2_OUTBOUND_TIMEOUT:-30}"
       OUTBOUND_CONNECT_TIMEOUT: "${OUTBOUND_CONNECT_TIMEOUT:-1}"
-      FEDERATION_ADMIN_DIDS: "${FEDERATION_ADMIN_DIDS:-did:web:ds1.catbird.blue,did:web:ds2.catbird.blue}"
+      FEDERATION_ADMIN_DIDS: "${FEDERATION_ADMIN_DIDS:-did:web:ds1.catbird.blue,did:plc:dsbfederationlocal24char}"
       ENFORCE_LXM: "${ENFORCE_LXM:-true}"
       ENFORCE_JTI: "${ENFORCE_JTI:-true}"
       SIGNING_KEY_FILE: "${DS2_SIGNING_KEY_FILE:-/app/fixtures/ds2-key.pem}"
-      TEST_DID_DOCUMENT_PATHS: "/app/fixtures/ds1-did.json,/app/fixtures/ds2-did.json,/app/fixtures/alice-did.json,/app/fixtures/bob-did.json"
+      RECEIPT_SIGNING_KEY_FILE: "${DS2_RECEIPT_SIGNING_KEY_FILE:-/app/fixtures/ds2-receipt-key.pem}"
+      RECEIPT_DID_DOCUMENT_FILE: /app/fixtures/ds2-plc-did.json
+      RECEIPT_ISSUANCE_MODE: issue
+      RECEIPT_VERIFICATION_METHOD: "did:plc:dsbfederationlocal24char#mls-receipt-1"
+      REQUEST_FIXTURE_DID_HOSTS: ds1.catbird.blue,alice.catbird.blue,bob.catbird.blue,plc.directory
+      REQUEST_FIXTURE_DID_PORT: "8443"
+      REQUEST_FIXTURE_DID_CA_PEM: /did-fixture/tls/ca.pem
+      DID_RESOLUTION_HOST_ALLOWLIST: ds1.catbird.blue,alice.catbird.blue,bob.catbird.blue,plc.directory
       CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: "${CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED:-handlers-and-legacy-apis-sealed}"
       S3_ENDPOINT: "${S3_ENDPOINT:-http://ds2-blobstore:9000}"
       S3_ACCESS_KEY: "${S3_ACCESS_KEY:-catbird-minio-access}"
@@ -170,6 +247,15 @@ services:
       retries: 25
       start_period: 15s
 
+  did-resolver-ds1:
+    <<: *did-resolver
+    network_mode: "service:ds1"
+
+  did-resolver-ds2:
+    <<: *did-resolver
+    network_mode: "service:ds2"
+
 volumes:
   ds1_pgdata:
   ds2_pgdata:
+  did-fixture:

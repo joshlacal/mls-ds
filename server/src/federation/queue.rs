@@ -572,15 +572,19 @@ impl OutboundQueue {
                     }
                 }
                 _ = cleanup_timer.tick() => {
-                    match self.cleanup_dead(dead_rows_max_age).await {
-                        Ok(n) if n > 0 => info!(purged = n, "Cleaned up dead outbound queue rows"),
+                    let old_rows_max_age =
+                        Duration::from_secs(old_rows_max_age_hours.max(1) as u64 * 3600);
+                    let retention = dead_rows_max_age.max(old_rows_max_age);
+                    match self.maintain_terminal_partitions(retention).await {
+                        Ok(n) if n > 0 => info!(
+                            partitions_dropped = n,
+                            "Dropped expired outbound queue history partitions"
+                        ),
                         Ok(_) => {}
-                        Err(e) => error!(error = %e, "Outbound queue cleanup_dead failed"),
-                    }
-                    match self.cleanup_old(old_rows_max_age_hours).await {
-                        Ok(n) if n > 0 => info!(purged = n, "Cleaned up old outbound queue rows"),
-                        Ok(_) => {}
-                        Err(e) => error!(error = %e, "Outbound queue cleanup_old failed"),
+                        Err(e) => error!(
+                            error = %e,
+                            "Outbound queue partition maintenance failed"
+                        ),
                     }
                 }
                 _ = shutdown.cancelled() => {
@@ -1448,32 +1452,30 @@ impl OutboundQueue {
     }
     // -- Maintenance ------------------------------------------------------------
 
-    /// Delete old delivered/failed/dead items older than `max_age_hours`.
-    pub async fn cleanup_old(&self, max_age_hours: i64) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            "DELETE FROM outbound_queue \
-             WHERE status IN ('delivered', 'failed', 'dead') \
-               AND created_at < $2 - make_interval(hours => $1::integer)",
-        )
-        .bind(max_age_hours as i32)
-        .bind(crate::sim_hooks::current_utc())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
-    /// Delete dead rows older than `max_age`.
-    pub async fn cleanup_dead(&self, max_age: Duration) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            "DELETE FROM outbound_queue \
-             WHERE status = 'dead' \
-               AND created_at < $2 - make_interval(secs => $1)",
+    /// Maintain monthly terminal-history partitions and return the number of
+    /// whole expired partitions dropped. Active rows remain in DEFAULT.
+    async fn maintain_terminal_partitions(&self, max_age: Duration) -> Result<u64, sqlx::Error> {
+        let dropped: i64 = sqlx::query_scalar(
+            "SELECT public.maintain_transport_partitions( \
+                 'public.outbound_queue'::regclass, \
+                 make_interval(secs => $1), $2)",
         )
         .bind(max_age.as_secs() as f64)
         .bind(crate::sim_hooks::current_utc())
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(result.rows_affected())
+        Ok(dropped as u64)
+    }
+
+    /// Compatibility entry point for callers configured in hours.
+    pub async fn cleanup_old(&self, max_age_hours: i64) -> Result<u64, sqlx::Error> {
+        self.maintain_terminal_partitions(Duration::from_secs(max_age_hours.max(1) as u64 * 3600))
+            .await
+    }
+
+    /// Compatibility entry point for callers configured with a duration.
+    pub async fn cleanup_dead(&self, max_age: Duration) -> Result<u64, sqlx::Error> {
+        self.maintain_terminal_partitions(max_age).await
     }
 
     /// Queue statistics for monitoring / health endpoints.

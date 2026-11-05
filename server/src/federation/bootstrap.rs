@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -17,10 +19,12 @@ use super::{
     target_supports_capability, CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1,
     CAPABILITY_RECONCILIATION_V1,
 };
-use crate::chat_protocol::transcript::{decode_canonical_signed_mutation, CleanEntryKind};
+use crate::chat_protocol::transcript::{
+    decode_canonical_signed_mutation, CanonicalValueRef, CleanEntryKind, SignedMutationKind,
+};
 use crate::chat_protocol::validation::{BareDid, MAX_SAFE_INTEGER};
 use crate::handlers::ds::get_convo_digest::CleanConvoDigestHasher;
-use crate::identity::canonical_did;
+use crate::identity::{canonical_did, dids_equivalent};
 
 const MAX_BOOTSTRAP_EVENTS: usize = 500;
 const MAX_BOOTSTRAP_MATERIAL_BYTES: usize = 1_048_576; // 1 MiB
@@ -49,6 +53,8 @@ pub enum RemotePrefixBootstrapError {
     PrefixTooLarge,
     #[error("no active local recipient")]
     NoLocalParticipant,
+    #[error("prefix is not an eligible direct Welcome opening")]
+    DirectWelcomeNotEligible,
     #[error("historical authority rejected")]
     Authority,
     #[error("existing conversation conflicts")]
@@ -123,6 +129,11 @@ pub enum RemotePrefixApplyOutcome {
         first_mismatch_seq: i64,
         reason: QuarantineReason,
     },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemotePrefixAdmissionPurpose {
+    General,
+    DirectWelcome,
 }
 
 pub fn compute_bootstrap_advisory_lock_key(conversation_id: Uuid) -> i64 {
@@ -248,6 +259,7 @@ pub struct VerifiedRemotePrefixAdmission {
     participant_routes: BTreeMap<String, Option<String>>,
     canonical_material_bytes: usize,
     page_count: usize,
+    purpose: RemotePrefixAdmissionPurpose,
 }
 
 impl VerifiedRemotePrefixAdmission {
@@ -272,6 +284,7 @@ impl VerifiedRemotePrefixAdmission {
             participant_routes,
             canonical_material_bytes,
             page_count: 1,
+            purpose: RemotePrefixAdmissionPurpose::General,
         }
     }
 
@@ -302,6 +315,7 @@ impl VerifiedRemotePrefixAdmission {
         Vec<StrictCleanRemoteEvent>,
         BTreeMap<String, Option<String>>,
         usize,
+        RemotePrefixAdmissionPurpose,
     ) {
         (
             self.selector,
@@ -310,8 +324,315 @@ impl VerifiedRemotePrefixAdmission {
             self.events,
             self.participant_routes,
             self.canonical_material_bytes,
+            self.purpose,
         )
     }
+}
+
+/// Exact inbound Welcome evidence that can authorize one otherwise-forbidden
+/// historical Direct creation. The final mailbox write revalidates every field
+/// against the graph produced in the same transaction.
+pub struct DirectWelcomeBootstrapBinding<'a> {
+    pub conversation_id: Uuid,
+    pub sequencer_did: &'a str,
+    pub sequencer_term: i64,
+    pub recipient_did: &'a str,
+    pub recipient_device_id: Uuid,
+    pub welcome_id: Uuid,
+    pub recovery_request_id: Uuid,
+    pub key_package_ref: &'a [u8; 32],
+    pub welcome_bytes: &'a [u8],
+    pub welcome_sha256: &'a [u8; 32],
+    pub entry_bytes: &'a [u8],
+    pub signed_request_bytes: &'a [u8],
+    pub entry_id: Uuid,
+    pub entry_seq: u64,
+    pub accepted_payload_sha256: &'a [u8; 32],
+    pub outer_entry_fingerprint: &'a [u8; 32],
+    pub coordinates: &'a ConversationCoordinates,
+}
+
+fn direct_welcome_coordinates_match(
+    next: &crate::chat_protocol::transcript::ClosedObjectRef<'_>,
+    binding: &DirectWelcomeBootstrapBinding<'_>,
+) -> bool {
+    matches!(
+        next.get("conversationId"),
+        Some(CanonicalValueRef::Uuid(value))
+            if value.as_bytes() == binding.conversation_id.as_bytes()
+    ) && matches!(
+        next.get("generation"),
+        Some(CanonicalValueRef::Integer(value))
+            if i64::try_from(value).ok() == Some(binding.coordinates.generation)
+    ) && matches!(
+        next.get("stateVersion"),
+        Some(CanonicalValueRef::Integer(value))
+            if i64::try_from(value).ok() == Some(binding.coordinates.state_version)
+    ) && matches!(
+        next.get("epoch"),
+        Some(CanonicalValueRef::Integer(value))
+            if i64::try_from(value).ok() == Some(binding.coordinates.epoch)
+    ) && matches!(
+        next.get("groupId"),
+        Some(CanonicalValueRef::Bytes(value))
+            if value == binding.coordinates.group_id.as_ref()
+    ) && matches!(
+        next.get("groupContextHash"),
+        Some(CanonicalValueRef::Bytes(value))
+            if value == binding.coordinates.group_context_hash.as_ref()
+    ) && matches!(
+        next.get("confirmationTag"),
+        Some(CanonicalValueRef::Bytes(value))
+            if value == binding.coordinates.confirmation_tag.as_ref()
+    ) && matches!(
+        next.get("lifecycle"),
+        Some(CanonicalValueRef::Text(value))
+            if value == binding.coordinates.lifecycle.as_str()
+    )
+}
+
+fn direct_welcome_manifest_matches(
+    manifest: &crate::chat_protocol::transcript::ClosedObjectRef<'_>,
+    binding: &DirectWelcomeBootstrapBinding<'_>,
+) -> bool {
+    let request_matches = matches!(
+        manifest.get("leafRecoveryRequestId"),
+        Some(CanonicalValueRef::Uuid(value))
+            if value.as_bytes() == binding.recovery_request_id.as_bytes()
+    );
+    let leaf_matches = match manifest.get("leafChanges") {
+        Some(CanonicalValueRef::Array(values)) if values.len() == 1 => match values.get(0) {
+            Some(CanonicalValueRef::Object(value)) => {
+                matches!(
+                    value.get("$type"),
+                    Some(CanonicalValueRef::Text(
+                        "blue.catbird.chat.defs#addLeafByRecovery"
+                    ))
+                ) && matches!(
+                    value.get("userDid"),
+                    Some(CanonicalValueRef::Did(did))
+                        if dids_equivalent(did.as_str(), binding.recipient_did)
+                ) && matches!(
+                    value.get("deviceId"),
+                    Some(CanonicalValueRef::Uuid(id))
+                        if id.as_bytes() == binding.recipient_device_id.as_bytes()
+                ) && matches!(
+                    value.get("recoveryRequestId"),
+                    Some(CanonicalValueRef::Uuid(id))
+                        if id.as_bytes() == binding.recovery_request_id.as_bytes()
+                ) && matches!(
+                    value.get("keyPackageRef"),
+                    Some(CanonicalValueRef::Bytes(value))
+                        if value == binding.key_package_ref
+                )
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    let welcome_matches = match manifest.get("welcomeBundle") {
+        Some(CanonicalValueRef::Object(bundle)) => {
+            let delivery_matches = match bundle.get("deliveries") {
+                Some(CanonicalValueRef::Array(values)) if values.len() == 1 => {
+                    match values.get(0) {
+                        Some(CanonicalValueRef::Object(delivery)) => {
+                            let provenance_matches = match delivery.get("provenance") {
+                                Some(CanonicalValueRef::Object(provenance)) => {
+                                    matches!(
+                                        provenance.get("recoveryRequestId"),
+                                        Some(CanonicalValueRef::Uuid(id))
+                                            if id.as_bytes()
+                                                == binding.recovery_request_id.as_bytes()
+                                    ) && matches!(
+                                        provenance.get("keyPackageRef"),
+                                        Some(CanonicalValueRef::Bytes(value))
+                                            if value == binding.key_package_ref
+                                    )
+                                }
+                                _ => false,
+                            };
+                            matches!(
+                                delivery.get("recipientDid"),
+                                Some(CanonicalValueRef::Did(did))
+                                    if dids_equivalent(did.as_str(), binding.recipient_did)
+                            ) && matches!(
+                                delivery.get("recipientDeviceId"),
+                                Some(CanonicalValueRef::Uuid(id))
+                                    if id.as_bytes() == binding.recipient_device_id.as_bytes()
+                            ) && provenance_matches
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            matches!(
+                bundle.get("welcomeId"),
+                Some(CanonicalValueRef::Uuid(id))
+                    if id.as_bytes() == binding.welcome_id.as_bytes()
+            ) && matches!(
+                bundle.get("opaqueWelcome"),
+                Some(CanonicalValueRef::Bytes(value))
+                    if value == binding.welcome_bytes
+            ) && matches!(
+                bundle.get("sha256"),
+                Some(CanonicalValueRef::Bytes(value))
+                    if value == binding.welcome_sha256
+            ) && delivery_matches
+        }
+        _ => false,
+    };
+    request_matches && leaf_matches && welcome_matches
+}
+
+/// Narrow the live canonical prefix to the exact first Direct Welcome being
+/// delivered. Only this sealed admission can authorize historical Direct
+/// creation; the general selector path remains Group-only.
+pub async fn bind_direct_welcome_admission(
+    pool: &PgPool,
+    admission: &mut VerifiedRemotePrefixAdmission,
+    binding: &DirectWelcomeBootstrapBinding<'_>,
+) -> Result<(), RemotePrefixBootstrapError> {
+    if admission.purpose != RemotePrefixAdmissionPurpose::General
+        || admission.selector.conversation_id() != binding.conversation_id
+        || !dids_equivalent(
+            admission.selector.configured_sequencer_did(),
+            binding.sequencer_did,
+        )
+        || admission.selector.configured_sequencer_term() != binding.sequencer_term
+        || admission.digest.conversation_id() != binding.conversation_id
+        || !dids_equivalent(admission.digest.sequencer_did(), binding.sequencer_did)
+        || admission.digest.sequencer_term() != binding.sequencer_term
+        || Uuid::parse_str(binding.coordinates.conversation_id.as_str()).ok()
+            != Some(binding.conversation_id)
+    {
+        return Err(RemotePrefixBootstrapError::Authority);
+    }
+
+    if admission.events.len() != 3
+        || admission.events[0].entry_kind() != CleanEntryKind::Creation
+        || admission.events[1].entry_kind() != CleanEntryKind::ParticipantAcceptance
+        || admission.events[2].entry_kind() != CleanEntryKind::LeafRecoveryFulfillment
+    {
+        return Err(RemotePrefixBootstrapError::DirectWelcomeNotEligible);
+    }
+
+    let creation = decode_canonical_signed_mutation(admission.events[0].signed_request())
+        .map_err(|_| RemotePrefixBootstrapError::InvalidEvent)?;
+    if creation.kind() != SignedMutationKind::Creation
+        || creation
+            .creation_conversation_kind()
+            .map_err(|_| RemotePrefixBootstrapError::InvalidEvent)?
+            != "direct"
+    {
+        return Err(RemotePrefixBootstrapError::DirectWelcomeNotEligible);
+    }
+    let participant_dids = creation
+        .creation_participant_dids()
+        .map_err(|_| RemotePrefixBootstrapError::InvalidEvent)?;
+    let participants: BTreeSet<String> = participant_dids
+        .iter()
+        .map(|did| canonical_did(did).to_string())
+        .collect();
+    if participant_dids.len() != 2
+        || participants.len() != 2
+        || !participants.contains(&canonical_did(binding.recipient_did).to_string())
+        || canonical_did(creation.actor_did().as_str()) == canonical_did(binding.recipient_did)
+    {
+        return Err(RemotePrefixBootstrapError::Authority);
+    }
+    let routed_participants: BTreeSet<String> = admission
+        .participant_routes
+        .keys()
+        .map(|did| canonical_did(did).to_string())
+        .collect();
+    let recipient_is_local = admission
+        .participant_routes
+        .iter()
+        .any(|(did, route)| dids_equivalent(did, binding.recipient_did) && route.is_none());
+    let creator_is_sequencer_home = admission.participant_routes.iter().any(|(did, route)| {
+        dids_equivalent(did, creation.actor_did().as_str())
+            && route
+                .as_deref()
+                .is_some_and(|home| dids_equivalent(home, binding.sequencer_did))
+    });
+    if routed_participants != participants || !recipient_is_local || !creator_is_sequencer_home {
+        return Err(RemotePrefixBootstrapError::NoLocalParticipant);
+    }
+
+    let acceptance = decode_canonical_signed_mutation(admission.events[1].signed_request())
+        .map_err(|_| RemotePrefixBootstrapError::InvalidEvent)?;
+    if acceptance.kind() != SignedMutationKind::ParticipantAcceptance
+        || !dids_equivalent(acceptance.actor_did().as_str(), binding.recipient_did)
+        || acceptance.actor_device_id().as_bytes() != binding.recipient_device_id.as_bytes()
+        || acceptance
+            .recovery_request_id()
+            .map_err(|_| RemotePrefixBootstrapError::InvalidEvent)?
+            .as_bytes()
+            != binding.recovery_request_id.as_bytes()
+    {
+        return Err(RemotePrefixBootstrapError::Authority);
+    }
+
+    let final_event = &admission.events[2];
+    let final_seq =
+        i64::try_from(binding.entry_seq).map_err(|_| RemotePrefixBootstrapError::InvalidEvent)?;
+    let expected_entry_sha256: [u8; 32] = Sha256::digest(binding.entry_bytes).into();
+    let expected_welcome_sha256: [u8; 32] = Sha256::digest(binding.welcome_bytes).into();
+    if final_event.seq() != final_seq
+        || admission.digest.last_seq() != final_seq
+        || admission.digest.event_count() != 3
+        || final_event.entry_id() != binding.entry_id
+        || final_event.accepted_payload_bytes() != binding.entry_bytes
+        || final_event.accepted_payload_sha256() != binding.accepted_payload_sha256
+        || expected_entry_sha256 != *binding.accepted_payload_sha256
+        || final_event.signed_request() != binding.signed_request_bytes
+        || final_event.outer_fingerprint() != binding.outer_entry_fingerprint
+        || expected_welcome_sha256 != *binding.welcome_sha256
+    {
+        return Err(RemotePrefixBootstrapError::Conflict);
+    }
+
+    let fulfillment = decode_canonical_signed_mutation(final_event.signed_request())
+        .map_err(|_| RemotePrefixBootstrapError::InvalidEvent)?;
+    if fulfillment.kind() != SignedMutationKind::LeafRecoveryFulfillment
+        || fulfillment
+            .recovery_request_id()
+            .map_err(|_| RemotePrefixBootstrapError::InvalidEvent)?
+            .as_bytes()
+            != binding.recovery_request_id.as_bytes()
+        || !direct_welcome_coordinates_match(
+            &fulfillment
+                .recovery_fulfillment_next()
+                .map_err(|_| RemotePrefixBootstrapError::InvalidEvent)?,
+            binding,
+        )
+        || !direct_welcome_manifest_matches(
+            &fulfillment
+                .recovery_fulfillment_manifest()
+                .map_err(|_| RemotePrefixBootstrapError::InvalidEvent)?,
+            binding,
+        )
+    {
+        return Err(RemotePrefixBootstrapError::Conflict);
+    }
+
+    let active_local_device: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM chat.devices \
+         WHERE user_did = $1 AND device_id = $2 \
+           AND status = 'active' AND revoked_at IS NULL",
+    )
+    .bind(binding.recipient_did)
+    .bind(binding.recipient_device_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| RemotePrefixBootstrapError::Database)?;
+    if active_local_device.is_none() {
+        return Err(RemotePrefixBootstrapError::NoLocalParticipant);
+    }
+
+    admission.purpose = RemotePrefixAdmissionPurpose::DirectWelcome;
+    Ok(())
 }
 
 pub(crate) fn validate_prefix_grammar(
@@ -627,6 +948,7 @@ pub async fn fetch_remote_prefix_admission(
         participant_routes,
         canonical_material_bytes: total_canonical_material_bytes,
         page_count,
+        purpose: RemotePrefixAdmissionPurpose::General,
     })
 }
 

@@ -5,9 +5,9 @@ SQL migrations for `catbird-server`, applied in version order by SQLx (`sqlx::mi
 ## Status
 
 - The R0 seal (bookmark `clean-slate-2026-10-31`, mls-ds `d5f6993c`) has 129 migrations, ending at `20261102000003_conversation_close_terminal_entries.sql`.
-- The unsealed Task 4 R1 provisional commits add thirteen, for 142: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010` and `000011`. Their contracts are in the sections below.
+- The unsealed Task 4 R1 provisional commits add fourteen, for 143: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010`, `000011` and `000012`. Their contracts are in the sections below.
 - **Held.** These migrations have run only against local disposable and guarded test databases. Do not apply them to a production database until R1 is sealed and the production migration is separately authorized. Server startup applies pending migrations, so the hold also covers starting this tree against a production database.
-- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 142 migrations ending at `20261104000011` (91 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
+- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 143 migrations ending at `20261104000012` (91 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
 
 ## Clean-Chat Operation Claim Rollout
 
@@ -227,6 +227,70 @@ sqlx maintains a `_sqlx_migrations` table to track applied migrations:
 ```sql
 SELECT * FROM _sqlx_migrations ORDER BY version;
 ```
+
+## PostgreSQL churn and terminal-history partitions
+
+`20261104000012_postgres_churn_partitions.sql` converts only the two public
+transport queues with age-expired terminal history. Active `pending` and
+`in_flight` rows have `terminal_at IS NULL` and stay in each table's DEFAULT
+partition. The first terminal transition stamps `terminal_at`; later terminal
+updates preserve it. PostgreSQL routes those immutable rows into UTC calendar
+month partitions. The workers call
+`public.maintain_transport_partitions(regclass, interval, timestamptz)` every
+five minutes, keep the current and next two months ready, and drop only a whole
+month whose upper bound is at least seven days old. A missed maintenance window
+is safe: finite rows land in DEFAULT and the next call moves them before
+attaching the month. The upgrade call creates and routes partitions with
+`drop_expired=FALSE`, so applying the migration itself deletes no rows.
+Raw-file size: `17047` bytes. SQLx SHA-384:
+`cdf0de967150738a150539a8c82c45010939282185b1c211c665d81e8551c6de143805b174b11c0edeb8d4ee950c150f`.
+
+
+PostgreSQL requires every partitioned unique constraint to include the
+partition key. Because active rows need a nullable key, the physical constraint
+is `UNIQUE NULLS NOT DISTINCT (id, terminal_at)`. A guarded trigger retains the
+old global `id` invariant across months. A shape check forbids an active row
+with a finite key; BEFORE UPDATE and AFTER INSERT triggers guarantee every
+terminal row receives one while preserving an existing terminal month.
+Deterministic enqueue sites first look for an existing `id` before
+`ON CONFLICT DO NOTHING`. Neither table has an inbound foreign key at this
+migration tip.
+
+| Relation | Time/identity and query indexes | Existing retention semantics | Decision |
+|---|---|---|---|
+| `public.outbound_queue` | Logical ID `id`; `created_at`; new nullable `terminal_at`; due, lease and `convo_id` indexes | Mutable while pending/leased; delivered, failed and dead history was row-deleted after seven days | DEFAULT for live state; monthly terminal partitions; whole-partition drop |
+| `public.federation_outbox` | Logical ID `id`; `created_at`/`updated_at`; new nullable `terminal_at`; due, lease and `conversation_id` indexes; no remaining delivery-event FK | Mutable while pending/leased; terminal handoff history, with dead rows previously row-deleted after seven days | DEFAULT for live state; monthly done/failed/dead partitions; seven-day whole-partition drop |
+| `chat.outbox` | PK `outbox_id`; unique `(event_position, work_kind)`; FK to `chat.events`; due/lease indexes | Live event work and retained protocol evidence; no age deletion | Not partitioned |
+| `chat.direct_request_transport_wakes` | PK/FK `delivery_id` to transport inbox; lease/due timestamps and indexes | Live pending/leased/delivered/failed wake state; removed with its inbox | Not partitioned |
+| `chat.direct_request_transport_inbox` | PK `delivery_id`, unique request/recipient device; `created_at`, `updated_at`, `import_until`; referenced by inventory and wake rows | Live import/relationship state; close wipe, not age deletion | Not partitioned |
+| `chat.direct_request_transport_entries` | PK `delivery_id`, unique `(conversation_id, seq)`; `created_at`; referenced by recipient grants | Ciphertext is pruned after 30 days, but the ordered skeleton remains until close | Not partitioned: dropping a month would delete live transcript identity |
+| `chat.entries` | PK `(conversation_id, seq)`, unique `entry_id` plus retained coordinate uniques; `received_at`; multiple protocol FKs/indexes | Ciphertext-only 30-day pruning; sequence skeleton retained | Not partitioned |
+| `chat.federation_delivery_receipts` | PK `delivery_id`; `completed_at`; FKs to conversation and entry; lookup by delivery ID | Replay/idempotency evidence retained until conversation close; no age TTL | Not partitioned |
+| `chat.inventory_page_receipts`, `chat.event_cursor_receipts` | 15-minute `expires_at`; PK/global unique cursor hashes; self/session FKs and session indexes | Deleted as one exact inventory-session graph | Not partitioned: self/global constraints and atomic graph deletion are authoritative |
+| Legacy `event_stream`, `delivery_events`, `delivery_acks`, `notification_outbox` | Legacy timestamps and indexes | Removed by the clean-slate migration | Absent; no fake partition shells |
+
+The migration also pins both autovacuum vacuum and analyze scale factors to
+`0.01` on every live KeyPackage/reservation churn table and sets
+`chat.conversations` to `fillfactor=70`. Inspect with
+`pg_options_to_table(pg_class.reloptions)`. Operators can invoke maintenance
+manually after downtime:
+
+```sql
+SELECT public.maintain_transport_partitions(
+  'public.outbound_queue'::regclass, interval '7 days'
+);
+SELECT public.maintain_transport_partitions(
+  'public.federation_outbox'::regclass, interval '7 days'
+);
+```
+
+Current clean-slate encrypted payloads continue to use their existing SHA-256
+columns and database checks. The former `chat.blobs`/object-store queue was
+removed by the clean-slate migration, so this change adds neither a generic
+`StorageBackend` nor a second content-addressing scheme. Existing repository
+transactions and the database function are the narrow test seams. Geographic
+or tenant sharding is a day-two design only; no routing or shard abstraction is
+introduced here.
 
 ## Rollback strategy
 

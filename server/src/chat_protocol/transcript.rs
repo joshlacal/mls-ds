@@ -1241,6 +1241,49 @@ impl CanonicalSignedMutation {
             _ => Err(AuthPrimitiveError::invalid("signed operation identity")),
         }
     }
+    pub fn creation_conversation_kind(&self) -> Result<&str, AuthPrimitiveError> {
+        if self.kind != SignedMutationKind::Creation {
+            return Err(AuthPrimitiveError::invalid("creation mutation kind"));
+        }
+        match self.body.get("conversationKind") {
+            Some(DagValue::Text(value)) => Ok(value),
+            _ => Err(AuthPrimitiveError::invalid("creation conversationKind")),
+        }
+    }
+
+    pub fn recovery_request_id(&self) -> Result<&CanonicalUuidV4, AuthPrimitiveError> {
+        if !matches!(
+            self.kind,
+            SignedMutationKind::ParticipantAcceptance | SignedMutationKind::LeafRecoveryFulfillment
+        ) {
+            return Err(AuthPrimitiveError::invalid("recovery mutation kind"));
+        }
+        match self.body.get("recoveryRequestId") {
+            Some(DagValue::Uuid(value)) => Ok(value),
+            _ => Err(AuthPrimitiveError::invalid("recoveryRequestId")),
+        }
+    }
+
+    pub fn recovery_fulfillment_next(&self) -> Result<ClosedObjectRef<'_>, AuthPrimitiveError> {
+        if self.kind != SignedMutationKind::LeafRecoveryFulfillment {
+            return Err(AuthPrimitiveError::invalid("fulfillment mutation kind"));
+        }
+        match self.body.get("next") {
+            Some(DagValue::Map(value)) => Ok(ClosedObjectRef(value)),
+            _ => Err(AuthPrimitiveError::invalid("fulfillment next")),
+        }
+    }
+
+    pub fn recovery_fulfillment_manifest(&self) -> Result<ClosedObjectRef<'_>, AuthPrimitiveError> {
+        if self.kind != SignedMutationKind::LeafRecoveryFulfillment {
+            return Err(AuthPrimitiveError::invalid("fulfillment mutation kind"));
+        }
+        match self.body.get("manifest") {
+            Some(DagValue::Map(value)) => Ok(ClosedObjectRef(value)),
+            _ => Err(AuthPrimitiveError::invalid("fulfillment manifest")),
+        }
+    }
+
     pub fn creation_participant_dids(&self) -> Result<Vec<String>, AuthPrimitiveError> {
         let manifest = match self.body.get("manifest") {
             Some(DagValue::Map(map)) => map,

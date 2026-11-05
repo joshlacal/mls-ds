@@ -1,0 +1,7 @@
+{
+  "$type": "blue.catbird.chat.declaration",
+  "protocolVersion": "1",
+  "allowIncoming": "all",
+  "deliveryService": "did:web:ds1.catbird.blue",
+  "createdAt": "2026-11-05T00:00:00.000Z"
+}

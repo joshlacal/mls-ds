@@ -4308,6 +4308,89 @@ async fn historical_execution_produces_exact_zero_notifications_and_outbox() {
     assert_eq!(participant_count, 1, "participant persisted");
 }
 
+#[tokio::test]
+async fn generic_historical_bootstrap_still_rejects_direct_creation() {
+    let Some((pool, _db_guard)) = setup_test_db().await else {
+        return;
+    };
+
+    let convo_id = Uuid::new_v4();
+    let sequencer_did = "did:web:sequencer.catbird.blue";
+    let creation_time = dynamic_fixture_instant(1_000);
+    let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
+    let (invitee_device, invitee_did) = fresh_bob();
+    let invitee_device = Uuid::from_bytes(*invitee_device.device_id());
+    let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let invitee = AcceptanceInvitee {
+        did: invitee_did,
+        device_id: invitee_device,
+        key_id: crate::chat_protocol::validation::ed25519_key_id(
+            &invitee_signing_key.verifying_key().to_bytes(),
+        )
+        .unwrap()
+        .as_str()
+        .to_owned(),
+        signing_key: invitee_signing_key,
+        participant_period_id: Uuid::new_v4(),
+    };
+    let crypto_fixture = genuine_terminal_fixture::build_dynamic_two_leaf_crypto_fixture(
+        convo_id,
+        Uuid::new_v4(),
+        invitee,
+        creation_time,
+        creation_time + chrono::Duration::seconds(1),
+        creation_time + chrono::Duration::seconds(2),
+        actor_created_at - chrono::Duration::hours(1),
+        actor_created_at + chrono::Duration::days(30),
+    );
+    seed_protocol_instance(&pool).await;
+    seed_actor_at(
+        &pool,
+        &crypto_fixture.entry.actor_did,
+        crypto_fixture.entry.actor_device_id,
+        &crypto_fixture.entry.public_key,
+        actor_created_at,
+    )
+    .await;
+
+    let signed_at = (creation_time - chrono::Duration::seconds(10))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let received_at = creation_time.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let entry = bind_creation_entry_to_group_info(
+        crypto_fixture.entry,
+        &crypto_fixture.genesis_group_info,
+        crypto_fixture.genesis.coordinate(),
+        &signed_at,
+        &received_at,
+    );
+    let (entry, pending) = add_pending_invitee_to_creation(entry, "direct");
+    let event = build_test_event_json(
+        1,
+        0,
+        entry.entry_id,
+        CREATION_ENTRY_TYPE_ID,
+        &entry.public_row_json,
+        &entry.raw_wrapper,
+        &entry.outer_entry_fingerprint,
+        creation_time,
+    );
+    let selector =
+        RemotePrefixBootstrapSelector::new(convo_id, sequencer_did.to_owned(), 0).unwrap();
+    let routes = BTreeMap::from([
+        (entry.actor_did.clone(), Some(sequencer_did.to_owned())),
+        (pending.did, None),
+    ]);
+    let before = snapshot_db_content(&pool).await;
+    let mut tx = pool.begin().await.expect("begin direct rejection");
+    let error =
+        test_apply_historical_creation_entry(&mut tx, [0x7a; 32], 1, selector, routes, event)
+            .await
+            .expect_err("generic historical authority must reject Direct creation");
+    assert_eq!(error, RemotePrefixBootstrapError::Authority);
+    tx.rollback().await.expect("rollback direct rejection");
+    assert_eq!(snapshot_db_content(&pool).await, before);
+}
+
 // 28. Positive four-step pipeline proves all four planners succeed with exact zero side effects
 #[tokio::test]
 async fn historical_planners_positive_pipeline_succeeds_with_zero_side_effects() {

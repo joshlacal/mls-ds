@@ -548,6 +548,22 @@ async fn deliver_message_entry_to_remote_peers(
         Some(("direct", _)) => {}
         _ => return Err(ChatFailure::invariant(ENDPOINT)),
     }
+    // C33 transport homes receive `deliverMessageEntry`; ordinary Direct homes
+    // already receive the signed clean envelope queued in the transaction.
+    let has_c33_publication: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM chat.direct_request_publications
+              WHERE conversation_id = $1
+         )",
+    )
+    .bind(convo_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+    if !has_c33_publication {
+        return Ok(());
+    }
+
     let participants: Vec<String> = sqlx::query_scalar(
         "SELECT user_did FROM chat.participants WHERE conversation_id=$1 AND current_membership",
     )
@@ -615,8 +631,9 @@ async fn deliver_message_entry_to_remote_peers(
             );
             sqlx::query(
                 "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, last_error, next_retry_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                 ON CONFLICT (id) DO NOTHING",
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
+                  WHERE NOT EXISTS (SELECT 1 FROM outbound_queue WHERE id = $1) \
+                 ON CONFLICT DO NOTHING",
             )
             .bind(format!("message-delivery-{entry_id}-{}", crate::identity::canonical_did(target_did)))
             .bind(target_did)

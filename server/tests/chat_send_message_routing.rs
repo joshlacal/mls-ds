@@ -693,40 +693,30 @@ async fn local_send_is_retryable_while_its_relationship_source_cannot_answer() {
 }
 
 #[tokio::test]
-async fn direct_send_preserves_authoritative_resolution_failure_after_commit() {
+async fn ordinary_direct_send_uses_queued_envelope_without_c33_redelivery() {
     let (pool, _database, fixture, device, router) = setup(true).await;
     let (status, response, trace) =
         post_with_trace(&router, &device, &fixture.signed_request).await;
-    assert_eq!(
-        status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "direct response: {response}"
-    );
-    assert_eq!(response, json!({"error": "InternalServerError"}));
+    assert_eq!(status, StatusCode::OK, "direct response: {response}");
     assert!(
-        trace.contains("Failed to resolve application entry peer"),
-        "exact post-commit resolver failure: {trace}"
+        !trace.contains("Failed to resolve application entry peer")
+            && !trace.contains("Failed to resolve PDS endpoint from DID document"),
+        "ordinary Direct must not enter the C33 delivery path: {trace}"
     );
-    assert!(
-        trace.contains("Failed to resolve PDS endpoint from DID document"),
-        "example.com fixture authority cannot resolve: {trace}"
-    );
-    // The genuine local direct send was admitted and committed before the
-    // unchanged direct coordinator resolver rejected the unique example.com fixture home.
+    // This is an ordinary Direct conversation, not a published C33 request.
+    // Its signed clean envelope was queued atomically with the accepted entry,
+    // so a redundant post-commit deliverMessageEntry would only duplicate it.
     assert_single_application_and_job(&pool, &fixture).await;
     let entries_before = application_entries(&pool, &fixture).await;
     let jobs_before = federation_jobs(&pool, &fixture).await;
 
     let (status, replay, trace) = post_with_trace(&router, &device, &fixture.signed_request).await;
-    assert_eq!(
-        status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "direct replay: {replay}"
-    );
+    assert_eq!(status, StatusCode::OK, "direct replay: {replay}");
     assert_eq!(replay, response);
     assert!(
-        trace.contains("Failed to resolve application entry peer"),
-        "replay retains direct resolver path: {trace}"
+        !trace.contains("Failed to resolve application entry peer")
+            && !trace.contains("Failed to resolve PDS endpoint from DID document"),
+        "ordinary Direct replay must not enter the C33 delivery path: {trace}"
     );
     assert_eq!(application_entries(&pool, &fixture).await, entries_before);
     assert_eq!(federation_jobs(&pool, &fixture).await, jobs_before);

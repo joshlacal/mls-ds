@@ -46,6 +46,7 @@ use catbird_server::federation::envelope::{
 use catbird_server::federation::outbound::OutboundClient;
 use catbird_server::federation::resolver::{DsResolver, ValidatedRemoteDestination};
 use catbird_server::federation::FederationMode;
+use catbird_server::federation::ServiceAuthClient;
 use catbird_server::handlers::chat::ChatRuntime;
 use catbird_server::handlers::ds::get_convo_digest::{
     compute_clean_convo_digest, CleanDigestRow, GetConvoDigestOutput,
@@ -79,6 +80,30 @@ struct TestDsState {
     pool: DbPool,
     ack_signer: Option<Arc<AckSigner>>,
     runtime: Arc<ChatRuntime>,
+    resolver: Arc<DsResolver>,
+    service_auth: Option<Arc<ServiceAuthClient>>,
+    outbound: Arc<OutboundClient>,
+}
+
+impl TestDsState {
+    fn new(pool: DbPool, ack_signer: Option<Arc<AckSigner>>, runtime: Arc<ChatRuntime>) -> Self {
+        let resolver = Arc::new(DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            LOCAL_DS_DID.to_string(),
+            "https://local.invalid".to_string(),
+            None,
+            3600,
+        ));
+        Self {
+            pool,
+            ack_signer,
+            runtime,
+            resolver,
+            service_auth: None,
+            outbound: Arc::new(OutboundClient::new(5, 5)),
+        }
+    }
 }
 
 impl FromRef<TestDsState> for DbPool {
@@ -96,6 +121,24 @@ impl FromRef<TestDsState> for Option<Arc<AckSigner>> {
 impl FromRef<TestDsState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestDsState) -> Arc<ChatRuntime> {
         state.runtime.clone()
+    }
+}
+
+impl FromRef<TestDsState> for Arc<DsResolver> {
+    fn from_ref(state: &TestDsState) -> Arc<DsResolver> {
+        state.resolver.clone()
+    }
+}
+
+impl FromRef<TestDsState> for Option<Arc<ServiceAuthClient>> {
+    fn from_ref(state: &TestDsState) -> Option<Arc<ServiceAuthClient>> {
+        state.service_auth.clone()
+    }
+}
+
+impl FromRef<TestDsState> for Arc<OutboundClient> {
+    fn from_ref(state: &TestDsState) -> Arc<OutboundClient> {
+        state.outbound.clone()
     }
 }
 
@@ -425,11 +468,7 @@ impl TestHarness {
                 .expect("build chat runtime"),
         );
 
-        let state = TestDsState {
-            pool: pool.clone(),
-            ack_signer: Some(ack_signer.clone()),
-            runtime,
-        };
+        let state = TestDsState::new(pool.clone(), Some(ack_signer.clone()), runtime);
         let router = build_federation_router(state);
 
         Self {
@@ -3945,6 +3984,58 @@ async fn test_deliver_welcome_router_authenticated_positive_and_replay() {
         DELIVER_WELCOME_NSID,
     );
 
+    // Authentication and sender binding fail before mailbox mutation or remote
+    // bootstrap. Exercise the same request bytes for each forged authority.
+    let wrong_caller = harness.mint_jwt(DELIVER_WELCOME_NSID);
+    let wrong_lxm = harness.mint_jwt_for(
+        &harness.sequencer_ds_did,
+        &harness.sequencer_ds_key,
+        DELIVER_MESSAGE_NSID,
+    );
+    let now_ts = Utc::now().timestamp();
+    let wrong_audience = sign_jwt(
+        json!({
+            "alg": "ES256",
+            "typ": "JWT",
+            "kid": format!("{}#atproto", harness.sequencer_ds_did),
+        }),
+        json!({
+            "iss": harness.sequencer_ds_did,
+            "sub": harness.sequencer_ds_did,
+            "aud": "did:web:not-this-ds.catbird.blue",
+            "lxm": DELIVER_WELCOME_NSID,
+            "iat": now_ts,
+            "exp": now_ts + 60,
+            "jti": Uuid::new_v4().to_string(),
+        }),
+        &harness.sequencer_ds_key,
+    );
+    for forged in [&wrong_caller, &wrong_lxm, &wrong_audience] {
+        let (status, _, _) = harness
+            .send_json(
+                "/xrpc/blue.catbird.mlsDS.deliverWelcome",
+                Some(forged),
+                &deliver_welcome_body,
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let forged_receipts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.federation_delivery_receipts WHERE delivery_id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(forged_receipts, 0);
+    let forged_delivery_status: String =
+        sqlx::query_scalar("SELECT status FROM chat.welcome_deliveries WHERE welcome_id = $1")
+            .bind(welcome_id)
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+    assert_eq!(forged_delivery_status, "pending");
+
     // 1. Positive authenticated delivery
     let (status, body, _) = harness
         .send_json(
@@ -3993,6 +4084,50 @@ async fn test_deliver_welcome_router_authenticated_positive_and_replay() {
         "replay must succeed with stored receipt: {body2:?}"
     );
     assert_eq!(body2, body, "replay body must be identical to original");
+
+    // 4. Same delivery ID with changed canonical bytes must conflict before any
+    // bootstrap retry or mailbox provenance lookup.
+    let mut conflicted_locator = locator_model.clone();
+    conflicted_locator.seq = 3;
+    let conflicted_digest = compute_welcome_envelope_digest(
+        &header_model,
+        &recipient.did,
+        recipient.device_id,
+        welcome_id,
+        recovery_request_id,
+        &key_package_ref,
+        &welcome_bytes,
+        &welcome_sha256,
+        &entry_bytes,
+        &signed_req_bytes,
+        &conflicted_locator,
+        &coordinates_dto,
+        &public_snapshot_sha256,
+        &tree_summary_sha256,
+    )
+    .unwrap();
+    let mut conflicted_body = deliver_welcome_body.clone();
+    conflicted_body["header"]["payloadSha256"] =
+        json!({ "$bytes": STANDARD.encode(conflicted_digest) });
+    conflicted_body["entryLocator"]["seq"] = json!(3);
+    let jwt3 = harness.mint_jwt_for(
+        &harness.sequencer_ds_did,
+        &harness.sequencer_ds_key,
+        DELIVER_WELCOME_NSID,
+    );
+    let (status_conflict, body_conflict, _) = harness
+        .send_json(
+            "/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            Some(&jwt3),
+            &conflicted_body,
+        )
+        .await;
+    assert_eq!(
+        status_conflict,
+        StatusCode::CONFLICT,
+        "changed Welcome replay must fail with 409: {body_conflict:?}"
+    );
+    assert_eq!(body_conflict["error"], "DeliveryConflict");
 
     // 4. Negative: missing auth -> 401
     let (status_no_auth, _, _) = harness
@@ -6576,11 +6711,11 @@ async fn test_remote_commit_rejected_order_leaves_mailbox_state_byte_for_byte_un
             .with_commit_submitter(commit_submitter),
     );
 
-    let test_state = TestDsState {
-        pool: harness.pool.clone(),
-        ack_signer: Some(harness.ack_signer.clone()),
+    let test_state = TestDsState::new(
+        harness.pool.clone(),
+        Some(harness.ack_signer.clone()),
         runtime,
-    };
+    );
     let custom_router = build_federation_router(test_state);
 
     let before = capture_mailbox_snapshot(&harness.pool).await;
@@ -6746,11 +6881,11 @@ async fn test_remote_commit_rejected_403_returns_not_authorized_and_leaves_mailb
             .with_commit_submitter(commit_submitter),
     );
 
-    let test_state = TestDsState {
-        pool: harness.pool.clone(),
-        ack_signer: Some(harness.ack_signer.clone()),
+    let test_state = TestDsState::new(
+        harness.pool.clone(),
+        Some(harness.ack_signer.clone()),
         runtime,
-    };
+    );
     let custom_router = build_federation_router(test_state);
 
     let before = capture_mailbox_snapshot(&harness.pool).await;
@@ -6926,11 +7061,11 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
             .expect("build sequencer chat runtime"),
     );
-    let seq_test_state = TestDsState {
-        pool: seq_pool.clone(),
-        ack_signer: Some(seq_ack_signer.clone()),
-        runtime: seq_runtime.clone(),
-    };
+    let seq_test_state = TestDsState::new(
+        seq_pool.clone(),
+        Some(seq_ack_signer.clone()),
+        seq_runtime.clone(),
+    );
     let seq_router = build_federation_router(seq_test_state);
 
     let signer_clone = seq_ack_signer.clone();
@@ -7072,11 +7207,11 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
             .with_commit_submitter(commit_submitter),
     );
 
-    let test_state = TestDsState {
-        pool: harness.pool.clone(),
-        ack_signer: Some(harness.ack_signer.clone()),
+    let test_state = TestDsState::new(
+        harness.pool.clone(),
+        Some(harness.ack_signer.clone()),
         runtime,
-    };
+    );
     let custom_router = build_federation_router(test_state);
 
     let before = capture_mailbox_snapshot(&harness.pool).await;
@@ -7233,11 +7368,11 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
             .expect("build sequencer chat runtime"),
     );
-    let seq_test_state = TestDsState {
-        pool: seq_pool.clone(),
-        ack_signer: Some(seq_ack_signer.clone()),
-        runtime: seq_runtime.clone(),
-    };
+    let seq_test_state = TestDsState::new(
+        seq_pool.clone(),
+        Some(seq_ack_signer.clone()),
+        seq_runtime.clone(),
+    );
     let seq_router = build_federation_router(seq_test_state);
 
     let signer_clone = seq_ack_signer.clone();
@@ -7371,11 +7506,11 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
             .with_commit_submitter(commit_submitter),
     );
 
-    let test_state = TestDsState {
-        pool: harness.pool.clone(),
-        ack_signer: Some(harness.ack_signer.clone()),
+    let test_state = TestDsState::new(
+        harness.pool.clone(),
+        Some(harness.ack_signer.clone()),
         runtime,
-    };
+    );
     let custom_router = build_federation_router(test_state);
 
     let before = capture_mailbox_snapshot(&harness.pool).await;
@@ -7532,11 +7667,11 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
             .expect("build sequencer chat runtime"),
     );
-    let seq_test_state = TestDsState {
-        pool: seq_pool.clone(),
-        ack_signer: Some(seq_ack_signer.clone()),
-        runtime: seq_runtime.clone(),
-    };
+    let seq_test_state = TestDsState::new(
+        seq_pool.clone(),
+        Some(seq_ack_signer.clone()),
+        seq_runtime.clone(),
+    );
     let seq_router = build_federation_router(seq_test_state);
 
     let signer_clone = seq_ack_signer.clone();
@@ -7670,11 +7805,11 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
             .with_commit_submitter(commit_submitter),
     );
 
-    let test_state = TestDsState {
-        pool: harness.pool.clone(),
-        ack_signer: Some(harness.ack_signer.clone()),
+    let test_state = TestDsState::new(
+        harness.pool.clone(),
+        Some(harness.ack_signer.clone()),
         runtime,
-    };
+    );
     let custom_router = build_federation_router(test_state);
 
     let before = capture_mailbox_snapshot(&harness.pool).await;
@@ -7831,11 +7966,11 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
             .expect("build sequencer chat runtime"),
     );
-    let seq_test_state = TestDsState {
-        pool: seq_pool.clone(),
-        ack_signer: Some(seq_ack_signer.clone()),
-        runtime: seq_runtime.clone(),
-    };
+    let seq_test_state = TestDsState::new(
+        seq_pool.clone(),
+        Some(seq_ack_signer.clone()),
+        seq_runtime.clone(),
+    );
     let seq_router = build_federation_router(seq_test_state);
     let call_counts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let received_delivery_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -7991,11 +8126,11 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
             .with_commit_submitter(commit_submitter),
     );
 
-    let test_state = TestDsState {
-        pool: harness.pool.clone(),
-        ack_signer: Some(harness.ack_signer.clone()),
+    let test_state = TestDsState::new(
+        harness.pool.clone(),
+        Some(harness.ack_signer.clone()),
         runtime,
-    };
+    );
     let custom_router = build_federation_router(test_state);
 
     let before = capture_mailbox_snapshot(&harness.pool).await;

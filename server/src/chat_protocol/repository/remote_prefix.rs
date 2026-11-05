@@ -23,8 +23,9 @@ use crate::chat_protocol::transcript::{
     VerifiedMutationProjection,
 };
 use crate::federation::bootstrap::{
-    compute_bootstrap_advisory_lock_key, QuarantineReason, RemotePrefixApplyOutcome,
-    RemotePrefixBootstrapError, RemotePrefixBootstrapSelector, VerifiedRemotePrefixAdmission,
+    compute_bootstrap_advisory_lock_key, QuarantineReason, RemotePrefixAdmissionPurpose,
+    RemotePrefixApplyOutcome, RemotePrefixBootstrapError, RemotePrefixBootstrapSelector,
+    VerifiedRemotePrefixAdmission,
 };
 use crate::federation::reconciliation::StrictCleanRemoteEvent;
 use crate::federation::{peer_policy, reconciliation};
@@ -86,7 +87,13 @@ pub(crate) fn derive_bootstrap_local_id(
 
 #[derive(Debug)]
 pub(crate) struct HistoricalWriteWitness {
-    _sealed: (),
+    purpose: RemotePrefixAdmissionPurpose,
+}
+
+impl HistoricalWriteWitness {
+    pub(in crate::chat_protocol) fn allows_direct_welcome_creation(&self) -> bool {
+        self.purpose == RemotePrefixAdmissionPurpose::DirectWelcome
+    }
 }
 
 enum HistoricalLockedHead {
@@ -128,6 +135,7 @@ impl<'borrow, 'conn> HistoricalPrefixAuthority<'borrow, 'conn> {
         closing_last_seq: i64,
         selector: &RemotePrefixBootstrapSelector,
         participant_routes: &BTreeMap<String, Option<String>>,
+        purpose: RemotePrefixAdmissionPurpose,
         event: &StrictCleanRemoteEvent,
         event_scope: &ConversationEventLockScope,
     ) -> Result<Self, RemotePrefixBootstrapError> {
@@ -370,10 +378,9 @@ impl<'borrow, 'conn> HistoricalPrefixAuthority<'borrow, 'conn> {
             _ => return Err(RemotePrefixBootstrapError::InvalidEvent),
         };
 
-        let plan_witness =
-            HistoricalPlanWitness::new(HistoricalWriteWitness { _sealed: () }, entry_id);
+        let plan_witness = HistoricalPlanWitness::new(HistoricalWriteWitness { purpose }, entry_id);
         let write_witness = HistoricalExecutionWriteAuthority::new(
-            HistoricalWriteWitness { _sealed: () },
+            HistoricalWriteWitness { purpose },
             *admission_digest,
             entry_id,
             entry_kind.type_id(),
@@ -860,8 +867,15 @@ pub(crate) async fn apply_remote_clean_prefix(
     tx: &mut Transaction<'_, Postgres>,
     admission: VerifiedRemotePrefixAdmission,
 ) -> Result<RemotePrefixApplyOutcome, RemotePrefixBootstrapError> {
-    let (selector, _destination, digest_anchor, events, participant_routes, _material_bytes) =
-        admission.into_parts();
+    let (
+        selector,
+        _destination,
+        digest_anchor,
+        events,
+        participant_routes,
+        _material_bytes,
+        purpose,
+    ) = admission.into_parts();
     let conversation_id = selector.conversation_id();
     let sequencer_did = selector.configured_sequencer_did().to_string();
     let sequencer_term = selector.configured_sequencer_term();
@@ -1340,6 +1354,7 @@ pub(crate) async fn apply_remote_clean_prefix(
             digest_anchor.last_seq(),
             &selector,
             &participant_routes,
+            purpose,
             event,
             &event_scope,
         )
@@ -1565,6 +1580,7 @@ pub mod test_support {
             closing_last_seq,
             &selector,
             &participant_routes,
+            RemotePrefixAdmissionPurpose::General,
             &event,
             &event_scope,
         )
@@ -1595,6 +1611,7 @@ pub mod test_support {
             closing_last_seq,
             &selector,
             &participant_routes,
+            RemotePrefixAdmissionPurpose::General,
             &event,
             &event_scope,
         )
@@ -1629,6 +1646,7 @@ pub mod test_support {
             closing_last_seq,
             &selector,
             &participant_routes,
+            RemotePrefixAdmissionPurpose::General,
             &event,
             &event_scope,
         )
@@ -1663,6 +1681,7 @@ pub mod test_support {
             closing_last_seq,
             &selector,
             &participant_routes,
+            RemotePrefixAdmissionPurpose::General,
             &event,
             &event_scope,
         )
@@ -1697,6 +1716,7 @@ pub mod test_support {
             closing_last_seq,
             &selector,
             &participant_routes,
+            RemotePrefixAdmissionPurpose::General,
             &event,
             &event_scope,
         )

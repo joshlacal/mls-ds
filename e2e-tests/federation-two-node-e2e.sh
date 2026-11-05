@@ -22,7 +22,7 @@ export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 export DS1_PORT="${DS1_PORT:-0}"
 export DS2_PORT="${DS2_PORT:-0}"
 export DS1_SERVICE_DID="${DS1_SERVICE_DID:-did:web:ds1.catbird.blue}"
-export DS2_SERVICE_DID="${DS2_SERVICE_DID:-did:web:ds2.catbird.blue}"
+export DS2_SERVICE_DID="${DS2_SERVICE_DID:-did:plc:dsbfederationlocal24char}"
 export DS1_SELF_ENDPOINT="${DS1_SELF_ENDPOINT:-http://ds1:3001}"
 export DS2_SELF_ENDPOINT="${DS2_SELF_ENDPOINT:-http://ds2:3001}"
 MODE="full"
@@ -180,14 +180,21 @@ run_checks() {
 
 cleanup() {
   local status="$1"
+  local teardown_status=0
+  trap - EXIT
   set +e
   if [[ "$STARTED_HARNESS" -eq 1 && "$NO_CLEANUP" != "true" ]]; then
     info "Cleaning up two-node federation harness for project '$FED_HARNESS_PROJECT_NAME'"
-    "$HARNESS_SCRIPT" down >/dev/null 2>&1
+    "$HARNESS_SCRIPT" down
+    teardown_status=$?
+    if [[ "$status" -eq 0 && "$teardown_status" -ne 0 ]]; then
+      status="$teardown_status"
+    fi
   fi
   if [[ "$status" -ne 0 ]]; then
     echo "Federation two-node E2E checks failed"
   fi
+  exit "$status"
 }
 
 trap 'cleanup $?' EXIT
@@ -222,6 +229,7 @@ case "$MODE" in
     echo "Planned checks:"
     echo "  - DS1/DS2 readiness (/health/ready)"
     echo "  - DS1/DS2 federation health (/xrpc/blue.catbird.mlsDS.healthCheck)"
+    echo "  - DS1 did:web and DS2 did:plc receipt documents served; delivery and dedicated signers initialized"
     echo "  - DS1/DS2 local /xrpc/com.atproto.repo.getRecord returns 404 (discovery requires DID->PDS/AppView)"
     echo "  - DS1->DS2 and DS2->DS1 federated API path health checks (inside harness network)"
     ;;

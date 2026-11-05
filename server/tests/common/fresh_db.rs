@@ -157,6 +157,8 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_devdirectory_",
     // `src/chat_protocol/repository/inventory_tests.rs` (HTTP acceptance)
     "chat_inventory_http_",
+    // `tests/postgres_churn.rs`
+    "mlsds_churn_",
     // the nine production-proof targets; see [`PRODUCTION_PROOF_DB_PREFIX`]
     PRODUCTION_PROOF_DB_PREFIX,
     // `tests/chat_protocol_production_cfg.rs`: a non-proof database the proof

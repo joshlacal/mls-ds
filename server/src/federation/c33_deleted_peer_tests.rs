@@ -344,21 +344,25 @@ impl RelayedPair {
     }
 }
 
-/// Before D's deletion, P's send reaches D's home, which stores it next. Once
-/// D's relayed deletion is sequenced at N, P's send and its replay, and P's
-/// relayed send and its redrive, are sequenced from N+1 while nothing more is
-/// sent or queued to D's home, whose stream would otherwise stall at N forever.
+/// Before D's deletion, P's relayed C33 send reaches D's home, which stores it
+/// next. Once D's relayed deletion is sequenced at N, P's local send and its
+/// replay, and P's relayed send and its redrive, are sequenced from N+1 while
+/// nothing more is sent or queued to D's home, whose stream would otherwise
+/// stall at N forever.
 #[tokio::test]
 async fn a_c33_coordinator_delivers_nothing_to_a_relay_deleted_partys_home() {
     let p = RelayedPair::new().await;
     scope_ds_clock(p.clock.clone(), async {
-        let (status, sent) = p.send(&p.peer_send()).await;
-        assert_eq!(status, StatusCode::OK, "{sent}");
+        let sent = p
+            .relay(&p.peer_send())
+            .await
+            .expect("P's relayed C33 send is sequenced");
         let first = p.seq + 1;
         assert_eq!(sent["entry"]["seq"], first);
         assert_eq!(p.delivered(), [first]);
         assert_eq!(p.held().await, [p.seq, first]);
-        assert!(p.queued().await.is_empty());
+        let jobs_before = p.queued().await;
+        assert_eq!(jobs_before.len(), 1, "the delivered C33 job is retained");
 
         let n = p.relay_deletion().await;
         assert_eq!(n, first + 1);
@@ -378,7 +382,11 @@ async fn a_c33_coordinator_delivers_nothing_to_a_relay_deleted_partys_home() {
         let again = p.relay(&relayed).await.expect("its redrive sends nothing");
         assert_eq!(again["entry"]["seq"], n + 2);
         assert_eq!(p.delivered(), [first], "nothing more reaches D's home");
-        assert!(p.queued().await.is_empty(), "nothing is queued for it");
+        assert_eq!(
+            p.queued().await,
+            jobs_before,
+            "nothing more is queued for it"
+        );
         assert_eq!(p.held().await, [p.seq, first]);
     })
     .await;

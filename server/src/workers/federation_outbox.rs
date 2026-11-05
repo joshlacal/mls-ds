@@ -32,8 +32,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{
-    cleanup_dead_rows, record_failure, try_reclaim, CLAIM_BATCH_SIZE, DEAD_ROWS_MAX_AGE,
-    POLL_INTERVAL,
+    maintain_federation_outbox_partitions, record_failure, try_reclaim, CLAIM_BATCH_SIZE,
+    DEAD_ROWS_MAX_AGE, PARTITION_MAINTENANCE_INTERVAL, POLL_INTERVAL,
 };
 use crate::chat_protocol::repository::delivery::QUEUED_COPY_OF_PRUNED_ENTRY_SQL;
 use crate::federation::FederationError;
@@ -56,13 +56,8 @@ pub struct FederationOutboxRow {
 }
 /// Worker entry point. Spawned at server startup from `main.rs`.
 ///
-/// Loops every [`POLL_INTERVAL`] seconds:
-/// 1. Reclaim stuck `in_flight` rows (post-crash recovery).
-/// 2. Claim up to [`CLAIM_BATCH_SIZE`] due `pending` rows in a single tx
-///    (`FOR UPDATE SKIP LOCKED`), flipping them to `in_flight`.
-/// 3. Dispatch each claimed row.
-/// 4. On success: `mark_done`. On failure: `record_failure` (a peer-policy
-///    denial is `dead`; anything else goes back to `pending` with backoff).
+/// Claims work every [`POLL_INTERVAL`] and maintains monthly terminal-history
+/// partitions every [`PARTITION_MAINTENANCE_INTERVAL`].
 pub async fn run_federation_outbox_worker(pool: PgPool) {
     info!(
         poll_interval_secs = POLL_INTERVAL.as_secs(),
@@ -71,28 +66,43 @@ pub async fn run_federation_outbox_worker(pool: PgPool) {
     );
 
     let mut ticker = interval(POLL_INTERVAL);
-    // Drift over time is fine here — we're rate-limiting Postgres polls,
-    // not enforcing a deadline.
+    let mut maintenance = interval(PARTITION_MAINTENANCE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        ticker.tick().await;
-        if let Err(e) = process_federation_outbox_tick(&pool, CLAIM_BATCH_SIZE).await {
-            error!(error = ?e, "federation_outbox: claim batch failed");
+        tokio::select! {
+            _ = ticker.tick() => {
+                if let Err(e) = process_federation_outbox_tick(&pool, CLAIM_BATCH_SIZE).await {
+                    error!(error = ?e, "federation_outbox: claim batch failed");
+                }
+            }
+            _ = maintenance.tick() => {
+                match maintain_federation_outbox_partitions(&pool, DEAD_ROWS_MAX_AGE).await {
+                    Ok(n) if n > 0 => info!(
+                        partitions_dropped = n,
+                        "federation_outbox: dropped expired terminal-history partitions"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => error!(
+                        error = ?e,
+                        "federation_outbox: partition maintenance failed"
+                    ),
+                }
+            }
         }
     }
 }
 
 /// Execute one production `federation_outbox` handoff iteration:
-/// reclaim stuck `in_flight` leases, purge expired `dead` rows, claim up to `limit`
-/// due `pending` rows, and atomically hand each row off to `outbound_queue` (or
-/// record retry backoff, or `dead` for a peer-policy denial).
+/// reclaim stuck `in_flight` leases, claim up to `limit` due `pending` rows,
+/// and atomically hand each row off to `outbound_queue` (or record retry
+/// backoff, or `dead` for a peer-policy denial).
 pub async fn process_federation_outbox_tick(
     pool: &PgPool,
     limit: i64,
 ) -> Result<usize, sqlx::Error> {
     try_reclaim(pool, TABLE_NAME).await;
-    let _ = cleanup_dead_rows(pool, TABLE_NAME, DEAD_ROWS_MAX_AGE).await;
     let claimed = claim_due_rows(pool, limit).await?;
     if claimed.is_empty() {
         return Ok(0);
@@ -260,8 +270,9 @@ pub async fn handoff_to_outbound_queue(
         sqlx::query(
             "INSERT INTO outbound_queue \
                (id, target_ds_did, target_endpoint, method, payload, convo_id, payload_sha256, envelope_version, status, next_retry_at, retry_count, max_retries, created_at) \
-             VALUES ($1, $2, '', $3, $4, $5, $6, $7, 'pending', $8, 0, 5, $8) \
-             ON CONFLICT (id) DO NOTHING",
+             SELECT $1, $2, '', $3, $4, $5, $6, $7, 'pending', $8, 0, 5, $8 \
+              WHERE NOT EXISTS (SELECT 1 FROM outbound_queue WHERE id = $1) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(&row.id)
         .bind(&canonical_target_ds_did)

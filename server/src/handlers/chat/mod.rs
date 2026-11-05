@@ -154,6 +154,9 @@ where
     DbPool: FromRef<S>,
     Arc<ChatRuntime>: FromRef<S>,
     Option<Arc<crate::federation::AckSigner>>: FromRef<S>,
+    Arc<crate::federation::DsResolver>: FromRef<S>,
+    Option<Arc<crate::federation::ServiceAuthClient>>: FromRef<S>,
+    Arc<crate::federation::outbound::OutboundClient>: FromRef<S>,
 {
     Router::new()
         .route(

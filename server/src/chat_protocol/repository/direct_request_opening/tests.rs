@@ -612,7 +612,10 @@ pub(crate) async fn residue(pool: &PgPool, needle: &[u8]) -> Vec<String> {
         "SELECT c.table_schema::text, c.table_name::text, c.column_name::text, c.data_type::text \
            FROM information_schema.columns c \
            JOIN information_schema.tables t USING (table_schema, table_name) \
+           JOIN pg_namespace n ON n.nspname = c.table_schema \
+           JOIN pg_class r ON r.relnamespace = n.oid AND r.relname = c.table_name \
           WHERE c.table_schema IN ('chat', 'public') AND t.table_type = 'BASE TABLE' \
+            AND NOT r.relispartition \
             AND c.data_type IN ('bytea', 'text', 'json', 'jsonb', 'character varying') \
           ORDER BY 1, 2, 3",
     )

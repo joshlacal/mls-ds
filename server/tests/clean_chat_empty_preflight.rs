@@ -223,7 +223,7 @@ async fn test_preflight_is_strictly_read_only_and_preserves_database_state() {
     sqlx::query(
         "INSERT INTO public.federation_outbox (id, conversation_id, target_service_did, payload, status)
          VALUES ('outbox-ro-1', 'legacy-convo-read-only', 'did:web:target.example.com', decode('', 'hex'), 'pending')
-         ON CONFLICT (id) DO NOTHING;",
+         ON CONFLICT DO NOTHING;",
     )
     .execute(&pool)
     .await
@@ -232,7 +232,7 @@ async fn test_preflight_is_strictly_read_only_and_preserves_database_state() {
     sqlx::query(
         "INSERT INTO public.outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, status)
          VALUES ('queue-ro-1', 'did:web:ds.example.com', 'https://ds.example.com', 'deliverMessage', decode('', 'hex'), 'legacy-convo-read-only', 'delivered')
-         ON CONFLICT (id) DO NOTHING;",
+         ON CONFLICT DO NOTHING;",
     )
     .execute(&pool)
     .await
@@ -437,7 +437,7 @@ async fn test_preflight_allows_legacy_non_uuid_rows_in_public_transport_tables()
         "INSERT INTO public.federation_outbox (id, conversation_id, target_service_did, payload, status)
          VALUES ('outbox-1', 'legacy-convo-id-12345', 'did:web:target.example.com', decode('', 'hex'), 'pending'),
                 ('outbox-2', 'not_a_uuid_at_all', 'did:web:target.example.com', decode('', 'hex'), 'done')
-         ON CONFLICT (id) DO NOTHING;",
+         ON CONFLICT DO NOTHING;",
     )
     .execute(&pool)
     .await
@@ -447,7 +447,7 @@ async fn test_preflight_allows_legacy_non_uuid_rows_in_public_transport_tables()
         "INSERT INTO public.outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, status)
          VALUES ('queue-1', 'did:web:ds.example.com', 'https://ds.example.com', 'deliverMessage', decode('', 'hex'), 'legacy-convo-999', 'delivered'),
                 ('queue-2', 'did:web:ds.example.com', 'https://ds.example.com', 'deliverMessage', decode('', 'hex'), 'convo_legacy_group', 'dead')
-         ON CONFLICT (id) DO NOTHING;",
+         ON CONFLICT DO NOTHING;",
     )
     .execute(&pool)
     .await

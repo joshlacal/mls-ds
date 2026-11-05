@@ -11,5 +11,12 @@
       "controller": "did:web:alice.catbird.blue",
       "publicKeyMultibase": "zDnaeWp1hEZZ97SCZmeqok6kPDWfzHWcvaE5zredZ6Qj1mzzX"
     }
+  ],
+  "service": [
+    {
+      "id": "did:web:alice.catbird.blue#atproto_pds",
+      "type": "AtprotoPersonalDataServer",
+      "serviceEndpoint": "https://alice.catbird.blue"
+    }
   ]
 }

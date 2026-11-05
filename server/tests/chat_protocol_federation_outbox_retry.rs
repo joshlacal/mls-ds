@@ -699,12 +699,13 @@ async fn test_outbox_and_queue_dead_rows_purged() {
     let target_ds = "did:web:target.ds.com";
     let payload = b"{\"mock\":\"envelope\"}".to_vec();
 
-    // 1. Insert dead rows in federation_outbox: 8 days old vs 1 hour old
+    // 1. Insert terminal rows in an expired whole month and the current month.
     sqlx::query(
         "INSERT INTO federation_outbox (
-            id, conversation_id, target_service_did, method, payload, status, next_attempt_at, created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, 'dead', NOW(), NOW() - INTERVAL '8 days', NOW() - INTERVAL '8 days'),
-                  ($6, $2, $3, $4, $5, 'dead', NOW(), NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour')",
+            id, conversation_id, target_service_did, method, payload, status,
+            next_attempt_at, created_at, updated_at, terminal_at
+         ) VALUES ($1, $2, $3, $4, $5, 'dead', NOW(), NOW() - INTERVAL '3 months', NOW() - INTERVAL '3 months', NOW() - INTERVAL '3 months'),
+                  ($6, $2, $3, $4, $5, 'dead', NOW(), NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour')",
     )
     .bind(&old_outbox_dead_id)
     .bind(&convo_id)
@@ -716,12 +717,13 @@ async fn test_outbox_and_queue_dead_rows_purged() {
     .await
     .unwrap();
 
-    // 2. Insert dead rows in outbound_queue: 8 days old vs 1 hour old
+    // 2. Do the same for outbound terminal history.
     sqlx::query(
         "INSERT INTO outbound_queue (
-            id, target_ds_did, target_endpoint, method, payload, convo_id, status, created_at
-         ) VALUES ($1, $2, '', $3, $4, $5, 'dead', NOW() - INTERVAL '8 days'),
-                  ($6, $2, '', $3, $4, $5, 'dead', NOW() - INTERVAL '1 hour')",
+            id, target_ds_did, target_endpoint, method, payload, convo_id,
+            status, created_at, terminal_at
+         ) VALUES ($1, $2, '', $3, $4, $5, 'dead', NOW() - INTERVAL '3 months', NOW() - INTERVAL '3 months'),
+                  ($6, $2, '', $3, $4, $5, 'dead', NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour')",
     )
     .bind(&old_queue_dead_id)
     .bind(target_ds)
@@ -733,13 +735,16 @@ async fn test_outbox_and_queue_dead_rows_purged() {
     .await
     .unwrap();
 
-    // 3. Run dead row cleanup with 7 day max_age
+    // 3. Retention drops one wholly expired monthly partition per table.
     let seven_days = std::time::Duration::from_secs(7 * 86_400);
     let outbox_purged =
-        catbird_server::workers::cleanup_dead_rows(&pool, "federation_outbox", seven_days)
+        catbird_server::workers::maintain_federation_outbox_partitions(&pool, seven_days)
             .await
             .unwrap();
-    assert_eq!(outbox_purged, 1, "Must purge exactly 1 old dead outbox row");
+    assert_eq!(
+        outbox_purged, 1,
+        "Must drop exactly one expired outbox partition"
+    );
 
     let queue = OutboundQueue::new(
         pool.clone(),
@@ -754,7 +759,10 @@ async fn test_outbox_and_queue_dead_rows_purged() {
         )),
     );
     let queue_purged = queue.cleanup_dead(seven_days).await.unwrap();
-    assert_eq!(queue_purged, 1, "Must purge exactly 1 old dead queue row");
+    assert_eq!(
+        queue_purged, 1,
+        "Must drop exactly one expired outbound partition"
+    );
 
     // 4. Verify old dead rows are gone, fresh dead rows remain
     let old_outbox_exists: bool =
@@ -763,7 +771,10 @@ async fn test_outbox_and_queue_dead_rows_purged() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(!old_outbox_exists, "Old dead outbox row must be deleted");
+    assert!(
+        !old_outbox_exists,
+        "Expired outbox partition must be dropped"
+    );
 
     let fresh_outbox_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM federation_outbox WHERE id = $1)")
@@ -782,7 +793,7 @@ async fn test_outbox_and_queue_dead_rows_purged() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(!old_queue_exists, "Old dead queue row must be deleted");
+    assert!(!old_queue_exists, "Expired queue partition must be dropped");
 
     let fresh_queue_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM outbound_queue WHERE id = $1)")
@@ -2300,15 +2311,15 @@ async fn test_outbound_queue_worker_periodic_cleanup_dead_and_old_wiring() {
     let payload = b"{\"test\":\"periodic_cleanup\"}".to_vec();
 
     // 1. Insert:
-    //    - dead item created in the past (will be purged by cleanup_dead)
-    //    - delivered item created in the past (will be purged by cleanup_old)
-    //    - pending item (must be preserved)
+    //    - dead and delivered terminal history in a wholly expired month
+    //    - pending live state in DEFAULT (must be preserved)
     sqlx::query(
         "INSERT INTO outbound_queue (
-            id, target_ds_did, target_endpoint, method, payload, convo_id, status, created_at
-         ) VALUES ($1, $2, '', $3, $4, $5, 'dead', NOW() - INTERVAL '2 hours'),
-                  ($6, $2, '', $3, $4, $5, 'delivered', NOW() - INTERVAL '2 hours'),
-                  ($7, $2, '', $3, $4, $5, 'pending', NOW())",
+            id, target_ds_did, target_endpoint, method, payload, convo_id,
+            status, created_at, terminal_at
+         ) VALUES ($1, $2, '', $3, $4, $5, 'dead', NOW() - INTERVAL '3 months', NOW() - INTERVAL '3 months'),
+                  ($6, $2, '', $3, $4, $5, 'delivered', NOW() - INTERVAL '3 months', NOW() - INTERVAL '3 months'),
+                  ($7, $2, '', $3, $4, $5, 'pending', NOW(), NULL)",
     )
     .bind(&dead_item_id)
     .bind(target_ds)
@@ -2339,8 +2350,8 @@ async fn test_outbound_queue_worker_periodic_cleanup_dead_and_old_wiring() {
         Arc::new(|_, _| Ok("dummy-token".to_string()));
     let shutdown = tokio_util::sync::CancellationToken::new();
 
-    // 2. Launch worker with short poll (50ms) and short cleanup interval (50ms)
-    //    and retention = 0s / 0 hours so older-than-now rows are purged
+    // 2. Launch worker with short poll and maintenance intervals. The one-hour
+    // retention still drops only the wholly expired monthly partition.
     let queue_worker = queue.clone();
     let outbound_worker = outbound.clone();
     let auth_sign_worker = auth_sign.clone();

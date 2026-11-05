@@ -11,5 +11,12 @@
       "controller": "did:web:bob.catbird.blue",
       "publicKeyMultibase": "zDnaeffSr8TvHcLYJk4ikoSvLmGx2FaCgXnHJaxiVYabCn2R7"
     }
+  ],
+  "service": [
+    {
+      "id": "did:web:bob.catbird.blue#atproto_pds",
+      "type": "AtprotoPersonalDataServer",
+      "serviceEndpoint": "https://bob.catbird.blue"
+    }
   ]
 }

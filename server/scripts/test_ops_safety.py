@@ -21,6 +21,7 @@ REPO = SERVER.parent
 SCRIPTS = SERVER / "scripts"
 FIXTURES = REPO / "e2e-tests" / "fixtures"
 WORKFLOW = REPO / ".github" / "workflows" / "mls-deploy.yml"
+E2E_COMPOSE = REPO / "e2e-tests" / "docker-compose.federation.yml"
 HOSTILE_GATE = REPO / "scripts" / "federation-hostile-test-gate.sh"
 APPROVAL = "handlers-and-legacy-apis-sealed"
 SECRET = "pw-8f3e-not-for-logs"
@@ -246,6 +247,61 @@ class FederationComposeTests(unittest.TestCase):
         for setting in ("ALLOW_UNSAFE_AUTH", "ENFORCE_LXM", "ENFORCE_JTI",
                         "FEDERATION_EMERGENCY_KILL_SWITCH", "TEST_DID_DOCUMENT_PATHS"):
             self.assertNotIn(setting, self.compose)
+
+    def test_both_two_home_stacks_load_real_service_and_receipt_keys(self):
+        compose_files = (("root", self.compose), ("lifecycle", E2E_COMPOSE.read_text()))
+        for name, compose in compose_files:
+            with self.subTest(compose=name):
+                for line in (
+                    'SIGNING_KEY_PEM="$$(cat "$$SIGNING_KEY_FILE")"',
+                    'RECEIPT_SIGNING_KEY_PEM="$$(cat "$$RECEIPT_SIGNING_KEY_FILE")"',
+                    'RECEIPT_DID_DOCUMENT_JSON="$$(cat "$$RECEIPT_DID_DOCUMENT_FILE")"',
+                    "export SIGNING_KEY_PEM RECEIPT_SIGNING_KEY_PEM RECEIPT_DID_DOCUMENT_JSON",
+                    "exec catbird-server",
+                ):
+                    self.assertIn(line, compose)
+                self.assertNotIn("TEST_DID_DOCUMENT_PATHS", compose)
+
+    def test_ignored_lifecycle_uses_https_did_web_and_did_plc_homes(self):
+        lifecycle_compose = E2E_COMPOSE.read_text()
+        for line in (
+            'SERVICE_DID: "${DS1_SERVICE_DID:-did:web:ds1.catbird.blue}"',
+            'SERVICE_DID: "${DS2_SERVICE_DID:-did:plc:dsbfederationlocal24char}"',
+            "RECEIPT_DID_DOCUMENT_FILE: /app/fixtures/ds1-local-did.json",
+            "RECEIPT_DID_DOCUMENT_FILE: /app/fixtures/ds2-plc-did.json",
+            'RECEIPT_VERIFICATION_METHOD: "did:web:ds1.catbird.blue#mls-receipt-1"',
+            'RECEIPT_VERIFICATION_METHOD: "did:plc:dsbfederationlocal24char#mls-receipt-1"',
+            "RECEIPT_ISSUANCE_MODE: issue",
+            "REQUEST_FIXTURE_DID_HOSTS: ds1.catbird.blue,alice.catbird.blue,bob.catbird.blue,plc.directory",
+            'network_mode: "service:ds1"',
+            'network_mode: "service:ds2"',
+        ):
+            self.assertIn(line, lifecycle_compose)
+
+    def test_user_home_declarations_use_https_pds_resolution(self):
+        homes = (
+            ("alice", "did:web:ds1.catbird.blue"),
+            ("bob", "did:plc:dsbfederationlocal24char"),
+        )
+        for actor, home in homes:
+            with self.subTest(actor=actor):
+                did = f"did:web:{actor}.catbird.blue"
+                document = json.loads((FIXTURES / f"{actor}-did.json").read_text())
+                self.assertEqual(document["service"], [{
+                    "id": f"{did}#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": f"https://{actor}.catbird.blue",
+                }])
+                declaration = json.loads(
+                    (FIXTURES / f"{actor}-chat-declaration.json").read_text()
+                )
+                self.assertEqual(declaration["$type"], "blue.catbird.chat.declaration")
+                self.assertEqual(declaration["protocolVersion"], "1")
+                self.assertEqual(declaration["deliveryService"], home)
+
+        for compose in (self.compose, E2E_COMPOSE.read_text()):
+            self.assertIn("/fixtures/alice-chat-declaration.json", compose)
+            self.assertIn("/fixtures/bob-chat-declaration.json", compose)
 
     def test_every_fixture_exists_and_is_committable(self):
         names = re.findall(r"/(?:app/)?fixtures/([\w./-]+?\.(?:pem|json))", self.compose)

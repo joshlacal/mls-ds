@@ -14,7 +14,7 @@ use catbird_atproto::generated::blue_catbird::mlsDS::{
 };
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use super::delivery::{
@@ -350,6 +350,44 @@ pub async fn insert_delivery_receipt(
     Ok(())
 }
 
+/// Cheap preflight used by `deliverWelcome`: a prior receipt must reach replay
+/// arbitration, and an exact provenance row needs no remote bootstrap.
+pub async fn welcome_mailbox_or_receipt_exists(
+    pool: &PgPool,
+    delivery_id: Uuid,
+    conversation_id: Uuid,
+    welcome_id: Uuid,
+    recipient_device_id: Uuid,
+    recovery_request_id: Uuid,
+) -> Result<bool, FederationError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+                   SELECT 1
+                     FROM chat.federation_delivery_receipts
+                    WHERE delivery_id = $1
+               )
+            OR EXISTS (
+                   SELECT 1
+                     FROM chat.welcome_deliveries d
+                     JOIN chat.welcome_bundles b ON b.welcome_id = d.welcome_id
+                    WHERE d.welcome_id = $2
+                      AND d.recipient_device_id = $3
+                      AND d.recovery_request_id = $4
+                      AND b.conversation_id = $5
+               )
+        "#,
+    )
+    .bind(delivery_id)
+    .bind(welcome_id)
+    .bind(recipient_device_id)
+    .bind(recovery_request_id)
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+    .map_err(FederationError::Database)
+}
+
 /// Deliver and verify an inbound MLS Welcome message for a preprovisioned local recipient (Choice C).
 #[allow(clippy::too_many_arguments)]
 pub async fn deliver_welcome_mailbox(
@@ -403,6 +441,28 @@ pub async fn deliver_welcome_mailbox(
         return Err(FederationError::InvalidEnvelope {
             reason: "payloadSha256 does not match computed envelope digest".to_string(),
         });
+    }
+
+    let is_quarantined = super::core::is_conversation_quarantined(tx, header.conversation_id)
+        .await
+        .map_err(FederationError::Database)?;
+    if is_quarantined {
+        return Err(FederationError::DeliveryConflict {
+            reason: format!("conversation {} is quarantined", header.conversation_id),
+        });
+    }
+    if let Some(cached_bytes) = check_delivery_receipt(
+        tx,
+        DELIVER_WELCOME_NSID,
+        &header,
+        &envelope_digest,
+        Some(&entry_locator),
+    )
+    .await?
+    {
+        let cached_output: DeliverWelcomeOutput =
+            serde_json::from_slice(&cached_bytes).map_err(FederationError::Json)?;
+        return Ok(cached_output);
     }
 
     // 1. One locked exact provenance join locking all relevant tables:
@@ -504,27 +564,6 @@ pub async fn deliver_welcome_mailbox(
                 .to_string(),
         });
     };
-    let is_quarantined = super::core::is_conversation_quarantined(tx, header.conversation_id)
-        .await
-        .map_err(FederationError::Database)?;
-    if is_quarantined {
-        return Err(FederationError::DeliveryConflict {
-            reason: format!("conversation {} is quarantined", header.conversation_id),
-        });
-    }
-    if let Some(cached_bytes) = check_delivery_receipt(
-        tx,
-        DELIVER_WELCOME_NSID,
-        &header,
-        &envelope_digest,
-        Some(&entry_locator),
-    )
-    .await?
-    {
-        let cached_output: DeliverWelcomeOutput =
-            serde_json::from_slice(&cached_bytes).map_err(FederationError::Json)?;
-        return Ok(cached_output);
-    }
 
     let d_status = r.d_status;
     let d_terminal_at = r.d_terminal_at;

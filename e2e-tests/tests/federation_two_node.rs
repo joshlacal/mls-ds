@@ -1,21 +1,21 @@
 //! Real two-DS federation scenario integration test using clean-chat public HTTP endpoints
-//! and selector-only fixture execution.
+//! and the live federation workers.
 //!
 //! Run with: `cargo test --test federation_two_node -- --ignored --nocapture`
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
+use catbird_atproto::generated::blue_catbird::mlsDS::FederationReceiptV1;
 use catbird_mls::chat_v2::transcript::strict_json::decode_strict_json;
 use catbird_mls::chat_v2::transcript::{
     project_signed_body, SignedMutationKind, SigningTranscript,
 };
 use catbird_mls::orchestrator::{canonical_application_aad_bytes, canonical_commit_aad_bytes};
 use chrono::{DateTime, SecondsFormat, Utc};
-use mls_e2e_tests::federation::{boot_two_node_cluster, TwoNodeCluster, DIGEST_ALLOWED_TABLES};
+use mls_e2e_tests::federation::{boot_two_node_cluster, TwoNodeCluster};
 use mls_e2e_tests::mls_engine::MlsEngine;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use p256::pkcs8::DecodePrivateKey;
@@ -28,6 +28,7 @@ const BOB_DID: &str = "did:web:bob.catbird.blue";
 const RECEIPT_SIGNING_DOMAIN: &[u8] = b"CATBIRD-CLEAN-FEDERATION-RECEIPT-V1\0";
 const DELIVER_MESSAGE_NSID: &str = "blue.catbird.mlsDS.deliverMessage";
 const DELIVER_WELCOME_NSID: &str = "blue.catbird.mlsDS.deliverWelcome";
+const DELIVER_MESSAGE_ENTRY_NSID: &str = "blue.catbird.mlsDS.deliverMessageEntry";
 const SUBMIT_COMMIT_NSID: &str = "blue.catbird.mlsDS.submitCommit";
 
 struct TestIdentity {
@@ -284,7 +285,7 @@ fn make_creation_body_with_invitee(
         participants.push(json!({
             "userDid": inv.did,
             "status": "pending",
-            "role": "member",
+            "role": "admin",
             "invitationProvenance": {
                 "invitationTransitionId": entry_id.to_string(),
                 "invitedByDid": creator.did,
@@ -302,7 +303,7 @@ fn make_creation_body_with_invitee(
         "$type": "blue.catbird.chat.defs#creationBody",
         "signatureDomain": "CATBIRD-CHAT-CREATE\u{0000}",
         "conversationId": convo_id.to_string(),
-        "conversationKind": "group",
+        "conversationKind": "direct",
         "transitionId": entry_id.to_string(),
         "idempotencyKey": entry_id.to_string(),
         "actorDid": creator.did,
@@ -841,6 +842,13 @@ async fn wait_for_signed_receipt(
     conversation_id: Uuid,
     receiver_ds_did: &str,
 ) -> Result<DateTime<Utc>> {
+    let expected_sender_ds_did = if receiver_ds_did == cluster.ds1_service_did {
+        cluster.ds2_service_did.as_str()
+    } else if receiver_ds_did == cluster.ds2_service_did {
+        cluster.ds1_service_did.as_str()
+    } else {
+        anyhow::bail!("unexpected receipt signer {receiver_ds_did}");
+    };
     let started = std::time::Instant::now();
     while started.elapsed() < Duration::from_secs(20) {
         let row = pg
@@ -859,11 +867,10 @@ async fn wait_for_signed_receipt(
                    AND e.entry_id = r.source_entry_id
                  WHERE r.conversation_id = $1
                    AND r.endpoint_nsid = $2
-                   AND r.receiver_ds_did = $3
                  ORDER BY r.completed_at DESC
                  LIMIT 1
                 "#,
-                &[&conversation_id, &endpoint, &receiver_ds_did],
+                &[&conversation_id, &endpoint],
             )
             .await?;
         if let Some(row) = row {
@@ -874,77 +881,116 @@ async fn wait_for_signed_receipt(
                 "stored receipt response digest mismatch"
             );
             let response: Value = serde_json::from_slice(&response_bytes)?;
-            let receipt = response
-                .get("receipt")
-                .context("federation response omitted receipt")?;
-            let completed_at_text = receipt
-                .get("completedAt")
-                .and_then(Value::as_str)
-                .context("federation receipt omitted completedAt")?;
+            let accepted = if endpoint == SUBMIT_COMMIT_NSID {
+                response.get("commitEntry").is_some()
+            } else {
+                response.get("accepted").and_then(Value::as_bool) == Some(true)
+            };
+            anyhow::ensure!(
+                accepted,
+                "federation response did not accept the delivery: {response}"
+            );
+            let receipt: FederationReceiptV1 = serde_json::from_value(
+                response
+                    .get("receipt")
+                    .context("federation response omitted receipt")?
+                    .clone(),
+            )
+            .context("decode FederationReceiptV1 response body")?;
+
+            let delivery_id: Uuid = row.get("delivery_id");
+            let sender_ds_did: String = row.get("sender_ds_did");
+            let stored_receiver_ds_did: String = row.get("receiver_ds_did");
+            let sequencer_did: String = row.get("sequencer_did");
+            let sequencer_term: i64 = row.get("sequencer_term");
+            let source_entry_id: Uuid = row.get("source_entry_id");
+            let source_entry_seq: i64 = row.get("source_entry_seq");
+            let completed_at: DateTime<Utc> = row.get("completed_at");
+            let response_completed_at =
+                DateTime::parse_from_rfc3339(receipt.completed_at.as_str())?.with_timezone(&Utc);
+            let response_delivery_id = Uuid::parse_str(receipt.delivery_id.as_str())?;
+            let response_conversation_id = Uuid::parse_str(receipt.conversation_id.as_str())?;
+            let response_source_entry_id =
+                Uuid::parse_str(receipt.source_locator.entry_id.as_str())?;
             let envelope_sha256 = digest32(row.get("envelope_sha256"), "envelope digest")?;
             let result_sha256 = digest32(row.get("result_sha256"), "result digest")?;
             let accepted_payload_sha256 =
                 digest32(row.get("accepted_payload_sha256"), "payload digest")?;
             let outer_entry_fingerprint =
                 digest32(row.get("source_entry_fingerprint"), "entry fingerprint")?;
+            let signature: Vec<u8> = row.get("receipt_signature");
+
+            anyhow::ensure!(
+                receipt.protocol_version.as_str() == "1"
+                    && receipt.endpoint.as_str() == endpoint
+                    && response_delivery_id == delivery_id
+                    && response_conversation_id == conversation_id
+                    && receipt.sender_ds_did.as_str() == sender_ds_did.as_str()
+                    && sender_ds_did.as_str() == expected_sender_ds_did
+                    && receipt.receiver_ds_did.as_str() == receiver_ds_did
+                    && stored_receiver_ds_did.as_str() == receiver_ds_did
+                    && receipt.sequencer_did.as_str() == sequencer_did.as_str()
+                    && sequencer_did.as_str() == cluster.ds1_service_did.as_str()
+                    && receipt.sequencer_term == sequencer_term
+                    && sequencer_term == 0
+                    && receipt.envelope_sha256.as_ref() == envelope_sha256.as_slice()
+                    && receipt.result_sha256.as_ref() == result_sha256.as_slice()
+                    && response_source_entry_id == source_entry_id
+                    && receipt.source_locator.seq == source_entry_seq
+                    && receipt.source_locator.accepted_payload_sha256.as_ref()
+                        == accepted_payload_sha256.as_slice()
+                    && receipt.source_locator.outer_entry_fingerprint.as_ref()
+                        == outer_entry_fingerprint.as_slice()
+                    && receipt.signature.as_ref() == signature.as_slice()
+                    && response_completed_at == completed_at,
+                "signed {endpoint} receipt body does not match its delivery, signer audience, source entry, or stored evidence"
+            );
+
             let canonical = canonical_receipt_bytes(
                 endpoint,
-                row.get("delivery_id"),
+                delivery_id,
                 conversation_id,
-                row.get::<_, String>("sender_ds_did").as_str(),
-                row.get::<_, String>("receiver_ds_did").as_str(),
-                row.get::<_, String>("sequencer_did").as_str(),
-                row.get::<_, i64>("sequencer_term").try_into()?,
+                &sender_ds_did,
+                receiver_ds_did,
+                &sequencer_did,
+                sequencer_term.try_into()?,
                 &envelope_sha256,
                 &result_sha256,
-                row.get("source_entry_id"),
-                row.get::<_, i64>("source_entry_seq").try_into()?,
+                source_entry_id,
+                source_entry_seq.try_into()?,
                 &accepted_payload_sha256,
                 &outer_entry_fingerprint,
-                completed_at_text,
+                receipt.completed_at.as_str(),
             );
-            let signature: Vec<u8> = row.get("receipt_signature");
             if receiver_ds_did == cluster.ds1_service_did {
-                cluster.verify_ds1_signature(&canonical, &signature)?;
-            } else if receiver_ds_did == cluster.ds2_service_did {
-                cluster.verify_ds2_signature(&canonical, &signature)?;
+                cluster.verify_ds1_signature(&canonical, receipt.signature.as_ref())?;
             } else {
-                anyhow::bail!("unexpected receipt signer {receiver_ds_did}");
+                cluster.verify_ds2_signature(&canonical, receipt.signature.as_ref())?;
             }
-            return Ok(row.get("completed_at"));
+            return Ok(completed_at);
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    anyhow::bail!("timed out waiting for signed {endpoint} receipt")
-}
-
-/// Waits until the full semantic digest allowlist stops changing for longer than the
-/// five-second federation worker interval, then returns that quiesced digest snapshot.
-async fn wait_for_semantic_quiescence(
-    cluster: &TwoNodeCluster,
-    pg: &tokio_postgres::Client,
-) -> Result<BTreeMap<String, String>> {
-    const QUIET_PERIOD: Duration = Duration::from_secs(6);
-    const TIMEOUT: Duration = Duration::from_secs(30);
-
-    let started = std::time::Instant::now();
-    let mut last_change = started;
-    let mut digests = cluster.table_digests(pg, DIGEST_ALLOWED_TABLES).await?;
-
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let current = cluster.table_digests(pg, DIGEST_ALLOWED_TABLES).await?;
-        if current != digests {
-            digests = current;
-            last_change = std::time::Instant::now();
-        }
-        if last_change.elapsed() >= QUIET_PERIOD {
-            return Ok(digests);
-        }
-        if started.elapsed() >= TIMEOUT {
-            anyhow::bail!("timed out waiting for federation semantic writes to quiesce");
-        }
-    }
+    let conversation_id_text = conversation_id.to_string();
+    let queue = pg
+        .query(
+            "SELECT method,status,retry_count,COALESCE(last_error,'') AS last_error \
+               FROM outbound_queue WHERE convo_id=$1 ORDER BY method",
+            &[&conversation_id_text],
+        )
+        .await?
+        .into_iter()
+        .map(|row| {
+            format!(
+                "{}:{}:{}:{}",
+                row.get::<_, String>("method"),
+                row.get::<_, String>("status"),
+                row.get::<_, i32>("retry_count"),
+                row.get::<_, String>("last_error")
+            )
+        })
+        .collect::<Vec<_>>();
+    anyhow::bail!("timed out waiting for signed {endpoint} receipt; queue={queue:?}")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1042,17 +1088,31 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     let alice_credential = alice.credential_identity();
     let bob_credential = bob.credential_identity();
 
+    let now = Utc::now();
+
     // Step 2: Generate real OpenMLS key packages
     tracing::info!("Step 2: Generating OpenMLS key packages...");
     let (alice_kp_bytes, alice_kp_ref_vec) = alice.engine.create_key_package(&alice_credential)?;
     let (bob_kp_bytes, bob_kp_ref_vec) = bob.engine.create_key_package(&bob_credential)?;
+    for identity in [&alice, &bob] {
+        cluster.publish_device_records(
+            &identity.did,
+            &json!({
+                "records": [{
+                    "value": {
+                        "mlsSignaturePublicKey": {"$bytes": STANDARD.encode(identity.public_key())},
+                        "algorithm": "ed25519",
+                        "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true)
+                    }
+                }]
+            }),
+        )?;
+    }
     let mut bob_kp_ref = [0u8; 32];
     bob_kp_ref.copy_from_slice(&bob_kp_ref_vec);
 
     let alice_kp_val = make_key_package_entry(&alice_kp_bytes, &alice_kp_ref_vec);
     let bob_kp_val = make_key_package_entry(&bob_kp_bytes, &bob_kp_ref_vec);
-
-    let now = Utc::now();
 
     // Step 3: Enroll Alice on DS1
     tracing::info!("Step 3: Enrolling Alice on DS1 via enrollDevice...");
@@ -1280,38 +1340,8 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     let _new_epoch = alice.engine.merge_pending_commit(&group_id)?;
     tracing::info!(?fulfill_res, "Leaf recovery fulfillment submitted on DS1");
 
-    // Step 9: Bootstrap DS2 via selector-only fixture (First Invocation -> Applied)
-    tracing::info!("Step 9: Bootstrapping DS2 via selector fixture (first invocation)...");
-    let outcome1 = cluster
-        .bootstrap_ds2_from_selector(convo_id, &cluster.ds1_service_did, 0)
-        .await?;
-    tracing::info!(?outcome1, "DS2 first selector invocation result");
-    assert_eq!(outcome1.outcome, "applied");
-    assert_eq!(outcome1.conversation_id, convo_id.to_string());
-    assert_eq!(outcome1.head_seq, 3);
-    assert_eq!(outcome1.sequencer_term, 0);
-
-    // Applied may schedule transport work on the five-second federation worker.
-    // Settle it before establishing the exact-replay baseline.
-    let ds2_digests_first = wait_for_semantic_quiescence(cluster, &ds2_pg).await?;
-
-    // Step 10: Replay selector on DS2 (Second Invocation -> ExactReplay with zero semantic writes)
-    tracing::info!("Step 10: Replaying selector fixture on DS2 (second invocation)...");
-    let outcome2 = cluster
-        .bootstrap_ds2_from_selector(convo_id, &cluster.ds1_service_did, 0)
-        .await?;
-    tracing::info!(?outcome2, "DS2 second selector invocation result");
-    assert_eq!(outcome2.outcome, "exactReplay");
-    assert_eq!(outcome2.conversation_id, convo_id.to_string());
-    assert_eq!(outcome2.head_seq, outcome1.head_seq);
-    assert_eq!(outcome2.digest_sha256, outcome1.digest_sha256);
-    assert_eq!(outcome2.sequencer_term, outcome1.sequencer_term);
-
-    let ds2_digests_replay = wait_for_semantic_quiescence(cluster, &ds2_pg).await?;
-    assert_eq!(
-        ds2_digests_first, ds2_digests_replay,
-        "DS2 semantic table content must be unchanged on exact replay"
-    );
+    // Step 9: The live worker delivers the remote prefix and Welcome. A signed
+    // receiver receipt is the durable proof that DS2 accepted the real delivery.
     let _welcome_receipt_at = wait_for_signed_receipt(
         cluster,
         &ds1_pg,
@@ -1320,6 +1350,22 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         &cluster.ds2_service_did,
     )
     .await?;
+    let remote_welcome = ds2_pg
+        .query_one(
+            "SELECT d.recipient_did, d.recipient_device_id, d.status, b.wrapper_bytes \
+               FROM chat.welcome_deliveries AS d \
+               JOIN chat.welcome_bundles AS b USING (welcome_id) \
+              WHERE d.welcome_id = $1",
+            &[&welcome_id],
+        )
+        .await?;
+    anyhow::ensure!(
+        remote_welcome.get::<_, String>("recipient_did") == BOB_DID
+            && remote_welcome.get::<_, Uuid>("recipient_device_id") == bob.device_id
+            && remote_welcome.get::<_, String>("status") == "pending"
+            && remote_welcome.get::<_, Vec<u8>>("wrapper_bytes") == welcome_data,
+        "DS2 did not retain the exact Welcome body for Bob's device"
+    );
 
     // Step 11: Post-bootstrap message on DS1 & Welcome processing on DS2
     tracing::info!("Step 11: Sending post-bootstrap message from Alice on DS1...");
@@ -1397,6 +1443,18 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         &cluster.ds2_service_did,
     )
     .await?;
+    let convo_id_text = convo_id.to_string();
+    let redundant_c33_retries: i64 = ds1_pg
+        .query_one(
+            "SELECT COUNT(*) FROM outbound_queue WHERE convo_id = $1 AND method = $2",
+            &[&convo_id_text, &DELIVER_MESSAGE_ENTRY_NSID],
+        )
+        .await?
+        .get(0);
+    anyhow::ensure!(
+        redundant_c33_retries == 0,
+        "ordinary direct conversation queued redundant C33 deliverMessageEntry retry"
+    );
 
     // Step 12: Bob submits a real self-update through DS2 to the DS1 sequencer.
     tracing::info!("Step 12: Submitting remote commit through DS2...");
@@ -1499,7 +1557,6 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         "sequencer stored remote commit at wrong seq"
     );
 
-    let convo_id_text = convo_id.to_string();
     let sync_started = std::time::Instant::now();
     let ds2_apply_at = loop {
         if sync_started.elapsed() >= Duration::from_secs(20) {

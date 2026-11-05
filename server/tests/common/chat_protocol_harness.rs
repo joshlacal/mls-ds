@@ -137,6 +137,11 @@ pub mod repository {
         pub struct HistoricalWriteWitness {
             _sealed: (),
         }
+        impl HistoricalWriteWitness {
+            pub fn allows_direct_welcome_creation(&self) -> bool {
+                false
+            }
+        }
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum BootstrapLocalIdLabel {
             ParticipantPeriod,
