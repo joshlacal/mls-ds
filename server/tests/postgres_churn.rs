@@ -145,7 +145,7 @@ async fn wait_for_backend_lock(pool: &PgPool, pid: i32, label: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let waiting: Option<bool> = sqlx::query_scalar(
-            "SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = $1",
+            "SELECT COALESCE(wait_event_type = 'Lock', false) FROM pg_stat_activity WHERE pid = $1",
         )
         .bind(pid)
         .fetch_optional(pool)

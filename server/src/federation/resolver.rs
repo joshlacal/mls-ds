@@ -1671,6 +1671,15 @@ impl DsResolver {
         &self,
         user_did: &str,
     ) -> Result<DsEndpoint, FederationError> {
+        // Test-support route injection models the live declaration authority; it is
+        // compiled out of production and must precede every network resolution.
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(hook) = &self.user_did_resolver {
+            if let Some(result) = hook(user_did) {
+                return result;
+            }
+        }
+
         let canonical_user = canonical_did(user_did).to_string();
         if self.is_self(&canonical_user) {
             return Ok(DsEndpoint {
