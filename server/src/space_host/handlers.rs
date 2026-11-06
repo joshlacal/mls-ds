@@ -4,14 +4,19 @@ use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use atproto_spaces::{
     http_signature::verify_credential_request,
-    kem::decode_p256_did_key,
+    kem::{decapsulate_p256, decode_p256_did_key},
+    lthash::LtHash,
+    mac::{
+        compute_commit_mac, format_commit_mac_header, parse_want_mac_header, COMMIT_MAC_TYPE,
+        SPACE_MAC_HEADER_NAME, SPACE_WANT_MAC_HEADER_NAME,
+    },
     tokens::{SpaceTokenClaims, SpaceTokenKind, CREDENTIAL_DEFAULT_LIFETIME_SECS},
     SpaceUri, SpacesError,
 };
 use axum::{
     body::Bytes,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -21,8 +26,10 @@ use base64::{
     Engine as _,
 };
 use chrono::{SecondsFormat, TimeZone as _, Utc};
+use hmac::{Hmac, Mac as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -615,6 +622,438 @@ struct WriterRow {
     data_cid: Vec<u8>,
 }
 
+const EMPTY_SPACE_SNAPSHOT_REV: &str = "2222222222222";
+const MAX_SNAPSHOT_WRITERS: i64 = 16_384;
+const INVENTORY_CURSOR_DOMAIN: &[u8] = b"catbird-space-inventory-cursor-v1";
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug)]
+struct InventoryCursor {
+    snapshot_rev: String,
+    commitment: [u8; 32],
+    offset: usize,
+}
+
+fn inventory_failure(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+    xrpc_err(status, code, message)
+}
+
+fn inventory_commitment(rows: &[WriterRow]) -> Result<[u8; 32], Response> {
+    let mut hash = LtHash::empty();
+    let mut previous_did: Option<&str> = None;
+    for row in rows {
+        if !atproto_spaces::is_valid_did(&row.writer_did)
+            || row.repo_rev.len() != 13
+            || decode_tid_micros(&row.repo_rev).is_none()
+            || row.space_rev.len() != 13
+            || decode_tid_micros(&row.space_rev).is_none()
+            || previous_did.is_some_and(|did| did >= row.writer_did.as_str())
+        {
+            return Err(inventory_failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "invalid or duplicate writer inventory row",
+            ));
+        }
+        let data: &[u8; 32] = row.data_cid.as_slice().try_into().map_err(|_| {
+            inventory_failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "writer inventory commitment is not 32 bytes",
+            )
+        })?;
+        hash.add_inventory_entry(&row.writer_did, &row.repo_rev, &row.space_rev, data)
+            .map_err(|_| {
+                inventory_failure(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    "writer inventory commitment could not be computed",
+                )
+            })?;
+        previous_did = Some(&row.writer_did);
+    }
+    Ok(hash.commitment())
+}
+
+fn cursor_mac(key: &[u8; 32], payload: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts a 32-byte key");
+    mac.update(INVENTORY_CURSOR_DOMAIN);
+    mac.update(payload);
+    mac.finalize().into_bytes().into()
+}
+
+fn encode_inventory_cursor(
+    key: &[u8; 32],
+    space_uri: &str,
+    snapshot_rev: &str,
+    commitment: &[u8; 32],
+    offset: usize,
+) -> Result<String, Response> {
+    let rev_len = u16::try_from(snapshot_rev.len()).map_err(|_| {
+        inventory_failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "snapshot revision is too long",
+        )
+    })?;
+    let offset = u32::try_from(offset).map_err(|_| {
+        inventory_failure(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "InventoryTooLarge",
+            "writer inventory exceeds the cursor range",
+        )
+    })?;
+    let mut payload = Vec::with_capacity(1 + 32 + 2 + snapshot_rev.len() + 32 + 4);
+    payload.push(1);
+    payload.extend_from_slice(&Sha256::digest(space_uri.as_bytes()));
+    payload.extend_from_slice(&rev_len.to_be_bytes());
+    payload.extend_from_slice(snapshot_rev.as_bytes());
+    payload.extend_from_slice(commitment);
+    payload.extend_from_slice(&offset.to_be_bytes());
+    let tag = cursor_mac(key, &payload);
+    payload.extend_from_slice(&tag);
+    Ok(URL_SAFE_NO_PAD.encode(payload))
+}
+
+fn decode_inventory_cursor(
+    key: &[u8; 32],
+    space_uri: &str,
+    cursor: &str,
+) -> Result<InventoryCursor, Response> {
+    if cursor.is_empty() || cursor.len() > 512 {
+        return Err(inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "inventory cursor is not valid",
+        ));
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| {
+        inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "inventory cursor is not base64url",
+        )
+    })?;
+    if bytes.len() < 1 + 32 + 2 + 1 + 32 + 4 + 32 {
+        return Err(inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "inventory cursor is truncated",
+        ));
+    }
+    let (payload, tag) = bytes.split_at(bytes.len() - 32);
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts a 32-byte key");
+    mac.update(INVENTORY_CURSOR_DOMAIN);
+    mac.update(payload);
+    if mac.verify_slice(tag).is_err() || payload[0] != 1 {
+        return Err(inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "inventory cursor authentication failed",
+        ));
+    }
+    let expected_space = Sha256::digest(space_uri.as_bytes());
+    if payload[1..33] != expected_space[..] {
+        return Err(inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "inventory cursor belongs to another Space",
+        ));
+    }
+    let rev_len = u16::from_be_bytes([payload[33], payload[34]]) as usize;
+    let rev_start = 35usize;
+    let Some(rev_end) = rev_start.checked_add(rev_len) else {
+        return Err(inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "inventory cursor has an invalid shape",
+        ));
+    };
+    let Some(expected_len) = rev_end.checked_add(32 + 4) else {
+        return Err(inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "inventory cursor has an invalid shape",
+        ));
+    };
+    if rev_len == 0 || payload.len() != expected_len {
+        return Err(inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "inventory cursor has an invalid shape",
+        ));
+    }
+    let snapshot_rev = std::str::from_utf8(&payload[rev_start..rev_end])
+        .map_err(|_| {
+            inventory_failure(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "inventory cursor revision is not UTF-8",
+            )
+        })?
+        .to_owned();
+    let commitment: [u8; 32] = payload[rev_end..rev_end + 32]
+        .try_into()
+        .expect("cursor commitment bounds checked");
+    let offset = u32::from_be_bytes(
+        payload[rev_end + 32..expected_len]
+            .try_into()
+            .expect("cursor offset bounds checked"),
+    ) as usize;
+    Ok(InventoryCursor {
+        snapshot_rev,
+        commitment,
+        offset,
+    })
+}
+
+async fn load_complete_writer_inventory(
+    runtime: &SpaceHostRuntime,
+    conversation_id: Uuid,
+    space_uri: &str,
+) -> Result<(String, Vec<WriterRow>, [u8; 32]), Response> {
+    let mut tx = runtime.pool().begin().await.map_err(|_| {
+        inventory_failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "could not begin inventory snapshot",
+        )
+    })?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| {
+            inventory_failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "could not establish inventory snapshot",
+            )
+        })?;
+    let status: Option<(Option<String>, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT latest_space_rev, deleted_at FROM chat.conversation_spaces WHERE space_uri = $1",
+    )
+    .bind(space_uri)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| {
+        inventory_failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "could not read inventory snapshot revision",
+        )
+    })?;
+    let Some((latest_space_rev, deleted_at)) = status else {
+        return Err(inventory_failure(
+            StatusCode::NOT_FOUND,
+            "SpaceNotFound",
+            "Space is not hosted here",
+        ));
+    };
+    if deleted_at.is_some() {
+        return Err(inventory_failure(
+            StatusCode::GONE,
+            "SpaceDeleted",
+            "Space generation is closed",
+        ));
+    }
+    let rows: Vec<WriterRow> = sqlx::query_as(
+        "SELECT w.writer_did, w.repo_rev, w.space_rev, w.data_cid \
+           FROM chat.conversation_space_writers w \
+          WHERE w.space_uri = $2 \
+            AND EXISTS ( \
+                SELECT 1 \
+                  FROM chat.participants p \
+                 WHERE p.conversation_id = $1 \
+                   AND p.user_did = w.writer_did \
+                   AND p.status IN ('active', 'left', 'removed') \
+            ) \
+          ORDER BY w.writer_did ASC \
+          LIMIT $3",
+    )
+    .bind(conversation_id)
+    .bind(space_uri)
+    .bind(MAX_SNAPSHOT_WRITERS + 1)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|_| {
+        inventory_failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "could not read writer inventory",
+        )
+    })?;
+    tx.commit().await.map_err(|_| {
+        inventory_failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "could not finish inventory snapshot",
+        )
+    })?;
+    if rows.len() as i64 > MAX_SNAPSHOT_WRITERS {
+        return Err(inventory_failure(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "InventoryTooLarge",
+            "writer inventory exceeds the supported snapshot size",
+        ));
+    }
+    let snapshot_rev = latest_space_rev
+        .or_else(|| rows.iter().map(|row| row.space_rev.clone()).max())
+        .unwrap_or_else(|| EMPTY_SPACE_SNAPSHOT_REV.to_owned());
+    if snapshot_rev.len() != 13 || decode_tid_micros(&snapshot_rev).is_none() {
+        return Err(inventory_failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "Space snapshot revision is invalid",
+        ));
+    }
+    if rows
+        .iter()
+        .any(|row| row.space_rev.as_str() > snapshot_rev.as_str())
+    {
+        return Err(inventory_failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "Space revision precedes a writer revision",
+        ));
+    }
+    let commitment = inventory_commitment(&rows)?;
+    Ok((snapshot_rev, rows, commitment))
+}
+
+async fn list_repos_snapshot(
+    runtime: &SpaceHostRuntime,
+    status: &SpaceStatusRow,
+    headers: &HeaderMap,
+    params: &BTreeMap<String, String>,
+    space_uri: &str,
+) -> Result<Response, Response> {
+    if params
+        .keys()
+        .any(|key| !matches!(key.as_str(), "space" | "cursor" | "limit"))
+    {
+        return Err(inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "unknown inventory parameter",
+        ));
+    }
+    let want_mac = headers
+        .get(SPACE_WANT_MAC_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            inventory_failure(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "inventory snapshot requires Atproto-Space-Want-Mac",
+            )
+        })?;
+    let key_share = parse_want_mac_header(want_mac, COMMIT_MAC_TYPE).map_err(|_| {
+        inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "invalid inventory MAC request",
+        )
+    })?;
+    let shared_secret = decapsulate_p256(runtime.kem_key(), &key_share).map_err(|_| {
+        inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "invalid inventory MAC key share",
+        )
+    })?;
+    let limit = match params.get("limit") {
+        None => 100,
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|limit| (1..=1000).contains(limit))
+            .ok_or_else(|| {
+                inventory_failure(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "limit must be 1..=1000",
+                )
+            })?,
+    };
+    let cursor = params
+        .get("cursor")
+        .map(|cursor| decode_inventory_cursor(runtime.inventory_cursor_key(), space_uri, cursor))
+        .transpose()?;
+    let (snapshot_rev, rows, commitment) =
+        load_complete_writer_inventory(runtime, status.conversation_id, space_uri).await?;
+    let offset = cursor.as_ref().map_or(0, |cursor| cursor.offset);
+    if let Some(cursor) = cursor {
+        if cursor.snapshot_rev != snapshot_rev || cursor.commitment != commitment {
+            return Err(inventory_failure(
+                StatusCode::CONFLICT,
+                "SnapshotChanged",
+                "writer inventory changed during pagination",
+            ));
+        }
+    }
+    if offset >= rows.len() && !(offset == 0 && rows.is_empty()) {
+        return Err(inventory_failure(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "inventory cursor is past the terminal page",
+        ));
+    }
+    let end = offset.saturating_add(limit).min(rows.len());
+    let complete = end == rows.len();
+    let repos: Vec<Value> = rows[offset..end]
+        .iter()
+        .map(|row| {
+            json!({
+                "did": &row.writer_did,
+                "repoRev": &row.repo_rev,
+                "spaceRev": &row.space_rev,
+                "data": { "$bytes": STANDARD.encode(&row.data_cid) },
+            })
+        })
+        .collect();
+    let mut output = json!({
+        "repos": repos,
+        "complete": complete,
+        "commit": {
+            "space": space_uri,
+            "repo": &status.authority_did,
+            "rev": &snapshot_rev,
+            "ver": 1,
+            "data": { "$bytes": STANDARD.encode(commitment) },
+        },
+    });
+    if !complete {
+        output["cursor"] = json!(encode_inventory_cursor(
+            runtime.inventory_cursor_key(),
+            space_uri,
+            &snapshot_rev,
+            &commitment,
+            end,
+        )?);
+    }
+    let mac = compute_commit_mac(
+        &shared_secret,
+        space_uri,
+        &status.authority_did,
+        &snapshot_rev,
+        &commitment,
+    )
+    .map_err(|_| {
+        inventory_failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "could not authenticate inventory commitment",
+        )
+    })?;
+    let mut response = (StatusCode::OK, Json(output)).into_response();
+    response.headers_mut().insert(
+        SPACE_MAC_HEADER_NAME,
+        HeaderValue::from_str(&format_commit_mac_header(&mac))
+            .expect("formatted Space MAC is a valid header"),
+    );
+    Ok(response)
+}
+
 async fn list_repos(
     State(runtime): State<Arc<SpaceHostRuntime>>,
     headers: HeaderMap,
@@ -628,6 +1067,14 @@ async fn list_repos(
             Ok(v) => v,
             Err(resp) => return resp,
         };
+
+    // A repository-MAC request opts into the archive snapshot contract.
+    // Ordinary upstream-compatible listRepos callers keep legacy spaceRev paging.
+    if headers.contains_key(SPACE_WANT_MAC_HEADER_NAME) {
+        return match list_repos_snapshot(&runtime, &status, &headers, &params, space_uri).await {
+            Ok(response) | Err(response) => response,
+        };
+    }
 
     let cursor = params.get("cursor").cloned();
     let limit = params
@@ -1150,5 +1597,57 @@ mod tests {
             .unwrap();
         let error: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(error["error"], "InvalidRequest");
+    }
+
+    #[test]
+    fn inventory_commitment_and_cursor_reject_reorder_duplicate_and_tamper() {
+        let row = |did: &str, rev: &str, byte: u8| WriterRow {
+            writer_did: did.to_owned(),
+            repo_rev: rev.to_owned(),
+            space_rev: rev.to_owned(),
+            data_cid: vec![byte; 32],
+        };
+        let rows = vec![
+            row("did:web:a.example", "3l2aaaaaaaaaa", 1),
+            row("did:web:b.example", "3l2aaaaaaaaab", 2),
+        ];
+        let commitment = inventory_commitment(&rows).unwrap();
+        let changed = vec![
+            row("did:web:a.example", "3l2aaaaaaaaaa", 1),
+            row("did:web:b.example", "3l2aaaaaaaaab", 3),
+        ];
+        assert_ne!(inventory_commitment(&changed).unwrap(), commitment);
+        let reordered = vec![
+            row("did:web:b.example", "3l2aaaaaaaaab", 2),
+            row("did:web:a.example", "3l2aaaaaaaaaa", 1),
+        ];
+        assert!(inventory_commitment(&reordered).is_err());
+        let duplicate = vec![
+            row("did:web:a.example", "3l2aaaaaaaaaa", 1),
+            row("did:web:a.example", "3l2aaaaaaaaab", 2),
+        ];
+        assert!(inventory_commitment(&duplicate).is_err());
+
+        let key = [9u8; 32];
+        let space = "at://did:web:authority.example/space/blue.catbird.labyrinth.conversation/test";
+        let cursor =
+            encode_inventory_cursor(&key, space, "3l2aaaaaaaaab", &commitment, 100).unwrap();
+        let decoded = decode_inventory_cursor(&key, space, &cursor).unwrap();
+        assert_eq!(decoded.snapshot_rev, "3l2aaaaaaaaab");
+        assert_eq!(decoded.commitment, commitment);
+        assert_eq!(decoded.offset, 100);
+        assert!(
+            decode_inventory_cursor(&key, "at://did:web:other.example/space/x/y", &cursor).is_err()
+        );
+        let mut tampered = cursor.into_bytes();
+        let midpoint = tampered.len() / 2;
+        tampered[midpoint] = if tampered[midpoint] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        assert!(
+            decode_inventory_cursor(&key, space, std::str::from_utf8(&tampered).unwrap()).is_err()
+        );
     }
 }

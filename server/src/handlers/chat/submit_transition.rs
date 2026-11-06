@@ -74,19 +74,20 @@ async fn submit(
         None
     } else if let Ok(add_principals) = admission.policy_addition_dids() {
         if !add_principals.is_empty() {
-            let routes = crate::chat_protocol::federation_routing::resolve_participant_routing(
-                pool,
-                runtime.resolver().map(|resolver| resolver.as_ref()),
-                &add_principals,
-            )
-            .await
-            .map_err(|err| {
-                tracing::warn!(
-                    ?err,
-                    "submitTransition participant routing resolution failed"
-                );
-                context::routing_failure(ENDPOINT, &err)
-            })?;
+            let routes =
+                crate::chat_protocol::federation_routing::resolve_participant_routing_authoritative(
+                    pool,
+                    runtime.resolver().map(|resolver| resolver.as_ref()),
+                    &add_principals,
+                )
+                .await
+                .map_err(|err| {
+                    tracing::warn!(
+                        ?err,
+                        "submitTransition participant routing resolution failed"
+                    );
+                    context::routing_failure(ENDPOINT, &err)
+                })?;
             crate::federation::group_relay::stage_remote_group_participants(pool, &routes)
                 .await
                 .map_err(|err| {

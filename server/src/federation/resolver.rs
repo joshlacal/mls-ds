@@ -607,14 +607,15 @@ impl DsResolver {
     /// Ordering (ADR-010 D2): self → fresh cache → `#atproto_mls` DID-document
     /// service entry → `blue.catbird.chat.declaration` repo record →
     /// `blue.catbird.chat.profile` legacy repo record →
-    /// expired-cache degraded mode → a live path's retryable failure →
+    /// cache stale by at most one cache TTL → a live path's retryable failure →
     /// default DS → not found.
     ///
     /// An unexpired cache row counts as "fresh resolution" (the TTL defines
-    /// freshness); expired rows are only consulted in degraded mode after all
-    /// live resolution paths have failed. A live path that could not answer
-    /// now (`FederationError::is_retryable`) wins over the default DS and over
-    /// "not found", so an outage stays retryable.
+    /// freshness); expired rows are only consulted for non-authorizing routing
+    /// after all live resolution paths have failed, and only until one
+    /// additional cache TTL has elapsed. A live path that could not answer now
+    /// (`FederationError::is_retryable`) wins over the default DS and over "not
+    /// found" once that bounded stale window closes.
     pub async fn resolve(&self, user_did: &str) -> Result<DsEndpoint, FederationError> {
         let (result, outcome) = self.resolve_with_outcome(user_did).await;
         // D2 telemetry: exactly one structured event per resolution exit, with
@@ -629,9 +630,10 @@ impl DsResolver {
         result
     }
 
-    /// Resolve a user DID to its DS endpoint without writing to did_ds_mappings or ds_endpoints.
+    /// Resolve a non-authorizing route without writing either resolution cache.
     ///
-    /// Required for pre-admission participant routing verification where database mutations must not occur on failure.
+    /// This may read fresh or bounded-stale cache state. Authorization,
+    /// persistence, and confidentiality decisions use [`Self::resolve_authoritative_ds`].
     pub async fn resolve_uncached(&self, user_did: &str) -> Result<DsEndpoint, FederationError> {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(hook) = &self.user_did_resolver {
@@ -679,7 +681,7 @@ impl DsResolver {
             Err(_) => {}
         }
 
-        // Degraded mode
+        // Non-authorizing degraded routing, bounded to one TTL after expiry.
         if let Ok(Some(cached)) = self.get_cached_any(user_did).await {
             return Ok(cached);
         }
@@ -781,15 +783,15 @@ impl DsResolver {
             }
         }
 
-        // Degraded mode (ADR-010 D2): all live resolution paths failed — fall
-        // back to an expired cache row if one exists. The row stays expired,
-        // so the next resolve attempt naturally retries live resolution.
+        // Degraded routing (ADR-010 D2): all live paths failed, so use a cache
+        // row only during its one-TTL post-expiry window. The row remains
+        // expired, so every resolution attempt still retries live sources.
         match self.get_cached_any(user_did).await {
             Ok(Some(cached)) => {
                 tracing::warn!(
                     did = %crate::crypto::redact_for_log(user_did),
                     endpoint = %cached.endpoint,
-                    "Live DS resolution failed; using expired cached endpoint (degraded mode)"
+                    "Live DS resolution failed; using bounded-stale cached endpoint (degraded routing)"
                 );
                 return (Ok(cached), "cache_stale_degraded");
             }
@@ -977,16 +979,23 @@ impl DsResolver {
         }))
     }
 
-    /// Look up degraded cached endpoint for an actor DID ignoring expires_at.
+    /// Look up a degraded routing endpoint no more than one cache TTL after
+    /// expiration. Authorization and confidentiality decisions use
+    /// [`Self::resolve_authoritative_ds`] and never call this path.
     async fn get_cached_any(&self, actor_did: &str) -> Result<Option<DsEndpoint>, FederationError> {
         let canonical = canonical_did(actor_did);
+        let now = crate::sim_hooks::current_utc();
         let row = sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT e.did, e.endpoint, e.supported_cipher_suites \
              FROM did_ds_mappings m \
              JOIN ds_endpoints e ON m.ds_did = e.did \
-             WHERE m.actor_did = $1",
+             WHERE m.actor_did = $1 \
+               AND m.expires_at > $2 - make_interval(secs => $3) \
+               AND e.expires_at > $2 - make_interval(secs => $3)",
         )
         .bind(&canonical)
+        .bind(now)
+        .bind(self.cache_ttl_secs.max(0) as f64)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -1011,28 +1020,6 @@ impl DsResolver {
         )
         .bind(&canonical)
         .bind(now)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(|(did, endpoint, suites)| DsEndpoint {
-            did,
-            endpoint,
-            supported_cipher_suites: suites.and_then(|s| serde_json::from_str(&s).ok()),
-            federation_capabilities: None,
-        }))
-    }
-
-    /// Look up degraded cached endpoint directly from ds_endpoints by target DS DID.
-    pub(crate) async fn get_cached_ds_endpoint_any(
-        &self,
-        ds_did: &str,
-    ) -> Result<Option<DsEndpoint>, FederationError> {
-        let canonical = canonical_did(ds_did);
-        let row = sqlx::query_as::<_, (String, String, Option<String>)>(
-            "SELECT did, endpoint, supported_cipher_suites \
-             FROM ds_endpoints WHERE did = $1",
-        )
-        .bind(&canonical)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -4108,22 +4095,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_expired_cache_degraded_after_live_failure() {
+    async fn test_resolve_expired_cache_is_bounded_to_one_degraded_ttl() {
         let (pool, _db) = setup_cache_test_pool().await;
 
-        let resolver = DsResolver::new(
+        let resolver = resolver_whose_hosts_fail(
             pool.clone(),
-            reqwest::Client::new(),
-            "did:web:self.example.com".to_string(),
-            "https://self.example.com".to_string(),
-            Some((
-                "did:web:default-ds.example.com".to_string(),
-                "https://default-ds.example.com".to_string(),
-            )),
-            3600,
+            ResolutionFailureKind::DnsNxdomain("NXDOMAIN".into()),
         );
 
-        let actor_did = format!("did:key:{}", Uuid::new_v4().as_simple());
+        let actor_did = "did:plc:staleroutingaaaaaaaaaaaa".to_string();
         let ds_did = format!(
             "did:web:stale-ds-{}.example.com",
             Uuid::new_v4().as_simple()
@@ -4134,7 +4114,7 @@ mod tests {
         );
         sqlx::query(
             "INSERT INTO ds_endpoints (did, endpoint, supported_cipher_suites, resolved_at, expires_at) \
-             VALUES ($1, $2, NULL, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour')",
+             VALUES ($1, $2, NULL, NOW() - INTERVAL '90 minutes', NOW() - INTERVAL '30 minutes')",
         )
         .bind(&ds_did)
         .bind(&stale_endpoint)
@@ -4143,7 +4123,7 @@ mod tests {
         .expect("expired endpoint insert succeeds");
         sqlx::query(
             "INSERT INTO did_ds_mappings (actor_did, ds_did, resolved_at, expires_at) \
-             VALUES ($1, $2, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour')",
+             VALUES ($1, $2, NOW() - INTERVAL '90 minutes', NOW() - INTERVAL '30 minutes')",
         )
         .bind(&actor_did)
         .bind(&ds_did)
@@ -4157,6 +4137,30 @@ mod tests {
             result.expect("degraded resolution succeeds").endpoint,
             stale_endpoint
         );
+
+        sqlx::query(
+            "UPDATE did_ds_mappings SET expires_at = NOW() - INTERVAL '2 hours' \
+             WHERE actor_did = $1",
+        )
+        .bind(&actor_did)
+        .execute(&pool)
+        .await
+        .expect("mapping ages beyond the degraded window");
+        sqlx::query(
+            "UPDATE ds_endpoints SET expires_at = NOW() - INTERVAL '2 hours' WHERE did = $1",
+        )
+        .bind(&ds_did)
+        .execute(&pool)
+        .await
+        .expect("endpoint ages beyond the degraded window");
+
+        let outage =
+            resolver_whose_hosts_fail(pool, ResolutionFailureKind::DnsTemporary("SERVFAIL".into()));
+        let (result, outcome) = outage.resolve_with_outcome(&actor_did).await;
+        assert_eq!(outcome, "transient_failure");
+        assert!(result
+            .expect_err("over-age stale route must not be used for routing")
+            .is_retryable());
     }
 
     #[tokio::test]

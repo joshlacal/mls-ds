@@ -16,13 +16,19 @@ mod common;
 
 use atproto_spaces::{
     http_signature::sign_credential_request,
-    kem::encode_p256_did_key,
+    kem::{encapsulate_p256, encode_p256_did_key},
+    lthash::LtHash,
+    mac::{
+        format_want_mac_header, verify_commit_mac, COMMIT_MAC_TYPE, SPACE_MAC_HEADER_NAME,
+        SPACE_WANT_MAC_HEADER_NAME,
+    },
     tokens::{mint_space_token, SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind},
 };
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, HeaderValue, Request, StatusCode},
+    response::Response,
     routing::post,
     Json, Router,
 };
@@ -46,7 +52,7 @@ use catbird_server::{
         space_host_router, SpaceHostConfig, SpaceHostRuntime,
     },
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use p256::{
     ecdsa::SigningKey as P256SigningKey, pkcs8::EncodePrivateKey, PublicKey as P256PublicKey,
     SecretKey as P256Secret,
@@ -78,6 +84,52 @@ fn build_signed_space_headers(
         .expect("sign_credential_request")
         .to_header_map()
         .expect("to_header_map")
+}
+
+async fn inventory_page(
+    app: &Router,
+    pop_key: &P256SigningKey,
+    credential: &str,
+    authority_did: &str,
+    authority_key: &P256SigningKey,
+    now_sec: u64,
+    space: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> (Response, [u8; 32]) {
+    let authority_kem = encode_p256_did_key(&P256PublicKey::from(authority_key.verifying_key()));
+    let encapsulation = encapsulate_p256(&authority_kem).expect("encapsulate inventory MAC key");
+    let want_mac =
+        format_want_mac_header(&encapsulation.key_share_did_key, COMMIT_MAC_TYPE).unwrap();
+    let mut headers = build_signed_space_headers(
+        pop_key,
+        credential,
+        authority_did,
+        now_sec,
+        &Uuid::new_v4().to_string(),
+    );
+    headers.insert(
+        SPACE_WANT_MAC_HEADER_NAME,
+        HeaderValue::from_str(&want_mac).unwrap(),
+    );
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("space", space);
+    query.append_pair("limit", &limit.to_string());
+    if let Some(cursor) = cursor {
+        query.append_pair("cursor", cursor);
+    }
+    let mut request = Request::builder()
+        .uri(format!(
+            "/xrpc/com.atproto.space.listRepos?{}",
+            query.finish()
+        ))
+        .body(Body::empty())
+        .unwrap();
+    *request.headers_mut() = headers;
+    (
+        app.clone().oneshot(request).await.unwrap(),
+        encapsulation.shared_secret,
+    )
 }
 
 #[derive(Clone, Default)]
@@ -852,4 +904,337 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     );
 
     pool.close().await;
+}
+
+#[tokio::test]
+async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_commit() {
+    let authority_did = "did:web:archive-inventory.example.com";
+    std::env::set_var("SERVICE_DID", authority_did);
+    std::env::set_var("SELF_ENDPOINT", "https://archive-inventory.example.com");
+
+    let db = common::fresh_db::fresh_fully_migrated_db("chat_space_host_").await;
+    let pool = db.connect(4).await;
+    common::http_acceptance::ensure_fence(&pool).await;
+    let fixture = seed_clean_slate_application_fixture(&pool, false, authority_did, None)
+        .await
+        .expect("seed inventory conversation");
+    let space_uri: String = sqlx::query_scalar(
+        "SELECT space_uri FROM chat.conversation_spaces WHERE conversation_id = $1 AND generation = 0",
+    )
+    .bind(fixture.conversation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (creator_did, creator_device, roster_transition, roster_changed_at): (
+        String,
+        Uuid,
+        Uuid,
+        DateTime<Utc>,
+    ) = sqlx::query_as(
+        "SELECT created_by_did, created_by_device_id, role_transition_id, role_changed_at \
+           FROM chat.participants \
+          WHERE conversation_id = $1 \
+          ORDER BY created_at ASC \
+          LIMIT 1",
+    )
+    .bind(fixture.conversation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let authority_key = P256SigningKey::from_bytes((&[0x51u8; 32]).into()).unwrap();
+    let sender_pds_key = P256SigningKey::from_bytes((&[0x52u8; 32]).into()).unwrap();
+    let runtime = Arc::new(SpaceHostRuntime::new(
+        pool.clone(),
+        SpaceHostConfig::for_test(authority_did.to_owned(), authority_key.clone()),
+    ));
+    runtime.register_test_did_endpoint(
+        &fixture.sender_did,
+        sender_pds_key.verifying_key(),
+        "https://sender-pds.example.com",
+    );
+
+    let now = Utc::now();
+    let now_sec = now.timestamp() as u64;
+    let mut previous_rev: Option<String> = sqlx::query_scalar(
+        "SELECT latest_space_rev FROM chat.conversation_spaces WHERE space_uri = $1",
+    )
+    .bind(&space_uri)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut expected = Vec::new();
+    let mut tx = pool.begin().await.unwrap();
+    // This fixture exercises inventory paging, not transition provenance. Materialize
+    // the otherwise-valid 105-member roster without synthesizing 105 MLS transitions.
+    sqlx::query("SET LOCAL session_replication_role = 'replica'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    for index in 0..105u16 {
+        let did = format!("did:web:writer-{index:03}.archive.example.com");
+        let rev = runtime.next_monotonic_tid(now_sec, previous_rev.as_deref());
+        let data = vec![index as u8; 32];
+        sqlx::query(
+            "INSERT INTO chat.principals (user_did, created_at) VALUES ($1, $2) \
+             ON CONFLICT (user_did) DO NOTHING",
+        )
+        .bind(&did)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat.participants ( \
+                 participant_period_id, conversation_id, user_did, status, role, \
+                 role_transition_id, role_changed_at, created_by_did, created_by_device_id, \
+                 current_membership, created_at \
+             ) VALUES ($1, $2, $3, 'active', 'admin', $4, $5, $6, $7, TRUE, $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.conversation_id)
+        .bind(&did)
+        .bind(roster_transition)
+        .bind(roster_changed_at)
+        .bind(&creator_did)
+        .bind(creator_device)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat.conversation_space_writers \
+                 (space_uri, writer_did, repo_rev, space_rev, data_cid, updated_at) \
+             VALUES ($1, $2, $3, $3, $4, $5)",
+        )
+        .bind(&space_uri)
+        .bind(&did)
+        .bind(&rev)
+        .bind(&data)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        expected.push((did, rev.clone(), data));
+        previous_rev = Some(rev);
+    }
+    sqlx::query("UPDATE chat.conversation_spaces SET latest_space_rev = $2 WHERE space_uri = $1")
+        .bind(&space_uri)
+        .bind(previous_rev.as_deref())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SET LOCAL session_replication_role = 'origin'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let sender_pop = P256SigningKey::from_bytes((&[0x61u8; 32]).into()).unwrap();
+    let sender_kid = encode_p256_did_key(&P256PublicKey::from(sender_pop.verifying_key()));
+    let delegation = mint_delegation(
+        &fixture.sender_did,
+        &sender_pds_key,
+        authority_did,
+        &space_uri,
+        &sender_kid,
+        "archive-inventory-delegation",
+        now_sec,
+    );
+    let app = space_host_router(runtime.clone());
+    let credential_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "space": &space_uri,
+                        "credentialKid": &sender_kid,
+                        "delegationToken": delegation,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(credential_response.status(), StatusCode::OK);
+    let credential_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(credential_response.into_body(), 65_536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let credential = credential_body["credential"].as_str().unwrap();
+
+    let (first_response, first_secret) = inventory_page(
+        &app,
+        &sender_pop,
+        credential,
+        authority_did,
+        &authority_key,
+        now_sec,
+        &space_uri,
+        None,
+        100,
+    )
+    .await;
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_mac = first_response.headers()[SPACE_MAC_HEADER_NAME]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let first: Value = serde_json::from_slice(
+        &axum::body::to_bytes(first_response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first["repos"].as_array().unwrap().len(), 100);
+    assert_eq!(first["complete"], false);
+    let cursor = first["cursor"].as_str().expect("non-terminal cursor");
+    let first_commit = first["commit"].clone();
+    let commitment: [u8; 32] = base64::engine::general_purpose::STANDARD
+        .decode(first_commit["data"]["$bytes"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    verify_commit_mac(
+        &first_secret,
+        &first_mac,
+        &space_uri,
+        authority_did,
+        first_commit["rev"].as_str().unwrap(),
+        &commitment,
+    )
+    .unwrap();
+
+    let (second_response, second_secret) = inventory_page(
+        &app,
+        &sender_pop,
+        credential,
+        authority_did,
+        &authority_key,
+        now_sec,
+        &space_uri,
+        Some(cursor),
+        100,
+    )
+    .await;
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_mac = second_response.headers()[SPACE_MAC_HEADER_NAME]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let second: Value = serde_json::from_slice(
+        &axum::body::to_bytes(second_response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(second["repos"].as_array().unwrap().len(), 5);
+    assert_eq!(second["complete"], true);
+    assert!(second.get("cursor").is_none());
+    assert_eq!(second["commit"], first_commit);
+    verify_commit_mac(
+        &second_secret,
+        &second_mac,
+        &space_uri,
+        authority_did,
+        second["commit"]["rev"].as_str().unwrap(),
+        &commitment,
+    )
+    .unwrap();
+
+    let rows: Vec<&Value> = first["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(second["repos"].as_array().unwrap())
+        .collect();
+    assert_eq!(rows.len(), expected.len());
+    let mut inventory_hash = LtHash::empty();
+    for (row, (expected_did, expected_rev, expected_data)) in rows.iter().zip(&expected) {
+        assert_eq!(row["did"], expected_did.as_str());
+        assert_eq!(row["repoRev"], expected_rev.as_str());
+        assert_eq!(row["spaceRev"], expected_rev.as_str());
+        let data: [u8; 32] = base64::engine::general_purpose::STANDARD
+            .decode(row["data"]["$bytes"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(data.as_slice(), expected_data.as_slice());
+        inventory_hash
+            .add_inventory_entry(expected_did, expected_rev, expected_rev, &data)
+            .unwrap();
+    }
+    assert_eq!(inventory_hash.commitment(), commitment);
+
+    let mut tampered_cursor = cursor.as_bytes().to_vec();
+    let midpoint = tampered_cursor.len() / 2;
+    tampered_cursor[midpoint] = if tampered_cursor[midpoint] == b'A' {
+        b'B'
+    } else {
+        b'A'
+    };
+    let tampered_cursor = std::str::from_utf8(&tampered_cursor).unwrap();
+    let (tampered_response, _) = inventory_page(
+        &app,
+        &sender_pop,
+        credential,
+        authority_did,
+        &authority_key,
+        now_sec,
+        &space_uri,
+        Some(tampered_cursor),
+        100,
+    )
+    .await;
+    assert_eq!(tampered_response.status(), StatusCode::BAD_REQUEST);
+
+    let changed_rev =
+        runtime.next_monotonic_tid(now_sec.saturating_add(1), previous_rev.as_deref());
+    let mut change = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE chat.conversation_space_writers \
+            SET repo_rev = $3, space_rev = $3, data_cid = $4, updated_at = $5 \
+          WHERE space_uri = $1 AND writer_did = $2",
+    )
+    .bind(&space_uri)
+    .bind(&expected[0].0)
+    .bind(&changed_rev)
+    .bind(vec![0xffu8; 32])
+    .bind(now)
+    .execute(&mut *change)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE chat.conversation_spaces SET latest_space_rev = $2 WHERE space_uri = $1")
+        .bind(&space_uri)
+        .bind(&changed_rev)
+        .execute(&mut *change)
+        .await
+        .unwrap();
+    change.commit().await.unwrap();
+    let (changed_response, _) = inventory_page(
+        &app,
+        &sender_pop,
+        credential,
+        authority_did,
+        &authority_key,
+        now_sec,
+        &space_uri,
+        Some(cursor),
+        100,
+    )
+    .await;
+    assert_eq!(changed_response.status(), StatusCode::CONFLICT);
+    let changed: Value = serde_json::from_slice(
+        &axum::body::to_bytes(changed_response.into_body(), 65_536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(changed["error"], "SnapshotChanged");
 }

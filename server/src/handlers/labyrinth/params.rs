@@ -37,6 +37,16 @@ impl Params {
         Ok(Self(map))
     }
 
+    pub fn parse_exact(query: Option<&str>, allowed: &[&str]) -> LabyrinthResult<Self> {
+        let params = Self::parse(query, allowed)?;
+        if params.0.contains_key("actorDeviceId") {
+            return Err(LabyrinthError::invalid(
+                "actorDeviceId is not accepted by this query",
+            ));
+        }
+        Ok(params)
+    }
+
     /// Every parameter of a query string, first value per key, unchecked
     /// (reading a signed claim's query).
     pub fn parse_any(query: &str) -> BTreeMap<String, String> {
@@ -138,6 +148,22 @@ pub async fn admit_query(
     let admission =
         auth::admit_query(pool, runtime.cutover_enabled(), &nsid, headers, query).await?;
     let params = Params::parse(query, allowed)?;
+    Ok((admission, params))
+}
+
+/// Admit a signed query whose only accepted parameters are `allowed`.
+pub async fn admit_fixed_query(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    name: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+    allowed: &[&str],
+) -> LabyrinthResult<(Admission, Params)> {
+    let nsid = format!("{NSID_PREFIX}{name}");
+    let admission =
+        auth::admit_fixed_query(pool, runtime.cutover_enabled(), &nsid, headers, query).await?;
+    let params = Params::parse_exact(query, allowed)?;
     Ok((admission, params))
 }
 

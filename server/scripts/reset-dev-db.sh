@@ -10,13 +10,16 @@
 # also named catbird (migration 20250101000000 grants on it), so the name proves
 # nothing: before anything is dropped, the live server must report database
 # catbird and the cluster_name the compose file gives that port's container
-# (catbird-federation-ds1 or catbird-federation-ds2). The allowlist lives only in
-# this file: there is no override, no Doppler and no .env lookup. Restart the
-# home that uses the database afterwards so it re-initializes its chat fence.
+# (catbird-federation-ds1 or catbird-federation-ds2). The target allowlist lives
+# only in this file: there is no override, no Doppler and no .env lookup. After
+# migration, the supported Compose peer-fixtures service restores both homes'
+# allowlist rows. Restart the reset home afterwards so it re-initializes its chat
+# fence.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ACTIVATION_GUC_VALUE=handlers-and-legacy-apis-sealed
 
 refuse() {
@@ -67,3 +70,5 @@ psql "$scheme://$userinfo$host:$port/postgres" -X -q -v ON_ERROR_STOP=1 \
     -c "DROP DATABASE IF EXISTS $database WITH (FORCE)" \
     -c "CREATE DATABASE $database"
 "$SCRIPT_DIR/run-migrations.sh" "$target_url"
+docker compose -f "$REPO_DIR/docker-compose.federation.yml" \
+    run --rm --no-deps peer-fixtures

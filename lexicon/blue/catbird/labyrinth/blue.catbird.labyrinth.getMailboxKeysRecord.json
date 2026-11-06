@@ -1,0 +1,66 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.getMailboxKeysRecord",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Reads one public mailboxKeys record through the authenticated caller's home mls-ds. The server resolves the target DID's PDS, fixes the collection to blue.catbird.labyrinth.mailboxKeys, and never forwards caller credentials or arbitrary URLs. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, RelayUnavailable.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "did",
+          "rkey"
+        ],
+        "properties": {
+          "did": {
+            "type": "string",
+            "format": "did",
+            "description": "Target account DID."
+          },
+          "rkey": {
+            "type": "string",
+            "format": "record-key",
+            "maxLength": 512,
+            "description": "MailboxKeys record key."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "uri",
+            "cid",
+            "value"
+          ],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri"
+            },
+            "cid": {
+              "type": "string",
+              "format": "cid"
+            },
+            "value": {
+              "type": "ref",
+              "ref": "blue.catbird.labyrinth.mailboxKeys"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "RecordNotFound"
+        },
+        {
+          "name": "UpstreamError"
+        },
+        {
+          "name": "RelayUnavailable"
+        }
+      ]
+    }
+  }
+}

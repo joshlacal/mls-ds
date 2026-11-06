@@ -1,8 +1,8 @@
 //! HTTP layer of the clean-slate Labyrinth directory (`blue.catbird.labyrinth.*`).
 //!
-//! Only the 6 zero-content directory and account-lifecycle endpoints remain on `mls-ds`:
+//! Only the 7 directory, relay, and account-lifecycle endpoints remain on `mls-ds`:
 //! - Procedures (3): `publishEpochHead`, `purgeMailbox`, `deleteAccountData`
-//! - Queries (3): `getEpochHead`, `getChatDeviceKeys`, `getMemberDevices`
+//! - Queries (4): `getEpochHead`, `getMailboxKeysRecord`, `getChatDeviceKeys`, `getMemberDevices`
 
 mod directory;
 mod params;
@@ -37,7 +37,12 @@ pub const PROCEDURES: &[(&str, usize)] = &[
 ];
 
 /// Active queries.
-pub const QUERIES: &[&str] = &["getEpochHead", "getChatDeviceKeys", "getMemberDevices"];
+pub const QUERIES: &[&str] = &[
+    "getEpochHead",
+    "getMailboxKeysRecord",
+    "getChatDeviceKeys",
+    "getMemberDevices",
+];
 
 fn path(name: &str) -> String {
     format!("/xrpc/{NSID_PREFIX}{name}")
@@ -77,6 +82,10 @@ where
             post(retention::delete_account_data),
         )
         .route(&path("getEpochHead"), get(directory::get_epoch_head))
+        .route(
+            &path("getMailboxKeysRecord"),
+            get(directory::get_mailbox_keys_record),
+        )
         .route(
             &path("getChatDeviceKeys"),
             get(directory::get_chat_device_keys),
@@ -118,6 +127,6 @@ mod tests {
             assert!(served.insert(((*name).to_owned(), "query".to_owned())));
         }
         assert_eq!(served, lexicon);
-        assert_eq!(served.len(), 6);
+        assert_eq!(served.len(), 7);
     }
 }

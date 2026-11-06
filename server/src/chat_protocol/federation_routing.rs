@@ -118,10 +118,10 @@ impl ParticipantRoutingIntent {
     }
 }
 
-/// Whether participant resolution may write endpoint/mapping resolution caches.
+/// Trust/freshness profile for participant route resolution.
 enum RoutingResolution {
     Cached,
-    Uncached,
+    Authoritative,
 }
 
 async fn resolve_participant_routing_with<I, S>(
@@ -147,7 +147,7 @@ where
         let did = did_ref.as_ref();
         let resolved = match resolution {
             RoutingResolution::Cached => resolver.resolve(did).await,
-            RoutingResolution::Uncached => resolver.resolve_uncached(did).await,
+            RoutingResolution::Authoritative => resolver.resolve_authoritative_ds(did).await,
         };
         let endpoint = resolved.map_err(|source| FederationRoutingError::ResolutionFailed {
             did: did.to_string(),
@@ -170,7 +170,9 @@ where
     Ok(routes)
 }
 
-/// Resolve participant DIDs to their delivery service endpoints and verify outbound peer policy.
+/// Resolve participant DIDs for non-authorizing delivery routing and enforce
+/// outbound peer policy. Authorization, persistence, and confidentiality
+/// decisions MUST use [`resolve_participant_routing_authoritative`].
 ///
 /// This MUST be called outside/before any business transaction.
 pub async fn resolve_participant_routing<I, S>(
@@ -185,10 +187,11 @@ where
     resolve_participant_routing_with(pool, resolver, dids, RoutingResolution::Cached).await
 }
 
-/// Resolve participant DIDs without writing to endpoint or mapping resolution caches.
+/// Resolve participant homes only from their live authoritative declarations.
 ///
-/// Used by remote-prefix bootstrap admission so that admission failures perform zero database writes.
-pub async fn resolve_participant_routing_uncached<I, S>(
+/// Authorization, membership persistence, and confidential fan-out MUST use
+/// this path rather than cached or degraded routing.
+pub async fn resolve_participant_routing_authoritative<I, S>(
     pool: &PgPool,
     resolver: Option<&DsResolver>,
     dids: I,
@@ -197,7 +200,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    resolve_participant_routing_with(pool, resolver, dids, RoutingResolution::Uncached).await
+    resolve_participant_routing_with(pool, resolver, dids, RoutingResolution::Authoritative).await
 }
 
 #[cfg(test)]

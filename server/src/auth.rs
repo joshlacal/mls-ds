@@ -2216,6 +2216,82 @@ mod tests {
         .await;
     }
 
+    #[cfg(feature = "sim")]
+    #[tokio::test]
+    async fn expired_scoped_did_cache_resolves_only_through_simulated_dns_and_http() {
+        use crate::sim_hooks::{scope_ds_clock, scope_sim_ds, ManualDsClock, SimDsHooks};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let document = |endpoint: &str| DidDocument {
+            id: did.to_string(),
+            verification_method: Vec::new(),
+            service: Some(vec![Service {
+                id: "#atproto_pds".to_string(),
+                service_type: "AtprotoPersonalDataServer".to_string(),
+                service_endpoint: endpoint.to_string(),
+            }]),
+        };
+        let middleware = AuthMiddleware::with_config(1, 100, 60);
+        let resolved_body =
+            serde_json::to_vec(&document("simulated-http")).expect("serialize DID document");
+        let dns_calls = Arc::new(AtomicUsize::new(0));
+        let http_calls = Arc::new(AtomicUsize::new(0));
+        let hooks = Arc::new(SimDsHooks {
+            service_did: "did:web:sim-ds.test".into(),
+            self_endpoint: "https://sim-ds.test".into(),
+            signing_key_pem: None,
+            group_relay_hmac_secret: None,
+            http_transport: {
+                let http_calls = Arc::clone(&http_calls);
+                Arc::new(move |request| {
+                    http_calls.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(
+                        request.url.as_str(),
+                        "https://plc.directory/did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+                    );
+                    let body = resolved_body.clone();
+                    Box::pin(async move {
+                        http::Response::builder()
+                            .status(StatusCode::OK)
+                            .body(body)
+                            .map_err(|error| error.to_string())
+                    })
+                })
+            },
+            dns_resolver: {
+                let dns_calls = Arc::clone(&dns_calls);
+                Arc::new(move |host| {
+                    assert_eq!(host, "plc.directory");
+                    dns_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(vec![std::net::IpAddr::from([93, 184, 216, 34])])
+                })
+            },
+            retain_application_ciphertext: false,
+        });
+        let clock = Arc::new(ManualDsClock::new(
+            DateTime::from_timestamp(1_600_000_000, 0).unwrap(),
+        ));
+
+        let resolved = scope_ds_clock(
+            Arc::clone(&clock) as Arc<dyn crate::sim_hooks::DsClock>,
+            scope_sim_ds(hooks, async {
+                middleware.cache_did_document(document("seeded")).await;
+                clock.advance(chrono::TimeDelta::seconds(1));
+                middleware.resolve_did(did).await
+            }),
+        )
+        .await
+        .expect("expired simulated DID resolves");
+
+        assert_eq!(
+            resolved.service.unwrap()[0].service_endpoint,
+            "simulated-http"
+        );
+        assert_eq!(dns_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(http_calls.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn did_document_resolution_has_no_unbounded_success_collector() {
         let source = include_str!("auth.rs");

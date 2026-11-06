@@ -26,6 +26,13 @@ fn manual_clock() -> Arc<ManualDsClock> {
 }
 
 fn hooks(documents: HashMap<String, Value>) -> Arc<SimDsHooks> {
+    hooks_with_device_records(documents, HashMap::new())
+}
+
+fn hooks_with_device_records(
+    documents: HashMap<String, Value>,
+    device_keys: HashMap<String, [u8; 32]>,
+) -> Arc<SimDsHooks> {
     Arc::new(SimDsHooks {
         service_did: HOME.to_string(),
         self_endpoint: HOME_URL.to_string(),
@@ -33,10 +40,36 @@ fn hooks(documents: HashMap<String, Value>) -> Arc<SimDsHooks> {
         group_relay_hmac_secret: None,
         http_transport: Arc::new(move |request| {
             let did = format!("did:web:{}", request.url.host_str().unwrap_or_default());
-            let response = documents
-                .get(&did)
-                .filter(|_| request.url.path() == /* did-web-test */ "/.well-known/did.json")
-                .map(|doc| serde_json::to_vec(doc).unwrap());
+            let repo = request
+                .url
+                .query_pairs()
+                .find_map(|(key, value)| (key == "repo").then(|| value.into_owned()));
+            let response = if request.url.path() == /* did-web-test */ "/.well-known/did.json" {
+                documents.get(&did).cloned()
+            } else {
+                repo.and_then(|repo| {
+                    device_keys.get(&repo).map(|key| match request.url.path() {
+                        "/xrpc/com.atproto.repo.getRecord" => json!({
+                            "uri": format!("at://{repo}/blue.catbird.chat.declaration/self"),
+                            "value": {
+                                "$type": "blue.catbird.chat.declaration",
+                                "protocolVersion": "2",
+                                "allowIncoming": "all",
+                                "deliveryService": HOME,
+                                "createdAt": "2026-07-15T12:00:00Z",
+                            },
+                        }),
+                        "/xrpc/com.atproto.repo.listRecords" => json!({"records": [{"value": {
+                            "mlsSignaturePublicKey": {"$bytes": STANDARD.encode(key)},
+                            "algorithm": "ed25519",
+                            "createdAt": "2026-07-15T12:00:00Z",
+                        }}]}),
+                        _ => Value::Null,
+                    })
+                })
+            }
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::to_vec(&value).unwrap());
             Box::pin(async move {
                 let body =
                     response.ok_or_else(|| format!("unexpected server HTTP: {}", request.url))?;
@@ -62,20 +95,13 @@ fn service_document(did: &str, key: &SigningKey) -> Value {
     })
 }
 
-fn bearer(issuer: &str, key: &SigningKey, method: &str, fallback: bool) -> HeaderMap {
+fn bearer_for_audience(issuer: &str, key: &SigningKey, audience: &str, method: &str) -> HeaderMap {
     let now = crate::sim_hooks::current_utc().timestamp();
-    // The 120s bare-DS token exercises the legacy Bearer fallback, while the
-    // 60s service-ref token must traverse verify_mls_service_principal.
-    let (audience, lifetime) = if fallback {
-        (HOME.to_string(), 120)
-    } else {
-        (format!("{HOME}#atproto_mls"), 60)
-    };
     let header = URL_SAFE_NO_PAD.encode(br##"{"alg":"ES256","typ":"JWT","kid":"#atproto"}"##);
     let payload = URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({
             "iss": issuer, "aud": audience,
-            "iat": now, "exp": now + lifetime, "lxm": method, "jti": Uuid::new_v4(),
+            "iat": now, "exp": now + 60, "lxm": method, "jti": Uuid::new_v4(),
         }))
         .unwrap(),
     );
@@ -92,6 +118,10 @@ fn bearer(issuer: &str, key: &SigningKey, method: &str, fallback: bool) -> Heade
         .unwrap(),
     );
     headers
+}
+
+fn bearer(issuer: &str, key: &SigningKey, method: &str) -> HeaderMap {
+    bearer_for_audience(issuer, key, HOME, method)
 }
 
 fn hmac_headers(caller: &str, method: &str, body: &[u8]) -> HeaderMap {
@@ -175,8 +205,7 @@ async fn s2s_bearer_and_hmac_cannot_bypass_peer_allowlist() {
             }
             let before = effects(&pool, Uuid::nil()).await;
             for headers in [
-                bearer(SOURCE, &key, DELIVER, false),
-                bearer(SOURCE, &key, DELIVER, true),
+                bearer(SOURCE, &key, DELIVER),
                 hmac_headers(SOURCE, DELIVER, body),
             ] {
                 let result = verify_s2s_caller(&state, &headers, DELIVER, body).await;
@@ -190,9 +219,28 @@ async fn s2s_bearer_and_hmac_cannot_bypass_peer_allowlist() {
         }
         let admitted_tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM auth_jti_nonce WHERE issuer_did=$1")
             .bind(SOURCE).fetch_one(&pool).await.unwrap();
-        assert_eq!(admitted_tokens, 6, "both Bearer authentication paths passed cryptographic/replay admission before peer policy in all three cases");
+        assert_eq!(admitted_tokens, 3, "the exact Bearer token passed cryptographic/replay admission before peer policy in all three cases");
     })).await;
     pool.close().await;
+}
+
+#[tokio::test]
+async fn s2s_bearer_requires_the_exact_target_and_method() {
+    crate::federation::open_federation_for_test();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://127.0.0.1/s2s_exact_scope")
+        .unwrap();
+    let state = GroupRelayState::for_test(pool, HOME.to_string(), SECRET, None);
+    let key = SigningKey::from_slice(&[18; 32]).unwrap();
+    for headers in [
+        bearer_for_audience(SOURCE, &key, &format!("{HOME}#atproto_mls"), DELIVER),
+        bearer(SOURCE, &key, "blue.catbird.mlsDS.relayGroupMutation"),
+    ] {
+        let response = verify_s2s_caller(&state, &headers, DELIVER, b"{}")
+            .await
+            .expect_err("non-exact service scope must be refused before issuer admission");
+        protocol_error(response, StatusCode::UNAUTHORIZED, "NotAuthorized").await;
+    }
 }
 
 fn application_request(
@@ -696,15 +744,26 @@ async fn terminal_close_checks_stored_authority_and_freezes_only_local_audiences
     }]});
     let actor_doc = json!({"id":fixture.sender_did,"service":[{
         "id":format!("{}#atproto_mls",fixture.sender_did),"type":"AtprotoMLSDeliveryService","serviceEndpoint":HOME_URL,
+    },{
+        "id":format!("{}#atproto_pds",fixture.sender_did),"type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.routing.example.com",
     }]});
     let outsider_doc = json!({"id":outsider,"service":[{
         "id":format!("{outsider}#atproto_mls"),"type":"AtprotoMLSDeliveryService","serviceEndpoint":HOME_URL,
+    },{
+        "id":format!("{outsider}#atproto_pds"),"type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.routing.example.com",
     }]});
     let documents = HashMap::from([
         (SOURCE.to_string(), source_doc),
         (OTHER.to_string(), other_doc),
         (fixture.sender_did.clone(), actor_doc),
         (outsider.to_string(), outsider_doc),
+    ]);
+    let device_keys = HashMap::from([
+        (fixture.sender_did.clone(), key.verifying_key().to_bytes()),
+        (
+            outsider.to_string(),
+            outsider_key.verifying_key().to_bytes(),
+        ),
     ]);
     // The same world with SOURCE's DID document unreachable.
     let without_source: HashMap<String, Value> = documents
@@ -717,7 +776,7 @@ async fn terminal_close_checks_stored_authority_and_freezes_only_local_audiences
     }
     let state = GroupRelayState::for_test(pool.clone(), HOME.to_string(), SECRET, None);
     let clock = manual_clock();
-    scope_ds_clock(clock,scope_sim_ds(hooks(documents),async {
+    scope_ds_clock(clock,scope_sim_ds(hooks_with_device_records(documents, device_keys.clone()),async {
         let unknown = close_request(&fixture,close_entry(&fixture,Uuid::new_v4(),"group",&fixture.sender_did,fixture.sender_device_id,&fixture.sender_key_id,&key));
         reject_close_unchanged(&state,SOURCE,&unknown,StatusCode::NOT_FOUND,"ConversationNotFound").await;
         let entry = close_entry(&fixture,fixture.conversation_id,"group",&fixture.sender_did,fixture.sender_device_id,&fixture.sender_key_id,&key);
@@ -756,7 +815,7 @@ async fn terminal_close_checks_stored_authority_and_freezes_only_local_audiences
         // SOURCE's receipt key cannot be fetched now: that decided nothing, so
         // this home answers 503 and SOURCE keeps the close queued.
         request.close_authority = Some(proof.clone());
-        scope_sim_ds(hooks(without_source.clone()),reject_close_unchanged(&state,SOURCE,&request,StatusCode::SERVICE_UNAVAILABLE,"ServiceUnavailable")).await;
+        scope_sim_ds(hooks_with_device_records(without_source.clone(), device_keys.clone()),reject_close_unchanged(&state,SOURCE,&request,StatusCode::SERVICE_UNAVAILABLE,"ServiceUnavailable")).await;
 
         request.close_authority = Some(proof);
         request.recipient_dids = vec![outsider.to_string(),fixture.recipient_did.clone()];
@@ -912,6 +971,18 @@ async fn member_home_directory_answers_a_pds_outage_retryably() {
                         "serviceEndpoint": "https://pds.routing.example.com",
                     }],
                 })),
+                "/xrpc/com.atproto.repo.getRecord" if host == "pds.routing.example.com" => {
+                    Ok(json!({
+                        "uri": format!("at://{did}/blue.catbird.chat.declaration/self"),
+                        "value": {
+                            "$type": "blue.catbird.chat.declaration",
+                            "protocolVersion": "2",
+                            "allowIncoming": "all",
+                            "deliveryService": HOME,
+                            "createdAt": "2026-07-15T12:00:00Z",
+                        },
+                    }))
+                }
                 "/xrpc/com.atproto.repo.listRecords" if host == "pds.routing.example.com" => {
                     (*pds.lock().unwrap()).map(|key| {
                         json!({"records": [{"value": {
@@ -1048,24 +1119,16 @@ async fn s2s_caller_admission_this_ds_could_not_decide_is_not_a_refusal() {
     scope_ds_clock(
         manual_clock(),
         scope_sim_ds(hooks(HashMap::new()), async {
-            for fallback in [false, true] {
-                let error = verify_s2s_caller(
-                    &state,
-                    &bearer(&caller, &key, DELIVER, fallback),
-                    DELIVER,
-                    body,
-                )
+            let error = verify_s2s_caller(&state, &bearer(&caller, &key, DELIVER), DELIVER, body)
                 .await
                 .unwrap_err();
-                protocol_error(error, StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable").await;
-            }
+            protocol_error(error, StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable").await;
             crate::sim_hooks::seed_sim_did_document(
                 serde_json::from_value(service_document(&caller, &key)).unwrap(),
             )
             .await;
             for headers in [
-                bearer(&caller, &key, DELIVER, false),
-                bearer(&caller, &key, DELIVER, true),
+                bearer(&caller, &key, DELIVER),
                 hmac_headers(&caller, DELIVER, body),
             ] {
                 let error = verify_s2s_caller(&state, &headers, DELIVER, body)

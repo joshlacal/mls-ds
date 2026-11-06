@@ -81,7 +81,7 @@ jobs:
         # catbird-mls and ../BIRDaemon (see "Run two-node federation lifecycle").
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach 5dc4b0058dbee563a83c12c927a66a89dd84c71f
+          git -C ../catbird-atproto checkout --detach a6986331eee54f3f0ce16e7ea07dda63ab581dd7
           git clone --filter=blob:none https://github.com/joshlacal/catbird-mls.git ../catbird-mls
           git -C ../catbird-mls checkout --detach 798ea4767c23f290034727da3dc31ba9e029bd9e
           git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
@@ -196,9 +196,10 @@ jobs:
           cargo test --test chat_protocol_signing_domain_vectors --test chat_protocol_route_inventory --test federation_fixture_auth_profile --test chat_protocol_generated_transition_compat --features namespace-bluecatbird,server-bin,test-support
 
       - name: Run two-node federation lifecycle
-        # e2e-tests/Cargo.toml has a path dependency on ../BIRDaemon (since
-        # 2026-11-01). BIRDaemon has no published repository to clone yet, so
-        # this step fails at manifest load until it has one and is cloned above.
+        # e2e-tests/Cargo.toml has a path dependency on ../BIRDaemon, currently
+        # verified at provisional commit 5e5619009b6fd054d8b1379e70935d62b49c755f.
+        # BIRDaemon has no published repository to clone yet, so this step fails
+        # at manifest load until it has one and is cloned above.
         working-directory: ./e2e-tests
         run: cargo test --locked --test federation_two_node -- --ignored --test-threads=1
 
@@ -317,7 +318,7 @@ jobs:
       - name: Clone pinned sibling repos
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach 5dc4b0058dbee563a83c12c927a66a89dd84c71f
+          git -C ../catbird-atproto checkout --detach a6986331eee54f3f0ce16e7ea07dda63ab581dd7
           git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
           git -C ../labyrinth checkout --detach 4c955a7656a5dba11301be7d2412729907a984c7
 
@@ -349,7 +350,7 @@ jobs:
         run: |
           sqlx migrate run
 
-      - name: Run ignore-gated DB suites
+      - name: Run DB and relationship regression suites
         working-directory: ./server
         env:
           DATABASE_URL: postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722
@@ -360,10 +361,14 @@ jobs:
           SERVICE_DID: did:web:ci-mls.test
           RUST_LOG: info
         # --test-threads=1: db_tests serializes via a static lock; single-threaded
-        # execution keeps the gate deterministic. Concurrency inside each test
-        # (barriers/spawned tasks) is unaffected.
+        # execution keeps the gate deterministic. The exact-filter output checks
+        # keep a misspelled relationship test name from becoming a zero-test pass.
         run: |
           cargo test --test db_tests -- --include-ignored --test-threads=1
+          cargo test --locked --lib chat_protocol::repository::relationship_repository_tests::repository_callers_answer_a_live_source_outage_as_unavailable -- --exact --test-threads=1 2>&1 | tee "$RUNNER_TEMP/relationship-outage.log"
+          grep -Fq "test result: ok. 1 passed; 0 failed" "$RUNNER_TEMP/relationship-outage.log"
+          cargo test --locked --lib chat_protocol::repository::relationship_repository_tests::policy_verifiers_keep_allow_block_and_store_failure_distinct -- --exact --test-threads=1 2>&1 | tee "$RUNNER_TEMP/relationship-verdicts.log"
+          grep -Fq "test result: ok. 1 passed; 0 failed" "$RUNNER_TEMP/relationship-verdicts.log"
 
       - name: Run authenticated handler regressions
         working-directory: ./server
@@ -455,7 +460,7 @@ jobs:
       - name: Clone pinned sibling repos
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach 5dc4b0058dbee563a83c12c927a66a89dd84c71f
+          git -C ../catbird-atproto checkout --detach a6986331eee54f3f0ce16e7ea07dda63ab581dd7
           git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
           git -C ../labyrinth checkout --detach 4c955a7656a5dba11301be7d2412729907a984c7
 

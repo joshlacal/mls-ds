@@ -160,7 +160,7 @@ async fn devices_for_user(
     let refused = |reason: &str| FederationError::Forbidden(reason.to_owned());
     BareDid::parse(user_did).map_err(|e| refused(&e.to_string()))?;
     let resolver = resolver(pool);
-    let home = resolver.resolve(user_did).await?;
+    let home = resolver.resolve_authoritative_ds(user_did).await?;
     if !crate::identity::dids_equivalent(&home.did, resolver.self_did()) {
         return Err(refused(
             "device directory request is not at the user's home",
@@ -211,7 +211,7 @@ pub(crate) async fn active_device_key(
     key_id: &str,
 ) -> Result<(Vec<u8>, i64), FederationError> {
     let resolver = resolver(pool);
-    let home = resolver.resolve(user_did).await?;
+    let home = resolver.resolve_authoritative_ds(user_did).await?;
     let devices = if crate::identity::dids_equivalent(&home.did, resolver.self_did()) {
         devices_for_user(pool, user_did).await?
     } else {
@@ -1031,7 +1031,10 @@ async fn get_group_state(
         Ok(request) => request,
         Err(e) => return s2s_err(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()),
     };
-    match resolver(&state.pool).resolve(&request.actor_did).await {
+    match resolver(&state.pool)
+        .resolve_authoritative_ds(&request.actor_did)
+        .await
+    {
         Ok(home) if crate::identity::dids_equivalent(&home.did, &caller) => {}
         Ok(_) => {
             return s2s_err(
@@ -1132,7 +1135,10 @@ async fn get_group_pending_welcomes(
         Ok(request) => request,
         Err(e) => return s2s_err(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()),
     };
-    match resolver(&state.pool).resolve(&request.actor_did).await {
+    match resolver(&state.pool)
+        .resolve_authoritative_ds(&request.actor_did)
+        .await
+    {
         Ok(home) if crate::identity::dids_equivalent(&home.did, &caller) => {}
         Ok(_) => {
             return s2s_err(
@@ -1208,7 +1214,7 @@ async fn relay_membership_inner(
     };
     let resolver = resolver(&state.pool);
     let home = resolver
-        .resolve(&request.actor_did)
+        .resolve_authoritative_ds(&request.actor_did)
         .await
         .map_err(RelayFailure::federation)?;
     if !crate::identity::dids_equivalent(&home.did, caller) {
@@ -1367,7 +1373,7 @@ pub(crate) async fn try_relay_labyrinth_directory(
         return Ok(None);
     };
     let target = resolver
-        .resolve(target_did)
+        .resolve_authoritative_ds(target_did)
         .await
         .map_err(labyrinth_relay_failure)?;
     if crate::identity::dids_equivalent(&target.did, resolver.self_did()) {
@@ -1471,7 +1477,7 @@ async fn get_labyrinth_directory(
     let result = async {
         let resolver = resolver(&state.pool);
         let actor_home = resolver
-            .resolve(&request.actor_did)
+            .resolve_authoritative_ds(&request.actor_did)
             .await
             .map_err(RelayFailure::federation)?;
         if !crate::identity::dids_equivalent(&actor_home.did, &caller) {
@@ -1483,7 +1489,7 @@ async fn get_labyrinth_directory(
             .find_map(|(key, value)| (key == "did").then(|| value.into_owned()))
             .ok_or_else(|| RelayFailure::denied("directory query has no target DID"))?;
         let target_home = resolver
-            .resolve(&target)
+            .resolve_authoritative_ds(&target)
             .await
             .map_err(RelayFailure::federation)?;
         if !crate::identity::dids_equivalent(&target_home.did, &state.self_did) {

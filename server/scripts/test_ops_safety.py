@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Regressions for the operations scripts and configuration that CI relies on.
 
-The shell scripts run against stub `psql` and `sqlx` binaries that only log
-their arguments, so no database is ever touched.
+The shell scripts run against stub `psql`, `sqlx`, and `docker` binaries that
+only log their arguments, so no database or container is ever touched.
 """
 
 import json
@@ -40,6 +40,9 @@ esac
 STUB_SQLX = """#!/bin/sh
 printf 'sqlx PGOPTIONS=%s %s\\n' "${PGOPTIONS:-}" "$*" >> "$STUB_LOG"
 """
+STUB_DOCKER = """#!/bin/sh
+printf 'docker %s\\n' "$*" >> "$STUB_LOG"
+"""
 
 
 def run_script(script, *args, identity="", approved=True):
@@ -49,7 +52,11 @@ def run_script(script, *args, identity="", approved=True):
     """
     with tempfile.TemporaryDirectory(prefix="mls-ops-safety-") as tmp:
         stubs = Path(tmp)
-        for name, body in (("psql", STUB_PSQL), ("sqlx", STUB_SQLX)):
+        for name, body in (
+            ("psql", STUB_PSQL),
+            ("sqlx", STUB_SQLX),
+            ("docker", STUB_DOCKER),
+        ):
             (stubs / name).write_text(body)
             (stubs / name).chmod(0o755)
         log = stubs / "calls.log"
@@ -162,10 +169,15 @@ class ResetDevDbTests(unittest.TestCase):
                 drop = (f"@localhost:{port}/postgres -X -q -v ON_ERROR_STOP=1 "
                         "-c DROP DATABASE IF EXISTS catbird WITH (FORCE) -c CREATE DATABASE catbird")
                 migrate = f"sqlx PGOPTIONS=-c chat.operation_claim_activation_approved={APPROVAL} migrate run"
+                fixtures = (f"docker compose -f {REPO / 'docker-compose.federation.yml'} "
+                            "run --rm --no-deps peer-fixtures")
                 self.assertIn(drop, calls)
                 self.assertIn(migrate, calls)
+                self.assertIn(fixtures, calls)
                 self.assertLess(calls.index("current_database()"), calls.index(drop))
                 self.assertLess(calls.index(drop), calls.index(migrate))
+                self.assertLess(calls.index(migrate), calls.index(fixtures))
+                self.assertNotIn("INSERT INTO federation_peers", (self.script).read_text())
                 self.assertNotIn(SECRET, result.stdout + result.stderr)
 
 

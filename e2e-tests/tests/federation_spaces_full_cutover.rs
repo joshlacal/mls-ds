@@ -2555,7 +2555,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .await?;
     }
 
-    let bird_bot = FederatedBirdBot::open_and_enroll_with_tokens(
+    let bird_bot = FederatedBirdBot::open_and_enroll_with_pds_token_for_test(
         FederatedBotConfig {
             storage_root: temp_root.path().join("bird-bot"),
             bot_did: bird_did.to_string(),
@@ -2571,7 +2571,6 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             max_reply_characters: 500,
         },
         Arc::new(DeterministicBirdResponder),
-        None,
         Some("bird-pds-oauth".into()),
     )?;
     assert!(bird_bot

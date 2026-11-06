@@ -58,19 +58,20 @@ async fn handle_inner(
         let principals = admission
             .creation_participant_dids()
             .map_err(|e| context::auth_repository_failure(endpoint, e))?;
-        let routes = crate::chat_protocol::federation_routing::resolve_participant_routing(
-            pool,
-            runtime.resolver().map(|resolver| resolver.as_ref()),
-            &principals,
-        )
-        .await
-        .map_err(|err| {
-            tracing::warn!(
-                ?err,
-                "createConversation participant routing resolution failed"
-            );
-            context::routing_failure(endpoint, &err)
-        })?;
+        let routes =
+            crate::chat_protocol::federation_routing::resolve_participant_routing_authoritative(
+                pool,
+                runtime.resolver().map(|resolver| resolver.as_ref()),
+                &principals,
+            )
+            .await
+            .map_err(|err| {
+                tracing::warn!(
+                    ?err,
+                    "createConversation participant routing resolution failed"
+                );
+                context::routing_failure(endpoint, &err)
+            })?;
         crate::federation::group_relay::stage_remote_group_participants(pool, &routes)
             .await
             .map_err(|err| {

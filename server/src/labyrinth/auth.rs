@@ -191,6 +191,38 @@ pub async fn admit_query(
     })
 }
 
+/// Admit a fixed-shape query whose device identity is carried exclusively by
+/// the signed read claim, so relay parameters contain only the remote record
+/// selector.
+pub async fn admit_fixed_query(
+    pool: &DbPool,
+    cutover_enabled: bool,
+    nsid: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> LabyrinthResult<Admission> {
+    require_cutover(cutover_enabled)?;
+    let principal = crate::auth::verify_mls_service_principal(headers, pool, nsid)
+        .await
+        .map_err(|error| service_auth_failure(nsid, error))?;
+    let proof = read_auth::read_proof(headers)?;
+    let instant = now_ms();
+    let canonical = read_auth::canonical_query(query);
+    let expected = read_auth::Expected {
+        did: principal.did(),
+        nsid,
+        query: Some(&canonical),
+    };
+    let (device_id, _) = read_auth::verify(pool, &proof, expected, instant).await?;
+    Ok(Admission {
+        did: principal.did().to_owned(),
+        device_id,
+        instant,
+        write: None,
+        read: Some(proof),
+    })
+}
+
 fn header_b64(headers: &HeaderMap, name: &str) -> LabyrinthResult<Vec<u8>> {
     let value = headers
         .get(name)

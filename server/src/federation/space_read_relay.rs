@@ -25,13 +25,19 @@ use atproto_spaces::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
 use crate::{
+    federation::{
+        errors::FederationError,
+        resolver::{send_hardened_resolution_request, DsResolver},
+    },
     push_gateway::ssrf::{
         system_dns_resolve, validate_https_url_with_resolver, PushGatewaySsrfError,
     },
     util::outbound_body::{
         collect_bounded, OutboundBodyError, ResponseBodyBudget, DID_DOCUMENT_MAX_BYTES,
+        ERROR_RESPONSE_MAX_BYTES, ORDINARY_DS_CONTROL_MAX_BYTES, PROFILE_OR_DEVICE_MAX_BYTES,
     },
 };
 
@@ -46,6 +52,31 @@ pub const ALLOWED_SPACE_READ_NSIDS: &[&str] = &[
     "com.atproto.space.getRepo",
     "com.atproto.space.getBlob",
 ];
+
+/// Blob reads cover the client's 10 MiB encrypted-attachment ceiling plus
+/// framing overhead. Repository exports are larger but still explicitly
+/// bounded because this relay currently returns one in-memory HTTP body.
+const SPACE_BLOB_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const SPACE_REPO_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const MAILBOX_KEYS_RECORD_MAX_BYTES: usize = 1024 * 1024;
+
+fn space_read_response_max_bytes(nsid: &str, status: reqwest::StatusCode) -> usize {
+    if !status.is_success() {
+        return ERROR_RESPONSE_MAX_BYTES;
+    }
+    match nsid {
+        "com.atproto.space.getBlob" => SPACE_BLOB_RESPONSE_MAX_BYTES,
+        "com.atproto.space.getRepo" => SPACE_REPO_RESPONSE_MAX_BYTES,
+        _ => ORDINARY_DS_CONTROL_MAX_BYTES,
+    }
+}
+
+fn body_read_was_transient(error: &OutboundBodyError) -> bool {
+    matches!(
+        error,
+        OutboundBodyError::DeadlineExceeded | OutboundBodyError::ReadFailed(_)
+    )
+}
 
 pub fn is_allowed_space_read_nsid(nsid: &str) -> bool {
     ALLOWED_SPACE_READ_NSIDS.contains(&nsid)
@@ -170,6 +201,7 @@ async fn resolve_ssrf_safe_space_endpoint(
             .resolve_to_addrs(&validated_plc.host, &validated_plc.pinned_addrs)
             .build()
             .map_err(|e| SpaceRelayError::UpstreamUnavailable(e.to_string()))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let doc_resp = crate::sim_hooks::send_reqwest(plc_client.get(&validated_plc.effective_url))
             .await
             .map_err(SpaceRelayError::UpstreamUnavailable)?;
@@ -182,13 +214,20 @@ async fn resolve_ssrf_safe_space_endpoint(
                 SpaceRelayError::InvalidTargetEndpoint(reason)
             });
         }
-        let doc: Value = doc_resp.json().await.map_err(|e| {
-            if e.is_decode() {
-                SpaceRelayError::InvalidTargetEndpoint(e.to_string())
+        let doc_bytes = collect_bounded(
+            doc_resp,
+            ResponseBodyBudget::new(DID_DOCUMENT_MAX_BYTES, deadline),
+        )
+        .await
+        .map_err(|error| {
+            if body_read_was_transient(&error) {
+                SpaceRelayError::UpstreamUnavailable(error.to_string())
             } else {
-                SpaceRelayError::UpstreamUnavailable(e.to_string())
+                SpaceRelayError::InvalidTargetEndpoint(error.to_string())
             }
         })?;
+        let doc: Value = serde_json::from_slice(&doc_bytes)
+            .map_err(|error| SpaceRelayError::InvalidTargetEndpoint(error.to_string()))?;
         let svc_ep = doc
             .get("service")
             .and_then(Value::as_array)
@@ -377,14 +416,30 @@ pub async fn relay_space_credential_stateless(
         credential_kid,
         delegation_token,
     };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let resp = crate::sim_hooks::send_reqwest(client.post(&url).json(&request))
         .await
         .map_err(SpaceRelayError::UpstreamUnavailable)?;
     let status = resp.status();
-    let bytes = resp
-        .bytes()
+    let max_bytes = if status.is_success() {
+        PROFILE_OR_DEVICE_MAX_BYTES
+    } else {
+        ERROR_RESPONSE_MAX_BYTES
+    };
+    let bytes = collect_bounded(resp, ResponseBodyBudget::new(max_bytes, deadline))
         .await
-        .map_err(|e| SpaceRelayError::UpstreamUnavailable(e.to_string()))?;
+        .map_err(|error| {
+            let reason = error.to_string();
+            if retryable_status(status) || body_read_was_transient(&error) {
+                SpaceRelayError::UpstreamUnavailable(reason)
+            } else if status == reqwest::StatusCode::UNAUTHORIZED {
+                SpaceRelayError::InvalidDelegationToken(reason)
+            } else if status == reqwest::StatusCode::FORBIDDEN {
+                SpaceRelayError::Forbidden(reason)
+            } else {
+                SpaceRelayError::UpstreamError(reason)
+            }
+        })?;
 
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(SpaceRelayError::InvalidDelegationToken(
@@ -444,11 +499,186 @@ pub async fn relay_space_credential_stateless(
     })
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailboxKeysRecordEnvelope {
+    uri: String,
+    cid: String,
+    #[serde(rename = "value")]
+    _value: catbird_atproto::generated::blue_catbird::labyrinth::mailbox_keys::MailboxKeys<String>,
+}
+
+fn valid_record_key(rkey: &str) -> bool {
+    (1..=512).contains(&rkey.len())
+        && rkey != "."
+        && rkey != ".."
+        && rkey.is_ascii()
+        && rkey.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'~' | b'-')
+        })
+}
+
+fn validate_mailbox_keys_record(
+    body: &[u8],
+    target_did: &str,
+    rkey: &str,
+) -> Result<(), SpaceRelayError> {
+    let envelope: MailboxKeysRecordEnvelope = serde_json::from_slice(body)
+        .map_err(|_| SpaceRelayError::UpstreamError("malformed mailboxKeys record".into()))?;
+    let expected_uri = format!("at://{target_did}/blue.catbird.labyrinth.mailboxKeys/{rkey}");
+    if envelope.uri != expected_uri {
+        return Err(SpaceRelayError::UpstreamError(
+            "mailboxKeys record URI does not match target DID and rkey".into(),
+        ));
+    }
+    let current = &envelope._value.current;
+    let exact_lengths = [
+        (current.auth_pubkey.len(), 32usize),
+        (current.encryption_pubkey.len(), 1216),
+        (current.signing_pubkey.len(), 32),
+        (current.members_hash.len(), 32),
+        (current.epoch_head.len(), 32),
+        (current.self_sig.len(), 64),
+        (current.attestation.transport_pubkey.len(), 32),
+        (current.attestation.sig.len(), 64),
+    ];
+    if !(0..=1_099_511_627_776).contains(&current.epoch_number)
+        || exact_lengths
+            .iter()
+            .any(|(actual, expected)| actual != expected)
+        || current
+            .previous_epoch_head
+            .as_ref()
+            .is_some_and(|value| value.len() != 32)
+        || current
+            .prev_sig
+            .as_ref()
+            .is_some_and(|value| value.len() != 64)
+    {
+        return Err(SpaceRelayError::UpstreamError(
+            "mailboxKeys value violates the epoch schema".into(),
+        ));
+    }
+    let cid = envelope
+        .cid
+        .parse::<cid::Cid>()
+        .map_err(|_| SpaceRelayError::UpstreamError("invalid mailboxKeys record CID".into()))?;
+    let canonical = serde_ipld_dagcbor::to_vec(&envelope._value).map_err(|_| {
+        SpaceRelayError::UpstreamError("mailboxKeys value is not canonical DAG-CBOR data".into())
+    })?;
+    if atproto_spaces::lthash::compute_dagcbor_cid(&canonical) != cid {
+        return Err(SpaceRelayError::UpstreamError(
+            "mailboxKeys record CID does not match its value".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn mailbox_resolution_error(error: FederationError) -> SpaceRelayError {
+    if error.is_retryable() {
+        SpaceRelayError::UpstreamUnavailable(error.to_string())
+    } else {
+        SpaceRelayError::InvalidTargetEndpoint(error.to_string())
+    }
+}
+
+/// Read one public `mailboxKeys` record through the authenticated caller's
+/// home service. Only the target DID and rkey influence the outbound request:
+/// the PDS endpoint is live-resolved and DNS-pinned, the collection is fixed,
+/// and no caller URL, authorization, headers, or token are forwarded.
+pub async fn relay_mailbox_keys_record(
+    resolver: &DsResolver,
+    target_did: &str,
+    rkey: &str,
+) -> Result<Option<bytes::Bytes>, SpaceRelayError> {
+    if crate::identity::canonical_did(target_did) != target_did
+        || !atproto_spaces::is_valid_did(target_did)
+        || !(target_did.starts_with("did:plc:") || target_did.starts_with("did:web:"))
+    {
+        return Err(SpaceRelayError::InvalidRequest(
+            "target DID must be one canonical bare did:plc or did:web".into(),
+        ));
+    }
+    if !valid_record_key(rkey) {
+        return Err(SpaceRelayError::InvalidRequest(
+            "invalid mailboxKeys record key".into(),
+        ));
+    }
+
+    let pds = resolver
+        .resolve_did_to_pds(target_did)
+        .await
+        .map_err(mailbox_resolution_error)?;
+    let mut url = Url::parse(&format!(
+        "{}/xrpc/com.atproto.repo.getRecord",
+        pds.trim_end_matches('/')
+    ))
+    .map_err(|error| SpaceRelayError::InvalidTargetEndpoint(error.to_string()))?;
+    url.query_pairs_mut()
+        .append_pair("repo", target_did)
+        .append_pair("collection", "blue.catbird.labyrinth.mailboxKeys")
+        .append_pair("rkey", rkey);
+    let destination = resolver
+        .resolve_endpoint_destination(url.as_str())
+        .await
+        .map_err(mailbox_resolution_error)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let response = send_hardened_resolution_request(
+        &destination,
+        deadline,
+        target_did,
+        "mailboxKeys record read failed",
+    )
+    .await
+    .map_err(mailbox_resolution_error)?;
+    let status = response.status();
+    let max_bytes = if status.is_success() {
+        MAILBOX_KEYS_RECORD_MAX_BYTES
+    } else {
+        ERROR_RESPONSE_MAX_BYTES
+    };
+    let body = collect_bounded(response, ResponseBodyBudget::new(max_bytes, deadline))
+        .await
+        .map_err(|error| {
+            if retryable_status(status) || body_read_was_transient(&error) {
+                SpaceRelayError::UpstreamUnavailable(error.to_string())
+            } else {
+                SpaceRelayError::UpstreamError(error.to_string())
+            }
+        })?;
+    if matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::NOT_FOUND
+    ) && serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("RecordNotFound")
+    {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let reason = format!("mailboxKeys PDS returned HTTP {}", status.as_u16());
+        return Err(if retryable_status(status) {
+            SpaceRelayError::UpstreamUnavailable(reason)
+        } else {
+            SpaceRelayError::UpstreamError(reason)
+        });
+    }
+    validate_mailbox_keys_record(&body, target_did, rkey)?;
+    Ok(Some(body))
+}
+
 pub struct RelayedSpaceReadResponse {
     pub status: u16,
     pub content_type: String,
     pub space_mac: Option<String>,
-    pub body: Vec<u8>,
+    pub body: bytes::Bytes,
 }
 
 /// Statelessly relay an RFC 9421 PoP-signed `com.atproto.space.*` read request to `target_did`.
@@ -493,10 +723,11 @@ pub async fn relay_space_read_stateless(
         req = req.header("atproto-space-want-mac", wm.trim());
     }
 
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let resp = crate::sim_hooks::send_reqwest(req)
         .await
         .map_err(SpaceRelayError::UpstreamUnavailable)?;
-    let status = resp.status().as_u16();
+    let status = resp.status();
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -508,11 +739,17 @@ pub async fn relay_space_read_stateless(
         .get("atproto-space-mac")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let body = resp
-        .bytes()
+    let max_bytes = space_read_response_max_bytes(nsid, status);
+    let body = collect_bounded(resp, ResponseBodyBudget::new(max_bytes, deadline))
         .await
-        .map_err(|e| SpaceRelayError::UpstreamUnavailable(e.to_string()))?
-        .to_vec();
+        .map_err(|error| {
+            if retryable_status(status) || body_read_was_transient(&error) {
+                SpaceRelayError::UpstreamUnavailable(error.to_string())
+            } else {
+                SpaceRelayError::UpstreamError(error.to_string())
+            }
+        })?;
+    let status = status.as_u16();
 
     // A 5xx/429 decided nothing; any other status is the target's answer.
     if status >= 500 || status == 429 {
@@ -532,24 +769,37 @@ pub async fn relay_space_read_stateless(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::resolver::ValidatedRemoteDestination;
     use atproto_spaces::{
         kem::encode_p256_did_key,
         tokens::{mint_space_token, SpaceSigningKey, SpaceTokenClaims},
     };
     use axum::{
-        extract::OriginalUri,
+        extract::{OriginalUri, Query},
         http::HeaderMap,
+        response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use base64::{
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+        Engine as _,
+    };
     use serde_json::json;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     };
 
     const NOW: u64 = 1_700_000_000;
+
+    fn mailbox_value_cid(value: &Value) -> String {
+        let typed: catbird_atproto::generated::blue_catbird::labyrinth::mailbox_keys::MailboxKeys<
+            String,
+        > = serde_json::from_value(value.clone()).unwrap();
+        let canonical = serde_ipld_dagcbor::to_vec(&typed).unwrap();
+        atproto_spaces::lthash::compute_dagcbor_cid(&canonical).to_string()
+    }
 
     /// Only a failed DNS lookup of the target decided nothing; every other
     /// endpoint refusal stays the permanent `InvalidTargetEndpoint`.
@@ -571,6 +821,267 @@ mod tests {
                 SpaceRelayError::InvalidTargetEndpoint(_)
             ));
         }
+    }
+
+    #[test]
+    fn read_body_budgets_are_explicit_per_response_class() {
+        assert_eq!(
+            space_read_response_max_bytes("com.atproto.space.listRecords", reqwest::StatusCode::OK),
+            ORDINARY_DS_CONTROL_MAX_BYTES
+        );
+        assert_eq!(
+            space_read_response_max_bytes("com.atproto.space.getBlob", reqwest::StatusCode::OK),
+            SPACE_BLOB_RESPONSE_MAX_BYTES
+        );
+        assert_eq!(
+            space_read_response_max_bytes("com.atproto.space.getRepo", reqwest::StatusCode::OK),
+            SPACE_REPO_RESPONSE_MAX_BYTES
+        );
+        assert_eq!(
+            space_read_response_max_bytes(
+                "com.atproto.space.getRepo",
+                reqwest::StatusCode::BAD_GATEWAY
+            ),
+            ERROR_RESPONSE_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn mailbox_record_validation_binds_selector_cid_and_typed_value() {
+        let did = "did:web:mailbox.example";
+        let rkey = "000000000007";
+        let bytes = |len| json!({ "$bytes": STANDARD.encode(vec![0u8; len]) });
+        let mut record = json!({
+            "uri": format!("at://{did}/blue.catbird.labyrinth.mailboxKeys/{rkey}"),
+            "cid": "",
+            "value": {
+                "$type": "blue.catbird.labyrinth.mailboxKeys",
+                "current": {
+                    "epochNumber": 7,
+                    "authPubkey": bytes(32),
+                    "encryptionPubkey": bytes(1216),
+                    "signingPubkey": bytes(32),
+                    "membersHash": bytes(32),
+                    "epochHead": bytes(32),
+                    "selfSig": bytes(64),
+                    "attestation": {
+                        "transportPubkey": bytes(32),
+                        "sig": bytes(64),
+                    },
+                },
+                "updatedAt": "2026-11-04T00:00:00Z",
+            },
+        });
+        let cid = mailbox_value_cid(&record["value"]);
+        record["cid"] = json!(&cid);
+        let encode = |value: &Value| serde_json::to_vec(value).unwrap();
+        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_ok());
+
+        record["uri"] =
+            json!("at://did:web:attacker.example/blue.catbird.labyrinth.mailboxKeys/other");
+        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_err());
+        record["uri"] = json!(format!(
+            "at://{did}/blue.catbird.labyrinth.mailboxKeys/{rkey}"
+        ));
+        record["cid"] = json!("not-a-cid");
+        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_err());
+        record["cid"] = json!(cid);
+        record["value"]["updatedAt"] = json!("2026-11-05T00:00:00Z");
+        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_err());
+        record["value"]["updatedAt"] = json!("2026-11-04T00:00:00Z");
+        record["value"]["current"]["authPubkey"] = bytes(31);
+        record["cid"] = json!(mailbox_value_cid(&record["value"]));
+        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_err());
+        record["value"].as_object_mut().unwrap().remove("current");
+        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_err());
+
+        assert_eq!(MAILBOX_KEYS_RECORD_MAX_BYTES, 1024 * 1024);
+        for invalid in ["", ".", "..", "bad/key", "bad key", &"x".repeat(513)] {
+            assert!(!valid_record_key(invalid), "{invalid:?}");
+        }
+        for valid in ["self", "000000000007", "a.b_c:d~e-f"] {
+            assert!(valid_record_key(valid), "{valid:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mailbox_relay_resolves_the_pds_and_forwards_only_the_fixed_public_selector() {
+        let target = "did:web:peer.example";
+        let oversized = Arc::new(AtomicBool::new(false));
+        let record_hits = Arc::new(AtomicUsize::new(0));
+        let bytes = |len| json!({ "$bytes": STANDARD.encode(vec![0u8; len]) });
+        let mut record = json!({
+            "uri": format!("at://{target}/blue.catbird.labyrinth.mailboxKeys/self"),
+            "cid": "",
+            "value": {
+                "$type": "blue.catbird.labyrinth.mailboxKeys",
+                "current": {
+                    "epochNumber": 1,
+                    "authPubkey": bytes(32),
+                    "encryptionPubkey": bytes(1216),
+                    "signingPubkey": bytes(32),
+                    "membersHash": bytes(32),
+                    "epochHead": bytes(32),
+                    "selfSig": bytes(64),
+                    "attestation": {
+                        "transportPubkey": bytes(32),
+                        "sig": bytes(64),
+                    },
+                },
+                "updatedAt": "2026-11-04T00:00:00Z",
+            },
+        });
+        record["cid"] = json!(mailbox_value_cid(&record["value"]));
+        let record = Arc::new(record);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route(
+                "/.well-known/did.json",
+                get(move || async move {
+                    Json(json!({
+                        "id": target,
+                        "service": [{
+                            "id": "#atproto_pds",
+                            "type": "AtprotoPersonalDataServer",
+                            "serviceEndpoint": "https://peer-pds.example",
+                        }],
+                    }))
+                }),
+            )
+            .route(
+                "/xrpc/com.atproto.repo.getRecord",
+                get({
+                    let oversized = oversized.clone();
+                    let record_hits = record_hits.clone();
+                    let record = record.clone();
+                    move |Query(query): Query<std::collections::BTreeMap<String, String>>,
+                          headers: HeaderMap| {
+                        let oversized = oversized.clone();
+                        let record_hits = record_hits.clone();
+                        let record = record.clone();
+                        async move {
+                            record_hits.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(query.len(), 3);
+                            assert_eq!(query.get("repo").map(String::as_str), Some(target));
+                            assert_eq!(
+                                query.get("collection").map(String::as_str),
+                                Some("blue.catbird.labyrinth.mailboxKeys")
+                            );
+                            assert_eq!(query.get("rkey").map(String::as_str), Some("self"));
+                            for forbidden in [
+                                "authorization",
+                                "cookie",
+                                "atproto-proxy",
+                                "x-forwarded-for",
+                            ] {
+                                assert!(headers.get(forbidden).is_none(), "{forbidden}");
+                            }
+                            if oversized.load(Ordering::SeqCst) {
+                                return http::Response::builder()
+                                    .status(200)
+                                    .header(
+                                        http::header::CONTENT_LENGTH,
+                                        (MAILBOX_KEYS_RECORD_MAX_BYTES + 1).to_string(),
+                                    )
+                                    .body(axum::body::Body::empty())
+                                    .unwrap();
+                            }
+                            Json(record.as_ref().clone()).into_response()
+                        }
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/nonexistent_mailbox_relay_test")
+            .unwrap();
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:home.example".to_owned(),
+            "https://home.example".to_owned(),
+            None,
+            300,
+        )
+        .with_destination_resolver_hook(Arc::new(move |target_url: &str| {
+            let remote = Url::parse(target_url).unwrap();
+            let mut local = Url::parse(&format!("http://127.0.0.1:{}/", addr.port())).unwrap();
+            local.set_path(remote.path());
+            local.set_query(remote.query());
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: local,
+                    host: "127.0.0.1".to_owned(),
+                    addrs: vec![addr],
+                })
+            }))
+        }));
+
+        let relayed = relay_mailbox_keys_record(&resolver, target, "self")
+            .await
+            .unwrap()
+            .expect("record");
+        assert_eq!(serde_json::from_slice::<Value>(&relayed).unwrap(), *record);
+        assert_eq!(record_hits.load(Ordering::SeqCst), 1);
+        for (did, rkey) in [
+            ("did:web:peer.example#fragment", "self"),
+            (target, "bad/key"),
+        ] {
+            assert!(matches!(
+                relay_mailbox_keys_record(&resolver, did, rkey).await,
+                Err(SpaceRelayError::InvalidRequest(_))
+            ));
+        }
+        assert_eq!(record_hits.load(Ordering::SeqCst), 1);
+
+        oversized.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            relay_mailbox_keys_record(&resolver, target, "self").await,
+            Err(SpaceRelayError::UpstreamError(_))
+        ));
+        assert_eq!(record_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn read_relay_rejects_a_declared_body_over_the_nsid_budget() {
+        let target = "did:web:space-read-budget.example";
+        let router = Router::new().route(
+            "/xrpc/com.atproto.space.listRepos",
+            get(|| async {
+                let declared_bytes = ORDINARY_DS_CONTROL_MAX_BYTES + 1;
+                http::Response::builder()
+                    .status(200)
+                    .header(http::header::CONTENT_LENGTH, declared_bytes.to_string())
+                    .body(axum::body::Body::from(vec![0; declared_bytes]))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        register_test_space_relay_target(
+            target,
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let error = relay_space_read_stateless(
+            target,
+            "com.atproto.space.listRepos",
+            None,
+            "credential",
+            "space",
+            None,
+            "sig1=(\"@method\")",
+            "sig1=:AA==:",
+        )
+        .await
+        .err()
+        .expect("declared oversized response must be refused");
+        assert!(matches!(error, SpaceRelayError::UpstreamError(_)));
+        server.abort();
     }
 
     fn credential_fixture(authority: &str) -> (SpaceSigningKey, SpaceTokenClaims, Value) {

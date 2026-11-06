@@ -36,6 +36,24 @@ pub(super) async fn handle(
         .unwrap_or_else(IntoResponse::into_response)
 }
 
+async fn is_transport_participant(
+    pool: &DbPool,
+    conversation_id: uuid::Uuid,
+    actor_did: &str,
+) -> Result<bool, ChatFailure> {
+    sqlx::query_scalar(
+        "SELECT EXISTS( \
+            SELECT 1 FROM chat.direct_request_transport_inbox \
+            WHERE conversation_id = $1 AND (sender_did = $2 OR recipient_did = $2) \
+         )",
+    )
+    .bind(conversation_id)
+    .bind(actor_did)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| ChatFailure::storage(ENDPOINT))
+}
+
 async fn send(
     pool: &DbPool,
     runtime: &ChatRuntime,
@@ -217,17 +235,7 @@ async fn send(
                 ));
             }
 
-            let is_participant: bool = sqlx::query_scalar(
-                "SELECT EXISTS( \
-                    SELECT 1 FROM chat.direct_request_transport_inbox \
-                    WHERE conversation_id = $1 AND (sender_did = $2 OR recipient_did = $2) \
-                 )",
-            )
-            .bind(convo_id)
-            .bind(actor_did)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(false);
+            let is_participant = is_transport_participant(pool, convo_id, actor_did).await?;
 
             if !is_participant {
                 return Err(ChatFailure::protocol(
@@ -813,6 +821,21 @@ mod tests {
         assert_eq!(
             c33_failure("test", &FederationError::BlockedRelationship).code(),
             Some(ChatProtocolErrorCode::BlockedRelationship)
+        );
+    }
+
+    #[tokio::test]
+    async fn participant_store_failure_is_storage_not_a_refusal() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://127.0.0.1/c33_participant_store_failure")
+            .unwrap();
+        pool.close().await;
+        let failure = is_transport_participant(&pool, uuid::Uuid::new_v4(), "did:plc:actor")
+            .await
+            .expect_err("closed pool must fail the participant lookup");
+        assert_eq!(
+            failure.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 }

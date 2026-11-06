@@ -189,9 +189,9 @@ pub(super) async fn verify_membership_evidence(
     let mut invited = Vec::new();
     for did in claimed.invited {
         let home = resolver
-            .resolve(&did)
+            .resolve_authoritative_ds(&did)
             .await
-            .map_err(|error| unavailable(format!("resolve invited {did}: {error}")))?;
+            .map_err(lookup_failure)?;
         if crate::identity::dids_equivalent(&home.did, &state.self_did) {
             invited.push(did);
         }

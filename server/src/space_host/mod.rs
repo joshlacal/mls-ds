@@ -25,9 +25,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use atproto_spaces::tokens::{
-    inspect_untrusted_space_token, mint_space_token, verify_space_token, SpaceKeyResolver,
-    SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind, SpaceVerifyingKey,
+use atproto_spaces::{
+    kem::P256SecretKey,
+    tokens::{
+        inspect_untrusted_space_token, mint_space_token, verify_space_token, SpaceKeyResolver,
+        SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind, SpaceVerifyingKey,
+    },
 };
 use axum::Router;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -36,6 +39,7 @@ use p256::ecdsa::{
     signature::Signer, Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
 };
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 
 use crate::{push_gateway::ssrf::validate_https_url_with_resolver, storage::DbPool};
 
@@ -45,13 +49,23 @@ pub use handlers::space_host_router;
 pub struct SpaceHostConfig {
     pub authority_did: String,
     pub signing_key: P256SigningKey,
+    kem_key: P256SecretKey,
+    inventory_cursor_key: [u8; 32],
 }
 
 impl SpaceHostConfig {
     pub fn new(authority_did: String, signing_key: P256SigningKey) -> Self {
+        let kem_key = P256SecretKey::from_slice(&signing_key.to_bytes())
+            .expect("a valid P-256 signing scalar is a valid P-256 KEM scalar");
+        let mut cursor_hasher = Sha256::new();
+        cursor_hasher.update(b"catbird-space-inventory-cursor-v1");
+        cursor_hasher.update(signing_key.to_bytes());
+        let inventory_cursor_key = cursor_hasher.finalize().into();
         Self {
             authority_did: crate::identity::canonical_did(&authority_did).to_string(),
             signing_key,
+            kem_key,
+            inventory_cursor_key,
         }
     }
 
@@ -123,6 +137,14 @@ impl SpaceHostRuntime {
 
     pub fn authority_did(&self) -> &str {
         &self.config.authority_did
+    }
+
+    pub(crate) fn kem_key(&self) -> &P256SecretKey {
+        &self.config.kem_key
+    }
+
+    pub(crate) fn inventory_cursor_key(&self) -> &[u8; 32] {
+        &self.config.inventory_cursor_key
     }
 
     pub fn space_signing_key(&self) -> SpaceSigningKey {

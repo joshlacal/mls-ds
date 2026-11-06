@@ -25,6 +25,7 @@ use base64::{
     Engine as _,
 };
 use chrono::SecondsFormat;
+#[cfg(any(test, feature = "test-support"))]
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -65,10 +66,14 @@ pub use entry_ack_relay::{
     enqueue_entries_pruned_notices, transport_control_entry::C33PeerHomes, SignedRelayError,
 };
 
+#[cfg(any(test, feature = "test-support"))]
 type HmacSha256 = Hmac<Sha256>;
 
+#[cfg(any(test, feature = "test-support"))]
 const S2S_CALLER_DID_HEADER: &str = "x-catbird-s2s-caller-did";
+#[cfg(any(test, feature = "test-support"))]
 const S2S_TARGET_DID_HEADER: &str = "x-catbird-s2s-target-did";
+#[cfg(any(test, feature = "test-support"))]
 const S2S_MAC_HEADER: &str = "x-catbird-s2s-mac";
 
 /// Relay fan-out and push wakes are awaited inline within the request's clock scope.
@@ -76,6 +81,7 @@ const S2S_MAC_HEADER: &str = "x-catbird-s2s-mac";
 pub struct GroupRelayState {
     pool: DbPool,
     self_did: String,
+    #[cfg(any(test, feature = "test-support"))]
     s2s_shared_secret: Option<Arc<Vec<u8>>>,
     i13_receipt_signer: Option<Arc<I13ReceiptSigner>>,
     push_gateway_client: Option<Arc<PushGatewayClient>>,
@@ -92,11 +98,13 @@ impl GroupRelayState {
         i13_receipt_signer: Option<Arc<I13ReceiptSigner>>,
         push_gateway_client: Option<Arc<PushGatewayClient>>,
     ) -> Self {
+        #[cfg(any(test, feature = "test-support"))]
         let s2s_shared_secret =
             configured_group_relay_hmac_secret().map(|s| Arc::new(s.into_bytes()));
         Self {
             pool,
             self_did: crate::identity::canonical_did(&self_did).to_string(),
+            #[cfg(any(test, feature = "test-support"))]
             s2s_shared_secret,
             i13_receipt_signer,
             push_gateway_client,
@@ -146,11 +154,14 @@ impl GroupRelayState {
     #[cfg(feature = "sim")]
     pub fn with_sim_hooks(mut self, hooks: Arc<crate::sim_hooks::SimDsHooks>) -> Self {
         self.self_did = crate::identity::canonical_did(&hooks.service_did).to_string();
-        self.s2s_shared_secret = hooks
-            .group_relay_hmac_secret
-            .as_ref()
-            .filter(|secret| !secret.is_empty())
-            .map(|secret| Arc::new(secret.as_bytes().to_vec()));
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.s2s_shared_secret = hooks
+                .group_relay_hmac_secret
+                .as_ref()
+                .filter(|secret| !secret.is_empty())
+                .map(|secret| Arc::new(secret.as_bytes().to_vec()));
+        }
         self.sim_hooks = Some(hooks);
         self
     }
@@ -266,20 +277,27 @@ pub fn group_relay_router(state: GroupRelayState) -> Router {
         .with_state(state)
 }
 
-/// Optional HMAC federation configuration, scoped per delivery service in simulations.
+/// Optional simulation-only HMAC configuration. Production builds never read
+/// or accept a shared group-relay secret.
 pub fn configured_group_relay_hmac_secret() -> Option<String> {
-    #[cfg(feature = "sim")]
-    if let Some(hooks) = crate::sim_hooks::active_sim_ds() {
-        return hooks
-            .group_relay_hmac_secret
-            .clone()
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        #[cfg(feature = "sim")]
+        if let Some(hooks) = crate::sim_hooks::active_sim_ds() {
+            return hooks
+                .group_relay_hmac_secret
+                .clone()
+                .filter(|secret| !secret.is_empty());
+        }
+        return std::env::var("FEDERATION_GROUP_RELAY_HMAC_SECRET")
+            .ok()
             .filter(|secret| !secret.is_empty());
     }
-    std::env::var("FEDERATION_GROUP_RELAY_HMAC_SECRET")
-        .ok()
-        .filter(|secret| !secret.is_empty())
+    #[cfg(not(any(test, feature = "test-support")))]
+    None
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn compute_s2s_mac(
     secret: &[u8],
     caller_did: &str,
@@ -299,6 +317,56 @@ fn compute_s2s_mac(
     URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
+#[derive(Deserialize)]
+struct ExactS2sScope<'a> {
+    aud: &'a str,
+    lxm: Option<&'a str>,
+}
+
+/// Reject every token not scoped to this exact DS and method before replay
+/// admission. Signature and issuer-key verification still happen in
+/// `verify_mls_service_principal` below.
+fn require_exact_s2s_scope(
+    headers: &HeaderMap,
+    target_did: &str,
+    lxm: &str,
+) -> Result<(), crate::auth::AuthError> {
+    use crate::auth::AuthError;
+
+    let authorization = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AuthError::MissingAuthHeader)?;
+    let token = authorization
+        .strip_prefix("Bearer ")
+        .ok_or(AuthError::InvalidAuthFormat)?;
+    let mut segments = token.split('.');
+    let (Some(header), Some(payload), Some(signature)) =
+        (segments.next(), segments.next(), segments.next())
+    else {
+        return Err(AuthError::InvalidToken("malformed service JWT".into()));
+    };
+    if header.is_empty() || payload.is_empty() || signature.is_empty() || segments.next().is_some()
+    {
+        return Err(AuthError::InvalidToken("malformed service JWT".into()));
+    }
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| AuthError::InvalidToken("malformed service JWT payload".into()))?;
+    let claims: ExactS2sScope<'_> = serde_json::from_slice(&payload)
+        .map_err(|_| AuthError::InvalidToken("malformed service JWT claims".into()))?;
+    if claims.aud != target_did {
+        return Err(AuthError::InvalidToken(
+            "service JWT audience does not exactly match this DS".into(),
+        ));
+    }
+    match claims.lxm {
+        Some(method) if method == lxm => Ok(()),
+        Some(_) => Err(AuthError::LxmMismatch),
+        None => Err(AuthError::MissingLxm),
+    }
+}
+
 async fn verify_s2s_caller(
     state: &GroupRelayState,
     headers: &HeaderMap,
@@ -306,6 +374,9 @@ async fn verify_s2s_caller(
     body: &[u8],
 ) -> Result<String, Response> {
     super::peer_policy::ensure_federation_open().map_err(IntoResponse::into_response)?;
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = body;
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(ref secret) = state.s2s_shared_secret {
         let caller = headers
             .get(S2S_CALLER_DID_HEADER)
@@ -342,33 +413,11 @@ async fn verify_s2s_caller(
         }
     }
 
-    match crate::auth::verify_mls_service_principal(headers, &state.pool, lxm).await {
-        Ok(principal) => return authorize_s2s_peer(state, principal.did()).await,
-        // Undecided here: the legacy audience below cannot accept a token this
-        // path already parsed, so falling back would turn it into a refusal.
-        Err(error @ crate::auth::AuthError::Internal(_)) => return Err(s2s_auth_failure(error)),
-        Err(error) if error.is_retryable() => return Err(s2s_auth_failure(error)),
-        Err(_) => {}
-    }
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| {
-            s2s_err(
-                StatusCode::UNAUTHORIZED,
-                "NotAuthorized",
-                "missing Bearer token",
-            )
-        })?;
-    let claims = crate::auth::shared_auth_middleware()
-        .verify_jwt_for_audience(token, Some(&state.self_did))
+    require_exact_s2s_scope(headers, &state.self_did, lxm).map_err(s2s_auth_failure)?;
+    let principal = crate::auth::verify_mls_service_principal(headers, &state.pool, lxm)
         .await
         .map_err(s2s_auth_failure)?;
-    crate::auth::enforce_standard_with_replay_store(&claims, lxm, &state.pool)
-        .await
-        .map_err(s2s_auth_failure)?;
-    authorize_s2s_peer(state, &claims.iss).await
+    authorize_s2s_peer(state, principal.did()).await
 }
 
 /// A caller's token checked against the issuer's DID document and this DS's
@@ -750,6 +799,7 @@ fn attach_group_s2s_auth(
     // Every inline group S2S send (relayGroupMutation, deliverGroupEntry) is
     // built here; a closed federation gate stops it before the network.
     super::peer_policy::ensure_federation_open()?;
+    #[cfg(any(test, feature = "test-support"))]
     if !s2s_secret.is_empty() {
         let mac = compute_s2s_mac(s2s_secret, caller_did, target_did, method, body_bytes);
         return Ok(request
@@ -757,6 +807,8 @@ fn attach_group_s2s_auth(
             .header(S2S_TARGET_DID_HEADER, target_did)
             .header(S2S_MAC_HEADER, mac));
     }
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = (s2s_secret, body_bytes);
     let signing_key_pem = super::canonical_relay::configured_s2s_signing_key_pem()?;
     let client = super::service_auth::ServiceAuthClient::from_es256_pem(
         caller_did.to_string(),
@@ -861,25 +913,26 @@ async fn sequence_relayed_group_submit_transition(
             None,
             300,
         );
-        let routes = crate::chat_protocol::federation_routing::resolve_participant_routing(
-            &state.pool,
-            Some(&resolver),
-            &add_principals,
-        )
-        .await
-        .map_err(|e| {
-            use crate::chat_protocol::federation_routing::FederationRoutingError;
-            let message = format!("participant routing failed: {e}");
-            match &e {
-                FederationRoutingError::ResolutionFailed { source, .. }
-                | FederationRoutingError::UntrustedPeer { source, .. } => {
-                    added_member_failure(source, message)
+        let routes =
+            crate::chat_protocol::federation_routing::resolve_participant_routing_authoritative(
+                &state.pool,
+                Some(&resolver),
+                &add_principals,
+            )
+            .await
+            .map_err(|e| {
+                use crate::chat_protocol::federation_routing::FederationRoutingError;
+                let message = format!("participant routing failed: {e}");
+                match &e {
+                    FederationRoutingError::ResolutionFailed { source, .. }
+                    | FederationRoutingError::UntrustedPeer { source, .. } => {
+                        added_member_failure(source, message)
+                    }
+                    FederationRoutingError::DriftDetected { .. } => {
+                        s2s_err(StatusCode::FORBIDDEN, "NotAuthorized", message)
+                    }
                 }
-                FederationRoutingError::DriftDetected { .. } => {
-                    s2s_err(StatusCode::FORBIDDEN, "NotAuthorized", message)
-                }
-            }
-        })?;
+            })?;
         stage_remote_group_participants(&state.pool, &routes)
             .await
             .map_err(|e| added_member_failure(&e, e.to_string()))?;
@@ -2174,7 +2227,10 @@ async fn verify_and_wipe_remote_closed_conversation(
     .await;
     // `None`: the actor is homed here and its current key is read under the transaction lock.
     let remote_actor_key: Result<Option<(Vec<u8>, i64)>, Response> = async {
-        let actor_home = resolver.resolve(actor_did).await.map_err(lookup_failure)?;
+        let actor_home = resolver
+            .resolve_authoritative_ds(actor_did)
+            .await
+            .map_err(lookup_failure)?;
         if crate::identity::dids_equivalent(&actor_home.did, &state.self_did) {
             return Ok(None);
         }
@@ -2577,6 +2633,46 @@ mod tests {
             GroupRelayError::from_response(302, b""),
             GroupRelayError::Rejected(ChatProtocolErrorCode::InvalidRequest)
         ));
+    }
+
+    #[tokio::test]
+    async fn another_peer_hmac_cannot_forge_the_caller_did() {
+        crate::federation::open_federation_for_test();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1/group_hmac_forgery_test")
+            .unwrap();
+        let state = GroupRelayState::for_test(
+            pool,
+            "did:web:target.example".to_string(),
+            b"target-test-secret",
+            None,
+        );
+        let body = b"{}";
+        let caller = "did:web:trusted-sequencer.example";
+        let method = "blue.catbird.mlsDS.deliverGroupEntry";
+        let mut headers = HeaderMap::new();
+        headers.insert(S2S_CALLER_DID_HEADER, caller.parse().unwrap());
+        headers.insert(
+            S2S_TARGET_DID_HEADER,
+            "did:web:target.example".parse().unwrap(),
+        );
+        headers.insert(
+            S2S_MAC_HEADER,
+            compute_s2s_mac(
+                b"another-peer-test-secret",
+                caller,
+                "did:web:target.example",
+                method,
+                body,
+            )
+            .parse()
+            .unwrap(),
+        );
+
+        let response = verify_s2s_caller(&state, &headers, method, body)
+            .await
+            .expect_err("another peer's secret must not authenticate a forged caller DID");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
     use tower_util::ServiceExt;
 

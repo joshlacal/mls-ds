@@ -25,6 +25,15 @@
 
 mod common;
 
+// `key_packages.rs` samples the production deterministic clock after locking a
+// reservation candidate. This standalone include harness exercises publishing,
+// so its crate-local clock only supplies that otherwise-unused symbol.
+mod sim_hooks {
+    pub(crate) fn current_utc() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+}
+
 mod repository {
     pub(crate) mod key_packages {
         include!(concat!(

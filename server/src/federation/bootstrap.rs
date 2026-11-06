@@ -889,7 +889,7 @@ pub async fn fetch_remote_prefix_admission(
     }
 
     let participant_routes =
-        crate::chat_protocol::federation_routing::resolve_participant_routing_uncached(
+        crate::chat_protocol::federation_routing::resolve_participant_routing_authoritative(
             pool,
             Some(resolver),
             &unique_dids,

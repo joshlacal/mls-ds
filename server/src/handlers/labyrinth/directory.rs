@@ -3,15 +3,16 @@
 use std::sync::Arc;
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{RawQuery, State},
-    http::HeaderMap,
-    response::Response,
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
 };
 use serde_json::json;
 
-use super::params::{admit_procedure, admit_query, begin_write};
+use super::params::{admit_fixed_query, admit_procedure, admit_query, begin_write};
 use super::respond;
+use crate::federation::space_read_relay::{relay_mailbox_keys_record, SpaceRelayError};
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth::{begin_read, Admission};
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
@@ -80,6 +81,63 @@ pub async fn get_epoch_head(
         }
         .await,
     )
+}
+
+pub async fn get_mailbox_keys_record(
+    State(pool): Pool,
+    State(rt): Runtime,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Response {
+    let result: LabyrinthResult<Bytes> = async {
+        let (_admission, params) = admit_fixed_query(
+            &pool,
+            &rt,
+            "getMailboxKeysRecord",
+            &headers,
+            q.as_deref(),
+            &["did", "rkey"],
+        )
+        .await?;
+        let did = params.req("did")?;
+        check_did("did", did)?;
+        let rkey = params.req("rkey")?;
+        let resolver = rt
+            .resolver()
+            .map(Arc::as_ref)
+            .ok_or_else(LabyrinthError::relay_unavailable)?;
+        relay_mailbox_keys_record(resolver, did, rkey)
+            .await
+            .map_err(mailbox_relay_error)?
+            .ok_or_else(|| LabyrinthError::not_found("RecordNotFound"))
+    }
+    .await;
+    match result {
+        Ok(bytes) => {
+            let mut response = Response::new(Body::from(bytes));
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            response
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+fn mailbox_relay_error(error: SpaceRelayError) -> LabyrinthError {
+    match error {
+        SpaceRelayError::InvalidRequest(message) => LabyrinthError::invalid(message),
+        SpaceRelayError::UpstreamUnavailable(_) => LabyrinthError::relay_unavailable(),
+        SpaceRelayError::InvalidNsid(_)
+        | SpaceRelayError::InvalidTargetEndpoint(_)
+        | SpaceRelayError::InvalidDelegationToken(_)
+        | SpaceRelayError::Forbidden(_)
+        | SpaceRelayError::UpstreamError(_) => LabyrinthError::new(
+            StatusCode::BAD_GATEWAY,
+            "UpstreamError",
+            "the target PDS returned an invalid mailboxKeys record",
+        ),
+    }
 }
 
 pub async fn get_chat_device_keys(

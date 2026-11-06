@@ -1,11 +1,15 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+#[cfg(any(test, feature = "test-support"))]
+use jsonwebtoken::{encode, EncodingKey};
+use jsonwebtoken::{Algorithm, Header};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::pkcs8::DecodePrivateKey;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use super::errors::FederationError;
+
+const SERVICE_AUTH_LIFETIME_SECONDS: i64 = 60;
 
 /// Claims for DS-to-DS service auth JWT.
 #[derive(Debug, Serialize, Deserialize)]
@@ -29,6 +33,7 @@ pub struct ServiceAuthClient {
 
 enum ServiceSigningKey {
     Es256(SigningKey),
+    #[cfg(any(test, feature = "test-support"))]
     SharedSecret(EncodingKey),
 }
 
@@ -64,7 +69,8 @@ impl ServiceAuthClient {
         })
     }
 
-    /// Create a shared-secret HMAC client (for development/testing).
+    /// Create a shared-secret client for test fixtures only.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_shared_secret(self_did: String, secret: &[u8]) -> Self {
         Self {
             self_did,
@@ -87,7 +93,7 @@ impl ServiceAuthClient {
         let claims = ServiceAuthClaims {
             iss: self.self_did.clone(),
             aud: target_did.to_string(),
-            exp: now + 120,
+            exp: now + SERVICE_AUTH_LIFETIME_SECONDS,
             iat: now,
             lxm: method.to_string(),
             jti: jti.to_string(),
@@ -95,6 +101,7 @@ impl ServiceAuthClient {
 
         let mut header = Header::new(match &self.signing_key {
             ServiceSigningKey::Es256(_) => Algorithm::ES256,
+            #[cfg(any(test, feature = "test-support"))]
             ServiceSigningKey::SharedSecret(_) => Algorithm::HS256,
         });
         if let Some(ref kid) = self.key_id {
@@ -125,6 +132,7 @@ impl ServiceAuthClient {
                     URL_SAFE_NO_PAD.encode(signature.to_bytes())
                 )
             }
+            #[cfg(any(test, feature = "test-support"))]
             ServiceSigningKey::SharedSecret(key) => {
                 encode(&header, &claims, key).map_err(|e| FederationError::AuthFailed {
                     reason: format!("JWT encoding failed: {e}"),
@@ -245,7 +253,10 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.header.kid.as_deref(), Some("#atproto"));
         assert_eq!(decoded.claims.iat, now.timestamp());
-        assert_eq!(decoded.claims.exp, now.timestamp() + 120);
+        assert_eq!(
+            decoded.claims.exp,
+            now.timestamp() + SERVICE_AUTH_LIFETIME_SECONDS
+        );
         assert_eq!(decoded.claims.lxm, "blue.catbird.mlsDS.deliverMessage");
     }
 
@@ -298,8 +309,7 @@ mod tests {
         let decoded = jsonwebtoken::decode::<ServiceAuthClaims>(&token, &key, &validation);
         assert!(decoded.is_ok());
         let claims = decoded.unwrap().claims;
-        // Token should expire 120 seconds after issuance
-        assert_eq!(claims.exp - claims.iat, 120);
+        assert_eq!(claims.exp - claims.iat, SERVICE_AUTH_LIFETIME_SECONDS);
     }
 
     #[test]

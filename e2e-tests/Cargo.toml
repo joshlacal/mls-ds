@@ -52,7 +52,7 @@ openmls_basic_credential = { version = "=0.6.0-rc.3", git = "https://github.com/
 atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
 labyrinth = { path = "../../labyrinth" }
 labyrinth-protocol = { path = "../../labyrinth/labyrinth-protocol" }
-bird-daemon = { path = "../../BIRDaemon" }
+bird-daemon = { path = "../../BIRDaemon", default-features = false, features = ["test-support"] }
 tempfile = "3"
 url = "2"
 axum = "0.8"

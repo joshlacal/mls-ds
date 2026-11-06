@@ -34,6 +34,77 @@ use crate::{
 
 const DELIVER_GROUP_ENTRY_NSID: &str = "blue.catbird.mlsDS.deliverGroupEntry";
 
+#[derive(Debug)]
+enum DrainStreamError {
+    ExpectedRetry(String),
+    MustSurface(String),
+}
+
+impl DrainStreamError {
+    #[cfg(feature = "sim")]
+    fn must_surface(&self) -> bool {
+        matches!(self, Self::MustSurface(_))
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::ExpectedRetry(message) | Self::MustSurface(message) => message,
+        }
+    }
+}
+
+#[cfg(feature = "sim")]
+static SIM_INLINE_FANOUT_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<usize, (std::sync::Weak<crate::sim_hooks::SimDsHooks>, Vec<String>)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+#[cfg(feature = "sim")]
+fn sim_hooks_key(hooks: &std::sync::Arc<crate::sim_hooks::SimDsHooks>) -> usize {
+    std::sync::Arc::as_ptr(hooks) as usize
+}
+
+#[cfg(feature = "sim")]
+fn record_sim_inline_fanout_failure(message: String) {
+    if let Some(hooks) = crate::sim_hooks::active_sim_ds() {
+        let mut failures = SIM_INLINE_FANOUT_FAILURES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let entry = failures
+            .entry(sim_hooks_key(&hooks))
+            .or_insert_with(|| (std::sync::Arc::downgrade(&hooks), Vec::new()));
+        if entry.0.upgrade().is_none() {
+            *entry = (std::sync::Arc::downgrade(&hooks), Vec::new());
+        }
+        entry.1.push(message);
+    }
+}
+
+/// Drain failures produced by inline post-commit fan-out for this simulated
+/// delivery service. Expected transport retries are deliberately excluded.
+#[cfg(feature = "sim")]
+#[doc(hidden)]
+pub fn take_sim_inline_fanout_failures(
+    hooks: &std::sync::Arc<crate::sim_hooks::SimDsHooks>,
+) -> Vec<String> {
+    SIM_INLINE_FANOUT_FAILURES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&sim_hooks_key(hooks))
+        .map(|(_, failures)| failures)
+        .unwrap_or_default()
+}
+
+fn report_drain_error(error: DrainStreamError) -> String {
+    #[cfg(feature = "sim")]
+    let must_surface = error.must_surface();
+    let message = error.into_message();
+    #[cfg(feature = "sim")]
+    if must_surface {
+        record_sim_inline_fanout_failure(message.clone());
+    }
+    message
+}
+
 #[derive(Debug, Clone)]
 struct RemoteHomeTarget {
     remote_home_did: String,
@@ -498,6 +569,7 @@ impl PreparedGroupEntryFanout {
             if let Err(error) =
                 drain_stream(pool, eff_resolver, &self.sequencer_did, &secret, stream).await
             {
+                let error = report_drain_error(error);
                 tracing::warn!(
                     remote_home_did = %home,
                     conversation_id = %conversation_id,
@@ -519,7 +591,7 @@ async fn drain_stream(
     sequencer_did: &str,
     secret: &str,
     stream: StreamHead<'_>,
-) -> Result<(), String> {
+) -> Result<(), DrainStreamError> {
     // Paused while the federation gate is closed: the stream stays pending
     // for the outbound worker, which sends it once the gate reopens.
     if super::peer_policy::ensure_federation_open().is_err() {
@@ -528,7 +600,9 @@ async fn drain_stream(
     let home = stream.target_ds_did;
     while let Some(item) = claim_due_heads(pool, 1, Some(stream))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|error| {
+            DrainStreamError::MustSurface(format!("claim group-entry stream for {home}: {error}"))
+        })?
         .pop()
     {
         let sent = match serde_json::from_slice::<DeliverGroupEntryRequest>(&item.payload) {
@@ -569,17 +643,72 @@ async fn drain_stream(
                     backoff_delay(item.retry_count),
                 )
                 .await
-                .map_err(|e| e.to_string())?;
-            } else {
-                mark_item_dead(pool, &item.id, item.claim_token, &reason)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                .map_err(|error| {
+                    DrainStreamError::MustSurface(format!(
+                        "schedule group-entry retry {} after {reason}: {error}",
+                        item.id
+                    ))
+                })?;
+                return Err(DrainStreamError::ExpectedRetry(reason));
             }
-            return Err(reason);
+            mark_item_dead(pool, &item.id, item.claim_token, &reason)
+                .await
+                .map_err(|error| {
+                    DrainStreamError::MustSurface(format!(
+                        "settle dead group entry {} after {reason}: {error}",
+                        item.id
+                    ))
+                })?;
+            return Err(DrainStreamError::MustSurface(reason));
         }
         mark_item_delivered(pool, &item.id, item.claim_token)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| {
+                DrainStreamError::MustSurface(format!(
+                    "settle delivered group entry {}: {error}",
+                    item.id
+                ))
+            })?;
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "sim"))]
+mod sim_failure_tests {
+    use super::*;
+    use crate::sim_hooks::SimDsHooks;
+    use std::sync::Arc;
+
+    fn hooks() -> Arc<SimDsHooks> {
+        Arc::new(SimDsHooks {
+            service_did: "did:web:sim.test".into(),
+            self_endpoint: "https://sim.test".into(),
+            signing_key_pem: None,
+            group_relay_hmac_secret: None,
+            http_transport: Arc::new(|_| Box::pin(async { Err("unused".into()) })),
+            dns_resolver: Arc::new(|_| Ok(vec![std::net::IpAddr::from([93, 184, 216, 34])])),
+            retain_application_ciphertext: false,
+        })
+    }
+
+    #[test]
+    fn inline_storage_failure_is_reported_but_scheduled_transport_retry_is_not() {
+        let hooks = hooks();
+        let _ = take_sim_inline_fanout_failures(&hooks);
+        crate::sim_hooks::with_sim_ds(Arc::clone(&hooks), || {
+            assert_eq!(
+                report_drain_error(DrainStreamError::ExpectedRetry("retry".into())),
+                "retry"
+            );
+        });
+        assert!(take_sim_inline_fanout_failures(&hooks).is_empty());
+
+        crate::sim_hooks::with_sim_ds(Arc::clone(&hooks), || {
+            assert_eq!(
+                report_drain_error(DrainStreamError::MustSurface("settlement".into())),
+                "settlement"
+            );
+        });
+        assert_eq!(take_sim_inline_fanout_failures(&hooks), vec!["settlement"]);
+    }
 }

@@ -104,7 +104,7 @@ pub fn reviewed_request_migrations() -> [BaselineMigration; 57] {
         baseline!(20261104000008, "queued copy conversation indexes", "20261104000008_queued_copy_conversation_indexes.sql", "4f815c232b88a8ff6b7b885288926493d24ce3ec418445fbd52f4bdc60dfda7f0021ca96c3f92c14ede138cd66bc75c1"),
         baseline!(20261104000010, "wipe returns whole retained charge", "20261104000010_wipe_returns_whole_retained_charge.sql", "2683e751903eadd28ba7b7df9a2d43a7eb10c62fb5a6bf644582dcc92565ddca85b0cccd1e7efcefcbb7f9d2f3880a8b"),
         baseline!(20261104000011, "direct request route answers", "20261104000011_direct_request_route_answers.sql", "6a8bce9ce6af92567d62820ca40464860a14b56b47d72f91f51649b1e98ea095ce9ea233258b7cc7cbf26e379516617d"),
-        baseline!(20261104000012, "postgres churn partitions", "20261104000012_postgres_churn_partitions.sql", "cdf0de967150738a150539a8c82c45010939282185b1c211c665d81e8551c6de143805b174b11c0edeb8d4ee950c150f"),
+        baseline!(20261104000012, "postgres churn partitions", "20261104000012_postgres_churn_partitions.sql", "e9700954fc90dd3f99c47eb93eddac7f233e2e2f274f01882c49144b2c9d7499ac60e277f3629039019555c6df9aaa80"),
     ]
 }
 pub fn reviewed_auth_replay_prerequisite() -> BaselineMigration {

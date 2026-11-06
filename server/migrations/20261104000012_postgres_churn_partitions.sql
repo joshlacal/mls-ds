@@ -203,8 +203,10 @@ FOR EACH ROW EXECUTE FUNCTION public.finalize_inserted_transport_terminal_at(
 );
 
 -- PostgreSQL cannot express a global unique key whose partition key is nullable.
--- The per-partition UNIQUE NULLS NOT DISTINCT constraint handles concurrent active
--- inserts; this trigger preserves the old global id invariant across months.
+-- The per-partition UNIQUE NULLS NOT DISTINCT constraint handles physical rows.
+-- Deterministic queue ids are idempotency keys: serialize every id before a
+-- fresh global lookup, then suppress an INSERT replay even when its winner has
+-- already moved to another month. An id-changing UPDATE remains an error.
 CREATE FUNCTION public.guard_transport_history_id()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -217,14 +219,19 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    PERFORM pg_advisory_xact_lock(hashtextextended(parent_table::text || ':' || NEW.id, 0));
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(parent_table::oid::text || ':' || NEW.id, 0)
+    );
     EXECUTE format(
-        'SELECT EXISTS (SELECT 1 FROM %s WHERE id = $1 AND terminal_at IS DISTINCT FROM $2)',
+        'SELECT EXISTS (SELECT 1 FROM %s WHERE id = $1)',
         parent_table
     )
        INTO duplicate_exists
-       USING NEW.id, NEW.terminal_at;
+       USING NEW.id;
     IF duplicate_exists THEN
+        IF TG_OP = 'INSERT' THEN
+            RETURN NULL;
+        END IF;
         RAISE unique_violation USING
             MESSAGE = format('duplicate transport history id %L', NEW.id),
             TABLE = TG_TABLE_NAME,
@@ -251,6 +258,7 @@ CREATE FUNCTION public.maintain_transport_partitions(
 )
 RETURNS BIGINT
 LANGUAGE plpgsql
+SET timezone = 'UTC'
 AS $$
 DECLARE
     parent_schema NAME;
@@ -292,7 +300,14 @@ BEGIN
     stage_name := parent_name || '_partition_stage';
     months_name := parent_name || '_partition_months';
 
-    PERFORM pg_advisory_xact_lock(hashtextextended(parent_table::text || ':partition-maintenance', 0));
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(parent_table::oid::text || ':partition-maintenance', 0)
+    );
+    -- Parent first: ordinary DML takes the same parent -> child order.
+    EXECUTE format(
+        'LOCK TABLE ONLY %I.%I IN ACCESS EXCLUSIVE MODE',
+        parent_schema, parent_name
+    );
     EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE', parent_schema, default_name);
 
     EXECUTE format('DROP TABLE IF EXISTS pg_temp.%I', stage_name);

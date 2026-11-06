@@ -86,6 +86,22 @@ async fn assert_churn_schema(pool: &PgPool) {
         );
     }
 
+    let maintenance_uses_utc: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+             SELECT 1 FROM pg_proc p \
+             CROSS JOIN LATERAL unnest(p.proconfig) AS config(setting) \
+              WHERE p.oid = to_regprocedure(\
+                  'public.maintain_transport_partitions(regclass,interval,timestamp with time zone,boolean,integer)'\
+              ) AND lower(setting) = 'timezone=utc')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        maintenance_uses_utc,
+        "partition-bound and retention arithmetic is catalog-pinned to UTC"
+    );
+
     let expected_options = vec![
         "autovacuum_analyze_scale_factor=0.01".to_owned(),
         "autovacuum_vacuum_scale_factor=0.01".to_owned(),
@@ -123,6 +139,79 @@ async fn assert_churn_schema(pool: &PgPool) {
     .await
     .unwrap();
     assert_eq!(conversation_options, vec!["fillfactor=70"]);
+}
+
+async fn wait_for_backend_lock(pool: &PgPool, pid: i32, label: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: Option<bool> = sqlx::query_scalar(
+            "SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = $1",
+        )
+        .bind(pid)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if waiting == Some(true) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label} never reached its lock wait"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+async fn assert_concurrent_terminal_replay_is_noop(
+    pool: &PgPool,
+    table: &str,
+    first_insert: &'static str,
+    replay_insert: &'static str,
+    terminal_update: &'static str,
+) {
+    let id = format!("concurrent-terminal-replay-{table}");
+    let mut winner = pool.begin().await.unwrap();
+    let inserted = sqlx::query(first_insert)
+        .bind(&id)
+        .execute(&mut *winner)
+        .await
+        .unwrap();
+    assert_eq!(inserted.rows_affected(), 1);
+
+    let mut contender = pool.acquire().await.unwrap();
+    let contender_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *contender)
+        .await
+        .unwrap();
+    let contender_id = id.clone();
+    let replay = tokio::spawn(async move {
+        let result = sqlx::query(replay_insert)
+            .bind(contender_id)
+            .execute(&mut *contender)
+            .await?;
+        Ok::<u64, sqlx::Error>(result.rows_affected())
+    });
+    wait_for_backend_lock(pool, contender_pid, table).await;
+
+    sqlx::query(terminal_update)
+        .bind(&id)
+        .execute(&mut *winner)
+        .await
+        .unwrap();
+    winner.commit().await.unwrap();
+    assert_eq!(
+        replay.await.unwrap().unwrap(),
+        0,
+        "the concurrent replay is the same no-op as ON CONFLICT DO NOTHING"
+    );
+
+    let count: i64 =
+        sqlx::query_scalar(&format!("SELECT count(*) FROM public.{table} WHERE id=$1"))
+            .bind(&id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "one deterministic transport id survives");
 }
 
 #[tokio::test]
@@ -276,17 +365,16 @@ async fn previous_schema_upgrade_preserves_rows_and_drops_only_expired_partition
     let duplicate = sqlx::query(
         "INSERT INTO public.outbound_queue \
          (id,target_ds_did,target_endpoint,method,payload,convo_id,status) \
-         VALUES ('stable-terminal','did:web:peer.example','https://peer.example','m',decode('06','hex'),'c','pending')",
+         VALUES ('stable-terminal','did:web:peer.example','https://peer.example','m',decode('06','hex'),'c','pending') \
+         ON CONFLICT DO NOTHING",
     )
     .execute(&pool)
     .await
-    .expect_err("global id guard rejects a duplicate across partitions");
+    .expect("a deterministic replay remains a no-op across partitions");
     assert_eq!(
-        duplicate
-            .as_database_error()
-            .and_then(|error| error.code())
-            .as_deref(),
-        Some("23505")
+        duplicate.rows_affected(),
+        0,
+        "the global id guard suppresses the replay just like ON CONFLICT DO NOTHING"
     );
 
     sqlx::query(
@@ -323,4 +411,157 @@ async fn previous_schema_upgrade_preserves_rows_and_drops_only_expired_partition
     .await
     .unwrap();
     assert_eq!(survivors, vec!["old-but-live"]);
+}
+
+#[tokio::test]
+#[ignore = "requires loopback PostgreSQL 16 with database creation privileges"]
+async fn concurrent_replay_remains_a_noop_after_the_winner_routes_terminal() {
+    let database = fresh_fully_migrated_db(PREFIX).await;
+    let pool = database.connect(6).await;
+
+    assert_concurrent_terminal_replay_is_noop(
+        &pool,
+        "outbound_queue",
+        "INSERT INTO public.outbound_queue \
+         (id,target_ds_did,target_endpoint,method,payload,convo_id,status) \
+         VALUES ($1,'did:web:peer.example','https://peer.example','m',decode('11','hex'),'c','pending') \
+         ON CONFLICT DO NOTHING",
+        "INSERT INTO public.outbound_queue \
+         (id,target_ds_did,target_endpoint,method,payload,convo_id,status) \
+         SELECT $1,'did:web:peer.example','https://peer.example','m',decode('12','hex'),'c','pending' \
+          WHERE NOT EXISTS(SELECT 1 FROM public.outbound_queue WHERE id=$1) \
+         ON CONFLICT DO NOTHING",
+        "UPDATE public.outbound_queue SET status='delivered' WHERE id=$1",
+    )
+    .await;
+    assert_concurrent_terminal_replay_is_noop(
+        &pool,
+        "federation_outbox",
+        "INSERT INTO public.federation_outbox \
+         (id,conversation_id,target_service_did,payload,status) \
+         VALUES ($1,'c','did:web:peer.example',decode('21','hex'),'pending') \
+         ON CONFLICT DO NOTHING",
+        "INSERT INTO public.federation_outbox \
+         (id,conversation_id,target_service_did,payload,status) \
+         SELECT $1,'c','did:web:peer.example',decode('22','hex'),'pending' \
+          WHERE NOT EXISTS(SELECT 1 FROM public.federation_outbox WHERE id=$1) \
+         ON CONFLICT DO NOTHING",
+        "UPDATE public.federation_outbox SET status='done' WHERE id=$1",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires loopback PostgreSQL 16 with database creation privileges"]
+async fn maintenance_locks_the_parent_before_default_and_cannot_deadlock_enqueue() {
+    let database = fresh_fully_migrated_db(PREFIX).await;
+    let pool = database.connect(6).await;
+    let mut producer = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE ONLY public.outbound_queue IN ROW EXCLUSIVE MODE")
+        .execute(&mut *producer)
+        .await
+        .unwrap();
+
+    let mut maintenance_connection = pool.acquire().await.unwrap();
+    let maintenance_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *maintenance_connection)
+        .await
+        .unwrap();
+    let maintenance = tokio::spawn(async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT public.maintain_transport_partitions(\
+                 'public.outbound_queue'::regclass,interval '7 days',\
+                 '2042-07-15T00:00:00Z'::timestamptz,FALSE,0)",
+        )
+        .fetch_one(&mut *maintenance_connection)
+        .await
+    });
+    wait_for_backend_lock(&pool, maintenance_pid, "partition maintenance").await;
+
+    sqlx::query("SET LOCAL lock_timeout='250ms'")
+        .execute(&mut *producer)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.outbound_queue \
+         (id,target_ds_did,target_endpoint,method,payload,convo_id,status) \
+         VALUES ('parent-first-producer','did:web:peer.example','https://peer.example',\
+                 'm',decode('31','hex'),'c','pending')",
+    )
+    .execute(&mut *producer)
+    .await
+    .expect("maintenance waiting on the parent must not hold DEFAULT");
+    producer.rollback().await.unwrap();
+    maintenance
+        .await
+        .unwrap()
+        .expect("maintenance proceeds after the producer releases the parent");
+}
+
+#[tokio::test]
+#[ignore = "requires loopback PostgreSQL 16 with database creation privileges"]
+async fn maintenance_month_arithmetic_is_utc_in_a_non_utc_session() {
+    let database = fresh_fully_migrated_db(PREFIX).await;
+    let pool = database.connect(3).await;
+    let mut connection = pool.acquire().await.unwrap();
+    sqlx::query("SET TIME ZONE 'America/New_York'")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query_scalar::<_, i64>(
+        "SELECT public.maintain_transport_partitions(\
+             'public.outbound_queue'::regclass,interval '7 days',\
+             '2026-03-15T00:00:00Z'::timestamptz,FALSE,0)",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    let timezone: String = sqlx::query_scalar("SELECT current_setting('TimeZone')")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        timezone, "America/New_York",
+        "the function's UTC setting is call-local"
+    );
+
+    sqlx::query(
+        "INSERT INTO public.outbound_queue \
+         (id,target_ds_did,target_endpoint,method,payload,convo_id,status,terminal_at) \
+         VALUES ('utc-month-end','did:web:peer.example','https://peer.example','m',\
+                 decode('41','hex'),'c','dead','2026-03-31T12:00:00Z')",
+    )
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    let location: String = sqlx::query_scalar(
+        "SELECT tableoid::regclass::text FROM public.outbound_queue WHERE id='utc-month-end'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        location, "outbound_queue_202603",
+        "March's upper bound is April 1 UTC, not a DST-shifted local instant"
+    );
+
+    sqlx::query_scalar::<_, i64>(
+        "SELECT public.maintain_transport_partitions(\
+             'public.outbound_queue'::regclass,interval '7 days',\
+             '2026-04-05T00:00:00Z'::timestamptz,TRUE,0)",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    let retained: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.outbound_queue_202603') IS NOT NULL \
+             AND EXISTS(SELECT 1 FROM public.outbound_queue WHERE id='utc-month-end')",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert!(
+        retained,
+        "the March partition contains rows younger than seven UTC days"
+    );
 }

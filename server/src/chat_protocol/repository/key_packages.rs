@@ -3,11 +3,12 @@
 // This is the single certified writer that turns already-validated key
 // packages into `available` `chat.key_packages` rows. Wire/profile/signature
 // validation is the caller's job (`wire::validate_key_package`); this module
-// only persists the resulting primitive columns, so it stays self-contained
-// (`chrono`/`sha2`/`sqlx`/`uuid`) and independently testable — the handler maps
-// a `wire::ValidatedKeyPackage` plus its original wire bytes into
-// `NewKeyPackage` before calling in. Regular `//` comments (not `//!`) so the
-// `#[path]`-including integration harness can inline this file as a module.
+// persists the resulting primitive columns. The reservation path samples the
+// crate's trusted clock only after locking its candidate; the standalone
+// integration harness supplies that one crate-local symbol. The handler maps a
+// `wire::ValidatedKeyPackage` plus its original wire bytes into `NewKeyPackage`
+// before calling in. Regular `//` comments (not `//!`) let the `#[path]`
+// integration harness inline this file as a module.
 //
 // `chat.key_packages` is not an inventory-selection domain: publishing an
 // `available` package is a plain batch INSERT with no delivery-event append.
@@ -174,14 +175,36 @@ pub(crate) async fn publish_key_packages(
 /// enrollment, replenishment, recovery and direct requests, so the deferred
 /// mapping's principal lock at commit is already held. Only a device whose
 /// current key is in `authorized_signing_keys` qualifies; a package under a live
-/// group export lease is left to its pending acceptance. Returns the wrapper and
-/// its SHA-256, or `None` when nothing is available.
+/// group export lease is left to its pending acceptance. The final reservation
+/// samples `trusted_now` again and rechecks both lifetime and export lease in a
+/// fresh CAS statement after locking the candidate. Returns the wrapper and its
+/// SHA-256, or `None` when nothing is available.
 pub(crate) async fn reserve_federated_key_package(
     transaction: &mut Transaction<'_, Postgres>,
     owner_did: &str,
     requester_ds_did: &str,
     authorized_signing_keys: &[Vec<u8>],
-    now: DateTime<Utc>,
+    selected_at: DateTime<Utc>,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, sqlx::Error> {
+    let trusted_now = crate::sim_hooks::current_utc;
+    reserve_federated_key_package_with_clock(
+        transaction,
+        owner_did,
+        requester_ds_did,
+        authorized_signing_keys,
+        selected_at,
+        trusted_now,
+    )
+    .await
+}
+
+pub(super) async fn reserve_federated_key_package_with_clock(
+    transaction: &mut Transaction<'_, Postgres>,
+    owner_did: &str,
+    requester_ds_did: &str,
+    authorized_signing_keys: &[Vec<u8>],
+    selected_at: DateTime<Utc>,
+    trusted_now: impl Fn() -> DateTime<Utc>,
 ) -> Result<Option<(Vec<u8>, Vec<u8>)>, sqlx::Error> {
     let principal: Option<String> =
         sqlx::query_scalar("SELECT user_did FROM chat.principals WHERE user_did = $1 FOR UPDATE")
@@ -214,9 +237,9 @@ pub(crate) async fn reserve_federated_key_package(
     let device_ids: Vec<Uuid> = devices.iter().map(|device| device.0).collect();
     let key_ids: Vec<&str> = devices.iter().map(|device| device.1.as_str()).collect();
     let generations: Vec<i64> = devices.iter().map(|device| device.2).collect();
-    let candidate: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    let candidate: Option<Vec<u8>> = sqlx::query_scalar(
         r#"
-        SELECT p.key_package_ref, p.wrapper_bytes, p.wrapper_sha256
+        SELECT p.key_package_ref
         FROM chat.key_packages p
         JOIN unnest($2::uuid[], $3::text[], $4::bigint[]) AS d(device_id, key_id, auth_generation)
           ON p.owner_device_id = d.device_id AND p.owner_key_id = d.key_id
@@ -234,29 +257,58 @@ pub(crate) async fn reserve_federated_key_package(
     .bind(&device_ids)
     .bind(&key_ids)
     .bind(&generations)
-    .bind(now)
+    .bind(selected_at)
     .fetch_optional(&mut **transaction)
     .await?;
-    let Some((key_package_ref, wrapper_bytes, wrapper_sha256)) = candidate else {
+    let Some(key_package_ref) = candidate else {
         return Ok(None);
     };
-    sqlx::query(
-        "UPDATE chat.key_packages SET status = 'reserved' \
-          WHERE key_package_ref = $1 AND status = 'available'",
+    reserve_locked_federated_key_package(
+        transaction,
+        &key_package_ref,
+        requester_ds_did,
+        trusted_now(),
     )
-    .bind(&key_package_ref)
-    .execute(&mut **transaction)
+    .await
+}
+
+/// CAS a candidate already locked by `reserve_federated_key_package`. The
+/// separate statement gets a fresh READ COMMITTED snapshot after any exporter
+/// that won the package lock committed its lease.
+pub(super) async fn reserve_locked_federated_key_package(
+    transaction: &mut Transaction<'_, Postgres>,
+    key_package_ref: &[u8],
+    requester_ds_did: &str,
+    reserved_at: DateTime<Utc>,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, sqlx::Error> {
+    let reserved: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        r#"
+        UPDATE chat.key_packages AS p
+           SET status = 'reserved'
+         WHERE p.key_package_ref = $1 AND p.status = 'available'
+           AND p.not_before < $2 AND $2 < p.not_after
+           AND NOT EXISTS(SELECT 1 FROM chat.group_key_package_exports e
+               WHERE e.key_package_ref = p.key_package_ref AND e.expires_at > $2)
+        RETURNING p.wrapper_bytes, p.wrapper_sha256
+        "#,
+    )
+    .bind(key_package_ref)
+    .bind(reserved_at)
+    .fetch_optional(&mut **transaction)
     .await?;
+    let Some(reserved) = reserved else {
+        return Ok(None);
+    };
     sqlx::query(
         "INSERT INTO chat.federated_key_package_reservations \
              (key_package_ref, requester_ds_did, reserved_at) VALUES ($1, $2, $3)",
     )
-    .bind(&key_package_ref)
+    .bind(key_package_ref)
     .bind(requester_ds_did)
-    .bind(now)
+    .bind(reserved_at)
     .execute(&mut **transaction)
     .await?;
-    Ok(Some((wrapper_bytes, wrapper_sha256)))
+    Ok(Some(reserved))
 }
 
 fn unix_to_timestamptz(secs: u64) -> Result<DateTime<Utc>, KeyPackageRepositoryError> {

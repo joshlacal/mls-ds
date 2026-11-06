@@ -235,26 +235,30 @@ transport queues with age-expired terminal history. Active `pending` and
 `in_flight` rows have `terminal_at IS NULL` and stay in each table's DEFAULT
 partition. The first terminal transition stamps `terminal_at`; later terminal
 updates preserve it. PostgreSQL routes those immutable rows into UTC calendar
-month partitions. The workers call
+month partitions. The maintenance function fixes its own timezone to UTC, so
+manual clients and the workers use identical interval arithmetic. It takes the
+partition parent lock before DEFAULT, matching producer parent-to-child order.
+The workers call
 `public.maintain_transport_partitions(regclass, interval, timestamptz)` every
 five minutes, keep the current and next two months ready, and drop only a whole
 month whose upper bound is at least seven days old. A missed maintenance window
 is safe: finite rows land in DEFAULT and the next call moves them before
 attaching the month. The upgrade call creates and routes partitions with
 `drop_expired=FALSE`, so applying the migration itself deletes no rows.
-Raw-file size: `17047` bytes. SQLx SHA-384:
-`cdf0de967150738a150539a8c82c45010939282185b1c211c665d81e8551c6de143805b174b11c0edeb8d4ee950c150f`.
+Raw-file size: `17470` bytes. SQLx SHA-384:
+`e9700954fc90dd3f99c47eb93eddac7f233e2e2f274f01882c49144b2c9d7499ac60e277f3629039019555c6df9aaa80`.
 
 
 PostgreSQL requires every partitioned unique constraint to include the
 partition key. Because active rows need a nullable key, the physical constraint
 is `UNIQUE NULLS NOT DISTINCT (id, terminal_at)`. A guarded trigger retains the
-old global `id` invariant across months. A shape check forbids an active row
+old global `id` invariant across months. It transaction-serializes inserts by
+the parent OID plus deterministic ID, then performs a fresh global existence
+check; a replay returns no row, preserving `ON CONFLICT DO NOTHING` even when
+the winner moved to a terminal partition. A shape check forbids an active row
 with a finite key; BEFORE UPDATE and AFTER INSERT triggers guarantee every
-terminal row receives one while preserving an existing terminal month.
-Deterministic enqueue sites first look for an existing `id` before
-`ON CONFLICT DO NOTHING`. Neither table has an inbound foreign key at this
-migration tip.
+terminal row receives one while preserving an existing terminal month. Neither
+table has an inbound foreign key at this migration tip.
 
 | Relation | Time/identity and query indexes | Existing retention semantics | Decision |
 |---|---|---|---|
@@ -319,7 +323,7 @@ PGOPTIONS="-c chat.operation_claim_activation_approved=handlers-and-legacy-apis-
   sqlx migrate run --database-url "$DATABASE_URL"
 ```
 
-`../scripts/reset-dev-db.sh <URL>` (`make reset-dev-db URL=...`) runs the same three steps for the local federation stack's databases only (`catbird` on `localhost` or `127.0.0.1` port `5433` or `5434`, whose server reports `cluster_name` `catbird-federation-ds1` or `catbird-federation-ds2`) and refuses any other target. `sqlx migrate info` lists applied and pending migrations with their checksums.
+`../scripts/reset-dev-db.sh <URL>` (`make reset-dev-db URL=...`) runs the same three steps for the local federation stack's databases only (`catbird` on `localhost` or `127.0.0.1` port `5433` or `5434`, whose server reports `cluster_name` `catbird-federation-ds1` or `catbird-federation-ds2`) and refuses any other target. It then invokes the existing Compose `peer-fixtures` service with `--no-deps`, restoring both homes' idempotent peer allowlist rows before the reset home is restarted. `sqlx migrate info` lists applied and pending migrations with their checksums.
 
 ## Index Creation
 
@@ -474,12 +478,11 @@ the exact endpoint/query claim, and serves its live epoch chain or device roster
 Local replicated keys never substitute for the remote subject's current roster;
 no home database connection remains held during federation I/O.
 
-Outbound group federation uses DS-to-DS service-auth tokens: `aud` is the
-target's canonical bare DID, `lxm` is the exact `blue.catbird.mlsDS.*` method,
-and the lifetime is 120 s. A receiver also accepts the short-lived (at most 60 s)
-profile addressed to its `#atproto_mls` service, or an HMAC from
-`FEDERATION_GROUP_RELAY_HMAC_SECRET`; every path then applies inbound peer
-policy.
+Outbound group federation requires a per-issuer ES256 DS-to-DS service JWT:
+`aud` is exactly the target's canonical bare DID, `lxm` is exactly the called
+`blue.catbird.mlsDS.*` method, and the token lifetime is at most 60 s. The
+receiver verifies the issuer's live DID key and replay admission before inbound
+peer policy. Production has no shared-secret group-relay HMAC configuration.
 
 ## Remote ciphertext pruning and device key history
 

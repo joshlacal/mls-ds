@@ -1448,9 +1448,8 @@ async fn live_collection_failures_convert_to_typed_repository_errors() {
 /// Every repository caller that collects live relationship evidence answers a
 /// source outage as `Unavailable` and a malformed answer as unusable evidence.
 #[tokio::test]
-#[ignore = "root fresh-database authorization required"]
 async fn repository_callers_answer_a_live_source_outage_as_unavailable() {
-    let db = crate::common::fresh_db::fresh_fully_migrated_db("chat_rel_outage_").await;
+    let db = crate::common::fresh_db::fresh_fully_migrated_db("clean_slate_").await;
     let pool = db.connect(2).await;
     let members = roster(3);
     persist_principal_read_set(&pool, &members).await;
@@ -1514,9 +1513,8 @@ async fn repository_callers_answer_a_live_source_outage_as_unavailable() {
 /// The live-evidence verifiers keep an allowed pair (`Ok(true)`), an evaluated
 /// block (`Ok(false)`) and this server's own store failing distinct.
 #[tokio::test]
-#[ignore = "root fresh-database authorization required"]
 async fn policy_verifiers_keep_allow_block_and_store_failure_distinct() {
-    let db = crate::common::fresh_db::fresh_fully_migrated_db("chat_rel_verdict_").await;
+    let db = crate::common::fresh_db::fresh_fully_migrated_db("clean_slate_").await;
     let pool = db.connect(2).await;
     let members = roster(2);
     let mut tx = pool.begin().await.unwrap();

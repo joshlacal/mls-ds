@@ -1,7 +1,10 @@
 //! GET `fetchKeyPackage` reservation regression on the fully migrated schema;
 //! mounted only by the library test crate because it uses genuine KeyPackages.
 
-use super::key_packages::reserve_federated_key_package;
+use super::key_packages::{
+    reserve_federated_key_package, reserve_federated_key_package_with_clock,
+    reserve_locked_federated_key_package,
+};
 use crate::common::executor_seed::{
     clock_now,
     genuine_terminal_fixture::{build_genuine_invitee_key_package, AcceptanceInvitee},
@@ -141,6 +144,97 @@ async fn concurrent_federated_fetches_reserve_each_package_exactly_once() {
         .is_none(),
         "an exhausted owner yields no package"
     );
+}
+
+#[tokio::test]
+async fn reservation_cas_uses_a_fresh_trusted_expiry_after_locking() {
+    let db = crate::common::fresh_db::fresh_fully_migrated_db("chat_kpfetch_").await;
+    let pool = db.connect(4).await;
+    let owner = seed_owner_with_packages(&pool, 1).await;
+    let selected_at = clock_now(&pool).await;
+    let mut tx = pool.begin().await.unwrap();
+    let reserved = reserve_federated_key_package_with_clock(
+        &mut tx,
+        &owner.did,
+        REQUESTER,
+        std::slice::from_ref(&owner.signing_public_key),
+        selected_at,
+        || selected_at + Duration::hours(2),
+    )
+    .await
+    .unwrap();
+    assert!(
+        reserved.is_none(),
+        "a package that expires after selection is not reserved"
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(package_state(&pool, &owner.did).await, (0, 1, 0));
+}
+
+#[tokio::test]
+async fn reservation_cas_rechecks_an_export_lease_after_candidate_selection() {
+    let db = crate::common::fresh_db::fresh_fully_migrated_db("chat_kpfetch_").await;
+    let pool = db.connect(4).await;
+    let owner = seed_owner_with_packages(&pool, 1).await;
+    let selected_at = clock_now(&pool).await;
+    let key_package_ref: Vec<u8> =
+        sqlx::query_scalar("SELECT key_package_ref FROM chat.key_packages WHERE owner_did=$1")
+            .bind(&owner.did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let conversation_id =
+        crate::chat_protocol::test_support::seed_clean_slate_application_fixture_unsealed(
+            &pool,
+            false,
+            "did:web:key-package-recipient.example.com",
+            Some([0x67; 32]),
+            None,
+        )
+        .await
+        .unwrap()
+        .conversation_id;
+    sqlx::query(
+        "INSERT INTO chat.group_key_package_exports(\
+             key_package_ref,conversation_id,recovery_request_id,sequencer_did,expires_at\
+         ) VALUES($1,$2,$3,'did:web:sequencer.example.com',$4)",
+    )
+    .bind(&key_package_ref)
+    .bind(conversation_id)
+    .bind(Uuid::new_v4())
+    .bind(selected_at - Duration::seconds(1))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let locked: Vec<u8> = sqlx::query_scalar(
+        "SELECT p.key_package_ref FROM chat.key_packages p \
+          WHERE p.key_package_ref=$1 AND p.status='available' \
+            AND NOT EXISTS(SELECT 1 FROM chat.group_key_package_exports e \
+                WHERE e.key_package_ref=p.key_package_ref AND e.expires_at>$2) \
+          FOR UPDATE OF p",
+    )
+    .bind(&key_package_ref)
+    .bind(selected_at)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the expired lease is eligible at candidate selection");
+    sqlx::query("UPDATE chat.group_key_package_exports SET expires_at=$2 WHERE key_package_ref=$1")
+        .bind(&locked)
+        .bind(selected_at + Duration::minutes(5))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let reserved = reserve_locked_federated_key_package(&mut tx, &locked, REQUESTER, selected_at)
+        .await
+        .unwrap();
+    assert!(
+        reserved.is_none(),
+        "the fresh CAS sees a lease that became live after candidate selection"
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(package_state(&pool, &owner.did).await, (0, 1, 0));
 }
 
 #[tokio::test]
