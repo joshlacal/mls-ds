@@ -124,47 +124,69 @@ enum RoutingResolution {
     Authoritative,
 }
 
-async fn resolve_participant_routing_with<I, S>(
+async fn resolve_participant_routing_with<'a, I>(
     pool: &PgPool,
     resolver: Option<&DsResolver>,
     dids: I,
     resolution: RoutingResolution,
 ) -> Result<BTreeMap<String, Option<String>>, FederationRoutingError>
 where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    I: IntoIterator<Item = &'a String> + Clone,
 {
     let mut routes = BTreeMap::new();
     let Some(resolver) = resolver else {
-        for did_ref in dids {
-            routes.insert(did_ref.as_ref().to_string(), None);
+        for did in dids {
+            routes.insert(did.clone(), None);
         }
         return Ok(routes);
     };
 
     let self_did = resolver.self_did();
-    for did_ref in dids {
-        let did = did_ref.as_ref();
+    // A closed federation gate must reject a known-remote (or not-yet-known)
+    // participant before live declaration resolution can leave this home.
+    // Fresh self mappings may still be authoritatively refreshed for local work.
+    if matches!(resolution, RoutingResolution::Authoritative) {
+        if let Err(source) = peer_policy::ensure_federation_open() {
+            let mut blocked_did = None;
+            for did in dids.clone() {
+                let cached = resolver.get_cached(did).await.map_err(|source| {
+                    FederationRoutingError::ResolutionFailed {
+                        did: did.clone(),
+                        source,
+                    }
+                })?;
+                if !matches!(cached, Some(endpoint) if endpoint.did == self_did) {
+                    blocked_did = Some(did.clone());
+                    break;
+                }
+            }
+            if let Some(did) = blocked_did {
+                return Err(FederationRoutingError::ResolutionFailed { did, source });
+            }
+        }
+    }
+
+    for did in dids {
         let resolved = match resolution {
             RoutingResolution::Cached => resolver.resolve(did).await,
             RoutingResolution::Authoritative => resolver.resolve_authoritative_ds(did).await,
         };
         let endpoint = resolved.map_err(|source| FederationRoutingError::ResolutionFailed {
-            did: did.to_string(),
+            did: did.clone(),
             source,
         })?;
 
         if endpoint.did == self_did {
-            routes.insert(did.to_string(), None);
+            routes.insert(did.clone(), None);
         } else {
             peer_policy::enforce_outbound_peer_policy(pool, &endpoint.did)
                 .await
                 .map_err(|source| FederationRoutingError::UntrustedPeer {
-                    did: did.to_string(),
+                    did: did.clone(),
                     ds_did: endpoint.did.clone(),
                     source,
                 })?;
-            routes.insert(did.to_string(), Some(endpoint.did));
+            routes.insert(did.clone(), Some(endpoint.did));
         }
     }
     Ok(routes)
@@ -175,14 +197,13 @@ where
 /// decisions MUST use [`resolve_participant_routing_authoritative`].
 ///
 /// This MUST be called outside/before any business transaction.
-pub async fn resolve_participant_routing<I, S>(
+pub async fn resolve_participant_routing<'a, I>(
     pool: &PgPool,
     resolver: Option<&DsResolver>,
     dids: I,
 ) -> Result<BTreeMap<String, Option<String>>, FederationRoutingError>
 where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    I: IntoIterator<Item = &'a String> + Clone,
 {
     resolve_participant_routing_with(pool, resolver, dids, RoutingResolution::Cached).await
 }
@@ -191,14 +212,13 @@ where
 ///
 /// Authorization, membership persistence, and confidential fan-out MUST use
 /// this path rather than cached or degraded routing.
-pub async fn resolve_participant_routing_authoritative<I, S>(
+pub async fn resolve_participant_routing_authoritative<'a, I>(
     pool: &PgPool,
     resolver: Option<&DsResolver>,
     dids: I,
 ) -> Result<BTreeMap<String, Option<String>>, FederationRoutingError>
 where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    I: IntoIterator<Item = &'a String> + Clone,
 {
     resolve_participant_routing_with(pool, resolver, dids, RoutingResolution::Authoritative).await
 }

@@ -627,10 +627,6 @@ pub(crate) async fn relay_remote_group_submit_transition(
     mailbox_commit: bool,
     body: &[u8],
 ) -> Result<Option<Vec<u8>>, GroupRelayError> {
-    let secret = configured_group_relay_hmac_secret();
-    if secret.is_none() && super::canonical_relay::configured_s2s_signing_key_pem().is_err() {
-        return Ok(None);
-    }
     let Ok(body_json) = serde_json::from_slice::<Value>(body) else {
         return Ok(None);
     };
@@ -646,17 +642,24 @@ pub(crate) async fn relay_remote_group_submit_transition(
     .await
     .map_err(|e| GroupRelayError::Internal(e.to_string()))?;
     let seq_ds = match local_convo {
-        Some((kind, true, Some(seq_ds))) if kind == "group" && !mailbox_commit => seq_ds,
+        Some((kind, true, Some(seq_ds))) if kind == "group" => seq_ds,
         _ => return Ok(None),
     };
+    // Only the sequencer can sequence a mirror's transition: a closed gate
+    // decided nothing, and refuses before the sequencer is resolved.
+    super::peer_policy::ensure_federation_open().map_err(GroupRelayError::from_local)?;
+    if mailbox_commit {
+        return Ok(None);
+    }
+    let secret = configured_group_relay_hmac_secret();
+    if secret.is_none() && super::canonical_relay::configured_s2s_signing_key_pem().is_err() {
+        return Ok(None);
+    }
     if signed_req.pointer("/body/actorDid").and_then(Value::as_str) != Some(actor_did) {
         return Err(GroupRelayError::Rejected(
             crate::chat_protocol::error::ChatProtocolErrorCode::NotAuthorized,
         ));
     }
-    // Only the sequencer can sequence a mirror's transition: a closed gate
-    // decided nothing, and refuses before the sequencer is resolved.
-    super::peer_policy::ensure_federation_open().map_err(GroupRelayError::from_local)?;
     let dest = resolver
         .resolve_ds_destination_uncached(&seq_ds)
         .await

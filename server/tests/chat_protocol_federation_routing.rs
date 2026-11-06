@@ -1221,6 +1221,25 @@ fn remote_invitee_world(
             request.url.host_str().unwrap_or_default(),
             request.url.path(),
         ) {
+            ("pds.local.example.net", "/xrpc/com.atproto.repo.getRecord")
+                if collection.as_deref() == Some("blue.catbird.chat.declaration")
+                    && repo.is_some() =>
+            {
+                let actor = repo.as_deref().expect("guarded local actor DID");
+                Some((
+                    200,
+                    json!({
+                        "uri": format!("at://{actor}/blue.catbird.chat.declaration/self"),
+                        "value": {
+                            "$type": "blue.catbird.chat.declaration",
+                            "protocolVersion": "1",
+                            "createdAt": "2026-07-15T12:00:00Z",
+                            "allowIncoming": "all",
+                            "deliveryService": SELF_DS_DID,
+                        },
+                    }),
+                ))
+            }
             ("plc.directory", path) if path.strip_prefix('/') == Some(did.as_str()) => {
                 match *plc.lock().unwrap() {
                     Directory::Vouches => Some((200, document.clone())),
@@ -2062,7 +2081,10 @@ async fn a_relayed_add_is_retryable_while_the_new_members_home_cannot_answer() {
         None,
         300,
     )
-    .with_destination_resolver_hook(Arc::new(|_| {
+    .with_destination_resolver_hook(Arc::new(|target| {
+        if target != SEQ_DS_DID && target != SEQ_ENDPOINT {
+            return None;
+        }
         Some(Box::pin(async {
             Ok(ValidatedRemoteDestination {
                 url: SEQ_ENDPOINT.parse().unwrap(),
@@ -2073,7 +2095,9 @@ async fn a_relayed_add_is_retryable_while_the_new_members_home_cannot_answer() {
     }));
     let rt = ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
         .expect("build clean-chat runtime")
-        .with_resolver(Arc::new(resolver));
+        .with_resolver(Arc::new(resolver))
+        .with_sim_allow_all_relationships()
+        .expect("mirror relationship authority");
     let home = seq.same_group_at(&pool, Arc::new(rt)).await;
     sqlx::query(
         "UPDATE chat.conversations SET is_remote = TRUE, sequencer_ds = $2, sequencer_term = 1 \
@@ -2503,7 +2527,10 @@ async fn closed_federation_gate_answers_a_forwarded_transition_retryably_and_uns
             None,
             300,
         )
-        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+        .with_destination_resolver_hook(Arc::new(move |target| {
+            if target != PEER_DS_DID {
+                return None;
+            }
             counted.fetch_add(1, SeqCst);
             Some(Box::pin(async move {
                 Ok(
@@ -2513,6 +2540,14 @@ async fn closed_federation_gate_answers_a_forwarded_transition_retryably_and_uns
                         addrs: vec![addr],
                     },
                 )
+            }))
+        }))
+        .with_user_did_resolver_hook(Arc::new(|_| {
+            Some(Ok(catbird_server::federation::resolver::DsEndpoint {
+                did: SELF_DS_DID.to_owned(),
+                endpoint: EXTERNAL_BASE.to_owned(),
+                supported_cipher_suites: None,
+                federation_capabilities: None,
             }))
         })),
     );
@@ -2539,7 +2574,9 @@ async fn closed_federation_gate_answers_a_forwarded_transition_retryably_and_uns
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
             .expect("build clean-chat runtime")
             .with_resolver(resolver)
-            .with_commit_submitter(Arc::new(submitter)),
+            .with_commit_submitter(Arc::new(submitter))
+            .with_sim_allow_all_relationships()
+            .expect("forwarding relationship authority"),
     );
     let home = group_home(&pool, rt).await;
     // The group's sequencing moved to the peer: this home now holds a mirror.

@@ -957,7 +957,7 @@ impl DsResolver {
     }
 
     /// Look up cached endpoint for an actor DID from did_ds_mappings joined with ds_endpoints.
-    async fn get_cached(&self, actor_did: &str) -> Result<Option<DsEndpoint>, FederationError> {
+    pub async fn get_cached(&self, actor_did: &str) -> Result<Option<DsEndpoint>, FederationError> {
         let canonical = canonical_did(actor_did);
         let now = crate::sim_hooks::current_utc();
         let row = sqlx::query_as::<_, (String, String, Option<String>)>(

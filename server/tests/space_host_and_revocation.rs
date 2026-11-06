@@ -260,9 +260,11 @@ fn mint_service_jwt_es256(issuer_did: &str, key: &P256SigningKey, aud: &str, lxm
     let sig: Signature = key.sign(signing_input.as_bytes());
     format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
 }
+static SPACE_HOST_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_deletion() {
+    let _env = SPACE_HOST_ENV.lock().await;
     let authority_did = "did:web:ds-space.example.com";
     std::env::set_var("SERVICE_DID", authority_did);
     std::env::set_var("SELF_ENDPOINT", "https://ds-space.example.com");
@@ -906,6 +908,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
 
 #[tokio::test]
 async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_commit() {
+    let _env = SPACE_HOST_ENV.lock().await;
     let authority_did = "did:web:archive-inventory.example.com";
     std::env::set_var("SERVICE_DID", authority_did);
     std::env::set_var("SELF_ENDPOINT", "https://archive-inventory.example.com");
