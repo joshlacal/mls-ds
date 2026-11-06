@@ -23,6 +23,7 @@ use atproto_spaces::{
         SPACE_WANT_MAC_HEADER_NAME,
     },
     tokens::{mint_space_token, SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind},
+    SpaceUri,
 };
 use axum::{
     body::Body,
@@ -210,13 +211,15 @@ async fn start_mock_pds_and_syncer() -> (String, Arc<Mutex<Vec<RecordedNotice>>>
 fn mint_delegation(
     user_did: &str,
     user_pds_key: &P256SigningKey,
-    authority_did: &str,
     space_uri: &str,
     cnf_kid: &str,
     jti: &str,
     now_sec: u64,
 ) -> String {
     let _ = cnf_kid;
+    let authority = SpaceUri::parse(space_uri)
+        .expect("canonical Space URI")
+        .authority;
     let signing_key = SpaceSigningKey::P256 {
         signing_key: user_pds_key.clone(),
         kid: "#atproto".to_string(),
@@ -227,7 +230,7 @@ fn mint_delegation(
         &SpaceTokenClaims {
             iss: user_did.to_string(),
             sub: space_uri.to_string(),
-            aud: Some(format!("{authority_did}#atproto_pds")),
+            aud: Some(format!("{authority}#atproto_pds")),
             iat: now_sec,
             exp: now_sec + 60,
             jti: jti.to_string(),
@@ -326,7 +329,6 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     let sender_del = mint_delegation(
         &fixture.sender_did,
         &sender_pds_key,
-        authority_did,
         &space_uri,
         &sender_kid,
         "del-jti-sender-1",
@@ -396,7 +398,6 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     let recip_del = mint_delegation(
         &fixture.recipient_did,
         &recipient_pds_key,
-        authority_did,
         &space_uri,
         &recip_kid,
         "del-jti-recip-1",
@@ -462,7 +463,6 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     let pending_del = mint_delegation(
         &pending_target_did,
         &pending_pds_key,
-        authority_did,
         &pending_space_uri,
         &recip_kid,
         "del-jti-pending-1",
@@ -586,7 +586,6 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     let charlie_del = mint_delegation(
         charlie_did,
         &charlie_pds_key,
-        authority_did,
         &space_uri,
         &charlie_kid,
         "del-jti-charlie-1",
@@ -673,7 +672,6 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     let charlie_del_after = mint_delegation(
         charlie_did,
         &charlie_pds_key,
-        authority_did,
         &space_uri,
         &charlie_kid,
         "del-jti-charlie-after-rem",
@@ -1034,7 +1032,6 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
     let delegation = mint_delegation(
         &fixture.sender_did,
         &sender_pds_key,
-        authority_did,
         &space_uri,
         &sender_kid,
         "archive-inventory-delegation",

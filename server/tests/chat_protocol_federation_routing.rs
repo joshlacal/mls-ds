@@ -684,7 +684,11 @@ async fn seed_device_for_creation(
             public_key_jwk: Some(jwk),
             public_key_multibase: None,
         }],
-        service: None,
+        service: Some(vec![catbird_server::auth::Service {
+            id: "#atproto_pds".to_string(),
+            service_type: "AtprotoPersonalDataServer".to_string(),
+            service_endpoint: "https://pds.local.example.net".to_string(),
+        }]),
     };
     catbird_server::auth::cache_test_did_document(doc).await;
 }
@@ -1072,6 +1076,60 @@ impl RemoteHome {
     fn pds_answers(&self, pds: Directory) {
         *self.pds.lock().unwrap() = pds;
     }
+}
+
+#[cfg(feature = "sim")]
+fn local_actor_world(actor_did: &str) -> Arc<catbird_server::sim_hooks::SimDsHooks> {
+    use catbird_server::sim_hooks::{SimDsHooks, SimHttpRequest};
+    use p256::pkcs8::{EncodePrivateKey as _, LineEnding};
+    use std::{future::Future, pin::Pin};
+    type Reply = Pin<Box<dyn Future<Output = Result<::http::Response<Vec<u8>>, String>> + Send>>;
+
+    let did = actor_did.to_owned();
+    let transport = move |request: SimHttpRequest| -> Reply {
+        let repo = request
+            .url
+            .query_pairs()
+            .find(|(name, _)| name == "repo")
+            .map(|(_, value)| value.into_owned());
+        let answer = (request.url.host_str() == Some("pds.local.example.net")
+            && request.url.path() == "/xrpc/com.atproto.repo.getRecord"
+            && repo.as_deref() == Some(did.as_str()))
+        .then(|| {
+            json!({
+                "uri": format!("at://{did}/blue.catbird.chat.declaration/self"),
+                "value": {
+                    "$type": "blue.catbird.chat.declaration",
+                    "protocolVersion": "1",
+                    "createdAt": "2026-07-15T12:00:00Z",
+                    "allowIncoming": "all",
+                    "deliveryService": SELF_DS_DID,
+                },
+            })
+        });
+        Box::pin(async move {
+            let body = answer.ok_or_else(|| "unreachable".to_owned())?;
+            ::http::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(body.to_string().into_bytes())
+                .map_err(|error| error.to_string())
+        })
+    };
+    Arc::new(SimDsHooks {
+        service_did: SELF_DS_DID.to_owned(),
+        self_endpoint: EXTERNAL_BASE.to_owned(),
+        signing_key_pem: Some(
+            random_p256()
+                .to_pkcs8_pem(LineEnding::LF)
+                .unwrap()
+                .to_string(),
+        ),
+        group_relay_hmac_secret: None,
+        http_transport: Arc::new(transport),
+        dns_resolver: Arc::new(|_| Ok(vec!["93.184.216.34".parse().unwrap()])),
+        retain_application_ciphertext: false,
+    })
 }
 
 /// The remote invitee's world through the sim transport: its home DS
@@ -1517,6 +1575,13 @@ async fn create_group(
         dpop_jkt,
     };
     let creation = json!({ "signedRequest": home.fixture.signed_request_json });
+    #[cfg(feature = "sim")]
+    let (status, bytes) = catbird_server::sim_hooks::scope_sim_ds(
+        local_actor_world(&home.fixture.actor_did),
+        send_raw(home.router.clone(), home.request(ENDPOINT, creation)),
+    )
+    .await;
+    #[cfg(not(feature = "sim"))]
     let (status, bytes) = send_raw(home.router.clone(), home.request(ENDPOINT, creation)).await;
     assert_eq!(
         status,

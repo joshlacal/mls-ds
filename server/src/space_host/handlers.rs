@@ -634,11 +634,32 @@ struct InventoryCursor {
     offset: usize,
 }
 
-fn inventory_failure(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
-    xrpc_err(status, code, message)
+#[derive(Debug)]
+struct InventoryFailure {
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
 }
 
-fn inventory_commitment(rows: &[WriterRow]) -> Result<[u8; 32], Response> {
+impl IntoResponse for InventoryFailure {
+    fn into_response(self) -> Response {
+        xrpc_err(self.status, self.code, self.message)
+    }
+}
+
+fn inventory_failure(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> InventoryFailure {
+    InventoryFailure {
+        status,
+        code,
+        message,
+    }
+}
+
+fn inventory_commitment(rows: &[WriterRow]) -> Result<[u8; 32], InventoryFailure> {
     let mut hash = LtHash::empty();
     let mut previous_did: Option<&str> = None;
     for row in rows {
@@ -688,7 +709,7 @@ fn encode_inventory_cursor(
     snapshot_rev: &str,
     commitment: &[u8; 32],
     offset: usize,
-) -> Result<String, Response> {
+) -> Result<String, InventoryFailure> {
     let rev_len = u16::try_from(snapshot_rev.len()).map_err(|_| {
         inventory_failure(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -719,7 +740,7 @@ fn decode_inventory_cursor(
     key: &[u8; 32],
     space_uri: &str,
     cursor: &str,
-) -> Result<InventoryCursor, Response> {
+) -> Result<InventoryCursor, InventoryFailure> {
     if cursor.is_empty() || cursor.len() > 512 {
         return Err(inventory_failure(
             StatusCode::BAD_REQUEST,
@@ -811,7 +832,7 @@ async fn load_complete_writer_inventory(
     runtime: &SpaceHostRuntime,
     conversation_id: Uuid,
     space_uri: &str,
-) -> Result<(String, Vec<WriterRow>, [u8; 32]), Response> {
+) -> Result<(String, Vec<WriterRow>, [u8; 32]), InventoryFailure> {
     let mut tx = runtime.pool().begin().await.map_err(|_| {
         inventory_failure(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -926,7 +947,7 @@ async fn list_repos_snapshot(
     headers: &HeaderMap,
     params: &BTreeMap<String, String>,
     space_uri: &str,
-) -> Result<Response, Response> {
+) -> Result<Response, InventoryFailure> {
     if params
         .keys()
         .any(|key| !matches!(key.as_str(), "space" | "cursor" | "limit"))
@@ -1072,7 +1093,8 @@ async fn list_repos(
     // Ordinary upstream-compatible listRepos callers keep legacy spaceRev paging.
     if headers.contains_key(SPACE_WANT_MAC_HEADER_NAME) {
         return match list_repos_snapshot(&runtime, &status, &headers, &params, space_uri).await {
-            Ok(response) | Err(response) => response,
+            Ok(response) => response,
+            Err(error) => error.into_response(),
         };
     }
 
