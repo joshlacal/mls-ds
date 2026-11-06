@@ -197,7 +197,7 @@ jobs:
 
       - name: Run two-node federation lifecycle
         # e2e-tests/Cargo.toml has a path dependency on ../BIRDaemon, currently
-        # verified at provisional commit 5e5619009b6fd054d8b1379e70935d62b49c755f.
+        # verified at provisional commit 3373d40a0b0e2131dd1cafb7f206ad9175eba405.
         # BIRDaemon has no published repository to clone yet, so this step fails
         # at manifest load until it has one and is cloned above.
         working-directory: ./e2e-tests

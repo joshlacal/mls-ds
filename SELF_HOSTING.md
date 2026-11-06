@@ -5,7 +5,7 @@
 ## Status
 
 - **Last seal (R0):** bookmark `clean-slate-2026-10-31`, mls-ds `d5f6993c`, 129 SQL migrations.
-- **This document:** the Task 4 fix-round R2 provisional commit on top of the bookmark, which is **unsealed**; its final gates have not all passed. R2 integrates the R1 cross-home protocol work plus authoritative routing, production-only ES256 service auth, bounded relays, database race fixes, deterministic server simulation hooks, and the archive mailbox/inventory contract. Its generated/runtime dependency inputs are PetrelCatbird `464eef2d5a6d4c95305372e49fb7620d180cf257`, catbird-atproto `a6986331eee54f3f0ce16e7ea07dda63ab581dd7`, and BIRDaemon `5e5619009b6fd054d8b1379e70935d62b49c755f`.
+- **This document:** the Task 4 fix-round R2 provisional commit on top of the bookmark, which is **unsealed**; its final gates have not all passed. R2 integrates the R1 cross-home protocol work plus authoritative routing, production-only ES256 service auth, bounded relays, database race fixes, deterministic server simulation hooks, and the archive mailbox/inventory contract. Its generated/runtime dependency inputs are PetrelCatbird `464eef2d5a6d4c95305372e49fb7620d180cf257`, catbird-atproto `a6986331eee54f3f0ce16e7ea07dda63ab581dd7`, and BIRDaemon `3373d40a0b0e2131dd1cafb7f206ad9175eba405`.
 - **Migrations are held.** The clean-slate work has run them only against local disposable and guarded test databases. Do not apply them to a production database until R2 is sealed and the production migration is separately authorized. See [server/migrations/README.md](server/migrations/README.md).
 - **Database:** PostgreSQL 16.
 
