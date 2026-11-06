@@ -123,6 +123,20 @@ fn dynamic_service_did_doc_and_i13_receipt_signer_support_self_hosted_web_and_pl
             service_auth_key.verifying_key(),
             Some(receipt_key.verifying_key()),
         );
+        let methods = doc["verificationMethod"]
+            .as_array()
+            .expect("verification methods");
+        let method = |suffix: &str| {
+            methods
+                .iter()
+                .find(|method| method["id"] == format!("{service_did}{suffix}"))
+                .unwrap_or_else(|| panic!("missing {suffix} verification method"))
+        };
+        assert_eq!(
+            method("#atproto_kem")["publicKeyMultibase"],
+            method("#atproto")["publicKeyMultibase"],
+            "the advertised KEM key must match SpaceHostConfig"
+        );
         let doc_str = serde_json::to_string(&doc).expect("did doc json");
         validate_receipt_did_document_for_service(
             &doc_str,

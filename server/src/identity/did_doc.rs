@@ -1,6 +1,6 @@
 //! Dynamic `SERVICE_DID` DID document generation (`did:web` and `did:plc`) for
-//! self-hosted and federated `mls-ds` deployments (`#atproto`, `#mls-receipt-1`,
-//! `#atproto_mls`, and `#atproto_pds` Option A Space host).
+//! self-hosted and federated `mls-ds` deployments (`#atproto`, `#atproto_kem`,
+//! `#mls-receipt-1`, `#atproto_mls`, and `#atproto_pds` Option A Space host).
 
 use p256::ecdsa::VerifyingKey;
 use serde_json::{json, Value};
@@ -23,6 +23,8 @@ pub fn encode_p256_multikey(verifying_key: &VerifyingKey) -> String {
 ///
 /// Advertises:
 /// - `{service_did}#atproto`: P-256 `Multikey` used for S2S JWTs and Space-host credentials;
+/// - `{service_did}#atproto_kem`: the same P-256 public key used by `SpaceHostConfig` for
+///   authenticated Space response MAC key agreement;
 /// - `{service_did}#mls-receipt-1` (when `receipt_verifying_key` is provided): P-256 `Multikey`
 ///   used for `I13` sequencer receipts;
 /// - `#atproto_mls` (`AtprotoMlsDeliveryService`) and `#atproto_pds` (`AtprotoPersonalDataServer`
@@ -35,12 +37,21 @@ pub fn build_service_did_document(
 ) -> Value {
     let base_did = canonical_did(service_did);
     let endpoint = service_endpoint.trim_end_matches('/');
-    let mut methods = vec![json!({
-        "id": format!("{base_did}#atproto"),
-        "type": "Multikey",
-        "controller": base_did,
-        "publicKeyMultibase": encode_p256_multikey(service_auth_verifying_key),
-    })];
+    let service_multikey = encode_p256_multikey(service_auth_verifying_key);
+    let mut methods = vec![
+        json!({
+            "id": format!("{base_did}#atproto"),
+            "type": "Multikey",
+            "controller": base_did,
+            "publicKeyMultibase": service_multikey,
+        }),
+        json!({
+            "id": format!("{base_did}#atproto_kem"),
+            "type": "Multikey",
+            "controller": base_did,
+            "publicKeyMultibase": service_multikey,
+        }),
+    ];
     if let Some(receipt_vk) = receipt_verifying_key {
         let receipt_multikey = encode_p256_multikey(receipt_vk);
         methods.push(json!({
