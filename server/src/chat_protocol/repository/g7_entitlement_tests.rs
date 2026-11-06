@@ -2402,13 +2402,14 @@ async fn production_subscription_ticket_mint_decodes_and_consumes_once() {
     .expect("seed consumed sealed inventory session");
 
     let admission = real_read_admission(&pool, "blue.catbird.chat.getSubscriptionTicket").await;
-    let (presented_ticket, _) =
+    let (presented_ticket, _, _) =
         chat_protocol::repository::ticket::mint_subscription_ticket_for_admission(
             &pool,
             admission,
             &capability,
             &capability,
             &sealer,
+            None,
         )
         .await
         .expect("production facade mints ticket");

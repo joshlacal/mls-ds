@@ -11,11 +11,10 @@ use catbird_atproto::generated::blue_catbird::chat::ConversationEntry;
 use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommitOutput;
 use serde_json::Value;
 use uuid::Uuid;
-/// The only verification method clients may resolve for V1 sequencer receipts.
+/// Baseline verification method used before the first receipt-key rotation.
 ///
-/// The DID document itself is published by the edge/operations layer. The
-/// server validates this fixed identifier before enabling receipt issuance so
-/// configuration cannot silently select the service-auth verification method.
+/// Operators rotate to `#mls-receipt-2`, `-3`, … and retain every prior
+/// method in the DID document so archived receipts remain verifiable.
 pub const RECEIPT_VERIFICATION_METHOD: &str = "did:web:chat.catbird.blue#mls-receipt-1";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -26,9 +25,9 @@ pub enum ReceiptConfigError {
     MissingSigningKey,
     #[error("RECEIPT_SIGNING_KEY_PEM is not a valid ES256 PKCS#8 private key")]
     MalformedSigningKey,
-    #[error("RECEIPT_VERIFICATION_METHOD must name the fixed MLS receipt method")]
+    #[error("RECEIPT_VERIFICATION_METHOD must name a versioned MLS receipt method")]
     UnexpectedVerificationMethod,
-    #[error("SERVICE_DID must own the fixed MLS receipt verification method")]
+    #[error("SERVICE_DID must own the configured MLS receipt verification method")]
     VerificationMethodOwnerMismatch,
     #[error("the receipt-signing key must be distinct from the service-auth key")]
     ServiceAuthKeyReuse,
@@ -48,11 +47,11 @@ pub enum ReceiptConfigError {
 pub enum ReceiptDidDocumentError {
     #[error("receipt DID document is not valid JSON")]
     MalformedDocument,
-    #[error("receipt DID document id does not own the fixed verification method")]
+    #[error("receipt DID document id does not own the configured verification method")]
     DocumentOwnerMismatch,
-    #[error("receipt DID document omits the fixed receipt verification method")]
+    #[error("receipt DID document omits a required receipt verification method")]
     MissingReceiptMethod,
-    #[error("receipt DID document defines the fixed verification method more than once")]
+    #[error("receipt DID document defines a receipt verification method more than once")]
     AmbiguousReceiptMethod,
     #[error("receipt verification method controller does not match the document owner")]
     ControllerMismatch,
@@ -62,13 +61,13 @@ pub enum ReceiptDidDocumentError {
     SignerKeyMismatch,
     #[error("published receipt key must be distinct from the service-auth key")]
     ServiceAuthKeyReuse,
+    #[error("receipt DID document must retain every prior key generation")]
+    ReceiptHistoryGap,
+    #[error("configured receipt verification method is not the newest generation")]
+    ConfiguredMethodNotCurrent,
 }
 
-/// Validate the fixed receipt verification method in a resolved DID document.
-///
-/// This is deliberately separate from generic service authentication. Receipt
-/// issuance may only be enabled after the exact method resolves to the
-/// configured P-256 signer and is distinct from the service-auth key.
+/// Validate the baseline receipt verification method in a resolved DID document.
 pub fn validate_receipt_did_document(
     document: &str,
     expected_receipt_key: &VerifyingKey,
@@ -77,19 +76,40 @@ pub fn validate_receipt_did_document(
     let method_owner = RECEIPT_VERIFICATION_METHOD
         .split_once('#')
         .map(|(did, _)| did)
-        .expect("fixed receipt verification method contains a fragment");
-    validate_receipt_did_document_for_service(
+        .expect("baseline receipt verification method contains a fragment");
+    validate_receipt_did_document_method_for_service(
         document,
         method_owner,
+        RECEIPT_VERIFICATION_METHOD,
         expected_receipt_key,
         service_auth_key,
     )
 }
 
-/// Validate `{service_did}#mls-receipt-1` in a resolved DID document for any `did:web` or `did:plc` `service_did`.
+/// Validate the baseline `{service_did}#mls-receipt-1` method.
 pub fn validate_receipt_did_document_for_service(
     document: &str,
     service_did: &str,
+    expected_receipt_key: &VerifyingKey,
+    service_auth_key: Option<&VerifyingKey>,
+) -> Result<(), ReceiptDidDocumentError> {
+    let method_owner = crate::identity::canonical_did(service_did);
+    let method_id = labyrinth_protocol::receipt::expected_receipt_key_id(method_owner);
+    validate_receipt_did_document_method_for_service(
+        document,
+        method_owner,
+        &method_id,
+        expected_receipt_key,
+        service_auth_key,
+    )
+}
+
+/// Validate the configured method and the retained, contiguous receipt-key
+/// history in a resolved DID document.
+pub fn validate_receipt_did_document_method_for_service(
+    document: &str,
+    service_did: &str,
+    configured_method_id: &str,
     expected_receipt_key: &VerifyingKey,
     service_auth_key: Option<&VerifyingKey>,
 ) -> Result<(), ReceiptDidDocumentError> {
@@ -99,43 +119,58 @@ pub fn validate_receipt_did_document_for_service(
     if document.get("id").and_then(serde_json::Value::as_str) != Some(method_owner) {
         return Err(ReceiptDidDocumentError::DocumentOwnerMismatch);
     }
-    let expected_method_id = format!("{method_owner}#mls-receipt-1");
+    let configured_generation =
+        labyrinth_protocol::receipt::receipt_key_generation(method_owner, configured_method_id)
+            .map_err(|_| ReceiptDidDocumentError::DocumentOwnerMismatch)?;
     let methods = document
         .get("verificationMethod")
         .and_then(serde_json::Value::as_array)
         .ok_or(ReceiptDidDocumentError::MissingReceiptMethod)?;
-    let mut matching_methods = methods.iter().filter(|method| {
-        method.get("id").and_then(serde_json::Value::as_str) == Some(expected_method_id.as_str())
-    });
-    let method = matching_methods
-        .next()
-        .ok_or(ReceiptDidDocumentError::MissingReceiptMethod)?;
-    if matching_methods.next().is_some() {
-        return Err(ReceiptDidDocumentError::AmbiguousReceiptMethod);
+    let mut receipt_methods = std::collections::BTreeMap::new();
+    for method in methods {
+        let Some(method_id) = method.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Ok(generation) =
+            labyrinth_protocol::receipt::receipt_key_generation(method_owner, method_id)
+        else {
+            continue;
+        };
+        if method.get("controller").and_then(serde_json::Value::as_str) != Some(method_owner) {
+            return Err(ReceiptDidDocumentError::ControllerMismatch);
+        }
+        if method.get("type").and_then(serde_json::Value::as_str) != Some("Multikey") {
+            return Err(ReceiptDidDocumentError::UnsupportedReceiptKey);
+        }
+        let encoded = method
+            .get("publicKeyMultibase")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ReceiptDidDocumentError::UnsupportedReceiptKey)?;
+        let (_, decoded) = multibase::decode(encoded)
+            .map_err(|_| ReceiptDidDocumentError::UnsupportedReceiptKey)?;
+        if !decoded.starts_with(&[0x80, 0x24]) || decoded.len() != 2 + 33 {
+            return Err(ReceiptDidDocumentError::UnsupportedReceiptKey);
+        }
+        let published_key = VerifyingKey::from_sec1_bytes(&decoded[2..])
+            .map_err(|_| ReceiptDidDocumentError::UnsupportedReceiptKey)?;
+        if service_auth_key == Some(&published_key) {
+            return Err(ReceiptDidDocumentError::ServiceAuthKeyReuse);
+        }
+        if receipt_methods.insert(generation, published_key).is_some() {
+            return Err(ReceiptDidDocumentError::AmbiguousReceiptMethod);
+        }
     }
-    if method.get("controller").and_then(serde_json::Value::as_str) != Some(method_owner) {
-        return Err(ReceiptDidDocumentError::ControllerMismatch);
+    let Some(current_key) = receipt_methods.get(&configured_generation) else {
+        return Err(ReceiptDidDocumentError::MissingReceiptMethod);
+    };
+    if receipt_methods.keys().next_back().copied() != Some(configured_generation) {
+        return Err(ReceiptDidDocumentError::ConfiguredMethodNotCurrent);
     }
-    if method.get("type").and_then(serde_json::Value::as_str) != Some("Multikey") {
-        return Err(ReceiptDidDocumentError::UnsupportedReceiptKey);
+    if (1..=configured_generation).any(|generation| !receipt_methods.contains_key(&generation)) {
+        return Err(ReceiptDidDocumentError::ReceiptHistoryGap);
     }
-    let encoded = method
-        .get("publicKeyMultibase")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(ReceiptDidDocumentError::UnsupportedReceiptKey)?;
-    let (_, decoded) =
-        multibase::decode(encoded).map_err(|_| ReceiptDidDocumentError::UnsupportedReceiptKey)?;
-    // p256-pub has multicodec value 0x1200, encoded as unsigned varint 0x80 0x24.
-    if !decoded.starts_with(&[0x80, 0x24]) || decoded.len() != 2 + 33 {
-        return Err(ReceiptDidDocumentError::UnsupportedReceiptKey);
-    }
-    let published_key = VerifyingKey::from_sec1_bytes(&decoded[2..])
-        .map_err(|_| ReceiptDidDocumentError::UnsupportedReceiptKey)?;
-    if &published_key != expected_receipt_key {
+    if current_key != expected_receipt_key {
         return Err(ReceiptDidDocumentError::SignerKeyMismatch);
-    }
-    if service_auth_key == Some(&published_key) {
-        return Err(ReceiptDidDocumentError::ServiceAuthKeyReuse);
     }
     Ok(())
 }
@@ -161,12 +196,13 @@ pub fn configured_receipt_signer(
         return Err(ReceiptConfigError::InvalidIssuanceMode);
     }
 
-    let Some((method_owner, "mls-receipt-1")) = receipt_verification_method
-        .and_then(|v| v.split_once('#'))
-        .filter(|(did, _)| {
-            !did.is_empty() && (did.starts_with("did:web:") || did.starts_with("did:plc:"))
-        })
-    else {
+    let method_id =
+        receipt_verification_method.ok_or(ReceiptConfigError::UnexpectedVerificationMethod)?;
+    let Some((method_owner, _)) = method_id.split_once('#').filter(|(did, _)| {
+        !did.is_empty()
+            && (did.starts_with("did:web:") || did.starts_with("did:plc:"))
+            && labyrinth_protocol::receipt::receipt_key_generation(did, method_id).is_ok()
+    }) else {
         return Err(ReceiptConfigError::UnexpectedVerificationMethod);
     };
     if crate::identity::canonical_did(service_did) != method_owner {
@@ -187,9 +223,10 @@ pub fn configured_receipt_signer(
 
     let published_did_document =
         published_did_document.ok_or(ReceiptConfigError::MissingPublishedDidDocument)?;
-    validate_receipt_did_document_for_service(
+    validate_receipt_did_document_method_for_service(
         published_did_document,
         method_owner,
+        method_id,
         receipt_key.verifying_key(),
         Some(service_key.verifying_key()),
     )?;
@@ -200,8 +237,8 @@ pub fn configured_receipt_signer(
     )))
 }
 
-/// Clean-slate `I13` ES256 sequencer receipt signer (`{sequencer_did}#mls-receipt-1`,
-/// `labyrinth_protocol::receipt::sign_sequencer_receipt`).
+/// Clean-slate `I13` ES256 sequencer receipt signer
+/// (`{sequencer_did}#mls-receipt-N`).
 #[derive(Debug, Clone)]
 pub struct I13ReceiptSigner {
     signing_key: SigningKey,
@@ -239,8 +276,8 @@ impl TerminalCloseAuthority {
     ) -> Result<(), String> {
         let expected_sequencer = crate::identity::canonical_did(expected_sequencer);
         if self.sequencer_did != expected_sequencer
-            || self.key_id
-                != labyrinth_protocol::receipt::expected_receipt_key_id(expected_sequencer)
+            || labyrinth_protocol::receipt::receipt_key_generation(expected_sequencer, &self.key_id)
+                .is_err()
             || self.conversation_id != conversation_id
             || self.close_entry_sha256 != terminal_close_entry_sha256(entry)?
         {
@@ -310,8 +347,8 @@ pub struct AccountDeletion {
 }
 
 /// `blue.catbird.chat.defs#accountDeletionAuthority`: the sequencer's signature
-/// over one [`AccountDeletion`] with its dedicated `#mls-receipt-1` key, never
-/// its service-auth key.
+/// over one [`AccountDeletion`] and the exact dedicated versioned receipt-key ID,
+/// never its service-auth key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountDeletionAuthority {
@@ -403,15 +440,18 @@ impl AccountDeletion {
 }
 
 impl AccountDeletionAuthority {
-    /// Verify that `deletion`'s own sequencer signed it with its `#mls-receipt-1` key.
+    /// Verify that `deletion`'s own sequencer signed it with the exact versioned receipt key.
     pub fn verify(
         &self,
         verifying_key: &VerifyingKey,
         deletion: &AccountDeletion,
     ) -> Result<(), String> {
         if self.sequencer_did != deletion.sequencer_did
-            || self.key_id
-                != labyrinth_protocol::receipt::expected_receipt_key_id(&deletion.sequencer_did)
+            || labyrinth_protocol::receipt::receipt_key_generation(
+                &deletion.sequencer_did,
+                &self.key_id,
+            )
+            .is_err()
         {
             return Err("account deletion authority binding mismatch".to_string());
         }
@@ -420,9 +460,27 @@ impl AccountDeletionAuthority {
             .filter(|signature| signature.normalize_s().is_none())
             .ok_or_else(|| "account deletion signature is not low-S ES256".to_string())?;
         verifying_key
-            .verify(&deletion.signing_bytes(), &signature)
+            .verify(
+                &account_deletion_authority_signing_bytes(deletion, &self.key_id),
+                &signature,
+            )
             .map_err(|_| "invalid account deletion authority signature".to_string())
     }
+}
+
+fn account_deletion_authority_signing_bytes(deletion: &AccountDeletion, key_id: &str) -> Vec<u8> {
+    let deletion_bytes = deletion.signing_bytes();
+    let mut bytes = Vec::with_capacity(
+        b"catbird-mls-account-deletion-authority-v2\0".len()
+            + 4
+            + key_id.len()
+            + deletion_bytes.len(),
+    );
+    bytes.extend_from_slice(b"catbird-mls-account-deletion-authority-v2\0");
+    bytes.extend_from_slice(&(key_id.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(key_id.as_bytes());
+    bytes.extend_from_slice(&deletion_bytes);
+    bytes
 }
 
 fn terminal_close_entry_sha256(entry: &Value) -> Result<[u8; 32], String> {
@@ -487,6 +545,21 @@ impl I13ReceiptSigner {
         }
     }
 
+    pub fn new_with_key_id(
+        signing_key: SigningKey,
+        sequencer_did: String,
+        key_id: String,
+    ) -> Result<Self, String> {
+        let base = crate::identity::canonical_did(&sequencer_did).to_string();
+        labyrinth_protocol::receipt::receipt_key_generation(&base, &key_id)
+            .map_err(|_| "receipt key ID does not name this sequencer".to_owned())?;
+        Ok(Self {
+            signing_key,
+            sequencer_did: base,
+            key_id,
+        })
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_signing_key_for_test(sequencer_did: String, signing_key: SigningKey) -> Self {
         Self::new(signing_key, sequencer_did)
@@ -543,8 +616,10 @@ impl I13ReceiptSigner {
         if deletion.sequencer_did != self.sequencer_did {
             return Err("account deletion names another sequencer".to_string());
         }
-        let signature: Signature =
-            p256::ecdsa::signature::Signer::sign(&self.signing_key, &deletion.signing_bytes());
+        let signature: Signature = p256::ecdsa::signature::Signer::sign(
+            &self.signing_key,
+            &account_deletion_authority_signing_bytes(deletion, &self.key_id),
+        );
         Ok(AccountDeletionAuthority {
             sequencer_did: self.sequencer_did.clone(),
             key_id: self.key_id.clone(),
@@ -1122,6 +1197,85 @@ mod tests {
                 Some(service_key.verifying_key()),
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn receipt_rotation_requires_retained_contiguous_history_and_selects_exact_key_id() {
+        let key1 = SigningKey::random(&mut OsRng);
+        let key2 = SigningKey::random(&mut OsRng);
+        let service_key = SigningKey::random(&mut OsRng);
+        let key2_id = "did:web:chat.catbird.blue#mls-receipt-2";
+        let method1: serde_json::Value = serde_json::from_str(&did_document(
+            RECEIPT_VERIFICATION_METHOD,
+            "did:web:chat.catbird.blue",
+            key1.verifying_key(),
+        ))
+        .unwrap();
+        let method2: serde_json::Value = serde_json::from_str(&did_document(
+            key2_id,
+            "did:web:chat.catbird.blue",
+            key2.verifying_key(),
+        ))
+        .unwrap();
+        let document = serde_json::json!({
+            "id": "did:web:chat.catbird.blue",
+            "verificationMethod": [
+                method1["verificationMethod"][0].clone(),
+                method2["verificationMethod"][0].clone(),
+            ],
+        })
+        .to_string();
+
+        assert_eq!(
+            validate_receipt_did_document_method_for_service(
+                &document,
+                "did:web:chat.catbird.blue",
+                key2_id,
+                key2.verifying_key(),
+                Some(service_key.verifying_key()),
+            ),
+            Ok(())
+        );
+        let signer = I13ReceiptSigner::new_with_key_id(
+            key2.clone(),
+            "did:web:chat.catbird.blue".to_owned(),
+            key2_id.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(signer.key_id(), key2_id);
+        assert!(configured_receipt_signer(
+            Some("issue"),
+            Some(&pem(&key2)),
+            Some(key2_id),
+            Some(&pem(&service_key)),
+            "did:web:chat.catbird.blue",
+            Some(&document),
+        )
+        .unwrap()
+        .is_some());
+
+        let missing_history =
+            did_document(key2_id, "did:web:chat.catbird.blue", key2.verifying_key());
+        assert_eq!(
+            validate_receipt_did_document_method_for_service(
+                &missing_history,
+                "did:web:chat.catbird.blue",
+                key2_id,
+                key2.verifying_key(),
+                None,
+            ),
+            Err(ReceiptDidDocumentError::ReceiptHistoryGap)
+        );
+        assert_eq!(
+            validate_receipt_did_document_method_for_service(
+                &document,
+                "did:web:chat.catbird.blue",
+                RECEIPT_VERIFICATION_METHOD,
+                key1.verifying_key(),
+                None,
+            ),
+            Err(ReceiptDidDocumentError::ConfiguredMethodNotCurrent)
         );
     }
 
@@ -1706,6 +1860,9 @@ mod tests {
         let mut other_method = authority.clone();
         other_method.key_id = format!("{SEQUENCER}#atproto");
         assert!(other_method.verify(&key, &deletion).is_err());
+        let mut other_generation = authority.clone();
+        other_generation.key_id = format!("{SEQUENCER}#mls-receipt-2");
+        assert!(other_generation.verify(&key, &deletion).is_err());
         let other_key = SigningKey::from_slice(&[8; 32]).unwrap();
         assert!(authority
             .verify(other_key.verifying_key(), &deletion)

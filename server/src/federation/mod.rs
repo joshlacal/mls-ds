@@ -341,11 +341,12 @@ pub struct FederationConfig {
     /// PEM-encoded ES256 private key for signing outbound service auth JWTs.
     pub signing_key_pem: Option<String>,
     /// `disabled` (default) or `issue`. Issue mode fails startup closed unless
-    /// the dedicated receipt key and fixed verification method are valid.
+    /// the dedicated receipt key and versioned verification method are valid.
     pub receipt_issuance_mode: Option<String>,
     /// Dedicated ES256 receipt key. This must never reuse `signing_key_pem`.
     pub receipt_signing_key_pem: Option<String>,
-    /// Fixed DID verification method used by receipt verifiers.
+    /// Exact current DID method (`#mls-receipt-N`); prior generations remain
+    /// published in `receipt_did_document_json`.
     pub receipt_verification_method: Option<String>,
     /// Exact DID document served at the shared did:web well-known route.
     /// Issue mode validates this document against both configured signing

@@ -5698,6 +5698,7 @@
       "payload": {
         "record": {
           "$type": "blue.catbird.labyrinth.virtualDevice",
+          "formatVersion": 2,
           "createdAt": "2026-10-03T04:00:00.004Z",
           "deviceKeyPubkey": {
             "$bytes": "+ZL9HjRc7joY2N8tacHbGcC2ajKrdJECI4emRf/Q2lw"
@@ -5713,9 +5714,6 @@
           },
           "encryptedEpochStorageKeyPriv": {
             "$bytes": "ArpttduodmUUa4JlHiBI+MSa8DGcuiCCWRYkE9MK3JJngivIPL3qbEjBSQU9KjmJVh8WGfjP3mhwYasQtIpGYPVqKQJGF4/wLvjC9uRoTBMGzCQ0mOqYt5htSHmWaRozN1igzldTxxHP"
-          },
-          "encryptedMailboxRootSalt": {
-            "$bytes": "AqTpiOGRwdk1iHOz/8qr/HXsTUE8vn4AYsIfznFNcSYosZ0NwspnZLqPmtmLg4vNVFseAgAJJvksVh44zXK/sxqkvZHSv08aVkjMaGHljofcSrfv5yWtxPB8eK+80hUPWv3JN5iMcPfV"
           },
           "encryptedOrfClientState": {
             "$bytes": "Am7qtlX20nDirfqJTmMS98nVuf6OpIwOPBmVhiautpL+ayKrcflDlKZWjR5hUGj8VPvXfNZkj0UARg+H/A+9GvQ3M9RWdEeqEveIM5VGVxjYrVny0n1RYnFFm0sXHfb3Bg1DMz1pJgul"
@@ -6044,6 +6042,7 @@
       "payload": {
         "record": {
           "$type": "blue.catbird.labyrinth.virtualDevice",
+          "formatVersion": 2,
           "createdAt": "2026-10-03T04:00:00.005Z",
           "deviceKeyPubkey": {
             "$bytes": "077z9LTqx9vlrLmNxA+n2Cs6PffPD2JwASgs4s+S63c"
@@ -6059,9 +6058,6 @@
           },
           "encryptedEpochStorageKeyPriv": {
             "$bytes": "AlkxZAzcwTOLNdQmrnyBwIPOiLEFU4NTOWqNpuh5Dpe7ETezNpOfdx6Q2PjwBTcthEh6Go6raPrwkPzjr2Jp4K44dlBTciae70uyb1ZaYXJ8VgNCSHpx7qi675fJXxhHEPh+XdIzOjAr"
-          },
-          "encryptedMailboxRootSalt": {
-            "$bytes": "AiiYAYdfuVbgL3x/FeC9qJ+xy+MrO8mDyT3GXBD7zgHFukQG9jy/KzwULxLI1obpaVPjaRXbTXgbCnxPgJt/Vzmr4uXbSj1wWYuD/OZFiMQMlBDlZbc+NWayCp8TgE1rZ0zMXGU/CE77"
           },
           "encryptedOrfClientState": {
             "$bytes": "AgceQbSBfcdcLggEVy8wtV4+68aNwo/cNYWtJHMVrFpEmNFd3I+rqESQPNYu7BbjSmJyQomep7VRBfmIcNrqmrkQ6/ku6MyMpVH0389WGPk4yuMVEvHNXWlXKizG4WclNw+SL2CZ/SU4"
@@ -6139,6 +6135,7 @@
       "response": {
         "record": {
           "$type": "blue.catbird.labyrinth.virtualDevice",
+          "formatVersion": 2,
           "createdAt": "2026-10-03T04:00:00.004Z",
           "deviceKeyPubkey": {
             "$bytes": "+ZL9HjRc7joY2N8tacHbGcC2ajKrdJECI4emRf/Q2lw"
@@ -6154,9 +6151,6 @@
           },
           "encryptedEpochStorageKeyPriv": {
             "$bytes": "ArpttduodmUUa4JlHiBI+MSa8DGcuiCCWRYkE9MK3JJngivIPL3qbEjBSQU9KjmJVh8WGfjP3mhwYasQtIpGYPVqKQJGF4/wLvjC9uRoTBMGzCQ0mOqYt5htSHmWaRozN1igzldTxxHP"
-          },
-          "encryptedMailboxRootSalt": {
-            "$bytes": "AqTpiOGRwdk1iHOz/8qr/HXsTUE8vn4AYsIfznFNcSYosZ0NwspnZLqPmtmLg4vNVFseAgAJJvksVh44zXK/sxqkvZHSv08aVkjMaGHljofcSrfv5yWtxPB8eK+80hUPWv3JN5iMcPfV"
           },
           "encryptedOrfClientState": {
             "$bytes": "Am7qtlX20nDirfqJTmMS98nVuf6OpIwOPBmVhiautpL+ayKrcflDlKZWjR5hUGj8VPvXfNZkj0UARg+H/A+9GvQ3M9RWdEeqEveIM5VGVxjYrVny0n1RYnFFm0sXHfb3Bg1DMz1pJgul"
@@ -6189,6 +6183,7 @@
       "response": {
         "record": {
           "$type": "blue.catbird.labyrinth.virtualDevice",
+          "formatVersion": 2,
           "createdAt": "2026-10-03T04:00:00.004Z",
           "deviceKeyPubkey": {
             "$bytes": "+ZL9HjRc7joY2N8tacHbGcC2ajKrdJECI4emRf/Q2lw"
@@ -6204,9 +6199,6 @@
           },
           "encryptedEpochStorageKeyPriv": {
             "$bytes": "ArpttduodmUUa4JlHiBI+MSa8DGcuiCCWRYkE9MK3JJngivIPL3qbEjBSQU9KjmJVh8WGfjP3mhwYasQtIpGYPVqKQJGF4/wLvjC9uRoTBMGzCQ0mOqYt5htSHmWaRozN1igzldTxxHP"
-          },
-          "encryptedMailboxRootSalt": {
-            "$bytes": "AqTpiOGRwdk1iHOz/8qr/HXsTUE8vn4AYsIfznFNcSYosZ0NwspnZLqPmtmLg4vNVFseAgAJJvksVh44zXK/sxqkvZHSv08aVkjMaGHljofcSrfv5yWtxPB8eK+80hUPWv3JN5iMcPfV"
           },
           "encryptedOrfClientState": {
             "$bytes": "Am7qtlX20nDirfqJTmMS98nVuf6OpIwOPBmVhiautpL+ayKrcflDlKZWjR5hUGj8VPvXfNZkj0UARg+H/A+9GvQ3M9RWdEeqEveIM5VGVxjYrVny0n1RYnFFm0sXHfb3Bg1DMz1pJgul"
@@ -6239,6 +6231,7 @@
       "response": {
         "record": {
           "$type": "blue.catbird.labyrinth.virtualDevice",
+          "formatVersion": 2,
           "createdAt": "2026-10-03T04:00:00.004Z",
           "deviceKeyPubkey": {
             "$bytes": "+ZL9HjRc7joY2N8tacHbGcC2ajKrdJECI4emRf/Q2lw"
@@ -6254,9 +6247,6 @@
           },
           "encryptedEpochStorageKeyPriv": {
             "$bytes": "ArpttduodmUUa4JlHiBI+MSa8DGcuiCCWRYkE9MK3JJngivIPL3qbEjBSQU9KjmJVh8WGfjP3mhwYasQtIpGYPVqKQJGF4/wLvjC9uRoTBMGzCQ0mOqYt5htSHmWaRozN1igzldTxxHP"
-          },
-          "encryptedMailboxRootSalt": {
-            "$bytes": "AqTpiOGRwdk1iHOz/8qr/HXsTUE8vn4AYsIfznFNcSYosZ0NwspnZLqPmtmLg4vNVFseAgAJJvksVh44zXK/sxqkvZHSv08aVkjMaGHljofcSrfv5yWtxPB8eK+80hUPWv3JN5iMcPfV"
           },
           "encryptedOrfClientState": {
             "$bytes": "Am7qtlX20nDirfqJTmMS98nVuf6OpIwOPBmVhiautpL+ayKrcflDlKZWjR5hUGj8VPvXfNZkj0UARg+H/A+9GvQ3M9RWdEeqEveIM5VGVxjYrVny0n1RYnFFm0sXHfb3Bg1DMz1pJgul"
@@ -8473,6 +8463,7 @@
         "items": [
           {
             "$type": "blue.catbird.labyrinth.virtualDevice",
+            "formatVersion": 2,
             "createdAt": "2026-10-03T04:00:00.005Z",
             "deviceKeyPubkey": {
               "$bytes": "077z9LTqx9vlrLmNxA+n2Cs6PffPD2JwASgs4s+S63c"
@@ -8488,9 +8479,6 @@
             },
             "encryptedEpochStorageKeyPriv": {
               "$bytes": "AlkxZAzcwTOLNdQmrnyBwIPOiLEFU4NTOWqNpuh5Dpe7ETezNpOfdx6Q2PjwBTcthEh6Go6raPrwkPzjr2Jp4K44dlBTciae70uyb1ZaYXJ8VgNCSHpx7qi675fJXxhHEPh+XdIzOjAr"
-            },
-            "encryptedMailboxRootSalt": {
-              "$bytes": "AiiYAYdfuVbgL3x/FeC9qJ+xy+MrO8mDyT3GXBD7zgHFukQG9jy/KzwULxLI1obpaVPjaRXbTXgbCnxPgJt/Vzmr4uXbSj1wWYuD/OZFiMQMlBDlZbc+NWayCp8TgE1rZ0zMXGU/CE77"
             },
             "encryptedOrfClientState": {
               "$bytes": "AgceQbSBfcdcLggEVy8wtV4+68aNwo/cNYWtJHMVrFpEmNFd3I+rqESQPNYu7BbjSmJyQomep7VRBfmIcNrqmrkQ6/ku6MyMpVH0389WGPk4yuMVEvHNXWlXKizG4WclNw+SL2CZ/SU4"
@@ -8509,6 +8497,7 @@
           },
           {
             "$type": "blue.catbird.labyrinth.virtualDevice",
+            "formatVersion": 2,
             "createdAt": "2026-10-03T04:00:00.004Z",
             "deviceKeyPubkey": {
               "$bytes": "+ZL9HjRc7joY2N8tacHbGcC2ajKrdJECI4emRf/Q2lw"
@@ -8524,9 +8513,6 @@
             },
             "encryptedEpochStorageKeyPriv": {
               "$bytes": "ArpttduodmUUa4JlHiBI+MSa8DGcuiCCWRYkE9MK3JJngivIPL3qbEjBSQU9KjmJVh8WGfjP3mhwYasQtIpGYPVqKQJGF4/wLvjC9uRoTBMGzCQ0mOqYt5htSHmWaRozN1igzldTxxHP"
-            },
-            "encryptedMailboxRootSalt": {
-              "$bytes": "AqTpiOGRwdk1iHOz/8qr/HXsTUE8vn4AYsIfznFNcSYosZ0NwspnZLqPmtmLg4vNVFseAgAJJvksVh44zXK/sxqkvZHSv08aVkjMaGHljofcSrfv5yWtxPB8eK+80hUPWv3JN5iMcPfV"
             },
             "encryptedOrfClientState": {
               "$bytes": "Am7qtlX20nDirfqJTmMS98nVuf6OpIwOPBmVhiautpL+ayKrcflDlKZWjR5hUGj8VPvXfNZkj0UARg+H/A+9GvQ3M9RWdEeqEveIM5VGVxjYrVny0n1RYnFFm0sXHfb3Bg1DMz1pJgul"

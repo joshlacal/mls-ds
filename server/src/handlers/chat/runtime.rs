@@ -898,9 +898,14 @@ fn build_i13_receipt_signer_from_env(
     let secret = p256::SecretKey::from_pkcs8_pem(pem.trim())
         .map_err(|_| "RECEIPT_SIGNING_KEY_PEM is not valid P-256 PKCS#8 PEM".to_owned())?;
     let signing_key = p256::ecdsa::SigningKey::from(secret);
-    Ok(Some(Arc::new(
-        crate::federation::receipt::I13ReceiptSigner::new(signing_key, service_did),
-    )))
+    let key_id = std::env::var("RECEIPT_VERIFICATION_METHOD")
+        .map_err(|_| "RECEIPT_VERIFICATION_METHOD is required with RECEIPT_SIGNING_KEY_PEM")?;
+    let signer = crate::federation::receipt::I13ReceiptSigner::new_with_key_id(
+        signing_key,
+        service_did,
+        key_id,
+    )?;
+    Ok(Some(Arc::new(signer)))
 }
 
 #[cfg(test)]

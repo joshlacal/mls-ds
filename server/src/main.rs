@@ -807,7 +807,10 @@ async fn main() -> anyhow::Result<()> {
     };
     if receipt_signer.is_some() {
         tracing::info!(
-            verification_method = federation::RECEIPT_VERIFICATION_METHOD,
+            verification_method = fed_config
+                .receipt_verification_method
+                .as_deref()
+                .expect("validated issue mode has a receipt verification method"),
             "Dedicated receipt signer initialized"
         );
     }
