@@ -318,6 +318,7 @@ async fn admin_seed_group_fixture(
     {
         Ok(f) => f,
         Err(e) => {
+            tracing::error!(error = %e, "clean-slate seed-group-fixture failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": e })),

@@ -13,7 +13,7 @@ use crate::{
             delivery, direct_request_opening::DIRECT_REQUEST_ENTRY_KIND,
             direct_request_opening_tests::residue,
         },
-        test_support::sign_mutation_json_for_test,
+        test_support::{original_sender_attestation_json_for_test, sign_mutation_json_for_test},
     },
     common::{fresh_db::DisposableDatabase, http_acceptance as http},
     federation::resolver::build_resolver_http_client,
@@ -447,9 +447,11 @@ impl Closing {
     /// the opening's transport entry.
     async fn hold_opening(&self, sender: &Party, recipient: &Party, status: &str) {
         let request = Uuid::new_v4();
+        let entry_id = Uuid::new_v4();
+        let archive_commitment: [u8; 32] = Sha256::digest(OPENING).into();
         let entry = json!({
             "$type": DIRECT_REQUEST_ENTRY_KIND,
-            "entryId": Uuid::new_v4(),
+            "entryId": entry_id,
             "conversationId": self.cid,
             "seq": 1,
             "receivedAt": canonical(current_utc()),
@@ -458,7 +460,19 @@ impl Closing {
                     "$type": "blue.catbird.chat.defs#directRequestPublicationBody",
                     "signatureDomain": "CATBIRD-DIRECT-REQUEST-PUBLISH\u{0}",
                     "requestId": request,
+                    "firstMessageId": entry_id,
                     "conversationId": self.cid,
+                    "actorDid": sender.did,
+                    "actorDeviceId": sender.device,
+                    "archiveCommitment": STANDARD.encode(archive_commitment),
+                    "originalSenderAttestation": original_sender_attestation_json_for_test(
+                        &sender.did,
+                        sender.device,
+                        &sender.signing_key(),
+                        &self.cid.to_string(),
+                        &entry_id.to_string(),
+                        &archive_commitment,
+                    ),
                     "artifacts": {
                         "initialCiphertext": STANDARD.encode(OPENING),
                         "welcome": {"opaqueWelcome": STANDARD.encode(b"welcome")}

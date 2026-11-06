@@ -254,7 +254,7 @@ impl GatewaySender<'_> {
         publish_body["preparationRequestDigest"] =
             json!(STANDARD.encode(verified_prepare.request_digest()));
         publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
-        publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
+        crate::bind_publication_original_sender_attestation(&mut publish_body, bootstrap)?;
         publish_body["next"] = bootstrap.coordinates.clone();
         publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
             bootstrap.import_until as i64,

@@ -604,11 +604,6 @@ impl AuthMiddleware {
         if claims.exp < now {
             return Err(AuthError::TokenExpired);
         }
-        if claims.exp.saturating_sub(now) > MAX_SERVICE_JWT_LIFETIME_SECS {
-            return Err(AuthError::InvalidToken(format!(
-                "JWT lifetime exceeds maximum ({MAX_SERVICE_JWT_LIFETIME_SECS}s)"
-            )));
-        }
         if let Some(iat) = claims.iat {
             if iat > now + MAX_SERVICE_JWT_FUTURE_SKEW_SECS {
                 return Err(AuthError::InvalidToken("JWT iat is in the future".into()));
@@ -616,6 +611,15 @@ impl AuthMiddleware {
             if claims.exp < iat {
                 return Err(AuthError::InvalidToken("JWT exp precedes iat".into()));
             }
+            if claims.exp.saturating_sub(iat) > MAX_SERVICE_JWT_LIFETIME_SECS {
+                return Err(AuthError::InvalidToken(format!(
+                    "JWT lifetime exceeds maximum ({MAX_SERVICE_JWT_LIFETIME_SECS}s)"
+                )));
+            }
+        } else if claims.exp.saturating_sub(now) > MAX_SERVICE_JWT_LIFETIME_SECS {
+            return Err(AuthError::InvalidToken(format!(
+                "JWT lifetime exceeds maximum ({MAX_SERVICE_JWT_LIFETIME_SECS}s)"
+            )));
         }
 
         // Audience enforcement

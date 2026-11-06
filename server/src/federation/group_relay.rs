@@ -1491,19 +1491,21 @@ async fn sequence_relayed_group_application_send(
     .await
     .map_err(relayed_traffic_failure)?;
 
-    let receipt_commitment: [u8; 32] = match projection.aad().get("archiveCommitment") {
-        None => msg_sha256,
-        Some(crate::chat_protocol::transcript::CanonicalValueRef::Bytes(v)) if v.len() == 32 => {
-            v.try_into().expect("32-byte archiveCommitment")
-        }
-        Some(_) => {
-            return Err(s2s_err(
-                StatusCode::BAD_REQUEST,
-                "InvalidRequest",
-                "archiveCommitment must be 32 bytes",
-            ));
-        }
-    };
+    let archive = crate::chat_protocol::transcript::verify_application_archive_attestation(
+        projection.aad(),
+        actor_did,
+        actor_device_id,
+        &signing_public_key,
+        conversation_id,
+        message_id,
+    )
+    .map_err(|error| {
+        s2s_err(
+            StatusCode::BAD_REQUEST,
+            "InvalidApplicationMessage",
+            error.to_string(),
+        )
+    })?;
 
     let entry_product = crate::chat_protocol::transcript::build_verified_application_entry(
         verified,
@@ -1528,34 +1530,35 @@ async fn sequence_relayed_group_application_send(
             )
         })?;
 
-    let receipt_json = if let Some(ref signer) = state.i13_receipt_signer {
-        let signed_rcpt = signer
-            .sign_application_receipt(
-                &conversation_id.to_string(),
-                &head_group_id,
-                head_epoch as u64,
+    let receipt_json = match (archive, state.i13_receipt_signer.as_ref()) {
+        (Some(archive), Some(signer)) => {
+            let signed_rcpt = signer
+                .sign_application_receipt(
+                    &conversation_id.to_string(),
+                    &head_group_id,
+                    head_epoch as u64,
+                    actor_did,
+                    &actor_device_id.to_string(),
+                    &entry_id_str,
+                    archive.commitment(),
+                    next_seq as u64,
+                    trusted_now.timestamp_millis(),
+                )
+                .map_err(|e| {
+                    s2s_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalServerError",
+                        e.to_string(),
+                    )
+                })?;
+            Some(I13ReceiptSigner::receipt_wire_json(
+                &signed_rcpt,
+                head_generation as u64,
                 actor_did,
                 &actor_device_id.to_string(),
-                &entry_id_str,
-                &receipt_commitment,
-                next_seq as u64,
-                trusted_now.timestamp_millis(),
-            )
-            .map_err(|e| {
-                s2s_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "InternalServerError",
-                    e.to_string(),
-                )
-            })?;
-        Some(I13ReceiptSigner::receipt_wire_json(
-            &signed_rcpt,
-            head_generation as u64,
-            actor_did,
-            &actor_device_id.to_string(),
-        ))
-    } else {
-        None
+            ))
+        }
+        _ => None,
     };
 
     let mut entry_json = json!({

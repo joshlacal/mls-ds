@@ -21,6 +21,7 @@ use crate::{
             expiry_sweep::delete_unanswered_outbound_routes,
         },
         test_support::{
+            original_sender_attestation_json_for_test,
             seed_clean_slate_pending_direct_request_fixture, seed_published_request_keys,
             CleanSlatePendingDirectRequestFixture,
         },
@@ -145,6 +146,21 @@ fn sign_request(
         ("signedAt", json!(signed_at)),
     ] {
         body[field] = value;
+    }
+    if kind == DirectRequestKind::Publish {
+        let archive_commitment: [u8; 32] = STANDARD
+            .decode(body["archiveCommitment"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        body["originalSenderAttestation"] = original_sender_attestation_json_for_test(
+            did,
+            device_id,
+            signing,
+            body["conversationId"].as_str().unwrap(),
+            body["firstMessageId"].as_str().unwrap(),
+            &archive_commitment,
+        );
     }
     let bytes = serde_json::to_vec(&body).unwrap();
     let message = direct_request_signing_bytes(kind, &bytes).unwrap();

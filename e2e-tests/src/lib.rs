@@ -41,6 +41,38 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use mls_engine::MlsEngine;
+/// Bind the canonical, sender-signed archive attestation emitted with a real
+/// direct-request bootstrap into its publication body.
+pub fn bind_publication_original_sender_attestation(
+    body: &mut Value,
+    bootstrap: &catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestBootstrap,
+) -> Result<()> {
+    let conversation_id = body["conversationId"]
+        .as_str()
+        .context("publication conversationId")?;
+    let message_id = body["firstMessageId"]
+        .as_str()
+        .context("publication firstMessageId")?;
+    let attestation = &bootstrap.original_sender_attestation;
+    anyhow::ensure!(
+        body["actorDid"].as_str() == Some(attestation.sender_did.as_str())
+            && body["actorDeviceId"].as_str() == Some(attestation.sender_device_id.as_str()),
+        "publication sender differs from original sender attestation"
+    );
+    attestation
+        .verify(conversation_id, message_id, &bootstrap.archive_commitment)
+        .context("verify original sender archive attestation")?;
+    body["archiveCommitment"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(bootstrap.archive_commitment));
+    body["originalSenderAttestation"] = json!({
+        "senderDid": attestation.sender_did,
+        "senderDeviceId": attestation.sender_device_id,
+        "senderTransportPubkey": base64::engine::general_purpose::STANDARD
+            .encode(&attestation.sender_transport_public_key),
+        "signature": base64::engine::general_purpose::STANDARD.encode(&attestation.signature),
+    });
+    Ok(())
+}
 
 const DEFAULT_AUDIENCE: &str = "did:web:localhost";
 const DEFAULT_CIPHER_SUITE: &str = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";

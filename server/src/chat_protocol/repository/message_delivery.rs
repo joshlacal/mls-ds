@@ -501,7 +501,10 @@ fn validate_artifacts(
     projection: &transcript::ApplicationSendProjection<'_>,
     coordinate: Coordinate,
     message_id: Uuid,
-) -> Result<Option<[u8; 32]>, MessageDeliveryError> {
+    expected_sender_did: &str,
+    expected_sender_device_id: Uuid,
+    expected_sender_public_key: &[u8],
+) -> Result<Option<transcript::VerifiedApplicationArchive>, MessageDeliveryError> {
     let aad = projection.aad();
     let aad_conversation = match aad.get("conversationId") {
         Some(CanonicalValueRef::Bytes(v)) if v.len() == 16 => {
@@ -548,17 +551,18 @@ fn validate_artifacts(
     {
         return Err(MessageDeliveryError::InvalidApplicationMessage);
     }
-    let archive_commitment = match aad.get("archiveCommitment") {
-        None => None,
-        Some(CanonicalValueRef::Bytes(v)) if v.len() == 32 => {
-            Some(v.try_into().expect("32-byte archiveCommitment"))
-        }
-        Some(_) => return Err(MessageDeliveryError::InvalidApplicationMessage),
-    };
     if !projection.blob_bindings().is_empty() {
         return Err(MessageDeliveryError::BlobNotFound);
     }
-    Ok(archive_commitment)
+    transcript::verify_application_archive_attestation(
+        aad,
+        expected_sender_did,
+        expected_sender_device_id,
+        expected_sender_public_key,
+        coordinate.conversation_id,
+        message_id,
+    )
+    .map_err(|_| MessageDeliveryError::InvalidApplicationMessage)
 }
 
 fn verified_mutation(
@@ -611,7 +615,17 @@ pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
     require_relationship_policy(tx, scope, head.coordinate, relationship_authority).await?;
     let message_id = Uuid::from_bytes(*projection.message_id().as_bytes());
     validate_application_message(&projection)?;
-    let archive_commitment = validate_artifacts(&projection, expected, message_id)?;
+    let actor_signing_public_key = scope
+        .actor_signing_public_key()
+        .ok_or(MessageDeliveryError::Invariant)?;
+    let archive = validate_artifacts(
+        &projection,
+        expected,
+        message_id,
+        scope.actor_did(),
+        scope.actor_device_id(),
+        actor_signing_public_key,
+    )?;
     let minted_entry_uuid = crate::sim_hooks::mint_entry_uuid_v4(
         b"chat.sendMessage",
         &[
@@ -641,8 +655,8 @@ pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
             .ok_or(MessageDeliveryError::Invariant)?,
     )
     .map_err(|_| MessageDeliveryError::Invariant)?;
-    let i13_receipt_json = match (archive_commitment, i13_signer) {
-        (Some(commitment), Some(signer)) => {
+    let i13_receipt_json = match (archive, i13_signer) {
+        (Some(archive), Some(signer)) => {
             let epoch_u64 =
                 u64::try_from(expected.epoch).map_err(|_| MessageDeliveryError::Invariant)?;
             let generation_u64 =
@@ -656,7 +670,7 @@ pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
                     scope.actor_did(),
                     &sender_device_text,
                     &entry_id_text,
-                    &commitment,
+                    archive.commitment(),
                     head.next_seq,
                     scope.trusted_instant().timestamp_millis(),
                 )

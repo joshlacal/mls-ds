@@ -406,7 +406,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     // Bob homed on `ds-b` (`did:plc`), and Eve on `ref_pds` (`atproto#5187`)
     let archive_commitment = [0x7A_u8; 32];
     let eve_did = "did:plc:eveatprotospacesref24chr";
-    let seeded_b: Value = admin_http
+    let seed_response = admin_http
         .post(format!(
             "{}/_test/clean-slate/seed-group-fixture",
             ds_b.base_url
@@ -418,10 +418,16 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             "extraMembers": []
         }))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+    let seed_status = seed_response.status();
+    let seed_body = seed_response.bytes().await?;
+    assert_eq!(
+        seed_status,
+        reqwest::StatusCode::OK,
+        "seed-group-fixture: {}",
+        String::from_utf8_lossy(&seed_body)
+    );
+    let seeded_b: Value = serde_json::from_slice(&seed_body)?;
 
     let convo_id = Uuid::parse_str(seeded_b["conversationId"].as_str().unwrap())?;
     let space_uri = seeded_b["spaceUri"].as_str().unwrap().to_string();
@@ -437,6 +443,80 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let bob_admin_did = seeded_b["senderDid"].as_str().unwrap().to_string();
     let bob_device_id = Uuid::parse_str(seeded_b["senderDeviceId"].as_str().unwrap())?;
     let bob_key_id = seeded_b["senderKeyId"].as_str().unwrap().to_string();
+    let bob_ed_seed: [u8; 32] = STANDARD
+        .decode(seeded_b["senderEd25519SeedB64"].as_str().unwrap())?
+        .try_into()
+        .unwrap();
+    let bob_ed_sk = Ed25519SigningKey::from_bytes(&bob_ed_seed);
+    let seeded_message_id = Uuid::parse_str(seeded_b["messageId"].as_str().unwrap())?;
+    let seeded_send = &seeded_b["signedRequest"]["body"];
+    assert_eq!(seeded_send["messageId"], seeded_message_id.to_string());
+    assert_eq!(seeded_send["actorDid"], bob_admin_did);
+    assert_eq!(seeded_send["actorDeviceId"], bob_device_id.to_string());
+    assert_eq!(seeded_send["keyId"], bob_key_id);
+    let seeded_aad = &seeded_send["aad"];
+    assert_eq!(
+        seeded_aad["conversationId"],
+        STANDARD.encode(convo_id.as_bytes())
+    );
+    assert_eq!(
+        seeded_aad["messageId"],
+        STANDARD.encode(seeded_message_id.as_bytes())
+    );
+    assert_eq!(
+        seeded_aad["archiveCommitment"],
+        STANDARD.encode(archive_commitment)
+    );
+    assert_eq!(
+        seeded_aad["prior"]["conversationId"],
+        STANDARD.encode(convo_id.as_bytes())
+    );
+    for field in [
+        "generation",
+        "stateVersion",
+        "groupId",
+        "epoch",
+        "groupContextHash",
+        "confirmationTag",
+        "lifecycle",
+    ] {
+        assert_eq!(
+            seeded_aad["prior"][field], seeded_send["prior"][field],
+            "seeded application AAD prior {field}"
+        );
+    }
+    let seeded_attestation = &seeded_aad["originalSenderAttestation"];
+    assert_eq!(seeded_attestation["senderDid"], bob_admin_did);
+    assert_eq!(
+        seeded_attestation["senderDeviceId"],
+        bob_device_id.to_string()
+    );
+    let seeded_attestation_key = STANDARD.decode(
+        seeded_attestation["senderTransportPubkey"]
+            .as_str()
+            .unwrap(),
+    )?;
+    assert_eq!(
+        seeded_attestation_key.as_slice(),
+        bob_ed_sk.verifying_key().to_bytes().as_slice()
+    );
+    let seeded_attestation_signature: [u8; 64] = STANDARD
+        .decode(seeded_attestation["signature"].as_str().unwrap())?
+        .try_into()
+        .unwrap();
+    let seeded_attestation_transcript =
+        labyrinth_protocol::transcripts::original_sender_archive_transcript(
+            &convo_id.to_string(),
+            &seeded_message_id.to_string(),
+            &archive_commitment,
+        );
+    bob_ed_sk
+        .verifying_key()
+        .verify_strict(
+            &seeded_attestation_transcript,
+            &Ed25519Signature::from_bytes(&seeded_attestation_signature),
+        )
+        .expect("seeded originalSenderAttestation must verify over exact coordinates");
 
     let alice_remote_did = seeded_b["recipientDid"].as_str().unwrap().to_string();
     let alice_device_id = Uuid::parse_str(seeded_b["recipientDeviceId"].as_str().unwrap())?;
@@ -1207,7 +1287,6 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
 
     // The sequencer accepts a relayed mutation only from the actor's own home: `ds-a` relaying
     // `ds-b`-local Bob's genuine seeded send is refused, and the conversation is untouched.
-    let seeded_message_id = Uuid::parse_str(seeded_b["messageId"].as_str().unwrap())?;
     let footprint_before = send_footprint(&ds_b.pool, &convo_id, &seeded_message_id).await?;
     let bob_relay_bytes = serde_json::to_vec(&json!({
         "conversationId": convo_id,
@@ -1261,6 +1340,24 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     alice_send_body["actorDid"] = json!(alice_remote_did);
     alice_send_body["actorDeviceId"] = json!(alice_device_id);
     alice_send_body["keyId"] = json!(alice_key_id);
+    let attestation_transcript =
+        labyrinth_protocol::transcripts::original_sender_archive_transcript(
+            &convo_id.to_string(),
+            &seeded_message_id.to_string(),
+            &archive_commitment,
+        );
+    let alice_attestation_signature = alice_ed_sk.sign(&attestation_transcript);
+    alice_ed_sk
+        .verifying_key()
+        .verify_strict(&attestation_transcript, &alice_attestation_signature)
+        .expect("Alice's originalSenderAttestation must verify before relay");
+    let alice_original_sender_attestation = json!({
+        "senderDid": alice_remote_did,
+        "senderDeviceId": alice_device_id,
+        "senderTransportPubkey": STANDARD.encode(alice_ed_sk.verifying_key().to_bytes()),
+        "signature": STANDARD.encode(alice_attestation_signature.to_bytes()),
+    });
+    alice_send_body["aad"]["originalSenderAttestation"] = alice_original_sender_attestation.clone();
     let alice_signed_send: Value = admin_http
         .post(format!("{}/_test/clean-slate/sign-mutation", ds_b.base_url))
         .json(&json!({
@@ -1313,11 +1410,46 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
 
     // Verify `I13` ES256 `sequencerReceipt` under `ds-b`'s (`did:plc`) `#mls-receipt-1` key!
     let mut rcpt_wire = sequenced_entry["sequencerReceipt"].clone();
+    assert_eq!(rcpt_wire["conversationId"], convo_id.to_string());
+    assert_eq!(
+        rcpt_wire["generation"],
+        alice_signed_send["body"]["prior"]["generation"]
+    );
+    assert_eq!(
+        rcpt_wire["groupId"],
+        alice_signed_send["body"]["prior"]["groupId"]
+    );
+    assert_eq!(
+        rcpt_wire["epoch"],
+        alice_signed_send["body"]["prior"]["epoch"]
+    );
+    assert_eq!(rcpt_wire["entryId"], sequenced_entry["entryId"]);
+    assert_eq!(rcpt_wire["seq"], sequenced_entry["seq"]);
+    assert_eq!(rcpt_wire["senderDid"], alice_remote_did);
+    assert_eq!(rcpt_wire["senderDeviceId"], alice_device_id.to_string());
+    assert_eq!(
+        rcpt_wire["archiveCommitment"],
+        STANDARD.encode(archive_commitment)
+    );
+    assert!(
+        rcpt_wire.get("originalSenderAttestation").is_none(),
+        "chat sequencerReceipt is the ES256 half of the Labyrinth archived receipt"
+    );
+    rcpt_wire["originalSenderAttestation"] = alice_original_sender_attestation.clone();
     assert_eq!(rcpt_wire["sequencerDid"], DS_B_DID);
     assert_eq!(rcpt_wire["kid"], format!("{DS_B_DID}#mls-receipt-1"));
     for bytes_field in ["groupId", "archiveCommitment", "signature"] {
         if let Some(b64) = rcpt_wire[bytes_field].as_str().map(str::to_owned) {
             rcpt_wire[bytes_field] = json!({ "$bytes": b64.trim_end_matches('=') });
+        }
+    }
+    for bytes_field in ["senderTransportPubkey", "signature"] {
+        if let Some(b64) = rcpt_wire["originalSenderAttestation"][bytes_field]
+            .as_str()
+            .map(str::to_owned)
+        {
+            rcpt_wire["originalSenderAttestation"][bytes_field] =
+                json!({ "$bytes": b64.trim_end_matches('=') });
         }
     }
     let rcpt_def: labyrinth::records::defs::SequencerReceiptDef =

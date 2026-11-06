@@ -305,7 +305,7 @@ async fn alice_publishes_with_note(
     body["preparationDigest"] = snapshot["preparationDigest"].clone();
     body["preparationRequestDigest"] = json!(STANDARD.encode(verified.request_digest()));
     body["contextHash"] = json!(STANDARD.encode(b.context_hash));
-    body["archiveCommitment"] = json!(STANDARD.encode(b.archive_commitment));
+    mls_e2e_tests::bind_publication_original_sender_attestation(&mut body, b)?;
     body["next"] = b.coordinates.clone();
     body["importUntil"] = json!(chrono::DateTime::from_timestamp(b.import_until as i64, 0)
         .context("import")?

@@ -1845,6 +1845,156 @@ impl<'a> From<&'a DagValue> for CanonicalValueRef<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct VerifiedApplicationArchive {
+    commitment: [u8; 32],
+}
+
+impl VerifiedApplicationArchive {
+    pub(crate) fn commitment(&self) -> &[u8; 32] {
+        &self.commitment
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_original_sender_archive_attestation(
+    sender_did: &str,
+    sender_device_id: &str,
+    transport_public_key: &[u8],
+    signature: &[u8],
+    expected_sender_did: &str,
+    expected_sender_device_id: &str,
+    expected_sender_public_key: &[u8],
+    conversation_id: &str,
+    message_id: &str,
+    archive_commitment: &[u8; 32],
+) -> Result<(), AuthPrimitiveError> {
+    let transport_public_key: [u8; 32] = transport_public_key
+        .try_into()
+        .map_err(|_| AuthPrimitiveError::invalid("original sender archive public key length"))?;
+    let signature: [u8; 64] = signature
+        .try_into()
+        .map_err(|_| AuthPrimitiveError::invalid("original sender archive signature length"))?;
+    let transcript = labyrinth_protocol::transcripts::original_sender_archive_transcript(
+        conversation_id,
+        message_id,
+        archive_commitment,
+    );
+    if sender_did != expected_sender_did
+        || sender_device_id != expected_sender_device_id
+        || transport_public_key.as_slice() != expected_sender_public_key
+        || VerifyingKey::from_bytes(&transport_public_key)
+            .and_then(|key| key.verify_strict(&transcript, &Signature::from_bytes(&signature)))
+            .is_err()
+    {
+        return Err(AuthPrimitiveError::invalid(
+            "invalid original sender archive attestation",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_application_archive_attestation(
+    aad: ClosedObjectRef<'_>,
+    expected_sender_did: &str,
+    expected_sender_device_id: uuid::Uuid,
+    expected_sender_public_key: &[u8],
+    conversation_id: uuid::Uuid,
+    message_id: uuid::Uuid,
+) -> Result<Option<VerifiedApplicationArchive>, AuthPrimitiveError> {
+    if !matches!(
+        aad.get("conversationId"),
+        Some(CanonicalValueRef::Bytes(value)) if value == conversation_id.as_bytes()
+    ) || !matches!(
+        aad.get("messageId"),
+        Some(CanonicalValueRef::Bytes(value)) if value == message_id.as_bytes()
+    ) {
+        return Err(AuthPrimitiveError::invalid(
+            "application archive coordinates differ",
+        ));
+    }
+    let commitment = match aad.get("archiveCommitment") {
+        None => {
+            if aad.get("originalSenderAttestation").is_some() {
+                return Err(AuthPrimitiveError::invalid(
+                    "original sender archive attestation has no commitment",
+                ));
+            }
+            return Ok(None);
+        }
+        Some(CanonicalValueRef::Bytes(value)) => <[u8; 32]>::try_from(value)
+            .map_err(|_| AuthPrimitiveError::invalid("archive commitment length"))?,
+        Some(_) => {
+            return Err(AuthPrimitiveError::invalid(
+                "archive commitment is not bytes",
+            ))
+        }
+    };
+    let attestation = match aad.get("originalSenderAttestation") {
+        Some(CanonicalValueRef::Object(value)) => value,
+        _ => {
+            return Err(AuthPrimitiveError::invalid(
+                "archive commitment has no original sender attestation",
+            ))
+        }
+    };
+    let sender_did = match attestation.get("senderDid") {
+        Some(CanonicalValueRef::Did(value)) => value.as_str(),
+        _ => {
+            return Err(AuthPrimitiveError::invalid(
+                "invalid original sender archive DID",
+            ))
+        }
+    };
+    let sender_device_id = match attestation.get("senderDeviceId") {
+        Some(CanonicalValueRef::Uuid(value))
+            if value.as_bytes() == expected_sender_device_id.as_bytes() =>
+        {
+            value.as_str()
+        }
+        _ => {
+            return Err(AuthPrimitiveError::invalid(
+                "invalid original sender archive device",
+            ))
+        }
+    };
+    let transport_public_key = match attestation.get("senderTransportPubkey") {
+        Some(CanonicalValueRef::Bytes(value)) => value,
+        _ => {
+            return Err(AuthPrimitiveError::invalid(
+                "invalid original sender archive public key",
+            ))
+        }
+    };
+    let signature = match attestation.get("signature") {
+        Some(CanonicalValueRef::Bytes(value)) => value,
+        _ => {
+            return Err(AuthPrimitiveError::invalid(
+                "invalid original sender archive signature",
+            ))
+        }
+    };
+    let mut conversation_buffer = uuid::Uuid::encode_buffer();
+    let conversation_id = conversation_id
+        .hyphenated()
+        .encode_lower(&mut conversation_buffer);
+    let mut message_buffer = uuid::Uuid::encode_buffer();
+    let message_id = message_id.hyphenated().encode_lower(&mut message_buffer);
+    verify_original_sender_archive_attestation(
+        sender_did,
+        sender_device_id,
+        transport_public_key,
+        signature,
+        expected_sender_did,
+        sender_device_id,
+        expected_sender_public_key,
+        conversation_id,
+        message_id,
+        &commitment,
+    )?;
+    Ok(Some(VerifiedApplicationArchive { commitment }))
+}
+
 pub struct CanonicalArrayRef<'a>(&'a [DagValue]);
 impl CanonicalArrayRef<'_> {
     pub fn len(&self) -> usize {

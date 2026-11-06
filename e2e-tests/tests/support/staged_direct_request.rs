@@ -378,7 +378,7 @@ async fn stage_request_configured(
     body["preparationDigest"] = preparation["preparationDigest"].clone();
     body["preparationRequestDigest"] = json!(STANDARD.encode(verified_prepare.request_digest()));
     body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
-    body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
+    mls_e2e_tests::bind_publication_original_sender_attestation(&mut body, bootstrap)?;
     body["next"] = bootstrap.coordinates.clone();
     body["importUntil"] = json!(
         chrono::DateTime::from_timestamp(bootstrap.import_until as i64, 0)

@@ -219,33 +219,12 @@ impl RelayedPair {
 
     /// P's own signed application, signed now.
     fn peer_send(&self) -> Value {
-        let message_id = Uuid::new_v4();
-        let mut body = self.fixture.signed_request["body"].clone();
-        body["messageId"] = json!(message_id);
-        body["actorDid"] = json!(self.fixture.recipient_did);
-        body["actorDeviceId"] = json!(self.fixture.recipient_device_id);
-        body["keyId"] = json!(self.fixture.recipient_key_id);
-        body["signedAt"] = json!(canonical(current_utc()));
-        body["aad"]["messageId"] = json!(STANDARD.encode(message_id.as_bytes()));
-        crate::chat_protocol::test_support::sign_mutation_json_for_test(
-            &body,
-            &ed25519_dalek::SigningKey::from_bytes(&self.fixture.recipient_ed25519_seed),
-        )
-        .unwrap()
+        self.fixture.next_recipient_signed_request()
     }
 
     /// D's own signed application, signed now.
     fn sender_send(&self) -> Value {
-        let message_id = Uuid::new_v4();
-        let mut body = self.fixture.signed_request["body"].clone();
-        body["messageId"] = json!(message_id);
-        body["signedAt"] = json!(canonical(current_utc()));
-        body["aad"]["messageId"] = json!(STANDARD.encode(message_id.as_bytes()));
-        crate::chat_protocol::test_support::sign_mutation_json_for_test(
-            &body,
-            &ed25519_dalek::SigningKey::from_bytes(&self.fixture.sender_ed25519_seed),
-        )
-        .unwrap()
+        self.fixture.next_sender_signed_request()
     }
 
     /// P sending `signed` through the coordinator's real `sendMessage` route.
@@ -898,20 +877,7 @@ impl Routed {
     /// P's own signed application, signed now.
     fn peer_send(&self) -> Value {
         self.sync_clock();
-        let p = &self.p;
-        let message_id = Uuid::new_v4();
-        let mut body = p.fixture.signed_request["body"].clone();
-        body["messageId"] = json!(message_id);
-        body["actorDid"] = json!(p.peer());
-        body["actorDeviceId"] = json!(p.fixture.recipient_device_id);
-        body["keyId"] = json!(p.fixture.recipient_key_id);
-        body["signedAt"] = json!(canonical(current_utc()));
-        body["aad"]["messageId"] = json!(STANDARD.encode(message_id.as_bytes()));
-        crate::chat_protocol::test_support::sign_mutation_json_for_test(
-            &body,
-            &ed25519_dalek::SigningKey::from_bytes(&p.fixture.recipient_ed25519_seed),
-        )
-        .unwrap()
+        self.p.fixture.next_recipient_signed_request()
     }
 
     /// P sending `signed` through its home's real `sendMessage` route.

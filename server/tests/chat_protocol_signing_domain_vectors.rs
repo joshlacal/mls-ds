@@ -65,7 +65,11 @@ mod chat_protocol {
 #[path = "common/signing_domain_bodies.rs"]
 mod bodies;
 
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
@@ -92,10 +96,10 @@ const CANONICAL_SOURCE_LEXICON_SHA256: &str =
     "3d5d867d9b651fc22e119cb6011262740e3308f127efbf87742850ecded6d639";
 // The frozen vectors retain their original provenance. Separately pin the
 // current canonical contract, which also contains the direct-request domains.
-const CURRENT_SOURCE_LEXICON_REVISION: &str = "0f4f58a27d161c35cf7dcc1072a570660a7fbb0f";
-const CURRENT_SOURCE_CORPUS_REVISION: &str = "0f4f58a27d161c35cf7dcc1072a570660a7fbb0f";
+const CURRENT_SOURCE_LEXICON_REVISION: &str = "1193ac5fdcff9a4c283704d649cdc3a6663fb8bf";
+const CURRENT_SOURCE_CORPUS_REVISION: &str = "971fd048b4ab2128b8d5b2c35f1be7885abfa1ce";
 const CURRENT_SOURCE_LEXICON_SHA256: &str =
-    "eb3af0eb332f4ea28d99b97f83aface8e7409d456b69be0d19b4bcb9f108c8ad";
+    "3764fc1be74a50e72ca9201eb2793357aaec3b27a7024a3e97e1d9e33ef7aab6";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures
@@ -113,6 +117,56 @@ fn signing_key() -> SigningKey {
 
 fn canonical_lexicon_sha256() -> String {
     hex::encode(Sha256::digest(CANONICAL_LEXICON))
+}
+fn collect_rust_sources(root: &Path, sources: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(root)
+        .unwrap_or_else(|error| panic!("read source directory {}: {error}", root.display()))
+    {
+        let path = entry.expect("read source directory entry").path();
+        if path.is_dir() {
+            collect_rust_sources(&path, sources);
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            sources.push(path);
+        }
+    }
+}
+
+#[test]
+fn every_direct_request_publication_builder_binds_original_sender_attestation() {
+    const BUILDER_MARKERS: [&str; 5] = [
+        "[\"$type\"] = json!(\"blue.catbird.chat.defs#directRequestPublicationBody\"",
+        "\"$type\": \"blue.catbird.chat.defs#directRequestPublicationBody\"",
+        "\"$type\":\"blue.catbird.chat.defs#directRequestPublicationBody\"",
+        "let pub_body = serde_json::json!({",
+        "fn sign_request(\n    kind: DirectRequestKind",
+    ];
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
+    collect_rust_sources(&manifest.join("src"), &mut sources);
+    collect_rust_sources(&manifest.join("../e2e-tests/tests"), &mut sources);
+
+    let mut builder_count = 0;
+    for path in sources {
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read source {}: {error}", path.display()));
+        for marker in BUILDER_MARKERS {
+            for tail in source.split(marker).skip(1) {
+                builder_count += 1;
+                let construction = &tail[..tail.len().min(4096)];
+                assert!(
+                    construction.contains("originalSenderAttestation")
+                        || construction.contains("bind_publication_original_sender_attestation",),
+                    "direct-request publication builder in {} omits original sender attestation",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert_eq!(
+        builder_count, 18,
+        "direct-request publication builder inventory changed"
+    );
 }
 
 fn frozen_case(body_name: &str) -> Value {

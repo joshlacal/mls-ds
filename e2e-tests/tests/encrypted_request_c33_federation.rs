@@ -24,6 +24,7 @@ use base64::{
 };
 use catbird_mls::{
     chat_v2::transcript::direct_request::{self as protocol, DirectRequestKind},
+    messaging::receive::OriginalSenderArchiveAttestationEnvelope,
     metadata::GroupMetadataV1,
     orchestrator::{
         canonical_application_aad_bytes,
@@ -51,6 +52,31 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 const MAINTENANCE_URL: &str = "postgresql://127.0.0.1:5432/postgres";
+fn original_sender_attestation(
+    value: &Value,
+) -> anyhow::Result<OriginalSenderArchiveAttestationEnvelope> {
+    let bytes = |field: &str| -> anyhow::Result<Vec<u8>> {
+        let value = &value[field];
+        Ok(STANDARD.decode(
+            value
+                .as_str()
+                .or_else(|| value["$bytes"].as_str())
+                .with_context(|| format!("missing original sender attestation {field}"))?,
+        )?)
+    };
+    Ok(OriginalSenderArchiveAttestationEnvelope {
+        sender_did: value["senderDid"]
+            .as_str()
+            .context("missing original sender attestation senderDid")?
+            .to_owned(),
+        sender_device_id: value["senderDeviceId"]
+            .as_str()
+            .context("missing original sender attestation senderDeviceId")?
+            .to_owned(),
+        sender_transport_public_key: bytes("senderTransportPubkey")?,
+        signature: bytes("signature")?,
+    })
+}
 
 struct DedicatedDatabase(String);
 
@@ -409,6 +435,10 @@ impl FederatedAuthorityServer {
                     .as_str(),
             )
             .env(
+                "RECEIPT_VERIFICATION_METHOD",
+                format!("{did}#mls-receipt-1"),
+            )
+            .env(
                 "SIGNING_KEY_PEM",
                 service_key
                     .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
@@ -514,6 +544,10 @@ impl FederatedAuthorityServer {
                 sequencer_receipt_key
                     .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
                     .as_str(),
+            )
+            .env(
+                "RECEIPT_VERIFICATION_METHOD",
+                format!("{}#mls-receipt-1", self.did),
             )
             .env(
                 "SIGNING_KEY_PEM",
@@ -1102,7 +1136,7 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
     publish_body["preparationRequestDigest"] =
         json!(STANDARD.encode(verified_prepare.request_digest()));
     publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
-    publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
+    mls_e2e_tests::bind_publication_original_sender_attestation(&mut publish_body, bootstrap)?;
     publish_body["next"] = bootstrap.coordinates.clone();
     publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
         bootstrap.import_until as i64,
@@ -1657,6 +1691,9 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         archive_commitment: wire_bytes(&publication["archiveCommitment"])?
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid delivered archive commitment"))?,
+        original_sender_attestation: original_sender_attestation(
+            &publication["originalSenderAttestation"],
+        )?,
         opening: None,
     };
     let welcome_input = DirectRequestWelcomeInput {
@@ -2875,7 +2912,7 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
     publish_body["preparationRequestDigest"] =
         json!(STANDARD.encode(verified_prepare.request_digest()));
     publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
-    publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
+    mls_e2e_tests::bind_publication_original_sender_attestation(&mut publish_body, bootstrap)?;
     publish_body["next"] = bootstrap.coordinates.clone();
     publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
         bootstrap.import_until as i64,
@@ -3289,6 +3326,9 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         archive_commitment: wire_bytes(&remote_publication["body"]["archiveCommitment"])?
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid delivered archive commitment"))?,
+        original_sender_attestation: original_sender_attestation(
+            &remote_publication["body"]["originalSenderAttestation"],
+        )?,
         opening: None,
     };
 

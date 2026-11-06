@@ -1506,6 +1506,10 @@ impl CleanSlateDsProcess {
             .env("SIGNING_KEY_PEM", p256_to_pem(&signing_key))
             .env("RECEIPT_SIGNING_KEY_PEM", p256_to_pem(&receipt_key))
             .env(
+                "RECEIPT_VERIFICATION_METHOD",
+                format!("{service_did}#mls-receipt-1"),
+            )
+            .env(
                 "FEDERATION_GROUP_RELAY_HMAC_SECRET",
                 std::str::from_utf8(s2s_secret).context("S2S secret is UTF-8")?,
             )

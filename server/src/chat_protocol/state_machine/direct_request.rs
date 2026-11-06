@@ -81,6 +81,32 @@ fn artifact(value: &Value, field: &str) -> Result<Vec<u8>, BootstrapError> {
 fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str, BootstrapError> {
     value[field].as_str().ok_or(BootstrapError::Binding)
 }
+/// Build the original sender's real Ed25519 archive attestation for an exact
+/// direct-request opening tuple.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn original_sender_attestation_json_for_test(
+    sender_did: &str,
+    sender_device_id: Uuid,
+    signing_key: &ed25519_dalek::SigningKey,
+    conversation_id: &str,
+    message_id: &str,
+    archive_commitment: &[u8; 32],
+) -> Value {
+    use ed25519_dalek::Signer as _;
+
+    let transcript = labyrinth_protocol::transcripts::original_sender_archive_transcript(
+        conversation_id,
+        message_id,
+        archive_commitment,
+    );
+    json!({
+        "senderDid": sender_did,
+        "senderDeviceId": sender_device_id,
+        "senderTransportPubkey": STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        "signature": STANDARD.encode(signing_key.sign(&transcript).to_bytes()),
+    })
+}
+
 fn timestamp(value: &Value) -> Result<u64, BootstrapError> {
     let instant =
         chrono::DateTime::parse_from_rfc3339(value.as_str().ok_or(BootstrapError::Binding)?)
@@ -312,6 +338,22 @@ pub(crate) fn verify_bootstrap(
     }
     let app = wire::validate_private_application(&application, 98304).map_err(public)?;
     let archive_commitment = hash(&b["archiveCommitment"])?;
+    let attestation = &b["originalSenderAttestation"];
+    let attestation_key = bytes(&attestation["senderTransportPubkey"])?;
+    let attestation_signature = bytes(&attestation["signature"])?;
+    crate::chat_protocol::transcript::verify_original_sender_archive_attestation(
+        text(attestation, "senderDid")?,
+        text(attestation, "senderDeviceId")?,
+        &attestation_key,
+        &attestation_signature,
+        actor,
+        actor_device,
+        actor_key,
+        text(b, "conversationId")?,
+        text(b, "firstMessageId")?,
+        &archive_commitment,
+    )
+    .map_err(|_| BootstrapError::Binding)?;
     let app_aad = transcript::direct_request_application_aad(
         &context_hash,
         &serde_json::to_vec(&b["next"]).map_err(|_| BootstrapError::Binding)?,
@@ -450,6 +492,14 @@ mod tests {
             let artifacts = json!({"genesisGroupInfo":artifact("genesis.mls","groupInfo"),"addCommit":artifact("add.mls","publicMessageCommit"),"finalGroupInfo":artifact("final.mls","groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&welcome),"sha256":STANDARD.encode(Sha256::digest(&welcome)),"deliveries":deliveries},"metadataSnapshot":metadata_snapshot,"initialCiphertext":STANDARD.encode(read("application.mls"))});
             let mut body = json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\u{0}","protocolVersion":"2","actorDid":ctx["actorDid"],"actorDeviceId":ctx["actorDeviceId"],"keyId":ctx["actorKeyId"],"authGeneration":1,"requestId":ctx["requestId"],"firstMessageId":ctx["firstMessageId"],"conversationId":ctx["conversationId"],"recipientDid":ctx["recipientDid"],"origin":ctx["origin"],"profile":"encryptedIntroduction1","preparationDigest":ctx["preparationDigest"],"preparationRequestDigest":STANDARD.encode([43u8;32]),"contextHash":STANDARD.encode(context_hash),"next":next,"importUntil":format_time(until),"artifacts":artifacts,"idempotencyKey":Uuid::new_v4().to_string(),"signedAt":format_time(now)});
             body["archiveCommitment"] = json!(STANDARD.encode(archive_commitment));
+            body["originalSenderAttestation"] = original_sender_attestation_json_for_test(
+                ctx["actorDid"].as_str().unwrap(),
+                Uuid::parse_str(ctx["actorDeviceId"].as_str().unwrap()).unwrap(),
+                &signing,
+                ctx["conversationId"].as_str().unwrap(),
+                ctx["firstMessageId"].as_str().unwrap(),
+                &archive_commitment,
+            );
             // Exercise the durable preparation/publication comparison with the
             // actual selected package references and real bootstrap artifacts.
             // This projection is not an authority-signed preparation: signature
@@ -539,6 +589,22 @@ mod tests {
                         ("/conversationId".into(), alternate_uuid.clone()),
                         ("/contextHash".into(), alternate_hash.clone()),
                         ("/archiveCommitment".into(), alternate_hash.clone()),
+                        (
+                            "/originalSenderAttestation/senderDid".into(),
+                            json!("did:plc:cccccccccccccccccccccccc"),
+                        ),
+                        (
+                            "/originalSenderAttestation/senderDeviceId".into(),
+                            alternate_uuid.clone(),
+                        ),
+                        (
+                            "/originalSenderAttestation/senderTransportPubkey".into(),
+                            alternate_hash.clone(),
+                        ),
+                        (
+                            "/originalSenderAttestation/signature".into(),
+                            json!(STANDARD.encode([0xA6; 64])),
+                        ),
                     ];
                     for (prefix, fields) in [
                         (

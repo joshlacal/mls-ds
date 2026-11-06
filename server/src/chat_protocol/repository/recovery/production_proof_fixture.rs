@@ -541,6 +541,8 @@ pub(super) struct DurableRecoveryFulfillmentFixture {
     pub(super) commit: Vec<u8>,
     pub(super) welcome: Vec<u8>,
     pub(super) application_messages: Vec<Vec<u8>>,
+    pub(super) supplemental_requester_application_messages: Vec<(Uuid, Vec<u8>)>,
+    pub(super) supplemental_fulfiller_application_messages: Vec<(Uuid, Vec<u8>)>,
     pub(super) removal_commit: Vec<u8>,
     pub(super) removal_next: ActivePublicState,
     pub(super) application_message: Vec<u8>,
@@ -563,6 +565,8 @@ struct TwoMemberFulfillmentProducts {
     commit: Vec<u8>,
     welcome: Vec<u8>,
     application_messages: Vec<Vec<u8>>,
+    supplemental_requester_application_messages: Vec<(Uuid, Vec<u8>)>,
+    supplemental_fulfiller_application_messages: Vec<(Uuid, Vec<u8>)>,
     removal_commit: Vec<u8>,
     removal_next: ActivePublicState,
     application_message: Vec<u8>,
@@ -574,6 +578,7 @@ struct TwoMemberFixtureOptions<'a> {
     direct: bool,
     application_message_id: Option<Uuid>,
     archive_commitment: Option<[u8; 32]>,
+    supplemental_application_messages: bool,
     recipient_service_did: Option<&'a str>,
     sender_service_did: Option<&'a str>,
     sequencer_service_did: Option<&'a str>,
@@ -1047,6 +1052,37 @@ mod opt_bytes_slice {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ApplicationRoutingOriginalSenderAttestation {
+    sender_did: String,
+    #[serde(with = "serde_bytes")]
+    sender_device_id: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    sender_transport_pubkey: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    signature: Vec<u8>,
+}
+
+fn application_routing_original_sender_attestation(
+    requester: &FixtureIdentity,
+    prior: &PublicGroupSnapshotCoordinate,
+    message_id: Uuid,
+    archive_commitment: &[u8; 32],
+) -> ApplicationRoutingOriginalSenderAttestation {
+    let transcript = labyrinth_protocol::transcripts::original_sender_archive_transcript(
+        &Uuid::from_bytes(*prior.conversation_id()).to_string(),
+        &message_id.to_string(),
+        archive_commitment,
+    );
+    ApplicationRoutingOriginalSenderAttestation {
+        sender_did: requester.did.clone(),
+        sender_device_id: requester.device_id.as_bytes().to_vec(),
+        sender_transport_pubkey: requester.signing_public_key().to_vec(),
+        signature: requester.signing_key.sign(&transcript).to_bytes().to_vec(),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ApplicationRoutingAad<'a> {
     protocol_version: &'static str,
     #[serde(with = "serde_bytes")]
@@ -1056,6 +1092,8 @@ struct ApplicationRoutingAad<'a> {
     message_id: &'a [u8],
     #[serde(skip_serializing_if = "Option::is_none", with = "opt_bytes_slice")]
     archive_commitment: Option<&'a [u8]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_sender_attestation: Option<&'a ApplicationRoutingOriginalSenderAttestation>,
     prior: RecoveryCommitPriorAad<'a>,
 }
 
@@ -1063,13 +1101,18 @@ fn application_routing_aad_bytes(
     prior: &PublicGroupSnapshotCoordinate,
     message_id: Uuid,
     archive_commitment: Option<&[u8; 32]>,
+    requester: &FixtureIdentity,
 ) -> Result<Vec<u8>, String> {
+    let original_sender_attestation = archive_commitment.map(|commitment| {
+        application_routing_original_sender_attestation(requester, prior, message_id, commitment)
+    });
     let canonical = serde_ipld_dagcbor::to_vec(&ApplicationRoutingAad {
         protocol_version: "1",
         conversation_id: prior.conversation_id(),
         generation: prior.generation(),
         message_id: message_id.as_bytes(),
         archive_commitment: archive_commitment.map(|c| c.as_slice()),
+        original_sender_attestation: original_sender_attestation.as_ref(),
         prior: RecoveryCommitPriorAad {
             conversation_id: prior.conversation_id(),
             generation: prior.generation(),
@@ -1091,27 +1134,38 @@ pub(super) fn application_routing_aad(
     prior: &PublicGroupSnapshotCoordinate,
     message_id: Uuid,
 ) -> Value {
-    application_routing_aad_with_commitment(prior, message_id, None)
-}
-
-pub(super) fn application_routing_aad_with_commitment(
-    prior: &PublicGroupSnapshotCoordinate,
-    message_id: Uuid,
-    archive_commitment: Option<&[u8; 32]>,
-) -> Value {
     let mut aad_prior = coordinate_json(prior);
     aad_prior["conversationId"] = json!(STANDARD.encode(prior.conversation_id()));
-    let mut obj = json!({
+    json!({
         "protocolVersion": "1",
         "conversationId": STANDARD.encode(prior.conversation_id()),
         "generation": prior.generation(),
         "messageId": STANDARD.encode(message_id.as_bytes()),
         "prior": aad_prior,
+    })
+}
+
+pub(super) fn application_routing_aad_with_commitment(
+    prior: &PublicGroupSnapshotCoordinate,
+    message_id: Uuid,
+    archive_commitment: &[u8; 32],
+    requester: &FixtureIdentity,
+) -> Value {
+    let mut aad = application_routing_aad(prior, message_id);
+    aad["archiveCommitment"] = json!(STANDARD.encode(archive_commitment));
+    let attestation = application_routing_original_sender_attestation(
+        requester,
+        prior,
+        message_id,
+        archive_commitment,
+    );
+    aad["originalSenderAttestation"] = json!({
+        "senderDid": attestation.sender_did,
+        "senderDeviceId": requester.device_id,
+        "senderTransportPubkey": STANDARD.encode(attestation.sender_transport_pubkey),
+        "signature": STANDARD.encode(attestation.signature),
     });
-    if let Some(commitment) = archive_commitment {
-        obj["archiveCommitment"] = json!(STANDARD.encode(commitment));
-    }
-    obj
+    aad
 }
 
 fn public_state_from_group_info(
@@ -1404,6 +1458,7 @@ fn build_two_member_fulfillment_products(
                 prior.coordinate(),
                 message_id,
                 options.archive_commitment.as_ref(),
+                requester,
             )?,
             _ => Vec::new(),
         };
@@ -1416,6 +1471,34 @@ fn build_two_member_fulfillment_products(
                 .tls_serialize_detached()
                 .map_err(|error| format!("serialize retained-generation application: {error:?}"))?,
         );
+    }
+    let mut supplemental_requester_application_messages = Vec::new();
+    if options.supplemental_application_messages {
+        let archive_commitment = options
+            .archive_commitment
+            .as_ref()
+            .ok_or("supplemental application fixtures require an archive commitment")?;
+        for _ in 0..4 {
+            let message_id = Uuid::new_v4();
+            requester_group.set_aad(application_routing_aad_bytes(
+                prior.coordinate(),
+                message_id,
+                Some(archive_commitment),
+                requester,
+            )?);
+            let message = requester_group
+                .create_message(
+                    &provider,
+                    &requester_signer,
+                    b"supplemental requester application",
+                )
+                .map_err(|error| format!("create supplemental requester application: {error:?}"))?
+                .tls_serialize_detached()
+                .map_err(|error| {
+                    format!("serialize supplemental requester application: {error:?}")
+                })?;
+            supplemental_requester_application_messages.push((message_id, message));
+        }
     }
     let join_message = MlsMessageIn::tls_deserialize_exact(&add_welcome)
         .map_err(|error| format!("parse fulfiller join Welcome: {error:?}"))?;
@@ -1431,6 +1514,34 @@ fn build_two_member_fulfillment_products(
     .map_err(|error| format!("stage fulfiller Recovery Welcome: {error:?}"))?
     .into_group(&fulfiller_provider)
     .map_err(|error| format!("join fulfiller Recovery MLS group: {error:?}"))?;
+    let mut supplemental_fulfiller_application_messages = Vec::new();
+    if options.supplemental_application_messages {
+        let archive_commitment = options
+            .archive_commitment
+            .as_ref()
+            .ok_or("supplemental application fixtures require an archive commitment")?;
+        for _ in 0..4 {
+            let message_id = Uuid::new_v4();
+            fulfiller_group.set_aad(application_routing_aad_bytes(
+                prior.coordinate(),
+                message_id,
+                Some(archive_commitment),
+                fulfiller,
+            )?);
+            let message = fulfiller_group
+                .create_message(
+                    &fulfiller_provider,
+                    &fulfiller_signer,
+                    b"supplemental fulfiller application",
+                )
+                .map_err(|error| format!("create supplemental fulfiller application: {error:?}"))?
+                .tls_serialize_detached()
+                .map_err(|error| {
+                    format!("serialize supplemental fulfiller application: {error:?}")
+                })?;
+            supplemental_fulfiller_application_messages.push((message_id, message));
+        }
+    }
     let (
         requester_recovery_package,
         requester_key_package_ref,
@@ -1587,6 +1698,8 @@ fn build_two_member_fulfillment_products(
         commit,
         welcome,
         application_messages,
+        supplemental_requester_application_messages,
+        supplemental_fulfiller_application_messages,
         removal_commit,
         removal_next,
         application_message,
@@ -2028,6 +2141,7 @@ pub(super) async fn seed_application_routing_fixture_with_commitment(
             direct,
             application_message_id: Some(message_id),
             archive_commitment,
+            supplemental_application_messages: archive_commitment.is_some(),
             recipient_service_did: Some(recipient_service_did),
             sender_service_did,
             sequencer_service_did,
@@ -2328,6 +2442,10 @@ async fn seed_two_member_fixture(
         commit: products.commit,
         welcome: products.welcome,
         application_messages: products.application_messages,
+        supplemental_requester_application_messages: products
+            .supplemental_requester_application_messages,
+        supplemental_fulfiller_application_messages: products
+            .supplemental_fulfiller_application_messages,
         removal_commit: products.removal_commit,
         removal_next: products.removal_next,
         application_message: products.application_message,

@@ -235,6 +235,32 @@ pub struct CleanSlateApplicationFixture {
     pub recipient_key_id: String,
     pub recipient_ed25519_seed: [u8; 32],
     pub signed_request: serde_json::Value,
+    sender_signed_requests: Vec<serde_json::Value>,
+    recipient_signed_requests: Vec<serde_json::Value>,
+    sender_request_index: std::sync::atomic::AtomicUsize,
+    recipient_request_index: std::sync::atomic::AtomicUsize,
+}
+
+impl CleanSlateApplicationFixture {
+    pub(crate) fn next_sender_signed_request(&self) -> serde_json::Value {
+        let index = self
+            .sender_request_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.sender_signed_requests
+            .get(index)
+            .expect("clean-slate sender application fixture capacity")
+            .clone()
+    }
+
+    pub(crate) fn next_recipient_signed_request(&self) -> serde_json::Value {
+        let index = self
+            .recipient_request_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.recipient_signed_requests
+            .get(index)
+            .expect("clean-slate recipient application fixture capacity")
+            .clone()
+    }
 }
 
 pub async fn seed_clean_slate_application_fixture(
@@ -404,6 +430,15 @@ async fn seed_clean_slate_application_fixture_inner(
         tx.commit().await.map_err(|error| error.to_string())?;
     }
 
+    let aad = match archive_commitment.as_ref() {
+        Some(commitment) => application_routing_fixture::application_routing_aad_with_commitment(
+            &fixture.prior,
+            message_id,
+            commitment,
+            &fixture.requester,
+        ),
+        None => application_routing_fixture::application_routing_aad(&fixture.prior, message_id),
+    };
     let application = fixture.application_messages.remove(0);
     let body = serde_json::json!({
         "$type": "blue.catbird.chat.defs#applicationSendBody",
@@ -416,11 +451,7 @@ async fn seed_clean_slate_application_fixture_inner(
         "prior": application_routing_fixture::coordinate_json(&fixture.prior),
         "signedAt": chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         "blobBindings": [],
-        "aad": application_routing_fixture::application_routing_aad_with_commitment(
-            &fixture.prior,
-            message_id,
-            archive_commitment.as_ref(),
-        ),
+        "aad": aad,
         "applicationMessage": {
             "framing": "mlsMessage",
             "contentType": "privateMessageApplication",
@@ -452,6 +483,52 @@ async fn seed_clean_slate_application_fixture_inner(
             "native MLS AAD differs from the clean-slate signed request projection".to_owned(),
         );
     }
+    let supplemental_requests = |identity: &application_routing_fixture::FixtureIdentity,
+                                 messages: &[(uuid::Uuid, Vec<u8>)]|
+     -> Result<Vec<serde_json::Value>, String> {
+        let commitment = archive_commitment
+            .as_ref()
+            .ok_or("supplemental application fixtures require an archive commitment")?;
+        messages
+            .iter()
+            .map(|(message_id, application)| {
+                let body = serde_json::json!({
+                    "$type": "blue.catbird.chat.defs#applicationSendBody",
+                    "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0000}",
+                    "messageId": message_id,
+                    "actorDid": identity.did,
+                    "actorDeviceId": identity.device_id,
+                    "keyId": identity.key_id,
+                    "authGeneration": 1,
+                    "prior": application_routing_fixture::coordinate_json(&fixture.prior),
+                    "signedAt": chrono::Utc::now()
+                        .to_rfc3339_opts(SecondsFormat::Millis, true),
+                    "blobBindings": [],
+                    "aad": application_routing_fixture::application_routing_aad_with_commitment(
+                        &fixture.prior,
+                        *message_id,
+                        commitment,
+                        identity,
+                    ),
+                    "applicationMessage": {
+                        "framing": "mlsMessage",
+                        "contentType": "privateMessageApplication",
+                        "bytes": STANDARD.encode(application),
+                        "sha256": STANDARD.encode(Sha256::digest(application)),
+                    },
+                });
+                sign_mutation_json_for_test(&body, &identity.signing_key)
+            })
+            .collect()
+    };
+    let sender_signed_requests = supplemental_requests(
+        &fixture.requester,
+        &fixture.supplemental_requester_application_messages,
+    )?;
+    let recipient_signed_requests = supplemental_requests(
+        &fixture.fulfiller,
+        &fixture.supplemental_fulfiller_application_messages,
+    )?;
 
     Ok(CleanSlateApplicationFixture {
         conversation_id: fixture.conversation_id,
@@ -465,6 +542,10 @@ async fn seed_clean_slate_application_fixture_inner(
         recipient_key_id: fixture.fulfiller.key_id,
         recipient_ed25519_seed: fixture.fulfiller.signing_key.to_bytes(),
         signed_request: wrapper,
+        sender_signed_requests,
+        recipient_signed_requests,
+        sender_request_index: std::sync::atomic::AtomicUsize::new(0),
+        recipient_request_index: std::sync::atomic::AtomicUsize::new(0),
     })
 }
 
@@ -487,6 +568,7 @@ pub fn sign_mutation_json_for_test(
     wrapper["signature"] = serde_json::json!(STANDARD.encode(sig.to_bytes()));
     Ok(wrapper)
 }
+pub(crate) use super::state_machine::direct_request::original_sender_attestation_json_for_test;
 
 /// Seeded overdue `C33` published direct request (`created_at <= now - 31 days`) satisfying all
 /// PostgreSQL deferred publication, state-output, key-package, and lifecycle-reserve triggers.
@@ -494,6 +576,8 @@ pub struct CleanSlateExpiredDirectRequestFixture {
     pub request_id: uuid::Uuid,
     pub conversation_id: uuid::Uuid,
     pub actor_did: String,
+    pub actor_device_id: uuid::Uuid,
+    pub actor_ed25519_seed: [u8; 32],
     pub recipient_did: String,
 }
 
@@ -638,6 +722,7 @@ async fn seed_published_direct_request(
         "ciphertext": STANDARD.encode(metadata_ciphertext),
     });
     let metadata_bytes = serde_json::to_vec(&metadata_json_obj).map_err(|e| e.to_string())?;
+    let archive_commitment: [u8; 32] = Sha256::digest(&initial_ct).into();
 
     let pub_body = serde_json::json!({
         "requestId": request_id.to_string(),
@@ -650,6 +735,15 @@ async fn seed_published_direct_request(
         "authGeneration": 1_i64,
         "contextHash": STANDARD.encode(context_hash),
         "preparationDigest": STANDARD.encode(preparation_digest),
+        "archiveCommitment": STANDARD.encode(archive_commitment),
+        "originalSenderAttestation": original_sender_attestation_json_for_test(
+            &actor.did,
+            actor.device_id,
+            &actor.signing_key,
+            &conversation_id.to_string(),
+            &first_message_id.to_string(),
+            &archive_commitment,
+        ),
         "importUntil": import_until.to_rfc3339_opts(SecondsFormat::Millis, true),
         "artifacts": {
             "finalGroupInfo": {
@@ -1246,6 +1340,8 @@ async fn seed_published_direct_request(
             request_id,
             conversation_id,
             actor_did: actor.did.clone(),
+            actor_device_id: actor.device_id,
+            actor_ed25519_seed: actor.signing_key.to_bytes(),
             recipient_did: recipient.did.clone(),
         },
         application_routing_fixture::coordinate_json(final_state.coordinate()),
@@ -1770,6 +1866,14 @@ async fn seed_genuine_pending_direct_request_between(
     ));
     publish_body["contextHash"] = json!(STANDARD.encode(context_hash));
     publish_body["archiveCommitment"] = json!(STANDARD.encode(archive_commitment));
+    publish_body["originalSenderAttestation"] = original_sender_attestation_json_for_test(
+        &actor.did,
+        actor.device_id,
+        &actor.signing_key,
+        &conversation_id.to_string(),
+        &first_message_id.to_string(),
+        &archive_commitment,
+    );
     publish_body["next"] = bootstrap.next.clone();
     publish_body["importUntil"] = json!(import_until);
     publish_body["artifacts"] = json!({

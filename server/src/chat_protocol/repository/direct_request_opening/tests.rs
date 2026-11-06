@@ -5,7 +5,8 @@ use super::direct_request_opening::*;
 use crate::chat_protocol::repository::delivery::TransportEntryInsert;
 use crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner;
 use crate::chat_protocol::test_support::{
-    seed_clean_slate_expired_direct_request_fixture, CleanSlateExpiredDirectRequestFixture,
+    original_sender_attestation_json_for_test, seed_clean_slate_expired_direct_request_fixture,
+    CleanSlateExpiredDirectRequestFixture,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
@@ -337,7 +338,15 @@ async fn p8_plant_retains_every_opening_copy() {
     assert!(whole);
 }
 
-fn opening(conversation_id: Uuid, request_id: Uuid, ciphertext: &[u8]) -> Value {
+fn opening(
+    fixture: &CleanSlateExpiredDirectRequestFixture,
+    conversation_id: Uuid,
+    request_id: Uuid,
+    first_message_id: Uuid,
+    ciphertext: &[u8],
+) -> Value {
+    let archive_commitment: [u8; 32] = Sha256::digest(ciphertext).into();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&fixture.actor_ed25519_seed);
     json!({
         "$type": DIRECT_REQUEST_ENTRY_KIND,
         "entryId": Uuid::new_v4(),
@@ -349,7 +358,19 @@ fn opening(conversation_id: Uuid, request_id: Uuid, ciphertext: &[u8]) -> Value 
                 "$type": "blue.catbird.chat.defs#directRequestPublicationBody",
                 "signatureDomain": "CATBIRD-DIRECT-REQUEST-PUBLISH\u{0}",
                 "requestId": request_id,
+                "firstMessageId": first_message_id,
                 "conversationId": conversation_id,
+                "actorDid": fixture.actor_did,
+                "actorDeviceId": fixture.actor_device_id,
+                "archiveCommitment": STANDARD.encode(archive_commitment),
+                "originalSenderAttestation": original_sender_attestation_json_for_test(
+                    &fixture.actor_did,
+                    fixture.actor_device_id,
+                    &signing_key,
+                    &conversation_id.to_string(),
+                    &first_message_id.to_string(),
+                    &archive_commitment,
+                ),
                 "artifacts": {
                     "initialCiphertext": STANDARD.encode(ciphertext),
                     "welcome": {"opaqueWelcome": STANDARD.encode(b"welcome")}
@@ -385,8 +406,8 @@ async fn transport_opening_as(
     now: DateTime<Utc>,
     status: &str,
 ) -> (Uuid, Uuid, Value) {
-    let (cid, request) = (Uuid::new_v4(), Uuid::new_v4());
-    let entry = opening(cid, request, ciphertext);
+    let (cid, request, first_message_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let entry = opening(&seeded.fixture, cid, request, first_message_id, ciphertext);
     let entry_bytes = serde_json::to_vec(&entry).unwrap();
     sqlx::query(
         "INSERT INTO chat.direct_request_transport_inbox(request_id,conversation_id,first_message_id, \
@@ -397,7 +418,7 @@ async fn transport_opening_as(
     )
     .bind(request)
     .bind(cid)
-    .bind(Uuid::new_v4())
+    .bind(first_message_id)
     .bind(&seeded.fixture.actor_did)
     .bind(seeded.actor_device)
     .bind(&seeded.fixture.recipient_did)
@@ -520,7 +541,19 @@ async fn transport_home_opening_waits_for_its_local_audience_and_replays_never_r
             .unwrap(),
         TransportEntryInsert::Duplicate
     );
-    let conflicting = serde_json::to_vec(&opening(cid, request, b"other bytes")).unwrap();
+    let conflicting = serde_json::to_vec(&opening(
+        &seeded.fixture,
+        cid,
+        request,
+        Uuid::parse_str(
+            entry["signedRequest"]["body"]["firstMessageId"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap(),
+        b"other bytes",
+    ))
+    .unwrap();
     assert_eq!(
         insert_transport_entry(&mut connection, cid, 1, entry_id, &conflicting, now)
             .await

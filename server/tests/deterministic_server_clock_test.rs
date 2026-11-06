@@ -409,6 +409,18 @@ struct RecoveryCommitAad<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct OriginalSenderAttestationAad<'a> {
+    sender_did: &'a str,
+    #[serde(with = "serde_bytes")]
+    sender_device_id: &'a [u8],
+    #[serde(with = "serde_bytes")]
+    sender_transport_pubkey: &'a [u8],
+    #[serde(with = "serde_bytes")]
+    signature: &'a [u8],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ApplicationRoutingAad<'a> {
     #[serde(with = "serde_bytes")]
     archive_commitment: &'a [u8],
@@ -417,6 +429,7 @@ struct ApplicationRoutingAad<'a> {
     generation: u64,
     #[serde(with = "serde_bytes")]
     message_id: &'a [u8],
+    original_sender_attestation: OriginalSenderAttestationAad<'a>,
     prior: CommitPriorAad<'a>,
     protocol_version: &'static str,
 }
@@ -452,6 +465,10 @@ fn encode_application_aad(
     prior: &PublicGroupSnapshotCoordinate,
     message_id: Uuid,
     archive_commitment: &[u8; 32],
+    sender_did: &str,
+    sender_device_id: &[u8; 16],
+    sender_public_key: &[u8; 32],
+    signature: &[u8; 64],
 ) -> Vec<u8> {
     let cbor = serde_ipld_dagcbor::to_vec(&ApplicationRoutingAad {
         protocol_version: "1",
@@ -459,6 +476,12 @@ fn encode_application_aad(
         generation: prior.generation(),
         message_id: message_id.as_bytes(),
         archive_commitment,
+        original_sender_attestation: OriginalSenderAttestationAad {
+            sender_did,
+            sender_device_id,
+            sender_transport_pubkey: sender_public_key,
+            signature,
+        },
         prior: CommitPriorAad {
             conversation_id: prior.conversation_id(),
             generation: prior.generation(),
@@ -1009,7 +1032,25 @@ fn build_deterministic_scenario(t0: DateTime<Utc>) -> PreparedScenario {
     let send_time = t0 + TimeDelta::milliseconds(send_offset_ms);
     let message_id = deterministic_uuid_v4(b"sim-message-1");
     let archive_commitment: [u8; 32] = Sha256::digest(b"sim-archive-commitment-payload-v1").into();
-    let app_aad_bytes = encode_application_aad(&add_coord, message_id, &archive_commitment);
+    let original_sender_signature = alice
+        .device_signing
+        .sign(
+            &labyrinth_protocol::transcripts::original_sender_archive_transcript(
+                &conversation_id.to_string(),
+                &message_id.to_string(),
+                &archive_commitment,
+            ),
+        )
+        .to_bytes();
+    let app_aad_bytes = encode_application_aad(
+        &add_coord,
+        message_id,
+        &archive_commitment,
+        &alice.did,
+        alice.device_id.as_bytes(),
+        alice.device_signing.verifying_key().as_bytes(),
+        &original_sender_signature,
+    );
     alice_group.set_aad(app_aad_bytes);
     let app_ciphertext = alice_group
         .create_message(
@@ -1037,6 +1078,14 @@ fn build_deterministic_scenario(t0: DateTime<Utc>) -> PreparedScenario {
             "generation": 0,
             "messageId": STANDARD.encode(message_id.as_bytes()),
             "archiveCommitment": STANDARD.encode(archive_commitment),
+            "originalSenderAttestation": {
+                "senderDid": alice.did,
+                "senderDeviceId": alice.device_id,
+                "senderTransportPubkey": STANDARD.encode(
+                    alice.device_signing.verifying_key().as_bytes()
+                ),
+                "signature": STANDARD.encode(original_sender_signature),
+            },
             "prior": aad_prior_json,
         },
         "applicationMessage": {

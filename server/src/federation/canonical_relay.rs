@@ -4357,12 +4357,15 @@ pub async fn coordinator_handle_message(
         crate::chat_protocol::validation::CanonicalUuidV4::parse(&conversation_id.to_string())
             .map_err(|_| FederationError::Invariant("invalid convo_id".into()))?;
 
-    let archive_commitment: Option<[u8; 32]> = match projection.aad().get("archiveCommitment") {
-        Some(crate::chat_protocol::transcript::CanonicalValueRef::Bytes(v)) if v.len() == 32 => {
-            v.try_into().ok()
-        }
-        _ => None,
-    };
+    let archive = crate::chat_protocol::transcript::verify_application_archive_attestation(
+        projection.aad(),
+        actor_did,
+        actor_device_id,
+        &signing_public_key,
+        conversation_id,
+        message_id,
+    )
+    .map_err(|error| FederationError::InvalidRequest(error.to_string()))?;
 
     let entry_product = crate::chat_protocol::transcript::build_verified_application_entry(
         verified,
@@ -4381,8 +4384,8 @@ pub async fn coordinator_handle_message(
     let server_fields =
         serde_ipld_dagcbor::to_vec(&std::collections::BTreeMap::<String, String>::new())
             .map_err(|_| FederationError::Invariant("server fields".into()))?;
-    let i13_receipt_json = match (archive_commitment, runtime.i13_receipt_signer()) {
-        (Some(commitment), Some(signer)) => {
+    let i13_receipt_json = match (archive, runtime.i13_receipt_signer()) {
+        (Some(archive), Some(signer)) => {
             let signed_receipt = signer
                 .sign_application_receipt(
                     &conversation_id.to_string(),
@@ -4391,7 +4394,7 @@ pub async fn coordinator_handle_message(
                     actor_did,
                     &actor_device_id.to_string(),
                     &entry_id_str,
-                    &commitment,
+                    archive.commitment(),
                     next_seq.max(0) as u64,
                     trusted_now.timestamp_millis(),
                 )

@@ -1457,6 +1457,10 @@ impl ShippingServerFixture {
                 sequencer_receipt.to_pkcs8_pem(LineEnding::LF)?.as_str(),
             )
             .env(
+                "RECEIPT_VERIFICATION_METHOD",
+                "did:web:chat.catbird.blue#mls-receipt-1",
+            )
+            .env(
                 "SIGNING_KEY_PEM",
                 service.to_pkcs8_pem(LineEnding::LF)?.as_str(),
             )

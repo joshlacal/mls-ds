@@ -1,6 +1,6 @@
 # Lexicons
 
-AT Protocol lexicons for `mls-ds`, by namespace. The JSON files are the source of truth; the server's generated Rust types come from `catbird-atproto` (`catbird_atproto::generated::blue_catbird::*`). The `blue.catbird.mls.*` lexicons this file used to describe belong to the pre-clean-slate API and no longer exist.
+AT Protocol lexicons for `mls-ds`, by namespace. The JSON files are the source of truth at PetrelCatbird `1193ac5fdcff9a4c283704d649cdc3a6663fb8bf`; the server's generated Rust types come from catbird-atproto `971fd048b4ab2128b8d5b2c35f1be7885abfa1ce` (`catbird_atproto::generated::blue_catbird::*`). The `blue.catbird.mls.*` lexicons this file used to describe belong to the pre-clean-slate API and no longer exist.
 
 | Directory | Contents |
 |---|---|
