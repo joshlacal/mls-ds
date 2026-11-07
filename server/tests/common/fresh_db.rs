@@ -164,6 +164,15 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     // `tests/chat_protocol_production_cfg.rs`: a non-proof database the proof
     // gate must refuse
     "chat_proofgate_",
+    // Seed-2323 send order: suites that resolve a fresh application `Accept`
+    // write `chat.application_send_order` (20261107000001), which the shared
+    // clean-chat target predates.
+    // `tests/chat_protocol_delivery.rs`
+    "chat_delivery_",
+    // `src/chat_protocol/repository/rollback_tests.rs`
+    "chat_rollback_",
+    // `src/federation/transfer.rs` (`send_order_tests`)
+    "chat_transfer_",
 ];
 
 /// Prefix used by [`crate::common::setup_test_db`], the shared legacy fixture

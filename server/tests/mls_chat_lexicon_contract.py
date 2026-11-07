@@ -38,7 +38,13 @@ CANONICAL_MLSDS_ROOT = STACK_ROOT / "PetrelCatbird/lexicons/blue/catbird/mlsDS"
 MIRROR_MLSDS_ROOT = MLS_DS_ROOT / "lexicon/blue/catbird/mlsDS"
 VECTOR_PATH = Path(__file__).with_name("fixtures") / "mls_chat_contract_vectors.json"
 CRYPTO_WIRE_ROOT = Path(__file__).with_name("fixtures") / "crypto-wire"
-DOCS_ROOT = STACK_ROOT / "docs" if (STACK_ROOT / "docs").is_dir() else STACK_ROOT.parent / "docs"
+# CATBIRD_STACK_DOCS_ROOT names the stack docs explicitly (side workspaces);
+# otherwise they sit beside or above the stack root.
+DOCS_ROOT = (
+    Path(os.environ["CATBIRD_STACK_DOCS_ROOT"])
+    if os.environ.get("CATBIRD_STACK_DOCS_ROOT")
+    else STACK_ROOT / "docs" if (STACK_ROOT / "docs").is_dir() else STACK_ROOT.parent / "docs"
+)
 CRYPTO_WIRE_V09_ROOT = SERVER_ROOT / "tests/fixtures/crypto-wire-v09"
 PROTOCOL_PATH = DOCS_ROOT / "mls-v2/CHAT_PROTOCOL.md"
 STANDARD_APPVIEW_ADR_PATH = DOCS_ROOT / "design-docs/adr-001-mls-standard-appview-auth.md"

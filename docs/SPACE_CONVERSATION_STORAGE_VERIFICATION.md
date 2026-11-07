@@ -108,6 +108,8 @@ Pull requests retain a complete repository-wide rustfmt report as an uploaded ar
 
 The application-entry tests previously depended on a manifest outside this repository. Their first frozen vector is now included at `server/tests/fixtures/chat_application_entry_golden.json`, copied unchanged from `docs/generated-artifacts/chat-application-v1/manifest.json` in the encompassing workspace. The fixture records the source SHA-256 `1c9830db9be547a96745f42d6e9090d1f102eb90111e6c41f2a70489ce226410` and selected `vectors[0]`; independent review confirmed exact equality. No expected cryptographic value was regenerated. Only the test include path changed; this test file is outside the 44 captured runtime source files.
 
+Later note (November 7, 2026): that fixture and its test are retired. The vector predates the required signed `sendCounter`, so the strict decoder refuses it, and its generator was deleted from catbird-mls. See the [decision log](DECISIONS.md) entry "Retire the frozen chat-application-v1 golden entry".
+
 Local checks after the CI repair:
 
 - All eight `chat_protocol::application_entry_tests` pass with `--no-default-features --features test-support --lib` (`/tmp/spaces-server-ci-application-entry-final.log`). The first command selected a nonexistent module path and ran zero tests; it is not counted as test evidence.

@@ -162,31 +162,6 @@ fn encode_test_cbor(value: &TestCbor) -> Vec<u8> {
     serde_ipld_dagcbor::to_vec(value).unwrap()
 }
 
-fn hex_array<const N: usize>(value: &Value) -> [u8; N] {
-    hex::decode(value.as_str().unwrap())
-        .unwrap()
-        .try_into()
-        .unwrap()
-}
-
-/// The frozen first chat-application-v1 vector: entry bytes and sender key.
-fn frozen_pre_send_counter_entry() -> (Vec<u8>, [u8; 32]) {
-    let manifest: Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/chat_application_entry_golden.json"
-    ))
-    .unwrap();
-    let vector = &manifest["vectors"][0];
-    (
-        hex::decode(
-            vector["signedOuterEntry"]["applicationEntryCborHex"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap(),
-        hex_array(&vector["transportEvidence"]["senderLeafSignaturePublicKeyHex"]),
-    )
-}
-
 fn coordinates(conversation_id: &str) -> Value {
     json!({
         "conversationId": conversation_id,
@@ -288,15 +263,6 @@ fn synthetic(message_id: &str) -> Synthetic {
         signature: *built.mutation().signature(),
         fingerprint: *built.outer_application_fingerprint(),
     }
-}
-
-/// The frozen chat-application-v1 vector was signed before `sendCounter`
-/// became a required signed field, and its generator is gone: the strict
-/// decoder must refuse it rather than admit a send without a device order.
-#[test]
-fn frozen_pre_send_counter_application_entry_fails_closed() {
-    let (entry, public_key) = frozen_pre_send_counter_entry();
-    assert!(decode_and_verify_application_entry(&entry, &public_key).is_err());
 }
 
 #[test]

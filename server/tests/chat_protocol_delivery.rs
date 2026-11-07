@@ -526,6 +526,22 @@ async fn send_order_state(
     (next_entry_seq(pool, conversation_id).await, sends, order)
 }
 
+/// Arms that resolve a fresh `Accept` write `chat.application_send_order`
+/// (`20261107000001`), which the shared fixed target predates: they run on a
+/// private clean-protocol database plus that one migration. Bind the returned
+/// guard for the whole test.
+async fn send_order_db(max_connections: u32) -> (PgPool, common::fresh_db::DisposableDatabase) {
+    let (pool, database) =
+        common::fresh_db::fresh_clean_protocol_db("chat_delivery_", max_connections).await;
+    sqlx::raw_sql(include_str!(
+        "../migrations/20261107000001_application_send_order.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install the send-order table");
+    (pool, database)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -537,7 +553,7 @@ async fn send_order_state(
 /// under DIFFERENT signed bytes conflicts.
 #[tokio::test]
 async fn application_send_accepts_appends_entry_and_is_idempotent() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (pool, _database) = send_order_db(4).await;
     let fixture = seed_fixture(&pool).await;
     let received_at = clock_now(&pool).await;
     let send = to_application_send(coherent_application_send(&fixture, received_at, 0x21));
@@ -607,7 +623,7 @@ async fn application_send_accepts_appends_entry_and_is_idempotent() {
 
 #[tokio::test]
 async fn accepted_application_send_appends_message_available_event() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (pool, _database) = send_order_db(4).await;
     let fixture = seed_fixture(&pool).await;
     let protocol_instance_id = ensure_protocol_instance(&pool).await;
     let received_at = clock_now(&pool).await;
@@ -744,7 +760,7 @@ async fn application_send_stale_tombstones_without_entry_and_never_succeeds() {
 /// generation admits a lower counter; each device is ordered on its own.
 #[tokio::test]
 async fn application_sends_are_sequenced_in_signed_per_device_order() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (pool, _database) = send_order_db(4).await;
     let fixture = seed_fixture(&pool).await;
     let cid = fixture.conversation_id;
     let device = fixture.actor_device_id;
@@ -817,7 +833,9 @@ async fn application_sends_are_sequenced_in_signed_per_device_order() {
     )
     .bind(&fixture.actor_did)
     .bind(other_device)
-    .bind(format!("{:042}A", 0_u128))
+    // Distinct from the fixture device's JKT (`devices_active_dpop_jkt_uq`); a canonical
+    // 32-byte base64url final character (`devices_dpop_jkt_check`).
+    .bind(format!("{:042}E", 0_u128))
     .bind(received_at)
     .execute(&pool)
     .await

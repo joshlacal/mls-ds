@@ -499,3 +499,275 @@ mod tests {
         assert_eq!(observed_lease_age_secs(&fresh, now), 10);
     }
 }
+
+/// A mirror records the send order of every application entry it replicates,
+/// so after it takes over sequencing it still refuses a device's held send
+/// that its replicated history already passed (seed 2323).
+#[cfg(all(test, feature = "test-support", feature = "sim"))]
+mod send_order_tests {
+    use super::{SequencerTransfer, TransferResult};
+    use crate::chat_protocol::{
+        repository::{
+            delivery::{
+                resolve_application_send, AppendEntry, ApplicationSend, ApplicationSendDisposition,
+                ApplicationSendOutcome, APPLICATION_ENTRY_KIND,
+            },
+            federation::deliver_message_replication,
+        },
+        test_support::seed_remote_clean_slate_application_fixture,
+        transcript::{build_verified_application_entry, decode_and_verify_signed_mutation},
+        validation::{CanonicalTimestamp, CanonicalUuidV4, TrustedRequestInstant},
+    };
+    use crate::federation::{
+        ack::AckSigner,
+        envelope::{
+            compute_message_envelope_digest, ValidatedEntryLocator, ValidatedEnvelopeHeader,
+        },
+    };
+    use serde_json::Value;
+    use sqlx::PgPool;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    const SEQ: &str = "did:web:transfer-sequencer.example.com";
+    const HOME: &str = "did:web:transfer-home.example.com";
+
+    /// `request` as a sequencer accepts it at `seq`.
+    fn sequenced(
+        request: &Value,
+        public_key: &[u8],
+        conversation_id: Uuid,
+        seq: u64,
+    ) -> ApplicationSend {
+        let signed_request_bytes = serde_json::to_vec(request).unwrap();
+        let verified =
+            decode_and_verify_signed_mutation(&signed_request_bytes, public_key).unwrap();
+        let entry_id = Uuid::new_v4();
+        let instant = TrustedRequestInstant::from_datetime(chrono::Utc::now()).unwrap();
+        let product = build_verified_application_entry(
+            verified,
+            CanonicalUuidV4::parse(&entry_id.to_string()).unwrap(),
+            CanonicalUuidV4::parse(&conversation_id.to_string()).unwrap(),
+            seq,
+            &instant,
+        )
+        .unwrap();
+        let body = &request["body"];
+        let integer = |pointer: &str| body.pointer(pointer).and_then(Value::as_i64).unwrap();
+        let uuid = |field: &str| Uuid::parse_str(body[field].as_str().unwrap()).unwrap();
+        ApplicationSend {
+            entry: AppendEntry {
+                conversation_id,
+                entry_id,
+                entry_kind: APPLICATION_ENTRY_KIND.to_owned(),
+                accepted_payload_bytes: product.canonical_entry_bytes().to_vec(),
+                accepted_payload_sha256: product.accepted_payload_sha256().to_vec(),
+                signed_request_bytes,
+                request_digest: product.mutation().request_digest().to_vec(),
+                signature: product.mutation().signature().to_vec(),
+                server_fields_bytes: serde_ipld_dagcbor::to_vec(&std::collections::BTreeMap::<
+                    String,
+                    String,
+                >::new())
+                .unwrap(),
+                outer_entry_fingerprint: product.outer_application_fingerprint().to_vec(),
+                actor_did: body["actorDid"].as_str().unwrap().to_owned(),
+                actor_device_id: uuid("actorDeviceId"),
+                actor_key_id: body["keyId"].as_str().unwrap().to_owned(),
+                actor_auth_generation: integer("/authGeneration"),
+                generation: Some(integer("/prior/generation")),
+                state_version: Some(integer("/prior/stateVersion")),
+                transition_id: None,
+                message_id: Some(uuid("messageId")),
+                received_at: instant.datetime(),
+            },
+            signing_transcript_bytes: product.mutation().transcript_bytes().to_vec(),
+            outcome_bytes: b"{}".to_vec(),
+            epoch: integer("/prior/epoch"),
+            send_counter: integer("/sendCounter"),
+        }
+    }
+
+    async fn resolve(pool: &PgPool, send: &ApplicationSend) -> ApplicationSendOutcome {
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = resolve_application_send(&mut tx, send, ApplicationSendDisposition::Accept)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        outcome
+    }
+
+    /// `(next_entry_seq, message_sends rows, every device's send order)`.
+    async fn state(pool: &PgPool, conversation_id: Uuid) -> (i64, i64, Vec<(Uuid, i64, i64, i64)>) {
+        let (next_entry_seq, sends): (i64, i64) = sqlx::query_as(
+            "SELECT c.next_entry_seq, \
+                    (SELECT count(*) FROM chat.message_sends s \
+                      WHERE s.conversation_id = c.conversation_id) \
+               FROM chat.conversations c WHERE c.conversation_id = $1",
+        )
+        .bind(conversation_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let order = sqlx::query_as(
+            "SELECT actor_device_id, generation, epoch, last_send_counter \
+               FROM chat.application_send_order WHERE conversation_id = $1 \
+              ORDER BY actor_device_id",
+        )
+        .bind(conversation_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        (next_entry_seq, sends, order)
+    }
+
+    #[tokio::test]
+    async fn a_mirror_that_takes_over_sequencing_refuses_sends_its_replicated_history_passed() {
+        let db = crate::common::fresh_db::fresh_fully_migrated_db("chat_transfer_").await;
+        let pool = db.connect(4).await;
+        crate::common::http_acceptance::ensure_fence(&pool).await;
+        let hooks = Arc::new(crate::sim_hooks::SimDsHooks {
+            service_did: HOME.to_owned(),
+            self_endpoint: "https://transfer-home.example.com".to_owned(),
+            signing_key_pem: None,
+            group_relay_hmac_secret: None,
+            http_transport: Arc::new(|_| Box::pin(async { Err("no network here".to_owned()) })),
+            dns_resolver: Arc::new(|_| Err("no DNS here".to_owned())),
+            retain_application_ciphertext: false,
+        });
+        crate::sim_hooks::scope_sim_ds(hooks, async {
+            // HOME mirrors SEQ's group; D (sender) and E (recipient) are members.
+            let fixture =
+                seed_remote_clean_slate_application_fixture(&pool, HOME, SEQ, Some([0x5a; 32]))
+                    .await
+                    .unwrap();
+            let cid = fixture.conversation_id;
+            let key = |seed: &[u8; 32]| {
+                ed25519_dalek::SigningKey::from_bytes(seed)
+                    .verifying_key()
+                    .to_bytes()
+            };
+            let (sender_key, recipient_key) = (
+                key(&fixture.sender_ed25519_seed),
+                key(&fixture.recipient_ed25519_seed),
+            );
+            // D's sends, sendCounter 1..=4.
+            let mut requests = vec![fixture.signed_request.clone()];
+            requests.extend((0..3).map(|_| fixture.next_sender_signed_request()));
+            let term: i64 = sqlx::query_scalar(
+                "SELECT sequencer_term FROM chat.conversations WHERE conversation_id = $1",
+            )
+            .bind(cid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            // SEQ sequenced counters 1..=3 at seqs 4..=6 and replicated them here.
+            let ack = AckSigner::new(
+                p256::ecdsa::SigningKey::from_slice(&[0x41; 32]).unwrap(),
+                HOME.to_owned(),
+            );
+            for (seq, request) in (4..).zip(&requests[..3]) {
+                let send = sequenced(request, &sender_key, cid, seq);
+                let locator = ValidatedEntryLocator {
+                    entry_id: send.entry.entry_id,
+                    seq,
+                    accepted_payload_sha256: send.entry.accepted_payload_sha256[..]
+                        .try_into()
+                        .unwrap(),
+                    outer_entry_fingerprint: send.entry.outer_entry_fingerprint[..]
+                        .try_into()
+                        .unwrap(),
+                };
+                let mut header = ValidatedEnvelopeHeader {
+                    protocol_version: "1".to_owned(),
+                    delivery_id: Uuid::new_v4(),
+                    conversation_id: cid,
+                    sender_ds_did: SEQ.to_owned(),
+                    receiver_ds_did: HOME.to_owned(),
+                    sequencer_did: SEQ.to_owned(),
+                    sequencer_term: term as u64,
+                    received_at: CanonicalTimestamp::parse(&chrono::Utc::now().to_rfc3339_opts(
+                        chrono::SecondsFormat::Millis,
+                        true,
+                    ))
+                    .unwrap(),
+                    payload_sha256: [0; 32],
+                };
+                header.payload_sha256 = compute_message_envelope_digest(
+                    &header,
+                    &fixture.recipient_did,
+                    &locator,
+                    &send.entry.accepted_payload_bytes,
+                    &send.entry.signed_request_bytes,
+                )
+                .unwrap();
+                let mut tx = pool.begin().await.unwrap();
+                deliver_message_replication(
+                    &mut tx,
+                    &ack,
+                    header,
+                    fixture.recipient_did.clone(),
+                    locator,
+                    send.entry.accepted_payload_bytes.clone(),
+                    send.entry.signed_request_bytes.clone(),
+                )
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+            }
+            let fourth = sequenced(&requests[3], &sender_key, cid, 7);
+            let (generation, epoch) = (fourth.entry.generation.unwrap(), fourth.epoch);
+            let replicated = (7, 3, vec![(fixture.sender_device_id, generation, epoch, 3)]);
+            assert_eq!(state(&pool, cid).await, replicated);
+
+            // SEQ goes silent and HOME assumes its role.
+            sqlx::query(
+                "INSERT INTO federation_sync_state(convo_id, sequencer_ds_did, sequencer_term, updated_at) \
+                 VALUES ($1, $2, $3, now() - interval '1 hour')",
+            )
+            .bind(cid.to_string())
+            .bind(SEQ)
+            .bind(term)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let assumed = SequencerTransfer::new(pool.clone(), HOME.to_owned())
+                .assume_sequencer_role(&cid.to_string(), SEQ)
+                .await
+                .unwrap();
+            assert!(matches!(assumed, TransferResult::Accepted { .. }));
+
+            // D's held sends, at counters its replicated history passed, under
+            // new message ids: refused, nothing written.
+            for counter in [2, 3] {
+                let mut held = fourth.clone();
+                held.entry.entry_id = Uuid::new_v4();
+                held.entry.message_id = Some(Uuid::new_v4());
+                held.send_counter = counter;
+                assert_eq!(
+                    resolve(&pool, &held).await,
+                    ApplicationSendOutcome::StaleSend
+                );
+                assert_eq!(state(&pool, cid).await, replicated);
+            }
+            assert_eq!(
+                resolve(&pool, &fourth).await,
+                ApplicationSendOutcome::Accepted { seq: 7 }
+            );
+            // E's first send is ordered on its own.
+            let other = sequenced(&fixture.next_recipient_signed_request(), &recipient_key, cid, 8);
+            assert_eq!(
+                resolve(&pool, &other).await,
+                ApplicationSendOutcome::Accepted { seq: 8 }
+            );
+            let mut order = vec![
+                (fixture.sender_device_id, generation, epoch, 4),
+                (fixture.recipient_device_id, generation, epoch, 1),
+            ];
+            order.sort();
+            assert_eq!(state(&pool, cid).await, (9, 5, order));
+        })
+        .await;
+    }
+}

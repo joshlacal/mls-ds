@@ -219,6 +219,9 @@ fn is_line_comment(line: &str) -> bool {
 /// justification. Exception (Main ruling 2026-11-04): the two Recovery
 /// production proofs that opened extra connections from `TEST_DATABASE_URL` now
 /// reuse their gated private proof database, so their entries were removed.
+/// Likewise (2026-11-07) `rollback_tests.rs`: each case resolves a fresh
+/// application `Accept`, which writes `chat.application_send_order`, a table the
+/// fixed target predates, so it now mints a private clean-protocol database.
 ///
 /// Each entry is `(path relative to src/, first line marker)`. Only lines at or
 /// after the first line containing the marker are exempt (`""` = whole file,
@@ -231,7 +234,6 @@ const REVIEWED_GATE_DB_TEST_EXEMPTIONS: &[(&str, &str)] = &[
     ),
     ("chat_protocol/repository/delivery/read_tests.rs", ""),
     ("chat_protocol/repository/reset/tests.rs", ""),
-    ("chat_protocol/repository/rollback_tests.rs", ""),
     ("chat_protocol/repository/ticket/tests.rs", ""),
     ("chat_protocol/repository/transition/tests.rs", ""),
     ("chat_protocol/state_machine/executor_tests.rs", ""),
@@ -557,7 +559,6 @@ fn no_src_test_source_defaults_a_database_connection_to_a_hardcoded_name() {
         offenders,
         &[
             "chat_protocol/repository/delivery/read_tests.rs",
-            "chat_protocol/repository/rollback_tests.rs",
             "chat_protocol/repository/ticket/tests.rs",
         ],
     );

@@ -13,7 +13,7 @@
 //! savepoint; rolling the savepoint back models a failure at/after that boundary.
 //! We then assert — on the still-open outer transaction — that every business row
 //! is gone while the exception rows survive. The whole outer transaction is then
-//! rolled back, so the never-truncated shared database stays leak-free.
+//! rolled back, leaving the database unchanged.
 //!
 //! ## Boundary coverage table (brief line 339)
 //!
@@ -57,15 +57,20 @@ use sha2::{Digest, Sha256};
 use sqlx::{Acquire, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-async fn test_pool() -> PgPool {
-    let url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722".to_string()
-    });
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .expect("connect test db")
+/// Every case resolves a fresh `Accept`, which writes
+/// `chat.application_send_order` (`20261107000001`); the shared fixed target
+/// predates it, so each case runs on its own clean-protocol database plus that
+/// one migration. Bind the returned guard for the whole test.
+async fn test_pool() -> (PgPool, crate::common::fresh_db::DisposableDatabase) {
+    let (pool, database) =
+        crate::common::fresh_db::fresh_clean_protocol_db("chat_rollback_", 2).await;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/20261107000001_application_send_order.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install the send-order table");
+    (pool, database)
 }
 
 fn random_plc_did() -> String {
@@ -199,7 +204,7 @@ async fn count(tx: &mut Transaction<'_, Postgres>, sql: &str, id: Uuid) -> i64 {
 
 #[tokio::test]
 async fn blob_and_quota_boundary_rolls_back_but_the_stale_tombstone_survives() {
-    let pool: PgPool = test_pool().await;
+    let (pool, _database) = test_pool().await;
     let mut tx = pool.begin().await.expect("begin outer");
     let owner = random_plc_did();
     let (device_id, key_id) = seed_owner_tx(&mut tx, &owner).await;
@@ -295,7 +300,7 @@ async fn blob_and_quota_boundary_rolls_back_but_the_stale_tombstone_survives() {
 
 #[tokio::test]
 async fn entry_allocation_and_message_send_roll_back_completely() {
-    let pool: PgPool = test_pool().await;
+    let (pool, _database) = test_pool().await;
     let mut tx = pool.begin().await.expect("begin outer");
     let owner = random_plc_did();
     let (device_id, key_id) = seed_owner_tx(&mut tx, &owner).await;
@@ -374,7 +379,7 @@ async fn accepted_send_and_stale_tombstone_are_mutually_exclusive_durability() {
     // back with a business failure, while a STALE tombstone is the explicit
     // durable exception. Prove both dispositions on the SAME conversation with
     // different message ids: the accepted one rolls back, the stale one survives.
-    let pool: PgPool = test_pool().await;
+    let (pool, _database) = test_pool().await;
     let mut tx = pool.begin().await.expect("begin outer");
     let owner = random_plc_did();
     let (device_id, key_id) = seed_owner_tx(&mut tx, &owner).await;

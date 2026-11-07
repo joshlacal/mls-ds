@@ -1326,6 +1326,27 @@ pub(crate) async fn apply_remote_clean_events(
                 event.seq()
             )),
         })?;
+        // Keep the device order the sequencer enforced, so it still holds if
+        // this DS takes over sequencing (`federation::transfer`).
+        let order = |value: u64| {
+            i64::try_from(value).map_err(|_| {
+                ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                    "application send order is outside the protocol domain for seq {}",
+                    event.seq()
+                ))
+            })
+        };
+        crate::chat_protocol::repository::delivery::advance_application_send_order(
+            tx,
+            convo_id,
+            &append_entry.actor_did,
+            append_entry.actor_device_id,
+            Some(order(prior_coord.generation())?),
+            order(prior_coord.epoch())?,
+            order(projection.send_counter())?,
+        )
+        .await
+        .map_err(|error| ApplyRemoteCleanEventsError::Database(error.to_string()))?;
 
         if mode == ApplicationImportMode::OrdinaryReconciliation {
             let signed_request_json = serde_json::from_slice::<serde_json::Value>(signed_req)

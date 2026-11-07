@@ -2605,22 +2605,25 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
             );
         }
     }
-    // 184 setup calls: 65 under tests/ and 119 in-crate. Four occurrences in
+    // 182 setup calls: 63 under tests/ and 119 in-crate. Four occurrences in
     // this schema and three in the G7 schema are the authorized Amendment-3
-    // calls, leaving 177 other fixed-target calls. This inventory catches
+    // calls, leaving 175 other fixed-target calls. This inventory catches
     // unreviewed drift in which tests depend on the shared database. 210 → 184
     // (Main ruling 2026-11-04): suites that read later-migration DDL left the
     // shared target for private fully migrated databases — device_directory (3),
     // production_cfg (20), and inventory_tests' three HTTP acceptance cases.
+    // 184 → 182 (seed 2323, 2026-11-07): the delivery arms that resolve a fresh
+    // application `Accept` write `chat.application_send_order`, which the
+    // fixed target predates, and moved to private clean-protocol databases.
     assert_eq!(
-        caller_occurrences, 184,
+        caller_occurrences, 182,
         "fixed-target setup caller inventory changed"
     );
     assert_eq!(
         caller_occurrences
             .checked_sub(schema_amendment_3_occurrences.len() + 3)
             .expect("Amendment-3 setup delta cannot exceed the closed inventory"),
-        177,
+        175,
         "the seven authorized Amendment-3 occurrences must be the only inventory delta"
     );
     let expected_targets: BTreeSet<String> = [

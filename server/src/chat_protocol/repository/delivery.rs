@@ -363,32 +363,18 @@ pub async fn resolve_application_send(
 
     match disposition {
         ApplicationSendDisposition::Accept => {
-            // The caller already holds the conversation head lock. A refused
-            // order changes no row, so the conflict arm updates nothing.
-            let advanced: Option<i32> = sqlx::query_scalar(
-                r#"
-                INSERT INTO chat.application_send_order AS o(
-                    conversation_id, actor_did, actor_device_id,
-                    generation, epoch, last_send_counter
-                ) VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (conversation_id, actor_did, actor_device_id) DO UPDATE
-                   SET generation = EXCLUDED.generation,
-                       epoch = EXCLUDED.epoch,
-                       last_send_counter = EXCLUDED.last_send_counter
-                 WHERE (o.generation, o.epoch, o.last_send_counter)
-                     < (EXCLUDED.generation, EXCLUDED.epoch, EXCLUDED.last_send_counter)
-                RETURNING 1
-                "#,
+            // The caller already holds the conversation head lock.
+            if !advance_application_send_order(
+                transaction,
+                send.entry.conversation_id,
+                &send.entry.actor_did,
+                send.entry.actor_device_id,
+                send.entry.generation,
+                send.epoch,
+                send.send_counter,
             )
-            .bind(send.entry.conversation_id)
-            .bind(&send.entry.actor_did)
-            .bind(send.entry.actor_device_id)
-            .bind(send.entry.generation)
-            .bind(send.epoch)
-            .bind(send.send_counter)
-            .fetch_optional(&mut **transaction)
-            .await?;
-            if advanced.is_none() {
+            .await?
+            {
                 return Ok(ApplicationSendOutcome::StaleSend);
             }
             let seq = append_entry(transaction, &send.entry).await?;
@@ -400,6 +386,48 @@ pub async fn resolve_application_send(
             Ok(ApplicationSendOutcome::Stale)
         }
     }
+}
+
+/// Advance the actor device's row in `chat.application_send_order` to a send's
+/// signed `(generation, epoch, send_counter)` if that is later than its last
+/// one; returns whether it advanced. A refusal changes no row. The sequencer
+/// refuses a send that does not advance (`StaleSend`); a mirror appending its
+/// sequencer's log records each send the same way, so after a sequencer
+/// transfer it orders new sends after the history it replicated. The caller
+/// holds the conversation head lock.
+pub(crate) async fn advance_application_send_order(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    generation: Option<i64>,
+    epoch: i64,
+    send_counter: i64,
+) -> Result<bool, sqlx::Error> {
+    let advanced: Option<i32> = sqlx::query_scalar(
+        r#"
+        INSERT INTO chat.application_send_order AS o(
+            conversation_id, actor_did, actor_device_id,
+            generation, epoch, last_send_counter
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (conversation_id, actor_did, actor_device_id) DO UPDATE
+           SET generation = EXCLUDED.generation,
+               epoch = EXCLUDED.epoch,
+               last_send_counter = EXCLUDED.last_send_counter
+         WHERE (o.generation, o.epoch, o.last_send_counter)
+             < (EXCLUDED.generation, EXCLUDED.epoch, EXCLUDED.last_send_counter)
+        RETURNING 1
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(actor_did)
+    .bind(actor_device_id)
+    .bind(generation)
+    .bind(epoch)
+    .bind(send_counter)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(advanced.is_some())
 }
 
 /// Insert the `chat.message_sends` row mirroring the send's signed envelope. Every

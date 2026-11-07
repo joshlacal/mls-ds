@@ -238,6 +238,10 @@ C33 coordinator relay) accepts it only if its triple is lexicographically
 greater, advancing the row with one conditional upsert under the conversation
 head lock. Otherwise it answers `StaleSend` and writes nothing. An exact replay
 of an accepted send is answered from `chat.message_sends` before this check.
+A mirror records the same triple for every application entry it appends from
+its sequencer (`deliverMessage` replication and reconciliation or bootstrap
+import) and keeps the later one, so a mirror that takes over sequencing
+(`federation::transfer`) refuses a send its replicated history already passed.
 Rows cascade with their conversation, so the close wipe removes them.
 
 ## PostgreSQL churn and terminal-history partitions

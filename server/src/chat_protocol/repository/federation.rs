@@ -18,7 +18,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use super::delivery::{
-    append_exact_application_entry, append_message_available_event,
+    advance_application_send_order, append_exact_application_entry, append_message_available_event,
     compare_exact_application_entry, AppendEntry, ApplicationSend, DeliveryRepositoryError,
 };
 use super::execution_context::{
@@ -1653,6 +1653,15 @@ pub async fn deliver_message_replication(
     });
     let outcome_bytes = serde_json::to_vec(&response).map_err(FederationError::Json)?;
     let signed_req_sha256: [u8; 32] = Sha256::digest(&signed_request_bytes).into();
+    // The device order its sequencer sequenced it under: the signed
+    // `(prior.generation, prior.epoch, sendCounter)`.
+    let invalid = |reason: &str| FederationError::InvalidEnvelope {
+        reason: reason.to_string(),
+    };
+    let prior = crate::chat_protocol::state_machine::closed_coordinate(&projection.prior())
+        .map_err(|_| invalid("invalid prior coordinate"))?;
+    let order_generation =
+        i64::try_from(prior.generation()).map_err(|_| invalid("invalid prior coordinate"))?;
 
     let send = ApplicationSend {
         entry: AppendEntry {
@@ -1684,12 +1693,9 @@ pub async fn deliver_message_replication(
         },
         signing_transcript_bytes: rebound_entry.mutation().transcript_bytes().to_vec(),
         outcome_bytes,
-        epoch: convo_epoch,
-        send_counter: i64::try_from(projection.send_counter()).map_err(|_| {
-            FederationError::InvalidEnvelope {
-                reason: "invalid sendCounter".to_string(),
-            }
-        })?,
+        epoch: i64::try_from(prior.epoch()).map_err(|_| invalid("invalid prior coordinate"))?,
+        send_counter: i64::try_from(projection.send_counter())
+            .map_err(|_| invalid("invalid sendCounter"))?,
     };
 
     // 4. Sequence and append rule.
@@ -1828,6 +1834,19 @@ pub async fn deliver_message_replication(
                     reason: format!("append_exact_application_entry failed: {e:?}"),
                 },
             })?;
+        // A mirror keeps the order its sequencer enforced, so the order still
+        // holds if this DS takes over sequencing (`federation::transfer`).
+        advance_application_send_order(
+            tx,
+            header.conversation_id,
+            actor_did,
+            actor_device_id,
+            Some(order_generation),
+            send.epoch,
+            send.send_counter,
+        )
+        .await
+        .map_err(FederationError::Database)?;
 
         event_position = Some(
             append_message_available_event(
