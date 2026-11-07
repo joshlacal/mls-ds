@@ -18,6 +18,7 @@ const DIRECTORY_NSID: &str = "blue.catbird.mlsDS.resolveGroupDevices";
 const PACKAGE_NSID: &str = "blue.catbird.mlsDS.fetchKeyPackage";
 const LABYRINTH_DIRECTORY_NSID: &str = "blue.catbird.mlsDS.getLabyrinthDirectory";
 const GROUP_STATE_NSID: &str = "blue.catbird.mlsDS.getGroupConversationState";
+const LABYRINTH_MEMBER_DEVICES_ENDPOINT: &str = "blue.catbird.labyrinth.getMemberDevices";
 const GROUP_WELCOMES_NSID: &str = "blue.catbird.mlsDS.getGroupPendingWelcomes";
 
 const CLAIM_GROUP_PACKAGE_EXPORT_SQL: &str = r#"
@@ -122,8 +123,21 @@ async fn call_home_response(
     nsid: &str,
     payload: &Value,
 ) -> Result<(u16, Vec<u8>), FederationError> {
+    call_home_response_via(pool, None, home, nsid, payload).await
+}
+
+async fn call_home_response_via(
+    pool: &DbPool,
+    route_resolver: Option<&super::super::resolver::DsResolver>,
+    home: &str,
+    nsid: &str,
+    payload: &Value,
+) -> Result<(u16, Vec<u8>), FederationError> {
     super::super::peer_policy::ensure_federation_open()?;
-    let destination = resolver(pool).resolve_ds_destination(home).await?;
+    let destination = match route_resolver {
+        Some(resolver) => resolver.resolve_ds_destination(home).await?,
+        None => resolver(pool).resolve_ds_destination(home).await?,
+    };
     let token = service_auth()
         .map_err(|reason| FederationError::ConfigError { reason })?
         .mint_token(home, nsid)?;
@@ -755,6 +769,8 @@ pub(super) enum RelayFailure {
     /// The caller, signed request or peer answer lacks authority for this
     /// step; retrying cannot change that.
     Denied(String),
+    /// The authoritative sequencer has no such conversation.
+    NotFound(String),
     /// A declared clean-chat protocol error the client must see.
     Protocol(ChatProtocolErrorCode),
     /// A dependency could not answer now; the caller may retry.
@@ -766,6 +782,10 @@ pub(super) enum RelayFailure {
 impl RelayFailure {
     fn denied(error: impl std::fmt::Display) -> Self {
         Self::Denied(error.to_string())
+    }
+
+    fn not_found(error: impl std::fmt::Display) -> Self {
+        Self::NotFound(error.to_string())
     }
 
     fn unavailable(error: impl std::fmt::Display) -> Self {
@@ -808,6 +828,7 @@ impl RelayFailure {
     pub(super) fn into_response(self) -> Response {
         match self {
             Self::Denied(error) => s2s_err(StatusCode::FORBIDDEN, "NotAuthorized", error),
+            Self::NotFound(error) => s2s_err(StatusCode::NOT_FOUND, "ConversationNotFound", error),
             Self::Protocol(code) => s2s_err(StatusCode::BAD_REQUEST, code.as_str(), code.as_str()),
             Self::Unavailable(error) => {
                 s2s_err(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", error)
@@ -1357,8 +1378,201 @@ struct LabyrinthDirectoryRequest {
     query: String,
     actor_did: String,
     actor_device_id: Uuid,
+    sequencer_term: Option<i64>,
     read_header: String,
     read_signature: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LabyrinthMemberDevicesResponse {
+    endpoint: String,
+    query: String,
+    sequencer_did: String,
+    sequencer_term: i64,
+    actor_did: String,
+    actor_device_id: Uuid,
+    conversation_id: Uuid,
+    subject_did: String,
+    page: LabyrinthMemberDevicesPage,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LabyrinthMemberDevicesPage {
+    items: Vec<LabyrinthMemberDevice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LabyrinthMemberDevice {
+    key_id: String,
+    signing_public_key: crate::labyrinth::wire::bytes::Bytes,
+    joined_seq: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed_seq: Option<i64>,
+}
+
+async fn member_devices_sequencer(
+    pool: &DbPool,
+    conversation_id: Uuid,
+    actor_did: &str,
+) -> crate::labyrinth::error::LabyrinthResult<Option<(String, i64)>> {
+    let route = sqlx::query_as(
+        "SELECT sequencer, term FROM (\
+             SELECT sequencer_ds AS sequencer, sequencer_term AS term, 0 AS priority \
+               FROM chat.conversations \
+              WHERE conversation_id=$1 AND is_remote \
+             UNION ALL \
+             SELECT i.coordinator_did, 0::bigint, 1 \
+               FROM chat.direct_request_transport_inbox i \
+               JOIN chat.direct_request_outbound_routes o \
+                 ON o.request_id=i.request_id AND o.actor_did=i.sender_did \
+              WHERE i.conversation_id=$1 AND i.sender_did=$2 \
+             UNION ALL \
+             SELECT i.coordinator_did, 0::bigint, 2 \
+               FROM chat.direct_request_transport_inbox i \
+              WHERE i.conversation_id=$1 AND i.recipient_did=$2 AND i.status='accepted'\
+         ) routes ORDER BY priority LIMIT 1",
+    )
+    .bind(conversation_id)
+    .bind(actor_did)
+    .fetch_optional(pool)
+    .await?;
+    Ok(route)
+}
+
+fn member_devices_relay_denied(message: &'static str) -> crate::labyrinth::error::LabyrinthError {
+    crate::labyrinth::error::LabyrinthError::forbidden("NotAuthorized", message)
+}
+
+fn decode_member_devices_relay(
+    bytes: &[u8],
+    sequencer: &str,
+    sequencer_term: i64,
+    admission: &crate::labyrinth::auth::Admission,
+    conversation_id: Uuid,
+    subject_did: &str,
+    query: &str,
+) -> crate::labyrinth::error::LabyrinthResult<Vec<u8>> {
+    let response: LabyrinthMemberDevicesResponse = serde_json::from_slice(bytes)
+        .map_err(|_| member_devices_relay_denied("invalid member device relay response"))?;
+    if response.endpoint != LABYRINTH_MEMBER_DEVICES_ENDPOINT
+        || response.query != query
+        || response.sequencer_did != sequencer
+        || response.sequencer_term != sequencer_term
+        || response.actor_did != admission.did
+        || response.actor_device_id != admission.device_id
+        || response.conversation_id != conversation_id
+        || response.subject_did != subject_did
+    {
+        return Err(member_devices_relay_denied(
+            "member device relay response binding mismatch",
+        ));
+    }
+    if response.page.items.len() > crate::labyrinth::repo::MAX_PAGE as usize
+        || response
+            .page
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > 64)
+    {
+        return Err(member_devices_relay_denied(
+            "invalid member device relay page",
+        ));
+    }
+    for item in &response.page.items {
+        let safe_seq = |seq: i64| (0..=9_007_199_254_740_991).contains(&seq);
+        let expected_key_id =
+            crate::chat_protocol::validation::ed25519_key_id(&item.signing_public_key.0)
+                .map(|key| key.as_str().to_owned())
+                .map_err(|_| member_devices_relay_denied("invalid member device relay page"))?;
+        if item.key_id.is_empty()
+            || item.key_id.len() > 128
+            || item.key_id != expected_key_id
+            || !safe_seq(item.joined_seq)
+            || item
+                .removed_seq
+                .is_some_and(|seq| !safe_seq(seq) || seq < item.joined_seq)
+        {
+            return Err(member_devices_relay_denied(
+                "invalid member device relay page",
+            ));
+        }
+    }
+    serde_json::to_vec(&response.page)
+        .map_err(|_| crate::labyrinth::error::LabyrinthError::internal())
+}
+
+pub(crate) async fn try_relay_labyrinth_member_devices(
+    pool: &DbPool,
+    resolver: Option<&super::super::resolver::DsResolver>,
+    admission: &crate::labyrinth::auth::Admission,
+    conversation_id: Uuid,
+    subject_did: &str,
+    query: Option<&str>,
+) -> crate::labyrinth::error::LabyrinthResult<Option<Vec<u8>>> {
+    let Some((sequencer, sequencer_term)) =
+        member_devices_sequencer(pool, conversation_id, &admission.did).await?
+    else {
+        return Ok(None);
+    };
+    let resolver =
+        resolver.ok_or_else(crate::labyrinth::error::LabyrinthError::relay_unavailable)?;
+    if crate::identity::dids_equivalent(&sequencer, resolver.self_did()) {
+        return Ok(None);
+    }
+    super::super::peer_policy::ensure_federation_open().map_err(labyrinth_relay_failure)?;
+    super::super::peer_policy::enforce_outbound_peer_policy(pool, &sequencer)
+        .await
+        .map_err(labyrinth_relay_failure)?;
+    crate::labyrinth::auth::begin_read(pool, admission.clone())
+        .await?
+        .finish_read()
+        .await?;
+    let proof = admission
+        .read
+        .as_ref()
+        .ok_or_else(crate::labyrinth::error::LabyrinthError::internal)?;
+    let query = crate::labyrinth::read_auth::canonical_query(query);
+    let payload = json!({
+        "endpoint": LABYRINTH_MEMBER_DEVICES_ENDPOINT,
+        "query": query,
+        "sequencerTerm": sequencer_term,
+        "actorDid": admission.did,
+        "actorDeviceId": admission.device_id,
+        "readHeader": proof.header,
+        "readSignature": proof.signature,
+    });
+    let (status, bytes) = call_home_response_via(
+        pool,
+        Some(resolver),
+        &sequencer,
+        LABYRINTH_DIRECTORY_NSID,
+        &payload,
+    )
+    .await
+    .map_err(labyrinth_relay_failure)?;
+    if !(200..300).contains(&status) {
+        return Err(labyrinth_peer_failure(status, &bytes));
+    }
+    let page = decode_member_devices_relay(
+        &bytes,
+        &sequencer,
+        sequencer_term,
+        admission,
+        conversation_id,
+        subject_did,
+        &query,
+    )?;
+    match member_devices_sequencer(pool, conversation_id, &admission.did).await? {
+        Some((current, term)) if current == sequencer && term == sequencer_term => Ok(Some(page)),
+        _ => Err(member_devices_relay_denied(
+            "member device sequencer route changed during the read",
+        )),
+    }
 }
 
 pub(crate) async fn try_relay_labyrinth_directory(
@@ -1439,6 +1653,7 @@ fn labyrinth_peer_failure(status: u16, body: &[u8]) -> crate::labyrinth::error::
         .unwrap_or("remote directory rejected the read");
     let name = match error.get("error").and_then(Value::as_str) {
         Some("EpochNotFound") => "EpochNotFound",
+        Some("ConversationNotFound") => "ConversationNotFound",
         Some("InvalidSignature") => "InvalidSignature",
         Some("NotAuthorized") => "NotAuthorized",
         Some("DeviceRevoked") => "DeviceRevoked",
@@ -1466,7 +1681,9 @@ async fn get_labyrinth_directory(
     };
     if !matches!(
         request.endpoint.as_str(),
-        "blue.catbird.labyrinth.getEpochHead" | "blue.catbird.labyrinth.getChatDeviceKeys"
+        "blue.catbird.labyrinth.getEpochHead"
+            | "blue.catbird.labyrinth.getChatDeviceKeys"
+            | LABYRINTH_MEMBER_DEVICES_ENDPOINT
     ) {
         return s2s_err(
             StatusCode::BAD_REQUEST,
@@ -1474,8 +1691,118 @@ async fn get_labyrinth_directory(
             "unsupported directory endpoint",
         );
     }
-    let result = async {
+    let result: Result<Option<(Uuid, String, i64)>, RelayFailure> = async {
         let resolver = resolver(&state.pool);
+        if request.endpoint == LABYRINTH_MEMBER_DEVICES_ENDPOINT {
+            if request.query != crate::labyrinth::read_auth::canonical_query(Some(&request.query)) {
+                return Err(RelayFailure::denied(
+                    "member device directory query is not canonical",
+                ));
+            }
+            let mut conversation = None;
+            let mut subject = None;
+            for (key, value) in url::form_urlencoded::parse(request.query.as_bytes()) {
+                match key.as_ref() {
+                    "threadId" if conversation.is_none() => {
+                        conversation = Some(
+                            crate::labyrinth::repo::parse_thread_id(&value)
+                                .map_err(RelayFailure::denied)?,
+                        );
+                    }
+                    "did" if subject.is_none() => {
+                        crate::labyrinth::wire::bytes::check_did("did", &value)
+                            .map_err(RelayFailure::denied)?;
+                        subject = Some(value.into_owned());
+                    }
+                    "threadId" | "did" => {
+                        return Err(RelayFailure::denied(
+                            "member device directory selector is duplicated",
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+            let conversation = conversation.ok_or_else(|| {
+                RelayFailure::denied("member device directory query has no conversation")
+            })?;
+            let subject = subject.ok_or_else(|| {
+                RelayFailure::denied("member device directory query has no target DID")
+            })?;
+            let route: Option<(bool, Option<String>, i64)> = sqlx::query_as(
+                "SELECT is_remote, sequencer_ds, sequencer_term FROM chat.conversations \
+                  WHERE conversation_id=$1",
+            )
+            .bind(conversation)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(RelayFailure::storage)?;
+            let sequencer_term = match route {
+                None => {
+                    return Err(RelayFailure::not_found(
+                        "conversation is not present at this sequencer",
+                    ))
+                }
+                Some((false, None, term)) if request.sequencer_term == Some(term) => term,
+                Some((false, None, _)) => {
+                    return Err(RelayFailure::denied(
+                        "member device directory sequencer term is stale",
+                    ))
+                }
+                Some(_) => {
+                    return Err(RelayFailure::denied(
+                        "conversation is not authoritative at this sequencer",
+                    ))
+                }
+            };
+            let participant_route_matches: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM chat.participants \
+                  WHERE conversation_id=$1 AND user_did=$2 AND ds_did=$3 \
+                    AND status IN ('active','left','removed'))",
+            )
+            .bind(conversation)
+            .bind(&request.actor_did)
+            .bind(&caller)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(RelayFailure::storage)?;
+            if !participant_route_matches {
+                let historical_member: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM chat.member_devices \
+                      WHERE conversation_id=$1 AND user_did=$2)",
+                )
+                .bind(conversation)
+                .bind(&request.actor_did)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(RelayFailure::storage)?;
+                let actor_home = resolver
+                    .resolve_authoritative_ds(&request.actor_did)
+                    .await
+                    .map_err(RelayFailure::federation)?;
+                if !historical_member || !crate::identity::dids_equivalent(&actor_home.did, &caller)
+                {
+                    return Err(RelayFailure::denied(
+                        "caller has no participant authority at this conversation sequencer",
+                    ));
+                }
+            }
+            let staged: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM chat.devices WHERE user_did=$1 AND device_id=$2)",
+            )
+            .bind(&request.actor_did)
+            .bind(request.actor_device_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(RelayFailure::storage)?;
+            if !staged {
+                let routes = BTreeMap::from([(request.actor_did.clone(), Some(caller.clone()))]);
+                stage_remote_group_participants(&state.pool, &routes)
+                    .await
+                    .map_err(RelayFailure::federation)?;
+            }
+            return Ok(Some((conversation, subject, sequencer_term)));
+        }
+
         let actor_home = resolver
             .resolve_authoritative_ds(&request.actor_did)
             .await
@@ -1500,12 +1827,14 @@ async fn get_labyrinth_directory(
         let routes = BTreeMap::from([(request.actor_did.clone(), Some(caller))]);
         stage_remote_group_participants(&state.pool, &routes)
             .await
-            .map_err(RelayFailure::federation)
+            .map_err(RelayFailure::federation)?;
+        Ok(None)
     }
     .await;
-    if let Err(failure) = result {
-        return failure.into_response();
-    }
+    let member_binding = match result {
+        Ok(binding) => binding,
+        Err(failure) => return failure.into_response(),
+    };
     match crate::handlers::labyrinth::read_federated_directory(
         &state.pool,
         &request.endpoint,
@@ -1519,11 +1848,51 @@ async fn get_labyrinth_directory(
     )
     .await
     {
-        Ok(bytes) => (
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) => {
+            let Some((conversation_id, subject_did, sequencer_term)) = member_binding else {
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    bytes,
+                )
+                    .into_response();
+            };
+            let current_term: Option<i64> = match sqlx::query_scalar(
+                "SELECT sequencer_term FROM chat.conversations \
+                  WHERE conversation_id=$1 AND NOT is_remote AND sequencer_ds IS NULL",
+            )
+            .bind(conversation_id)
+            .fetch_optional(&state.pool)
+            .await
+            {
+                Ok(term) => term,
+                Err(error) => return RelayFailure::storage(error).into_response(),
+            };
+            if current_term != Some(sequencer_term) {
+                return RelayFailure::denied(
+                    "member device sequencer route changed during the read",
+                )
+                .into_response();
+            }
+            let page: LabyrinthMemberDevicesPage = match serde_json::from_slice(&bytes) {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::error!(?error, "sequencer produced an invalid member device page");
+                    return RelayFailure::storage(error).into_response();
+                }
+            };
+            Json(LabyrinthMemberDevicesResponse {
+                endpoint: request.endpoint,
+                query: request.query,
+                sequencer_did: state.self_did,
+                sequencer_term,
+                actor_did: request.actor_did,
+                actor_device_id: request.actor_device_id,
+                conversation_id,
+                subject_did,
+                page,
+            })
+            .into_response()
+        }
         Err(error) => error.into_response(),
     }
 }
@@ -1592,6 +1961,13 @@ mod labyrinth_relay_tests {
         assert_eq!(
             wire(labyrinth_peer_failure(404, br#"{"error":"EpochNotFound"}"#)),
             (404, "EpochNotFound", None)
+        );
+        assert_eq!(
+            wire(labyrinth_peer_failure(
+                404,
+                br#"{"error":"ConversationNotFound"}"#
+            )),
+            (404, "ConversationNotFound", None)
         );
         assert_eq!(
             wire(labyrinth_peer_failure(403, br#"{"error":"NotAuthorized"}"#)),

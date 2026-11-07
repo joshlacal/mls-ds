@@ -199,26 +199,19 @@ pub async fn get_member_devices(
             let did = p.req("did")?.to_owned();
             check_did("did", &did)?;
             let page = p.page()?;
-            let mut r = begin_read(&pool, adm).await?;
-            let caller = r.caller.did.clone();
-            let (rows, cursor) =
-                repo::member_devices(&mut r.tx, thread, &did, &caller, &page).await?;
-            r.finish_read().await?;
-            let items: Vec<_> = rows
-                .into_iter()
-                .map(|m| {
-                    let mut v = json!({
-                        "keyId": m.key_id,
-                        "signingPublicKey": AtBytes(m.signing_public_key),
-                        "joinedSeq": m.joined_seq,
-                    });
-                    if let Some(seq) = m.removed_seq {
-                        v["removedSeq"] = json!(seq);
-                    }
-                    v
-                })
-                .collect();
-            to_bytes(&Page { items, cursor })
+            if let Some(bytes) = crate::federation::group_relay::try_relay_labyrinth_member_devices(
+                &pool,
+                rt.resolver().map(Arc::as_ref),
+                &adm,
+                thread,
+                &did,
+                q.as_deref(),
+            )
+            .await?
+            {
+                return Ok(bytes);
+            }
+            member_devices_response(&pool, adm, thread, &did, &page).await
         }
         .await,
     )
@@ -269,6 +262,34 @@ async fn keys_response(
     to_bytes(&Page { items, cursor })
 }
 
+async fn member_devices_response(
+    pool: &DbPool,
+    admission: Admission,
+    thread: uuid::Uuid,
+    did: &str,
+    page: &crate::labyrinth::repo::PageReq,
+) -> LabyrinthResult<Vec<u8>> {
+    let mut read = begin_read(pool, admission).await?;
+    let caller = read.caller.did.clone();
+    let (rows, cursor) = repo::member_devices(&mut read.tx, thread, did, &caller, page).await?;
+    read.finish_read().await?;
+    let items: Vec<_> = rows
+        .into_iter()
+        .map(|member| {
+            let mut item = json!({
+                "keyId": member.key_id,
+                "signingPublicKey": AtBytes(member.signing_public_key),
+                "joinedSeq": member.joined_seq,
+            });
+            if let Some(seq) = member.removed_seq {
+                item["removedSeq"] = json!(seq);
+            }
+            item
+        })
+        .collect();
+    to_bytes(&Page { items, cursor })
+}
+
 pub(crate) async fn read_federated_directory(
     pool: &DbPool,
     endpoint: &str,
@@ -280,6 +301,7 @@ pub(crate) async fn read_federated_directory(
     let allowed: &[&str] = match endpoint {
         "blue.catbird.labyrinth.getEpochHead" => &["did", "epochNumber"],
         "blue.catbird.labyrinth.getChatDeviceKeys" => &["did", "cursor", "limit"],
+        "blue.catbird.labyrinth.getMemberDevices" => &["threadId", "did", "cursor", "limit"],
         _ => return Err(LabyrinthError::invalid("unsupported directory endpoint")),
     };
     let params = super::params::Params::parse(Some(query), allowed)?;
@@ -302,16 +324,30 @@ pub(crate) async fn read_federated_directory(
         &device.to_string(),
     )
     .await?;
-    if endpoint == "blue.catbird.labyrinth.getEpochHead" {
-        epoch_response(
-            pool,
-            admission,
-            did,
-            params.int("epochNumber", MAX_EPOCH_NUMBER)?,
-        )
-        .await
-    } else {
-        keys_response(pool, admission, did, &params.page()?).await
+    match endpoint {
+        "blue.catbird.labyrinth.getEpochHead" => {
+            epoch_response(
+                pool,
+                admission,
+                did,
+                params.int("epochNumber", MAX_EPOCH_NUMBER)?,
+            )
+            .await
+        }
+        "blue.catbird.labyrinth.getChatDeviceKeys" => {
+            keys_response(pool, admission, did, &params.page()?).await
+        }
+        "blue.catbird.labyrinth.getMemberDevices" => {
+            member_devices_response(
+                pool,
+                admission,
+                parse_thread_id(params.req("threadId")?)?,
+                did,
+                &params.page()?,
+            )
+            .await
+        }
+        _ => unreachable!("endpoint was matched above"),
     }
 }
 

@@ -283,6 +283,23 @@ pub async fn member_devices(
     caller_did: &str,
     page: &PageReq,
 ) -> LabyrinthResult<(Vec<MemberDeviceRow>, Option<String>)> {
+    let route: Option<(bool, Option<String>)> = sqlx::query_as(
+        "SELECT is_remote, sequencer_ds FROM chat.conversations \
+          WHERE conversation_id = $1 FOR SHARE",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    match route {
+        None => return Err(LabyrinthError::not_found("ConversationNotFound")),
+        Some((false, None)) => {}
+        Some(_) => {
+            return Err(LabyrinthError::forbidden(
+                "NotAuthorized",
+                "member device history is served only by the conversation sequencer",
+            ))
+        }
+    }
     if !ever_participant(conn, conversation_id, caller_did).await? {
         return Err(LabyrinthError::not_found("ConversationNotFound"));
     }

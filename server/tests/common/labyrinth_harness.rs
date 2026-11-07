@@ -7,7 +7,10 @@
 
 #![allow(dead_code)]
 
-use std::sync::{Arc, Once};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Once,
+};
 
 use axum::{body::Body, extract::FromRef, http::Request, http::StatusCode, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -21,8 +24,9 @@ use sqlx::PgPool;
 use tower_util::ServiceExt;
 use uuid::Uuid;
 
+use catbird_server::federation::group_relay::{group_relay_router, GroupRelayState};
 use catbird_server::federation::outbound::OutboundClient;
-use catbird_server::federation::resolver::ValidatedRemoteDestination;
+use catbird_server::federation::resolver::{DsEndpoint, ValidatedRemoteDestination};
 use catbird_server::federation::{DsResolver, ServiceAuthClient};
 use catbird_server::handlers::chat::ChatRuntime;
 use catbird_server::handlers::labyrinth::labyrinth_router;
@@ -62,6 +66,8 @@ pub struct Federation {
     pub self_did: String,
     pub key: P256Key,
     pub peer: Option<std::net::SocketAddr>,
+    #[cfg(feature = "sim")]
+    pub sim_hooks: Option<Arc<catbird_server::sim_hooks::SimDsHooks>>,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -95,6 +101,10 @@ fn ensure_runtime_env() {
 
 /// A chat runtime with the cutover gate as requested.
 pub fn runtime(cutover: bool) -> Arc<ChatRuntime> {
+    runtime_with_resolver(cutover, None)
+}
+
+fn runtime_with_resolver(cutover: bool, resolver: Option<Arc<DsResolver>>) -> Arc<ChatRuntime> {
     use std::sync::Mutex;
     static LOCK: Mutex<()> = Mutex::new(());
     ensure_runtime_env();
@@ -104,16 +114,19 @@ pub fn runtime(cutover: bool) -> Arc<ChatRuntime> {
     } else {
         std::env::remove_var("CHAT_CUTOVER_ENABLED");
     }
-    Arc::new(
-        ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
-            .expect("chat runtime"),
-    )
+    let mut runtime = ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
+        .expect("chat runtime");
+    if let Some(resolver) = resolver {
+        runtime = runtime.with_resolver(resolver);
+    }
+    Arc::new(runtime)
 }
 
 /// One test's database and router.
 pub struct Env {
     pub pool: PgPool,
     pub router: Router,
+    pub request_count: Arc<AtomicUsize>,
     _db: DisposableDatabase,
 }
 
@@ -138,14 +151,27 @@ impl Env {
             .as_ref()
             .map(|f| f.self_did.clone())
             .unwrap_or_else(|| "did:web:labyrinth-test.invalid".to_owned());
+        let self_endpoint = "https://labyrinth-test.invalid".to_owned();
         let mut resolver = DsResolver::new(
             pool.clone(),
             reqwest::Client::new(),
-            self_did,
-            "https://labyrinth-test.invalid".to_owned(),
+            self_did.clone(),
+            self_endpoint.clone(),
             None,
             3600,
         );
+        if federation.is_some() {
+            let local_did = self_did.clone();
+            let local_endpoint = self_endpoint.clone();
+            resolver = resolver.with_user_did_resolver_hook(Arc::new(move |_did| {
+                Some(Ok(DsEndpoint {
+                    did: local_did.clone(),
+                    endpoint: local_endpoint.clone(),
+                    supported_cipher_suites: None,
+                    federation_capabilities: None,
+                }))
+            }));
+        }
         if let Some(addr) = federation.as_ref().and_then(|f| f.peer) {
             resolver = resolver.with_destination_resolver_hook(Arc::new(move |_did| {
                 Some(Box::pin(async move {
@@ -167,16 +193,44 @@ impl Env {
         });
         let resolver = Arc::new(resolver);
         let outbound = Arc::new(OutboundClient::new(2, 10));
-        let router = labyrinth_router::<TestState>().with_state(TestState {
+        let runtime =
+            runtime_with_resolver(cutover, federation.as_ref().map(|_| Arc::clone(&resolver)));
+        let mut router = labyrinth_router::<TestState>().with_state(TestState {
             pool: pool.clone(),
-            runtime: runtime(cutover),
+            runtime,
             resolver,
             outbound,
             service_auth,
         });
+        if let Some(federation) = federation.as_ref() {
+            let relay = GroupRelayState::for_test(
+                pool.clone(),
+                federation.self_did.clone(),
+                b"labyrinth-directory-tests",
+                None,
+            );
+            #[cfg(feature = "sim")]
+            let relay = match federation.sim_hooks.as_ref() {
+                Some(hooks) => relay.with_sim_hooks(Arc::clone(hooks)),
+                None => relay,
+            };
+            router = router.merge(group_relay_router(relay));
+        }
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&request_count);
+        let router = router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let count = Arc::clone(&count);
+                async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    next.run(request).await
+                }
+            },
+        ));
         Self {
             pool,
             router,
+            request_count,
             _db: db,
         }
     }
@@ -824,6 +878,18 @@ pub async fn make_remote_to(env: &Env, conversation_id: Uuid, sequencer: &str) {
     .execute(&mut *tx)
     .await
     .unwrap();
+    tx.commit().await.unwrap();
+}
+
+pub async fn set_sequencer_term(env: &Env, conversation_id: Uuid, term: i64) {
+    let mut tx = env.pool.begin().await.unwrap();
+    replica(&mut tx).await;
+    sqlx::query("UPDATE chat.conversations SET sequencer_term = $2 WHERE conversation_id = $1")
+        .bind(conversation_id)
+        .bind(term)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 }
 

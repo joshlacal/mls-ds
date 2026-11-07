@@ -647,6 +647,323 @@ async fn member_devices_serve_join_and_removal_seqs_to_participants_only() {
         .fails(404, "ConversationNotFound");
 }
 
+static MEMBER_DEVICE_FEDERATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(feature = "sim")]
+#[tokio::test]
+async fn member_devices_use_the_pinned_two_home_sequencer_without_mirror_fallback() {
+    use axum::{extract::Json, routing::post, Router};
+    use p256::pkcs8::EncodePrivateKey as _;
+    use std::sync::{
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct RestoreFederation(Option<std::ffi::OsString>);
+    impl Drop for RestoreFederation {
+        fn drop(&mut self) {
+            catbird_server::federation::open_federation_for_test();
+            match self.0.take() {
+                Some(value) => std::env::set_var("SIGNING_KEY_PEM", value),
+                None => std::env::remove_var("SIGNING_KEY_PEM"),
+            }
+        }
+    }
+
+    let _guard = MEMBER_DEVICE_FEDERATION.lock().await;
+    catbird_server::federation::open_federation_for_test();
+    let restore = RestoreFederation(std::env::var_os("SIGNING_KEY_PEM"));
+    let sequencer_did = "did:web:other.catbird.blue";
+    let sequencer_key = jwt_key_for(sequencer_did);
+    let sequencer_hooks = Arc::new(catbird_server::sim_hooks::SimDsHooks {
+        service_did: sequencer_did.to_owned(),
+        self_endpoint: "https://other.catbird.blue".to_owned(),
+        signing_key_pem: Some(
+            sequencer_key
+                .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+                .unwrap()
+                .to_string(),
+        ),
+        group_relay_hmac_secret: None,
+        http_transport: Arc::new(|_| {
+            Box::pin(async { Err("unexpected sequencer outbound request".to_owned()) })
+        }),
+        dns_resolver: Arc::new(|_| Ok(vec!["93.184.216.34".parse().unwrap()])),
+        retain_application_ciphertext: false,
+    });
+    let sequencer = Env::federated(Federation {
+        self_did: sequencer_did.to_owned(),
+        key: sequencer_key,
+        peer: None,
+        sim_hooks: Some(sequencer_hooks),
+    })
+    .await;
+    let sequencer_addr = sequencer.serve().await;
+    let home_did = catbird_server::identity::service_did_base();
+    let home_key = jwt_key_for(&home_did);
+    std::env::set_var(
+        "SIGNING_KEY_PEM",
+        home_key
+            .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+            .unwrap()
+            .as_str(),
+    );
+    cache_did_key(&home_did, &home_key).await;
+    let home = Env::federated(Federation {
+        self_did: home_did.clone(),
+        key: home_key.clone(),
+        peer: Some(sequencer_addr),
+        sim_hooks: None,
+    })
+    .await;
+    allow_peer(&sequencer, &home_did).await;
+    allow_peer(&home, sequencer_did).await;
+
+    let alice = sequencer.account().await;
+    let bob = sequencer.account().await;
+    let conversation = seed_conversation(
+        &sequencer,
+        &[
+            Leaf {
+                device: &alice,
+                joined_seq: 1,
+                removed_seq: None,
+            },
+            Leaf {
+                device: &bob,
+                joined_seq: 1,
+                removed_seq: None,
+            },
+        ],
+        2,
+    )
+    .await;
+    set_home_ds(&sequencer, conversation, &alice, &home_did).await;
+
+    // Local authority remains a direct read.
+    let local = bob
+        .query(
+            "getMemberDevices",
+            &[
+                ("threadId", conversation.to_string()),
+                ("did", bob.did.clone()),
+            ],
+        )
+        .await;
+    assert_eq!(local.ok()["items"].as_array().unwrap().len(), 1);
+
+    let home_alice = home.replicate(&alice).await;
+    let home_bob = home.replicate(&bob).await;
+    seed_conversation_with_id(
+        &home,
+        conversation,
+        &[
+            Leaf {
+                device: &home_alice,
+                joined_seq: 99,
+                removed_seq: None,
+            },
+            Leaf {
+                device: &home_bob,
+                joined_seq: 99,
+                removed_seq: None,
+            },
+        ],
+        100,
+    )
+    .await;
+    make_remote_to(&home, conversation, sequencer_did).await;
+
+    // A closed gate returns 503 before even reaching the sequencer.
+    let before = sequencer.request_count.load(Ordering::Relaxed);
+    catbird_server::federation::FederationMode::set_runtime_override(Some(
+        catbird_server::federation::FederationMode::Off,
+    ));
+    home_alice
+        .query(
+            "getMemberDevices",
+            &[
+                ("threadId", conversation.to_string()),
+                ("did", bob.did.clone()),
+            ],
+        )
+        .await
+        .fails(503, "RelayUnavailable");
+    assert_eq!(
+        sequencer.request_count.load(Ordering::Relaxed),
+        before,
+        "closed federation must send no S2S request"
+    );
+    catbird_server::federation::open_federation_for_test();
+
+    // The mirror's complete-looking Bob leaf says 99; only the sequencer says 1.
+    let remote = home_alice
+        .query(
+            "getMemberDevices",
+            &[
+                ("threadId", conversation.to_string()),
+                ("did", bob.did.clone()),
+            ],
+        )
+        .await;
+    let remote_item = &remote.ok()["items"][0];
+    assert_eq!(remote_item["joinedSeq"], 1);
+    assert_eq!(unb(&remote_item["signingPublicKey"]), bob.chat_pub());
+
+    // A fresh restore intersects home device keys with sequencer leaf history.
+    let directory = home_alice
+        .query("getChatDeviceKeys", &[("did", bob.did.clone())])
+        .await;
+    let directory_key = &directory.ok()["items"][0];
+    assert_eq!(directory_key["keyId"], remote_item["keyId"]);
+    assert_eq!(
+        unb(&directory_key["signingPublicKey"]),
+        unb(&remote_item["signingPublicKey"])
+    );
+
+    // The sequencer response must bind the pinned term, not just the DS DID.
+    set_sequencer_term(&home, conversation, 1).await;
+    home_alice
+        .query(
+            "getMemberDevices",
+            &[
+                ("threadId", conversation.to_string()),
+                ("did", bob.did.clone()),
+            ],
+        )
+        .await
+        .fails(403, "NotAuthorized");
+    set_sequencer_term(&home, conversation, 0).await;
+
+    // The sequencer's semantic absence stays a 404.
+    let missing = uuid::Uuid::new_v4();
+    seed_conversation_with_id(
+        &home,
+        missing,
+        &[Leaf {
+            device: &home_alice,
+            joined_seq: 1,
+            removed_seq: None,
+        }],
+        2,
+    )
+    .await;
+    make_remote_to(&home, missing, sequencer_did).await;
+    home_alice
+        .query(
+            "getMemberDevices",
+            &[("threadId", missing.to_string()), ("did", bob.did.clone())],
+        )
+        .await
+        .fails(404, "ConversationNotFound");
+
+    // An old sequencer with a moved route refuses the stale request.
+    make_remote_to(&sequencer, conversation, "did:web:replacement.catbird.blue").await;
+    home_alice
+        .query(
+            "getMemberDevices",
+            &[
+                ("threadId", conversation.to_string()),
+                ("did", bob.did.clone()),
+            ],
+        )
+        .await
+        .fails(403, "NotAuthorized");
+
+    // A second home points at a controlled peer for transient and tamper cases.
+    let peer_mode = Arc::new(AtomicU8::new(0));
+    let peer_calls = Arc::new(AtomicUsize::new(0));
+    let fake_router = Router::new().route(
+        "/xrpc/blue.catbird.mlsDS.getLabyrinthDirectory",
+        post({
+            let peer_mode = Arc::clone(&peer_mode);
+            let peer_calls = Arc::clone(&peer_calls);
+            move |Json(request): Json<Value>| {
+                let peer_mode = Arc::clone(&peer_mode);
+                let peer_calls = Arc::clone(&peer_calls);
+                async move {
+                    peer_calls.fetch_add(1, Ordering::Relaxed);
+                    if peer_mode.load(Ordering::Relaxed) == 1 {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error": "ServiceUnavailable"})),
+                        );
+                    }
+                    let query = request["query"].as_str().unwrap();
+                    let thread = url::form_urlencoded::parse(query.as_bytes())
+                        .find_map(|(key, value)| (key == "threadId").then(|| value.into_owned()))
+                        .unwrap();
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "endpoint": request["endpoint"],
+                            "query": query,
+                            "sequencerDid": sequencer_did,
+                            "sequencerTerm": 0,
+                            "actorDid": request["actorDid"],
+                            "actorDeviceId": request["actorDeviceId"],
+                            "conversationId": thread,
+                            "subjectDid": "did:web:tampered.example.com",
+                            "page": {"items": []},
+                        })),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, fake_router).await;
+    });
+    let fake_home = Env::federated(Federation {
+        self_did: home_did.clone(),
+        key: home_key,
+        peer: Some(fake_addr),
+        sim_hooks: None,
+    })
+    .await;
+    allow_peer(&fake_home, sequencer_did).await;
+    let fake_alice = fake_home.replicate(&alice).await;
+    let fake_conversation = seed_conversation(
+        &fake_home,
+        &[Leaf {
+            device: &fake_alice,
+            joined_seq: 1,
+            removed_seq: None,
+        }],
+        2,
+    )
+    .await;
+    make_remote_to(&fake_home, fake_conversation, sequencer_did).await;
+
+    peer_mode.store(1, Ordering::Relaxed);
+    fake_alice
+        .query(
+            "getMemberDevices",
+            &[
+                ("threadId", fake_conversation.to_string()),
+                ("did", bob.did.clone()),
+            ],
+        )
+        .await
+        .fails(503, "RelayUnavailable");
+    peer_mode.store(0, Ordering::Relaxed);
+    fake_alice
+        .query(
+            "getMemberDevices",
+            &[
+                ("threadId", fake_conversation.to_string()),
+                ("did", bob.did.clone()),
+            ],
+        )
+        .await
+        .fails(403, "NotAuthorized");
+    assert_eq!(peer_calls.load(Ordering::Relaxed), 2);
+
+    drop(restore);
+}
+
 #[tokio::test]
 async fn lf01_purge_preserves_epoch_head_high_water_floor() {
     let env = Env::new().await;

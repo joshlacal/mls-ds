@@ -46,7 +46,7 @@ mod membership;
 pub(crate) use membership::{
     active_device_key, stage_remote_group_participants, stage_verified_remote_device,
     try_relay_group_state, try_relay_home_group_operation, try_relay_index_only_welcome,
-    try_relay_labyrinth_directory,
+    try_relay_labyrinth_directory, try_relay_labyrinth_member_devices,
 };
 
 #[path = "remote_group_index.rs"]
