@@ -783,15 +783,12 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let receipt_signer = federation::configured_receipt_signer(
-        fed_config.receipt_issuance_mode.as_deref(),
-        fed_config.receipt_signing_key_pem.as_deref(),
-        fed_config.receipt_verification_method.as_deref(),
-        fed_config.signing_key_pem.as_deref(),
-        &fed_config.self_did,
-        fed_config.receipt_did_document_json.as_deref(),
-    )
-    .unwrap_or_else(|error| panic!("Invalid sequencer receipt configuration: {error}"));
+    // The one receipt signer: the commit sequencer, the chat runtime and the
+    // group relay all issue with this validated key, or none of them do.
+    let receipt_signer = fed_config
+        .receipt_signer()
+        .unwrap_or_else(|error| panic!("Invalid sequencer receipt configuration: {error}"))
+        .map(Arc::new);
     let receipt_did_document = if receipt_signer.is_some() {
         Some(
             serde_json::from_str(
@@ -805,19 +802,16 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    if receipt_signer.is_some() {
+    if let Some(signer) = &receipt_signer {
         tracing::info!(
-            verification_method = fed_config
-                .receipt_verification_method
-                .as_deref()
-                .expect("validated issue mode has a receipt verification method"),
+            verification_method = signer.key_id(),
             "Dedicated receipt signer initialized"
         );
     }
 
     let sequencer = Arc::new(
         federation::Sequencer::new(db_pool.clone(), fed_config.self_did.clone())
-            .with_receipt_signer(receipt_signer),
+            .with_receipt_signer(receipt_signer.clone()),
     );
 
     let sequencer_transfer = Arc::new(federation::SequencerTransfer::new(
@@ -839,6 +833,7 @@ async fn main() -> anyhow::Result<()> {
             sse_state.clone(),
             resolver.clone(),
             commit_submitter,
+            receipt_signer.clone(),
         )
         .unwrap_or_else(|error| {
             tracing::error!("clean-chat runtime configuration rejected: {error}");
@@ -1097,11 +1092,7 @@ async fn main() -> anyhow::Result<()> {
         catbird_server::federation::group_relay::GroupRelayState::new(
             db_pool.clone(),
             fed_config.self_did.clone(),
-            app_state
-                .chat_runtime
-                .i13_receipt_signer()
-                .cloned()
-                .map(Arc::new),
+            receipt_signer,
             app_state.chat_runtime.push_gateway_client().cloned(),
         )
         .with_relationship_authority_of(&app_state.chat_runtime),

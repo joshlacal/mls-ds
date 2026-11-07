@@ -38,6 +38,7 @@ use crate::chat_protocol::relationship_policy::ProductionRelationshipAuthority;
 use crate::{
     push_gateway::client::{PushGatewayClient, PushWakeDispatch, PushWakeKind},
     storage::DbPool,
+    util::outbound_body::{collect_bounded, ResponseBodyBudget, ERROR_RESPONSE_MAX_BYTES},
     SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
 };
 
@@ -568,6 +569,13 @@ fn remote_protocol_code(body: &[u8]) -> Option<crate::chat_protocol::error::Chat
         .ok()
 }
 
+/// Bound on a sequencer's `relayGroupMutation` answer: its echoed entry carries
+/// at most the relayed request (`SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES`), and the
+/// rest (one base64 Welcome of at most 1 MiB, coordinates, receipt) fits 2 MiB.
+const RELAY_GROUP_MUTATION_RESPONSE_MAX_BYTES: usize =
+    SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES + 2 * 1024 * 1024;
+const RELAY_GROUP_MUTATION_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Outbound S2S client helper: relay a group mutation from the member's home `mls-ds` to `sequencer_ds`.
 pub async fn relay_group_mutation_to_sequencer(
     sequencer_endpoint: &str,
@@ -587,7 +595,7 @@ pub async fn relay_group_mutation_to_sequencer(
     );
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(15))
+        .timeout(RELAY_GROUP_MUTATION_TIMEOUT)
         .build()
         .map_err(|e| internal(e.to_string()))?;
     let mut req = client
@@ -602,11 +610,20 @@ pub async fn relay_group_mutation_to_sequencer(
         &body_bytes,
     )
     .map_err(GroupRelayError::from_local)?;
+    let deadline = tokio::time::Instant::now() + RELAY_GROUP_MUTATION_TIMEOUT;
     let resp = crate::sim_hooks::send_reqwest(req.body(body_bytes))
         .await
         .map_err(|e| unavailable(format!("relayGroupMutation POST failed: {e}")))?;
     let status = resp.status();
-    let resp_bytes = resp.bytes().await.map_err(|e| unavailable(e.to_string()))?;
+    // A peer's body is bounded before any status or JSON handling.
+    let limit = if status.is_success() {
+        RELAY_GROUP_MUTATION_RESPONSE_MAX_BYTES
+    } else {
+        ERROR_RESPONSE_MAX_BYTES
+    };
+    let resp_bytes = collect_bounded(resp, ResponseBodyBudget::new(limit, deadline))
+        .await
+        .map_err(|e| unavailable(e.to_string()))?;
     if !status.is_success() {
         return Err(GroupRelayError::from_response(status.as_u16(), &resp_bytes));
     }
@@ -2118,8 +2135,9 @@ async fn handle_deliver_group_entry(
 }
 
 /// A replicated `accountDeletedEntry` is its sequencer's signed evidence: only the exact
-/// entry, bound to this conversation and signed with the calling sequencer's resolved
-/// `#mls-receipt-1` key, is stored, verbatim. Resolution completes before any transaction.
+/// entry, bound to this conversation and signed with the calling sequencer's retained
+/// receipt method its authority names, is stored, verbatim. Resolution completes before
+/// any transaction.
 async fn verify_account_deletion(
     state: &GroupRelayState,
     sequencer_ds: &str,
@@ -2143,7 +2161,7 @@ async fn verify_account_deletion(
         None,
         300,
     )
-    .resolve_i13_receipt_key(sequencer_ds)
+    .resolve_i13_receipt_key(sequencer_ds, &authority.key_id)
     .await
     .map_err(lookup_failure)?;
     let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key_bytes)
@@ -2238,7 +2256,7 @@ async fn verify_and_wipe_remote_closed_conversation(
             )
         })?;
         let key_bytes = resolver
-            .resolve_i13_receipt_key(sequencer_ds)
+            .resolve_i13_receipt_key(sequencer_ds, &proof.key_id)
             .await
             .map_err(lookup_failure)?;
         let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key_bytes)
@@ -2621,6 +2639,80 @@ mod tests {
     use super::*;
     use crate::sim_hooks::{scope_ds_clock, ManualDsClock};
     use axum::{body::Body, http::Request};
+
+    /// MLS-R3-04: a sequencer's `relayGroupMutation` answer is collected within
+    /// its budget whether it declares an oversized length or streams one
+    /// chunked, and an error body within 16 KiB. Each oversized body is
+    /// otherwise valid, so the unbounded read accepted it.
+    #[tokio::test]
+    async fn an_oversized_sequencer_answer_is_refused_before_it_is_buffered() {
+        fn padded_entry(pad: usize) -> String {
+            format!(r#"{{"entry":{{"pad":"{}"}}}}"#, "a".repeat(pad))
+        }
+        const METHOD: &str = "/xrpc/blue.catbird.mlsDS.relayGroupMutation";
+        crate::federation::open_federation_for_test();
+        let router = Router::new()
+            .route(
+                &format!("/small{METHOD}"),
+                post(|| async { padded_entry(0) }),
+            )
+            .route(
+                &format!("/declared{METHOD}"),
+                post(|| async { padded_entry(RELAY_GROUP_MUTATION_RESPONSE_MAX_BYTES) }),
+            )
+            .route(
+                &format!("/chunked{METHOD}"),
+                post(|| async {
+                    let mebibyte = Bytes::from(vec![b'a'; 1 << 20]);
+                    let chunks = std::iter::once(Bytes::from_static(br#"{"entry":{"pad":""#))
+                        .chain(std::iter::repeat_n(mebibyte, 17))
+                        .chain(std::iter::once(Bytes::from_static(br#""}}"#)));
+                    Body::from_stream(futures::stream::iter(chunks.map(Ok::<_, std::io::Error>)))
+                }),
+            )
+            .route(
+                &format!("/error{METHOD}"),
+                post(|| async {
+                    let pad = "a".repeat(ERROR_RESPONSE_MAX_BYTES);
+                    let body = format!(r#"{{"error":"BlockedRelationship","message":"{pad}"}}"#);
+                    (StatusCode::FORBIDDEN, body)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let request = RelayGroupMutationRequest {
+            conversation_id: Uuid::new_v4(),
+            endpoint: "blue.catbird.chat.sendMessage".to_owned(),
+            actor_did: "did:web:relay-actor.example.com".to_owned(),
+            actor_device_id: Uuid::new_v4(),
+            signed_request: json!({}),
+        };
+        let relay = |path: &str| {
+            let (endpoint, request) = (format!("{base}/{path}"), request.clone());
+            async move {
+                relay_group_mutation_to_sequencer(
+                    &endpoint,
+                    "did:web:relay-home.example.com",
+                    "did:web:relay-sequencer.example.com",
+                    b"relay-budget-secret",
+                    &request,
+                )
+                .await
+            }
+        };
+
+        assert!(relay("small").await.is_ok());
+        for path in ["declared", "chunked", "error"] {
+            match relay(path).await {
+                Err(GroupRelayError::Unavailable(message)) => {
+                    assert!(message.contains("exceeding limit"), "{path}: {message}")
+                }
+                other => panic!("{path}: {other:?}"),
+            }
+        }
+        server.abort();
+    }
 
     /// A sequencer that rate-limits (429) or fails (5xx) a relayed operation
     /// decided nothing: the client gets its endpoint's declared retryable 503

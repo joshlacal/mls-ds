@@ -21,7 +21,8 @@ use catbird_server::{
         test_support::seed_clean_slate_application_fixture,
     },
     federation::receipt::{
-        configured_receipt_signer, validate_receipt_did_document_for_service, I13ReceiptSigner,
+        configured_receipt_signer, validate_receipt_did_document_method_for_service,
+        I13ReceiptSigner,
     },
     identity::did_doc::{build_service_did_document, did_web_document_path},
 };
@@ -138,15 +139,16 @@ fn dynamic_service_did_doc_and_i13_receipt_signer_support_self_hosted_web_and_pl
             "the advertised KEM key must match SpaceHostConfig"
         );
         let doc_str = serde_json::to_string(&doc).expect("did doc json");
-        validate_receipt_did_document_for_service(
+        let vm = format!("{service_did}#mls-receipt-1");
+        validate_receipt_did_document_method_for_service(
             &doc_str,
             service_did,
+            &vm,
             receipt_key.verifying_key(),
             Some(service_auth_key.verifying_key()),
         )
         .expect("dynamic DID doc validates receipt method");
 
-        let vm = format!("{service_did}#mls-receipt-1");
         let signer = configured_receipt_signer(
             Some("issue"),
             Some(&p256_pem(&receipt_key)),

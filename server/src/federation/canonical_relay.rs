@@ -2111,8 +2111,13 @@ pub async fn ingest_remote_direct_request_delivery(
                 "coordinator receipt signature verification failed: {e:?}"
             ))
         })?;
+    let i13_key_id = input
+        .entry
+        .pointer("/sequencerReceipt/kid")
+        .and_then(|kid| kid.as_str())
+        .ok_or(FederationError::InvalidProof)?;
     let i13_public_key = resolver
-        .resolve_i13_receipt_key(&coord.coordinator_did)
+        .resolve_i13_receipt_key(&coord.coordinator_did, i13_key_id)
         .await?;
 
     // 3. Verify actor signature: live PDS or commit-time proof (M-F04: HTTP before tx).

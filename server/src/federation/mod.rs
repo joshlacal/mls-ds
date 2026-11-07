@@ -41,7 +41,7 @@ pub use envelope::*;
 pub use errors::{FederationError, ResolutionFailureKind};
 pub use receipt::{
     configured_receipt_signer, hash_commit, validate_receipt_did_document, ReceiptConfigError,
-    ReceiptDidDocumentError, ReceiptSigner, SequencerReceipt, RECEIPT_VERIFICATION_METHOD,
+    ReceiptDidDocumentError, SequencerReceipt, RECEIPT_VERIFICATION_METHOD,
 };
 pub use resolver::{DsEndpoint, DsResolver};
 pub use sequencer::{CommitResult, Sequencer};
@@ -469,5 +469,19 @@ impl FederationConfig {
 
     pub fn default_ds_endpoint(&self) -> Option<&str> {
         self.default_ds.as_ref().map(|(_, ep)| ep.as_str())
+    }
+
+    /// The process's one receipt signer, which startup shares with every
+    /// issuer: `None` unless `RECEIPT_ISSUANCE_MODE=issue`, and issue mode
+    /// refuses startup unless the key, method and published history validate.
+    pub fn receipt_signer(&self) -> Result<Option<receipt::I13ReceiptSigner>, ReceiptConfigError> {
+        configured_receipt_signer(
+            self.receipt_issuance_mode.as_deref(),
+            self.receipt_signing_key_pem.as_deref(),
+            self.receipt_verification_method.as_deref(),
+            self.signing_key_pem.as_deref(),
+            &self.self_did,
+            self.receipt_did_document_json.as_deref(),
+        )
     }
 }

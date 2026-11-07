@@ -864,6 +864,87 @@ async fn application_sends_are_sequenced_in_signed_per_device_order() {
     assert_eq!(send_order_state(&pool, cid).await, (7, 5, order));
 }
 
+/// MLS-R3-01: a sequencer upgraded with accepted application history orders
+/// each device's next sends after it. The fixed target is the prior schema, so
+/// these sends land as it wrote them (entry plus `accepted` row, no order):
+/// counter 3 before the held counter 2, and one signed before `sendCounter`
+/// existed. Migration `20261107000001` then backfills the order from the
+/// signed requests: a distinct lower or equal counter is `StaleSend`, and an
+/// exact replay of an accepted send still returns its seq.
+#[tokio::test]
+async fn an_upgraded_sequencer_orders_sends_after_its_accepted_history() {
+    const EPOCH: i64 = 2;
+    let (pool, _database) = common::fresh_db::fresh_clean_protocol_db("chat_delivery_", 4).await;
+    let table: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('chat.application_send_order')::text")
+            .fetch_one(&pool)
+            .await
+            .expect("probe the send-order table");
+    assert_eq!(table, None, "the prior schema has no send-order table");
+    let fixture = seed_fixture(&pool).await;
+    let (cid, device) = (fixture.conversation_id, fixture.actor_device_id);
+    let received_at = clock_now(&pool).await;
+    // Every accepted wrapper carries its signed `prior` and `sendCounter`.
+    let signed = |salt, counter: Option<i64>| {
+        let mut send = coherent_application_send(&fixture, received_at, salt);
+        let mut body = serde_json::json!({ "prior": { "generation": 0, "epoch": EPOCH } });
+        if let Some(counter) = counter {
+            body["sendCounter"] = counter.into();
+        }
+        send.entry.signed_request_bytes =
+            serde_json::to_vec(&serde_json::json!({ "body": body })).unwrap();
+        send
+    };
+
+    let mut tx = pool.begin().await.expect("begin pre-upgrade history");
+    let mut history = Vec::new();
+    for (salt, counter) in [(0x51, Some(3)), (0x52, Some(2)), (0x53, None)] {
+        let send = signed(salt, counter);
+        let seq = append_entry(&mut tx, &send.entry)
+            .await
+            .expect("append a pre-upgrade send");
+        insert_accepted_message_send(&mut tx, &send, seq).await;
+        history.push(ordered_send(send, EPOCH, counter.unwrap_or(1)));
+    }
+    tx.commit().await.expect("commit pre-upgrade history");
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/20261107000001_application_send_order.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("upgrade the populated sequencer");
+    let upgraded = (5, 3, vec![(device, 0, EPOCH, 3)]);
+    assert_eq!(send_order_state(&pool, cid).await, upgraded);
+
+    // Held sends the history passed, under new message ids: refused, nothing written.
+    for (salt, counter) in [(0x54, 2), (0x55, 3)] {
+        let held = ordered_send(signed(salt, Some(counter)), EPOCH, counter);
+        assert_eq!(
+            resolve_committed(&pool, &held).await,
+            ApplicationSendOutcome::StaleSend
+        );
+        assert_eq!(send_order_state(&pool, cid).await, upgraded);
+    }
+    // Exact replays of the accepted pre-upgrade sends keep their seqs.
+    for (send, seq) in history.iter().zip(2..) {
+        assert_eq!(
+            resolve_committed(&pool, send).await,
+            ApplicationSendOutcome::Accepted { seq }
+        );
+    }
+    assert_eq!(send_order_state(&pool, cid).await, upgraded);
+    let next = ordered_send(signed(0x56, Some(4)), EPOCH, 4);
+    assert_eq!(
+        resolve_committed(&pool, &next).await,
+        ApplicationSendOutcome::Accepted { seq: 5 }
+    );
+    assert_eq!(
+        send_order_state(&pool, cid).await,
+        (6, 4, vec![(device, 0, EPOCH, 4)])
+    );
+}
+
 /// K sequential appends in one transaction allocate unique, gap-free seqs that
 /// start at the conversation's current `next_entry_seq` (2, past the genesis)
 /// and leave the append counter and committed log contiguous.

@@ -248,8 +248,12 @@ pub(in crate::handlers::chat) async fn materialize_sender_home_published_mirror(
             ChatProtocolErrorCode::NotAuthorized,
         ));
     }
+    let i13_key_id = entry_val
+        .pointer("/sequencerReceipt/kid")
+        .and_then(|kid| kid.as_str())
+        .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidSignature))?;
     let i13_public_key = resolver
-        .resolve_i13_receipt_key(&coord.coordinator_did)
+        .resolve_i13_receipt_key(&coord.coordinator_did, i13_key_id)
         .await
         .map_err(|error| key_failure(endpoint, ChatProtocolErrorCode::InvalidSignature, error))?;
     crate::chat_protocol::direct_request_transcript::verify_direct_request_opening_receipt(

@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use sqlx::{PgPool, Postgres, Transaction};
 use tracing::{debug, warn};
 
-use super::receipt::{ReceiptSigner, SequencerReceipt};
+use super::receipt::{I13ReceiptSigner, SequencerReceipt};
 use crate::identity::canonical_did;
 
 /// Result of a commit submission.
@@ -22,7 +24,7 @@ pub enum CommitResult {
 pub struct Sequencer {
     pool: PgPool,
     self_did: String,
-    receipt_signer: Option<ReceiptSigner>,
+    receipt_signer: Option<Arc<I13ReceiptSigner>>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -44,8 +46,8 @@ impl Sequencer {
         }
     }
 
-    /// Set an optional receipt signer for producing sequencer receipts.
-    pub fn with_receipt_signer(mut self, signer: Option<ReceiptSigner>) -> Self {
+    /// Set the process's validated receipt signer, shared with every issuer.
+    pub fn with_receipt_signer(mut self, signer: Option<Arc<I13ReceiptSigner>>) -> Self {
         self.receipt_signer = signer;
         self
     }
@@ -214,17 +216,17 @@ mod local_receipt_tests {
 
     use super::*;
 
-    fn sequencer(signer: Option<ReceiptSigner>) -> Sequencer {
+    fn sequencer(signer: Option<I13ReceiptSigner>) -> Sequencer {
         Sequencer::new(
             PgPool::connect_lazy("postgres://localhost/unused").unwrap(),
             "did:web:ds.example.com".to_string(),
         )
-        .with_receipt_signer(signer)
+        .with_receipt_signer(signer.map(Arc::new))
     }
 
     #[tokio::test]
     async fn local_receipt_requires_matching_canonical_sequencer_did() {
-        let signer = ReceiptSigner::new(
+        let signer = I13ReceiptSigner::new(
             SigningKey::random(&mut OsRng),
             "did:web:ds.example.com".to_string(),
         );
@@ -256,7 +258,7 @@ mod local_receipt_tests {
 
     #[tokio::test]
     async fn local_receipt_rejects_mismatched_signer_identity() {
-        let signer = ReceiptSigner::new(
+        let signer = I13ReceiptSigner::new(
             SigningKey::random(&mut OsRng),
             "did:web:other.example.com".to_string(),
         );
@@ -274,7 +276,7 @@ mod local_receipt_tests {
 
     #[tokio::test]
     async fn local_receipt_is_bound_to_commit_and_authority() {
-        let signer = ReceiptSigner::new(
+        let signer = I13ReceiptSigner::new(
             SigningKey::random(&mut OsRng),
             "did:web:ds.example.com".to_string(),
         );

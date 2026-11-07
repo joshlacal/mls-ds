@@ -182,6 +182,101 @@ async fn a_group_mirror_stores_only_its_sequencers_signed_account_deletion_verba
     assert_eq!(served(&pool, cid).await, [evidence(genuine)]);
 }
 
+/// MLS-R3-02: SEQ rotated its receipt key to `#mls-receipt-2` and retains `#1`.
+/// The home verifies a new `#2` deletion and an archived `#1` one against SEQ's
+/// published history, never requiring the archived method to be current; a key
+/// signing under the other method's `kid` is refused and stores nothing.
+#[tokio::test]
+async fn a_group_mirror_verifies_new_and_archived_deletions_after_a_key_rotation() {
+    crate::federation::open_federation_for_test();
+    let db = fresh_fully_migrated_db("chat_fed_relay_").await;
+    let pool = db.connect(4).await;
+    prepare(&pool).await;
+    let mirror = seed_remote_clean_slate_application_fixture(&pool, HOME, SEQ, None)
+        .await
+        .unwrap();
+    let cid = mirror.conversation_id;
+    let (seq_key, home_key, first, second) = (key(0x41), key(0x42), key(0x43), key(0x44));
+    let network = Network::new(&[(SEQ, &seq_key), (HOME, &home_key)]);
+    for (generation, receipt_key) in [(1, &first), (2, &second)] {
+        network
+            .documents
+            .lock()
+            .unwrap()
+            .get_mut(host(SEQ))
+            .unwrap()["verificationMethod"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": format!("{SEQ}#mls-receipt-{generation}"),
+                "type": "Multikey",
+                "controller": SEQ,
+                "publicKeyMultibase":
+                    crate::identity::did_doc::encode_p256_multikey(receipt_key.verifying_key()),
+            }));
+    }
+    let home_hooks = hooks(HOME, Some(&home_key), true, &network);
+    let state = GroupRelayState::for_test(pool.clone(), HOME.to_owned(), HMAC.as_bytes(), None)
+        .with_sim_hooks(Arc::clone(&home_hooks))
+        .with_clock(manual_clock());
+    let deletion = |seq: i64, deleted_did: &str| AccountDeletion {
+        sequencer_did: SEQ.to_owned(),
+        conversation_id: cid,
+        deleted_did: deleted_did.to_owned(),
+        seq,
+        entry_id: Uuid::new_v4(),
+        deleted_at: DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap(),
+    };
+    let sign = |deletion: &AccountDeletion, generation: u8, receipt_key: &SigningKey| {
+        let signer = I13ReceiptSigner::new_with_key_id(
+            receipt_key.clone(),
+            SEQ.to_owned(),
+            format!("{SEQ}#mls-receipt-{generation}"),
+        )
+        .unwrap();
+        deletion.entry(&signer.sign_account_deletion(deletion).unwrap())
+    };
+    let deliver = |entry: Value| {
+        let body = serde_json::to_vec(&DeliverGroupEntryRequest {
+            conversation_id: cid,
+            generation: 0,
+            space_uri: format!("at://{SEQ}/space/blue.catbird.labyrinth.conversation/{cid}-0"),
+            recipient_dids: vec![mirror.recipient_did.clone()],
+            recipient_devices: vec![(mirror.recipient_did.clone(), mirror.recipient_device_id)],
+            entry,
+            close_authority: None,
+        })
+        .unwrap();
+        scope_sim_ds(
+            Arc::clone(&home_hooks),
+            handle_deliver_group_entry(
+                State(state.clone()),
+                deliver_headers(SEQ, &body),
+                Bytes::from(body),
+            ),
+        )
+    };
+
+    let (current, archived) = (
+        deletion(9, &mirror.sender_did),
+        deletion(10, &mirror.recipient_did),
+    );
+    for crossed in [sign(&current, 2, &first), sign(&archived, 1, &second)] {
+        let response = deliver(crossed.clone()).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{crossed}");
+        assert!(served(&pool, cid).await.is_empty(), "{crossed}");
+    }
+    let (new_proof, archived_proof) = (sign(&current, 2, &second), sign(&archived, 1, &first));
+    for proof in [&new_proof, &archived_proof] {
+        let response = deliver(proof.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{proof}");
+    }
+    assert_eq!(
+        served(&pool, cid).await,
+        [evidence(new_proof), evidence(archived_proof)]
+    );
+}
+
 #[tokio::test]
 async fn a_c33_transport_home_serves_its_pairs_deletions_to_every_recipient_device_only() {
     let db = fresh_fully_migrated_db("chat_fed_relay_").await;

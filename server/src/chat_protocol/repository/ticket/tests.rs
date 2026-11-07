@@ -353,6 +353,9 @@ async fn seed_session(
         (None, None, None, None, None, None)
     };
 
+    // The shared database may be freshly migrated: never rely on another test
+    // having seeded the singleton fence first.
+    http::ensure_fence(pool).await;
     let (protocol_instance_id, cursor_key_id, retained_floor): (Uuid, String, i64) =
         sqlx::query_as(
             "SELECT protocol_instance_id, cursor_key_id, retained_floor FROM chat.protocol_instances JOIN chat.event_retention USING (protocol_instance_id) WHERE singleton = TRUE",

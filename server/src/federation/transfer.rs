@@ -623,6 +623,18 @@ mod send_order_tests {
 
     #[tokio::test]
     async fn a_mirror_that_takes_over_sequencing_refuses_sends_its_replicated_history_passed() {
+        takeover_refuses_sends_the_replicated_history_passed(false).await;
+    }
+
+    /// MLS-R3-01: the same mirror, populated before migration `20261107000001`.
+    /// That migration adds only the send-order table, so dropping it leaves the
+    /// prior schema with this history; the upgrade must backfill the order.
+    #[tokio::test]
+    async fn a_mirror_populated_before_the_send_order_upgrade_refuses_sends_its_history_passed() {
+        takeover_refuses_sends_the_replicated_history_passed(true).await;
+    }
+
+    async fn takeover_refuses_sends_the_replicated_history_passed(populated_before_upgrade: bool) {
         let db = crate::common::fresh_db::fresh_fully_migrated_db("chat_transfer_").await;
         let pool = db.connect(4).await;
         crate::common::http_acceptance::ensure_fence(&pool).await;
@@ -716,6 +728,18 @@ mod send_order_tests {
                 .unwrap();
                 tx.commit().await.unwrap();
             }
+            if populated_before_upgrade {
+                sqlx::query("DROP TABLE chat.application_send_order")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::raw_sql(include_str!(
+                    "../../migrations/20261107000001_application_send_order.sql"
+                ))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
             let fourth = sequenced(&requests[3], &sender_key, cid, 7);
             let (generation, epoch) = (fourth.entry.generation.unwrap(), fourth.epoch);
             let replicated = (7, 3, vec![(fixture.sender_device_id, generation, epoch, 3)]);
@@ -751,6 +775,13 @@ mod send_order_tests {
                 );
                 assert_eq!(state(&pool, cid).await, replicated);
             }
+            // SEQ's exact counter-3 send replays the seq it was sequenced at.
+            let third = sequenced(&requests[2], &sender_key, cid, 6);
+            assert_eq!(
+                resolve(&pool, &third).await,
+                ApplicationSendOutcome::Accepted { seq: 6 }
+            );
+            assert_eq!(state(&pool, cid).await, replicated);
             assert_eq!(
                 resolve(&pool, &fourth).await,
                 ApplicationSendOutcome::Accepted { seq: 7 }

@@ -40,6 +40,8 @@ Publish these in the DS's DID document. A `did:plc` DS publishes them through PL
 
 `RECEIPT_ISSUANCE_MODE=issue` (with `RECEIPT_VERIFICATION_METHOD={SERVICE_DID}#mls-receipt-1` and `RECEIPT_DID_DOCUMENT_JSON`) also makes the DS serve that document at its `did:web` path (`/.well-known/did.json` or `/<path>/did.json`).
 
+That validated signer is the only receipt signer in the process: commit receipts, message receipts, group close and account-deletion authorities all use it, and with `RECEIPT_ISSUANCE_MODE=disabled` (the default) nothing is signed even if `RECEIPT_SIGNING_KEY_PEM` is set. To rotate, publish `#mls-receipt-2` (then `-3`, …) while keeping every earlier method in the document and point `RECEIPT_VERIFICATION_METHOD` at the newest; peers verify each receipt against the exact method its `kid` names, so receipts signed before the rotation still verify.
+
 A user's `blue.catbird.chat.declaration/self` names the home: `deliveryService` is the DS's bare DID and `protocolVersion` is `"1"` or `"2"`. Authorization, membership persistence and confidential routing use only this live declaration and fail closed without it. Non-authorizing delivery lookups try, in order: a fresh cache entry (`ENDPOINT_CACHE_TTL`, 3,600 s), the user's DID document `#atproto_mls` service, this declaration, a legacy profile record, and an expired cache entry no older than one additional cache TTL. If a live step could not answer now (the PLC directory, a `did:web` host or the PDS unreachable or answering 5xx/429, or a temporary DNS failure) and no bounded-stale entry exists, the lookup fails retryably instead of falling back to `DEFAULT_DS_DID`/`DEFAULT_DS_ENDPOINT`; a malformed document or record still decides.
 
 ## 3. Federation and peer policy

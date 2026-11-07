@@ -4,12 +4,15 @@ use anyhow::{Context, Result};
 use axum::{extract::FromRef, Router};
 use catbird_server::{
     auth::install_test_https_did_resolver,
-    federation::{outbound::OutboundClient, DsResolver, ServiceAuthClient},
+    federation::{
+        outbound::OutboundClient, receipt::I13ReceiptSigner, DsResolver, ServiceAuthClient,
+    },
     handlers::chat::{chat_router, install_test_https_relationship_resolver, ChatRuntime},
     handlers::labyrinth::labyrinth_router,
     realtime::SseState,
     storage::DbPool,
 };
+use p256::pkcs8::DecodePrivateKey as _;
 use sqlx::postgres::PgPoolOptions;
 
 const EXACT_DATABASE_URL: &str =
@@ -214,7 +217,21 @@ async fn main() -> Result<()> {
         .connect(&database_url)
         .await
         .context("connect guarded request database")?;
-    let runtime = ChatRuntime::from_env(Arc::new(SseState::new(64))).map_err(anyhow::Error::msg)?;
+    let mut runtime =
+        ChatRuntime::from_env(Arc::new(SseState::new(64))).map_err(anyhow::Error::msg)?;
+    // The server binary takes its receipt signer from validated startup
+    // configuration; this fixture issues with the key its harness hands it.
+    if let Ok(pem) = std::env::var("RECEIPT_SIGNING_KEY_PEM") {
+        let method = std::env::var("RECEIPT_VERIFICATION_METHOD")
+            .context("RECEIPT_VERIFICATION_METHOD is required with RECEIPT_SIGNING_KEY_PEM")?;
+        let service_did = std::env::var("SERVICE_DID").context("SERVICE_DID is required")?;
+        let key = p256::ecdsa::SigningKey::from_pkcs8_pem(&pem)
+            .context("RECEIPT_SIGNING_KEY_PEM is not a P-256 PKCS#8 key")?;
+        runtime = runtime.with_i13_receipt_signer(
+            I13ReceiptSigner::new_with_key_id(key, service_did, method)
+                .map_err(anyhow::Error::msg)?,
+        );
+    }
     // D2: the targeted worker signs with this DS's Push Gateway client
     // (SERVICE_DID + SIGNING_KEY_PEM) and wakes the gateway each device
     // registered through registerPushGateway.

@@ -540,6 +540,7 @@ fn spawn_server_fixture(
             "RECEIPT_SIGNING_KEY_PEM",
             sequencer_receipt_key.to_pkcs8_pem(LineEnding::LF)?.as_str(),
         )
+        .env("RECEIPT_VERIFICATION_METHOD", format!("{did}#mls-receipt-1"))
         .env(
             "SIGNING_KEY_PEM",
             service_key.to_pkcs8_pem(LineEnding::LF)?.as_str(),

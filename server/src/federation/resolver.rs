@@ -1626,40 +1626,18 @@ impl DsResolver {
         )))
     }
 
-    /// Resolve only the independent I13 method owned by the authoritative sequencer.
+    /// Resolve the sequencer's I13 receipt method that `key_id`, the `kid` of the
+    /// receipt or authority being verified, names: a SEC1 P-256 key from its
+    /// valid, contiguous published history, current or retained after rotation.
     pub async fn resolve_i13_receipt_key(
         &self,
         sequencer_did: &str,
+        key_id: &str,
     ) -> Result<Vec<u8>, FederationError> {
         let doc = self.fetch_did_document(sequencer_did).await?;
-        let method_id = labyrinth_protocol::receipt::expected_receipt_key_id(sequencer_did);
-        let method = doc["verificationMethod"]
-            .as_array()
-            .and_then(|methods| {
-                methods
-                    .iter()
-                    .find(|method| method["id"].as_str() == Some(method_id.as_str()))
-            })
-            .ok_or(FederationError::InvalidProof)?;
-        let (_, key) = multibase::decode(
-            method["publicKeyMultibase"]
-                .as_str()
-                .ok_or(FederationError::InvalidProof)?,
-        )
-        .map_err(|_| FederationError::InvalidProof)?;
-        if key.len() != 35 || key[..2] != [0x80, 0x24] {
-            return Err(FederationError::InvalidProof);
-        }
-        let verifying_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key[2..])
+        let key = super::receipt::retained_receipt_key(&doc, sequencer_did, key_id)
             .map_err(|_| FederationError::InvalidProof)?;
-        super::receipt::validate_receipt_did_document_for_service(
-            &serde_json::to_string(&doc).map_err(FederationError::Json)?,
-            sequencer_did,
-            &verifying_key,
-            None,
-        )
-        .map_err(|_| FederationError::InvalidProof)?;
-        Ok(key[2..].to_vec())
+        Ok(key.to_encoded_point(true).as_bytes().to_vec())
     }
 
     /// Resolve the authoritative Delivery Service for a user from their live

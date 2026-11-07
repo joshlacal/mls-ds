@@ -86,24 +86,6 @@ pub fn validate_receipt_did_document(
     )
 }
 
-/// Validate the baseline `{service_did}#mls-receipt-1` method.
-pub fn validate_receipt_did_document_for_service(
-    document: &str,
-    service_did: &str,
-    expected_receipt_key: &VerifyingKey,
-    service_auth_key: Option<&VerifyingKey>,
-) -> Result<(), ReceiptDidDocumentError> {
-    let method_owner = crate::identity::canonical_did(service_did);
-    let method_id = labyrinth_protocol::receipt::expected_receipt_key_id(method_owner);
-    validate_receipt_did_document_method_for_service(
-        document,
-        method_owner,
-        &method_id,
-        expected_receipt_key,
-        service_auth_key,
-    )
-}
-
 /// Validate the configured method and the retained, contiguous receipt-key
 /// history in a resolved DID document.
 pub fn validate_receipt_did_document_method_for_service(
@@ -116,12 +98,50 @@ pub fn validate_receipt_did_document_method_for_service(
     let document: serde_json::Value =
         serde_json::from_str(document).map_err(|_| ReceiptDidDocumentError::MalformedDocument)?;
     let method_owner = crate::identity::canonical_did(service_did);
-    if document.get("id").and_then(serde_json::Value::as_str) != Some(method_owner) {
-        return Err(ReceiptDidDocumentError::DocumentOwnerMismatch);
-    }
     let configured_generation =
         labyrinth_protocol::receipt::receipt_key_generation(method_owner, configured_method_id)
             .map_err(|_| ReceiptDidDocumentError::DocumentOwnerMismatch)?;
+    let receipt_methods = receipt_key_history(&document, method_owner, service_auth_key)?;
+    let Some(current_key) = receipt_methods.get(&configured_generation) else {
+        return Err(ReceiptDidDocumentError::MissingReceiptMethod);
+    };
+    if receipt_methods.keys().next_back().copied() != Some(configured_generation) {
+        return Err(ReceiptDidDocumentError::ConfiguredMethodNotCurrent);
+    }
+    if current_key != expected_receipt_key {
+        return Err(ReceiptDidDocumentError::SignerKeyMismatch);
+    }
+    Ok(())
+}
+
+/// The key of the exact receipt method `key_id` (a proof's signed `kid`) in
+/// `sequencer_did`'s resolved DID document. The published history must hold as
+/// it does at issuance, but the method need not be the newest generation: a
+/// proof signed before a rotation still verifies against its retained method.
+pub fn retained_receipt_key(
+    document: &serde_json::Value,
+    sequencer_did: &str,
+    key_id: &str,
+) -> Result<VerifyingKey, ReceiptDidDocumentError> {
+    let method_owner = crate::identity::canonical_did(sequencer_did);
+    let generation = labyrinth_protocol::receipt::receipt_key_generation(method_owner, key_id)
+        .map_err(|_| ReceiptDidDocumentError::DocumentOwnerMismatch)?;
+    receipt_key_history(document, method_owner, None)?
+        .remove(&generation)
+        .ok_or(ReceiptDidDocumentError::MissingReceiptMethod)
+}
+
+/// Every receipt method `document` publishes for `method_owner`, by generation:
+/// each a P-256 Multikey its owner controls, never the service-auth key, and
+/// the generations exactly `1..=N`, since a rotation retains every prior method.
+fn receipt_key_history(
+    document: &serde_json::Value,
+    method_owner: &str,
+    service_auth_key: Option<&VerifyingKey>,
+) -> Result<std::collections::BTreeMap<u64, VerifyingKey>, ReceiptDidDocumentError> {
+    if document.get("id").and_then(serde_json::Value::as_str) != Some(method_owner) {
+        return Err(ReceiptDidDocumentError::DocumentOwnerMismatch);
+    }
     let methods = document
         .get("verificationMethod")
         .and_then(serde_json::Value::as_array)
@@ -160,22 +180,19 @@ pub fn validate_receipt_did_document_method_for_service(
             return Err(ReceiptDidDocumentError::AmbiguousReceiptMethod);
         }
     }
-    let Some(current_key) = receipt_methods.get(&configured_generation) else {
-        return Err(ReceiptDidDocumentError::MissingReceiptMethod);
-    };
-    if receipt_methods.keys().next_back().copied() != Some(configured_generation) {
-        return Err(ReceiptDidDocumentError::ConfiguredMethodNotCurrent);
-    }
-    if (1..=configured_generation).any(|generation| !receipt_methods.contains_key(&generation)) {
+    if !receipt_methods
+        .keys()
+        .copied()
+        .eq(1..=receipt_methods.len() as u64)
+    {
         return Err(ReceiptDidDocumentError::ReceiptHistoryGap);
     }
-    if current_key != expected_receipt_key {
-        return Err(ReceiptDidDocumentError::SignerKeyMismatch);
-    }
-    Ok(())
+    Ok(receipt_methods)
 }
 
-/// Build the optional receipt signer from its dedicated configuration.
+/// Build the process's one receipt signer from its dedicated configuration.
+/// Startup injects it into every issuer; disabled mode yields no signer, so a
+/// configured key signs nothing.
 ///
 /// `SIGNING_KEY_PEM` is accepted only for a public-key separation check. It is
 /// never used to construct the receipt signer and is never a fallback for a
@@ -187,7 +204,7 @@ pub fn configured_receipt_signer(
     service_auth_signing_key_pem: Option<&str>,
     service_did: &str,
     published_did_document: Option<&str>,
-) -> Result<Option<ReceiptSigner>, ReceiptConfigError> {
+) -> Result<Option<I13ReceiptSigner>, ReceiptConfigError> {
     let mode = issuance_mode.unwrap_or("disabled").trim();
     if mode.eq_ignore_ascii_case("disabled") || mode.eq_ignore_ascii_case("off") {
         return Ok(None);
@@ -231,10 +248,9 @@ pub fn configured_receipt_signer(
         Some(service_key.verifying_key()),
     )?;
 
-    Ok(Some(ReceiptSigner::new(
-        receipt_key,
-        service_did.to_string(),
-    )))
+    I13ReceiptSigner::new_with_key_id(receipt_key, service_did.to_string(), method_id.to_owned())
+        .map(Some)
+        .map_err(|_| ReceiptConfigError::UnexpectedVerificationMethod)
 }
 
 /// Clean-slate `I13` ES256 sequencer receipt signer
@@ -577,6 +593,41 @@ impl I13ReceiptSigner {
         *self.signing_key.verifying_key()
     }
 
+    /// Sign a `CATBIRD-RECEIPT-V1` commit receipt with the dedicated key.
+    ///
+    /// Hashes the raw commit ciphertext with SHA-256, constructs canonical bytes,
+    /// and produces an ES256 signature.
+    pub fn sign_receipt(
+        &self,
+        convo_id: &str,
+        epoch: i32,
+        sequencer_term: u64,
+        commit_ciphertext: &[u8],
+    ) -> SequencerReceipt {
+        let commit_hash = hash_commit(commit_ciphertext);
+        let issued_at = crate::sim_hooks::current_utc().timestamp();
+        let canonical = canonical_receipt_bytes(
+            convo_id,
+            epoch,
+            sequencer_term,
+            &commit_hash,
+            &self.sequencer_did,
+            issued_at,
+        );
+
+        let sig: Signature = p256::ecdsa::signature::Signer::sign(&self.signing_key, &canonical);
+
+        SequencerReceipt {
+            convo_id: convo_id.to_string(),
+            epoch,
+            sequencer_term,
+            commit_hash: commit_hash.to_vec(),
+            sequencer_did: self.sequencer_did.clone(),
+            issued_at,
+            signature: sig.to_bytes().to_vec(),
+        }
+    }
+
     /// Attest an already-authorized group close, using only the dedicated I13 key.
     /// The caller must prove the applied close and current actor/roster in its
     /// transaction before calling this method; see `attach_close_authority`.
@@ -729,63 +780,6 @@ impl SequencerReceipt {
             return false;
         };
         verifying_key.verify(&canonical, &sig).is_ok()
-    }
-}
-
-/// Signs sequencer receipts using an ES256 private key.
-#[derive(Debug)]
-pub struct ReceiptSigner {
-    signing_key: SigningKey,
-    sequencer_did: String,
-}
-
-impl ReceiptSigner {
-    /// Create a new receipt signer from an ES256 signing key and the sequencer's DID.
-    pub fn new(signing_key: SigningKey, sequencer_did: String) -> Self {
-        Self {
-            signing_key,
-            sequencer_did: crate::identity::canonical_did(&sequencer_did).to_string(),
-        }
-    }
-
-    /// Sign a receipt for a commit.
-    ///
-    /// Hashes the raw commit ciphertext with SHA-256, constructs canonical bytes,
-    /// and produces an ES256 signature.
-    pub fn sign_receipt(
-        &self,
-        convo_id: &str,
-        epoch: i32,
-        sequencer_term: u64,
-        commit_ciphertext: &[u8],
-    ) -> SequencerReceipt {
-        let commit_hash = hash_commit(commit_ciphertext);
-        let issued_at = crate::sim_hooks::current_utc().timestamp();
-        let canonical = canonical_receipt_bytes(
-            convo_id,
-            epoch,
-            sequencer_term,
-            &commit_hash,
-            &self.sequencer_did,
-            issued_at,
-        );
-
-        let sig: Signature = p256::ecdsa::signature::Signer::sign(&self.signing_key, &canonical);
-
-        SequencerReceipt {
-            convo_id: convo_id.to_string(),
-            epoch,
-            sequencer_term,
-            commit_hash: commit_hash.to_vec(),
-            sequencer_did: self.sequencer_did.clone(),
-            issued_at,
-            signature: sig.to_bytes().to_vec(),
-        }
-    }
-
-    /// Return the verifying (public) key corresponding to this signer.
-    pub fn verifying_key(&self) -> VerifyingKey {
-        *self.signing_key.verifying_key()
     }
 }
 
@@ -1046,7 +1040,7 @@ mod tests {
             );
         }
         let mut cross_protocol = proof;
-        cross_protocol.signature = ReceiptSigner::new(key, signer.sequencer_did().to_string())
+        cross_protocol.signature = I13ReceiptSigner::new(key, signer.sequencer_did().to_string())
             .sign_receipt(&conversation_id.to_string(), 3, 0, b"commit")
             .signature;
         assert!(cross_protocol
@@ -1244,7 +1238,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(signer.key_id(), key2_id);
-        assert!(configured_receipt_signer(
+        let configured = configured_receipt_signer(
             Some("issue"),
             Some(&pem(&key2)),
             Some(key2_id),
@@ -1253,7 +1247,8 @@ mod tests {
             Some(&document),
         )
         .unwrap()
-        .is_some());
+        .expect("issue mode signer");
+        assert_eq!(configured.key_id(), key2_id);
 
         let missing_history =
             did_document(key2_id, "did:web:chat.catbird.blue", key2.verifying_key());
@@ -1276,6 +1271,30 @@ mod tests {
                 None,
             ),
             Err(ReceiptDidDocumentError::ConfiguredMethodNotCurrent)
+        );
+
+        // A verifier selects the exact retained method a proof's `kid` names,
+        // newest or not, and still requires the whole history.
+        let owner = "did:web:chat.catbird.blue";
+        let resolved: serde_json::Value = serde_json::from_str(&document).unwrap();
+        for (key_id, key) in [(RECEIPT_VERIFICATION_METHOD, &key1), (key2_id, &key2)] {
+            assert_eq!(
+                retained_receipt_key(&resolved, owner, key_id),
+                Ok(*key.verifying_key())
+            );
+        }
+        let gap: serde_json::Value = serde_json::from_str(&missing_history).unwrap();
+        assert_eq!(
+            retained_receipt_key(&gap, owner, key2_id),
+            Err(ReceiptDidDocumentError::ReceiptHistoryGap)
+        );
+        assert_eq!(
+            retained_receipt_key(&resolved, owner, &format!("{owner}#mls-receipt-3")),
+            Err(ReceiptDidDocumentError::MissingReceiptMethod)
+        );
+        assert_eq!(
+            retained_receipt_key(&resolved, owner, "did:web:attacker.example#mls-receipt-1"),
+            Err(ReceiptDidDocumentError::DocumentOwnerMismatch)
         );
     }
 
@@ -1517,7 +1536,7 @@ mod tests {
     #[test]
     fn sign_and_verify_round_trip() {
         let sk = SigningKey::random(&mut OsRng);
-        let signer = ReceiptSigner::new(sk.clone(), "did:web:ds.example.com".to_string());
+        let signer = I13ReceiptSigner::new(sk.clone(), "did:web:ds.example.com".to_string());
         let vk = signer.verifying_key();
 
         let receipt = signer.sign_receipt("convo-123", 5, 2, b"fake-commit-ciphertext");
@@ -1538,7 +1557,7 @@ mod tests {
 
     #[test]
     fn signer_canonicalizes_fragmented_service_did() {
-        let signer = ReceiptSigner::new(
+        let signer = I13ReceiptSigner::new(
             SigningKey::random(&mut OsRng),
             "did:web:ds.example.com#mls".to_string(),
         );
@@ -1551,7 +1570,7 @@ mod tests {
     #[test]
     fn verify_rejects_wrong_key() {
         let sk = SigningKey::random(&mut OsRng);
-        let signer = ReceiptSigner::new(sk, "did:web:ds.example.com".to_string());
+        let signer = I13ReceiptSigner::new(sk, "did:web:ds.example.com".to_string());
         let receipt = signer.sign_receipt("convo-456", 1, 1, b"data");
 
         let other_sk = SigningKey::random(&mut OsRng);
@@ -1565,7 +1584,7 @@ mod tests {
     #[test]
     fn verify_rejects_tampered_receipt() {
         let sk = SigningKey::random(&mut OsRng);
-        let signer = ReceiptSigner::new(sk.clone(), "did:web:ds.example.com".to_string());
+        let signer = I13ReceiptSigner::new(sk.clone(), "did:web:ds.example.com".to_string());
         let vk = signer.verifying_key();
 
         let mut receipt = signer.sign_receipt("convo-789", 3, 9, b"original");
@@ -1575,7 +1594,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_each_authority_binding_tamper() {
-        let signer = ReceiptSigner::new(
+        let signer = I13ReceiptSigner::new(
             SigningKey::random(&mut OsRng),
             "did:web:ds.example.com".to_string(),
         );
@@ -1610,7 +1629,7 @@ mod tests {
     #[test]
     fn serde_round_trip() {
         let sk = SigningKey::random(&mut OsRng);
-        let signer = ReceiptSigner::new(sk, "did:web:ds.example.com".to_string());
+        let signer = I13ReceiptSigner::new(sk, "did:web:ds.example.com".to_string());
         let receipt = signer.sign_receipt("convo-serde", 10, 3, b"ciphertext");
 
         let json = serde_json::to_string(&receipt).expect("serialize");

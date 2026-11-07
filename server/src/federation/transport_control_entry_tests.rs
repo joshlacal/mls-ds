@@ -383,6 +383,13 @@ async fn a_transport_only_home_verifies_a_control_entry_before_any_effect() {
         let forbidden = (StatusCode::FORBIDDEN, "NotAuthorized");
         let unsigned = (StatusCode::FORBIDDEN, "InvalidSignature");
         let impostor = I13ReceiptSigner::new(key(0x56), C33_SEQ.to_owned());
+        // An authority naming a receipt method the coordinator never published.
+        let unpublished = I13ReceiptSigner::new_with_key_id(
+            key(0x57),
+            C33_SEQ.to_owned(),
+            format!("{C33_SEQ}#mls-receipt-2"),
+        )
+        .unwrap();
         let cases = [
             // Not the pair's coordinator, with the coordinator's entry or its own.
             (C33_OTHER, genuine.clone(), forbidden),
@@ -425,6 +432,11 @@ async fn a_transport_only_home_verifies_a_control_entry_before_any_effect() {
             (
                 C33_SEQ,
                 Pair::entry(&impostor, cid, &deleted, seq + 1, entry_id, at),
+                unsigned,
+            ),
+            (
+                C33_SEQ,
+                Pair::entry(&unpublished, cid, &deleted, seq + 1, entry_id, at),
                 unsigned,
             ),
             // Every signed field, altered after signing.

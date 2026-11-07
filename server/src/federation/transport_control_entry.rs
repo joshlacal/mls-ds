@@ -7,10 +7,10 @@
 //! the pair's earlier deliveries there and retried until delivered. Before any
 //! effect the home verifies that its caller is the pair's recorded coordinator
 //! and the entry's sequencer, that the deleted account is its party's
-//! counterparty, the coordinator's `#mls-receipt-1` authority, and that the
-//! entry continues its stored seq chain. It then stores the entry verbatim, so
-//! `getEntries` returns it, and prunes the account's held ciphertext exactly as
-//! a sequencer's prune notice would.
+//! counterparty, the coordinator's receipt authority under the retained method
+//! its `keyId` names, and that the entry continues its stored seq chain. It
+//! then stores the entry verbatim, so `getEntries` returns it, and prunes the
+//! account's held ciphertext exactly as a sequencer's prune notice would.
 
 use super::*;
 use std::collections::BTreeMap;
@@ -248,14 +248,17 @@ pub(crate) async fn accept_transport_control_entry(
         Err(error) if error.is_retryable() => return Err(unavailable(error)),
         Err(error) => return Err(denied(&error.to_string())),
     }
+    // The caller is the pair's coordinator; what remains is its evidence. The
+    // authority names its own receipt method, so one the coordinator does not
+    // retain is an authority that does not verify, like any altered signed field.
     let key = resolver
-        .resolve_i13_receipt_key(caller)
+        .resolve_i13_receipt_key(caller, &authority.key_id)
         .await
         .map_err(|error| {
             if error.is_retryable() {
                 unavailable(error)
             } else {
-                denied(&error.to_string())
+                s2s_err(StatusCode::FORBIDDEN, "InvalidSignature", error.to_string())
             }
         })?;
     let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key)

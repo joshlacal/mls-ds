@@ -219,7 +219,6 @@ impl ChatRuntime {
             return Err("request push requires chat cutover".into());
         }
         let require_signed_reads = env_flag("CHAT_REQUIRE_SIGNED_READS");
-        let i13_receipt_signer = build_i13_receipt_signer_from_env()?;
         let space_host_config = crate::space_host::SpaceHostConfig::from_env();
         let push_gateway_client = space_host_config.as_ref().map(|cfg| {
             Arc::new(crate::push_gateway::client::PushGatewayClient::new_es256(
@@ -237,7 +236,8 @@ impl ChatRuntime {
             cutover_enabled,
             request_producers_enabled,
             request_receipt_signer,
-            i13_receipt_signer,
+            // Only startup's validated signer issues receipts (`from_env_with_federation`).
+            i13_receipt_signer: None,
             require_signed_reads,
             ws_registry: Arc::new(std::sync::Mutex::new(WsRegistryState::default())),
             events_notify: Arc::new(tokio::sync::Notify::new()),
@@ -351,13 +351,17 @@ impl ChatRuntime {
         self.resolver.as_ref()
     }
 
+    /// The production runtime: `i13_receipt_signer` is the one validated signer
+    /// startup also gives the commit sequencer and the group relay.
     pub fn from_env_with_federation(
         sse_state: Arc<SseState>,
         resolver: Arc<crate::federation::DsResolver>,
         commit_submitter: Option<Arc<crate::federation::commit_submitter::RemoteCommitSubmitter>>,
+        i13_receipt_signer: Option<Arc<crate::federation::receipt::I13ReceiptSigner>>,
     ) -> Result<Self, String> {
         let mut runtime = Self::from_env_with_resolver(sse_state, resolver)?;
         runtime.commit_submitter = commit_submitter;
+        runtime.i13_receipt_signer = i13_receipt_signer;
         Ok(runtime)
     }
 
@@ -881,31 +885,6 @@ impl ChatRuntime {
             }),
         );
     }
-}
-
-fn build_i13_receipt_signer_from_env(
-) -> Result<Option<Arc<crate::federation::receipt::I13ReceiptSigner>>, String> {
-    use p256::pkcs8::DecodePrivateKey as _;
-    let Ok(pem) = std::env::var("RECEIPT_SIGNING_KEY_PEM") else {
-        return Ok(None);
-    };
-    if pem.trim().is_empty() {
-        return Ok(None);
-    }
-    let Some(service_did) = crate::identity::service_did_base_opt() else {
-        return Ok(None);
-    };
-    let secret = p256::SecretKey::from_pkcs8_pem(pem.trim())
-        .map_err(|_| "RECEIPT_SIGNING_KEY_PEM is not valid P-256 PKCS#8 PEM".to_owned())?;
-    let signing_key = p256::ecdsa::SigningKey::from(secret);
-    let key_id = std::env::var("RECEIPT_VERIFICATION_METHOD")
-        .map_err(|_| "RECEIPT_VERIFICATION_METHOD is required with RECEIPT_SIGNING_KEY_PEM")?;
-    let signer = crate::federation::receipt::I13ReceiptSigner::new_with_key_id(
-        signing_key,
-        service_did,
-        key_id,
-    )?;
-    Ok(Some(Arc::new(signer)))
 }
 
 #[cfg(test)]

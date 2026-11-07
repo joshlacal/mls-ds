@@ -83,9 +83,9 @@ jobs:
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
           git -C ../catbird-atproto checkout --detach 971fd048b4ab2128b8d5b2c35f1be7885abfa1ce
           git clone --filter=blob:none https://github.com/joshlacal/catbird-mls.git ../catbird-mls
-          git -C ../catbird-mls checkout --detach f609cd3413eff8dc291f25e607290627c16c4a0e
+          git -C ../catbird-mls checkout --detach 9a2708e192197c5b787f2330c2456c5b42063dfe
           git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
-          git -C ../labyrinth checkout --detach 276c0972a05eb96f87509e8916e0e51ac46ac154
+          git -C ../labyrinth checkout --detach f771b9c26558ce6a39ed87c657dc8bd6e331d94a
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2026-03-27)
@@ -320,7 +320,7 @@ jobs:
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
           git -C ../catbird-atproto checkout --detach 971fd048b4ab2128b8d5b2c35f1be7885abfa1ce
           git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
-          git -C ../labyrinth checkout --detach 276c0972a05eb96f87509e8916e0e51ac46ac154
+          git -C ../labyrinth checkout --detach f771b9c26558ce6a39ed87c657dc8bd6e331d94a
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2026-03-27)
@@ -462,7 +462,7 @@ jobs:
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
           git -C ../catbird-atproto checkout --detach 971fd048b4ab2128b8d5b2c35f1be7885abfa1ce
           git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
-          git -C ../labyrinth checkout --detach 276c0972a05eb96f87509e8916e0e51ac46ac154
+          git -C ../labyrinth checkout --detach f771b9c26558ce6a39ed87c657dc8bd6e331d94a
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0

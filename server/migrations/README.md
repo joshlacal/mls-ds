@@ -244,6 +244,21 @@ import) and keeps the later one, so a mirror that takes over sequencing
 (`federation::transfer`) refuses a send its replicated history already passed.
 Rows cascade with their conversation, so the close wipe removes them.
 
+The migration also backfills the table from the accepted application entries a
+sequencer or mirror already holds: under `LOCK TABLE chat.entries IN SHARE
+MODE`, each device starts at the greatest triple its retained signed requests
+carry, so a held lower send is `StaleSend` after the upgrade and after a
+populated mirror takes over. Entries signed before `sendCounter` existed order
+nothing, and a pruned entry's triple left with its signed request. Signing
+domains end in an escaped NUL (`\u0000`) that `jsonb` refuses, so a
+`regexp_replace` that consumes escapes pairwise drops exactly those escapes
+before the cast. Raw-file size: `3524` bytes. SQLx SHA-384:
+`457b8d78861a458425a5ed617874a8397547e03fdf2a7038f3ead6737f5cb156b5e9b3fa5df40442a152d72b1279c1c1`.
+The R3 cut (`dc18b03f`) shipped this version without the backfill (SHA-384
+`0883b7dc…e649`); a local database that applied it must be recreated, because
+SQLx refuses the changed checksum (`VersionMismatch`). Nothing outside local
+test databases ever applied it.
+
 ## PostgreSQL churn and terminal-history partitions
 
 `20261104000012_postgres_churn_partitions.sql` converts only the two public
