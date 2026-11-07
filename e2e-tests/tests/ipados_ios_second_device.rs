@@ -276,6 +276,7 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
             "actorDeviceId": f.bob.device_id.to_string(),
             "keyId": URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),
             "authGeneration": 1,
+            "sendCounter": encrypted_requests::next_send_counter(),
             "prior": premature_prior,
             "aad": premature_aad,
             "applicationMessage": {
@@ -423,6 +424,7 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
             "actorDeviceId": f.bob.device_id.to_string(),
             "keyId": URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),
             "authGeneration": 1,
+            "sendCounter": encrypted_requests::next_send_counter(),
             "prior": reply1_prior,
             "aad": aad1,
             "applicationMessage": {
@@ -503,6 +505,7 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
             "actorDeviceId": sibling.service.device_id.to_string(),
             "keyId": URL_SAFE_NO_PAD.encode(Sha256::digest(&sibling_public)),
             "authGeneration": 1,
+            "sendCounter": encrypted_requests::next_send_counter(),
             "prior": reply2_prior,
             "aad": aad2,
             "applicationMessage": {

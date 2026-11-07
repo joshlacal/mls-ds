@@ -45,6 +45,9 @@ pub(crate) enum MessageDeliveryError {
     BlobNotFound,
     BlobBindingConflict,
     IdempotencyConflict,
+    /// The device already sequenced a send at or after this one's signed
+    /// `(generation, epoch, sendCounter)`. Nothing was written.
+    StaleSend,
     Invariant,
 }
 
@@ -745,6 +748,9 @@ pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
             entry: append.clone(),
             signing_transcript_bytes: entry.mutation().transcript_bytes().to_vec(),
             outcome_bytes: response_bytes.clone(),
+            epoch: expected.epoch,
+            send_counter: i64::try_from(projection.send_counter())
+                .map_err(|_| MessageDeliveryError::Invariant)?,
         },
         delivery::ApplicationSendDisposition::Accept,
     )
@@ -761,6 +767,7 @@ pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
         delivery::ApplicationSendOutcome::Stale => {
             return Err(MessageDeliveryError::InvalidCoordinates)
         }
+        delivery::ApplicationSendOutcome::StaleSend => return Err(MessageDeliveryError::StaleSend),
     };
     if seq != head.next_seq {
         return Err(MessageDeliveryError::Invariant);

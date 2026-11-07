@@ -5264,6 +5264,7 @@ fn genuine_application_event(
         "actorDeviceId": actor_device_id.to_string(),
         "keyId": actor_key_id,
         "authGeneration": 1,
+        "sendCounter": seq,
         "prior": {
             "conversationId": convo_id.to_string(),
             "generation": prior_coord.generation(),

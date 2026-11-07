@@ -184,6 +184,8 @@ fn application_send(
         },
         signing_transcript_bytes,
         outcome_bytes: vec![9_u8; 8],
+        epoch: 0,
+        send_counter: 1,
     }
 }
 

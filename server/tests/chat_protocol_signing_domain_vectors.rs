@@ -90,16 +90,18 @@ const CANONICAL_LEXICON: &[u8] =
 const CANONICAL_LEXICON_PATH: &str = "lexicon/blue/catbird/chat/blue.catbird.chat.defs.json";
 const CANONICAL_SOURCE_LEXICON_PATH: &str =
     "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json";
-const CANONICAL_SOURCE_LEXICON_REVISION: &str = "34e5cc3b23cc30b4a3ea837719614c436898d321";
-const CANONICAL_SOURCE_CORPUS_REVISION: &str = "a063ed8f995031fa0cf122bca3f4f82c89f08c90";
+// The fixture was regenerated when `applicationSendBody` gained its required
+// signed `sendCounter` (PetrelCatbird e4227af6, catbird-atproto 838df09a).
+const CANONICAL_SOURCE_LEXICON_REVISION: &str = "e4227af68226a61a4cae7478496d1a7b930f28f6";
+const CANONICAL_SOURCE_CORPUS_REVISION: &str = "838df09a4fa46ba651280c01e74b66b989ca7a74";
 const CANONICAL_SOURCE_LEXICON_SHA256: &str =
-    "3d5d867d9b651fc22e119cb6011262740e3308f127efbf87742850ecded6d639";
+    "1c21d1b04555c800a0491e997b74e3185520b0634362e68a2a27e6b8babdb075";
 // The frozen vectors retain their original provenance. Separately pin the
 // current canonical contract, which also contains the direct-request domains.
-const CURRENT_SOURCE_LEXICON_REVISION: &str = "1193ac5fdcff9a4c283704d649cdc3a6663fb8bf";
-const CURRENT_SOURCE_CORPUS_REVISION: &str = "971fd048b4ab2128b8d5b2c35f1be7885abfa1ce";
+const CURRENT_SOURCE_LEXICON_REVISION: &str = "e4227af68226a61a4cae7478496d1a7b930f28f6";
+const CURRENT_SOURCE_CORPUS_REVISION: &str = "838df09a4fa46ba651280c01e74b66b989ca7a74";
 const CURRENT_SOURCE_LEXICON_SHA256: &str =
-    "3764fc1be74a50e72ca9201eb2793357aaec3b27a7024a3e97e1d9e33ef7aab6";
+    "1c21d1b04555c800a0491e997b74e3185520b0634362e68a2a27e6b8babdb075";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures

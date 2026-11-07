@@ -217,6 +217,7 @@ fn application_send(key_id: &str) -> Value {
         "actorDeviceId": ACTOR_DEVICE_ID,
         "keyId": key_id,
         "authGeneration": 1,
+        "sendCounter": 1,
         "prior": coordinates(),
         "aad": {
             "protocolVersion": "1",

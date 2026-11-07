@@ -675,6 +675,7 @@ fn c33_failure(stage: &'static str, error: &FederationError) -> ChatFailure {
         FederationError::BlockedRelationship => {
             ChatFailure::protocol(ENDPOINT, C::BlockedRelationship)
         }
+        FederationError::StaleSend => ChatFailure::protocol(ENDPOINT, C::StaleSend),
         FederationError::RemoteError { status: 409, .. } => {
             ChatFailure::protocol(ENDPOINT, C::StaleCoordinates)
         }
@@ -731,6 +732,7 @@ fn map_failure(error: MessageDeliveryError) -> ChatFailure {
         MessageDeliveryError::IdempotencyConflict => {
             ChatFailure::protocol(ENDPOINT, C::IdempotencyConflict)
         }
+        MessageDeliveryError::StaleSend => ChatFailure::protocol(ENDPOINT, C::StaleSend),
         MessageDeliveryError::RateLimited | MessageDeliveryError::Invariant => {
             ChatFailure::invariant(ENDPOINT)
         }

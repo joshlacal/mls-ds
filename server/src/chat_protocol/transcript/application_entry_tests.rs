@@ -162,15 +162,6 @@ fn encode_test_cbor(value: &TestCbor) -> Vec<u8> {
     serde_ipld_dagcbor::to_vec(value).unwrap()
 }
 
-struct Golden {
-    entry: Vec<u8>,
-    public_key: [u8; 32],
-    payload_sha256: [u8; 32],
-    request_digest: [u8; 32],
-    fingerprint_projection: Vec<u8>,
-    fingerprint: [u8; 32],
-}
-
 fn hex_array<const N: usize>(value: &Value) -> [u8; N] {
     hex::decode(value.as_str().unwrap())
         .unwrap()
@@ -178,26 +169,22 @@ fn hex_array<const N: usize>(value: &Value) -> [u8; N] {
         .unwrap()
 }
 
-fn golden() -> Golden {
-    // Exact first vector from the workspace manifest; provenance and its full
-    // source SHA-256 are stored in this repository-local immutable fixture.
+/// The frozen first chat-application-v1 vector: entry bytes and sender key.
+fn frozen_pre_send_counter_entry() -> (Vec<u8>, [u8; 32]) {
     let manifest: Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/chat_application_entry_golden.json"
     ))
     .unwrap();
     let vector = &manifest["vectors"][0];
-    let signed = &vector["signedOuterEntry"];
-    Golden {
-        entry: hex::decode(signed["applicationEntryCborHex"].as_str().unwrap()).unwrap(),
-        public_key: hex_array(&vector["transportEvidence"]["senderLeafSignaturePublicKeyHex"]),
-        payload_sha256: hex_array(&signed["applicationEntryCborSha256Hex"]),
-        request_digest: hex_array(&signed["requestDigestHex"]),
-        fingerprint_projection: hex::decode(
-            signed["fingerprintProjectionCborHex"].as_str().unwrap(),
+    (
+        hex::decode(
+            vector["signedOuterEntry"]["applicationEntryCborHex"]
+                .as_str()
+                .unwrap(),
         )
         .unwrap(),
-        fingerprint: hex_array(&signed["fingerprintHex"]),
-    }
+        hex_array(&vector["transportEvidence"]["senderLeafSignaturePublicKeyHex"]),
+    )
 }
 
 fn coordinates(conversation_id: &str) -> Value {
@@ -238,6 +225,7 @@ fn sign_application_wrapper(
             "actorDeviceId": ACTOR_DEVICE_ID,
             "keyId": key_id.as_str(),
             "authGeneration": 1,
+            "sendCounter": 1,
             "prior": coordinates(conversation_id),
             "aad": {
                 "protocolVersion": "1",
@@ -302,24 +290,13 @@ fn synthetic(message_id: &str) -> Synthetic {
     }
 }
 
+/// The frozen chat-application-v1 vector was signed before `sendCounter`
+/// became a required signed field, and its generator is gone: the strict
+/// decoder must refuse it rather than admit a send without a device order.
 #[test]
-fn frozen_application_entry_golden_is_exact_and_historically_verified() {
-    let golden = golden();
-    let entry = decode_and_verify_application_entry(&golden.entry, &golden.public_key).unwrap();
-
-    assert_eq!(entry.entry_id().as_str(), ENTRY_ID);
-    assert_eq!(entry.conversation_id().as_str(), CONVERSATION_ID);
-    assert_eq!(entry.seq(), 930_197_622_689_980);
-    assert_eq!(entry.received_at().as_str(), "2026-07-22T12:34:56.000Z");
-    assert_eq!(entry.canonical_entry_bytes(), golden.entry);
-    assert_eq!(entry.accepted_payload_sha256(), &golden.payload_sha256);
-    assert_eq!(entry.mutation().request_digest(), &golden.request_digest);
-    assert_eq!(
-        entry.outer_application_projection(),
-        golden.fingerprint_projection
-    );
-    assert_eq!(entry.outer_application_fingerprint(), &golden.fingerprint);
-    assert_eq!(entry.mutation().accepted_wrapper_bytes(), None);
+fn frozen_pre_send_counter_application_entry_fails_closed() {
+    let (entry, public_key) = frozen_pre_send_counter_entry();
+    assert!(decode_and_verify_application_entry(&entry, &public_key).is_err());
 }
 
 #[test]
@@ -515,8 +492,8 @@ fn restart_rebind_requires_every_exact_persisted_crypto_column() {
 
 #[test]
 fn outer_scalar_mutations_are_bound_or_rejected_before_authority() {
-    let golden = golden();
-    let original = decode_test_cbor(&golden.entry);
+    let fixture = synthetic(MESSAGE_ID);
+    let original = decode_test_cbor(&fixture.canonical_entry);
 
     for field in ["entryId", "seq", "receivedAt"] {
         let mut changed = original.clone();
@@ -527,12 +504,12 @@ fn outer_scalar_mutations_are_bound_or_rejected_before_authority() {
             _ => panic!("unexpected scalar type"),
         }
         let changed = encode_test_cbor(&changed);
-        let verified = decode_and_verify_application_entry(&changed, &golden.public_key).unwrap();
-        assert_ne!(verified.canonical_entry_bytes(), golden.entry);
-        assert_ne!(verified.accepted_payload_sha256(), &golden.payload_sha256);
+        let verified = decode_and_verify_application_entry(&changed, &fixture.public_key).unwrap();
+        assert_ne!(verified.canonical_entry_bytes(), fixture.canonical_entry);
+        assert_ne!(verified.accepted_payload_sha256(), &fixture.payload_sha256);
         assert_ne!(
             verified.outer_application_fingerprint(),
-            &golden.fingerprint
+            &fixture.fingerprint
         );
     }
 
@@ -546,7 +523,7 @@ fn outer_scalar_mutations_are_bound_or_rejected_before_authority() {
     }
     assert!(decode_and_verify_application_entry(
         &encode_test_cbor(&conversation_mismatch),
-        &golden.public_key,
+        &fixture.public_key,
     )
     .is_err());
 
@@ -560,10 +537,11 @@ fn outer_scalar_mutations_are_bound_or_rejected_before_authority() {
         TestCbor::Bytes(bytes) => bytes[0] ^= 1,
         _ => panic!("signature must be bytes"),
     }
-    assert!(
-        decode_and_verify_application_entry(&encode_test_cbor(&signature), &golden.public_key,)
-            .is_err()
-    );
+    assert!(decode_and_verify_application_entry(
+        &encode_test_cbor(&signature),
+        &fixture.public_key,
+    )
+    .is_err());
 
     let mut body_digest = original;
     let signed = test_map_mut(
@@ -578,26 +556,27 @@ fn outer_scalar_mutations_are_bound_or_rejected_before_authority() {
     }
     assert!(decode_and_verify_application_entry(
         &encode_test_cbor(&body_digest),
-        &golden.public_key,
+        &fixture.public_key,
     )
     .is_err());
 }
 
 #[test]
 fn closed_application_entry_rejects_extra_missing_wrong_wrapper_and_noncanonical_bytes() {
-    let golden = golden();
-    let original = decode_test_cbor(&golden.entry);
+    let fixture = synthetic(MESSAGE_ID);
+    let original = decode_test_cbor(&fixture.canonical_entry);
 
     let mut extra = original.clone();
     test_map_mut(&mut extra).insert("unknown".into(), TestCbor::Bool(true));
     assert!(
-        decode_and_verify_application_entry(&encode_test_cbor(&extra), &golden.public_key).is_err()
+        decode_and_verify_application_entry(&encode_test_cbor(&extra), &fixture.public_key)
+            .is_err()
     );
 
     let mut missing = original.clone();
     test_map_mut(&mut missing).remove("entryId");
     assert!(
-        decode_and_verify_application_entry(&encode_test_cbor(&missing), &golden.public_key)
+        decode_and_verify_application_entry(&encode_test_cbor(&missing), &fixture.public_key)
             .is_err()
     );
 
@@ -606,20 +585,20 @@ fn closed_application_entry_rejects_extra_missing_wrong_wrapper_and_noncanonical
     test_map_mut(&mut wrong_wrapper).insert("signedRequest".into(), body);
     assert!(decode_and_verify_application_entry(
         &encode_test_cbor(&wrong_wrapper),
-        &golden.public_key,
+        &fixture.public_key,
     )
     .is_err());
 
-    let mut trailing = golden.entry.clone();
+    let mut trailing = fixture.canonical_entry.clone();
     trailing.push(0);
-    assert!(decode_and_verify_application_entry(&trailing, &golden.public_key).is_err());
+    assert!(decode_and_verify_application_entry(&trailing, &fixture.public_key).is_err());
 
-    assert_eq!(golden.entry[0], 0xa5);
+    assert_eq!(fixture.canonical_entry[0], 0xa5);
     let mut nonminimal_map = vec![0xb8, 0x05];
-    nonminimal_map.extend_from_slice(&golden.entry[1..]);
-    assert!(decode_and_verify_application_entry(&nonminimal_map, &golden.public_key).is_err());
+    nonminimal_map.extend_from_slice(&fixture.canonical_entry[1..]);
+    assert!(decode_and_verify_application_entry(&nonminimal_map, &fixture.public_key).is_err());
 
-    assert!(decode_and_verify_application_entry(br#"{}"#, &golden.public_key).is_err());
+    assert!(decode_and_verify_application_entry(br#"{}"#, &fixture.public_key).is_err());
 }
 
 #[test]

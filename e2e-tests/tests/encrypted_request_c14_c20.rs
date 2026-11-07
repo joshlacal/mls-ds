@@ -1232,6 +1232,7 @@ async fn c18_pending_authority_matrix_forbids_mutations_while_close_available() 
             "actorDeviceId": device_id.to_string(),
             "keyId": key_id,
             "authGeneration": 1,
+            "sendCounter": encrypted_requests::next_send_counter(),
             "prior": prior,
             "aad": aad,
             "applicationMessage": {
@@ -2465,6 +2466,7 @@ async fn c20_close_terminal_and_late_events_cannot_resurrect() -> anyhow::Result
             "actorDeviceId": f.alice.device_id.to_string(),
             "keyId": alice_key_id,
             "authGeneration": 1,
+            "sendCounter": encrypted_requests::next_send_counter(),
             "prior": prior,
             "aad": aad,
             "applicationMessage": {

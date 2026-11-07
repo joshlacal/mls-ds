@@ -552,7 +552,7 @@ async fn send_ready_application(
     let body = json!({
         "$type":"blue.catbird.chat.defs#applicationSendBody", "signatureDomain":"CATBIRD-CHAT-MESSAGE\u{0000}",
         "messageId":message_id,"actorDid":fixture.requester.did,"actorDeviceId":fixture.requester.device_id,
-        "keyId":fixture.requester.key_id,"authGeneration":1,"prior":prior,
+        "keyId":fixture.requester.key_id,"authGeneration":1,"sendCounter":1,"prior":prior,
         "signedAt":Utc::now().to_rfc3339_opts(SecondsFormat::Millis,true),"blobBindings":[],
         "aad":{"conversationId":STANDARD.encode(fixture.conversation_id.as_bytes()),"generation":0,"protocolVersion":"1",
             "messageId":STANDARD.encode(message_id.as_bytes()),"prior":aad_prior},
@@ -830,7 +830,7 @@ async fn send_application(
     let body = json!({
         "$type":"blue.catbird.chat.defs#applicationSendBody", "signatureDomain":"CATBIRD-CHAT-MESSAGE\u{0000}",
         "messageId":message_id,"actorDid":fixture.actor_did,"actorDeviceId":fixture.actor_device_id,
-        "keyId":fixture.actor_key_id,"authGeneration":1,"prior":prior,
+        "keyId":fixture.actor_key_id,"authGeneration":1,"sendCounter":1,"prior":prior,
         "signedAt":Utc::now().to_rfc3339_opts(SecondsFormat::Millis,true),"blobBindings":[],
         "aad":{"conversationId":STANDARD.encode(fixture.cid.as_bytes()),"generation":0,"protocolVersion":"1",
             "messageId":STANDARD.encode(message_id.as_bytes()),"prior":aad_prior},

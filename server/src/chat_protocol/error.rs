@@ -153,6 +153,7 @@ define_error_codes!(
     InvalidNsid,
     InvalidTargetEndpoint,
     UpstreamError,
+    StaleSend,
 );
 
 impl ChatProtocolErrorCode {
@@ -864,6 +865,7 @@ define_endpoint_contracts!(
         RecipientNotReady,
         RelationshipPolicyUnavailable,
         StaleCoordinates,
+        StaleSend,
         UnsupportedMlsProfile,
         ProtocolUpgradeRequired,
         NotAuthorized,

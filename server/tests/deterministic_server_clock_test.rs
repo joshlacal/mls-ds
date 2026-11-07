@@ -1071,6 +1071,7 @@ fn build_deterministic_scenario(t0: DateTime<Utc>) -> PreparedScenario {
         "actorDeviceId": alice.device_id.hyphenated().to_string(),
         "keyId": alice.key_id,
         "authGeneration": 1,
+        "sendCounter": 1,
         "prior": coordinate_json(&add_coord),
         "aad": {
             "protocolVersion": "1",

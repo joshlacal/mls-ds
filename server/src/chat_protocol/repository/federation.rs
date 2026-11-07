@@ -1684,6 +1684,12 @@ pub async fn deliver_message_replication(
         },
         signing_transcript_bytes: rebound_entry.mutation().transcript_bytes().to_vec(),
         outcome_bytes,
+        epoch: convo_epoch,
+        send_counter: i64::try_from(projection.send_counter()).map_err(|_| {
+            FederationError::InvalidEnvelope {
+                reason: "invalid sendCounter".to_string(),
+            }
+        })?,
     };
 
     // 4. Sequence and append rule.

@@ -414,6 +414,7 @@ fn sign_application_wrapper(
             "actorDeviceId": APPLICATION_ACTOR_DEVICE_ID,
             "keyId": key_id.as_str(),
             "authGeneration": 1,
+            "sendCounter": 1,
             "prior": application_coordinates(conversation_id),
             "aad": {
                 "protocolVersion": "1",

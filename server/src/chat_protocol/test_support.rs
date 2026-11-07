@@ -169,6 +169,7 @@ async fn seed_application_routing_fixture_with_sequencer(
         "actorDeviceId": fixture.requester.device_id,
         "keyId": fixture.requester.key_id,
         "authGeneration": 1,
+        "sendCounter": 1,
         "prior": application_routing_fixture::coordinate_json(&fixture.prior),
         "signedAt": chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         "blobBindings": [],
@@ -448,6 +449,7 @@ async fn seed_clean_slate_application_fixture_inner(
         "actorDeviceId": fixture.requester.device_id,
         "keyId": fixture.requester.key_id,
         "authGeneration": 1,
+        "sendCounter": 1,
         "prior": application_routing_fixture::coordinate_json(&fixture.prior),
         "signedAt": chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         "blobBindings": [],
@@ -483,8 +485,11 @@ async fn seed_clean_slate_application_fixture_inner(
             "native MLS AAD differs from the clean-slate signed request projection".to_owned(),
         );
     }
+    // Each device's frames were encrypted in order: the sender's main
+    // application first, so its supplemental counters start at 2.
     let supplemental_requests = |identity: &application_routing_fixture::FixtureIdentity,
-                                 messages: &[(uuid::Uuid, Vec<u8>)]|
+                                 messages: &[(uuid::Uuid, Vec<u8>)],
+                                 first_counter: usize|
      -> Result<Vec<serde_json::Value>, String> {
         if messages.is_empty() {
             return Ok(Vec::new());
@@ -494,7 +499,8 @@ async fn seed_clean_slate_application_fixture_inner(
             .ok_or("supplemental application fixtures require an archive commitment")?;
         messages
             .iter()
-            .map(|(message_id, application)| {
+            .enumerate()
+            .map(|(index, (message_id, application))| {
                 let body = serde_json::json!({
                     "$type": "blue.catbird.chat.defs#applicationSendBody",
                     "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0000}",
@@ -503,6 +509,7 @@ async fn seed_clean_slate_application_fixture_inner(
                     "actorDeviceId": identity.device_id,
                     "keyId": identity.key_id,
                     "authGeneration": 1,
+                    "sendCounter": first_counter + index,
                     "prior": application_routing_fixture::coordinate_json(&fixture.prior),
                     "signedAt": chrono::Utc::now()
                         .to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -527,10 +534,12 @@ async fn seed_clean_slate_application_fixture_inner(
     let sender_signed_requests = supplemental_requests(
         &fixture.requester,
         &fixture.supplemental_requester_application_messages,
+        2,
     )?;
     let recipient_signed_requests = supplemental_requests(
         &fixture.fulfiller,
         &fixture.supplemental_fulfiller_application_messages,
+        1,
     )?;
 
     Ok(CleanSlateApplicationFixture {

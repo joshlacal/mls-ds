@@ -1431,6 +1431,13 @@ async fn sequence_relayed_group_application_send(
             "group coordinates stale",
         ));
     }
+    let send_counter = i64::try_from(projection.send_counter()).map_err(|_| {
+        s2s_err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "invalid sendCounter",
+        )
+    })?;
 
     let trusted_instant = crate::chat_protocol::validation::TrustedRequestInstant::capture()
         .map_err(|_| {
@@ -1607,6 +1614,8 @@ async fn sequence_relayed_group_application_send(
         entry: append_entry,
         signing_transcript_bytes: entry_product.mutation().transcript_bytes().to_vec(),
         outcome_bytes,
+        epoch: head_epoch,
+        send_counter,
     };
 
     let send_outcome = crate::chat_protocol::repository::delivery::resolve_application_send(
@@ -1630,6 +1639,14 @@ async fn sequence_relayed_group_application_send(
                 StatusCode::CONFLICT,
                 "StaleCoordinates",
                 "stale application coordinates",
+            ));
+        }
+        // The member's home answers its client this declared code.
+        crate::chat_protocol::repository::delivery::ApplicationSendOutcome::StaleSend => {
+            return Err(s2s_err(
+                StatusCode::CONFLICT,
+                "StaleSend",
+                "send is not newer than the device's last accepted send",
             ));
         }
     };

@@ -1963,6 +1963,7 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
             "actorDeviceId": sender.svc.device_id.to_string(),
             "keyId": sender.key_id,
             "authGeneration": 1,
+            "sendCounter": encrypted_requests::next_send_counter(),
             "prior": accept_body["next"],
             "aad": aad,
             "applicationMessage": {
@@ -3539,6 +3540,7 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
             "actorDeviceId": sender.svc.device_id.to_string(),
             "keyId": sender.key_id,
             "authGeneration": 1,
+            "sendCounter": encrypted_requests::next_send_counter(),
             "prior": accept_body["next"],
             "aad": aad,
             "applicationMessage": {

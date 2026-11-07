@@ -1177,7 +1177,7 @@ pub async fn accept_reply_offline(
         &bob_identity,
         json!({
             "$type":"blue.catbird.chat.defs#applicationSendBody","signatureDomain":"CATBIRD-CHAT-MESSAGE\0","messageId":message.to_string(),
-            "actorDid":f.bob.did,"actorDeviceId":f.bob.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"authGeneration":1,
+            "actorDid":f.bob.did,"actorDeviceId":f.bob.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"authGeneration":1,"sendCounter":encrypted_requests::next_send_counter(),
             "prior":next,"aad":aad,"applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication","bytes":STANDARD.encode(&ciphertext),"sha256":STANDARD.encode(Sha256::digest(&ciphertext))},"blobBindings":[],"signedAt":canonical_now()
         }),
     )?;
@@ -1431,7 +1431,7 @@ pub async fn accept_reply_offline_with_followup() -> anyhow::Result<Uuid> {
         &bob_identity,
         json!({
             "$type":"blue.catbird.chat.defs#applicationSendBody","signatureDomain":"CATBIRD-CHAT-MESSAGE\0","messageId":message.to_string(),
-            "actorDid":f.bob.did,"actorDeviceId":f.bob.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"authGeneration":1,
+            "actorDid":f.bob.did,"actorDeviceId":f.bob.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"authGeneration":1,"sendCounter":encrypted_requests::next_send_counter(),
             "prior":next,"aad":aad,"applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication","bytes":STANDARD.encode(&ciphertext),"sha256":STANDARD.encode(Sha256::digest(&ciphertext))},"blobBindings":[],"signedAt":canonical_now()
         }),
     )?;
@@ -1457,7 +1457,7 @@ pub async fn accept_reply_offline_with_followup() -> anyhow::Result<Uuid> {
         &alice_identity,
         json!({
             "$type":"blue.catbird.chat.defs#applicationSendBody","signatureDomain":"CATBIRD-CHAT-MESSAGE\0","messageId":message2.to_string(),
-            "actorDid":f.alice.did,"actorDeviceId":f.alice.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public)),"authGeneration":1,
+            "actorDid":f.alice.did,"actorDeviceId":f.alice.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public)),"authGeneration":1,"sendCounter":encrypted_requests::next_send_counter(),
             "prior":next,"aad":aad2,"applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication","bytes":STANDARD.encode(&ciphertext2), "sha256":STANDARD.encode(Sha256::digest(&ciphertext2))},"blobBindings":[],"signedAt":canonical_now()
         }),
     )?;

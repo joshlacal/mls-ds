@@ -2182,6 +2182,10 @@ impl<'a> ApplicationSendProjection<'a> {
         body_uuid(&self.0.canonical.body, "messageId")
     }
 
+    pub fn send_counter(&self) -> u64 {
+        body_integer(&self.0.canonical.body, "sendCounter")
+    }
+
     pub fn prior(&self) -> ClosedObjectRef<'a> {
         body_object(&self.0.canonical.body, "prior")
     }

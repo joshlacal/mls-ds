@@ -695,6 +695,13 @@ fn make_commit_body(
     (wrapper, signed_bytes)
 }
 
+/// Strictly increasing across this test binary, so every device's sends are
+/// signed in the order they are built.
+fn next_send_counter() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_message_body(
     convo_id: Uuid,
@@ -716,6 +723,7 @@ fn make_message_body(
         "actorDeviceId": actor.device_id.to_string(),
         "keyId": actor.key_id(),
         "authGeneration": 1,
+        "sendCounter": next_send_counter(),
         "signedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
         "prior": {
             "conversationId": convo_id.to_string(),

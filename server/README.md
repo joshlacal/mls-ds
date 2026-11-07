@@ -111,7 +111,7 @@ cargo test --features sim --test deterministic_server_clock_test
 cargo test --test clean_chat_empty_preflight
 ```
 
-`clean_chat_empty_preflight` runs `scripts/assert_clean_chat_empty.sql`, which accepts only a sealed migration catalog. The current seal is 143 migrations ending at `20261104000012`. After a migration change, reseal it from `server/`:
+`clean_chat_empty_preflight` runs `scripts/assert_clean_chat_empty.sql`, which accepts only a sealed migration catalog. The current seal is 144 migrations ending at `20261107000001`. After a migration change, reseal it from `server/`:
 
 ```sh
 CLEAN_CHAT_PREFLIGHT_RESEAL=write cargo test --offline --test clean_chat_empty_preflight -- --ignored --exact reseal_clean_slate_catalog

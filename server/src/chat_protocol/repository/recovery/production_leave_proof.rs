@@ -365,7 +365,7 @@ pub(super) async fn run_removed_device_terminal_entry_read(pool: &PgPool) -> Res
     // is genuinely inside its prior application interval before removal.
     let message_id=Uuid::new_v4();
     let app_body=json!({"$type":"blue.catbird.chat.defs#applicationSendBody","signatureDomain":"CATBIRD-CHAT-MESSAGE\0",
-        "messageId":message_id.to_string(),"actorDid":creator.did,"actorDeviceId":creator.device_id.to_string(),"keyId":creator.key_id,"authGeneration":1,
+        "messageId":message_id.to_string(),"actorDid":creator.did,"actorDeviceId":creator.device_id.to_string(),"keyId":creator.key_id,"authGeneration":1,"sendCounter":1,
         "prior":prior,"signedAt":trusted.as_str(),"blobBindings":[],
         "aad":{"conversationId":STANDARD.encode(fixture.conversation_id.as_bytes()),"generation":0,"protocolVersion":"1","messageId":STANDARD.encode(message_id.as_bytes()),"prior":aad_prior},
         "applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication","bytes":STANDARD.encode(&fixture.application_message),"sha256":STANDARD.encode(Sha256::digest(&fixture.application_message))}});

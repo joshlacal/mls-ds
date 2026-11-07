@@ -57,6 +57,12 @@ pub enum FederationError {
     #[error("Blocked by relationship policy")]
     BlockedRelationship,
 
+    /// The coordinator refused a relayed first send that does not exceed the
+    /// actor device's last accepted `(generation, epoch, sendCounter)`: the
+    /// declared `StaleSend` (409). Nothing was written.
+    #[error("Send is not newer than the device's last accepted send")]
+    StaleSend,
+
     #[error("Sequencer transfer failed: {reason}")]
     TransferFailed { reason: String },
 
@@ -174,7 +180,8 @@ impl FederationError {
             | Self::TermStale { .. }
             | Self::DeliveryConflict { .. }
             | Self::SequenceConflict { .. }
-            | Self::PredecessorMissing { .. } => StatusCode::CONFLICT,
+            | Self::PredecessorMissing { .. }
+            | Self::StaleSend => StatusCode::CONFLICT,
             Self::NotSequencer { .. }
             | Self::UnauthorizedParticipantDs { .. }
             | Self::UnauthorizedRecipient { .. } => StatusCode::FORBIDDEN,
@@ -224,6 +231,7 @@ impl FederationError {
             Self::FederationDisabled { .. } => "FederationDisabled",
             Self::RelationshipPolicyUnavailable { .. } => "RelationshipPolicyUnavailable",
             Self::BlockedRelationship => "BlockedRelationship",
+            Self::StaleSend => "StaleSend",
             Self::TransferFailed { .. } => "TransferFailed",
             Self::RemoteError { .. } => "RemoteError",
             Self::ResolutionFailed { .. } => "ResolutionFailed",
@@ -260,6 +268,7 @@ impl FederationError {
             Self::FederationDisabled { .. } => "federation_disabled",
             Self::RelationshipPolicyUnavailable { .. } => "relationship_policy_unavailable",
             Self::BlockedRelationship => "blocked_relationship",
+            Self::StaleSend => "stale_send",
             Self::NotSequencer { .. } => "not_sequencer",
             Self::TermStale { .. } => "term_stale",
             Self::CommitConflict { .. } | Self::ConversationNotFound { .. } => "conflict",

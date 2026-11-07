@@ -374,7 +374,7 @@ DECLARE
     ];
 
     -- BEGIN GENERATED CLEAN-SLATE SEAL
-    -- 59 migrations after 20260828000005 (143 total, max 20261104000012); chat tables: 91; chat views: 1.
+    -- 60 migrations after 20260828000005 (144 total, max 20261107000001); chat tables: 92; chat views: 1.
     v_clean_slate_versions BIGINT[] := ARRAY[
         20260905000001::BIGINT,
         20260907000001::BIGINT,
@@ -434,7 +434,8 @@ DECLARE
         20261104000008::BIGINT,
         20261104000010::BIGINT,
         20261104000011::BIGINT,
-        20261104000012::BIGINT
+        20261104000012::BIGINT,
+        20261107000001::BIGINT
     ];
     v_clean_slate_descriptions TEXT[] := ARRAY[
         'chat historical recovery package mapping',
@@ -495,7 +496,8 @@ DECLARE
         'queued copy conversation indexes',
         'wipe returns whole retained charge',
         'direct request route answers',
-        'postgres churn partitions'
+        'postgres churn partitions',
+        'application send order'
     ];
     v_clean_slate_checksums TEXT[] := ARRAY[
         'a66f9dc9bd5f8f1cb3da0f3ddfcb64c08fc068de39602891e584c86cdbaebd1de2d29b6bb46959155496639ad12f9c5d',
@@ -556,11 +558,13 @@ DECLARE
         '4f815c232b88a8ff6b7b885288926493d24ce3ec418445fbd52f4bdc60dfda7f0021ca96c3f92c14ede138cd66bc75c1',
         '2683e751903eadd28ba7b7df9a2d43a7eb10c62fb5a6bf644582dcc92565ddca85b0cccd1e7efcefcbb7f9d2f3880a8b',
         '6a8bce9ce6af92567d62820ca40464860a14b56b47d72f91f51649b1e98ea095ce9ea233258b7cc7cbf26e379516617d',
-        'e9700954fc90dd3f99c47eb93eddac7f233e2e2f274f01882c49144b2c9d7499ac60e277f3629039019555c6df9aaa80'
+        'e9700954fc90dd3f99c47eb93eddac7f233e2e2f274f01882c49144b2c9d7499ac60e277f3629039019555c6df9aaa80',
+        '0883b7dc68674afcaeaccc6f531a976d6a467eb61063478d07a8b9a6b3b4f1a8576269e3ffbad0a8e470a00e13c0e649'
     ];
     v_clean_slate_tables TEXT[] := ARRAY[
         'application_intervals',
         'application_schedule_terminal_proofs',
+        'application_send_order',
         'conversation_close_terminal_entries',
         'conversation_space_syncers',
         'conversation_space_writers',

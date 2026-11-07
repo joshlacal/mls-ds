@@ -839,6 +839,7 @@ mod tests {
                 "actorDeviceId": "70707070-7070-4070-b070-707070707070",
                 "keyId": "If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
                 "authGeneration": 1,
+                "sendCounter": 1,
                 "prior": coordinates.clone(),
                 "aad": {
                     "protocolVersion": "1",

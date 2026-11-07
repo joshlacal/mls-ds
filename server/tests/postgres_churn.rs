@@ -287,7 +287,10 @@ async fn previous_schema_upgrade_preserves_rows_and_drops_only_expired_partition
         .fetch_one(&mut connection)
         .await
         .unwrap();
-    assert_eq!(applied, CURRENT_VERSION);
+    assert!(
+        applied >= CURRENT_VERSION,
+        "upgrade ran through the churn migration"
+    );
 
     let pool = database.connect(4).await;
     assert_churn_schema(&pool).await;

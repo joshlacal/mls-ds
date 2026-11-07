@@ -275,12 +275,16 @@ pub(crate) async fn append_entry_at(
 /// `request_digest` / `signature` / `received_at` the durable `message_sends` row
 /// must mirror exactly — `assert_message_send_mapping`), plus the
 /// `signing_transcript_bytes` the digest covers and the server-authored
-/// `outcome_bytes` returned to the sender.
+/// `outcome_bytes` returned to the sender. `epoch` and `send_counter` are the
+/// verified signed body's `prior.epoch` and `sendCounter`; with
+/// `entry.generation` they order the device's sends.
 #[derive(Clone, Debug)]
 pub struct ApplicationSend {
     pub entry: AppendEntry,
     pub signing_transcript_bytes: Vec<u8>,
     pub outcome_bytes: Vec<u8>,
+    pub epoch: i64,
+    pub send_counter: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,20 +295,29 @@ pub enum ApplicationSendDisposition {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplicationSendOutcome {
-    Accepted { seq: u64 },
+    Accepted {
+        seq: u64,
+    },
     Stale,
+    /// A first `Accept` resolution whose `(generation, epoch, send_counter)`
+    /// does not exceed the device's last accepted send. Nothing was written.
+    StaleSend,
 }
 /// Resolve an application send idempotently on `(conversation_id, message_id)`.
 ///
 /// * FIRST resolution: apply `disposition` — `Accept` appends the
 ///   `applicationEntry` at a fresh seq (`append_entry`) and records an `accepted`
-///   `message_sends` row bound to it; `Stale` records a `stale` tombstone row with
-///   NO entry / NO seq (the explicitly-committed rejection path — it COMMITS even
-///   though the business outcome is a refusal).
+///   `message_sends` row bound to it, only if the send's `(generation, epoch,
+///   send_counter)` exceeds the actor device's last accepted send in the
+///   conversation, which it advances; otherwise it writes nothing and returns
+///   `StaleSend`. `Stale` records a `stale` tombstone row with NO entry / NO seq
+///   (the explicitly-committed rejection path — it COMMITS even though the
+///   business outcome is a refusal).
 /// * REPLAY (a row already exists): return the STORED outcome, ignoring the
-///   caller's disposition — an accepted send re-returns its original seq, a stale
-///   send stays stale. A replay whose `request_digest` disagrees with the stored
-///   one is a distinct message reusing the id → `MessageSendConflict`.
+///   caller's disposition and send order — an accepted send re-returns its
+///   original seq, a stale send stays stale. A replay whose `request_digest`
+///   disagrees with the stored one is a distinct message reusing the id →
+///   `MessageSendConflict`.
 ///
 /// The two `chat.message_sends` ↔ `chat.entries` foreign keys are DEFERRED, so the
 /// entry + accepted row (written here in the caller's transaction) are reconciled
@@ -350,6 +363,34 @@ pub async fn resolve_application_send(
 
     match disposition {
         ApplicationSendDisposition::Accept => {
+            // The caller already holds the conversation head lock. A refused
+            // order changes no row, so the conflict arm updates nothing.
+            let advanced: Option<i32> = sqlx::query_scalar(
+                r#"
+                INSERT INTO chat.application_send_order AS o(
+                    conversation_id, actor_did, actor_device_id,
+                    generation, epoch, last_send_counter
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (conversation_id, actor_did, actor_device_id) DO UPDATE
+                   SET generation = EXCLUDED.generation,
+                       epoch = EXCLUDED.epoch,
+                       last_send_counter = EXCLUDED.last_send_counter
+                 WHERE (o.generation, o.epoch, o.last_send_counter)
+                     < (EXCLUDED.generation, EXCLUDED.epoch, EXCLUDED.last_send_counter)
+                RETURNING 1
+                "#,
+            )
+            .bind(send.entry.conversation_id)
+            .bind(&send.entry.actor_did)
+            .bind(send.entry.actor_device_id)
+            .bind(send.entry.generation)
+            .bind(send.epoch)
+            .bind(send.send_counter)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            if advanced.is_none() {
+                return Ok(ApplicationSendOutcome::StaleSend);
+            }
             let seq = append_entry(transaction, &send.entry).await?;
             insert_message_send_row(transaction, send, message_id, "accepted", Some(seq)).await?;
             Ok(ApplicationSendOutcome::Accepted { seq })

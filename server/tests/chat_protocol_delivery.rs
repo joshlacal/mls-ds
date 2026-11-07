@@ -478,13 +478,52 @@ async fn insert_accepted_message_send(
     .expect("insert accepted message send");
 }
 
-/// The production `ApplicationSend` mirrors the test `CoherentSend` field-for-field.
+/// The production `ApplicationSend` mirrors the test `CoherentSend` field-for-field,
+/// as the device's first send at epoch 0.
 fn to_application_send(send: CoherentSend) -> ApplicationSend {
+    ordered_send(send, 0, 1)
+}
+
+fn ordered_send(send: CoherentSend, epoch: i64, send_counter: i64) -> ApplicationSend {
     ApplicationSend {
         entry: send.entry,
         signing_transcript_bytes: send.signing_transcript_bytes,
         outcome_bytes: send.outcome_bytes,
+        epoch,
+        send_counter,
     }
+}
+
+async fn resolve_committed(pool: &PgPool, send: &ApplicationSend) -> ApplicationSendOutcome {
+    let mut tx = pool.begin().await.expect("begin send");
+    let outcome = resolve_application_send(&mut tx, send, ApplicationSendDisposition::Accept)
+        .await
+        .expect("send resolves");
+    tx.commit().await.expect("send COMMIT");
+    outcome
+}
+
+/// `(next_entry_seq, message_sends rows, every device's order row)`.
+async fn send_order_state(
+    pool: &PgPool,
+    conversation_id: Uuid,
+) -> (i64, i64, Vec<(Uuid, i64, i64, i64)>) {
+    let sends: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.message_sends WHERE conversation_id = $1")
+            .bind(conversation_id)
+            .fetch_one(pool)
+            .await
+            .expect("count message sends");
+    let order = sqlx::query_as(
+        "SELECT actor_device_id, generation, epoch, last_send_counter \
+           FROM chat.application_send_order WHERE conversation_id = $1 \
+          ORDER BY actor_device_id",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+    .expect("read send order");
+    (next_entry_seq(pool, conversation_id).await, sends, order)
 }
 
 // ---------------------------------------------------------------------------
@@ -696,6 +735,115 @@ async fn application_send_stale_tombstones_without_entry_and_never_succeeds() {
     .await
     .expect("still no entry after the accept replay");
     assert_eq!(entry_count_after, 0);
+}
+
+/// Seed 2323: a device's sends are sequenced in its signed `(generation,
+/// epoch, sendCounter)` order. A first resolution that does not exceed the
+/// device's last accepted send is `StaleSend` and writes nothing; an exact
+/// replay of an accepted send still returns its stored seq; a later epoch or
+/// generation admits a lower counter; each device is ordered on its own.
+#[tokio::test]
+async fn application_sends_are_sequenced_in_signed_per_device_order() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fixture = seed_fixture(&pool).await;
+    let cid = fixture.conversation_id;
+    let device = fixture.actor_device_id;
+    let received_at = clock_now(&pool).await;
+    let send = |salt, epoch, counter| {
+        ordered_send(
+            coherent_application_send(&fixture, received_at, salt),
+            epoch,
+            counter,
+        )
+    };
+
+    let first = send(0x41, 0, 1);
+    assert_eq!(
+        resolve_committed(&pool, &first).await,
+        ApplicationSendOutcome::Accepted { seq: 2 }
+    );
+    assert_eq!(
+        resolve_committed(&pool, &send(0x42, 0, 2)).await,
+        ApplicationSendOutcome::Accepted { seq: 3 }
+    );
+    let accepted = (4, 2, vec![(device, 0, 0, 2)]);
+    assert_eq!(send_order_state(&pool, cid).await, accepted);
+
+    // The held send arriving late, and a reused counter: refused, nothing written.
+    for (salt, counter) in [(0x43, 1), (0x44, 2)] {
+        assert_eq!(
+            resolve_committed(&pool, &send(salt, 0, counter)).await,
+            ApplicationSendOutcome::StaleSend
+        );
+        assert_eq!(send_order_state(&pool, cid).await, accepted);
+    }
+
+    // Idempotency precedes the order check: the accepted counter-1 send replays.
+    assert_eq!(
+        resolve_committed(&pool, &first).await,
+        ApplicationSendOutcome::Accepted { seq: 2 }
+    );
+    assert_eq!(send_order_state(&pool, cid).await, accepted);
+
+    // A later epoch, then a later generation, admit a lower counter.
+    assert_eq!(
+        resolve_committed(&pool, &send(0x45, 1, 1)).await,
+        ApplicationSendOutcome::Accepted { seq: 4 }
+    );
+    let mut next_generation = send(0x46, 0, 1);
+    next_generation.entry.generation = Some(1);
+    assert_eq!(
+        resolve_committed(&pool, &next_generation).await,
+        ApplicationSendOutcome::Accepted { seq: 5 }
+    );
+    assert_eq!(
+        resolve_committed(&pool, &send(0x47, 5, 9)).await,
+        ApplicationSendOutcome::StaleSend,
+        "generation outranks epoch and counter"
+    );
+
+    // Another device of the same actor starts its own order at counter 1.
+    let other_device = Uuid::new_v4();
+    let mut public_key = Uuid::new_v4().as_bytes().to_vec();
+    public_key.extend_from_slice(Uuid::new_v4().as_bytes());
+    let other_key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(&public_key)
+        .fetch_one(&pool)
+        .await
+        .expect("derive second key id");
+    sqlx::query(
+        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+         VALUES($1,$2,'second-device','active',$3,1,chat.protocol_capabilities(),$4,$4)",
+    )
+    .bind(&fixture.actor_did)
+    .bind(other_device)
+    .bind(format!("{:042}A", 0_u128))
+    .bind(received_at)
+    .execute(&pool)
+    .await
+    .expect("insert second device");
+    sqlx::query(
+        "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
+         VALUES($1,$2,$3,$4,1,$5)",
+    )
+    .bind(&fixture.actor_did)
+    .bind(other_device)
+    .bind(&other_key_id)
+    .bind(&public_key)
+    .bind(received_at)
+    .execute(&pool)
+    .await
+    .expect("insert second device key");
+    let mut other = send(0x48, 0, 1);
+    other.entry.actor_device_id = other_device;
+    other.entry.actor_key_id = other_key_id;
+    assert_eq!(
+        resolve_committed(&pool, &other).await,
+        ApplicationSendOutcome::Accepted { seq: 6 }
+    );
+    let mut order = vec![(device, 1, 0, 1), (other_device, 0, 0, 1)];
+    order.sort();
+    assert_eq!(send_order_state(&pool, cid).await, (7, 5, order));
 }
 
 /// K sequential appends in one transaction allocate unique, gap-free seqs that

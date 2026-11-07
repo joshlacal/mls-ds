@@ -514,6 +514,11 @@ fn relay_error(
             error_name: Some(error_name),
             ..
         } if error_name == "BlockedRelationship" => FederationError::BlockedRelationship,
+        E::RemoteError {
+            status: 409,
+            error_name: Some(error_name),
+            ..
+        } if error_name == "StaleSend" => FederationError::StaleSend,
         E::RemoteError { status, body, .. } => FederationError::RemoteError { status, body },
         E::ResolutionFailed { did, kind } => FederationError::ResolutionFailed { did, kind },
         E::FederationDisabled { reason } => FederationError::FederationDisabled { reason },
@@ -4254,6 +4259,8 @@ pub async fn coordinator_handle_message(
             "stale application coordinates".into(),
         ));
     }
+    let send_counter = i64::try_from(projection.send_counter())
+        .map_err(|_| FederationError::InvalidRequest("invalid sendCounter".into()))?;
 
     // 8. Device leaf check
     let is_leaf: bool = sqlx::query_scalar(
@@ -4454,6 +4461,8 @@ pub async fn coordinator_handle_message(
         entry: append_entry,
         signing_transcript_bytes: entry_product.mutation().transcript_bytes().to_vec(),
         outcome_bytes,
+        epoch: prior_epoch,
+        send_counter,
     };
 
     let outcome = crate::chat_protocol::repository::delivery::resolve_application_send(
@@ -4478,6 +4487,9 @@ pub async fn coordinator_handle_message(
             return Err(FederationError::InvalidRequest(
                 "stale application coordinates".into(),
             ));
+        }
+        crate::chat_protocol::repository::delivery::ApplicationSendOutcome::StaleSend => {
+            return Err(FederationError::StaleSend);
         }
     };
     // A replay returns its stored seq; this receipt signs only a fresh append.

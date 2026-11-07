@@ -529,6 +529,8 @@ async fn remote_group_transport_waits_for_local_acks_as_home() {
             },
             signing_transcript_bytes: product.mutation().transcript_bytes().to_vec(),
             outcome_bytes: serde_json::to_vec(&json!({"entry": entry})).unwrap(),
+            epoch: 0,
+            send_counter: 1,
         },
         ApplicationSendDisposition::Accept,
     )

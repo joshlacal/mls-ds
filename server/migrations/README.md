@@ -5,9 +5,9 @@ SQL migrations for `catbird-server`, applied in version order by SQLx (`sqlx::mi
 ## Status
 
 - The R0 seal (bookmark `clean-slate-2026-10-31`, mls-ds `d5f6993c`) has 129 migrations, ending at `20261102000003_conversation_close_terminal_entries.sql`.
-- The unsealed Task 4 R1 provisional commits add fourteen, for 143: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010`, `000011` and `000012`. Their contracts are in the sections below.
+- The unsealed Task 4 R1 provisional commits add fourteen, for 143: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010`, `000011` and `000012`. The seed-2323 fix adds `20261107000001`, for 144. Their contracts are in the sections below.
 - **Held.** These migrations have run only against local disposable and guarded test databases. Do not apply them to a production database until R1 is sealed and the production migration is separately authorized. Server startup applies pending migrations, so the hold also covers starting this tree against a production database.
-- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 143 migrations ending at `20261104000012` (91 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
+- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 144 migrations ending at `20261107000001` (92 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
 
 ## Clean-Chat Operation Claim Rollout
 
@@ -227,6 +227,18 @@ sqlx maintains a `_sqlx_migrations` table to track applied migrations:
 ```sql
 SELECT * FROM _sqlx_migrations ORDER BY version;
 ```
+
+## Per-device application send order
+
+`20261107000001_application_send_order.sql` adds `chat.application_send_order`:
+one row per `(conversation_id, actor_did, actor_device_id)` holding the last
+accepted send's signed `(generation, epoch, sendCounter)`. A sequencer resolving
+a `messageId` for the first time (local `sendMessage`, the group relay, or the
+C33 coordinator relay) accepts it only if its triple is lexicographically
+greater, advancing the row with one conditional upsert under the conversation
+head lock. Otherwise it answers `StaleSend` and writes nothing. An exact replay
+of an accepted send is answered from `chat.message_sends` before this check.
+Rows cascade with their conversation, so the close wipe removes them.
 
 ## PostgreSQL churn and terminal-history partitions
 

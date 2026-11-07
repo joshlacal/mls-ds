@@ -425,7 +425,7 @@ async fn c27_live_no_second_introduction_and_capacity_refusal_preserve_history(
         &identity,
         json!({
             "$type":"blue.catbird.chat.defs#applicationSendBody","signatureDomain":"CATBIRD-CHAT-MESSAGE\0","messageId":message.to_string(),
-            "actorDid":f.alice.did,"actorDeviceId":f.alice.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&public)),"authGeneration":1,
+            "actorDid":f.alice.did,"actorDeviceId":f.alice.device_id.to_string(),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&public)),"authGeneration":1,"sendCounter":encrypted_requests::next_send_counter(),
             "prior":prior,"aad":aad,"applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication","bytes":STANDARD.encode(&ciphertext),"sha256":STANDARD.encode(Sha256::digest(&ciphertext))},
             "blobBindings":[],"signedAt":canonical_now()
         }),

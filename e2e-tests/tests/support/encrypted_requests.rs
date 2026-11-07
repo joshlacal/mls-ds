@@ -17,6 +17,13 @@ pub use request_migrations::{
     FEDERATION_CACHE_SCHEMA,
 };
 
+/// The next signed `sendCounter`: strictly increasing across this test binary,
+/// so every device's hand-built sends are ordered as they are built.
+pub fn next_send_counter() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader},

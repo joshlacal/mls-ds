@@ -106,6 +106,7 @@ fn map_failure(error: MessageDeliveryError) -> ChatFailure {
         MessageDeliveryError::InvalidApplicationMessage
         | MessageDeliveryError::BlobNotFound
         | MessageDeliveryError::BlobBindingConflict
+        | MessageDeliveryError::StaleSend
         | MessageDeliveryError::Invariant => ChatFailure::invariant(ENDPOINT),
     }
 }

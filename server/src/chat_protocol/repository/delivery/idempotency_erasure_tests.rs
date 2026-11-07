@@ -302,6 +302,45 @@ async fn an_ack_prune_erases_the_receipt_and_its_replay_returns_the_pruned_entry
     .await;
 }
 
+/// Seed 2323 through the real `sendMessage` route: a held send arriving after
+/// the same device's newer send is `StaleSend` (400) and writes nothing, while
+/// exact replays of the accepted sends still return their stored 200 replies.
+#[tokio::test]
+async fn a_late_send_is_stale_send_and_accepted_replays_still_succeed() {
+    let ds = ds().await;
+    as_ds(false, async {
+        let sent = send(&ds, 0x51).await;
+        let f = &sent.fixture;
+        let held = f.next_sender_signed_request();
+        let newer = f.next_sender_signed_request();
+        assert!(newer["body"]["sendCounter"].as_u64() > held["body"]["sendCounter"].as_u64());
+        let (status, accepted) = submit_signed(&ds, f, &newer).await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+
+        let entries = entry_count(&ds.pool, f.conversation_id).await;
+        let (status, refused) = submit_signed(&ds, f, &held).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["error"], "StaleSend", "{refused}");
+        assert_eq!(entry_count(&ds.pool, f.conversation_id).await, entries);
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM chat.message_sends WHERE conversation_id = $1 AND message_id = $2",
+        )
+        .bind(f.conversation_id)
+        .bind(Uuid::parse_str(held["body"]["messageId"].as_str().unwrap()).unwrap())
+        .fetch_one(&ds.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, 0, "a refused send retires nothing");
+
+        assert_eq!(submit(&ds, f).await, (StatusCode::OK, sent.reply.clone()));
+        assert_eq!(
+            submit_signed(&ds, f, &newer).await,
+            (StatusCode::OK, accepted)
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn the_30_day_sweep_erases_every_receipt_it_reaches() {
     let ds = ds().await;

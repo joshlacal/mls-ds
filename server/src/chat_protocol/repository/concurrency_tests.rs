@@ -426,6 +426,8 @@ fn coherent_application_send(base: &BaseConversation, salt: u8) -> ApplicationSe
         entry,
         signing_transcript_bytes: vec![salt ^ 0x5a; 8],
         outcome_bytes: vec![salt ^ 0x0f; 8],
+        epoch: 0,
+        send_counter: 1,
     }
 }
 
@@ -524,6 +526,22 @@ async fn two_terminal_authorities_on_one_work_row_serialize_to_one_winner() {
 async fn concurrent_application_appends_get_unique_contiguous_seqs() {
     let (pool, _database) = concurrency_db(4).await;
     let base = seed_base(&pool).await;
+    // This frozen clean-protocol schema predates the send-order table every
+    // first application resolution now advances.
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/20261107000001_application_send_order.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install the send-order table");
+    // Racer B signs as another device: one device's racing sends would turn
+    // this seq race into a send-order race (`application_send_order`).
+    let mut send_b = coherent_application_send(&base, 0x22);
+    (
+        send_b.entry.actor_did,
+        send_b.entry.actor_device_id,
+        send_b.entry.actor_key_id,
+    ) = seed_actor(&pool).await;
 
     let barrier = Arc::new(Barrier::new(2));
     let run = |barrier: Arc<Barrier>, pool: PgPool, send: ApplicationSend| async move {
@@ -541,20 +559,16 @@ async fn concurrent_application_appends_get_unique_contiguous_seqs() {
             pool.clone(),
             coherent_application_send(&base, 0x21)
         ),
-        run(
-            barrier.clone(),
-            pool.clone(),
-            coherent_application_send(&base, 0x22)
-        ),
+        run(barrier.clone(), pool.clone(), send_b),
     );
 
     let seq_a = match outcome_a {
         ApplicationSendOutcome::Accepted { seq } => seq,
-        ApplicationSendOutcome::Stale => panic!("send A must be accepted"),
+        other => panic!("send A must be accepted, got {other:?}"),
     };
     let seq_b = match outcome_b {
         ApplicationSendOutcome::Accepted { seq } => seq,
-        ApplicationSendOutcome::Stale => panic!("send B must be accepted"),
+        other => panic!("send B must be accepted, got {other:?}"),
     };
     assert_ne!(seq_a, seq_b, "concurrent appends never share a seq");
     let mut seqs = [seq_a, seq_b];

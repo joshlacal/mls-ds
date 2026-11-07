@@ -46,7 +46,7 @@ pub fn reviewed_baseline() -> [BaselineMigration; 14] {
     ]
 }
 
-pub fn reviewed_request_migrations() -> [BaselineMigration; 57] {
+pub fn reviewed_request_migrations() -> [BaselineMigration; 58] {
     [
         baseline!(20260919000001, "direct request preparation", "20260919000001_direct_request_preparation.sql", "d4d3527aa77b8fe91d8d754f72290b682571cc6731866d72c059f10d4b2f7cf8ef629069737addeedaabd6f6eee682ca"),
         baseline!(20260919000002, "direct request publication", "20260919000002_direct_request_publication.sql", "7fda0b09fcdef20e4da2e1701f6a56c12f636f7881b46e2f6e249cb0d5fc2aa63c734dc07cbb543169398253e29cec9e"),
@@ -105,6 +105,7 @@ pub fn reviewed_request_migrations() -> [BaselineMigration; 57] {
         baseline!(20261104000010, "wipe returns whole retained charge", "20261104000010_wipe_returns_whole_retained_charge.sql", "2683e751903eadd28ba7b7df9a2d43a7eb10c62fb5a6bf644582dcc92565ddca85b0cccd1e7efcefcbb7f9d2f3880a8b"),
         baseline!(20261104000011, "direct request route answers", "20261104000011_direct_request_route_answers.sql", "6a8bce9ce6af92567d62820ca40464860a14b56b47d72f91f51649b1e98ea095ce9ea233258b7cc7cbf26e379516617d"),
         baseline!(20261104000012, "postgres churn partitions", "20261104000012_postgres_churn_partitions.sql", "e9700954fc90dd3f99c47eb93eddac7f233e2e2f274f01882c49144b2c9d7499ac60e277f3629039019555c6df9aaa80"),
+        baseline!(20261107000001, "application send order", "20261107000001_application_send_order.sql", "0883b7dc68674afcaeaccc6f531a976d6a467eb61063478d07a8b9a6b3b4f1a8576269e3ffbad0a8e470a00e13c0e649"),
     ]
 }
 pub fn reviewed_auth_replay_prerequisite() -> BaselineMigration {
