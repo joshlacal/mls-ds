@@ -363,7 +363,13 @@ pub async fn resolve_application_send(
 
     match disposition {
         ApplicationSendDisposition::Accept => {
-            // The caller already holds the conversation head lock.
+            // Lock the head before the send-order upsert. Its foreign key takes KEY SHARE on
+            // this row, so two sends that each held KEY SHARE would deadlock upgrading to
+            // `append_entry`'s FOR UPDATE. A caller already holding the head re-locks for free.
+            sqlx::query("SELECT 1 FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE")
+                .bind(send.entry.conversation_id)
+                .execute(&mut **transaction)
+                .await?;
             if !advance_application_send_order(
                 transaction,
                 send.entry.conversation_id,
