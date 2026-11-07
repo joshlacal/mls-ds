@@ -486,6 +486,9 @@ async fn seed_clean_slate_application_fixture_inner(
     let supplemental_requests = |identity: &application_routing_fixture::FixtureIdentity,
                                  messages: &[(uuid::Uuid, Vec<u8>)]|
      -> Result<Vec<serde_json::Value>, String> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
         let commitment = archive_commitment
             .as_ref()
             .ok_or("supplemental application fixtures require an archive commitment")?;
