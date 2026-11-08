@@ -260,6 +260,29 @@ fn mint_service_jwt_es256(issuer_did: &str, key: &P256SigningKey, aud: &str, lxm
     let sig: Signature = key.sign(signing_input.as_bytes());
     format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
 }
+
+/// Claims of the authority's signed refusal in a 403 `getSpaceCredential` body, after its
+/// ES256 signature verified under the authority's `#atproto` key.
+fn verified_denial(body: &[u8], authority_key: &P256SigningKey) -> Value {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use p256::ecdsa::{signature::Verifier as _, Signature};
+    let body: Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(body["error"], "NotAuthorized");
+    let jws = body["denial"].as_str().expect("a signed denial");
+    let (input, signature) = jws.rsplit_once('.').unwrap();
+    let (header, claims) = input.split_once('.').unwrap();
+    let decode = |part: &str| URL_SAFE_NO_PAD.decode(part).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&decode(header)).unwrap(),
+        json!({"alg": "ES256", "typ": "catbird-space-denial+jwt", "kid": "#atproto"})
+    );
+    let signature = Signature::from_slice(&decode(signature)).unwrap();
+    authority_key
+        .verifying_key()
+        .verify(input.as_bytes(), &signature)
+        .expect("signed by the Space authority");
+    serde_json::from_slice(&decode(claims)).unwrap()
+}
 static SPACE_HOST_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
@@ -702,6 +725,32 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         charlie_after_resp.status(),
         StatusCode::FORBIDDEN,
         "removed member must be denied getSpaceCredential"
+    );
+    // The refusal is the authority's signed denial of exactly this request: Space, requester,
+    // conversation generation, MLS group and the request's PoP key, live for 60 s.
+    let group_id: Vec<u8> = sqlx::query_scalar(
+        "SELECT group_id FROM chat.generations WHERE conversation_id = $1 AND generation = 0",
+    )
+    .bind(fixture.conversation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let claims = verified_denial(
+        &axum::body::to_bytes(charlie_after_resp.into_body(), 65536)
+            .await
+            .unwrap(),
+        &authority_key,
+    );
+    let iat = claims["iat"].as_u64().unwrap();
+    assert!(claims["jti"].as_str().is_some_and(|jti| !jti.is_empty()));
+    assert_eq!(
+        claims,
+        json!({
+            "iss": authority_did, "sub": space_uri, "aud": charlie_did,
+            "iat": iat, "exp": iat + 60, "jti": claims["jti"], "cnf": {"kid": charlie_kid},
+            "conversationId": fixture.conversation_id, "generation": 0,
+            "groupId": hex::encode(group_id), "reason": "notActiveMember",
+        })
     );
 
     // Charlie's previously-minted credential MUST now fail with 401 CredentialRevoked on listRepos!

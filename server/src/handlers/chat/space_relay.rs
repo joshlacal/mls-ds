@@ -22,7 +22,8 @@ use super::{context, errors::ChatFailure, runtime::ChatRuntime};
 use crate::{
     chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode},
     federation::space_read_relay::{
-        relay_space_credential_stateless, relay_space_read_stateless, SpaceRelayError,
+        relay_space_credential_stateless, relay_space_read_stateless, RelayedCredentialOutput,
+        SpaceRelayError,
     },
     storage::DbPool,
 };
@@ -107,15 +108,35 @@ async fn relay_credential(
     )
     .await?;
 
-    let out = relay_space_credential_stateless(
-        input.authority_did.as_ref(),
-        input.space.as_ref(),
-        input.delegation_token.as_ref(),
-        input.cnf_key.as_ref(),
+    credential_relay_response(
+        relay_space_credential_stateless(
+            input.authority_did.as_ref(),
+            input.space.as_ref(),
+            input.delegation_token.as_ref(),
+            input.cnf_key.as_ref(),
+        )
+        .await,
     )
-    .await
-    .map_err(credential_relay_failure)?;
+}
 
+/// What the client receives: the authority-verified credential, the authority's signed
+/// refusal byte for byte (only that signature, which the client verifies, makes a refusal
+/// removal proof), or a declared failure.
+fn credential_relay_response(
+    relayed: Result<RelayedCredentialOutput, SpaceRelayError>,
+) -> Result<Response, ChatFailure> {
+    let out = match relayed {
+        Ok(out) => out,
+        Err(SpaceRelayError::Forbidden(body)) if is_signed_refusal(&body) => {
+            return Ok((
+                StatusCode::FORBIDDEN,
+                [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+                body,
+            )
+                .into_response());
+        }
+        Err(error) => return Err(credential_relay_failure(error)),
+    };
     let response_bytes = serde_json::to_vec(&json!({
         "credential": out.credential,
         "expiresAt": out.expires_at,
@@ -124,8 +145,14 @@ async fn relay_credential(
     context::canonical_json_response(CREDENTIAL_ENDPOINT, 200, response_bytes)
 }
 
-/// The authority's denial reaches the client with its status: 401 rejects the
-/// delegation token, 403 refuses an authenticated caller (e.g. a removed member).
+/// An authority refusal under the declared `NotAuthorized` that carries a signed `denial`.
+fn is_signed_refusal(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .is_ok_and(|refusal| refusal["error"] == "NotAuthorized" && refusal["denial"].is_string())
+}
+
+/// The authority's refusal reaches the client with its status: 401 rejects the delegation
+/// token, 403 refuses an authenticated caller; unsigned, a 403 proves no removal.
 fn credential_relay_failure(err: SpaceRelayError) -> ChatFailure {
     match err {
         SpaceRelayError::InvalidTargetEndpoint(_) => ChatFailure::protocol(
@@ -295,6 +322,66 @@ mod tests {
             )
             .unwrap();
             assert_eq!(body["error"], error, "{upstream_error}");
+        }
+        server.abort();
+    }
+
+    /// The authority's signed refusal reaches the client byte for byte (no re-encoding the
+    /// client's signature check would depend on); an unsigned one stays the relay's own
+    /// `NotAuthorized`, which proves nothing.
+    #[tokio::test]
+    async fn signed_authority_refusals_cross_the_credential_relay_byte_for_byte() {
+        let authority = "did:web:credential-relay-signed-denial.example";
+        let space = format!("at://{authority}/space/blue.catbird.labyrinth.conversation/c-0");
+        let pop = p256::SecretKey::from_slice(&[0x32; 32]).unwrap();
+        let kid = atproto_spaces::kem::encode_p256_did_key(&pop.public_key());
+        // Field order and spacing no serializer here would produce.
+        let signed: &[u8] =
+            br#"{ "message":"not an active member" , "denial":"h.p.s","error":"NotAuthorized"}"#;
+        let upstream = Arc::new(Mutex::new(signed.to_vec()));
+        let router = Router::new().route(
+            "/xrpc/com.atproto.space.getSpaceCredential",
+            post({
+                let upstream = upstream.clone();
+                move || {
+                    let body = upstream.lock().unwrap().clone();
+                    async move { (StatusCode::FORBIDDEN, body) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        register_test_space_relay_target(
+            authority,
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let relayed = || async {
+            let response = match credential_relay_response(
+                relay_space_credential_stateless(authority, &space, "dt", &kid).await,
+            ) {
+                Ok(response) => response,
+                Err(failure) => failure.into_response(),
+            };
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+            axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap()
+        };
+        assert_eq!(relayed().await.as_ref(), signed);
+
+        for unsigned in [
+            br#"{"error":"NotAuthorized","message":"not an active member"}"#.as_slice(),
+            br#"{"error":"Forbidden","denial":"h.p.s"}"#,
+            br#"{"error":"NotAuthorized","denial":7}"#,
+            b"not json",
+        ] {
+            *upstream.lock().unwrap() = unsigned.to_vec();
+            let body = relayed().await;
+            assert_ne!(body.as_ref(), unsigned);
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "NotAuthorized");
+            assert!(body.get("denial").is_none(), "{body}");
         }
         server.abort();
     }

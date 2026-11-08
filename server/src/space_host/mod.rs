@@ -45,6 +45,14 @@ use crate::{push_gateway::ssrf::validate_https_url_with_resolver, storage::DbPoo
 
 pub use handlers::space_host_router;
 
+/// JOSE `typ` of the authority's signed refusal of a Space credential. It names a token the
+/// same `#atproto` key signs for no other purpose (credentials, service auth).
+pub const SPACE_DENIAL_JWT_TYP: &str = "catbird-space-denial+jwt";
+/// The one refusal the authority signs: the requester is not an active member of the Space.
+pub const SPACE_DENIAL_REASON: &str = "notActiveMember";
+/// A refusal answers one credential request and is removal proof only this long.
+pub const SPACE_DENIAL_LIFETIME_SECS: u64 = 60;
+
 #[derive(Debug, Clone)]
 pub struct SpaceHostConfig {
     pub authority_did: String,
@@ -206,18 +214,62 @@ impl SpaceHostRuntime {
             b"space_host.service_jwt",
             &[aud.as_bytes(), lxm.as_bytes()],
         );
-        let header = URL_SAFE_NO_PAD.encode(br##"{"alg":"ES256","typ":"JWT","kid":"#atproto"}"##);
-        let claims = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&json!({
+        self.sign_compact_jws(
+            r##"{"alg":"ES256","typ":"JWT","kid":"#atproto"}"##,
+            &json!({
                 "iss": self.config.authority_did,
                 "aud": aud,
                 "lxm": lxm,
                 "iat": now,
                 "exp": now + 60,
                 "jti": jti.to_string(),
-            }))
-            .map_err(|e| e.to_string())?,
+            }),
+        )
+    }
+
+    /// Sign the refusal of one credential request: `requester` is not an active member of
+    /// `space_uri` (conversation `conversation_id`, `generation`, MLS `group_id`). `cnf.kid` is
+    /// the request's fresh proof-of-possession key, so the refusal answers that request only.
+    pub(crate) fn mint_space_denial(
+        &self,
+        space_uri: &str,
+        requester: &str,
+        credential_kid: &str,
+        coordinates: (uuid::Uuid, i64, &[u8]),
+        now_sec: u64,
+    ) -> Result<String, String> {
+        let (conversation_id, generation, group_id) = coordinates;
+        let jti = crate::sim_hooks::mint_outbound_jti_uuid_v4(
+            b"space_host.denial",
+            &[
+                self.authority_did().as_bytes(),
+                space_uri.as_bytes(),
+                requester.as_bytes(),
+                credential_kid.as_bytes(),
+            ],
         );
+        self.sign_compact_jws(
+            &format!(r##"{{"alg":"ES256","typ":"{SPACE_DENIAL_JWT_TYP}","kid":"#atproto"}}"##),
+            &json!({
+                "iss": self.authority_did(),
+                "sub": space_uri,
+                "aud": requester,
+                "iat": now_sec,
+                "exp": now_sec + SPACE_DENIAL_LIFETIME_SECS,
+                "jti": jti.to_string(),
+                "cnf": { "kid": credential_kid },
+                "conversationId": conversation_id,
+                "generation": generation,
+                "groupId": hex::encode(group_id),
+                "reason": SPACE_DENIAL_REASON,
+            }),
+        )
+    }
+
+    /// Compact low-S ES256 JWS of `header` (exact JSON) and `claims` under the `#atproto` key.
+    fn sign_compact_jws(&self, header: &str, claims: &Value) -> Result<String, String> {
+        let header = URL_SAFE_NO_PAD.encode(header);
+        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).map_err(|e| e.to_string())?);
         let signing_input = format!("{header}.{claims}");
         let sig: Signature = self.config.signing_key.sign(signing_input.as_bytes());
         let norm = sig.normalize_s().unwrap_or(sig);

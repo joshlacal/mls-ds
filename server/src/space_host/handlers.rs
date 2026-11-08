@@ -98,6 +98,8 @@ pub fn space_host_router(runtime: Arc<SpaceHostRuntime>) -> Router {
 pub(crate) struct SpaceStatusRow {
     pub conversation_id: Uuid,
     pub generation: i64,
+    /// The MLS group of `generation`, bound into a signed membership refusal.
+    pub group_id: Vec<u8>,
     pub authority_did: String,
     pub latest_space_rev: Option<String>,
     pub deleted_at: Option<chrono::DateTime<Utc>>,
@@ -123,6 +125,7 @@ pub(crate) async fn load_active_space_status(
     let row: Option<SpaceStatusRow> = sqlx::query_as(
         "SELECT cs.conversation_id, \
                 cs.generation, \
+                g.group_id, \
                 cs.authority_did, \
                 cs.latest_space_rev, \
                 cs.deleted_at, \
@@ -507,15 +510,35 @@ async fn get_space_credential(
         );
     }
 
-    // Active member check (excludes pending C33 direct-request targets, left, and removed members)
+    // Active member check (excludes pending C33 direct-request targets, left, and removed members).
+    // The refusal is signed: relayed through another home, only the authority's signature makes
+    // it the removal proof a fresh device needs before it restores owner-only history.
     match is_active_space_member(runtime.pool(), status.conversation_id, &del_claims.iss).await {
         Ok(true) => {}
         Ok(false) => {
-            return xrpc_err(
-                StatusCode::FORBIDDEN,
-                "Forbidden",
-                "requester is not an active member of this conversation Space",
+            let coordinates = (
+                status.conversation_id,
+                status.generation,
+                status.group_id.as_slice(),
             );
+            return match runtime.mint_space_denial(
+                space_uri,
+                &del_claims.iss,
+                credential_kid,
+                coordinates,
+                now_sec,
+            ) {
+                Ok(denial) => (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "NotAuthorized",
+                        "message": "requester is not an active member of this conversation Space",
+                        "denial": denial,
+                    })),
+                )
+                    .into_response(),
+                Err(e) => xrpc_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e),
+            };
         }
         Err(resp) => return resp,
     }

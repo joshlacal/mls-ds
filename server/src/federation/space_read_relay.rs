@@ -12,7 +12,9 @@
 //!
 //! Credential exchange uses standard POST JSON (never a delegation token in the URL).
 //! The home response's `expiresAt` comes from the authority-signed credential after exact
-//! issuer, Space, PoP-key, and current scoped-clock expiry checks.
+//! issuer, Space, PoP-key, and current scoped-clock expiry checks. The authority's signed
+//! refusal (403 `NotAuthorized` carrying `denial`) reaches the client byte for byte; only the
+//! client's check of that signature makes a refusal removal proof.
 
 use std::{collections::HashMap, net::SocketAddr, sync::RwLock, time::Duration};
 
@@ -92,9 +94,10 @@ pub enum SpaceRelayError {
     InvalidTargetEndpoint(String),
     #[error("invalid delegation token rejected upstream: {0}")]
     InvalidDelegationToken(String),
-    /// The Space authority authenticated the request and denied it (HTTP 403).
-    #[error("Space authority denied the credential: {0}")]
-    Forbidden(String),
+    /// The Space authority authenticated the request and denied it (HTTP 403): its exact
+    /// response body, which a signed refusal must reach the client in unchanged.
+    #[error("Space authority denied the credential")]
+    Forbidden(bytes::Bytes),
     /// The target answered definitively but unusably (4xx, malformed or
     /// unverifiable response).
     #[error("upstream Space endpoint error: {0}")]
@@ -435,7 +438,8 @@ pub async fn relay_space_credential_stateless(
             } else if status == reqwest::StatusCode::UNAUTHORIZED {
                 SpaceRelayError::InvalidDelegationToken(reason)
             } else if status == reqwest::StatusCode::FORBIDDEN {
-                SpaceRelayError::Forbidden(reason)
+                // An unreadable refusal carries no signature the client could verify.
+                SpaceRelayError::Forbidden(bytes::Bytes::new())
             } else {
                 SpaceRelayError::UpstreamError(reason)
             }
@@ -447,9 +451,7 @@ pub async fn relay_space_credential_stateless(
         ));
     }
     if status == reqwest::StatusCode::FORBIDDEN {
-        return Err(SpaceRelayError::Forbidden(
-            String::from_utf8_lossy(&bytes).into_owned(),
-        ));
+        return Err(SpaceRelayError::Forbidden(bytes));
     }
     if !status.is_success() {
         let reason = format!(
