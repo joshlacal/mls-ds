@@ -83,7 +83,7 @@ jobs:
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
           git -C ../catbird-atproto checkout --detach 49c6fdb00671ffe96e58e3b5ebec7d5e6532f51f
           git clone --filter=blob:none https://github.com/joshlacal/catbird-mls.git ../catbird-mls
-          git -C ../catbird-mls checkout --detach c045032d42a7a68f320a3bc8f2162e503cab5645
+          git -C ../catbird-mls checkout --detach 85d25801a538d82c85d11213d4aafaef213afa58
           git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
           git -C ../labyrinth checkout --detach f771b9c26558ce6a39ed87c657dc8bd6e331d94a
 
