@@ -124,6 +124,7 @@ Two-home end-to-end suite, from the repository root (`e2e-tests` is outside the 
 ```sh
 cargo build --locked --manifest-path server/Cargo.toml --features test-support --bin clean_slate_federation_fixture
 cargo test --manifest-path e2e-tests/Cargo.toml --features labyrinth --test federation_spaces_full_cutover
+cargo test --manifest-path e2e-tests/Cargo.toml --features labyrinth --test space_denial_two_home_live
 ```
 
 It runs two `clean_slate_federation_fixture` processes from `target/debug/`, each over a fresh `clean_slate_fed_<hex>` database on `127.0.0.1:5432` (admin URL `CLEAN_SLATE_PG_ADMIN_URL`, default `postgresql://127.0.0.1:5432/postgres`), with loopback mock PDSes and a mock Push Gateway. The ignored Docker lifecycle test uses `e2e-tests/docker-compose.federation.yml` and the same deterministic `did:web` DS1 plus `did:plc` DS2 identity pair as the root local stack. It loads each service-auth and dedicated `#mls-receipt-1` key from its committed test fixture, resolves every DID and each user's DID-advertised PDS declaration through the loopback HTTPS fixture, leaves DS2 unprovisioned until the authenticated `deliverWelcome` worker fetches and binds the exact Direct prefix, verifies the signed `deliverWelcome`, `deliverMessage` and `submitCommit` receipt bodies and signer audiences, and requires `down --volumes` to leave no project container or volume:
