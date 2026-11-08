@@ -236,10 +236,41 @@ pub struct CleanSlateApplicationFixture {
     pub recipient_key_id: String,
     pub recipient_ed25519_seed: [u8; 32],
     pub signed_request: serde_json::Value,
+    pub self_update_signed_request: serde_json::Value,
+    pub peer_self_update_signed_request: serde_json::Value,
+    pub post_update_signed_request: serde_json::Value,
     sender_signed_requests: Vec<serde_json::Value>,
     recipient_signed_requests: Vec<serde_json::Value>,
     sender_request_index: std::sync::atomic::AtomicUsize,
     recipient_request_index: std::sync::atomic::AtomicUsize,
+}
+
+pub struct GenuineRecoveryRelayFixture {
+    pub conversation_id: uuid::Uuid,
+    pub requester_did: String,
+    pub requester_device_id: uuid::Uuid,
+    pub requester_key_id: String,
+    pub requester_ed25519_seed: [u8; 32],
+    pub fulfiller_did: String,
+    pub fulfiller_device_id: uuid::Uuid,
+    pub fulfiller_key_id: String,
+    pub fulfiller_ed25519_seed: [u8; 32],
+    pub request: serde_json::Value,
+    pub fulfillment: serde_json::Value,
+}
+
+pub struct GenuineLeaflessGroupRelayFixture {
+    pub conversation_id: uuid::Uuid,
+    pub entry_count: usize,
+    pub prior: serde_json::Value,
+    pub admin_did: String,
+    pub admin_device_id: uuid::Uuid,
+    pub admin_key_id: String,
+    pub admin_ed25519_seed: [u8; 32],
+    pub departing_did: Option<String>,
+    pub departing_device_id: Option<uuid::Uuid>,
+    pub departing_key_id: Option<String>,
+    pub departing_ed25519_seed: Option<[u8; 32]>,
 }
 
 impl CleanSlateApplicationFixture {
@@ -343,6 +374,208 @@ pub async fn seed_remote_clean_slate_application_fixture(
         true,
     )
     .await
+}
+
+pub async fn seed_genuine_recovery_relay_fixture(
+    pool: &sqlx::PgPool,
+    home_did: &str,
+) -> Result<GenuineRecoveryRelayFixture, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use sha2::{Digest as _, Sha256};
+
+    let at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let trusted =
+        super::validation::TrustedRequestInstant::from_datetime(at - chrono::Duration::seconds(2))
+            .map_err(|error| format!("recovery relay fixture instant: {error:?}"))?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let requester = application_routing_fixture::FixtureIdentity::fresh_for_did(
+        &format!("did:web:recovery-requester-{suffix}.example.com"),
+        b"recovery-relay-requester",
+    )?;
+    let fulfiller = application_routing_fixture::FixtureIdentity::fresh_for_did(
+        &format!("did:web:recovery-fulfiller-{suffix}.example.com"),
+        b"recovery-relay-fulfiller",
+    )?;
+    let transition_id = uuid::Uuid::new_v4();
+    let fixture =
+        application_routing_fixture::seed_remote_home_recovery_fulfillment_fixture_for_identities(
+            pool,
+            &trusted,
+            requester,
+            fulfiller,
+            transition_id,
+            home_did,
+        )
+        .await?;
+    let request_id = uuid::Uuid::new_v4();
+    let request = application_routing_fixture::leaf_recovery_request(
+        &fixture.requester,
+        request_id,
+        application_routing_fixture::coordinate_json(&fixture.prior),
+        trusted.as_str(),
+    )?;
+    let welcome_id = uuid::Uuid::new_v4();
+    let metadata_ciphertext = vec![0x64_u8; 16];
+    let prior = &fixture.prior;
+    let next = fixture.next.coordinate();
+    let requester = &fixture.requester;
+    let body = serde_json::json!({
+        "recoveryRequestId": request_id,
+        "transitionId": transition_id,
+        "prior": application_routing_fixture::coordinate_json(prior),
+        "next": application_routing_fixture::coordinate_json(next),
+        "aad": {
+            "protocolVersion": "1",
+            "conversationId": STANDARD.encode(fixture.conversation_id.as_bytes()),
+            "generation": prior.generation(),
+            "transitionId": STANDARD.encode(transition_id.as_bytes()),
+            "prior": {
+                "conversationId": STANDARD.encode(fixture.conversation_id.as_bytes()),
+                "generation": prior.generation(),
+                "stateVersion": prior.state_version(),
+                "groupId": STANDARD.encode(prior.group_id()),
+                "epoch": prior.epoch(),
+                "groupContextHash": STANDARD.encode(prior.group_context_hash()),
+                "confirmationTag": STANDARD.encode(prior.confirmation_tag()),
+                "lifecycle": "active",
+            },
+        },
+        "manifest": {
+            "participantChanges": [],
+            "leafChanges": [{
+                "$type": "blue.catbird.chat.defs#removeLeaf",
+                "userDid": requester.did,
+                "deviceId": requester.device_id,
+            }, {
+                "$type": "blue.catbird.chat.defs#addLeafByRecovery",
+                "userDid": requester.did,
+                "deviceId": requester.device_id,
+                "recoveryRequestId": request_id,
+                "keyPackageRef": STANDARD.encode(fixture.requester_key_package_ref),
+            }],
+            "leafRecoveryRequestId": request_id,
+            "welcomeBundle": {
+                "welcomeId": welcome_id,
+                "framing": "mlsMessage",
+                "contentType": "welcome",
+                "opaqueWelcome": STANDARD.encode(&fixture.welcome),
+                "sha256": STANDARD.encode(Sha256::digest(&fixture.welcome)),
+                "deliveries": [{
+                    "recipientDid": requester.did,
+                    "recipientDeviceId": requester.device_id,
+                    "provenance": {
+                        "recoveryRequestId": request_id,
+                        "keyPackageRef": STANDARD.encode(fixture.requester_key_package_ref),
+                    },
+                }],
+            },
+        },
+        "commit": {
+            "framing": "mlsMessage",
+            "contentType": "publicMessageCommit",
+            "bytes": STANDARD.encode(&fixture.commit),
+            "sha256": STANDARD.encode(Sha256::digest(&fixture.commit)),
+        },
+        "metadataSnapshot": {
+            "coordinate": {
+                "conversationId": STANDARD.encode(fixture.conversation_id.as_bytes()),
+                "generation": next.generation(),
+                "groupId": STANDARD.encode(next.group_id()),
+                "epoch": next.epoch(),
+                "groupContextHash": STANDARD.encode(next.group_context_hash()),
+                "confirmationTag": STANDARD.encode(next.confirmation_tag()),
+            },
+            "originTransitionId": fixture.creation_transition_id,
+            "metadataVersion": 1,
+            "nonce": STANDARD.encode([0x63_u8; 12]),
+            "ciphertext": STANDARD.encode(&metadata_ciphertext),
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(&metadata_ciphertext)),
+            "ciphertextSize": metadata_ciphertext.len(),
+            "authorProof": {
+                "authorDid": requester.did,
+                "authorDeviceId": requester.device_id,
+                "authorKeyId": requester.key_id,
+                "signaturePublicKey": STANDARD.encode(requester.signing_public_key()),
+                "authGenerationAtOrigin": 1,
+                "originTransitionId": fixture.creation_transition_id,
+                "originSeq": 1,
+                "roleAtOrigin": "admin",
+                "deviceStatusAtOrigin": "active",
+            },
+        },
+        "idempotencyKey": transition_id,
+        "signedAt": trusted.as_str(),
+    });
+    let fulfillment =
+        application_routing_fixture::leaf_recovery_fulfillment(&fixture.fulfiller, body)?;
+    Ok(GenuineRecoveryRelayFixture {
+        conversation_id: fixture.conversation_id,
+        requester_did: fixture.requester.did.clone(),
+        requester_device_id: fixture.requester.device_id,
+        requester_key_id: fixture.requester.key_id.clone(),
+        requester_ed25519_seed: fixture.requester.signing_key.to_bytes(),
+        fulfiller_did: fixture.fulfiller.did.clone(),
+        fulfiller_device_id: fixture.fulfiller.device_id,
+        fulfiller_key_id: fixture.fulfiller.key_id.clone(),
+        fulfiller_ed25519_seed: fixture.fulfiller.signing_key.to_bytes(),
+        request: serde_json::from_slice(&request.raw_wrapper).map_err(|error| error.to_string())?,
+        fulfillment: serde_json::from_slice(&fulfillment.raw_wrapper)
+            .map_err(|error| error.to_string())?,
+    })
+}
+
+pub async fn seed_genuine_leafless_group_relay_fixture(
+    pool: &sqlx::PgPool,
+    home_did: &str,
+    with_departing: bool,
+    accept_departing: bool,
+) -> Result<GenuineLeaflessGroupRelayFixture, String> {
+    let at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let trusted =
+        super::validation::TrustedRequestInstant::from_datetime(at - chrono::Duration::seconds(2))
+            .map_err(|error| format!("leafless relay fixture instant: {error:?}"))?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let admin = application_routing_fixture::FixtureIdentity::fresh_for_did(
+        &format!("did:web:leafless-admin-{suffix}.example.com"),
+        b"leafless-relay-admin",
+    )?;
+    let departing = if with_departing {
+        Some(application_routing_fixture::FixtureIdentity::fresh_for_did(
+            &format!("did:web:leafless-departing-{suffix}.example.com"),
+            b"leafless-relay-departing",
+        )?)
+    } else {
+        None
+    };
+    let fixture = application_routing_fixture::seed_remote_home_leafless_group_fixture(
+        pool,
+        &trusted,
+        admin,
+        departing,
+        accept_departing,
+        home_did,
+    )
+    .await?;
+    Ok(GenuineLeaflessGroupRelayFixture {
+        conversation_id: fixture.conversation_id,
+        entry_count: usize::try_from(fixture.entry_count)
+            .map_err(|_| "leafless entry count overflow".to_owned())?,
+        prior: application_routing_fixture::coordinate_json(&fixture.prior),
+        admin_did: fixture.admin.did.clone(),
+        admin_device_id: fixture.admin.device_id,
+        admin_key_id: fixture.admin.key_id.clone(),
+        admin_ed25519_seed: fixture.admin.signing_key.to_bytes(),
+        departing_did: fixture.departing.as_ref().map(|d| d.did.clone()),
+        departing_device_id: fixture.departing.as_ref().map(|d| d.device_id),
+        departing_key_id: fixture.departing.as_ref().map(|d| d.key_id.clone()),
+        departing_ed25519_seed: fixture.departing.as_ref().map(|d| d.signing_key.to_bytes()),
+    })
 }
 
 async fn seed_clean_slate_application_fixture_inner(
@@ -542,6 +775,137 @@ async fn seed_clean_slate_application_fixture_inner(
         1,
     )?;
 
+    let (origin_transition_id, metadata_version, prior_metadata_ciphertext): (
+        uuid::Uuid,
+        i64,
+        Vec<u8>,
+    ) = sqlx::query_as(
+        "SELECT origin_transition_id,metadata_version,ciphertext \
+           FROM chat.metadata_snapshots \
+          WHERE conversation_id=$1 ORDER BY generation DESC,state_version DESC LIMIT 1",
+    )
+    .bind(fixture.conversation_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("read clean-slate metadata snapshot: {error}"))?;
+    let metadata_nonce = [0x7c_u8; 12];
+    let metadata_ciphertext = vec![0x7d_u8; prior_metadata_ciphertext.len()];
+    let prior = &fixture.prior;
+    let signed_self_update = |actor: &application_routing_fixture::FixtureIdentity,
+                              transition_id: uuid::Uuid,
+                              commit: &[u8],
+                              next: &super::snapshot::PublicGroupSnapshotCoordinate|
+     -> Result<serde_json::Value, String> {
+        let mut aad_prior = application_routing_fixture::coordinate_json(prior);
+        aad_prior["conversationId"] = serde_json::json!(STANDARD.encode(prior.conversation_id()));
+        let aad = serde_json::json!({
+            "protocolVersion": "1",
+            "conversationId": STANDARD.encode(prior.conversation_id()),
+            "generation": prior.generation(),
+            "transitionId": STANDARD.encode(transition_id.as_bytes()),
+            "prior": aad_prior,
+        });
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#commitTransitionBody",
+            "signatureDomain": "CATBIRD-CHAT-COMMIT\u{0000}",
+            "transitionId": transition_id,
+            "idempotencyKey": transition_id,
+            "actorDid": actor.did,
+            "actorDeviceId": actor.device_id,
+            "keyId": actor.key_id,
+            "authGeneration": 1,
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            "prior": application_routing_fixture::coordinate_json(prior),
+            "next": application_routing_fixture::coordinate_json(next),
+            "aad": aad,
+            "manifest": {
+                "participantChanges": [],
+                "leafChanges": [],
+            },
+            "commit": {
+                "framing": "mlsMessage",
+                "contentType": "publicMessageCommit",
+                "bytes": STANDARD.encode(commit),
+                "sha256": STANDARD.encode(Sha256::digest(commit)),
+            },
+            "metadataSnapshot": {
+                "coordinate": {
+                    "conversationId": STANDARD.encode(next.conversation_id()),
+                    "generation": next.generation(),
+                    "groupId": STANDARD.encode(next.group_id()),
+                    "epoch": next.epoch(),
+                    "groupContextHash": STANDARD.encode(next.group_context_hash()),
+                    "confirmationTag": STANDARD.encode(next.confirmation_tag()),
+                },
+                "originTransitionId": origin_transition_id,
+                "metadataVersion": metadata_version,
+                "nonce": STANDARD.encode(&metadata_nonce),
+                "ciphertext": STANDARD.encode(&metadata_ciphertext),
+                "ciphertextSha256": STANDARD.encode(Sha256::digest(&metadata_ciphertext)),
+                "ciphertextSize": metadata_ciphertext.len(),
+                "authorProof": {
+                    "authorDid": fixture.requester.did,
+                    "authorDeviceId": fixture.requester.device_id,
+                    "authorKeyId": fixture.requester.key_id,
+                    "signaturePublicKey": STANDARD.encode(fixture.requester.signing_public_key()),
+                    "authGenerationAtOrigin": 1,
+                    "originTransitionId": origin_transition_id,
+                    "originSeq": 1,
+                    "roleAtOrigin": "admin",
+                    "deviceStatusAtOrigin": "active",
+                },
+            },
+        });
+        sign_mutation_json_for_test(&body, &actor.signing_key)
+    };
+    let next = fixture.self_update_next.coordinate();
+    let self_update_signed_request = signed_self_update(
+        &fixture.requester,
+        fixture.self_update_transition_id,
+        &fixture.self_update_commit,
+        next,
+    )?;
+    let peer_self_update_signed_request = signed_self_update(
+        &fixture.fulfiller,
+        fixture.peer_self_update_transition_id,
+        &fixture.peer_self_update_commit,
+        fixture.peer_self_update_next.coordinate(),
+    )?;
+    let post_update_aad = match archive_commitment.as_ref() {
+        Some(commitment) => application_routing_fixture::application_routing_aad_with_commitment(
+            next,
+            fixture.post_update_message_id,
+            commitment,
+            &fixture.requester,
+        ),
+        None => application_routing_fixture::application_routing_aad(
+            next,
+            fixture.post_update_message_id,
+        ),
+    };
+    let post_update_body = serde_json::json!({
+        "$type": "blue.catbird.chat.defs#applicationSendBody",
+        "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0000}",
+        "messageId": fixture.post_update_message_id,
+        "actorDid": fixture.requester.did,
+        "actorDeviceId": fixture.requester.device_id,
+        "keyId": fixture.requester.key_id,
+        "authGeneration": 1,
+        "sendCounter": 2,
+        "prior": application_routing_fixture::coordinate_json(next),
+        "signedAt": chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "blobBindings": [],
+        "aad": post_update_aad,
+        "applicationMessage": {
+            "framing": "mlsMessage",
+            "contentType": "privateMessageApplication",
+            "bytes": STANDARD.encode(&fixture.post_update_application_message),
+            "sha256": STANDARD.encode(Sha256::digest(&fixture.post_update_application_message)),
+        },
+    });
+    let post_update_signed_request =
+        sign_mutation_json_for_test(&post_update_body, &fixture.requester.signing_key)?;
+
     Ok(CleanSlateApplicationFixture {
         conversation_id: fixture.conversation_id,
         message_id,
@@ -554,6 +918,9 @@ async fn seed_clean_slate_application_fixture_inner(
         recipient_key_id: fixture.fulfiller.key_id,
         recipient_ed25519_seed: fixture.fulfiller.signing_key.to_bytes(),
         signed_request: wrapper,
+        self_update_signed_request,
+        peer_self_update_signed_request,
+        post_update_signed_request,
         sender_signed_requests,
         recipient_signed_requests,
         sender_request_index: std::sync::atomic::AtomicUsize::new(0),
@@ -2491,6 +2858,7 @@ pub async fn execute_creation_with_routing_test(
         transaction,
         prepared,
         runtime.relationship_authority().as_ref(),
+        runtime.i13_receipt_signer(),
         routing,
     )
     .await
@@ -2728,7 +3096,32 @@ pub async fn seed_deterministic_pending_add_fallback(
 /// would. `requestLeafRecovery` consumes it for 60 seconds.
 pub async fn seed_deterministic_recovery_reservation_fallback(
     pool: &PgPool,
+    roster: Vec<String>,
+) -> Result<(), String> {
+    seed_deterministic_recovery_fallback(
+        pool,
+        roster,
+        ProjectionOperationScope::RecoveryReservation,
+    )
+    .await
+}
+
+pub async fn seed_deterministic_recovery_fulfillment_fallback(
+    pool: &PgPool,
+    roster: Vec<String>,
+) -> Result<(), String> {
+    seed_deterministic_recovery_fallback(
+        pool,
+        roster,
+        ProjectionOperationScope::RecoveryFulfillment,
+    )
+    .await
+}
+
+async fn seed_deterministic_recovery_fallback(
+    pool: &PgPool,
     mut roster: Vec<String>,
+    scope: ProjectionOperationScope,
 ) -> Result<(), String> {
     let rel_authority = RelationshipAuthority::new(
         fixed_production_relationship_policy_config()
@@ -2750,12 +3143,7 @@ pub async fn seed_deterministic_recovery_reservation_fallback(
         .await
         .map_err(|e| format!("anchor projection clock: {e}"))?;
     let live_rel = rel_authority
-        .collect_block_projection(
-            &clock,
-            live_allocation,
-            ProjectionOperationScope::RecoveryReservation,
-            roster,
-        )
+        .collect_block_projection(&clock, live_allocation, scope, roster)
         .await
         .map_err(|e| format!("collect block projection: {e:?}"))?;
     let observation = observe_relationship_persistence(&clock);
@@ -2779,6 +3167,54 @@ pub fn sign_reset_activation_for_test(
     reset_request_id: uuid::Uuid,
     prior: &serde_json::Value,
     participants: serde_json::Value,
+    origin_seq: u64,
+    actor_did: &str,
+    actor_device_id: uuid::Uuid,
+    actor_key_id: &str,
+    actor_seed: [u8; 32],
+) -> Result<serde_json::Value, String> {
+    sign_reset_activation_for_test_kind(
+        "group",
+        reset_request_id,
+        prior,
+        participants,
+        origin_seq,
+        actor_did,
+        actor_device_id,
+        actor_key_id,
+        actor_seed,
+    )
+}
+
+pub fn sign_direct_reset_activation_for_test(
+    reset_request_id: uuid::Uuid,
+    prior: &serde_json::Value,
+    participants: serde_json::Value,
+    origin_seq: u64,
+    actor_did: &str,
+    actor_device_id: uuid::Uuid,
+    actor_key_id: &str,
+    actor_seed: [u8; 32],
+) -> Result<serde_json::Value, String> {
+    sign_reset_activation_for_test_kind(
+        "direct",
+        reset_request_id,
+        prior,
+        participants,
+        origin_seq,
+        actor_did,
+        actor_device_id,
+        actor_key_id,
+        actor_seed,
+    )
+}
+
+fn sign_reset_activation_for_test_kind(
+    conversation_kind: &str,
+    reset_request_id: uuid::Uuid,
+    prior: &serde_json::Value,
+    participants: serde_json::Value,
+    origin_seq: u64,
     actor_did: &str,
     actor_device_id: uuid::Uuid,
     actor_key_id: &str,
@@ -2821,7 +3257,7 @@ pub fn sign_reset_activation_for_test(
         "signatureDomain": "CATBIRD-CHAT-RESET-ACTIVATE\u{0000}",
         "resetRequestId": reset_request_id,
         "transitionId": transition_id,
-        "conversationKind": "group",
+        "conversationKind": conversation_kind,
         "actorDid": actor_did,
         "actorDeviceId": actor_device_id,
         "keyId": actor_key_id,
@@ -2874,7 +3310,7 @@ pub fn sign_reset_activation_for_test(
                 "signaturePublicKey": STANDARD.encode(signing_key.verifying_key().to_bytes()),
                 "authGenerationAtOrigin": 1,
                 "originTransitionId": transition_id,
-                "originSeq": 1,
+                "originSeq": origin_seq,
                 "roleAtOrigin": "admin",
                 "deviceStatusAtOrigin": "active",
             },

@@ -67,6 +67,7 @@ fn mf11_client_and_s2s_artifact_routes_enforce_symmetric_16_mib_body_limits() {
         "/xrpc/blue.catbird.mlsDS.relaySendMessage",
         "/xrpc/blue.catbird.mlsDS.deliverMessageEntry",
         "/xrpc/blue.catbird.mlsDS.relayGroupMutation",
+        "/xrpc/blue.catbird.mlsDS.deliverTransportControlEntry",
     ] {
         assert_eq!(
             request_body_limit(route),
@@ -714,6 +715,7 @@ async fn r4_non_admin_reset_activation_is_admin_required_without_any_effect() {
         reset_request_id,
         &prior,
         json!(participants),
+        1,
         &fixture.recipient_did,
         fixture.recipient_device_id,
         &fixture.recipient_key_id,
@@ -759,6 +761,147 @@ async fn r4_non_admin_reset_activation_is_admin_required_without_any_effect() {
     );
 }
 
+#[tokio::test]
+async fn reset_request_and_activation_with_i13_replay_byte_identically() {
+    std::env::set_var("SERVICE_DID", "did:web:chat.catbird.blue");
+    std::env::set_var("SELF_ENDPOINT", "https://chat.catbird.blue");
+
+    let db = common::fresh_db::fresh_fully_migrated_db("chat_gate8_r4_").await;
+    let pool = db.connect(4).await;
+    http::ensure_fence(&pool).await;
+    let fixture =
+        seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
+            .await
+            .expect("group fixture");
+    let admin = fixture_device(&fixture.sender_did, fixture.sender_device_id);
+    http::cache_device_did(&admin).await;
+    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
+
+    let prior = fixture.signed_request["body"]["prior"].clone();
+    let reset_request_id = Uuid::new_v4();
+    let request = catbird_server::chat_protocol::test_support::sign_mutation_json_for_test(
+        &json!({
+            "$type": "blue.catbird.chat.defs#resetRequestBody",
+            "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\u{0000}",
+            "resetRequestId": reset_request_id,
+            "idempotencyKey": reset_request_id,
+            "actorDid": fixture.sender_did,
+            "actorDeviceId": fixture.sender_device_id,
+            "keyId": fixture.sender_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "reason": "manualRecovery",
+            "signedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        }),
+        &EdSigningKey::from_bytes(&fixture.sender_ed25519_seed),
+    )
+    .expect("sign reset request");
+    let request_bytes = serde_json::to_vec(&json!({ "signedRequest": request })).unwrap();
+    let (request_status, request_response) = http::send_bytes(
+        router.clone(),
+        http::unsigned_json_request(
+            &admin,
+            "blue.catbird.chat.requestReset",
+            request_bytes.clone(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        request_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&request_response)
+    );
+    let request_json: serde_json::Value = serde_json::from_slice(&request_response).unwrap();
+    common::assert_proof_i13_control_receipt(&request_json["entry"]);
+    let (replay_status, replay_response) = http::send_bytes(
+        router.clone(),
+        http::unsigned_json_request(&admin, "blue.catbird.chat.requestReset", request_bytes),
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::OK);
+    assert_eq!(replay_response, request_response);
+
+    let participant_rows: Vec<(String, String, String, Option<Uuid>, String, Uuid)> =
+        sqlx::query_as(
+            "SELECT user_did, status, role, invitation_transition_id, created_by_did, \
+                    created_by_device_id \
+               FROM chat.participants \
+              WHERE conversation_id = $1 AND current_membership \
+              ORDER BY convert_to(user_did, 'UTF8')",
+        )
+        .bind(fixture.conversation_id)
+        .fetch_all(&pool)
+        .await
+        .expect("current participant manifest");
+    let participants = participant_rows
+        .into_iter()
+        .map(
+            |(
+                user_did,
+                status,
+                role,
+                invitation_transition_id,
+                invited_by_did,
+                invited_by_device_id,
+            )| {
+                let mut participant = json!({"userDid": user_did, "status": status, "role": role});
+                if let Some(invitation_transition_id) = invitation_transition_id {
+                    participant["invitationProvenance"] = json!({
+                        "invitationTransitionId": invitation_transition_id,
+                        "invitedByDid": invited_by_did,
+                        "invitedByDeviceId": invited_by_device_id,
+                    });
+                }
+                participant
+            },
+        )
+        .collect::<Vec<_>>();
+    let origin_seq: i64 = sqlx::query_scalar(
+        "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(fixture.conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("activation entry sequence");
+    let activation = catbird_server::chat_protocol::test_support::sign_reset_activation_for_test(
+        reset_request_id,
+        &prior,
+        json!(participants),
+        origin_seq as u64,
+        &fixture.sender_did,
+        fixture.sender_device_id,
+        &fixture.sender_key_id,
+        fixture.sender_ed25519_seed,
+    )
+    .expect("sign reset activation");
+    let activation_bytes = serde_json::to_vec(&json!({ "signedRequest": activation })).unwrap();
+    let (activation_status, activation_response) = http::send_bytes(
+        router.clone(),
+        http::unsigned_json_request(
+            &admin,
+            "blue.catbird.chat.activateReset",
+            activation_bytes.clone(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        activation_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&activation_response)
+    );
+    let activation_json: serde_json::Value = serde_json::from_slice(&activation_response).unwrap();
+    common::assert_proof_i13_control_receipt(&activation_json["entry"]);
+    let (replay_status, replay_response) = http::send_bytes(
+        router,
+        http::unsigned_json_request(&admin, "blue.catbird.chat.activateReset", activation_bytes),
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::OK);
+    assert_eq!(replay_response, activation_response);
+}
+
 #[test]
 fn mf04_no_outbound_federation_http_awaited_inside_db_transactions() {
     let publish_handler = include_str!("../src/handlers/chat/publish_direct_request.rs");
@@ -774,5 +917,525 @@ fn mf04_no_outbound_federation_http_awaited_inside_db_transactions() {
     assert!(
         !submit_facade.contains("submitter\n            .submit(\n                transaction"),
         "execute_prepared_submit_transition must not hold an active PostgreSQL transaction across RemoteCommitSubmitter::submit"
+    );
+}
+
+struct ControlReplayHarness {
+    _db: common::fresh_db::DisposableDatabase,
+    pool: sqlx::PgPool,
+    fixture: catbird_server::chat_protocol::test_support::CleanSlateApplicationFixture,
+    sender: http::Device,
+    recipient: http::Device,
+    router: axum::Router,
+}
+
+async fn control_replay_harness(direct: bool) -> ControlReplayHarness {
+    std::env::set_var("SERVICE_DID", "did:web:chat.catbird.blue");
+    std::env::set_var("SELF_ENDPOINT", "https://chat.catbird.blue");
+    let db = common::fresh_db::fresh_fully_migrated_db("chat_gate8_r4_").await;
+    let pool = db.connect(4).await;
+    http::ensure_fence(&pool).await;
+    let fixture =
+        seed_clean_slate_application_fixture(&pool, direct, "did:web:chat.catbird.blue", None)
+            .await
+            .expect("clean-slate control fixture");
+    let sender = fixture_device(&fixture.sender_did, fixture.sender_device_id);
+    let recipient = fixture_device(&fixture.recipient_did, fixture.recipient_device_id);
+    http::cache_device_did(&sender).await;
+    http::cache_device_did(&recipient).await;
+    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
+    ControlReplayHarness {
+        _db: db,
+        pool,
+        fixture,
+        sender,
+        recipient,
+        router,
+    }
+}
+
+fn signed_control_body(body: serde_json::Value, seed: [u8; 32]) -> serde_json::Value {
+    catbird_server::chat_protocol::test_support::sign_mutation_json_for_test(
+        &body,
+        &EdSigningKey::from_bytes(&seed),
+    )
+    .expect("sign control body")
+}
+
+fn wrapped_request(signed_request: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({ "signedRequest": signed_request })).unwrap()
+}
+
+async fn entry_sequence_watermark(harness: &ControlReplayHarness) -> i64 {
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), 0) FROM chat.entries WHERE conversation_id = $1",
+    )
+    .bind(harness.fixture.conversation_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    let terminal: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT terminal.entry_bytes \
+           FROM chat.conversation_close_terminal_entries terminal \
+           JOIN chat.events event USING (event_position) \
+          WHERE event.event_kind = 'conversationClosed' \
+            AND convert_from(event.payload_bytes, 'UTF8')::jsonb->>'conversationId' = $1::TEXT \
+          ORDER BY event_position DESC LIMIT 1",
+    )
+    .bind(harness.fixture.conversation_id)
+    .fetch_optional(&harness.pool)
+    .await
+    .unwrap();
+    let terminal = terminal
+        .map(|entry| {
+            serde_json::from_slice::<serde_json::Value>(&entry).unwrap()["seq"]
+                .as_i64()
+                .unwrap()
+        })
+        .unwrap_or(0);
+    active.max(terminal)
+}
+
+async fn assert_http_replay(
+    harness: &ControlReplayHarness,
+    device: &http::Device,
+    nsid: &str,
+    request_bytes: Vec<u8>,
+    sequenced_entries: i64,
+) -> serde_json::Value {
+    let before = entry_sequence_watermark(harness).await;
+    let (status, first) = http::send_bytes(
+        harness.router.clone(),
+        http::unsigned_json_request(device, nsid, request_bytes.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{nsid}: {}",
+        String::from_utf8_lossy(&first)
+    );
+    let after_first = entry_sequence_watermark(harness).await;
+    assert_eq!(after_first, before + sequenced_entries, "{nsid}");
+
+    let (replay_status, replay) = http::send_bytes(
+        harness.router.clone(),
+        http::unsigned_json_request(device, nsid, request_bytes),
+    )
+    .await;
+    assert_eq!(replay_status, status, "{nsid}");
+    assert_eq!(replay, first, "{nsid} replay body");
+    assert_eq!(
+        entry_sequence_watermark(harness).await,
+        after_first,
+        "{nsid} replay"
+    );
+    serde_json::from_slice(&first).expect("control response JSON")
+}
+
+fn contains_sequencer_receipt(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.contains_key("sequencerReceipt")
+                || object.values().any(contains_sequencer_receipt)
+        }
+        serde_json::Value::Array(items) => items.iter().any(contains_sequencer_receipt),
+        _ => false,
+    }
+}
+
+fn leave_request(harness: &ControlReplayHarness, leave_request_id: Uuid) -> Vec<u8> {
+    wrapped_request(signed_control_body(
+        json!({
+            "$type": "blue.catbird.chat.defs#leaveRequestBody",
+            "signatureDomain": "CATBIRD-CHAT-LEAVE-REQUEST\u{0000}",
+            "leaveRequestId": leave_request_id,
+            "actorDid": &harness.fixture.recipient_did,
+            "actorDeviceId": harness.fixture.recipient_device_id,
+            "keyId": &harness.fixture.recipient_key_id,
+            "authGeneration": 1,
+            "prior": harness.fixture.signed_request["body"]["prior"],
+            "idempotencyKey": leave_request_id,
+            "signedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        }),
+        harness.fixture.recipient_ed25519_seed,
+    ))
+}
+
+fn recovery_request(harness: &ControlReplayHarness, recovery_request_id: Uuid) -> Vec<u8> {
+    wrapped_request(signed_control_body(
+        json!({
+            "$type": "blue.catbird.chat.defs#leafRecoveryRequestBody",
+            "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-REQUEST\u{0000}",
+            "recoveryRequestId": recovery_request_id,
+            "actorDid": &harness.fixture.sender_did,
+            "actorDeviceId": harness.fixture.sender_device_id,
+            "keyId": &harness.fixture.sender_key_id,
+            "authGeneration": 1,
+            "prior": harness.fixture.signed_request["body"]["prior"],
+            "recoveryKind": "replace",
+            "idempotencyKey": recovery_request_id,
+            "signedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        }),
+        harness.fixture.sender_ed25519_seed,
+    ))
+}
+
+async fn seed_recovery_fallback(harness: &ControlReplayHarness) {
+    catbird_server::chat_protocol::test_support::seed_deterministic_recovery_reservation_fallback(
+        &harness.pool,
+        vec![
+            harness.fixture.sender_did.clone(),
+            harness.fixture.recipient_did.clone(),
+        ],
+    )
+    .await
+    .expect("fresh recovery reservation fallback");
+}
+
+#[tokio::test]
+async fn close_conversation_with_i13_receipt_replays_verbatim_and_sequences_once() {
+    let harness = control_replay_harness(true).await;
+    let prior = harness.fixture.signed_request["body"]["prior"].clone();
+    let mut retired = prior.clone();
+    retired["stateVersion"] = json!(prior["stateVersion"].as_u64().unwrap() + 1);
+    retired["lifecycle"] = json!("superseded");
+    let transition_id = Uuid::new_v4();
+    let request = wrapped_request(signed_control_body(
+        json!({
+            "$type": "blue.catbird.chat.defs#conversationCloseBody",
+            "signatureDomain": "CATBIRD-CHAT-CLOSE\u{0000}",
+            "transitionId": transition_id,
+            "conversationKind": "direct",
+            "actorDid": &harness.fixture.sender_did,
+            "actorDeviceId": harness.fixture.sender_device_id,
+            "keyId": &harness.fixture.sender_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "retired": retired,
+            "idempotencyKey": transition_id,
+            "signedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        }),
+        harness.fixture.sender_ed25519_seed,
+    ));
+    let response = assert_http_replay(
+        &harness,
+        &harness.sender,
+        "blue.catbird.chat.closeConversation",
+        request,
+        1,
+    )
+    .await;
+    common::assert_proof_i13_control_receipt(&response["result"]["entry"]);
+}
+
+#[tokio::test]
+async fn request_leave_with_i13_receipt_replays_verbatim_and_sequences_once() {
+    let harness = control_replay_harness(false).await;
+    let response = assert_http_replay(
+        &harness,
+        &harness.recipient,
+        "blue.catbird.chat.requestLeave",
+        leave_request(&harness, Uuid::new_v4()),
+        1,
+    )
+    .await;
+    common::assert_proof_i13_control_receipt(&response["result"]["entry"]);
+}
+
+#[tokio::test]
+async fn cancel_leave_with_i13_receipt_replays_verbatim_and_sequences_once() {
+    let harness = control_replay_harness(false).await;
+    let leave_request_id = Uuid::new_v4();
+    assert_http_replay(
+        &harness,
+        &harness.recipient,
+        "blue.catbird.chat.requestLeave",
+        leave_request(&harness, leave_request_id),
+        1,
+    )
+    .await;
+    let cancellation_id = Uuid::new_v4();
+    let request = wrapped_request(signed_control_body(
+        json!({
+            "$type": "blue.catbird.chat.defs#leaveCancellationBody",
+            "signatureDomain": "CATBIRD-CHAT-LEAVE-CANCEL\u{0000}",
+            "conversationId": harness.fixture.conversation_id,
+            "leaveRequestId": leave_request_id,
+            "actorDid": &harness.fixture.recipient_did,
+            "actorDeviceId": harness.fixture.recipient_device_id,
+            "keyId": &harness.fixture.recipient_key_id,
+            "authGeneration": 1,
+            "idempotencyKey": cancellation_id,
+            "signedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        }),
+        harness.fixture.recipient_ed25519_seed,
+    ));
+    let response = assert_http_replay(
+        &harness,
+        &harness.recipient,
+        "blue.catbird.chat.cancelLeave",
+        request,
+        1,
+    )
+    .await;
+    common::assert_proof_i13_control_receipt(&response["entry"]);
+}
+
+#[tokio::test]
+async fn request_leaf_recovery_replays_verbatim_without_receipt_or_entry() {
+    let harness = control_replay_harness(false).await;
+    seed_recovery_fallback(&harness).await;
+    let response = assert_http_replay(
+        &harness,
+        &harness.sender,
+        "blue.catbird.chat.requestLeafRecovery",
+        recovery_request(&harness, Uuid::new_v4()),
+        0,
+    )
+    .await;
+    assert!(!contains_sequencer_receipt(&response), "{response}");
+}
+
+#[tokio::test]
+async fn cancel_leaf_recovery_replays_verbatim_without_receipt_or_entry() {
+    let harness = control_replay_harness(false).await;
+    seed_recovery_fallback(&harness).await;
+    let recovery_request_id = Uuid::new_v4();
+    assert_http_replay(
+        &harness,
+        &harness.sender,
+        "blue.catbird.chat.requestLeafRecovery",
+        recovery_request(&harness, recovery_request_id),
+        0,
+    )
+    .await;
+    let cancellation_id = Uuid::new_v4();
+    let request = wrapped_request(signed_control_body(
+        json!({
+            "$type": "blue.catbird.chat.defs#leafRecoveryCancellationBody",
+            "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-CANCEL\u{0000}",
+            "recoveryRequestId": recovery_request_id,
+            "actorDid": &harness.fixture.sender_did,
+            "actorDeviceId": harness.fixture.sender_device_id,
+            "keyId": &harness.fixture.sender_key_id,
+            "authGeneration": 1,
+            "idempotencyKey": cancellation_id,
+            "signedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        }),
+        harness.fixture.sender_ed25519_seed,
+    ));
+    let response = assert_http_replay(
+        &harness,
+        &harness.sender,
+        "blue.catbird.chat.cancelLeafRecovery",
+        request,
+        0,
+    )
+    .await;
+    assert!(!contains_sequencer_receipt(&response), "{response}");
+}
+
+/// Every genuine receipted entry exported by a sequencer must pass the same
+/// verifier reconciliation and prefix bootstrap use.
+#[tokio::test]
+async fn reconciliation_verifier_accepts_genuine_leave_and_cancellation_receipts() {
+    use catbird_server::federation::reconciliation::{
+        verify_remote_event_receipt, RemoteEvent, StrictCleanRemoteEvent,
+    };
+    use sqlx::Row;
+
+    let harness = control_replay_harness(false).await;
+    let leave_request_id = Uuid::new_v4();
+    let leave = assert_http_replay(
+        &harness,
+        &harness.recipient,
+        "blue.catbird.chat.requestLeave",
+        leave_request(&harness, leave_request_id),
+        1,
+    )
+    .await;
+    common::assert_proof_i13_control_receipt(&leave["result"]["entry"]);
+    let cancellation_id = Uuid::new_v4();
+    let request = wrapped_request(signed_control_body(
+        json!({
+            "$type": "blue.catbird.chat.defs#leaveCancellationBody",
+            "signatureDomain": "CATBIRD-CHAT-LEAVE-CANCEL\u{0000}",
+            "conversationId": harness.fixture.conversation_id,
+            "leaveRequestId": leave_request_id,
+            "actorDid": &harness.fixture.recipient_did,
+            "actorDeviceId": harness.fixture.recipient_device_id,
+            "keyId": &harness.fixture.recipient_key_id,
+            "authGeneration": 1,
+            "idempotencyKey": cancellation_id,
+            "signedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        }),
+        harness.fixture.recipient_ed25519_seed,
+    ));
+    let cancellation = assert_http_replay(
+        &harness,
+        &harness.recipient,
+        "blue.catbird.chat.cancelLeave",
+        request,
+        1,
+    )
+    .await;
+    common::assert_proof_i13_control_receipt(&cancellation["entry"]);
+
+    let sequencer = "did:web:chat.catbird.blue";
+    let proof_key =
+        p256::ecdsa::VerifyingKey::from(&p256::ecdsa::SigningKey::from_slice(&[0x13; 32]).unwrap());
+    let resolver = catbird_server::federation::resolver::DsResolver::new(
+        harness.pool.clone(),
+        catbird_server::federation::resolver::build_resolver_http_client(),
+        "did:web:r4-mirror-home.example.com".to_owned(),
+        "https://r4-mirror-home.example.com".to_owned(),
+        None,
+        300,
+    );
+    let rows = sqlx::query(
+        "SELECT CAST(seq AS BIGINT) AS seq, \
+                CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id,message_id,entry_kind, \
+                COALESCE(accepted_payload_bytes, ''::bytea) AS accepted_payload_bytes, \
+                accepted_payload_sha256, \
+                COALESCE(signed_request_bytes, ''::bytea) AS signed_request_bytes, \
+                outer_entry_fingerprint,sequencer_receipt_bytes,received_at \
+           FROM chat.entries WHERE conversation_id=$1 ORDER BY seq",
+    )
+    .bind(harness.fixture.conversation_id)
+    .fetch_all(&harness.pool)
+    .await
+    .unwrap();
+    let mut keys = std::collections::HashMap::new();
+    let mut refused = Vec::new();
+    let mut receipt_coordinate = None;
+    let mut leave_predecessor = None;
+    for row in rows {
+        let seq: i64 = row.get("seq");
+        let entry_id: Uuid = row.get("entry_id");
+        let entry_kind: String = row.get("entry_kind");
+        let message_id: Option<Uuid> = row.get("message_id");
+        let receipt: Vec<u8> = row
+            .get::<Option<Vec<u8>>, _>("sequencer_receipt_bytes")
+            .expect("every row in this history has a receipt");
+        let kid = serde_json::from_slice::<serde_json::Value>(&receipt).unwrap()["kid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        keys.entry(kid).or_insert_with(|| proof_key.clone());
+        if entry_kind == "blue.catbird.chat.defs#leaveRequestEntry" {
+            leave_predecessor = receipt_coordinate.clone();
+        }
+        let event = StrictCleanRemoteEvent::try_from(RemoteEvent {
+            seq,
+            epoch: row.get("epoch"),
+            msg_id: message_id.unwrap_or(entry_id).to_string(),
+            message_type: entry_kind.clone(),
+            ciphertext: row.get("accepted_payload_bytes"),
+            padded_size: 0,
+            created_at: row.get("received_at"),
+            entry_id: Some(entry_id.to_string()),
+            entry_kind: Some(entry_kind.clone()),
+            accepted_payload_sha256: Some(row.get("accepted_payload_sha256")),
+            signed_request: Some(row.get("signed_request_bytes")),
+            outer_fingerprint: Some(row.get("outer_entry_fingerprint")),
+            sequencer_receipt: Some(receipt),
+            account_deleted_entry: None,
+        })
+        .expect("strict clean event");
+        match verify_remote_event_receipt(
+            &resolver,
+            sequencer,
+            harness.fixture.conversation_id,
+            &event,
+            &mut keys,
+            receipt_coordinate.as_ref(),
+        )
+        .await
+        {
+            Ok(coordinate) => receipt_coordinate = Some(coordinate),
+            Err(error) => refused.push((seq, entry_kind, error)),
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "reconciliation refused genuine sequencer receipts: {refused:?}"
+    );
+
+    let row = sqlx::query(
+        "SELECT CAST(seq AS BIGINT) AS seq, \
+                CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id,message_id,entry_kind,accepted_payload_bytes, \
+                accepted_payload_sha256,signed_request_bytes, \
+                outer_entry_fingerprint,sequencer_receipt_bytes,received_at \
+           FROM chat.entries WHERE conversation_id=$1 \
+             AND entry_kind='blue.catbird.chat.defs#leaveRequestEntry'",
+    )
+    .bind(harness.fixture.conversation_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    let seq: i64 = row.get("seq");
+    let generation: i64 = row.get("epoch");
+    let entry_id: Uuid = row.get("entry_id");
+    let message_id: Option<Uuid> = row.get("message_id");
+    let entry_kind: String = row.get("entry_kind");
+    let ciphertext: Vec<u8> = row.get("accepted_payload_bytes");
+    let accepted_payload_sha256: Vec<u8> = row.get("accepted_payload_sha256");
+    let signed_request: Vec<u8> = row.get("signed_request_bytes");
+    let outer_fingerprint: Vec<u8> = row.get("outer_entry_fingerprint");
+    let received_at = row.get("received_at");
+    let receipt: Vec<u8> = row
+        .get::<Option<Vec<u8>>, _>("sequencer_receipt_bytes")
+        .unwrap();
+    let make_event = |epoch, receipt| {
+        StrictCleanRemoteEvent::try_from(RemoteEvent {
+            seq,
+            epoch,
+            msg_id: message_id.unwrap_or(entry_id).to_string(),
+            message_type: entry_kind.clone(),
+            ciphertext: ciphertext.clone(),
+            padded_size: 0,
+            created_at: received_at,
+            entry_id: Some(entry_id.to_string()),
+            entry_kind: Some(entry_kind.clone()),
+            accepted_payload_sha256: Some(accepted_payload_sha256.clone()),
+            signed_request: Some(signed_request.clone()),
+            outer_fingerprint: Some(outer_fingerprint.clone()),
+            sequencer_receipt: Some(receipt),
+            account_deleted_entry: None,
+        })
+        .unwrap()
+    };
+    let mut forged_receipt: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+    forged_receipt["signature"] = json!(STANDARD.encode([0_u8; 64]));
+    let forged = make_event(generation, serde_json::to_vec(&forged_receipt).unwrap());
+    assert!(
+        verify_remote_event_receipt(
+            &resolver,
+            sequencer,
+            harness.fixture.conversation_id,
+            &forged,
+            &mut keys,
+            leave_predecessor.as_ref(),
+        )
+        .await
+        .is_err(),
+        "removing cryptographic receipt verification must fail this control"
+    );
+    let wrong_generation = make_event(generation + 1, receipt);
+    assert!(
+        verify_remote_event_receipt(
+            &resolver,
+            sequencer,
+            harness.fixture.conversation_id,
+            &wrong_generation,
+            &mut keys,
+            leave_predecessor.as_ref(),
+        )
+        .await
+        .is_err(),
+        "removing event-generation binding must fail this control"
     );
 }

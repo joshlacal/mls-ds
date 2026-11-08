@@ -4,6 +4,8 @@
 //! headers must reach the real admission dispatcher, while a cutover-closed
 //! request must stop before the pool or verifier is touched.
 
+mod common;
+
 use std::sync::{Arc, Mutex, Once};
 
 use axum::{
@@ -73,7 +75,11 @@ fn runtime(cutover_enabled: bool) -> Arc<ChatRuntime> {
     } else {
         std::env::remove_var("CHAT_CUTOVER_ENABLED");
     }
-    Arc::new(ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("clean-chat runtime"))
+    Arc::new(
+        ChatRuntime::from_env(Arc::new(SseState::new(64)))
+            .expect("clean-chat runtime")
+            .with_i13_receipt_signer(common::proof_i13_signer()),
+    )
 }
 
 fn router(cutover_enabled: bool) -> Router {

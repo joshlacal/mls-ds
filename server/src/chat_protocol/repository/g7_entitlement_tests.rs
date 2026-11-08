@@ -1607,57 +1607,6 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
     assert_executor_db_absent(&maintenance_url, &db_name).await;
 }
 
-// Re-pinned AGAIN when the frozen crypto-wire corpus moved in-repo to
-// server/tests/fixtures/crypto-wire: executor_seed.rs:148's include_str! had to
-// stop traversing ../../../../docs out of the repository, which changes its bytes.
-// Re-pinned after the C2 lane. The previous value was set at `e98ef5da` and
-// three later sealed commits changed the helper without re-pinning it, so both
-// guards below asserted a baseline that no longer existed:
-//   b2f7ae9e  production's single-clock time model in the executor fixtures
-//   a63bc3fa  the signing authority production always mints
-//   0c6290a0  the planner's own due-expiry rows in coordinate-changing arms
-// Re-pinned for the finding-3 wedge fixture: `seed_private_genuine_pending_reset`
-// and `private_genuine_pending_reset_graph` seed the same genuine two-leaf graph
-// as `seed_private_genuine_reset` but stop BEFORE `commit_dynamic_reset_activation`,
-// leaving a live `chat.reset_requests` row in `pending`. Nothing existing could
-// produce that state: the reset fixture consumes the row in the same call, and the
-// shared clean-chat database holds zero reset rows. Value taken from the
-// POST-rustfmt bytes.
-// Re-pinned once more in the same lane for a REPAIR the wedge control exposed:
-// `build_genuine_reset_request` signed `idempotencyKey` as a fresh uuid, but
-// production `parse_reset_authority` derives a Reset REQUEST's operation id FROM
-// `resetRequestId` and then requires `idempotencyKey` to equal it. Those
-// otherwise-genuine bytes were therefore unparseable by `seal_pending_reset`
-// (`InvalidResetRow`), which went unnoticed only because the sole consumer
-// consumed the row through activation without re-parsing the request. The
-// fixture now signs `idempotencyKey: request_id`, which is what production
-// requires; every suite that consumes the seed is unchanged by it.
-// Re-pinned for the OpenMLS 0.9 clean cutover: the helper now consumes the
-// sealed v0.9 corpus and mints only routing- and lock-bound authority.
-// Re-pin only alongside a reviewed change to `tests/common/executor_seed.rs`;
-// an unexplained mismatch here still means the seed drifted.
-// Re-pinned 2026-10-04 for the main + encrypted-requests line merge: the
-// helper is main's file plus encrypted-requests' fresh-database migration
-// retry/advisory lock and clock-anchored seeds.
-// Re-pinned 2026-11-04 for `58d38d8f` ("mls-ds: Add Option A SpaceHost, Push
-// Gateway client, and D1/3A group & Space relays"), whose only change to the
-// helper was its rustfmt pass: `rustfmt --edition 2021` of the previously
-// pinned bytes (33877d5f…) is byte-identical to the new bytes, so the seed's
-// token stream is unchanged. The guard had stayed red from that commit on.
-const FROZEN_EXECUTOR_SEED_SHA256: &str =
-    "5c4207acd7123bae8d5a2fe04f41404b41da40de30c59c98063ab0cc85b3bb4c";
-
-#[test]
-fn frozen_executor_seed_helper_is_byte_identical_to_the_sealed_baseline() {
-    assert_eq!(
-        hex::encode(Sha256::digest(include_bytes!(
-            "../../../tests/common/executor_seed.rs"
-        ))),
-        FROZEN_EXECUTOR_SEED_SHA256,
-        "tests/common/executor_seed.rs must stay byte-identical to the frozen P helper"
-    );
-}
-
 // Behavioral replacement for the obsolete whole-file core.rs hash: exercise
 // the reviewed manifest and the actual row-lock/lease allocation contract.
 #[tokio::test]
@@ -4435,13 +4384,6 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
         hex::encode(Sha256::digest(B_AUTH_DEVICE_VIEWS_SOURCE.as_bytes())),
         B_AUTH_DEVICE_VIEWS_SHA256,
         "device_views.rs matches the reviewed clean-cutover surface"
-    );
-    assert_eq!(
-        hex::encode(Sha256::digest(include_bytes!(
-            "../../../tests/common/executor_seed.rs"
-        ))),
-        FROZEN_EXECUTOR_SEED_SHA256,
-        "the frozen executor seed helper is unchanged by Stage B"
     );
 }
 

@@ -33,6 +33,8 @@ cargo run
 
 Clients call only their home DS. Calls authenticate with an ATProto service-auth JWT for `{SERVICE_DID}#atproto_mls`: at most 60 s lifetime, exact `lxm`, unique `jti`. The `subscribeEvents` WebSocket instead presents a one-use ticket from `getSubscriptionTicket`. Mutations carry the device's signed request. With `CHAT_REQUIRE_SIGNED_READS`, GET reads must carry device-signed read headers too.
 
+Enabling chat cutover **or federation** requires a valid service signer: federation requires `SIGNING_KEY_PEM`, while chat additionally requires `RECEIPT_ISSUANCE_MODE=issue` with valid `RECEIPT_SIGNING_KEY_PEM`, `RECEIPT_VERIFICATION_METHOD`, and `RECEIPT_DID_DOCUMENT_JSON`, with the two signing keys distinct. Startup refuses either enabled mode without its signer. A signer-enabled server rejects an application send without `archiveCommitment` before sequencing it, so every accepted application entry has its I13 receipt. Runtime constructors stay signer-optional only for tests and historical-migration fixtures.
+
 | Method (body limit) | Endpoints |
 |---|---|
 | GET | `getDirectRequestOutcome`, `getDeviceKey`, `getDevices`, `getOwnDevices`, `getConversationState`, `getEntries`, `getConversations`, `getPendingWelcomes`, `getLeafRecoveryInbox`, `subscribeEvents` (WebSocket) |
@@ -52,7 +54,7 @@ The list is pinned by `chat_protocol_route_inventory`. The pre-clean-slate `blue
 |---|---|
 | Original DS routes | POST `deliverMessage`, `deliverWelcome`, `submitCommit` (15 MiB each), `transferSequencer`; GET `fetchKeyPackage` (reserves a recovery KeyPackage for the calling DS), `getConvoDigest`, `getConvoEvents`, `healthCheck` (unauthenticated) |
 | Peer administration | GET `getFederationPeers`, `getFederationMode`; POST `upsertFederationPeer`, `deleteFederationPeer`, `setFederationMode`. Callers must be in `FEDERATION_ADMIN_DIDS`. GET `resolveDeliveryService` needs any authenticated user. |
-| Groups and cross-home effects | POST `relayGroupMutation`, `deliverGroupEntry` (15 MiB each); `resolveGroupDevices`; `fetchKeyPackage` (a group's recovery-package export under a 5-minute lease); `getLabyrinthDirectory`, `getGroupConversationState`, `getGroupPendingWelcomes`, `notifyEntriesPruned` (64 KiB each); `relayEntryAck`, `relayAccountDeletion`, `deliverTransportControlEntry` (16 KiB each) |
+| Groups and cross-home effects | POST `relayGroupMutation`, `deliverGroupEntry`, `deliverTransportControlEntry` (15 MiB each); `resolveGroupDevices`; `fetchKeyPackage` (a group's recovery-package export under a 5-minute lease); `getLabyrinthDirectory`, `getGroupConversationState`, `getGroupPendingWelcomes`, `notifyEntriesPruned` (64 KiB each); `relayEntryAck`, `relayAccountDeletion` (16 KiB each) |
 | C33 direct requests | POST `reserveRecipientBootstrap`, `releaseRecipientBootstrap`, `prepareDirectRequest`, `deliverAcceptance`, `deliverAcceptanceEntry` (64 KiB each); `publishDirectRequest`, `deliverDirectRequest` (16 MiB each); `relaySendMessage`, `deliverMessageEntry` (15 MiB each); GET `getDirectRequestOutcome` |
 
 ### Space host: `com.atproto.space.*`
@@ -111,7 +113,7 @@ cargo test --features sim --test deterministic_server_clock_test
 cargo test --test clean_chat_empty_preflight
 ```
 
-`clean_chat_empty_preflight` runs `scripts/assert_clean_chat_empty.sql`, which accepts only a sealed migration catalog. The current seal is 144 migrations ending at `20261107000001`. After a migration change, reseal it from `server/`:
+`clean_chat_empty_preflight` runs `scripts/assert_clean_chat_empty.sql`, which accepts only a sealed migration catalog. The current seal is 145 migrations ending at `20261113000001`. After a migration change, reseal it from `server/`:
 
 ```sh
 CLEAN_CHAT_PREFLIGHT_RESEAL=write cargo test --offline --test clean_chat_empty_preflight -- --ignored --exact reseal_clean_slate_catalog

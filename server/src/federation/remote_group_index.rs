@@ -127,6 +127,44 @@ fn claimed_evidence(body: &Value, seq: i64, entry_id: Uuid) -> MembershipEvidenc
 ///
 /// The caller has already authenticated the stored sequencer as the caller and,
 /// for an `accountDeletedEntry`, verified its sequencer authority.
+/// The actor signs the closed control-entry projection; the sequencer appends I13 evidence after
+/// sequencing. Verify the former without teaching the closed actor transcript about server fields.
+fn actor_signed_control_entry_bytes(
+    entry_bytes: &[u8],
+) -> Result<Vec<u8>, (StatusCode, &'static str, String)> {
+    let mut entry: serde_json::Value = serde_json::from_slice(entry_bytes).map_err(|error| {
+        (
+            StatusCode::FORBIDDEN,
+            "NotAuthorized",
+            format!("membership evidence JSON: {error}"),
+        )
+    })?;
+    let fields = entry.as_object_mut().ok_or_else(|| {
+        (
+            StatusCode::FORBIDDEN,
+            "NotAuthorized",
+            "membership evidence is not an object".to_owned(),
+        )
+    })?;
+    if fields
+        .remove("sequencerReceipt")
+        .is_some_and(|receipt| !receipt.is_object())
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "NotAuthorized",
+            "membership evidence sequencerReceipt is not an object".to_owned(),
+        ));
+    }
+    serde_json::to_vec(&entry).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            error.to_string(),
+        )
+    })
+}
+
 pub(super) async fn verify_membership_evidence(
     state: &GroupRelayState,
     req: &DeliverGroupEntryRequest,
@@ -225,7 +263,9 @@ pub(super) async fn verify_membership_evidence(
     }
 
     let forbidden = |error: String| s2s_err(StatusCode::FORBIDDEN, "NotAuthorized", error);
-    let mutation = decode_control_entry_mutation_unverified(entry_bytes)
+    let actor_entry_bytes = actor_signed_control_entry_bytes(entry_bytes)
+        .map_err(|(status, code, message)| s2s_err(status, code, message))?;
+    let mutation = decode_control_entry_mutation_unverified(&actor_entry_bytes)
         .map_err(|error| forbidden(format!("membership evidence: {error:?}")))?;
     let generation = i64::try_from(mutation.auth_generation())
         .map_err(|_| forbidden("membership evidence generation".into()))?;
@@ -233,7 +273,7 @@ pub(super) async fn verify_membership_evidence(
     let device = Uuid::from_bytes(*mutation.actor_device_id().as_bytes());
     let key_id = mutation.key_id().as_str().to_owned();
     let key = actor_signing_key(state, &actor, device, &key_id, generation).await?;
-    let verified = decode_and_verify_control_entry(entry_bytes, &key).map_err(|error| {
+    let verified = decode_and_verify_control_entry(&actor_entry_bytes, &key).map_err(|error| {
         s2s_err(
             StatusCode::UNAUTHORIZED,
             "InvalidSignature",
@@ -601,6 +641,21 @@ mod tests {
     use super::*;
 
     const INVITEE: &str = "did:plc:inviteeaaaaaaaaaaaaaaaaa";
+    #[test]
+    fn sequencer_receipt_is_not_part_of_the_actor_signed_projection() {
+        let entry = json!({
+            "$type": "blue.catbird.chat.defs#commitEntry",
+            "entryId": Uuid::new_v4(),
+            "signedRequest": {"body": {"actorDid": MEMBER}},
+            "sequencerReceipt": {"seq": 3, "signature": {"$bytes": "AA=="}},
+        });
+        let projected =
+            actor_signed_control_entry_bytes(&serde_json::to_vec(&entry).unwrap()).unwrap();
+        let projected: serde_json::Value = serde_json::from_slice(&projected).unwrap();
+        assert!(projected.get("sequencerReceipt").is_none());
+        assert_eq!(projected["signedRequest"], entry["signedRequest"]);
+    }
+
     const MEMBER: &str = "did:plc:memberaaaaaaaaaaaaaaaaaaa";
 
     #[test]

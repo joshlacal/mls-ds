@@ -10,6 +10,7 @@
 // integration slice adds that module edge, the dedicated compile target
 // includes it directly.
 
+use crate::federation::receipt::{I13ControlReceiptInput, I13ReceiptSigner};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::{json, Value as JsonValue};
@@ -409,6 +410,19 @@ pub(crate) fn cancellation_actor_matches_requester(
         && actor_device_id == requester_device_id
         && actor_key_id == requester_key_id
         && actor_auth_generation == requester_auth_generation
+}
+
+pub(crate) async fn recovery_conversation_id(
+    pool: &sqlx::PgPool,
+    recovery_request_id: Uuid,
+) -> Result<Option<Uuid>, RecoveryRepositoryError> {
+    sqlx::query_scalar(
+        "SELECT conversation_id FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+    )
+    .bind(recovery_request_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(RecoveryRepositoryError::Database)
 }
 
 #[derive(Debug)]
@@ -917,6 +931,7 @@ struct RecoveryFulfillmentReplayRow {
     entry_generation: Option<i64>,
     entry_state_version: Option<i64>,
     entry_transition_id: Option<Uuid>,
+    sequencer_receipt_bytes: Option<Vec<u8>>,
     received_at: DateTime<Utc>,
     group_id: Vec<u8>,
     epoch: i64,
@@ -2427,6 +2442,7 @@ pub(in crate::chat_protocol) struct PreparedRecoveryExecutionGraph {
     plan: ConversationPersistencePlan,
     accepted_control_entry_bytes: Option<Vec<u8>>,
     canonical_response_entry_bytes: Option<Vec<u8>>,
+    sequencer_receipt: Option<(Uuid, u64, Vec<u8>)>,
     persistence_witness: RecoveryPersistenceWitness,
     origin: RecoveryGraphPrewriteOrigin,
     material: RecoveryCanonicalMaterial,
@@ -2438,6 +2454,7 @@ impl PreparedRecoveryExecutionGraph {
         plan: ConversationPersistencePlan,
         accepted_control_entry_bytes: Option<Vec<u8>>,
         canonical_response_entry_bytes: Option<Vec<u8>>,
+        sequencer_receipt: Option<(Uuid, u64, Vec<u8>)>,
         persistence_witness: RecoveryPersistenceWitness,
         prewrite: RecoveryPreludePrewriteWitness,
         material: RecoveryCanonicalMaterial,
@@ -2461,6 +2478,7 @@ impl PreparedRecoveryExecutionGraph {
             plan,
             accepted_control_entry_bytes,
             canonical_response_entry_bytes,
+            sequencer_receipt,
             persistence_witness,
             origin: RecoveryGraphPrewriteOrigin::Client { witness },
             material,
@@ -2493,6 +2511,7 @@ impl PreparedRecoveryExecutionGraph {
             plan,
             accepted_control_entry_bytes: None,
             canonical_response_entry_bytes: None,
+            sequencer_receipt: None,
             persistence_witness,
             origin: RecoveryGraphPrewriteOrigin::Scheduler {
                 plan_fingerprint,
@@ -2614,6 +2633,24 @@ impl PreparedRecoveryMutation {
         )
         .await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
+        if let Some((conversation_id, seq, receipt_bytes)) = graph.sequencer_receipt.take() {
+            super::delivery::set_entry_sequencer_receipt(
+                transaction,
+                conversation_id,
+                seq,
+                &receipt_bytes,
+            )
+            .await
+            .map_err(|error| match error {
+                super::delivery::DeliveryRepositoryError::Database(error) => {
+                    RecoveryRepositoryError::Database(error)
+                }
+                super::delivery::DeliveryRepositoryError::CompareAndSetConflict => {
+                    RecoveryRepositoryError::CompareAndSetConflict
+                }
+                _ => RecoveryRepositoryError::AuthorityBindingMismatch,
+            })?;
+        }
         let response = graph.take_response();
         Ok(AppliedRecoveryMutation {
             applied,
@@ -2633,6 +2670,7 @@ pub(crate) struct AppliedRecoveryMutation {
 
 fn seal_planned_recovery(
     planned: PlannedRecoveryMutation,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<PreparedRecoveryMutation, RecoveryRepositoryError> {
     let (
         transition,
@@ -2663,11 +2701,67 @@ fn seal_planned_recovery(
             transition_id,
         },
     };
+    let plan = transition.into_persistence_plan()?;
+    let (canonical_response_entry_bytes, sequencer_receipt) =
+        match (i13_signer, accepted_control_entry_bytes.as_deref()) {
+            (Some(signer), Some(accepted)) => {
+                let signing_key = scope_authority
+                    .actor_signing_public_key()
+                    .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+                let entry = decode_and_verify_control_entry(accepted, signing_key)
+                    .map_err(|_| RecoveryRepositoryError::AuthorityBindingMismatch)?;
+                let conversation_id = Uuid::parse_str(entry.conversation_id().as_str())
+                    .map_err(|_| RecoveryRepositoryError::AuthorityBindingMismatch)?;
+                let seq = entry.seq();
+                let receipt_input = I13ControlReceiptInput::from_fields(
+                    entry.conversation_id().as_str(),
+                    entry.entry_id().as_str(),
+                    entry.seq(),
+                    entry.received_at().as_str(),
+                    entry.mutation().actor_did().as_str(),
+                    entry.mutation().actor_device_id().as_str(),
+                    *entry.mutation().request_digest(),
+                )
+                .map_err(|_| RecoveryRepositoryError::AuthorityBindingMismatch)?;
+                let coordinate = plan
+                    .successor_coordinate()
+                    .or_else(|| plan.expected_prior())
+                    .or_else(|| plan.retired_coordinate())
+                    .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+                let coordinate_conversation = Uuid::from_bytes(*coordinate.conversation_id())
+                    .hyphenated()
+                    .to_string();
+                let receipt = signer
+                    .sign_control_receipt_at(
+                        &receipt_input,
+                        &coordinate_conversation,
+                        coordinate.generation(),
+                        coordinate.group_id(),
+                        coordinate.epoch(),
+                    )
+                    .map_err(|_| RecoveryRepositoryError::AuthorityBindingMismatch)?;
+                let response_entry = I13ReceiptSigner::attach_control_receipt(
+                    canonical_response_entry_bytes
+                        .as_deref()
+                        .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?,
+                    &receipt,
+                )
+                .map_err(|_| RecoveryRepositoryError::AuthorityBindingMismatch)?;
+                let receipt_bytes = serde_json::to_vec(&receipt)
+                    .map_err(|_| RecoveryRepositoryError::AuthorityBindingMismatch)?;
+                (
+                    Some(response_entry),
+                    Some((conversation_id, seq, receipt_bytes)),
+                )
+            }
+            _ => (canonical_response_entry_bytes, None),
+        };
     Ok(PreparedRecoveryMutation {
         graph: PreparedRecoveryExecutionGraph::new_client(
-            transition.into_persistence_plan()?,
+            plan,
             accepted_control_entry_bytes,
             canonical_response_entry_bytes,
+            sequencer_receipt,
             persistence_witness,
             prewrite,
             material,
@@ -2708,27 +2802,33 @@ fn scheduler_expiry_material(
 pub(crate) fn plan_recovery_request<T: PublicTransport>(
     input: RecoveryRequestPlanInput,
     relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<PreparedRecoveryMutation, RecoveryRepositoryError> {
-    seal_planned_recovery(HydrationAuthority::plan_recovery_request_input(
-        input,
-        relationship_authority,
-    )?)
+    seal_planned_recovery(
+        HydrationAuthority::plan_recovery_request_input(input, relationship_authority)?,
+        i13_signer,
+    )
 }
 
 pub(crate) fn plan_recovery_cancellation(
     input: RecoveryCancellationPlanInput,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<PreparedRecoveryMutation, RecoveryRepositoryError> {
-    seal_planned_recovery(HydrationAuthority::plan_recovery_cancellation_input(input)?)
+    seal_planned_recovery(
+        HydrationAuthority::plan_recovery_cancellation_input(input)?,
+        i13_signer,
+    )
 }
 
 pub(crate) fn plan_recovery_fulfillment<T: PublicTransport>(
     input: RecoveryFulfillmentPlanInput,
     relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<PreparedRecoveryMutation, RecoveryRepositoryError> {
-    seal_planned_recovery(HydrationAuthority::plan_recovery_fulfillment_input(
-        input,
-        relationship_authority,
-    )?)
+    seal_planned_recovery(
+        HydrationAuthority::plan_recovery_fulfillment_input(input, relationship_authority)?,
+        i13_signer,
+    )
 }
 
 pub(crate) fn plan_client_recovery_expiry(
@@ -2749,6 +2849,7 @@ pub(crate) fn plan_client_recovery_expiry(
     Ok(PreparedRecoveryMutation {
         graph: PreparedRecoveryExecutionGraph::new_client(
             transition.into_persistence_plan()?,
+            None,
             None,
             None,
             persistence_witness,
@@ -2809,6 +2910,7 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
     transaction: &mut Transaction<'_, Postgres>,
     prepared: PreparedSignedOperation,
     relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<RecoveryTransactionOutcome, RecoveryRepositoryError> {
     let (authority, reservation) = match prepared.into_state() {
         PreparedSignedOperationState::Replay { authority, replay } => {
@@ -2839,7 +2941,7 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
             let input = domain
                 .into_plan_input(transaction, relationship_authority, &trusted)
                 .await?;
-            let applied = plan_recovery_request(input, relationship_authority)?
+            let applied = plan_recovery_request(input, relationship_authority, i13_signer)?
                 .apply(transaction)
                 .await?;
             complete_applied_recovery(
@@ -2861,9 +2963,10 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
             .await?;
             match prepare_recovery_cancellation_authority(transaction, prelude, mutation).await? {
                 RecoveryCancellationRead::Execute(domain) => {
-                    let applied = plan_recovery_cancellation(domain.into_plan_input(&trusted)?)?
-                        .apply(transaction)
-                        .await?;
+                    let applied =
+                        plan_recovery_cancellation(domain.into_plan_input(&trusted)?, i13_signer)?
+                            .apply(transaction)
+                            .await?;
                     complete_applied_recovery(
                         transaction,
                         &authority,
@@ -2906,9 +3009,10 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
                     let input = domain
                         .into_plan_input(transaction, relationship_authority, &trusted)
                         .await?;
-                    let applied = plan_recovery_fulfillment(input, relationship_authority)?
-                        .apply(transaction)
-                        .await?;
+                    let applied =
+                        plan_recovery_fulfillment(input, relationship_authority, i13_signer)?
+                            .apply(transaction)
+                            .await?;
                     complete_applied_recovery(
                         transaction,
                         &authority,
@@ -3078,6 +3182,14 @@ pub mod production_composition_proof {
     use serde_json::Value;
     use sqlx::PgPool;
     use std::panic::AssertUnwindSafe;
+
+    fn proof_i13_signer() -> I13ReceiptSigner {
+        I13ReceiptSigner::new(
+            p256::ecdsa::SigningKey::from_slice(&[0x13; 32])
+                .expect("proof receipt key is a valid P-256 scalar"),
+            "did:web:chat.catbird.blue".to_owned(),
+        )
+    }
 
     #[cfg(test)]
     #[path = "../../../../tests/common/chat_protocol_inventory_generation_transport.rs"]
@@ -4165,7 +4277,8 @@ pub mod production_composition_proof {
         let input = authority
             .into_plan_input(transaction, relationship_authority, trusted_request_instant)
             .await?;
-        plan_recovery_request(input, relationship_authority)?
+        let i13_signer = proof_i13_signer();
+        plan_recovery_request(input, relationship_authority, Some(&i13_signer))?
             .apply(transaction)
             .await
     }
@@ -4176,7 +4289,10 @@ pub mod production_composition_proof {
         trusted_request_instant: &TrustedRequestInstant,
     ) -> Result<AppliedRecoveryMutation, RecoveryRepositoryError> {
         let input = authority.into_plan_input(trusted_request_instant)?;
-        plan_recovery_cancellation(input)?.apply(transaction).await
+        let i13_signer = proof_i13_signer();
+        plan_recovery_cancellation(input, Some(&i13_signer))?
+            .apply(transaction)
+            .await
     }
 
     async fn fulfillment<T: PublicTransport>(
@@ -4188,7 +4304,8 @@ pub mod production_composition_proof {
         let input = authority
             .into_plan_input(transaction, relationship_authority, trusted_request_instant)
             .await?;
-        plan_recovery_fulfillment(input, relationship_authority)?
+        let signer = proof_i13_signer();
+        plan_recovery_fulfillment(input, relationship_authority, Some(&signer))?
             .apply(transaction)
             .await
     }
@@ -5087,6 +5204,7 @@ async fn lock_recovery_fulfillment_replay_graph(
             e.state_version AS entry_state_version,
             e.transition_id AS entry_transition_id,
             e.received_at,
+            e.sequencer_receipt_bytes,
             g.group_id,
             s.epoch,
             s.group_context_hash,
@@ -5242,7 +5360,19 @@ async fn lock_recovery_fulfillment_replay_graph(
             .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?,
     )
     .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
-    let entry: JsonValue = serde_json::from_slice(canonical_entry.canonical_response_json())
+    let canonical_response_entry = match row.sequencer_receipt_bytes.as_deref() {
+        Some(bytes) => {
+            let receipt: JsonValue = serde_json::from_slice(bytes)
+                .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+            I13ReceiptSigner::attach_control_receipt(
+                canonical_entry.canonical_response_json(),
+                &receipt,
+            )
+            .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?
+        }
+        None => canonical_entry.canonical_response_json().to_vec(),
+    };
+    let entry: JsonValue = serde_json::from_slice(&canonical_response_entry)
         .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
     if !entry.is_object() {
         return Err(RecoveryRepositoryError::InvalidDurableRow);
@@ -5285,11 +5415,8 @@ async fn lock_recovery_fulfillment_replay_graph(
         }],
     }))
     .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
-    let graph_digest = digest_recovery_fulfillment_replay_graph(
-        row,
-        canonical_entry.canonical_response_json(),
-        &response_bytes,
-    );
+    let graph_digest =
+        digest_recovery_fulfillment_replay_graph(row, &canonical_response_entry, &response_bytes);
     Ok(LockedRecoveryFulfillmentReplayGraph {
         response_bytes,
         graph_digest,

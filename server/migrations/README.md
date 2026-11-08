@@ -5,9 +5,9 @@ SQL migrations for `catbird-server`, applied in version order by SQLx (`sqlx::mi
 ## Status
 
 - The R0 seal (bookmark `clean-slate-2026-10-31`, mls-ds `d5f6993c`) has 129 migrations, ending at `20261102000003_conversation_close_terminal_entries.sql`.
-- The unsealed Task 4 R1 provisional commits add fourteen, for 143: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010`, `000011` and `000012`. The seed-2323 fix adds `20261107000001`, for 144. Their contracts are in the sections below.
+- The unsealed Task 4 R1 provisional commits add fourteen, for 143: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010`, `000011` and `000012`. The seed-2323 fix adds `20261107000001`, for 144. The Round 4 lifecycle relay adds `20261113000001`, for 145. Their contracts are in the sections below.
 - **Held.** These migrations have run only against local disposable and guarded test databases. Do not apply them to a production database until R1 is sealed and the production migration is separately authorized. Server startup applies pending migrations, so the hold also covers starting this tree against a production database.
-- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 144 migrations ending at `20261107000001` (92 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
+- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 145 migrations ending at `20261113000001` (94 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
 
 ## Clean-Chat Operation Claim Rollout
 
@@ -683,6 +683,25 @@ them answered (`answered_at = created_at`); none is left unanswered. Every
 route still counts toward the 20-per-hour route quota by `created_at`. The
 expiry sweeper deletes an unanswered route an hour after `created_at`, using
 the partial index on unanswered rows; it never deletes an answered route.
+
+## Remote lifecycle recovery bindings
+
+`20261113000001_remote_lifecycle_recovery_bindings.sql` retains the immutable,
+indexed route and exact response for a leaf-recovery request relayed through a
+member's home to the remote sequencer. A transport-only C33 home has no
+`chat.conversations` row, so the binding deliberately owns its conversation ID
+without a foreign key. Cancellation resolves only by the request-ID primary key
+plus actor/device binding; no transport entry scan is involved. Fulfilment,
+cancellation, conversation close and the sequencer-issued expiry delete the
+route.
+
+The same migration retains each completed relayed lifecycle operation's exact
+response for 24 hours, matching direct API idempotency retention. Its primary
+key binds actor, device, endpoint and operation ID; a signed-request SHA-256
+rejects operation-ID reuse with different bytes. Close removes routing state but
+not this bounded replay. The expiry sweeper deletes both due tables.
+Raw-file size: `4702` bytes. SQLx SHA-384:
+`78975bab32bfaa527ee1233ad49b36956d91fb4c9fef47533365cabd6c98778b50709a57fda8fa5c5933fab388e9e596`.
 
 ## Credential and opening evidence contracts
 

@@ -602,6 +602,197 @@ async fn a_failed_identical_prepare_never_withdraws_an_answered_route() {
     );
 }
 
+/// The sender's non-coordinator home loses the coordinator's first successful
+/// prepare answer, then sends the byte-identical request again before
+/// publication. The coordinator returns the retained preparation bytes and
+/// executes no second preparation.
+#[tokio::test]
+async fn c33_lost_prepare_answer_replays_the_retained_prepared_outcome() {
+    let (_home_db, _home_pool, network, sender, recipient, home_hooks, home_router, _) =
+        relay_home(None).await;
+    let coordinator_db = fresh_fully_migrated_db("chat_fed_relay_").await;
+    let coordinator_pool = coordinator_db.connect(4).await;
+    ensure_fence(&coordinator_pool).await;
+    sqlx::query("INSERT INTO federation_peers(ds_did,status) VALUES($1,'allow')")
+        .bind(SENDER_DS)
+        .execute(&coordinator_pool)
+        .await
+        .unwrap();
+
+    let (recipient_key, _) = seed_published_request_keys(&coordinator_pool, &recipient, 1)
+        .await
+        .expect("the recipient's published request key");
+    network.authorize_device(&recipient, &recipient_key);
+
+    let coordinator_key = key(0x6b);
+    let receipt_key = key(0x7a);
+    let receipt_pem = pem(&receipt_key);
+    let service_pem = pem(&coordinator_key);
+    let document = crate::identity::did_doc::build_direct_request_receipt_did_document(
+        COORDINATOR_DS,
+        receipt_key.verifying_key(),
+    )
+    .to_string();
+    let mut built = None;
+    let _ = http::router_for_authenticated_acceptance_with(coordinator_pool.clone(), |runtime| {
+        built = Some(ChatRuntime::from_env(Arc::new(crate::realtime::SseState::new(8))).unwrap());
+        runtime
+    })
+    .await;
+    let coordinator_hooks = hooks(COORDINATOR_DS, Some(&coordinator_key), false, &network);
+    let coordinator_runtime = built
+        .unwrap()
+        .with_request_receipt_keys(&receipt_pem, &service_pem, &document)
+        .unwrap()
+        .with_sim_allow_all_relationships()
+        .unwrap()
+        .with_sim_hooks(Arc::clone(&coordinator_hooks));
+    coordinator_runtime
+        .validate_protocol_fence(&coordinator_pool)
+        .await
+        .unwrap();
+    let coordinator_runtime = Arc::new(coordinator_runtime);
+
+    let first_answer = Arc::new(std::sync::Mutex::new(None));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    network.serve(COORDINATOR_DS, {
+        let pool = coordinator_pool.clone();
+        let runtime = Arc::clone(&coordinator_runtime);
+        let hooks = Arc::clone(&coordinator_hooks);
+        let retained = Arc::clone(&first_answer);
+        let calls = Arc::clone(&calls);
+        Router::new().route(
+            "/xrpc/blue.catbird.mlsDS.prepareDirectRequest",
+            axum::routing::post(move |Json(input): Json<Value>| {
+                let pool = pool.clone();
+                let runtime = Arc::clone(&runtime);
+                let hooks = Arc::clone(&hooks);
+                let retained = Arc::clone(&retained);
+                let calls = Arc::clone(&calls);
+                async move {
+                    match scope_sim_ds(
+                        hooks,
+                        coordinator_prepare_direct_request(&pool, &runtime, SENDER_DS, &input),
+                    )
+                    .await
+                    {
+                        Ok(outcome) if calls.fetch_add(1, SeqCst) == 0 => {
+                            *retained.lock().unwrap() = Some(serde_json::to_vec(&outcome).unwrap());
+                            StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        }
+                        Ok(outcome) => Json(outcome).into_response(),
+                        Err(error) => error.into_response(),
+                    }
+                }
+            }),
+        )
+    });
+
+    let request_id = Uuid::new_v4();
+    let prepare = sender.sign(DirectRequestKind::Prepare, &recipient, request_id);
+    let conversation_id =
+        Uuid::parse_str(prepare["body"]["conversationId"].as_str().unwrap()).unwrap();
+    let (status, retry_after, body) =
+        call(&home_router, &home_hooks, &sender, PREPARE, &prepare).await;
+    assert_eq!(
+        (status, retry_after.as_deref(), body["error"].as_str()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("5"),
+            Some("CapacityUnavailable")
+        ),
+        "the first successful coordinator answer was lost: {body}"
+    );
+    let retained_answer = first_answer
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the coordinator prepared before its answer was lost");
+    let retained_effects = effects(&coordinator_pool).await;
+    let retained_attempt: (
+        String,
+        String,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    ) = sqlx::query_as(
+        "SELECT xmin::text,status,prepare_response,terminal_response,prepared_at,lease_expires_at \
+             FROM chat.direct_request_attempts WHERE request_id=$1",
+    )
+    .bind(request_id)
+    .fetch_one(&coordinator_pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_attempt.1, "prepared");
+    assert!(retained_attempt.3.is_none(), "no terminal receipt exists");
+    let sequence_position: Option<i64> = sqlx::query_scalar(
+        "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&coordinator_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sequence_position, None,
+        "publication has not allocated a seq"
+    );
+
+    let (status, _, replay) = call(&home_router, &home_hooks, &sender, PREPARE, &prepare).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the identical retry did not receive the retained prepared outcome: {replay}"
+    );
+    assert_eq!(
+        replay["outcome"]["$type"],
+        "blue.catbird.chat.defs#directRequestPreparedOutcome"
+    );
+    assert_eq!(
+        serde_json::to_vec(&replay).unwrap(),
+        retained_answer,
+        "the replayed answer changed bytes"
+    );
+    let relays = delivered(&network, "/xrpc/blue.catbird.mlsDS.prepareDirectRequest");
+    assert_eq!(relays.len(), 2);
+    assert_eq!(relays[0], relays[1], "the retried request changed bytes");
+    assert_eq!(
+        effects(&coordinator_pool).await,
+        retained_effects,
+        "the replay created a second direct-request effect"
+    );
+    let replayed_attempt: (
+        String,
+        String,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    ) = sqlx::query_as(
+        "SELECT xmin::text,status,prepare_response,terminal_response,prepared_at,lease_expires_at \
+         FROM chat.direct_request_attempts WHERE request_id=$1",
+    )
+    .bind(request_id)
+    .fetch_one(&coordinator_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        replayed_attempt, retained_attempt,
+        "the replay rewrote the preparation or created a receipt"
+    );
+    let replayed_sequence: Option<i64> = sqlx::query_scalar(
+        "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&coordinator_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        replayed_sequence, sequence_position,
+        "the replay allocated a sequence position"
+    );
+}
+
 /// This home coordinates a pair it also homes. A DID document its policy
 /// source does not find is an authoritative answer: the durable signed
 /// `RequestPolicyDenied`, which replays after the source recovers. While that

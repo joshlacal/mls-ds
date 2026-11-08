@@ -91,6 +91,9 @@
           "name": "RelationshipPolicyUnavailable"
         },
         {
+          "name": "SignedOperationExpired"
+        },
+        {
           "name": "UnsupportedMlsProfile"
         },
         {

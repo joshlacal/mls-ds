@@ -13,7 +13,7 @@ use crate::{
             seed_clean_slate_application_fixture_unsealed,
             seed_clean_slate_application_fixture_with_sender_home,
             seed_remote_clean_slate_application_fixture,
-            seed_remote_group_application_routing_fixture,
+            seed_remote_group_application_routing_fixture, CleanSlateApplicationFixture,
         },
     },
     common::{
@@ -394,6 +394,148 @@ async fn queue_rows(pool: &DbPool, conversation_id: Uuid) -> Vec<QueueRow> {
     .unwrap()
 }
 
+type RelayedSendState = (i64, i64, i64, i64, i64);
+
+async fn relayed_send_state(pool: &DbPool, conversation_id: Uuid) -> RelayedSendState {
+    sqlx::query_as(
+        "SELECT c.next_entry_seq,c.current_generation,c.current_state_version, \
+                (SELECT count(*) FROM chat.entries e WHERE e.conversation_id=c.conversation_id), \
+                (SELECT count(*) FROM chat.message_sends m WHERE m.conversation_id=c.conversation_id) + \
+                (SELECT count(*) FROM outbound_queue q WHERE q.convo_id=c.conversation_id::text) \
+           FROM chat.conversations c WHERE c.conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn receipted_relay_refuses_an_archive_less_group_send_before_any_effect() {
+    crate::federation::open_federation_for_test();
+    let seq_db = fresh_fully_migrated_db("chat_fed_relay_").await;
+    let seq_pool = seq_db.connect(4).await;
+    let home_db = fresh_fully_migrated_db("chat_fed_relay_").await;
+    let home_pool = home_db.connect(4).await;
+    prepare(&seq_pool).await;
+    prepare(&home_pool).await;
+    let missing =
+        seed_clean_slate_application_fixture_unsealed(&seq_pool, false, SEQ, None, Some(HOME))
+            .await
+            .unwrap();
+    let valid = seed_clean_slate_application_fixture_unsealed(
+        &seq_pool,
+        false,
+        SEQ,
+        Some([0x5c; 32]),
+        Some(HOME),
+    )
+    .await
+    .unwrap();
+    let (seq_key, home_key) = (key(0x35), key(0x36));
+    let network = Network::new(&[(SEQ, &seq_key), (HOME, &home_key)]);
+    for fixture in [&missing, &valid] {
+        network.declare_user(&fixture.sender_did, HOME);
+        network.authorize_device(
+            &fixture.sender_did,
+            &ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed)
+                .verifying_key()
+                .to_bytes(),
+        );
+        network.declare_user(&fixture.recipient_did, SEQ);
+        network.authorize_device(
+            &fixture.recipient_did,
+            &ed25519_dalek::SigningKey::from_bytes(&fixture.recipient_ed25519_seed)
+                .verifying_key()
+                .to_bytes(),
+        );
+    }
+    let clock = manual_clock();
+    let seq_hooks = hooks(SEQ, Some(&seq_key), true, &network);
+    let home_hooks = hooks(HOME, Some(&home_key), false, &network);
+    let state = GroupRelayState::for_test(
+        seq_pool.clone(),
+        SEQ.to_owned(),
+        HMAC.as_bytes(),
+        Some(Arc::new(I13ReceiptSigner::new(
+            seq_key.clone(),
+            SEQ.to_owned(),
+        ))),
+    )
+    .with_sim_hooks(seq_hooks)
+    .with_clock(clock.clone());
+    network.serve(SEQ, group_relay_router(state));
+
+    let relay = |fixture: &CleanSlateApplicationFixture| RelayGroupMutationRequest {
+        conversation_id: fixture.conversation_id,
+        endpoint: "blue.catbird.chat.sendMessage".to_owned(),
+        actor_did: fixture.sender_did.clone(),
+        actor_device_id: fixture.sender_device_id,
+        signed_request: fixture.signed_request.clone(),
+        signed_request_bytes: None,
+    };
+    scope_ds_clock(
+        clock,
+        scope_sim_ds(home_hooks, async {
+            let before = relayed_send_state(&seq_pool, missing.conversation_id).await;
+            let rejected = relay_group_mutation_to_sequencer(
+                &format!("https://{}", host(SEQ)),
+                HOME,
+                SEQ,
+                HMAC.as_bytes(),
+                &relay(&missing),
+            )
+            .await;
+            assert!(
+                matches!(
+                    rejected,
+                    Err(GroupRelayError::Rejected(
+                        crate::chat_protocol::error::ChatProtocolErrorCode::InvalidApplicationMessage
+                    ))
+                ),
+                "{rejected:?}"
+            );
+            assert_eq!(
+                relayed_send_state(&seq_pool, missing.conversation_id).await,
+                before
+            );
+
+            let valid_before = relayed_send_state(&seq_pool, valid.conversation_id).await;
+            let request = relay(&valid);
+            let accepted = relay_group_mutation_to_sequencer(
+                &format!("https://{}", host(SEQ)),
+                HOME,
+                SEQ,
+                HMAC.as_bytes(),
+                &request,
+            )
+            .await
+            .expect("archive-bound group send");
+            assert_eq!(accepted.entry["seq"], valid_before.0);
+            assert!(accepted.entry["sequencerReceipt"].is_object());
+            let accepted_state = relayed_send_state(&seq_pool, valid.conversation_id).await;
+            let replay = relay_group_mutation_to_sequencer(
+                &format!("https://{}", host(SEQ)),
+                HOME,
+                SEQ,
+                HMAC.as_bytes(),
+                &request,
+            )
+            .await
+            .expect("exact replay");
+            assert_eq!(
+                serde_json::to_value(replay).unwrap(),
+                serde_json::to_value(accepted).unwrap()
+            );
+            assert_eq!(
+                relayed_send_state(&seq_pool, valid.conversation_id).await,
+                accepted_state
+            );
+        }),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn sequencer_prunes_only_after_the_remote_home_relays_its_device_ack() {
     crate::federation::open_federation_for_test();
@@ -459,6 +601,7 @@ async fn sequencer_prunes_only_after_the_remote_home_relays_its_device_ack() {
             actor_did: fixture.sender_did.clone(),
             actor_device_id: fixture.sender_device_id,
             signed_request: fixture.signed_request.clone(),
+            signed_request_bytes: None,
         };
         let entry = scope_sim_ds(
             Arc::clone(&seq_hooks),
@@ -1885,6 +2028,7 @@ async fn a_sequencer_prune_without_the_remote_member_ack_notifies_its_home() {
                 actor_did: fixture.sender_did.clone(),
                 actor_device_id: fixture.sender_device_id,
                 signed_request: fixture.signed_request.clone(),
+                signed_request_bytes: None,
             };
             // HOME is unreachable, so the entry fanned out to it stays queued.
             let seq = sequence_relayed_group_application_send(&state, HOME, &request)
@@ -2220,6 +2364,7 @@ async fn relayed_application(
         actor_did: fixture.sender_did.clone(),
         actor_device_id: fixture.sender_device_id,
         signed_request: fixture.signed_request.clone(),
+        signed_request_bytes: None,
     };
     let seq = scope_ds_clock(
         clock,

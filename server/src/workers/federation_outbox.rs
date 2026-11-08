@@ -255,17 +255,22 @@ pub async fn handoff_to_outbound_queue(
         )
         .await?;
 
-        let (per_peer_cap, per_convo_cap) =
-            crate::federation::queue::current_pending_caps_from_env();
-        crate::federation::queue::enforce_pending_caps_with_executor(
-            &mut *tx,
-            &canonical_target_ds_did,
-            &row.conversation_id,
-            &policy,
-            per_peer_cap,
-            per_convo_cap,
-        )
-        .await?;
+        // Welcome is the ordering fence for this direct stream. Let its one
+        // stable outbox row cross a full pending cap; otherwise the rows held
+        // behind that fence can never drain and free capacity.
+        if row.method != crate::federation::envelope::DELIVER_WELCOME_NSID {
+            let (per_peer_cap, per_convo_cap) =
+                crate::federation::queue::current_pending_caps_from_env();
+            crate::federation::queue::enforce_pending_caps_with_executor(
+                &mut *tx,
+                &canonical_target_ds_did,
+                &row.conversation_id,
+                &policy,
+                per_peer_cap,
+                per_convo_cap,
+            )
+            .await?;
+        }
 
         sqlx::query(
             "INSERT INTO outbound_queue \

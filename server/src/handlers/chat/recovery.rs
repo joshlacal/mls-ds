@@ -76,6 +76,22 @@ async fn handle(
 ) -> Result<Response, ChatFailure> {
     let admission =
         context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
+    if let Some(response) =
+        context::try_relay_remote_lifecycle(pool, runtime, endpoint, &admission, body).await?
+    {
+        return Ok(response);
+    }
+    context::refuse_remote_sequencing(pool, endpoint, &admission).await?;
+    execute_admitted(pool, runtime, endpoint, admission, None).await
+}
+
+pub(super) async fn execute_admitted(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    endpoint: ChatEndpoint,
+    admission: crate::chat_protocol::repository::auth::SignedOperationAdmission,
+    _relay_home: Option<&str>,
+) -> Result<Response, ChatFailure> {
     let mut transaction = pool
         .begin()
         .await
@@ -88,6 +104,7 @@ async fn handle(
         .commit()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
+    runtime.notify_events();
     Ok(response)
 }
 
@@ -104,6 +121,7 @@ pub(super) async fn execute_prepared(
         transaction,
         prepared,
         runtime.relationship_authority().as_ref(),
+        runtime.i13_receipt_signer(),
     )
     .await
     .map_err(|error| recovery_failure(endpoint, error))?;
@@ -138,7 +156,9 @@ fn recovery_failure(endpoint: ChatEndpoint, error: RecoveryRepositoryError) -> C
             ChatFailure::protocol(endpoint, C::StaleCoordinates)
         }
         E::RecoveryMissing => ChatFailure::protocol(endpoint, C::LeafRecoveryNotFound),
-        E::PackageUnavailable => ChatFailure::protocol(endpoint, C::KeyPackageUnavailable),
+        E::PackageUnavailable | E::PackageHydration(P::PackageMissing) => {
+            ChatFailure::protocol(endpoint, C::KeyPackageUnavailable)
+        }
         // A relationship source that could not answer now decided nothing.
         E::RelationshipUnavailable | E::Relationship(R::Unavailable) => {
             ChatFailure::unavailable(endpoint)
@@ -202,10 +222,17 @@ fn map_recovery_state_machine_error(
         S::InvalidWelcomeMapping => ChatFailure::protocol(endpoint, C::InvalidWelcomeMapping),
         S::InvalidPolicyAuthority => ChatFailure::protocol(endpoint, C::BlockedRelationship),
         S::InvalidMetadataAuthority => ChatFailure::protocol(endpoint, C::InvalidMetadataSnapshot),
-        S::InvalidTransition | S::InvalidCommitEffects | S::InvalidPublicState => {
-            ChatFailure::protocol(endpoint, C::InvalidCommit)
-        }
-        S::InvalidIntervalBoundary => ChatFailure::protocol(endpoint, C::InvalidCommit),
+        S::InvalidTransition
+        | S::InvalidCommitEffects
+        | S::InvalidPublicState
+        | S::InvalidIntervalBoundary => ChatFailure::protocol(
+            endpoint,
+            if endpoint == ChatEndpoint::SubmitTransition {
+                C::InvalidCommit
+            } else {
+                C::InvalidRequest
+            },
+        ),
         S::MetadataVersionOverflow => ChatFailure::protocol(endpoint, C::MetadataVersionOverflow),
         S::LeaveRequestNotFound => ChatFailure::protocol(endpoint, C::LeaveRequestNotFound),
         S::ConversationCloseNotAllowed => ChatFailure::protocol(endpoint, C::AdminRequired),
@@ -276,5 +303,43 @@ mod tests {
                 (400, false, Some("BlockedRelationship"))
             );
         }
+    }
+
+    #[test]
+    fn recovery_state_machine_and_package_missing_errors_use_endpoint_declared_codes() {
+        use RecoveryPackageHydrationError as P;
+        use RecoveryRepositoryError as E;
+        use StateMachineError as S;
+
+        assert_eq!(
+            wire(
+                ChatEndpoint::RequestLeafRecovery,
+                E::StateMachine(S::InvalidTransition),
+            ),
+            (400, false, Some("InvalidRequest"))
+        );
+        assert_eq!(
+            wire(
+                ChatEndpoint::CancelLeafRecovery,
+                E::StateMachine(S::InvalidTransition),
+            ),
+            (400, false, Some("InvalidRequest"))
+        );
+        assert_eq!(
+            wire(
+                ChatEndpoint::SubmitTransition,
+                E::StateMachine(S::InvalidTransition),
+            ),
+            (400, false, Some("InvalidCommit"))
+        );
+        let unavailable = wire(ChatEndpoint::RequestLeafRecovery, E::PackageUnavailable);
+        assert_eq!(unavailable.2, Some("KeyPackageUnavailable"));
+        assert_eq!(
+            wire(
+                ChatEndpoint::RequestLeafRecovery,
+                E::PackageHydration(P::PackageMissing),
+            ),
+            unavailable
+        );
     }
 }

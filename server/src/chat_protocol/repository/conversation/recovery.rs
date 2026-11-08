@@ -124,7 +124,91 @@ pub(super) async fn load_pending_leaf_recoveries(
         .fetch_all(&mut **transaction)
         .await
         .map_err(|_| ConversationStateReadError::Storage)?;
-    rows.into_iter().map(project_recovery).collect()
+    let mut recoveries = rows
+        .into_iter()
+        .map(project_recovery)
+        .collect::<Result<Vec<_>, _>>()?;
+    recoveries.extend(load_remote_pending_leaf_recoveries(transaction, authority).await?);
+    Ok(recoveries)
+}
+
+async fn load_remote_pending_leaf_recoveries(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &ConversationStateReadAuthority,
+) -> Result<Vec<RecoveryView>, ConversationStateReadError> {
+    let now = crate::sim_hooks::current_utc();
+    let rows: Vec<RemoteLeafRecoverySourceRow> = sqlx::query_as(
+        "SELECT recovery_request_id,actor_did,actor_device_id,response_sha256,response_bytes \
+         FROM chat.remote_lifecycle_recovery_bindings \
+         WHERE conversation_id=$1 AND expires_at>$4 \
+           AND NOT (actor_did=$2 AND actor_device_id=$3) \
+         ORDER BY bound_at,recovery_request_id LIMIT 100",
+    )
+    .bind(authority.conversation_id())
+    .bind(authority.user_did())
+    .bind(authority.device_id())
+    .bind(now)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| ConversationStateReadError::Storage)?;
+    let mut recoveries = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.response_sha256.as_slice() != Sha256::digest(&row.response_bytes).as_slice() {
+            return Err(ConversationStateReadError::Invariant);
+        }
+        let value: serde_json::Value = serde_json::from_slice(&row.response_bytes)
+            .map_err(|_| ConversationStateReadError::Invariant)?;
+        let recovery = value
+            .get("recovery")
+            .ok_or(ConversationStateReadError::Invariant)?;
+        let expires_at = recovery
+            .get("expiresAt")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .ok_or(ConversationStateReadError::Invariant)?;
+        if expires_at <= now {
+            continue;
+        }
+        if value.as_object().map(serde_json::Map::len) != Some(1)
+            || recovery
+                .get("recoveryRequestId")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                != Some(row.recovery_request_id)
+            || recovery
+                .get("conversationId")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                != Some(authority.conversation_id())
+            || recovery
+                .get("requesterDid")
+                .and_then(serde_json::Value::as_str)
+                != Some(row.actor_did.as_str())
+            || recovery
+                .get("requesterDeviceId")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                != Some(row.actor_device_id)
+            || recovery.get("status").and_then(serde_json::Value::as_str) != Some("open")
+            || recovery.get("signedRequest").is_none()
+        {
+            return Err(ConversationStateReadError::Invariant);
+        }
+        recoveries.push(
+            serde_json::from_value(recovery.clone())
+                .map_err(|_| ConversationStateReadError::Invariant)?,
+        );
+    }
+    Ok(recoveries)
+}
+
+#[derive(Debug, FromRow)]
+struct RemoteLeafRecoverySourceRow {
+    recovery_request_id: Uuid,
+    actor_did: String,
+    actor_device_id: Uuid,
+    response_sha256: Vec<u8>,
+    response_bytes: Vec<u8>,
 }
 
 fn canonical_datetime(value: DateTime<Utc>) -> String {

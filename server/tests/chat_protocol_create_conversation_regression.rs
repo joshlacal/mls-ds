@@ -43,7 +43,13 @@ fn genesis_group_info_rejects_excessive_leaf_lifetime_as_declared_error() {
     let policy = GroupInfoValidationPolicy {
         expected_basic_credential: &basic_credential,
         expected_signature_key: &pubkey_bytes,
-        now_unix_seconds: chrono::Utc::now().timestamp() as u64,
+        now_unix_seconds: chrono::DateTime::parse_from_rfc3339(
+            fixture["body"]["signedRequest"]["body"]["signedAt"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+        .timestamp() as u64,
         max_bytes: 65536,
         max_ratchet_tree_bytes: 65536,
         max_members: 100,

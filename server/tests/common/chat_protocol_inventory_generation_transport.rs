@@ -533,6 +533,29 @@ async fn advance_unrelated_global_event(pool: &PgPool, router: &axum::Router) {
     create_group(router, &device, &fixture).await;
 }
 
+fn bind_application_archive_attestation(
+    body: &mut Value,
+    sender_did: &str,
+    sender_device_id: Uuid,
+    signing_key: &Ed25519SigningKey,
+    conversation_id: Uuid,
+    message_id: Uuid,
+    archive_commitment: &[u8; 32],
+) {
+    let transcript = labyrinth_protocol::transcripts::original_sender_archive_transcript(
+        &conversation_id.to_string(),
+        &message_id.to_string(),
+        archive_commitment,
+    );
+    body["aad"]["archiveCommitment"] = json!(STANDARD.encode(archive_commitment));
+    body["aad"]["originalSenderAttestation"] = json!({
+        "senderDid": sender_did,
+        "senderDeviceId": sender_device_id,
+        "senderTransportPubkey": STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        "signature": STANDARD.encode(signing_key.sign(&transcript).to_bytes()),
+    });
+}
+
 async fn send_ready_application(
     pool: &PgPool,
     router: &axum::Router,
@@ -549,7 +572,7 @@ async fn send_ready_application(
         "distinct native payload remains"
     );
     let application = fixture.application_messages.remove(0);
-    let body = json!({
+    let mut body = json!({
         "$type":"blue.catbird.chat.defs#applicationSendBody", "signatureDomain":"CATBIRD-CHAT-MESSAGE\u{0000}",
         "messageId":message_id,"actorDid":fixture.requester.did,"actorDeviceId":fixture.requester.device_id,
         "keyId":fixture.requester.key_id,"authGeneration":1,"sendCounter":1,"prior":prior,
@@ -559,6 +582,16 @@ async fn send_ready_application(
         "applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication",
             "bytes":STANDARD.encode(&application),"sha256":STANDARD.encode(Sha256::digest(&application))}
     });
+    let archive_commitment = <[u8; 32]>::from(Sha256::digest(&application));
+    bind_application_archive_attestation(
+        &mut body,
+        &fixture.requester.did,
+        fixture.requester.device_id,
+        &fixture.requester.signing_key,
+        fixture.conversation_id,
+        message_id,
+        &archive_commitment,
+    );
     let mut wrapper = json!({"body":body,"signature":STANDARD.encode([0_u8;64])});
     let unsigned = serde_json::to_vec(&wrapper).unwrap();
     let canonical = decode_canonical_signed_mutation(&unsigned).unwrap();
@@ -827,7 +860,7 @@ async fn send_application(
         .expect("real MLS application encryption")
         .tls_serialize_detached()
         .unwrap();
-    let body = json!({
+    let mut body = json!({
         "$type":"blue.catbird.chat.defs#applicationSendBody", "signatureDomain":"CATBIRD-CHAT-MESSAGE\u{0000}",
         "messageId":message_id,"actorDid":fixture.actor_did,"actorDeviceId":fixture.actor_device_id,
         "keyId":fixture.actor_key_id,"authGeneration":1,"sendCounter":1,"prior":prior,
@@ -837,6 +870,16 @@ async fn send_application(
         "applicationMessage":{"framing":"mlsMessage","contentType":"privateMessageApplication",
             "bytes":STANDARD.encode(&application),"sha256":STANDARD.encode(Sha256::digest(&application))}
     });
+    let archive_commitment = <[u8; 32]>::from(Sha256::digest(&application));
+    bind_application_archive_attestation(
+        &mut body,
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &fixture.actor_ed25519_signing_key,
+        fixture.cid,
+        message_id,
+        &archive_commitment,
+    );
     let mut wrapper = json!({"body":body,"signature":STANDARD.encode([0_u8;64])});
     let unsigned = serde_json::to_vec(&wrapper).unwrap();
     let canonical = decode_canonical_signed_mutation(&unsigned)

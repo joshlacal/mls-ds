@@ -2191,7 +2191,7 @@ async fn main() -> Result<()> {
             Some(Arc::new(i13_signer)),
             Some(push_client),
         )
-        .with_relationship_authority_of(&runtime),
+        .with_chat_runtime(Arc::clone(&runtime)),
     );
 
     // A remote home provisions its group mirror from the sequencer's discovery and

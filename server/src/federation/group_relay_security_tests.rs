@@ -257,6 +257,7 @@ fn application_request(
             .parse()
             .unwrap(),
         signed_request,
+        signed_request_bytes: None,
     }
 }
 
@@ -576,6 +577,7 @@ async fn a_relayed_policy_add_across_a_block_is_the_local_refusal() {
             signed,
             None,
             &authority,
+            None,
         ),
     )
     .await;

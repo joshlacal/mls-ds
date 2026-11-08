@@ -15,6 +15,8 @@ const REVOCATION: &str = include_str!("../src/handlers/chat/revoke_device.rs");
 const RECOVERY: &str = include_str!("../src/handlers/chat/recovery.rs");
 const WELCOME: &str = include_str!("../src/handlers/chat/welcome.rs");
 const SUBMIT_TRANSITION: &str = include_str!("../src/handlers/chat/submit_transition.rs");
+const CONTEXT: &str = include_str!("../src/handlers/chat/context.rs");
+const DS_DELIVER_MESSAGE: &str = include_str!("../src/handlers/ds/deliver_message.rs");
 
 /// Remove comments while preserving code and string literals.  The latter are
 /// intentionally retained so the SQL-string prohibition below is meaningful.
@@ -249,6 +251,62 @@ fn submit_transition_has_a_closed_recovery_routing_union() {
         !source.contains("SignedMutationKind::ZeroLeafLeave"),
         "submitTransition must never admit or dispatch ZeroLeafLeave"
     );
+}
+
+#[test]
+fn unknown_remote_recovery_cancellation_uses_only_the_indexed_binding() {
+    let source = without_comments(CONTEXT);
+    assert!(
+        source.contains("SELECT conversation_id FROM chat.remote_lifecycle_recovery_bindings"),
+        "remote recovery cancellation must resolve through its durable binding"
+    );
+    assert!(
+        !source.contains("position($1::bytea IN entry_bytes)")
+            && !source.contains(
+                "SELECT conversation_id,entry_bytes FROM chat.direct_request_transport_entries"
+            ),
+        "an unknown recovery id must not scan replicated entry payloads"
+    );
+}
+
+#[test]
+fn ds_requesters_are_not_charged_for_this_servers_5xx() {
+    assert!(
+        DS_DELIVER_MESSAGE.contains("if !error.status_code().is_server_error()"),
+        "the shared outcome recorder must exclude this server's 5xx"
+    );
+    for (name, source) in [
+        ("deliverMessage", DS_DELIVER_MESSAGE),
+        (
+            "deliverWelcome",
+            include_str!("../src/handlers/ds/deliver_welcome.rs"),
+        ),
+        (
+            "fetchKeyPackage",
+            include_str!("../src/handlers/ds/fetch_key_package.rs"),
+        ),
+        (
+            "getConvoDigest",
+            include_str!("../src/handlers/ds/get_convo_digest.rs"),
+        ),
+        (
+            "getConvoEvents",
+            include_str!("../src/handlers/ds/get_convo_events.rs"),
+        ),
+        (
+            "submitCommit",
+            include_str!("../src/handlers/ds/submit_commit.rs"),
+        ),
+        (
+            "transferSequencer",
+            include_str!("../src/handlers/ds/transfer_sequencer.rs"),
+        ),
+    ] {
+        assert!(
+            source.contains("record_ds_outcome(&pool, &requester_ds, &result).await"),
+            "{name} must delegate typed outcome accounting"
+        );
+    }
 }
 
 #[test]

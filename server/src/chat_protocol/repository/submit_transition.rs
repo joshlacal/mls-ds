@@ -31,6 +31,7 @@ use crate::chat_protocol::{
     },
     validation::{CanonicalTimestamp, CanonicalUuidV4, TrustedRequestInstant},
 };
+use crate::federation::receipt::{I13ControlReceiptInput, I13ReceiptSigner};
 
 use super::{
     auth::{CompletedIdempotentResponse, RepositoryAuthorityClass},
@@ -81,6 +82,7 @@ pub(crate) enum SubmitTransitionFacadeError {
     Executor(ExecutorError),
     Database(sqlx::Error),
     Federation(crate::federation::FederationError),
+    Delivery(super::delivery::DeliveryRepositoryError),
 }
 
 macro_rules! facade_from {
@@ -104,6 +106,7 @@ facade_from!(ExecutionContextHydrationError, ExecutionContext);
 facade_from!(ExecutorError, Executor);
 facade_from!(sqlx::Error, Database);
 facade_from!(crate::federation::FederationError, Federation);
+facade_from!(super::delivery::DeliveryRepositoryError, Delivery);
 
 /// Generated-DTO-validated output bytes. The binding digest prevents accidental
 /// replacement after the plan-derived response has been sealed.
@@ -438,6 +441,7 @@ pub(crate) async fn execute_prepared_submit_transition<T: PublicTransport>(
     transaction: &mut Transaction<'_, Postgres>,
     prepared: PreparedSignedOperation,
     relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&I13ReceiptSigner>,
     routing: Option<crate::chat_protocol::federation_routing::ParticipantRoutingIntent>,
     remote_commit: RemoteCommitPreflightOutcome,
 ) -> Result<SubmitTransitionTransactionOutcome, SubmitTransitionFacadeError> {
@@ -451,6 +455,7 @@ pub(crate) async fn execute_prepared_submit_transition<T: PublicTransport>(
                 authority,
                 reservation,
                 relationship_authority,
+                i13_signer,
                 routing,
                 remote_commit,
             )
@@ -483,6 +488,7 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     authority: VerifiedChatDeviceRequest,
     reservation: OperationReservationGuard,
     relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&I13ReceiptSigner>,
     routing: Option<crate::chat_protocol::federation_routing::ParticipantRoutingIntent>,
     remote_commit: RemoteCommitPreflightOutcome,
 ) -> Result<SubmitTransitionTransactionOutcome, SubmitTransitionFacadeError> {
@@ -562,6 +568,24 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         &effective_instant,
         CanonicalControlServerFields::empty(control_kind(admitted.kind())?)?,
     )?;
+    let receipt_input: Option<I13ControlReceiptInput> = if is_remote {
+        None
+    } else {
+        i13_signer
+            .map(|_| {
+                I13ControlReceiptInput::from_fields(
+                    entry.conversation_id().as_str(),
+                    entry.entry_id().as_str(),
+                    entry.seq(),
+                    entry.received_at().as_str(),
+                    entry.mutation().actor_did().as_str(),
+                    entry.mutation().actor_device_id().as_str(),
+                    *entry.mutation().request_digest(),
+                )
+            })
+            .transpose()
+            .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?
+    };
     let products = CanonicalControlEntryProducts::mint(&entry)?;
     let planned = match admitted.kind() {
         SignedMutationKind::CommitTransition => {
@@ -629,11 +653,43 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         _ => return Err(SubmitTransitionFacadeError::UnsupportedMutation),
     };
     let plan = planned.into_persistence_plan()?;
-    let local_response = canonical_response_from_plan(&plan, products.canonical_response_json())?;
+    let successor = plan
+        .successor_coordinate()
+        .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+    let control_receipt = if is_remote {
+        let RemoteCommitPreflightOutcome::Verified(verified) = &remote_commit else {
+            return Err(SubmitTransitionFacadeError::CandidateScopeDrift);
+        };
+        let remote_response: JsonValue =
+            serde_json::from_slice(&verified.submit_transition_response_bytes)
+                .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+        Some(
+            remote_response
+                .pointer("/entry/sequencerReceipt")
+                .cloned()
+                .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?,
+        )
+    } else {
+        match (i13_signer, receipt_input.as_ref()) {
+            (Some(signer), Some(input)) => Some(
+                signer
+                    .sign_control_receipt(input, successor)
+                    .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?,
+            ),
+            _ => None,
+        }
+    };
+    let response_entry = match control_receipt.as_ref() {
+        Some(receipt) => {
+            I13ReceiptSigner::attach_control_receipt(products.canonical_response_json(), receipt)
+                .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?
+        }
+        None => products.canonical_response_json().to_vec(),
+    };
+    let local_response = canonical_response_from_plan(&plan, &response_entry)?;
     if !local_response.validates() {
         return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
     }
-
     if let Some((true, Some(sequencer_ds), sequencer_term)) = convo_row {
         let verified = match remote_commit {
             RemoteCommitPreflightOutcome::Disabled => {
@@ -701,6 +757,18 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         expected_seq,
         expected_coordinate.as_ref(),
     )?;
+    if let Some(receipt) = &control_receipt {
+        let receipt_bytes = serde_json::to_vec(receipt)
+            .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+        super::delivery::set_entry_sequencer_receipt(
+            transaction,
+            Uuid::from_bytes(*parsed.prior.conversation_id()),
+            expected_seq,
+            &receipt_bytes,
+        )
+        .await
+        .map_err(SubmitTransitionFacadeError::Delivery)?;
+    }
     let event_position = applied.event_positions.first().copied();
     complete_operation(
         transaction,
@@ -1261,6 +1329,7 @@ struct ReplayEntryRow {
     transition_id: Option<Uuid>,
     message_id: Option<Uuid>,
     received_at: DateTime<Utc>,
+    sequencer_receipt_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, FromRow)]
@@ -1349,7 +1418,8 @@ async fn lock_submit_transition_replay_post_state(
                accepted_payload_sha256,signed_request_bytes,request_digest,
                signature,server_fields_bytes,outer_entry_fingerprint,
                actor_did,actor_device_id,actor_key_id,actor_auth_generation,
-               generation,state_version,transition_id,message_id,received_at
+               generation,state_version,transition_id,message_id,received_at,
+               sequencer_receipt_bytes
           FROM chat.entries
          WHERE transition_id=$1
          FOR SHARE
@@ -1421,13 +1491,18 @@ async fn lock_submit_transition_replay_post_state(
         decode_and_verify_control_entry(&entry.accepted_payload_bytes, &signing_public_key)?;
     validate_replay_entry(&verified_entry, mutation, &transition, &entry)?;
     let products = CanonicalControlEntryProducts::mint(&verified_entry)?;
+    let response_entry = match entry.sequencer_receipt_bytes.as_deref() {
+        Some(bytes) => {
+            let receipt: JsonValue = serde_json::from_slice(bytes)
+                .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+            I13ReceiptSigner::attach_control_receipt(products.canonical_response_json(), &receipt)
+                .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?
+        }
+        None => products.canonical_response_json().to_vec(),
+    };
     let coordinate = replay_successor_coordinate(&successor)?;
     let welcome_json = replay_welcome_json(&mut welcomes, &transition, &coordinate)?;
-    let response = canonical_response_from_replay_rows(
-        &coordinate,
-        products.canonical_response_json(),
-        welcome_json,
-    )?;
+    let response = canonical_response_from_replay_rows(&coordinate, &response_entry, welcome_json)?;
     let post_state_digest =
         submit_replay_post_state_digest(&transition, &entry, &successor, &welcomes, &response);
     let accepted_request = mutation

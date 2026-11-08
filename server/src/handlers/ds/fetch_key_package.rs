@@ -187,7 +187,7 @@ pub async fn fetch_key_package(
     }
     .await;
 
-    super::deliver_message::record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
+    super::deliver_message::record_ds_outcome(&pool, &requester_ds, &result).await;
     result
 }
 

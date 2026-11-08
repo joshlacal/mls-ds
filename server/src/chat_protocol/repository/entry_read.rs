@@ -455,6 +455,9 @@ async fn read_entries_in_transaction(
                 };
                 let mut val: Value =
                     serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
+                if let Some(local) = by_seq.get_mut(&seq_u64) {
+                    preserve_replicated_receipt_on_pruned_local(local, &val);
+                }
                 if !replicated_entry_supersedes_local(by_seq.get(&seq_u64), &val) {
                     continue;
                 }
@@ -534,6 +537,16 @@ pub(super) fn replicated_entry_supersedes_local(local: Option<&Value>, replicate
     })
 }
 
+fn preserve_replicated_receipt_on_pruned_local(local: &mut Value, replicated: &Value) {
+    if local.get("payloadPruned").and_then(Value::as_bool) == Some(true)
+        && local.get("sequencerReceipt").is_none()
+    {
+        if let Some(receipt) = replicated.get("sequencerReceipt") {
+            local["sequencerReceipt"] = receipt.clone();
+        }
+    }
+}
+
 /// The application entry the send `(conversation_id, message_id, request_digest)`
 /// appended, exactly as `getEntries` serves it: `payloadPruned` without
 /// `signedRequest` once its ciphertext is pruned (O7). `None` when no entry
@@ -562,6 +575,50 @@ pub(crate) async fn sent_application_entry(
         .map(entry_json)
         .transpose()
         .map_err(|_| sqlx::Error::Protocol("stored application entry cannot be served".into()))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn entry_json_for_test(
+    pool: &sqlx::PgPool,
+    conversation_id: Uuid,
+    seq: i64,
+) -> Result<Value, String> {
+    let row: DeliveredEntryRow = sqlx::query_as(
+        "SELECT conversation_id, seq, entry_id, entry_kind, signed_request_bytes, \
+                request_digest, signature, server_fields_bytes, outer_entry_fingerprint, \
+                payload_pruned_at, sequencer_receipt_bytes, received_at \
+           FROM chat.entries WHERE conversation_id = $1 AND seq = $2",
+    )
+    .bind(conversation_id)
+    .bind(seq)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    entry_json(&row).map_err(|error| format!("{error:?}"))
+}
+
+/// A just-applied control entry exactly as delivery serves it, including its
+/// sequencer receipt. Used before commit to prepare remote-home fan-out.
+pub(crate) async fn entry_for_fanout(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    entry_id: Uuid,
+) -> Result<Option<Value>, String> {
+    let row: Option<DeliveredEntryRow> = sqlx::query_as(
+        "SELECT conversation_id, seq, entry_id, entry_kind, signed_request_bytes, \
+                request_digest, signature, server_fields_bytes, outer_entry_fingerprint, \
+                payload_pruned_at, sequencer_receipt_bytes, received_at \
+           FROM chat.entries WHERE conversation_id=$1 AND entry_id=$2",
+    )
+    .bind(conversation_id)
+    .bind(entry_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    row.as_ref()
+        .map(entry_json)
+        .transpose()
+        .map_err(|error| format!("{error:?}"))
 }
 
 /// `sendMessage`'s accepted outcome for its served `entry`: `{entry,
@@ -693,12 +750,16 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
         serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant)?
     };
     if is_direct_request_entry {
-        if row.entry_kind == "blue.catbird.chat.defs#directRequestAcceptanceEntry" {
-            if let Some(receipt) = &row.sequencer_receipt_bytes {
-                entry["sequencerReceipt"] =
-                    serde_json::from_slice(receipt).map_err(|_| EntryReadFacadeError::Invariant)?;
-            }
-        }
+        let acceptance_receipt =
+            if row.entry_kind == "blue.catbird.chat.defs#directRequestAcceptanceEntry" {
+                row.sequencer_receipt_bytes
+                    .as_deref()
+                    .map(serde_json::from_slice::<Value>)
+                    .transpose()
+                    .map_err(|_| EntryReadFacadeError::Invariant)?
+            } else {
+                None
+            };
         // Encrypted-request entries echo their retained signed wrapper; the
         // encrypted-requests presentation bridge emits their declared bytes as
         // lexicon `{"$bytes"}` at read time only.
@@ -707,6 +768,15 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
             &mut entry,
         )
         .map_err(|_| EntryReadFacadeError::Invariant)?;
+        if let Some(receipt) = acceptance_receipt {
+            let receipt = encode_canonical_generated_chat_json_v1(
+                &receipt,
+                "blue.catbird.chat.defs#sequencerReceipt",
+            )
+            .map_err(|_| EntryReadFacadeError::Invariant)?;
+            entry["sequencerReceipt"] = serde_json::from_slice(receipt.bytes())
+                .map_err(|_| EntryReadFacadeError::Invariant)?;
+        }
         return Ok(entry);
     }
     let canonical =
@@ -715,7 +785,20 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
                 tracing::error!("entry response canonicalization failed: {error}");
                 EntryReadFacadeError::Invariant
             })?;
-    serde_json::from_slice(canonical.bytes()).map_err(|_| EntryReadFacadeError::Invariant)
+    let mut presented: Value =
+        serde_json::from_slice(canonical.bytes()).map_err(|_| EntryReadFacadeError::Invariant)?;
+    if let Some(receipt_bytes) = &row.sequencer_receipt_bytes {
+        let receipt: Value =
+            serde_json::from_slice(receipt_bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
+        let receipt = encode_canonical_generated_chat_json_v1(
+            &receipt,
+            "blue.catbird.chat.defs#sequencerReceipt",
+        )
+        .map_err(|_| EntryReadFacadeError::Invariant)?;
+        presented["sequencerReceipt"] =
+            serde_json::from_slice(receipt.bytes()).map_err(|_| EntryReadFacadeError::Invariant)?;
+    }
+    Ok(presented)
 }
 
 fn map_authority_error(error: ReadAuthorityError) -> EntryReadFacadeError {
@@ -818,6 +901,29 @@ mod tests {
     }
 
     #[test]
+    fn late_receipted_replica_repairs_pruned_local_without_restoring_payload() {
+        let mut local = json!({
+            "seq": 4,
+            "payloadPruned": true,
+            "acceptedPayloadSha256": {"$bytes": STANDARD.encode([0x11_u8; 32])},
+        });
+        let replicated = json!({
+            "seq": 4,
+            "signedRequest": {"body": {"applicationMessage": {"bytes": "ciphertext"}}},
+            "sequencerReceipt": {
+                "kid": "did:web:sequencer.example#mls-receipt-1",
+                "signature": STANDARD.encode([0x22_u8; 64]),
+            },
+        });
+
+        preserve_replicated_receipt_on_pruned_local(&mut local, &replicated);
+
+        assert_eq!(local["sequencerReceipt"], replicated["sequencerReceipt"]);
+        assert_eq!(local["payloadPruned"], true);
+        assert!(local.get("signedRequest").is_none());
+    }
+
+    #[test]
     fn entry_json_application_entry_emits_lexicon_bytes_objects() {
         let conversation_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
         let coordinates = json!({
@@ -868,6 +974,21 @@ mod tests {
             },
             "signature": STANDARD.encode([0_u8; 64])
         });
+        let receipt = json!({
+            "conversationId": conversation_id.hyphenated().to_string(),
+            "generation": 1,
+            "groupId": STANDARD.encode([0x22_u8; 32]),
+            "epoch": 1,
+            "entryId": "51515151-5151-4151-9151-515151515151",
+            "seq": 2,
+            "senderDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+            "senderDeviceId": "70707070-7070-4070-b070-707070707070",
+            "archiveCommitment": STANDARD.encode([0x25_u8; 32]),
+            "issuedAtMs": 1_752_000_000_000_i64,
+            "sequencerDid": "did:web:chat.catbird.blue",
+            "kid": "did:web:chat.catbird.blue#mls-receipt-1",
+            "signature": STANDARD.encode([0x26_u8; 64]),
+        });
         let row = DeliveredEntryRow {
             conversation_id,
             seq: 2,
@@ -880,7 +1001,7 @@ mod tests {
             server_fields_bytes: vec![0xA0],
             outer_entry_fingerprint: vec![0x33; 32],
             payload_pruned_at: None,
-            sequencer_receipt_bytes: None,
+            sequencer_receipt_bytes: Some(serde_json::to_vec(&receipt).unwrap()),
             pruned_payload_bytes: None,
             received_at: "2026-07-22T12:34:56.000Z".parse().unwrap(),
         };
@@ -897,6 +1018,10 @@ mod tests {
         assert_eq!(
             value["signedRequest"]["signature"]["$bytes"],
             STANDARD.encode([0_u8; 64])
+        );
+        assert_eq!(
+            value["sequencerReceipt"]["signature"]["$bytes"],
+            STANDARD.encode([0x26_u8; 64])
         );
     }
 }

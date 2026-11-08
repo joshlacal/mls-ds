@@ -251,8 +251,176 @@ pub(crate) async fn admit_signed_operation_only(
         .await
         .map_err(|error| auth_repository_failure(endpoint, error))
 }
-/// cannot surface completed response bytes; the caller-owned operation prelude
-/// must first reserve the global operation and lock the enrollment slot.
+
+/// Refuse an operation that would otherwise be sequenced by a mirror or
+/// transport-only home. Lifecycle operations call this only after an existing
+/// coordinator relay declined to handle the mutation.
+pub(crate) async fn refuse_remote_sequencing(
+    pool: &DbPool,
+    endpoint: ChatEndpoint,
+    admission: &SignedOperationAdmission,
+) -> Result<(), ChatFailure> {
+    let conversation_id =
+        if admission.mutation_kind() == transcript::SignedMutationKind::LeafRecoveryCancellation {
+            let request_id = admission
+                .recovery_request_id()
+                .map_err(|_| ChatFailure::invariant(endpoint))?;
+            crate::chat_protocol::repository::recovery::recovery_conversation_id(pool, request_id)
+                .await
+                .map_err(|_| ChatFailure::storage(endpoint))?
+        } else {
+            Some(
+                admission
+                    .conversation_id()
+                    .map_err(|_| ChatFailure::invariant(endpoint))?,
+            )
+        };
+    let Some(conversation_id) = conversation_id else {
+        return Ok(());
+    };
+    let (remote, quarantined): (bool, bool) = sqlx::query_as(
+        "SELECT \
+             EXISTS(SELECT 1 FROM chat.conversations \
+                    WHERE conversation_id=$1 AND is_remote) \
+             OR EXISTS(SELECT 1 FROM chat.direct_request_transport_inbox \
+                    WHERE conversation_id=$1), \
+             EXISTS(SELECT 1 FROM federation_sync_state \
+                    WHERE convo_id=$2 AND status='quarantined')",
+    )
+    .bind(conversation_id)
+    .bind(conversation_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+    if quarantined {
+        return Err(ChatFailure::protocol(
+            endpoint,
+            ChatProtocolErrorCode::StaleCoordinates,
+        ));
+    }
+    if remote {
+        return Err(ChatFailure::protocol(
+            endpoint,
+            ChatProtocolErrorCode::ProtocolUpgradeRequired,
+        ));
+    }
+    Ok(())
+}
+
+/// Relay a lifecycle mutation from its member's strict home before any local
+/// sequencing transaction is opened.
+pub(crate) async fn try_relay_remote_lifecycle(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    endpoint: ChatEndpoint,
+    admission: &SignedOperationAdmission,
+    body: &[u8],
+) -> Result<Option<Response>, ChatFailure> {
+    use transcript::SignedMutationKind as K;
+    let kind = admission.mutation_kind();
+    let relayable = matches!(
+        (endpoint, kind),
+        (
+            ChatEndpoint::RequestLeave,
+            K::LeaveRequest | K::ZeroLeafLeave
+        ) | (ChatEndpoint::CancelLeave, K::LeaveCancellation)
+            | (ChatEndpoint::CloseConversation, K::ConversationClose)
+            | (ChatEndpoint::RequestReset, K::ResetRequest)
+            | (ChatEndpoint::ActivateReset, K::ResetActivation)
+            | (ChatEndpoint::RequestLeafRecovery, K::LeafRecoveryRequest)
+            | (
+                ChatEndpoint::CancelLeafRecovery,
+                K::LeafRecoveryCancellation
+            )
+            | (ChatEndpoint::SubmitTransition, K::LeafRecoveryFulfillment)
+    );
+    if !relayable {
+        return Ok(None);
+    }
+    let operation_id = admission
+        .operation_id()
+        .map_err(|_| ChatFailure::invariant(endpoint))?;
+    let signed_request = signed_request_bytes(body, endpoint)?;
+    if let Some(response) = crate::federation::group_relay::replay_remote_lifecycle_operation(
+        pool,
+        endpoint.nsid(),
+        admission.subject(),
+        admission.device_id(),
+        operation_id,
+        &signed_request,
+    )
+    .await
+    .map_err(|error| error.into_failure(endpoint))?
+    {
+        return Ok(Some(json_ok(response)));
+    }
+    let conversation_id = if kind == K::LeafRecoveryCancellation {
+        let request_id = admission
+            .recovery_request_id()
+            .map_err(|_| ChatFailure::invariant(endpoint))?;
+        if let Some(conversation_id) =
+            crate::chat_protocol::repository::recovery::recovery_conversation_id(pool, request_id)
+                .await
+                .map_err(|_| ChatFailure::storage(endpoint))?
+        {
+            conversation_id
+        } else if let Some(conversation_id) = sqlx::query_scalar(
+            "SELECT conversation_id FROM chat.remote_lifecycle_recovery_bindings \
+             WHERE recovery_request_id=$1 AND actor_did=$2 AND actor_device_id=$3 \
+               AND expires_at>$4",
+        )
+        .bind(request_id)
+        .bind(crate::identity::canonical_did(admission.subject()))
+        .bind(admission.device_id())
+        .bind(crate::sim_hooks::current_utc())
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?
+        {
+            conversation_id
+        } else {
+            return Err(ChatFailure::protocol(
+                endpoint,
+                ChatProtocolErrorCode::LeafRecoveryNotFound,
+            ));
+        }
+    } else {
+        admission
+            .conversation_id()
+            .map_err(|_| ChatFailure::invariant(endpoint))?
+    };
+    let quarantined: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM federation_sync_state \
+          WHERE convo_id=$1 AND status='quarantined')",
+    )
+    .bind(conversation_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))?;
+    if quarantined {
+        return Err(ChatFailure::protocol(
+            endpoint,
+            ChatProtocolErrorCode::StaleCoordinates,
+        ));
+    }
+    let Some(resolver) = runtime.resolver() else {
+        return Ok(None);
+    };
+    let response = crate::federation::group_relay::relay_remote_lifecycle_operation(
+        pool,
+        resolver,
+        endpoint.nsid(),
+        admission.subject(),
+        admission.device_id(),
+        operation_id,
+        conversation_id,
+        signed_request,
+    )
+    .await
+    .map_err(|error| error.into_failure(endpoint))?;
+    Ok(response.map(json_ok))
+}
+
 pub(crate) async fn admit_enrollment_operation_only(
     pool: &DbPool,
     runtime: &ChatRuntime,
@@ -418,8 +586,20 @@ pub(crate) fn auth_repository_failure(
         E::DeviceNotRegistered | E::DeviceKeyMissing => C::DeviceNotRegistered,
         E::DeviceAlreadyRegistered => C::DeviceAlreadyExists,
         E::DeviceRevoked | E::DeviceKeyRevoked => C::DeviceRevoked,
-        E::AuthenticationGenerationMismatch => C::AuthenticationGenerationConflict,
-        E::IdempotencyConflict => C::IdempotencyConflict,
+        E::AuthenticationGenerationMismatch => {
+            if endpoint.declares(C::AuthenticationGenerationConflict) {
+                C::AuthenticationGenerationConflict
+            } else {
+                C::InvalidRequest
+            }
+        }
+        E::IdempotencyConflict => {
+            if endpoint.declares(C::IdempotencyConflict) {
+                C::IdempotencyConflict
+            } else {
+                C::InvalidRequest
+            }
+        }
         E::RequestBindingMismatch
         | E::MissingAcceptedRequestBytes
         | E::UnsupportedAuthorizationShape => C::InvalidRequest,
@@ -457,7 +637,12 @@ pub(crate) fn operation_prelude_failure(
             ChatFailure::protocol(endpoint, C::DeviceNotRegistered)
         }
         E::OperationIdConflict => ChatFailure::protocol(endpoint, C::IdempotencyConflict),
-        E::SignedOperationExpired if endpoint == ChatEndpoint::SubmitTransition => {
+        E::SignedOperationExpired
+            if matches!(
+                endpoint,
+                ChatEndpoint::SubmitTransition | ChatEndpoint::CreateConversation
+            ) =>
+        {
             ChatFailure::protocol(endpoint, C::SignedOperationExpired)
         }
         E::SignedOperationExpired => ChatFailure::invariant(endpoint),

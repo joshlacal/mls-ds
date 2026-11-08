@@ -4953,7 +4953,28 @@ pub(crate) async fn load_historical_control_evidence(
         &signing_public_key,
     )
     .map_err(|_| ControlEvidenceLoadError::InvalidEvidence)?;
-    if decoded.outer_control_fingerprint().as_slice() != stored_fingerprint {
+    let fingerprint_matches = if decoded.mutation().kind()
+        == SignedMutationKind::DirectRequestAcceptance
+    {
+        // I13 is signed independently and is outside the legacy acceptance-entry hash that
+        // the acceptance-commit receipt and durable fingerprint bind.
+        let row: serde_json::Value = serde_json::from_slice(&public_row_json)
+            .map_err(|_| ControlEvidenceLoadError::InvalidEvidence)?;
+        let (legacy_entry, _) =
+            super::super::direct_request_transcript::normalize_direct_request_acceptance_entry_with_i13(
+                &row,
+            )
+            .map_err(|_| ControlEvidenceLoadError::InvalidEvidence)?;
+        let legacy_bytes = serde_json::to_vec(&legacy_entry)
+            .map_err(|_| ControlEvidenceLoadError::InvalidEvidence)?;
+        super::super::direct_request_transcript::direct_request_acceptance_entry_hash(&legacy_bytes)
+            .map_err(|_| ControlEvidenceLoadError::InvalidEvidence)?
+            .as_slice()
+            == stored_fingerprint
+    } else {
+        decoded.outer_control_fingerprint().as_slice() == stored_fingerprint
+    };
+    if !fingerprint_matches {
         return Err(ControlEvidenceLoadError::InvalidEvidence);
     }
     if matches!(
@@ -4991,7 +5012,9 @@ async fn verify_direct_request_durable_proof(
     actor_key: &[u8],
 ) -> Result<(), ControlEvidenceLoadError> {
     use super::super::direct_request_transcript::{
-        verify_direct_request_acceptance_proof, verify_signed_request, DirectRequestKind,
+        normalize_direct_request_acceptance_entry_with_i13,
+        verify_received_direct_request_acceptance_proof_with_i13, verify_signed_request,
+        DirectRequestKind,
     };
     use serde_json::Value;
     let invalid = || ControlEvidenceLoadError::InvalidEvidence;
@@ -5046,8 +5069,9 @@ async fn verify_direct_request_durable_proof(
                 .ok_or_else(invalid)?,
         )
         .await?;
-        let proof = verify_direct_request_acceptance_proof(&proof_bytes, &key, actor_key)
-            .map_err(|_| invalid())?;
+        let proof =
+            verify_received_direct_request_acceptance_proof_with_i13(&proof_bytes, &key, actor_key)
+                .map_err(|_| invalid())?;
         let publication = match (publication_bytes, redacted_opening) {
             (Some(bytes), _) => {
                 verify_signed_request(DirectRequestKind::Publish, &bytes, &sender_key)
@@ -5060,7 +5084,13 @@ async fn verify_direct_request_durable_proof(
                 .clone(),
             (None, None) => return Err(invalid()),
         };
-        if proof["entry"] != untagged
+        let (proof_entry, proof_receipt) =
+            normalize_direct_request_acceptance_entry_with_i13(&proof["entry"])
+                .map_err(|_| invalid())?;
+        let (durable_entry, durable_receipt) =
+            normalize_direct_request_acceptance_entry_with_i13(&untagged).map_err(|_| invalid())?;
+        if proof_entry != durable_entry
+            || proof_receipt != durable_receipt
             || body["transitionId"].as_str() != Some(transition_id.to_string().as_str())
             || body["requestId"] != publication["requestId"]
             || body["actorDid"] != publication["recipientDid"]

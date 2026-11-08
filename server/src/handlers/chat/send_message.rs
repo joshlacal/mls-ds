@@ -184,6 +184,7 @@ async fn send(
                             actor_did: actor_did.to_string(),
                             actor_device_id: actor_device_uuid,
                             signed_request: signed_req.clone(),
+                            signed_request_bytes: None,
                         },
                     )
                     .await

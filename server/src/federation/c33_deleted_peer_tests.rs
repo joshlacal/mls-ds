@@ -240,6 +240,18 @@ impl RelayedPair {
         .await
     }
 
+    async fn submit(&self, nsid: &str, signed: &Value) -> (StatusCode, Value) {
+        let body = serde_json::to_vec(&json!({ "signedRequest": signed })).unwrap();
+        scope_sim_ds(Arc::clone(&self.seq_hooks), async {
+            http::send(
+                self.router.clone(),
+                http::unsigned_json_request(&self.device, nsid, body),
+            )
+            .await
+        })
+        .await
+    }
+
     /// P's `signed` application sequenced through the coordinator's relayed-send path.
     async fn relay(&self, signed: &Value) -> Result<Value, crate::federation::FederationError> {
         scope_sim_ds(
@@ -390,6 +402,143 @@ async fn a_c33_send_needs_no_declaration_from_a_relay_deleted_peer() {
         assert_eq!(sent["entry"]["seq"], n + 1);
         assert!(p.delivered().is_empty());
         assert!(p.queued().await.is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn survivor_controls_ignore_a_relay_deleted_peers_home_and_declaration() {
+    let p = RelayedPair::new().await;
+    scope_ds_clock(p.clock.clone(), async {
+        let deleted_seq = p.relay_deletion().await;
+        assert_eq!(deleted_seq, p.seq + 1);
+        p.network.serve(
+            &format!("pds-{}", host(&p.fixture.sender_did)),
+            Router::new(),
+        );
+        let peer_key = ed25519_dalek::SigningKey::from_bytes(&p.fixture.recipient_ed25519_seed);
+        let reset_id = Uuid::new_v4();
+        let reset = crate::chat_protocol::test_support::sign_mutation_json_for_test(
+            &json!({
+                "$type": "blue.catbird.chat.defs#resetRequestBody",
+                "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\u{0000}",
+                "resetRequestId": reset_id,
+                "idempotencyKey": reset_id,
+                "actorDid": p.fixture.recipient_did,
+                "actorDeviceId": p.fixture.recipient_device_id,
+                "keyId": p.fixture.recipient_key_id,
+                "authGeneration": 1,
+                "prior": p.fixture.peer_self_update_signed_request["body"]["prior"],
+                "reason": "manualRecovery",
+                "signedAt": current_utc().to_rfc3339_opts(SecondsFormat::Millis, true),
+            }),
+            &peer_key,
+        )
+        .unwrap();
+        let (status, reset_response) = p.submit("blue.catbird.chat.requestReset", &reset).await;
+        assert_eq!(status, StatusCode::OK, "{reset_response}");
+        assert!(reset_response["entry"]["sequencerReceipt"].is_object());
+        let next_after_reset: i64 = sqlx::query_scalar(
+            "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+        )
+        .bind(p.cid)
+        .fetch_one(&p.seq_pool)
+        .await
+        .unwrap();
+        let (status, reset_replay) = p.submit("blue.catbird.chat.requestReset", &reset).await;
+        assert_eq!((status, reset_replay), (StatusCode::OK, reset_response));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+            )
+            .bind(p.cid)
+            .fetch_one(&p.seq_pool)
+            .await
+            .unwrap(),
+            next_after_reset
+        );
+
+        let update = p.fixture.peer_self_update_signed_request.clone();
+        let (status, update_response) = p
+            .submit("blue.catbird.chat.submitTransition", &update)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{update_response}");
+        assert!(update_response["entry"]["sequencerReceipt"].is_object());
+        let next_after_update: i64 = sqlx::query_scalar(
+            "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+        )
+        .bind(p.cid)
+        .fetch_one(&p.seq_pool)
+        .await
+        .unwrap();
+        let (status, update_replay) = p
+            .submit("blue.catbird.chat.submitTransition", &update)
+            .await;
+        assert_eq!((status, update_replay), (StatusCode::OK, update_response));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+            )
+            .bind(p.cid)
+            .fetch_one(&p.seq_pool)
+            .await
+            .unwrap(),
+            next_after_update
+        );
+        let controls: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM outbound_queue WHERE convo_id=$1 \
+               AND target_ds_did=$2 AND id LIKE 'transport-control-%'",
+        )
+        .bind(p.cid.to_string())
+        .bind(C33_HOME)
+        .fetch_all(&p.seq_pool)
+        .await
+        .unwrap();
+        assert!(
+            controls.is_empty(),
+            "deleted peer home received later controls: {controls:?}"
+        );
+    })
+    .await;
+
+    let retained = RelayedPair::new().await;
+    scope_ds_clock(retained.clock.clone(), async {
+        retained.relay_deletion().await;
+        let reset_id = Uuid::new_v4();
+        let reset = crate::chat_protocol::test_support::sign_mutation_json_for_test(
+            &json!({
+                "$type": "blue.catbird.chat.defs#resetRequestBody",
+                "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\u{0000}",
+                "resetRequestId": reset_id,
+                "idempotencyKey": reset_id,
+                "actorDid": retained.fixture.recipient_did,
+                "actorDeviceId": retained.fixture.recipient_device_id,
+                "keyId": retained.fixture.recipient_key_id,
+                "authGeneration": 1,
+                "prior": retained.fixture.peer_self_update_signed_request["body"]["prior"],
+                "reason": "manualRecovery",
+                "signedAt": current_utc().to_rfc3339_opts(SecondsFormat::Millis, true),
+            }),
+            &ed25519_dalek::SigningKey::from_bytes(&retained.fixture.recipient_ed25519_seed),
+        )
+        .unwrap();
+        let (status, response) = retained
+            .submit("blue.catbird.chat.requestReset", &reset)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let controls: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM outbound_queue WHERE convo_id=$1 \
+               AND target_ds_did=$2 AND id LIKE 'transport-control-%'",
+        )
+        .bind(retained.cid.to_string())
+        .bind(C33_HOME)
+        .fetch_all(&retained.seq_pool)
+        .await
+        .unwrap();
+        assert!(
+            controls.is_empty(),
+            "retained deleted declaration still routed a control: {controls:?}"
+        );
     })
     .await;
 }
@@ -737,7 +886,7 @@ async fn a_c33_senders_transport_only_home_relays_its_state_read_to_the_coordina
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Some("5"),
-                json!({ "error": "InternalServerError" })
+                json!({ "error": "RateLimited", "message": "RateLimited" })
             )
         );
     })
@@ -764,12 +913,6 @@ impl Routed {
     async fn new() -> Self {
         let p = Pair::new().await;
         let relationships = SimSourceFault::default();
-        p.network.authorize_device(
-            p.peer(),
-            &ed25519_dalek::SigningKey::from_bytes(&p.fixture.recipient_ed25519_seed)
-                .verifying_key()
-                .to_bytes(),
-        );
         let (clock, hooks, receipt, seq_relationships) = (
             p.clock.clone(),
             Arc::clone(&p.seq_hooks),

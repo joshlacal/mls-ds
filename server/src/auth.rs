@@ -440,6 +440,30 @@ impl AuthMiddleware {
                 .expect("BUG: burst calculation should always be >= 1"),
         );
 
+        struct DefaultDidHttpClient {
+            http_client: reqwest::Client,
+        }
+        static DEFAULT_DID_HTTP_CLIENT: std::sync::OnceLock<DefaultDidHttpClient> =
+            std::sync::OnceLock::new();
+        let http_client = if did_resolution_timeout_seconds == 10 {
+            DEFAULT_DID_HTTP_CLIENT
+                .get_or_init(|| DefaultDidHttpClient {
+                    http_client: reqwest::Client::builder()
+                        .timeout(Duration::from_secs(10))
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .unwrap_or_else(|_| reqwest::Client::new()),
+                })
+                .http_client
+                .clone()
+        } else {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(did_resolution_timeout_seconds))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        };
+
         Self {
             did_cache,
             did_cache_ttl: Duration::from_secs(cache_ttl_seconds),
@@ -449,11 +473,7 @@ impl AuthMiddleware {
                     .time_to_live(std::time::Duration::from_secs(300))
                     .build(),
             ),
-            http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(did_resolution_timeout_seconds))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            http_client,
             did_resolution_timeout: Duration::from_secs(did_resolution_timeout_seconds),
             rate_limit_quota: quota,
             did_host_allowlist,

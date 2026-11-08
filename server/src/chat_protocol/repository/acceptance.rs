@@ -24,6 +24,7 @@ use crate::chat_protocol::{
         CanonicalValueRef, ControlEntryKind, SignedMutationKind, VerifiedMutationProjection,
     },
 };
+use crate::federation::receipt::{I13ControlReceiptInput, I13ReceiptSigner};
 
 use super::{
     auth::CompletedIdempotentResponse,
@@ -58,6 +59,7 @@ pub(crate) enum AcceptanceFacadeError {
     ExecutionContext(ExecutionContextHydrationError),
     Executor(ExecutorError),
     Database(sqlx::Error),
+    Delivery(super::delivery::DeliveryRepositoryError),
 }
 macro_rules! from_error {
     ($source:ty, $variant:ident) => {
@@ -80,6 +82,7 @@ from_error!(
 from_error!(ExecutionContextHydrationError, ExecutionContext);
 from_error!(ExecutorError, Executor);
 from_error!(sqlx::Error, Database);
+from_error!(super::delivery::DeliveryRepositoryError, Delivery);
 
 #[derive(Debug)]
 pub(crate) struct AcceptanceCanonicalResponse {
@@ -216,14 +219,21 @@ pub(crate) async fn execute_prepared_acceptance<T: PublicTransport>(
     transaction: &mut Transaction<'_, Postgres>,
     prepared: PreparedSignedOperation,
     _relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<AcceptanceTransactionOutcome, AcceptanceFacadeError> {
     match prepared.into_state() {
         PreparedSignedOperationState::First {
             authority,
             reservation,
         } => {
-            execute_first_acceptance(transaction, authority, reservation, _relationship_authority)
-                .await
+            execute_first_acceptance(
+                transaction,
+                authority,
+                reservation,
+                _relationship_authority,
+                i13_signer,
+            )
+            .await
         }
         PreparedSignedOperationState::Replay { authority, replay } => {
             let locked =
@@ -254,6 +264,7 @@ async fn execute_first_acceptance<T: PublicTransport>(
     authority: VerifiedChatDeviceRequest,
     reservation: OperationReservationGuard,
     relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<AcceptanceTransactionOutcome, AcceptanceFacadeError> {
     let mutation = authority
         .mutation()
@@ -344,6 +355,20 @@ async fn execute_first_acceptance<T: PublicTransport>(
         authority.trusted_instant(),
         server_fields,
     )?;
+    let receipt_input: Option<I13ControlReceiptInput> = i13_signer
+        .map(|_| {
+            I13ControlReceiptInput::from_fields(
+                entry.conversation_id().as_str(),
+                entry.entry_id().as_str(),
+                entry.seq(),
+                entry.received_at().as_str(),
+                entry.mutation().actor_did().as_str(),
+                entry.mutation().actor_device_id().as_str(),
+                *entry.mutation().request_digest(),
+            )
+        })
+        .transpose()
+        .map_err(|_| AcceptanceFacadeError::InvalidCanonicalMaterial)?;
     let products = CanonicalControlEntryProducts::mint(&entry)?;
     // Acceptance advances the coordinate and supersedes prior recovery work.
     // Lock those existing reservations as well as the accepting device's new
@@ -385,7 +410,25 @@ async fn execute_first_acceptance<T: PublicTransport>(
             &trusted_now,
         )?
         .into_persistence_plan()?;
-    let response = acceptance_response(&plan, products.canonical_response_json())?;
+    let successor = plan
+        .successor_coordinate()
+        .ok_or(AcceptanceFacadeError::InvalidCanonicalMaterial)?;
+    let control_receipt = match (i13_signer, receipt_input.as_ref()) {
+        (Some(signer), Some(input)) => Some(
+            signer
+                .sign_control_receipt(input, successor)
+                .map_err(|_| AcceptanceFacadeError::InvalidCanonicalMaterial)?,
+        ),
+        _ => None,
+    };
+    let response_entry = match control_receipt.as_ref() {
+        Some(receipt) => {
+            I13ReceiptSigner::attach_control_receipt(products.canonical_response_json(), receipt)
+                .map_err(|_| AcceptanceFacadeError::InvalidCanonicalMaterial)?
+        }
+        None => products.canonical_response_json().to_vec(),
+    };
+    let response = acceptance_response(&plan, &response_entry)?;
     let (scope, completion) = prelude.into_execution_parts();
     let prepared = prepare_acceptance_execution(
         transaction,
@@ -397,6 +440,17 @@ async fn execute_first_acceptance<T: PublicTransport>(
     let applied = apply_prepared_acceptance_execution(prepared).await?;
     if applied.entry_id != transition_id {
         return Err(AcceptanceFacadeError::InvalidCanonicalMaterial);
+    }
+    if let Some(receipt) = &control_receipt {
+        let receipt_bytes = serde_json::to_vec(receipt)
+            .map_err(|_| AcceptanceFacadeError::InvalidCanonicalMaterial)?;
+        super::delivery::set_entry_sequencer_receipt(
+            transaction,
+            conversation_id,
+            aggregate.head().next_entry_seq(),
+            &receipt_bytes,
+        )
+        .await?;
     }
     let event_position = applied.event_positions.first().copied();
     complete_operation(
@@ -942,6 +996,7 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     principal: &crate::auth::VerifiedServicePrincipal,
     raw: &[u8],
     signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
+    i13_signer: Option<&I13ReceiptSigner>,
     policy: &RelationshipAuthority<T>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<u8>, DirectAcceptanceError> {
@@ -1028,11 +1083,16 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     let generation: i64 = head.try_get("current_generation")?;
     let version: i64 = head.try_get("current_state_version")?;
     let seq: i64 = head.try_get("next_entry_seq")?;
-    let prior = json!({"conversationId":conversation_id,"generation":generation,"stateVersion":version,"groupId":STANDARD.encode(head.try_get::<Vec<u8>,_>("group_id")?),"epoch":head.try_get::<i64,_>("epoch")?,"groupContextHash":STANDARD.encode(head.try_get::<Vec<u8>,_>("group_context_hash")?),"confirmationTag":STANDARD.encode(head.try_get::<Vec<u8>,_>("confirmation_tag")?),"lifecycle":"active"});
-    let mut next = prior.clone();
-    next["stateVersion"] = json!(version
+    let group_id: Vec<u8> = head.try_get("group_id")?;
+    let epoch: i64 = head.try_get("epoch")?;
+    let group_context_hash: Vec<u8> = head.try_get("group_context_hash")?;
+    let confirmation_tag: Vec<u8> = head.try_get("confirmation_tag")?;
+    let prior = json!({"conversationId":conversation_id,"generation":generation,"stateVersion":version,"groupId":STANDARD.encode(&group_id),"epoch":epoch,"groupContextHash":STANDARD.encode(&group_context_hash),"confirmationTag":STANDARD.encode(&confirmation_tag),"lifecycle":"active"});
+    let next_version = version
         .checked_add(1)
-        .ok_or(DirectAcceptanceError::Invariant)?);
+        .ok_or(DirectAcceptanceError::Invariant)?;
+    let mut next = prior.clone();
+    next["stateVersion"] = json!(next_version);
     if body["prior"] != prior || body["next"] != next {
         return Err(DirectAcceptanceError::StaleCoordinates);
     }
@@ -1082,12 +1142,60 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
         )
         .map_err(|_| DirectAcceptanceError::Invariant)?;
     let receipt = json!({"body":receipt_body,"signature":STANDARD.encode(receipt_signature)});
-    let proof = json!({"entry":entry,"receipt":receipt});
+    let control_receipt = if let Some(signer) = i13_signer {
+        let input = I13ControlReceiptInput::from_fields(
+            &conversation_id.to_string(),
+            &transition_id.to_string(),
+            u64::try_from(seq).map_err(|_| DirectAcceptanceError::Invariant)?,
+            &received_at,
+            principal.did(),
+            &actor_device_id.to_string(),
+            *signed.request_digest(),
+        )
+        .map_err(|_| DirectAcceptanceError::Invariant)?;
+        let coordinate = crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
+            *conversation_id.as_bytes(),
+            u64::try_from(generation).map_err(|_| DirectAcceptanceError::Invariant)?,
+            u64::try_from(next_version).map_err(|_| DirectAcceptanceError::Invariant)?,
+            group_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| DirectAcceptanceError::Invariant)?,
+            u64::try_from(epoch).map_err(|_| DirectAcceptanceError::Invariant)?,
+            group_context_hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| DirectAcceptanceError::Invariant)?,
+            confirmation_tag
+                .as_slice()
+                .try_into()
+                .map_err(|_| DirectAcceptanceError::Invariant)?,
+            PublicGroupSnapshotLifecycle::Active,
+        );
+        Some(
+            signer
+                .sign_control_receipt(&input, &coordinate)
+                .map_err(|_| DirectAcceptanceError::Invariant)?,
+        )
+    } else {
+        None
+    };
+    let control_receipt_bytes = control_receipt
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|_| DirectAcceptanceError::Invariant)?;
+    let mut proof_entry = entry.clone();
+    let mut tagged_entry = entry;
+    tagged_entry["$type"] = json!("blue.catbird.chat.defs#directRequestAcceptanceEntry");
+    if let Some(receipt) = &control_receipt {
+        proof_entry["sequencerReceipt"] = receipt.clone();
+        tagged_entry["sequencerReceipt"] = receipt.clone();
+    }
+    let proof = json!({"entry":proof_entry,"receipt":receipt});
     let proof_bytes = serde_json::to_vec(&proof).map_err(|_| DirectAcceptanceError::Invariant)?;
     let server_fields =
         serde_json::to_vec(&receipt).map_err(|_| DirectAcceptanceError::Invariant)?;
-    let mut tagged_entry = entry;
-    tagged_entry["$type"] = json!("blue.catbird.chat.defs#directRequestAcceptanceEntry");
     let tagged_bytes =
         serde_json::to_vec(&tagged_entry).map_err(|_| DirectAcceptanceError::Invariant)?;
     let devices: Vec<(String,Uuid)> = sqlx::query_as("SELECT d.user_did,d.device_id FROM chat.devices d JOIN chat.participants p ON p.user_did=d.user_did WHERE p.conversation_id=$1 AND p.current_membership AND d.status='active' ORDER BY convert_to(d.user_did,'UTF8'),uuid_send(d.device_id)")
@@ -1109,6 +1217,7 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
             signed.signature().as_slice(),
             &tagged_bytes,
             &server_fields,
+            control_receipt_bytes.as_deref().unwrap_or_default(),
             &proof_bytes,
             &response,
             &event_payload,
@@ -1154,6 +1263,11 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     .map_err(|_| DirectAcceptanceError::Invariant)?;
     if allocated != seq as u64 {
         return Err(DirectAcceptanceError::Invariant);
+    }
+    if let Some(receipt_bytes) = &control_receipt_bytes {
+        delivery::set_entry_sequencer_receipt(tx, conversation_id, allocated, receipt_bytes)
+            .await
+            .map_err(|_| DirectAcceptanceError::Invariant)?;
     }
     sqlx::query("INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,prior_generation,prior_state_version,next_generation,next_state_version,entry_seq,accepted_at) VALUES($1,$2,'directRequestAcceptance',$3,$4,$5,$6,'admin','active',$7,$8,$9,$10,$11,$12,$13,$12,$14,$15,$16)")
         .bind(transition_id).bind(conversation_id).bind(principal.did()).bind(actor_device_id).bind(signed.key_id()).bind(signed.auth_generation().unwrap() as i64)

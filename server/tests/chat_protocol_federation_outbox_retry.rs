@@ -563,7 +563,7 @@ async fn test_outbox_worker_atomic_handoff_and_done() {
 }
 
 #[tokio::test]
-async fn test_outbox_worker_replay_succeeds_over_cap_and_new_insert_rejected() {
+async fn test_outbox_worker_replay_and_welcome_succeed_over_cap_while_new_message_is_rejected() {
     let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
@@ -573,6 +573,7 @@ async fn test_outbox_worker_replay_succeeds_over_cap_and_new_insert_rejected() {
     let convo_id = Uuid::new_v4().to_string();
     let existing_job_id = Uuid::new_v4().to_string();
     let new_job_id = Uuid::new_v4().to_string();
+    let welcome_job_id = Uuid::new_v4().to_string();
     let target_ds = "did:web:target.ds.com";
     let payload = b"{\"mock\":\"envelope\"}".to_vec();
 
@@ -664,6 +665,52 @@ async fn test_outbox_worker_replay_succeeds_over_cap_and_new_insert_rejected() {
         new_outbox_status, "in_flight",
         "Failed new insert must not mark outbox done"
     );
+
+    // A new Welcome is the ordering fence for this stream. It must cross the
+    // cap so the rows held behind it can drain.
+    sqlx::query(
+        "INSERT INTO federation_outbox (
+            id, conversation_id, target_service_did, method, payload, status, next_attempt_at, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, 'in_flight', NOW(), NOW(), NOW())",
+    )
+    .bind(&welcome_job_id)
+    .bind(&convo_id)
+    .bind(target_ds)
+    .bind(DELIVER_WELCOME_NSID)
+    .bind(&payload)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let welcome_row = FederationOutboxRow {
+        id: welcome_job_id.clone(),
+        conversation_id: convo_id.clone(),
+        delivery_event_id: None,
+        target_service_did: target_ds.to_string(),
+        method: DELIVER_WELCOME_NSID.to_string(),
+        payload: payload.clone(),
+        payload_sha256: None,
+        envelope_version: 1,
+        attempts: 0,
+        created_at: Utc::now(),
+        claim_token: None,
+    };
+    handoff_to_outbound_queue(&pool, &welcome_row)
+        .await
+        .expect("the Welcome fence must cross a full pending cap");
+    let welcome_outbox_status: String =
+        sqlx::query_scalar("SELECT status FROM federation_outbox WHERE id = $1")
+            .bind(&welcome_job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let welcome_queue_method: String =
+        sqlx::query_scalar("SELECT method FROM outbound_queue WHERE id = $1")
+            .bind(&welcome_job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(welcome_outbox_status, "done");
+    assert_eq!(welcome_queue_method, DELIVER_WELCOME_NSID);
 
     // 4. Replay handoff must SUCCEED over cap, skip duplicate insertion, and mark source done
     handoff_to_outbound_queue(&pool, &existing_row)

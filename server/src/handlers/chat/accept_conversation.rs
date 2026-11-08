@@ -11,6 +11,10 @@ use axum::{
 
 use crate::{
     chat_protocol::{
+        direct_request_transcript::{
+            normalize_direct_request_acceptance_entry_with_i13 as normalized_acceptance_entry_with_i13,
+            normalize_direct_request_acceptance_proof_with_i13 as normalized_acceptance_proof_with_i13,
+        },
         error::{ChatEndpoint, ChatProtocolErrorCode},
         repository::{
             acceptance::{self, AcceptanceFacadeError},
@@ -293,10 +297,18 @@ async fn handle_inner(
                                         ChatProtocolErrorCode::InvalidRequest,
                                     )
                                 })?;
-                            let normalized_proof = crate::chat_protocol::direct_request_transcript::normalize_read_presentation(
-                                &serde_json::to_vec(presented_proof).map_err(|_| ChatFailure::invariant(endpoint))?,
-                                "directRequestAcceptanceProof", false,
-                            ).map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+                            let normalized_proof = normalized_acceptance_proof_with_i13(
+                                presented_proof,
+                            )
+                            .map_err(|_| {
+                                ChatFailure::protocol(
+                                    endpoint,
+                                    ChatProtocolErrorCode::InvalidRequest,
+                                )
+                            })?;
+                            let normalized_stored_proof =
+                                normalized_acceptance_proof_with_i13(&stored_proof)
+                                    .map_err(|_| ChatFailure::invariant(endpoint))?;
                             let presented_coordinates =
                                 stored_outcome.get("coordinates").ok_or_else(|| {
                                     ChatFailure::protocol(
@@ -308,7 +320,7 @@ async fn handle_inner(
                                 &serde_json::to_vec(presented_coordinates).map_err(|_| ChatFailure::invariant(endpoint))?,
                                 "conversationCoordinates", false,
                             ).map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-                            if normalized_proof != stored_proof
+                            if normalized_proof != normalized_stored_proof
                                 || Some(&normalized_coordinates) != parsed_req.pointer("/body/next")
                             {
                                 return Err(ChatFailure::protocol(
@@ -321,11 +333,18 @@ async fn handle_inner(
                                     serde_json::from_slice(entry_bytes)
                                         .map_err(|_| ChatFailure::invariant(endpoint))?;
                                 if let Some(outcome_entry) = stored_outcome.get("entry") {
-                                    let normalized_entry = crate::chat_protocol::direct_request_transcript::normalize_read_presentation(
-                                        &serde_json::to_vec(outcome_entry).map_err(|_| ChatFailure::invariant(endpoint))?,
-                                        "directRequestAcceptanceEntry", false,
-                                    ).map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-                                    if normalized_entry != old_entry {
+                                    let normalized_entry =
+                                        normalized_acceptance_entry_with_i13(outcome_entry)
+                                            .map_err(|_| {
+                                                ChatFailure::protocol(
+                                                    endpoint,
+                                                    ChatProtocolErrorCode::InvalidRequest,
+                                                )
+                                            })?;
+                                    let normalized_old_entry =
+                                        normalized_acceptance_entry_with_i13(&old_entry)
+                                            .map_err(|_| ChatFailure::invariant(endpoint))?;
+                                    if normalized_entry != normalized_old_entry {
                                         return Err(ChatFailure::protocol(
                                             endpoint,
                                             ChatProtocolErrorCode::InvalidRequest,
@@ -412,9 +431,6 @@ async fn handle_inner(
                     ChatProtocolErrorCode::InvalidRequest,
                 ));
             }
-            let key_id_receipt = proof_receipt["keyId"].as_str().ok_or_else(|| {
-                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-            })?;
 
             let entry_seq = output
                 .entry
@@ -445,11 +461,9 @@ async fn handle_inner(
             let entry_convo = output
                 .entry
                 .get("conversationId")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
-                })?;
-            if entry_convo != conversation_id.to_string().as_str() {
+                .and_then(|value| value.as_str())
+                .and_then(|value| uuid::Uuid::parse_str(value).ok());
+            if entry_convo != Some(conversation_id) {
                 return Err(ChatFailure::protocol(
                     endpoint,
                     ChatProtocolErrorCode::InvalidRequest,
@@ -462,37 +476,41 @@ async fn handle_inner(
                 ));
             }
 
-            let resolver = crate::federation::resolver::DsResolver::with_default_endpoint(
-                pool.clone(),
-                crate::federation::resolver::build_resolver_http_client(),
-                crate::identity::service_did(),
-                crate::identity::self_endpoint(),
-                std::env::var("DEFAULT_DS_ENDPOINT").ok(),
-                3600,
-            );
-            let authority_key = resolver
-                .resolve_coordinator_receipt_key(pool, &coord.coordinator_did, key_id_receipt)
+            let verified_proof =
+                crate::federation::canonical_relay::verify_remote_acceptance_evidence(
+                    pool,
+                    &coord.coordinator_did,
+                    conversation_id,
+                    &output.entry,
+                    &output.acceptance_proof,
+                    &public_key,
+                )
                 .await
                 .map_err(|error| {
-                    coordinator_failure(endpoint, "coordinator receipt key", &error)
+                    tracing::error!(
+                        ?error,
+                        "relayed direct-request acceptance evidence did not verify"
+                    );
+                    if error.is_retryable()
+                        || matches!(
+                            &error,
+                            crate::federation::FederationError::Database(_)
+                                | crate::federation::FederationError::Storage(_)
+                        )
+                    {
+                        coordinator_failure(endpoint, "acceptance evidence", &error)
+                    } else {
+                        ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidSignature)
+                    }
                 })?;
-
             let proof_bytes = serde_json::to_vec(&output.acceptance_proof)
                 .map_err(|_| ChatFailure::invariant(endpoint))?;
-            let verified_proof = crate::chat_protocol::direct_request_transcript::verify_received_direct_request_acceptance_proof(
-                &proof_bytes,
-                &authority_key,
-                &public_key,
-            )
-            .map_err(|e| {
-                tracing::error!("verify_received_direct_request_acceptance_proof failed: {e:?}");
-                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidSignature)
-            })?;
 
             let mut untagged_entry = output.entry.clone();
             if let Some(obj) = untagged_entry.as_object_mut() {
                 obj.remove("$type");
                 obj.remove("acceptanceProof");
+                obj.remove("sequencerReceipt");
             }
             if verified_proof.get("entry") != Some(&untagged_entry) {
                 return Err(ChatFailure::protocol(
@@ -526,6 +544,7 @@ async fn handle_inner(
                 let mut untagged_outcome_entry = outcome_entry.clone();
                 if let Some(obj) = untagged_outcome_entry.as_object_mut() {
                     obj.remove("$type");
+                    obj.remove("sequencerReceipt");
                 }
                 if untagged_outcome_entry != untagged_entry {
                     return Err(ChatFailure::protocol(
@@ -648,6 +667,7 @@ async fn handle_inner(
             &principal,
             envelope.request.get().as_bytes(),
             signer,
+            runtime.i13_receipt_signer(),
             runtime.relationship_authority().as_ref(),
             now,
         )
@@ -758,7 +778,13 @@ async fn handle_inner(
             serde_json::to_vec(&output).map_err(|_| ChatFailure::invariant(endpoint))?,
         ));
     }
-    execute_admitted(pool, admission, runtime.relationship_authority().as_ref()).await
+    execute_admitted(
+        pool,
+        admission,
+        runtime.relationship_authority().as_ref(),
+        runtime.i13_receipt_signer(),
+    )
+    .await
 }
 
 pub(crate) async fn execute_admitted<
@@ -767,6 +793,7 @@ pub(crate) async fn execute_admitted<
     pool: &DbPool,
     admission: crate::chat_protocol::repository::auth::SignedOperationAdmission,
     relationship_authority: &crate::chat_protocol::relationship_policy::RelationshipAuthority<T>,
+    i13_signer: Option<&crate::federation::receipt::I13ReceiptSigner>,
 ) -> Result<Response, ChatFailure> {
     let endpoint = ChatEndpoint::AcceptConversation;
     let mut transaction = pool
@@ -779,10 +806,14 @@ pub(crate) async fn execute_admitted<
     )
     .await
     .map_err(|error| context::operation_prelude_failure(endpoint, error))?;
-    let outcome =
-        acceptance::execute_prepared_acceptance(&mut transaction, prepared, relationship_authority)
-            .await
-            .map_err(|error| acceptance_failure(endpoint, error))?;
+    let outcome = acceptance::execute_prepared_acceptance(
+        &mut transaction,
+        prepared,
+        relationship_authority,
+        i13_signer,
+    )
+    .await
+    .map_err(|error| acceptance_failure(endpoint, error))?;
     let response = context::canonical_json_response(
         endpoint,
         outcome.status(),
@@ -811,7 +842,7 @@ fn acceptance_failure(endpoint: ChatEndpoint, error: AcceptanceFacadeError) -> C
     use ChatProtocolErrorCode as C;
     use StateMachineError as S;
     match error {
-        E::Database(_) => ChatFailure::storage(endpoint),
+        E::Database(_) | E::Delivery(_) => ChatFailure::storage(endpoint),
         E::Prelude(PreludeError::Authorization(error)) => {
             context::auth_repository_failure(endpoint, error)
         }

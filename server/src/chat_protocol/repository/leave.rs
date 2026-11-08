@@ -40,6 +40,7 @@ use crate::chat_protocol::{
     },
     validation::CanonicalUuidV4,
 };
+use crate::federation::receipt::{I13ControlReceiptInput, I13ReceiptSigner};
 
 use crate::chat_protocol::repository::prelude::{
     lock_signed_operation_replay_authority, release_signed_operation_replay,
@@ -64,6 +65,7 @@ pub(crate) enum LeaveFacadeError {
     Transition(TransitionRepositoryError),
     Database(sqlx::Error),
     Authorization(crate::chat_protocol::repository::auth::AuthRepositoryError),
+    Delivery(super::delivery::DeliveryRepositoryError),
 }
 
 macro_rules! from_err {
@@ -83,6 +85,7 @@ from_err!(
     TransitionRepositoryError => Transition,
     sqlx::Error => Database,
     crate::chat_protocol::repository::auth::AuthRepositoryError => Authorization,
+    super::delivery::DeliveryRepositoryError => Delivery,
 );
 
 pub(crate) struct LeaveTransactionOutcome {
@@ -113,12 +116,13 @@ impl LeaveCompletion {
 pub(crate) async fn execute_prepared_leave(
     transaction: &mut Transaction<'_, Postgres>,
     prepared: PreparedSignedOperation,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<LeaveTransactionOutcome, LeaveFacadeError> {
     match prepared.into_state() {
         PreparedSignedOperationState::First {
             authority,
             reservation,
-        } => execute_first(transaction, authority, reservation).await,
+        } => execute_first(transaction, authority, reservation, i13_signer).await,
         PreparedSignedOperationState::Replay { authority, replay } => {
             // Replay remains byte-opaque until the operation row, actor rows,
             // retained entry, and terminal status are all locked in this tx.
@@ -153,6 +157,7 @@ async fn execute_first(
     transaction: &mut Transaction<'_, Postgres>,
     authority: VerifiedChatDeviceRequest,
     reservation: OperationReservationGuard,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<LeaveTransactionOutcome, LeaveFacadeError> {
     let mutation = authority
         .mutation()
@@ -227,6 +232,20 @@ async fn execute_first(
         .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
     let products = CanonicalControlEntryProducts::mint(&entry)
         .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
+    let receipt_input: Option<I13ControlReceiptInput> = i13_signer
+        .map(|_| {
+            I13ControlReceiptInput::from_fields(
+                entry.conversation_id().as_str(),
+                entry.entry_id().as_str(),
+                entry.seq(),
+                entry.received_at().as_str(),
+                entry.mutation().actor_did().as_str(),
+                entry.mutation().actor_device_id().as_str(),
+                *entry.mutation().request_digest(),
+            )
+        })
+        .transpose()
+        .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
     // Closing or removing a zero-leaf participant changes the coordinate and
     // supersedes every open recovery reservation at that coordinate. Carry
     // each locked package guard into the planner so those releases are atomic.
@@ -260,7 +279,26 @@ async fn execute_first(
         _ => return Err(LeaveFacadeError::UnsupportedMutation),
     };
     let plan = planned.into_persistence_plan()?;
-    let response_bytes = response_for_plan(&plan, products.canonical_response_json(), parsed)?;
+    let receipt_coordinate = plan
+        .successor_coordinate()
+        .or_else(|| plan.retired_coordinate())
+        .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
+    let control_receipt = match (i13_signer, receipt_input.as_ref()) {
+        (Some(signer), Some(input)) => Some(
+            signer
+                .sign_control_receipt(input, receipt_coordinate)
+                .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?,
+        ),
+        _ => None,
+    };
+    let response_entry = match control_receipt.as_ref() {
+        Some(receipt) => {
+            I13ReceiptSigner::attach_control_receipt(products.canonical_response_json(), receipt)
+                .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?
+        }
+        None => products.canonical_response_json().to_vec(),
+    };
+    let response_bytes = response_for_plan(&plan, &response_entry, parsed)?;
     if parsed.kind == SignedMutationKind::ConversationClose {
         let pending: Option<(Uuid,i64)> = sqlx::query_as("SELECT p.request_id,octet_length(s.public_snapshot_bytes)::bigint+octet_length(s.tree_summary_bytes)::bigint FROM chat.direct_request_publications p LEFT JOIN chat.direct_request_lifecycle l USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id JOIN chat.generation_states s ON s.conversation_id=c.conversation_id AND s.generation=c.current_generation AND s.state_version=c.current_state_version WHERE p.conversation_id=$1 AND COALESCE(l.consent,'pending')='pending'")
             .bind(parsed.conversation_id).fetch_optional(&mut **transaction).await?;
@@ -323,6 +361,17 @@ async fn execute_first(
     )
     .await?;
     let applied = apply_prepared_leave_lifecycle_execution(execution).await?;
+    if let Some(receipt) = &control_receipt {
+        let receipt_bytes =
+            serde_json::to_vec(receipt).map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
+        super::delivery::set_entry_sequencer_receipt(
+            transaction,
+            parsed.conversation_id,
+            next_seq,
+            &receipt_bytes,
+        )
+        .await?;
+    }
     if parsed.kind == SignedMutationKind::ConversationClose {
         sqlx::query("INSERT INTO chat.direct_request_lifecycle(request_id,conversation_id,consent,closed_at) SELECT request_id,conversation_id,'closed',$2 FROM chat.direct_request_publications WHERE conversation_id=$1 ON CONFLICT(request_id) DO UPDATE SET consent='closed',closed_at=EXCLUDED.closed_at")
             .bind(parsed.conversation_id).bind(authority.trusted_instant().datetime()).execute(&mut **transaction).await?;

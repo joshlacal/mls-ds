@@ -117,6 +117,7 @@
         },
         "acceptedPayloadSha256": { "type": "bytes", "minLength": 32, "maxLength": 32 },
         "signedRequest": { "type": "bytes", "minLength": 1, "maxLength": 1048576 },
+        "sequencerReceipt": { "type": "bytes", "minLength": 1, "maxLength": 1048576 },
         "outerFingerprint": { "type": "bytes", "minLength": 32, "maxLength": 32 }
       }
     }

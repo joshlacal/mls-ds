@@ -26,6 +26,7 @@ use crate::{
     handlers::chat::ChatRuntime,
 };
 use ed25519_dalek::Signer as _;
+use sha2::Digest as _;
 
 const ACCEPT_CONVERSATION: &str = "blue.catbird.chat.acceptConversation";
 
@@ -123,6 +124,10 @@ struct PendingPair {
 
 impl PendingPair {
     async fn new(requester_home: &str) -> Self {
+        Self::new_with_i13(requester_home, true).await
+    }
+
+    async fn new_with_i13(requester_home: &str, issue_i13: bool) -> Self {
         crate::federation::open_federation_for_test();
         let seq_db = fresh_fully_migrated_db("chat_fed_relay_").await;
         let seq_pool = seq_db.connect(4).await;
@@ -166,12 +171,18 @@ impl PendingPair {
         .await
         .unwrap();
         let relationships = SimSourceFault::default();
+        let runtime_receipt = receipt.clone();
         let (seq_runtime, seq_router) = validated_router(&seq_pool, &seq_keys, |runtime| {
-            runtime
+            let runtime = runtime
                 .with_sim_faulty_relationships(relationships.clone())
                 .unwrap()
                 .with_clock(clock.clone())
-                .with_sim_hooks(Arc::clone(&seq_hooks))
+                .with_sim_hooks(Arc::clone(&seq_hooks));
+            if issue_i13 {
+                runtime.with_i13_receipt_signer(runtime_receipt)
+            } else {
+                runtime
+            }
         })
         .await;
         let (_, home_router) =
@@ -445,6 +456,20 @@ impl PendingPair {
         hooks: &Arc<SimDsHooks>,
         acceptance: &Value,
     ) -> (StatusCode, Option<String>, Value) {
+        let (status, retry_after, body) = self.raw_answer_at(router, hooks, acceptance).await;
+        (
+            status,
+            retry_after,
+            serde_json::from_slice(&body).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn raw_answer_at(
+        &self,
+        router: &Router,
+        hooks: &Arc<SimDsHooks>,
+        acceptance: &Value,
+    ) -> (StatusCode, Option<String>, Vec<u8>) {
         let body = serde_json::to_vec(&json!({ "directRequest": acceptance })).unwrap();
         let response = scope_sim_ds(Arc::clone(hooks), async {
             tower_util::ServiceExt::oneshot(
@@ -464,13 +489,119 @@ impl PendingPair {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        (
-            status,
-            retry_after,
-            serde_json::from_slice(&body).unwrap_or(Value::Null),
-        )
+        (status, retry_after, body.into())
     }
 
+    async fn entries_at(&self, pool: &DbPool, did: &str, device_id: Uuid) -> Vec<Value> {
+        let dpop_jkt: String = sqlx::query_scalar(
+            "SELECT dpop_jkt FROM chat.devices WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(did)
+        .bind(device_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let trusted = canonical(current_utc());
+        let proof_jti: [u8; 12] = Uuid::new_v4().as_bytes()[..12].try_into().unwrap();
+        let authority = crate::chat_protocol::repository::auth::authorize_unsigned_request(
+            pool,
+            crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
+                Uuid::new_v4(),
+                proof_jti,
+                "blue.catbird.chat.getEntries",
+                &trusted,
+                did,
+                device_id,
+                &dpop_jkt,
+            ),
+        )
+        .await
+        .unwrap();
+        let admission = crate::chat_protocol::dpop::seal_read_admission(authority).unwrap();
+        let page = crate::chat_protocol::repository::entry_read::get_entries_for_admission(
+            pool,
+            admission,
+            self.fixture.conversation_id,
+            1,
+            100,
+        )
+        .await
+        .unwrap();
+        let page: Value = serde_json::from_slice(&page.into_response_bytes()).unwrap();
+        page["entries"].as_array().unwrap().clone()
+    }
+
+    fn assert_i13_receipt(&self, acceptance: &Value, entry: &Value) {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let body = &acceptance["body"];
+        let receipt = &entry["sequencerReceipt"];
+        let decode = |field: &str| {
+            STANDARD
+                .decode(
+                    receipt[field]
+                        .as_str()
+                        .or_else(|| receipt[field]["$bytes"].as_str())
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        let transcript = direct_request_signing_bytes(
+            DirectRequestKind::Accept,
+            &serde_json::to_vec(body).unwrap(),
+        )
+        .unwrap();
+        let request_digest: [u8; 32] = sha2::Sha256::digest(transcript).into();
+        let archive_commitment: [u8; 32] = decode("archiveCommitment").try_into().unwrap();
+        let group_id = decode("groupId");
+        let signature: [u8; 64] = decode("signature").try_into().unwrap();
+        let issued_at_ms =
+            chrono::DateTime::parse_from_rfc3339(entry["receivedAt"].as_str().unwrap())
+                .unwrap()
+                .timestamp_millis();
+
+        assert_eq!(receipt["sequencerDid"], C33_SEQ);
+        assert_eq!(receipt["conversationId"], entry["conversationId"]);
+        assert_eq!(receipt["entryId"], entry["entryId"]);
+        assert_eq!(receipt["seq"], entry["seq"]);
+        assert_eq!(receipt["issuedAtMs"], issued_at_ms);
+        assert_eq!(receipt["senderDid"], body["actorDid"]);
+        assert_eq!(receipt["senderDeviceId"], body["actorDeviceId"]);
+        assert_eq!(archive_commitment, request_digest);
+        assert_eq!(receipt["generation"], body["next"]["generation"]);
+        assert_eq!(receipt["epoch"], body["next"]["epoch"]);
+        assert_eq!(
+            group_id,
+            STANDARD
+                .decode(body["next"]["groupId"].as_str().unwrap())
+                .unwrap()
+        );
+
+        labyrinth_protocol::receipt::verify_sequencer_receipt(
+            &self.receipt.verifying_key(),
+            C33_SEQ,
+            &labyrinth_protocol::receipt::SignedSequencerReceipt {
+                payload: labyrinth_protocol::receipt::SequencerReceiptPayload {
+                    sequencer_did: C33_SEQ.to_owned(),
+                    conversation_id: entry["conversationId"].as_str().unwrap().to_owned(),
+                    group_id,
+                    epoch: receipt["epoch"].as_u64().unwrap(),
+                    sender_device_did_url: format!(
+                        "{}#{}",
+                        body["actorDid"].as_str().unwrap(),
+                        body["actorDeviceId"].as_str().unwrap()
+                    ),
+                    entry_id: entry["entryId"].as_str().unwrap().to_owned(),
+                    archive_commitment,
+                    seq: entry["seq"].as_u64().unwrap(),
+                    issued_at_ms,
+                },
+                key_id: receipt["kid"].as_str().unwrap().to_owned(),
+                signature,
+            },
+        )
+        .unwrap();
+    }
     /// The pair's graph source answering that the greater of D and P blocks
     /// the lesser: the one edge a two-party block-only graph asks about.
     fn blocking_graph(&self) -> Option<Result<PublicResponse, TransportError>> {
@@ -593,8 +724,71 @@ impl PendingPair {
             1
         );
         let rows = control_rows(&self.seq_pool, self.fixture.conversation_id).await;
-        assert_eq!(rows[0].2, "delivered");
+        let (status, last_error) = (
+            &rows[0].2,
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT last_error FROM outbound_queue WHERE id = $1",
+            )
+            .bind(&rows[0].0)
+            .fetch_one(&self.seq_pool)
+            .await
+            .unwrap(),
+        );
+        assert_eq!(status, "delivered", "{last_error:?}");
     }
+}
+
+/// The coordinator binds the relay's outer conversation id both to the signed
+/// acceptance prior and to the publication selected by its request id. Neither
+/// mismatch reaches signature admission or mutates the pending pair.
+#[tokio::test]
+async fn a_relayed_acceptance_rejects_each_outer_conversation_id_mismatch() {
+    let p = PendingPair::new(C33_SEQ).await;
+    let accepted = p.acceptance();
+    let wrong = Uuid::new_v4();
+    scope_ds_clock(p.clock.clone(), async {
+        let before = p.coordinator_state().await;
+        let signed_mismatch = scope_sim_ds(
+            Arc::clone(&p.seq_hooks),
+            coordinator_accept_direct_request(
+                &p.seq_pool,
+                &p.seq_runtime,
+                C33_HOME,
+                wrong,
+                &accepted,
+            ),
+        )
+        .await
+        .expect_err("outer id must match the signed acceptance");
+        assert!(matches!(
+            &signed_mismatch,
+            crate::federation::FederationError::InvalidRequest(reason)
+                if reason == "outer conversationId does not match signed acceptance"
+        ));
+        assert_eq!(p.coordinator_state().await, before);
+
+        let mut publication_mismatch = accepted;
+        publication_mismatch["body"]["prior"]["conversationId"] = json!(wrong);
+        let stored_mismatch = scope_sim_ds(
+            Arc::clone(&p.seq_hooks),
+            coordinator_accept_direct_request(
+                &p.seq_pool,
+                &p.seq_runtime,
+                C33_HOME,
+                wrong,
+                &publication_mismatch,
+            ),
+        )
+        .await
+        .expect_err("outer id must match the stored publication");
+        assert!(matches!(
+            &stored_mismatch,
+            crate::federation::FederationError::InvalidRequest(reason)
+                if reason == "outer conversationId does not match stored direct request"
+        ));
+        assert_eq!(p.coordinator_state().await, before);
+    })
+    .await;
 }
 
 /// D's home relays D's deletion; the coordinator sequences it at seq 2. P,
@@ -702,36 +896,157 @@ async fn a_coordinator_replays_an_acceptance_completed_before_a_later_relayed_de
     let (cid, requester) = (p.fixture.conversation_id, p.fixture.actor_did.clone());
     scope_ds_clock(p.clock.clone(), async {
         let acceptance = p.acceptance();
-        let (status, accepted) = p.accept_at(&p.seq_router, &p.seq_hooks, &acceptance).await;
+        let (status, _, accepted_bytes) = p
+            .raw_answer_at(&p.seq_router, &p.seq_hooks, &acceptance)
+            .await;
+        let accepted: Value = serde_json::from_slice(&accepted_bytes).unwrap();
         assert_eq!(status, StatusCode::OK, "{accepted}");
+        let entry = &accepted["acceptanceProof"]["entry"];
+        p.assert_i13_receipt(&acceptance, entry);
+        let stored_receipt: Vec<u8> = sqlx::query_scalar(
+            "SELECT sequencer_receipt_bytes FROM chat.entries \
+             WHERE conversation_id = $1 AND seq = 2",
+        )
+        .bind(cid)
+        .fetch_one(&p.seq_pool)
+        .await
+        .unwrap();
+        let mut stored_receipt: Value = serde_json::from_slice(&stored_receipt).unwrap();
+        crate::chat_protocol::direct_request_transcript::present_read_presentation(
+            "sequencerReceipt",
+            &mut stored_receipt,
+        )
+        .unwrap();
+        assert_eq!(stored_receipt, entry["sequencerReceipt"]);
+        let home_entries = p
+            .entries_at(
+                &p.home_pool,
+                &p.fixture.recipient_did,
+                p.fixture.recipient_device_id,
+            )
+            .await;
+        let synced = home_entries.iter().find(|row| row["seq"] == 2).unwrap();
+        assert_eq!(synced["sequencerReceipt"], entry["sequencerReceipt"]);
+
         p.relay_requester_deletion().await;
         assert_eq!(deletions(&p.seq_pool, cid).await, [(3, requester.clone())]);
-        let (status, replayed) = p.accept_at(&p.seq_router, &p.seq_hooks, &acceptance).await;
-        assert_eq!((status, &replayed), (StatusCode::OK, &accepted));
+        let (status, _, replayed_bytes) = p
+            .raw_answer_at(&p.seq_router, &p.seq_hooks, &acceptance)
+            .await;
+        assert_eq!((status, replayed_bytes), (StatusCode::OK, accepted_bytes));
+        let entries: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM chat.entries WHERE conversation_id = $1")
+                .bind(cid)
+                .fetch_one(&p.seq_pool)
+                .await
+                .unwrap();
+        assert_eq!(entries, 3);
     })
     .await;
 }
 
 /// P accepts at its transport-only home, which relays to D's coordinator;
-/// D's deletion there reaches P's home after the acceptance. P's exact replay
-/// at its home returns the stored outcome, as any duplicate does.
+/// the coordinator's receipt is mirrored byte-for-byte and is readable there.
 #[tokio::test]
 async fn a_transport_home_replays_an_acceptance_completed_before_a_later_deletion() {
     let p = PendingPair::new(C33_SEQ).await;
     let (cid, requester) = (p.fixture.conversation_id, p.fixture.actor_did.clone());
     scope_ds_clock(p.clock.clone(), async {
         let acceptance = p.acceptance();
-        let (status, accepted) = p
-            .accept_at(&p.home_router, &p.home_hooks, &acceptance)
+        let (status, _, accepted_bytes) = p
+            .raw_answer_at(&p.home_router, &p.home_hooks, &acceptance)
             .await;
+        let accepted: Value = serde_json::from_slice(&accepted_bytes).unwrap();
         assert_eq!(status, StatusCode::OK, "{accepted}");
+        let entry = &accepted["acceptanceProof"]["entry"];
+        p.assert_i13_receipt(&acceptance, entry);
+        assert_eq!(entry["sequencerReceipt"]["sequencerDid"], C33_SEQ);
+
+        let coordinator_receipt: Vec<u8> = sqlx::query_scalar(
+            "SELECT sequencer_receipt_bytes FROM chat.entries \
+             WHERE conversation_id = $1 AND seq = 2",
+        )
+        .bind(cid)
+        .fetch_one(&p.seq_pool)
+        .await
+        .unwrap();
+        let coordinator_receipt: Value = serde_json::from_slice(&coordinator_receipt).unwrap();
+        let mut presented_receipt = coordinator_receipt.clone();
+        crate::chat_protocol::direct_request_transcript::present_read_presentation(
+            "sequencerReceipt",
+            &mut presented_receipt,
+        )
+        .unwrap();
+        assert_eq!(presented_receipt, entry["sequencerReceipt"]);
+
+        let mirror_bytes: Vec<u8> = sqlx::query_scalar(
+            "SELECT entry_bytes FROM chat.direct_request_transport_entries \
+             WHERE conversation_id = $1 AND seq = 2",
+        )
+        .bind(cid)
+        .fetch_one(&p.home_pool)
+        .await
+        .unwrap();
+        let mirror: Value = serde_json::from_slice(&mirror_bytes).unwrap();
+        assert_eq!(mirror["sequencerReceipt"], coordinator_receipt);
+        let home_entries = p
+            .entries_at(
+                &p.home_pool,
+                &p.fixture.recipient_did,
+                p.fixture.recipient_device_id,
+            )
+            .await;
+        let synced = home_entries.iter().find(|entry| entry["seq"] == 2).unwrap();
+        assert_eq!(synced["sequencerReceipt"], presented_receipt);
+
         p.delete_requester_at_coordinator().await;
         assert_eq!(deletions(&p.seq_pool, cid).await, [(3, requester.clone())]);
         p.deliver_deletion_to_home().await;
-        let (status, replayed) = p
-            .accept_at(&p.home_router, &p.home_hooks, &acceptance)
+        let (status, _, replayed_bytes) = p
+            .raw_answer_at(&p.home_router, &p.home_hooks, &acceptance)
             .await;
-        assert_eq!((status, &replayed), (StatusCode::OK, &accepted));
+        assert_eq!((status, replayed_bytes), (StatusCode::OK, accepted_bytes));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_signerless_coordinator_keeps_acceptance_compatible_and_idempotent() {
+    let p = PendingPair::new_with_i13(C33_HOME, false).await;
+    let cid = p.fixture.conversation_id;
+    scope_ds_clock(p.clock.clone(), async {
+        let acceptance = p.acceptance();
+        let (status, _, accepted_bytes) = p
+            .raw_answer_at(&p.seq_router, &p.seq_hooks, &acceptance)
+            .await;
+        let accepted: Value = serde_json::from_slice(&accepted_bytes).unwrap();
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        assert!(
+            accepted["acceptanceProof"]["entry"]
+                .get("sequencerReceipt")
+                .is_none(),
+            "{accepted}"
+        );
+        let stored_receipt: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT sequencer_receipt_bytes FROM chat.entries \
+             WHERE conversation_id = $1 AND seq = 2",
+        )
+        .bind(cid)
+        .fetch_one(&p.seq_pool)
+        .await
+        .unwrap();
+        assert!(stored_receipt.is_none());
+        let (status, _, replayed_bytes) = p
+            .raw_answer_at(&p.seq_router, &p.seq_hooks, &acceptance)
+            .await;
+        assert_eq!((status, replayed_bytes), (StatusCode::OK, accepted_bytes));
+        let entries: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM chat.entries WHERE conversation_id = $1")
+                .bind(cid)
+                .fetch_one(&p.seq_pool)
+                .await
+                .unwrap();
+        assert_eq!(entries, 2);
     })
     .await;
 }

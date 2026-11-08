@@ -103,16 +103,23 @@ impl ChatFailure {
     /// A source the endpoint depends on could not answer now: a closed
     /// federation gate, or a peer or resolver that was unreachable or answered
     /// 5xx/429. That decided nothing, so it is the endpoint's declared
-    /// retryable code (`RelationshipPolicyUnavailable`, else
-    /// `CapacityUnavailable`) with a 5 s retry; an endpoint declaring neither
-    /// answers 503 with the same retry and no protocol code.
+    /// availability code, falling back to its declared `RateLimited` code, with
+    /// a 5 s retry. The status remains 503: the dependency, not this caller's
+    /// quota, is unavailable.
     pub(crate) fn unavailable(endpoint: ChatEndpoint) -> Self {
-        use ChatProtocolErrorCode::{CapacityUnavailable, RelationshipPolicyUnavailable};
-        match [RelationshipPolicyUnavailable, CapacityUnavailable]
-            .into_iter()
-            .find(|code| endpoint.declares(*code))
+        use ChatProtocolErrorCode::{
+            CapacityUnavailable, RateLimited, RelationshipPolicyUnavailable,
+        };
+        match [
+            RelationshipPolicyUnavailable,
+            CapacityUnavailable,
+            RateLimited,
+        ]
+        .into_iter()
+        .find(|code| endpoint.declares(*code))
         {
-            Some(code) => Self::protocol_with_retry(endpoint, code, Some(5)),
+            Some(code) => Self::protocol_with_retry(endpoint, code, Some(5))
+                .with_status(StatusCode::SERVICE_UNAVAILABLE),
             None => Self {
                 retry_after_secs: Some(5),
                 status: Some(StatusCode::SERVICE_UNAVAILABLE),
@@ -225,8 +232,8 @@ mod tests {
         );
     }
 
-    /// Every endpoint answers a source that could not answer now with 503 and
-    /// `Retry-After: 5`: its declared retryable code, else no protocol code.
+    /// Every endpoint answers a source that could not answer now with 503,
+    /// `Retry-After: 5`, and a declared retryable protocol code.
     #[tokio::test]
     async fn unavailable_is_503_with_retry_after_on_every_endpoint() {
         for (endpoint, error) in [
@@ -235,7 +242,11 @@ mod tests {
                 "RelationshipPolicyUnavailable",
             ),
             (ChatEndpoint::PublishDirectRequest, "CapacityUnavailable"),
-            (ChatEndpoint::GetConversationState, "InternalServerError"),
+            (ChatEndpoint::RequestLeave, "RateLimited"),
+            (ChatEndpoint::CancelLeave, "RateLimited"),
+            (ChatEndpoint::RequestReset, "RateLimited"),
+            (ChatEndpoint::ActivateReset, "RateLimited"),
+            (ChatEndpoint::CancelLeafRecovery, "RateLimited"),
         ] {
             let failure = ChatFailure::unavailable(endpoint);
             assert!(failure.is_transient(), "{endpoint:?}");

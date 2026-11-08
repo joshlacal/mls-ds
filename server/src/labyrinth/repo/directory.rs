@@ -308,7 +308,7 @@ pub async fn member_devices(
         "SELECT leaf_key_id, leaf_signature_key, joined_seq, removed_seq \
            FROM chat.member_devices \
           WHERE conversation_id = $1 AND user_did = $2 \
-          ORDER BY joined_seq, leaf_period_id OFFSET $3 LIMIT $4",
+          ORDER BY joined_seq, uuid_send(device_id), leaf_period_id OFFSET $3 LIMIT $4",
     )
     .bind(conversation_id)
     .bind(did)

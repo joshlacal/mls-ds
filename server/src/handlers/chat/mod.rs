@@ -58,6 +58,50 @@ pub(crate) use acknowledge_entries::execute_for_principal as acknowledge_entries
 pub(crate) use conversation_state::execute_federated_read as execute_federated_conversation_state_read;
 pub(crate) use welcome::execute_admitted as execute_federated_group_welcome;
 
+pub(crate) fn federated_admission_failure(
+    endpoint: ChatEndpoint,
+    error: crate::chat_protocol::repository::auth::AuthRepositoryError,
+) -> Response {
+    context::auth_repository_failure(endpoint, error).into_response()
+}
+
+pub(crate) fn federated_completed_response(
+    endpoint: ChatEndpoint,
+    status: i32,
+    response_bytes: Vec<u8>,
+) -> Response {
+    context::canonical_json_response(endpoint, status, response_bytes)
+        .unwrap_or_else(IntoResponse::into_response)
+}
+
+pub(crate) async fn execute_federated_lifecycle(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    endpoint: ChatEndpoint,
+    admission: crate::chat_protocol::repository::auth::SignedOperationAdmission,
+    body: &[u8],
+    relay_home: Option<&str>,
+) -> Response {
+    let result = match endpoint {
+        ChatEndpoint::RequestLeave
+        | ChatEndpoint::CancelLeave
+        | ChatEndpoint::CloseConversation => {
+            leave::execute_admitted(pool, runtime, endpoint, admission, body, relay_home).await
+        }
+        ChatEndpoint::RequestReset | ChatEndpoint::ActivateReset => {
+            reset::execute_admitted(pool, runtime, endpoint, admission, body, relay_home).await
+        }
+        ChatEndpoint::RequestLeafRecovery | ChatEndpoint::CancelLeafRecovery => {
+            recovery::execute_admitted(pool, runtime, endpoint, admission, relay_home).await
+        }
+        ChatEndpoint::SubmitTransition => {
+            submit_transition::execute_admitted(pool, runtime, admission, body, relay_home).await
+        }
+        _ => Err(ChatFailure::invariant(endpoint)),
+    };
+    result.unwrap_or_else(IntoResponse::into_response)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn admit_signed_operation_for_test(
     pool: &DbPool,

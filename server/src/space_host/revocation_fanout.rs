@@ -40,11 +40,17 @@ async fn post_space_notice(
 
     let full_url = format!("{}/xrpc/{nsid}", endpoint_base.trim_end_matches('/'));
     let http_client = if is_test_override {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?
+        static TEST_OVERRIDE_CLIENT: std::sync::OnceLock<reqwest::Client> =
+            std::sync::OnceLock::new();
+        TEST_OVERRIDE_CLIENT
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .expect("build test space notice HTTP client")
+            })
+            .clone()
     } else {
         let validated =
             validate_https_url_with_resolver(&full_url, None, false, system_dns_resolve)
@@ -103,7 +109,7 @@ pub async fn revoke_member_space_credentials_and_fan_out(
     };
 
     let now = crate::sim_hooks::current_utc();
-    let revoked_rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+    let mut revoked_rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
         "UPDATE chat.space_credential_jtis \
             SET revoked_at = $3 \
           WHERE space_uri = $1 \
@@ -118,6 +124,9 @@ pub async fn revoke_member_space_credentials_and_fan_out(
     .fetch_all(runtime.pool())
     .await
     .map_err(|e| e.to_string())?;
+    // `UPDATE .. RETURNING` has no row-order guarantee. Keep the wire payload
+    // stable so retries and deterministic simulator replays send identical bytes.
+    revoked_rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
 
     if revoked_rows.is_empty() {
         return Ok(0);

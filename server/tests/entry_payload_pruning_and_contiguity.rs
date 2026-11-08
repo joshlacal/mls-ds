@@ -207,8 +207,7 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
         .await
         .expect("clean-slate application fixture");
 
-    let receipt_sk = P256SigningKey::random(&mut OsRng);
-    let i13_signer = I13ReceiptSigner::new(receipt_sk.clone(), self_did.to_string());
+    let receipt_verifying_key = common::proof_i13_signer().verifying_key();
 
     let sender_p256 = http::random_p256();
     let sender_jwk = http::public_jwk(&sender_p256);
@@ -232,8 +231,7 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
     };
     http::cache_device_did(&recipient_dev).await;
 
-    let router: Router =
-        http::router_for_authenticated_acceptance_with_i13(pool.clone(), i13_signer).await;
+    let router: Router = http::router_for_authenticated_acceptance(pool.clone()).await;
 
     // 1. Send application message carrying archiveCommitment -> receives I13 sequencerReceipt
     let (send_status, send_body) = http::send(
@@ -286,7 +284,7 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
         key_id: format!("{self_did}#mls-receipt-1"),
         signature: sig_raw,
     };
-    verify_sequencer_receipt(receipt_sk.verifying_key(), self_did, &reconstructed)
+    verify_sequencer_receipt(&receipt_verifying_key, self_did, &reconstructed)
         .expect("I13 sequencerReceipt verifies cryptographically");
 
     // 2. Partial ACK (sender only) does NOT prune ciphertext while recipient is active & non-dormant
@@ -431,10 +429,14 @@ async fn dormant_60d_devices_and_30d_ceiling_prune_without_stalling_active_conve
     let pool = db.connect(4).await;
     http::ensure_fence(&pool).await;
 
-    let fixture =
-        seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
-            .await
-            .expect("fixture");
+    let fixture = seed_clean_slate_application_fixture(
+        &pool,
+        false,
+        "did:web:chat.catbird.blue",
+        Some([0x45; 32]),
+    )
+    .await
+    .expect("fixture");
 
     let sender_p256 = http::random_p256();
     let sender_jwk = http::public_jwk(&sender_p256);

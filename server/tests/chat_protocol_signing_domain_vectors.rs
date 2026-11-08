@@ -96,14 +96,14 @@ const CANONICAL_SOURCE_LEXICON_REVISION: &str = "e4227af68226a61a4cae7478496d1a7
 const CANONICAL_SOURCE_CORPUS_REVISION: &str = "838df09a4fa46ba651280c01e74b66b989ca7a74";
 const CANONICAL_SOURCE_LEXICON_SHA256: &str =
     "1c21d1b04555c800a0491e997b74e3185520b0634362e68a2a27e6b8babdb075";
-// The frozen vectors retain their original provenance. Separately pin the
-// current canonical contract, which also contains the direct-request domains
-// and `leafRecoveryView.signedRequest` (PetrelCatbird e782e46c,
-// catbird-atproto 49c6fdb0).
-const CURRENT_SOURCE_LEXICON_REVISION: &str = "e782e46ca8489c881517186fe0bf1a9c35c99634";
-const CURRENT_SOURCE_CORPUS_REVISION: &str = "49c6fdb00671ffe96e58e3b5ebec7d5e6532f51f";
+// The current canonical contract also contains the direct-request domains and
+// `leafRecoveryView.signedRequest`, while account deletion relies only on its
+// independently verified `sequencerAuthority` (PetrelCatbird 5c991ba1,
+// catbird-atproto 15603813 plus the Task 5 schema projection).
+const CURRENT_SOURCE_LEXICON_REVISION: &str = "5c991ba1410c097c659cc82f3be5247982291ce5";
+const CURRENT_SOURCE_CORPUS_REVISION: &str = "1560381359debd4b75291579161c8846b388df10";
 const CURRENT_SOURCE_LEXICON_SHA256: &str =
-    "cf931d0fda7b68082f7f0ac9105dd62122692ee35afbf0ddf7eb2d134340f848";
+    "b0fe4af17f657647a8e1ceedb7a34765a0c72d514420ce3b153d6ecd11d240ff";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures

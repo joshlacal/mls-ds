@@ -15,7 +15,7 @@ use crate::chat_protocol::{
     },
     validation::{
         ed25519_key_id, BareDid, CanonicalTimestamp, CanonicalUuidV4, KeyThumbprint,
-        TrustedRequestInstant,
+        TrustedRequestInstant, MAX_FIRST_EXECUTION_FUTURE_SKEW_MILLIS,
     },
     wire::{
         validate_group_info, GroupInfoValidationPolicy, MAX_GROUP_INFO_WIRE_BYTES,
@@ -212,6 +212,28 @@ fn fixture_package_not_after() -> ServerTimestamp {
         corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_600_000,
     )
     .unwrap()
+}
+
+fn acceptance_evidence_with_authority() -> TransitionEvidence {
+    let manifest = corpus_manifest();
+    TransitionEvidence::for_test_acceptance(
+        ACCEPT_SEQ,
+        uuid_v4_bytes(0x22),
+        uuid_v4_bytes(0x24),
+        [0x22; 32],
+        fixture_received_at(ACCEPT_SEQ),
+        direct_creation().coordinate().clone(),
+        uuid_v4_bytes(0x23),
+        bob(&manifest),
+        uuid_v4_bytes(0x11),
+        alice(&manifest),
+        corpus_key_package_ref(),
+        vec![0xAA_u8; 32],
+        [0x44; 32],
+        1,
+        fixture_package_not_after(),
+    )
+    .expect("acceptance evidence")
 }
 
 fn hydrate_conversation_state(
@@ -1166,29 +1188,56 @@ fn acceptance_rebinds_same_snapshot_and_opens_no_application_interval() {
 }
 
 #[test]
-fn acceptance_recovery_package_comparison_rejects_wrapper_and_hash_drift() {
+fn participant_acceptance_preserves_admitted_future_clock_skew() {
     let manifest = corpus_manifest();
-    let prior = direct_creation().coordinate().clone();
+    let prior = direct_creation();
+    let received_at = fixture_received_at(ACCEPT_SEQ);
+    let admitted_at = ServerTimestamp::from_unix_millis_for_test(
+        received_at.unix_millis() + MAX_FIRST_EXECUTION_FUTURE_SKEW_MILLIS,
+    )
+    .expect("future skew boundary");
+    let admitted = acceptance_evidence_with_authority()
+        .for_test_with_signed_at(admitted_at)
+        .expect("rebind admitted signedAt");
+    plan_accept_conversation(
+        &prior,
+        AcceptConversation {
+            actor: bob(&manifest),
+            transition: admitted,
+            recovery_request_id: uuid_v4_bytes(0x23),
+            key_package_ref: corpus_key_package_ref(),
+            package_not_after: fixture_package_not_after(),
+        },
+    )
+    .expect("admission-window future skew remains a valid durable transition");
+
+    let outside_at = ServerTimestamp::from_unix_millis_for_test(
+        received_at.unix_millis() + MAX_FIRST_EXECUTION_FUTURE_SKEW_MILLIS + 1,
+    )
+    .expect("outside future skew boundary");
+    let outside = acceptance_evidence_with_authority()
+        .for_test_with_signed_at(outside_at)
+        .expect("rebind outside signedAt");
+    assert!(matches!(
+        plan_accept_conversation(
+            &prior,
+            AcceptConversation {
+                actor: bob(&manifest),
+                transition: outside,
+                recovery_request_id: uuid_v4_bytes(0x23),
+                key_package_ref: corpus_key_package_ref(),
+                package_not_after: fixture_package_not_after(),
+            },
+        ),
+        Err(StateMachineError::InvariantViolation)
+    ));
+}
+
+#[test]
+fn acceptance_recovery_package_comparison_rejects_wrapper_and_hash_drift() {
     let wrapper = vec![0xAA_u8; 32];
     let wrapper_sha256: [u8; 32] = Sha256::digest(&wrapper).into();
-    let acceptance = TransitionEvidence::for_test_acceptance(
-        ACCEPT_SEQ,
-        uuid_v4_bytes(0x22),
-        uuid_v4_bytes(0x24),
-        [0x22; 32],
-        fixture_received_at(ACCEPT_SEQ),
-        prior,
-        uuid_v4_bytes(0x23),
-        bob(&manifest),
-        uuid_v4_bytes(0x11),
-        alice(&manifest),
-        corpus_key_package_ref(),
-        wrapper.clone(),
-        [0x44; 32],
-        1,
-        fixture_package_not_after(),
-    )
-    .expect("acceptance evidence");
+    let acceptance = acceptance_evidence_with_authority();
 
     assert!(acceptance_recovery_package_artifact_matches(
         &acceptance,
@@ -3346,4 +3395,85 @@ fn mf01_group_commit_removing_other_principal_requires_admin() {
         },
     )
     .expect("direct peer retains mutual admin authority");
+}
+
+#[test]
+fn signed_request_and_device_revocation_preserve_admitted_future_clock_skew() {
+    let state = added_direct();
+    let actor = bob(&corpus_manifest());
+    let request_id = uuid_v4_bytes(0x9a);
+    let conversation_id = *state.coordinate().conversation_id();
+    let signing_key = SigningKey::from_bytes(&[0x54; 32]);
+    let received_at_text = "2030-01-01T00:00:00.000Z";
+    let trusted_received_at = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(received_at_text).unwrap(),
+    );
+    let authority = HydrationAuthority::for_test_with_locked_instant(
+        conversation_id,
+        &trusted_received_at,
+        Some(*state.coordinate()),
+    )
+    .unwrap();
+
+    let build_request_evidence = |signed_at_text: &str| -> RequestEvidence {
+        let kind = SignedMutationKind::LeafRecoveryRequest;
+        let body = json!({
+            "$type": kind.type_id(),
+            "signatureDomain": String::from_utf8(kind.domain().to_vec()).unwrap(),
+            "recoveryRequestId": Uuid::from_bytes(request_id).hyphenated().to_string(),
+            "actorDid": std::str::from_utf8(actor.principal().as_bytes()).unwrap(),
+            "actorDeviceId": Uuid::from_bytes(*actor.device_id()).hyphenated().to_string(),
+            "keyId": ed25519_key_id(&signing_key.verifying_key().to_bytes()).unwrap().as_str(),
+            "authGeneration": 1,
+            "prior": coordinate_json(state.coordinate()),
+            "recoveryKind": "replace",
+            "idempotencyKey": Uuid::from_bytes(uuid_v4_bytes(0x9b)).hyphenated().to_string(),
+            "signedAt": signed_at_text,
+        });
+        let raw = resign_signed_wrapper(json!({ "body": body, "signature": "" }), &signing_key);
+        authority
+            .signed_request(
+                DurableSignedRequestEnvelope::new(conversation_id, &trusted_received_at).unwrap(),
+                decode_and_verify_signed_mutation(&raw, &signing_key.verifying_key().to_bytes())
+                    .unwrap(),
+            )
+            .unwrap()
+    };
+
+    // Exact +60,000 ms boundary must be admitted by validate_request_evidence & planner.
+    let admitted_req = build_request_evidence("2030-01-01T00:01:00.000Z");
+    let received_at = admitted_req.received_at();
+    let package_not_after =
+        ServerTimestamp::from_unix_millis_for_test(received_at.unix_millis() + 3_600_000).unwrap();
+    plan_leaf_recovery_request(
+        &state,
+        LeafRecoveryRequestCommand {
+            actor: actor.clone(),
+            recovery_request_id: request_id,
+            kind: LeafRecoveryKind::Replace,
+            key_package_ref: corpus_key_package_ref(),
+            received_at,
+            package_not_after,
+            evidence: admitted_req,
+        },
+    )
+    .expect("admission-window future skew on requestLeafRecovery must plan cleanly");
+
+    // +60,001 ms (1 ms past MAX_FIRST_EXECUTION_FUTURE_SKEW_MILLIS) must fail closed.
+    let outside_req = build_request_evidence("2030-01-01T00:01:00.001Z");
+    assert!(matches!(
+        plan_leaf_recovery_request(
+            &state,
+            LeafRecoveryRequestCommand {
+                actor,
+                recovery_request_id: request_id,
+                kind: LeafRecoveryKind::Replace,
+                key_package_ref: corpus_key_package_ref(),
+                received_at,
+                package_not_after,
+                evidence: outside_req,
+            },
+        ),
+        Err(StateMachineError::InvalidTransition)
+    ));
 }

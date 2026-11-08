@@ -11,6 +11,8 @@ use uuid::{Uuid, Variant, Version};
 use super::model::AuthPrimitiveError;
 
 pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+pub(crate) const MAX_FIRST_EXECUTION_FUTURE_SKEW_MILLIS: i64 = 60_000;
+const MAX_FIRST_EXECUTION_PAST_SKEW_MILLIS: i64 = 300_000;
 const RESERVED_TLDS: [&str; 9] = [
     "alt",
     "arpa",
@@ -449,10 +451,10 @@ pub fn validate_first_execution_signed_at(
 ) -> Result<(), AuthPrimitiveError> {
     let trusted_ms = trusted_instant.datetime().timestamp_millis();
     let lower = trusted_ms
-        .checked_sub(300_000)
+        .checked_sub(MAX_FIRST_EXECUTION_PAST_SKEW_MILLIS)
         .ok_or_else(|| AuthPrimitiveError::invalid("signedAt lower-bound overflow"))?;
     let upper = trusted_ms
-        .checked_add(60_000)
+        .checked_add(MAX_FIRST_EXECUTION_FUTURE_SKEW_MILLIS)
         .ok_or_else(|| AuthPrimitiveError::invalid("signedAt upper-bound overflow"))?;
     if !(lower..=upper).contains(&signed_at.datetime().timestamp_millis()) {
         return Err(AuthPrimitiveError::invalid(

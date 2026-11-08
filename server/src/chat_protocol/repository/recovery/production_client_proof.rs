@@ -152,7 +152,12 @@ async fn prepare_request(
         .into_plan_input(transaction, &proof.relationship_authority, &proof.trusted)
         .await
         .map_err(|error| format!("load immutable client Recovery fallback: {error:?}"))?;
-    plan_recovery_request(input, &proof.relationship_authority)
+    let i13_signer = proof_i13_signer();
+    plan_recovery_request(
+        input,
+        &proof.relationship_authority,
+        Some(&i13_signer),
+    )
         .map_err(|error| format!("plan client Recovery request: {error:?}"))
 }
 
@@ -324,7 +329,7 @@ fn require_terminal_delta(
         && before.target_reservation_status.as_deref() == Some("active")
         && before.completion == 0
         && before.operation_claim == 0
-        && before.package_status == "available"
+        && before.package_status == "reserved"
     {
         Ok(())
     } else {

@@ -1542,20 +1542,28 @@ pub(crate) struct StreamHead<'a> {
 /// statement's snapshot, but the row lock rechecks only `q`'s own predicates
 /// against a row a rival claim committed since: `q` itself must still be
 /// pending and due, or a head already in flight is claimed and sent again.
-/// Streams due at one instant order by `id`: without it a tie follows the rows'
-/// physical order, which their retry and lease history decides.
+/// A pending Welcome handoff fences its whole stream. Once handed off, the
+/// Welcome heads controls copied from its source entry.
 pub(crate) const CLAIM_DUE_HEADS_SQL: &str = "WITH heads AS ( \
          SELECT DISTINCT ON (CASE WHEN convo_id = '' THEN id ELSE convo_id END, target_ds_did) \
              id, status, next_retry_at, method \
          FROM outbound_queue \
          WHERE status IN ('pending', 'in_flight') \
            AND ($3::text IS NULL OR (convo_id = $3 AND target_ds_did = $4)) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM federation_outbox bootstrap \
+                WHERE bootstrap.conversation_id = outbound_queue.convo_id \
+                  AND bootstrap.target_service_did = outbound_queue.target_ds_did \
+                  AND bootstrap.method = 'blue.catbird.mlsDS.deliverWelcome' \
+                  AND bootstrap.status IN ('pending', 'in_flight') \
+           ) \
          ORDER BY (CASE WHEN convo_id = '' THEN id ELSE convo_id END), target_ds_did, \
              CASE \
                  WHEN method = 'blue.catbird.mlsDS.deliverDirectRequest' THEN 1 \
                  WHEN method = 'blue.catbird.mlsDS.deliverAcceptanceEntry' THEN 2 \
                  WHEN method IN ('blue.catbird.mlsDS.deliverMessageEntry', \
-                                 'blue.catbird.mlsDS.deliverMessage') THEN \
+                                 'blue.catbird.mlsDS.deliverMessage', \
+                                 'blue.catbird.mlsDS.deliverWelcome') THEN \
                      COALESCE( \
                          (substring(encode(payload, 'escape') from '\"seq\"[[:space:]]*:[[:space:]]*([0-9]+)'))::bigint, \
                          (substring(id from '-([0-9]+)$'))::bigint, \
@@ -1573,6 +1581,7 @@ pub(crate) const CLAIM_DUE_HEADS_SQL: &str = "WITH heads AS ( \
                      ) \
                  ELSE NULL \
              END ASC NULLS LAST, \
+             CASE WHEN method = 'blue.catbird.mlsDS.deliverWelcome' THEN 0 ELSE 1 END ASC, \
              created_at ASC, id ASC \
      ) \
      SELECT q.id FROM outbound_queue q \
@@ -1587,9 +1596,9 @@ pub(crate) const CLAIM_DUE_HEADS_SQL: &str = "WITH heads AS ( \
 ///
 /// Head-of-line ordering from the encrypted-requests line: at most one live item
 /// per (conversation, target DS) is eligible, and an in-flight head blocks its
-/// successors so claim fencing cannot reorder delivery. Sequenced streams order
-/// by `seq`, never by an id's text (9 < 10). Heads return, and so dispatch, in
-/// candidate order `(next_retry_at, id)`. No transaction spans the send.
+/// successors so claim fencing cannot reorder delivery. A pending outbox
+/// Welcome fences the stream through its atomic handoff; then sequenced items
+/// order by `seq`, with that Welcome before a same-seq control.
 pub(crate) async fn claim_due_heads(
     pool: &PgPool,
     limit: i64,
@@ -3387,6 +3396,105 @@ mod tests {
             error_name: Some("SequenceConflict".into()),
         };
         assert!(is_outbound_predecessor_gap(&gap));
+    }
+
+    /// A pending Welcome handoff fences its two-home stream; once handed off,
+    /// that Welcome heads controls copied from the same source entry. Otherwise
+    /// a control's retryable 404 blocks the Welcome and every later item.
+    #[tokio::test]
+    async fn bootstrap_welcome_heads_same_seq_control_then_later_entries() {
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 2, 1).await;
+        let conversation_id = Uuid::new_v4();
+        let convo = conversation_id.to_string();
+        let target = format!(
+            "did:web:bootstrap-home-{}.example.com",
+            Uuid::new_v4().simple()
+        );
+        let welcome_id = Uuid::new_v4().to_string();
+        let welcome_payload =
+            serde_json::to_vec(&serde_json::json!({"entryLocator": {"seq": 3}})).unwrap();
+        let due = Utc::now() - chrono::TimeDelta::seconds(1);
+        for (id, method, payload) in [
+            (
+                format!("transport-control-{conversation_id}-3"),
+                DELIVER_TRANSPORT_CONTROL_ENTRY_NSID,
+                serde_json::json!({"entry": {"seq": 3}}),
+            ),
+            (
+                format!("message-{conversation_id}-4"),
+                DELIVER_MESSAGE_NSID,
+                serde_json::json!({"entryLocator": {"seq": 4}}),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO outbound_queue (id,target_ds_did,target_endpoint,method,payload, \
+                     convo_id,next_retry_at,created_at) VALUES($1,$2,'',$3,$4,$5,$6,$6)",
+            )
+            .bind(id)
+            .bind(&target)
+            .bind(method)
+            .bind(serde_json::to_vec(&payload).unwrap())
+            .bind(&convo)
+            .bind(due)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO federation_outbox \
+                 (id,conversation_id,target_service_did,method,payload,next_attempt_at,created_at,updated_at) \
+             VALUES($1,$2,$3,$4,$5,$6,$6,$6)",
+        )
+        .bind(&welcome_id)
+        .bind(&convo)
+        .bind(&target)
+        .bind(DELIVER_WELCOME_NSID)
+        .bind(&welcome_payload)
+        .bind(due)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            claim_due_heads(&pool, 10, None).await.unwrap().is_empty(),
+            "a stream escaped while its bootstrap Welcome awaited handoff"
+        );
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO outbound_queue (id,target_ds_did,target_endpoint,method,payload, \
+                 convo_id,next_retry_at,created_at) VALUES($1,$2,'',$3,$4,$5,$6,$6)",
+        )
+        .bind(&welcome_id)
+        .bind(&target)
+        .bind(DELIVER_WELCOME_NSID)
+        .bind(&welcome_payload)
+        .bind(&convo)
+        .bind(due)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE federation_outbox SET status='done',updated_at=$2 WHERE id=$1")
+            .bind(&welcome_id)
+            .bind(due)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        for expected in [
+            DELIVER_WELCOME_NSID,
+            DELIVER_TRANSPORT_CONTROL_ENTRY_NSID,
+            DELIVER_MESSAGE_NSID,
+        ] {
+            let claimed = claim_due_heads(&pool, 10, None).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].method, expected);
+            assert!(
+                mark_item_delivered(&pool, &claimed[0].id, claimed[0].claim_token)
+                    .await
+                    .unwrap()
+            );
+        }
     }
 
     async fn insert_due_message(

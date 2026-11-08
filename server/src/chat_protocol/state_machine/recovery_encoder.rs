@@ -681,7 +681,7 @@ pub(in crate::chat_protocol::state_machine) fn plan_zero_leaf_leave_inner(
         .iter()
         .any(|leaf| leaf.device.principal() == command.actor.principal())
     {
-        return Err(StateMachineError::InvariantViolation);
+        return Err(StateMachineError::InvalidTransition);
     }
     if would_remove_last_active_admin(prior, command.actor.principal()) {
         return Err(StateMachineError::LastAdminRequired);

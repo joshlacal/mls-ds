@@ -201,12 +201,11 @@ async fn runtime(pool: &DbPool, cutover_enabled: bool) -> Arc<ChatRuntime> {
     } else {
         std::env::remove_var("CHAT_CUTOVER_ENABLED");
     }
-    let rt = Arc::new(
-        ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
-            .expect("build clean-chat runtime"),
-    );
+    let runtime = ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
+        .expect("build clean-chat runtime")
+        .with_i13_receipt_signer(common::proof_i13_signer());
     std::env::set_var("CHAT_CUTOVER_ENABLED", "1");
-    rt
+    Arc::new(runtime)
 }
 
 async fn router_with(pool: DbPool, cutover_enabled: bool) -> Router {
@@ -809,7 +808,7 @@ async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_
     .await;
 
     let payload = json!({
-        "signedRequest": fixture.signed_request_json,
+        "signedRequest": fixture.signed_request_json.clone(),
     });
     let router = router_with(pool.clone(), true).await;
     let request = build_authenticated_request(
@@ -843,6 +842,7 @@ async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_
     assert_eq!(first_body["result"]["coordinates"]["stateVersion"], 0);
     assert_eq!(first_body["result"]["coordinates"]["epoch"], 0);
     assert_eq!(first_body["result"]["coordinates"]["lifecycle"], "active");
+    common::assert_proof_i13_control_receipt(&first_body["result"]["entry"]);
 
     // Idempotent replay with the exact same request
     let replay_request = build_authenticated_request(
@@ -851,7 +851,7 @@ async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_
         &dpop_key,
         &dpop_jwk,
         &dpop_jkt,
-        payload,
+        payload.clone(),
     );
 
     let (replay_status, replay_response_bytes) = send_raw(router.clone(), replay_request).await;
@@ -897,6 +897,27 @@ async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_
         first_response_bytes, replay_response_bytes,
         "idempotent replay must return byte-identical response"
     );
+
+    let mut conflicting_body = fixture.signed_request_json["body"].clone();
+    conflicting_body["signedAt"] = json!((trusted_at - chrono::Duration::milliseconds(400))
+        .to_rfc3339_opts(SecondsFormat::Millis, true));
+    let conflicting_signed =
+        catbird_server::chat_protocol::test_support::sign_mutation_json_for_test(
+            &conflicting_body,
+            &fixture.actor_ed25519_signing_key,
+        )
+        .expect("sign conflicting creation request");
+    let conflicting_request = build_authenticated_request(
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        json!({"signedRequest": conflicting_signed}),
+    );
+    let (conflict_status, conflict_body) = send(router.clone(), conflicting_request).await;
+    assert_eq!(conflict_status, StatusCode::BAD_REQUEST);
+    assert_eq!(conflict_body["error"], "IdempotencyConflict");
     let (is_remote, sequencer_ds, sequencer_term): (bool, Option<String>, i64) = sqlx::query_as(
         "SELECT is_remote, sequencer_ds, sequencer_term \
              FROM chat.conversations WHERE conversation_id = $1",
@@ -1356,11 +1377,17 @@ async fn exercise_generated_transition_handler(origin: GeneratedTransitionOrigin
         policy_entry, &first_value["entry"],
         "ACK and canonical read expose the same complete entry"
     );
+    common::assert_proof_i13_control_receipt(policy_entry);
+    let mut actor_entry = policy_entry.clone();
+    actor_entry
+        .as_object_mut()
+        .expect("policy entry object")
+        .remove("sequencerReceipt");
     let read_verified = decode_and_verify_control_entry(
-        &serde_json::to_vec(policy_entry).unwrap(),
+        &serde_json::to_vec(&actor_entry).unwrap(),
         &fixture.actor_ed25519_public_key,
     )
-    .expect("production authority verifier accepts actual canonical read entry");
+    .expect("production authority verifier accepts the actor-signed canonical read entry");
     assert_eq!(
         read_verified.outer_control_fingerprint(),
         rebound.outer_control_fingerprint()
@@ -1598,6 +1625,7 @@ async fn submit_transition_policy_add_against_production_router_replays_byte_ide
         "blue.catbird.chat.defs#policyEntry"
     );
     assert_eq!(first_body["coordinates"]["stateVersion"], 1);
+    common::assert_proof_i13_control_receipt(&first_body["entry"]);
 
     // Idempotent replay with the exact same request
     let replay_policy_request = build_authenticated_post_for_endpoint(
@@ -1607,7 +1635,7 @@ async fn submit_transition_policy_add_against_production_router_replays_byte_ide
         &dpop_jwk,
         &dpop_jkt,
         "blue.catbird.chat.submitTransition",
-        policy_payload,
+        policy_payload.clone(),
     );
 
     let (replay_status, replay_response_bytes) =
@@ -1622,6 +1650,28 @@ async fn submit_transition_policy_add_against_production_router_replays_byte_ide
         first_response_bytes, replay_response_bytes,
         "idempotent replay of submitTransition policy-add must return byte-identical response"
     );
+
+    let mut conflicting_policy_body = policy_payload["signedRequest"]["body"].clone();
+    conflicting_policy_body["signedAt"] = json!((trusted_at - chrono::Duration::milliseconds(400))
+        .to_rfc3339_opts(SecondsFormat::Millis, true));
+    let conflicting_policy_signed =
+        catbird_server::chat_protocol::test_support::sign_mutation_json_for_test(
+            &conflicting_policy_body,
+            &fixture.actor_ed25519_signing_key,
+        )
+        .expect("sign conflicting policy request");
+    let conflicting_policy_request = build_authenticated_post_for_endpoint(
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        "blue.catbird.chat.submitTransition",
+        json!({"signedRequest": conflicting_policy_signed}),
+    );
+    let (conflict_status, conflict_body) = send(router.clone(), conflicting_policy_request).await;
+    assert_eq!(conflict_status, StatusCode::BAD_REQUEST);
+    assert_eq!(conflict_body["error"], "IdempotencyConflict");
 
     let (completed_status, response_sha256, response_bytes): (i32, Vec<u8>, Vec<u8>) =
         sqlx::query_as(
@@ -2027,6 +2077,156 @@ async fn submit_transition_negative_corrupted_signature_returns_invalid_signatur
         status,
         StatusCode::INTERNAL_SERVER_ERROR,
         "corrupted signedRequest must NOT return 500: {body}"
+    );
+}
+
+#[tokio::test]
+async fn stale_creation_auth_generation_is_a_declared_client_error() {
+    let database = common::fresh_db::fresh_fully_migrated_db("chat_convhandlers_").await;
+    let pool = database.connect(4).await;
+    let trusted_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            .fetch_one(&pool)
+            .await
+            .expect("sample timestamp");
+    let fixture = build_test_creation_fixture(trusted_at);
+    let dpop_key = random_p256();
+    let dpop_jwk = public_jwk(&dpop_key);
+    let dpop_jkt = jwk_thumbprint(&dpop_jwk);
+    seed_device_for_creation(
+        &pool,
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &fixture.actor_key_id,
+        &fixture.actor_ed25519_public_key,
+        &dpop_key,
+        &dpop_jkt,
+    )
+    .await;
+    let router = router_with(pool, true).await;
+    let mut wrong_generation = fixture.signed_request_json["body"].clone();
+    wrong_generation["authGeneration"] = json!(2);
+    let wrong_generation =
+        catbird_server::chat_protocol::test_support::sign_mutation_json_for_test(
+            &wrong_generation,
+            &fixture.actor_ed25519_signing_key,
+        )
+        .expect("sign creation with stale generation");
+    let request = build_authenticated_request(
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        json!({ "signedRequest": wrong_generation }),
+    );
+    let (status, body) = send_raw(router, request).await;
+    let body: Value = serde_json::from_slice(&body).expect("error response JSON");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "InvalidRequest");
+}
+
+#[tokio::test]
+async fn create_conversation_expired_unclaimed_returns_signed_operation_expired_and_claimed_replay_succeeds(
+) {
+    let database = common::fresh_db::fresh_fully_migrated_db("chat_convhandlers_").await;
+    let pool = database.connect(4).await;
+    let trusted_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            .fetch_one(&pool)
+            .await
+            .expect("sample timestamp");
+
+    let expired = build_test_creation_fixture(trusted_at - chrono::Duration::seconds(305));
+    let dpop_key = random_p256();
+    let dpop_jwk = public_jwk(&dpop_key);
+    let dpop_jkt = jwk_thumbprint(&dpop_jwk);
+    seed_device_for_creation(
+        &pool,
+        &expired.actor_did,
+        expired.actor_device_id,
+        &expired.actor_key_id,
+        &expired.actor_ed25519_public_key,
+        &dpop_key,
+        &dpop_jkt,
+    )
+    .await;
+
+    // 1. Expired + tampered Ed25519 signature MUST fail with 401 InvalidSignature before expiry.
+    let mut forged = expired.signed_request_json.clone();
+    let mut sig_bytes = STANDARD
+        .decode(forged["signature"].as_str().expect("signature str"))
+        .expect("decode signature");
+    sig_bytes[0] ^= 0x01;
+    forged["signature"] = json!(STANDARD.encode(sig_bytes));
+    let forged_req = build_authenticated_request(
+        &expired.actor_did,
+        expired.actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        json!({ "signedRequest": forged }),
+    );
+    let (forged_status, forged_body) =
+        send(router_with(pool.clone(), true).await, forged_req).await;
+    assert_eq!(forged_status, StatusCode::UNAUTHORIZED, "{forged_body}");
+    assert_eq!(forged_body["error"], "InvalidSignature");
+
+    // 2. Expired + valid Ed25519 signature on unclaimed operation returns 400 SignedOperationExpired.
+    let expired_req = build_authenticated_request(
+        &expired.actor_did,
+        expired.actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        json!({ "signedRequest": expired.signed_request_json }),
+    );
+    let (exp_status, exp_body) = send(router_with(pool.clone(), true).await, expired_req).await;
+    assert_eq!(exp_status, StatusCode::BAD_REQUEST, "{exp_body}");
+    assert_eq!(exp_body["error"], "SignedOperationExpired");
+
+    // 3. An operation claimed inside the 300 s window replays 200 OK even after signedAt ages >300 s.
+    let now_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            .fetch_one(&pool)
+            .await
+            .expect("sample timestamp");
+    let near_expiry = build_test_creation_fixture(now_at - chrono::Duration::milliseconds(298_200));
+    seed_device_for_creation(
+        &pool,
+        &near_expiry.actor_did,
+        near_expiry.actor_device_id,
+        &near_expiry.actor_key_id,
+        &near_expiry.actor_ed25519_public_key,
+        &dpop_key,
+        &dpop_jkt,
+    )
+    .await;
+    let first_req = build_authenticated_request(
+        &near_expiry.actor_did,
+        near_expiry.actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        json!({ "signedRequest": near_expiry.signed_request_json.clone() }),
+    );
+    let (first_status, first_body) = send(router_with(pool.clone(), true).await, first_req).await;
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_800)).await;
+    let replay_req = build_authenticated_request(
+        &near_expiry.actor_did,
+        near_expiry.actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        json!({ "signedRequest": near_expiry.signed_request_json }),
+    );
+    let (replay_status, replay_body) = send(router_with(pool, true).await, replay_req).await;
+    assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+    assert_eq!(
+        replay_body["entry"]["entryId"],
+        first_body["entry"]["entryId"]
     );
 }
 

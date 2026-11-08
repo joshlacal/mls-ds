@@ -770,7 +770,10 @@ pub(in crate::chat_protocol::state_machine) fn validate_request_evidence(
                 || authority.signed_request_bytes != evidence.signed_request_bytes
                 || authority.canonical_projection.is_empty()
                 || authority.transcript_bytes.is_empty()
-                || authority.signed_at > evidence.received_at
+                || !evidence
+                    .received_at
+                    .checked_add_millis(MAX_FIRST_EXECUTION_FUTURE_SKEW_MILLIS)
+                    .is_ok_and(|deadline| authority.signed_at <= deadline)
         })
         || (evidence.authority.is_some()
             && if is_control {

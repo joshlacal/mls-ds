@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::core;
+use super::delivery;
 use super::execution_context::{
     hydrate_historical_execution_context, ExecutionContextHydrationError,
 };
@@ -987,12 +988,14 @@ pub(crate) async fn apply_remote_clean_prefix(
             i64,
             Uuid,
             String,
+            Option<Vec<u8>>,
             Vec<u8>,
+            Option<Vec<u8>>,
             Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
+            Option<Vec<u8>>,
             DateTime<Utc>,
             Option<Uuid>,
+            Option<DateTime<Utc>>,
         )> = sqlx::query_as(
             r#"
             SELECT CAST(seq AS BIGINT),
@@ -1003,8 +1006,10 @@ pub(crate) async fn apply_remote_clean_prefix(
                    accepted_payload_sha256,
                    signed_request_bytes,
                    outer_entry_fingerprint,
+                   sequencer_receipt_bytes,
                    received_at,
-                   message_id
+                   message_id,
+                   payload_pruned_at
               FROM chat.entries
              WHERE conversation_id = $1
              ORDER BY seq ASC
@@ -1018,6 +1023,7 @@ pub(crate) async fn apply_remote_clean_prefix(
         let local_count = local_entries.len();
         let remote_count = events.len();
 
+        let mut missing_receipts = Vec::new();
         let mut first_mismatch_seq: Option<i64> = None;
         for (local, r_event) in local_entries.iter().zip(&events) {
             let (
@@ -1029,8 +1035,10 @@ pub(crate) async fn apply_remote_clean_prefix(
                 l_payload_sha,
                 l_signed_req,
                 l_outer_fp,
+                l_receipt,
                 l_received_at,
                 l_message_id,
+                l_payload_pruned_at,
             ) = local;
 
             let expected_message_id = match r_event.entry_kind() {
@@ -1049,15 +1057,27 @@ pub(crate) async fn apply_remote_clean_prefix(
                 || *l_gen != r_event.generation()
                 || *l_entry_id != r_event.entry_id()
                 || l_kind.as_str() != r_event.entry_kind().type_id()
-                || l_payload_bytes.as_slice() != r_event.accepted_payload_bytes()
+                || match (l_payload_bytes.as_deref(), l_signed_req.as_deref()) {
+                    (Some(payload), Some(signed_request)) => {
+                        payload != r_event.accepted_payload_bytes()
+                            || signed_request != r_event.signed_request()
+                    }
+                    (None, None) => l_payload_pruned_at.is_none(),
+                    _ => true,
+                }
                 || l_payload_sha.as_slice() != r_event.accepted_payload_sha256().as_slice()
-                || l_signed_req.as_slice() != r_event.signed_request()
                 || l_outer_fp.as_slice() != r_event.outer_fingerprint().as_slice()
+                || l_receipt
+                    .as_deref()
+                    .is_some_and(|receipt| receipt != r_event.sequencer_receipt())
                 || l_received_at.timestamp_millis() != r_event.received_at().timestamp_millis()
                 || *l_message_id != expected_message_id
             {
                 first_mismatch_seq = Some(r_event.seq());
                 break;
+            }
+            if l_receipt.is_none() && r_event.entry_kind().requires_sequencer_receipt() {
+                missing_receipts.push((r_event.seq(), r_event.sequencer_receipt()));
             }
         }
         if let Some(mismatch_seq) = first_mismatch_seq {
@@ -1088,6 +1108,18 @@ pub(crate) async fn apply_remote_clean_prefix(
                 local_ahead_seq,
             )
             .await;
+        }
+
+        for (seq, receipt) in missing_receipts {
+            let seq = u64::try_from(seq).map_err(|_| RemotePrefixBootstrapError::Authority)?;
+            delivery::set_entry_sequencer_receipt(tx, conversation_id, seq, receipt)
+                .await
+                .map_err(|error| match error {
+                    delivery::DeliveryRepositoryError::Database(_) => {
+                        RemotePrefixBootstrapError::Database
+                    }
+                    _ => RemotePrefixBootstrapError::Authority,
+                })?;
         }
 
         if local_count < remote_count {
@@ -1370,8 +1402,24 @@ pub(crate) async fn apply_remote_clean_prefix(
             }
             _ => return Err(RemotePrefixBootstrapError::InvalidEvent),
         };
-        step.apply(&event_scope).await.map_err(|err| match err {
+        let applied = step.apply(&event_scope).await.map_err(|err| match err {
             ExecutorError::HydrationDatabase(_) => RemotePrefixBootstrapError::Database,
+            _ => RemotePrefixBootstrapError::Authority,
+        })?;
+        if applied.allocated_seq
+            != u64::try_from(event.seq()).map_err(|_| RemotePrefixBootstrapError::Authority)?
+        {
+            return Err(RemotePrefixBootstrapError::Authority);
+        }
+        delivery::set_entry_sequencer_receipt(
+            tx,
+            conversation_id,
+            applied.allocated_seq,
+            event.sequencer_receipt(),
+        )
+        .await
+        .map_err(|error| match error {
+            delivery::DeliveryRepositoryError::Database(_) => RemotePrefixBootstrapError::Database,
             _ => RemotePrefixBootstrapError::Authority,
         })?;
         index += 1;

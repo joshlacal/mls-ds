@@ -874,7 +874,7 @@ pub async fn accept_reply_offline(
     future_signed_at: bool,
 ) -> anyhow::Result<()> {
     use catbird_mls::chat_v2::transcript::{decode_strict_json, VerifiedApplicationEntry};
-    use catbird_mls::orchestrator::{canonical_application_aad_bytes, MLSMessagePayload};
+    use catbird_mls::orchestrator::MLSMessagePayload;
     // Both scenarios start with an unimported recipient. The sender must be
     // offline before the first recipient Welcome import, not merely before
     // acceptance and reply.
@@ -1080,9 +1080,11 @@ pub async fn accept_reply_offline(
     )
     .await?;
     let accepted: Value = serde_json::from_slice(&accepted_bytes)?;
-    let proof = protocol::verify_received_direct_request_acceptance_proof(
+    let proof = mls_e2e_tests::verify_received_direct_request_acceptance_proof_with_i13(
         &serde_json::to_vec(&accepted["acceptanceProof"])?,
+        "did:web:chat.catbird.blue",
         &f.server.receipt_public_key,
+        &f.server.sequencer_receipt_public_key,
         &bob_public,
     )?;
     assert_eq!(
@@ -1161,17 +1163,24 @@ pub async fn accept_reply_offline(
     );
 
     let message = Uuid::new_v4();
+    let conversation_id = f.conversation_id.to_string();
+    let message_id = message.to_string();
     let mut aad_prior = next.clone();
     aad_prior["conversationId"] = json!(STANDARD.encode(f.conversation_id.as_bytes()));
     let aad = json!({"protocolVersion":"1","conversationId":STANDARD.encode(f.conversation_id.as_bytes()),"generation":next["generation"],"messageId":STANDARD.encode(message.as_bytes()),"prior":aad_prior});
     let text = "Reply while the original sender is offline";
     let content = MLSMessagePayload::text(text).encode()?;
-    let ciphertext = f.bob_engine.encrypt_canonical(
-        &group,
-        &content,
-        canonical_application_aad_bytes(&aad)?,
-        epoch,
-    )?;
+    let (aad, aad_bytes, inner_plaintext) =
+        mls_e2e_tests::archive_bound_application(&f.bob_engine, &bob_identity, aad, &content)?;
+    let (archive_commitment, original_sender_attestation) =
+        catbird_mls::messaging::receive::verify_application_aad_archive_evidence(
+            &aad_bytes,
+            &conversation_id,
+            &message_id,
+        )?;
+    let ciphertext =
+        f.bob_engine
+            .encrypt_canonical(&group, &inner_plaintext, aad_bytes.clone(), epoch)?;
     let application = signed_ordinary(
         &f.bob_engine,
         &bob_identity,
@@ -1219,9 +1228,11 @@ pub async fn accept_reply_offline(
         String::from_utf8_lossy(&state_bytes)
     );
     let state: Value = serde_json::from_slice(&state_bytes)?;
-    let sender_proof = protocol::verify_received_direct_request_acceptance_proof(
+    let sender_proof = mls_e2e_tests::verify_received_direct_request_acceptance_proof_with_i13(
         &serde_json::to_vec(&state["state"]["directRequest"]["acceptanceProof"])?,
+        "did:web:chat.catbird.blue",
         &f.server.receipt_public_key,
+        &f.server.sequencer_receipt_public_key,
         &bob_public,
     )?;
     assert_eq!(sender_proof, proof);
@@ -1336,11 +1347,41 @@ pub async fn accept_reply_offline(
         "applicationEntry",
         true,
     )?;
-    let mut normalized_row = normalized_response.clone();
+    let mut normalized_row = normalized_response;
+    let receipt = normalized_row
+        .as_object_mut()
+        .context("entry object")?
+        .remove("sequencerReceipt")
+        .context("application entry missing sequencerReceipt")?;
     normalized_row
         .as_object_mut()
         .context("entry object")?
         .remove("$type");
+    let (receipt_seq, receipt_generation, _) =
+        catbird_mls::client::chat_wire::parse_and_verify_i13_sequencer_receipt(
+            &receipt,
+            &f.server.sequencer_receipt_public_key,
+            "did:web:chat.catbird.blue",
+            &conversation_id,
+            &group,
+            epoch,
+            normalized_row["entryId"]
+                .as_str()
+                .context("application entry ID")?,
+            &message_id,
+            &archive_commitment,
+            Some(&original_sender_attestation),
+        )?;
+    assert_eq!(
+        Some(receipt_seq),
+        normalized_row["seq"].as_u64(),
+        "application receipt sequence"
+    );
+    assert_eq!(
+        Some(receipt_generation),
+        normalized_row["signedRequest"]["body"]["prior"]["generation"].as_u64(),
+        "application receipt generation"
+    );
     let verified_entry = VerifiedApplicationEntry::verify(
         &decode_strict_json(&serde_json::to_vec(&normalized_row)?)?,
         &bob_public,
@@ -1349,16 +1390,20 @@ pub async fn accept_reply_offline(
     let authenticated = sender.decrypt_authenticated(&group, &ciphertext)?;
     verified_entry.bind_sender(&authenticated.sender_credential.identity)?;
     assert_eq!(authenticated.epoch, epoch);
-    assert_eq!(
-        MLSMessagePayload::decode(&authenticated.plaintext)?.display_text(),
-        text
-    );
+    let (decrypted_text, _, decrypted_commitment, decrypted_attestation) =
+        catbird_mls::messaging::receive::extract_plaintext_body_and_verify_aad(
+            &authenticated.plaintext,
+            &aad_bytes,
+        )?;
+    assert_eq!(decrypted_commitment, Some(archive_commitment));
+    assert_eq!(decrypted_attestation, Some(original_sender_attestation));
+    assert_eq!(decrypted_text, text);
     assert_eq!(sender.epoch(&group)?, epoch);
     assert_eq!(request_database_snapshot(f.request_id)?.message_rows, 1);
     assert_generated_accepted_reads(&f, &state_bytes, &bytes).await
 }
 pub async fn accept_reply_offline_with_followup() -> anyhow::Result<Uuid> {
-    use catbird_mls::orchestrator::{canonical_application_aad_bytes, MLSMessagePayload};
+    use catbird_mls::orchestrator::MLSMessagePayload;
     let mut f = publish_request(false).await?;
     let (pending_status, pending_bytes) = f
         .bob
@@ -1420,12 +1465,11 @@ pub async fn accept_reply_offline_with_followup() -> anyhow::Result<Uuid> {
     let aad = json!({"protocolVersion":"1","conversationId":STANDARD.encode(f.conversation_id.as_bytes()),"generation":next["generation"],"messageId":STANDARD.encode(message.as_bytes()),"prior":aad_prior});
     let text = "Reply while the original sender is offline";
     let content = MLSMessagePayload::text(text).encode()?;
-    let ciphertext = f.bob_engine.encrypt_canonical(
-        &group,
-        &content,
-        canonical_application_aad_bytes(&aad)?,
-        epoch,
-    )?;
+    let (aad, aad_bytes, inner_plaintext) =
+        mls_e2e_tests::archive_bound_application(&f.bob_engine, &bob_identity, aad, &content)?;
+    let ciphertext = f
+        .bob_engine
+        .encrypt_canonical(&group, &inner_plaintext, aad_bytes, epoch)?;
     let application = signed_ordinary(
         &f.bob_engine,
         &bob_identity,
@@ -1444,14 +1488,11 @@ pub async fn accept_reply_offline_with_followup() -> anyhow::Result<Uuid> {
     let aad2 = json!({"protocolVersion":"1","conversationId":STANDARD.encode(f.conversation_id.as_bytes()),"generation":next["generation"],"messageId":STANDARD.encode(message2.as_bytes()),"prior":aad_prior2});
     let text2 = "Follow-up reply after restart";
     let content2 = MLSMessagePayload::text(text2).encode()?;
-    let ciphertext2 = sender.encrypt_canonical(
-        &group,
-        &content2,
-        canonical_application_aad_bytes(&aad2)?,
-        epoch,
-    )?;
     let alice_identity = format!("{}#{}", f.alice.did, f.alice.device_id);
     let alice_public = sender.identity_public_key(&alice_identity)?;
+    let (aad2, aad2_bytes, inner_plaintext2) =
+        mls_e2e_tests::archive_bound_application(&sender, &alice_identity, aad2, &content2)?;
+    let ciphertext2 = sender.encrypt_canonical(&group, &inner_plaintext2, aad2_bytes, epoch)?;
     let application2 = signed_ordinary(
         &sender,
         &alice_identity,
@@ -1688,9 +1729,11 @@ pub async fn accept_existing_fixture(f: &PublishedRequestFixture) -> anyhow::Res
     let envelope = json!({"directRequest":signed});
     let bytes = checked_post(f, &f.bob, "blue.catbird.chat.acceptConversation", &envelope).await?;
     let accepted: Value = serde_json::from_slice(&bytes)?;
-    let proof = protocol::verify_received_direct_request_acceptance_proof(
+    let proof = mls_e2e_tests::verify_received_direct_request_acceptance_proof_with_i13(
         &serde_json::to_vec(&accepted["acceptanceProof"])?,
+        "did:web:chat.catbird.blue",
         &f.server.receipt_public_key,
+        &f.server.sequencer_receipt_public_key,
         &public_key,
     )?;
     assert_eq!(

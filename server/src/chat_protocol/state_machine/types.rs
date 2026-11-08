@@ -752,7 +752,10 @@ pub(in crate::chat_protocol::state_machine) fn validate_device_revocation_eviden
         && evidence.actor_auth_generation <= MAX_PROTOCOL_INTEGER
         && evidence.expected_target_auth_generation > 0
         && evidence.expected_target_auth_generation <= MAX_PROTOCOL_INTEGER
-        && evidence.signed_at <= evidence.accepted_at
+        && evidence
+            .accepted_at
+            .checked_add_millis(MAX_FIRST_EXECUTION_FUTURE_SKEW_MILLIS)
+            .is_ok_and(|deadline| evidence.signed_at <= deadline)
         && evidence.request_digest != [0; 32]
         && evidence.signature != [0; 64]
         && !evidence.signed_request_bytes.is_empty()

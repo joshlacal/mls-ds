@@ -4,6 +4,8 @@
 //! exercise the production library configuration, avoiding the repository
 //! modules that are deliberately absent from the library's `cfg(test)` graph.
 
+mod common;
+
 use std::sync::{Arc, Mutex, Once};
 
 use axum::{
@@ -83,7 +85,8 @@ fn runtime(cutover_enabled: bool) -> Arc<ChatRuntime> {
     }
     Arc::new(
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
-            .expect("build clean-chat runtime"),
+            .expect("build clean-chat runtime")
+            .with_i13_receipt_signer(common::proof_i13_signer()),
     )
 }
 

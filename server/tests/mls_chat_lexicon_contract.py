@@ -1214,8 +1214,12 @@ def validate_core_definitions(documents: dict[str, dict[str, Any]]) -> None:
         entry = defs[entry_kind.split("#", 1)[1]]
         expected_fields = common_control_fields | ({server_field} if server_field else set())
         assert required(entry) == expected_fields
-        assert set(entry["properties"]) == expected_fields
+        # The I13 receipt is attached by the sequencer after the signed projection, so it is
+        # declared but never required and never part of the control fingerprint.
+        assert set(entry["properties"]) == expected_fields | {"sequencerReceipt"}
+        assert_ref(entry["properties"]["sequencerReceipt"], "sequencerReceipt")
         assert_ref(entry["properties"]["signedRequest"], signed_request_ref)
+    assert "sequencerReceipt" not in defs["accountDeletedEntry"]["properties"]
     leave_cancellation = defs["leaveCancellationBody"]
     assert "conversationId" in required(leave_cancellation)
     assert_ref(leave_cancellation["properties"]["conversationId"], "operationId")
@@ -4048,6 +4052,14 @@ class ChatLexiconContractTests(unittest.TestCase):
         self.assertTrue(mls_ds_canonical, "mlsDS canonical manifest must not be empty")
         self.assertTrue(mls_ds_mirror, "mlsDS mirror manifest must not be empty")
         self.assertEqual(mls_ds_canonical, mls_ds_mirror)
+
+        get_convo_events = strict_json_loads(
+            mls_ds_canonical["blue.catbird.mlsDS.getConvoEvents.json"].decode("utf-8")
+        )
+        self.assertEqual(
+            get_convo_events["defs"]["convoEventEntry"]["properties"]["sequencerReceipt"],
+            {"type": "bytes", "minLength": 1, "maxLength": 1_048_576},
+        )
 
     def test_negative_schema_mutations_are_rejected(self) -> None:
         try:

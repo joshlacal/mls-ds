@@ -53,9 +53,8 @@ async fn sequencer() -> Sequencer {
     let db = common::fresh_db::fresh_fully_migrated_db("labyrinth_srv_").await;
     let pool = db.connect(6).await;
     http::ensure_fence(&pool).await;
-    let signer = I13ReceiptSigner::new(http::random_p256(), SELF_DID.to_owned());
-    let router =
-        http::router_for_authenticated_acceptance_with_i13(pool.clone(), signer.clone()).await;
+    let signer = common::proof_i13_signer();
+    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
     Sequencer {
         pool,
         router,

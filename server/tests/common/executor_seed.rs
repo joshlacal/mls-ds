@@ -6521,6 +6521,17 @@ pub async fn build_creation_with_invitee(
     bob_did: String,
     bob_sig_key: Vec<u8>,
 ) -> CreationApply {
+    build_creation_with_invitee_at(pool, Uuid::new_v4(), kind, bob_id, bob_did, bob_sig_key).await
+}
+
+async fn build_creation_with_invitee_at(
+    pool: &PgPool,
+    conversation_id: Uuid,
+    kind: ConversationKind,
+    bob_id: DeviceIdentity,
+    bob_did: String,
+    bob_sig_key: Vec<u8>,
+) -> CreationApply {
     let manifest = corpus_manifest();
     let alice_id = alice(&manifest);
     let alice_did = manifest.identity.alice.actor_did.clone();
@@ -6534,9 +6545,6 @@ pub async fn build_creation_with_invitee(
     let bob_key_id = seed_actor(pool, &bob_did, bob_device, &bob_sig_key).await;
     let protocol_instance_id = seed_protocol_instance(pool).await;
 
-    // Fresh conversation id per run (the corpus id is fixed; rebind onto a fresh
-    // one so committed rows never collide across runs).
-    let conversation_id = Uuid::new_v4();
     let template = verified_genesis(&manifest);
     let coordinate =
         coordinate_with_conversation(&genesis_coordinate(&manifest), *conversation_id.as_bytes());
@@ -7068,6 +7076,14 @@ pub struct BuiltFulfillment {
 }
 
 pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
+    build_fulfillment_at(pool, ConversationKind::Group, Uuid::new_v4()).await
+}
+
+async fn build_fulfillment_at(
+    pool: &PgPool,
+    kind: ConversationKind,
+    conversation_id: Uuid,
+) -> BuiltFulfillment {
     let pool = pool.clone();
     let manifest = corpus_manifest();
     let bob_id = bob_corpus(&manifest);
@@ -7080,9 +7096,10 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
     //    exact `member_devices.leaf_key_id` the recovered keyPackage leaf requires.
     let bob_leaf_sig_key: Vec<u8> =
         hex::decode(&manifest.identity.bob.signature_public_key_hex).unwrap();
-    let fixture = build_creation_with_invitee(
+    let fixture = build_creation_with_invitee_at(
         &pool,
-        ConversationKind::Group,
+        conversation_id,
+        kind,
         bob_id.clone(),
         bob_did.clone(),
         bob_leaf_sig_key.clone(),
@@ -7389,7 +7406,10 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
 
 /// Create + acceptance + fulfillment, all COMMITTED on a fresh DB, at sv 2 /
 /// epoch 1 with alice + bob leaves — the prior for the epoch-changing follow-ons.
-pub async fn run_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
+async fn commit_fulfillment_scenario(
+    pool: &PgPool,
+    built: BuiltFulfillment,
+) -> FulfillmentScenario {
     let BuiltFulfillment {
         plan,
         ctx,
@@ -7403,7 +7423,7 @@ pub async fn run_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
         recovery_request_id,
         corpus_ref,
         fulfillment_state,
-    } = build_fulfillment(pool).await;
+    } = built;
     let pool = pool.clone();
 
     let mut tx = pool.begin().await.expect("begin fulfillment");
@@ -7572,4 +7592,20 @@ pub async fn run_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
         event_positions: applied.event_positions.clone(),
         fixture,
     }
+}
+
+pub async fn run_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
+    let built = build_fulfillment(pool).await;
+    commit_fulfillment_scenario(pool, built).await
+}
+
+pub async fn run_direct_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
+    let manifest = corpus_manifest();
+    let conversation_id = Uuid::from_slice(
+        &hex::decode(&manifest.identifiers.conversation_id_hex)
+            .expect("corpus conversation id hex"),
+    )
+    .expect("corpus conversation UUID");
+    let built = build_fulfillment_at(pool, ConversationKind::Direct, conversation_id).await;
+    commit_fulfillment_scenario(pool, built).await
 }

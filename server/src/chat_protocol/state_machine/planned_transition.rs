@@ -520,6 +520,18 @@ impl TransitionEvidence {
         Ok(evidence)
     }
 
+    pub(crate) fn for_test_with_signed_at(
+        mut self,
+        signed_at: ServerTimestamp,
+    ) -> Result<Self, StateMachineError> {
+        self.authority
+            .as_mut()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?
+            .signed_at = signed_at;
+        self.durable_row_digest = durable_control_transition_row_digest(&self)?;
+        Ok(self)
+    }
+
     /// A `signedLeafRecoveryFulfillment` `TransitionEvidence` carrying the exact
     /// `LeafRecoveryFulfillment` body a real signed fulfillment carries: the
     /// prior/next coordinates + recovery_request_id `require_commit_body` matches,

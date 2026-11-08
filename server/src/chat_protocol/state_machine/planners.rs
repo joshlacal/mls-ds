@@ -908,17 +908,15 @@ pub(in crate::chat_protocol::state_machine) fn validate_transition_evidence(
                 && !authority.signed_request_bytes.is_empty()
                 && !authority.canonical_projection.is_empty()
                 && !authority.transcript_bytes.is_empty()
-                && (authority.signed_at <= evidence.received_at
-                    || (authority.kind == SignedMutationKind::DirectRequestPublication
-                        && evidence
-                            .received_at
-                            .checked_add_millis(60_000)
-                            .is_ok_and(|deadline| authority.signed_at <= deadline))
-                    || (authority.kind == SignedMutationKind::DirectRequestAcceptance
-                        && evidence
-                            .received_at
-                            .checked_add_millis(30_000)
-                            .is_ok_and(|deadline| authority.signed_at <= deadline)))
+                // Durable validation must accept every first execution that admission can
+                // persist. `receivedAt` remains the authoritative ordering timestamp.
+                && evidence.received_at.checked_add_millis(
+                    if authority.kind == SignedMutationKind::DirectRequestAcceptance {
+                        30_000
+                    } else {
+                        MAX_FIRST_EXECUTION_FUTURE_SKEW_MILLIS
+                    },
+                ).is_ok_and(|deadline| authority.signed_at <= deadline)
         })
 }
 

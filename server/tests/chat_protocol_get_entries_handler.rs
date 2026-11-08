@@ -1,5 +1,7 @@
 //! Production-library reachability checks for the clean `getEntries` handler.
 
+mod common;
+
 use std::sync::{Arc, Mutex, Once};
 
 use axum::{
@@ -66,7 +68,8 @@ fn router() -> Router {
     std::env::set_var("CHAT_CUTOVER_ENABLED", "1");
     let runtime = Arc::new(
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
-            .expect("clean-chat runtime"),
+            .expect("clean-chat runtime")
+            .with_i13_receipt_signer(common::proof_i13_signer()),
     );
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)

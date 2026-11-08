@@ -39,7 +39,6 @@ use catbird_mls::{
     },
     metadata::GroupMetadataV1,
     orchestrator::{
-        canonical_application_aad_bytes,
         direct_request_bootstrap::{
             metadata_coordinate, DirectRequestBootstrapInput, DirectRequestIntroductionResult,
             DirectRequestWelcomeInput,
@@ -259,12 +258,16 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
         "prior": premature_aad_prior
     });
     let premature_content = MLSMessagePayload::text("Premature send before accept").encode()?;
-    let premature_ct = f.bob_engine.encrypt_canonical(
-        &group,
-        &premature_content,
-        canonical_application_aad_bytes(&premature_aad)?,
-        epoch,
-    )?;
+    let (premature_aad, premature_aad_bytes, premature_plaintext) =
+        mls_e2e_tests::archive_bound_application(
+            &f.bob_engine,
+            &bob_iphone_identity,
+            premature_aad,
+            &premature_content,
+        )?;
+    let premature_ct =
+        f.bob_engine
+            .encrypt_canonical(&group, &premature_plaintext, premature_aad_bytes, epoch)?;
     let premature_app = signed_ordinary(
         &f.bob_engine,
         &bob_iphone_identity,
@@ -407,12 +410,15 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
     });
     let reply1_text = "Reply from Bob's iPhone";
     let reply1_content = MLSMessagePayload::text(reply1_text).encode()?;
-    let reply1_ct = f.bob_engine.encrypt_canonical(
-        &group,
+    let (aad1, aad1_bytes, reply1_plaintext) = mls_e2e_tests::archive_bound_application(
+        &f.bob_engine,
+        &bob_iphone_identity,
+        aad1,
         &reply1_content,
-        canonical_application_aad_bytes(&aad1)?,
-        epoch,
     )?;
+    let reply1_ct =
+        f.bob_engine
+            .encrypt_canonical(&group, &reply1_plaintext, aad1_bytes.clone(), epoch)?;
     let reply1_app = signed_ordinary(
         &f.bob_engine,
         &bob_iphone_identity,
@@ -455,10 +461,13 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
 
     // 10. Reply decrypts on Bob-iPad (sibling device!)
     let ipad_decrypted_reply1 = sibling.engine.decrypt(&group, &reply1_ct)?;
-    let ipad_payload1 = MLSMessagePayload::decode(&ipad_decrypted_reply1)?;
+    let (ipad_reply1, _, _, _) =
+        catbird_mls::messaging::receive::extract_plaintext_body_and_verify_aad(
+            &ipad_decrypted_reply1,
+            &aad1_bytes,
+        )?;
     assert_eq!(
-        ipad_payload1.text.as_deref(),
-        Some(reply1_text),
+        ipad_reply1, reply1_text,
         "Bob-iPad decrypts reply from Bob-iPhone"
     );
 
@@ -466,10 +475,13 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
     let alice_reopened = offline_sender.reopen()?;
     assert_eq!(alice_reopened.epoch(&group)?, epoch);
     let alice_decrypted_reply1 = alice_reopened.decrypt(&group, &reply1_ct)?;
-    let alice_payload1 = MLSMessagePayload::decode(&alice_decrypted_reply1)?;
+    let (alice_reply1, _, _, _) =
+        catbird_mls::messaging::receive::extract_plaintext_body_and_verify_aad(
+            &alice_decrypted_reply1,
+            &aad1_bytes,
+        )?;
     assert_eq!(
-        alice_payload1.text.as_deref(),
-        Some(reply1_text),
+        alice_reply1, reply1_text,
         "Alice decrypts reply from Bob-iPhone"
     );
 
@@ -488,12 +500,16 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
     });
     let reply2_text = "Reply from Bob's iPad second device";
     let reply2_content = MLSMessagePayload::text(reply2_text).encode()?;
-    let reply2_ct = sibling.engine.encrypt_canonical(
-        &group,
+    let (aad2, aad2_bytes, reply2_plaintext) = mls_e2e_tests::archive_bound_application(
+        &sibling.engine,
+        &bob_ipad_identity,
+        aad2,
         &reply2_content,
-        canonical_application_aad_bytes(&aad2)?,
-        epoch,
     )?;
+    let reply2_ct =
+        sibling
+            .engine
+            .encrypt_canonical(&group, &reply2_plaintext, aad2_bytes.clone(), epoch)?;
     let reply2_app = signed_ordinary(
         &sibling.engine,
         &bob_ipad_identity,
@@ -536,18 +552,24 @@ async fn ipados_ios_second_device_sibling_inclusion_and_acceptance() -> anyhow::
 
     // 13. Decrypts on Bob-iPhone and Alice
     let iphone_decrypted_reply2 = f.bob_engine.decrypt(&group, &reply2_ct)?;
-    let iphone_payload2 = MLSMessagePayload::decode(&iphone_decrypted_reply2)?;
+    let (iphone_reply2, _, _, _) =
+        catbird_mls::messaging::receive::extract_plaintext_body_and_verify_aad(
+            &iphone_decrypted_reply2,
+            &aad2_bytes,
+        )?;
     assert_eq!(
-        iphone_payload2.text.as_deref(),
-        Some(reply2_text),
+        iphone_reply2, reply2_text,
         "Bob-iPhone decrypts reply from Bob-iPad"
     );
 
     let alice_decrypted_reply2 = alice_reopened.decrypt(&group, &reply2_ct)?;
-    let alice_payload2 = MLSMessagePayload::decode(&alice_decrypted_reply2)?;
+    let (alice_reply2, _, _, _) =
+        catbird_mls::messaging::receive::extract_plaintext_body_and_verify_aad(
+            &alice_decrypted_reply2,
+            &aad2_bytes,
+        )?;
     assert_eq!(
-        alice_payload2.text.as_deref(),
-        Some(reply2_text),
+        alice_reply2, reply2_text,
         "Alice decrypts reply from Bob-iPad"
     );
 

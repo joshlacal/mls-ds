@@ -31,8 +31,8 @@ use uuid::Uuid;
 use openmls::prelude::{
     tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize},
     BasicCredential, Capabilities, CredentialType, CredentialWithKey, GroupId, KeyPackage,
-    LeafNodeIndex, Lifetime, MlsGroup, MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageBodyOut,
-    MlsMessageIn, MlsMessageOut, ProtocolVersion, StagedWelcome,
+    LeafNodeIndex, LeafNodeParameters, Lifetime, MlsGroup, MlsGroupCreateConfig, MlsMessageBodyIn,
+    MlsMessageBodyOut, MlsMessageIn, MlsMessageOut, ProtocolVersion, StagedWelcome,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
@@ -59,6 +59,7 @@ use crate::chat_protocol::{
         MAX_WELCOME_WIRE_BYTES, XWING_CIPHERSUITE,
     },
 };
+use crate::federation::receipt::{I13ControlReceiptInput, I13ReceiptSigner};
 
 #[cfg(any(test, feature = "chat-protocol-production-proof"))]
 use crate::chat_protocol::repository::auth::{authorize_signed_request, AuthorizationOutcome};
@@ -543,6 +544,14 @@ pub(super) struct DurableRecoveryFulfillmentFixture {
     pub(super) application_messages: Vec<Vec<u8>>,
     pub(super) supplemental_requester_application_messages: Vec<(Uuid, Vec<u8>)>,
     pub(super) supplemental_fulfiller_application_messages: Vec<(Uuid, Vec<u8>)>,
+    pub(super) self_update_transition_id: Uuid,
+    pub(super) self_update_commit: Vec<u8>,
+    pub(super) self_update_next: ActivePublicState,
+    pub(super) peer_self_update_transition_id: Uuid,
+    pub(super) peer_self_update_commit: Vec<u8>,
+    pub(super) peer_self_update_next: ActivePublicState,
+    pub(super) post_update_message_id: Uuid,
+    pub(super) post_update_application_message: Vec<u8>,
     pub(super) removal_commit: Vec<u8>,
     pub(super) removal_next: ActivePublicState,
     pub(super) application_message: Vec<u8>,
@@ -567,6 +576,14 @@ struct TwoMemberFulfillmentProducts {
     application_messages: Vec<Vec<u8>>,
     supplemental_requester_application_messages: Vec<(Uuid, Vec<u8>)>,
     supplemental_fulfiller_application_messages: Vec<(Uuid, Vec<u8>)>,
+    self_update_transition_id: Uuid,
+    self_update_commit: Vec<u8>,
+    self_update_next: ActivePublicState,
+    peer_self_update_transition_id: Uuid,
+    peer_self_update_commit: Vec<u8>,
+    peer_self_update_next: ActivePublicState,
+    post_update_message_id: Uuid,
+    post_update_application_message: Vec<u8>,
     removal_commit: Vec<u8>,
     removal_next: ActivePublicState,
     application_message: Vec<u8>,
@@ -579,9 +596,42 @@ struct TwoMemberFixtureOptions<'a> {
     application_message_id: Option<Uuid>,
     archive_commitment: Option<[u8; 32]>,
     supplemental_application_messages: bool,
+    self_update_fixture: bool,
     recipient_service_did: Option<&'a str>,
     sender_service_did: Option<&'a str>,
     sequencer_service_did: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn genuine_fixture_control_receipt(
+    sequencer_did: &str,
+    conversation_id: Uuid,
+    entry_id: Uuid,
+    seq: u64,
+    received_at: &str,
+    actor: &FixtureIdentity,
+    request_digest: &[u8],
+    coordinate: &PublicGroupSnapshotCoordinate,
+) -> Result<Vec<u8>, String> {
+    let request_digest: [u8; 32] = request_digest
+        .try_into()
+        .map_err(|_| "fixture control request digest has the wrong length".to_owned())?;
+    let input = I13ControlReceiptInput::from_fields(
+        &conversation_id.to_string(),
+        &entry_id.to_string(),
+        seq,
+        received_at,
+        &actor.did,
+        &actor.device_id.to_string(),
+        request_digest,
+    )?;
+    let signer = I13ReceiptSigner::new(
+        P256SigningKey::from_slice(&[0x13; 32])
+            .map_err(|error| format!("fixture I13 key: {error}"))?,
+        sequencer_did.to_owned(),
+    );
+    let receipt = signer.sign_control_receipt(&input, coordinate)?;
+    serde_json::to_vec(&receipt).map_err(|error| format!("serialize fixture I13 receipt: {error}"))
 }
 
 struct RealAcceptanceEntry {
@@ -1255,6 +1305,56 @@ fn coordinate_from_merged_group(
     ))
 }
 
+fn build_self_update_artifacts(
+    group: &mut MlsGroup,
+    provider: &openmls_libcrux_crypto::Provider,
+    signer: &SignatureKeyPair,
+    prior: &ActivePublicState,
+    conversation_id: Uuid,
+    at: DateTime<Utc>,
+) -> Result<(Uuid, Vec<u8>, ActivePublicState), String> {
+    let transition_id = Uuid::new_v4();
+    let aad = recovery_commit_aad(conversation_id, transition_id, prior.coordinate())?;
+    group.set_aad(aad.clone());
+    let bundle = group
+        .self_update(provider, signer, LeafNodeParameters::default())
+        .map_err(|error| format!("create genuine self-update Commit: {error:?}"))?;
+    let commit = bundle
+        .commit()
+        .tls_serialize_detached()
+        .map_err(|error| format!("serialize genuine self-update Commit: {error:?}"))?;
+    group
+        .merge_pending_commit(provider)
+        .map_err(|error| format!("merge genuine self-update Commit: {error:?}"))?;
+    let group_info = group
+        .export_group_info(provider.crypto(), signer, true)
+        .map_err(|error| format!("export self-update GroupInfo: {error:?}"))?;
+    let context = match group_info.body() {
+        MlsMessageBodyOut::GroupInfo(group_info) => group_info
+            .group_context()
+            .tls_serialize_detached()
+            .map_err(|error| format!("serialize self-update GroupInfo context: {error:?}"))?,
+        _ => return Err("self-update export did not produce GroupInfo".to_owned()),
+    };
+    let coordinate = coordinate_from_merged_group(
+        group,
+        &context,
+        conversation_id,
+        prior.coordinate().state_version() + 1,
+    )?;
+    let next = process_commit(
+        prior,
+        &commit,
+        &aad,
+        coordinate,
+        u64::try_from(at.timestamp()).map_err(|_| "negative self-update time")?,
+        2,
+    )
+    .map_err(|error| format!("verify genuine self-update Commit: {error:?}"))?
+    .into_next();
+    Ok((transition_id, commit, next))
+}
+
 fn build_key_package_material(
     identity: &FixtureIdentity,
     at: DateTime<Utc>,
@@ -1548,6 +1648,73 @@ fn build_two_member_fulfillment_products(
         requester_key_package_wrapper,
         requester_key_package_init_key,
     ) = build_key_package_material(requester, at, &provider, &requester_signer)?;
+    if options.self_update_fixture {
+        let (self_update_transition_id, self_update_commit, self_update_next) =
+            build_self_update_artifacts(
+                &mut requester_group,
+                &provider,
+                &requester_signer,
+                &prior,
+                conversation_id,
+                at,
+            )?;
+        let (peer_self_update_transition_id, peer_self_update_commit, peer_self_update_next) =
+            build_self_update_artifacts(
+                &mut fulfiller_group,
+                &fulfiller_provider,
+                &fulfiller_signer,
+                &prior,
+                conversation_id,
+                at,
+            )?;
+        let post_update_message_id = Uuid::new_v4();
+        requester_group.set_aad(application_routing_aad_bytes(
+            self_update_next.coordinate(),
+            post_update_message_id,
+            options.archive_commitment.as_ref(),
+            requester,
+        )?);
+        let post_update_application_message = requester_group
+            .create_message(
+                &provider,
+                &requester_signer,
+                b"application after self-update",
+            )
+            .map_err(|error| format!("create application after self-update: {error:?}"))?
+            .tls_serialize_detached()
+            .map_err(|error| format!("serialize application after self-update: {error:?}"))?;
+        return Ok(TwoMemberFulfillmentProducts {
+            genesis_group_info,
+            genesis,
+            acceptance,
+            next: self_update_next.clone(),
+            fulfiller_key_package_ref,
+            fulfiller_key_package_wrapper,
+            fulfiller_key_package_init_key,
+            add_commit,
+            add_welcome,
+            requester_key_package_ref,
+            requester_key_package_wrapper,
+            requester_key_package_init_key,
+            commit: Vec::new(),
+            welcome: Vec::new(),
+            application_messages,
+            supplemental_requester_application_messages,
+            supplemental_fulfiller_application_messages,
+            self_update_transition_id,
+            self_update_commit,
+            self_update_next: self_update_next.clone(),
+            peer_self_update_transition_id,
+            peer_self_update_commit,
+            peer_self_update_next,
+            post_update_message_id,
+            post_update_application_message,
+            removal_commit: Vec::new(),
+            removal_next: self_update_next,
+            application_message: Vec::new(),
+            prior,
+        });
+    }
     // The renewal proof applies this real policy transition through the signed
     // facade before using these cryptographic products. Keep the persisted Add
     // fixture at v2, but bind this Commit to the subsequent policy coordinate.
@@ -1685,7 +1852,7 @@ fn build_two_member_fulfillment_products(
         genesis_group_info,
         genesis,
         acceptance,
-        prior,
+        prior: prior.clone(),
         next,
         fulfiller_key_package_ref,
         fulfiller_key_package_wrapper,
@@ -1700,6 +1867,14 @@ fn build_two_member_fulfillment_products(
         application_messages,
         supplemental_requester_application_messages,
         supplemental_fulfiller_application_messages,
+        self_update_transition_id: Uuid::nil(),
+        self_update_commit: Vec::new(),
+        self_update_next: prior.clone(),
+        peer_self_update_transition_id: Uuid::nil(),
+        peer_self_update_commit: Vec::new(),
+        peer_self_update_next: prior,
+        post_update_message_id: Uuid::nil(),
+        post_update_application_message: Vec::new(),
         removal_commit,
         removal_next,
         application_message,
@@ -2100,6 +2275,733 @@ pub(super) async fn seed_durable_recovery_fulfillment_fixture_for_identities(
     .await
 }
 
+pub(super) async fn seed_remote_home_recovery_fulfillment_fixture_for_identities(
+    pool: &PgPool,
+    trusted_instant: &TrustedRequestInstant,
+    requester: FixtureIdentity,
+    fulfiller: FixtureIdentity,
+    fulfillment_transition_id: Uuid,
+    home_did: &str,
+) -> Result<DurableRecoveryFulfillmentFixture, String> {
+    seed_two_member_fixture(
+        pool,
+        trusted_instant,
+        requester,
+        fulfiller,
+        fulfillment_transition_id,
+        TwoMemberFixtureOptions {
+            recipient_service_did: Some(home_did),
+            sender_service_did: Some(home_did),
+            ..TwoMemberFixtureOptions::default()
+        },
+    )
+    .await
+}
+
+#[allow(dead_code)]
+pub(super) struct DurableLeaflessGroupFixture {
+    pub(super) admin: FixtureIdentity,
+    pub(super) departing: Option<FixtureIdentity>,
+    pub(super) conversation_id: Uuid,
+    pub(super) prior: PublicGroupSnapshotCoordinate,
+    pub(super) entry_count: i64,
+}
+
+#[allow(dead_code)]
+pub(super) async fn seed_remote_home_leafless_group_fixture(
+    pool: &PgPool,
+    trusted_instant: &TrustedRequestInstant,
+    admin: FixtureIdentity,
+    departing: Option<FixtureIdentity>,
+    accept_departing: bool,
+    home_did: &str,
+) -> Result<DurableLeaflessGroupFixture, String> {
+    let conversation_id = Uuid::new_v4();
+    let at = trusted_instant.datetime();
+    let sequencer_did = crate::identity::service_did_base_opt()
+        .unwrap_or_else(|| "did:web:chat.catbird.blue".to_owned());
+    let key_package_not_before = DateTime::<Utc>::from_timestamp(at.timestamp() - 60, 0)
+        .ok_or_else(|| "Recovery KeyPackage not-before is out of range".to_owned())?;
+    let key_package_not_after = DateTime::<Utc>::from_timestamp(at.timestamp() + 3_600, 0)
+        .ok_or_else(|| "Recovery KeyPackage not-after is out of range".to_owned())?;
+
+    match departing {
+        None => {
+            let (group_info, state) = build_genesis_state(&admin, conversation_id, at)?;
+            let prior = state.coordinate().clone();
+            let creation = build_real_creation_entry(
+                &admin,
+                conversation_id,
+                &prior,
+                &group_info,
+                trusted_instant.as_str(),
+            )?;
+            seed_identity(pool, &admin, trusted_instant).await?;
+            let creation_verified = decode_and_verify_signed_mutation(
+                &creation.raw_wrapper,
+                &admin.signing_public_key(),
+            )
+            .map_err(|error| format!("verify sole-admin creation: {error:?}"))?;
+            let creation_control = decode_and_verify_control_entry(
+                &creation.public_row_json,
+                &admin.signing_public_key(),
+            )
+            .map_err(|error| format!("verify sole-admin control: {error:?}"))?;
+            let creation_receipt = genuine_fixture_control_receipt(
+                &sequencer_did,
+                conversation_id,
+                creation.entry_id,
+                1,
+                trusted_instant.as_str(),
+                &admin,
+                creation_verified.request_digest(),
+                &prior,
+            )?;
+            let creation_wrapper: Value = serde_json::from_slice(&creation.raw_wrapper)
+                .map_err(|error| format!("decode sole-admin creation metadata: {error}"))?;
+            let creation_metadata = &creation_wrapper["body"]["metadataSnapshot"];
+            let creation_nonce = STANDARD
+                .decode(
+                    creation_metadata["nonce"]
+                        .as_str()
+                        .ok_or_else(|| "sole-admin creation nonce missing".to_owned())?,
+                )
+                .map_err(|error| format!("decode sole-admin creation nonce: {error}"))?;
+            let creation_ciphertext = STANDARD
+                .decode(
+                    creation_metadata["ciphertext"]
+                        .as_str()
+                        .ok_or_else(|| "sole-admin creation ciphertext missing".to_owned())?,
+                )
+                .map_err(|error| format!("decode sole-admin creation ciphertext: {error}"))?;
+            let admin_credential = format!("{}#{}", admin.did, admin.device_id).into_bytes();
+            let admin_leaf = state
+                .binding()
+                .tree_summary()
+                .leaves()
+                .iter()
+                .find(|leaf| leaf.basic_credential() == admin_credential)
+                .ok_or_else(|| "sole-admin genesis lacks admin leaf".to_owned())?;
+            let (tree_summary, tree_summary_sha256) =
+                encode_public_tree_summary(state.binding().tree_summary())
+                    .map_err(|error| format!("encode sole-admin public tree: {error:?}"))?
+                    .into_parts();
+            let (key_package_ref, key_package_wrapper, init_key) =
+                build_available_key_package(&admin, at)?;
+            let admin_participant_period_id = Uuid::new_v4();
+            let admin_leaf_period_id = Uuid::new_v4();
+            let creation_metadata_snapshot_id = Uuid::new_v4();
+            let mut transaction = pool
+                .begin()
+                .await
+                .map_err(|error| format!("begin sole-admin group fixture: {error}"))?;
+            sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at,is_remote,sequencer_ds) VALUES($1,'group','active',0,0,2,$2,false,NULL)")
+                .bind(conversation_id)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert sole-admin conversation: {error}"))?;
+            sqlx::query("INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,0,1,$5)")
+                .bind(conversation_id)
+                .bind(prior.group_id())
+                .bind(&group_info)
+                .bind(Sha256::digest(&group_info).to_vec())
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert sole-admin generation: {error}"))?;
+            crate::chat_protocol::repository::transition::register_conversation_space_if_migrated(
+                &mut *transaction,
+                conversation_id,
+                0,
+                at,
+                crate::identity::service_did_base_opt().as_deref(),
+            )
+            .await
+            .map_err(|error| format!("register sole-admin space: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,next_generation,next_state_version,metadata_snapshot_id,entry_seq,accepted_at) VALUES($1,$2,'creation',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,0,0,$11,1,$12)"#)
+                .bind(creation.transition_id)
+                .bind(conversation_id)
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(&admin.key_id)
+                .bind(&creation.raw_wrapper)
+                .bind(creation_verified.canonical_projection())
+                .bind(creation_verified.transcript_bytes())
+                .bind(creation_verified.request_digest().to_vec())
+                .bind(creation_verified.signature().to_vec())
+                .bind(creation_metadata_snapshot_id)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert sole-admin creation transition: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.generation_states(conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,lifecycle,state_kind,producing_transition_id,public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,leaf_count,created_at) VALUES($1,0,0,$2,$3,$4,$5,'active','creation',$6,$7,$8,$9,$10,1,$11)"#)
+                .bind(conversation_id)
+                .bind(prior.group_id())
+                .bind(i64::try_from(prior.epoch()).map_err(|_| "epoch overflow".to_owned())?)
+                .bind(prior.group_context_hash())
+                .bind(prior.confirmation_tag())
+                .bind(creation.transition_id)
+                .bind(state.snapshot())
+                .bind(state.snapshot_sha256())
+                .bind(&tree_summary)
+                .bind(&tree_summary_sha256)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert sole-admin state: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,current_membership,created_at,ds_did) VALUES($1,$2,$3,'active','admin',$4,$5,$3,$6,true,$5,$7)"#)
+                .bind(admin_participant_period_id)
+                .bind(conversation_id)
+                .bind(&admin.did)
+                .bind(creation.transition_id)
+                .bind(at)
+                .bind(admin.device_id)
+                .bind(home_did)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert sole-admin participant: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)"#)
+                .bind(key_package_ref.to_vec())
+                .bind(&key_package_wrapper)
+                .bind(Sha256::digest(&key_package_wrapper).to_vec())
+                .bind(init_key)
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(&admin.key_id)
+                .bind(key_package_not_before)
+                .bind(key_package_not_after)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert sole-admin KeyPackage: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.member_devices(leaf_period_id,participant_period_id,conversation_id,generation,user_did,device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,leaf_auth_generation,origin,joined_state_version,joined_transition_id,joined_seq,active,created_at) VALUES($1,$2,$3,0,$4,$5,$6,$7,$8,$9,1,'genesis',0,$10,1,true,$11)"#)
+                .bind(admin_leaf_period_id)
+                .bind(admin_participant_period_id)
+                .bind(conversation_id)
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(i64::from(admin_leaf.leaf_index()))
+                .bind(admin_leaf.basic_credential())
+                .bind(admin_leaf.signature_key())
+                .bind(&admin.key_id)
+                .bind(creation.transition_id)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert sole-admin leaf: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.metadata_snapshots(metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,author_auth_generation,author_origin_seq,author_role,author_device_status,created_at) VALUES($1,$2,0,0,$3,$4,$5,$6,$7,$7,1,$8,$9,$10,16,$11,$12,$13,$14,1,1,'admin','active',$15)"#)
+                .bind(creation_metadata_snapshot_id)
+                .bind(conversation_id)
+                .bind(prior.group_id())
+                .bind(i64::try_from(prior.epoch()).map_err(|_| "epoch overflow".to_owned())?)
+                .bind(prior.group_context_hash())
+                .bind(prior.confirmation_tag())
+                .bind(creation.transition_id)
+                .bind(&creation_nonce)
+                .bind(&creation_ciphertext)
+                .bind(Sha256::digest(&creation_ciphertext).to_vec())
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(&admin.key_id)
+                .bind(admin.signing_public_key().to_vec())
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert sole-admin metadata: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,sequencer_receipt_bytes,received_at) VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,0,$13,$14,$15)"#)
+                .bind(conversation_id)
+                .bind(creation.entry_id)
+                .bind(&creation.public_row_json)
+                .bind(Sha256::digest(&creation.public_row_json).to_vec())
+                .bind(&creation.raw_wrapper)
+                .bind(creation_verified.request_digest().to_vec())
+                .bind(creation_verified.signature().to_vec())
+                .bind(creation_control.server_fields_dag_cbor().map_err(|error| format!("encode sole-admin server fields: {error:?}"))?)
+                .bind(creation.outer_fingerprint.to_vec())
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(&admin.key_id)
+                .bind(creation.transition_id)
+                .bind(&creation_receipt)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert sole-admin entry: {error}"))?;
+            sqlx::query("INSERT INTO chat.entry_recipients(conversation_id,seq,user_did,device_id,entitlement_kind) VALUES($1,1,$2,$3,'control')")
+                .bind(conversation_id)
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert sole-admin entry recipient: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.application_intervals(membership_interval_id,conversation_id,generation,recipient_did,recipient_device_id,start_seq,opening_kind,opening_transition_id,opening_outer_entry_fingerprint,opening_state_version,opening_group_id,opening_epoch,opening_group_context_hash,opening_confirmation_tag,opening_leaf_period_id,created_at) VALUES($1,$2,0,$3,$4,1,'creation',$5,$6,0,$7,$8,$9,$10,$11,$12)"#)
+                .bind(creation.transition_id)
+                .bind(conversation_id)
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(creation.transition_id)
+                .bind(creation.outer_fingerprint.to_vec())
+                .bind(prior.group_id())
+                .bind(i64::try_from(prior.epoch()).map_err(|_| "epoch overflow".to_owned())?)
+                .bind(prior.group_context_hash())
+                .bind(prior.confirmation_tag())
+                .bind(admin_leaf_period_id)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert sole-admin interval: {error}"))?;
+            transaction
+                .commit()
+                .await
+                .map_err(|error| format!("commit sole-admin group fixture: {error}"))?;
+            Ok(DurableLeaflessGroupFixture {
+                admin,
+                departing: None,
+                conversation_id,
+                prior,
+                entry_count: 1,
+            })
+        }
+        Some(departing) => {
+            if admin.did == departing.did {
+                return Err("leafless group fixture requires two distinct DIDs".to_owned());
+            }
+            let products = build_two_member_fulfillment_products(
+                &admin,
+                &departing,
+                conversation_id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                at,
+                &TwoMemberFixtureOptions {
+                    recipient_service_did: Some(home_did),
+                    sender_service_did: Some(home_did),
+                    ..TwoMemberFixtureOptions::default()
+                },
+            )?;
+            let creation = build_real_creation_entry_with_pending(
+                &admin,
+                &departing,
+                conversation_id,
+                products.genesis.coordinate(),
+                &products.genesis_group_info,
+                trusted_instant.as_str(),
+            )?;
+            let acceptance = if accept_departing {
+                Some(build_real_acceptance_entry(
+                    &admin,
+                    &departing,
+                    conversation_id,
+                    creation.transition_id,
+                    products.genesis.coordinate(),
+                    products.acceptance.coordinate(),
+                    products.fulfiller_key_package_ref,
+                    &products.fulfiller_key_package_wrapper,
+                    at,
+                )?)
+            } else {
+                None
+            };
+            seed_identity(pool, &admin, trusted_instant).await?;
+            seed_identity(pool, &departing, trusted_instant).await?;
+            let creation_verified = decode_and_verify_signed_mutation(
+                &creation.raw_wrapper,
+                &admin.signing_public_key(),
+            )
+            .map_err(|error| format!("verify leafless fixture creation: {error:?}"))?;
+            let creation_control = decode_and_verify_control_entry(
+                &creation.public_row_json,
+                &admin.signing_public_key(),
+            )
+            .map_err(|error| format!("verify leafless fixture control: {error:?}"))?;
+            let creation_receipt = genuine_fixture_control_receipt(
+                &sequencer_did,
+                conversation_id,
+                creation.entry_id,
+                1,
+                trusted_instant.as_str(),
+                &admin,
+                creation_verified.request_digest(),
+                products.genesis.coordinate(),
+            )?;
+            let acceptance_receipt = match acceptance.as_ref() {
+                Some(acc) => Some(genuine_fixture_control_receipt(
+                    &sequencer_did,
+                    conversation_id,
+                    acc.entry_id,
+                    2,
+                    trusted_instant.as_str(),
+                    &departing,
+                    &acc.request_digest,
+                    products.acceptance.coordinate(),
+                )?),
+                None => None,
+            };
+            let creation_wrapper: Value = serde_json::from_slice(&creation.raw_wrapper)
+                .map_err(|error| format!("decode leafless creation metadata: {error}"))?;
+            let creation_metadata = &creation_wrapper["body"]["metadataSnapshot"];
+            let creation_nonce = STANDARD
+                .decode(
+                    creation_metadata["nonce"]
+                        .as_str()
+                        .ok_or_else(|| "leafless creation nonce missing".to_owned())?,
+                )
+                .map_err(|error| format!("decode leafless creation nonce: {error}"))?;
+            let creation_ciphertext = STANDARD
+                .decode(
+                    creation_metadata["ciphertext"]
+                        .as_str()
+                        .ok_or_else(|| "leafless creation ciphertext missing".to_owned())?,
+                )
+                .map_err(|error| format!("decode leafless creation ciphertext: {error}"))?;
+            let admin_credential = format!("{}#{}", admin.did, admin.device_id).into_bytes();
+            let admin_genesis_leaf = products
+                .genesis
+                .binding()
+                .tree_summary()
+                .leaves()
+                .iter()
+                .find(|leaf| leaf.basic_credential() == admin_credential)
+                .ok_or_else(|| "leafless genesis lacks admin leaf".to_owned())?;
+            let admin_participant_period_id = Uuid::new_v4();
+            let departing_participant_period_id = Uuid::new_v4();
+            let admin_leaf_period_id = Uuid::new_v4();
+            let creation_metadata_snapshot_id = Uuid::new_v4();
+            let current_state_version = if accept_departing { 1_i64 } else { 0_i64 };
+            let next_entry_seq = if accept_departing { 3_i64 } else { 2_i64 };
+            let prior = if accept_departing {
+                products.acceptance.coordinate().clone()
+            } else {
+                products.genesis.coordinate().clone()
+            };
+            let mut transaction = pool
+                .begin()
+                .await
+                .map_err(|error| format!("begin leafless group fixture: {error}"))?;
+            sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at,is_remote,sequencer_ds) VALUES($1,'group','active',0,$2,$3,$4,false,NULL)")
+                .bind(conversation_id)
+                .bind(current_state_version)
+                .bind(next_entry_seq)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert leafless conversation: {error}"))?;
+            sqlx::query("INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,$5,1,$6)")
+                .bind(conversation_id)
+                .bind(products.genesis.coordinate().group_id())
+                .bind(&products.genesis_group_info)
+                .bind(Sha256::digest(&products.genesis_group_info).to_vec())
+                .bind(current_state_version)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert leafless generation: {error}"))?;
+            crate::chat_protocol::repository::transition::register_conversation_space_if_migrated(
+                &mut *transaction,
+                conversation_id,
+                0,
+                at,
+                crate::identity::service_did_base_opt().as_deref(),
+            )
+            .await
+            .map_err(|error| format!("register leafless space: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,next_generation,next_state_version,metadata_snapshot_id,entry_seq,accepted_at) VALUES($1,$2,'creation',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,0,0,$11,1,$12)"#)
+                .bind(creation.transition_id)
+                .bind(conversation_id)
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(&admin.key_id)
+                .bind(&creation.raw_wrapper)
+                .bind(creation_verified.canonical_projection())
+                .bind(creation_verified.transcript_bytes())
+                .bind(creation_verified.request_digest().to_vec())
+                .bind(creation_verified.signature().to_vec())
+                .bind(creation_metadata_snapshot_id)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert leafless creation transition: {error}"))?;
+            if let Some(acc) = acceptance.as_ref() {
+                sqlx::query(r#"INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,prior_generation,prior_state_version,next_generation,next_state_version,entry_seq,accepted_at) VALUES($1,$2,'acceptConversation',$3,$4,$5,1,'member','active',$6,$7,$8,$9,$10,0,0,0,1,2,$11)"#)
+                    .bind(acc.transition_id)
+                    .bind(conversation_id)
+                    .bind(&departing.did)
+                    .bind(departing.device_id)
+                    .bind(&departing.key_id)
+                    .bind(&acc.raw_wrapper)
+                    .bind(&acc.canonical_projection)
+                    .bind(&acc.signing_transcript)
+                    .bind(&acc.request_digest)
+                    .bind(&acc.signature)
+                    .bind(at)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| format!("insert leafless acceptance transition: {error}"))?;
+            }
+            let mut states = vec![(&products.genesis, "creation", creation.transition_id)];
+            if let Some(acc) = acceptance.as_ref() {
+                states.push((
+                    &products.acceptance,
+                    "acceptConversation",
+                    acc.transition_id,
+                ));
+            }
+            for (state, state_kind, producer) in states {
+                let (tree_summary, tree_summary_sha256) =
+                    encode_public_tree_summary(state.binding().tree_summary())
+                        .map_err(|error| format!("encode leafless public tree: {error:?}"))?
+                        .into_parts();
+                let coordinate = state.coordinate();
+                sqlx::query(r#"INSERT INTO chat.generation_states(conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,lifecycle,state_kind,producing_transition_id,public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,leaf_count,created_at) VALUES($1,0,$2,$3,$4,$5,$6,'active',$7,$8,$9,$10,$11,$12,1,$13)"#)
+                    .bind(conversation_id)
+                    .bind(i64::try_from(coordinate.state_version()).map_err(|_| "state version overflow".to_owned())?)
+                    .bind(coordinate.group_id())
+                    .bind(i64::try_from(coordinate.epoch()).map_err(|_| "epoch overflow".to_owned())?)
+                    .bind(coordinate.group_context_hash())
+                    .bind(coordinate.confirmation_tag())
+                    .bind(state_kind)
+                    .bind(producer)
+                    .bind(state.snapshot())
+                    .bind(state.snapshot_sha256())
+                    .bind(&tree_summary)
+                    .bind(&tree_summary_sha256)
+                    .bind(at)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| format!("insert leafless state {state_kind}: {error}"))?;
+            }
+            sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,current_membership,created_at,ds_did) VALUES($1,$2,$3,'active','admin',$4,$5,$3,$6,true,$5,$7)"#)
+                .bind(admin_participant_period_id)
+                .bind(conversation_id)
+                .bind(&admin.did)
+                .bind(creation.transition_id)
+                .bind(at)
+                .bind(admin.device_id)
+                .bind(home_did)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert leafless admin participant: {error}"))?;
+            if let Some(acc) = acceptance.as_ref() {
+                sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,invitation_entry_id,invited_at,acceptance_transition_id,acceptance_entry_id,accepted_at,current_membership,created_at,ds_did) VALUES($1,$2,$3,'active','member',$4,$5,$6,$7,$4,$8,$5,$9,$10,$5,true,$5,$11)"#)
+                    .bind(departing_participant_period_id)
+                    .bind(conversation_id)
+                    .bind(&departing.did)
+                    .bind(creation.transition_id)
+                    .bind(at)
+                    .bind(&admin.did)
+                    .bind(admin.device_id)
+                    .bind(creation.entry_id)
+                    .bind(acc.transition_id)
+                    .bind(acc.entry_id)
+                    .bind(home_did)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| format!("insert leafless accepted participant: {error}"))?;
+            } else {
+                sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,invitation_entry_id,invited_at,current_membership,created_at,ds_did) VALUES($1,$2,$3,'pending','member',$4,$5,$6,$7,$4,$8,$5,true,$5,$9)"#)
+                    .bind(departing_participant_period_id)
+                    .bind(conversation_id)
+                    .bind(&departing.did)
+                    .bind(creation.transition_id)
+                    .bind(at)
+                    .bind(&admin.did)
+                    .bind(admin.device_id)
+                    .bind(creation.entry_id)
+                    .bind(home_did)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| format!("insert leafless pending participant: {error}"))?;
+            }
+            let departing_package_status = if accept_departing {
+                "reserved"
+            } else {
+                "available"
+            };
+            sqlx::query(r#"INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11)"#)
+                .bind(products.fulfiller_key_package_ref.to_vec())
+                .bind(&products.fulfiller_key_package_wrapper)
+                .bind(Sha256::digest(&products.fulfiller_key_package_wrapper).to_vec())
+                .bind(&products.fulfiller_key_package_init_key)
+                .bind(&departing.did)
+                .bind(departing.device_id)
+                .bind(&departing.key_id)
+                .bind(key_package_not_before)
+                .bind(key_package_not_after)
+                .bind(departing_package_status)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert leafless departing KeyPackage: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)"#)
+                .bind(products.requester_key_package_ref.to_vec())
+                .bind(&products.requester_key_package_wrapper)
+                .bind(Sha256::digest(&products.requester_key_package_wrapper).to_vec())
+                .bind(&products.requester_key_package_init_key)
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(&admin.key_id)
+                .bind(key_package_not_before)
+                .bind(key_package_not_after)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert leafless admin KeyPackage: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.member_devices(leaf_period_id,participant_period_id,conversation_id,generation,user_did,device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,leaf_auth_generation,origin,joined_state_version,joined_transition_id,joined_seq,active,created_at) VALUES($1,$2,$3,0,$4,$5,$6,$7,$8,$9,1,'genesis',0,$10,1,true,$11)"#)
+                .bind(admin_leaf_period_id)
+                .bind(admin_participant_period_id)
+                .bind(conversation_id)
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(i64::from(admin_genesis_leaf.leaf_index()))
+                .bind(admin_genesis_leaf.basic_credential())
+                .bind(admin_genesis_leaf.signature_key())
+                .bind(&admin.key_id)
+                .bind(creation.transition_id)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert leafless admin leaf: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.metadata_snapshots(metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,author_auth_generation,author_origin_seq,author_role,author_device_status,created_at) VALUES($1,$2,0,0,$3,$4,$5,$6,$7,$7,1,$8,$9,$10,16,$11,$12,$13,$14,1,1,'admin','active',$15)"#)
+                .bind(creation_metadata_snapshot_id)
+                .bind(conversation_id)
+                .bind(products.genesis.coordinate().group_id())
+                .bind(i64::try_from(products.genesis.coordinate().epoch()).map_err(|_| "epoch overflow".to_owned())?)
+                .bind(products.genesis.coordinate().group_context_hash())
+                .bind(products.genesis.coordinate().confirmation_tag())
+                .bind(creation.transition_id)
+                .bind(&creation_nonce)
+                .bind(&creation_ciphertext)
+                .bind(Sha256::digest(&creation_ciphertext).to_vec())
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(&admin.key_id)
+                .bind(admin.signing_public_key().to_vec())
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert leafless metadata: {error}"))?;
+            sqlx::query(r#"INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,sequencer_receipt_bytes,received_at) VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,0,$13,$14,$15)"#)
+                .bind(conversation_id)
+                .bind(creation.entry_id)
+                .bind(&creation.public_row_json)
+                .bind(Sha256::digest(&creation.public_row_json).to_vec())
+                .bind(&creation.raw_wrapper)
+                .bind(creation_verified.request_digest().to_vec())
+                .bind(creation_verified.signature().to_vec())
+                .bind(creation_control.server_fields_dag_cbor().map_err(|error| format!("encode leafless server fields: {error:?}"))?)
+                .bind(creation.outer_fingerprint.to_vec())
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(&admin.key_id)
+                .bind(creation.transition_id)
+                .bind(&creation_receipt)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert leafless creation entry: {error}"))?;
+            if let (Some(acc), Some(receipt)) = (acceptance.as_ref(), acceptance_receipt.as_ref()) {
+                sqlx::query(r#"INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,sequencer_receipt_bytes,received_at) VALUES($1,2,$2,'blue.catbird.chat.defs#participantAcceptanceEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,1,$13,$14,$15)"#)
+                    .bind(conversation_id)
+                    .bind(acc.entry_id)
+                    .bind(&acc.public_row_json)
+                    .bind(Sha256::digest(&acc.public_row_json).to_vec())
+                    .bind(&acc.raw_wrapper)
+                    .bind(&acc.request_digest)
+                    .bind(&acc.signature)
+                    .bind(&acc.server_fields)
+                    .bind(acc.outer_fingerprint.to_vec())
+                    .bind(&departing.did)
+                    .bind(departing.device_id)
+                    .bind(&departing.key_id)
+                    .bind(acc.transition_id)
+                    .bind(receipt)
+                    .bind(at)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| format!("insert leafless acceptance entry: {error}"))?;
+            }
+            let entry_count = 1_i64 + i64::from(accept_departing);
+            for seq in 1_i64..=entry_count {
+                for identity in [&admin, &departing] {
+                    sqlx::query("INSERT INTO chat.entry_recipients(conversation_id,seq,user_did,device_id,entitlement_kind) VALUES($1,$2,$3,$4,'control')")
+                        .bind(conversation_id)
+                        .bind(seq)
+                        .bind(&identity.did)
+                        .bind(identity.device_id)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|error| format!("insert leafless entry recipient: {error}"))?;
+                }
+            }
+            sqlx::query(r#"INSERT INTO chat.application_intervals(membership_interval_id,conversation_id,generation,recipient_did,recipient_device_id,start_seq,opening_kind,opening_transition_id,opening_outer_entry_fingerprint,opening_state_version,opening_group_id,opening_epoch,opening_group_context_hash,opening_confirmation_tag,opening_leaf_period_id,created_at) VALUES($1,$2,0,$3,$4,1,'creation',$5,$6,0,$7,$8,$9,$10,$11,$12)"#)
+                .bind(creation.transition_id)
+                .bind(conversation_id)
+                .bind(&admin.did)
+                .bind(admin.device_id)
+                .bind(creation.transition_id)
+                .bind(creation.outer_fingerprint.to_vec())
+                .bind(products.genesis.coordinate().group_id())
+                .bind(i64::try_from(products.genesis.coordinate().epoch()).map_err(|_| "epoch overflow".to_owned())?)
+                .bind(products.genesis.coordinate().group_context_hash())
+                .bind(products.genesis.coordinate().confirmation_tag())
+                .bind(admin_leaf_period_id)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("insert leafless admin interval: {error}"))?;
+            if let Some(acc) = acceptance.as_ref() {
+                sqlx::query(r#"INSERT INTO chat.key_package_reservations(recovery_request_id,key_package_ref,conversation_id,generation,requester_did,requester_device_id,requester_key_id,requester_auth_generation,recipient_did,recipient_device_id,bound_state_version,bound_group_id,bound_epoch,bound_group_context_hash,bound_confirmation_tag,purpose,expires_at,status,created_at) VALUES($1,$2,$3,0,$4,$5,$6,1,$4,$5,1,$7,$8,$9,$10,'leafRecovery',$11,'active',$12)"#)
+                    .bind(acc.request_id)
+                    .bind(products.fulfiller_key_package_ref.to_vec())
+                    .bind(conversation_id)
+                    .bind(&departing.did)
+                    .bind(departing.device_id)
+                    .bind(&departing.key_id)
+                    .bind(products.acceptance.coordinate().group_id())
+                    .bind(i64::try_from(products.acceptance.coordinate().epoch()).map_err(|_| "epoch overflow".to_owned())?)
+                    .bind(products.acceptance.coordinate().group_context_hash())
+                    .bind(products.acceptance.coordinate().confirmation_tag())
+                    .bind(acc.expires_at)
+                    .bind(at)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| format!("insert leafless acceptance reservation: {error}"))?;
+                sqlx::query(r#"INSERT INTO chat.leaf_recovery_requests(recovery_request_id,conversation_id,generation,requester_did,requester_device_id,requester_key_id,requester_auth_generation,recovery_kind,source,bound_state_version,bound_group_id,bound_epoch,bound_group_context_hash,bound_confirmation_tag,reservation_request_id,status,signed_request_bytes,signing_transcript_bytes,request_digest,signature,requested_at,expires_at) VALUES($1,$2,0,$3,$4,$5,1,'add','acceptConversation',1,$6,$7,$8,$9,$1,'open',$10,$11,$12,$13,$14,$15)"#)
+                    .bind(acc.request_id)
+                    .bind(conversation_id)
+                    .bind(&departing.did)
+                    .bind(departing.device_id)
+                    .bind(&departing.key_id)
+                    .bind(products.acceptance.coordinate().group_id())
+                    .bind(i64::try_from(products.acceptance.coordinate().epoch()).map_err(|_| "epoch overflow".to_owned())?)
+                    .bind(products.acceptance.coordinate().group_context_hash())
+                    .bind(products.acceptance.coordinate().confirmation_tag())
+                    .bind(&acc.raw_wrapper)
+                    .bind(&acc.signing_transcript)
+                    .bind(&acc.request_digest)
+                    .bind(&acc.signature)
+                    .bind(at)
+                    .bind(acc.expires_at)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| format!("insert leafless acceptance recovery request: {error}"))?;
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|error| format!("commit leafless group fixture: {error}"))?;
+            Ok(DurableLeaflessGroupFixture {
+                admin,
+                departing: Some(departing),
+                conversation_id,
+                prior,
+                entry_count,
+            })
+        }
+    }
+}
+
 pub(super) async fn seed_recovery_package_reuse_fixture(
     pool: &PgPool,
     trusted_instant: &TrustedRequestInstant,
@@ -2172,6 +3074,7 @@ pub(super) async fn seed_application_routing_fixture_with_commitment(
             application_message_id: Some(message_id),
             archive_commitment,
             supplemental_application_messages: archive_commitment.is_some(),
+            self_update_fixture: true,
             recipient_service_did: Some(recipient_service_did),
             sender_service_did,
             sequencer_service_did,
@@ -2250,6 +3153,41 @@ async fn seed_two_member_fixture(
     let creation_control =
         decode_and_verify_control_entry(&creation.public_row_json, &requester.signing_public_key())
             .map_err(|error| format!("verify singleton Recovery fixture control: {error:?}"))?;
+    let sequencer_did = options
+        .sequencer_service_did
+        .map(str::to_owned)
+        .or_else(crate::identity::service_did_base_opt)
+        .unwrap_or_else(|| "did:web:chat.catbird.blue".to_owned());
+    let creation_receipt = genuine_fixture_control_receipt(
+        &sequencer_did,
+        conversation_id,
+        creation.entry_id,
+        1,
+        trusted_instant.as_str(),
+        &requester,
+        creation_verified.request_digest(),
+        products.genesis.coordinate(),
+    )?;
+    let acceptance_receipt = genuine_fixture_control_receipt(
+        &sequencer_did,
+        conversation_id,
+        acceptance.entry_id,
+        2,
+        trusted_instant.as_str(),
+        &fulfiller,
+        &acceptance.request_digest,
+        products.acceptance.coordinate(),
+    )?;
+    let fulfillment_receipt = genuine_fixture_control_receipt(
+        &sequencer_did,
+        conversation_id,
+        add_fulfillment.entry_id,
+        3,
+        trusted_instant.as_str(),
+        &requester,
+        &add_fulfillment.request_digest,
+        products.prior.coordinate(),
+    )?;
     let creation_wrapper: Value = serde_json::from_slice(&creation.raw_wrapper)
         .map_err(|error| format!("decode singleton Recovery creation metadata: {error}"))?;
     let creation_metadata = &creation_wrapper["body"]["metadataSnapshot"];
@@ -2422,14 +3360,14 @@ async fn seed_two_member_fixture(
     sqlx::query(r#"INSERT INTO chat.metadata_snapshots(metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,author_auth_generation,author_origin_seq,author_role,author_device_status,created_at) VALUES($1,$2,0,2,$3,$4,$5,$6,$7,$8,1,$9,$10,$11,16,$12,$13,$14,$15,1,1,'admin','active',$16)"#)
         .bind(add_metadata_snapshot_id).bind(conversation_id).bind(products.prior.coordinate().group_id()).bind(i64::try_from(products.prior.coordinate().epoch()).map_err(|_| "Add Recovery epoch overflow".to_owned())?).bind(products.prior.coordinate().group_context_hash()).bind(products.prior.coordinate().confirmation_tag()).bind(add_fulfillment.transition_id).bind(creation.transition_id).bind(&add_fulfillment.metadata_nonce).bind(&add_fulfillment.metadata_ciphertext).bind(Sha256::digest(&add_fulfillment.metadata_ciphertext).to_vec()).bind(&requester.did).bind(requester.device_id).bind(&requester.key_id).bind(requester.signing_public_key().to_vec()).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert Add Recovery metadata: {error}"))?;
-    sqlx::query(r#"INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at) VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,0,$13,$14)"#)
-        .bind(conversation_id).bind(creation.entry_id).bind(&creation.public_row_json).bind(Sha256::digest(&creation.public_row_json).to_vec()).bind(&creation.raw_wrapper).bind(creation_verified.request_digest().to_vec()).bind(creation_verified.signature().to_vec()).bind(creation_control.server_fields_dag_cbor().map_err(|error| format!("encode singleton Recovery server fields: {error:?}"))?).bind(creation.outer_fingerprint.to_vec()).bind(&requester.did).bind(requester.device_id).bind(&requester.key_id).bind(creation.transition_id).bind(at)
+    sqlx::query(r#"INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,sequencer_receipt_bytes,received_at) VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,0,$13,$14,$15)"#)
+        .bind(conversation_id).bind(creation.entry_id).bind(&creation.public_row_json).bind(Sha256::digest(&creation.public_row_json).to_vec()).bind(&creation.raw_wrapper).bind(creation_verified.request_digest().to_vec()).bind(creation_verified.signature().to_vec()).bind(creation_control.server_fields_dag_cbor().map_err(|error| format!("encode singleton Recovery server fields: {error:?}"))?).bind(creation.outer_fingerprint.to_vec()).bind(&requester.did).bind(requester.device_id).bind(&requester.key_id).bind(creation.transition_id).bind(&creation_receipt).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert singleton Recovery entry: {error}"))?;
-    sqlx::query(r#"INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at) VALUES($1,2,$2,'blue.catbird.chat.defs#participantAcceptanceEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,1,$13,$14)"#)
-        .bind(conversation_id).bind(acceptance.entry_id).bind(&acceptance.public_row_json).bind(Sha256::digest(&acceptance.public_row_json).to_vec()).bind(&acceptance.raw_wrapper).bind(&acceptance.request_digest).bind(&acceptance.signature).bind(&acceptance.server_fields).bind(acceptance.outer_fingerprint.to_vec()).bind(&fulfiller.did).bind(fulfiller.device_id).bind(&fulfiller.key_id).bind(acceptance.transition_id).bind(at)
+    sqlx::query(r#"INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,sequencer_receipt_bytes,received_at) VALUES($1,2,$2,'blue.catbird.chat.defs#participantAcceptanceEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,1,$13,$14,$15)"#)
+        .bind(conversation_id).bind(acceptance.entry_id).bind(&acceptance.public_row_json).bind(Sha256::digest(&acceptance.public_row_json).to_vec()).bind(&acceptance.raw_wrapper).bind(&acceptance.request_digest).bind(&acceptance.signature).bind(&acceptance.server_fields).bind(acceptance.outer_fingerprint.to_vec()).bind(&fulfiller.did).bind(fulfiller.device_id).bind(&fulfiller.key_id).bind(acceptance.transition_id).bind(&acceptance_receipt).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert genuine Recovery acceptance entry: {error}"))?;
-    sqlx::query(r#"INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at) VALUES($1,3,$2,'blue.catbird.chat.defs#leafRecoveryFulfillmentEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,2,$13,$14)"#)
-        .bind(conversation_id).bind(add_fulfillment.entry_id).bind(&add_fulfillment.public_row_json).bind(Sha256::digest(&add_fulfillment.public_row_json).to_vec()).bind(&add_fulfillment.raw_wrapper).bind(&add_fulfillment.request_digest).bind(&add_fulfillment.signature).bind(&add_fulfillment.server_fields).bind(add_fulfillment.outer_fingerprint.to_vec()).bind(&requester.did).bind(requester.device_id).bind(&requester.key_id).bind(add_fulfillment.transition_id).bind(at)
+    sqlx::query(r#"INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,sequencer_receipt_bytes,received_at) VALUES($1,3,$2,'blue.catbird.chat.defs#leafRecoveryFulfillmentEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,2,$13,$14,$15)"#)
+        .bind(conversation_id).bind(add_fulfillment.entry_id).bind(&add_fulfillment.public_row_json).bind(Sha256::digest(&add_fulfillment.public_row_json).to_vec()).bind(&add_fulfillment.raw_wrapper).bind(&add_fulfillment.request_digest).bind(&add_fulfillment.signature).bind(&add_fulfillment.server_fields).bind(add_fulfillment.outer_fingerprint.to_vec()).bind(&requester.did).bind(requester.device_id).bind(&requester.key_id).bind(add_fulfillment.transition_id).bind(&fulfillment_receipt).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert genuine Add Recovery entry: {error}"))?;
     for seq in 1_i64..=3_i64 {
         for identity in [&requester, &fulfiller] {
@@ -2476,6 +3414,14 @@ async fn seed_two_member_fixture(
             .supplemental_requester_application_messages,
         supplemental_fulfiller_application_messages: products
             .supplemental_fulfiller_application_messages,
+        self_update_transition_id: products.self_update_transition_id,
+        self_update_commit: products.self_update_commit,
+        self_update_next: products.self_update_next,
+        peer_self_update_transition_id: products.peer_self_update_transition_id,
+        peer_self_update_commit: products.peer_self_update_commit,
+        peer_self_update_next: products.peer_self_update_next,
+        post_update_message_id: products.post_update_message_id,
+        post_update_application_message: products.post_update_application_message,
         removal_commit: products.removal_commit,
         removal_next: products.removal_next,
         application_message: products.application_message,

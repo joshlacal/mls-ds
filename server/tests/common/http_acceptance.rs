@@ -24,6 +24,7 @@ pub const AUDIENCE: &str = "did:web:chat.catbird.blue#atproto_mls";
 pub const CHAT_INSTANCE: &str = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
 pub const EXTERNAL_BASE: &str = "https://chat.example.net";
 pub const NEST_KEY_ID: &str = "http-acceptance";
+include!("proof_i13.rs");
 
 #[derive(Clone)]
 pub struct TestState {
@@ -230,7 +231,7 @@ pub async fn ensure_fence(pool: &DbPool) {
 
 /// Build the route harness with the pre-cutover fence held by default.
 pub async fn router(pool: DbPool) -> Router {
-    build_router_with_options(pool, false, |runtime| runtime).await
+    build_router_with_options(pool, false, true, |runtime| runtime).await
 }
 
 /// The named authenticated acceptance cases exercise routes gated behind the
@@ -238,21 +239,28 @@ pub async fn router(pool: DbPool) -> Router {
 /// the process-level value is restored to the explicit pre-cutover value
 /// immediately afterward.
 pub async fn router_for_authenticated_acceptance(pool: DbPool) -> Router {
-    build_router_with_options(pool, true, |runtime| runtime).await
+    build_router_with_options(pool, true, true, |runtime| runtime).await
 }
 
-pub async fn router_for_authenticated_acceptance_with_i13(
+pub async fn router_and_runtime_for_authenticated_acceptance(
     pool: DbPool,
-    i13_signer: catbird_server::federation::receipt::I13ReceiptSigner,
-) -> Router {
-    build_router_with_options(pool, true, |runtime| {
-        runtime.with_i13_receipt_signer(i13_signer)
-    })
-    .await
+) -> (Router, Arc<ChatRuntime>) {
+    let state = acceptance_state(pool, true, true, |runtime| runtime).await;
+    let runtime = Arc::clone(&state.runtime);
+    (chat_router::<TestState>().with_state(state), runtime)
+}
+
+pub async fn router_and_runtime_for_authenticated_acceptance_with(
+    pool: DbPool,
+    customize: impl FnOnce(ChatRuntime) -> ChatRuntime,
+) -> (Router, Arc<ChatRuntime>) {
+    let state = acceptance_state(pool, true, true, customize).await;
+    let runtime = Arc::clone(&state.runtime);
+    (chat_router::<TestState>().with_state(state), runtime)
 }
 
 pub async fn router_for_authenticated_acceptance_strict_reads(pool: DbPool) -> Router {
-    build_router_with_options(pool, true, |runtime| {
+    build_router_with_options(pool, true, true, |runtime| {
         runtime.with_require_signed_reads(true)
     })
     .await
@@ -263,7 +271,13 @@ pub async fn router_for_authenticated_acceptance_with(
     pool: DbPool,
     customize: impl FnOnce(ChatRuntime) -> ChatRuntime,
 ) -> Router {
-    build_router_with_options(pool, true, customize).await
+    build_router_with_options(pool, true, true, customize).await
+}
+
+/// [`router_for_authenticated_acceptance`] without an I13 signer, for
+/// historical-migration fixtures that intentionally preserve signer-less sends.
+pub async fn router_for_authenticated_acceptance_without_i13(pool: DbPool) -> Router {
+    build_router_with_options(pool, true, false, |runtime| runtime).await
 }
 
 /// [`router_for_authenticated_acceptance_with`] after the runtime's startup
@@ -272,7 +286,7 @@ pub async fn router_for_validated_acceptance_with(
     pool: DbPool,
     customize: impl FnOnce(ChatRuntime) -> ChatRuntime,
 ) -> Router {
-    let state = acceptance_state(pool, true, customize).await;
+    let state = acceptance_state(pool, true, true, customize).await;
     state
         .runtime
         .validate_protocol_fence(&state.pool)
@@ -284,14 +298,18 @@ pub async fn router_for_validated_acceptance_with(
 async fn build_router_with_options(
     pool: DbPool,
     cutover_enabled: bool,
+    with_i13_receipt_signer: bool,
     customize: impl FnOnce(ChatRuntime) -> ChatRuntime,
 ) -> Router {
-    chat_router::<TestState>().with_state(acceptance_state(pool, cutover_enabled, customize).await)
+    chat_router::<TestState>().with_state(
+        acceptance_state(pool, cutover_enabled, with_i13_receipt_signer, customize).await,
+    )
 }
 
 async fn acceptance_state(
     pool: DbPool,
     cutover_enabled: bool,
+    with_i13_receipt_signer: bool,
     customize: impl FnOnce(ChatRuntime) -> ChatRuntime,
 ) -> TestState {
     let key_id: String = sqlx::query_scalar(
@@ -347,9 +365,13 @@ async fn acceptance_state(
         "CHAT_CUTOVER_ENABLED",
         if cutover_enabled { "1" } else { "0" },
     );
-    let runtime = Arc::new(customize(
-        ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("runtime"),
-    ));
+    let runtime = ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("runtime");
+    let runtime = if with_i13_receipt_signer {
+        runtime.with_i13_receipt_signer(proof_i13_signer())
+    } else {
+        runtime
+    };
+    let runtime = Arc::new(customize(runtime));
     std::env::set_var("CHAT_CUTOVER_ENABLED", "0");
     TestState { pool, runtime }
 }

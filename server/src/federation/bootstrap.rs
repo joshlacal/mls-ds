@@ -12,7 +12,8 @@ use super::{
     outbound::{OutboundClient, OutboundError},
     peer_policy,
     reconciliation::{
-        fetch_discovery_payload, query_remote_digest, query_remote_events, StrictCleanRemoteEvent,
+        fetch_discovery_payload, query_remote_digest, query_remote_events,
+        verify_remote_event_receipt_from_peer, RemoteReceiptKeyCache, StrictCleanRemoteEvent,
         DIGEST_NSID, EVENTS_NSID, EVENTS_PAGE_LIMIT,
     },
     resolver::{DsResolver, ValidatedRemoteDestination},
@@ -742,6 +743,8 @@ pub async fn fetch_remote_prefix_admission(
 
     let mut from_seq = 0_i64;
     let mut events: Vec<StrictCleanRemoteEvent> = Vec::new();
+    let mut receipt_keys = RemoteReceiptKeyCache::new();
+    let mut receipt_coordinate: Option<serde_json::Value> = None;
     let mut total_canonical_material_bytes: usize = 0;
     let mut seen_entry_ids: HashSet<Uuid> = HashSet::new();
     let mut hasher = CleanConvoDigestHasher::new();
@@ -781,6 +784,18 @@ pub async fn fetch_remote_prefix_admission(
             if strict_event.seq() != rolling_last_seq + 1 {
                 return Err(RemotePrefixBootstrapError::InvalidEvent);
             }
+            let verified_coordinate = verify_remote_event_receipt_from_peer(
+                pool,
+                resolver,
+                selector.configured_sequencer_did(),
+                selector.conversation_id(),
+                &strict_event,
+                &mut receipt_keys,
+                receipt_coordinate.as_ref(),
+            )
+            .await
+            .map_err(|_| RemotePrefixBootstrapError::InvalidEvent)?;
+            receipt_coordinate = Some(verified_coordinate);
             rolling_last_seq = strict_event.seq();
             rolling_last_generation = strict_event.generation();
 
@@ -792,8 +807,9 @@ pub async fn fetch_remote_prefix_admission(
                 return Err(RemotePrefixBootstrapError::PrefixTooLarge);
             }
 
-            let material_bytes =
-                strict_event.accepted_payload_bytes().len() + strict_event.signed_request().len();
+            let material_bytes = strict_event.accepted_payload_bytes().len()
+                + strict_event.signed_request().len()
+                + strict_event.sequencer_receipt().len();
             total_canonical_material_bytes = total_canonical_material_bytes
                 .checked_add(material_bytes)
                 .ok_or(RemotePrefixBootstrapError::PrefixTooLarge)?;
@@ -1011,6 +1027,7 @@ pub async fn bootstrap_remote_mailbox_from_selector(
 mod tests {
     use super::super::reconciliation::RemoteEvent;
     use super::*;
+    use crate::federation::receipt::I13ReceiptSigner;
     use sha2::{Digest, Sha256};
 
     #[test]
@@ -1043,19 +1060,47 @@ mod tests {
     fn test_strict_event(seq: i64, kind: CleanEntryKind) -> StrictCleanRemoteEvent {
         let ciphertext = vec![1, 2, 3];
         let hash = Sha256::digest(&ciphertext).to_vec();
+        let created_at = chrono::Utc::now();
+        let entry_id = format!("00000000-0000-0000-0000-{seq:012x}");
+        let actor_device_id = Uuid::from_bytes([7; 16]);
+        let signer = I13ReceiptSigner::from_signing_key_for_test(
+            "did:web:strict-event.example".to_owned(),
+            p256::ecdsa::SigningKey::from_slice(&[0x63; 32]).unwrap(),
+        );
+        let signed_receipt = signer
+            .sign_application_receipt(
+                "00000000-0000-0000-0000-000000000000",
+                &[3; 32],
+                0,
+                "did:plc:strict-event",
+                &actor_device_id.to_string(),
+                &entry_id,
+                &[4; 32],
+                seq as u64,
+                created_at.timestamp_millis(),
+            )
+            .unwrap();
+        let receipt = I13ReceiptSigner::receipt_wire_json(
+            &signed_receipt,
+            0,
+            "did:plc:strict-event",
+            &actor_device_id.to_string(),
+        );
         StrictCleanRemoteEvent::try_from(RemoteEvent {
             seq,
             epoch: 0,
-            msg_id: format!("00000000-0000-0000-0000-{:012x}", seq),
+            msg_id: entry_id.clone(),
             message_type: kind.type_id().to_string(),
             accepted_payload_sha256: Some(hash),
             ciphertext,
             padded_size: 3,
-            created_at: chrono::Utc::now(),
-            entry_id: Some(format!("00000000-0000-0000-0000-{:012x}", seq)),
+            created_at,
+            entry_id: Some(entry_id),
             entry_kind: Some(kind.type_id().to_string()),
             signed_request: Some(vec![1; 64]),
             outer_fingerprint: Some(vec![2; 32]),
+            sequencer_receipt: Some(serde_json::to_vec(&receipt).unwrap()),
+            account_deleted_entry: None,
         })
         .expect("valid strict event")
     }

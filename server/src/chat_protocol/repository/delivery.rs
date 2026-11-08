@@ -2354,8 +2354,8 @@ pub(crate) const APPLICATION_ENTRY_KIND: &str = "blue.catbird.chat.defs#applicat
 /// forbids from re-appearing as duplicated projection fields. The outer
 /// fingerprint is carried alongside (not inside) the projection so a caller can
 /// assert the recomputed projection fingerprint equals the frozen column.
-/// Attach an immutable `I13` `sequencer_receipt_bytes` JSON payload to an
-/// accepted `applicationEntry` row inside the sequencing transaction.
+/// Attach an immutable `I13` `sequencer_receipt_bytes` JSON payload to one accepted entry inside
+/// the sequencing transaction. Exactly one previously unsigned row must exist.
 pub(crate) async fn set_entry_sequencer_receipt(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
@@ -2363,22 +2363,23 @@ pub(crate) async fn set_entry_sequencer_receipt(
     receipt_bytes: &[u8],
 ) -> Result<(), DeliveryRepositoryError> {
     let seq_i64 = i64::try_from(seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
-    sqlx::query(
+    let updated = sqlx::query(
         r#"
         UPDATE chat.entries
            SET sequencer_receipt_bytes = $3
          WHERE conversation_id = $1
            AND seq = $2
-           AND entry_kind = $4
            AND sequencer_receipt_bytes IS NULL
         "#,
     )
     .bind(conversation_id)
     .bind(seq_i64)
     .bind(receipt_bytes)
-    .bind(APPLICATION_ENTRY_KIND)
     .execute(&mut **transaction)
     .await?;
+    if updated.rows_affected() != 1 {
+        return Err(DeliveryRepositoryError::CompareAndSetConflict);
+    }
     Ok(())
 }
 

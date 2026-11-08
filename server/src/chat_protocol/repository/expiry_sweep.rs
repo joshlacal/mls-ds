@@ -591,6 +591,45 @@ pub async fn delete_unanswered_outbound_routes(
     Ok(result.rows_affected())
 }
 
+/// Delete expired member-home recovery routes and completed lifecycle replays.
+/// Active recovery bindings use the sequencer's deadline; exact response
+/// replays use the direct API's fixed 24-hour idempotency retention.
+pub async fn delete_expired_remote_lifecycle_state(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    limit: i64,
+) -> Result<u64, ExpirySweepError> {
+    let mut transaction = pool.begin().await?;
+    let bindings = sqlx::query(
+        "DELETE FROM chat.remote_lifecycle_recovery_bindings \
+          WHERE recovery_request_id IN ( \
+              SELECT recovery_request_id FROM chat.remote_lifecycle_recovery_bindings \
+               WHERE expires_at <= $1 ORDER BY expires_at,recovery_request_id \
+               LIMIT $2 FOR UPDATE SKIP LOCKED)",
+    )
+    .bind(now)
+    .bind(limit)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    let replays = sqlx::query(
+        "DELETE FROM chat.remote_lifecycle_operation_replays \
+          WHERE (actor_did,actor_device_id,endpoint_nsid,operation_id) IN ( \
+              SELECT actor_did,actor_device_id,endpoint_nsid,operation_id \
+                FROM chat.remote_lifecycle_operation_replays \
+               WHERE expires_at <= $1 \
+               ORDER BY expires_at,actor_did,actor_device_id,endpoint_nsid,operation_id \
+               LIMIT $2 FOR UPDATE SKIP LOCKED)",
+    )
+    .bind(now)
+    .bind(limit)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    transaction.commit().await?;
+    Ok(bindings + replays)
+}
+
 /// Hard 30-day ceiling sweep: prune any unpruned `applicationEntry` ciphertext older
 /// than 30 days while keeping contiguous `seq` skeletons and `sequencer_receipt_bytes`.
 /// A sequencer queues the same signed entries-pruned notices as an ACK prune in the

@@ -1037,13 +1037,14 @@ mod direct_request_history_tests {
         };
         let bytes =
             direct_request_signing_bytes(direct_kind, &serde_json::to_vec(&body).unwrap()).unwrap();
+        let request_digest = Sha256::digest(&bytes).into();
         let wrapper = json!({"body":body,"signature":STANDARD.encode(key.sign(&bytes).to_bytes())});
         let conversation = if kind == "directRequestEntry" {
             &wrapper["body"]["conversationId"]
         } else {
             &wrapper["body"]["prior"]["conversationId"]
         };
-        let entry = if kind == "directRequestEntry" {
+        let mut entry = if kind == "directRequestEntry" {
             crate::chat_protocol::direct_request_transcript::signed_opening_entry_for_test(
                 &wrapper,
                 seq,
@@ -1052,6 +1053,34 @@ mod direct_request_history_tests {
         } else {
             json!({"$type":format!("blue.catbird.chat.defs#{kind}"),"entryId":"00000000-0000-4000-8000-000000000009","conversationId":conversation,"seq":seq,"signedRequest":wrapper,"receivedAt":"2026-09-19T12:00:00.000Z"})
         };
+        if kind == "directRequestAcceptanceEntry" {
+            let body = &entry["signedRequest"]["body"];
+            let input = crate::federation::receipt::I13ControlReceiptInput::from_fields(
+                entry["conversationId"].as_str().unwrap(),
+                entry["entryId"].as_str().unwrap(),
+                seq,
+                entry["receivedAt"].as_str().unwrap(),
+                body["actorDid"].as_str().unwrap(),
+                body["actorDeviceId"].as_str().unwrap(),
+                request_digest,
+            )
+            .unwrap();
+            let group_id = STANDARD
+                .decode(body["next"]["groupId"].as_str().unwrap())
+                .unwrap();
+            entry["sequencerReceipt"] = crate::federation::receipt::I13ReceiptSigner::new(
+                p256::ecdsa::SigningKey::from_slice(&[11; 32]).unwrap(),
+                "did:web:chat.catbird.blue".to_owned(),
+            )
+            .sign_control_receipt_at(
+                &input,
+                entry["conversationId"].as_str().unwrap(),
+                body["next"]["generation"].as_u64().unwrap(),
+                &group_id,
+                body["next"]["epoch"].as_u64().unwrap(),
+            )
+            .unwrap();
+        }
         let row = serde_json::to_vec(&entry).unwrap();
         let signed = serde_json::to_vec(&wrapper).unwrap();
         // Dedicated admission remains mandatory; historical kinds are never v1 mutations.
@@ -1077,11 +1106,13 @@ mod direct_request_history_tests {
         assert_eq!(validate_transition_evidence(&evidence), expected_valid);
         let mut wire = entry.clone();
         wire.as_object_mut().unwrap().remove("$type");
-        let wire = serde_json::to_vec(&wire).unwrap();
         let expected = if kind == "directRequestEntry" {
+            let wire = serde_json::to_vec(&wire).unwrap();
             crate::chat_protocol::direct_request_transcript::direct_request_entry_hash(&wire)
                 .unwrap()
         } else {
+            wire.as_object_mut().unwrap().remove("sequencerReceipt");
+            let wire = serde_json::to_vec(&wire).unwrap();
             crate::chat_protocol::direct_request_transcript::direct_request_acceptance_entry_hash(
                 &wire,
             )
@@ -1472,5 +1503,49 @@ mod direct_request_history_tests {
                 key.verifying_key().as_bytes()
             )
             .is_err());
+    }
+
+    #[test]
+    fn device_revocation_evidence_preserves_admitted_future_clock_skew_boundary() {
+        let dev_id = *uuid::Uuid::parse_str("77777777-7777-4777-8777-777777777777")
+            .unwrap()
+            .as_bytes();
+        let rev_id = *uuid::Uuid::parse_str("88888888-8888-4888-8888-888888888888")
+            .unwrap()
+            .as_bytes();
+        let actor = DeviceIdentity::new(
+            PrincipalId::new(b"did:plc:alice0000000000000000000".to_vec()).unwrap(),
+            dev_id,
+        )
+        .unwrap();
+        let accepted_at = ServerTimestamp::from_unix_millis(1_800_000_000_000).unwrap();
+        let admitted_signed_at = ServerTimestamp::from_unix_millis(
+            accepted_at.unix_millis() + MAX_FIRST_EXECUTION_FUTURE_SKEW_MILLIS,
+        )
+        .unwrap();
+        let outside_signed_at = ServerTimestamp::from_unix_millis(
+            accepted_at.unix_millis() + MAX_FIRST_EXECUTION_FUTURE_SKEW_MILLIS + 1,
+        )
+        .unwrap();
+        let revocation = DeviceRevocationEvidence::for_test(
+            rev_id,
+            actor.clone(),
+            actor,
+            [0x55; 32],
+            1,
+            1,
+            admitted_signed_at,
+            accepted_at,
+            [0x56; 32],
+            [0x57; 64],
+            vec![0x58; 16],
+            vec![0x59; 16],
+        );
+        assert!(validate_device_revocation_evidence(&revocation));
+
+        let mut outside_revocation = revocation;
+        outside_revocation.signed_at = outside_signed_at;
+        outside_revocation.durable_row_digest = device_revocation_row_digest(&outside_revocation);
+        assert!(!validate_device_revocation_evidence(&outside_revocation));
     }
 }

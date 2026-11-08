@@ -49,19 +49,14 @@ pub(super) async fn handle(
     }
 }
 
-async fn submit(
+pub(super) async fn execute_admitted(
     pool: &DbPool,
     runtime: &ChatRuntime,
-    headers: &HeaderMap,
+    admission: crate::chat_protocol::repository::auth::SignedOperationAdmission,
     body: &[u8],
+    relay_home: Option<&str>,
 ) -> Result<Response, ChatFailure> {
-    let admission =
-        context::admit_signed_operation_only(pool, runtime, ENDPOINT, headers, body).await?;
-    if let Some(relayed) =
-        try_relay_remote_group_submit_transition(pool, runtime, &admission, body).await?
-    {
-        return Ok(relayed);
-    }
+    let actor = admission.subject().to_owned();
     let completed_preflight =
         crate::chat_protocol::repository::auth::preflight_completed_response(pool, &admission)
             .await
@@ -101,6 +96,34 @@ async fn submit(
     } else {
         None
     };
+    let conversation_id = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/signedRequest/body/prior/conversationId")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        });
+    let c33_control_home = match (completed_preflight, conversation_id, relay_home) {
+        (false, _, Some(home)) => Some(home.to_owned()),
+        (false, Some(conversation_id), None) => {
+            crate::federation::group_relay::C33PeerHomes::transition_peer_home(
+                pool,
+                conversation_id,
+                &actor,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(?error, "submitTransition C33 peer resolution failed");
+                ChatFailure::storage(ENDPOINT)
+            })?
+        }
+        _ => None,
+    };
+    if c33_control_home.is_some() && runtime.i13_receipt_signer().is_none() {
+        tracing::error!("C33 submitTransition refused without an I13 receipt signer");
+        return Err(ChatFailure::storage(ENDPOINT));
+    }
 
     let remote_commit = if completed_preflight {
         submit_transition::RemoteCommitPreflightOutcome::NotRemoteOrDeferred
@@ -131,6 +154,7 @@ async fn submit(
         SignedMutationKind::LeafRecoveryFulfillment => {
             let (resp, bytes) =
                 recovery::execute_prepared(&mut transaction, runtime, ENDPOINT, prepared).await?;
+            enqueue_c33_control(&mut transaction, c33_control_home.as_deref(), &bytes).await?;
             let (fanout, local_push) =
                 prepare_post_commit_work(&mut transaction, runtime, &bytes).await?;
             (resp, None, fanout, local_push)
@@ -143,12 +167,14 @@ async fn submit(
                 &mut transaction,
                 prepared,
                 runtime.relationship_authority().as_ref(),
+                runtime.i13_receipt_signer(),
                 routing_intent,
                 remote_commit,
             )
             .await
             .map_err(|error| submit_failure(mutation_kind, error))?;
             let bytes = outcome.response_bytes().to_vec();
+            enqueue_c33_control(&mut transaction, c33_control_home.as_deref(), &bytes).await?;
             let (fanout, local_push) =
                 prepare_post_commit_work(&mut transaction, runtime, &bytes).await?;
             let post_commit = matches!(
@@ -186,6 +212,36 @@ async fn submit(
     runtime.notify_events();
     Ok(response)
 }
+async fn submit(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Response, ChatFailure> {
+    let admission =
+        context::admit_signed_operation_only(pool, runtime, ENDPOINT, headers, body).await?;
+    if let Some(relayed) =
+        context::try_relay_remote_lifecycle(pool, runtime, ENDPOINT, &admission, body).await?
+    {
+        return Ok(relayed);
+    }
+    if let Some(relayed) =
+        try_relay_remote_group_submit_transition(pool, runtime, &admission, body).await?
+    {
+        return Ok(relayed);
+    }
+    let deferred_remote_transition = matches!(
+        admission.mutation_kind(),
+        SignedMutationKind::CommitTransition
+            | SignedMutationKind::PolicyTransition
+            | SignedMutationKind::MetadataTransition
+            | SignedMutationKind::LeaveCommitFulfillment
+    ) && runtime.commit_submitter().is_some();
+    if !deferred_remote_transition {
+        context::refuse_remote_sequencing(pool, ENDPOINT, &admission).await?;
+    }
+    execute_admitted(pool, runtime, admission, body, None).await
+}
 
 /// Capture remote group fan-out and local push audiences before commit.
 async fn prepare_post_commit_work(
@@ -212,6 +268,27 @@ async fn prepare_post_commit_work(
         None => None,
     };
     Ok((fanout, local_push))
+}
+
+async fn enqueue_c33_control(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    home: Option<&str>,
+    response_bytes: &[u8],
+) -> Result<(), ChatFailure> {
+    let Some(home) = home else {
+        return Ok(());
+    };
+    crate::federation::group_relay::enqueue_transport_control_response(
+        transaction,
+        home,
+        response_bytes,
+        crate::sim_hooks::current_utc(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(?error, "C33 control entry queueing failed");
+        ChatFailure::storage(ENDPOINT)
+    })
 }
 
 async fn try_relay_remote_group_submit_transition(
@@ -271,6 +348,7 @@ fn submit_failure(
     use SubmitTransitionFacadeError as E;
     match error {
         E::Database(_)
+        | E::Delivery(_)
         | E::RecoveryPackage(P::Database(_))
         | E::InvitationQuota(Q::Database(_))
         | E::Relationship(R::Database(_))

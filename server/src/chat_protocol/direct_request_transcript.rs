@@ -1756,6 +1756,73 @@ pub fn verify_received_signed_request(
     verified.accepted_wrapper = raw_wrapper.to_vec();
     Ok(verified)
 }
+/// Validate a stored acceptance entry while keeping the I13 receipt outside the
+/// legacy entry whose hash the acceptance-commit receipt signed.
+pub fn normalize_direct_request_acceptance_entry_with_i13(
+    value: &Value,
+) -> Result<(Value, Option<Value>)> {
+    let mut entry = value.clone();
+    let fields = entry
+        .as_object_mut()
+        .ok_or_else(|| error("acceptance entry"))?;
+    fields.remove("$type");
+    let receipt = fields.remove("sequencerReceipt");
+    if receipt.as_ref().is_some_and(|value| !value.is_object()) {
+        return Err(error("acceptance sequencer receipt"));
+    }
+    let entry = normalize_read_presentation(
+        &serde_json::to_vec(&entry).map_err(error)?,
+        "directRequestAcceptanceEntry",
+        false,
+    )?;
+    let receipt = receipt
+        .map(|receipt| {
+            normalize_read_presentation(
+                &serde_json::to_vec(&receipt).map_err(error)?,
+                "sequencerReceipt",
+                false,
+            )
+        })
+        .transpose()?;
+    Ok((entry, receipt))
+}
+
+/// Validate a stored receipt-bearing proof as two closed contracts. The I13
+/// extension is not part of the legacy acceptance-entry inclusion hash.
+pub fn normalize_direct_request_acceptance_proof_with_i13(
+    value: &Value,
+) -> Result<(Value, Option<Value>)> {
+    let mut proof = value.clone();
+    let (entry, receipt) = normalize_direct_request_acceptance_entry_with_i13(&proof["entry"])?;
+    proof["entry"] = entry;
+    let proof = normalize_read_presentation(
+        &serde_json::to_vec(&proof).map_err(error)?,
+        "directRequestAcceptanceProof",
+        false,
+    )?;
+    Ok((proof, receipt))
+}
+
+/// Verify the unchanged legacy proof, then restore its separately validated
+/// I13 receipt for read presentation.
+pub fn verify_received_direct_request_acceptance_proof_with_i13(
+    raw_proof: &[u8],
+    trusted_authority_key: &[u8],
+    recipient_device_key: &[u8],
+) -> Result<Value> {
+    strict_document(raw_proof)?;
+    let presented: Value = serde_json::from_slice(raw_proof).map_err(error)?;
+    let (legacy, receipt) = normalize_direct_request_acceptance_proof_with_i13(&presented)?;
+    let mut verified = verify_direct_request_acceptance_proof(
+        &serde_json::to_vec(&legacy).map_err(error)?,
+        trusted_authority_key,
+        recipient_device_key,
+    )?;
+    if let Some(receipt) = receipt {
+        verified["entry"]["sequencerReceipt"] = receipt;
+    }
+    Ok(verified)
+}
 
 /// Read-side counterpart: normalize nested byte presentations before strict
 /// signature verification and acceptance-entry/receipt equality checks.
@@ -2013,5 +2080,68 @@ mod read_presentation_tests {
             .unwrap(),
             expected
         );
+        let i13 = json!({
+            "archiveCommitment": STANDARD.encode(checked.request_digest()),
+            "conversationId": checked.body()["prior"]["conversationId"],
+            "entryId": bare["entry"]["entryId"],
+            "epoch": checked.body()["next"]["epoch"],
+            "generation": checked.body()["next"]["generation"],
+            "groupId": checked.body()["next"]["groupId"],
+            "issuedAtMs": 1_758_283_200_000_i64,
+            "kid": "did:web:chat.catbird.blue#mls-receipt-1",
+            "senderDeviceId": checked.body()["actorDeviceId"],
+            "senderDid": checked.body()["actorDid"],
+            "seq": 1,
+            "sequencerDid": "did:web:chat.catbird.blue",
+            "signature": STANDARD.encode([0_u8; 64]),
+        });
+        let mut extended = bare.clone();
+        extended["entry"]["sequencerReceipt"] = i13.clone();
+        assert!(verify_direct_request_acceptance_proof(
+            &serde_json::to_vec(&extended).unwrap(),
+            &authority,
+            &recipient
+        )
+        .is_err());
+        let mut verified = verify_received_direct_request_acceptance_proof_with_i13(
+            &serde_json::to_vec(&extended).unwrap(),
+            &authority,
+            &recipient,
+        )
+        .unwrap();
+        assert_eq!(
+            verified["entry"]
+                .as_object_mut()
+                .unwrap()
+                .remove("sequencerReceipt"),
+            Some(i13.clone())
+        );
+        assert_eq!(verified, expected);
+        let state = json!({
+            "acceptanceProof": extended.clone(),
+            "consent": "accepted",
+            "contextHash": STANDARD.encode([1_u8; 32]),
+            "firstMessageId": "22345678-1234-4234-8234-123456789abc",
+            "importUntil": "2026-09-19T12:00:00.000Z",
+            "preparationDigest": STANDARD.encode([2_u8; 32]),
+            "recipientDid": checked.body()["actorDid"],
+            "requestId": checked.body()["requestId"],
+            "senderDid": checked.body()["actorDid"],
+        });
+        let _: catbird_atproto::generated::blue_catbird::chat::DirectRequestState =
+            crate::chat_protocol::transcript::decode_direct_request_generated_view(
+                &serde_json::to_vec(&state).unwrap(),
+                "directRequestState",
+                false,
+            )
+            .unwrap();
+
+        extended["entry"]["sequencerReceipt"]["unknown"] = json!(true);
+        assert!(verify_received_direct_request_acceptance_proof_with_i13(
+            &serde_json::to_vec(&extended).unwrap(),
+            &authority,
+            &recipient,
+        )
+        .is_err());
     }
 }

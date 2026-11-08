@@ -71,6 +71,70 @@ impl Party {
         )
         .unwrap()
     }
+
+    fn reset_request(&self, prior: &Value) -> (Uuid, Value) {
+        let request_id = Uuid::new_v4();
+        let signed = sign_mutation_json_for_test(
+            &json!({
+                "$type": "blue.catbird.chat.defs#resetRequestBody",
+                "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\u{0}",
+                "resetRequestId": request_id,
+                "idempotencyKey": request_id,
+                "actorDid": self.did,
+                "actorDeviceId": self.device,
+                "keyId": self.key_id,
+                "authGeneration": 1,
+                "prior": prior,
+                "reason": "manualRecovery",
+                "signedAt": canonical(current_utc()),
+            }),
+            &self.signing_key(),
+        )
+        .unwrap();
+        (request_id, signed)
+    }
+
+    fn recovery_request(&self, prior: &Value) -> (Uuid, Value) {
+        let request_id = Uuid::new_v4();
+        let signed = sign_mutation_json_for_test(
+            &json!({
+                "$type": "blue.catbird.chat.defs#leafRecoveryRequestBody",
+                "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-REQUEST\u{0}",
+                "recoveryRequestId": request_id,
+                "idempotencyKey": request_id,
+                "actorDid": self.did,
+                "actorDeviceId": self.device,
+                "keyId": self.key_id,
+                "authGeneration": 1,
+                "prior": prior,
+                "recoveryKind": "replace",
+                "signedAt": canonical(current_utc()),
+            }),
+            &self.signing_key(),
+        )
+        .unwrap();
+        (request_id, signed)
+    }
+
+    fn cancel_recovery(&self, recovery_request_id: Uuid) -> (Uuid, Value) {
+        let operation_id = Uuid::new_v4();
+        let signed = sign_mutation_json_for_test(
+            &json!({
+                "$type": "blue.catbird.chat.defs#leafRecoveryCancellationBody",
+                "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-CANCEL\u{0}",
+                "recoveryRequestId": recovery_request_id,
+                "idempotencyKey": operation_id,
+                "actorDid": self.did,
+                "actorDeviceId": self.device,
+                "keyId": self.key_id,
+                "authGeneration": 1,
+                "signedAt": canonical(current_utc()),
+            }),
+            &self.signing_key(),
+        )
+        .unwrap();
+        (operation_id, signed)
+    }
 }
 
 /// Publish `user`'s one `blue.catbird.chat.device` record on its PDS.
@@ -130,7 +194,9 @@ struct Closing {
     home_hooks: Arc<SimDsHooks>,
     seq_key: SigningKey,
     home: GroupRelayState,
+    sequencer: GroupRelayState,
     router: Router,
+    home_router: Router,
     spawner: Arc<QueuedTaskSpawner>,
     queue: OutboundQueue,
     cid: Uuid,
@@ -159,6 +225,21 @@ impl Closing {
         for ds in [SEQ_DS, HOME_DS, OTHER_DS] {
             network.declare_delivery_service(ds);
         }
+        network
+            .documents
+            .lock()
+            .unwrap()
+            .get_mut(host(SEQ_DS))
+            .unwrap()["verificationMethod"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": format!("{SEQ_DS}#mls-receipt-1"),
+                "type": "Multikey",
+                "controller": SEQ_DS,
+                "publicKeyMultibase":
+                    crate::identity::did_doc::encode_p256_multikey(seq_key.verifying_key()),
+            }));
         network.declare_user(&actor.did, SEQ_DS);
         network.declare_user(&peer.did, HOME_DS);
         publish_device(
@@ -167,19 +248,71 @@ impl Closing {
             &actor.signing_key().verifying_key().to_bytes(),
         );
         let clock = manual_clock();
-        let seq_hooks = hooks(SEQ_DS, Some(&seq_key), false, &network);
-        // The home also admits this file's HMAC-authenticated direct deliveries.
+        // Both test DSes admit the harness's HMAC-authenticated S2S calls.
+        let seq_hooks = hooks(SEQ_DS, Some(&seq_key), true, &network);
         let home_hooks = hooks(HOME_DS, Some(&home_key), true, &network);
+        let resolver = |pool: &DbPool, did: &str| {
+            Arc::new(DsResolver::new(
+                pool.clone(),
+                build_resolver_http_client(),
+                did.to_owned(),
+                format!("https://{}", host(did)),
+                None,
+                300,
+            ))
+        };
+        let spawner = Arc::new(QueuedTaskSpawner::new());
+        let (router, seq_runtime) = {
+            let (spawner, hooks, clock, resolver, signer) = (
+                Arc::clone(&spawner),
+                Arc::clone(&seq_hooks),
+                Arc::clone(&clock),
+                resolver(&seq_pool, SEQ_DS),
+                crate::federation::receipt::I13ReceiptSigner::new(
+                    seq_key.clone(),
+                    SEQ_DS.to_owned(),
+                ),
+            );
+            http::router_and_runtime_for_authenticated_acceptance_with(
+                seq_pool.clone(),
+                move |runtime| {
+                    runtime
+                        .with_spawner(spawner)
+                        .with_sim_hooks(hooks)
+                        .with_clock(clock)
+                        .with_resolver(resolver)
+                        .with_i13_receipt_signer(signer)
+                },
+            )
+            .await
+        };
+        let (home_router, home_runtime) = {
+            let (hooks, clock, resolver) = (
+                Arc::clone(&home_hooks),
+                Arc::clone(&clock),
+                resolver(&home_pool, HOME_DS),
+            );
+            http::router_and_runtime_for_authenticated_acceptance_with(
+                home_pool.clone(),
+                move |runtime| {
+                    runtime
+                        .with_sim_hooks(hooks)
+                        .with_clock(clock)
+                        .with_resolver(resolver)
+                },
+            )
+            .await
+        };
         let state = |did: &str, pool: &DbPool, hooks: &Arc<SimDsHooks>| {
             GroupRelayState::for_test(pool.clone(), did.to_owned(), HMAC.as_bytes(), None)
                 .with_sim_hooks(Arc::clone(hooks))
                 .with_clock(clock.clone())
         };
-        let home = state(HOME_DS, &home_pool, &home_hooks);
-        network.serve(
-            SEQ_DS,
-            group_relay_router(state(SEQ_DS, &seq_pool, &seq_hooks)),
-        );
+        let home =
+            state(HOME_DS, &home_pool, &home_hooks).with_chat_runtime(Arc::clone(&home_runtime));
+        let sequencer =
+            state(SEQ_DS, &seq_pool, &seq_hooks).with_chat_runtime(Arc::clone(&seq_runtime));
+        network.serve(SEQ_DS, group_relay_router(sequencer.clone()));
         network.serve(HOME_DS, group_relay_router(home.clone()));
         // The peer's device is registered at its own home.
         seed_actor_at(
@@ -190,21 +323,6 @@ impl Closing {
             clock_now(&home_pool).await,
         )
         .await;
-        let spawner = Arc::new(QueuedTaskSpawner::new());
-        let router = {
-            let (spawner, hooks, clock) = (
-                Arc::clone(&spawner),
-                Arc::clone(&seq_hooks),
-                Arc::clone(&clock),
-            );
-            http::router_for_authenticated_acceptance_with(seq_pool.clone(), move |runtime| {
-                runtime
-                    .with_spawner(spawner)
-                    .with_sim_hooks(hooks)
-                    .with_clock(clock)
-            })
-            .await
-        };
         let queue = OutboundQueue::new(
             seq_pool.clone(),
             AuthMiddleware::new(),
@@ -227,6 +345,8 @@ impl Closing {
             home_hooks,
             seq_key,
             home,
+            sequencer,
+            home_router,
             router,
             spawner,
             queue,
@@ -250,15 +370,27 @@ impl Closing {
         party: &Party,
         signed: Value,
     ) -> (StatusCode, Option<String>, Value) {
+        let (status, retry_after, bytes) = self.close_bytes(party, signed, false).await;
+        (
+            status,
+            retry_after,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// `party`'s exact lifecycle answer through either its home or the coordinator.
+    async fn lifecycle_bytes(
+        &self,
+        party: &Party,
+        endpoint: &'static str,
+        signed: Value,
+        at_home: bool,
+    ) -> (StatusCode, Option<String>, Vec<u8>) {
         use tower_util::ServiceExt as _;
-        // The harness mints the client's service-auth token on the wall clock.
         let wall = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
         self.clock.set_utc(wall.max(current_utc()));
-        // One service-auth key per party, however often it closes.
         let signing = p256::ecdsa::SigningKey::from_slice(&Sha256::digest(party.seed)).unwrap();
         let jwk = http::public_jwk(&signing);
-        // The party's DID document, which also names its PDS for the home's
-        // resolver, carries the key its service-auth JWT verifies with.
         self.network
             .documents
             .lock()
@@ -278,10 +410,14 @@ impl Closing {
             signing,
         };
         let body = serde_json::to_vec(&json!({ "signedRequest": signed })).unwrap();
-        scope_sim_ds(Arc::clone(&self.seq_hooks), async {
-            let request =
-                http::unsigned_json_request(&device, "blue.catbird.chat.closeConversation", body);
-            let response = self.router.clone().oneshot(request).await.unwrap();
+        let (hooks, router) = if at_home {
+            (Arc::clone(&self.home_hooks), self.home_router.clone())
+        } else {
+            (Arc::clone(&self.seq_hooks), self.router.clone())
+        };
+        scope_sim_ds(hooks, async {
+            let request = http::unsigned_json_request(&device, endpoint, body);
+            let response = router.oneshot(request).await.unwrap();
             let retry_after = response
                 .headers()
                 .get(axum::http::header::RETRY_AFTER)
@@ -290,13 +426,63 @@ impl Closing {
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
-            (
-                status,
-                retry_after,
-                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-            )
+            (status, retry_after, bytes.to_vec())
         })
         .await
+    }
+
+    async fn close_bytes(
+        &self,
+        party: &Party,
+        signed: Value,
+        at_home: bool,
+    ) -> (StatusCode, Option<String>, Vec<u8>) {
+        self.lifecycle_bytes(
+            party,
+            "blue.catbird.chat.closeConversation",
+            signed,
+            at_home,
+        )
+        .await
+    }
+
+    /// Send one exact signed close over the S2S lifecycle route.
+    async fn relay_close_direct(&self, party: &Party, signed: Value) -> (StatusCode, Value) {
+        let exact = serde_json::to_vec(&signed).unwrap();
+        let request = RelayGroupMutationRequest {
+            conversation_id: self.cid,
+            endpoint: "blue.catbird.chat.closeConversation".to_owned(),
+            actor_did: party.did.clone(),
+            actor_device_id: party.device,
+            signed_request: signed,
+            signed_request_bytes: Some(STANDARD.encode(exact)),
+        };
+        let body = serde_json::to_vec(&request).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(S2S_CALLER_DID_HEADER, HOME_DS.parse().unwrap());
+        headers.insert(S2S_TARGET_DID_HEADER, SEQ_DS.parse().unwrap());
+        headers.insert(
+            S2S_MAC_HEADER,
+            compute_s2s_mac(
+                HMAC.as_bytes(),
+                HOME_DS,
+                SEQ_DS,
+                "blue.catbird.mlsDS.relayGroupMutation",
+                &body,
+            )
+            .parse()
+            .unwrap(),
+        );
+        let response = scope_sim_ds(
+            Arc::clone(&self.seq_hooks),
+            handle_relay_group_mutation(State(self.sequencer.clone()), headers, Bytes::from(body)),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
     }
 
     /// The coordinator's one queued delivery of `cid`'s close, to the peer's home.
@@ -728,6 +914,427 @@ async fn a_c33_close_wipes_the_accepted_pairs_transport_only_home() {
                 assert!(!residue(pool, &application).await.is_empty());
             }
             c.close_and_relay(&[OPENING, &application]).await;
+        }),
+    )
+    .await;
+}
+
+/// D sends its signed close only to D's home. The home relays the exact bytes;
+/// the coordinator alone sequences and signs, then delivers that entry back.
+#[tokio::test]
+async fn a_c33_peer_close_at_its_home_is_sequenced_only_by_the_coordinator() {
+    let (dbs, seq_pool, home_pool) = databases().await;
+    let fixture = seed_clean_slate_application_fixture_with_sender_home(
+        &seq_pool,
+        true,
+        SEQ_DS,
+        Some([0x6e; 32]),
+        None,
+    )
+    .await
+    .unwrap();
+    let actor = Party {
+        did: fixture.recipient_did.clone(),
+        device: fixture.recipient_device_id,
+        key_id: fixture.recipient_key_id.clone(),
+        seed: fixture.recipient_ed25519_seed,
+    };
+    let peer = Party {
+        did: fixture.sender_did.clone(),
+        device: fixture.sender_device_id,
+        key_id: fixture.sender_key_id.clone(),
+        seed: fixture.sender_ed25519_seed,
+    };
+    let prior = fixture.signed_request["body"]["prior"].clone();
+    let c = Closing::new(
+        dbs,
+        seq_pool,
+        home_pool,
+        fixture.conversation_id,
+        actor,
+        peer,
+        prior,
+    )
+    .await;
+    scope_ds_clock(
+        c.clock.clone(),
+        Box::pin(async {
+            c.hold_opening(&c.peer, &c.actor, "accepted").await;
+            let transition = Uuid::new_v4();
+            let mismatched = c.peer.signed_close(&c.prior, transition, Uuid::new_v4());
+            let (probe_status, probe) = c.relay_close_direct(&c.peer, mismatched).await;
+            assert_eq!(
+                probe_status,
+                StatusCode::BAD_REQUEST,
+                "C33 S2S admission must reach ordinary close semantics: {probe}"
+            );
+            let signed = c.peer.close(&c.prior);
+            let home_before: (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM chat.events), \
+                        (SELECT count(*) FROM chat.conversation_close_terminal_entries)",
+            )
+            .fetch_one(&c.home_pool)
+            .await
+            .unwrap();
+
+            let (status, retry_after, first) = c.close_bytes(&c.peer, signed.clone(), true).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&first)
+            );
+            assert_eq!(retry_after, None);
+            let (replay_status, _, replay) = c.close_bytes(&c.peer, signed.clone(), true).await;
+            assert_eq!(
+                replay_status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&replay)
+            );
+            assert_eq!(replay, first, "relay replay returns exact response bytes");
+            let body: Value = serde_json::from_slice(&first).unwrap();
+            assert_eq!(
+                body["result"]["entry"]["sequencerReceipt"]["sequencerDid"], SEQ_DS,
+                "the coordinator signed the retained entry"
+            );
+
+            let home_after: (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM chat.events), \
+                        (SELECT count(*) FROM chat.conversation_close_terminal_entries)",
+            )
+            .fetch_one(&c.home_pool)
+            .await
+            .unwrap();
+            assert_eq!(home_after, home_before, "the home did not sequence or sign");
+            let coordinator_closes: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM chat.conversation_close_terminal_entries")
+                    .fetch_one(&c.seq_pool)
+                    .await
+                    .unwrap();
+            assert_eq!(coordinator_closes, 1);
+
+            c.spawner.drain_all().await;
+            assert!(queue_rows(&c.seq_pool, c.cid).await.is_empty());
+            c.assert_closed(&body["result"]["entry"], &[OPENING]).await;
+            let (closed_replay_status, _, closed_replay) =
+                c.close_bytes(&c.peer, signed, true).await;
+            assert_eq!(
+                closed_replay_status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&closed_replay)
+            );
+            assert_eq!(
+                closed_replay, first,
+                "the transport home retains the coordinator's exact response after close delivery"
+            );
+        }),
+    )
+    .await;
+}
+
+/// A recovery request through a C33 transport-only home is durably routable,
+/// byte-exact on retry, and its cancellation deletes the short-lived binding.
+#[tokio::test]
+async fn a_c33_peer_recovery_round_trip_uses_transport_only_home_bindings() {
+    let (dbs, seq_pool, home_pool) = databases().await;
+    let fixture = seed_clean_slate_application_fixture_with_sender_home(
+        &seq_pool,
+        true,
+        SEQ_DS,
+        Some([0x70; 32]),
+        None,
+    )
+    .await
+    .unwrap();
+    let actor = Party {
+        did: fixture.recipient_did.clone(),
+        device: fixture.recipient_device_id,
+        key_id: fixture.recipient_key_id.clone(),
+        seed: fixture.recipient_ed25519_seed,
+    };
+    let peer = Party {
+        did: fixture.sender_did.clone(),
+        device: fixture.sender_device_id,
+        key_id: fixture.sender_key_id.clone(),
+        seed: fixture.sender_ed25519_seed,
+    };
+    let c = Closing::new(
+        dbs,
+        seq_pool,
+        home_pool,
+        fixture.conversation_id,
+        actor,
+        peer,
+        fixture.signed_request["body"]["prior"].clone(),
+    )
+    .await;
+    scope_ds_clock(
+        c.clock.clone(),
+        Box::pin(async {
+            c.hold_opening(&c.peer, &c.actor, "accepted").await;
+            let now = current_utc();
+            let package_owner =
+                crate::common::executor_seed::genuine_terminal_fixture::AcceptanceInvitee {
+                    did: c.peer.did.clone(),
+                    device_id: c.peer.device,
+                    key_id: c.peer.key_id.clone(),
+                    signing_key: c.peer.signing_key(),
+                    participant_period_id: Uuid::new_v4(),
+                };
+            let (package_ref, wrapper, not_before, not_after) =
+                crate::common::executor_seed::genuine_terminal_fixture::
+                    build_genuine_invitee_key_package(
+                        &package_owner,
+                        now,
+                        now - chrono::Duration::hours(1),
+                        now + chrono::Duration::days(1),
+                    );
+            crate::common::executor_seed::seed_genuine_key_package_at(
+                &c.seq_pool,
+                &c.peer.did,
+                c.peer.device,
+                &c.peer.key_id,
+                &package_ref,
+                &wrapper,
+                not_before,
+                not_after,
+                now,
+            )
+            .await;
+            let home_conversation: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id=$1)",
+            )
+            .bind(c.cid)
+            .fetch_one(&c.home_pool)
+            .await
+            .unwrap();
+            assert!(!home_conversation, "the home must remain transport-only");
+
+            let (recovery_id, signed_request) = c.peer.recovery_request(&c.prior);
+            let (status, _, first) = c
+                .lifecycle_bytes(
+                    &c.peer,
+                    "blue.catbird.chat.requestLeafRecovery",
+                    signed_request.clone(),
+                    true,
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&first)
+            );
+            let (retry_status, _, retry) = c
+                .lifecycle_bytes(
+                    &c.peer,
+                    "blue.catbird.chat.requestLeafRecovery",
+                    signed_request,
+                    true,
+                )
+                .await;
+            assert_eq!(retry_status, StatusCode::OK);
+            assert_eq!(
+                retry, first,
+                "recovery retry must return exact coordinator bytes"
+            );
+            let retained: Vec<u8> = sqlx::query_scalar(
+                "SELECT response_bytes FROM chat.remote_lifecycle_recovery_bindings \
+                 WHERE recovery_request_id=$1",
+            )
+            .bind(recovery_id)
+            .fetch_one(&c.home_pool)
+            .await
+            .unwrap();
+            assert_eq!(retained, first);
+
+            let (cancel_id, signed_cancel) = c.peer.cancel_recovery(recovery_id);
+            let (cancel_status, _, cancel_first) = c
+                .lifecycle_bytes(
+                    &c.peer,
+                    "blue.catbird.chat.cancelLeafRecovery",
+                    signed_cancel.clone(),
+                    true,
+                )
+                .await;
+            assert_eq!(
+                cancel_status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&cancel_first)
+            );
+            let (cancel_retry_status, _, cancel_retry) = c
+                .lifecycle_bytes(
+                    &c.peer,
+                    "blue.catbird.chat.cancelLeafRecovery",
+                    signed_cancel,
+                    true,
+                )
+                .await;
+            assert_eq!(cancel_retry_status, StatusCode::OK);
+            assert_eq!(cancel_retry, cancel_first);
+            let state: String = sqlx::query_scalar(
+                "SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+            )
+            .bind(recovery_id)
+            .fetch_one(&c.seq_pool)
+            .await
+            .unwrap();
+            assert_eq!(state, "cancelled");
+            let binding: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.remote_lifecycle_recovery_bindings \
+                 WHERE recovery_request_id=$1",
+            )
+            .bind(recovery_id)
+            .fetch_one(&c.home_pool)
+            .await
+            .unwrap();
+            assert_eq!(binding, 0);
+            let replay_rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.remote_lifecycle_operation_replays \
+                 WHERE operation_id IN ($1,$2)",
+            )
+            .bind(recovery_id)
+            .bind(cancel_id)
+            .fetch_one(&c.home_pool)
+            .await
+            .unwrap();
+            assert_eq!(replay_rows, 2);
+        }),
+    )
+    .await;
+}
+
+/// The accepted pair's admin sends `requestReset` only to its transport home.
+/// The coordinator is the sole sequencer/signer and delivers the exact entry back.
+#[tokio::test]
+async fn a_c33_peer_reset_request_at_home_is_sequenced_only_by_the_coordinator() {
+    let (dbs, seq_pool, home_pool) = databases().await;
+    let fixture = seed_clean_slate_application_fixture_with_sender_home(
+        &seq_pool,
+        true,
+        SEQ_DS,
+        Some([0x6f; 32]),
+        None,
+    )
+    .await
+    .unwrap();
+    let actor = Party {
+        did: fixture.recipient_did.clone(),
+        device: fixture.recipient_device_id,
+        key_id: fixture.recipient_key_id.clone(),
+        seed: fixture.recipient_ed25519_seed,
+    };
+    let peer = Party {
+        did: fixture.sender_did.clone(),
+        device: fixture.sender_device_id,
+        key_id: fixture.sender_key_id.clone(),
+        seed: fixture.sender_ed25519_seed,
+    };
+    let prior = fixture.signed_request["body"]["prior"].clone();
+    let c = Closing::new(
+        dbs,
+        seq_pool,
+        home_pool,
+        fixture.conversation_id,
+        actor,
+        peer,
+        prior,
+    )
+    .await;
+    scope_ds_clock(
+        c.clock.clone(),
+        Box::pin(async {
+            c.hold_opening(&c.peer, &c.actor, "accepted").await;
+            let predecessors: Vec<Vec<u8>> = sqlx::query_scalar(
+                "SELECT accepted_payload_bytes FROM chat.entries \
+                  WHERE conversation_id=$1 AND seq>1 ORDER BY seq",
+            )
+            .bind(c.cid)
+            .fetch_all(&c.seq_pool)
+            .await
+            .unwrap();
+            for bytes in predecessors {
+                c.store(&serde_json::from_slice(&bytes).unwrap()).await;
+            }
+            let (_, signed) = c.peer.reset_request(&c.prior);
+            let home_before: (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM chat.entries WHERE conversation_id=$1), \
+                        (SELECT count(*) FROM chat.reset_requests WHERE conversation_id=$1)",
+            )
+            .bind(c.cid)
+            .fetch_one(&c.home_pool)
+            .await
+            .unwrap();
+            let (status, retry_after, first) = c
+                .lifecycle_bytes(
+                    &c.peer,
+                    "blue.catbird.chat.requestReset",
+                    signed.clone(),
+                    true,
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&first)
+            );
+            assert_eq!(retry_after, None);
+            let (replay_status, _, replay) = c
+                .lifecycle_bytes(&c.peer, "blue.catbird.chat.requestReset", signed, true)
+                .await;
+            assert_eq!(replay_status, StatusCode::OK);
+            assert_eq!(replay, first);
+            let body: Value = serde_json::from_slice(&first).unwrap();
+            let entry = body
+                .get("entry")
+                .or_else(|| body.pointer("/result/entry"))
+                .expect("reset response entry");
+            assert_eq!(entry["sequencerReceipt"]["sequencerDid"], SEQ_DS);
+            let home_after: (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM chat.entries WHERE conversation_id=$1), \
+                        (SELECT count(*) FROM chat.reset_requests WHERE conversation_id=$1)",
+            )
+            .bind(c.cid)
+            .fetch_one(&c.home_pool)
+            .await
+            .unwrap();
+            assert_eq!(home_after, home_before, "the home did not sequence or sign");
+            let coordinator_resets: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.reset_requests WHERE conversation_id=$1",
+            )
+            .bind(c.cid)
+            .fetch_one(&c.seq_pool)
+            .await
+            .unwrap();
+            assert_eq!(coordinator_resets, 1);
+
+            c.spawner.drain_all().await;
+            c.drain_queue().await;
+            let queued = queue_rows(&c.seq_pool, c.cid).await;
+            assert!(
+                matches!(
+                    queued.as_slice(),
+                    [(id, target, status, 0, _, _)]
+                        if id.starts_with(&format!("transport-control-{}-", c.cid))
+                            && target == HOME_DS
+                            && status == "delivered"
+                ),
+                "one delivered reset entry: {queued:?}"
+            );
+            let mirrored: Vec<u8> = sqlx::query_scalar(
+                "SELECT entry_bytes FROM chat.direct_request_transport_entries \
+                 WHERE conversation_id=$1 AND seq=$2",
+            )
+            .bind(c.cid)
+            .bind(entry["seq"].as_i64().unwrap())
+            .fetch_one(&c.home_pool)
+            .await
+            .unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&mirrored).unwrap(), *entry);
         }),
     )
     .await;

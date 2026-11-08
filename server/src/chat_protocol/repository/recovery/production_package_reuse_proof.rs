@@ -32,12 +32,14 @@ async fn execute(
     let (status, bytes) = if is_policy {
         let outcome =
         crate::chat_protocol::repository::submit_transition::execute_prepared_submit_transition(
-            &mut tx, prepared, relationship, None,
+            &mut tx, prepared, relationship, None, None,
             crate::chat_protocol::repository::submit_transition::RemoteCommitPreflightOutcome::NotRemoteOrDeferred,
         ).await.map_err(|e| format!("execute {endpoint}: {e:?}"))?;
         (outcome.status(), outcome.response_bytes().to_vec())
     } else {
-        let outcome = execute_prepared_recovery(&mut tx, prepared, relationship)
+        let signer = proof_i13_signer();
+        let outcome =
+            execute_prepared_recovery(&mut tx, prepared, relationship, Some(&signer))
             .await
             .map_err(|e| format!("execute {endpoint}: {e:?}"))?;
         (outcome.status(), outcome.response_bytes().to_vec())

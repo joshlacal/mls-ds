@@ -72,10 +72,11 @@ async fn owned_database() -> (PgPool, DisposableDatabase) {
     // 20261104000001-02, 20261104000005-08, 20261104000010-12). The guard had
     // stayed red since the first of them; the disposable fixture must still
     // match this exact stage inventory. The seed-2323 send-order fix added
-    // 20261107000001 (144).
+    // 20261107000001 (144); the remote lifecycle recovery binding and
+    // operation replay state added 20261113000001 (145).
     assert_eq!(
         expected.len(),
-        144,
+        145,
         "exact deployed stage migration inventory"
     );
     let applied: Vec<(i64, bool, Vec<u8>)> =

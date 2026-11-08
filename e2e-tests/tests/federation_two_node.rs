@@ -13,7 +13,7 @@ use catbird_mls::chat_v2::transcript::strict_json::decode_strict_json;
 use catbird_mls::chat_v2::transcript::{
     project_signed_body, SignedMutationKind, SigningTranscript,
 };
-use catbird_mls::orchestrator::{canonical_application_aad_bytes, canonical_commit_aad_bytes};
+use catbird_mls::orchestrator::{canonical_commit_aad_bytes, MLSMessagePayload};
 use chrono::{DateTime, SecondsFormat, Utc};
 use mls_e2e_tests::federation::{boot_two_node_cluster, TwoNodeCluster};
 use mls_e2e_tests::mls_engine::MlsEngine;
@@ -712,6 +712,7 @@ fn make_message_body(
     epoch: u64,
     group_context_hash: &[u8; 32],
     confirmation_tag: &[u8; 32],
+    aad: Value,
     ciphertext: &[u8],
     now: DateTime<Utc>,
 ) -> (Value, Vec<u8>) {
@@ -735,15 +736,7 @@ fn make_message_body(
             "confirmationTag": STANDARD.encode(confirmation_tag),
             "lifecycle": "active"
         },
-        "aad": application_aad(
-            convo_id,
-            message_id,
-            group_id,
-            state_version,
-            epoch,
-            group_context_hash,
-            confirmation_tag,
-        ),
+        "aad": aad,
         "applicationMessage": {
             "framing": "mlsMessage",
             "contentType": "privateMessageApplication",
@@ -1380,13 +1373,19 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     let bob_group_id = bob.engine.process_welcome(&welcome_data, &bob_credential)?;
 
     let msg1_id = Uuid::new_v4();
-    let msg1_text = b"Hello Bob from Alice after remote-prefix bootstrap!";
+    let msg1_text = "Hello Bob from Alice after remote-prefix bootstrap!";
+    let msg1_payload = MLSMessagePayload::text(msg1_text).encode()?;
     let msg1_aad = application_aad(convo_id, msg1_id, &group_id, 2, 1, &sv2_gch, &sv2_ctag);
-    let msg1_aad = canonical_application_aad_bytes(&msg1_aad)
-        .map_err(|error| anyhow::anyhow!("canonical message AAD: {error}"))?;
-    let (msg1_ciphertext, _) = alice
-        .engine
-        .encrypt_with_aad(&group_id, msg1_text, &msg1_aad)?;
+    let (msg1_aad, msg1_aad_bytes, msg1_plaintext) = mls_e2e_tests::archive_bound_application(
+        &alice.engine,
+        &alice_credential,
+        msg1_aad,
+        &msg1_payload,
+    )?;
+    let (msg1_ciphertext, _) =
+        alice
+            .engine
+            .encrypt_with_aad(&group_id, &msg1_plaintext, &msg1_aad_bytes)?;
 
     let (msg1_wrapper, _) = make_message_body(
         convo_id,
@@ -1397,6 +1396,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         1,
         &sv2_gch,
         &sv2_ctag,
+        msg1_aad,
         &msg1_ciphertext,
         now,
     );
@@ -1438,9 +1438,22 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     );
 
     let decrypted1 = bob.engine.decrypt(&bob_group_id, &msg1_ciphertext)?;
+    let (decrypted1_text, _, decrypted1_commitment, decrypted1_attestation) =
+        catbird_mls::messaging::receive::extract_plaintext_body_and_verify_aad(
+            &decrypted1,
+            &msg1_aad_bytes,
+        )?;
     assert_eq!(
-        decrypted1, msg1_text,
+        decrypted1_text, msg1_text,
         "Bob successfully decrypted message 1 on DS2"
+    );
+    assert!(
+        decrypted1_commitment.is_some(),
+        "message 1 decryption must verify its archive commitment"
+    );
+    assert!(
+        decrypted1_attestation.is_some(),
+        "message 1 decryption must verify its original-sender attestation"
     );
 
     let _message_receipt_at = wait_for_signed_receipt(
@@ -1602,7 +1615,8 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     cluster.pause_service("ds2")?;
 
     let msg2_id = Uuid::new_v4();
-    let msg2_text = b"Message 2 sent while DS2 was paused!";
+    let msg2_text = "Message 2 sent while DS2 was paused!";
+    let msg2_payload = MLSMessagePayload::text(msg2_text).encode()?;
     let msg2_aad = application_aad(
         convo_id,
         msg2_id,
@@ -1612,11 +1626,16 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         &commit_gch,
         &commit_ctag,
     );
-    let msg2_aad = canonical_application_aad_bytes(&msg2_aad)
-        .map_err(|error| anyhow::anyhow!("canonical message AAD: {error}"))?;
-    let (msg2_ciphertext, _) = alice
-        .engine
-        .encrypt_with_aad(&group_id, msg2_text, &msg2_aad)?;
+    let (msg2_aad, msg2_aad_bytes, msg2_plaintext) = mls_e2e_tests::archive_bound_application(
+        &alice.engine,
+        &alice_credential,
+        msg2_aad,
+        &msg2_payload,
+    )?;
+    let (msg2_ciphertext, _) =
+        alice
+            .engine
+            .encrypt_with_aad(&group_id, &msg2_plaintext, &msg2_aad_bytes)?;
     let (msg2_wrapper, _) = make_message_body(
         convo_id,
         msg2_id,
@@ -1626,6 +1645,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         2,
         &commit_gch,
         &commit_ctag,
+        msg2_aad,
         &msg2_ciphertext,
         Utc::now(),
     );
@@ -1707,9 +1727,22 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     }
 
     let decrypted2 = bob.engine.decrypt(&bob_group_id, &msg2_ciphertext)?;
+    let (decrypted2_text, _, decrypted2_commitment, decrypted2_attestation) =
+        catbird_mls::messaging::receive::extract_plaintext_body_and_verify_aad(
+            &decrypted2,
+            &msg2_aad_bytes,
+        )?;
     assert_eq!(
-        decrypted2, msg2_text,
+        decrypted2_text, msg2_text,
         "Bob successfully decrypted message 2 on DS2"
+    );
+    assert!(
+        decrypted2_commitment.is_some(),
+        "message 2 decryption must verify its archive commitment"
+    );
+    assert!(
+        decrypted2_attestation.is_some(),
+        "message 2 decryption must verify its original-sender attestation"
     );
 
     Ok(())

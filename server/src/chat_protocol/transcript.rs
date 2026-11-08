@@ -1223,6 +1223,9 @@ impl CanonicalSignedMutation {
     pub fn signed_at(&self) -> &CanonicalTimestamp {
         body_timestamp(&self.body, "signedAt")
     }
+    pub(crate) fn conversation_id(&self) -> Result<&CanonicalUuidV4, AuthPrimitiveError> {
+        signed_body_conversation_id(self)
+    }
 
     /// Return the exact client-generated operation identity for this signed
     /// mutation. Clean application sends and typing publications deliberately
@@ -1254,7 +1257,10 @@ impl CanonicalSignedMutation {
     pub fn recovery_request_id(&self) -> Result<&CanonicalUuidV4, AuthPrimitiveError> {
         if !matches!(
             self.kind,
-            SignedMutationKind::ParticipantAcceptance | SignedMutationKind::LeafRecoveryFulfillment
+            SignedMutationKind::LeafRecoveryRequest
+                | SignedMutationKind::LeafRecoveryCancellation
+                | SignedMutationKind::ParticipantAcceptance
+                | SignedMutationKind::LeafRecoveryFulfillment
         ) {
             return Err(AuthPrimitiveError::invalid("recovery mutation kind"));
         }
@@ -2879,7 +2885,7 @@ control_entry_kinds!(
         DirectRequestAcceptance,
         "directRequestAcceptanceEntry",
         DirectRequestAcceptance,
-        &[]
+        &["sequencerReceipt"]
     ),
     (Commit, "commitEntry", CommitTransition, &[]),
     (Policy, "policyEntry", PolicyTransition, &[]),
@@ -2947,6 +2953,7 @@ impl ControlEntryKind {
 }
 
 pub const APPLICATION_ENTRY_TYPE_ID: &str = "blue.catbird.chat.defs#applicationEntry";
+pub const ACCOUNT_DELETED_ENTRY_TYPE_ID: &str = "blue.catbird.chat.defs#accountDeletedEntry";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CleanEntryKind {
@@ -2967,10 +2974,11 @@ pub(crate) enum CleanEntryKind {
     /// Encrypted first-contact entries (encrypted-requests line).
     DirectRequestPublication,
     DirectRequestAcceptance,
+    AccountDeletion,
 }
 
 impl CleanEntryKind {
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 17] = [
         Self::Application,
         Self::Commit,
         Self::Policy,
@@ -2987,6 +2995,7 @@ impl CleanEntryKind {
         Self::LeaveCommitFulfillment,
         Self::DirectRequestPublication,
         Self::DirectRequestAcceptance,
+        Self::AccountDeletion,
     ];
 
     pub(crate) const fn type_id(self) -> &'static str {
@@ -3007,14 +3016,18 @@ impl CleanEntryKind {
             Self::LeaveCommitFulfillment => ControlEntryKind::LeaveCommitFulfillment.type_id(),
             Self::DirectRequestPublication => ControlEntryKind::DirectRequestPublication.type_id(),
             Self::DirectRequestAcceptance => ControlEntryKind::DirectRequestAcceptance.type_id(),
+            Self::AccountDeletion => ACCOUNT_DELETED_ENTRY_TYPE_ID,
         }
+    }
+    pub(crate) const fn requires_sequencer_receipt(self) -> bool {
+        !matches!(self, Self::AccountDeletion)
     }
 
     pub(crate) fn from_type_id(value: &str) -> Option<Self> {
-        if value == APPLICATION_ENTRY_TYPE_ID {
-            Some(Self::Application)
-        } else {
-            ControlEntryKind::from_type_id(value).map(Self::from_control_kind)
+        match value {
+            APPLICATION_ENTRY_TYPE_ID => Some(Self::Application),
+            ACCOUNT_DELETED_ENTRY_TYPE_ID => Some(Self::AccountDeletion),
+            _ => ControlEntryKind::from_type_id(value).map(Self::from_control_kind),
         }
     }
 
@@ -4102,9 +4115,13 @@ fn finish_verified_control_entry(
                 ])),
             ),
         ]);
-        // Publication rows carry their I13 and signed-outcome receipts as
-        // server fields; the write-time entry hash covers them.
-        row.extend(server_fields.clone());
+        // Publication receipts are part of its write-time entry hash. An acceptance's
+        // independently signed I13 receipt is attached after its legacy commit hash.
+        for (name, value) in &server_fields {
+            if kind != ControlEntryKind::DirectRequestAcceptance || name != "sequencerReceipt" {
+                row.insert(name.clone(), value.clone());
+            }
+        }
         let canonical_projection = serde_ipld_dagcbor::to_vec(&DagMapRef(&row))
             .map_err(|_| AuthPrimitiveError::invalid("direct entry canonical encoding"))?;
         let domain: &[u8] = match kind {
@@ -4451,8 +4468,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clean_entry_kind_matches_all_sixteen_definitions() {
-        assert_eq!(CleanEntryKind::ALL.len(), 16);
+    fn clean_entry_kind_matches_all_seventeen_definitions() {
+        assert_eq!(CleanEntryKind::ALL.len(), 17);
         for kind in CleanEntryKind::ALL {
             let type_id = kind.type_id();
             assert!(type_id.starts_with("blue.catbird.chat.defs#"));

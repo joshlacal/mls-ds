@@ -88,6 +88,17 @@ fn truthy_env_var(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn validate_receipt_startup(
+    receipt_issuance_required: bool,
+    receipt_signer_configured: bool,
+) -> Result<(), &'static str> {
+    if receipt_issuance_required && !receipt_signer_configured {
+        Err("chat or federation receipt issuance requires RECEIPT_ISSUANCE_MODE=issue and a valid receipt signer")
+    } else {
+        Ok(())
+    }
+}
+
 fn is_production_environment() -> bool {
     let explicit_env = std::env::var("APP_ENV")
         .or_else(|_| std::env::var("ENVIRONMENT"))
@@ -603,6 +614,28 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Receipt issuance is a startup prerequisite for clean chat. Validate it
+    // before opening the database or starting any worker.
+    let fed_config = federation::FederationConfig::from_env();
+    tracing::info!(
+        federation_enabled = fed_config.enabled,
+        federation_mode = fed_config.mode.as_str(),
+        self_did = %fed_config.self_did,
+        self_endpoint = %fed_config.self_endpoint,
+        "Federation config loaded"
+    );
+    // The one receipt signer: the commit sequencer, the chat runtime and the
+    // group relay all issue with this validated key, or none of them do.
+    let receipt_signer = fed_config
+        .receipt_signer()
+        .unwrap_or_else(|error| panic!("Invalid sequencer receipt configuration: {error}"))
+        .map(Arc::new);
+    validate_receipt_startup(
+        truthy_env_var("CHAT_CUTOVER_ENABLED") || fed_config.enabled,
+        receipt_signer.is_some(),
+    )
+    .unwrap_or_else(|error| panic!("Refusing to start: {error}"));
+
     // Offline DID fixtures (strictly gated to APP_ENV=test). Install the HTTPS
     // fixture resolver first so seeded documents land in its cache.
     #[cfg(feature = "test-support")]
@@ -674,14 +707,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Shared JTI cleanup worker started");
 
     // ── Federation setup ──────────────────────────────────────────────
-    let fed_config = federation::FederationConfig::from_env();
-    tracing::info!(
-        federation_enabled = fed_config.enabled,
-        federation_mode = fed_config.mode.as_str(),
-        self_did = %fed_config.self_did,
-        self_endpoint = %fed_config.self_endpoint,
-        "Federation config loaded"
-    );
 
     let http_client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(
@@ -783,12 +808,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // The one receipt signer: the commit sequencer, the chat runtime and the
-    // group relay all issue with this validated key, or none of them do.
-    let receipt_signer = fed_config
-        .receipt_signer()
-        .unwrap_or_else(|error| panic!("Invalid sequencer receipt configuration: {error}"))
-        .map(Arc::new);
     let receipt_did_document = if receipt_signer.is_some() {
         Some(
             serde_json::from_str(
@@ -1089,13 +1108,13 @@ async fn main() -> anyhow::Result<()> {
         .with_state(app_state.clone());
 
     let ds_router = ds_router.merge(catbird_server::federation::group_relay::group_relay_router(
-        catbird_server::federation::group_relay::GroupRelayState::new(
+        catbird_server::federation::group_relay::GroupRelayState::for_production(
             db_pool.clone(),
             fed_config.self_did.clone(),
             receipt_signer,
             app_state.chat_runtime.push_gateway_client().cloned(),
-        )
-        .with_relationship_authority_of(&app_state.chat_runtime),
+            Arc::clone(&app_state.chat_runtime),
+        ),
     ));
 
     let chat_router =
@@ -1304,6 +1323,18 @@ mod tests {
         Arc,
     };
     use tower_util::ServiceExt;
+
+    #[test]
+    fn chat_or_federation_receipt_issuance_requires_signer_at_startup() {
+        assert_eq!(
+            validate_receipt_startup(true, false),
+            Err(
+                "chat or federation receipt issuance requires RECEIPT_ISSUANCE_MODE=issue and a valid receipt signer"
+            )
+        );
+        assert_eq!(validate_receipt_startup(true, true), Ok(()));
+        assert_eq!(validate_receipt_startup(false, false), Ok(()));
+    }
 
     async fn consume_body(body: Bytes) -> StatusCode {
         let _ = body;

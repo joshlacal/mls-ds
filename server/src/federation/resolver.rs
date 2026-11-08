@@ -2721,18 +2721,32 @@ pub(crate) async fn send_hardened_resolution_request(
                 )),
             })?
         } else {
-            reqwest::Client::builder()
-                .user_agent("catbird-mls-ds/1.0")
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .resolve_to_addrs(&destination.host, &destination.addrs)
-                .build()
-                .map_err(|e| FederationError::ResolutionFailed {
-                    did: did.to_string(),
-                    kind: ResolutionFailureKind::InvalidConfiguration(format!(
-                        "{context}: client build failed: {e}"
-                    )),
-                })?
+            static RESOLUTION_PINNED_POOL: LazyLock<
+                Mutex<BTreeMap<(String, Vec<SocketAddr>), reqwest::Client>>,
+            > = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+            let pool_key = (destination.host.clone(), destination.addrs.clone());
+            let cached = RESOLUTION_PINNED_POOL.lock().await.get(&pool_key).cloned();
+            if let Some(cached) = cached {
+                cached
+            } else {
+                let built = reqwest::Client::builder()
+                    .user_agent("catbird-mls-ds/1.0")
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .resolve_to_addrs(&destination.host, &destination.addrs)
+                    .build()
+                    .map_err(|e| FederationError::ResolutionFailed {
+                        did: did.to_string(),
+                        kind: ResolutionFailureKind::InvalidConfiguration(format!(
+                            "{context}: client build failed: {e}"
+                        )),
+                    })?;
+                let mut guard = RESOLUTION_PINNED_POOL.lock().await;
+                if guard.len() < 256 {
+                    guard.insert(pool_key, built.clone());
+                }
+                built
+            }
         };
 
     send_resolution_request(client.get(destination.url.clone()), deadline, did, context).await
@@ -2839,14 +2853,6 @@ pub fn build_resolver_http_client() -> reqwest::Client {
         return client;
     }
 
-    #[allow(unused_mut)]
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .pool_max_idle_per_host(10)
-        .user_agent("catbird-mls-ds/1.0");
-
     #[cfg(any(test, feature = "test-support"))]
     if let (Ok(hosts), Ok(port_str), Ok(ca_path)) = (
         std::env::var("REQUEST_FIXTURE_DID_HOSTS"),
@@ -2856,19 +2862,37 @@ pub fn build_resolver_http_client() -> reqwest::Client {
         if let (Ok(port), Ok(ca_pem)) = (port_str.parse::<u16>(), std::fs::read(&ca_path)) {
             if let Ok(cert) = reqwest::Certificate::from_pem(&ca_pem) {
                 let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-                builder = builder
+                let mut builder = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .pool_max_idle_per_host(10)
+                    .user_agent("catbird-mls-ds/1.0")
                     .tls_built_in_root_certs(false)
                     .add_root_certificate(cert);
                 for host in hosts.split(',').map(str::trim).filter(|h| !h.is_empty()) {
                     builder = builder.resolve(host, loopback);
                 }
+                return builder
+                    .build()
+                    .expect("failed to build fixture federation resolver HTTP client");
             }
         }
     }
 
-    builder
-        .build()
-        .expect("failed to build federation resolver HTTP client")
+    static RESOLVER_HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    RESOLVER_HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .pool_max_idle_per_host(10)
+                .user_agent("catbird-mls-ds/1.0")
+                .build()
+                .expect("failed to build federation resolver HTTP client")
+        })
+        .clone()
 }
 
 #[cfg(test)]

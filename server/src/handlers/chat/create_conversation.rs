@@ -99,6 +99,7 @@ async fn handle_inner(
         &mut transaction,
         prepared,
         runtime.relationship_authority().as_ref(),
+        runtime.i13_receipt_signer(),
         routing_intent,
     )
     .await
@@ -132,7 +133,7 @@ fn creation_failure(endpoint: ChatEndpoint, error: CreationFacadeError) -> ChatF
     use StateMachineError as S;
 
     match error {
-        E::Database(_) => ChatFailure::storage(endpoint),
+        E::Database(_) | E::Delivery(_) => ChatFailure::storage(endpoint),
         E::Prelude(PreludeError::Authorization(error)) => {
             context::auth_repository_failure(endpoint, error)
         }

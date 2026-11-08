@@ -340,8 +340,9 @@ pub struct FederationConfig {
     pub self_endpoint: String,
     /// PEM-encoded ES256 private key for signing outbound service auth JWTs.
     pub signing_key_pem: Option<String>,
-    /// `disabled` (default) or `issue`. Issue mode fails startup closed unless
-    /// the dedicated receipt key and versioned verification method are valid.
+    /// `disabled` (the local default, valid only while chat cutover is off) or
+    /// `issue`. Issue mode fails startup closed unless the dedicated receipt key
+    /// and versioned verification method are valid.
     pub receipt_issuance_mode: Option<String>,
     /// Dedicated ES256 receipt key. This must never reuse `signing_key_pem`.
     pub receipt_signing_key_pem: Option<String>,
@@ -474,6 +475,7 @@ impl FederationConfig {
     /// The process's one receipt signer, which startup shares with every
     /// issuer: `None` unless `RECEIPT_ISSUANCE_MODE=issue`, and issue mode
     /// refuses startup unless the key, method and published history validate.
+    /// Process startup separately refuses `None` when chat cutover is enabled.
     pub fn receipt_signer(&self) -> Result<Option<receipt::I13ReceiptSigner>, ReceiptConfigError> {
         configured_receipt_signer(
             self.receipt_issuance_mode.as_deref(),

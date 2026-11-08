@@ -2457,15 +2457,18 @@ pub(crate) async fn prepare_signed_operation(
         });
     }
 
-    // Only submitTransition exposes this terminal nonacceptance proof. The
-    // operation lock is held and no durable claim exists; completed operations
-    // already took the age-independent replay branch above. Verify the exact
-    // device signature before distinguishing an expired-past timestamp from
-    // cryptographic failure. Future timestamps retain ordinary auth errors.
+    // Only submitTransition and createConversation expose this terminal
+    // nonacceptance proof. The operation lock is held and no durable claim
+    // exists; completed operations already took the age-independent replay
+    // branch above. Verify the exact device signature before distinguishing an
+    // expired-past timestamp from cryptographic failure. Future timestamps
+    // retain ordinary auth errors.
     let signed_at = admission.canonical().signed_at();
     let trusted = admission.pre_replay().trusted_instant();
-    if binding.endpoint_nsid == "blue.catbird.chat.submitTransition"
-        && signed_at.datetime() < trusted.datetime()
+    if matches!(
+        binding.endpoint_nsid.as_str(),
+        "blue.catbird.chat.submitTransition" | "blue.catbird.chat.createConversation"
+    ) && signed_at.datetime() < trusted.datetime()
         && crate::chat_protocol::validation::validate_first_execution_signed_at(signed_at, trusted)
             .is_err()
     {

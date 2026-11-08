@@ -440,12 +440,25 @@ impl SignedOperationAdmission {
     pub(crate) fn mutation_kind(&self) -> super::super::transcript::SignedMutationKind {
         self.canonical.kind()
     }
+    pub(crate) fn conversation_id(&self) -> Result<Uuid, AuthRepositoryError> {
+        self.canonical
+            .conversation_id()
+            .map(|id| Uuid::from_bytes(*id.as_bytes()))
+            .map_err(AuthRepositoryError::from)
+    }
+
+    pub(crate) fn recovery_request_id(&self) -> Result<Uuid, AuthRepositoryError> {
+        self.canonical
+            .recovery_request_id()
+            .map(|id| Uuid::from_bytes(*id.as_bytes()))
+            .map_err(AuthRepositoryError::from)
+    }
 
     pub(super) fn signing_public_key(&self) -> &[u8] {
         &self.signing_public_key
     }
 
-    pub(super) fn operation_id(&self) -> Result<Uuid, AuthRepositoryError> {
+    pub(crate) fn operation_id(&self) -> Result<Uuid, AuthRepositoryError> {
         operation_id_from_canonical(&self.canonical)
     }
     pub(crate) fn creation_participant_dids(&self) -> Result<Vec<String>, AuthRepositoryError> {
@@ -508,9 +521,10 @@ pub(crate) async fn preflight_completed_response(
     };
     // An erased receipt (O7) keeps no response to replay; its operation stays spent.
     let response_bytes = response_bytes.ok_or(AuthRepositoryError::IdempotencyConflict)?;
-    if request_digest.as_slice() != admission.canonical.request_digest()
-        || response_sha256.as_slice() != Sha256::digest(&response_bytes).as_slice()
-    {
+    if request_digest.as_slice() != admission.canonical.request_digest() {
+        return Err(AuthRepositoryError::IdempotencyConflict);
+    }
+    if response_sha256.as_slice() != Sha256::digest(&response_bytes).as_slice() {
         return Err(AuthRepositoryError::CorruptIdempotencyRecord);
     }
     Ok(Some(CompletedResponsePreflight {

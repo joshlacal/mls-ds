@@ -1,6 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
+use p256::ecdsa::VerifyingKey;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -77,6 +79,14 @@ pub enum StrictCleanRemoteEventError {
     InvalidSignedRequestLength(usize),
     #[error("invalid outer fingerprint length: expected 32, got {0}")]
     InvalidOuterFingerprintLength(usize),
+    #[error("invalid sequencer receipt length: {0}")]
+    InvalidSequencerReceiptLength(usize),
+    #[error("account-deletion event has an unexpected sequencer receipt")]
+    UnexpectedSequencerReceipt,
+    #[error("non-deletion event has an unexpected account-deletion entry")]
+    UnexpectedAccountDeletedEntry,
+    #[error("account-deletion entry is not an object")]
+    InvalidAccountDeletedEntry,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -89,6 +99,8 @@ pub struct StrictCleanRemoteEvent {
     accepted_payload_sha256: [u8; 32],
     signed_request: Vec<u8>,
     outer_fingerprint: [u8; 32],
+    sequencer_receipt: Vec<u8>,
+    account_deleted_entry: Option<serde_json::Value>,
     received_at: DateTime<Utc>,
 }
 
@@ -123,6 +135,13 @@ impl StrictCleanRemoteEvent {
 
     pub fn outer_fingerprint(&self) -> &[u8; 32] {
         &self.outer_fingerprint
+    }
+
+    pub fn sequencer_receipt(&self) -> &[u8] {
+        &self.sequencer_receipt
+    }
+    pub fn account_deleted_entry(&self) -> Option<&serde_json::Value> {
+        self.account_deleted_entry.as_ref()
     }
 
     pub fn received_at(&self) -> DateTime<Utc> {
@@ -182,6 +201,37 @@ impl TryFrom<RemoteEvent> for StrictCleanRemoteEvent {
             StrictCleanRemoteEventError::InvalidOuterFingerprintLength(fingerprint.len())
         })?;
 
+        let account_deleted_entry = event.account_deleted_entry;
+        let sequencer_receipt =
+            if entry_kind == CleanEntryKind::AccountDeletion {
+                if event.sequencer_receipt.is_some() {
+                    return Err(StrictCleanRemoteEventError::UnexpectedSequencerReceipt);
+                }
+                let entry = account_deleted_entry.as_ref().ok_or(
+                    StrictCleanRemoteEventError::MissingField("accountDeletedEntry"),
+                )?;
+                if !entry.is_object() {
+                    return Err(StrictCleanRemoteEventError::InvalidAccountDeletedEntry);
+                }
+                Vec::new()
+            } else {
+                if account_deleted_entry.is_some() {
+                    return Err(StrictCleanRemoteEventError::UnexpectedAccountDeletedEntry);
+                }
+                let receipt =
+                    event
+                        .sequencer_receipt
+                        .ok_or(StrictCleanRemoteEventError::MissingField(
+                            "sequencerReceipt",
+                        ))?;
+                if receipt.is_empty() || receipt.len() > 1_048_576 {
+                    return Err(StrictCleanRemoteEventError::InvalidSequencerReceiptLength(
+                        receipt.len(),
+                    ));
+                }
+                receipt
+            };
+
         Ok(Self {
             seq: event.seq,
             generation: event.epoch,
@@ -191,6 +241,8 @@ impl TryFrom<RemoteEvent> for StrictCleanRemoteEvent {
             accepted_payload_sha256,
             signed_request,
             outer_fingerprint,
+            sequencer_receipt,
+            account_deleted_entry,
             received_at: event.created_at,
         })
     }
@@ -217,6 +269,368 @@ pub struct RemoteEvent {
     pub signed_request: Option<Vec<u8>>,
     #[serde(default, with = "crate::atproto_bytes::option")]
     pub outer_fingerprint: Option<Vec<u8>>,
+    #[serde(default, with = "crate::atproto_bytes::option")]
+    pub sequencer_receipt: Option<Vec<u8>>,
+    #[serde(default)]
+    pub account_deleted_entry: Option<serde_json::Value>,
+}
+
+pub(crate) type RemoteReceiptKeyCache = HashMap<String, VerifyingKey>;
+
+fn receipt_text<'a>(receipt: &'a serde_json::Value, field: &str) -> Result<&'a str, String> {
+    receipt
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("sequencer receipt {field} is missing"))
+}
+
+fn receipt_u64(receipt: &serde_json::Value, field: &str) -> Result<u64, String> {
+    receipt
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("sequencer receipt {field} is missing"))
+}
+
+fn receipt_bytes(receipt: &serde_json::Value, field: &str) -> Result<Vec<u8>, String> {
+    let value = receipt
+        .get(field)
+        .ok_or_else(|| format!("sequencer receipt {field} is missing"))?;
+    let encoded = value
+        .as_str()
+        .or_else(|| value.get("$bytes").and_then(serde_json::Value::as_str))
+        .ok_or_else(|| format!("sequencer receipt {field} is not bytes"))?;
+    STANDARD
+        .decode(encoded)
+        .map_err(|_| format!("sequencer receipt {field} is not base64"))
+}
+
+fn verify_application_event_receipt(
+    event: &StrictCleanRemoteEvent,
+    receipt: &serde_json::Value,
+    key: &VerifyingKey,
+    expected_sequencer: &str,
+    expected_conversation_id: uuid::Uuid,
+) -> Result<serde_json::Value, String> {
+    let expected_entry_id = event.entry_id().to_string();
+    let expected_seq = u64::try_from(event.seq())
+        .map_err(|_| "application event seq is outside the protocol domain".to_owned())?;
+    let mutation =
+        crate::chat_protocol::transcript::decode_canonical_signed_mutation(event.signed_request())
+            .map_err(|_| "application signedRequest is invalid".to_owned())?;
+    if mutation.kind() != crate::chat_protocol::transcript::SignedMutationKind::ApplicationSend {
+        return Err("application event carries another mutation kind".to_owned());
+    }
+    let signed: serde_json::Value = serde_json::from_slice(event.signed_request())
+        .map_err(|_| "application signedRequest is not JSON".to_owned())?;
+    let body = signed
+        .get("body")
+        .ok_or_else(|| "application signedRequest has no body".to_owned())?;
+    let prior = body
+        .get("prior")
+        .ok_or_else(|| "application signedRequest has no prior coordinate".to_owned())?;
+    let aad = body
+        .get("aad")
+        .ok_or_else(|| "application signedRequest has no AAD".to_owned())?;
+    let prior_conversation = receipt_text(prior, "conversationId")?;
+    let prior_generation = receipt_u64(prior, "generation")?;
+    let prior_epoch = receipt_u64(prior, "epoch")?;
+    let prior_group_id = receipt_bytes(prior, "groupId")?;
+    let archive_commitment: [u8; 32] = receipt_bytes(aad, "archiveCommitment")?
+        .try_into()
+        .map_err(|_| "application archive commitment has the wrong length".to_owned())?;
+
+    let receipt_group_id = receipt_bytes(receipt, "groupId")?;
+    let receipt_commitment: [u8; 32] = receipt_bytes(receipt, "archiveCommitment")?
+        .try_into()
+        .map_err(|_| "sequencer receipt archive commitment has the wrong length".to_owned())?;
+    let signature: [u8; 64] = receipt_bytes(receipt, "signature")?
+        .try_into()
+        .map_err(|_| "sequencer receipt signature has the wrong length".to_owned())?;
+    let issued_at_ms = event.received_at().timestamp_millis();
+    let expected_generation = u64::try_from(event.generation())
+        .map_err(|_| "application generation is outside the protocol domain".to_owned())?;
+    let expected_sequencer = canonical_did(expected_sequencer);
+    if prior_conversation != expected_conversation_id.to_string()
+        || prior_generation != expected_generation
+        || canonical_did(receipt_text(receipt, "sequencerDid")?) != expected_sequencer
+        || receipt_text(receipt, "conversationId")? != expected_conversation_id.to_string()
+        || receipt_text(receipt, "entryId")? != expected_entry_id
+        || receipt_u64(receipt, "seq")? != expected_seq
+        || receipt
+            .get("issuedAtMs")
+            .and_then(serde_json::Value::as_i64)
+            != Some(issued_at_ms)
+        || receipt_text(receipt, "senderDid")? != mutation.actor_did().as_str()
+        || receipt_text(receipt, "senderDeviceId")? != mutation.actor_device_id().as_str()
+        || receipt_commitment != archive_commitment
+        || receipt_u64(receipt, "generation")? != expected_generation
+        || receipt_u64(receipt, "epoch")? != prior_epoch
+        || receipt_group_id != prior_group_id
+    {
+        return Err("application sequencer receipt binding mismatch".to_owned());
+    }
+
+    labyrinth_protocol::receipt::verify_sequencer_receipt(
+        key,
+        expected_sequencer,
+        &labyrinth_protocol::receipt::SignedSequencerReceipt {
+            payload: labyrinth_protocol::receipt::SequencerReceiptPayload {
+                sequencer_did: expected_sequencer.to_owned(),
+                conversation_id: expected_conversation_id.to_string(),
+                group_id: receipt_group_id,
+                epoch: prior_epoch,
+                sender_device_did_url: format!(
+                    "{}#{}",
+                    mutation.actor_did().as_str(),
+                    mutation.actor_device_id().as_str()
+                ),
+                entry_id: expected_entry_id,
+                archive_commitment,
+                seq: expected_seq,
+                issued_at_ms,
+            },
+            key_id: receipt_text(receipt, "kid")?.to_owned(),
+            signature,
+        },
+    )
+    .map_err(|_| "application sequencer receipt signature is invalid".to_owned())?;
+    Ok(prior.clone())
+}
+
+fn verify_control_event_receipt(
+    event: &StrictCleanRemoteEvent,
+    receipt: &serde_json::Value,
+    key: &VerifyingKey,
+    expected_sequencer: &str,
+    expected_conversation_id: uuid::Uuid,
+    predecessor_coordinate: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut entry: serde_json::Value = serde_json::from_slice(event.accepted_payload_bytes())
+        .map_err(|_| "control entry is not JSON".to_owned())?;
+    entry
+        .as_object_mut()
+        .ok_or_else(|| "control entry is not an object".to_owned())?
+        .remove("sequencerReceipt");
+    let entry_id = event.entry_id().to_string();
+    let conversation_id = expected_conversation_id.to_string();
+    let seq = u64::try_from(event.seq())
+        .map_err(|_| "control event seq is outside the protocol domain".to_owned())?;
+    let received_at = event
+        .received_at()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if entry
+        .get("conversationId")
+        .and_then(serde_json::Value::as_str)
+        != Some(conversation_id.as_str())
+        || entry.get("entryId").and_then(serde_json::Value::as_str) != Some(entry_id.as_str())
+        || entry.get("seq").and_then(serde_json::Value::as_u64) != Some(seq)
+        || entry.get("receivedAt").and_then(serde_json::Value::as_str) != Some(received_at.as_str())
+    {
+        return Err("control event metadata does not match its accepted entry".to_owned());
+    }
+    let entry_bytes = serde_json::to_vec(&entry).map_err(|error| error.to_string())?;
+    let mutation =
+        crate::chat_protocol::transcript::decode_control_entry_mutation_unverified(&entry_bytes)
+            .map_err(|_| "control accepted entry is invalid".to_owned())?;
+    let body = entry
+        .pointer("/signedRequest/body")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "control entry has no signed body".to_owned())?;
+    let coordinate = crate::federation::receipt::control_receipt_coordinate(
+        mutation.kind(),
+        body,
+        predecessor_coordinate,
+    )?;
+    let coordinate_generation = coordinate
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "control receipt coordinate has no generation".to_owned())?;
+    let event_generation = u64::try_from(event.generation())
+        .map_err(|_| "control event generation is outside the protocol domain".to_owned())?;
+    if event_generation != coordinate_generation {
+        return Err("control event generation does not match its receipt coordinate".to_owned());
+    }
+    let input = crate::federation::receipt::I13ControlReceiptInput::from_fields(
+        &conversation_id,
+        &entry_id,
+        seq,
+        &received_at,
+        mutation.actor_did().as_str(),
+        mutation.actor_device_id().as_str(),
+        *mutation.request_digest(),
+    )?;
+    crate::federation::receipt::verify_control_receipt(
+        receipt,
+        key,
+        expected_sequencer,
+        &input,
+        coordinate,
+    )?;
+    Ok(coordinate.clone())
+}
+
+fn parse_bound_account_deletion(
+    event: &StrictCleanRemoteEvent,
+    expected_sequencer: &str,
+    expected_conversation_id: uuid::Uuid,
+) -> Result<
+    (
+        crate::federation::receipt::AccountDeletion,
+        crate::federation::receipt::AccountDeletionAuthority,
+    ),
+    String,
+> {
+    let entry = event
+        .account_deleted_entry()
+        .ok_or_else(|| "account-deletion event has no signed entry".to_owned())?;
+    let (deletion, authority) = crate::federation::receipt::AccountDeletion::from_entry(entry)?;
+    let payload: serde_json::Value = serde_json::from_slice(event.accepted_payload_bytes())
+        .map_err(|_| "account-deletion accepted payload is not JSON".to_owned())?;
+    let expected_received_at = event
+        .received_at()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let expected_conversation_id_string = expected_conversation_id.to_string();
+    let expected_entry_id = event.entry_id().to_string();
+    if event.signed_request() != event.accepted_payload_bytes()
+        || !crate::identity::dids_equivalent(&deletion.sequencer_did, expected_sequencer)
+        || deletion.conversation_id != expected_conversation_id
+        || deletion.entry_id != event.entry_id()
+        || deletion.seq != event.seq()
+        || deletion.deleted_at.timestamp_millis() != event.received_at().timestamp_millis()
+        || payload.get("$type").and_then(serde_json::Value::as_str)
+            != Some(crate::chat_protocol::transcript::ACCOUNT_DELETED_ENTRY_TYPE_ID)
+        || payload
+            .get("conversationId")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_conversation_id_string.as_str())
+        || payload.get("entryId").and_then(serde_json::Value::as_str)
+            != Some(expected_entry_id.as_str())
+        || payload.get("seq").and_then(serde_json::Value::as_i64) != Some(event.seq())
+        || payload
+            .get("generation")
+            .and_then(serde_json::Value::as_i64)
+            != Some(event.generation())
+        || payload
+            .get("stateVersion")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        || payload
+            .get("deletedDid")
+            .and_then(serde_json::Value::as_str)
+            != Some(deletion.deleted_did.as_str())
+        || payload
+            .get("sequencerDid")
+            .and_then(serde_json::Value::as_str)
+            != Some(deletion.sequencer_did.as_str())
+        || payload
+            .get("receivedAt")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_received_at.as_str())
+    {
+        return Err("account-deletion event binding mismatch".to_owned());
+    }
+    Ok((deletion, authority))
+}
+
+/// Verify a separately transported I13 receipt before its event can enter a
+/// sealed prefix admission or reconciliation suffix.
+pub async fn verify_remote_event_receipt(
+    resolver: &DsResolver,
+    expected_sequencer: &str,
+    expected_conversation_id: uuid::Uuid,
+    event: &StrictCleanRemoteEvent,
+    keys: &mut RemoteReceiptKeyCache,
+    predecessor_coordinate: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    if event.entry_kind() == CleanEntryKind::AccountDeletion {
+        let (deletion, authority) =
+            parse_bound_account_deletion(event, expected_sequencer, expected_conversation_id)?;
+        let key_id = authority.key_id.clone();
+        if !keys.contains_key(&key_id) {
+            let bytes = resolver
+                .resolve_i13_receipt_key(expected_sequencer, &key_id)
+                .await
+                .map_err(|error| format!("resolve account-deletion authority key: {error}"))?;
+            let key = VerifyingKey::from_sec1_bytes(&bytes)
+                .map_err(|_| "account-deletion authority key is not P-256".to_owned())?;
+            keys.insert(key_id.clone(), key);
+        }
+        authority.verify(
+            keys.get(&key_id)
+                .ok_or_else(|| "account-deletion authority key disappeared".to_owned())?,
+            &deletion,
+        )?;
+        return predecessor_coordinate
+            .cloned()
+            .ok_or_else(|| "account-deletion event has no predecessor coordinate".to_owned());
+    }
+    let receipt: serde_json::Value = serde_json::from_slice(event.sequencer_receipt())
+        .map_err(|_| "sequencer receipt is not JSON".to_owned())?;
+    if !receipt.is_object() {
+        return Err("sequencer receipt is not an object".to_owned());
+    }
+    let key_id = receipt_text(&receipt, "kid")?.to_owned();
+    if !keys.contains_key(&key_id) {
+        let bytes = resolver
+            .resolve_i13_receipt_key(expected_sequencer, &key_id)
+            .await
+            .map_err(|error| format!("resolve sequencer receipt key: {error}"))?;
+        let key = VerifyingKey::from_sec1_bytes(&bytes)
+            .map_err(|_| "sequencer receipt key is not P-256".to_owned())?;
+        keys.insert(key_id.clone(), key);
+    }
+    let key = keys
+        .get(&key_id)
+        .ok_or_else(|| "sequencer receipt key disappeared".to_owned())?;
+    if event.entry_kind() == CleanEntryKind::Application {
+        verify_application_event_receipt(
+            event,
+            &receipt,
+            key,
+            expected_sequencer,
+            expected_conversation_id,
+        )
+    } else {
+        verify_control_event_receipt(
+            event,
+            &receipt,
+            key,
+            expected_sequencer,
+            expected_conversation_id,
+            predecessor_coordinate,
+        )
+    }
+}
+
+/// Verify one event supplied by a peer and charge only exporter-controlled
+/// proof failures to that exporter. Key-resolution failures remain retryable
+/// infrastructure failures and do not affect peer standing.
+pub async fn verify_remote_event_receipt_from_peer(
+    pool: &PgPool,
+    resolver: &DsResolver,
+    expected_sequencer: &str,
+    expected_conversation_id: uuid::Uuid,
+    event: &StrictCleanRemoteEvent,
+    keys: &mut RemoteReceiptKeyCache,
+    predecessor_coordinate: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let result = verify_remote_event_receipt(
+        resolver,
+        expected_sequencer,
+        expected_conversation_id,
+        event,
+        keys,
+        predecessor_coordinate,
+    )
+    .await;
+    if let Err(error) = &result {
+        if !error.starts_with("resolve sequencer receipt key:")
+            && !error.starts_with("resolve account-deletion authority key:")
+        {
+            peer_policy::record_rejected(pool, expected_sequencer).await;
+        }
+    }
+    result
 }
 #[derive(Debug)]
 pub(crate) struct LocalDigestState {
@@ -392,6 +806,7 @@ pub async fn reconcile_conversation(
         pool,
         convo_uuid,
         sequencer_ds,
+        resolver,
         &destination,
         outbound,
         auth_sign,
@@ -447,6 +862,7 @@ async fn reconcile_clean_conversation(
     pool: &PgPool,
     convo_uuid: uuid::Uuid,
     sequencer_ds: &str,
+    resolver: &DsResolver,
     destination: &ValidatedRemoteDestination,
     outbound: &OutboundClient,
     auth_sign: &(dyn Fn(&str, &str) -> Result<String, String> + Send + Sync),
@@ -594,6 +1010,8 @@ async fn reconcile_clean_conversation(
     let mut first_mismatch: Option<(i64, &'static str)> = None;
     let mut retained_suffix_chunk: Vec<StrictCleanRemoteEvent> = Vec::new();
     let mut retained_bytes: usize = 0;
+    let mut receipt_keys = RemoteReceiptKeyCache::new();
+    let mut receipt_coordinate: Option<serde_json::Value> = None;
 
     let mut cursor = 0_i64;
     while cursor < remote_digest.last_seq {
@@ -676,6 +1094,24 @@ async fn reconcile_clean_conversation(
             }
             expected_seq += 1;
 
+            let verified_coordinate = verify_remote_event_receipt_from_peer(
+                pool,
+                resolver,
+                sequencer_ds,
+                convo_uuid,
+                &strict_event,
+                &mut receipt_keys,
+                receipt_coordinate.as_ref(),
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "clean remote event has an invalid sequencer receipt at seq {}: {error}",
+                    strict_event.seq()
+                )
+            })?;
+            receipt_coordinate = Some(verified_coordinate);
+
             remote_hasher.update_event(
                 strict_event.seq(),
                 strict_event.generation(),
@@ -721,6 +1157,7 @@ async fn reconcile_clean_conversation(
                     let event_len = strict_event.accepted_payload_bytes().len()
                         + strict_event.signed_request().len()
                         + strict_event.outer_fingerprint().len()
+                        + strict_event.sequencer_receipt().len()
                         + 200;
                     if retained_bytes + event_len <= ORDINARY_DS_CONTROL_MAX_BYTES {
                         retained_bytes += event_len;
@@ -1311,10 +1748,22 @@ pub(crate) async fn apply_remote_clean_events(
             received_at: rebound_entry.received_at().datetime(),
         };
 
-        crate::chat_protocol::repository::delivery::append_entry_at(
+        crate::chat_protocol::repository::delivery::append_entry_at(tx, &append_entry, event_seq)
+            .await
+            .map_err(|error| match error {
+                crate::chat_protocol::repository::delivery::DeliveryRepositoryError::Database(
+                    database,
+                ) => ApplyRemoteCleanEventsError::Database(database.to_string()),
+                other => ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                    "failed to append entry at seq {}: {other:?}",
+                    event.seq()
+                )),
+            })?;
+        crate::chat_protocol::repository::delivery::set_entry_sequencer_receipt(
             tx,
-            &append_entry,
-            event.seq() as u64,
+            convo_id,
+            event_seq,
+            event.sequencer_receipt(),
         )
         .await
         .map_err(|error| match error {
@@ -1322,7 +1771,7 @@ pub(crate) async fn apply_remote_clean_events(
                 database,
             ) => ApplyRemoteCleanEventsError::Database(database.to_string()),
             other => ApplyRemoteCleanEventsError::InvalidEvent(format!(
-                "failed to append entry at seq {}: {other:?}",
+                "failed to store sequencer receipt at seq {}: {other:?}",
                 event.seq()
             )),
         })?;
@@ -1496,6 +1945,7 @@ pub(crate) async fn local_clean_digest_state_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::receipt::I13ReceiptSigner;
     use axum::{
         body::Body,
         http::{Response, StatusCode},
@@ -1507,6 +1957,7 @@ mod tests {
     use serde_json::json;
     use std::convert::Infallible;
     use tokio::net::TcpListener;
+    use uuid::Uuid;
 
     async fn spawn_discovery_server(router: Router) -> ValidatedRemoteDestination {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1763,8 +2214,8 @@ mod tests {
     }
 
     #[test]
-    fn clean_entry_kind_parses_all_fourteen_kinds_and_rejects_shorthand() {
-        assert_eq!(CleanEntryKind::ALL.len(), 16);
+    fn clean_entry_kind_parses_all_seventeen_kinds_and_rejects_shorthand() {
+        assert_eq!(CleanEntryKind::ALL.len(), 17);
         for kind in CleanEntryKind::ALL {
             let type_id = kind.type_id();
             assert!(type_id.starts_with("blue.catbird.chat.defs#"));
@@ -1783,6 +2234,31 @@ mod tests {
 
     fn complete_remote_event(entry_kind: CleanEntryKind) -> RemoteEvent {
         let ciphertext = vec![1, 2, 3];
+        let created_at = Utc::now();
+        let actor_device_id = Uuid::from_bytes([7; 16]);
+        let signer = I13ReceiptSigner::from_signing_key_for_test(
+            "did:web:strict-event.example".to_owned(),
+            p256::ecdsa::SigningKey::from_slice(&[0x63; 32]).unwrap(),
+        );
+        let signed_receipt = signer
+            .sign_application_receipt(
+                "00000000-0000-0000-0000-000000000000",
+                &[3; 32],
+                0,
+                "did:plc:strict-event",
+                &actor_device_id.to_string(),
+                "00000000-0000-0000-0000-000000000001",
+                &[4; 32],
+                1,
+                created_at.timestamp_millis(),
+            )
+            .unwrap();
+        let receipt = I13ReceiptSigner::receipt_wire_json(
+            &signed_receipt,
+            0,
+            "did:plc:strict-event",
+            &actor_device_id.to_string(),
+        );
         RemoteEvent {
             seq: 1,
             epoch: 0,
@@ -1791,11 +2267,13 @@ mod tests {
             accepted_payload_sha256: Some(Sha256::digest(&ciphertext).to_vec()),
             ciphertext,
             padded_size: 3,
-            created_at: Utc::now(),
+            created_at,
             entry_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
             entry_kind: Some(entry_kind.type_id().to_string()),
             signed_request: Some(vec![1; 64]),
             outer_fingerprint: Some(vec![2; 32]),
+            sequencer_receipt: Some(serde_json::to_vec(&receipt).unwrap()),
+            account_deleted_entry: None,
         }
     }
 
@@ -1811,6 +2289,7 @@ mod tests {
     #[test]
     fn strict_clean_remote_event_from_complete_clean_event_succeeds() {
         let event = complete_remote_event(CleanEntryKind::Creation);
+        let expected_receipt = event.sequencer_receipt.clone().unwrap();
         let ciphertext = [1, 2, 3];
         let payload_hash: [u8; 32] = Sha256::digest(ciphertext).into();
 
@@ -1830,6 +2309,7 @@ mod tests {
         assert_eq!(strict.accepted_payload_sha256(), &payload_hash);
         assert_eq!(strict.signed_request(), &[1; 64]);
         assert_eq!(strict.outer_fingerprint(), &[2; 32]);
+        assert_eq!(strict.sequencer_receipt(), expected_receipt);
     }
 
     #[test]
@@ -1853,6 +2333,10 @@ mod tests {
         assert_strict_event_error(
             |event| event.outer_fingerprint = None,
             StrictCleanRemoteEventError::MissingField("outerFingerprint"),
+        );
+        assert_strict_event_error(
+            |event| event.sequencer_receipt = None,
+            StrictCleanRemoteEventError::MissingField("sequencerReceipt"),
         );
     }
 

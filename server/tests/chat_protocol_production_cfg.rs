@@ -407,16 +407,7 @@ async fn recovery_client_completion_mismatch_rolls_back_applied_business_writes(
         .expect("client Recovery completion-mismatch rollback negative");
 }
 
-// BLOCKED, not a fixture gap. The fixture is now complete and the whole
-// production lifecycle runs: `after` equals `expected` field-for-field. The
-// only failing conjunct is `require_terminal_delta`'s precondition
-// `before.package_status == "available"` (production_client_proof.rs). A request
-// that is about to be cancelled necessarily holds a *reserved* package — the
-// same predicate's `expected` already asserts the package returns to
-// "available" afterwards — so this precondition is unsatisfiable as written.
-// Correcting it changes what the proof asserts, so it is left for the owner.
 #[tokio::test]
-#[ignore = "blocked on a contradictory precondition in require_terminal_delta (expects before.package_status == \"available\"; a cancellable request holds \"reserved\")"]
 async fn recovery_client_cancellation_runs_through_real_auth_prelude_apply_and_completion() {
     let (pool, _database) = common::fresh_db::fresh_proof_pool(2).await;
     mint_singleton_fallback(&pool).await;
@@ -453,16 +444,7 @@ async fn recovery_client_cancellation_due_for_expiry_orders_expiry_before_client
         .expect("Recovery cancellation DueForExpiry ordering");
 }
 
-// BLOCKED on an expectation/production disagreement, not a fixture gap. The
-// fixture is complete and the full two-party Replace lifecycle now runs to
-// completion; `successor_exact` is true and request/reservation/package all
-// reach their terminal statuses. Two conjuncts disagree with what production
-// actually did: the proof asserts `event_count`/`outbox_count` grow by exactly
-// 1 (observed +2, while the transition itself still reports exactly one event
-// position), and that the `welcomeAvailable` event has 2 recipient rows
-// (observed 1). Deciding which side is wrong is a protocol question.
 #[tokio::test]
-#[ignore = "blocked: production emits +2 events/outbox rows where the proof asserts +1, and 1 welcomeAvailable recipient where it asserts 2"]
 async fn recovery_client_fulfillment_runs_through_real_auth_prelude_apply_and_completion() {
     let (pool, _database) = common::fresh_db::fresh_proof_pool(2).await;
     mint_two_party_fallbacks(&pool).await;

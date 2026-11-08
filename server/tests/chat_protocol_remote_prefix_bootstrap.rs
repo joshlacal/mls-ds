@@ -37,6 +37,7 @@ use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use p256::ecdsa::SigningKey as P256SigningKey;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -60,6 +61,7 @@ use catbird_server::federation::bootstrap::{
     fetch_remote_prefix_admission, QuarantineReason, RemoteDigestAnchor, RemotePrefixApplyOutcome,
     RemotePrefixBootstrapError, RemotePrefixBootstrapSelector, VerifiedRemotePrefixAdmission,
 };
+use catbird_server::federation::receipt::I13ReceiptSigner;
 use catbird_server::federation::reconciliation::StrictCleanRemoteEvent;
 use catbird_server::federation::resolver::{DsResolver, ValidatedRemoteDestination};
 use catbird_server::federation::service_auth::{ServiceAuthClaims, ServiceAuthClient};
@@ -497,7 +499,18 @@ fn build_test_signed_policy(
     serde_json::to_vec(&wrapper).expect("serialize signed policy")
 }
 
+const TEST_RECEIPT_KEY: [u8; 32] = [0x53; 32];
+
+fn test_receipt_signer(sequencer_did: &str) -> I13ReceiptSigner {
+    I13ReceiptSigner::from_signing_key_for_test(
+        sequencer_did.to_owned(),
+        P256SigningKey::from_slice(&TEST_RECEIPT_KEY).expect("valid fixture receipt key"),
+    )
+}
+
 fn build_test_event_json(
+    conversation_id: Uuid,
+    sequencer_did: &str,
     seq: i64,
     epoch: i64,
     entry_id: Uuid,
@@ -508,6 +521,69 @@ fn build_test_event_json(
     received_at: DateTime<Utc>,
 ) -> Value {
     let payload_sha256: [u8; 32] = Sha256::digest(ciphertext).into();
+    let signed: Value = serde_json::from_slice(signed_request).unwrap_or(Value::Null);
+    let body = &signed["body"];
+    let coordinate = body
+        .get("next")
+        .filter(|value| value.is_object())
+        .or_else(|| body.get("successor").filter(|value| value.is_object()))
+        .or_else(|| body.get("prior").filter(|value| value.is_object()));
+    let decode = |value: &Value| {
+        value
+            .as_str()
+            .or_else(|| value.get("$bytes").and_then(Value::as_str))
+            .and_then(|encoded| STANDARD.decode(encoded).ok())
+    };
+    let group_id = coordinate
+        .and_then(|value| decode(&value["groupId"]))
+        .unwrap_or_else(|| vec![0x47; 32]);
+    let receipt_epoch = coordinate
+        .and_then(|value| value["epoch"].as_u64())
+        .unwrap_or_else(|| u64::try_from(epoch).unwrap_or_default());
+    let generation = coordinate
+        .and_then(|value| value["generation"].as_u64())
+        .unwrap_or_else(|| u64::try_from(epoch).unwrap_or_default());
+    let mutation =
+        crate::chat_protocol::transcript::decode_canonical_signed_mutation(signed_request).ok();
+    let actor_did = mutation
+        .as_ref()
+        .map(|value| value.actor_did().as_str().to_owned())
+        .unwrap_or_else(|| "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned());
+    let actor_device_id = mutation
+        .as_ref()
+        .map(|value| value.actor_device_id().as_str().to_owned())
+        .unwrap_or_else(|| Uuid::nil().to_string());
+    let archive_commitment: [u8; 32] = if entry_kind_type_id == APPLICATION_ENTRY_TYPE_ID {
+        decode(&body["aad"]["archiveCommitment"])
+            .and_then(|bytes| bytes.try_into().ok())
+            .unwrap_or_else(|| Sha256::digest(signed_request).into())
+    } else {
+        mutation
+            .as_ref()
+            .map(|value| *value.request_digest())
+            .unwrap_or_else(|| Sha256::digest(signed_request).into())
+    };
+    let signer = test_receipt_signer(sequencer_did);
+    let signed_receipt = signer
+        .sign_application_receipt(
+            &conversation_id.to_string(),
+            &group_id,
+            receipt_epoch,
+            &actor_did,
+            &actor_device_id,
+            &entry_id.to_string(),
+            &archive_commitment,
+            u64::try_from(seq).expect("fixture seq"),
+            received_at.timestamp_millis(),
+        )
+        .expect("sign fixture receipt");
+    let receipt = I13ReceiptSigner::receipt_wire_json(
+        &signed_receipt,
+        generation,
+        &actor_did,
+        &actor_device_id,
+    );
+    let receipt_bytes = serde_json::to_vec(&receipt).expect("serialize fixture receipt");
     json!({
         "seq": seq,
         "epoch": epoch,
@@ -518,9 +594,10 @@ fn build_test_event_json(
         "createdAt": received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
         "entryId": entry_id.to_string(),
         "entryKind": entry_kind_type_id,
-        "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256)},
+        "acceptedPayloadSha256": {"$bytes": STANDARD.encode(payload_sha256)},
         "signedRequest": {"$bytes": STANDARD.encode(signed_request)},
         "outerFingerprint": {"$bytes": STANDARD.encode(outer_fingerprint)},
+        "sequencerReceipt": {"$bytes": STANDARD.encode(receipt_bytes)},
     })
 }
 
@@ -660,11 +737,26 @@ async fn spawn_mock_sequencer(state: MockSequencerState) -> (ValidatedRemoteDest
     )
 }
 
-fn create_test_resolver(
+async fn create_test_resolver(
     pool: PgPool,
     destination: ValidatedRemoteDestination,
     sequencer_did: &str,
 ) -> DsResolver {
+    let signer = test_receipt_signer(sequencer_did);
+    let mut multikey = vec![0x80, 0x24];
+    multikey.extend_from_slice(signer.verifying_key().to_encoded_point(true).as_bytes());
+    auth::cache_test_did_document(auth::DidDocument {
+        id: sequencer_did.to_owned(),
+        verification_method: vec![auth::VerificationMethod {
+            id: signer.key_id().to_owned(),
+            key_type: "Multikey".to_owned(),
+            controller: sequencer_did.to_owned(),
+            public_key_multibase: Some(multibase::encode(multibase::Base::Base58Btc, multikey)),
+            public_key_jwk: None,
+        }],
+        service: None,
+    })
+    .await;
     let dest_clone = destination.clone();
     let seq_did_owned = sequencer_did.to_string();
     DsResolver::new(
@@ -703,6 +795,50 @@ fn create_test_resolver(
         };
         Some(Ok(endpoint))
     }))
+}
+
+async fn fetch_test_remote_prefix_admission(
+    pool: &PgPool,
+    conversation_id: Uuid,
+    sequencer_did: &str,
+    state: MockSequencerState,
+) -> Result<VerifiedRemotePrefixAdmission, RemotePrefixBootstrapError> {
+    let (destination, _) = spawn_mock_sequencer(state).await;
+    let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
+    let outbound = OutboundClient::new(2, 2);
+    let auth_client = ServiceAuthClient::from_shared_secret(
+        "did:web:destination.catbird.blue".to_string(),
+        b"test-secret",
+    );
+    let auth_sign = move |target: &str, method: &str| {
+        auth_client
+            .sign_request(target, method)
+            .map_err(|error| error.to_string())
+    };
+    let selector =
+        RemotePrefixBootstrapSelector::new(conversation_id, sequencer_did.to_string(), 0).unwrap();
+    fetch_remote_prefix_admission(pool, &resolver, &outbound, &auth_sign, selector).await
+}
+
+async fn seeded_full_prefix_fixture(
+    pool: &PgPool,
+    sequencer_did: &str,
+    local_device_status: &str,
+) -> FullTestPrefixFixture {
+    let fixture = build_full_5_event_prefix_fixture(
+        Uuid::new_v4(),
+        sequencer_did,
+        dynamic_fixture_instant(0) - chrono::Duration::hours(1),
+    );
+    seed_test_device(
+        pool,
+        &fixture.actor_did,
+        fixture.actor_device,
+        local_device_status,
+    )
+    .await;
+    seed_approved_peer(pool, sequencer_did).await;
+    fixture
 }
 
 // 1. Selector validation tests
@@ -747,159 +883,36 @@ async fn admission_retains_single_destination_across_all_queries() {
     let Some((pool, _db_guard)) = setup_test_db().await else {
         return;
     };
-
-    let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:seq.catbird.blue";
-    let local_participant_did = "did:web:destination.catbird.blue";
-    let local_device_id = Uuid::new_v4();
-
-    seed_test_device(&pool, local_participant_did, local_device_id, "active").await;
-    seed_approved_peer(&pool, sequencer_did).await;
-
-    let now = Utc::now();
-    let creation_signed = build_test_signed_creation(
-        convo_id,
-        local_participant_did,
-        local_device_id,
-        &[local_participant_did],
-        now,
-    );
-
-    let entry_1 = Uuid::new_v4();
-    let entry_2 = Uuid::new_v4();
-    let entry_3 = Uuid::new_v4();
-
-    let fp_1 = [1u8; 32];
-    let fp_2 = [2u8; 32];
-    let fp_3 = [3u8; 32];
-
-    let ev1 = build_test_event_json(
-        1,
-        0,
-        entry_1,
-        CREATION_ENTRY_TYPE_ID,
-        b"payload-1",
-        &creation_signed,
-        &fp_1,
-        now,
-    );
-    let ev2 = build_test_event_json(
-        2,
-        0,
-        entry_2,
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        b"payload-2",
-        b"{\"signed\":{}}",
-        &fp_2,
-        now,
-    );
-    let ev3 = build_test_event_json(
-        3,
-        0,
-        entry_3,
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        b"payload-3",
-        b"{\"signed\":{}}",
-        &fp_3,
-        now,
-    );
-
-    let mut hasher = CleanConvoDigestHasher::new();
-
-    hasher.update_event(
-        1,
-        0,
-        entry_1,
-        CREATION_ENTRY_TYPE_ID,
-        b"payload-1",
-        &creation_signed,
-        &fp_1,
-        now,
-    );
-    hasher.update_event(
-        2,
-        0,
-        entry_2,
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        b"payload-2",
-        b"{\"signed\":{}}",
-        &fp_2,
-        now,
-    );
-    hasher.update_event(
-        3,
-        0,
-        entry_3,
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        b"payload-3",
-        b"{\"signed\":{}}",
-        &fp_3,
-        now,
-    );
-    let digest_hex = hasher.finalize();
-
-    let digest_json = json!({
-        "convoId": convo_id.to_string(),
-        "sequencerDsDid": sequencer_did,
-        "sequencerTerm": 0,
-        "epoch": 0,
-        "lastSeq": 3,
-        "eventCount": 3,
-        "digestSha256": digest_hex,
-        "generatedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true)
-    });
-
-    let events_page = json!({
-        "convoId": convo_id.to_string(),
-        "fromSeqExclusive": 0,
-        "toSeqInclusive": 3,
-        "events": [ev1, ev2, ev3]
-    });
-
-    let mock_state = MockSequencerState {
-        capabilities: vec![
-            CAPABILITY_RECONCILIATION_V1.to_string(),
-            CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
-        ],
-        opening_digest: Some(digest_json.clone()),
-        closing_digest: Some(digest_json),
-        events_pages: vec![events_page],
-        recorded_requests: Arc::new(Mutex::new(Vec::new())),
-        destination_hits: Arc::new(AtomicUsize::new(0)),
-    };
-
-    let hits_counter = mock_state.destination_hits.clone();
-    let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
-    let outbound = OutboundClient::new(2, 2);
-
-    let auth_client = ServiceAuthClient::from_shared_secret(
-        "did:web:destination.catbird.blue".to_string(),
-        b"test-secret",
-    );
-    let auth_sign = move |target: &str, method: &str| {
-        auth_client
-            .sign_request(target, method)
-            .map_err(|e| e.to_string())
-    };
-
-    let selector =
-        RemotePrefixBootstrapSelector::new(convo_id, sequencer_did.to_string(), 0).unwrap();
-
-    let admission = match fetch_remote_prefix_admission(
-        &pool, &resolver, &outbound, &auth_sign, selector,
+    let fixture = seeded_full_prefix_fixture(&pool, sequencer_did, "active").await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let admission = fetch_test_remote_prefix_admission(
+        &pool,
+        fixture.convo_id,
+        sequencer_did,
+        MockSequencerState {
+            capabilities: vec![
+                CAPABILITY_RECONCILIATION_V1.to_string(),
+                CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
+            ],
+            opening_digest: Some(fixture.opening_digest.clone()),
+            closing_digest: Some(fixture.closing_digest),
+            events_pages: vec![json!({
+                "convoId": fixture.convo_id,
+                "fromSeqExclusive": 0,
+                "toSeqInclusive": 5,
+                "events": fixture.events,
+            })],
+            destination_hits: hits.clone(),
+            ..Default::default()
+        },
     )
     .await
-    {
-        Ok(adm) => adm,
-        Err(e) => panic!("admission must succeed, got {e:?}"),
-    };
+    .expect("admission must succeed");
 
-    assert_eq!(admission.event_count(), 3);
-    assert_eq!(admission.conversation_id(), convo_id);
-    // 4 queries: healthCheck (1) + opening digest (1) + events page (1) + closing digest (1) = 4 hits
-    assert_eq!(hits_counter.load(Ordering::SeqCst), 4);
+    assert_eq!(admission.event_count(), 5);
+    assert_eq!(admission.conversation_id(), fixture.convo_id);
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
 }
 
 // 4. Fresh JTI and exact LXM each query
@@ -908,159 +921,45 @@ async fn admission_mints_fresh_jti_and_exact_lxm_per_query() {
     let Some((pool, _db_guard)) = setup_test_db().await else {
         return;
     };
-
-    let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:seq.catbird.blue";
-    let local_participant_did = "did:web:destination.catbird.blue";
-    let local_device_id = Uuid::new_v4();
-
-    seed_test_device(&pool, local_participant_did, local_device_id, "active").await;
-    seed_approved_peer(&pool, sequencer_did).await;
-
-    let now = Utc::now();
-    let creation_signed = build_test_signed_creation(
-        convo_id,
-        local_participant_did,
-        local_device_id,
-        &[local_participant_did],
-        now,
-    );
-
-    let entry_1 = Uuid::new_v4();
-    let entry_2 = Uuid::new_v4();
-    let entry_3 = Uuid::new_v4();
-    let fp = [1u8; 32];
-
-    let ev1 = build_test_event_json(
-        1,
-        0,
-        entry_1,
-        CREATION_ENTRY_TYPE_ID,
-        b"p1",
-        &creation_signed,
-        &fp,
-        now,
-    );
-    let ev2 = build_test_event_json(
-        2,
-        0,
-        entry_2,
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        b"p2",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-    let ev3 = build_test_event_json(
-        3,
-        0,
-        entry_3,
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        b"p3",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-
-    let mut hasher = CleanConvoDigestHasher::new();
-    hasher.update_event(
-        1,
-        0,
-        entry_1,
-        CREATION_ENTRY_TYPE_ID,
-        b"p1",
-        &creation_signed,
-        &fp,
-        now,
-    );
-    hasher.update_event(
-        2,
-        0,
-        entry_2,
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        b"p2",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-    hasher.update_event(
-        3,
-        0,
-        entry_3,
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        b"p3",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-    let digest_hex = hasher.finalize();
-
-    let digest_json = json!({
-        "convoId": convo_id.to_string(),
-        "sequencerDsDid": sequencer_did,
-        "sequencerTerm": 0,
-        "epoch": 0,
-        "lastSeq": 3,
-        "eventCount": 3,
-        "digestSha256": digest_hex,
-        "generatedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true)
-    });
-
+    let fixture = seeded_full_prefix_fixture(&pool, sequencer_did, "active").await;
     let recorded = Arc::new(Mutex::new(Vec::new()));
-    let mock_state = MockSequencerState {
-        capabilities: vec![
-            CAPABILITY_RECONCILIATION_V1.to_string(),
-            CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
-        ],
-        opening_digest: Some(digest_json.clone()),
-        closing_digest: Some(digest_json),
-        events_pages: vec![json!({
-            "convoId": convo_id.to_string(),
-            "fromSeqExclusive": 0,
-            "toSeqInclusive": 3,
-            "events": [ev1, ev2, ev3]
-        })],
-        recorded_requests: recorded.clone(),
-        destination_hits: Arc::new(AtomicUsize::new(0)),
-    };
-
-    let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
-    let outbound = OutboundClient::new(2, 2);
-
-    let auth_client = ServiceAuthClient::from_shared_secret(
-        "did:web:destination.catbird.blue".to_string(),
-        b"test-secret",
-    );
-    let auth_sign = move |target: &str, method: &str| {
-        auth_client
-            .sign_request(target, method)
-            .map_err(|e| e.to_string())
-    };
-
-    let selector =
-        RemotePrefixBootstrapSelector::new(convo_id, sequencer_did.to_string(), 0).unwrap();
-    let _admission = match fetch_remote_prefix_admission(
-        &pool, &resolver, &outbound, &auth_sign, selector,
+    fetch_test_remote_prefix_admission(
+        &pool,
+        fixture.convo_id,
+        sequencer_did,
+        MockSequencerState {
+            capabilities: vec![
+                CAPABILITY_RECONCILIATION_V1.to_string(),
+                CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
+            ],
+            opening_digest: Some(fixture.opening_digest.clone()),
+            closing_digest: Some(fixture.closing_digest),
+            events_pages: vec![json!({
+                "convoId": fixture.convo_id,
+                "fromSeqExclusive": 0,
+                "toSeqInclusive": 5,
+                "events": fixture.events,
+            })],
+            recorded_requests: recorded.clone(),
+            ..Default::default()
+        },
     )
     .await
-    {
-        Ok(adm) => adm,
-        Err(e) => panic!("admission must succeed, got {e:?}"),
-    };
+    .expect("admission must succeed");
 
-    let reqs = recorded.lock().await;
+    let requests = recorded.lock().await;
+    let authenticated: Vec<_> = requests
+        .iter()
+        .filter(|(_, authorization)| authorization.is_some())
+        .collect();
+    assert_eq!(authenticated.len(), 3);
     let mut jtis = std::collections::HashSet::new();
-
-    // Authenticated queries: opening digest, events, closing digest (healthCheck is unauthenticated)
-    let authenticated_queries: Vec<&(String, Option<String>)> =
-        reqs.iter().filter(|(_, auth)| auth.is_some()).collect();
-
-    assert_eq!(authenticated_queries.len(), 3);
-
-    for (nsid, auth_opt) in authenticated_queries {
-        let auth_str = auth_opt.as_ref().unwrap();
-        let token = auth_str.trim_start_matches("Bearer ");
+    for (nsid, authorization) in authenticated {
+        let token = authorization
+            .as_deref()
+            .unwrap()
+            .trim_start_matches("Bearer ");
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_audience(&[sequencer_did]);
         let token_data = decode::<ServiceAuthClaims>(
@@ -1069,12 +968,8 @@ async fn admission_mints_fresh_jti_and_exact_lxm_per_query() {
             &validation,
         )
         .expect("decode token");
-
         assert_eq!(&token_data.claims.lxm, nsid);
-        assert!(
-            jtis.insert(token_data.claims.jti),
-            "JTI must be unique per query"
-        );
+        assert!(jtis.insert(token_data.claims.jti), "JTI must be unique");
     }
 }
 
@@ -1100,7 +995,7 @@ async fn admission_fails_on_missing_bootstrap_capability_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -1139,162 +1034,45 @@ async fn admission_fails_on_moving_digest_snapshot_with_no_db_write() {
     let Some((pool, _db_guard)) = setup_test_db().await else {
         return;
     };
-
-    let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:seq.catbird.blue";
-    let local_participant_did = "did:web:destination.catbird.blue";
-    let local_device_id = Uuid::new_v4();
+    let fixture = seeded_full_prefix_fixture(&pool, sequencer_did, "active").await;
+    let conversation_id = fixture.convo_id;
+    let mut closing_digest = fixture.closing_digest;
+    closing_digest["lastSeq"] = json!(6);
+    closing_digest["eventCount"] = json!(6);
+    closing_digest["digestSha256"] = json!("00".repeat(32));
+    let before = snapshot_db_content(&pool).await;
 
-    seed_test_device(&pool, local_participant_did, local_device_id, "active").await;
-    seed_approved_peer(&pool, sequencer_did).await;
-
-    let now = Utc::now();
-    let creation_signed = build_test_signed_creation(
-        convo_id,
-        local_participant_did,
-        local_device_id,
-        &[local_participant_did],
-        now,
-    );
-
-    let entry_1 = Uuid::new_v4();
-    let entry_2 = Uuid::new_v4();
-    let entry_3 = Uuid::new_v4();
-    let fp = [1u8; 32];
-
-    let ev1 = build_test_event_json(
-        1,
-        0,
-        entry_1,
-        CREATION_ENTRY_TYPE_ID,
-        b"p1",
-        &creation_signed,
-        &fp,
-        now,
-    );
-    let ev2 = build_test_event_json(
-        2,
-        0,
-        entry_2,
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        b"p2",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-    let ev3 = build_test_event_json(
-        3,
-        0,
-        entry_3,
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        b"p3",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-
-    let mut hasher = CleanConvoDigestHasher::new();
-    hasher.update_event(
-        1,
-        0,
-        entry_1,
-        CREATION_ENTRY_TYPE_ID,
-        b"p1",
-        &creation_signed,
-        &fp,
-        now,
-    );
-    hasher.update_event(
-        2,
-        0,
-        entry_2,
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        b"p2",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-    hasher.update_event(
-        3,
-        0,
-        entry_3,
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        b"p3",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-    let digest_hex = hasher.finalize();
-
-    let opening_digest = json!({
-        "convoId": convo_id.to_string(),
-        "sequencerDsDid": sequencer_did,
-        "sequencerTerm": 0,
-        "epoch": 0,
-        "lastSeq": 3,
-        "eventCount": 3,
-        "digestSha256": digest_hex,
-        "generatedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true)
-    });
-
-    let closing_digest = json!({
-        "convoId": convo_id.to_string(),
-        "sequencerDsDid": sequencer_did,
-        "sequencerTerm": 0,
-        "epoch": 0,
-        "lastSeq": 4, // Snapshot advanced concurrently
-        "eventCount": 4,
-        "digestSha256": "00".repeat(32),
-        "generatedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true)
-    });
-
-    let mock_state = MockSequencerState {
-        capabilities: vec![
-            CAPABILITY_RECONCILIATION_V1.to_string(),
-            CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
-        ],
-        opening_digest: Some(opening_digest),
-        closing_digest: Some(closing_digest),
-        events_pages: vec![json!({
-            "convoId": convo_id.to_string(),
-            "fromSeqExclusive": 0,
-            "toSeqInclusive": 3,
-            "events": [ev1, ev2, ev3]
-        })],
-        recorded_requests: Arc::new(Mutex::new(Vec::new())),
-        destination_hits: Arc::new(AtomicUsize::new(0)),
+    let error = match fetch_test_remote_prefix_admission(
+        &pool,
+        conversation_id,
+        sequencer_did,
+        MockSequencerState {
+            capabilities: vec![
+                CAPABILITY_RECONCILIATION_V1.to_string(),
+                CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
+            ],
+            opening_digest: Some(fixture.opening_digest),
+            closing_digest: Some(closing_digest),
+            events_pages: vec![json!({
+                "convoId": conversation_id,
+                "fromSeqExclusive": 0,
+                "toSeqInclusive": 5,
+                "events": fixture.events,
+            })],
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("moving snapshot must fail"),
     };
 
-    let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
-    let outbound = OutboundClient::new(2, 2);
-
-    let auth_client = ServiceAuthClient::from_shared_secret(
-        "did:web:destination.catbird.blue".to_string(),
-        b"test-secret",
-    );
-    let auth_sign = move |target: &str, method: &str| {
-        auth_client
-            .sign_request(target, method)
-            .map_err(|e| e.to_string())
-    };
-
-    let snapshot_before = snapshot_db_content(&pool).await;
-
-    let selector =
-        RemotePrefixBootstrapSelector::new(convo_id, sequencer_did.to_string(), 0).unwrap();
-    let res =
-        fetch_remote_prefix_admission(&pool, &resolver, &outbound, &auth_sign, selector).await;
-
-    let err = match res {
-        Err(e) => e,
-        Ok(_) => panic!("expected Err, got Ok"),
-    };
-    assert_eq!(err, RemotePrefixBootstrapError::MovingSnapshot);
-
-    let snapshot_after = snapshot_db_content(&pool).await;
+    assert_eq!(error, RemotePrefixBootstrapError::MovingSnapshot);
     assert_eq!(
-        snapshot_before, snapshot_after,
+        before,
+        snapshot_db_content(&pool).await,
         "no DB write on moving snapshot"
     );
 }
@@ -1328,6 +1106,8 @@ async fn admission_fails_on_sequence_gap_with_no_db_write() {
     let fp = [1u8; 32];
 
     let ev1 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry_1,
@@ -1338,6 +1118,8 @@ async fn admission_fails_on_sequence_gap_with_no_db_write() {
         now,
     );
     let ev3 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         3,
         0,
         entry_3,
@@ -1377,7 +1159,7 @@ async fn admission_fails_on_sequence_gap_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -1438,6 +1220,8 @@ async fn admission_fails_on_duplicate_entry_id_with_no_db_write() {
     let fp = [1u8; 32];
 
     let ev1 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         duplicate_entry_id,
@@ -1448,6 +1232,8 @@ async fn admission_fails_on_duplicate_entry_id_with_no_db_write() {
         now,
     );
     let ev2 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         2,
         0,
         duplicate_entry_id, // Duplicate entry UUID
@@ -1487,7 +1273,7 @@ async fn admission_fails_on_duplicate_entry_id_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -1549,6 +1335,8 @@ async fn admission_fails_on_event_reorder_with_no_db_write() {
     let fp = [1u8; 32];
 
     let ev1 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry_1,
@@ -1559,6 +1347,8 @@ async fn admission_fails_on_event_reorder_with_no_db_write() {
         now,
     );
     let ev2 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         2,
         0,
         entry_2,
@@ -1599,7 +1389,7 @@ async fn admission_fails_on_event_reorder_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -1661,6 +1451,8 @@ async fn admission_fails_on_page_truncation_with_no_db_write() {
     let fp = [1u8; 32];
 
     let ev1 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry_1,
@@ -1671,6 +1463,8 @@ async fn admission_fails_on_page_truncation_with_no_db_write() {
         now,
     );
     let ev2 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         2,
         0,
         entry_2,
@@ -1711,7 +1505,7 @@ async fn admission_fails_on_page_truncation_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -1774,6 +1568,8 @@ async fn admission_fails_on_rolling_digest_mismatch_with_no_db_write() {
     let fp = [1u8; 32];
 
     let ev1 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry_1,
@@ -1784,6 +1580,8 @@ async fn admission_fails_on_rolling_digest_mismatch_with_no_db_write() {
         now,
     );
     let ev2 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         2,
         0,
         entry_2,
@@ -1794,6 +1592,8 @@ async fn admission_fails_on_rolling_digest_mismatch_with_no_db_write() {
         now,
     );
     let ev3 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         3,
         0,
         entry_3,
@@ -1834,7 +1634,7 @@ async fn admission_fails_on_rolling_digest_mismatch_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -1895,6 +1695,8 @@ async fn admission_fails_on_event_hash_mismatch_with_no_db_write() {
     let fp = [1u8; 32];
 
     let mut ev1 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry_1,
@@ -1936,7 +1738,7 @@ async fn admission_fails_on_event_hash_mismatch_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -2006,7 +1808,7 @@ async fn admission_fails_on_declared_oversized_prefix_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -2045,140 +1847,75 @@ async fn admission_fails_on_stream_oversized_events_with_no_db_write() {
     let Some((pool, _db_guard)) = setup_test_db().await else {
         return;
     };
-
-    let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:seq.catbird.blue";
-    let local_participant_did = "did:web:destination.catbird.blue";
-    let local_device_id = Uuid::new_v4();
-
-    seed_test_device(&pool, local_participant_did, local_device_id, "active").await;
-    seed_approved_peer(&pool, sequencer_did).await;
-
-    let now = Utc::now();
-    let creation_signed = build_test_signed_creation(
-        convo_id,
-        local_participant_did,
-        local_device_id,
-        &[local_participant_did],
-        now,
-    );
-
-    // Generate 501 valid grammar events: Creation -> Acceptance -> Fulfillment -> (498 Applications)
-    let mut events = Vec::with_capacity(501);
-    let fp = [1u8; 32];
-    events.push(build_test_event_json(
-        1,
-        0,
-        Uuid::new_v4(),
-        CREATION_ENTRY_TYPE_ID,
-        b"p1",
-        &creation_signed,
-        &fp,
-        now,
-    ));
-    events.push(build_test_event_json(
-        2,
-        0,
-        Uuid::new_v4(),
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        b"p2",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    ));
-    events.push(build_test_event_json(
-        3,
-        0,
-        Uuid::new_v4(),
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        b"p3",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    ));
-    for seq in 4..=501 {
-        events.push(build_test_event_json(
+    let fixture = seeded_full_prefix_fixture(&pool, sequencer_did, "active").await;
+    let conversation_id = fixture.convo_id;
+    let actor_signing_key = SigningKey::from_bytes(&fixture.creation_entry.signing_seed);
+    let mut events = fixture.events;
+    events.reserve(496);
+    for seq in 6_i64..=501 {
+        events.push(genuine_application_event(
+            conversation_id,
+            sequencer_did,
             seq,
-            0,
-            Uuid::new_v4(),
-            APPLICATION_ENTRY_TYPE_ID,
-            b"app",
-            b"{\"signed\":{}}",
-            &fp,
-            now,
+            &fixture.actor_did,
+            fixture.actor_device,
+            &fixture.actor_key_id,
+            &actor_signing_key,
+            &fixture.actor_public_key,
+            &fixture.committed_coordinate,
+            &[0x31; 8],
+            dynamic_fixture_instant(seq * 1_000),
         ));
     }
-
-    // Split into normal bounded pages of <= 100 events each
     let mut pages = Vec::new();
-    let mut from_seq = 0;
-    while from_seq < 501 {
-        let chunk_size = (501 - from_seq).min(100);
-        let to_seq = from_seq + chunk_size;
-        let page_events = events[from_seq..to_seq].to_vec();
+    let mut from_seq = 0_usize;
+    while from_seq < events.len() {
+        let to_seq = (from_seq + 100).min(events.len());
         pages.push(json!({
-            "convoId": convo_id.to_string(),
+            "convoId": conversation_id,
             "fromSeqExclusive": from_seq as i64,
             "toSeqInclusive": to_seq as i64,
-            "events": page_events
+            "events": events[from_seq..to_seq].to_vec(),
         }));
         from_seq = to_seq;
     }
-
-    // Opening digest declares lastSeq: 501, eventCount: 500 (passes initial check but fails in loop on 501st event)
-    let digest_json = json!({
-        "convoId": convo_id.to_string(),
+    let digest = json!({
+        "convoId": conversation_id,
         "sequencerDsDid": sequencer_did,
         "sequencerTerm": 0,
         "epoch": 0,
         "lastSeq": 501,
         "eventCount": 500,
         "digestSha256": "00".repeat(32),
-        "generatedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true)
+        "generatedAt": dynamic_fixture_instant(501_000),
     });
-
-    let mock_state = MockSequencerState {
-        capabilities: vec![
-            CAPABILITY_RECONCILIATION_V1.to_string(),
-            CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
-        ],
-        opening_digest: Some(digest_json.clone()),
-        closing_digest: Some(digest_json),
-        events_pages: pages,
-        recorded_requests: Arc::new(Mutex::new(Vec::new())),
-        destination_hits: Arc::new(AtomicUsize::new(0)),
+    let before = snapshot_db_content(&pool).await;
+    let error = match fetch_test_remote_prefix_admission(
+        &pool,
+        conversation_id,
+        sequencer_did,
+        MockSequencerState {
+            capabilities: vec![
+                CAPABILITY_RECONCILIATION_V1.to_string(),
+                CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
+            ],
+            opening_digest: Some(digest.clone()),
+            closing_digest: Some(digest),
+            events_pages: pages,
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("501st event must exceed the stream cap"),
     };
 
-    let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
-    let outbound = OutboundClient::new(2, 2);
-
-    let auth_client = ServiceAuthClient::from_shared_secret(
-        "did:web:destination.catbird.blue".to_string(),
-        b"test-secret",
-    );
-    let auth_sign = move |target: &str, method: &str| {
-        auth_client
-            .sign_request(target, method)
-            .map_err(|e| e.to_string())
-    };
-
-    let snapshot_before = snapshot_db_content(&pool).await;
-
-    let selector =
-        RemotePrefixBootstrapSelector::new(convo_id, sequencer_did.to_string(), 0).unwrap();
-    let res =
-        fetch_remote_prefix_admission(&pool, &resolver, &outbound, &auth_sign, selector).await;
-
-    let err = match res {
-        Err(e) => e,
-        Ok(_) => panic!("expected Err, got Ok"),
-    };
-    assert_eq!(err, RemotePrefixBootstrapError::PrefixTooLarge);
-
-    let snapshot_after = snapshot_db_content(&pool).await;
+    assert_eq!(error, RemotePrefixBootstrapError::PrefixTooLarge);
     assert_eq!(
-        snapshot_before, snapshot_after,
+        before,
+        snapshot_db_content(&pool).await,
         "no DB write on stream oversized events"
     );
 }
@@ -2189,140 +1926,76 @@ async fn admission_fails_on_material_byte_cap_exceeded_with_no_db_write() {
     let Some((pool, _db_guard)) = setup_test_db().await else {
         return;
     };
-
-    let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:seq.catbird.blue";
-    let local_participant_did = "did:web:destination.catbird.blue";
-    let local_device_id = Uuid::new_v4();
-
-    seed_test_device(&pool, local_participant_did, local_device_id, "active").await;
-    seed_approved_peer(&pool, sequencer_did).await;
-
-    let now = Utc::now();
-    let creation_signed = build_test_signed_creation(
-        convo_id,
-        local_participant_did,
-        local_device_id,
-        &[local_participant_did],
-        now,
-    );
-
-    // 100 events, each with 12 KB ciphertext: 100 * 12,000 = 1.2 MB > 1_048_576 (1 MiB)
-    let chunk_payload = vec![0x42u8; 12_000];
-    let mut events = Vec::with_capacity(100);
-    let fp = [1u8; 32];
-    events.push(build_test_event_json(
-        1,
-        0,
-        Uuid::new_v4(),
-        CREATION_ENTRY_TYPE_ID,
-        &chunk_payload,
-        &creation_signed,
-        &fp,
-        now,
-    ));
-    events.push(build_test_event_json(
-        2,
-        0,
-        Uuid::new_v4(),
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        &chunk_payload,
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    ));
-    events.push(build_test_event_json(
-        3,
-        0,
-        Uuid::new_v4(),
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        &chunk_payload,
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    ));
-    for seq in 4..=100 {
-        events.push(build_test_event_json(
+    let fixture = seeded_full_prefix_fixture(&pool, sequencer_did, "active").await;
+    let conversation_id = fixture.convo_id;
+    let actor_signing_key = SigningKey::from_bytes(&fixture.creation_entry.signing_seed);
+    let application_bytes = vec![0x42; 12_000];
+    let mut events = fixture.events;
+    events.reserve(95);
+    for seq in 6_i64..=100 {
+        events.push(genuine_application_event(
+            conversation_id,
+            sequencer_did,
             seq,
-            0,
-            Uuid::new_v4(),
-            APPLICATION_ENTRY_TYPE_ID,
-            &chunk_payload,
-            b"{\"signed\":{}}",
-            &fp,
-            now,
+            &fixture.actor_did,
+            fixture.actor_device,
+            &fixture.actor_key_id,
+            &actor_signing_key,
+            &fixture.actor_public_key,
+            &fixture.committed_coordinate,
+            &application_bytes,
+            dynamic_fixture_instant(seq * 1_000),
         ));
     }
-
-    // Split into 10 bounded pages of 10 events each (120 KB per page, safely within HTTP transport)
     let mut pages = Vec::new();
-    let mut from_seq = 0;
-    while from_seq < 100 {
-        let chunk_size = (100 - from_seq).min(10);
-        let to_seq = from_seq + chunk_size;
-        let page_events = events[from_seq..to_seq].to_vec();
+    let mut from_seq = 0_usize;
+    while from_seq < events.len() {
+        let to_seq = (from_seq + 10).min(events.len());
         pages.push(json!({
-            "convoId": convo_id.to_string(),
+            "convoId": conversation_id,
             "fromSeqExclusive": from_seq as i64,
             "toSeqInclusive": to_seq as i64,
-            "events": page_events
+            "events": events[from_seq..to_seq].to_vec(),
         }));
         from_seq = to_seq;
     }
-
-    let digest_json = json!({
-        "convoId": convo_id.to_string(),
+    let digest = json!({
+        "convoId": conversation_id,
         "sequencerDsDid": sequencer_did,
         "sequencerTerm": 0,
         "epoch": 0,
         "lastSeq": 100,
         "eventCount": 100,
         "digestSha256": "00".repeat(32),
-        "generatedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true)
+        "generatedAt": dynamic_fixture_instant(100_000),
     });
-
-    let mock_state = MockSequencerState {
-        capabilities: vec![
-            CAPABILITY_RECONCILIATION_V1.to_string(),
-            CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
-        ],
-        opening_digest: Some(digest_json.clone()),
-        closing_digest: Some(digest_json),
-        events_pages: pages,
-        recorded_requests: Arc::new(Mutex::new(Vec::new())),
-        destination_hits: Arc::new(AtomicUsize::new(0)),
+    let before = snapshot_db_content(&pool).await;
+    let error = match fetch_test_remote_prefix_admission(
+        &pool,
+        conversation_id,
+        sequencer_did,
+        MockSequencerState {
+            capabilities: vec![
+                CAPABILITY_RECONCILIATION_V1.to_string(),
+                CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
+            ],
+            opening_digest: Some(digest.clone()),
+            closing_digest: Some(digest),
+            events_pages: pages,
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("canonical material must exceed the byte cap"),
     };
 
-    let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
-    let outbound = OutboundClient::new(2, 2);
-
-    let auth_client = ServiceAuthClient::from_shared_secret(
-        "did:web:destination.catbird.blue".to_string(),
-        b"test-secret",
-    );
-    let auth_sign = move |target: &str, method: &str| {
-        auth_client
-            .sign_request(target, method)
-            .map_err(|e| e.to_string())
-    };
-
-    let snapshot_before = snapshot_db_content(&pool).await;
-
-    let selector =
-        RemotePrefixBootstrapSelector::new(convo_id, sequencer_did.to_string(), 0).unwrap();
-    let res =
-        fetch_remote_prefix_admission(&pool, &resolver, &outbound, &auth_sign, selector).await;
-
-    let err = match res {
-        Err(e) => e,
-        Ok(_) => panic!("expected Err, got Ok"),
-    };
-    assert_eq!(err, RemotePrefixBootstrapError::PrefixTooLarge);
-
-    let snapshot_after = snapshot_db_content(&pool).await;
+    assert_eq!(error, RemotePrefixBootstrapError::PrefixTooLarge);
     assert_eq!(
-        snapshot_before, snapshot_after,
+        before,
+        snapshot_db_content(&pool).await,
         "no DB write on material byte cap exceeded"
     );
 }
@@ -2359,6 +2032,8 @@ async fn admission_fails_on_disordered_grammar_with_no_db_write() {
     let fp = [1u8; 32];
 
     let ev1 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry_1,
@@ -2369,6 +2044,8 @@ async fn admission_fails_on_disordered_grammar_with_no_db_write() {
         now,
     );
     let ev2 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         2,
         0,
         entry_2,
@@ -2379,6 +2056,8 @@ async fn admission_fails_on_disordered_grammar_with_no_db_write() {
         now,
     );
     let ev3 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         3,
         0,
         entry_3,
@@ -2389,6 +2068,8 @@ async fn admission_fails_on_disordered_grammar_with_no_db_write() {
         now,
     );
     let ev4 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         4,
         0,
         entry_4,
@@ -2400,6 +2081,8 @@ async fn admission_fails_on_disordered_grammar_with_no_db_write() {
     );
     // A second Creation after application traffic is never a valid prefix.
     let ev5 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         5,
         0,
         entry_5,
@@ -2492,7 +2175,7 @@ async fn admission_fails_on_disordered_grammar_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -2564,6 +2247,8 @@ async fn admission_fails_on_policy_with_zero_additions_with_no_db_write() {
     let fp = [1u8; 32];
 
     let ev1 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry_1,
@@ -2574,6 +2259,8 @@ async fn admission_fails_on_policy_with_zero_additions_with_no_db_write() {
         now,
     );
     let ev2 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         2,
         0,
         entry_2,
@@ -2584,6 +2271,8 @@ async fn admission_fails_on_policy_with_zero_additions_with_no_db_write() {
         now,
     );
     let ev3 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         3,
         0,
         entry_3,
@@ -2594,6 +2283,8 @@ async fn admission_fails_on_policy_with_zero_additions_with_no_db_write() {
         now,
     );
     let ev4 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         4,
         0,
         entry_4,
@@ -2676,7 +2367,7 @@ async fn admission_fails_on_policy_with_zero_additions_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -2751,6 +2442,8 @@ async fn admission_fails_on_policy_with_non_add_changes_with_no_db_write() {
     let fp = [1u8; 32];
 
     let ev1 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry_1,
@@ -2761,6 +2454,8 @@ async fn admission_fails_on_policy_with_non_add_changes_with_no_db_write() {
         now,
     );
     let ev2 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         2,
         0,
         entry_2,
@@ -2771,6 +2466,8 @@ async fn admission_fails_on_policy_with_non_add_changes_with_no_db_write() {
         now,
     );
     let ev3 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         3,
         0,
         entry_3,
@@ -2781,6 +2478,8 @@ async fn admission_fails_on_policy_with_non_add_changes_with_no_db_write() {
         now,
     );
     let ev4 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         4,
         0,
         entry_4,
@@ -2863,7 +2562,7 @@ async fn admission_fails_on_policy_with_non_add_changes_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -2902,153 +2601,40 @@ async fn admission_fails_when_no_active_local_device_exists() {
     let Some((pool, _db_guard)) = setup_test_db().await else {
         return;
     };
-
-    let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:seq.catbird.blue";
-    let local_participant_did = "did:web:destination.catbird.blue";
-    let remote_participant_did = "did:web:remote-participant.catbird.blue";
-    let local_device_id = Uuid::new_v4();
-
-    // Device is REVOKED -> must fail with NoLocalParticipant
-    seed_test_device(&pool, local_participant_did, local_device_id, "revoked").await;
-    seed_approved_peer(&pool, sequencer_did).await;
-    seed_approved_peer(&pool, "did:web:remote-seq.catbird.blue").await;
-
-    let now = Utc::now();
-    let creation_signed = build_test_signed_creation(
-        convo_id,
-        local_participant_did,
-        local_device_id,
-        &[local_participant_did, remote_participant_did],
-        now,
-    );
-    let entry_1 = Uuid::new_v4();
-    let entry_2 = Uuid::new_v4();
-    let entry_3 = Uuid::new_v4();
-    let fp = [1u8; 32];
-
-    let ev1 = build_test_event_json(
-        1,
-        0,
-        entry_1,
-        CREATION_ENTRY_TYPE_ID,
-        b"p1",
-        &creation_signed,
-        &fp,
-        now,
-    );
-    let ev2 = build_test_event_json(
-        2,
-        0,
-        entry_2,
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        b"p2",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-    let ev3 = build_test_event_json(
-        3,
-        0,
-        entry_3,
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        b"p3",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-
-    let mut hasher = CleanConvoDigestHasher::new();
-    hasher.update_event(
-        1,
-        0,
-        entry_1,
-        CREATION_ENTRY_TYPE_ID,
-        b"p1",
-        &creation_signed,
-        &fp,
-        now,
-    );
-    hasher.update_event(
-        2,
-        0,
-        entry_2,
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        b"p2",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-    hasher.update_event(
-        3,
-        0,
-        entry_3,
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        b"p3",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-    let digest_hex = hasher.finalize();
-
-    let digest_json = json!({
-        "convoId": convo_id.to_string(),
-        "sequencerDsDid": sequencer_did,
-        "sequencerTerm": 0,
-        "epoch": 0,
-        "lastSeq": 3,
-        "eventCount": 3,
-        "digestSha256": digest_hex,
-        "generatedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true)
-    });
-
-    let mock_state = MockSequencerState {
-        capabilities: vec![
-            CAPABILITY_RECONCILIATION_V1.to_string(),
-            CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
-        ],
-        opening_digest: Some(digest_json.clone()),
-        closing_digest: Some(digest_json),
-        events_pages: vec![json!({
-            "convoId": convo_id.to_string(),
-            "fromSeqExclusive": 0,
-            "toSeqInclusive": 3,
-            "events": [ev1, ev2, ev3]
-        })],
-        recorded_requests: Arc::new(Mutex::new(Vec::new())),
-        destination_hits: Arc::new(AtomicUsize::new(0)),
+    let fixture = seeded_full_prefix_fixture(&pool, sequencer_did, "revoked").await;
+    let conversation_id = fixture.convo_id;
+    let before = snapshot_db_content(&pool).await;
+    let error = match fetch_test_remote_prefix_admission(
+        &pool,
+        conversation_id,
+        sequencer_did,
+        MockSequencerState {
+            capabilities: vec![
+                CAPABILITY_RECONCILIATION_V1.to_string(),
+                CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
+            ],
+            opening_digest: Some(fixture.opening_digest),
+            closing_digest: Some(fixture.closing_digest),
+            events_pages: vec![json!({
+                "convoId": conversation_id,
+                "fromSeqExclusive": 0,
+                "toSeqInclusive": 5,
+                "events": fixture.events,
+            })],
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("revoked local devices must not admit a mailbox"),
     };
 
-    let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
-    let outbound = OutboundClient::new(2, 2);
-
-    let auth_client = ServiceAuthClient::from_shared_secret(
-        "did:web:destination.catbird.blue".to_string(),
-        b"test-secret",
-    );
-    let auth_sign = move |target: &str, method: &str| {
-        auth_client
-            .sign_request(target, method)
-            .map_err(|e| e.to_string())
-    };
-
-    let snapshot_before = snapshot_db_content(&pool).await;
-
-    let selector =
-        RemotePrefixBootstrapSelector::new(convo_id, sequencer_did.to_string(), 0).unwrap();
-    let res =
-        fetch_remote_prefix_admission(&pool, &resolver, &outbound, &auth_sign, selector).await;
-
-    let err = match res {
-        Err(e) => e,
-        Ok(_) => panic!("expected Err, got Ok"),
-    };
-    assert_eq!(err, RemotePrefixBootstrapError::NoLocalParticipant);
-
-    let snapshot_after = snapshot_db_content(&pool).await;
+    assert_eq!(error, RemotePrefixBootstrapError::NoLocalParticipant);
     assert_eq!(
-        snapshot_before, snapshot_after,
+        before,
+        snapshot_db_content(&pool).await,
         "no DB write when no active local device exists"
     );
 }
@@ -3077,7 +2663,7 @@ async fn admission_fails_on_unapproved_peer_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -3116,151 +2702,91 @@ async fn admission_succeeds_with_nonzero_generation() {
     let Some((pool, _db_guard)) = setup_test_db().await else {
         return;
     };
-
-    let convo_id = Uuid::new_v4();
     let sequencer_did = "did:web:seq.catbird.blue";
-    let local_participant_did = "did:web:destination.catbird.blue";
-    let local_device_id = Uuid::new_v4();
-
-    seed_test_device(&pool, local_participant_did, local_device_id, "active").await;
-    seed_approved_peer(&pool, sequencer_did).await;
-
-    let now = Utc::now();
-    let creation_signed = build_test_signed_creation(
-        convo_id,
-        local_participant_did,
-        local_device_id,
-        &[local_participant_did],
-        now,
-    );
-
-    let entry_1 = Uuid::new_v4();
-    let entry_2 = Uuid::new_v4();
-    let entry_3 = Uuid::new_v4();
-    let fp = [1u8; 32];
-
-    // Epoch / generation = 2
-    let ev1 = build_test_event_json(
-        1,
+    let fixture = seeded_full_prefix_fixture(&pool, sequencer_did, "active").await;
+    let conversation_id = fixture.convo_id;
+    let prior = fixture.committed_coordinate;
+    let nonzero_coordinate = PublicGroupSnapshotCoordinate::new(
+        *prior.conversation_id(),
         2,
-        entry_1,
-        CREATION_ENTRY_TYPE_ID,
-        b"p1",
-        &creation_signed,
-        &fp,
-        now,
+        prior.state_version(),
+        *prior.group_id(),
+        prior.epoch(),
+        *prior.group_context_hash(),
+        *prior.confirmation_tag(),
+        prior.lifecycle(),
     );
-    let ev2 = build_test_event_json(
-        2,
-        2,
-        entry_2,
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        b"p2",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
+    let received_at = dynamic_fixture_instant(6_000);
+    let actor_signing_key = SigningKey::from_bytes(&fixture.creation_entry.signing_seed);
+    let nonzero_event = genuine_application_event(
+        conversation_id,
+        sequencer_did,
+        6,
+        &fixture.actor_did,
+        fixture.actor_device,
+        &fixture.actor_key_id,
+        &actor_signing_key,
+        &fixture.actor_public_key,
+        &nonzero_coordinate,
+        &[0x31; 8],
+        received_at,
     );
-    let ev3 = build_test_event_json(
-        3,
-        2,
-        entry_3,
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        b"p3",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-
+    let mut events = fixture.events;
+    events.push(nonzero_event);
     let mut hasher = CleanConvoDigestHasher::new();
-    hasher.update_event(
-        1,
-        2,
-        entry_1,
-        CREATION_ENTRY_TYPE_ID,
-        b"p1",
-        &creation_signed,
-        &fp,
-        now,
-    );
-    hasher.update_event(
-        2,
-        2,
-        entry_2,
-        PARTICIPANT_ACCEPTANCE_ENTRY_TYPE_ID,
-        b"p2",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-    hasher.update_event(
-        3,
-        2,
-        entry_3,
-        LEAF_RECOVERY_FULFILLMENT_ENTRY_TYPE_ID,
-        b"p3",
-        b"{\"signed\":{}}",
-        &fp,
-        now,
-    );
-    let digest_hex = hasher.finalize();
-
-    let digest_json = json!({
-        "convoId": convo_id.to_string(),
+    for event in &events {
+        let strict = StrictCleanRemoteEvent::try_from(
+            serde_json::from_value::<crate::federation::reconciliation::RemoteEvent>(event.clone())
+                .expect("fixture event JSON"),
+        )
+        .expect("complete fixture event");
+        hasher.update_event(
+            strict.seq(),
+            strict.generation(),
+            strict.entry_id(),
+            event["entryKind"].as_str().expect("fixture entry kind"),
+            strict.accepted_payload_bytes(),
+            strict.signed_request(),
+            strict.outer_fingerprint(),
+            strict.received_at(),
+        );
+    }
+    let digest = json!({
+        "convoId": conversation_id,
         "sequencerDsDid": sequencer_did,
         "sequencerTerm": 0,
         "epoch": 2,
-        "lastSeq": 3,
-        "eventCount": 3,
-        "digestSha256": digest_hex,
-        "generatedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true)
+        "lastSeq": 6,
+        "eventCount": 6,
+        "digestSha256": hasher.finalize(),
+        "generatedAt": received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
     });
-
-    let mock_state = MockSequencerState {
-        capabilities: vec![
-            CAPABILITY_RECONCILIATION_V1.to_string(),
-            CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
-        ],
-        opening_digest: Some(digest_json.clone()),
-        closing_digest: Some(digest_json),
-        events_pages: vec![json!({
-            "convoId": convo_id.to_string(),
-            "fromSeqExclusive": 0,
-            "toSeqInclusive": 3,
-            "events": [ev1, ev2, ev3]
-        })],
-        recorded_requests: Arc::new(Mutex::new(Vec::new())),
-        destination_hits: Arc::new(AtomicUsize::new(0)),
-    };
-
-    let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
-    let outbound = OutboundClient::new(2, 2);
-
-    let auth_client = ServiceAuthClient::from_shared_secret(
-        "did:web:destination.catbird.blue".to_string(),
-        b"test-secret",
-    );
-    let auth_sign = move |target: &str, method: &str| {
-        auth_client
-            .sign_request(target, method)
-            .map_err(|e| e.to_string())
-    };
-
-    let selector =
-        RemotePrefixBootstrapSelector::new(convo_id, sequencer_did.to_string(), 0).unwrap();
-    let admission = match fetch_remote_prefix_admission(
-        &pool, &resolver, &outbound, &auth_sign, selector,
+    let admission = fetch_test_remote_prefix_admission(
+        &pool,
+        conversation_id,
+        sequencer_did,
+        MockSequencerState {
+            capabilities: vec![
+                CAPABILITY_RECONCILIATION_V1.to_string(),
+                CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
+            ],
+            opening_digest: Some(digest.clone()),
+            closing_digest: Some(digest),
+            events_pages: vec![json!({
+                "convoId": conversation_id,
+                "fromSeqExclusive": 0,
+                "toSeqInclusive": 6,
+                "events": events,
+            })],
+            ..Default::default()
+        },
     )
     .await
-    {
-        Ok(adm) => adm,
-        Err(e) => panic!("admission with nonzero generation must succeed, got {e:?}"),
-    };
+    .expect("genuine receipt at a nonzero generation must be admitted");
 
-    assert_eq!(admission.event_count(), 3);
-    assert_eq!(admission.conversation_id(), convo_id);
+    assert_eq!(admission.event_count(), 6);
+    assert_eq!(admission.conversation_id(), conversation_id);
 }
-
 // 22. Generation mismatch produces InvalidEvent with no DB write
 #[tokio::test]
 async fn admission_fails_on_generation_mismatch_with_no_db_write() {
@@ -3292,6 +2818,8 @@ async fn admission_fails_on_generation_mismatch_with_no_db_write() {
 
     // Events have generation 1
     let ev1 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         1,
         entry_1,
@@ -3302,6 +2830,8 @@ async fn admission_fails_on_generation_mismatch_with_no_db_write() {
         now,
     );
     let ev2 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         2,
         1,
         entry_2,
@@ -3312,6 +2842,8 @@ async fn admission_fails_on_generation_mismatch_with_no_db_write() {
         now,
     );
     let ev3 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         3,
         1,
         entry_3,
@@ -3385,7 +2917,7 @@ async fn admission_fails_on_generation_mismatch_with_no_db_write() {
     };
 
     let (dest, _url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), dest, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -3461,7 +2993,11 @@ fn fresh_bob() -> (DeviceIdentity, String) {
     (device, did)
 }
 
-fn genuine_creation_event(cid: Uuid, received_at: DateTime<Utc>) -> (RealCreationEntry, Value) {
+fn genuine_creation_event(
+    cid: Uuid,
+    sequencer_did: &str,
+    received_at: DateTime<Utc>,
+) -> (RealCreationEntry, Value) {
     let manifest = corpus_manifest();
     let entry = build_real_corpus_creation_entry(*cid.as_bytes());
     let group_info = corpus_file("group-info.mls");
@@ -3477,6 +3013,8 @@ fn genuine_creation_event(cid: Uuid, received_at: DateTime<Utc>) -> (RealCreatio
         &received_at_str,
     );
     let event = build_test_event_json(
+        cid,
+        sequencer_did,
         1,
         0,
         entry.entry_id,
@@ -3498,7 +3036,9 @@ fn genuine_policy_event(
     coordinate: &PublicGroupSnapshotCoordinate,
     invitee_did: &str,
     received_at: DateTime<Utc>,
+    sequencer_did: &str,
 ) -> (GenuinePolicyControl, PublicGroupSnapshotCoordinate, Value) {
+    let convo_id = Uuid::from_bytes(*coordinate.conversation_id());
     let received_at_str = received_at.to_rfc3339_opts(SecondsFormat::Millis, true);
     let next_coordinate = PublicGroupSnapshotCoordinate::new(
         *coordinate.conversation_id(),
@@ -3519,6 +3059,8 @@ fn genuine_policy_event(
     );
     let outer_fingerprint = vec_to_32(&policy.entry.outer_entry_fingerprint);
     let event = build_test_event_json(
+        convo_id,
+        sequencer_did,
         2,
         0,
         policy.entry.entry_id,
@@ -3538,7 +3080,9 @@ fn genuine_acceptance_event(
     prior_coordinate: &PublicGroupSnapshotCoordinate,
     corpus_package: Option<([u8; 32], Vec<u8>)>,
     received_at: DateTime<Utc>,
+    sequencer_did: &str,
 ) -> (RealAcceptanceEntry, Value) {
+    let convo_id = Uuid::from_bytes(*prior_coordinate.conversation_id());
     let signed_at = received_at.to_rfc3339_opts(SecondsFormat::Millis, true);
     let received_at_str = signed_at.clone();
     let expires_at =
@@ -3556,6 +3100,8 @@ fn genuine_acceptance_event(
         corpus_package,
     );
     let event = build_test_event_json(
+        convo_id,
+        sequencer_did,
         3,
         0,
         acceptance.entry_id,
@@ -3579,7 +3125,7 @@ async fn historical_authority_preserves_exact_historical_instant() {
     let sequencer_did = "did:web:sequencer.catbird.blue";
     let historical_instant = corpus_evaluation_instant(1_000);
 
-    let (entry, event_json) = genuine_creation_event(convo_id, historical_instant);
+    let (entry, event_json) = genuine_creation_event(convo_id, sequencer_did, historical_instant);
     let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
     seed_protocol_instance(&pool).await;
     seed_actor_at(
@@ -3655,7 +3201,7 @@ async fn historical_authority_fails_on_signer_drift_and_revocation() {
     let sequencer_did = "did:web:sequencer.catbird.blue";
     let now = corpus_evaluation_instant(1_000);
 
-    let (entry, event_json) = genuine_creation_event(convo_id, now);
+    let (entry, event_json) = genuine_creation_event(convo_id, sequencer_did, now);
     let selector =
         RemotePrefixBootstrapSelector::new(convo_id, sequencer_did.to_string(), 0).unwrap();
     let admission_digest = [0x55u8; 32];
@@ -3857,7 +3403,7 @@ async fn historical_authority_fails_on_package_graph_drift() {
     let acceptance_time = corpus_evaluation_instant(3_000);
 
     let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
-    let (entry, creation_event) = genuine_creation_event(convo_id, creation_time);
+    let (entry, creation_event) = genuine_creation_event(convo_id, sequencer_did, creation_time);
 
     let (bob_device_identity, bob_did) = fresh_bob();
     let bob_device = Uuid::from_bytes(*bob_device_identity.device_id());
@@ -3875,7 +3421,7 @@ async fn historical_authority_fails_on_package_graph_drift() {
     let coordinate =
         coordinate_with_conversation(&genesis_coordinate(&manifest), *convo_id.as_bytes());
     let (policy, policy_next_coordinate, policy_event) =
-        genuine_policy_event(&entry, &coordinate, &bob_did, policy_time);
+        genuine_policy_event(&entry, &coordinate, &bob_did, policy_time, sequencer_did);
 
     let pkg_not_before = actor_created_at - chrono::Duration::hours(1);
     let pkg_not_after = actor_created_at + chrono::Duration::days(30);
@@ -3950,6 +3496,7 @@ async fn historical_authority_fails_on_package_graph_drift() {
         &policy_next_coordinate,
         Some((pkg_ref, pkg_wrapper.clone())),
         acceptance_time,
+        sequencer_did,
     );
 
     // Case A: Missing key package in DB
@@ -4001,6 +3548,7 @@ async fn historical_authority_fails_on_package_graph_drift() {
             &policy_next_coordinate,
             Some((expired_ref, expired_wrapper)),
             acceptance_time,
+            sequencer_did,
         );
 
         let mut tx = pool_b.begin().await.expect("begin tx");
@@ -4100,7 +3648,7 @@ async fn historical_policy_rejects_non_pending_add_changes() {
     let policy_time = corpus_evaluation_instant(2_000);
 
     let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
-    let (entry, creation_event) = genuine_creation_event(convo_id, creation_time);
+    let (entry, creation_event) = genuine_creation_event(convo_id, sequencer_did, creation_time);
     seed_protocol_instance(&pool).await;
     seed_actor_at(
         &pool,
@@ -4143,6 +3691,8 @@ async fn historical_policy_rejects_non_pending_add_changes() {
         vec![GenuinePolicyChange::Remove(&remove_did)],
     );
     let bad_policy_event = build_test_event_json(
+        convo_id,
+        sequencer_did,
         2,
         0,
         bad_policy.entry.entry_id,
@@ -4181,7 +3731,7 @@ async fn historical_execution_produces_exact_zero_notifications_and_outbox() {
     let now = corpus_evaluation_instant(1_000);
 
     let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
-    let (entry, creation_event) = genuine_creation_event(convo_id, now);
+    let (entry, creation_event) = genuine_creation_event(convo_id, sequencer_did, now);
     seed_protocol_instance(&pool).await;
     seed_actor_at(
         &pool,
@@ -4365,6 +3915,8 @@ async fn generic_historical_bootstrap_still_rejects_direct_creation() {
     );
     let (entry, pending) = add_pending_invitee_to_creation(entry, "direct");
     let event = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry.entry_id,
@@ -4508,6 +4060,8 @@ async fn historical_planners_positive_pipeline_succeeds_with_zero_side_effects()
         &received_at_str,
     );
     let creation_event = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry.entry_id,
@@ -4538,6 +4092,7 @@ async fn historical_planners_positive_pipeline_succeeds_with_zero_side_effects()
         crypto_fixture.genesis.coordinate(),
         &bob_did,
         policy_time,
+        sequencer_did,
     );
     let mut tx = pool.begin().await.expect("begin tx 2");
     let outcome2 = test_apply_historical_policy_entry(
@@ -4565,6 +4120,7 @@ async fn historical_planners_positive_pipeline_succeeds_with_zero_side_effects()
             crypto_fixture.key_package_wrapper.clone(),
         )),
         acceptance_time,
+        sequencer_did,
     );
     let mut tx = pool.begin().await.expect("begin tx 3");
     let outcome3 = test_apply_historical_acceptance_entry(
@@ -4612,6 +4168,8 @@ async fn historical_planners_positive_pipeline_succeeds_with_zero_side_effects()
         0x72,
     );
     let fulfillment_event = build_test_event_json(
+        convo_id,
+        sequencer_did,
         4,
         0,
         fulfillment.entry_id,
@@ -4747,7 +4305,7 @@ async fn historical_bootstrap_ignores_exhausted_live_invitation_quota_and_mutate
     let policy_time = corpus_evaluation_instant(2_000);
 
     let actor_created_at = corpus_evaluation_instant(0) - chrono::Duration::hours(1);
-    let (entry, creation_event) = genuine_creation_event(convo_id, creation_time);
+    let (entry, creation_event) = genuine_creation_event(convo_id, sequencer_did, creation_time);
     seed_protocol_instance(&pool).await;
     seed_actor_at(
         &pool,
@@ -4780,7 +4338,7 @@ async fn historical_bootstrap_ignores_exhausted_live_invitation_quota_and_mutate
     for _ in 0..5 {
         let existing_cid = Uuid::new_v4();
         let (existing_entry, existing_creation) =
-            genuine_creation_event(existing_cid, creation_time);
+            genuine_creation_event(existing_cid, sequencer_did, creation_time);
         let existing_sel =
             RemotePrefixBootstrapSelector::new(existing_cid, sequencer_did.to_string(), 0).unwrap();
         let mut tx = pool.begin().await.expect("begin setup tx");
@@ -4798,8 +4356,13 @@ async fn historical_bootstrap_ignores_exhausted_live_invitation_quota_and_mutate
         let manifest = corpus_manifest();
         let coordinate =
             coordinate_with_conversation(&genesis_coordinate(&manifest), *existing_cid.as_bytes());
-        let (_policy, _, policy_ev) =
-            genuine_policy_event(&existing_entry, &coordinate, &bob_did, policy_time);
+        let (_policy, _, policy_ev) = genuine_policy_event(
+            &existing_entry,
+            &coordinate,
+            &bob_did,
+            policy_time,
+            sequencer_did,
+        );
         test_apply_historical_policy_entry(
             &mut tx,
             admission_digest,
@@ -4836,7 +4399,8 @@ async fn historical_bootstrap_ignores_exhausted_live_invitation_quota_and_mutate
 
     // Now import the 6th remote conversation with the same (Alice -> Bob) pending invitation
     let sixth_convo_id = Uuid::new_v4();
-    let (sixth_entry, sixth_creation) = genuine_creation_event(sixth_convo_id, creation_time);
+    let (sixth_entry, sixth_creation) =
+        genuine_creation_event(sixth_convo_id, sequencer_did, creation_time);
     let sixth_sel =
         RemotePrefixBootstrapSelector::new(sixth_convo_id, sequencer_did.to_string(), 0).unwrap();
 
@@ -4855,8 +4419,13 @@ async fn historical_bootstrap_ignores_exhausted_live_invitation_quota_and_mutate
     let manifest = corpus_manifest();
     let coordinate =
         coordinate_with_conversation(&genesis_coordinate(&manifest), *sixth_convo_id.as_bytes());
-    let (_policy, _, sixth_policy_ev) =
-        genuine_policy_event(&sixth_entry, &coordinate, &bob_did, policy_time);
+    let (_policy, _, sixth_policy_ev) = genuine_policy_event(
+        &sixth_entry,
+        &coordinate,
+        &bob_did,
+        policy_time,
+        sequencer_did,
+    );
     test_apply_historical_policy_entry(
         &mut tx,
         admission_digest,
@@ -4894,7 +4463,8 @@ async fn historical_bootstrap_ignores_exhausted_live_invitation_quota_and_mutate
     );
     // Ordinary live/unauthorized insert of a 7th pending invitation for (Alice -> Bob) without the historical session variable fails with quota error 23514
     let seventh_convo_id = Uuid::new_v4();
-    let (seventh_entry, seventh_creation) = genuine_creation_event(seventh_convo_id, creation_time);
+    let (seventh_entry, seventh_creation) =
+        genuine_creation_event(seventh_convo_id, sequencer_did, creation_time);
     let seventh_sel =
         RemotePrefixBootstrapSelector::new(seventh_convo_id, sequencer_did.to_string(), 0).unwrap();
 
@@ -4913,8 +4483,13 @@ async fn historical_bootstrap_ignores_exhausted_live_invitation_quota_and_mutate
     let manifest = corpus_manifest();
     let coordinate =
         coordinate_with_conversation(&genesis_coordinate(&manifest), *seventh_convo_id.as_bytes());
-    let (_policy, _, seventh_policy_ev) =
-        genuine_policy_event(&seventh_entry, &coordinate, &bob_did, policy_time);
+    let (_policy, _, seventh_policy_ev) = genuine_policy_event(
+        &seventh_entry,
+        &coordinate,
+        &bob_did,
+        policy_time,
+        sequencer_did,
+    );
     test_apply_historical_policy_entry(
         &mut ordinary_tx,
         admission_digest,
@@ -4951,7 +4526,7 @@ async fn hostile_custom_guc_is_completely_inert() {
     let admission_digest = [0x77; 32];
     seed_protocol_instance(&pool).await;
 
-    let (actor, _) = genuine_creation_event(Uuid::new_v4(), creation_time);
+    let (actor, _) = genuine_creation_event(Uuid::new_v4(), sequencer_did, creation_time);
     seed_actor_at(
         &pool,
         &actor.actor_did,
@@ -4977,7 +4552,8 @@ async fn hostile_custom_guc_is_completely_inert() {
 
     for _ in 0..5 {
         let conversation_id = Uuid::new_v4();
-        let (entry, creation_event) = genuine_creation_event(conversation_id, creation_time);
+        let (entry, creation_event) =
+            genuine_creation_event(conversation_id, sequencer_did, creation_time);
         let selector =
             RemotePrefixBootstrapSelector::new(conversation_id, sequencer_did.to_string(), 0)
                 .unwrap();
@@ -4985,7 +4561,8 @@ async fn hostile_custom_guc_is_completely_inert() {
             &genesis_coordinate(&corpus_manifest()),
             *conversation_id.as_bytes(),
         );
-        let (_, _, policy_event) = genuine_policy_event(&entry, &coordinate, &bob_did, policy_time);
+        let (_, _, policy_event) =
+            genuine_policy_event(&entry, &coordinate, &bob_did, policy_time, sequencer_did);
         let mut tx = pool.begin().await.unwrap();
         test_apply_historical_creation_entry(
             &mut tx,
@@ -5012,14 +4589,15 @@ async fn hostile_custom_guc_is_completely_inert() {
     }
 
     let target_id = Uuid::new_v4();
-    let (entry, creation_event) = genuine_creation_event(target_id, creation_time);
+    let (entry, creation_event) = genuine_creation_event(target_id, sequencer_did, creation_time);
     let selector =
         RemotePrefixBootstrapSelector::new(target_id, sequencer_did.to_string(), 0).unwrap();
     let coordinate = coordinate_with_conversation(
         &genesis_coordinate(&corpus_manifest()),
         *target_id.as_bytes(),
     );
-    let (_, _, policy_event) = genuine_policy_event(&entry, &coordinate, &bob_did, policy_time);
+    let (_, _, policy_event) =
+        genuine_policy_event(&entry, &coordinate, &bob_did, policy_time, sequencer_did);
     let mut tx = pool.begin().await.unwrap();
     sqlx::query("SELECT set_config('catbird.historical_bootstrap_conversation', $1, true)")
         .bind(target_id.to_string())
@@ -5242,6 +4820,7 @@ async fn cutoff_integrity_and_immutability() {
 
 fn genuine_application_event(
     convo_id: Uuid,
+    sequencer_did: &str,
     seq: i64,
     actor_did: &str,
     actor_device_id: Uuid,
@@ -5249,11 +4828,12 @@ fn genuine_application_event(
     actor_signing_key: &SigningKey,
     actor_public_key: &[u8],
     prior_coord: &PublicGroupSnapshotCoordinate,
+    application_bytes: &[u8],
     received_at: DateTime<Utc>,
 ) -> Value {
     let msg_id = Uuid::new_v4();
     let entry_id = Uuid::new_v4();
-    let msg_bytes = vec![0x31u8; 8];
+    let msg_bytes = application_bytes.to_vec();
     let now_str = received_at.to_rfc3339_opts(SecondsFormat::Millis, true);
 
     let unsigned = json!({
@@ -5289,7 +4869,8 @@ fn genuine_application_event(
                 "groupContextHash": STANDARD.encode(prior_coord.group_context_hash()),
                 "confirmationTag": STANDARD.encode(prior_coord.confirmation_tag()),
                 "lifecycle": "active"
-            }
+            },
+            "archiveCommitment": STANDARD.encode([0x6d_u8; 32])
         },
         "applicationMessage": {
             "framing": "mlsMessage",
@@ -5337,8 +4918,10 @@ fn genuine_application_event(
     let outer_fp = *built.outer_application_fingerprint();
 
     build_test_event_json(
+        convo_id,
+        sequencer_did,
         seq,
-        0,
+        i64::try_from(prior_coord.generation()).expect("fixture generation fits i64"),
         entry_id,
         APPLICATION_ENTRY_TYPE_ID,
         &ciphertext,
@@ -5439,6 +5022,8 @@ fn build_full_5_event_prefix_fixture(
 
     // Event 1: Creation
     let ev1 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry.entry_id,
@@ -5456,6 +5041,7 @@ fn build_full_5_event_prefix_fixture(
         crypto_fixture.genesis.coordinate(),
         &bob_did,
         policy_time,
+        sequencer_did,
     );
     let policy_entry_id = policy.entry.entry_id;
 
@@ -5470,6 +5056,7 @@ fn build_full_5_event_prefix_fixture(
             crypto_fixture.key_package_wrapper.clone(),
         )),
         acceptance_time,
+        sequencer_did,
     );
     let acceptance_entry_id = acceptance.entry_id;
 
@@ -5504,6 +5091,8 @@ fn build_full_5_event_prefix_fixture(
         0x72,
     );
     let ev4 = build_test_event_json(
+        convo_id,
+        sequencer_did,
         4,
         0,
         fulfillment.entry_id,
@@ -5519,6 +5108,7 @@ fn build_full_5_event_prefix_fixture(
     let alice_signing_key = SigningKey::from_bytes(&entry.signing_seed);
     let ev5 = genuine_application_event(
         convo_id,
+        sequencer_did,
         5,
         &entry.actor_did,
         entry.actor_device_id,
@@ -5526,6 +5116,7 @@ fn build_full_5_event_prefix_fixture(
         &alice_signing_key,
         &entry.public_key,
         crypto_fixture.committed.coordinate(),
+        &[0x31; 8],
         app_time,
     );
     let app_entry_id = Uuid::parse_str(ev5["entryId"].as_str().unwrap()).unwrap();
@@ -5666,7 +5257,11 @@ fn corrupt_accepted_payload(event: &mut Value) {
     event["acceptedPayloadSha256"]["$bytes"] = json!(STANDARD.encode(Sha256::digest(&payload)));
 }
 
-fn build_corrupted_group_info_creation_event(convo_id: Uuid, received_at: DateTime<Utc>) -> Value {
+fn build_corrupted_group_info_creation_event(
+    convo_id: Uuid,
+    sequencer_did: &str,
+    received_at: DateTime<Utc>,
+) -> Value {
     let manifest = corpus_manifest();
     let entry = build_real_corpus_creation_entry(*convo_id.as_bytes());
     let bad_group_info = vec![0xff; 64];
@@ -5683,6 +5278,8 @@ fn build_corrupted_group_info_creation_event(convo_id: Uuid, received_at: DateTi
         &received_at_str,
     );
     build_test_event_json(
+        convo_id,
+        sequencer_did,
         1,
         0,
         entry.entry_id,
@@ -5791,7 +5388,7 @@ async fn bootstrap_remote_prefix_positive_apply_succeeds_with_all_checks() {
     };
 
     let (destination, _base_url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
 
     let auth_client = ServiceAuthClient::from_shared_secret(
@@ -5892,13 +5489,22 @@ async fn bootstrap_remote_prefix_positive_apply_succeeds_with_all_checks() {
         )
     );
 
-    let wire_rows: Vec<(i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, DateTime<Utc>)> = sqlx::query_as(
+    let wire_rows: Vec<(
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
         r#"
         SELECT CAST(seq AS BIGINT),
                accepted_payload_bytes,
                accepted_payload_sha256,
                signed_request_bytes,
                outer_entry_fingerprint,
+               sequencer_receipt_bytes,
                received_at
           FROM chat.entries
          WHERE conversation_id = $1
@@ -5920,11 +5526,27 @@ async fn bootstrap_remote_prefix_positive_apply_succeeds_with_all_checks() {
         assert_eq!(row.2, source_bytes("acceptedPayloadSha256"));
         assert_eq!(row.3, source_bytes("signedRequest"));
         assert_eq!(row.4, source_bytes("outerFingerprint"));
+        assert_eq!(row.5, source_bytes("sequencerReceipt"));
         assert_eq!(
-            row.5.timestamp_millis(),
+            row.6.timestamp_millis(),
             DateTime::parse_from_rfc3339(source["createdAt"].as_str().unwrap())
                 .unwrap()
                 .timestamp_millis()
+        );
+    }
+
+    for seq in 1..=5 {
+        let client_entry =
+            catbird_server::chat_protocol::repository::entry_read::entry_json_for_test(
+                &pool,
+                fixture.convo_id,
+                seq,
+            )
+            .await
+            .expect("project imported entry through the client-facing read path");
+        assert!(
+            client_entry["sequencerReceipt"].is_object(),
+            "imported seq {seq} must never be exposed without its I13 receipt"
         );
     }
 
@@ -6087,6 +5709,94 @@ async fn bootstrap_remote_prefix_positive_apply_succeeds_with_all_checks() {
     .await
     .expect("fetch sync status");
     assert_eq!(sync_status, "healthy");
+}
+
+#[tokio::test]
+async fn admission_rejects_missing_forged_and_misbound_receipts_without_writes() {
+    let Some((pool, _db_guard)) = setup_test_db().await else {
+        return;
+    };
+    let sequencer_did = "did:web:sequencer.catbird.blue";
+    seed_approved_peer(&pool, sequencer_did).await;
+    seed_protocol_instance(&pool).await;
+
+    for case in ["missing", "forged", "wrong-seq"] {
+        let convo_id = Uuid::new_v4();
+        let actor_created_at = dynamic_fixture_instant(0) - chrono::Duration::hours(1);
+        let fixture = build_full_5_event_prefix_fixture(convo_id, sequencer_did, actor_created_at);
+        seed_full_test_authority(&pool, &fixture, actor_created_at).await;
+        let mut events = fixture.events.clone();
+        match case {
+            "missing" => {
+                events[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("sequencerReceipt");
+            }
+            "forged" => {
+                let mut receipt: Value = serde_json::from_slice(
+                    &STANDARD
+                        .decode(events[0]["sequencerReceipt"]["$bytes"].as_str().unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+                let mut signature = STANDARD
+                    .decode(receipt["signature"].as_str().unwrap())
+                    .unwrap();
+                signature[0] ^= 1;
+                receipt["signature"] = json!(STANDARD.encode(signature));
+                events[0]["sequencerReceipt"]["$bytes"] =
+                    json!(STANDARD.encode(serde_json::to_vec(&receipt).unwrap()));
+            }
+            "wrong-seq" => {
+                events[1]["sequencerReceipt"] = events[0]["sequencerReceipt"].clone();
+            }
+            _ => unreachable!(),
+        }
+
+        let mock_state = MockSequencerState {
+            capabilities: vec![
+                CAPABILITY_RECONCILIATION_V1.to_string(),
+                CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string(),
+            ],
+            opening_digest: Some(fixture.opening_digest.clone()),
+            closing_digest: Some(fixture.closing_digest.clone()),
+            events_pages: vec![json!({
+                "convoId": convo_id,
+                "fromSeqExclusive": 0,
+                "toSeqInclusive": 5,
+                "events": events,
+            })],
+            ..Default::default()
+        };
+        let (destination, _base_url) = spawn_mock_sequencer(mock_state).await;
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
+        let outbound = OutboundClient::new(2, 2);
+        let auth_client = ServiceAuthClient::from_shared_secret(
+            "did:web:destination.catbird.blue".to_string(),
+            b"test-secret",
+        );
+        let auth_sign = move |target: &str, method: &str| {
+            auth_client
+                .sign_request(target, method)
+                .map_err(|error| error.to_string())
+        };
+        let before = snapshot_db_content(&pool).await;
+        let selector =
+            RemotePrefixBootstrapSelector::new(convo_id, sequencer_did.to_string(), 0).unwrap();
+        let result =
+            fetch_remote_prefix_admission(&pool, &resolver, &outbound, &auth_sign, selector).await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("{case} receipt must fail closed"),
+        };
+        assert_eq!(error, RemotePrefixBootstrapError::InvalidEvent, "{case}");
+        assert_eq!(
+            before,
+            snapshot_db_content(&pool).await,
+            "{case} receipt rejection must perform zero database writes"
+        );
+    }
 }
 
 // 32. Mid-transaction rollback on event 2 failure (proves sequence 1 write was rolled back)
@@ -6355,7 +6065,7 @@ async fn bootstrap_absent_bootstraps_serialize_cleanly() {
     };
 
     let (destination, _base_url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
     let outbound1 = OutboundClient::new(2, 2);
     let outbound2 = OutboundClient::new(2, 2);
 
@@ -6598,7 +6308,7 @@ async fn bootstrap_exact_replay_produces_zero_database_writes() {
     };
 
     let (destination, _base_url) = spawn_mock_sequencer(mock_state).await;
-    let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+    let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
     let outbound = OutboundClient::new(2, 2);
     let auth_client = ServiceAuthClient::from_shared_secret(
         "did:web:destination.catbird.blue".to_string(),
@@ -6662,6 +6372,7 @@ async fn bootstrap_exact_replay_produces_zero_database_writes() {
     let alice_signing_key = SigningKey::from_bytes(&fixture.creation_entry.signing_seed);
     let ev6 = genuine_application_event(
         fixture.convo_id,
+        &fixture.sequencer_did,
         6,
         &fixture.actor_did,
         fixture.actor_device,
@@ -6669,6 +6380,7 @@ async fn bootstrap_exact_replay_produces_zero_database_writes() {
         &alice_signing_key,
         &fixture.actor_public_key,
         &fixture.committed_coordinate,
+        &[0x31; 8],
         dynamic_fixture_instant(6_000),
     );
 
@@ -6734,7 +6446,7 @@ async fn bootstrap_exact_replay_produces_zero_database_writes() {
     };
 
     let (dest_recon, _) = spawn_mock_sequencer(mock_state_suffix).await;
-    let resolver_recon = create_test_resolver(pool.clone(), dest_recon, sequencer_did);
+    let resolver_recon = create_test_resolver(pool.clone(), dest_recon, sequencer_did).await;
     let recon_res = catbird_server::federation::reconciliation::reconcile_conversation(
         &pool,
         &resolver_recon,
@@ -7062,7 +6774,7 @@ async fn test_hostile_network_admission_matrix() {
             host: "127.0.0.1".to_string(),
             addrs: vec!["127.0.0.1:8080".parse().unwrap()],
         };
-        let resolver = create_test_resolver(pool.clone(), destination, blocked_did);
+        let resolver = create_test_resolver(pool.clone(), destination, blocked_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7104,7 +6816,7 @@ async fn test_hostile_network_admission_matrix() {
             host: "127.0.0.1".to_string(),
             addrs: vec!["127.0.0.1:8080".parse().unwrap()],
         };
-        let resolver = create_test_resolver(pool.clone(), destination, suspended_did);
+        let resolver = create_test_resolver(pool.clone(), destination, suspended_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7141,7 +6853,7 @@ async fn test_hostile_network_admission_matrix() {
             host: "127.0.0.1".to_string(),
             addrs: vec!["127.0.0.1:8080".parse().unwrap()],
         };
-        let resolver = create_test_resolver(pool.clone(), destination, unapproved_did);
+        let resolver = create_test_resolver(pool.clone(), destination, unapproved_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7172,7 +6884,7 @@ async fn test_hostile_network_admission_matrix() {
         let mut state = base_mock_state();
         state.capabilities = vec![CAPABILITY_RECONCILIATION_V1.to_string()]; // lacks CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7204,7 +6916,7 @@ async fn test_hostile_network_admission_matrix() {
     // 5. Auth sign error (service auth failure)
     {
         let (destination, _base_url) = spawn_mock_sequencer(base_mock_state()).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_sign =
             |_target: &str, _method: &str| Err("simulated service auth signing error".to_string());
@@ -7233,7 +6945,7 @@ async fn test_hostile_network_admission_matrix() {
         opening["sequencerTerm"] = json!(1); // mismatch with selector term 0
         state.opening_digest = Some(opening);
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7269,7 +6981,7 @@ async fn test_hostile_network_admission_matrix() {
         closing["sequencerTerm"] = json!(1);
         state.closing_digest = Some(closing);
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7305,7 +7017,7 @@ async fn test_hostile_network_admission_matrix() {
         closing["lastSeq"] = json!(6);
         state.closing_digest = Some(closing);
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7341,7 +7053,7 @@ async fn test_hostile_network_admission_matrix() {
         closing["eventCount"] = json!(6);
         state.closing_digest = Some(closing);
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7378,7 +7090,7 @@ async fn test_hostile_network_admission_matrix() {
             json!("0000000000000000000000000000000000000000000000000000000000000000");
         state.closing_digest = Some(closing);
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7414,7 +7126,7 @@ async fn test_hostile_network_admission_matrix() {
         closing["epoch"] = json!(1);
         state.closing_digest = Some(closing);
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7455,7 +7167,7 @@ async fn test_hostile_network_admission_matrix() {
             "events": gapped_events,
         })];
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7496,7 +7208,7 @@ async fn test_hostile_network_admission_matrix() {
             "events": dup_events,
         })];
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7537,7 +7249,7 @@ async fn test_hostile_network_admission_matrix() {
             "events": reordered_events,
         })];
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7578,7 +7290,7 @@ async fn test_hostile_network_admission_matrix() {
             "events": truncated_events,
         })];
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7619,7 +7331,7 @@ async fn test_hostile_network_admission_matrix() {
             "events": corrupted_events,
         })];
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7656,7 +7368,7 @@ async fn test_hostile_network_admission_matrix() {
         opening["lastSeq"] = json!(501);
         state.opening_digest = Some(opening);
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7697,7 +7409,7 @@ async fn test_hostile_network_admission_matrix() {
             "events": forbidden_events,
         })];
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7738,7 +7450,7 @@ async fn test_hostile_network_admission_matrix() {
             "events": unknown_events,
         })];
         let (destination, _base_url) = spawn_mock_sequencer(state).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7770,7 +7482,7 @@ async fn test_hostile_network_admission_matrix() {
     // 20. Missing local recipient entitlement (revoked local device)
     {
         let (destination, _base_url) = spawn_mock_sequencer(base_mock_state()).await;
-        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did);
+        let resolver = create_test_resolver(pool.clone(), destination, sequencer_did).await;
         let outbound = OutboundClient::new(2, 2);
         let auth_client = ServiceAuthClient::from_shared_secret(
             "did:web:destination.catbird.blue".to_string(),
@@ -7855,6 +7567,7 @@ async fn test_hostile_reducer_authority_single_field_mutations() {
                 prior,
                 Some((key_package_ref, key_package_wrapper)),
                 dynamic_fixture_instant(3_000),
+                &fixture.sequencer_did,
             );
             event
         };
@@ -7880,6 +7593,8 @@ async fn test_hostile_reducer_authority_single_field_mutations() {
                         0x72,
                     );
                 build_test_event_json(
+                    fixture.convo_id,
+                    &fixture.sequencer_did,
                     4,
                     0,
                     fulfillment.entry_id,
@@ -7996,6 +7711,7 @@ async fn test_hostile_reducer_authority_single_field_mutations() {
                 // Target GroupInfo: corrupt the genesis group info bytes in event 1
                 let bad_creation_ev = build_corrupted_group_info_creation_event(
                     fixture.convo_id,
+                    &fixture.sequencer_did,
                     dynamic_fixture_instant(1_000),
                 );
                 events[0] = bad_creation_ev;

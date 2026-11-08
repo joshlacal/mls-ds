@@ -1,6 +1,7 @@
 use axum::{extract::State, Json};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{auth::AuthUser, federation::FederationError, storage::DbPool};
 
@@ -51,6 +52,14 @@ pub struct ConvoEventEntry {
         with = "crate::atproto_bytes::option"
     )]
     pub outer_fingerprint: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::atproto_bytes::option"
+    )]
+    pub sequencer_receipt: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_deleted_entry: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,6 +82,8 @@ struct CleanEventRow {
     accepted_payload_sha256: Vec<u8>,
     signed_request_bytes: Vec<u8>,
     outer_entry_fingerprint: Vec<u8>,
+    sequencer_receipt_bytes: Option<Vec<u8>>,
+    server_fields_bytes: Vec<u8>,
     received_at: DateTime<Utc>,
 }
 
@@ -109,6 +120,8 @@ pub async fn get_convo_events(
                accepted_payload_sha256, \
                COALESCE(signed_request_bytes, ''::bytea) AS signed_request_bytes, \
                outer_entry_fingerprint, \
+               sequencer_receipt_bytes, \
+               server_fields_bytes, \
                received_at \
              FROM chat.entries \
              WHERE conversation_id = $1 AND seq > $2 \
@@ -125,12 +138,49 @@ pub async fn get_convo_events(
         let events: Vec<ConvoEventEntry> = rows
             .into_iter()
             .map(|row| {
+                let account_deleted_entry = if row.entry_kind
+                    == crate::chat_protocol::transcript::ACCOUNT_DELETED_ENTRY_TYPE_ID
+                {
+                    Some(
+                        serde_ipld_dagcbor::from_slice::<
+                            crate::chat_protocol::repository::entry_read::AccountDeletedServerFields,
+                        >(&row.server_fields_bytes)
+                        .map_err(|_| {
+                            FederationError::Invariant(format!(
+                                "account-deletion entry {} at seq {} has invalid authority fields",
+                                row.entry_id, row.seq
+                            ))
+                        })?
+                        .entry(convo_uuid, row.seq, row.entry_id, row.received_at),
+                    )
+                } else {
+                    None
+                };
+                let sequencer_receipt = match (
+                    account_deleted_entry.is_some(),
+                    row.sequencer_receipt_bytes,
+                ) {
+                    (true, None) => None,
+                    (false, Some(receipt)) => Some(receipt),
+                    (true, Some(_)) => {
+                        return Err(FederationError::Invariant(format!(
+                            "account-deletion entry {} at seq {} unexpectedly has a sequencer receipt",
+                            row.entry_id, row.seq
+                        )));
+                    }
+                    (false, None) => {
+                        return Err(FederationError::Invariant(format!(
+                            "clean entry {} at seq {} has no sequencer receipt",
+                            row.entry_id, row.seq
+                        )));
+                    }
+                };
                 let msg_id = row
                     .message_id
                     .map(|u| u.to_string())
                     .unwrap_or_else(|| row.entry_id.to_string());
                 let padded_size = row.accepted_payload_bytes.len() as i64;
-                ConvoEventEntry {
+                Ok(ConvoEventEntry {
                     seq: row.seq,
                     epoch: row.epoch,
                     msg_id,
@@ -143,9 +193,11 @@ pub async fn get_convo_events(
                     accepted_payload_sha256: Some(row.accepted_payload_sha256),
                     signed_request: Some(row.signed_request_bytes),
                     outer_fingerprint: Some(row.outer_entry_fingerprint),
-                }
+                    sequencer_receipt,
+                    account_deleted_entry,
+                })
             })
-            .collect();
+            .collect::<Result<_, FederationError>>()?;
         let to_seq_inclusive = events.last().map(|event| event.seq).unwrap_or(from_seq);
         Ok(Json(GetConvoEventsOutput {
             convo_id: state.convo_id,
@@ -156,7 +208,7 @@ pub async fn get_convo_events(
     }
     .await;
 
-    super::deliver_message::record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
+    super::deliver_message::record_ds_outcome(&pool, &requester_ds, &result).await;
     result
 }
 
@@ -167,7 +219,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn clean_event_serialization_emits_all_five_fields_with_atproto_bytes() {
+    fn clean_event_serialization_emits_all_six_fields_with_atproto_bytes() {
         let entry = ConvoEventEntry {
             seq: 1,
             epoch: 0,
@@ -181,6 +233,8 @@ mod tests {
             accepted_payload_sha256: Some(vec![5; 32]),
             signed_request: Some(vec![6; 20]),
             outer_fingerprint: Some(vec![7; 32]),
+            sequencer_receipt: Some(br#"{"seq":1}"#.to_vec()),
+            account_deleted_entry: None,
         };
 
         let serialized = serde_json::to_value(&entry).expect("must serialize");
@@ -202,6 +256,7 @@ mod tests {
             "acceptedPayloadSha256",
             "signedRequest",
             "outerFingerprint",
+            "sequencerReceipt",
         ] {
             assert!(
                 obj[field].get("$bytes").is_some(),
@@ -211,7 +266,34 @@ mod tests {
     }
 
     #[test]
-    fn legacy_event_serialization_omits_all_five_clean_fields() {
+    fn clean_event_round_trip_preserves_separately_stored_receipt_bytes() {
+        let wire = json!({
+            "seq": 1,
+            "epoch": 0,
+            "msgId": "00000000-0000-0000-0000-000000000001",
+            "messageType": "blue.catbird.chat.defs#creationEntry",
+            "ciphertext": {"$bytes": "AQIDBA=="},
+            "paddedSize": 4,
+            "createdAt": "2023-11-14T22:13:20Z",
+            "entryId": "00000000-0000-0000-0000-000000000001",
+            "entryKind": "blue.catbird.chat.defs#creationEntry",
+            "acceptedPayloadSha256": {"$bytes": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU="},
+            "signedRequest": {"$bytes": "BgYGBgYGBgYGBgYGBgYGBgYGBgY="},
+            "outerFingerprint": {"$bytes": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="},
+            "sequencerReceipt": {"$bytes": "eyJzZXEiOjF9"},
+        });
+
+        let entry: ConvoEventEntry =
+            serde_json::from_value(wire.clone()).expect("event wire shape");
+        let serialized = serde_json::to_value(entry).expect("event serialization");
+        assert_eq!(
+            serialized["sequencerReceipt"], wire["sequencerReceipt"],
+            "the separately stored I13 receipt must survive getConvoEvents"
+        );
+    }
+
+    #[test]
+    fn legacy_event_serialization_omits_all_six_clean_fields() {
         let entry = ConvoEventEntry {
             seq: 2,
             epoch: 1,
@@ -225,6 +307,8 @@ mod tests {
             accepted_payload_sha256: None,
             signed_request: None,
             outer_fingerprint: None,
+            sequencer_receipt: None,
+            account_deleted_entry: None,
         };
 
         let serialized = serde_json::to_value(&entry).expect("must serialize");
@@ -238,6 +322,7 @@ mod tests {
             "acceptedPayloadSha256",
             "signedRequest",
             "outerFingerprint",
+            "sequencerReceipt",
         ] {
             assert!(obj.get(field).is_none(), "{field} must be omitted");
         }
@@ -252,8 +337,9 @@ mod tests {
                 deserialized.accepted_payload_sha256,
                 deserialized.signed_request,
                 deserialized.outer_fingerprint,
+                deserialized.sequencer_receipt,
             ),
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         );
     }
 }

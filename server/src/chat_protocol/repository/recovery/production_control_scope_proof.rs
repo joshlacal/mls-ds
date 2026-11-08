@@ -238,6 +238,7 @@ pub(super) async fn run_control_close_historical_scope(pool: &PgPool) -> Result<
             prepared,
             &relationship,
             None,
+            None,
             crate::chat_protocol::repository::submit_transition::RemoteCommitPreflightOutcome::NotRemoteOrDeferred,
         )
         .await
@@ -276,6 +277,7 @@ pub(super) async fn run_control_close_historical_scope(pool: &PgPool) -> Result<
             &mut tx,
             prepared,
             &relationship,
+            None,
             None,
             crate::chat_protocol::repository::submit_transition::RemoteCommitPreflightOutcome::NotRemoteOrDeferred,
         )
@@ -342,7 +344,7 @@ pub(super) async fn run_control_close_historical_scope(pool: &PgPool) -> Result<
     let prepared = prelude::prepare_signed_operation(&mut tx, admission)
         .await
         .map_err(|e| format!("prepare historical Close: {e:?}"))?;
-    let result = leave::execute_prepared_leave(&mut tx, prepared)
+    let result = leave::execute_prepared_leave(&mut tx, prepared, None)
         .await
         .map_err(|e| format!("execute historical Close: {e:?}"))?;
     let completion = result.completion.ok_or("Close completion absent")?;

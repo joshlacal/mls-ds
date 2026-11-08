@@ -74,6 +74,133 @@ pub fn bind_publication_original_sender_attestation(
     Ok(())
 }
 
+/// Verify the legacy acceptance inclusion proof and the I13 receipt that the
+/// shipping server adds after computing that proof's entry hash.
+pub fn verify_received_direct_request_acceptance_proof_with_i13(
+    raw_proof: &[u8],
+    authority_did: &str,
+    receipt_public_key: &[u8],
+    sequencer_receipt_public_key: &[u8],
+    recipient_device_key: &[u8],
+) -> Result<Value> {
+    use catbird_mls::chat_v2::transcript::direct_request::{self as protocol, DirectRequestKind};
+    use sha2::{Digest as _, Sha256};
+
+    let mut proof: Value = serde_json::from_slice(raw_proof)?;
+    let receipt = proof
+        .pointer_mut("/entry")
+        .and_then(Value::as_object_mut)
+        .and_then(|entry| entry.remove("sequencerReceipt"))
+        .context("acceptance proof missing sequencerReceipt")?;
+    let mut verified = protocol::verify_received_direct_request_acceptance_proof_for_authority(
+        authority_did,
+        &serde_json::to_vec(&proof)?,
+        receipt_public_key,
+        recipient_device_key,
+    )?;
+    let receipt = protocol::normalize_read_presentation(
+        &serde_json::to_vec(&receipt)?,
+        "sequencerReceipt",
+        false,
+    )?;
+    let entry = &verified["entry"];
+    let body = &entry["signedRequest"]["body"];
+    let digest: [u8; 32] = Sha256::digest(protocol::direct_request_signing_bytes(
+        DirectRequestKind::Accept,
+        &serde_json::to_vec(body)?,
+    )?)
+    .into();
+    catbird_mls::client::chat_wire::verify_control_sequencer_receipt(
+        &receipt,
+        sequencer_receipt_public_key,
+        authority_did,
+        entry["conversationId"]
+            .as_str()
+            .context("acceptance entry conversationId")?,
+        entry["entryId"]
+            .as_str()
+            .context("acceptance entry entryId")?,
+        entry["seq"].as_i64().context("acceptance entry seq")?,
+        body["actorDid"].as_str().context("acceptance actorDid")?,
+        body["actorDeviceId"]
+            .as_str()
+            .context("acceptance actorDeviceId")?,
+        &body["next"],
+        &digest,
+    )?;
+    verified["entry"]["sequencerReceipt"] = receipt;
+    Ok(verified)
+}
+
+/// Produce the same archive-bound AAD and encrypted inner plaintext used by
+/// the shipping Task 5 senders.
+pub fn archive_bound_application(
+    engine: &MlsEngine,
+    identity: &str,
+    mut aad: Value,
+    canonical_payload: &[u8],
+) -> Result<(Value, Vec<u8>, Vec<u8>)> {
+    use catbird_mls::messaging::receive::{
+        OriginalSenderArchiveAttestationEnvelope, PrivateMessagePlaintextEnvelope,
+    };
+
+    let (sender_did, sender_device_id) = identity
+        .rsplit_once('#')
+        .context("sender identity lacks device fragment")?;
+    let uuid_field = |field: &str| -> Result<Uuid> {
+        let value = &aad[field];
+        let encoded = value
+            .as_str()
+            .or_else(|| value["$bytes"].as_str())
+            .with_context(|| format!("application AAD {field}"))?;
+        Ok(Uuid::from_slice(
+            &base64::engine::general_purpose::STANDARD.decode(encoded)?,
+        )?)
+    };
+    let conversation_id = uuid_field("conversationId")?;
+    let message_id = uuid_field("messageId")?;
+    let canonical_conversation_id = conversation_id.hyphenated().to_string();
+    let canonical_message_id = message_id.hyphenated().to_string();
+    let frame_nonce: [u8; 32] = rand::random();
+    let archive_commitment =
+        labyrinth_protocol::receipt::compute_archive_commitment(&frame_nonce, canonical_payload);
+    let attestation = OriginalSenderArchiveAttestationEnvelope {
+        sender_did: sender_did.to_owned(),
+        sender_device_id: sender_device_id.to_owned(),
+        sender_transport_public_key: engine.identity_public_key(identity)?,
+        signature: engine.sign_with_identity_key(
+            identity,
+            &labyrinth_protocol::transcripts::original_sender_archive_transcript(
+                &canonical_conversation_id,
+                &canonical_message_id,
+                &archive_commitment,
+            ),
+        )?,
+    };
+    attestation.verify(
+        &canonical_conversation_id,
+        &canonical_message_id,
+        &archive_commitment,
+    )?;
+    aad["archiveCommitment"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(archive_commitment));
+    aad["originalSenderAttestation"] = json!({
+        "senderDid": attestation.sender_did,
+        "senderDeviceId": attestation.sender_device_id,
+        "senderTransportPubkey": base64::engine::general_purpose::STANDARD
+            .encode(&attestation.sender_transport_public_key),
+        "signature": base64::engine::general_purpose::STANDARD.encode(&attestation.signature),
+    });
+    let aad_bytes = catbird_mls::orchestrator::canonical_application_aad_bytes(&aad)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let plaintext = serde_json::to_vec(&PrivateMessagePlaintextEnvelope {
+        frame_nonce,
+        canonical_payload_bytes: canonical_payload.to_vec(),
+        original_sender_attestation: Some(attestation),
+    })?;
+    Ok((aad, aad_bytes, plaintext))
+}
+
 const DEFAULT_AUDIENCE: &str = "did:web:localhost";
 const DEFAULT_CIPHER_SUITE: &str = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
 

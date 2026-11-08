@@ -318,7 +318,7 @@ pub async fn deliver_welcome(
     }
     .await;
 
-    record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
+    record_ds_outcome(&pool, &requester_ds, &result).await;
     result
 }
 

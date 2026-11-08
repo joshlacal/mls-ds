@@ -247,9 +247,10 @@ async fn prepare_fanout(
                FROM chat.participants p JOIN chat.devices d ON d.user_did = p.user_did \
               WHERE p.conversation_id = $1 AND p.current_membership \
                 AND COALESCE(p.ds_did, CASE WHEN p.user_did = $3 THEN $4 END) IS NOT NULL \
-                AND NOT EXISTS(SELECT 1 FROM chat.member_devices m \
-                                WHERE m.conversation_id = p.conversation_id \
-                                  AND m.user_did = p.user_did AND m.active) \
+                AND NOT EXISTS(
+                    SELECT 1 FROM chat.member_devices m \
+                     WHERE m.conversation_id = p.conversation_id \
+                       AND m.user_did = p.user_did AND m.active) \
                 AND d.status = 'active' AND d.revoked_at IS NULL \
              ORDER BY 1, 2",
         )
@@ -456,7 +457,12 @@ pub async fn attach_close_authority(
     let signing_key = signing_key.ok_or_else(|| {
         "terminal close actor does not have the current active signing key".to_string()
     })?;
-    let entry_bytes = serde_json::to_vec(close_entry).map_err(|error| error.to_string())?;
+    let mut actor_entry = close_entry.clone();
+    actor_entry
+        .as_object_mut()
+        .ok_or_else(|| "terminal close entry is not an object".to_string())?
+        .remove("sequencerReceipt");
+    let entry_bytes = serde_json::to_vec(&actor_entry).map_err(|error| error.to_string())?;
     let verified = crate::chat_protocol::transcript::decode_and_verify_control_entry(
         &entry_bytes,
         &signing_key,
@@ -538,11 +544,17 @@ impl PreparedGroupEntryFanout {
     /// backing off; the queue worker retries whatever is left.
     pub async fn deliver(self, pool: &DbPool, resolver: Option<&DsResolver>) -> Result<(), String> {
         let owned_resolver = if resolver.is_none() {
-            let http = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(15))
-                .build()
-                .map_err(|e| e.to_string())?;
+            static FANOUT_HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> =
+                std::sync::OnceLock::new();
+            let http = FANOUT_HTTP_CLIENT
+                .get_or_init(|| {
+                    reqwest::Client::builder()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .timeout(std::time::Duration::from_secs(15))
+                        .build()
+                        .expect("build group fanout HTTP client")
+                })
+                .clone();
             Some(DsResolver::new(
                 pool.clone(),
                 http,

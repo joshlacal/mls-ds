@@ -1,21 +1,19 @@
 //! `blue.catbird.mlsDS.deliverTransportControlEntry` (C33 coordinator to the
-//! peer's transport-only home). That home keeps no seq chain of its own: it
-//! stores what its pair's coordinator delivers, and `deliverMessageEntry`
-//! carries application entries only. When an account the coordinator homes is
-//! deleted, the coordinator queues, in the transaction that sequences its signed
-//! `accountDeletedEntry`, that exact entry to the peer's home, ordered behind
-//! the pair's earlier deliveries there and retried until delivered. Before any
-//! effect the home verifies that its caller is the pair's recorded coordinator
-//! and the entry's sequencer, that the deleted account is its party's
-//! counterparty, the coordinator's receipt authority under the retained method
-//! its `keyId` names, and that the entry continues its stored seq chain. It
-//! then stores the entry verbatim, so `getEntries` returns it, and prunes the
-//! account's held ciphertext exactly as a sequencer's prune notice would.
+//! peer's transport-only home). A transport home keeps no seq chain of its own:
+//! it stores the I13-receipted control and application entries its pair's
+//! coordinator delivers. Every control delivery is queued in the transaction
+//! that sequences it, ordered by seq, and has a deterministic id.
+//!
+//! Before any effect the home verifies the recorded coordinator, the receipt
+//! method named by its own `kid`, every signed receipt binding, and continuity
+//! with the stored seq chain. Account deletion additionally verifies its
+//! retained deletion authority and prunes the deleted account's held
+//! ciphertext. Entries are stored verbatim so `getEntries` returns the receipt.
 
 use super::*;
 use std::collections::BTreeMap;
 
-use crate::federation::receipt::AccountDeletion;
+use crate::federation::receipt::{verify_control_receipt, AccountDeletion, I13ControlReceiptInput};
 use crate::federation::resolver::{build_resolver_http_client, DsResolver};
 use crate::federation::FederationError;
 
@@ -36,6 +34,11 @@ pub(crate) struct DeliverTransportControlEntry {
 /// in that conversation.
 #[derive(Debug, Default)]
 pub struct C33PeerHomes(BTreeMap<Uuid, Option<String>>);
+
+pub(crate) struct C33TransitionPeer {
+    pub(crate) home: Option<String>,
+    pub(crate) deleted: bool,
+}
 
 impl C33PeerHomes {
     /// Resolve the peer's home in every active direct conversation this DS
@@ -79,6 +82,67 @@ impl C33PeerHomes {
     /// `None` when `conversation_id` was not resolved, so its peer is unknown.
     pub fn home(&self, conversation_id: Uuid) -> Option<Option<&str>> {
         self.0.get(&conversation_id).map(Option::as_deref)
+    }
+    /// Resolve the peer routing state for a local C33 direct pair. Keeping the
+    /// deletion bit separate lets a relayed transition suppress its receipt
+    /// delivery even when the peer's ordinary home would also be local.
+    pub(crate) async fn transition_peer(
+        pool: &DbPool,
+        conversation_id: Uuid,
+        actor: &str,
+    ) -> Result<Option<C33TransitionPeer>, FederationError> {
+        let pair: Option<(String, String)> = sqlx::query_as(
+            "SELECT direct_did_low,direct_did_high \
+               FROM chat.conversations \
+              WHERE conversation_id=$1 AND kind='direct' AND NOT is_remote \
+                AND lifecycle='active' \
+                AND direct_did_low IS NOT NULL AND direct_did_high IS NOT NULL",
+        )
+        .bind(conversation_id)
+        .fetch_optional(pool)
+        .await?;
+        let Some((requester, recipient)) = pair else {
+            return Ok(None);
+        };
+        let actor = crate::identity::canonical_did(actor);
+        let peer = if crate::identity::canonical_did(&requester) == actor {
+            recipient
+        } else if crate::identity::canonical_did(&recipient) == actor {
+            requester
+        } else {
+            return Err(FederationError::InvalidRequest(
+                "control actor is not a party of the C33 pair".to_owned(),
+            ));
+        };
+        if crate::federation::canonical_relay::account_deleted_in(pool, conversation_id, &peer)
+            .await?
+        {
+            return Ok(Some(C33TransitionPeer {
+                home: None,
+                deleted: true,
+            }));
+        }
+        let resolver = resolver(pool);
+        let actor_home = resolver.resolve_authoritative_ds(actor).await?;
+        let home = home_of(&resolver, &peer)
+            .await?
+            .filter(|peer_home| !crate::identity::dids_equivalent(&actor_home.did, peer_home));
+        Ok(Some(C33TransitionPeer {
+            home,
+            deleted: false,
+        }))
+    }
+
+    /// Resolve the transport-only home owed a control entry for a local C33
+    /// direct pair. Ordinary Direct and Group conversations return `None`.
+    pub(crate) async fn transition_peer_home(
+        pool: &DbPool,
+        conversation_id: Uuid,
+        actor: &str,
+    ) -> Result<Option<String>, FederationError> {
+        Ok(Self::transition_peer(pool, conversation_id, actor)
+            .await?
+            .and_then(|peer| peer.home))
     }
 }
 
@@ -125,17 +189,46 @@ async fn home_of(resolver: &DsResolver, peer: &str) -> Result<Option<String>, Fe
     }
 }
 
-/// Queue, in the transaction that sequenced it, the signed `entry` of a C33
-/// pair this DS coordinates to the peer's transport-only `home`. The queue
-/// keeps it behind the pair's earlier deliveries there by `seq`, and its id is
-/// deterministic, so a replay adds nothing.
+#[derive(Clone, Copy)]
+struct TransportControlLocator {
+    conversation_id: Uuid,
+    entry_id: Uuid,
+    seq: i64,
+}
+
+fn transport_control_locator(entry: &Value) -> Result<TransportControlLocator, String> {
+    let conversation_id = entry
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| "invalid control entry conversationId".to_owned())?;
+    let entry_id = entry
+        .get("entryId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| "invalid control entry entryId".to_owned())?;
+    let seq = entry
+        .get("seq")
+        .and_then(Value::as_u64)
+        .and_then(|value| i64::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "invalid control entry seq".to_owned())?;
+    Ok(TransportControlLocator {
+        conversation_id,
+        entry_id,
+        seq,
+    })
+}
+
+/// Queue, in the transaction that sequenced it, the exact receipted control
+/// `entry` owed to a C33 peer's transport-only `home`.
 pub(crate) async fn enqueue_transport_control_entry(
     tx: &mut Transaction<'_, Postgres>,
     home: &str,
     entry: &Value,
     now: DateTime<Utc>,
 ) -> Result<(), SignedRelayError> {
-    let (deletion, _) = AccountDeletion::from_entry(entry).map_err(SignedRelayError::Storage)?;
+    let locator = transport_control_locator(entry).map_err(SignedRelayError::Storage)?;
     let payload = serde_json::to_vec(&DeliverTransportControlEntry {
         entry: entry.clone(),
     })
@@ -144,21 +237,44 @@ pub(crate) async fn enqueue_transport_control_entry(
         tx,
         &format!(
             "transport-control-{}-{}",
-            deletion.conversation_id, deletion.seq
+            locator.conversation_id, locator.seq
         ),
         crate::identity::canonical_did(home),
         DELIVER_TRANSPORT_CONTROL_ENTRY_NSID,
         &payload,
-        deletion.conversation_id,
+        locator.conversation_id,
         now,
     )
     .await
 }
 
+/// Extract and queue the exact I13-receipted entry from a canonical endpoint
+/// response. A signer-less response is never allowed to commit for a remote
+/// C33 peer.
+pub(crate) async fn enqueue_transport_control_response(
+    tx: &mut Transaction<'_, Postgres>,
+    home: &str,
+    response_bytes: &[u8],
+    now: DateTime<Utc>,
+) -> Result<(), SignedRelayError> {
+    let response: Value = serde_json::from_slice(response_bytes)
+        .map_err(|error| SignedRelayError::Storage(error.to_string()))?;
+    let entry = response
+        .pointer("/entry")
+        .or_else(|| response.pointer("/result/entry"))
+        .filter(|entry| entry["sequencerReceipt"].is_object())
+        .ok_or_else(|| {
+            SignedRelayError::Storage("C33 control response has no I13 receipt".to_owned())
+        })?;
+    enqueue_transport_control_entry(tx, home, entry, now).await
+}
+
 pub(super) fn routes() -> Router<GroupRelayState> {
     Router::new().route(
         "/xrpc/blue.catbird.mlsDS.deliverTransportControlEntry",
-        post(ClockScoped(deliver_transport_control_entry)).layer(DefaultBodyLimit::max(16_384)),
+        post(ClockScoped(deliver_transport_control_entry)).layer(DefaultBodyLimit::max(
+            crate::request_body_limit("/xrpc/blue.catbird.mlsDS.deliverTransportControlEntry"),
+        )),
     )
 }
 
@@ -179,6 +295,135 @@ async fn deliver_transport_control_entry(
         Err(response) => response,
     }
 }
+fn is_relayed_control_kind(kind: crate::chat_protocol::transcript::SignedMutationKind) -> bool {
+    use crate::chat_protocol::transcript::SignedMutationKind;
+    matches!(
+        kind,
+        SignedMutationKind::CommitTransition
+            | SignedMutationKind::PolicyTransition
+            | SignedMutationKind::MetadataTransition
+            | SignedMutationKind::ResetRequest
+            | SignedMutationKind::ResetActivation
+            | SignedMutationKind::LeafRecoveryRequest
+            | SignedMutationKind::LeafRecoveryCancellation
+            | SignedMutationKind::LeafRecoveryFulfillment
+            | SignedMutationKind::ConversationClose
+            | SignedMutationKind::LeaveRequest
+            | SignedMutationKind::ZeroLeafLeave
+            | SignedMutationKind::LeaveCancellation
+            | SignedMutationKind::LeaveCommitFulfillment
+    )
+}
+
+async fn resolve_control_receipt_key(
+    resolver: &DsResolver,
+    caller: &str,
+    entry: &Value,
+) -> Result<p256::ecdsa::VerifyingKey, Response> {
+    let key_id = entry
+        .pointer("/sequencerReceipt/kid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("control receipt has no kid"))?;
+    let key = resolver
+        .resolve_i13_receipt_key(caller, key_id)
+        .await
+        .map_err(|error| {
+            if error.is_retryable() {
+                unavailable(error)
+            } else {
+                s2s_err(StatusCode::FORBIDDEN, "InvalidSignature", error.to_string())
+            }
+        })?;
+    p256::ecdsa::VerifyingKey::from_sec1_bytes(&key)
+        .map_err(|_| denied("coordinator receipt key is not P-256"))
+}
+
+fn stored_entry_receipt_coordinate(entry: &Value) -> Option<&Value> {
+    let body = entry.pointer("/signedRequest/body")?.as_object()?;
+    let kind = entry
+        .get("$type")
+        .and_then(Value::as_str)
+        .and_then(crate::chat_protocol::transcript::ControlEntryKind::from_type_id);
+    match kind {
+        Some(kind) => {
+            crate::federation::receipt::control_receipt_coordinate(kind.signed_kind(), body, None)
+                .ok()
+        }
+        None => body.get("prior").filter(|value| value.is_object()),
+    }
+}
+
+enum ControlReceiptError {
+    Invalid(String),
+    InvalidSignature(String),
+}
+
+impl ControlReceiptError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Invalid(message) => invalid(&message),
+            Self::InvalidSignature(message) => {
+                s2s_err(StatusCode::FORBIDDEN, "InvalidSignature", message)
+            }
+        }
+    }
+}
+
+fn verify_receipted_control_entry(
+    entry: &Value,
+    caller: &str,
+    locator: TransportControlLocator,
+    predecessor_coordinate: Option<&Value>,
+    key: &p256::ecdsa::VerifyingKey,
+) -> Result<(), ControlReceiptError> {
+    let receipt = entry.get("sequencerReceipt").ok_or_else(|| {
+        ControlReceiptError::Invalid("control entry has no sequencer receipt".into())
+    })?;
+    let mut actor_entry = entry.clone();
+    actor_entry
+        .as_object_mut()
+        .ok_or_else(|| ControlReceiptError::Invalid("control entry is not an object".into()))?
+        .remove("sequencerReceipt");
+    let bytes = serde_json::to_vec(&actor_entry)
+        .map_err(|error| ControlReceiptError::Invalid(error.to_string()))?;
+    let mutation =
+        crate::chat_protocol::transcript::decode_control_entry_mutation_unverified(&bytes)
+            .map_err(|error| {
+                ControlReceiptError::Invalid(format!("invalid control entry: {error:?}"))
+            })?;
+    if !is_relayed_control_kind(mutation.kind()) {
+        return Err(ControlReceiptError::Invalid(
+            "entry kind is not a relayed control entry".into(),
+        ));
+    }
+    let body = entry
+        .pointer("/signedRequest/body")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ControlReceiptError::Invalid("control entry has no signed body".into()))?;
+    let coordinate = crate::federation::receipt::control_receipt_coordinate(
+        mutation.kind(),
+        body,
+        predecessor_coordinate,
+    )
+    .map_err(ControlReceiptError::Invalid)?;
+    let received_at = entry
+        .get("receivedAt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ControlReceiptError::Invalid("control entry has no receivedAt".into()))?;
+    let input = I13ControlReceiptInput::from_fields(
+        &locator.conversation_id.to_string(),
+        &locator.entry_id.to_string(),
+        u64::try_from(locator.seq)
+            .map_err(|_| ControlReceiptError::Invalid("invalid control entry seq".into()))?,
+        received_at,
+        mutation.actor_did().as_str(),
+        mutation.actor_device_id().as_str(),
+        *mutation.request_digest(),
+    )
+    .map_err(ControlReceiptError::Invalid)?;
+    verify_control_receipt(receipt, key, caller, &input, coordinate)
+        .map_err(ControlReceiptError::InvalidSignature)
+}
 
 /// Apply a C33 coordinator's signed control entry at this transport-only home.
 /// Every check precedes every effect; an entry that does not yet continue the
@@ -190,13 +435,12 @@ pub(crate) async fn accept_transport_control_entry(
 ) -> Result<Value, Response> {
     let request: DeliverTransportControlEntry =
         serde_json::from_slice(body).map_err(|error| invalid(&error.to_string()))?;
-    let (deletion, authority) =
-        AccountDeletion::from_entry(&request.entry).map_err(|error| invalid(&error))?;
-    if deletion.sequencer_did != caller || caller == state.self_did {
-        return Err(denied("entry is not sequenced by this caller"));
+    let locator = transport_control_locator(&request.entry).map_err(|error| invalid(&error))?;
+    if crate::identity::dids_equivalent(caller, &state.self_did) {
+        return Err(denied("entry is not sequenced by a remote caller"));
     }
-    let conversation_id = deletion.conversation_id;
-    let (sequenced_here, pairs): (bool, Vec<(String, String, String)>) = (
+    let conversation_id = locator.conversation_id;
+    let (sequenced_here, pairs): (bool, Vec<(String, String, String, String)>) = (
         sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id = $1)",
         )
@@ -205,8 +449,9 @@ pub(crate) async fn accept_transport_control_entry(
         .await
         .map_err(storage)?,
         sqlx::query_as(
-            "SELECT coordinator_did, sender_did, recipient_did \
-               FROM chat.direct_request_transport_inbox WHERE conversation_id = $1",
+            "SELECT coordinator_did, sender_did, recipient_did, status \
+               FROM chat.direct_request_transport_inbox \
+              WHERE conversation_id = $1 AND status IN ('pending', 'accepted')",
         )
         .bind(conversation_id)
         .fetch_all(&state.pool)
@@ -216,24 +461,15 @@ pub(crate) async fn accept_transport_control_entry(
     if sequenced_here {
         return Err(denied("this DS is not the pair's transport-only home"));
     }
-    let Some((_, sender, recipient)) = pairs.first() else {
+    let Some((_, sender, recipient, _)) = pairs.first() else {
         return Err(missing("conversation is not held here"));
     };
-    if pairs.iter().any(|(coordinator, s, r)| {
-        crate::identity::canonical_did(coordinator) != caller || s != sender || r != recipient
+    if pairs.iter().any(|(coordinator, s, r, _)| {
+        !crate::identity::dids_equivalent(coordinator, caller) || s != sender || r != recipient
     }) {
         return Err(denied("caller is not the pair's recorded coordinator"));
     }
-    let party = if deletion.deleted_did == *sender {
-        recipient
-    } else if deletion.deleted_did == *recipient {
-        sender
-    } else {
-        return Err(denied("deleted account is not a party of the pair"));
-    };
 
-    // The pair's other party must be homed here. A C33 coordinator is one of
-    // the pair's two homes, so the deleted account is then homed at the caller.
     let resolver = DsResolver::new(
         state.pool.clone(),
         build_resolver_http_client(),
@@ -242,30 +478,53 @@ pub(crate) async fn accept_transport_control_entry(
         None,
         300,
     );
-    match resolver.resolve_authoritative_ds(party).await {
-        Ok(home) if crate::identity::dids_equivalent(&home.did, &state.self_did) => {}
-        Ok(_) => return Err(denied("deleted account is this home's own party")),
-        Err(error) if error.is_retryable() => return Err(unavailable(error)),
-        Err(error) => return Err(denied(&error.to_string())),
-    }
-    // The caller is the pair's coordinator; what remains is its evidence. The
-    // authority names its own receipt method, so one the coordinator does not
-    // retain is an authority that does not verify, like any altered signed field.
-    let key = resolver
-        .resolve_i13_receipt_key(caller, &authority.key_id)
-        .await
-        .map_err(|error| {
-            if error.is_retryable() {
-                unavailable(error)
-            } else {
-                s2s_err(StatusCode::FORBIDDEN, "InvalidSignature", error.to_string())
+    let deletion = match AccountDeletion::from_entry(&request.entry) {
+        Ok((deletion, authority)) => {
+            if !crate::identity::dids_equivalent(&deletion.sequencer_did, caller) {
+                return Err(denied("entry is not sequenced by this caller"));
             }
-        })?;
-    let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key)
-        .map_err(|_| denied("coordinator receipt key is not P-256"))?;
-    authority
-        .verify(&key, &deletion)
-        .map_err(|error| s2s_err(StatusCode::FORBIDDEN, "InvalidSignature", error))?;
+            let party = if deletion.deleted_did == *sender {
+                recipient
+            } else if deletion.deleted_did == *recipient {
+                sender
+            } else {
+                return Err(denied("deleted account is not a party of the pair"));
+            };
+            // A C33 coordinator is one of the pair's two homes. The other
+            // party must therefore be homed here before deletion may prune.
+            match resolver.resolve_authoritative_ds(party).await {
+                Ok(home) if crate::identity::dids_equivalent(&home.did, &state.self_did) => {}
+                Ok(_) => return Err(denied("deleted account is this home's own party")),
+                Err(error) if error.is_retryable() => return Err(unavailable(error)),
+                Err(error) => return Err(denied(&error.to_string())),
+            }
+            let key = resolver
+                .resolve_i13_receipt_key(caller, &authority.key_id)
+                .await
+                .map_err(|error| {
+                    if error.is_retryable() {
+                        unavailable(error)
+                    } else {
+                        s2s_err(StatusCode::FORBIDDEN, "InvalidSignature", error.to_string())
+                    }
+                })?;
+            let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key)
+                .map_err(|_| denied("coordinator receipt key is not P-256"))?;
+            authority
+                .verify(&key, &deletion)
+                .map_err(|error| s2s_err(StatusCode::FORBIDDEN, "InvalidSignature", error))?;
+            Some(deletion)
+        }
+        Err(_) => None,
+    };
+    if deletion.is_none() && !pairs.iter().any(|(_, _, _, status)| status == "accepted") {
+        return Err(missing("conversation is not accepted here"));
+    }
+    let receipt_key = if deletion.is_none() {
+        Some(resolve_control_receipt_key(&resolver, caller, &request.entry).await?)
+    } else {
+        None
+    };
 
     let now = crate::sim_hooks::current_utc();
     let mut tx = state.pool.begin().await.map_err(storage)?;
@@ -284,7 +543,7 @@ pub(crate) async fn accept_transport_control_entry(
                         WHERE conversation_id = $1 AND seq = $2 - 1)",
     )
     .bind(conversation_id)
-    .bind(deletion.seq)
+    .bind(locator.seq)
     .fetch_one(&mut *tx)
     .await
     .map_err(storage)?;
@@ -295,13 +554,42 @@ pub(crate) async fn accept_transport_control_entry(
             "the entry's predecessor is not stored here yet",
         ));
     }
+    let predecessor: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT entry_bytes FROM chat.direct_request_transport_entries \
+          WHERE conversation_id=$1 AND seq=$2-1",
+    )
+    .bind(conversation_id)
+    .bind(locator.seq)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(storage)?;
+    let predecessor = predecessor
+        .as_deref()
+        .map(serde_json::from_slice::<Value>)
+        .transpose()
+        .map_err(|error| storage(format!("stored predecessor is invalid: {error}")))?;
+    if deletion.is_none() {
+        let predecessor_coordinate = predecessor
+            .as_ref()
+            .and_then(stored_entry_receipt_coordinate);
+        verify_receipted_control_entry(
+            &request.entry,
+            caller,
+            locator,
+            predecessor_coordinate,
+            receipt_key
+                .as_ref()
+                .expect("non-deletion receipt key was resolved before the inbox lock"),
+        )
+        .map_err(ControlReceiptError::into_response)?;
+    }
     let entry_bytes =
         serde_json::to_vec(&request.entry).map_err(|error| storage(error.to_string()))?;
     match delivery::insert_transport_entry(
         &mut tx,
         conversation_id,
-        deletion.seq,
-        deletion.entry_id,
+        locator.seq,
+        locator.entry_id,
         &entry_bytes,
         now,
     )
@@ -320,7 +608,44 @@ pub(crate) async fn accept_transport_control_entry(
             ));
         }
     }
-    let pruned = prune_deleted_account_payloads(&mut tx, &deletion, now).await?;
+    match request
+        .entry
+        .pointer("/signedRequest/body/$type")
+        .and_then(Value::as_str)
+    {
+        Some("blue.catbird.chat.defs#leafRecoveryCancellationBody")
+        | Some("blue.catbird.chat.defs#leafRecoveryFulfillmentBody") => {
+            if let Some(request_id) = request
+                .entry
+                .pointer("/signedRequest/body/recoveryRequestId")
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+            {
+                sqlx::query(
+                    "DELETE FROM chat.remote_lifecycle_recovery_bindings \
+                     WHERE recovery_request_id=$1",
+                )
+                .bind(request_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+            }
+        }
+        Some("blue.catbird.chat.defs#conversationCloseBody") => {
+            sqlx::query(
+                "DELETE FROM chat.remote_lifecycle_recovery_bindings WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        }
+        _ => {}
+    }
+    let pruned = match &deletion {
+        Some(deletion) => prune_deleted_account_payloads(&mut tx, deletion, now).await?,
+        None => 0,
+    };
     tx.commit().await.map_err(storage)?;
     Ok(json!({ "accepted": true, "applied": true, "prunedCount": pruned }))
 }

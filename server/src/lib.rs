@@ -125,7 +125,10 @@ pub fn request_body_limit(path: &str) -> usize {
         | "/xrpc/blue.catbird.mlsDS.relaySendMessage"
         | "/xrpc/blue.catbird.mlsDS.deliverMessageEntry"
         | "/xrpc/blue.catbird.mlsDS.relayGroupMutation"
-        | "/xrpc/blue.catbird.mlsDS.deliverGroupEntry" => SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
+        | "/xrpc/blue.catbird.mlsDS.deliverGroupEntry"
+        | "/xrpc/blue.catbird.mlsDS.deliverTransportControlEntry" => {
+            SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES
+        }
         p if p.starts_with("/xrpc/blue.catbird.labyrinth.") => 1_572_864,
         _ => DEFAULT_REQUEST_BODY_LIMIT_BYTES,
     }

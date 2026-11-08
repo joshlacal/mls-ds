@@ -191,8 +191,9 @@ fn receipt_key_history(
 }
 
 /// Build the process's one receipt signer from its dedicated configuration.
-/// Startup injects it into every issuer; disabled mode yields no signer, so a
-/// configured key signs nothing.
+/// Disabled mode yields no signer, so a configured key signs nothing. Process
+/// startup refuses that result when chat cutover is enabled; signer-less
+/// runtime constructors remain valid for tests and historical migrations.
 ///
 /// `SIGNING_KEY_PEM` is accepted only for a public-key separation check. It is
 /// never used to construct the receipt signer and is never a fallback for a
@@ -539,8 +540,13 @@ fn terminal_close_mutation(
     {
         return Err("terminal close authority requires the exact group close entry".to_string());
     }
-    // The entry's wire presentation (`signature` as `$bytes`), not the request wrapper form.
-    let bytes = serde_json::to_vec(entry).map_err(|error| error.to_string())?;
+    // `sequencerReceipt` is appended after the actor signs the closed control projection.
+    let mut actor_entry = entry.clone();
+    actor_entry
+        .as_object_mut()
+        .ok_or_else(|| "terminal close entry is not an object".to_string())?
+        .remove("sequencerReceipt");
+    let bytes = serde_json::to_vec(&actor_entry).map_err(|error| error.to_string())?;
     let mutation =
         crate::chat_protocol::transcript::decode_control_entry_mutation_unverified(&bytes)
             .map_err(|error| format!("invalid terminal close entry: {error:?}"))?;
@@ -548,6 +554,163 @@ fn terminal_close_mutation(
         return Err("terminal close authority requires a close mutation".to_string());
     }
     Ok(mutation)
+}
+
+/// Immutable actor-signed material captured before a control entry is moved into its state plan.
+#[derive(Debug, Clone)]
+pub struct I13ControlReceiptInput {
+    conversation_id: String,
+    entry_id: String,
+    seq: u64,
+    issued_at_ms: i64,
+    sender_did: String,
+    sender_device_id: String,
+    request_digest: [u8; 32],
+}
+impl I13ControlReceiptInput {
+    pub fn from_fields(
+        conversation_id: &str,
+        entry_id: &str,
+        seq: u64,
+        received_at: &str,
+        sender_did: &str,
+        sender_device_id: &str,
+        request_digest: [u8; 32],
+    ) -> Result<Self, String> {
+        let issued_at_ms = DateTime::parse_from_rfc3339(received_at)
+            .map_err(|_| "control entry receivedAt is not canonical RFC3339".to_owned())?
+            .timestamp_millis();
+        Ok(Self {
+            conversation_id: conversation_id.to_owned(),
+            entry_id: entry_id.to_owned(),
+            seq,
+            issued_at_ms,
+            sender_did: sender_did.to_owned(),
+            sender_device_id: sender_device_id.to_owned(),
+            request_digest,
+        })
+    }
+}
+
+/// Select the one authoritative coordinate a control kind's sequencer signs.
+///
+/// Coordinate-less cancellations retain the immediately preceding
+/// authoritative coordinate; callers must supply that exact predecessor.
+pub(crate) fn control_receipt_coordinate<'a>(
+    kind: crate::chat_protocol::transcript::SignedMutationKind,
+    body: &'a serde_json::Map<String, Value>,
+    predecessor: Option<&'a Value>,
+) -> Result<&'a Value, String> {
+    use crate::chat_protocol::transcript::SignedMutationKind as K;
+
+    let field = match kind {
+        K::ResetActivation => Some("successor"),
+        K::ConversationClose => Some("retired"),
+        K::ResetRequest | K::LeafRecoveryRequest | K::LeaveRequest => Some("prior"),
+        K::LeafRecoveryCancellation | K::LeaveCancellation => None,
+        K::DirectRequestPublication
+        | K::DirectRequestAcceptance
+        | K::CommitTransition
+        | K::PolicyTransition
+        | K::MetadataTransition
+        | K::Creation
+        | K::ParticipantAcceptance
+        | K::LeafRecoveryFulfillment
+        | K::ZeroLeafLeave
+        | K::LeaveCommitFulfillment => Some("next"),
+        _ => return Err("mutation kind has no control receipt coordinate".to_owned()),
+    };
+    let coordinate = match field {
+        Some(field) => body.get(field),
+        None => predecessor,
+    }
+    .filter(|value| value.is_object())
+    .ok_or_else(|| "control entry has no authoritative receipt coordinate".to_owned())?;
+    Ok(coordinate)
+}
+
+/// Verify an I13 control receipt against the actor-signed mutation and its successor coordinate.
+pub fn verify_control_receipt(
+    receipt: &Value,
+    verifying_key: &VerifyingKey,
+    expected_sequencer: &str,
+    input: &I13ControlReceiptInput,
+    coordinate: &Value,
+) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let text = |field: &str| {
+        receipt[field]
+            .as_str()
+            .ok_or_else(|| format!("control receipt {field}"))
+    };
+    let bytes = |field: &str| {
+        receipt[field]
+            .as_str()
+            .or_else(|| receipt[field]["$bytes"].as_str())
+            .ok_or_else(|| format!("control receipt {field}"))
+            .and_then(|encoded| STANDARD.decode(encoded).map_err(|error| error.to_string()))
+    };
+    let number = |field: &str| {
+        receipt[field]
+            .as_u64()
+            .ok_or_else(|| format!("control receipt {field}"))
+    };
+    let group_id = bytes("groupId")?;
+    let archive_commitment: [u8; 32] = bytes("archiveCommitment")?
+        .try_into()
+        .map_err(|_| "control receipt archiveCommitment length".to_owned())?;
+    let signature: [u8; 64] = bytes("signature")?
+        .try_into()
+        .map_err(|_| "control receipt signature length".to_owned())?;
+    let coordinate_group_id = coordinate["groupId"]
+        .as_str()
+        .or_else(|| coordinate["groupId"]["$bytes"].as_str())
+        .ok_or_else(|| "control receipt coordinate groupId".to_owned())
+        .and_then(|encoded| STANDARD.decode(encoded).map_err(|error| error.to_string()))?;
+    let receipt_generation = number("generation")?;
+    let coordinate_generation = coordinate["generation"]
+        .as_u64()
+        .ok_or_else(|| "control receipt coordinate generation".to_owned())?;
+    let coordinate_epoch = coordinate["epoch"]
+        .as_u64()
+        .ok_or_else(|| "control receipt coordinate epoch".to_owned())?;
+    let expected_sequencer = crate::identity::canonical_did(expected_sequencer);
+    if crate::identity::canonical_did(text("sequencerDid")?) != expected_sequencer
+        || text("conversationId")? != input.conversation_id
+        || coordinate["conversationId"].as_str() != Some(input.conversation_id.as_str())
+        || text("entryId")? != input.entry_id
+        || number("seq")? != input.seq
+        || receipt["issuedAtMs"].as_i64() != Some(input.issued_at_ms)
+        || text("senderDid")? != input.sender_did
+        || text("senderDeviceId")? != input.sender_device_id
+        || archive_commitment != input.request_digest
+        || receipt_generation != coordinate_generation
+        || number("epoch")? != coordinate_epoch
+        || group_id != coordinate_group_id
+    {
+        return Err("control receipt binding mismatch".to_owned());
+    }
+    labyrinth_protocol::receipt::verify_sequencer_receipt(
+        verifying_key,
+        expected_sequencer,
+        &labyrinth_protocol::receipt::SignedSequencerReceipt {
+            payload: labyrinth_protocol::receipt::SequencerReceiptPayload {
+                sequencer_did: expected_sequencer.to_owned(),
+                conversation_id: input.conversation_id.clone(),
+                group_id,
+                epoch: number("epoch")?,
+                sender_device_did_url: format!("{}#{}", input.sender_did, input.sender_device_id),
+                entry_id: input.entry_id.clone(),
+                archive_commitment,
+                seq: input.seq,
+                issued_at_ms: input.issued_at_ms,
+            },
+            key_id: text("kid")?.to_owned(),
+            signature,
+        },
+    )
+    .map_err(|error| error.to_string())
 }
 
 impl I13ReceiptSigner {
@@ -716,6 +879,103 @@ impl I13ReceiptSigner {
         )
     }
 
+    /// Capture scalar control fields from the server's transcript module.
+    pub fn control_receipt_input(
+        &self,
+        entry: &crate::chat_protocol::transcript::VerifiedControlEntry,
+    ) -> Result<I13ControlReceiptInput, String> {
+        I13ControlReceiptInput::from_fields(
+            entry.conversation_id().as_str(),
+            entry.entry_id().as_str(),
+            entry.seq(),
+            entry.received_at().as_str(),
+            entry.mutation().actor_did().as_str(),
+            entry.mutation().actor_device_id().as_str(),
+            *entry.mutation().request_digest(),
+        )
+    }
+
+    /// Sign one control entry from scalar coordinate fields so repository modules included by
+    /// integration tests do not have to exchange their duplicate transcript/snapshot types.
+    pub fn sign_control_receipt_at(
+        &self,
+        input: &I13ControlReceiptInput,
+        coordinate_conversation_id: &str,
+        generation: u64,
+        group_id: &[u8],
+        epoch: u64,
+    ) -> Result<Value, String> {
+        if coordinate_conversation_id != input.conversation_id {
+            return Err("control receipt coordinate conversation mismatch".into());
+        }
+        let signed = self
+            .sign_application_receipt(
+                &input.conversation_id,
+                group_id,
+                epoch,
+                &input.sender_did,
+                &input.sender_device_id,
+                &input.entry_id,
+                &input.request_digest,
+                input.seq,
+                input.issued_at_ms,
+            )
+            .map_err(|error| format!("sign control receipt: {error}"))?;
+        Ok(Self::receipt_wire_json(
+            &signed,
+            generation,
+            &input.sender_did,
+            &input.sender_device_id,
+        ))
+    }
+
+    /// Sign one control entry at the coordinate its transition produced. The request digest is
+    /// carried in the existing I13 archive-commitment slot, binding the receipt to the exact
+    /// actor-signed control bytes as well as `(conversation, seq, entry, generation, epoch)`.
+    pub fn sign_control_receipt(
+        &self,
+        input: &I13ControlReceiptInput,
+        coordinate: &crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate,
+    ) -> Result<Value, String> {
+        let coordinate_conversation = Uuid::from_bytes(*coordinate.conversation_id())
+            .hyphenated()
+            .to_string();
+        self.sign_control_receipt_at(
+            input,
+            &coordinate_conversation,
+            coordinate.generation(),
+            coordinate.group_id(),
+            coordinate.epoch(),
+        )
+    }
+
+    /// Add a verified server-generated receipt to a generated control-entry JSON projection.
+    pub fn attach_control_receipt(
+        canonical_entry: &[u8],
+        receipt: &Value,
+    ) -> Result<Vec<u8>, String> {
+        let mut entry: Value =
+            serde_json::from_slice(canonical_entry).map_err(|error| error.to_string())?;
+        let fields = entry
+            .as_object_mut()
+            .ok_or_else(|| "control entry projection is not an object".to_owned())?;
+        let canonical_receipt =
+            crate::chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                receipt,
+                "blue.catbird.chat.defs#sequencerReceipt",
+            )
+            .map_err(|error| error.to_string())?;
+        let presented_receipt: Value =
+            serde_json::from_slice(canonical_receipt.bytes()).map_err(|error| error.to_string())?;
+        if fields
+            .insert("sequencerReceipt".to_owned(), presented_receipt)
+            .is_some()
+        {
+            return Err("control entry already carries a sequencer receipt".into());
+        }
+        serde_json::to_vec(&entry).map_err(|error| error.to_string())
+    }
+
     /// Project a `SignedSequencerReceipt` + `generation` into the canonical `blue.catbird.chat.defs#sequencerReceipt` JSON object (bare base64 for internal storage; `present_endpoint_output` / `encode_canonical_generated_chat_json_v1` wrap `$bytes` on wire).
     pub fn receipt_wire_json(
         signed: &labyrinth_protocol::receipt::SignedSequencerReceipt,
@@ -857,6 +1117,159 @@ mod tests {
     use p256::pkcs8::{EncodePrivateKey, LineEnding};
     use rand::rngs::OsRng;
 
+    #[test]
+    fn every_receipted_control_kind_selects_only_its_signed_coordinate() {
+        use crate::chat_protocol::transcript::SignedMutationKind as K;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use serde_json::json;
+
+        let sequencer = "did:web:all-control-receipts.example.com";
+        let conversation_id = "11111111-1111-4111-8111-111111111111";
+        let coordinate = |source: &str, generation: u64, group_id: u8, epoch: u64| {
+            json!({
+                "source": source,
+                "conversationId": conversation_id,
+                "generation": generation,
+                "groupId": STANDARD.encode([group_id; 32]),
+                "epoch": epoch,
+            })
+        };
+        let body = json!({
+            "next": coordinate("next", 1, 0x11, 2),
+            "prior": coordinate("prior", 0, 0x22, 1),
+            "successor": coordinate("successor", 2, 0x33, 3),
+            "retired": coordinate("retired", 3, 0x44, 4),
+        });
+        let body = body.as_object().unwrap();
+        let predecessor = coordinate("predecessor", 4, 0x55, 5);
+        let signer = I13ReceiptSigner::from_signing_key_for_test(
+            sequencer.to_owned(),
+            SigningKey::from_slice(&[0x41; 32]).unwrap(),
+        );
+        let input = I13ControlReceiptInput::from_fields(
+            conversation_id,
+            "22222222-2222-4222-8222-222222222222",
+            7,
+            "2026-11-13T12:00:00.000Z",
+            "did:plc:allcontrolreceiptactor",
+            "33333333-3333-4333-8333-333333333333",
+            [0x66; 32],
+        )
+        .unwrap();
+        for (kind, source) in [
+            (K::DirectRequestPublication, "next"),
+            (K::DirectRequestAcceptance, "next"),
+            (K::CommitTransition, "next"),
+            (K::PolicyTransition, "next"),
+            (K::MetadataTransition, "next"),
+            (K::Creation, "next"),
+            (K::ParticipantAcceptance, "next"),
+            (K::ConversationClose, "retired"),
+            (K::ResetRequest, "prior"),
+            (K::ResetActivation, "successor"),
+            (K::LeafRecoveryRequest, "prior"),
+            (K::LeafRecoveryCancellation, "predecessor"),
+            (K::LeafRecoveryFulfillment, "next"),
+            (K::LeaveRequest, "prior"),
+            (K::ZeroLeafLeave, "next"),
+            (K::LeaveCancellation, "predecessor"),
+            (K::LeaveCommitFulfillment, "next"),
+        ] {
+            let selected = control_receipt_coordinate(kind, body, Some(&predecessor)).unwrap();
+            assert_eq!(selected["source"], source, "{kind:?}");
+            let group_id = STANDARD
+                .decode(selected["groupId"].as_str().unwrap())
+                .unwrap();
+            let receipt = signer
+                .sign_control_receipt_at(
+                    &input,
+                    conversation_id,
+                    selected["generation"].as_u64().unwrap(),
+                    &group_id,
+                    selected["epoch"].as_u64().unwrap(),
+                )
+                .unwrap();
+            verify_control_receipt(
+                &receipt,
+                &signer.verifying_key(),
+                sequencer,
+                &input,
+                selected,
+            )
+            .unwrap();
+        }
+
+        let body_without_successor = json!({
+            "next": {"source": "next"},
+            "prior": {"source": "prior"},
+        });
+        assert!(
+            control_receipt_coordinate(
+                K::ResetActivation,
+                body_without_successor.as_object().unwrap(),
+                Some(&predecessor),
+            )
+            .is_err(),
+            "reset activation must never fall back to another coordinate"
+        );
+    }
+
+    #[test]
+    fn control_receipt_verifier_accepts_only_the_signed_coordinate() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use serde_json::json;
+
+        let sequencer = "did:web:receipt-coordinate.example.com";
+        let conversation_id = "11111111-1111-4111-8111-111111111111";
+        let signer = I13ReceiptSigner::from_signing_key_for_test(
+            sequencer.to_owned(),
+            SigningKey::from_slice(&[0x42; 32]).unwrap(),
+        );
+        let input = I13ControlReceiptInput::from_fields(
+            conversation_id,
+            "22222222-2222-4222-8222-222222222222",
+            7,
+            "2026-11-13T12:00:00.000Z",
+            "did:plc:receiptcoordinateactor",
+            "33333333-3333-4333-8333-333333333333",
+            [0x33; 32],
+        )
+        .unwrap();
+        let successor_group_id = [0x22; 32];
+        let successor = json!({
+            "conversationId": conversation_id,
+            "generation": 3,
+            "groupId": STANDARD.encode(successor_group_id),
+            "epoch": 5,
+        });
+        let exact = signer
+            .sign_control_receipt_at(&input, conversation_id, 3, &successor_group_id, 5)
+            .unwrap();
+        verify_control_receipt(
+            &exact,
+            &signer.verifying_key(),
+            sequencer,
+            &input,
+            &successor,
+        )
+        .unwrap();
+
+        let wrong = signer
+            .sign_control_receipt_at(&input, conversation_id, 2, &[0x11; 32], 4)
+            .unwrap();
+        assert_eq!(
+            verify_control_receipt(
+                &wrong,
+                &signer.verifying_key(),
+                sequencer,
+                &input,
+                &successor,
+            )
+            .unwrap_err(),
+            "control receipt binding mismatch"
+        );
+    }
+
     fn terminal_close_fixture() -> (Uuid, Value, [u8; 32]) {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use serde_json::json;
@@ -925,12 +1338,13 @@ mod tests {
     fn terminal_close_authority_is_deterministic_and_binds_the_exact_group_close() {
         use serde_json::json;
 
-        let (conversation_id, entry, device_public) = terminal_close_fixture();
+        let (conversation_id, mut entry, device_public) = terminal_close_fixture();
         crate::chat_protocol::transcript::decode_and_verify_control_entry(
             &serde_json::to_vec(&entry).unwrap(),
             &device_public,
         )
         .unwrap();
+        entry["sequencerReceipt"] = json!({"seq": 10, "signature": {"$bytes": "AA=="}});
         let key = SigningKey::from_slice(&[7; 32]).unwrap();
         let signer = I13ReceiptSigner::new(key.clone(), "did:web:sequencer.example".to_string());
         let proof = signer

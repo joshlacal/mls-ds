@@ -64,6 +64,58 @@ async fn handle(
 ) -> Result<Response, ChatFailure> {
     let admission =
         context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
+    if let Some(response) =
+        context::try_relay_remote_lifecycle(pool, runtime, endpoint, &admission, body).await?
+    {
+        return Ok(response);
+    }
+    context::refuse_remote_sequencing(pool, endpoint, &admission).await?;
+    execute_admitted(pool, runtime, endpoint, admission, body, None).await
+}
+
+pub(super) async fn execute_admitted(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    endpoint: ChatEndpoint,
+    admission: crate::chat_protocol::repository::auth::SignedOperationAdmission,
+    body: &[u8],
+    relay_home: Option<&str>,
+) -> Result<Response, ChatFailure> {
+    let actor = admission.subject().to_owned();
+    let completed_preflight =
+        crate::chat_protocol::repository::auth::preflight_completed_response(pool, &admission)
+            .await
+            .map_err(|error| context::auth_repository_failure(endpoint, error))?
+            .is_some();
+
+    let conversation_id = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/signedRequest/body/prior/conversationId")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        });
+    let c33_control_home = match (completed_preflight, conversation_id, relay_home) {
+        (false, _, Some(home)) => Some(home.to_owned()),
+        (false, Some(conversation_id), None) => {
+            crate::federation::group_relay::C33PeerHomes::transition_peer_home(
+                pool,
+                conversation_id,
+                &actor,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(?error, "Reset C33 peer resolution failed");
+                ChatFailure::storage(endpoint)
+            })?
+        }
+        _ => None,
+    };
+    if c33_control_home.is_some() && runtime.i13_receipt_signer().is_none() {
+        tracing::error!("C33 Reset refused without an I13 receipt signer");
+        return Err(ChatFailure::storage(endpoint));
+    }
     let mut transaction = pool
         .begin()
         .await
@@ -71,13 +123,15 @@ async fn handle(
     let prepared = prelude::prepare_signed_operation(&mut transaction, admission)
         .await
         .map_err(|error| context::operation_prelude_failure(endpoint, error))?;
-    let outcome = reset::execute_prepared_reset(&mut transaction, prepared)
-        .await
-        .map_err(|error| reset_failure(endpoint, error))?;
+    let outcome =
+        reset::execute_prepared_reset(&mut transaction, prepared, runtime.i13_receipt_signer())
+            .await
+            .map_err(|error| reset_failure(endpoint, error))?;
 
-    let response = match outcome {
+    let (response, response_bytes) = match outcome {
         ResetTransactionOutcome::Replay(completed) => {
-            context::replay_response(endpoint, &completed)?
+            let bytes = completed.response_bytes().to_vec();
+            (context::replay_response(endpoint, &completed)?, bytes)
         }
         ResetTransactionOutcome::First(applied) => {
             let event_position = applied.event_position();
@@ -96,14 +150,41 @@ async fn handle(
             )
             .await
             .map_err(|error| context::operation_prelude_failure(endpoint, error))?;
-            context::canonical_json_response(endpoint, status, response_bytes)?
+            (
+                context::canonical_json_response(endpoint, status, response_bytes.clone())?,
+                response_bytes,
+            )
         }
     };
+    if let Some(home) = c33_control_home.as_deref() {
+        crate::federation::group_relay::enqueue_transport_control_response(
+            &mut transaction,
+            home,
+            &response_bytes,
+            crate::sim_hooks::current_utc(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(?error, "C33 Reset control queueing failed");
+            ChatFailure::storage(endpoint)
+        })?;
+    }
+    let response_value =
+        serde_json::from_slice(&response_bytes).map_err(|_| ChatFailure::invariant(endpoint))?;
+    let group_fanout = crate::federation::group_fanout::prepare_group_entry_fanout(
+        &mut transaction,
+        &response_value,
+    )
+    .await
+    .map_err(|_| ChatFailure::storage(endpoint))?;
 
     transaction
         .commit()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
+    if let Some(fanout) = group_fanout {
+        runtime.spawn_post_commit_group_entry_fanout(pool, fanout);
+    }
     runtime.notify_events();
     Ok(response)
 }
@@ -115,7 +196,7 @@ fn reset_failure(endpoint: ChatEndpoint, error: ResetFacadeError) -> ChatFailure
     use StateMachineError as S;
 
     match error {
-        E::Database(_) => ChatFailure::storage(endpoint),
+        E::Database(_) | E::Delivery(_) => ChatFailure::storage(endpoint),
         E::Prelude(error) => prelude_failure(endpoint, error),
         E::Primitive(_) => ChatFailure::protocol(endpoint, C::InvalidSignature),
         E::Repository(R::Database(_)) => ChatFailure::storage(endpoint),

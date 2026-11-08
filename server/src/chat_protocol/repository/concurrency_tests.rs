@@ -1016,7 +1016,8 @@ mod accept_admission_contention {
             .execute(&mut *tx)
             .await
             .unwrap();
-        let outcome = accept_direct_request(&mut tx, &principal, &raw, &signer, &policy, now).await;
+        let outcome =
+            accept_direct_request(&mut tx, &principal, &raw, &signer, None, &policy, now).await;
         tx.rollback().await.unwrap();
         holder.rollback().await.unwrap();
         assert!(

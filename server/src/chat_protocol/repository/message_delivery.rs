@@ -687,7 +687,8 @@ pub(crate) async fn send_with_receipt_signer<T: PublicTransport>(
                 ),
             )
         }
-        _ => None,
+        (None, Some(_)) => return Err(MessageDeliveryError::InvalidApplicationMessage),
+        (_, None) => None,
     };
     let mut entry_obj = json!({
         "entryId": entry_id_text,

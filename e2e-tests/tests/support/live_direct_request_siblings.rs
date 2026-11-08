@@ -167,9 +167,11 @@ async fn retained_welcome(
     let state: Value = serde_json::from_slice(&raw)?;
     assert_eq!(state["state"]["directRequest"]["consent"], "accepted");
     let accepting_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
-    let proof = protocol::verify_received_direct_request_acceptance_proof(
+    let proof = mls_e2e_tests::verify_received_direct_request_acceptance_proof_with_i13(
         &serde_json::to_vec(&state["state"]["directRequest"]["acceptanceProof"])?,
+        "did:web:chat.catbird.blue",
         &f.server.receipt_public_key,
+        &f.server.sequencer_receipt_public_key,
         &f.bob_engine.identity_public_key(&accepting_identity)?,
     )?;
     assert_eq!(

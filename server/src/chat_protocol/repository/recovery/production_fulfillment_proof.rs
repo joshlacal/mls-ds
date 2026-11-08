@@ -179,7 +179,8 @@ async fn prepare_request(
         .map_err(|error| {
             format!("load immutable Recovery reservation fallback prerequisite: {error:?}")
         })?;
-    plan_recovery_request(input, relationship_authority)
+    let i13_signer = proof_i13_signer();
+    plan_recovery_request(input, relationship_authority, Some(&i13_signer))
         .map_err(|error| format!("plan committed Recovery prerequisite request: {error:?}"))
 }
 
@@ -573,14 +574,16 @@ async fn verify_successor_and_delivery(
         || after.entry_count != before.entry_count + 1
         || after.welcome_count != before.welcome_count + 1
         || after.welcome_delivery_count != before.welcome_delivery_count + 1
-        || after.event_count != before.event_count + 1
-        || after.outbox_count != before.outbox_count + 1
+        // Replace fulfillment emits the new Welcome plus the disposition for the
+        // target's prior pending Welcome.
+        || after.event_count != before.event_count + 2
+        || after.outbox_count != before.outbox_count + 2
         || after.claim_count != before.claim_count + 1
         || after.exact_claim_binding_count != before.exact_claim_binding_count + 1
         || after.completion_count != before.completion_count + 1
         || event_kind != "welcomeAvailable"
         || protocol_instance_id != before.protocol_instance_id
-        || recipient_rows != 2
+        || recipient_rows != 1
         || outbox_rows != 1
     {
         return Err(format!(
@@ -654,7 +657,8 @@ async fn prepare_fulfillment(
         .map_err(|error| {
             format!("load immutable Recovery fulfillment relationship fallback: {error:?}")
         })?;
-    plan_recovery_fulfillment(input, relationship_authority)
+    let signer = proof_i13_signer();
+    plan_recovery_fulfillment(input, relationship_authority, Some(&signer))
         .map_err(|error| format!("plan genuine Recovery fulfillment: {error:?}"))
 }
 
@@ -776,6 +780,19 @@ pub(super) async fn run_leaf_recovery_fulfillment_happy_path(pool: &PgPool) -> R
         })?
         .as_bytes()
         .to_vec();
+    let response_json: Value = serde_json::from_slice(&response)
+        .map_err(|error| format!("decode fulfilled Recovery response: {error}"))?;
+    let response_entry = response_json
+        .get("result")
+        .unwrap_or(&response_json)
+        .get("entry")
+        .ok_or_else(|| "fulfilled Recovery response omitted its control entry".to_owned())?;
+    if !response_entry
+        .get("sequencerReceipt")
+        .is_some_and(Value::is_object)
+    {
+        return Err("fulfilled Recovery response omitted its signed sequencerReceipt".to_owned());
+    }
     crate::chat_protocol::repository::prelude::complete_operation(
         &mut transaction,
         &authority,
@@ -1110,7 +1127,8 @@ pub(super) async fn run_signed_operation_age_fence(pool: &PgPool) -> Result<(), 
     let admission=super::production_proof_fixture::admit_lifecycle(pool,&proof.fixture.fulfiller,FULFILLMENT_ENDPOINT,&envelope,&now).await?;
     let mut tx=pool.begin().await.map_err(|e|e.to_string())?;
     let prepared=crate::chat_protocol::repository::prelude::prepare_signed_operation(&mut tx,admission).await.map_err(|e|format!("fresh arbitration: {e:?}"))?;
-    let accepted=execute_prepared_recovery(&mut tx,prepared,&proof.relationship_authority).await.map_err(|e|format!("fresh facade: {e:?}"))?;
+    let signer=proof_i13_signer();
+    let accepted=execute_prepared_recovery(&mut tx,prepared,&proof.relationship_authority,Some(&signer)).await.map_err(|e|format!("fresh facade: {e:?}"))?;
     if accepted.status()!=200 { return Err(format!("fresh status {}",accepted.status())); }
     let original=accepted.response_bytes().to_vec();
     tx.commit().await.map_err(|e|format!("commit accepted fulfillment: {e}"))?;
@@ -1118,7 +1136,7 @@ pub(super) async fn run_signed_operation_age_fence(pool: &PgPool) -> Result<(), 
     let admission=super::production_proof_fixture::admit_lifecycle(pool,&proof.fixture.fulfiller,FULFILLMENT_ENDPOINT,&envelope,&later).await?;
     let mut tx=pool.begin().await.map_err(|e|e.to_string())?;
     let prepared=crate::chat_protocol::repository::prelude::prepare_signed_operation(&mut tx,admission).await.map_err(|e|format!("old accepted arbitration: {e:?}"))?;
-    let replay=execute_prepared_recovery(&mut tx,prepared,&proof.relationship_authority).await.map_err(|e|format!("old accepted facade replay: {e:?}"))?;
+    let replay=execute_prepared_recovery(&mut tx,prepared,&proof.relationship_authority,Some(&signer)).await.map_err(|e|format!("old accepted facade replay: {e:?}"))?;
     if replay.status()!=200 || replay.response_bytes()!=original { return Err("aged completed operation did not return exact original response bytes".into()); }
     tx.commit().await.map_err(|e|e.to_string())?;
     Ok(())

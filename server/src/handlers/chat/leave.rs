@@ -73,15 +73,34 @@ async fn execute(
 ) -> Result<Response, ChatFailure> {
     let admission =
         context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
+    if let Some(response) =
+        context::try_relay_remote_lifecycle(pool, runtime, endpoint, &admission, body).await?
+    {
+        return Ok(response);
+    }
+    context::refuse_remote_sequencing(pool, endpoint, &admission).await?;
+    execute_admitted(pool, runtime, endpoint, admission, body, None).await
+}
+
+pub(super) async fn execute_admitted(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    endpoint: ChatEndpoint,
+    admission: crate::chat_protocol::repository::auth::SignedOperationAdmission,
+    body: &[u8],
+    relay_home: Option<&str>,
+) -> Result<Response, ChatFailure> {
+    let actor = admission.subject().to_owned();
     let closing = match endpoint {
         ChatEndpoint::CloseConversation => closed_conversation_id(body),
         _ => None,
     };
-    let c33_peer = match closing {
-        Some(conversation_id) => {
-            c33_peer_home(pool, endpoint, admission.subject(), conversation_id).await?
+    let c33_peer = match (closing, relay_home) {
+        (Some(_), Some(home)) => Some((actor.clone(), home.to_owned())),
+        (Some(conversation_id), None) => {
+            c33_peer_home(pool, endpoint, &actor, conversation_id).await?
         }
-        None => None,
+        (None, _) => None,
     };
     let mut tx = pool
         .begin()
@@ -112,9 +131,13 @@ async fn execute(
     }
     // Boxed, like the relay's close future: inline, the transition's state would
     // size every await of this handler (and every caller holding it).
-    let outcome = Box::pin(leave::execute_prepared_leave(&mut tx, prepared))
-        .await
-        .map_err(|error| logged(endpoint, "transition", error, map_failure))?;
+    let outcome = Box::pin(leave::execute_prepared_leave(
+        &mut tx,
+        prepared,
+        runtime.i13_receipt_signer(),
+    ))
+    .await
+    .map_err(|error| logged(endpoint, "transition", error, map_failure))?;
     let response =
         context::canonical_json_response(endpoint, outcome.status, outcome.response_bytes.clone())?;
     let mut prepared_space = None;
@@ -387,7 +410,7 @@ fn map_failure(endpoint: ChatEndpoint, error: LeaveFacadeError) -> ChatFailure {
     match error {
         E::Retention(crate::chat_protocol::repository::direct_request_retention::RetentionError::Database(_)) => ChatFailure::storage(endpoint),
         E::Retention(_) => ChatFailure::protocol_with_retry(endpoint,C::CapacityUnavailable,Some(30)),
-        E::Database(_) | E::Authorization(_) => ChatFailure::storage(endpoint),
+        E::Database(_) | E::Authorization(_) | E::Delivery(_) => ChatFailure::storage(endpoint),
         E::IdempotencyKeyMismatch => ChatFailure::protocol(endpoint, C::InvalidRequest),
         E::Prelude(error) => context::operation_prelude_failure(endpoint, error),
         E::Conversation(error) => match error {
@@ -406,6 +429,7 @@ fn map_failure(endpoint: ChatEndpoint, error: LeaveFacadeError) -> ChatFailure {
         | E::Executor(crate::chat_protocol::state_machine::ExecutorError::Transition(crate::chat_protocol::repository::transition::TransitionRepositoryError::CompareAndSetConflict))
         | E::StateMachine(S::StaleCoordinates)
         | E::StateMachine(S::ConversationClosed) => ChatFailure::protocol(endpoint, C::StaleCoordinates),
+        E::StateMachine(S::InvalidTransition) => ChatFailure::protocol(endpoint, C::InvalidRequest),
         E::StateMachine(S::CoordinateOverflow) => ChatFailure::protocol(endpoint, C::CoordinateOverflow),
         E::StateMachine(S::DirectParticipantMutationForbidden) => ChatFailure::protocol(endpoint, C::DirectParticipantMutationForbidden),
         E::StateMachine(S::LastAdminRequired) => ChatFailure::protocol(endpoint, C::LastAdminRequired),

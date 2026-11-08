@@ -268,13 +268,23 @@ async fn resolve_ssrf_safe_space_endpoint(
 }
 
 fn build_pinned_client(target: &ResolvedRelayEndpoint) -> Result<reqwest::Client, SpaceRelayError> {
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(15));
-    if !target.is_test_override && !target.pinned_addrs.is_empty() {
-        builder = builder.resolve_to_addrs(&target.host, &target.pinned_addrs);
+    if target.is_test_override || target.pinned_addrs.is_empty() {
+        static UNPINNED_SPACE_RELAY_CLIENT: std::sync::OnceLock<reqwest::Client> =
+            std::sync::OnceLock::new();
+        return Ok(UNPINNED_SPACE_RELAY_CLIENT
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(15))
+                    .build()
+                    .expect("build unpinned space relay HTTP client")
+            })
+            .clone());
     }
-    builder
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .resolve_to_addrs(&target.host, &target.pinned_addrs)
         .build()
         .map_err(|e| SpaceRelayError::UpstreamUnavailable(e.to_string()))
 }

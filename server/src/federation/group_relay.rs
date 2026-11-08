@@ -59,8 +59,11 @@ pub(crate) use remote_group_index::{
 #[path = "entry_ack_relay.rs"]
 mod entry_ack_relay;
 pub(crate) use entry_ack_relay::{
-    account_deletion_relay::enqueue_account_deletion_relays, enqueue_entry_ack_relay,
-    transport_control_entry::enqueue_transport_control_entry,
+    account_deletion_relay::enqueue_account_deletion_relays,
+    enqueue_entry_ack_relay,
+    transport_control_entry::{
+        enqueue_transport_control_entry, enqueue_transport_control_response,
+    },
 };
 // The expiry sweep is also compiled into integration-test crates.
 pub use entry_ack_relay::{
@@ -88,6 +91,7 @@ pub struct GroupRelayState {
     push_gateway_client: Option<Arc<PushGatewayClient>>,
     clock: Arc<dyn crate::sim_hooks::DsClock>,
     relationship_authority: Option<Arc<ProductionRelationshipAuthority>>,
+    chat_runtime: Option<Arc<crate::handlers::chat::ChatRuntime>>,
     #[cfg(feature = "sim")]
     sim_hooks: Option<Arc<crate::sim_hooks::SimDsHooks>>,
 }
@@ -111,9 +115,23 @@ impl GroupRelayState {
             push_gateway_client,
             clock: Arc::new(crate::sim_hooks::SystemDsClock),
             relationship_authority: None,
+            chat_runtime: None,
             #[cfg(feature = "sim")]
             sim_hooks: crate::sim_hooks::active_sim_ds(),
         }
+    }
+
+    /// Construct the process router state with the lifecycle sequencer runtime
+    /// wired in; production callers must not assemble these independently.
+    pub fn for_production(
+        pool: DbPool,
+        self_did: String,
+        i13_receipt_signer: Option<Arc<I13ReceiptSigner>>,
+        push_gateway_client: Option<Arc<PushGatewayClient>>,
+        runtime: Arc<crate::handlers::chat::ChatRuntime>,
+    ) -> Self {
+        Self::new(pool, self_did, i13_receipt_signer, push_gateway_client)
+            .with_chat_runtime(runtime)
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn crate::sim_hooks::DsClock>) -> Self {
@@ -135,6 +153,14 @@ impl GroupRelayState {
         self
     }
 
+    /// Use the same runtime as the member-facing handlers when sequencing a
+    /// relayed lifecycle operation.
+    pub fn with_chat_runtime(mut self, runtime: Arc<crate::handlers::chat::ChatRuntime>) -> Self {
+        self.relationship_authority = Some(Arc::clone(runtime.relationship_authority()));
+        self.chat_runtime = Some(runtime);
+        self
+    }
+
     /// The configured relationship authority; a state built without a chat
     /// runtime admits under the deterministic simulation authority or the
     /// fixed production one.
@@ -150,6 +176,9 @@ impl GroupRelayState {
         crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard()
             .map(|guard| Arc::new(ProductionRelationshipAuthority::from_startup_guard(guard)))
             .map_err(|e| format!("{e:?}"))
+    }
+    pub(super) fn i13_receipt_signer(&self) -> Option<&I13ReceiptSigner> {
+        self.i13_receipt_signer.as_deref()
     }
 
     #[cfg(feature = "sim")]
@@ -193,6 +222,7 @@ impl GroupRelayState {
             push_gateway_client,
             clock: Arc::new(crate::sim_hooks::SystemDsClock),
             relationship_authority: None,
+            chat_runtime: None,
             #[cfg(feature = "sim")]
             sim_hooks: crate::sim_hooks::active_sim_ds(),
         }
@@ -207,6 +237,9 @@ pub struct RelayGroupMutationRequest {
     pub actor_did: String,
     pub actor_device_id: Uuid,
     pub signed_request: Value,
+    /// Exact member-supplied JSON bytes, base64-encoded for the S2S envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_request_bytes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,14 +321,19 @@ pub fn configured_group_relay_hmac_secret() -> Option<String> {
             return hooks
                 .group_relay_hmac_secret
                 .clone()
-                .filter(|secret| !secret.is_empty());
+                .and_then(nonempty_group_relay_secret);
         }
         return std::env::var("FEDERATION_GROUP_RELAY_HMAC_SECRET")
             .ok()
-            .filter(|secret| !secret.is_empty());
+            .and_then(nonempty_group_relay_secret);
     }
     #[cfg(not(any(test, feature = "test-support")))]
     None
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn nonempty_group_relay_secret(secret: String) -> Option<String> {
+    (!secret.is_empty()).then_some(secret)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -553,8 +591,22 @@ impl GroupRelayError {
         use crate::handlers::chat::ChatFailure;
         match self {
             Self::Rejected(code) => ChatFailure::protocol(endpoint, code),
-            Self::Unavailable(_) => ChatFailure::unavailable(endpoint),
-            Self::Internal(_) => ChatFailure::storage(endpoint),
+            Self::Unavailable(error) => {
+                tracing::error!(
+                    endpoint = endpoint.nsid(),
+                    %error,
+                    "remote group relay source unavailable"
+                );
+                ChatFailure::unavailable(endpoint)
+            }
+            Self::Internal(error) => {
+                tracing::error!(
+                    endpoint = endpoint.nsid(),
+                    %error,
+                    "remote group relay failed locally"
+                );
+                ChatFailure::storage(endpoint)
+            }
         }
     }
 }
@@ -584,6 +636,24 @@ pub async fn relay_group_mutation_to_sequencer(
     s2s_secret: &[u8],
     request: &RelayGroupMutationRequest,
 ) -> Result<RelayGroupMutationOutput, GroupRelayError> {
+    let bytes = relay_group_mutation_bytes_to_sequencer(
+        sequencer_endpoint,
+        caller_home_did,
+        sequencer_did,
+        s2s_secret,
+        request,
+    )
+    .await?;
+    serde_json::from_slice(&bytes).map_err(|error| GroupRelayError::Unavailable(error.to_string()))
+}
+
+async fn relay_group_mutation_bytes_to_sequencer(
+    sequencer_endpoint: &str,
+    caller_home_did: &str,
+    sequencer_did: &str,
+    s2s_secret: &[u8],
+    request: &RelayGroupMutationRequest,
+) -> Result<Vec<u8>, GroupRelayError> {
     let internal = |error: String| GroupRelayError::Internal(error);
     let unavailable = |error: String| GroupRelayError::Unavailable(error);
     let body_bytes = serde_json::to_vec(request).map_err(|e| internal(e.to_string()))?;
@@ -593,11 +663,14 @@ pub async fn relay_group_mutation_to_sequencer(
         "{}/xrpc/blue.catbird.mlsDS.relayGroupMutation",
         sequencer_endpoint.trim_end_matches('/')
     );
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(RELAY_GROUP_MUTATION_TIMEOUT)
-        .build()
-        .map_err(|e| internal(e.to_string()))?;
+    static MUTATION_HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = MUTATION_HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(RELAY_GROUP_MUTATION_TIMEOUT)
+            .build()
+            .expect("build group mutation HTTP client")
+    });
     let mut req = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "application/json");
@@ -615,7 +688,6 @@ pub async fn relay_group_mutation_to_sequencer(
         .await
         .map_err(|e| unavailable(format!("relayGroupMutation POST failed: {e}")))?;
     let status = resp.status();
-    // A peer's body is bounded before any status or JSON handling.
     let limit = if status.is_success() {
         RELAY_GROUP_MUTATION_RESPONSE_MAX_BYTES
     } else {
@@ -627,15 +699,15 @@ pub async fn relay_group_mutation_to_sequencer(
     if !status.is_success() {
         return Err(GroupRelayError::from_response(status.as_u16(), &resp_bytes));
     }
-    serde_json::from_slice(&resp_bytes).map_err(|e| unavailable(e.to_string()))
+    Ok(resp_bytes.to_vec())
 }
 
-/// Relay a strict-home member's group transition to the group's sequencer.
+/// Relay a strict-home participant's transition to its sequencer.
 ///
-/// Returns `None` unless this DS holds the conversation as a remote group
-/// mirror. `mailbox_commit` keeps mirrored CommitTransitions on the
-/// `RemoteCommitSubmitter` path. The bytes are the sequencer's
-/// `submitTransition` output.
+/// This applies to a remote Group mirror and to an accepted C33 pair held only
+/// in this home's transport inbox. `mailbox_commit` keeps only Group commits on
+/// the `RemoteCommitSubmitter` path; C33 has no local mailbox to preflight.
+/// The bytes are the sequencer's `submitTransition` output.
 pub(crate) async fn relay_remote_group_submit_transition(
     pool: &DbPool,
     resolver: &super::DsResolver,
@@ -644,58 +716,38 @@ pub(crate) async fn relay_remote_group_submit_transition(
     mailbox_commit: bool,
     body: &[u8],
 ) -> Result<Option<Vec<u8>>, GroupRelayError> {
-    let Ok(body_json) = serde_json::from_slice::<Value>(body) else {
+    let Some((signed_req, exact_bytes)) = exact_signed_request(body) else {
         return Ok(None);
     };
-    let signed_req = body_json.get("signedRequest").unwrap_or(&body_json);
-    let Some(convo_id) = signed_conversation_id(signed_req) else {
+    let Some(conversation_id) = signed_conversation_id(&signed_req) else {
         return Ok(None);
     };
-    let local_convo: Option<(String, bool, Option<String>)> = sqlx::query_as(
-        "SELECT kind, is_remote, sequencer_ds FROM chat.conversations WHERE conversation_id = $1",
-    )
-    .bind(convo_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| GroupRelayError::Internal(e.to_string()))?;
-    let seq_ds = match local_convo {
-        Some((kind, true, Some(seq_ds))) if kind == "group" => seq_ds,
-        _ => return Ok(None),
+    let Some((sequencer, c33_transport)) =
+        remote_sequence_target(pool, actor_did, actor_device_id, conversation_id).await?
+    else {
+        return Ok(None);
     };
-    // Only the sequencer can sequence a mirror's transition: a closed gate
-    // decided nothing, and refuses before the sequencer is resolved.
-    super::peer_policy::ensure_federation_open().map_err(GroupRelayError::from_local)?;
-    if mailbox_commit {
+    if mailbox_commit && !c33_transport {
         return Ok(None);
     }
-    let secret = configured_group_relay_hmac_secret();
-    if secret.is_none() && super::canonical_relay::configured_s2s_signing_key_pem().is_err() {
+    if configured_group_relay_hmac_secret().is_none()
+        && super::canonical_relay::configured_s2s_signing_key_pem().is_err()
+    {
         return Ok(None);
     }
-    if signed_req.pointer("/body/actorDid").and_then(Value::as_str) != Some(actor_did) {
-        return Err(GroupRelayError::Rejected(
-            crate::chat_protocol::error::ChatProtocolErrorCode::NotAuthorized,
-        ));
-    }
-    let dest = resolver
-        .resolve_ds_destination_uncached(&seq_ds)
-        .await
-        .map_err(GroupRelayError::from_local)?;
-    let secret_bytes = secret.as_deref().map(str::as_bytes).unwrap_or(&[]);
-    let out = relay_group_mutation_to_sequencer(
-        dest.url.as_str(),
-        &crate::identity::service_did(),
-        &seq_ds,
-        secret_bytes,
-        &RelayGroupMutationRequest {
-            conversation_id: convo_id,
-            endpoint: "blue.catbird.chat.submitTransition".to_string(),
-            actor_did: actor_did.to_string(),
-            actor_device_id,
-            signed_request: signed_req.clone(),
-        },
+    let out = relay_remote_signed_operation(
+        resolver,
+        &sequencer,
+        "blue.catbird.chat.submitTransition",
+        actor_did,
+        actor_device_id,
+        conversation_id,
+        signed_req.clone(),
+        exact_bytes,
     )
     .await?;
+    let out: RelayGroupMutationOutput = serde_json::from_slice(&out)
+        .map_err(|error| GroupRelayError::Unavailable(error.to_string()))?;
     let output = json!({
         "coordinates": out.coordinates.unwrap_or_else(|| signed_req["body"]["next"].clone()),
         "entry": out.entry,
@@ -703,7 +755,414 @@ pub(crate) async fn relay_remote_group_submit_transition(
     });
     serde_json::to_vec(&output)
         .map(Some)
-        .map_err(|e| GroupRelayError::Internal(e.to_string()))
+        .map_err(|error| GroupRelayError::Internal(error.to_string()))
+}
+
+/// Relay an admitted lifecycle operation before the home opens a sequencing
+/// transaction. The returned bytes are the sequencer's exact client response.
+pub(crate) async fn replay_remote_lifecycle_operation(
+    pool: &DbPool,
+    endpoint: &str,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    operation_id: Uuid,
+    signed_request_bytes: &[u8],
+) -> Result<Option<Vec<u8>>, GroupRelayError> {
+    let request_digest: [u8; 32] = Sha256::digest(signed_request_bytes).into();
+    let now =
+        chrono::DateTime::from_timestamp_millis(crate::sim_hooks::current_utc().timestamp_millis())
+            .ok_or_else(|| GroupRelayError::Internal("invalid replay instant".to_owned()))?;
+    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, i16)> = sqlx::query_as(
+        "SELECT signed_request_sha256,response_sha256,response_bytes,response_status \
+         FROM chat.remote_lifecycle_operation_replays \
+         WHERE actor_did=$1 AND actor_device_id=$2 AND endpoint_nsid=$3 \
+           AND operation_id=$4 AND expires_at>$5",
+    )
+    .bind(crate::identity::canonical_did(actor_did))
+    .bind(actor_device_id)
+    .bind(endpoint)
+    .bind(operation_id)
+    .bind(now)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %operation_id, "remote lifecycle replay lookup failed");
+        GroupRelayError::Internal(error.to_string())
+    })?;
+    let Some((stored_request, stored_response, response, status)) = row else {
+        return Ok(None);
+    };
+    if stored_request.as_slice() != request_digest
+        || status != 200
+        || stored_response.as_slice() != Sha256::digest(&response).as_slice()
+    {
+        return Err(GroupRelayError::Rejected(
+            crate::chat_protocol::error::ChatProtocolErrorCode::IdempotencyConflict,
+        ));
+    }
+    Ok(Some(response))
+}
+
+pub(crate) async fn relay_remote_lifecycle_operation(
+    pool: &DbPool,
+    resolver: &super::DsResolver,
+    endpoint: &str,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    operation_id: Uuid,
+    conversation_id: Uuid,
+    signed_request_bytes: Vec<u8>,
+) -> Result<Option<Vec<u8>>, GroupRelayError> {
+    let signed_request: Value = serde_json::from_slice(&signed_request_bytes)
+        .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+    let request_digest: [u8; 32] = Sha256::digest(&signed_request_bytes).into();
+    let Some((sequencer, _)) =
+        remote_sequence_target(pool, actor_did, actor_device_id, conversation_id).await?
+    else {
+        return Ok(None);
+    };
+    let response = relay_remote_signed_operation(
+        resolver,
+        &sequencer,
+        endpoint,
+        actor_did,
+        actor_device_id,
+        conversation_id,
+        signed_request.clone(),
+        signed_request_bytes,
+    )
+    .await?;
+    retain_remote_lifecycle_result(
+        pool,
+        endpoint,
+        actor_did,
+        actor_device_id,
+        operation_id,
+        conversation_id,
+        &sequencer,
+        &signed_request,
+        &request_digest,
+        &response,
+    )
+    .await?;
+    Ok(Some(response))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn retain_remote_lifecycle_result(
+    pool: &DbPool,
+    endpoint: &str,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    operation_id: Uuid,
+    conversation_id: Uuid,
+    sequencer_did: &str,
+    signed_request: &Value,
+    request_digest: &[u8; 32],
+    response: &[u8],
+) -> Result<(), GroupRelayError> {
+    let response_digest: [u8; 32] = Sha256::digest(response).into();
+    let completed_at =
+        chrono::DateTime::from_timestamp_millis(crate::sim_hooks::current_utc().timestamp_millis())
+            .ok_or_else(|| GroupRelayError::Internal("invalid replay instant".to_owned()))?;
+    let expires_at = completed_at + chrono::Duration::hours(24);
+    let recovery_request_id = signed_request
+        .pointer("/body/recoveryRequestId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let recovery_expiry = if endpoint == "blue.catbird.chat.requestLeafRecovery" {
+        let request_id = recovery_request_id
+            .ok_or_else(|| GroupRelayError::Internal("invalid recovery request id".to_owned()))?;
+        let output: Value = serde_json::from_slice(response)
+            .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+        let output_request_id = output
+            .pointer("/recovery/recoveryRequestId")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok());
+        let output_conversation_id = output
+            .pointer("/recovery/conversationId")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok());
+        let expiry = output
+            .pointer("/recovery/expiresAt")
+            .and_then(Value::as_str)
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&chrono::Utc))
+            .filter(|value| {
+                value.timestamp_subsec_nanos() % 1_000_000 == 0 && *value > completed_at
+            });
+        if output_request_id != Some(request_id)
+            || output_conversation_id != Some(conversation_id)
+            || expiry.is_none()
+        {
+            return Err(GroupRelayError::Internal(
+                "invalid recovery response binding".to_owned(),
+            ));
+        }
+        expiry
+    } else {
+        None
+    };
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+    match endpoint {
+        "blue.catbird.chat.requestLeafRecovery" => {
+            let request_id = recovery_request_id.expect("validated recovery request id");
+            let binding_expiry = recovery_expiry.expect("validated recovery expiry");
+            sqlx::query(
+                "INSERT INTO chat.remote_lifecycle_recovery_bindings \
+                    (recovery_request_id,conversation_id,sequencer_did,actor_did,actor_device_id, \
+                     signed_request_sha256,response_sha256,response_bytes,bound_at,expires_at) \
+                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+                 ON CONFLICT(recovery_request_id) DO UPDATE SET \
+                    conversation_id=EXCLUDED.conversation_id,sequencer_did=EXCLUDED.sequencer_did, \
+                    actor_did=EXCLUDED.actor_did,actor_device_id=EXCLUDED.actor_device_id, \
+                    signed_request_sha256=EXCLUDED.signed_request_sha256, \
+                    response_sha256=EXCLUDED.response_sha256,response_bytes=EXCLUDED.response_bytes, \
+                    bound_at=EXCLUDED.bound_at,expires_at=EXCLUDED.expires_at \
+                 WHERE chat.remote_lifecycle_recovery_bindings.expires_at<=EXCLUDED.bound_at",
+            )
+            .bind(request_id)
+            .bind(conversation_id)
+            .bind(crate::identity::canonical_did(sequencer_did))
+            .bind(crate::identity::canonical_did(actor_did))
+            .bind(actor_device_id)
+            .bind(request_digest.as_slice())
+            .bind(response_digest.as_slice())
+            .bind(response)
+            .bind(completed_at)
+            .bind(binding_expiry)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+            let exact: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM chat.remote_lifecycle_recovery_bindings \
+                  WHERE recovery_request_id=$1 AND conversation_id=$2 AND sequencer_did=$3 \
+                    AND actor_did=$4 AND actor_device_id=$5 AND signed_request_sha256=$6 \
+                    AND response_sha256=$7 AND response_bytes=$8 AND expires_at=$9)",
+            )
+            .bind(request_id)
+            .bind(conversation_id)
+            .bind(crate::identity::canonical_did(sequencer_did))
+            .bind(crate::identity::canonical_did(actor_did))
+            .bind(actor_device_id)
+            .bind(request_digest.as_slice())
+            .bind(response_digest.as_slice())
+            .bind(response)
+            .bind(binding_expiry)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+            if !exact {
+                return Err(GroupRelayError::Rejected(
+                    crate::chat_protocol::error::ChatProtocolErrorCode::IdempotencyConflict,
+                ));
+            }
+        }
+        "blue.catbird.chat.cancelLeafRecovery" => {
+            if let Some(request_id) = recovery_request_id {
+                sqlx::query(
+                    "DELETE FROM chat.remote_lifecycle_recovery_bindings \
+                     WHERE recovery_request_id=$1 AND actor_did=$2 AND actor_device_id=$3",
+                )
+                .bind(request_id)
+                .bind(crate::identity::canonical_did(actor_did))
+                .bind(actor_device_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+            }
+        }
+        "blue.catbird.chat.submitTransition" => {
+            if let Some(request_id) = recovery_request_id {
+                sqlx::query(
+                    "DELETE FROM chat.remote_lifecycle_recovery_bindings \
+                     WHERE recovery_request_id=$1",
+                )
+                .bind(request_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+            }
+        }
+        "blue.catbird.chat.closeConversation" => {
+            sqlx::query(
+                "DELETE FROM chat.remote_lifecycle_recovery_bindings WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+        }
+        _ => {}
+    }
+    sqlx::query(
+        "INSERT INTO chat.remote_lifecycle_operation_replays \
+            (endpoint_nsid,actor_did,actor_device_id,operation_id,conversation_id,sequencer_did, \
+             signed_request_sha256,response_status,response_sha256,response_bytes,completed_at,expires_at) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,200,$8,$9,$10,$11) \
+         ON CONFLICT(actor_did,actor_device_id,endpoint_nsid,operation_id) DO UPDATE SET \
+            conversation_id=EXCLUDED.conversation_id,sequencer_did=EXCLUDED.sequencer_did, \
+            signed_request_sha256=EXCLUDED.signed_request_sha256,response_status=EXCLUDED.response_status, \
+            response_sha256=EXCLUDED.response_sha256,response_bytes=EXCLUDED.response_bytes, \
+            completed_at=EXCLUDED.completed_at,expires_at=EXCLUDED.expires_at \
+         WHERE chat.remote_lifecycle_operation_replays.expires_at<=EXCLUDED.completed_at",
+    )
+    .bind(endpoint)
+    .bind(crate::identity::canonical_did(actor_did))
+    .bind(actor_device_id)
+    .bind(operation_id)
+    .bind(conversation_id)
+    .bind(crate::identity::canonical_did(sequencer_did))
+    .bind(request_digest.as_slice())
+    .bind(response_digest.as_slice())
+    .bind(response)
+    .bind(completed_at)
+    .bind(expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+    let exact: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.remote_lifecycle_operation_replays \
+          WHERE actor_did=$1 AND actor_device_id=$2 AND endpoint_nsid=$3 AND operation_id=$4 \
+            AND conversation_id=$5 AND sequencer_did=$6 AND signed_request_sha256=$7 \
+            AND response_status=200 AND response_sha256=$8 AND response_bytes=$9)",
+    )
+    .bind(crate::identity::canonical_did(actor_did))
+    .bind(actor_device_id)
+    .bind(endpoint)
+    .bind(operation_id)
+    .bind(conversation_id)
+    .bind(crate::identity::canonical_did(sequencer_did))
+    .bind(request_digest.as_slice())
+    .bind(response_digest.as_slice())
+    .bind(response)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+    if !exact {
+        return Err(GroupRelayError::Rejected(
+            crate::chat_protocol::error::ChatProtocolErrorCode::IdempotencyConflict,
+        ));
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|error| GroupRelayError::Internal(error.to_string()))
+}
+
+async fn relay_remote_signed_operation(
+    resolver: &super::DsResolver,
+    sequencer: &str,
+    endpoint: &str,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    conversation_id: Uuid,
+    signed_request: Value,
+    signed_request_bytes: Vec<u8>,
+) -> Result<Vec<u8>, GroupRelayError> {
+    super::peer_policy::ensure_federation_open().map_err(GroupRelayError::from_local)?;
+    let secret = configured_group_relay_hmac_secret();
+    if signed_request
+        .pointer("/body/actorDid")
+        .and_then(Value::as_str)
+        != Some(actor_did)
+    {
+        return Err(GroupRelayError::Rejected(
+            crate::chat_protocol::error::ChatProtocolErrorCode::NotAuthorized,
+        ));
+    }
+    let destination = resolver
+        .resolve_ds_destination_uncached(sequencer)
+        .await
+        .map_err(GroupRelayError::from_local)?;
+    let request = RelayGroupMutationRequest {
+        conversation_id,
+        endpoint: endpoint.to_owned(),
+        actor_did: actor_did.to_owned(),
+        actor_device_id,
+        signed_request,
+        signed_request_bytes: Some(STANDARD.encode(signed_request_bytes)),
+    };
+    let secret = secret.as_deref().map(str::as_bytes).unwrap_or(&[]);
+    relay_group_mutation_bytes_to_sequencer(
+        destination.url.as_str(),
+        &crate::identity::service_did(),
+        sequencer,
+        secret,
+        &request,
+    )
+    .await
+}
+
+async fn remote_sequence_target(
+    pool: &DbPool,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<Option<(String, bool)>, GroupRelayError> {
+    let local_conversation: Option<(String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT kind,is_remote,sequencer_ds FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+    if let Some((kind, true, Some(sequencer))) = local_conversation {
+        if kind == "group" {
+            return Ok(Some((sequencer, false)));
+        }
+    }
+    let rows: Vec<(String, String, Uuid, String, Uuid, String)> = sqlx::query_as(
+        "SELECT coordinator_did,sender_did,sender_device_id,recipient_did,recipient_device_id,status \
+           FROM chat.direct_request_transport_inbox WHERE conversation_id=$1 ORDER BY delivery_id",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+    let Some((coordinator, sender, sender_device, recipient, _, _)) = rows.first() else {
+        return Ok(None);
+    };
+    let consistent_pair = !rows.iter().any(|(candidate, s, sd, r, _, status)| {
+        !crate::identity::dids_equivalent(candidate, coordinator)
+            || s != sender
+            || sd != sender_device
+            || r != recipient
+            || status != "accepted"
+    });
+    let actor_is_sender =
+        crate::identity::dids_equivalent(actor_did, sender) && actor_device_id == *sender_device;
+    let actor_is_recipient = crate::identity::dids_equivalent(actor_did, recipient)
+        && rows
+            .iter()
+            .any(|(_, _, _, _, recipient_device, _)| actor_device_id == *recipient_device);
+    if !consistent_pair || !(actor_is_sender || actor_is_recipient) {
+        return Err(GroupRelayError::Rejected(
+            crate::chat_protocol::error::ChatProtocolErrorCode::NotAuthorized,
+        ));
+    }
+    Ok(Some((coordinator.clone(), true)))
+}
+
+fn exact_signed_request(body: &[u8]) -> Option<(Value, Vec<u8>)> {
+    #[derive(Deserialize)]
+    struct Envelope<'a> {
+        #[serde(rename = "signedRequest", borrow)]
+        signed_request: &'a serde_json::value::RawValue,
+    }
+    if let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(body) {
+        let bytes = envelope.signed_request.get().as_bytes().to_vec();
+        return serde_json::from_slice(&bytes)
+            .ok()
+            .map(|value| (value, bytes));
+    }
+    serde_json::from_slice(body)
+        .ok()
+        .map(|value| (value, body.to_vec()))
 }
 
 /// The conversation a signed transition targets, from its canonical body.
@@ -756,11 +1215,14 @@ pub async fn deliver_group_entry_to_remote_home(
         "{}/xrpc/{METHOD}",
         remote_home_endpoint.trim_end_matches('/')
     );
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| local(e.to_string()))?;
+    static DELIVERY_HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = DELIVERY_HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("build group delivery HTTP client")
+    });
     let mut req = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "application/json");
@@ -869,7 +1331,25 @@ async fn handle_relay_group_mutation(
     ) {
         return membership::relay_membership(&state, &caller_ds, &req).await;
     }
-    let res = match req.endpoint.as_str() {
+    let lifecycle = matches!(
+        req.endpoint.as_str(),
+        "blue.catbird.chat.requestLeave"
+            | "blue.catbird.chat.cancelLeave"
+            | "blue.catbird.chat.closeConversation"
+            | "blue.catbird.chat.requestReset"
+            | "blue.catbird.chat.activateReset"
+            | "blue.catbird.chat.requestLeafRecovery"
+            | "blue.catbird.chat.cancelLeafRecovery"
+    ) || (req.endpoint == "blue.catbird.chat.submitTransition"
+        && req
+            .signed_request
+            .pointer("/body/$type")
+            .and_then(Value::as_str)
+            == Some("blue.catbird.chat.defs#leafRecoveryFulfillmentBody"));
+    if lifecycle {
+        return sequence_relayed_lifecycle(&state, &caller_ds, &req).await;
+    }
+    let result = match req.endpoint.as_str() {
         "blue.catbird.chat.sendMessage" => {
             sequence_relayed_group_application_send(&state, &caller_ds, &req).await
         }
@@ -882,10 +1362,439 @@ async fn handle_relay_group_mutation(
             format!("unsupported relayed group endpoint: {}", req.endpoint),
         )),
     };
-    match res {
-        Ok(out) => (StatusCode::OK, Json(out)).into_response(),
-        Err(resp) => resp,
+    match result {
+        Ok(output) => (StatusCode::OK, Json(output)).into_response(),
+        Err(response) => response,
     }
+}
+
+async fn sequence_relayed_lifecycle(
+    state: &GroupRelayState,
+    caller_ds: &str,
+    request: &RelayGroupMutationRequest,
+) -> Response {
+    let Some(runtime) = state.chat_runtime.as_deref() else {
+        return s2s_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "sequencer lifecycle runtime is unavailable",
+        );
+    };
+    let endpoint = match request.endpoint.as_str() {
+        "blue.catbird.chat.requestLeave" => crate::chat_protocol::error::ChatEndpoint::RequestLeave,
+        "blue.catbird.chat.cancelLeave" => crate::chat_protocol::error::ChatEndpoint::CancelLeave,
+        "blue.catbird.chat.closeConversation" => {
+            crate::chat_protocol::error::ChatEndpoint::CloseConversation
+        }
+        "blue.catbird.chat.requestReset" => crate::chat_protocol::error::ChatEndpoint::RequestReset,
+        "blue.catbird.chat.activateReset" => {
+            crate::chat_protocol::error::ChatEndpoint::ActivateReset
+        }
+        "blue.catbird.chat.requestLeafRecovery" => {
+            crate::chat_protocol::error::ChatEndpoint::RequestLeafRecovery
+        }
+        "blue.catbird.chat.cancelLeafRecovery" => {
+            crate::chat_protocol::error::ChatEndpoint::CancelLeafRecovery
+        }
+        "blue.catbird.chat.submitTransition" => {
+            crate::chat_protocol::error::ChatEndpoint::SubmitTransition
+        }
+        _ => {
+            return s2s_err(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "unsupported relayed lifecycle endpoint",
+            )
+        }
+    };
+    let Some(encoded) = request.signed_request_bytes.as_deref() else {
+        return s2s_err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "relayed lifecycle request lacks exact signed bytes",
+        );
+    };
+    let signed_bytes = match STANDARD.decode(encoded) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return s2s_err(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                format!("invalid signed request bytes: {error}"),
+            )
+        }
+    };
+    let signed_value: Value = match serde_json::from_slice(&signed_bytes) {
+        Ok(value) if value == request.signed_request => value,
+        Ok(_) => {
+            return s2s_err(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "signed request value does not match its exact bytes",
+            )
+        }
+        Err(error) => {
+            return s2s_err(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                format!("invalid signed request: {error}"),
+            )
+        }
+    };
+    let canonical =
+        match crate::chat_protocol::transcript::decode_canonical_signed_mutation(&signed_bytes) {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                return s2s_err(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    format!("invalid signed request: {error}"),
+                )
+            }
+        };
+    if canonical.actor_did().as_str() != request.actor_did
+        || canonical.actor_device_id().as_bytes() != request.actor_device_id.as_bytes()
+    {
+        return s2s_err(
+            StatusCode::FORBIDDEN,
+            "NotAuthorized",
+            "relayed lifecycle actor binding mismatch",
+        );
+    }
+    let signed_conversation = if canonical.kind()
+        == crate::chat_protocol::transcript::SignedMutationKind::LeafRecoveryCancellation
+    {
+        let recovery_request = match canonical.recovery_request_id() {
+            Ok(id) => Uuid::from_bytes(*id.as_bytes()),
+            Err(_) => {
+                return s2s_err(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "recovery cancellation has no request id",
+                )
+            }
+        };
+        match sqlx::query_scalar::<_, Uuid>(
+            "SELECT conversation_id FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+        )
+        .bind(recovery_request)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(Some(conversation_id)) => conversation_id,
+            Ok(None) => {
+                return s2s_err(
+                    StatusCode::BAD_REQUEST,
+                    "LeafRecoveryNotFound",
+                    "recovery request is unknown",
+                )
+            }
+            Err(error) => {
+                return s2s_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    error.to_string(),
+                )
+            }
+        }
+    } else {
+        match canonical.conversation_id() {
+            Ok(id) => Uuid::from_bytes(*id.as_bytes()),
+            Err(_) => {
+                return s2s_err(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "signed lifecycle request has no conversation id",
+                )
+            }
+        }
+    };
+    if signed_conversation != request.conversation_id {
+        return s2s_err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "relayed conversation id does not match the signed request",
+        );
+    }
+    let principal = crate::auth::VerifiedServicePrincipal::for_federated_s2s(
+        &request.actor_did,
+        &request.endpoint,
+    );
+    let method = match crate::chat_protocol::validation::CanonicalHttpMethod::parse("POST") {
+        Ok(method) => method,
+        Err(error) => {
+            return s2s_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                error.to_string(),
+            )
+        }
+    };
+    let trusted_instant = match crate::chat_protocol::validation::TrustedRequestInstant::capture() {
+        Ok(instant) => instant,
+        Err(error) => {
+            return s2s_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                error.to_string(),
+            )
+        }
+    };
+    let pre_replay = match crate::chat_protocol::dpop::standard_service_auth_evidence(
+        principal,
+        &request.actor_device_id.to_string(),
+        method,
+        trusted_instant,
+        None,
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => return s2s_err(StatusCode::FORBIDDEN, "NotAuthorized", error.to_string()),
+    };
+    let admission = match crate::chat_protocol::repository::auth::authorize_signed_operation_only(
+        &state.pool,
+        pre_replay,
+        canonical,
+    )
+    .await
+    {
+        Ok(admission) => admission,
+        Err(error) => return crate::handlers::chat::federated_admission_failure(endpoint, error),
+    };
+    let completed = match crate::chat_protocol::repository::auth::preflight_completed_response(
+        &state.pool,
+        &admission,
+    )
+    .await
+    {
+        Ok(completed) => completed,
+        Err(error) => return crate::handlers::chat::federated_admission_failure(endpoint, error),
+    };
+    if let Some(completed) = completed {
+        let recorded_home = match sqlx::query_scalar::<_, Option<String>>(
+            "SELECT ds_did FROM chat.participants \
+              WHERE conversation_id=$1 AND user_did=$2 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(request.conversation_id)
+        .bind(&request.actor_did)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(Some(home)) => home,
+            Ok(None) => None,
+            Err(error) => {
+                return s2s_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    error.to_string(),
+                )
+            }
+        };
+        let caller_authorized = recorded_home
+            .as_deref()
+            .is_some_and(|home| crate::identity::dids_equivalent(home, caller_ds));
+        let caller_authorized = if caller_authorized {
+            true
+        } else if !crate::identity::dids_equivalent(caller_ds, &state.self_did) {
+            let resolver = super::resolver::DsResolver::new(
+                state.pool.clone(),
+                super::resolver::build_resolver_http_client(),
+                state.self_did.clone(),
+                crate::identity::self_endpoint(),
+                None,
+                300,
+            );
+            match resolver.resolve_authoritative_ds(&request.actor_did).await {
+                Ok(home) => crate::identity::dids_equivalent(&home.did, caller_ds),
+                Err(error) if error.is_retryable() => {
+                    return s2s_err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ServiceUnavailable",
+                        error.to_string(),
+                    )
+                }
+                Err(error) => {
+                    return s2s_err(StatusCode::FORBIDDEN, "NotAuthorized", error.to_string())
+                }
+            }
+        } else {
+            false
+        };
+        if !caller_authorized {
+            return s2s_err(
+                StatusCode::FORBIDDEN,
+                "NotAuthorized",
+                "caller is not the actor's authoritative home",
+            );
+        }
+        return crate::handlers::chat::federated_completed_response(
+            endpoint,
+            completed.status,
+            completed.response_bytes,
+        );
+    }
+    let conversation: Option<(String, bool, Option<String>)> = match sqlx::query_as(
+        "SELECT kind,is_remote,sequencer_ds FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(request.conversation_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            return s2s_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                error.to_string(),
+            )
+        }
+    };
+    let Some((kind, false, sequencer)) = conversation else {
+        return s2s_err(
+            StatusCode::NOT_FOUND,
+            "ConversationNotFound",
+            "conversation is not sequenced here",
+        );
+    };
+    if sequencer
+        .as_deref()
+        .is_some_and(|did| !crate::identity::dids_equivalent(did, &state.self_did))
+    {
+        return s2s_err(
+            StatusCode::FORBIDDEN,
+            "NotAuthorized",
+            "conversation names another sequencer",
+        );
+    }
+    let participant: Option<(Option<String>,)> = match sqlx::query_as(
+        "SELECT ds_did FROM chat.participants \
+          WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(request.conversation_id)
+    .bind(&request.actor_did)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            return s2s_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                error.to_string(),
+            )
+        }
+    };
+    let Some((participant_home,)) = participant else {
+        return s2s_err(
+            StatusCode::FORBIDDEN,
+            "NotAuthorized",
+            "actor is not a current participant",
+        );
+    };
+    let c33_home = if kind == "group" {
+        if !participant_home
+            .as_deref()
+            .is_some_and(|home| crate::identity::dids_equivalent(home, caller_ds))
+        {
+            return s2s_err(
+                StatusCode::FORBIDDEN,
+                "NotAuthorized",
+                "caller is not the member's recorded home",
+            );
+        }
+        None
+    } else if kind == "direct" {
+        if crate::identity::dids_equivalent(caller_ds, &state.self_did) {
+            return s2s_err(
+                StatusCode::FORBIDDEN,
+                "NotAuthorized",
+                "the coordinator is not a transport-only home",
+            );
+        }
+        let peer = match C33PeerHomes::transition_peer(
+            &state.pool,
+            request.conversation_id,
+            &request.actor_did,
+        )
+        .await
+        {
+            Ok(Some(peer)) => peer,
+            Ok(None) => {
+                return s2s_err(
+                    StatusCode::FORBIDDEN,
+                    "NotAuthorized",
+                    "direct conversation is not an active C33 pair",
+                )
+            }
+            Err(error) if error.is_retryable() => {
+                return s2s_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                    error.to_string(),
+                )
+            }
+            Err(error) => {
+                return s2s_err(StatusCode::FORBIDDEN, "NotAuthorized", error.to_string())
+            }
+        };
+        if peer
+            .home
+            .as_deref()
+            .is_some_and(|home| !crate::identity::dids_equivalent(home, &state.self_did))
+        {
+            return s2s_err(
+                StatusCode::FORBIDDEN,
+                "NotAuthorized",
+                "direct conversation is not an accepted C33 pair",
+            );
+        }
+        let resolver = super::resolver::DsResolver::new(
+            state.pool.clone(),
+            super::resolver::build_resolver_http_client(),
+            state.self_did.clone(),
+            crate::identity::self_endpoint(),
+            None,
+            300,
+        );
+        let actor_home = match resolver.resolve_authoritative_ds(&request.actor_did).await {
+            Ok(home) => home,
+            Err(error) if error.is_retryable() => {
+                return s2s_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                    error.to_string(),
+                )
+            }
+            Err(error) => {
+                return s2s_err(StatusCode::FORBIDDEN, "NotAuthorized", error.to_string())
+            }
+        };
+        if !crate::identity::dids_equivalent(&actor_home.did, caller_ds) {
+            return s2s_err(
+                StatusCode::FORBIDDEN,
+                "NotAuthorized",
+                "caller is not the actor's authoritative home",
+            );
+        }
+        (!peer.deleted).then(|| caller_ds.to_owned())
+    } else {
+        return s2s_err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "unsupported conversation kind",
+        );
+    };
+    let mut body = b"{\"signedRequest\":".to_vec();
+    body.extend_from_slice(&signed_bytes);
+    body.push(b'}');
+    crate::handlers::chat::execute_federated_lifecycle(
+        &state.pool,
+        runtime,
+        endpoint,
+        admission,
+        &body,
+        c33_home.as_deref(),
+    )
+    .await
 }
 
 async fn sequence_relayed_group_submit_transition(
@@ -903,13 +1812,109 @@ async fn sequence_relayed_group_submit_transition(
         .pointer("/body/actorDeviceId")
         .and_then(Value::as_str)
         .and_then(|s| Uuid::parse_str(s).ok());
-    if body_actor != req.actor_did || body_device != Some(req.actor_device_id) {
+    if body_actor != req.actor_did {
         return Err(s2s_err(
             StatusCode::UNAUTHORIZED,
             "NotAuthorized",
-            "actor identity mismatch",
+            "actor DID mismatch",
         ));
     }
+    if body_device != Some(req.actor_device_id) {
+        return Err(s2s_err(
+            StatusCode::UNAUTHORIZED,
+            "NotAuthorized",
+            "actor device mismatch",
+        ));
+    }
+    let conversation: Option<(String, bool)> =
+        sqlx::query_as("SELECT kind,is_remote FROM chat.conversations WHERE conversation_id=$1")
+            .bind(req.conversation_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|error| {
+                s2s_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    error.to_string(),
+                )
+            })?;
+    let c33_control_home = match conversation {
+        Some((kind, false)) if kind == "direct" => {
+            if crate::identity::dids_equivalent(caller_ds, &state.self_did) {
+                return Err(s2s_err(
+                    StatusCode::FORBIDDEN,
+                    "NotAuthorized",
+                    "the coordinator is not a transport-only home",
+                ));
+            }
+            let peer = C33PeerHomes::transition_peer(&state.pool, req.conversation_id, body_actor)
+                .await
+                .map_err(|error| {
+                    s2s_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalServerError",
+                        error.to_string(),
+                    )
+                })?;
+            if peer
+                .as_ref()
+                .and_then(|peer| peer.home.as_deref())
+                .is_some_and(|home| !crate::identity::dids_equivalent(home, &state.self_did))
+            {
+                return Err(s2s_err(
+                    StatusCode::FORBIDDEN,
+                    "NotAuthorized",
+                    "direct conversation is not an accepted C33 pair",
+                ));
+            }
+            let resolver = super::resolver::DsResolver::new(
+                state.pool.clone(),
+                super::resolver::build_resolver_http_client(),
+                state.self_did.clone(),
+                crate::identity::self_endpoint(),
+                None,
+                300,
+            );
+            let actor_home = resolver
+                .resolve_authoritative_ds(body_actor)
+                .await
+                .map_err(|error| {
+                    if error.is_retryable() {
+                        s2s_err(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "ServiceUnavailable",
+                            error.to_string(),
+                        )
+                    } else {
+                        s2s_err(StatusCode::FORBIDDEN, "NotAuthorized", error.to_string())
+                    }
+                })?;
+            if !crate::identity::dids_equivalent(&actor_home.did, caller_ds) {
+                return Err(s2s_err(
+                    StatusCode::FORBIDDEN,
+                    "NotAuthorized",
+                    "caller is not the transition actor's authoritative home",
+                ));
+            }
+            if state.i13_receipt_signer().is_none() {
+                return Err(s2s_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "SignerUnavailable",
+                    "C33 control relay requires the coordinator's I13 signer",
+                ));
+            }
+            (!peer.as_ref().is_some_and(|peer| peer.deleted)).then_some(caller_ds)
+        }
+        Some((kind, false)) if kind == "group" => None,
+        Some((kind, _)) if kind == "direct" => {
+            return Err(s2s_err(
+                StatusCode::FORBIDDEN,
+                "NotAuthorized",
+                "direct conversation is not an accepted C33 pair",
+            ));
+        }
+        _ => None,
+    };
     let signed_bytes = serde_json::to_vec(&req.signed_request)
         .map_err(|e| s2s_err(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()))?;
     let canonical = crate::chat_protocol::transcript::decode_canonical_signed_mutation(
@@ -982,6 +1987,7 @@ async fn sequence_relayed_group_submit_transition(
             signed_bytes,
             routing_intent,
             relationship_authority.as_ref(),
+            state.i13_receipt_signer(),
         )
         .await
         .map_err(|err| match err {
@@ -1029,6 +2035,27 @@ async fn sequence_relayed_group_submit_transition(
             e.to_string(),
         )
     })?;
+    if let Some(home) = c33_control_home {
+        let entry = out_val
+            .get("entry")
+            .filter(|entry| entry["sequencerReceipt"].is_object())
+            .ok_or_else(|| {
+                s2s_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    "C33 transition response has no I13 receipt",
+                )
+            })?;
+        enqueue_transport_control_entry(&mut tx, home, entry, crate::sim_hooks::current_utc())
+            .await
+            .map_err(|error| {
+                s2s_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    format!("queue C33 control entry: {error:?}"),
+                )
+            })?;
+    }
     let fanout = super::group_fanout::prepare_group_entry_fanout(&mut tx, &out_val)
         .await
         .map_err(|e| s2s_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e))?;
@@ -1582,7 +2609,14 @@ async fn sequence_relayed_group_application_send(
                 &actor_device_id.to_string(),
             ))
         }
-        _ => None,
+        (None, Some(_)) => {
+            return Err(s2s_err(
+                StatusCode::BAD_REQUEST,
+                "InvalidApplicationMessage",
+                "archive commitment required",
+            ))
+        }
+        (_, None) => None,
     };
 
     let mut entry_json = json!({
@@ -2076,6 +3110,22 @@ async fn handle_deliver_group_entry(
             .execute(&mut *tx)
             .await?;
         }
+        if body_type == Some("blue.catbird.chat.defs#leafRecoveryFulfillmentBody") {
+            if let Some(request_id) = req
+                .entry
+                .pointer("/signedRequest/body/recoveryRequestId")
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+            {
+                sqlx::query(
+                    "DELETE FROM chat.remote_lifecycle_recovery_bindings \
+                     WHERE recovery_request_id=$1",
+                )
+                .bind(request_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
         tx.commit().await
     }
     .await;
@@ -2441,8 +3491,39 @@ async fn verify_and_wipe_remote_closed_conversation(
             })?
         }
     };
+    let mut actor_entry: Value = serde_json::from_slice(entry_bytes).map_err(|error| {
+        s2s_err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            format!("invalid close entry JSON: {error}"),
+        )
+    })?;
+    let actor_fields = actor_entry.as_object_mut().ok_or_else(|| {
+        s2s_err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "close entry is not an object",
+        )
+    })?;
+    if actor_fields
+        .remove("sequencerReceipt")
+        .is_some_and(|receipt| !receipt.is_object())
+    {
+        return Err(s2s_err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "close sequencerReceipt is not an object",
+        ));
+    }
+    let actor_entry_bytes = serde_json::to_vec(&actor_entry).map_err(|error| {
+        s2s_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            error.to_string(),
+        )
+    })?;
     let control_entry = crate::chat_protocol::transcript::decode_and_verify_control_entry(
-        entry_bytes,
+        &actor_entry_bytes,
         &signing_public_key,
     )
     .map_err(|error| {
@@ -2630,6 +3711,11 @@ async fn verify_and_wipe_remote_closed_conversation(
         .execute(&mut *tx)
         .await
         .map_err(storage)?;
+    sqlx::query("DELETE FROM chat.remote_lifecycle_recovery_bindings WHERE conversation_id=$1")
+        .bind(req.conversation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(storage)?;
     tx.commit().await.map_err(storage)?;
     Ok(audience)
 }
@@ -2639,6 +3725,43 @@ mod tests {
     use super::*;
     use crate::sim_hooks::{scope_ds_clock, ManualDsClock};
     use axum::{body::Body, http::Request};
+
+    #[test]
+    fn group_relay_secret_rejects_an_empty_configuration() {
+        assert_eq!(
+            nonempty_group_relay_secret("relay-secret".to_owned()).as_deref(),
+            Some("relay-secret")
+        );
+        assert_eq!(nonempty_group_relay_secret(String::new()), None);
+    }
+
+    #[tokio::test]
+    async fn production_constructor_wires_the_lifecycle_runtime() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1/group_relay_wiring_test")
+            .unwrap();
+        let runtime = Arc::new(
+            crate::handlers::chat::ChatRuntime::from_env(Arc::new(crate::realtime::SseState::new(
+                8,
+            )))
+            .unwrap(),
+        );
+        let state = GroupRelayState::for_production(
+            pool,
+            "did:web:sequencer.example".to_owned(),
+            None,
+            None,
+            Arc::clone(&runtime),
+        );
+        assert!(Arc::ptr_eq(
+            state.chat_runtime.as_ref().expect("lifecycle runtime"),
+            &runtime
+        ));
+        assert!(
+            include_str!("../main.rs").contains("GroupRelayState::for_production("),
+            "the process router must use the constructor that wires lifecycle sequencing"
+        );
+    }
 
     /// MLS-R3-04: a sequencer's `relayGroupMutation` answer is collected within
     /// its budget whether it declares an oversized length or streams one
@@ -2687,6 +3810,7 @@ mod tests {
             actor_did: "did:web:relay-actor.example.com".to_owned(),
             actor_device_id: Uuid::new_v4(),
             signed_request: json!({}),
+            signed_request_bytes: None,
         };
         let relay = |path: &str| {
             let (endpoint, request) = (format!("{base}/{path}"), request.clone());

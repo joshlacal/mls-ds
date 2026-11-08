@@ -27,6 +27,7 @@ use openmls::prelude::{
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
+use p256::pkcs8::EncodePrivateKey;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
@@ -51,9 +52,9 @@ use catbird_server::{
     realtime::{SseState, StreamEvent},
     sim_hooks::{
         audit_live_catalog_timestamp_defaults, audit_sql_timestamp_defaults,
-        compact_sim_postgres_schema, derive_sim_ed25519_key_id, open_disposable_sim_pool,
-        reset_sim_postgres_schema, scope_ds_clock, seed_sim_did_document, sign_sim_chat_body,
-        DsClock, ManualDsClock, QueuedTaskSpawner, PROTECTED_DATABASE_NAMES,
+        compact_sim_postgres_schema, derive_sim_ed25519_key_id, drive_sim_io,
+        open_disposable_sim_pool, reset_sim_postgres_schema, scope_ds_clock, seed_sim_did_document,
+        sign_sim_chat_body, DsClock, ManualDsClock, QueuedTaskSpawner, PROTECTED_DATABASE_NAMES,
     },
     space_host::SpaceHostConfig,
     storage::DbPool,
@@ -1251,6 +1252,27 @@ async fn execute_scenario_run(
     );
     assert_eq!(entries_json["nextAfterSeq"], 4);
     assert_eq!(entries_json["hasMore"], false);
+    for entry in entries {
+        assert!(
+            entry["sequencerReceipt"].is_object(),
+            "every served entry carries I13 evidence: {entry}"
+        );
+        assert_eq!(entry["sequencerReceipt"]["seq"], entry["seq"]);
+        assert_eq!(entry["sequencerReceipt"]["entryId"], entry["entryId"]);
+    }
+    let recovery_json: Value = serde_json::from_slice(
+        &outputs
+            .iter()
+            .find(|(label, _)| label == "submit_transition_add")
+            .expect("recovery fulfillment output")
+            .1,
+    )
+    .expect("parse recovery fulfillment");
+    assert_eq!(recovery_json["entry"]["seq"], 3);
+    assert_eq!(
+        recovery_json["entry"]["sequencerReceipt"], entries[2]["sequencerReceipt"],
+        "fulfillment response and durable getEntries projection retain the same I13 receipt"
+    );
     let application_entry = entries.last().expect("application entry");
     assert_eq!(
         application_entry["$type"],
@@ -1428,6 +1450,174 @@ fn manual_clock_publication_advance_is_monotonic() {
     clock.advance_to(initial + TimeDelta::seconds(1));
     clock.advance_to(initial);
     assert_eq!(clock.now_utc(), initial + TimeDelta::seconds(1));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn accept_conversation_with_i13_receipt_replays_verbatim_and_sequences_once() {
+    ensure_chat_runtime_env();
+    let sim_db = open_disposable_sim_pool(None)
+        .await
+        .expect("open disposable acceptance replay database");
+    let pool = sim_db.pool().clone();
+    let t0 = DateTime::from_timestamp_millis(Utc::now().timestamp_millis())
+        .expect("construct acceptance replay clock");
+    let clock = Arc::new(ManualDsClock::new(t0));
+    let spawner = Arc::new(QueuedTaskSpawner::new());
+    let receipt_signer = I13ReceiptSigner::new(
+        deterministic_p256(b"accept-replay-receipt"),
+        SERVICE_DID.to_owned(),
+    );
+    let receipt_verifying_key = receipt_signer.verifying_key();
+    let runtime = Arc::new(
+        ChatRuntime::from_env(Arc::new(SseState::new(8)))
+            .expect("build acceptance replay runtime")
+            .with_clock(Arc::clone(&clock) as Arc<dyn DsClock>)
+            .with_spawner(Arc::clone(&spawner) as _)
+            .with_i13_receipt_signer(receipt_signer)
+            .with_space_host_config(SpaceHostConfig::new(
+                SERVICE_DID.to_owned(),
+                deterministic_p256(b"accept-replay-space"),
+            ))
+            .with_sim_allow_all_relationships()
+            .expect("configure acceptance replay relationships"),
+    );
+    let router = chat_router::<SimAppState>().with_state(SimAppState {
+        pool: pool.clone(),
+        runtime,
+    });
+    let scenario = build_deterministic_scenario(t0);
+    scope_ds_clock(clock.clone(), async {
+        seed_sim_did_document(scenario.alice.did_document()).await;
+        seed_sim_did_document(scenario.bob_primary.did_document()).await;
+    })
+    .await;
+
+    for step in &scenario.steps[..4] {
+        clock.set_utc(t0 + TimeDelta::milliseconds(step.clock_offset_ms));
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/xrpc/{}", step.nsid))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", step.bearer_jwt))
+            .body(Body::from(step.body_bytes.clone()))
+            .expect("build acceptance prerequisite request");
+        execute_request(&router, step.label, request).await;
+    }
+
+    let before: i64 = drive_sim_io(
+        sqlx::query_scalar("SELECT count(*) FROM chat.entries WHERE conversation_id=$1")
+            .bind(scenario.conversation_id)
+            .fetch_one(&pool),
+    )
+    .await
+    .expect("count entries before acceptance");
+    let accept = &scenario.steps[4];
+    let accept_time = t0 + TimeDelta::milliseconds(accept.clock_offset_ms);
+    clock.set_utc(accept_time);
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/xrpc/{}", accept.nsid))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", accept.bearer_jwt))
+        .body(Body::from(accept.body_bytes.clone()))
+        .expect("build first acceptance request");
+    let first = execute_request(&router, "accept_conversation_first", request).await;
+    let first_json: Value = serde_json::from_slice(&first).expect("parse acceptance response");
+    let entry = &first_json["entry"];
+    let receipt = &entry["sequencerReceipt"];
+    assert!(
+        receipt.is_object(),
+        "acceptance entry lacks I13 receipt: {entry}"
+    );
+    assert_eq!(receipt["seq"], entry["seq"]);
+    assert_eq!(receipt["entryId"], entry["entryId"]);
+    let decode_bytes = |value: &Value| {
+        STANDARD
+            .decode(
+                value
+                    .as_str()
+                    .or_else(|| value.pointer("/$bytes").and_then(Value::as_str))
+                    .expect("receipt byte field"),
+            )
+            .expect("base64 receipt field")
+    };
+    let request_digest: [u8; 32] = drive_sim_io(
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT request_digest FROM chat.entries WHERE conversation_id=$1 AND seq=$2",
+        )
+        .bind(scenario.conversation_id)
+        .bind(entry["seq"].as_i64().expect("acceptance entry seq"))
+        .fetch_one(&pool),
+    )
+    .await
+    .expect("acceptance request digest")
+    .try_into()
+    .expect("32-byte acceptance request digest");
+    let archive_commitment: [u8; 32] = decode_bytes(&receipt["archiveCommitment"])
+        .try_into()
+        .expect("32-byte acceptance archive commitment");
+    assert_eq!(archive_commitment, request_digest);
+    let signed_receipt = labyrinth_protocol::receipt::SignedSequencerReceipt {
+        payload: labyrinth_protocol::receipt::SequencerReceiptPayload {
+            sequencer_did: receipt["sequencerDid"].as_str().unwrap().to_owned(),
+            conversation_id: receipt["conversationId"].as_str().unwrap().to_owned(),
+            group_id: decode_bytes(&receipt["groupId"]),
+            epoch: receipt["epoch"].as_u64().unwrap(),
+            sender_device_did_url: format!(
+                "{}#{}",
+                scenario.bob_primary.did, scenario.bob_primary.device_id
+            ),
+            entry_id: receipt["entryId"].as_str().unwrap().to_owned(),
+            archive_commitment,
+            seq: receipt["seq"].as_u64().unwrap(),
+            issued_at_ms: receipt["issuedAtMs"].as_i64().unwrap(),
+        },
+        key_id: receipt["kid"].as_str().unwrap().to_owned(),
+        signature: decode_bytes(&receipt["signature"])
+            .try_into()
+            .expect("64-byte acceptance receipt signature"),
+    };
+    labyrinth_protocol::receipt::verify_sequencer_receipt(
+        &receipt_verifying_key,
+        SERVICE_DID,
+        &signed_receipt,
+    )
+    .expect("acceptance sequencerReceipt verifies");
+    let after_first: i64 = drive_sim_io(
+        sqlx::query_scalar("SELECT count(*) FROM chat.entries WHERE conversation_id=$1")
+            .bind(scenario.conversation_id)
+            .fetch_one(&pool),
+    )
+    .await
+    .expect("count entries after acceptance");
+    assert_eq!(after_first, before + 1);
+
+    let replay_jwt = scenario.bob_primary.service_jwt(
+        accept.nsid,
+        accept_time.timestamp(),
+        deterministic_uuid_v4(b"accept-conversation-replay-jti"),
+    );
+    let replay_request = Request::builder()
+        .method("POST")
+        .uri(format!("/xrpc/{}", accept.nsid))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {replay_jwt}"))
+        .body(Body::from(accept.body_bytes.clone()))
+        .expect("build replay acceptance request");
+    let replay = execute_request(&router, "accept_conversation_replay", replay_request).await;
+    assert_eq!(replay, first);
+    assert_eq!(
+        drive_sim_io(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM chat.entries WHERE conversation_id=$1",
+            )
+            .bind(scenario.conversation_id)
+            .fetch_one(&pool),
+        )
+        .await
+        .expect("count entries after acceptance replay"),
+        after_first
+    );
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1639,6 +1829,55 @@ async fn identical_clock_and_queued_spawner_produce_identical_sequencer_receipts
         &signed_receipt,
     )
     .expect("ES256 sequencerReceipt must verify cryptographically");
+
+    // The recovery fulfillment's control receipt is independently valid, not merely present.
+    let recovery_json: Value = serde_json::from_slice(
+        &run1
+            .iter()
+            .find(|(label, _)| label == "submit_transition_add")
+            .expect("submit_transition_add output")
+            .1,
+    )
+    .expect("parse recovery response");
+    let recovery_receipt = &recovery_json["entry"]["sequencerReceipt"];
+    assert_eq!(recovery_receipt["seq"], 3);
+    assert_eq!(
+        recovery_receipt["entryId"],
+        recovery_json["entry"]["entryId"]
+    );
+    let recovery_signature: [u8; 64] = extract_b64(&recovery_receipt["signature"])
+        .try_into()
+        .expect("64-byte recovery receipt signature");
+    let recovery_commitment: [u8; 32] = extract_b64(&recovery_receipt["archiveCommitment"])
+        .try_into()
+        .expect("32-byte recovery request digest");
+    let signed_recovery_receipt = labyrinth_protocol::receipt::SignedSequencerReceipt {
+        payload: labyrinth_protocol::receipt::SequencerReceiptPayload {
+            sequencer_did: recovery_receipt["sequencerDid"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            conversation_id: recovery_receipt["conversationId"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            group_id: extract_b64(&recovery_receipt["groupId"]),
+            epoch: recovery_receipt["epoch"].as_u64().unwrap(),
+            sender_device_did_url: format!("{}#{}", scenario.alice.did, scenario.alice.device_id),
+            entry_id: recovery_receipt["entryId"].as_str().unwrap().to_owned(),
+            archive_commitment: recovery_commitment,
+            seq: recovery_receipt["seq"].as_u64().unwrap(),
+            issued_at_ms: recovery_receipt["issuedAtMs"].as_i64().unwrap(),
+        },
+        key_id: recovery_receipt["kid"].as_str().unwrap().to_owned(),
+        signature: recovery_signature,
+    };
+    labyrinth_protocol::receipt::verify_sequencer_receipt(
+        &receipt_verifying_key,
+        SERVICE_DID,
+        &signed_recovery_receipt,
+    )
+    .expect("recovery fulfillment I13 receipt must verify cryptographically");
 
     sim_db.cleanup().await.expect("drop disposable sim DB");
 }
@@ -1873,10 +2112,16 @@ async fn parallel_manual_clocks_keep_jti_and_tid_sequences_and_resets_isolated()
     }
 
     let t0 = DateTime::from_timestamp(1_800_000_000, 0).expect("fixed clock origin");
-    let client = Arc::new(ServiceAuthClient::from_shared_secret(
-        SERVICE_DID.to_owned(),
-        b"deterministic-counter-isolation-test",
-    ));
+    let service_signing = deterministic_p256(b"deterministic-counter-isolation-test");
+    let service_signing_der = service_signing.to_pkcs8_der().expect("encode service key");
+    let client = Arc::new(
+        ServiceAuthClient::from_es256_der(
+            SERVICE_DID.to_owned(),
+            service_signing_der.as_bytes(),
+            None,
+        )
+        .expect("build service auth client"),
+    );
     let expected = scope_ds_clock(Arc::new(ManualDsClock::new(t0)), samples(&client, 5)).await;
     assert!(
         expected

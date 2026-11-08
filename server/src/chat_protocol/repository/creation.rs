@@ -28,6 +28,7 @@ use crate::chat_protocol::{
         CanonicalUuidV4,
     },
 };
+use crate::federation::receipt::{I13ControlReceiptInput, I13ReceiptSigner};
 
 use super::{
     auth::CompletedIdempotentResponse,
@@ -73,6 +74,7 @@ pub(crate) enum CreationFacadeError {
     ExecutionContext(ExecutionContextHydrationError),
     Executor(ExecutorError),
     Database(sqlx::Error),
+    Delivery(super::delivery::DeliveryRepositoryError),
 }
 
 macro_rules! from_error {
@@ -94,6 +96,7 @@ from_error!(RelationshipRepositoryError, Relationship);
 from_error!(ExecutionContextHydrationError, ExecutionContext);
 from_error!(ExecutorError, Executor);
 from_error!(sqlx::Error, Database);
+from_error!(super::delivery::DeliveryRepositoryError, Delivery);
 
 #[derive(Debug)]
 pub(crate) struct CreationCanonicalResponse {
@@ -246,6 +249,7 @@ pub(crate) async fn execute_prepared_creation<T: PublicTransport>(
     transaction: &mut Transaction<'_, Postgres>,
     prepared: PreparedSignedOperation,
     relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&I13ReceiptSigner>,
     routing: Option<crate::chat_protocol::federation_routing::ConversationRoutingIntent>,
 ) -> Result<CreationTransactionOutcome, CreationFacadeError> {
     match prepared.into_state() {
@@ -258,6 +262,7 @@ pub(crate) async fn execute_prepared_creation<T: PublicTransport>(
                 authority,
                 reservation,
                 relationship_authority,
+                i13_signer,
                 routing,
             )
             .await
@@ -287,6 +292,7 @@ async fn execute_first_creation<T: PublicTransport>(
     authority: VerifiedChatDeviceRequest,
     reservation: OperationReservationGuard,
     relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&I13ReceiptSigner>,
     routing: Option<crate::chat_protocol::federation_routing::ConversationRoutingIntent>,
 ) -> Result<CreationTransactionOutcome, CreationFacadeError> {
     let mutation = authority
@@ -409,6 +415,20 @@ async fn execute_first_creation<T: PublicTransport>(
         authority.trusted_instant(),
         CanonicalControlServerFields::empty(ControlEntryKind::Creation)?,
     )?;
+    let receipt_input: Option<I13ControlReceiptInput> = i13_signer
+        .map(|_| {
+            I13ControlReceiptInput::from_fields(
+                entry.conversation_id().as_str(),
+                entry.entry_id().as_str(),
+                entry.seq(),
+                entry.received_at().as_str(),
+                entry.mutation().actor_did().as_str(),
+                entry.mutation().actor_device_id().as_str(),
+                *entry.mutation().request_digest(),
+            )
+        })
+        .transpose()
+        .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
     let products = CanonicalControlEntryProducts::mint(&entry)?;
     let trusted_now = crate::chat_protocol::validation::TrustedRequestInstant::from_datetime(
         scope_authority.trusted_instant(),
@@ -468,7 +488,25 @@ async fn execute_first_creation<T: PublicTransport>(
             return Err(CreationFacadeError::InvalidCanonicalMaterial)
         }
     };
-    let response = creation_response(&plan, products.canonical_response_json())?;
+    let successor = plan
+        .successor_coordinate()
+        .ok_or(CreationFacadeError::InvalidCanonicalMaterial)?;
+    let control_receipt = match (i13_signer, receipt_input.as_ref()) {
+        (Some(signer), Some(input)) => Some(
+            signer
+                .sign_control_receipt(input, successor)
+                .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?,
+        ),
+        _ => None,
+    };
+    let response_entry = match control_receipt.as_ref() {
+        Some(receipt) => {
+            I13ReceiptSigner::attach_control_receipt(products.canonical_response_json(), receipt)
+                .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?
+        }
+        None => products.canonical_response_json().to_vec(),
+    };
+    let response = creation_response(&plan, &response_entry)?;
     let accepted = products.durable_json().to_vec();
     let genesis = match mutation.projection() {
         VerifiedMutationProjection::Creation(value) => {
@@ -496,6 +534,17 @@ async fn execute_first_creation<T: PublicTransport>(
         || applied.successor_coordinate.as_ref() != expected.as_ref()
     {
         return Err(CreationFacadeError::InvalidCanonicalMaterial);
+    }
+    if let Some(receipt) = &control_receipt {
+        let receipt_bytes = serde_json::to_vec(receipt)
+            .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
+        super::delivery::set_entry_sequencer_receipt(
+            transaction,
+            conversation_id,
+            1,
+            &receipt_bytes,
+        )
+        .await?;
     }
     let event_position = applied.event_positions.first().copied();
     complete_operation(
@@ -1036,7 +1085,7 @@ mod tests {
         let rel_auth = ProductionRelationshipAuthority::from_startup_guard(guard);
 
         let prepared = PreparedSignedOperation::first_for_test(request, reservation);
-        let outcome = execute_prepared_creation(&mut tx, prepared, &rel_auth, None)
+        let outcome = execute_prepared_creation(&mut tx, prepared, &rel_auth, None, None)
             .await
             .expect("member creation on existing direct conversation must succeed");
 
@@ -1200,7 +1249,7 @@ mod tests {
         let rel_auth = ProductionRelationshipAuthority::from_startup_guard(guard);
 
         let prepared = PreparedSignedOperation::first_for_test(request, reservation);
-        let err = execute_prepared_creation(&mut tx, prepared, &rel_auth, None)
+        let err = execute_prepared_creation(&mut tx, prepared, &rel_auth, None, None)
             .await
             .expect_err("non-member creation on existing direct conversation must be rejected");
 

@@ -91,7 +91,7 @@ pub async fn deliver_message(
     }
     .await;
 
-    record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
+    record_ds_outcome(&pool, &requester_ds, &result).await;
     result
 }
 
@@ -115,7 +115,9 @@ pub async fn enforce_ds_request_security(
     let policy = match peer_policy::enforce_inbound_peer_policy(pool, &requester_ds).await {
         Ok(policy) => policy,
         Err(err) => {
-            peer_policy::record_rejected(pool, &requester_ds).await;
+            if !err.status_code().is_server_error() {
+                peer_policy::record_rejected(pool, &requester_ds).await;
+            }
             return Err(err);
         }
     };
@@ -148,11 +150,17 @@ pub async fn enforce_ds_request_security(
     Ok(DsSecurityContext { requester_ds })
 }
 
-pub async fn record_ds_outcome(pool: &DbPool, requester_ds: &str, success: bool) {
-    if success {
-        peer_policy::record_success(pool, requester_ds).await;
-    } else {
-        peer_policy::record_rejected(pool, requester_ds).await;
+pub async fn record_ds_outcome<T>(
+    pool: &DbPool,
+    requester_ds: &str,
+    result: &Result<T, FederationError>,
+) {
+    match result {
+        Ok(_) => peer_policy::record_success(pool, requester_ds).await,
+        Err(error) if !error.status_code().is_server_error() => {
+            peer_policy::record_rejected(pool, requester_ds).await;
+        }
+        Err(_) => {}
     }
 }
 

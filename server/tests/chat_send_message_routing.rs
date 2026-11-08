@@ -12,8 +12,9 @@ mod common;
 use axum::{http::StatusCode, Router};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use catbird_server::chat_protocol::test_support::{
-    decode_canonical_signed_mutation, seed_application_routing_fixture,
-    seed_remote_group_application_routing_fixture, ApplicationRoutingFixture,
+    decode_canonical_signed_mutation, seed_clean_slate_application_fixture,
+    seed_remote_clean_slate_application_fixture, sign_mutation_json_for_test,
+    CleanSlateApplicationFixture,
 };
 use common::http_acceptance as http;
 use serde_json::{json, Value};
@@ -62,20 +63,21 @@ async fn setup(
 ) -> (
     PgPool,
     common::fresh_db::DisposableDatabase,
-    ApplicationRoutingFixture,
+    CleanSlateApplicationFixture,
     http::Device,
     Router,
 ) {
-    setup_routing(direct, false).await
+    setup_routing(direct, false, true).await
 }
 
 async fn setup_routing(
     direct: bool,
     remote_group: bool,
+    signer_configured: bool,
 ) -> (
     PgPool,
     common::fresh_db::DisposableDatabase,
-    ApplicationRoutingFixture,
+    CleanSlateApplicationFixture,
     http::Device,
     Router,
 ) {
@@ -85,11 +87,19 @@ async fn setup_routing(
     std::env::set_var("SELF_ENDPOINT", "https://chat.catbird.blue");
     let (pool, database) = common::fresh_db::fresh_legacy_pool("chat_sendrouting_", 4, 1).await;
     http::ensure_fence(&pool).await;
+    let archive_commitment = signer_configured.then_some([0xa7_u8; 32]);
     let fixture = if remote_group {
         assert!(!direct, "remote regression is specific to group sequencing");
-        seed_remote_group_application_routing_fixture(&pool, REMOTE_SERVICE, REMOTE_SERVICE).await
+        seed_remote_clean_slate_application_fixture(
+            &pool,
+            REMOTE_SERVICE,
+            REMOTE_SERVICE,
+            archive_commitment,
+        )
+        .await
     } else {
-        seed_application_routing_fixture(&pool, direct, REMOTE_SERVICE).await
+        seed_clean_slate_application_fixture(&pool, direct, REMOTE_SERVICE, archive_commitment)
+            .await
     }
     .expect("genuine ready MLS history and validated traffic projection");
     assert!(application_entries(&pool, &fixture).await.is_empty());
@@ -104,7 +114,11 @@ async fn setup_routing(
         jwk,
     };
     http::cache_device_did(&device).await;
-    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
+    let router = if signer_configured {
+        http::router_for_authenticated_acceptance(pool.clone()).await
+    } else {
+        http::router_for_authenticated_acceptance_without_i13(pool.clone()).await
+    };
     (pool, database, fixture, device, router)
 }
 
@@ -146,7 +160,7 @@ async fn post_with_trace(
 
 async fn application_entries(
     pool: &PgPool,
-    fixture: &ApplicationRoutingFixture,
+    fixture: &CleanSlateApplicationFixture,
 ) -> Vec<(Uuid, i64, Vec<u8>)> {
     sqlx::query_as(
         "SELECT entry_id,seq,signed_request_bytes FROM chat.entries \
@@ -161,7 +175,7 @@ async fn application_entries(
 
 async fn federation_jobs(
     pool: &PgPool,
-    fixture: &ApplicationRoutingFixture,
+    fixture: &CleanSlateApplicationFixture,
 ) -> Vec<(String, String, String, Vec<u8>, Vec<u8>)> {
     sqlx::query_as(
         "SELECT id,method,target_service_did,payload,payload_sha256 \
@@ -173,7 +187,7 @@ async fn federation_jobs(
     .unwrap()
 }
 
-async fn assert_no_direct_delivery(pool: &PgPool, fixture: &ApplicationRoutingFixture) {
+async fn assert_no_direct_delivery(pool: &PgPool, fixture: &CleanSlateApplicationFixture) {
     let count: i64 = sqlx::query_scalar(
         "SELECT (SELECT count(*) FROM federation_outbox WHERE conversation_id=$1 AND method=$2) \
               + (SELECT count(*) FROM outbound_queue WHERE convo_id=$1 AND method=$2)",
@@ -186,7 +200,7 @@ async fn assert_no_direct_delivery(pool: &PgPool, fixture: &ApplicationRoutingFi
     assert_eq!(count, 0, "no direct-request entry delivery is queued");
 }
 
-async fn business_snapshot(pool: &PgPool, fixture: &ApplicationRoutingFixture) -> Value {
+async fn business_snapshot(pool: &PgPool, fixture: &CleanSlateApplicationFixture) -> Value {
     sqlx::query_scalar(
         "SELECT jsonb_build_object(\
          'head', (SELECT to_jsonb(c) FROM chat.conversations c WHERE conversation_id=$1), \
@@ -203,7 +217,7 @@ async fn business_snapshot(pool: &PgPool, fixture: &ApplicationRoutingFixture) -
     .expect("snapshot head and durable send/entry/operation state")
 }
 
-async fn assert_single_application_and_job(pool: &PgPool, fixture: &ApplicationRoutingFixture) {
+async fn assert_single_application_and_job(pool: &PgPool, fixture: &CleanSlateApplicationFixture) {
     let entries = application_entries(pool, fixture).await;
     assert_eq!(entries.len(), 1, "exactly one accepted application entry");
     assert_eq!(
@@ -236,7 +250,7 @@ async fn assert_single_application_and_job(pool: &PgPool, fixture: &ApplicationR
 /// the post-commit sender retries the unreachable fixture home.
 async fn group_entry_deliveries(
     pool: &PgPool,
-    fixture: &ApplicationRoutingFixture,
+    fixture: &CleanSlateApplicationFixture,
 ) -> Vec<(String, String, String, Vec<u8>)> {
     sqlx::query_as(
         "SELECT id, method, target_ds_did, payload FROM outbound_queue \
@@ -252,7 +266,7 @@ async fn group_entry_deliveries(
 /// `deliverGroupEntry` stream: one delivery for its seq, no `deliverMessage`.
 async fn assert_single_application_and_group_entry(
     pool: &PgPool,
-    fixture: &ApplicationRoutingFixture,
+    fixture: &CleanSlateApplicationFixture,
 ) {
     let entries = application_entries(pool, fixture).await;
     assert_eq!(entries.len(), 1, "exactly one accepted application entry");
@@ -313,6 +327,9 @@ fn request_presentation_of_response(response: &Value) -> Value {
         "/body/aad/prior/conversationId",
         "/body/aad/prior/groupId",
         "/body/aad/prior/groupContextHash",
+        "/body/aad/archiveCommitment",
+        "/body/aad/originalSenderAttestation/senderTransportPubkey",
+        "/body/aad/originalSenderAttestation/signature",
         "/body/aad/prior/confirmationTag",
         "/body/applicationMessage/bytes",
         "/body/applicationMessage/sha256",
@@ -341,6 +358,38 @@ fn request_presentation_of_response(response: &Value) -> Value {
         *field = Value::String(encoded.to_owned());
     }
     wrapper
+}
+
+fn archive_less_request(fixture: &CleanSlateApplicationFixture) -> Value {
+    let mut body = fixture.signed_request["body"].clone();
+    let aad = body["aad"].as_object_mut().expect("application AAD object");
+    assert!(aad.remove("archiveCommitment").is_some());
+    assert!(aad.remove("originalSenderAttestation").is_some());
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
+    sign_mutation_json_for_test(&body, &signing_key).expect("sign archive-less request")
+}
+
+async fn application_receipt_state(
+    pool: &PgPool,
+    fixture: &CleanSlateApplicationFixture,
+) -> (i64, Vec<(i64, Option<Vec<u8>>)>) {
+    let next_entry_seq = sqlx::query_scalar(
+        "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(fixture.conversation_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let entries = sqlx::query_as(
+        "SELECT seq,sequencer_receipt_bytes FROM chat.entries \
+         WHERE conversation_id=$1 AND message_id=$2 ORDER BY seq",
+    )
+    .bind(fixture.conversation_id)
+    .bind(fixture.message_id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    (next_entry_seq, entries)
 }
 
 #[tokio::test]
@@ -394,6 +443,73 @@ async fn group_send_and_exact_replay_keep_one_ordered_group_entry_delivery() {
     assert_no_direct_delivery(&pool, &fixture).await;
 }
 
+#[tokio::test]
+async fn signer_configured_send_requires_archive_commitment_before_sequencing() {
+    let (pool, _database, fixture, device, router) = setup(false).await;
+    let (expected_seq, initial_entries) = application_receipt_state(&pool, &fixture).await;
+    assert_eq!(expected_seq, 4);
+    assert!(initial_entries.is_empty());
+
+    let archive_less = archive_less_request(&fixture);
+    let (status, refusal) = post(&router, &device, &archive_less).await;
+    let (after_bad_next, after_bad_entries) = application_receipt_state(&pool, &fixture).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "archive-less result: status={status}, body={refusal}, \
+         next_entry_seq={after_bad_next}, entries={after_bad_entries:?}"
+    );
+    assert_eq!(refusal["error"], "InvalidApplicationMessage");
+    assert_eq!(after_bad_next, expected_seq);
+    assert!(after_bad_entries.is_empty());
+
+    let (status, accepted) = post(&router, &device, &fixture.signed_request).await;
+    assert_eq!(status, StatusCode::OK, "well-formed send: {accepted}");
+    assert_eq!(accepted["entry"]["seq"].as_i64(), Some(expected_seq));
+    assert!(accepted["sequencerReceipt"].is_object());
+    assert!(accepted["entry"]["sequencerReceipt"].is_object());
+    let accepted_state = application_receipt_state(&pool, &fixture).await;
+    assert_eq!(accepted_state.0, expected_seq + 1);
+    assert_eq!(accepted_state.1.len(), 1);
+    assert_eq!(accepted_state.1[0].0, expected_seq);
+    assert!(
+        accepted_state.1[0]
+            .1
+            .as_ref()
+            .is_some_and(|bytes| !bytes.is_empty()),
+        "accepted entry stores its sequencer receipt"
+    );
+
+    let (status, replay) = post(&router, &device, &fixture.signed_request).await;
+    assert_eq!(status, StatusCode::OK, "accepted replay: {replay}");
+    assert_eq!(replay, accepted);
+    assert_eq!(
+        application_receipt_state(&pool, &fixture).await,
+        accepted_state,
+        "accepted replay neither sequences nor rewrites the receipt"
+    );
+}
+
+#[tokio::test]
+async fn signerless_server_still_sequences_archive_less_send_without_receipt() {
+    let (pool, _database, fixture, device, router) = setup_routing(false, false, false).await;
+    assert!(fixture
+        .signed_request
+        .pointer("/body/aad/archiveCommitment")
+        .is_none());
+    let (expected_seq, initial_entries) = application_receipt_state(&pool, &fixture).await;
+    assert_eq!(expected_seq, 4);
+    assert!(initial_entries.is_empty());
+
+    let (status, accepted) = post(&router, &device, &fixture.signed_request).await;
+    assert_eq!(status, StatusCode::OK, "signer-less send: {accepted}");
+    assert!(accepted.get("sequencerReceipt").is_none());
+    assert!(accepted["entry"].get("sequencerReceipt").is_none());
+    let (next_entry_seq, entries) = application_receipt_state(&pool, &fixture).await;
+    assert_eq!(next_entry_seq, expected_seq + 1);
+    assert_eq!(entries, vec![(expected_seq, None)]);
+}
+
 /// Status, `Retry-After` and body of one send through `router`.
 async fn post_answer(
     router: &Router,
@@ -436,7 +552,7 @@ fn answered(
 /// rows are exactly `before`.
 async fn assert_nothing_committed(
     pool: &PgPool,
-    fixture: &ApplicationRoutingFixture,
+    fixture: &CleanSlateApplicationFixture,
     before: &Value,
     attempt: &str,
 ) {
@@ -478,7 +594,7 @@ async fn remote_group_send_is_only_ever_sequenced_by_its_sequencer() {
         StoreFailing,
         Resolves,
     }
-    let (pool, _database, fixture, device, _) = setup_routing(false, true).await;
+    let (pool, _database, fixture, device, _) = setup_routing(false, true, true).await;
     let routing: (String, bool, Option<String>, i64) = sqlx::query_as(
         "SELECT kind,is_remote,sequencer_ds,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
     )

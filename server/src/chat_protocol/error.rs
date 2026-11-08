@@ -536,6 +536,7 @@ define_endpoint_contracts!(
         NotFollowedByRecipient,
         RateLimited,
         RelationshipPolicyUnavailable,
+        SignedOperationExpired,
         UnsupportedMlsProfile,
         ProtocolUpgradeRequired,
         DeviceBindingMismatch,

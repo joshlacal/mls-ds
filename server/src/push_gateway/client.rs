@@ -227,16 +227,26 @@ impl PushGatewayClient {
                     }
                 })?;
 
-            let mut client_builder = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(10));
-            if !validated.is_test_override && !validated.pinned_addrs.is_empty() {
-                client_builder =
-                    client_builder.resolve_to_addrs(&validated.host, &validated.pinned_addrs);
-            }
-            let http_client = client_builder
-                .build()
-                .map_err(|e| PushDispatchError::Unavailable(e.to_string()))?;
+            let http_client = if validated.is_test_override || validated.pinned_addrs.is_empty() {
+                static UNPINNED_PUSH_GATEWAY_CLIENT: std::sync::OnceLock<reqwest::Client> =
+                    std::sync::OnceLock::new();
+                UNPINNED_PUSH_GATEWAY_CLIENT
+                    .get_or_init(|| {
+                        reqwest::Client::builder()
+                            .redirect(reqwest::redirect::Policy::none())
+                            .timeout(Duration::from_secs(10))
+                            .build()
+                            .expect("build unpinned push gateway HTTP client")
+                    })
+                    .clone()
+            } else {
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(10))
+                    .resolve_to_addrs(&validated.host, &validated.pinned_addrs)
+                    .build()
+                    .map_err(|e| PushDispatchError::Unavailable(e.to_string()))?
+            };
 
             let req_body = Deliver {
                 app_id: binding.app_id.clone().into(),

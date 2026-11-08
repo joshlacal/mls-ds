@@ -63,6 +63,7 @@ use crate::federation::envelope::{
     DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID,
 };
 use crate::federation::errors::FederationError;
+use crate::federation::receipt::{I13ControlReceiptInput, I13ReceiptSigner};
 use crate::identity::{canonical_did, dids_equivalent, service_did_base};
 
 /// Acquire a transaction-scoped advisory lock on a delivery ID.
@@ -829,10 +830,27 @@ pub async fn deliver_welcome_mailbox(
             },
         )?;
 
-    let verified_control = decode_and_verify_control_entry(&entry_bytes, &actor_public_key)
+    let mut actor_entry: serde_json::Value =
+        serde_json::from_slice(&entry_bytes).map_err(FederationError::Json)?;
+    let actor_fields =
+        actor_entry
+            .as_object_mut()
+            .ok_or_else(|| FederationError::InvalidEnvelope {
+                reason: "welcome control entry is not an object".to_string(),
+            })?;
+    if actor_fields
+        .remove("sequencerReceipt")
+        .is_some_and(|receipt| !receipt.is_object())
+    {
+        return Err(FederationError::InvalidEnvelope {
+            reason: "welcome sequencerReceipt is not an object".to_string(),
+        });
+    }
+    let actor_entry_bytes = serde_json::to_vec(&actor_entry).map_err(FederationError::Json)?;
+    let verified_control = decode_and_verify_control_entry(&actor_entry_bytes, &actor_public_key)
         .map_err(|e| FederationError::InvalidEnvelope {
-            reason: format!("control entry verification failed in welcome: {e}"),
-        })?;
+        reason: format!("control entry verification failed in welcome: {e}"),
+    })?;
 
     let rebound =
         rebind_persisted_control_entry(verified_control, &signed_request_bytes, &actor_public_key)
@@ -1940,6 +1958,7 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
     header: ValidatedEnvelopeHeader,
     signed_request_bytes: Vec<u8>,
     relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<SubmitCommitOutput, FederationError> {
     lock_delivery_id(tx, header.delivery_id).await?;
 
@@ -2387,6 +2406,12 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
     .map_err(|e| FederationError::InvalidEnvelope {
         reason: format!("cannot build verified control entry: {e:?}"),
     })?;
+    let receipt_input: Option<I13ControlReceiptInput> = i13_signer
+        .map(|signer| signer.control_receipt_input(&entry))
+        .transpose()
+        .map_err(|error| FederationError::InvalidEnvelope {
+            reason: format!("cannot capture control receipt input: {error}"),
+        })?;
     let request_digest = *entry.mutation().request_digest();
     let signature = *entry.mutation().signature();
     let outer_control_fingerprint = *entry.outer_control_fingerprint();
@@ -2415,14 +2440,42 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
             reason: format!("into_persistence_plan error: {e:?}"),
         })?;
 
-    let response = canonical_response_from_plan(&plan, products.canonical_response_json())
-        .map_err(|e| FederationError::InvalidEnvelope {
-            reason: format!("cannot build canonical response: {e:?}"),
-        })?;
-
     let expected_entry_id = parsed.transition_id;
     let expected_seq = aggregate.head().next_entry_seq();
     let expected_coordinate = plan.successor_coordinate().copied();
+    let control_receipt = match (
+        i13_signer,
+        receipt_input.as_ref(),
+        expected_coordinate.as_ref(),
+    ) {
+        (Some(signer), Some(input), Some(coordinate)) => Some(
+            signer
+                .sign_control_receipt(input, coordinate)
+                .map_err(|error| FederationError::InvalidEnvelope {
+                    reason: format!("cannot sign control receipt: {error}"),
+                })?,
+        ),
+        (Some(_), _, _) => {
+            return Err(FederationError::InvalidEnvelope {
+                reason: "commit receipt lacks its successor coordinate".to_string(),
+            })
+        }
+        _ => None,
+    };
+    let response_entry = match control_receipt.as_ref() {
+        Some(receipt) => {
+            I13ReceiptSigner::attach_control_receipt(products.canonical_response_json(), receipt)
+                .map_err(|error| FederationError::InvalidEnvelope {
+                    reason: format!("cannot attach control receipt: {error}"),
+                })?
+        }
+        None => products.canonical_response_json().to_vec(),
+    };
+    let response = canonical_response_from_plan(&plan, &response_entry).map_err(|e| {
+        FederationError::InvalidEnvelope {
+            reason: format!("cannot build canonical response: {e:?}"),
+        }
+    })?;
     let accepted_control_entry_bytes = products.durable_json().to_vec();
 
     // Source locator for the commit entry. For submitCommit the source entry is
@@ -2465,6 +2518,22 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
     .map_err(|e| FederationError::InvalidEnvelope {
         reason: format!("validate_applied_transition error: {e:?}"),
     })?;
+    if let Some(receipt) = &control_receipt {
+        let receipt_bytes = serde_json::to_vec(receipt).map_err(FederationError::Json)?;
+        super::delivery::set_entry_sequencer_receipt(
+            tx,
+            header.conversation_id,
+            expected_seq,
+            &receipt_bytes,
+        )
+        .await
+        .map_err(|error| match error {
+            DeliveryRepositoryError::Database(error) => FederationError::Database(error),
+            error => FederationError::SequenceConflict {
+                reason: format!("persist control receipt failed: {error:?}"),
+            },
+        })?;
+    }
 
     let result_sha256: [u8; 32] = *response.sha256();
     let receipt = sign_receipt(
@@ -2548,6 +2617,7 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
     signed_request_bytes: Vec<u8>,
     routing: Option<crate::chat_protocol::federation_routing::ParticipantRoutingIntent>,
     relationship_authority: &RelationshipAuthority<T>,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<Vec<u8>, FederationError> {
     // This store failing decided nothing: each typed store failure below stays
     // `Database` (the relay answers 5xx); every other failure is the request's.
@@ -2851,6 +2921,12 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
     .map_err(|e| FederationError::InvalidEnvelope {
         reason: format!("cannot build verified control entry: {e:?}"),
     })?;
+    let receipt_input: Option<I13ControlReceiptInput> = i13_signer
+        .map(|signer| signer.control_receipt_input(&entry))
+        .transpose()
+        .map_err(|error| FederationError::InvalidEnvelope {
+            reason: format!("cannot capture control receipt input: {error}"),
+        })?;
     let products = CanonicalControlEntryProducts::mint(&entry).map_err(|e| {
         FederationError::InvalidEnvelope {
             reason: format!("cannot mint control entry products: {e:?}"),
@@ -2970,13 +3046,42 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
         .map_err(|e| FederationError::InvalidEnvelope {
             reason: format!("into_persistence_plan error: {e:?}"),
         })?;
-    let response = canonical_response_from_plan(&plan, products.canonical_response_json())
-        .map_err(|e| FederationError::InvalidEnvelope {
-            reason: format!("cannot build canonical response: {e:?}"),
-        })?;
     let expected_entry_id = parsed.transition_id;
     let expected_seq = aggregate.head().next_entry_seq();
     let expected_coordinate = plan.successor_coordinate().copied();
+    let control_receipt = match (
+        i13_signer,
+        receipt_input.as_ref(),
+        expected_coordinate.as_ref(),
+    ) {
+        (Some(signer), Some(input), Some(coordinate)) => Some(
+            signer
+                .sign_control_receipt(input, coordinate)
+                .map_err(|error| FederationError::InvalidEnvelope {
+                    reason: format!("cannot sign control receipt: {error}"),
+                })?,
+        ),
+        (Some(_), _, _) => {
+            return Err(FederationError::InvalidEnvelope {
+                reason: "relayed control receipt lacks its successor coordinate".to_string(),
+            })
+        }
+        _ => None,
+    };
+    let response_entry = match control_receipt.as_ref() {
+        Some(receipt) => {
+            I13ReceiptSigner::attach_control_receipt(products.canonical_response_json(), receipt)
+                .map_err(|error| FederationError::InvalidEnvelope {
+                    reason: format!("cannot attach control receipt: {error}"),
+                })?
+        }
+        None => products.canonical_response_json().to_vec(),
+    };
+    let response = canonical_response_from_plan(&plan, &response_entry).map_err(|e| {
+        FederationError::InvalidEnvelope {
+            reason: format!("cannot build canonical response: {e:?}"),
+        }
+    })?;
     let accepted_control_entry_bytes = products.durable_json().to_vec();
 
     let prepared_execution = prepare_submit_transition_execution(
@@ -3005,6 +3110,22 @@ pub async fn sequence_relayed_group_transition<T: PublicTransport>(
     .map_err(|e| FederationError::InvalidEnvelope {
         reason: format!("validate_applied_transition error: {e:?}"),
     })?;
+    if let Some(receipt) = &control_receipt {
+        let receipt_bytes = serde_json::to_vec(receipt).map_err(FederationError::Json)?;
+        super::delivery::set_entry_sequencer_receipt(
+            tx,
+            conversation_id,
+            expected_seq,
+            &receipt_bytes,
+        )
+        .await
+        .map_err(|error| match error {
+            DeliveryRepositoryError::Database(error) => FederationError::Database(error),
+            error => FederationError::SequenceConflict {
+                reason: format!("persist relayed control receipt failed: {error:?}"),
+            },
+        })?;
+    }
 
     let response_bytes = response.as_bytes().to_vec();
     complete_federated_operation(

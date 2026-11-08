@@ -49,8 +49,9 @@ use crate::chat_protocol::{
         HydrationAuthority, ParticipantRole, PlannedTransition, PrincipalId, StateMachineError,
     },
     transcript::{
-        decode_and_verify_signed_mutation, CanonicalValueRef, SignedMutationKind,
-        VerifiedControlEntry, VerifiedMutationProjection, VerifiedSignedMutation,
+        decode_and_verify_control_entry, decode_and_verify_signed_mutation, CanonicalValueRef,
+        SignedMutationKind, VerifiedControlEntry, VerifiedMutationProjection,
+        VerifiedSignedMutation,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -65,6 +66,7 @@ use crate::chat_protocol::{
     },
     validation::CanonicalUuidV4,
 };
+use crate::federation::receipt::{I13ControlReceiptInput, I13ReceiptSigner};
 
 const MAX_PREPARE_ATTEMPTS: usize = 3;
 const RESET_REQUEST_IMMUTABLE_DOMAIN: &[u8] = b"CATBIRD-CHAT-RESET-REQUEST-IMMUTABLE-ROW\0";
@@ -222,6 +224,7 @@ pub(crate) enum ResetFacadeError {
     ExecutionContext(ExecutionContextHydrationError),
     Executor(ExecutorError),
     Database(sqlx::Error),
+    Delivery(super::delivery::DeliveryRepositoryError),
 }
 
 impl From<ResetRepositoryError> for ResetFacadeError {
@@ -272,6 +275,11 @@ impl From<ExecutorError> for ResetFacadeError {
 impl From<sqlx::Error> for ResetFacadeError {
     fn from(value: sqlx::Error) -> Self {
         Self::Database(value)
+    }
+}
+impl From<super::delivery::DeliveryRepositoryError> for ResetFacadeError {
+    fn from(value: super::delivery::DeliveryRepositoryError) -> Self {
+        Self::Delivery(value)
     }
 }
 
@@ -439,6 +447,7 @@ struct PreparedResetExecutionGraph {
     plan: ConversationPersistencePlan,
     artifacts: ExecutionContextArtifacts,
     response: ResetCanonicalResponse,
+    sequencer_receipt: Option<(Uuid, u64, Vec<u8>)>,
 }
 
 impl PreparedResetExecutionGraph {
@@ -446,6 +455,7 @@ impl PreparedResetExecutionGraph {
         plan: ConversationPersistencePlan,
         artifacts: ExecutionContextArtifacts,
         response: ResetCanonicalResponse,
+        sequencer_receipt: Option<(Uuid, u64, Vec<u8>)>,
     ) -> Result<Self, ResetFacadeError> {
         let expected = match plan.effects().kind() {
             PlanKind::ResetRequest => ResetOperationEndpoint::RequestReset,
@@ -477,6 +487,7 @@ impl PreparedResetExecutionGraph {
             plan,
             artifacts,
             response,
+            sequencer_receipt,
         })
     }
 
@@ -489,6 +500,7 @@ impl PreparedResetExecutionGraph {
             plan,
             artifacts,
             response,
+            sequencer_receipt,
         } = self;
         let prepared =
             hydrate_execution_context(transaction, &plan, artifacts, event_scope).await?;
@@ -497,6 +509,15 @@ impl PreparedResetExecutionGraph {
                 prepared,
             )
             .await?;
+        if let Some((conversation_id, seq, receipt)) = sequencer_receipt {
+            super::delivery::set_entry_sequencer_receipt(
+                transaction,
+                conversation_id,
+                seq,
+                &receipt,
+            )
+            .await?;
+        }
         Ok((applied, response))
     }
 }
@@ -572,6 +593,7 @@ struct ResetReplayEntryRow {
     state_version: Option<i64>,
     transition_id: Option<Uuid>,
     received_at: DateTime<Utc>,
+    sequencer_receipt_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, FromRow)]
@@ -1488,8 +1510,9 @@ async fn lock_reset_request_replay_rows(
     {
         return Err(ResetFacadeError::InvalidCanonicalMaterial);
     }
+    let response_entry = reset_replay_response_entry(transaction, &entry).await?;
     let response = ResetCanonicalResponse::request(
-        &entry.accepted_payload_bytes,
+        &response_entry,
         row.reset_request_id,
         row.conversation_id,
         &row.requester_did,
@@ -1669,8 +1692,8 @@ async fn lock_reset_activation_replay_rows(
     {
         return Err(ResetFacadeError::InvalidCanonicalMaterial);
     }
-    let response =
-        ResetCanonicalResponse::activation(&entry.accepted_payload_bytes, &retired, &successor)?;
+    let response_entry = reset_replay_response_entry(transaction, &entry).await?;
+    let response = ResetCanonicalResponse::activation(&response_entry, &retired, &successor)?;
     let mut digest = reset_replay_post_state_digest("activation", head, &entry);
     digest_transition(&mut digest, &transition);
     digest_uuid(&mut digest, request.reset_request_id);
@@ -1704,7 +1727,8 @@ async fn lock_reset_replay_entry(
         SELECT seq,entry_id,accepted_payload_bytes,accepted_payload_sha256,
                signed_request_bytes,request_digest,signature,server_fields_bytes,
                outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,
-               actor_auth_generation,generation,state_version,transition_id,received_at
+               actor_auth_generation,generation,state_version,transition_id,received_at,
+               sequencer_receipt_bytes
           FROM chat.entries
          WHERE conversation_id=$1 AND entry_kind=$2
            AND signed_request_bytes=$3 AND request_digest=$4 AND signature=$5
@@ -1746,6 +1770,37 @@ async fn lock_reset_replay_entry(
         return Err(ResetFacadeError::InvalidCanonicalMaterial);
     }
     Ok(rows.into_iter().next().expect("single exact Reset entry"))
+}
+
+async fn reset_replay_response_entry(
+    transaction: &mut Transaction<'_, Postgres>,
+    entry: &ResetReplayEntryRow,
+) -> Result<Vec<u8>, ResetFacadeError> {
+    let signing_public_key: Vec<u8> = sqlx::query_scalar(
+        "SELECT signing_public_key FROM chat.device_keys \
+         WHERE user_did=$1 AND device_id=$2 AND key_id=$3 \
+         FOR SHARE",
+    )
+    .bind(&entry.actor_did)
+    .bind(entry.actor_device_id)
+    .bind(&entry.actor_key_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    let verified =
+        decode_and_verify_control_entry(&entry.accepted_payload_bytes, &signing_public_key)
+            .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+    let products = CanonicalControlEntryProducts::mint(&verified)
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+    match entry.sequencer_receipt_bytes.as_deref() {
+        Some(bytes) => {
+            let receipt: JsonValue = serde_json::from_slice(bytes)
+                .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+            I13ReceiptSigner::attach_control_receipt(products.canonical_response_json(), &receipt)
+                .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)
+        }
+        None => Ok(products.canonical_response_json().to_vec()),
+    }
 }
 
 async fn lock_reset_generation_state(
@@ -1800,12 +1855,13 @@ fn coordinate_pair(
 pub(crate) async fn execute_prepared_reset(
     transaction: &mut Transaction<'_, Postgres>,
     prepared: PreparedSignedOperation,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<ResetTransactionOutcome, ResetFacadeError> {
     match prepared.into_state() {
         PreparedSignedOperationState::First {
             authority,
             reservation,
-        } => execute_first_reset(transaction, authority, reservation)
+        } => execute_first_reset(transaction, authority, reservation, i13_signer)
             .await
             .map(ResetTransactionOutcome::First),
         PreparedSignedOperationState::Replay { authority, replay } => {
@@ -1839,6 +1895,7 @@ async fn execute_first_reset(
     transaction: &mut Transaction<'_, Postgres>,
     authority: VerifiedChatDeviceRequest,
     reservation: OperationReservationGuard,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<AppliedResetOperation, ResetFacadeError> {
     let mutation = authority
         .mutation()
@@ -1856,10 +1913,12 @@ async fn execute_first_reset(
         prepare_identity_scope_prelude(transaction, &authority, reservation, scope).await?;
     let graph = match expected {
         ResetPreparationKind::Request => {
-            prepare_reset_request_graph(transaction, &authority, prelude, mutation).await?
+            prepare_reset_request_graph(transaction, &authority, prelude, mutation, i13_signer)
+                .await?
         }
         ResetPreparationKind::Activation => {
-            prepare_reset_activation_graph(transaction, &authority, prelude, mutation).await?
+            prepare_reset_activation_graph(transaction, &authority, prelude, mutation, i13_signer)
+                .await?
         }
     };
     let (scope_authority, completion) = graph.1.into_execution_parts();
@@ -1881,6 +1940,7 @@ async fn prepare_reset_request_graph(
     request: &VerifiedChatDeviceRequest,
     prelude: PreparedBusinessPrelude,
     mutation: &VerifiedSignedMutation,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<(PreparedResetExecutionGraph, PreparedBusinessPrelude), ResetFacadeError> {
     let authority = prepare_reset_request_authority(transaction, prelude, mutation).await?;
     let parsed = parse_reset_authority(mutation, ResetPreparationKind::Request)?;
@@ -1905,26 +1965,31 @@ async fn prepare_reset_request_graph(
         request.trusted_instant(),
         CanonicalControlServerFields::empty(ControlEntryKind::ResetRequest)?,
     )?;
+    let receipt_input: Option<I13ControlReceiptInput> = i13_signer
+        .map(|_| {
+            I13ControlReceiptInput::from_fields(
+                entry.conversation_id().as_str(),
+                entry.entry_id().as_str(),
+                entry.seq(),
+                entry.received_at().as_str(),
+                entry.mutation().actor_did().as_str(),
+                entry.mutation().actor_device_id().as_str(),
+                *entry.mutation().request_digest(),
+            )
+        })
+        .transpose()
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
     let products = CanonicalControlEntryProducts::mint(&entry)?;
     let trusted_instant = authority.trusted_instant;
     let expires_at = trusted_instant
         .checked_add_signed(Duration::hours(24))
         .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
     let reason = match entry.mutation().projection() {
-        VerifiedMutationProjection::ResetRequest(value) => value.reason(),
+        VerifiedMutationProjection::ResetRequest(value) => value.reason().to_owned(),
         _ => return Err(ResetFacadeError::UnsupportedMutation),
     };
-    let response = ResetCanonicalResponse::request(
-        products.canonical_response_json(),
-        parsed.reset_request_id,
-        conversation_id,
-        entry.mutation().actor_did().as_str(),
-        Uuid::from_bytes(*entry.mutation().actor_device_id().as_bytes()),
-        &parsed.prior,
-        reason,
-        trusted_instant,
-        expires_at,
-    )?;
+    let actor_did = entry.mutation().actor_did().as_str().to_owned();
+    let actor_device_id = Uuid::from_bytes(*entry.mutation().actor_device_id().as_bytes());
     let artifacts = ExecutionContextArtifacts {
         accepted_control_entry_bytes: Some(products.durable_json().to_vec()),
         genesis_group_info_bytes: None,
@@ -1953,8 +2018,43 @@ async fn prepare_reset_request_graph(
         }
     };
     let plan = planned.into_persistence_plan()?;
+    let receipt_coordinate = plan
+        .successor_coordinate()
+        .or_else(|| plan.expected_prior())
+        .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    let control_receipt = match (i13_signer, receipt_input.as_ref()) {
+        (Some(signer), Some(input)) => Some(
+            signer
+                .sign_control_receipt(input, receipt_coordinate)
+                .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?,
+        ),
+        _ => None,
+    };
+    let response_entry = match control_receipt.as_ref() {
+        Some(receipt) => {
+            I13ReceiptSigner::attach_control_receipt(products.canonical_response_json(), receipt)
+                .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?
+        }
+        None => products.canonical_response_json().to_vec(),
+    };
+    let response = ResetCanonicalResponse::request(
+        &response_entry,
+        parsed.reset_request_id,
+        conversation_id,
+        &actor_did,
+        actor_device_id,
+        &parsed.prior,
+        &reason,
+        trusted_instant,
+        expires_at,
+    )?;
+    let receipt_row = control_receipt
+        .map(|receipt| serde_json::to_vec(&receipt))
+        .transpose()
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?
+        .map(|bytes| (conversation_id, seq, bytes));
     Ok((
-        PreparedResetExecutionGraph::new(plan, artifacts, response)?,
+        PreparedResetExecutionGraph::new(plan, artifacts, response, receipt_row)?,
         prelude,
     ))
 }
@@ -1964,6 +2064,7 @@ async fn prepare_reset_activation_graph(
     request: &VerifiedChatDeviceRequest,
     prelude: PreparedBusinessPrelude,
     mutation: &VerifiedSignedMutation,
+    i13_signer: Option<&I13ReceiptSigner>,
 ) -> Result<(PreparedResetExecutionGraph, PreparedBusinessPrelude), ResetFacadeError> {
     let authority = prepare_reset_activation_authority(transaction, prelude, mutation).await?;
     let parsed = parse_reset_authority(mutation, ResetPreparationKind::Activation)?;
@@ -1989,6 +2090,20 @@ async fn prepare_reset_activation_graph(
         request.trusted_instant(),
         CanonicalControlServerFields::empty(ControlEntryKind::ResetActivation)?,
     )?;
+    let receipt_input: Option<I13ControlReceiptInput> = i13_signer
+        .map(|_| {
+            I13ControlReceiptInput::from_fields(
+                entry.conversation_id().as_str(),
+                entry.entry_id().as_str(),
+                entry.seq(),
+                entry.received_at().as_str(),
+                entry.mutation().actor_did().as_str(),
+                entry.mutation().actor_device_id().as_str(),
+                *entry.mutation().request_digest(),
+            )
+        })
+        .transpose()
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
     let products = CanonicalControlEntryProducts::mint(&entry)?;
     let (planned, _pending, prelude) = authority.plan_reset_activation_entry(mutation, entry)?;
     let plan = planned.into_persistence_plan()?;
@@ -1998,8 +2113,22 @@ async fn prepare_reset_activation_graph(
     let successor = plan
         .successor_coordinate()
         .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
-    let response =
-        ResetCanonicalResponse::activation(products.canonical_response_json(), retired, successor)?;
+    let control_receipt = match (i13_signer, receipt_input.as_ref()) {
+        (Some(signer), Some(input)) => Some(
+            signer
+                .sign_control_receipt(input, successor)
+                .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?,
+        ),
+        _ => None,
+    };
+    let response_entry = match control_receipt.as_ref() {
+        Some(receipt) => {
+            I13ReceiptSigner::attach_control_receipt(products.canonical_response_json(), receipt)
+                .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?
+        }
+        None => products.canonical_response_json().to_vec(),
+    };
+    let response = ResetCanonicalResponse::activation(&response_entry, retired, successor)?;
     let artifacts = ExecutionContextArtifacts {
         accepted_control_entry_bytes: Some(products.durable_json().to_vec()),
         genesis_group_info_bytes: Some(group_info),
@@ -2010,8 +2139,13 @@ async fn prepare_reset_activation_graph(
         sequencer_term: 0,
         participant_ds_dids: std::collections::HashMap::new(),
     };
+    let receipt_row = control_receipt
+        .map(|receipt| serde_json::to_vec(&receipt))
+        .transpose()
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?
+        .map(|bytes| (conversation_id, seq, bytes));
     Ok((
-        PreparedResetExecutionGraph::new(plan, artifacts, response)?,
+        PreparedResetExecutionGraph::new(plan, artifacts, response, receipt_row)?,
         prelude,
     ))
 }

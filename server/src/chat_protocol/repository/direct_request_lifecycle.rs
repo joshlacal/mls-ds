@@ -151,7 +151,8 @@ pub(crate) async fn load_request_projection(
 > {
     use super::inventory::InventoryRepositoryError as E;
     use crate::chat_protocol::direct_request_transcript::{
-        verify_direct_request_acceptance_proof, verify_signed_request, DirectRequestKind,
+        verify_received_direct_request_acceptance_proof_with_i13, verify_signed_request,
+        DirectRequestKind,
     };
     use serde_json::{json, Value};
     use sqlx::Row;
@@ -218,9 +219,12 @@ pub(crate) async fn load_request_projection(
             )
             .fetch_one(&mut **tx)
             .await?;
-            let verified =
-                verify_direct_request_acceptance_proof(&bytes, &authority_key, &recipient_key)
-                    .map_err(|_| E::InvalidMaterialization)?;
+            let verified = verify_received_direct_request_acceptance_proof_with_i13(
+                &bytes,
+                &authority_key,
+                &recipient_key,
+            )
+            .map_err(|_| E::InvalidMaterialization)?;
             if verified["entry"]["signedRequest"]["body"]["actorDid"] != recipient
                 || verified["receipt"]["body"]["requestId"] != body["requestId"]
             {

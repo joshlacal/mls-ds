@@ -142,7 +142,9 @@ pub(super) async fn run_request_inventory_concurrency(pool: &PgPool) -> Result<(
             crate::chat_protocol::repository::prelude::prepare_signed_operation(&mut tx, admission)
                 .await
                 .map_err(|e| format!("prepare request: {e:?}"))?;
-        let outcome = execute_prepared_recovery(&mut tx, prepared, &relationship)
+        let i13_signer = proof_i13_signer();
+        let outcome =
+            execute_prepared_recovery(&mut tx, prepared, &relationship, Some(&i13_signer))
             .await
             .map_err(|e| format!("signed request facade: {e:?}"))?;
         if outcome.status() != 200 {

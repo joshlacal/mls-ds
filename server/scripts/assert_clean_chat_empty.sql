@@ -374,7 +374,7 @@ DECLARE
     ];
 
     -- BEGIN GENERATED CLEAN-SLATE SEAL
-    -- 60 migrations after 20260828000005 (144 total, max 20261107000001); chat tables: 92; chat views: 1.
+    -- 61 migrations after 20260828000005 (145 total, max 20261113000001); chat tables: 94; chat views: 1.
     v_clean_slate_versions BIGINT[] := ARRAY[
         20260905000001::BIGINT,
         20260907000001::BIGINT,
@@ -435,7 +435,8 @@ DECLARE
         20261104000010::BIGINT,
         20261104000011::BIGINT,
         20261104000012::BIGINT,
-        20261107000001::BIGINT
+        20261107000001::BIGINT,
+        20261113000001::BIGINT
     ];
     v_clean_slate_descriptions TEXT[] := ARRAY[
         'chat historical recovery package mapping',
@@ -497,7 +498,8 @@ DECLARE
         'wipe returns whole retained charge',
         'direct request route answers',
         'postgres churn partitions',
-        'application send order'
+        'application send order',
+        'remote lifecycle recovery bindings'
     ];
     v_clean_slate_checksums TEXT[] := ARRAY[
         'a66f9dc9bd5f8f1cb3da0f3ddfcb64c08fc068de39602891e584c86cdbaebd1de2d29b6bb46959155496639ad12f9c5d',
@@ -559,7 +561,8 @@ DECLARE
         '2683e751903eadd28ba7b7df9a2d43a7eb10c62fb5a6bf644582dcc92565ddca85b0cccd1e7efcefcbb7f9d2f3880a8b',
         '6a8bce9ce6af92567d62820ca40464860a14b56b47d72f91f51649b1e98ea095ce9ea233258b7cc7cbf26e379516617d',
         'e9700954fc90dd3f99c47eb93eddac7f233e2e2f274f01882c49144b2c9d7499ac60e277f3629039019555c6df9aaa80',
-        '457b8d78861a458425a5ed617874a8397547e03fdf2a7038f3ead6737f5cb156b5e9b3fa5df40442a152d72b1279c1c1'
+        '457b8d78861a458425a5ed617874a8397547e03fdf2a7038f3ead6737f5cb156b5e9b3fa5df40442a152d72b1279c1c1',
+        '78975bab32bfaa527ee1233ad49b36956d91fb4c9fef47533365cabd6c98778b50709a57fda8fa5c5933fab388e9e596'
     ];
     v_clean_slate_tables TEXT[] := ARRAY[
         'application_intervals',
@@ -645,6 +648,8 @@ DECLARE
         'relationship_projection_snapshots',
         'remote_group_memberships',
         'remote_group_pending_welcomes',
+        'remote_lifecycle_operation_replays',
+        'remote_lifecycle_recovery_bindings',
         'reset_requests',
         'service_auth_admissions',
         'space_credential_jtis',

@@ -141,7 +141,7 @@ async fn mirror_group_membership(
 
     let rows = sqlx::query(
         "SELECT seq,generation,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256, \
-                signed_request_bytes,outer_entry_fingerprint,received_at \
+                signed_request_bytes,outer_entry_fingerprint,sequencer_receipt_bytes,received_at \
          FROM chat.entries WHERE conversation_id=$1 AND seq < 4 ORDER BY seq",
     ).bind(fixture.conversation_id).fetch_all(sequencer).await.unwrap();
     assert_eq!(
@@ -168,6 +168,8 @@ async fn mirror_group_membership(
             accepted_payload_sha256: Some(row.get("accepted_payload_sha256")),
             signed_request: Some(row.get("signed_request_bytes")),
             outer_fingerprint: Some(row.get("outer_entry_fingerprint")),
+            sequencer_receipt: Some(row.get("sequencer_receipt_bytes")),
+            account_deleted_entry: None,
         })
         .unwrap();
         hasher.update_event(
@@ -344,6 +346,7 @@ async fn d1_cross_server_group_relay_sequences_on_authority_and_fans_out_with_i1
             actor_did: fixture.sender_did.clone(),
             actor_device_id: fixture.sender_device_id,
             signed_request: fixture.signed_request.clone(),
+            signed_request_bytes: None,
         },
     )
     .await
@@ -522,10 +525,15 @@ async fn a_relayed_group_send_runs_the_sequencers_traffic_check_across_three_hom
     let db_seq = common::fresh_db::fresh_fully_migrated_db("chat_fed_relay_").await;
     let seq_pool = db_seq.connect(4).await;
     http::ensure_fence(&seq_pool).await;
-    let fixture =
-        seed_clean_slate_application_fixture_unsealed(&seq_pool, false, PEER, None, Some(HOME))
-            .await
-            .expect("seed SEQ's group");
+    let fixture = seed_clean_slate_application_fixture_unsealed(
+        &seq_pool,
+        false,
+        PEER,
+        Some([0xac; 32]),
+        Some(HOME),
+    )
+    .await
+    .expect("seed SEQ's group");
     for peer in [HOME, FORGER] {
         sqlx::query("INSERT INTO federation_peers(ds_did,status) VALUES($1,'allow')")
             .bind(peer)
@@ -536,6 +544,7 @@ async fn a_relayed_group_send_runs_the_sequencers_traffic_check_across_three_hom
     let relationships = SimSourceFault::default();
     let seq_rt = ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
         .unwrap()
+        .with_i13_receipt_signer(common::proof_i13_signer_for(SEQ))
         .with_sim_faulty_relationships(relationships.clone())
         .unwrap();
     // What reached each member home's `deliverGroupEntry`: (host, seq).
@@ -581,9 +590,14 @@ async fn a_relayed_group_send_runs_the_sequencers_traffic_check_across_three_hom
         retain_application_ciphertext: false,
     });
     let sequencer = group_relay_router(
-        GroupRelayState::for_test(seq_pool.clone(), SEQ.to_owned(), SECRET.as_bytes(), None)
-            .with_sim_hooks(seq_hooks)
-            .with_relationship_authority_of(&seq_rt),
+        GroupRelayState::for_test(
+            seq_pool.clone(),
+            SEQ.to_owned(),
+            SECRET.as_bytes(),
+            Some(Arc::new(common::proof_i13_signer_for(SEQ))),
+        )
+        .with_sim_hooks(seq_hooks)
+        .with_relationship_authority_of(&seq_rt),
     );
 
     // HOME and FORGER reach only SEQ.
@@ -764,6 +778,7 @@ async fn a_relayed_group_send_runs_the_sequencers_traffic_check_across_three_hom
                 actor_did: fixture.sender_did.clone(),
                 actor_device_id: fixture.sender_device_id,
                 signed_request: signed.clone(),
+                signed_request_bytes: None,
             },
         ),
     )

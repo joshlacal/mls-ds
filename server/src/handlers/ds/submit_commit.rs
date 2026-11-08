@@ -72,6 +72,7 @@ pub async fn submit_commit(
             header,
             msg.signed_request_bytes.to_vec(),
             runtime.relationship_authority().as_ref(),
+            runtime.i13_receipt_signer(),
         )
         .await?;
 
@@ -114,6 +115,6 @@ pub async fn submit_commit(
     }
     .await;
 
-    record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
+    record_ds_outcome(&pool, &requester_ds, &result).await;
     result
 }

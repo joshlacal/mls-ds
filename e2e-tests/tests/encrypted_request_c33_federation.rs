@@ -27,7 +27,6 @@ use catbird_mls::{
     messaging::receive::OriginalSenderArchiveAttestationEnvelope,
     metadata::GroupMetadataV1,
     orchestrator::{
-        canonical_application_aad_bytes,
         direct_request_bootstrap::{
             metadata_coordinate, DirectRequestBootstrap, DirectRequestBootstrapInput,
             DirectRequestIntroductionResult, DirectRequestWelcomeInput,
@@ -52,6 +51,31 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 const MAINTENANCE_URL: &str = "postgresql://127.0.0.1:5432/postgres";
+
+fn has_receipted_client_entry(response: &Value) -> bool {
+    response["sequencerReceipt"].is_object()
+        && response["entry"].as_object().is_some_and(|entry| {
+            entry.len() == 6
+                && !entry.contains_key("$type")
+                && entry.get("sequencerReceipt") == response.get("sequencerReceipt")
+        })
+}
+
+#[test]
+fn c33_response_shape_rejects_null_receipts() {
+    let response = json!({
+        "entry": {
+            "entryId": Uuid::new_v4(),
+            "conversationId": Uuid::new_v4(),
+            "seq": 3,
+            "signedRequest": {},
+            "receivedAt": "2026-11-11T00:00:00.000Z",
+            "sequencerReceipt": null,
+        },
+        "sequencerReceipt": null,
+    });
+    assert!(!has_receipted_client_entry(&response));
+}
 fn original_sender_attestation(
     value: &Value,
 ) -> anyhow::Result<OriginalSenderArchiveAttestationEnvelope> {
@@ -1949,10 +1973,16 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
             "prior": aad_prior
         });
         let plaintext = MLSMessagePayload::text(text).encode()?;
+        let (aad, aad_bytes, inner_plaintext) = mls_e2e_tests::archive_bound_application(
+            &sender.engine,
+            &sender.identity,
+            aad,
+            &plaintext,
+        )?;
         let ciphertext = sender.engine.encrypt_canonical(
             &group_id_bytes,
-            &plaintext,
-            canonical_application_aad_bytes(&aad)?,
+            &inner_plaintext,
+            aad_bytes.clone(),
             epoch,
         )?;
         let body = json!({
@@ -1995,9 +2025,10 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         );
         let response: Value = serde_json::from_slice(&response_bytes)?;
         assert_eq!(response["entry"]["seq"], seq);
-        anyhow::ensure!(response["entry"].as_object().is_some_and(|entry|
-            entry.len() == 5 && !entry.contains_key("$type")),
-            "XRPC sendMessage response must expose the five-field client entry, not the internally tagged S2S delivery entry");
+        anyhow::ensure!(
+            has_receipted_client_entry(&response),
+            "XRPC sendMessage response must expose the six-field receipt-bearing client entry, not the internally tagged S2S delivery entry"
+        );
         if seq == 3 {
             let (retry_status, retry_bytes) = sender
                 .svc
@@ -2012,7 +2043,7 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
             anyhow::ensure!(
                 retry_status == StatusCode::OK
                     && serde_json::from_slice::<Value>(&retry_bytes)? == response,
-                "remote exact send retry must replay the same five-field accepted entry"
+                "remote exact send retry must replay the same receipt-bearing accepted entry"
             );
             let mut changed = body;
             changed["signedAt"] = json!(canonical_now());
@@ -2080,12 +2111,12 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
         let authenticated = recipient
             .engine
             .decrypt_authenticated(&group_id_bytes, &STANDARD.decode(fetched_b64)?)?;
-        let decoded = MLSMessagePayload::decode(&authenticated.plaintext)?;
-        assert_eq!(
-            decoded.display_text(),
-            text,
-            "peer could not decrypt shipped MLS reply"
-        );
+        let (decoded, _, _, _) =
+            catbird_mls::messaging::receive::extract_plaintext_body_and_verify_aad(
+                &authenticated.plaintext,
+                &aad_bytes,
+            )?;
+        assert_eq!(decoded, text, "peer could not decrypt shipped MLS reply");
     }
 
     // -------------------------------------------------------------------------
@@ -3526,10 +3557,16 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
             "prior": aad_prior
         });
         let plaintext = MLSMessagePayload::text(text).encode()?;
+        let (aad, aad_bytes, inner_plaintext) = mls_e2e_tests::archive_bound_application(
+            &sender.engine,
+            &sender.identity,
+            aad,
+            &plaintext,
+        )?;
         let ciphertext = sender.engine.encrypt_canonical(
             &group_id_bytes,
-            &plaintext,
-            canonical_application_aad_bytes(&aad)?,
+            &inner_plaintext,
+            aad_bytes.clone(),
             epoch,
         )?;
         let body = json!({
@@ -3600,10 +3637,13 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
         let authenticated = recipient
             .engine
             .decrypt_authenticated(&group_id_bytes, &STANDARD.decode(fetched_b64)?)?;
-        let decoded = MLSMessagePayload::decode(&authenticated.plaintext)?;
+        let (decoded, _, _, _) =
+            catbird_mls::messaging::receive::extract_plaintext_body_and_verify_aad(
+                &authenticated.plaintext,
+                &aad_bytes,
+            )?;
         assert_eq!(
-            decoded.display_text(),
-            text,
+            decoded, text,
             "peer successfully decrypted converged MLS reply"
         );
     }

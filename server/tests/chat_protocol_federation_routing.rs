@@ -223,7 +223,8 @@ async fn runtime(pool: &DbPool, cutover_enabled: bool) -> Arc<ChatRuntime> {
     Arc::new(
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
             .expect("build clean-chat runtime")
-            .with_resolver(resolver),
+            .with_resolver(resolver)
+            .with_i13_receipt_signer(common::proof_i13_signer()),
     )
 }
 async fn router_with(pool: DbPool, cutover_enabled: bool) -> Router {
@@ -2038,6 +2039,7 @@ async fn a_relayed_add_is_retryable_while_the_new_members_home_cannot_answer() {
             None,
             300,
         )))
+        .with_i13_receipt_signer(common::proof_i13_signer_for(SEQ_DS_DID))
         .with_sim_faulty_relationships(relationships.clone())
         .expect("the sequencer's relationship authority");
     let seq = group_home(&seq_pool, Arc::new(seq_rt)).await;
@@ -2054,7 +2056,7 @@ async fn a_relayed_add_is_retryable_while_the_new_members_home_cannot_answer() {
             seq_pool.clone(),
             SEQ_DS_DID.to_owned(),
             SECRET.as_bytes(),
-            None,
+            Some(Arc::new(common::proof_i13_signer_for(SEQ_DS_DID))),
         )
         .with_sim_hooks(Arc::new(SimDsHooks {
             service_did: SEQ_DS_DID.to_owned(),
@@ -2096,6 +2098,7 @@ async fn a_relayed_add_is_retryable_while_the_new_members_home_cannot_answer() {
     let rt = ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
         .expect("build clean-chat runtime")
         .with_resolver(Arc::new(resolver))
+        .with_i13_receipt_signer(common::proof_i13_signer_for(SELF_DS_DID))
         .with_sim_allow_all_relationships()
         .expect("mirror relationship authority");
     let home = seq.same_group_at(&pool, Arc::new(rt)).await;
@@ -2297,6 +2300,7 @@ async fn a_relayed_add_is_retryable_while_the_new_members_home_cannot_answer() {
     member_home.answer(Directory::Vouches);
     let (status, _, sequenced) = submit().await;
     assert_eq!(status, StatusCode::OK, "member home answering: {sequenced}");
+    common::assert_proof_i13_control_receipt_for(&sequenced["entry"], SEQ_DS_DID);
     assert_eq!(
         participant_home(&seq_pool, seq.fixture.cid, &invitee).await,
         Some(PEER_DS_DID.to_owned()),
@@ -2363,6 +2367,7 @@ async fn a_relayed_add_is_retryable_while_the_new_members_home_cannot_answer() {
                 actor_did: home.fixture.actor_did.clone(),
                 actor_device_id: home.fixture.actor_device_id,
                 signed_request: home.fixture.signed_request_json.clone(),
+                signed_request_bytes: None,
             },
         ),
     )
@@ -2574,6 +2579,7 @@ async fn closed_federation_gate_answers_a_forwarded_transition_retryably_and_uns
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
             .expect("build clean-chat runtime")
             .with_resolver(resolver)
+            .with_i13_receipt_signer(common::proof_i13_signer_for(SELF_DS_DID))
             .with_commit_submitter(Arc::new(submitter))
             .with_sim_allow_all_relationships()
             .expect("forwarding relationship authority"),
@@ -2698,7 +2704,8 @@ async fn unresolved_participant_home_is_retryable_only_while_resolution_cannot_a
         runtime: Arc::new(
             ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
                 .expect("build clean-chat runtime")
-                .with_resolver(resolver),
+                .with_resolver(resolver)
+                .with_i13_receipt_signer(common::proof_i13_signer_for(SELF_DS_DID)),
         ),
     });
     let create = || {
@@ -3116,7 +3123,8 @@ async fn test_replay_counting_failing_resolver_proves_zero_calls() {
     let rt = Arc::new(
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
             .expect("build clean-chat runtime")
-            .with_resolver(resolver),
+            .with_resolver(resolver)
+            .with_i13_receipt_signer(common::proof_i13_signer()),
     );
 
     let router = chat_router::<TestState>().with_state(TestState {
@@ -3148,6 +3156,9 @@ async fn test_replay_counting_failing_resolver_proves_zero_calls() {
         1,
         "first request must resolve exactly the 1 participant"
     );
+    let first_body: serde_json::Value =
+        serde_json::from_slice(&first_response_bytes).expect("parse first response");
+    common::assert_proof_i13_control_receipt(&first_body["result"]["entry"]);
 
     // On identical replay, preflight_completed_response is advisory and hits the idempotency record,
     // skipping routing resolution entirely.

@@ -413,9 +413,11 @@ async fn c34_migration_and_compatible_rollback() -> Result<()> {
         .await?;
     assert_eq!(acc1_status, reqwest::StatusCode::OK);
     let acc1_val: Value = serde_json::from_slice(&acc1_bytes)?;
-    let acc1_proof = protocol::verify_received_direct_request_acceptance_proof(
+    let acc1_proof = mls_e2e_tests::verify_received_direct_request_acceptance_proof_with_i13(
         &serde_json::to_vec(&acc1_val["acceptanceProof"])?,
+        "did:web:chat.catbird.blue",
         &fixture1.server.receipt_public_key,
+        &fixture1.server.sequencer_receipt_public_key,
         &bob_public1,
     )?;
     assert_eq!(

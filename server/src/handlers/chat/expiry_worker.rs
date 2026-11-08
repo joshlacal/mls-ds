@@ -13,8 +13,9 @@ use tokio::time::interval;
 
 use super::runtime::ChatRuntime;
 use crate::chat_protocol::repository::expiry_sweep::{
-    delete_unanswered_outbound_routes, due_leaf_recovery_targets, due_welcome_delivery_targets,
-    sweep_one_welcome, WelcomeSweepOutcome,
+    delete_expired_remote_lifecycle_state, delete_unanswered_outbound_routes,
+    due_leaf_recovery_targets, due_welcome_delivery_targets, sweep_one_welcome,
+    WelcomeSweepOutcome,
 };
 use crate::handlers::chat::recovery_scheduler::{expire_one, RecoveryExpiryServiceOutcome};
 use crate::storage::DbPool;
@@ -283,6 +284,14 @@ pub(crate) async fn run_sweep_cycle(
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "unanswered direct request route sweep failed"),
+    }
+
+    match delete_expired_remote_lifecycle_state(pool, now, config.batch).await {
+        Ok(deleted) if deleted > 0 => {
+            tracing::info!(deleted, "deleted expired remote lifecycle state")
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "remote lifecycle expiry sweep failed"),
     }
 
     counts

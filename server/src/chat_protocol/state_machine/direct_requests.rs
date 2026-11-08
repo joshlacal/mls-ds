@@ -783,7 +783,6 @@ impl HydrationAuthority {
             .to_vec();
         if expected_target_auth_generation == 0
             || expected_target_auth_generation > MAX_PROTOCOL_INTEGER
-            || signed_at > accepted_at
         {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }

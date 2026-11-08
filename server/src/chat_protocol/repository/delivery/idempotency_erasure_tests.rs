@@ -54,8 +54,10 @@ async fn ds() -> Ds {
     let pool = db.connect(6).await;
     http::ensure_fence(&pool).await;
     let signer = I13ReceiptSigner::new(http::random_p256(), DS.to_owned());
-    let router =
-        http::router_for_authenticated_acceptance_with_i13(pool.clone(), signer.clone()).await;
+    let router = http::router_for_authenticated_acceptance_with(pool.clone(), |runtime| {
+        runtime.with_i13_receipt_signer(signer.clone())
+    })
+    .await;
     Ds {
         pool,
         router,

@@ -44,6 +44,7 @@ use catbird_server::federation::envelope::{
     DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID,
 };
 use catbird_server::federation::outbound::OutboundClient;
+use catbird_server::federation::receipt::{I13ControlReceiptInput, I13ReceiptSigner};
 use catbird_server::federation::resolver::{DsResolver, ValidatedRemoteDestination};
 use catbird_server::federation::FederationMode;
 use catbird_server::federation::ServiceAuthClient;
@@ -356,6 +357,7 @@ struct TestHarness {
     sender_ds_key: P256SigningKey,
     sequencer_ds_did: String,
     sequencer_ds_key: P256SigningKey,
+    sequencer_receipt_signer: I13ReceiptSigner,
 }
 
 impl TestHarness {
@@ -380,7 +382,14 @@ impl TestHarness {
         // used the constant REMOTE_SEQUENCER_DID.
         let sequencer_ds_did = format!("did:web:s-{clean_suffix}-{short_id}.catbird.blue");
         let sequencer_ds_key = random_p256();
-        cache_did_key(&sequencer_ds_did, &sequencer_ds_key).await;
+        let sequencer_receipt_signer =
+            I13ReceiptSigner::new(random_p256(), sequencer_ds_did.clone());
+        cache_test_did_document(make_test_receipt_did_doc_with_auth(
+            &sequencer_ds_did,
+            &sequencer_receipt_signer.verifying_key(),
+            sequencer_ds_key.verifying_key(),
+        ))
+        .await;
         // Seed peer policy
         sqlx::query(
             r#"
@@ -463,9 +472,11 @@ impl TestHarness {
             "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
         );
 
+        let i13_signer = I13ReceiptSigner::new(random_p256(), LOCAL_DS_DID.to_owned());
         let runtime = Arc::new(
             ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
-                .expect("build chat runtime"),
+                .expect("build chat runtime")
+                .with_i13_receipt_signer(i13_signer),
         );
 
         let state = TestDsState::new(pool.clone(), Some(ack_signer.clone()), runtime);
@@ -480,6 +491,7 @@ impl TestHarness {
             sender_ds_key,
             sequencer_ds_did,
             sequencer_ds_key,
+            sequencer_receipt_signer,
         }
     }
 
@@ -821,6 +833,38 @@ async fn seed_corpus_conversation_at_added(
     let add_entry_id = Uuid::new_v4();
     let sv3_metadata_snapshot_id = Uuid::new_v4();
     let recovery_request_id = Uuid::new_v4();
+    let (_, inv_signed_req_bytes) = make_policy_body(
+        convo_id,
+        inv_transition_id,
+        &alice,
+        &group_id,
+        0,
+        0,
+        &genesis_group_context_hash,
+        &genesis_confirmation_tag,
+        creation_time,
+    );
+    let inv_mutation =
+        decode_and_verify_signed_mutation(&inv_signed_req_bytes, &alice.public_key).unwrap();
+    let inv_received_at = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(&creation_time.to_rfc3339_opts(SecondsFormat::Millis, true))
+            .unwrap(),
+    );
+    let inv_endpoint = ValidatedChatNsid::parse("blue.catbird.chat.submitTransition").unwrap();
+    let inv_server_fields = CanonicalControlServerFields::empty(ControlEntryKind::Policy).unwrap();
+    let inv_built = build_verified_control_entry(
+        inv_mutation,
+        &inv_endpoint,
+        CanonicalUuidV4::parse(&inv_entry_id.to_string()).unwrap(),
+        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+        2,
+        &inv_received_at,
+        inv_server_fields,
+    )
+    .unwrap();
+    let inv_products = CanonicalControlEntryProducts::mint(&inv_built).unwrap();
+    let inv_entry_bytes = inv_products.durable_json().to_vec();
+    let inv_outer_fp = *inv_built.outer_control_fingerprint();
     let _recovery_req_time = now - chrono::Duration::minutes(1);
 
     let (_, acc_signed_req_bytes) = make_acceptance_body(
@@ -1051,11 +1095,11 @@ async fn seed_corpus_conversation_at_added(
     .bind(&alice.did)
     .bind(alice.device_id)
     .bind(&alice.key_id)
-    .bind(&signed_request)
-    .bind(&unsigned_projection)
-    .bind(&signing_transcript)
-    .bind(&request_digest)
-    .bind(&signature)
+    .bind(&inv_signed_req_bytes)
+    .bind(inv_built.mutation().canonical_projection())
+    .bind(inv_built.mutation().transcript_bytes())
+    .bind(inv_built.mutation().request_digest().as_slice())
+    .bind(inv_built.mutation().signature().as_slice())
     .bind(creation_time)
     .execute(&mut *tx)
     .await
@@ -1647,12 +1691,12 @@ async fn seed_corpus_conversation_at_added(
     )
     .bind(convo_id)
     .bind(inv_entry_id)
-    .bind(&accepted_payload)
-    .bind(Sha256::digest(&accepted_payload).to_vec())
-    .bind(&signed_request)
-    .bind(&request_digest)
-    .bind(&signature)
-    .bind(&creation_fingerprint)
+    .bind(&inv_entry_bytes)
+    .bind(Sha256::digest(&inv_entry_bytes).to_vec())
+    .bind(&inv_signed_req_bytes)
+    .bind(inv_built.mutation().request_digest().as_slice())
+    .bind(inv_built.mutation().signature().as_slice())
+    .bind(&inv_outer_fp[..])
     .bind(&alice.did)
     .bind(alice.device_id)
     .bind(&alice.key_id)
@@ -2666,63 +2710,18 @@ fn make_message_body(
     attachments: Vec<Value>,
     now: DateTime<Utc>,
 ) -> (Value, Vec<u8>) {
-    let msg_bytes = vec![0x31u8; 8];
-    let unsigned = json!({
-        "$type": "blue.catbird.chat.defs#applicationSendBody",
-        "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0}",
-        "messageId": message_id.to_string(),
-        "actorDid": actor.did,
-        "actorDeviceId": actor.device_id.to_string(),
-        "keyId": actor.key_id,
-        "authGeneration": 1,
-        "sendCounter": next_send_counter(),
-        "prior": {
-            "conversationId": convo_id.to_string(),
-            "generation": 0,
-            "stateVersion": 0,
-            "groupId": STANDARD.encode(group_id),
-            "epoch": 0,
-            "groupContextHash": STANDARD.encode([0u8; 32]),
-            "confirmationTag": STANDARD.encode([0u8; 32]),
-            "lifecycle": "active"
-        },
-        "aad": {
-            "protocolVersion": "1",
-            "conversationId": STANDARD.encode(convo_id.as_bytes()),
-            "generation": 0,
-            "messageId": STANDARD.encode(message_id.as_bytes()),
-            "prior": {
-                "conversationId": STANDARD.encode(convo_id.as_bytes()),
-                "generation": 0,
-                "stateVersion": 0,
-                "groupId": STANDARD.encode(group_id),
-                "epoch": 0,
-                "groupContextHash": STANDARD.encode([0u8; 32]),
-                "confirmationTag": STANDARD.encode([0u8; 32]),
-                "lifecycle": "active"
-            }
-        },
-        "applicationMessage": {
-            "framing": "mlsMessage",
-            "contentType": "privateMessageApplication",
-            "bytes": STANDARD.encode(&msg_bytes),
-            "sha256": STANDARD.encode(Sha256::digest(&msg_bytes))
-        },
-        "blobBindings": attachments,
-        "signedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
-    });
-
-    let mut wrapper = json!({
-        "body": unsigned,
-        "signature": STANDARD.encode([0u8; 64]),
-    });
-    let unsigned_bytes = serde_json::to_vec(&wrapper).unwrap();
-    let mutation = decode_canonical_signed_mutation(&unsigned_bytes).unwrap();
-    let sig = actor.signing_key.sign(mutation.transcript_bytes());
-
-    wrapper["signature"] = Value::String(STANDARD.encode(sig.to_bytes()));
-    let signed_bytes = serde_json::to_vec(&wrapper).unwrap();
-    (wrapper, signed_bytes)
+    make_message_body_with_coordinates(
+        convo_id,
+        message_id,
+        actor,
+        group_id,
+        0,
+        0,
+        &[0; 32],
+        &[0; 32],
+        attachments,
+        now,
+    )
 }
 
 fn make_commit_body(
@@ -2962,6 +2961,13 @@ fn make_message_body_with_coordinates(
     now: DateTime<Utc>,
 ) -> (Value, Vec<u8>) {
     let msg_bytes = vec![0x31u8; 8];
+    let archive_commitment: [u8; 32] = Sha256::digest(&msg_bytes).into();
+    let archive_transcript = labyrinth_protocol::transcripts::original_sender_archive_transcript(
+        &convo_id.to_string(),
+        &message_id.to_string(),
+        &archive_commitment,
+    );
+    let archive_signature: ed25519_dalek::Signature = actor.signing_key.sign(&archive_transcript);
     let unsigned = json!({
         "$type": "blue.catbird.chat.defs#applicationSendBody",
         "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0}",
@@ -2995,7 +3001,14 @@ fn make_message_body_with_coordinates(
                 "groupContextHash": STANDARD.encode(group_context_hash),
                 "confirmationTag": STANDARD.encode(confirmation_tag),
                 "lifecycle": "active"
-            }
+            },
+            "archiveCommitment": STANDARD.encode(archive_commitment),
+            "originalSenderAttestation": {
+                "senderDid": actor.did,
+                "senderDeviceId": actor.device_id.to_string(),
+                "senderTransportPubkey": STANDARD.encode(actor.public_key),
+                "signature": STANDARD.encode(archive_signature.to_bytes()),
+            },
         },
         "applicationMessage": {
             "framing": "mlsMessage",
@@ -4663,6 +4676,47 @@ async fn test_submit_commit_router_authenticated_positive_and_replay() {
         "submitCommit must succeed: {body:?}"
     );
     assert_eq!(body["receipt"]["deliveryId"], delivery_id.to_string());
+    let control_receipt = &body["commitEntry"]["sequencerReceipt"];
+    assert!(
+        control_receipt.is_object(),
+        "commitEntry must carry signed I13 evidence: {body}"
+    );
+    assert_eq!(control_receipt["seq"], body["commitEntry"]["seq"]);
+    assert_eq!(control_receipt["entryId"], body["commitEntry"]["entryId"]);
+    assert_eq!(control_receipt["sequencerDid"], LOCAL_DS_DID);
+    let bytes = |value: &Value| {
+        let encoded = value
+            .as_str()
+            .or_else(|| value.pointer("/$bytes").and_then(Value::as_str))
+            .expect("receipt bytes");
+        STANDARD.decode(encoded).expect("base64 receipt bytes")
+    };
+    assert_eq!(
+        bytes(&control_receipt["signature"]).len(),
+        64,
+        "I13 uses a raw ES256 signature"
+    );
+    let persisted_receipt: Vec<u8> = sqlx::query_scalar(
+        "SELECT sequencer_receipt_bytes FROM chat.entries \
+         WHERE conversation_id = $1 AND transition_id = $2",
+    )
+    .bind(convo_id)
+    .bind(generic_transition_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("persisted commit receipt");
+    let persisted_receipt: Value = serde_json::from_slice(&persisted_receipt).unwrap();
+    for field in ["sequencerDid", "conversationId", "entryId", "seq", "kid"] {
+        assert_eq!(
+            persisted_receipt[field], control_receipt[field],
+            "durable receipt field {field}"
+        );
+    }
+    assert_eq!(
+        bytes(&persisted_receipt["signature"]),
+        bytes(&control_receipt["signature"]),
+        "mutation answer and durable projection retain the same signature"
+    );
 
     // 3. Verify receipt in DB
     let receipt_count: i64 = sqlx::query_scalar(
@@ -6530,10 +6584,18 @@ fn make_test_receipt_did_doc(
     did: &str,
     key: &p256::ecdsa::VerifyingKey,
 ) -> catbird_server::auth::DidDocument {
+    make_test_receipt_did_doc_with_auth(did, key, key)
+}
+
+fn make_test_receipt_did_doc_with_auth(
+    did: &str,
+    receipt_key: &p256::ecdsa::VerifyingKey,
+    auth_key: &p256::ecdsa::VerifyingKey,
+) -> catbird_server::auth::DidDocument {
     let mut multikey = vec![0x80, 0x24];
-    multikey.extend_from_slice(key.to_encoded_point(true).as_bytes());
+    multikey.extend_from_slice(receipt_key.to_encoded_point(true).as_bytes());
     let public_key_multibase = multibase::encode(multibase::Base::Base58Btc, multikey);
-    let point = key.to_encoded_point(false);
+    let point = auth_key.to_encoded_point(false);
     let jwk_val = serde_json::json!({
         "kty": "EC",
         "crv": "P-256",
@@ -6545,7 +6607,7 @@ fn make_test_receipt_did_doc(
         id: did.to_string(),
         verification_method: vec![
             catbird_server::auth::VerificationMethod {
-                id: catbird_server::federation::RECEIPT_VERIFICATION_METHOD.to_string(),
+                id: format!("{did}#mls-receipt-1"),
                 key_type: "Multikey".to_string(),
                 controller: did.to_string(),
                 public_key_multibase: Some(public_key_multibase),
@@ -7973,7 +8035,11 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
     ));
     let seq_runtime = Arc::new(
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
-            .expect("build sequencer chat runtime"),
+            .expect("build sequencer chat runtime")
+            .with_i13_receipt_signer(I13ReceiptSigner::new(
+                local_ds_key.clone(),
+                LOCAL_DS_DID.to_owned(),
+            )),
     );
     let seq_test_state = TestDsState::new(
         seq_pool.clone(),
@@ -8183,6 +8249,7 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
     // Call 2: Client retries with fresh service auth token but identical signedRequest.
     // The sequencer already committed the entry on call 1 (its response was dropped),
     // so the retry must succeed and apply exactly once.
+    let retry_ts = Utc::now().timestamp();
     let jwt2 = sign_jwt(
         json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto", alice.did)}),
         json!({
@@ -8190,8 +8257,8 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
             "sub": alice.did,
             "aud": AUDIENCE,
             "lxm": "blue.catbird.chat.submitTransition",
-            "iat": now_ts,
-            "exp": now_ts + 60,
+            "iat": retry_ts,
+            "exp": retry_ts + 60,
             "jti": Uuid::new_v4().to_string(),
         }),
         &alice_p256,
@@ -8421,9 +8488,21 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
     };
     let mut remote_events: Vec<Value> = remote_rows
         .iter()
-        .map(|row| clean_event_json(row, row.entry_id))
+        .map(|row| {
+            clean_event_json(
+                convo_id,
+                row,
+                row.entry_id,
+                &harness.sequencer_receipt_signer,
+            )
+        })
         .collect();
-    remote_events.push(clean_event_json(&remote_row_5, msg_id_5));
+    remote_events.push(clean_event_json(
+        convo_id,
+        &remote_row_5,
+        msg_id_5,
+        &harness.sequencer_receipt_signer,
+    ));
     remote_rows.push(remote_row_5);
     let remote_digest_sha256 = compute_clean_convo_digest(&remote_rows);
 
@@ -8440,12 +8519,36 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
         generated_at: now,
     };
 
-    let events_output = serde_json::json!({
+    let valid_remote_events = remote_events;
+    let expected_suffix_receipt = valid_remote_events
+        .last()
+        .and_then(|event| event.pointer("/sequencerReceipt/$bytes"))
+        .and_then(Value::as_str)
+        .and_then(|encoded| STANDARD.decode(encoded).ok())
+        .expect("valid suffix receipt bytes");
+    let mut forged_remote_events = valid_remote_events.clone();
+    let mut forged_receipt = expected_suffix_receipt.clone();
+    *forged_receipt.last_mut().expect("non-empty receipt") ^= 1;
+    *forged_remote_events
+        .last_mut()
+        .unwrap()
+        .pointer_mut("/sequencerReceipt/$bytes")
+        .unwrap() = json!(STANDARD.encode(forged_receipt));
+    let valid_events_output = serde_json::json!({
         "convoId": convo_id_str,
         "fromSeqExclusive": 0,
         "toSeqInclusive": 5,
-        "events": remote_events,
+        "events": valid_remote_events,
     });
+    let forged_events_output = serde_json::json!({
+        "convoId": convo_id_str,
+        "fromSeqExclusive": 0,
+        "toSeqInclusive": 5,
+        "events": forged_remote_events,
+    });
+    let events_body = Arc::new(std::sync::Mutex::new(
+        serde_json::to_vec(&forged_events_output).unwrap(),
+    ));
 
     let app = axum::Router::new()
         .route(
@@ -8467,9 +8570,9 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
         .route(
             "/xrpc/blue.catbird.mlsDS.getConvoEvents",
             axum::routing::get({
-                let e = serde_json::to_vec(&events_output).unwrap();
+                let events_body = Arc::clone(&events_body);
                 move || {
-                    let b = e.clone();
+                    let b = events_body.lock().unwrap().clone();
                     async move {
                         axum::response::Response::builder()
                             .status(200)
@@ -8523,6 +8626,41 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
     let outbound = Arc::new(OutboundClient::new(2, 2));
     let auth_sign = Arc::new(move |_target: &str, _nsid: &str| Ok("test-token".to_string()));
 
+    let forged = catbird_server::federation::reconciliation::reconcile_conversation(
+        &harness.pool,
+        &resolver,
+        &outbound,
+        auth_sign.as_ref(),
+        &convo_id_str,
+        &harness.sequencer_ds_did,
+    )
+    .await;
+    assert!(
+        forged.is_err(),
+        "a forged reconciliation receipt was accepted"
+    );
+    let imported: (i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT count(*) FROM chat.entries WHERE conversation_id=$1 AND seq=5), \
+             (SELECT count(*) FROM chat.message_sends WHERE conversation_id=$1 AND message_id=$2)",
+    )
+    .bind(convo_id)
+    .bind(msg_id_5)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        imported,
+        (0, 0),
+        "receipt verification must precede every reconciliation import"
+    );
+    sqlx::query("DELETE FROM federation_sync_state WHERE convo_id=$1")
+        .bind(&convo_id_str)
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+    *events_body.lock().unwrap() = serde_json::to_vec(&valid_events_output).unwrap();
+
     let res = catbird_server::federation::reconciliation::reconcile_conversation(
         &harness.pool,
         &resolver,
@@ -8532,7 +8670,6 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
         &harness.sequencer_ds_did,
     )
     .await;
-
     assert!(
         res.is_ok(),
         "reconcile_conversation must succeed: {:?}",
@@ -8564,6 +8701,18 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
         now,
     )
     .await;
+    let stored_suffix_receipt: Vec<u8> = sqlx::query_scalar(
+        "SELECT sequencer_receipt_bytes FROM chat.entries \
+         WHERE conversation_id=$1 AND seq=5",
+    )
+    .bind(convo_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored_suffix_receipt, expected_suffix_receipt,
+        "reconciliation must persist the exact verified sequencer receipt"
+    );
     let sync_state: (String, i64, Option<String>) = sqlx::query_as(
         "SELECT status, last_seq, quarantine_reason FROM federation_sync_state WHERE convo_id = $1",
     )
@@ -8728,7 +8877,7 @@ async fn test_reconciliation_same_last_seq_differing_fingerprint_quarantines_wit
             outer_entry_fingerprint: local_row_1.outer_entry_fingerprint.clone(),
             received_at: local_row_1.received_at,
         },
-        remote_row_2,
+        remote_row_2.clone(),
     ];
     let remote_digest_sha256 = compute_clean_convo_digest(&remote_rows);
 
@@ -8750,34 +8899,18 @@ async fn test_reconciliation_same_last_seq_differing_fingerprint_quarantines_wit
         "fromSeqExclusive": 0,
         "toSeqInclusive": 2,
         "events": [
-            {
-                "seq": 1,
-                "epoch": local_row_1.epoch,
-                "msgId": local_row_1.entry_id.to_string(),
-                "messageType": local_row_1.entry_kind,
-                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
-                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
-                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "entryId": local_row_1.entry_id.to_string(),
-                "entryKind": local_row_1.entry_kind,
-                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
-                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
-                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
-            },
-            {
-                "seq": 2,
-                "epoch": 0,
-                "msgId": msg_id_2_remote.to_string(),
-                "messageType": "blue.catbird.chat.defs#applicationEntry",
-                "ciphertext": {"$bytes": STANDARD.encode(&ciphertext_2_remote)},
-                "paddedSize": ciphertext_2_remote.len() as i64,
-                "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "entryId": msg_id_2_remote.to_string(),
-                "entryKind": "blue.catbird.chat.defs#applicationEntry",
-                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256_2_remote)},
-                "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2_remote)},
-                "outerFingerprint": {"$bytes": STANDARD.encode(&payload_sha256_2_remote)}
-            }
+            clean_event_json(
+                convo_id,
+                &local_row_1,
+                local_row_1.entry_id,
+                &harness.sequencer_receipt_signer,
+            ),
+            clean_event_json(
+                convo_id,
+                &remote_row_2,
+                msg_id_2_remote,
+                &harness.sequencer_receipt_signer,
+            ),
         ]
     });
 
@@ -9043,22 +9176,12 @@ async fn test_reconciliation_local_ahead_of_sequencer_quarantines_without_trunca
         "convoId": convo_id_str,
         "fromSeqExclusive": 0,
         "toSeqInclusive": 1,
-        "events": [
-            {
-                "seq": 1,
-                "epoch": local_row_1.epoch,
-                "msgId": local_row_1.entry_id.to_string(),
-                "messageType": local_row_1.entry_kind,
-                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
-                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
-                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "entryId": local_row_1.entry_id.to_string(),
-                "entryKind": local_row_1.entry_kind,
-                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
-                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
-                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
-            }
-        ]
+        "events": [clean_event_json(
+            convo_id,
+            &local_row_1,
+            local_row_1.entry_id,
+            &harness.sequencer_receipt_signer,
+        )]
     });
 
     let app = axum::Router::new()
@@ -9755,7 +9878,14 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
     // Generate 505 suffix events (seq 5..=509) after a genuine four-entry prefix.
     let mut all_events: Vec<Value> = local_rows
         .iter()
-        .map(|row| clean_event_json(row, row.entry_id))
+        .map(|row| {
+            clean_event_json(
+                convo_id,
+                row,
+                row.entry_id,
+                &harness.sequencer_receipt_signer,
+            )
+        })
         .collect();
     let mut all_digest_rows = local_rows;
     all_events.reserve(505);
@@ -9808,7 +9938,12 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             received_at: now,
         };
 
-        all_events.push(clean_event_json(&row, msg_id));
+        all_events.push(clean_event_json(
+            convo_id,
+            &row,
+            msg_id,
+            &harness.sequencer_receipt_signer,
+        ));
         all_digest_rows.push(row);
         generated_suffix.push(GeneratedSuffix {
             seq,
@@ -10045,10 +10180,9 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             "reconciliation exceeded 50 passes without converging"
         );
     }
-    assert!(
-        passes > 1,
-        "reconciliation of 509 events must take multiple bounded passes, took {}",
-        passes
+    assert_eq!(
+        passes, 3,
+        "receipt-complete reconciliation of 509 events must take exactly three bounded passes"
     );
 
     // Verify exact authenticated pagination sequence
@@ -10063,9 +10197,13 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             (0, 500),
             (130, 500),
             (260, 500),
-            (390, 500)
+            (390, 500),
+            (0, 500),
+            (130, 500),
+            (260, 500),
+            (390, 500),
         ],
-        "pagination requests must match exact two-pass chunked sequence"
+        "pagination requests must match exact three-pass chunked sequence"
     );
     let final_next_seq: i64 = sqlx::query_scalar(
         "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id = $1",
@@ -10559,6 +10697,17 @@ async fn test_reconciliation_discontinuous_or_out_of_order_peer_page_gives_zero_
     let ciphertext_3 = built_3.canonical_entry_bytes().to_vec();
     let payload_sha256_3 = built_3.accepted_payload_sha256().to_vec();
     let outer_fp_3 = built_3.outer_application_fingerprint().to_vec();
+    let remote_row_3 = CleanDigestRow {
+        seq: 3,
+        epoch: 0,
+        entry_id: msg_entry_id_3,
+        entry_kind: "blue.catbird.chat.defs#applicationEntry".to_string(),
+        accepted_payload_bytes: ciphertext_3.clone(),
+        accepted_payload_sha256: payload_sha256_3,
+        signed_request_bytes: signed_req_bytes_3.clone(),
+        outer_entry_fingerprint: outer_fp_3.clone(),
+        received_at: now,
+    };
     let mut hasher = catbird_server::handlers::ds::get_convo_digest::CleanConvoDigestHasher::new();
     hasher.update_row(&local_row_1);
     hasher.update_event(
@@ -10592,34 +10741,18 @@ async fn test_reconciliation_discontinuous_or_out_of_order_peer_page_gives_zero_
         "fromSeqExclusive": 0,
         "toSeqInclusive": 3,
         "events": [
-            {
-                "seq": 1,
-                "epoch": local_row_1.epoch,
-                "msgId": local_row_1.entry_id.to_string(),
-                "messageType": local_row_1.entry_kind,
-                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
-                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
-                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "entryId": local_row_1.entry_id.to_string(),
-                "entryKind": local_row_1.entry_kind,
-                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
-                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
-                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
-            },
-            {
-                "seq": 3, // Discontinuous: expected 2, got 3
-                "epoch": 0,
-                "msgId": msg_id_3.to_string(),
-                "messageType": "blue.catbird.chat.defs#applicationEntry",
-                "ciphertext": {"$bytes": STANDARD.encode(&ciphertext_3)},
-                "paddedSize": ciphertext_3.len() as i64,
-                "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "entryId": msg_entry_id_3.to_string(),
-                "entryKind": "blue.catbird.chat.defs#applicationEntry",
-                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256_3)},
-                "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_3)},
-                "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_3)}
-            }
+            clean_event_json(
+                convo_id,
+                &local_row_1,
+                local_row_1.entry_id,
+                &harness.sequencer_receipt_signer,
+            ),
+            clean_event_json(
+                convo_id,
+                &remote_row_3,
+                msg_id_3,
+                &harness.sequencer_receipt_signer,
+            ),
         ]
     });
 
@@ -10811,7 +10944,7 @@ async fn test_reconciliation_concurrent_local_head_movement_aborts_without_write
             outer_entry_fingerprint: local_row_1.outer_entry_fingerprint.clone(),
             received_at: local_row_1.received_at,
         },
-        remote_row_2,
+        remote_row_2.clone(),
     ];
     let remote_digest_sha256 = compute_clean_convo_digest(&remote_rows);
 
@@ -10833,34 +10966,18 @@ async fn test_reconciliation_concurrent_local_head_movement_aborts_without_write
         "fromSeqExclusive": 0,
         "toSeqInclusive": 2,
         "events": [
-            {
-                "seq": 1,
-                "epoch": local_row_1.epoch,
-                "msgId": local_row_1.entry_id.to_string(),
-                "messageType": local_row_1.entry_kind,
-                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
-                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
-                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "entryId": local_row_1.entry_id.to_string(),
-                "entryKind": local_row_1.entry_kind,
-                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
-                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
-                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
-            },
-            {
-                "seq": 2,
-                "epoch": 0,
-                "msgId": msg_id_2.to_string(),
-                "messageType": "blue.catbird.chat.defs#applicationEntry",
-                "ciphertext": {"$bytes": STANDARD.encode(&ciphertext_2)},
-                "paddedSize": ciphertext_2.len() as i64,
-                "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "entryId": msg_entry_id_2.to_string(),
-                "entryKind": "blue.catbird.chat.defs#applicationEntry",
-                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256_2)},
-                "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2)},
-                "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_2)}
-            }
+            clean_event_json(
+                convo_id,
+                &local_row_1,
+                local_row_1.entry_id,
+                &harness.sequencer_receipt_signer,
+            ),
+            clean_event_json(
+                convo_id,
+                &remote_row_2,
+                msg_id_2,
+                &harness.sequencer_receipt_signer,
+            ),
         ]
     });
 
@@ -12983,7 +13100,82 @@ async fn capture_full_mailbox_snapshot(pool: &DbPool, convo_id: Uuid) -> FullMai
     }
 }
 
-fn clean_event_json(row: &CleanDigestRow, msg_id: Uuid) -> Value {
+fn clean_event_json(
+    conversation_id: Uuid,
+    row: &CleanDigestRow,
+    msg_id: Uuid,
+    signer: &I13ReceiptSigner,
+) -> Value {
+    let mutation = decode_canonical_signed_mutation(&row.signed_request_bytes)
+        .expect("clean fixture signed request must be canonical");
+    let signed_request: Value = serde_json::from_slice(&row.signed_request_bytes)
+        .expect("clean fixture signed request JSON");
+    let body = &signed_request["body"];
+    let coordinate = body
+        .get("next")
+        .filter(|value| value.is_object())
+        .or_else(|| body.get("successor").filter(|value| value.is_object()))
+        .or_else(|| body.get("prior").filter(|value| value.is_object()))
+        .expect("clean fixture receipt coordinate");
+    let decode_bytes = |value: &Value| {
+        let encoded = value
+            .as_str()
+            .or_else(|| value.get("$bytes").and_then(Value::as_str))
+            .expect("clean fixture bytes");
+        STANDARD.decode(encoded).expect("clean fixture base64")
+    };
+    let group_id = decode_bytes(&coordinate["groupId"]);
+    let generation = coordinate["generation"]
+        .as_u64()
+        .expect("clean fixture generation");
+    let epoch = coordinate["epoch"].as_u64().expect("clean fixture epoch");
+    let seq = u64::try_from(row.seq).expect("clean fixture seq");
+    let issued_at_ms = row.received_at.timestamp_millis();
+    let receipt = if row.entry_kind == "blue.catbird.chat.defs#applicationEntry" {
+        let archive_commitment: [u8; 32] = decode_bytes(&body["aad"]["archiveCommitment"])
+            .try_into()
+            .expect("clean fixture archive commitment");
+        let signed_receipt = signer
+            .sign_application_receipt(
+                &conversation_id.to_string(),
+                &group_id,
+                epoch,
+                mutation.actor_did().as_str(),
+                mutation.actor_device_id().as_str(),
+                &row.entry_id.to_string(),
+                &archive_commitment,
+                seq,
+                issued_at_ms,
+            )
+            .expect("sign clean application receipt");
+        I13ReceiptSigner::receipt_wire_json(
+            &signed_receipt,
+            generation,
+            mutation.actor_did().as_str(),
+            mutation.actor_device_id().as_str(),
+        )
+    } else {
+        let input = I13ControlReceiptInput::from_fields(
+            &conversation_id.to_string(),
+            &row.entry_id.to_string(),
+            seq,
+            &row.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            mutation.actor_did().as_str(),
+            mutation.actor_device_id().as_str(),
+            *mutation.request_digest(),
+        )
+        .expect("build clean control receipt input");
+        signer
+            .sign_control_receipt_at(
+                &input,
+                &conversation_id.to_string(),
+                generation,
+                &group_id,
+                epoch,
+            )
+            .expect("sign clean control receipt")
+    };
+    let receipt_bytes = serde_json::to_vec(&receipt).expect("serialize clean receipt");
     json!({
         "seq": row.seq,
         "epoch": row.epoch,
@@ -12996,7 +13188,8 @@ fn clean_event_json(row: &CleanDigestRow, msg_id: Uuid) -> Value {
         "entryKind": row.entry_kind.as_str(),
         "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&row.accepted_payload_sha256)},
         "signedRequest": {"$bytes": STANDARD.encode(&row.signed_request_bytes)},
-        "outerFingerprint": {"$bytes": STANDARD.encode(&row.outer_entry_fingerprint)}
+        "outerFingerprint": {"$bytes": STANDARD.encode(&row.outer_entry_fingerprint)},
+        "sequencerReceipt": {"$bytes": STANDARD.encode(receipt_bytes)}
     })
 }
 
@@ -13058,7 +13251,12 @@ async fn assert_reconciliation_rejects_invalid_accepted_payload_hash(
     let pre_snapshot = capture_full_mailbox_snapshot(&harness.pool, convo_id).await;
 
     let mut remote_rows = vec![local_row.clone()];
-    let mut events = vec![clean_event_json(&local_row, local_row.entry_id)];
+    let mut events = vec![clean_event_json(
+        convo_id,
+        &local_row,
+        local_row.entry_id,
+        &harness.sequencer_receipt_signer,
+    )];
     if location == InvalidCleanHashLocation::Suffix {
         let message_id = Uuid::new_v4();
         let entry_id = Uuid::new_v4();
@@ -13088,7 +13286,12 @@ async fn assert_reconciliation_rejects_invalid_accepted_payload_hash(
             outer_entry_fingerprint: built.outer_application_fingerprint().to_vec(),
             received_at: now,
         };
-        events.push(clean_event_json(&remote_row, message_id));
+        events.push(clean_event_json(
+            convo_id,
+            &remote_row,
+            message_id,
+            &harness.sequencer_receipt_signer,
+        ));
         remote_rows.push(remote_row);
     }
 

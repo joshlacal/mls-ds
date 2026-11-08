@@ -878,6 +878,7 @@ pub(crate) async fn try_relay_home_group_operation(
         actor_did: actor.to_owned(),
         actor_device_id: device,
         signed_request: signed.clone(),
+        signed_request_bytes: None,
     };
     let payload = serde_json::to_value(request).map_err(|e| internal(e.to_string()))?;
     let (status, bytes) = call_home_response(
@@ -1345,6 +1346,7 @@ async fn relay_membership_inner(
             &state.pool,
             admission,
             relationship.as_ref(),
+            state.i13_receipt_signer(),
         )
         .await
         .unwrap_or_else(IntoResponse::into_response))

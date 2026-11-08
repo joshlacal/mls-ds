@@ -135,7 +135,8 @@ fn runtime(cutover_enabled: bool) -> Arc<ChatRuntime> {
     }
     Arc::new(
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
-            .expect("build clean-chat runtime"),
+            .expect("build clean-chat runtime")
+            .with_i13_receipt_signer(common::proof_i13_signer()),
     )
 }
 

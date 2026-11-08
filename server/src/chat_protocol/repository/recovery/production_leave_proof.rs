@@ -70,7 +70,9 @@ pub(super) async fn run_leafless_lifecycle_with_open_recovery(
         crate::chat_protocol::repository::prelude::prepare_signed_operation(&mut tx, admission)
             .await
             .map_err(|e| format!("prepare recovery: {e:?}"))?;
-    let opened = execute_prepared_recovery(&mut tx, prepared, &relationship)
+    let i13_signer = proof_i13_signer();
+    let opened =
+        execute_prepared_recovery(&mut tx, prepared, &relationship, Some(&i13_signer))
         .await
         .map_err(|e| format!("open recovery: {e:?}"))?;
     if opened.status() != 200 {
@@ -158,6 +160,7 @@ pub(super) async fn run_leafless_lifecycle_with_open_recovery(
             &mut tx,
             prepared,
             &relationship,
+            None,
         )
         .await
         .map_err(|e| format!("accept with reserved recovery: {e:?}"))?;
@@ -172,7 +175,7 @@ pub(super) async fn run_leafless_lifecycle_with_open_recovery(
         result.response_bytes().to_vec()
     } else {
         let result =
-            crate::chat_protocol::repository::leave::execute_prepared_leave(&mut tx, prepared)
+            crate::chat_protocol::repository::leave::execute_prepared_leave(&mut tx, prepared, None)
                 .await
                 .map_err(|e| format!("execute {endpoint} with reserved recovery: {e:?}"))?;
         if result.status != 200 {
@@ -390,7 +393,7 @@ pub(super) async fn run_removed_device_terminal_entry_read(pool: &PgPool) -> Res
     let prepared=crate::chat_protocol::repository::prelude::prepare_signed_operation(&mut tx,admission).await.map_err(|e|format!("prepare Remove: {e:?}"))?;
     let relationship=crate::chat_protocol::relationship_policy::ProductionRelationshipAuthority::from_startup_guard(
         crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard().map_err(|e|format!("relationship authority: {e:?}"))?);
-    let outcome=crate::chat_protocol::repository::submit_transition::execute_prepared_submit_transition(&mut tx,prepared,&relationship,None,crate::chat_protocol::repository::submit_transition::RemoteCommitPreflightOutcome::NotRemoteOrDeferred).await.map_err(|e|format!("execute real signed Remove: {e:?}"))?;
+    let outcome=crate::chat_protocol::repository::submit_transition::execute_prepared_submit_transition(&mut tx,prepared,&relationship,None,None,crate::chat_protocol::repository::submit_transition::RemoteCommitPreflightOutcome::NotRemoteOrDeferred).await.map_err(|e|format!("execute real signed Remove: {e:?}"))?;
     if outcome.status()!=200 { return Err(format!("Remove status {}",outcome.status())); }
     tx.commit().await.map_err(|e|format!("commit signed Remove: {e}"))?;
     // A later genuine policy control is not part of the removed leaf's MLS
@@ -404,7 +407,7 @@ pub(super) async fn run_removed_device_terminal_entry_read(pool: &PgPool) -> Res
     let admission=admit_lifecycle(pool,creator,"blue.catbird.chat.submitTransition",&policy,&trusted).await?;
     let mut tx=pool.begin().await.map_err(|e|e.to_string())?;
     let prepared=crate::chat_protocol::repository::prelude::prepare_signed_operation(&mut tx,admission).await.map_err(|e|format!("prepare policy: {e:?}"))?;
-    let outcome=crate::chat_protocol::repository::submit_transition::execute_prepared_submit_transition(&mut tx,prepared,&relationship,None,crate::chat_protocol::repository::submit_transition::RemoteCommitPreflightOutcome::NotRemoteOrDeferred).await.map_err(|e|format!("execute later signed policy: {e:?}"))?;
+    let outcome=crate::chat_protocol::repository::submit_transition::execute_prepared_submit_transition(&mut tx,prepared,&relationship,None,None,crate::chat_protocol::repository::submit_transition::RemoteCommitPreflightOutcome::NotRemoteOrDeferred).await.map_err(|e|format!("execute later signed policy: {e:?}"))?;
     if outcome.status()!=200 {return Err("later policy did not execute".into())}
     tx.commit().await.map_err(|e|format!("commit later policy: {e}"))?;
     sqlx::query("INSERT INTO chat.entry_recipients(conversation_id,seq,user_did,device_id,entitlement_kind) SELECT conversation_id,seq,$2,$3,'control' FROM chat.entries WHERE conversation_id=$1 AND transition_id=$4 ON CONFLICT DO NOTHING")
