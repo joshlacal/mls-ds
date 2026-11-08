@@ -6546,15 +6546,16 @@ async fn former_exact_device_gets_access_outside_membership_interval() {
 
 #[tokio::test]
 #[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
-async fn post_reset_old_exact_device_cannot_inherit_current_did_state() {
+async fn post_reset_old_exact_device_reads_zero_leaf_current_state_only() {
     let fixture = executor_seed::private_genuine_reset_graph().await;
     let pool = fixture.pool.clone();
     let conversation_id = fixture.graph.conversation_id;
     let old = &fixture.old;
 
-    // BREAD-05 shape proof: the old exact device's DID is still a current
-    // participant, and the old exact device has no current leaf — the exact
-    // DID-level current-state inheritance trap the classification must refuse.
+    // BREAD-05 shape: the old exact device's DID is still an ACTIVE current
+    // participant, and the old exact device has no current leaf. Its
+    // reset-closed interval yields to that participation (spec §8: a zero-leaf
+    // active participant gets the current state it needs to rejoin).
     let current_participant: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM chat.participants \
          WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
@@ -6595,24 +6596,26 @@ async fn post_reset_old_exact_device_cannot_inherit_current_did_state() {
     )
     .await
     .expect("single-attempt lock");
-    let state_outcome = chat_protocol::read_authority::authorize_conversation_state(
+    let state = chat_protocol::read_authority::authorize_conversation_state(
         &mut tx,
         guard,
         conversation_id,
     )
     .await
-    .err()
-    .expect("the post-reset old exact device must not inherit the DID's current state");
-    assert_eq!(
-        state_outcome,
-        chat_protocol::read_authority::ReadAuthorityError::AccessOutsideMembershipInterval,
-        "BREAD-05: the exact device's finite reset interval is classified before \
-         the DID-only zero-leaf participant arm"
+    .expect("the reset-closed device of an active DID reads current state");
+    let view = chat_protocol::read_authority_bridge::state_authority_view(&state);
+    assert!(
+        matches!(
+            view.relationship.arm,
+            chat_protocol::read_authority_bridge::RelationshipArmView::ActiveParticipant
+        ),
+        "the reset-closed device is a zero-leaf active participant, never an open leaf"
     );
-    // By contrast, a sibling device of the same reset-retired DID (which has NO
-    // exact-device finite interval) DOES authorize current state under the
-    // active-participant arm, proving exact-device finite interval precedence
-    // over the participant arm.
+    assert_eq!(view.relationship.leaf_period_id, None);
+    assert_eq!(view.relationship.open_membership_interval_id, None);
+    rollback_with_constraints(tx).await;
+    // A sibling device of the same DID (no exact-device finite interval)
+    // authorizes the same zero-leaf active-participant arm.
     let sibling_device = Uuid::new_v4();
     let sibling_jkt = register_read_device(&pool, &old.did, sibling_device).await;
     let sibling_admission = fixture_read_admission(
@@ -6894,17 +6897,48 @@ async fn entry_intervals_preserve_readd_gaps_and_generation_boundaries() {
     )
     .await
     .expect("single-attempt lock");
-    // The post-reset OLD device is a former leaf: denied, not unioned. Its
-    // generation binding is proved above, directly against the durable rows.
-    let old_outcome =
+    // The post-reset OLD device holds only the bounded capability of its
+    // reset-closed interval: its separately entitled control entries through
+    // the reset activation that closed it, nothing after, no application
+    // ciphertext. Its generation binding is proved above.
+    let old_entries =
         chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
             .await
-            .err()
-            .expect("the post-reset old exact device holds no entry authority");
+            .expect("the reset-closed device holds bounded control entry authority");
+    let (opening_seq, end_seq) = old_entries
+        .terminal_control_interval()
+        .expect("a reset-closed interval mints a bounded control capability");
+    let page = chat_protocol::repository::delivery::get_entries_with_terminal_control_interval(
+        &mut tx,
+        conversation_id,
+        &old.did,
+        old.device_id,
+        0,
+        100,
+        Some((opening_seq, end_seq)),
+    )
+    .await
+    .expect("read the bounded control entries");
+    let seqs: Vec<i64> = page.entries.iter().map(|entry| entry.seq).collect();
+    assert!(
+        page.entries.iter().all(|entry| {
+            entry.seq >= opening_seq as i64
+                && entry.seq <= end_seq as i64
+                && entry.entry_kind != "blue.catbird.chat.defs#applicationEntry"
+        }),
+        "only control entries inside the reset-closed interval: {seqs:?}"
+    );
+    let last = page
+        .entries
+        .last()
+        .expect("the interval holds control entries");
     assert_eq!(
-        old_outcome,
-        chat_protocol::read_authority::ReadAuthorityError::AccessOutsideMembershipInterval,
-        "the retired-generation denial is the outside-interval error"
+        (last.seq, last.entry_kind.as_str()),
+        (
+            end_seq as i64,
+            "blue.catbird.chat.defs#resetActivationEntry"
+        ),
+        "the reset activation that closed the interval is readable and last"
     );
     rollback_with_constraints(tx).await;
 
@@ -8376,6 +8410,8 @@ fn c1_2_leaf_recovery_source(view_status: &str) -> RetainedLeafRecoveryProjectio
         C1_2_REQUESTED_AT,
         C1_2_EXPIRES_AT,
         reservation,
+        "acceptConversation",
+        &[],
     )
     .expect("fixture leaf-recovery source is checked")
 }
@@ -9237,6 +9273,8 @@ fn c1_2_checked_constructors_reject_invalid_values_before_materialization() {
         C1_2_REQUESTED_AT,
         C1_2_EXPIRES_AT,
         c1_2_reservation("consumed"),
+        "acceptConversation",
+        &[],
     )
     .err()
     .expect("checked-source failure");

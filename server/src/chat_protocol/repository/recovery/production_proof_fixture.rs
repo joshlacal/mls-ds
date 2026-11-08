@@ -1734,30 +1734,7 @@ fn build_genesis_state(
     conversation_id: Uuid,
     at: DateTime<Utc>,
 ) -> Result<(Vec<u8>, ActivePublicState), String> {
-    let provider = openmls_libcrux_crypto::Provider::new()
-        .map_err(|error| format!("create Recovery proof OpenMLS provider: {error:?}"))?;
-    let signing_key = SignatureKeyPair::from_raw(
-        XWING_CIPHERSUITE.signature_algorithm(),
-        identity.signing_key.to_bytes().to_vec(),
-        identity.signing_public_key().to_vec(),
-    );
-    signing_key
-        .store(provider.storage())
-        .map_err(|error| format!("store Recovery proof OpenMLS signer: {error:?}"))?;
     let credential = format!("{}#{}", identity.did, identity.device_id).into_bytes();
-    let lifetime = Lifetime::init(
-        u64::try_from((at - chrono::Duration::minutes(1)).timestamp())
-            .map_err(|_| "negative fixture lifetime".to_owned())?,
-        u64::try_from((at + chrono::Duration::hours(1)).timestamp())
-            .map_err(|_| "negative fixture lifetime".to_owned())?,
-    );
-    let config = MlsGroupCreateConfig::builder()
-        .ciphersuite(XWING_CIPHERSUITE)
-        .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
-        .use_ratchet_tree_extension(true)
-        .capabilities(exact_mls_capabilities())
-        .lifetime(lifetime)
-        .build();
     let group_id: [u8; 32] = Sha256::digest(
         [
             b"CATBIRD-RECOVERY-PRODUCTION-PROOF-GENESIS\0".as_ref(),
@@ -1766,46 +1743,22 @@ fn build_genesis_state(
         .concat(),
     )
     .into();
-    let group = MlsGroup::new_with_group_id(
-        &provider,
-        &signing_key,
-        &config,
-        GroupId::from_slice(&group_id),
-        CredentialWithKey {
-            credential: BasicCredential::new(credential.clone()).into(),
-            signature_key: identity.signing_public_key().to_vec().into(),
-        },
-    )
-    .map_err(|error| format!("create Recovery proof MLS group: {error:?}"))?;
-    let group_info = group
-        .export_group_info(provider.crypto(), &signing_key, true)
-        .map_err(|error| format!("export Recovery proof GroupInfo: {error:?}"))?
-        .tls_serialize_detached()
-        .map_err(|error| format!("serialize Recovery proof GroupInfo: {error:?}"))?;
-    let validated = validate_group_info(
-        &group_info,
-        GroupInfoValidationPolicy {
-            expected_basic_credential: &credential,
-            expected_signature_key: &identity.signing_public_key(),
-            now_unix_seconds: u64::try_from(at.timestamp())
-                .map_err(|_| "negative fixture clock".to_owned())?,
-            max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
-            max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
-            max_members: 2,
-        },
-    )
-    .map_err(|error| format!("validate Recovery proof GroupInfo: {error:?}"))?;
+    let (group_info, group_id, epoch, group_context_hash, confirmation_tag) =
+        single_member_group_info(
+            &identity.did,
+            identity.device_id,
+            &identity.signing_key,
+            group_id,
+            at,
+        )?;
     let coordinate = PublicGroupSnapshotCoordinate::new(
         *conversation_id.as_bytes(),
         0,
         0,
-        validated
-            .group_id()
-            .try_into()
-            .map_err(|_| "Recovery proof group id is not 32 bytes".to_owned())?,
-        validated.epoch(),
-        *validated.group_context_hash(),
-        *validated.confirmation_tag(),
+        group_id,
+        epoch,
+        group_context_hash,
+        confirmation_tag,
         PublicGroupSnapshotLifecycle::Active,
     );
     let state = verify_genesis_group_info(
@@ -1823,6 +1776,83 @@ fn build_genesis_state(
     )
     .map_err(|error| format!("construct Recovery proof public state: {error:?}"))?;
     Ok((group_info, state))
+}
+
+/// A genuine single-member GroupInfo for `did#device_id` signed by
+/// `signing_key`, with its validated group id, epoch, group-context hash, and
+/// confirmation tag.
+pub(super) fn single_member_group_info(
+    did: &str,
+    device_id: Uuid,
+    signing_key: &Ed25519SigningKey,
+    group_id: [u8; 32],
+    at: DateTime<Utc>,
+) -> Result<(Vec<u8>, [u8; 32], u64, [u8; 32], [u8; 32]), String> {
+    let provider = openmls_libcrux_crypto::Provider::new()
+        .map_err(|error| format!("create fixture OpenMLS provider: {error:?}"))?;
+    let public_key = signing_key.verifying_key().to_bytes();
+    let signer = SignatureKeyPair::from_raw(
+        XWING_CIPHERSUITE.signature_algorithm(),
+        signing_key.to_bytes().to_vec(),
+        public_key.to_vec(),
+    );
+    signer
+        .store(provider.storage())
+        .map_err(|error| format!("store fixture OpenMLS signer: {error:?}"))?;
+    let credential = format!("{did}#{device_id}").into_bytes();
+    let lifetime = Lifetime::init(
+        u64::try_from((at - chrono::Duration::minutes(1)).timestamp())
+            .map_err(|_| "negative fixture lifetime".to_owned())?,
+        u64::try_from((at + chrono::Duration::hours(1)).timestamp())
+            .map_err(|_| "negative fixture lifetime".to_owned())?,
+    );
+    let config = MlsGroupCreateConfig::builder()
+        .ciphersuite(XWING_CIPHERSUITE)
+        .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .use_ratchet_tree_extension(true)
+        .capabilities(exact_mls_capabilities())
+        .lifetime(lifetime)
+        .build();
+    let group = MlsGroup::new_with_group_id(
+        &provider,
+        &signer,
+        &config,
+        GroupId::from_slice(&group_id),
+        CredentialWithKey {
+            credential: BasicCredential::new(credential.clone()).into(),
+            signature_key: public_key.to_vec().into(),
+        },
+    )
+    .map_err(|error| format!("create fixture MLS group: {error:?}"))?;
+    let group_info = group
+        .export_group_info(provider.crypto(), &signer, true)
+        .map_err(|error| format!("export fixture GroupInfo: {error:?}"))?
+        .tls_serialize_detached()
+        .map_err(|error| format!("serialize fixture GroupInfo: {error:?}"))?;
+    let validated = validate_group_info(
+        &group_info,
+        GroupInfoValidationPolicy {
+            expected_basic_credential: &credential,
+            expected_signature_key: &public_key,
+            now_unix_seconds: u64::try_from(at.timestamp())
+                .map_err(|_| "negative fixture clock".to_owned())?,
+            max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+            max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+            max_members: 2,
+        },
+    )
+    .map_err(|error| format!("validate fixture GroupInfo: {error:?}"))?;
+    let group_id = validated
+        .group_id()
+        .try_into()
+        .map_err(|_| "fixture group id is not 32 bytes".to_owned())?;
+    Ok((
+        group_info,
+        group_id,
+        validated.epoch(),
+        *validated.group_context_hash(),
+        *validated.confirmation_tag(),
+    ))
 }
 
 fn build_available_key_package(

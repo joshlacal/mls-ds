@@ -12,6 +12,9 @@
 //! - `M-F08`: `revokeDevice` immediately revokes device access, deletes push bindings, and
 //!   evicts active WebSocket connections for the revoked device;
 //! - `M-F11`: Symmetric `16 MiB` (`16_777_216`) body limits across client and S2S artifact routes.
+//! - `R4`: every requestLeafRecovery-created `leafRecoveryView` carries the requester's exact
+//!   signed request (acceptance-created ones carry none); a non-admin `activateReset` is
+//!   `AdminRequired` with no effect.
 
 mod common;
 
@@ -449,6 +452,311 @@ async fn f03_non_admin_group_request_reset_rejected_while_admin_succeeds_and_mf0
         "revoked device must immediately lose read entitlement, got {post_revoke_read_status}"
     );
     let _ = STANDARD;
+}
+
+fn fixture_device(did: &str, device_id: Uuid) -> http::Device {
+    let signing = http::random_p256();
+    let jwk = http::public_jwk(&signing);
+    http::Device {
+        did: did.to_owned(),
+        device_id,
+        jkt: http::jwk_thumbprint(&jwk),
+        signing,
+        jwk,
+    }
+}
+
+/// Rewrite every lexicon `{"$bytes": b64}` presentation to the bare base64
+/// form a client signs and submits.
+fn bare_bytes(value: &mut serde_json::Value) {
+    if let Some(bytes) = value
+        .get("$bytes")
+        .and_then(serde_json::Value::as_str)
+        .filter(|_| value.as_object().is_some_and(|object| object.len() == 1))
+        .map(str::to_owned)
+    {
+        *value = serde_json::Value::String(bytes);
+        return;
+    }
+    match value {
+        serde_json::Value::Object(object) => object.values_mut().for_each(bare_bytes),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(bare_bytes),
+        _ => {}
+    }
+}
+
+/// The view's `signedRequest` is exactly the submitted wrapper and verifies
+/// under the requester's device key.
+fn assert_exact_signed_request(
+    view: &serde_json::Value,
+    submitted: &serde_json::Value,
+    requester: &ed25519_dalek::VerifyingKey,
+) {
+    let mut signed = view
+        .get("signedRequest")
+        .cloned()
+        .unwrap_or_else(|| panic!("requestLeafRecovery view lacks signedRequest: {view}"));
+    bare_bytes(&mut signed);
+    assert_eq!(
+        &signed, submitted,
+        "signedRequest is the exact submitted wrapper"
+    );
+    let canonical = catbird_server::chat_protocol::test_support::decode_canonical_signed_mutation(
+        &serde_json::to_vec(&signed).unwrap(),
+    )
+    .expect("signedRequest decodes as a canonical signed mutation");
+    let signature: [u8; 64] = STANDARD
+        .decode(signed["signature"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    requester
+        .verify_strict(
+            canonical.transcript_bytes(),
+            &ed25519_dalek::Signature::from_bytes(&signature),
+        )
+        .expect("signedRequest verifies under the requester device key");
+}
+
+/// The requester device's leaf-recovery inbox items, read through the
+/// inventory session its own getConversations opens.
+async fn leaf_recovery_inbox(
+    router: axum::Router,
+    device: &http::Device,
+) -> Vec<serde_json::Value> {
+    let (status, conversations) = http::send(
+        router.clone(),
+        http::unsigned_get_request(
+            device,
+            "blue.catbird.chat.getConversations",
+            &format!("actorDeviceId={}&limit=50", device.device_id),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "getConversations: {conversations}");
+    let session = conversations["inventorySessionId"].as_str().unwrap();
+    let (status, inbox) = http::send(
+        router,
+        http::unsigned_get_request(
+            device,
+            "blue.catbird.chat.getLeafRecoveryInbox",
+            &format!(
+                "actorDeviceId={}&inventorySessionId={session}&limit=50",
+                device.device_id
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "getLeafRecoveryInbox: {inbox}");
+    inbox["items"].as_array().unwrap().clone()
+}
+
+/// R4: a requestLeafRecovery-created recovery carries the requester's exact
+/// verified signed request in the requestLeafRecovery answer, in another
+/// current leaf's `getConversationState.pendingLeafRecoveryRequests`, and in the
+/// requester's inbox; an acceptance-created recovery carries none.
+#[tokio::test]
+async fn r4_leaf_recovery_views_carry_exactly_the_requesters_signed_request() {
+    std::env::set_var("SERVICE_DID", "did:web:chat.catbird.blue");
+    std::env::set_var("SELF_ENDPOINT", "https://chat.catbird.blue");
+
+    let db = common::fresh_db::fresh_fully_migrated_db("chat_gate8_r4_").await;
+    let pool = db.connect(4).await;
+    http::ensure_fence(&pool).await;
+    let fixture =
+        seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
+            .await
+            .expect("group fixture (sender holds a leaf and an available KeyPackage)");
+    let requester_dev = fixture_device(&fixture.sender_did, fixture.sender_device_id);
+    let fulfiller_dev = fixture_device(&fixture.recipient_did, fixture.recipient_device_id);
+    http::cache_device_did(&requester_dev).await;
+    http::cache_device_did(&fulfiller_dev).await;
+    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
+    catbird_server::chat_protocol::test_support::seed_deterministic_recovery_reservation_fallback(
+        &pool,
+        vec![fixture.sender_did.clone(), fixture.recipient_did.clone()],
+    )
+    .await
+    .expect("fresh recoveryReservation fallback");
+
+    let recovery_request_id = Uuid::new_v4();
+    let requester_ed = EdSigningKey::from_bytes(&fixture.sender_ed25519_seed);
+    let submitted = catbird_server::chat_protocol::test_support::sign_mutation_json_for_test(
+        &json!({
+            "$type": "blue.catbird.chat.defs#leafRecoveryRequestBody",
+            "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-REQUEST\u{0000}",
+            "recoveryRequestId": recovery_request_id,
+            "idempotencyKey": recovery_request_id,
+            "actorDid": fixture.sender_did,
+            "actorDeviceId": fixture.sender_device_id,
+            "keyId": fixture.sender_key_id,
+            "authGeneration": 1,
+            "prior": fixture.signed_request["body"]["prior"],
+            "recoveryKind": "replace",
+            "signedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        }),
+        &requester_ed,
+    )
+    .expect("sign leafRecoveryRequestBody");
+    let (status, answer) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            &requester_dev,
+            "blue.catbird.chat.requestLeafRecovery",
+            serde_json::to_vec(&json!({ "signedRequest": submitted })).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "requestLeafRecovery: {answer}");
+    let requester_key = requester_ed.verifying_key();
+    assert_exact_signed_request(&answer["recovery"], &submitted, &requester_key);
+
+    // Another current leaf discovers it, with the requester's signed request.
+    let (status, state) = http::send(
+        router.clone(),
+        http::unsigned_get_request(
+            &fulfiller_dev,
+            "blue.catbird.chat.getConversationState",
+            &format!(
+                "actorDeviceId={}&conversationId={}",
+                fixture.recipient_device_id, fixture.conversation_id
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "getConversationState: {state}");
+    let pending = state["pendingLeafRecoveryRequests"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "exactly the open request: {state}");
+    assert_eq!(
+        pending[0]["recoveryRequestId"],
+        recovery_request_id.to_string()
+    );
+    assert_exact_signed_request(&pending[0], &submitted, &requester_key);
+
+    // The requester's own inbox carries it too.
+    let requester_inbox = leaf_recovery_inbox(router.clone(), &requester_dev).await;
+    let own = requester_inbox
+        .iter()
+        .find(|item| item["recoveryRequestId"] == recovery_request_id.to_string())
+        .unwrap_or_else(|| panic!("requester inbox lacks the request: {requester_inbox:?}"));
+    assert_exact_signed_request(own, &submitted, &requester_key);
+
+    // The fixture's acceptance-created recovery (the fulfiller's join) carries none.
+    let fulfiller_inbox = leaf_recovery_inbox(router, &fulfiller_dev).await;
+    let accepted = fulfiller_inbox
+        .iter()
+        .find(|item| item["requesterDid"] == fixture.recipient_did.as_str())
+        .unwrap_or_else(|| {
+            panic!("fulfiller inbox lacks its acceptance recovery: {fulfiller_inbox:?}")
+        });
+    assert!(
+        accepted.get("signedRequest").is_none(),
+        "an acceptance-created recovery carries no signedRequest: {accepted}"
+    );
+}
+
+/// R4: `activateReset` signed by an active non-admin member, after an admin's
+/// pending reset request, is refused `AdminRequired` and changes nothing.
+#[tokio::test]
+async fn r4_non_admin_reset_activation_is_admin_required_without_any_effect() {
+    std::env::set_var("SERVICE_DID", "did:web:chat.catbird.blue");
+    std::env::set_var("SELF_ENDPOINT", "https://chat.catbird.blue");
+
+    let db = common::fresh_db::fresh_fully_migrated_db("chat_gate8_r4_").await;
+    let pool = db.connect(4).await;
+    http::ensure_fence(&pool).await;
+    let fixture =
+        seed_clean_slate_application_fixture(&pool, false, "did:web:chat.catbird.blue", None)
+            .await
+            .expect("group fixture (sender is admin, recipient is member)");
+    let admin_dev = fixture_device(&fixture.sender_did, fixture.sender_device_id);
+    let member_dev = fixture_device(&fixture.recipient_did, fixture.recipient_device_id);
+    http::cache_device_did(&admin_dev).await;
+    http::cache_device_did(&member_dev).await;
+    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
+
+    let prior = fixture.signed_request["body"]["prior"].clone();
+    let reset_request_id = Uuid::new_v4();
+    let admin_request = catbird_server::chat_protocol::test_support::sign_mutation_json_for_test(
+        &json!({
+            "$type": "blue.catbird.chat.defs#resetRequestBody",
+            "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\u{0000}",
+            "resetRequestId": reset_request_id,
+            "idempotencyKey": reset_request_id,
+            "actorDid": fixture.sender_did,
+            "actorDeviceId": fixture.sender_device_id,
+            "keyId": fixture.sender_key_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "reason": "manualRecovery",
+            "signedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        }),
+        &EdSigningKey::from_bytes(&fixture.sender_ed25519_seed),
+    )
+    .expect("sign admin resetRequestBody");
+    let (status, response) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            &admin_dev,
+            "blue.catbird.chat.requestReset",
+            serde_json::to_vec(&json!({ "signedRequest": admin_request })).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin requestReset: {response}");
+
+    let mut participants = vec![
+        json!({"userDid": fixture.sender_did, "role": "admin", "status": "active"}),
+        json!({"userDid": fixture.recipient_did, "role": "member", "status": "active"}),
+    ];
+    participants.sort_by(|a, b| a["userDid"].as_str().cmp(&b["userDid"].as_str()));
+    let activation = catbird_server::chat_protocol::test_support::sign_reset_activation_for_test(
+        reset_request_id,
+        &prior,
+        json!(participants),
+        &fixture.recipient_did,
+        fixture.recipient_device_id,
+        &fixture.recipient_key_id,
+        fixture.recipient_ed25519_seed,
+    )
+    .expect("sign member resetActivationBody");
+
+    let (pool_ref, conversation_id) = (&pool, fixture.conversation_id);
+    let snapshot = move || async move {
+        sqlx::query_as::<_, (i64, i64, i64, Vec<u8>, i64, String)>(
+            "SELECT c.current_generation, c.current_state_version, c.next_entry_seq, s.group_id, \
+                    (SELECT count(*) FROM chat.entries e WHERE e.conversation_id = c.conversation_id), \
+                    (SELECT r.status FROM chat.reset_requests r WHERE r.reset_request_id = $2) \
+               FROM chat.conversations c \
+               JOIN chat.generation_states s ON s.conversation_id = c.conversation_id \
+                AND s.generation = c.current_generation \
+                AND s.state_version = c.current_state_version \
+              WHERE c.conversation_id = $1",
+        )
+        .bind(conversation_id)
+        .bind(reset_request_id)
+        .fetch_one(pool_ref)
+        .await
+        .expect("conversation head, coordinate, entries, and reset request")
+    };
+    let before = snapshot().await;
+    assert_eq!(before.5, "pending");
+    let (status, refused) = http::send(
+        router,
+        http::unsigned_json_request(
+            &member_dev,
+            "blue.catbird.chat.activateReset",
+            serde_json::to_vec(&json!({ "signedRequest": activation })).unwrap(),
+        ),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "non-admin activateReset: {refused}");
+    assert_eq!(refused["error"], "AdminRequired", "{refused}");
+    assert_eq!(
+        snapshot().await,
+        before,
+        "a refused activation changes nothing"
+    );
 }
 
 #[test]

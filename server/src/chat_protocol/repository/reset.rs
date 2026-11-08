@@ -114,6 +114,8 @@ pub(crate) enum ResetRepositoryError {
     ForeignTransaction,
     UnsupportedAuthority,
     AuthorityBindingMismatch,
+    /// An active participant who is not an admin tried to activate a Reset.
+    AdminRequired,
     TrustedInstantMismatch,
     NonCanonicalOperation,
     NonCanonicalScope,
@@ -2256,14 +2258,13 @@ async fn prepare_reset_attempt(
         .state()
         .participant(&actor_principal)
         .ok_or(ResetRepositoryError::AuthorityBindingMismatch)?;
-    let actor_authorized = match parsed.kind {
-        ResetPreparationKind::Request => actor.is_active(),
-        ResetPreparationKind::Activation => {
-            actor.is_active() && actor.role() == ParticipantRole::Admin
-        }
-    };
-    if !actor_authorized {
+    if !actor.is_active() {
         return Err(ResetRepositoryError::AuthorityBindingMismatch);
+    }
+    if matches!(parsed.kind, ResetPreparationKind::Activation)
+        && actor.role() != ParticipantRole::Admin
+    {
+        return Err(ResetRepositoryError::AdminRequired);
     }
     let pending_row = load_locked_pending_row(transaction, conversation_id).await?;
     let pending = match pending_row {

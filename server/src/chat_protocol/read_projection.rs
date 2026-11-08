@@ -442,6 +442,7 @@ fn normalize_def(
                     | "directRequestPublicationBody"
                     | "directRequestCancellationBody"
                     | "directRequestKeysPublicationBody"
+                    | "leafRecoveryRequestBody"
             );
             if signed_request_body {
                 if let CanonValue::Object(entries) = value {
@@ -1119,6 +1120,8 @@ const LEAF_RECOVERY_STATUS_FULFILLED: &str = "fulfilled";
 const LEAF_RECOVERY_STATUS_CANCELLED: &str = "cancelled";
 const LEAF_RECOVERY_STATUS_EXPIRED: &str = "expired";
 const LEAF_RECOVERY_STATUS_SUPERSEDED: &str = "superseded";
+const LEAF_RECOVERY_SOURCE_REQUEST: &str = "requestLeafRecovery";
+const LEAF_RECOVERY_SOURCE_ACCEPTANCE: &str = "acceptConversation";
 const RESERVATION_STATUS_ACTIVE: &str = "active";
 const RESERVATION_STATUS_CONSUMED: &str = "consumed";
 const RESERVATION_STATUS_EXPIRED: &str = "expired";
@@ -2026,9 +2029,14 @@ pub(crate) struct RetainedLeafRecoveryProjectionSource {
     requested_at: SmolStr,
     expires_at: SmolStr,
     reservation: CheckedLeafRecoveryReservation,
+    signed_request: Option<chat_dto::SignedLeafRecoveryRequest<DefaultStr>>,
 }
 
 impl RetainedLeafRecoveryProjectionSource {
+    /// `source` is the retained row's origin. A `requestLeafRecovery` row
+    /// projects `signed_request_bytes` (the exact wrapper the server verified)
+    /// as `signedRequest`; an `acceptConversation` row carries none.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         recovery_request_id: &str,
         conversation_id: &str,
@@ -2040,6 +2048,8 @@ impl RetainedLeafRecoveryProjectionSource {
         requested_at: &str,
         expires_at: &str,
         reservation: CheckedLeafRecoveryReservation,
+        source: &str,
+        signed_request_bytes: &[u8],
     ) -> Result<Self, ProjectionError> {
         checked_nonempty(recovery_request_id, "leafRecovery.recoveryRequestId")?;
         checked_nonempty(conversation_id, "leafRecovery.conversationId")?;
@@ -2102,6 +2112,26 @@ impl RetainedLeafRecoveryProjectionSource {
                 "reservation status is not consistent with the retained leaf-recovery status",
             ));
         }
+        let signed_request = match source {
+            LEAF_RECOVERY_SOURCE_ACCEPTANCE => None,
+            LEAF_RECOVERY_SOURCE_REQUEST => Some(retained_signed_leaf_recovery_request(
+                signed_request_bytes,
+                recovery_request_id,
+                requester_did,
+                requester_device_id,
+                recovery_kind,
+                reservation.requester_key_id.as_str(),
+                reservation.requester_auth_generation,
+                conversation_coordinates_dto(&bound_coordinate),
+            )?),
+            _ => {
+                return Err(ProjectionError::new(
+                    ProjectionErrorKind::StringEnumViolation,
+                    "leafRecovery.source",
+                    "unknown leaf-recovery source",
+                ))
+            }
+        };
         Ok(Self {
             recovery_request_id: SmolStr::from(recovery_request_id),
             conversation_id: SmolStr::from(conversation_id),
@@ -2113,8 +2143,80 @@ impl RetainedLeafRecoveryProjectionSource {
             requested_at: SmolStr::from(requested_at),
             expires_at: SmolStr::from(expires_at),
             reservation,
+            signed_request,
         })
     }
+}
+
+/// Parse the retained signed wrapper of a `requestLeafRecovery` row strictly:
+/// the server's exact signed-mutation decoder must accept it as a
+/// `leafRecoveryRequestBody`, the lexicon presentation must decode into the
+/// generated DTO with no unknown fields, and the signed body must name the
+/// row's exact request, requester, kind, key, auth generation, and bound
+/// coordinate. Anything else is a projection error, never a view without it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn retained_signed_leaf_recovery_request(
+    bytes: &[u8],
+    recovery_request_id: &str,
+    requester_did: &str,
+    requester_device_id: &str,
+    recovery_kind: &str,
+    key_id: &str,
+    auth_generation: i64,
+    mut bound: chat_dto::ConversationCoordinates<DefaultStr>,
+) -> Result<chat_dto::SignedLeafRecoveryRequest<DefaultStr>, ProjectionError> {
+    const PATH: &str = "leafRecovery.signedRequest";
+    let not_canonical = || {
+        ProjectionError::new(
+            ProjectionErrorKind::StoredBytesNotCanonical,
+            PATH,
+            "retained signed leaf-recovery request is not an exact signed wrapper",
+        )
+    };
+    let canonical =
+        super::transcript::decode_canonical_signed_mutation(bytes).map_err(|_| not_canonical())?;
+    if !matches!(
+        canonical.kind(),
+        super::transcript::SignedMutationKind::LeafRecoveryRequest
+    ) {
+        return Err(not_canonical());
+    }
+    let mut presented: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| not_canonical())?;
+    crate::chat_protocol::direct_request_transcript::present_read_presentation(
+        "signedLeafRecoveryRequest",
+        &mut presented,
+    )
+    .map_err(|_| not_canonical())?;
+    let signed: chat_dto::SignedLeafRecoveryRequest<DefaultStr> =
+        serde_json::from_value(presented).map_err(|_| not_canonical())?;
+    let body = &signed.body;
+    // The signed body keeps its exact `$type` (already checked by the
+    // canonical decoder) in DTO extra_data; nothing else may ride along.
+    let body_type_only = body
+        .extra_data
+        .as_ref()
+        .is_some_and(|extra| extra.len() == 1 && extra.contains_key("$type"));
+    if signed.extra_data.is_some() || !body_type_only || body.prior.extra_data.is_some() {
+        return Err(not_canonical());
+    }
+    // The retained bound coordinate carries the conversation's current
+    // lifecycle (a later close changes it); the signed prior is immutable.
+    bound.lifecycle = body.prior.lifecycle.clone();
+    if body.recovery_request_id.as_str() != recovery_request_id
+        || body.actor_did.as_str() != requester_did
+        || body.actor_device_id.as_str() != requester_device_id
+        || body.recovery_kind.as_str() != recovery_kind
+        || body.key_id.as_str() != key_id
+        || body.auth_generation != auth_generation
+        || body.prior != bound
+    {
+        return Err(source_inconsistency(
+            PATH,
+            "the signed request must name the exact retained recovery request",
+        ));
+    }
+    Ok(signed)
 }
 
 /// Closed terminal shape of one retained recovery-work row: pending,
@@ -2673,6 +2775,7 @@ pub(crate) fn leaf_recovery_view(
             status: source.reservation.status.clone(),
             extra_data: None,
         },
+        signed_request: source.signed_request.clone(),
         status: source.status.clone(),
         extra_data: None,
     })

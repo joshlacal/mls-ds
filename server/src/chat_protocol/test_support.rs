@@ -2723,6 +2723,168 @@ pub async fn seed_deterministic_pending_add_fallback(
     Ok(())
 }
 
+/// Seal a fresh BlockOnly `recoveryReservation` fallback over `roster` from
+/// deterministic relationship evidence (no blocks), as a running DS's refresh
+/// would. `requestLeafRecovery` consumes it for 60 seconds.
+pub async fn seed_deterministic_recovery_reservation_fallback(
+    pool: &PgPool,
+    mut roster: Vec<String>,
+) -> Result<(), String> {
+    let rel_authority = RelationshipAuthority::new(
+        fixed_production_relationship_policy_config()
+            .map_err(|e| format!("fixed config error: {e:?}"))?,
+        DeterministicTestTransport,
+    );
+    roster.sort();
+    let mut fallback_tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("begin fallback tx: {e}"))?;
+    let live_allocation = allocate_projection_revision(&mut fallback_tx)
+        .await
+        .map_err(|e| format!("allocate live revision: {e:?}"))?;
+    let fallback_allocation = allocate_projection_revision(&mut fallback_tx)
+        .await
+        .map_err(|e| format!("allocate fallback revision: {e:?}"))?;
+    let clock = anchor_projection_clock(&mut *fallback_tx)
+        .await
+        .map_err(|e| format!("anchor projection clock: {e}"))?;
+    let live_rel = rel_authority
+        .collect_block_projection(
+            &clock,
+            live_allocation,
+            ProjectionOperationScope::RecoveryReservation,
+            roster,
+        )
+        .await
+        .map_err(|e| format!("collect block projection: {e:?}"))?;
+    let observation = observe_relationship_persistence(&clock);
+    let sealed_fallback = live_rel
+        .export_persisted_fallback(fallback_allocation, &rel_authority, &observation)
+        .map_err(|e| format!("seal fallback: {e:?}"))?;
+    persist_relationship_projection(&mut fallback_tx, sealed_fallback)
+        .await
+        .map_err(|e| format!("persist fallback: {e:?}"))?;
+    fallback_tx
+        .commit()
+        .await
+        .map_err(|e| format!("commit fallback tx: {e}"))
+}
+
+/// A genuinely signed `activateReset` wrapper by the given device for the
+/// pending `reset_request_id` bound to `prior` (wire coordinate JSON), with a
+/// real single-member successor GroupInfo signed by that device's key.
+/// Callers submit it through the production router.
+pub fn sign_reset_activation_for_test(
+    reset_request_id: uuid::Uuid,
+    prior: &serde_json::Value,
+    participants: serde_json::Value,
+    actor_did: &str,
+    actor_device_id: uuid::Uuid,
+    actor_key_id: &str,
+    actor_seed: [u8; 32],
+) -> Result<serde_json::Value, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use chrono::SecondsFormat;
+    use sha2::{Digest as _, Sha256};
+
+    let now = chrono::Utc::now();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&actor_seed);
+    let (group_info, group_id, _, group_context_hash, confirmation_tag) =
+        application_routing_fixture::single_member_group_info(
+            actor_did,
+            actor_device_id,
+            &signing_key,
+            Sha256::digest(uuid::Uuid::new_v4().as_bytes()).into(),
+            now,
+        )?;
+    let conversation_id = prior["conversationId"]
+        .as_str()
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .ok_or("prior lacks a conversationId")?;
+    let generation = prior["generation"]
+        .as_u64()
+        .ok_or("prior lacks a generation")?
+        + 1;
+    let mut retired = prior.clone();
+    retired["stateVersion"] = json!(
+        prior["stateVersion"]
+            .as_u64()
+            .ok_or("prior lacks a stateVersion")?
+            + 1
+    );
+    retired["lifecycle"] = json!("superseded");
+    let transition_id = uuid::Uuid::new_v4();
+    let ciphertext = [0xb2_u8; 16];
+    let body = json!({
+        "$type": "blue.catbird.chat.defs#resetActivationBody",
+        "signatureDomain": "CATBIRD-CHAT-RESET-ACTIVATE\u{0000}",
+        "resetRequestId": reset_request_id,
+        "transitionId": transition_id,
+        "conversationKind": "group",
+        "actorDid": actor_did,
+        "actorDeviceId": actor_device_id,
+        "keyId": actor_key_id,
+        "authGeneration": 1,
+        "prior": prior,
+        "retired": retired,
+        "successor": {
+            "conversationId": conversation_id,
+            "generation": generation,
+            "stateVersion": 0,
+            "groupId": STANDARD.encode(group_id),
+            "epoch": 0,
+            "groupContextHash": STANDARD.encode(group_context_hash),
+            "confirmationTag": STANDARD.encode(confirmation_tag),
+            "lifecycle": "active",
+        },
+        "manifest": {
+            "participants": participants,
+            "actorLeaf": {
+                "userDid": actor_did,
+                "deviceId": actor_device_id,
+                "leafOrigin": "genesis",
+            },
+        },
+        "genesisGroupInfo": {
+            "framing": "mlsMessage",
+            "contentType": "groupInfo",
+            "bytes": STANDARD.encode(&group_info),
+            "sha256": STANDARD.encode(Sha256::digest(&group_info)),
+        },
+        "metadataSnapshot": {
+            "coordinate": {
+                "conversationId": STANDARD.encode(conversation_id.as_bytes()),
+                "generation": generation,
+                "groupId": STANDARD.encode(group_id),
+                "epoch": 0,
+                "groupContextHash": STANDARD.encode(group_context_hash),
+                "confirmationTag": STANDARD.encode(confirmation_tag),
+            },
+            "originTransitionId": transition_id,
+            "metadataVersion": 2,
+            "nonce": STANDARD.encode([0xb1_u8; 12]),
+            "ciphertext": STANDARD.encode(ciphertext),
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(ciphertext)),
+            "ciphertextSize": ciphertext.len(),
+            "authorProof": {
+                "authorDid": actor_did,
+                "authorDeviceId": actor_device_id,
+                "authorKeyId": actor_key_id,
+                "signaturePublicKey": STANDARD.encode(signing_key.verifying_key().to_bytes()),
+                "authGenerationAtOrigin": 1,
+                "originTransitionId": transition_id,
+                "originSeq": 1,
+                "roleAtOrigin": "admin",
+                "deviceStatusAtOrigin": "active",
+            },
+        },
+        "idempotencyKey": transition_id,
+        "signedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+    sign_mutation_json_for_test(&body, &signing_key)
+}
+
 #[cfg(feature = "test-support")]
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

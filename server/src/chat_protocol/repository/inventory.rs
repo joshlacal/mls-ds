@@ -6852,6 +6852,7 @@ async fn retained_recovery_inbox_entries(
                request.bound_epoch, request.bound_group_context_hash,
                request.bound_confirmation_tag, request.status,
                request.requested_at, request.expires_at,
+               request.source, request.signed_request_bytes,
                conversation.lifecycle AS conversation_lifecycle,
                reservation.conversation_id AS reservation_conversation_id,
                reservation.generation AS reservation_generation,
@@ -6956,6 +6957,8 @@ async fn retained_recovery_inbox_entries(
             &canonical_datetime(row.requested_at),
             &canonical_datetime(row.expires_at),
             reservation,
+            &row.source,
+            &row.signed_request_bytes,
         )
         .map_err(InventoryRepositoryError::Projection)?;
         let input = LeafRecoveryInboxInput::leaf_recovery(source);
@@ -7104,6 +7107,8 @@ struct LeafRecoverySourceRow {
     status: String,
     requested_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
+    source: String,
+    signed_request_bytes: Vec<u8>,
     conversation_lifecycle: String,
     reservation_conversation_id: Uuid,
     reservation_generation: i64,

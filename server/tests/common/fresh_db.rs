@@ -128,6 +128,7 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_space_roster_",
     "chat_gate8_auth_",
     "chat_gate8_f03_",
+    "chat_gate8_r4_",
     "chat_space_host_",
     "chat_push_gw_",
     "chat_fed_relay_",

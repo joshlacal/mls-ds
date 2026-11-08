@@ -38,15 +38,19 @@
 // matrix over the hydrated conversation aggregate:
 //
 // - a current exact open leaf authorizes state and entries;
-// - a finite exact Remove/Close interval separately authorizes bounded control
-//   reads only; it grants neither current state nor application ciphertext;
+// - a finite exact Remove/Reset/Close interval separately authorizes bounded
+//   control reads only (spec §8: a reset-roster-only device sees its interval's
+//   control entries, including the reset activation that closed it); it grants
+//   no application ciphertext and nothing past the interval;
 // - an eligible active zero-leaf participant or pending participant authorizes
 //   current state only; direct-pending stays absent from enumerable inventory;
-// - a finite reset/remove interval for the requesting exact device takes
+// - a finite remove/terminal interval for the requesting exact device takes
 //   precedence over same-DID current participation unless the same exact
 //   device has a later valid open interval or the DID was re-invited later as
-//   a pending participant (BREAD-05);
-// - a known former, post-reset-old, or exact terminal-proof holder receives
+//   a pending participant (BREAD-05). A reset-closed interval does not take
+//   precedence over the DID's ACTIVE participation: that device is a zero-leaf
+//   active participant and receives the current state it needs to rejoin;
+// - a known former, remove-closed, or exact terminal-proof holder receives
 //   `AccessOutsideMembershipInterval`;
 // - an unrelated requester for an active or terminal conversation receives
 //   `NotEntitled` (BREAD-04: the historical-relationship check guards both
@@ -582,10 +586,12 @@ pub(in crate::chat_protocol) fn finite_interval_takes_precedence(
 /// terminal conversation receives `NotEntitled`, never
 /// `AccessOutsideMembershipInterval`.
 ///
-/// BREAD-05: the requesting exact device's finite reset/remove interval is
+/// BREAD-05: the requesting exact device's finite remove/terminal interval is
 /// classified BEFORE DID-only active participation. A later pending invitation
 /// is a new consent period and may point-read state, but still cannot read
-/// entries or appear in direct-conversation inventory.
+/// entries or appear in direct-conversation inventory. A reset-closed interval
+/// of an ACTIVE participant DID yields to that participation (spec §8: a
+/// zero-leaf active participant gets the current state it needs to rejoin).
 fn classify_current_relationship(
     user_did: &str,
     device_id: Uuid,
@@ -605,14 +611,18 @@ fn classify_current_relationship(
         });
     }
     if let Some(latest_finite) = facts.latest_finite {
-        let interval_end_seq = latest_finite
-            .end()
-            .ok_or(ReadAuthorityError::Invariant)?
-            .seq();
+        let end = latest_finite.end().ok_or(ReadAuthorityError::Invariant)?;
+        let reset_of_active_participant = matches!(
+            end.kind(),
+            crate::chat_protocol::state_machine::CloseKind::Reset
+        ) && participant
+            .is_some_and(|participant| participant.is_active());
         let pending_invitation_seq = participant
             .filter(|participant| participant.is_pending())
             .and_then(|participant| participant.invitation_transition_seq());
-        if finite_interval_takes_precedence(interval_end_seq, pending_invitation_seq) {
+        if !reset_of_active_participant
+            && finite_interval_takes_precedence(end.seq(), pending_invitation_seq)
+        {
             return Err(ReadAuthorityError::AccessOutsideMembershipInterval);
         }
     }
@@ -1386,10 +1396,11 @@ async fn load_control_recipient_fence(
 }
 
 /// Current exact open leaves retain their existing entry scope. An exact
-/// device whose latest finite interval ended in Remove or Close may obtain
-/// only separately entitled control entries within that interval. Current
-/// state, historical application ciphertext, same-DID sibling participation,
-/// and Reset/Replace-only intervals cannot mint this finite capability.
+/// device whose latest finite interval ended in Remove, Reset, or Close may
+/// obtain only separately entitled control entries within that interval (for
+/// Reset, through the activation that closed it). Current state, historical
+/// application ciphertext, same-DID sibling participation, and Replace-only
+/// intervals cannot mint this finite capability.
 pub(crate) async fn authorize_entries(
     tx: &mut Transaction<'_, Postgres>,
     device: LockedReadDeviceAuthority,
@@ -1417,7 +1428,8 @@ pub(crate) async fn authorize_entries(
     } else if let Some(interval) = facts.latest_finite {
         let end = interval.end().ok_or(ReadAuthorityError::Invariant)?;
         match end.kind() {
-            crate::chat_protocol::state_machine::CloseKind::Remove => {}
+            crate::chat_protocol::state_machine::CloseKind::Remove
+            | crate::chat_protocol::state_machine::CloseKind::Reset => {}
             crate::chat_protocol::state_machine::CloseKind::Terminal
                 if facts.terminal && facts.terminal_proof_holder => {}
             _ => return Err(ReadAuthorityError::AccessOutsideMembershipInterval),

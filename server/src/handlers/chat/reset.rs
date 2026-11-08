@@ -133,6 +133,7 @@ fn reset_failure(endpoint: ChatEndpoint, error: ResetFacadeError) -> ChatFailure
         ) if endpoint == ChatEndpoint::ActivateReset => {
             ChatFailure::protocol(endpoint, C::ResetRequestStale)
         }
+        E::Repository(R::AdminRequired) => ChatFailure::protocol(endpoint, C::AdminRequired),
         E::Repository(R::PendingResetCoordinateMismatch | R::CompareAndSetConflict) => {
             ChatFailure::protocol(endpoint, C::StaleCoordinates)
         }

@@ -97,11 +97,13 @@ const CANONICAL_SOURCE_CORPUS_REVISION: &str = "838df09a4fa46ba651280c01e74b66b9
 const CANONICAL_SOURCE_LEXICON_SHA256: &str =
     "1c21d1b04555c800a0491e997b74e3185520b0634362e68a2a27e6b8babdb075";
 // The frozen vectors retain their original provenance. Separately pin the
-// current canonical contract, which also contains the direct-request domains.
-const CURRENT_SOURCE_LEXICON_REVISION: &str = "e4227af68226a61a4cae7478496d1a7b930f28f6";
-const CURRENT_SOURCE_CORPUS_REVISION: &str = "838df09a4fa46ba651280c01e74b66b989ca7a74";
+// current canonical contract, which also contains the direct-request domains
+// and `leafRecoveryView.signedRequest` (PetrelCatbird e782e46c,
+// catbird-atproto 49c6fdb0).
+const CURRENT_SOURCE_LEXICON_REVISION: &str = "e782e46ca8489c881517186fe0bf1a9c35c99634";
+const CURRENT_SOURCE_CORPUS_REVISION: &str = "49c6fdb00671ffe96e58e3b5ebec7d5e6532f51f";
 const CURRENT_SOURCE_LEXICON_SHA256: &str =
-    "1c21d1b04555c800a0491e997b74e3185520b0634362e68a2a27e6b8babdb075";
+    "cf931d0fda7b68082f7f0ac9105dd62122692ee35afbf0ddf7eb2d134340f848";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures

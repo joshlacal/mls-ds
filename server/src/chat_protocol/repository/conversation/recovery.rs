@@ -28,6 +28,7 @@ const PENDING_LEAF_RECOVERIES_SQL: &str = r#"
                request.bound_epoch, request.bound_group_context_hash,
                request.bound_confirmation_tag, request.status,
                request.requested_at, request.expires_at,
+               request.source, request.signed_request_bytes,
                conversation.lifecycle AS conversation_lifecycle,
                reservation.conversation_id AS reservation_conversation_id,
                reservation.generation AS reservation_generation,
@@ -209,6 +210,8 @@ fn project_recovery(
         &canonical_datetime(row.requested_at),
         &canonical_datetime(row.expires_at),
         reservation,
+        &row.source,
+        &row.signed_request_bytes,
     )
     .map_err(|_| ConversationStateReadError::Invariant)?;
     leaf_recovery_view(&source).map_err(|_| ConversationStateReadError::Invariant)
@@ -232,6 +235,8 @@ struct LeafRecoverySourceRow {
     status: String,
     requested_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
+    source: String,
+    signed_request_bytes: Vec<u8>,
     conversation_lifecycle: String,
     reservation_conversation_id: Uuid,
     reservation_generation: i64,
@@ -286,6 +291,8 @@ mod tests {
             status: "open".into(),
             requested_at: now,
             expires_at: now + Duration::minutes(5),
+            source: "acceptConversation".into(),
+            signed_request_bytes: Vec::new(),
             conversation_lifecycle: "active".into(),
             reservation_conversation_id: cid,
             reservation_generation: 2,
@@ -324,6 +331,8 @@ mod tests {
             |row: &mut LeafRecoverySourceRow| row.reservation_requester_key_id = "other".into(),
             |row: &mut LeafRecoverySourceRow| row.reservation_requester_auth_generation += 1,
             |row: &mut LeafRecoverySourceRow| row.reservation_expires_at += Duration::seconds(1),
+            // A requestLeafRecovery row must carry its exact signed wrapper.
+            |row: &mut LeafRecoverySourceRow| row.source = "requestLeafRecovery".into(),
             |row: &mut LeafRecoverySourceRow| row.package_wrapper_sha256[0] ^= 1,
         ] {
             let mut row = source_row();
@@ -397,7 +406,7 @@ mod tests {
             ),
             (
                 "leaf_recovery_requests",
-                serde_json::json!({"recovery_request_id":rid,"reservation_request_id":rid,"conversation_id":cid,"generation":0,"requester_did":"did:plc:alice","requester_device_id":target,"requester_key_id":"key","requester_auth_generation":1,"recovery_kind":"add","bound_state_version":1,"bound_group_id":b,"bound_epoch":0,"bound_group_context_hash":b,"bound_confirmation_tag":b,"status":"open","requested_at":now,"expires_at":expiry}),
+                serde_json::json!({"recovery_request_id":rid,"reservation_request_id":rid,"conversation_id":cid,"generation":0,"requester_did":"did:plc:alice","requester_device_id":target,"requester_key_id":"key","requester_auth_generation":1,"recovery_kind":"add","source":"acceptConversation","signed_request_bytes":b,"bound_state_version":1,"bound_group_id":b,"bound_epoch":0,"bound_group_context_hash":b,"bound_confirmation_tag":b,"status":"open","requested_at":now,"expires_at":expiry}),
             ),
             (
                 "key_package_reservations",

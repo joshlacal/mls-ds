@@ -2244,14 +2244,14 @@ fn leaf_recovery_response_from_rows(
         &request.bound_group_context_hash,
         &request.bound_confirmation_tag,
     )?;
-    serde_json::to_vec(&json!({
+    let mut response = json!({
         "recovery": {
             "recoveryRequestId": request.recovery_request_id.hyphenated().to_string(),
             "conversationId": request.conversation_id.hyphenated().to_string(),
             "requesterDid": request.requester_did,
             "requesterDeviceId": request.requester_device_id.hyphenated().to_string(),
             "recoveryKind": recovery_kind_text(&request.recovery_kind),
-            "boundCoordinate": coordinate,
+            "boundCoordinate": coordinate.clone(),
             "reservation": {
                 "recoveryRequestId": reservation.recovery_request_id.hyphenated().to_string(),
                 "conversationId": reservation.conversation_id.hyphenated().to_string(),
@@ -2285,8 +2285,26 @@ fn leaf_recovery_response_from_rows(
             "requestedAt": canonical_datetime(request.requested_at),
             "expiresAt": canonical_datetime(request.expires_at),
         },
-    }))
-    .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)
+    });
+    // Exactly a requestLeafRecovery-created recovery carries the requester's
+    // exact verified signed request; an acceptance-created one carries none.
+    if request.source == LeafRecoverySource::RequestLeafRecovery {
+        let signed = crate::chat_protocol::read_projection::retained_signed_leaf_recovery_request(
+            &request.signed_request_bytes,
+            &request.recovery_request_id.hyphenated().to_string(),
+            &request.requester_did,
+            &request.requester_device_id.hyphenated().to_string(),
+            recovery_kind_text(&request.recovery_kind),
+            &request.requester_key_id,
+            request.requester_auth_generation,
+            serde_json::from_value(coordinate)
+                .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?,
+        )
+        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+        response["recovery"]["signedRequest"] =
+            serde_json::to_value(signed).map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+    }
+    serde_json::to_vec(&response).map_err(|_| RecoveryRepositoryError::InvalidDurableRow)
 }
 
 fn fulfillment_response_bytes(
