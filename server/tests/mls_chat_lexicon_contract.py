@@ -32,9 +32,16 @@ from typing import Any, Iterable
 SERVER_ROOT = Path(__file__).resolve().parents[1]
 MLS_DS_ROOT = SERVER_ROOT.parent
 STACK_ROOT = MLS_DS_ROOT.parent
-CANONICAL_ROOT = STACK_ROOT / "PetrelCatbird/lexicons/blue/catbird/chat"
+CANONICAL_LEXICON_BASE = (
+    STACK_ROOT / "PetrelCatbird/lexicons"
+    if (STACK_ROOT / "PetrelCatbird/lexicons").is_dir()
+    else STACK_ROOT.parent / "dec1-w0/wave1-petrel-catbird/lexicons"
+    if (STACK_ROOT.parent / "dec1-w0/wave1-petrel-catbird/lexicons").is_dir()
+    else STACK_ROOT.parent.parent / "Catbird+Petrel/PetrelCatbird/lexicons"
+)
+CANONICAL_ROOT = CANONICAL_LEXICON_BASE / "blue/catbird/chat"
 MIRROR_ROOT = MLS_DS_ROOT / "lexicon/blue/catbird/chat"
-CANONICAL_MLSDS_ROOT = STACK_ROOT / "PetrelCatbird/lexicons/blue/catbird/mlsDS"
+CANONICAL_MLSDS_ROOT = CANONICAL_LEXICON_BASE / "blue/catbird/mlsDS"
 MIRROR_MLSDS_ROOT = MLS_DS_ROOT / "lexicon/blue/catbird/mlsDS"
 VECTOR_PATH = Path(__file__).with_name("fixtures") / "mls_chat_contract_vectors.json"
 CRYPTO_WIRE_ROOT = Path(__file__).with_name("fixtures") / "crypto-wire"
@@ -43,7 +50,11 @@ CRYPTO_WIRE_ROOT = Path(__file__).with_name("fixtures") / "crypto-wire"
 DOCS_ROOT = (
     Path(os.environ["CATBIRD_STACK_DOCS_ROOT"])
     if os.environ.get("CATBIRD_STACK_DOCS_ROOT")
-    else STACK_ROOT / "docs" if (STACK_ROOT / "docs").is_dir() else STACK_ROOT.parent / "docs"
+    else STACK_ROOT / "docs"
+    if (STACK_ROOT / "docs").is_dir()
+    else STACK_ROOT.parent / "docs"
+    if (STACK_ROOT.parent / "docs").is_dir()
+    else STACK_ROOT.parent.parent / "Catbird+Petrel/docs"
 )
 CRYPTO_WIRE_V09_ROOT = SERVER_ROOT / "tests/fixtures/crypto-wire-v09"
 PROTOCOL_PATH = DOCS_ROOT / "mls-v2/CHAT_PROTOCOL.md"
@@ -202,6 +213,7 @@ SUITE = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
 
 ENDPOINTS: dict[str, str] = {
     "enrollDevice": "procedure",
+    "approveDevice": "procedure",
     "replenishKeyPackages": "procedure",
     "revokeDevice": "procedure",
     "getDeviceKey": "query",
@@ -246,6 +258,7 @@ RECORDS: dict[str, str] = {
 
 SIGNED_PROJECTIONS: dict[str, tuple[str, str]] = {
     "signedDeviceEnrollment": ("deviceEnrollmentBody", "CATBIRD-CHAT-DEVICE-ENROLL\0"),
+    "signedDeviceApproval": ("deviceApprovalBody", "CATBIRD-CHAT-DEVICE-APPROVE\0"),
     "signedKeyPackageReplenishment": ("keyPackageReplenishmentBody", "CATBIRD-CHAT-DEVICE-REPLENISH\0"),
     "signedDeviceRevocation": ("deviceRevocationBody", "CATBIRD-CHAT-DEVICE-REVOKE\0"),
     "signedBlobUploadPreparation": ("blobUploadPreparationBody", "CATBIRD-CHAT-BLOB-PREPARE\0"),
@@ -1337,6 +1350,7 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
 
     refs = {
         "enrollDevice": "signedDeviceEnrollment",
+        "approveDevice": "signedDeviceApproval",
         "replenishKeyPackages": "signedKeyPackageReplenishment",
         "revokeDevice": "signedDeviceRevocation",
         "createConversation": "signedCreation",

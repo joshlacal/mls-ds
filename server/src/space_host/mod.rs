@@ -5,13 +5,14 @@
 //!
 //! Key security & federation invariants:
 //! - Zero `NOT c.is_remote` local-only guards anywhere in `space_host`.
-//! - `getSpaceCredential` and `notifyWrite` require `status = 'active'` in `chat.participants`
+//! - `authorizeSpaceSync` and `notifyRepoUpdate` require `status = 'active'` in `chat.participants`
 //!   (excluding `'pending'` / declined `C33` direct-request targets and `'left'` / `'removed'` ex-members).
-//! - `listRepos` includes historical writers with `status IN ('active', 'left', 'removed')` in
-//!   ascending `spaceRev` order while strictly excluding `'pending'` `C33` targets and deleted accounts.
+//! - `listWriters` includes historical writers with `status IN ('active', 'left', 'removed')` in
+//!   ascending `spaceRev` order (plus `#repoRemoved` tombstones within 72h) while strictly excluding
+//!   `'pending'` `C33` targets and deleted accounts.
 //! - Single-use 60s delegation `jti` replay cache (`chat.space_delegation_jtis`) and 10m credential
 //!   `jti` ledger (`chat.space_credential_jtis`).
-//! - Post-commit revocation & Space-deletion webhook fan-out (`M-F04`: never inside an open SQL transaction).
+//! - Post-commit revocation & Space-update/deletion webhook fan-out (`M-F04`: never inside an open SQL transaction).
 
 pub mod handlers;
 pub mod revocation_fanout;
@@ -112,8 +113,11 @@ pub struct SpaceHostRuntime {
     clock: Arc<dyn crate::sim_hooks::DsClock>,
     tid_counter: AtomicU64,
     did_cache: RwLock<HashMap<String, CachedDidEntry>>,
+    client_key_cache: RwLock<HashMap<String, (SpaceVerifyingKey, Instant)>>,
     #[cfg(any(test, feature = "test-support"))]
     test_did_overrides: RwLock<HashMap<String, (SpaceVerifyingKey, String)>>,
+    #[cfg(any(test, feature = "test-support"))]
+    test_client_keys: RwLock<HashMap<String, SpaceVerifyingKey>>,
 }
 
 impl SpaceHostRuntime {
@@ -124,8 +128,11 @@ impl SpaceHostRuntime {
             clock: Arc::new(crate::sim_hooks::SystemDsClock),
             tid_counter: AtomicU64::new(0),
             did_cache: RwLock::new(HashMap::new()),
+            client_key_cache: RwLock::new(HashMap::new()),
             #[cfg(any(test, feature = "test-support"))]
             test_did_overrides: RwLock::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            test_client_keys: RwLock::new(HashMap::new()),
         }
     }
 
@@ -181,6 +188,21 @@ impl SpaceHostRuntime {
                     SpaceVerifyingKey::P256(*verifying_key),
                     endpoint_url.trim_end_matches('/').to_string(),
                 ),
+            );
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_test_client_attestation_key(
+        &self,
+        client_id_url: &str,
+        kid: &str,
+        verifying_key: &P256VerifyingKey,
+    ) {
+        if let Ok(mut guard) = self.test_client_keys.write() {
+            guard.insert(
+                format!("{client_id_url}#{kid}"),
+                SpaceVerifyingKey::P256(*verifying_key),
             );
         }
     }
@@ -443,6 +465,128 @@ impl SpaceHostRuntime {
         Ok((vk, ep, false))
     }
 
+    async fn resolve_client_attestation_key(
+        &self,
+        client_id_url: &str,
+        kid: &str,
+        force_refresh: bool,
+    ) -> Result<SpaceVerifyingKey, atproto_spaces::SpacesError> {
+        let cache_key = format!("{client_id_url}#{kid}");
+
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(vk) = self
+            .test_client_keys
+            .read()
+            .ok()
+            .and_then(|m| m.get(&cache_key).cloned())
+        {
+            return Ok(vk);
+        }
+
+        if !force_refresh {
+            if let Some((vk, fetched_at)) = self
+                .client_key_cache
+                .read()
+                .ok()
+                .and_then(|m| m.get(&cache_key).cloned())
+            {
+                if fetched_at.elapsed() < Duration::from_secs(300) {
+                    return Ok(vk);
+                }
+            }
+        }
+
+        let allow_loopback = revocation_fanout::allow_loopback_space_endpoint(client_id_url);
+        let validated = validate_https_url_with_resolver(
+            client_id_url,
+            None,
+            allow_loopback,
+            crate::push_gateway::ssrf::system_dns_resolve,
+        )
+        .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .resolve_to_addrs(&validated.host, &validated.pinned_addrs)
+            .build()
+            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+
+        let resp = crate::sim_hooks::send_reqwest(client.get(&validated.effective_url))
+            .await
+            .map_err(atproto_spaces::SpacesError::InvalidClientAttestation)?;
+        if !resp.status().is_success() {
+            return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+                format!("client metadata HTTP {}", resp.status().as_u16()),
+            ));
+        }
+        let meta: Value = resp
+            .json()
+            .await
+            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+        if meta.get("client_id").and_then(Value::as_str) != Some(client_id_url) {
+            return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+                "client metadata client_id mismatch".into(),
+            ));
+        }
+
+        let keys_val = if let Some(keys) = meta
+            .get("jwks")
+            .and_then(|j| j.get("keys"))
+            .and_then(Value::as_array)
+        {
+            keys.clone()
+        } else if let Some(jwks_uri) = meta.get("jwks_uri").and_then(Value::as_str) {
+            let allow_jwks_loopback = revocation_fanout::allow_loopback_space_endpoint(jwks_uri);
+            let jwks_validated = validate_https_url_with_resolver(
+                jwks_uri,
+                None,
+                allow_jwks_loopback,
+                crate::push_gateway::ssrf::system_dns_resolve,
+            )
+            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+            let jwks_client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(10))
+                .resolve_to_addrs(&jwks_validated.host, &jwks_validated.pinned_addrs)
+                .build()
+                .map_err(|e| {
+                    atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string())
+                })?;
+            let jwks_resp =
+                crate::sim_hooks::send_reqwest(jwks_client.get(&jwks_validated.effective_url))
+                    .await
+                    .map_err(atproto_spaces::SpacesError::InvalidClientAttestation)?;
+            if !jwks_resp.status().is_success() {
+                return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+                    format!("client jwks_uri HTTP {}", jwks_resp.status().as_u16()),
+                ));
+            }
+            let jwks_doc: Value = jwks_resp.json().await.map_err(|e| {
+                atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string())
+            })?;
+            jwks_doc
+                .get("keys")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| {
+                    atproto_spaces::SpacesError::InvalidClientAttestation(
+                        "client jwks_uri missing keys array".into(),
+                    )
+                })?
+        } else {
+            return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+                "client metadata missing jwks and jwks_uri".into(),
+            ));
+        };
+
+        let vk = extract_client_jwk_verifying_key(&keys_val, kid)?;
+        if let Ok(mut guard) = self.client_key_cache.write() {
+            guard.insert(cache_key, (vk.clone(), Instant::now()));
+        }
+        Ok(vk)
+    }
+
     /// `Send`-safe wrapper around `atproto_spaces::tokens::verify_space_token` with one-shot key refresh.
     pub async fn verify_space_token_send(
         &self,
@@ -450,7 +594,39 @@ impl SpaceHostRuntime {
         jwt: &str,
         now_sec: u64,
     ) -> Result<SpaceTokenClaims, atproto_spaces::SpacesError> {
-        let (_kid, untrusted) = inspect_untrusted_space_token(kind, jwt, now_sec)?;
+        let (_alg, untrusted) = inspect_untrusted_space_token(kind, jwt, now_sec)?;
+        if kind == SpaceTokenKind::ClientAttestation {
+            let hdr_b64 = jwt.split('.').next().unwrap_or_default();
+            let hdr_bytes = URL_SAFE_NO_PAD.decode(hdr_b64).map_err(|e| {
+                atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string())
+            })?;
+            let hdr_json: Value = serde_json::from_slice(&hdr_bytes).map_err(|e| {
+                atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string())
+            })?;
+            let kid = hdr_json
+                .get("kid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    atproto_spaces::SpacesError::InvalidClientAttestation("missing JOSE kid".into())
+                })?
+                .to_string();
+            let vk = self
+                .resolve_client_attestation_key(&untrusted.iss, &kid, false)
+                .await?;
+            let resolver = SinglePreResolvedKey(vk);
+            return match futures::executor::block_on(verify_space_token(
+                kind, jwt, &resolver, now_sec,
+            )) {
+                Ok(claims) => Ok(claims),
+                Err(_) => {
+                    let refreshed_vk = self
+                        .resolve_client_attestation_key(&untrusted.iss, &kid, true)
+                        .await?;
+                    let refreshed = SinglePreResolvedKey(refreshed_vk);
+                    futures::executor::block_on(verify_space_token(kind, jwt, &refreshed, now_sec))
+                }
+            };
+        }
         let (vk, _, _) = self.resolve_did_entry(&untrusted.iss, false).await?;
         let resolver = SinglePreResolvedKey(vk);
         match futures::executor::block_on(verify_space_token(kind, jwt, &resolver, now_sec)) {
@@ -462,6 +638,58 @@ impl SpaceHostRuntime {
             }
         }
     }
+}
+
+fn extract_client_jwk_verifying_key(
+    keys: &[Value],
+    expected_kid: &str,
+) -> Result<SpaceVerifyingKey, atproto_spaces::SpacesError> {
+    for jwk in keys {
+        if jwk.get("kid").and_then(Value::as_str) != Some(expected_kid) {
+            continue;
+        }
+        if jwk.get("kty").and_then(Value::as_str) != Some("EC")
+            || jwk.get("crv").and_then(Value::as_str) != Some("P-256")
+        {
+            return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+                "client attestation JWK must be EC P-256".into(),
+            ));
+        }
+        if let Some(alg) = jwk.get("alg").and_then(Value::as_str) {
+            if alg != "ES256" {
+                return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+                    format!("unsupported client attestation JWK alg {alg}"),
+                ));
+            }
+        }
+        let x_b64 = jwk.get("x").and_then(Value::as_str).ok_or_else(|| {
+            atproto_spaces::SpacesError::InvalidClientAttestation("JWK missing x".into())
+        })?;
+        let y_b64 = jwk.get("y").and_then(Value::as_str).ok_or_else(|| {
+            atproto_spaces::SpacesError::InvalidClientAttestation("JWK missing y".into())
+        })?;
+        let x = URL_SAFE_NO_PAD
+            .decode(x_b64)
+            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+        let y = URL_SAFE_NO_PAD
+            .decode(y_b64)
+            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+        if x.len() != 32 || y.len() != 32 {
+            return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+                "P-256 JWK coordinates must be 32 bytes".into(),
+            ));
+        }
+        let mut sec1 = [0u8; 65];
+        sec1[0] = 0x04;
+        sec1[1..33].copy_from_slice(&x);
+        sec1[33..65].copy_from_slice(&y);
+        let vk = P256VerifyingKey::from_sec1_bytes(&sec1)
+            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+        return Ok(SpaceVerifyingKey::P256(vk));
+    }
+    Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+        format!("client metadata JWKS has no key matching kid {expected_kid}"),
+    ))
 }
 
 struct SinglePreResolvedKey(SpaceVerifyingKey);

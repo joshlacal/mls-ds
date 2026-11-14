@@ -224,6 +224,7 @@ pub fn classify_device_auth_endpoint(nsid: &str) -> Option<DeviceAuthEndpointCla
         | "blue.catbird.chat.acknowledgeEntries"
         | "blue.catbird.chat.acknowledgeWelcome"
         | "blue.catbird.chat.activateReset"
+        | "blue.catbird.chat.approveDevice"
         | "blue.catbird.chat.cancelDirectRequestPreparation"
         | "blue.catbird.chat.cancelLeafRecovery"
         | "blue.catbird.chat.cancelLeave"
@@ -509,6 +510,46 @@ impl InlineTriggerConfig {
     /// Test-only constructor returning the spec defaults verbatim.
     pub fn test_defaults() -> Self {
         Self::default()
+    }
+}
+
+/// Clean-chat multi-device dormancy and ephemeral application-payload retention.
+///
+/// - `CHAT_DEVICE_DORMANT_AFTER_HOURS` (default `48`): active devices whose
+///   coarse UTC-day `last_active_at` is at or older than `now - N hours` are
+///   marked dormant so inactive devices cannot stall ACK-driven payload pruning.
+/// - `CHAT_APPLICATION_PAYLOAD_TTL_HOURS` (default `72`): hard ceiling after
+///   which unacknowledged `#applicationEntry` ciphertexts are pruned even if an
+///   active device has not acknowledged them (`#commitEntry` and control entries
+///   remain untouched).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatRetentionConfig {
+    pub device_dormant_after_hours: i64,
+    pub application_payload_ttl_hours: i64,
+}
+
+impl Default for ChatRetentionConfig {
+    fn default() -> Self {
+        Self {
+            device_dormant_after_hours: 48,
+            application_payload_ttl_hours: 72,
+        }
+    }
+}
+
+impl ChatRetentionConfig {
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            device_dormant_after_hours: parse_env_i64_positive(
+                "CHAT_DEVICE_DORMANT_AFTER_HOURS",
+                defaults.device_dormant_after_hours,
+            ),
+            application_payload_ttl_hours: parse_env_i64_positive(
+                "CHAT_APPLICATION_PAYLOAD_TTL_HOURS",
+                defaults.application_payload_ttl_hours,
+            ),
+        }
     }
 }
 

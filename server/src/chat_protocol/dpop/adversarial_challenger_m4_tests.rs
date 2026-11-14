@@ -1139,8 +1139,8 @@ fn is_get_endpoint(endpoint: ChatEndpoint) -> bool {
 async fn challenge_4_all_32_endpoints_cutover_disabled_rejection() {
     assert_eq!(
         ChatEndpoint::ALL.len(),
-        36,
-        "Must contain exactly 36 endpoints"
+        37,
+        "Must contain exactly 37 endpoints"
     );
 
     for endpoint in ChatEndpoint::ALL {

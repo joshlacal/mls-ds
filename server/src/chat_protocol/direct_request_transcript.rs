@@ -1606,6 +1606,7 @@ fn endpoint_output_schema(nsid: &str) -> Option<&'static Value> {
                 "acknowledgeEntries",
                 "acknowledgeWelcome",
                 "activateReset",
+                "approveDevice",
                 "authFull",
                 "cancelDirectRequestPreparation",
                 "cancelLeafRecovery",

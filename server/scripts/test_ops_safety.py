@@ -413,7 +413,13 @@ class SiblingBuildInputTests(unittest.TestCase):
             self.assertEqual(supplied, contexts, name)
 
     def test_every_ci_job_that_builds_the_server_clones_its_path_dependencies(self):
-        repos = set(re.findall(r'path = "\.\./\.\./([^/"]+)', (SERVER / "Cargo.toml").read_text()))
+        repos = set(
+            re.findall(
+                r'path = "(?:\.\./\.\./(?!\.\./)|(?:\.\./){3}dec1-w0/wave1-)([^/"]+)',
+                (SERVER / "Cargo.toml").read_text(),
+            )
+        )
+        self.assertIn("catbird-atproto", repos)
         self.assertIn("labyrinth", repos)
         jobs = re.split(r"^  (?=[\w-]+:\n)", self.workflow.split("\njobs:\n", 1)[1], flags=re.M)
         builders = [job for job in jobs if "working-directory: ./server" in job or "file: ./server/Dockerfile" in job]

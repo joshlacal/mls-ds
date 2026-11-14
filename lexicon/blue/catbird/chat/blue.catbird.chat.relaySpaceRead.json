@@ -1,7 +1,7 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.chat.relaySpaceRead",
-  "description": "Stateless zero-persistence home-mls-ds relay (3A) forwarding client-signed RFC 9421 Space read requests (listRepos, getSpace, listRecords, getRecord, listRepoOps, getLatestCommit, getRepo, getBlob) to a remote Space host or writer PDS, returning raw bytes and preserving the Atproto-Space-Mac header.",
+  "description": "Stateless zero-persistence home-mls-ds relay (3A) forwarding client-signed RFC 9421 Space read requests (listWriters, getSpace, listRecords, getRecord, listRepoOps, getLatestCommit, getRepo, getBlob) to a remote Space host or writer PDS, returning raw bytes and preserving Atproto-Space-Commit / Atproto-Space-Record / Signature-Input / Signature headers.",
   "defs": {
     "main": {
       "type": "procedure",
@@ -31,7 +31,7 @@
             "nsid": {
               "type": "string",
               "maxLength": 128,
-              "description": "Read-only com.atproto.space.* NSID (listRepos, getSpace, listRecords, getRecord, listRepoOps, getLatestCommit, getRepo, getBlob)."
+              "description": "Read-only com.atproto.space.* NSID (listWriters, getSpace, listRecords, getRecord, listRepoOps, getLatestCommit, getRepo, getBlob)."
             },
             "query": {
               "type": "string",
@@ -62,6 +62,11 @@
               "type": "string",
               "maxLength": 2048,
               "description": "RFC 9421 Signature header produced by the client's ephemeral PoP key."
+            },
+            "acceptSignature": {
+              "type": "string",
+              "maxLength": 1024,
+              "description": "Optional RFC 9421 Accept-Signature header requesting Atproto-Space-Commit or Atproto-Space-Record MAC authentication (#atproto_kem did:key share in keyid)."
             }
           }
         }

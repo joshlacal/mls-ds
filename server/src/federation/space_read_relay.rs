@@ -1,32 +1,40 @@
-//! `3A` Stateless Home-`mls-ds` Space Credential & Space Read Relays (`D1`, `3A`).
+//! Stateless Home-`mls-ds` Space Credential, Space Read, & Signed `mailboxKeys` Relays.
 //!
 //! Preserves metadata privacy when a client accesses a remote Space Authority or remote writer PDS:
-//! - The client connects ONLY to its own home `mls-ds` (`blue.catbird.chat.relaySpaceCredential`
-//!   and `blue.catbird.chat.relaySpaceRead`).
+//! - The client connects ONLY to its own home `mls-ds` (`blue.catbird.chat.relaySpaceCredential`,
+//!   `blue.catbird.chat.relaySpaceRead`, and `blue.catbird.labyrinth.getMailboxKeysRecord`).
 //! - The home `mls-ds` resolves the target DID's HTTPS `:443` endpoint, enforces DNS-pinned SSRF
 //!   protection (`M-F06`), enforces a strict read-only `com.atproto.space.*` NSID allowlist,
 //!   forwards the client's RFC 9421 PoP headers (`Authorization`, `Atproto-Space-Audience`,
-//!   `Atproto-Space-Want-Mac`, `Signature-Input`, `Signature`) untouched, preserves upstream
-//!   `Atproto-Space-Mac`, sets `Access-Control-Expose-Headers: Atproto-Space-Mac`, and writes
-//!   ZERO operational database rows on the home `mls-ds`!
-//!
-//! Credential exchange uses standard POST JSON (never a delegation token in the URL).
-//! The home response's `expiresAt` comes from the authority-signed credential after exact
-//! issuer, Space, PoP-key, and current scoped-clock expiry checks. The authority's signed
-//! refusal (403 `NotAuthorized` carrying `denial`) reaches the client byte for byte; only the
-//! client's check of that signature makes a refusal removal proof.
+//!   `Atproto-Space-Want-Mac`, `Accept-Signature`, `Signature-Input`, `Signature`) untouched,
+//!   preserves upstream `Atproto-Space-Commit`, `Atproto-Space-Record`, `Signature-Input`,
+//!   `Signature`, `Vary`, and `Atproto-Space-Mac` headers, and writes ZERO operational database
+//!   rows on the home `mls-ds`.
+//! - `relay_mailbox_keys_record` fetches `com.atproto.sync.getRecord` (`application/vnd.ipld.car`),
+//!   verifies CARv1 block CIDs, canonical IPLD DAG-CBOR encoding, the ATProto v3 root commit
+//!   signature under `targetDid`'s resolved `#atproto` key, and authenticated MST inclusion or
+//!   non-inclusion before accepting any record or `404 RecordNotFound`.
 
-use std::{collections::HashMap, net::SocketAddr, sync::RwLock, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    io::Cursor,
+    net::SocketAddr,
+    sync::RwLock,
+    time::Duration,
+};
 
 use atproto_spaces::{
     did_resolver::DidDocument,
     kem::decode_p256_did_key,
+    lthash::compute_dagcbor_cid,
     tokens::{verify_space_token, SpaceKeyResolver, SpaceTokenKind, SpaceVerifyingKey},
     SpaceUri, SpacesError,
 };
-
+use catbird_atproto::generated::blue_catbird::labyrinth::mailbox_keys::{
+    MailboxKeys, MailboxKeysBackend,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use url::Url;
 
 use crate::{
@@ -43,9 +51,9 @@ use crate::{
     },
 };
 
-/// Closed allowlist of read-only `com.atproto.space.*` NSIDs permitted through `relaySpaceRead` (`3A`).
+/// Closed allowlist of read-only `com.atproto.space.*` NSIDs permitted through `relaySpaceRead`.
 pub const ALLOWED_SPACE_READ_NSIDS: &[&str] = &[
-    "com.atproto.space.listRepos",
+    "com.atproto.space.listWriters",
     "com.atproto.space.getSpace",
     "com.atproto.space.listRecords",
     "com.atproto.space.getRecord",
@@ -61,6 +69,12 @@ pub const ALLOWED_SPACE_READ_NSIDS: &[&str] = &[
 const SPACE_BLOB_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SPACE_REPO_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAILBOX_KEYS_RECORD_MAX_BYTES: usize = 1024 * 1024;
+const CAR_HEADER_MAX_BYTES: usize = 64 * 1024;
+const CAR_MAX_BLOCKS: usize = 512;
+const MST_MAX_DEPTH: usize = 64;
+const DAGCBOR_MAX_DEPTH: usize = 32;
+const DAG_CBOR_CODEC: u64 = 0x71;
+const MAX_MAILBOX_EPOCH_NUMBER: i64 = 999_999_999_999;
 
 fn space_read_response_max_bytes(nsid: &str, status: reqwest::StatusCode) -> usize {
     if !status.is_success() {
@@ -379,17 +393,39 @@ impl SpaceKeyResolver for CredentialAuthorityKey<'_> {
     }
 }
 
+/// Optional Nov-12 `authorizeSpaceSync` inputs forwarded through `relaySpaceCredential`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelayCredentialOptions<'a> {
+    pub client_attestation: Option<&'a str>,
+    pub notify: Option<(&'a str, &'a str)>,
+    pub space_rev: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamNotifyTarget<'a> {
+    endpoint: &'a str,
+    token: &'a str,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UpstreamCredentialRequest<'a> {
     space: &'a str,
-    credential_kid: &'a str,
+    credential_key: &'a str,
     delegation_token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_attestation: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notify: Option<UpstreamNotifyTarget<'a>>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UpstreamCredentialOutput {
     credential: String,
+    #[serde(default)]
+    space_rev: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,37 +433,70 @@ struct UpstreamCredentialOutput {
 pub struct RelayedCredentialOutput {
     pub credential: String,
     pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_rev: Option<String>,
 }
 
-/// Exchange via standard POST JSON and return only an authority-verified, PoP-bound credential.
+/// Exchange via standard POST JSON (`com.atproto.space.authorizeSpaceSync`) and return only an
+/// authority-verified, PoP-bound credential.
 pub async fn relay_space_credential_stateless(
     authority_did: &str,
     space_uri: &str,
     delegation_token: &str,
-    credential_kid: &str,
+    credential_key: &str,
+) -> Result<RelayedCredentialOutput, SpaceRelayError> {
+    relay_space_credential_with_options(
+        authority_did,
+        space_uri,
+        delegation_token,
+        credential_key,
+        RelayCredentialOptions::default(),
+    )
+    .await
+}
+
+/// Exchange via standard POST JSON (`com.atproto.space.authorizeSpaceSync`) with optional Nov-12
+/// `clientAttestation`, `notify`, and `spaceRev` parameters.
+pub async fn relay_space_credential_with_options(
+    authority_did: &str,
+    space_uri: &str,
+    delegation_token: &str,
+    credential_key: &str,
+    options: RelayCredentialOptions<'_>,
 ) -> Result<RelayedCredentialOutput, SpaceRelayError> {
     let authority_did = crate::identity::canonical_did(authority_did);
-    let space =
-        SpaceUri::parse(space_uri).map_err(|e| SpaceRelayError::InvalidRequest(e.to_string()))?;
+    let space = SpaceUri::parse_hedged(space_uri)
+        .map_err(|e| SpaceRelayError::InvalidRequest(e.to_string()))?;
     if space.authority != authority_did {
         return Err(SpaceRelayError::InvalidRequest(
             "Space authority does not match authorityDid".into(),
         ));
     }
-    decode_p256_did_key(credential_kid)
+    decode_p256_did_key(credential_key)
         .map_err(|e| SpaceRelayError::InvalidRequest(e.to_string()))?;
+    if let Some(rev) = options.space_rev {
+        if crate::space_host::decode_tid_micros(rev).is_none() {
+            return Err(SpaceRelayError::InvalidRequest(
+                "spaceRev must be a canonical 13-character TID".into(),
+            ));
+        }
+    }
 
     let target = resolve_ssrf_safe_space_endpoint(authority_did).await?;
     let client = build_pinned_client(&target)?;
 
     let url = format!(
-        "{}/xrpc/com.atproto.space.getSpaceCredential",
+        "{}/xrpc/com.atproto.space.authorizeSpaceSync",
         target.base_url
     );
     let request = UpstreamCredentialRequest {
-        space: space_uri,
-        credential_kid,
+        space: space.as_str(),
+        credential_key,
         delegation_token,
+        client_attestation: options.client_attestation.filter(|s| !s.is_empty()),
+        notify: options
+            .notify
+            .map(|(endpoint, token)| UpstreamNotifyTarget { endpoint, token }),
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let resp = crate::sim_hooks::send_reqwest(client.post(&url).json(&request))
@@ -465,7 +534,7 @@ pub async fn relay_space_credential_stateless(
     }
     if !status.is_success() {
         let reason = format!(
-            "upstream getSpaceCredential HTTP {}: {}",
+            "upstream authorizeSpaceSync HTTP {}: {}",
             status.as_u16(),
             String::from_utf8_lossy(&bytes)
         );
@@ -478,6 +547,14 @@ pub async fn relay_space_credential_stateless(
 
     let upstream: UpstreamCredentialOutput = serde_json::from_slice(&bytes)
         .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))?;
+    if let Some(ref rev) = upstream.space_rev {
+        if crate::space_host::decode_tid_micros(rev).is_none() {
+            return Err(SpaceRelayError::UpstreamError(
+                "upstream authorizeSpaceSync returned malformed spaceRev".into(),
+            ));
+        }
+    }
+
     let resolver = CredentialAuthorityKey {
         authority_did,
         key: resolve_space_credential_key(authority_did, &target).await?,
@@ -491,9 +568,10 @@ pub async fn relay_space_credential_stateless(
         now_sec,
     ))
     .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))?;
+    let claim_space = SpaceUri::parse_hedged(&claims.sub).ok();
     if claims.iss != authority_did
-        || claims.sub != space_uri
-        || claims.cnf_kid.as_deref() != Some(credential_kid)
+        || claim_space.as_ref() != Some(&space)
+        || claims.cnf_kid.as_deref() != Some(credential_key)
         || claims.exp <= now_sec
     {
         return Err(SpaceRelayError::UpstreamError(
@@ -504,20 +582,12 @@ pub async fn relay_space_credential_stateless(
         .ok()
         .and_then(|exp| chrono::DateTime::from_timestamp(exp, 0))
         .ok_or_else(|| SpaceRelayError::UpstreamError("invalid credential expiry".into()))?
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     Ok(RelayedCredentialOutput {
         credential: upstream.credential,
         expires_at,
+        space_rev: upstream.space_rev,
     })
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MailboxKeysRecordEnvelope {
-    uri: String,
-    cid: String,
-    #[serde(rename = "value")]
-    _value: catbird_atproto::generated::blue_catbird::labyrinth::mailbox_keys::MailboxKeys<String>,
 }
 
 fn valid_record_key(rkey: &str) -> bool {
@@ -530,20 +600,599 @@ fn valid_record_key(rkey: &str) -> bool {
         })
 }
 
-fn validate_mailbox_keys_record(
-    body: &[u8],
-    target_did: &str,
-    rkey: &str,
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CarHeader {
+    roots: Vec<cid::Cid>,
+    version: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UnsignedAtprotoCommitV3 {
+    did: String,
+    rev: String,
+    data: cid::Cid,
+    prev: Option<cid::Cid>,
+    version: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedAtprotoCommitV3 {
+    did: String,
+    rev: String,
+    #[serde(with = "serde_bytes")]
+    sig: Vec<u8>,
+    data: cid::Cid,
+    prev: Option<cid::Cid>,
+    version: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MstTreeEntry {
+    #[serde(with = "serde_bytes")]
+    k: Vec<u8>,
+    p: usize,
+    t: Option<cid::Cid>,
+    v: cid::Cid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MstNodeData {
+    e: Vec<MstTreeEntry>,
+    l: Option<cid::Cid>,
+}
+
+fn read_uvarint(bytes: &[u8], pos: &mut usize) -> Result<u64, SpaceRelayError> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    for _ in 0..9 {
+        let byte = *bytes
+            .get(*pos)
+            .ok_or_else(|| SpaceRelayError::UpstreamError("truncated CAR varint".into()))?;
+        *pos += 1;
+        if byte < 0x80 {
+            if shift > 0 && byte == 0 {
+                return Err(SpaceRelayError::UpstreamError(
+                    "non-minimal CAR varint".into(),
+                ));
+            }
+            return Ok(value | ((byte as u64) << shift));
+        }
+        value |= ((byte & 0x7f) as u64) << shift;
+        shift += 7;
+    }
+    Err(SpaceRelayError::UpstreamError("CAR varint overflow".into()))
+}
+
+fn read_cbor_uint(bytes: &[u8], pos: &mut usize, info: u8) -> Result<u64, SpaceRelayError> {
+    match info {
+        0..=23 => Ok(info as u64),
+        24 => {
+            let v = *bytes
+                .get(*pos)
+                .ok_or_else(|| SpaceRelayError::UpstreamError("truncated CBOR uint8".into()))?;
+            *pos += 1;
+            if v < 24 {
+                return Err(SpaceRelayError::UpstreamError(
+                    "non-canonical CBOR uint8".into(),
+                ));
+            }
+            Ok(v as u64)
+        }
+        25 => {
+            let slice = bytes
+                .get(*pos..pos.saturating_add(2))
+                .filter(|s| s.len() == 2)
+                .ok_or_else(|| SpaceRelayError::UpstreamError("truncated CBOR uint16".into()))?;
+            *pos += 2;
+            let v = u16::from_be_bytes([slice[0], slice[1]]);
+            if v <= u8::MAX as u16 {
+                return Err(SpaceRelayError::UpstreamError(
+                    "non-canonical CBOR uint16".into(),
+                ));
+            }
+            Ok(v as u64)
+        }
+        26 => {
+            let slice = bytes
+                .get(*pos..pos.saturating_add(4))
+                .filter(|s| s.len() == 4)
+                .ok_or_else(|| SpaceRelayError::UpstreamError("truncated CBOR uint32".into()))?;
+            *pos += 4;
+            let v = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
+            if v <= u16::MAX as u32 {
+                return Err(SpaceRelayError::UpstreamError(
+                    "non-canonical CBOR uint32".into(),
+                ));
+            }
+            Ok(v as u64)
+        }
+        27 => {
+            let slice = bytes
+                .get(*pos..pos.saturating_add(8))
+                .filter(|s| s.len() == 8)
+                .ok_or_else(|| SpaceRelayError::UpstreamError("truncated CBOR uint64".into()))?;
+            *pos += 8;
+            let v = u64::from_be_bytes([
+                slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+            ]);
+            if v <= u32::MAX as u64 {
+                return Err(SpaceRelayError::UpstreamError(
+                    "non-canonical CBOR uint64".into(),
+                ));
+            }
+            Ok(v)
+        }
+        _ => Err(SpaceRelayError::UpstreamError(
+            "indefinite or reserved CBOR additional info".into(),
+        )),
+    }
+}
+
+fn verify_canonical_dagcbor_item(
+    bytes: &[u8],
+    pos: &mut usize,
+    depth: usize,
 ) -> Result<(), SpaceRelayError> {
-    let envelope: MailboxKeysRecordEnvelope = serde_json::from_slice(body)
-        .map_err(|_| SpaceRelayError::UpstreamError("malformed mailboxKeys record".into()))?;
-    let expected_uri = format!("at://{target_did}/blue.catbird.labyrinth.mailboxKeys/{rkey}");
-    if envelope.uri != expected_uri {
+    if depth > DAGCBOR_MAX_DEPTH {
         return Err(SpaceRelayError::UpstreamError(
-            "mailboxKeys record URI does not match target DID and rkey".into(),
+            "DAG-CBOR nesting depth exceeded".into(),
         ));
     }
-    let current = &envelope._value.current;
+    let head = *bytes
+        .get(*pos)
+        .ok_or_else(|| SpaceRelayError::UpstreamError("truncated DAG-CBOR item".into()))?;
+    *pos += 1;
+    let major = head >> 5;
+    let info = head & 0x1f;
+    match major {
+        0 | 1 => {
+            read_cbor_uint(bytes, pos, info)?;
+            Ok(())
+        }
+        2 => {
+            let len = usize::try_from(read_cbor_uint(bytes, pos, info)?)
+                .map_err(|_| SpaceRelayError::UpstreamError("CBOR bytes length overflow".into()))?;
+            let end = pos
+                .checked_add(len)
+                .filter(|&end| end <= bytes.len())
+                .ok_or_else(|| SpaceRelayError::UpstreamError("truncated CBOR bytes".into()))?;
+            *pos = end;
+            Ok(())
+        }
+        3 => {
+            let len = usize::try_from(read_cbor_uint(bytes, pos, info)?)
+                .map_err(|_| SpaceRelayError::UpstreamError("CBOR text length overflow".into()))?;
+            let end = pos
+                .checked_add(len)
+                .filter(|&end| end <= bytes.len())
+                .ok_or_else(|| SpaceRelayError::UpstreamError("truncated CBOR text".into()))?;
+            std::str::from_utf8(&bytes[*pos..end])
+                .map_err(|_| SpaceRelayError::UpstreamError("invalid UTF-8 in CBOR text".into()))?;
+            *pos = end;
+            Ok(())
+        }
+        4 => {
+            let count = usize::try_from(read_cbor_uint(bytes, pos, info)?)
+                .map_err(|_| SpaceRelayError::UpstreamError("CBOR array length overflow".into()))?;
+            for _ in 0..count {
+                verify_canonical_dagcbor_item(bytes, pos, depth + 1)?;
+            }
+            Ok(())
+        }
+        5 => {
+            let count = usize::try_from(read_cbor_uint(bytes, pos, info)?)
+                .map_err(|_| SpaceRelayError::UpstreamError("CBOR map length overflow".into()))?;
+            let mut prev_key: Option<&[u8]> = None;
+            for _ in 0..count {
+                let key_head = *bytes.get(*pos).ok_or_else(|| {
+                    SpaceRelayError::UpstreamError("truncated CBOR map key".into())
+                })?;
+                if (key_head >> 5) != 3 {
+                    return Err(SpaceRelayError::UpstreamError(
+                        "DAG-CBOR map key must be a UTF-8 string".into(),
+                    ));
+                }
+                *pos += 1;
+                let key_len = usize::try_from(read_cbor_uint(bytes, pos, key_head & 0x1f)?)
+                    .map_err(|_| {
+                        SpaceRelayError::UpstreamError("CBOR map key length overflow".into())
+                    })?;
+                let key_end = pos
+                    .checked_add(key_len)
+                    .filter(|&end| end <= bytes.len())
+                    .ok_or_else(|| {
+                        SpaceRelayError::UpstreamError("truncated CBOR map key".into())
+                    })?;
+                let key_slice = &bytes[*pos..key_end];
+                std::str::from_utf8(key_slice).map_err(|_| {
+                    SpaceRelayError::UpstreamError("invalid UTF-8 in CBOR map key".into())
+                })?;
+                if let Some(prev) = prev_key {
+                    if (prev.len(), prev) >= (key_slice.len(), key_slice) {
+                        return Err(SpaceRelayError::UpstreamError(
+                            "non-canonical or duplicate DAG-CBOR map key order".into(),
+                        ));
+                    }
+                }
+                prev_key = Some(key_slice);
+                *pos = key_end;
+                verify_canonical_dagcbor_item(bytes, pos, depth + 1)?;
+            }
+            Ok(())
+        }
+        6 => {
+            let tag = read_cbor_uint(bytes, pos, info)?;
+            if tag != 42 {
+                return Err(SpaceRelayError::UpstreamError(
+                    "unsupported CBOR tag in DAG-CBOR".into(),
+                ));
+            }
+            let payload_head = *bytes
+                .get(*pos)
+                .ok_or_else(|| SpaceRelayError::UpstreamError("truncated CBOR CID tag".into()))?;
+            if (payload_head >> 5) != 2 {
+                return Err(SpaceRelayError::UpstreamError(
+                    "DAG-CBOR tag 42 payload must be byte string".into(),
+                ));
+            }
+            *pos += 1;
+            let len = usize::try_from(read_cbor_uint(bytes, pos, payload_head & 0x1f)?).map_err(
+                |_| SpaceRelayError::UpstreamError("CBOR CID tag length overflow".into()),
+            )?;
+            let end = pos
+                .checked_add(len)
+                .filter(|&end| end <= bytes.len())
+                .ok_or_else(|| SpaceRelayError::UpstreamError("truncated CBOR CID bytes".into()))?;
+            let cid_bytes = &bytes[*pos..end];
+            if cid_bytes.first() != Some(&0x00) {
+                return Err(SpaceRelayError::UpstreamError(
+                    "DAG-CBOR tag 42 CID missing identity multibase prefix".into(),
+                ));
+            }
+            let parsed = cid::Cid::try_from(&cid_bytes[1..])
+                .map_err(|_| SpaceRelayError::UpstreamError("invalid CID inside tag 42".into()))?;
+            if parsed.to_bytes().as_slice() != &cid_bytes[1..] {
+                return Err(SpaceRelayError::UpstreamError(
+                    "non-canonical CID bytes inside tag 42".into(),
+                ));
+            }
+            *pos = end;
+            Ok(())
+        }
+        7 => match info {
+            20..=22 => Ok(()),
+            _ => Err(SpaceRelayError::UpstreamError(
+                "floats and undefined are forbidden in ATProto DAG-CBOR".into(),
+            )),
+        },
+        _ => Err(SpaceRelayError::UpstreamError("invalid CBOR major".into())),
+    }
+}
+
+fn verify_canonical_dagcbor(bytes: &[u8]) -> Result<(), SpaceRelayError> {
+    let mut pos = 0usize;
+    verify_canonical_dagcbor_item(bytes, &mut pos, 0)?;
+    if pos != bytes.len() {
+        return Err(SpaceRelayError::UpstreamError(
+            "trailing bytes after DAG-CBOR block".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_verified_car_v1(
+    car_bytes: &[u8],
+) -> Result<(cid::Cid, HashMap<cid::Cid, Vec<u8>>), SpaceRelayError> {
+    if car_bytes.is_empty() || car_bytes.len() > MAILBOX_KEYS_RECORD_MAX_BYTES {
+        return Err(SpaceRelayError::UpstreamError(
+            "CARv1 response empty or exceeds size ceiling".into(),
+        ));
+    }
+    let mut pos = 0usize;
+    let header_len = usize::try_from(read_uvarint(car_bytes, &mut pos)?)
+        .map_err(|_| SpaceRelayError::UpstreamError("CAR header length overflow".into()))?;
+    if !(1..=CAR_HEADER_MAX_BYTES).contains(&header_len) {
+        return Err(SpaceRelayError::UpstreamError(
+            "CAR header length outside [1, 65536]".into(),
+        ));
+    }
+    let header_end = pos
+        .checked_add(header_len)
+        .filter(|&end| end <= car_bytes.len())
+        .ok_or_else(|| SpaceRelayError::UpstreamError("truncated CAR header".into()))?;
+    let header_bytes = &car_bytes[pos..header_end];
+    pos = header_end;
+    verify_canonical_dagcbor(header_bytes)?;
+    let header: CarHeader = serde_ipld_dagcbor::from_slice(header_bytes)
+        .map_err(|_| SpaceRelayError::UpstreamError("malformed CARv1 header".into()))?;
+    if header.version != 1 || header.roots.len() != 1 {
+        return Err(SpaceRelayError::UpstreamError(
+            "CARv1 header must have version 1 and exactly 1 root CID".into(),
+        ));
+    }
+    let root_cid = header.roots[0];
+
+    let mut blocks = HashMap::new();
+    while pos < car_bytes.len() {
+        if blocks.len() >= CAR_MAX_BLOCKS {
+            return Err(SpaceRelayError::UpstreamError(
+                "CARv1 block count exceeds 512".into(),
+            ));
+        }
+        let section_len = usize::try_from(read_uvarint(car_bytes, &mut pos)?)
+            .map_err(|_| SpaceRelayError::UpstreamError("CAR section length overflow".into()))?;
+        if section_len == 0 {
+            return Err(SpaceRelayError::UpstreamError(
+                "empty CAR block section".into(),
+            ));
+        }
+        let section_end = pos
+            .checked_add(section_len)
+            .filter(|&end| end <= car_bytes.len())
+            .ok_or_else(|| SpaceRelayError::UpstreamError("truncated CAR block section".into()))?;
+        let section = &car_bytes[pos..section_end];
+        pos = section_end;
+
+        let mut reader = Cursor::new(section);
+        let block_cid = cid::Cid::read_bytes(&mut reader)
+            .map_err(|_| SpaceRelayError::UpstreamError("malformed CID in CAR section".into()))?;
+        let cid_len = usize::try_from(reader.position())
+            .map_err(|_| SpaceRelayError::UpstreamError("CAR CID length overflow".into()))?;
+        let _data_len = section_len
+            .checked_sub(cid_len)
+            .ok_or_else(|| SpaceRelayError::UpstreamError("CAR section shorter than CID".into()))?;
+        if block_cid.to_bytes().as_slice() != &section[..cid_len] {
+            return Err(SpaceRelayError::UpstreamError(
+                "non-canonical CID encoding in CAR block".into(),
+            ));
+        }
+        if block_cid.version() != cid::Version::V1 || block_cid.codec() != DAG_CBOR_CODEC {
+            return Err(SpaceRelayError::UpstreamError(
+                "CAR block must use CIDv1 dag-cbor (0x71)".into(),
+            ));
+        }
+        let block_data = &section[cid_len..];
+        verify_canonical_dagcbor(block_data)?;
+        if compute_dagcbor_cid(block_data) != block_cid {
+            return Err(SpaceRelayError::UpstreamError(
+                "CAR block CID digest mismatch".into(),
+            ));
+        }
+        if blocks.insert(block_cid, block_data.to_vec()).is_some() {
+            return Err(SpaceRelayError::UpstreamError(
+                "duplicate CID block in CAR proof".into(),
+            ));
+        }
+    }
+
+    if !blocks.contains_key(&root_cid) {
+        return Err(SpaceRelayError::UpstreamError(
+            "CARv1 proof missing root commit block".into(),
+        ));
+    }
+    Ok((root_cid, blocks))
+}
+
+fn verify_atproto_v3_commit(
+    commit_bytes: &[u8],
+    expected_did: &str,
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<cid::Cid, SpaceRelayError> {
+    let commit: SignedAtprotoCommitV3 = serde_ipld_dagcbor::from_slice(commit_bytes)
+        .map_err(|_| SpaceRelayError::UpstreamError("malformed ATProto v3 commit".into()))?;
+    if commit.version != 3 {
+        return Err(SpaceRelayError::UpstreamError(
+            "ATProto commit version must be 3".into(),
+        ));
+    }
+    if commit.did != expected_did {
+        return Err(SpaceRelayError::UpstreamError(
+            "ATProto commit DID does not match target DID".into(),
+        ));
+    }
+    if crate::space_host::decode_tid_micros(&commit.rev).is_none() {
+        return Err(SpaceRelayError::UpstreamError(
+            "ATProto commit rev is not a valid TID".into(),
+        ));
+    }
+    if commit.sig.len() != 64 {
+        return Err(SpaceRelayError::UpstreamError(
+            "ATProto commit signature must be 64 bytes".into(),
+        ));
+    }
+    let unsigned = UnsignedAtprotoCommitV3 {
+        did: commit.did,
+        rev: commit.rev,
+        data: commit.data,
+        prev: commit.prev,
+        version: commit.version,
+    };
+    let unsigned_bytes = serde_ipld_dagcbor::to_vec(&unsigned).map_err(|_| {
+        SpaceRelayError::UpstreamError("failed to encode unsigned ATProto commit".into())
+    })?;
+    if !atproto_key.verify_raw(atproto_key.expected_alg(), &unsigned_bytes, &commit.sig) {
+        return Err(SpaceRelayError::UpstreamError(
+            "ATProto commit signature failed verification under target #atproto key".into(),
+        ));
+    }
+    Ok(commit.data)
+}
+
+fn walk_mst_proof(
+    blocks: &HashMap<cid::Cid, Vec<u8>>,
+    node_cid: cid::Cid,
+    target_key: &[u8],
+    lower_bound: Option<&[u8]>,
+    upper_bound: Option<&[u8]>,
+    visited: &mut HashSet<cid::Cid>,
+    depth: usize,
+) -> Result<Option<cid::Cid>, SpaceRelayError> {
+    if depth > MST_MAX_DEPTH {
+        return Err(SpaceRelayError::UpstreamError(
+            "MST proof exceeded maximum depth".into(),
+        ));
+    }
+    if !visited.insert(node_cid) {
+        return Err(SpaceRelayError::UpstreamError(
+            "cycle detected in MST proof".into(),
+        ));
+    }
+    let node_bytes = blocks.get(&node_cid).ok_or_else(|| {
+        SpaceRelayError::UpstreamError("missing MST node block in CAR proof".into())
+    })?;
+    let node: MstNodeData = serde_ipld_dagcbor::from_slice(node_bytes)
+        .map_err(|_| SpaceRelayError::UpstreamError("malformed MST node block".into()))?;
+    if depth > 0 && node.e.is_empty() {
+        return Err(SpaceRelayError::UpstreamError(
+            "non-root MST node cannot be empty".into(),
+        ));
+    }
+
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(node.e.len());
+    for (idx, entry) in node.e.iter().enumerate() {
+        if entry.k.is_empty() {
+            return Err(SpaceRelayError::UpstreamError(
+                "MST entry key suffix cannot be empty".into(),
+            ));
+        }
+        let full_key = if idx == 0 {
+            if entry.p != 0 {
+                return Err(SpaceRelayError::UpstreamError(
+                    "first MST entry must have zero prefix length".into(),
+                ));
+            }
+            entry.k.clone()
+        } else {
+            let prev = &keys[idx - 1];
+            if entry.p > prev.len() {
+                return Err(SpaceRelayError::UpstreamError(
+                    "MST entry prefix length exceeds previous key".into(),
+                ));
+            }
+            if entry.p < prev.len() && prev[entry.p] == entry.k[0] {
+                return Err(SpaceRelayError::UpstreamError(
+                    "non-canonical MST entry prefix length".into(),
+                ));
+            }
+            let mut full = Vec::with_capacity(entry.p + entry.k.len());
+            full.extend_from_slice(&prev[..entry.p]);
+            full.extend_from_slice(&entry.k);
+            if prev.as_slice() >= full.as_slice() {
+                return Err(SpaceRelayError::UpstreamError(
+                    "MST entries are not in strict lexicographic order".into(),
+                ));
+            }
+            full
+        };
+        if std::str::from_utf8(&full_key).is_err() {
+            return Err(SpaceRelayError::UpstreamError(
+                "MST entry key is not valid UTF-8".into(),
+            ));
+        }
+        if let Some(lo) = lower_bound {
+            if full_key.as_slice() <= lo {
+                return Err(SpaceRelayError::UpstreamError(
+                    "MST entry key violates parent lower bound".into(),
+                ));
+            }
+        }
+        if let Some(hi) = upper_bound {
+            if full_key.as_slice() >= hi {
+                return Err(SpaceRelayError::UpstreamError(
+                    "MST entry key violates parent upper bound".into(),
+                ));
+            }
+        }
+        keys.push(full_key);
+    }
+
+    if keys.is_empty() {
+        return match node.l {
+            Some(left_cid) => walk_mst_proof(
+                blocks,
+                left_cid,
+                target_key,
+                lower_bound,
+                upper_bound,
+                visited,
+                depth + 1,
+            ),
+            None => Ok(None),
+        };
+    }
+
+    match keys.binary_search_by(|candidate| candidate.as_slice().cmp(target_key)) {
+        Ok(idx) => Ok(Some(node.e[idx].v)),
+        Err(0) => match node.l {
+            Some(left_cid) => walk_mst_proof(
+                blocks,
+                left_cid,
+                target_key,
+                lower_bound,
+                Some(keys[0].as_slice()),
+                visited,
+                depth + 1,
+            ),
+            None => Ok(None),
+        },
+        Err(insert_pos) => {
+            let idx = insert_pos - 1;
+            let next_upper = keys.get(insert_pos).map(Vec::as_slice).or(upper_bound);
+            match node.e[idx].t {
+                Some(sub_cid) => walk_mst_proof(
+                    blocks,
+                    sub_cid,
+                    target_key,
+                    Some(keys[idx].as_slice()),
+                    next_upper,
+                    visited,
+                    depth + 1,
+                ),
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+fn validate_mailbox_keys_cbor_value(
+    record_bytes: &[u8],
+    record_cid: cid::Cid,
+    target_did: &str,
+    rkey: &str,
+) -> Result<bytes::Bytes, SpaceRelayError> {
+    let typed: MailboxKeys<String> =
+        serde_ipld_dagcbor::from_slice(record_bytes).map_err(|_| {
+            SpaceRelayError::UpstreamError("malformed mailboxKeys DAG-CBOR record".into())
+        })?;
+    if matches!(typed.backend, Some(MailboxKeysBackend::Other(_))) {
+        return Err(SpaceRelayError::UpstreamError(
+            "unknown mailboxKeys backend variant".into(),
+        ));
+    }
+    if typed.extra_data.as_ref().is_some_and(|m| !m.is_empty())
+        || typed
+            .current
+            .extra_data
+            .as_ref()
+            .is_some_and(|m| !m.is_empty())
+        || typed
+            .current
+            .attestation
+            .extra_data
+            .as_ref()
+            .is_some_and(|m| !m.is_empty())
+    {
+        return Err(SpaceRelayError::UpstreamError(
+            "unexpected unknown fields in mailboxKeys record".into(),
+        ));
+    }
+
+    let current = &typed.current;
     let exact_lengths = [
         (current.auth_pubkey.len(), 32usize),
         (current.encryption_pubkey.len(), 1216),
@@ -554,7 +1203,7 @@ fn validate_mailbox_keys_record(
         (current.attestation.transport_pubkey.len(), 32),
         (current.attestation.sig.len(), 64),
     ];
-    if !(0..=1_099_511_627_776).contains(&current.epoch_number)
+    if !(0..=MAX_MAILBOX_EPOCH_NUMBER).contains(&current.epoch_number)
         || exact_lengths
             .iter()
             .any(|(actual, expected)| actual != expected)
@@ -571,19 +1220,61 @@ fn validate_mailbox_keys_record(
             "mailboxKeys value violates the epoch schema".into(),
         ));
     }
-    let cid = envelope
-        .cid
-        .parse::<cid::Cid>()
-        .map_err(|_| SpaceRelayError::UpstreamError("invalid mailboxKeys record CID".into()))?;
-    let canonical = serde_ipld_dagcbor::to_vec(&envelope._value).map_err(|_| {
-        SpaceRelayError::UpstreamError("mailboxKeys value is not canonical DAG-CBOR data".into())
-    })?;
-    if atproto_spaces::lthash::compute_dagcbor_cid(&canonical) != cid {
-        return Err(SpaceRelayError::UpstreamError(
-            "mailboxKeys record CID does not match its value".into(),
-        ));
+    if rkey != "self" && rkey.len() == 12 && rkey.bytes().all(|b| b.is_ascii_digit()) {
+        let expected_epoch = rkey
+            .parse::<i64>()
+            .map_err(|_| SpaceRelayError::UpstreamError("invalid numeric rkey".into()))?;
+        if current.epoch_number != expected_epoch {
+            return Err(SpaceRelayError::UpstreamError(
+                "mailboxKeys epochNumber does not match 12-digit rkey".into(),
+            ));
+        }
     }
-    Ok(())
+
+    let expected_uri = format!("at://{target_did}/blue.catbird.labyrinth.mailboxKeys/{rkey}");
+    let envelope = json!({
+        "uri": expected_uri,
+        "cid": record_cid.to_string(),
+        "value": typed,
+    });
+    let out = serde_json::to_vec(&envelope).map_err(|_| {
+        SpaceRelayError::UpstreamError("failed to encode verified mailboxKeys JSON".into())
+    })?;
+    Ok(bytes::Bytes::from(out))
+}
+
+fn verify_mailbox_keys_car_proof(
+    car_bytes: &[u8],
+    target_did: &str,
+    rkey: &str,
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<Option<bytes::Bytes>, SpaceRelayError> {
+    let (root_cid, blocks) = parse_verified_car_v1(car_bytes)?;
+    let commit_bytes = blocks
+        .get(&root_cid)
+        .ok_or_else(|| SpaceRelayError::UpstreamError("missing root commit block".into()))?;
+    let mst_root_cid = verify_atproto_v3_commit(commit_bytes, target_did, atproto_key)?;
+    let mst_key = format!("blue.catbird.labyrinth.mailboxKeys/{rkey}");
+    let mut visited = HashSet::new();
+    let Some(record_cid) = walk_mst_proof(
+        &blocks,
+        mst_root_cid,
+        mst_key.as_bytes(),
+        None,
+        None,
+        &mut visited,
+        0,
+    )?
+    else {
+        return Ok(None);
+    };
+    let record_bytes = blocks.get(&record_cid).ok_or_else(|| {
+        SpaceRelayError::UpstreamError(
+            "MST included mailboxKeys CID but CAR omitted record block".into(),
+        )
+    })?;
+    let json_bytes = validate_mailbox_keys_cbor_value(record_bytes, record_cid, target_did, rkey)?;
+    Ok(Some(json_bytes))
 }
 
 fn mailbox_resolution_error(error: FederationError) -> SpaceRelayError {
@@ -594,10 +1285,13 @@ fn mailbox_resolution_error(error: FederationError) -> SpaceRelayError {
     }
 }
 
-/// Read one public `mailboxKeys` record through the authenticated caller's
-/// home service. Only the target DID and rkey influence the outbound request:
-/// the PDS endpoint is live-resolved and DNS-pinned, the collection is fixed,
-/// and no caller URL, authorization, headers, or token are forwarded.
+/// Read and cryptographically verify one public `mailboxKeys` record through the authenticated
+/// caller's home service via `com.atproto.sync.getRecord` (`application/vnd.ipld.car`).
+///
+/// Only `target_did` and `rkey` influence the outbound request: the PDS endpoint and `#atproto`
+/// signing key are live-resolved and DNS-pinned, the collection is fixed to
+/// `blue.catbird.labyrinth.mailboxKeys`, and no caller URL, authorization, headers, or token are
+/// forwarded. Unsigned HTTP `404`/`400` responses are NEVER trusted as `RecordNotFound`.
 pub async fn relay_mailbox_keys_record(
     resolver: &DsResolver,
     target_did: &str,
@@ -617,17 +1311,21 @@ pub async fn relay_mailbox_keys_record(
         ));
     }
 
-    let pds = resolver
-        .resolve_did_to_pds(target_did)
+    let (pds, atproto_key_opt) = resolver
+        .resolve_did_to_pds_and_atproto_key(target_did)
         .await
         .map_err(mailbox_resolution_error)?;
+    let atproto_key = atproto_key_opt.ok_or_else(|| {
+        SpaceRelayError::UpstreamError("target DID document has no #atproto signing key".into())
+    })?;
+
     let mut url = Url::parse(&format!(
-        "{}/xrpc/com.atproto.repo.getRecord",
+        "{}/xrpc/com.atproto.sync.getRecord",
         pds.trim_end_matches('/')
     ))
     .map_err(|error| SpaceRelayError::InvalidTargetEndpoint(error.to_string()))?;
     url.query_pairs_mut()
-        .append_pair("repo", target_did)
+        .append_pair("did", target_did)
         .append_pair("collection", "blue.catbird.labyrinth.mailboxKeys")
         .append_pair("rkey", rkey);
     let destination = resolver
@@ -639,7 +1337,7 @@ pub async fn relay_mailbox_keys_record(
         &destination,
         deadline,
         target_did,
-        "mailboxKeys record read failed",
+        "mailboxKeys CAR proof read failed",
     )
     .await
     .map_err(mailbox_resolution_error)?;
@@ -658,42 +1356,34 @@ pub async fn relay_mailbox_keys_record(
                 SpaceRelayError::UpstreamError(error.to_string())
             }
         })?;
-    if matches!(
-        status,
-        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::NOT_FOUND
-    ) && serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .as_deref()
-        == Some("RecordNotFound")
-    {
-        return Ok(None);
-    }
     if !status.is_success() {
-        let reason = format!("mailboxKeys PDS returned HTTP {}", status.as_u16());
+        let reason = format!(
+            "mailboxKeys sync.getRecord returned HTTP {}",
+            status.as_u16()
+        );
         return Err(if retryable_status(status) {
             SpaceRelayError::UpstreamUnavailable(reason)
         } else {
             SpaceRelayError::UpstreamError(reason)
         });
     }
-    validate_mailbox_keys_record(&body, target_did, rkey)?;
-    Ok(Some(body))
+    verify_mailbox_keys_car_proof(&body, target_did, rkey, &atproto_key)
 }
 
 pub struct RelayedSpaceReadResponse {
     pub status: u16,
     pub content_type: String,
     pub space_mac: Option<String>,
+    pub space_commit: Option<String>,
+    pub space_record: Option<String>,
+    pub signature_input: Option<String>,
+    pub signature: Option<String>,
+    pub vary: Option<String>,
     pub body: bytes::Bytes,
 }
 
 /// Statelessly relay an RFC 9421 PoP-signed `com.atproto.space.*` read request to `target_did`.
+#[allow(clippy::too_many_arguments)]
 pub async fn relay_space_read_stateless(
     target_did: &str,
     nsid: &str,
@@ -701,6 +1391,34 @@ pub async fn relay_space_read_stateless(
     credential: &str,
     space_audience: &str,
     want_mac: Option<&str>,
+    signature_input: &str,
+    signature: &str,
+) -> Result<RelayedSpaceReadResponse, SpaceRelayError> {
+    relay_space_read_with_headers(
+        target_did,
+        nsid,
+        query,
+        credential,
+        space_audience,
+        want_mac,
+        None,
+        signature_input,
+        signature,
+    )
+    .await
+}
+
+/// Statelessly relay an RFC 9421 PoP-signed `com.atproto.space.*` read request, including optional
+/// `Accept-Signature` negotiation and preserving signed response proof headers.
+#[allow(clippy::too_many_arguments)]
+pub async fn relay_space_read_with_headers(
+    target_did: &str,
+    nsid: &str,
+    query: Option<&str>,
+    credential: &str,
+    space_audience: &str,
+    want_mac: Option<&str>,
+    accept_signature: Option<&str>,
     signature_input: &str,
     signature: &str,
 ) -> Result<RelayedSpaceReadResponse, SpaceRelayError> {
@@ -734,23 +1452,33 @@ pub async fn relay_space_read_stateless(
     if let Some(wm) = want_mac.filter(|s| !s.is_empty()) {
         req = req.header("atproto-space-want-mac", wm.trim());
     }
+    if let Some(accept_sig) = accept_signature.filter(|s| !s.is_empty()) {
+        req = req.header("accept-signature", accept_sig.trim());
+    }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let resp = crate::sim_hooks::send_reqwest(req)
         .await
         .map_err(SpaceRelayError::UpstreamUnavailable)?;
     let status = resp.status();
+    let header_str = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
-    let space_mac = resp
-        .headers()
-        .get("atproto-space-mac")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    let space_mac = header_str("atproto-space-mac");
+    let space_commit = header_str("atproto-space-commit");
+    let space_record = header_str("atproto-space-record");
+    let resp_signature_input = header_str("signature-input");
+    let resp_signature = header_str("signature");
+    let vary = header_str("vary");
     let max_bytes = space_read_response_max_bytes(nsid, status);
     let body = collect_bounded(resp, ResponseBodyBudget::new(max_bytes, deadline))
         .await
@@ -774,12 +1502,209 @@ pub async fn relay_space_read_stateless(
         status,
         content_type,
         space_mac,
+        space_commit,
+        space_record,
+        signature_input: resp_signature_input,
+        signature: resp_signature,
+        vary,
         body,
     })
 }
 
+/// Test-support builder for canonical DAG-CBOR + CARv1 + signed ATProto v3 commit + MST proofs.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_car_builder {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+    fn write_cbor_head(out: &mut Vec<u8>, major: u8, val: u64) {
+        let prefix = major << 5;
+        if val < 24 {
+            out.push(prefix | (val as u8));
+        } else if val <= u8::MAX as u64 {
+            out.push(prefix | 24);
+            out.push(val as u8);
+        } else if val <= u16::MAX as u64 {
+            out.push(prefix | 25);
+            out.extend_from_slice(&(val as u16).to_be_bytes());
+        } else if val <= u32::MAX as u64 {
+            out.push(prefix | 26);
+            out.extend_from_slice(&(val as u32).to_be_bytes());
+        } else {
+            out.push(prefix | 27);
+            out.extend_from_slice(&val.to_be_bytes());
+        }
+    }
+
+    pub fn encode_uvarint(mut val: u64, out: &mut Vec<u8>) {
+        while val >= 0x80 {
+            out.push(((val as u8) & 0x7f) | 0x80);
+            val >>= 7;
+        }
+        out.push(val as u8);
+    }
+
+    pub fn encode_cid_link(cid: &cid::Cid, out: &mut Vec<u8>) {
+        write_cbor_head(out, 6, 42);
+        let raw = cid.to_bytes();
+        write_cbor_head(out, 2, (raw.len() + 1) as u64);
+        out.push(0x00);
+        out.extend_from_slice(&raw);
+    }
+
+    /// Encode an ATProto JSON value (`{"$bytes": ...}`, `{"$link": ...}`, primitives, arrays,
+    /// objects) as canonical IPLD DAG-CBOR with `(key.len(), key)` sorted map keys.
+    pub fn json_to_canonical_dagcbor(value: &Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_json_item(value, &mut out);
+        out
+    }
+
+    fn encode_json_item(value: &Value, out: &mut Vec<u8>) {
+        match value {
+            Value::Null => out.push(0xf6),
+            Value::Bool(false) => out.push(0xf4),
+            Value::Bool(true) => out.push(0xf5),
+            Value::Number(n) => {
+                if let Some(u) = n.as_u64() {
+                    write_cbor_head(out, 0, u);
+                } else if let Some(i) = n.as_i64() {
+                    assert!(i < 0);
+                    let mag = (-1i128 - (i as i128)) as u64;
+                    write_cbor_head(out, 1, mag);
+                } else {
+                    panic!("floats not allowed in ATProto DAG-CBOR");
+                }
+            }
+            Value::String(s) => {
+                write_cbor_head(out, 3, s.len() as u64);
+                out.extend_from_slice(s.as_bytes());
+            }
+            Value::Array(arr) => {
+                write_cbor_head(out, 4, arr.len() as u64);
+                for item in arr {
+                    encode_json_item(item, out);
+                }
+            }
+            Value::Object(map) => {
+                if map.len() == 1 {
+                    if let Some(Value::String(b64)) = map.get("$bytes") {
+                        let raw = STANDARD.decode(b64).expect("valid $bytes base64");
+                        write_cbor_head(out, 2, raw.len() as u64);
+                        out.extend_from_slice(&raw);
+                        return;
+                    }
+                    if let Some(Value::String(cid_str)) = map.get("$link") {
+                        let parsed: cid::Cid = cid_str.parse().expect("valid $link CID");
+                        encode_cid_link(&parsed, out);
+                        return;
+                    }
+                }
+                let mut entries: Vec<(&str, &Value)> =
+                    map.iter().map(|(k, v)| (k.as_str(), v)).collect();
+                entries.sort_by(|(a, _), (b, _)| {
+                    (a.len(), a.as_bytes()).cmp(&(b.len(), b.as_bytes()))
+                });
+                write_cbor_head(out, 5, entries.len() as u64);
+                for (k, v) in entries {
+                    write_cbor_head(out, 3, k.len() as u64);
+                    out.extend_from_slice(k.as_bytes());
+                    encode_json_item(v, out);
+                }
+            }
+        }
+    }
+
+    /// Build a signed CARv1 proof over a flat MST leaf containing `records` (sorted automatically
+    /// by `collection/rkey`), signed by `p256_secret` (`#atproto`).
+    pub fn build_signed_repo_car(
+        did: &str,
+        rev: &str,
+        p256_secret: &p256::SecretKey,
+        records: &[(&str, &Value)],
+    ) -> (Vec<u8>, BTreeMap<String, cid::Cid>) {
+        let mut sorted: Vec<(&str, &Value)> = records.to_vec();
+        sorted.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+
+        let mut blocks: Vec<(cid::Cid, Vec<u8>)> = Vec::new();
+        let mut record_cids = BTreeMap::new();
+        let mut entries_json = Vec::new();
+        let mut prev_key: &[u8] = &[];
+
+        for (full_key, val) in sorted {
+            let rec_cbor = json_to_canonical_dagcbor(val);
+            let rec_cid = compute_dagcbor_cid(&rec_cbor);
+            blocks.push((rec_cid, rec_cbor));
+            record_cids.insert(full_key.to_string(), rec_cid);
+
+            let key_bytes = full_key.as_bytes();
+            let prefix_len = prev_key
+                .iter()
+                .zip(key_bytes.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let suffix = &key_bytes[prefix_len..];
+            entries_json.push(json!({
+                "p": prefix_len,
+                "k": { "$bytes": STANDARD.encode(suffix) },
+                "v": { "$link": rec_cid.to_string() },
+                "t": Value::Null,
+            }));
+            prev_key = key_bytes;
+        }
+
+        let mst_cbor = json_to_canonical_dagcbor(&json!({
+            "l": Value::Null,
+            "e": entries_json,
+        }));
+        let mst_cid = compute_dagcbor_cid(&mst_cbor);
+        blocks.push((mst_cid, mst_cbor));
+
+        let unsigned_cbor = json_to_canonical_dagcbor(&json!({
+            "did": did,
+            "version": 3,
+            "data": { "$link": mst_cid.to_string() },
+            "rev": rev,
+            "prev": Value::Null,
+        }));
+        let signing_key = SigningKey::from(p256_secret);
+        let sig: Signature = signing_key.sign(&unsigned_cbor);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let commit_cbor = json_to_canonical_dagcbor(&json!({
+            "did": did,
+            "version": 3,
+            "data": { "$link": mst_cid.to_string() },
+            "rev": rev,
+            "prev": Value::Null,
+            "sig": { "$bytes": STANDARD.encode(sig.to_bytes()) },
+        }));
+        let commit_cid = compute_dagcbor_cid(&commit_cbor);
+        blocks.insert(0, (commit_cid, commit_cbor));
+
+        let header_cbor = json_to_canonical_dagcbor(&json!({
+            "version": 1,
+            "roots": [{ "$link": commit_cid.to_string() }],
+        }));
+
+        let mut car = Vec::new();
+        encode_uvarint(header_cbor.len() as u64, &mut car);
+        car.extend_from_slice(&header_cbor);
+        for (cid, data) in blocks {
+            let cid_bytes = cid.to_bytes();
+            encode_uvarint((cid_bytes.len() + data.len()) as u64, &mut car);
+            car.extend_from_slice(&cid_bytes);
+            car.extend_from_slice(&data);
+        }
+        (car, record_cids)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_car_builder::{
+        build_signed_repo_car, encode_uvarint, json_to_canonical_dagcbor,
+    };
     use super::*;
     use crate::federation::resolver::ValidatedRemoteDestination;
     use atproto_spaces::{
@@ -805,16 +1730,27 @@ mod tests {
 
     const NOW: u64 = 1_700_000_000;
 
-    fn mailbox_value_cid(value: &Value) -> String {
-        let typed: catbird_atproto::generated::blue_catbird::labyrinth::mailbox_keys::MailboxKeys<
-            String,
-        > = serde_json::from_value(value.clone()).unwrap();
-        let canonical = serde_ipld_dagcbor::to_vec(&typed).unwrap();
-        atproto_spaces::lthash::compute_dagcbor_cid(&canonical).to_string()
+    fn sample_mailbox_value(epoch_number: i64) -> Value {
+        let bytes = |len| json!({ "$bytes": STANDARD.encode(vec![0x42u8; len]) });
+        json!({
+            "$type": "blue.catbird.labyrinth.mailboxKeys",
+            "current": {
+                "epochNumber": epoch_number,
+                "authPubkey": bytes(32),
+                "encryptionPubkey": bytes(1216),
+                "signingPubkey": bytes(32),
+                "membersHash": bytes(32),
+                "epochHead": bytes(32),
+                "selfSig": bytes(64),
+                "attestation": {
+                    "transportPubkey": bytes(32),
+                    "sig": bytes(64),
+                },
+            },
+            "updatedAt": "2026-11-04T00:00:00Z",
+        })
     }
 
-    /// Only a failed DNS lookup of the target decided nothing; every other
-    /// endpoint refusal stays the permanent `InvalidTargetEndpoint`.
     #[test]
     fn only_a_failed_dns_lookup_of_the_target_is_retryable() {
         let dns = PushGatewaySsrfError::DnsResolutionFailed("space.example".into());
@@ -859,53 +1795,77 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_record_validation_binds_selector_cid_and_typed_value() {
+    fn signed_car_proof_verifies_inclusion_non_inclusion_and_rejects_tampering() {
         let did = "did:web:mailbox.example";
-        let rkey = "000000000007";
-        let bytes = |len| json!({ "$bytes": STANDARD.encode(vec![0u8; len]) });
-        let mut record = json!({
-            "uri": format!("at://{did}/blue.catbird.labyrinth.mailboxKeys/{rkey}"),
-            "cid": "",
-            "value": {
-                "$type": "blue.catbird.labyrinth.mailboxKeys",
-                "current": {
-                    "epochNumber": 7,
-                    "authPubkey": bytes(32),
-                    "encryptionPubkey": bytes(1216),
-                    "signingPubkey": bytes(32),
-                    "membersHash": bytes(32),
-                    "epochHead": bytes(32),
-                    "selfSig": bytes(64),
-                    "attestation": {
-                        "transportPubkey": bytes(32),
-                        "sig": bytes(64),
-                    },
-                },
-                "updatedAt": "2026-11-04T00:00:00Z",
-            },
-        });
-        let cid = mailbox_value_cid(&record["value"]);
-        record["cid"] = json!(&cid);
-        let encode = |value: &Value| serde_json::to_vec(value).unwrap();
-        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_ok());
+        let secret = p256::SecretKey::from_slice(&[0x51; 32]).unwrap();
+        let vk = SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(secret.public_key()));
+        let wrong_secret = p256::SecretKey::from_slice(&[0x52; 32]).unwrap();
+        let wrong_vk =
+            SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(wrong_secret.public_key()));
 
-        record["uri"] =
-            json!("at://did:web:attacker.example/blue.catbird.labyrinth.mailboxKeys/other");
-        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_err());
-        record["uri"] = json!(format!(
-            "at://{did}/blue.catbird.labyrinth.mailboxKeys/{rkey}"
-        ));
-        record["cid"] = json!("not-a-cid");
-        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_err());
-        record["cid"] = json!(cid);
-        record["value"]["updatedAt"] = json!("2026-11-05T00:00:00Z");
-        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_err());
-        record["value"]["updatedAt"] = json!("2026-11-04T00:00:00Z");
-        record["value"]["current"]["authPubkey"] = bytes(31);
-        record["cid"] = json!(mailbox_value_cid(&record["value"]));
-        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_err());
-        record["value"].as_object_mut().unwrap().remove("current");
-        assert!(validate_mailbox_keys_record(&encode(&record), did, rkey).is_err());
+        let val_7 = sample_mailbox_value(7);
+        let (car, cids) = build_signed_repo_car(
+            did,
+            "3l2aaaaaaaaaa",
+            &secret,
+            &[("blue.catbird.labyrinth.mailboxKeys/000000000007", &val_7)],
+        );
+        let verified = verify_mailbox_keys_car_proof(&car, did, "000000000007", &vk)
+            .expect("valid inclusion proof")
+            .expect("record present");
+        let parsed: Value = serde_json::from_slice(&verified).unwrap();
+        assert_eq!(
+            parsed["uri"],
+            format!("at://{did}/blue.catbird.labyrinth.mailboxKeys/000000000007")
+        );
+        assert_eq!(
+            parsed["cid"],
+            cids["blue.catbird.labyrinth.mailboxKeys/000000000007"].to_string()
+        );
+        assert_eq!(parsed["value"]["current"]["epochNumber"], 7);
+
+        // Authenticated non-inclusion for `self` in the same signed MST returns `Ok(None)`.
+        assert!(verify_mailbox_keys_car_proof(&car, did, "self", &vk)
+            .expect("valid non-inclusion proof")
+            .is_none());
+
+        // Wrong DID or wrong signing key fails closed.
+        assert!(
+            verify_mailbox_keys_car_proof(&car, "did:web:other.example", "000000000007", &vk)
+                .is_err()
+        );
+        assert!(verify_mailbox_keys_car_proof(&car, did, "000000000007", &wrong_vk).is_err());
+
+        // Numeric 12-digit rkey mismatch with epochNumber fails closed.
+        let (mismatch_car, _) = build_signed_repo_car(
+            did,
+            "3l2aaaaaaaaaa",
+            &secret,
+            &[("blue.catbird.labyrinth.mailboxKeys/000000000008", &val_7)],
+        );
+        assert!(verify_mailbox_keys_car_proof(&mismatch_car, did, "000000000008", &vk).is_err());
+
+        // epochNumber > 999_999_999_999 fails closed.
+        let val_overflow = sample_mailbox_value(1_000_000_000_000);
+        let (overflow_car, _) = build_signed_repo_car(
+            did,
+            "3l2aaaaaaaaaa",
+            &secret,
+            &[("blue.catbird.labyrinth.mailboxKeys/self", &val_overflow)],
+        );
+        assert!(verify_mailbox_keys_car_proof(&overflow_car, did, "self", &vk).is_err());
+
+        // Truncated CAR block section shorter than CID fails closed without panic/underflow.
+        let header = json_to_canonical_dagcbor(&json!({
+            "version": 1,
+            "roots": [{ "$link": cids["blue.catbird.labyrinth.mailboxKeys/000000000007"].to_string() }],
+        }));
+        let mut truncated = Vec::new();
+        encode_uvarint(header.len() as u64, &mut truncated);
+        truncated.extend_from_slice(&header);
+        encode_uvarint(3, &mut truncated);
+        truncated.extend_from_slice(&[0x01, 0x71, 0x12]);
+        assert!(verify_mailbox_keys_car_proof(&truncated, did, "self", &vk).is_err());
 
         assert_eq!(MAILBOX_KEYS_RECORD_MAX_BYTES, 1024 * 1024);
         for invalid in ["", ".", "..", "bad/key", "bad key", &"x".repeat(513)] {
@@ -917,70 +1877,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mailbox_relay_resolves_the_pds_and_forwards_only_the_fixed_public_selector() {
+    async fn mailbox_relay_resolves_the_pds_and_verifies_signed_sync_get_record_car() {
         let target = "did:web:peer.example";
-        let oversized = Arc::new(AtomicBool::new(false));
+        let pds_secret = p256::SecretKey::from_slice(&[0x61; 32]).unwrap();
+        let pds_did_key = encode_p256_did_key(&pds_secret.public_key());
+        let mode = Arc::new(AtomicUsize::new(0)); // 0 = valid CAR, 1 = unsigned 404 JSON, 2 = oversized
         let record_hits = Arc::new(AtomicUsize::new(0));
-        let bytes = |len| json!({ "$bytes": STANDARD.encode(vec![0u8; len]) });
-        let mut record = json!({
-            "uri": format!("at://{target}/blue.catbird.labyrinth.mailboxKeys/self"),
-            "cid": "",
-            "value": {
-                "$type": "blue.catbird.labyrinth.mailboxKeys",
-                "current": {
-                    "epochNumber": 1,
-                    "authPubkey": bytes(32),
-                    "encryptionPubkey": bytes(1216),
-                    "signingPubkey": bytes(32),
-                    "membersHash": bytes(32),
-                    "epochHead": bytes(32),
-                    "selfSig": bytes(64),
-                    "attestation": {
-                        "transportPubkey": bytes(32),
-                        "sig": bytes(64),
-                    },
-                },
-                "updatedAt": "2026-11-04T00:00:00Z",
-            },
-        });
-        record["cid"] = json!(mailbox_value_cid(&record["value"]));
-        let record = Arc::new(record);
+        let val = sample_mailbox_value(1);
+        let (valid_car, cids) = build_signed_repo_car(
+            target,
+            "3l2aaaaaaaaaa",
+            &pds_secret,
+            &[("blue.catbird.labyrinth.mailboxKeys/self", &val)],
+        );
+        let valid_car = Arc::new(valid_car);
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let router = Router::new()
             .route(
                 "/.well-known/did.json",
-                get(move || async move {
-                    Json(json!({
-                        "id": target,
-                        "service": [{
-                            "id": "#atproto_pds",
-                            "type": "AtprotoPersonalDataServer",
-                            "serviceEndpoint": "https://peer-pds.example",
-                        }],
-                    }))
+                get({
+                    let multibase = pds_did_key.strip_prefix("did:key:").unwrap().to_string();
+                    move || {
+                        let multibase = multibase.clone();
+                        async move {
+                            Json(json!({
+                                "id": target,
+                                "verificationMethod": [{
+                                    "id": format!("{target}#atproto"),
+                                    "type": "Multikey",
+                                    "controller": target,
+                                    "publicKeyMultibase": multibase,
+                                }],
+                                "service": [{
+                                    "id": "#atproto_pds",
+                                    "type": "AtprotoPersonalDataServer",
+                                    "serviceEndpoint": "https://peer-pds.example",
+                                }],
+                            }))
+                        }
+                    }
                 }),
             )
             .route(
-                "/xrpc/com.atproto.repo.getRecord",
+                "/xrpc/com.atproto.sync.getRecord",
                 get({
-                    let oversized = oversized.clone();
+                    let mode = mode.clone();
                     let record_hits = record_hits.clone();
-                    let record = record.clone();
+                    let valid_car = valid_car.clone();
                     move |Query(query): Query<std::collections::BTreeMap<String, String>>,
                           headers: HeaderMap| {
-                        let oversized = oversized.clone();
+                        let mode = mode.clone();
                         let record_hits = record_hits.clone();
-                        let record = record.clone();
+                        let valid_car = valid_car.clone();
                         async move {
                             record_hits.fetch_add(1, Ordering::SeqCst);
                             assert_eq!(query.len(), 3);
-                            assert_eq!(query.get("repo").map(String::as_str), Some(target));
+                            assert_eq!(query.get("did").map(String::as_str), Some(target));
                             assert_eq!(
                                 query.get("collection").map(String::as_str),
                                 Some("blue.catbird.labyrinth.mailboxKeys")
                             );
-                            assert_eq!(query.get("rkey").map(String::as_str), Some("self"));
                             for forbidden in [
                                 "authorization",
                                 "cookie",
@@ -989,17 +1947,26 @@ mod tests {
                             ] {
                                 assert!(headers.get(forbidden).is_none(), "{forbidden}");
                             }
-                            if oversized.load(Ordering::SeqCst) {
-                                return http::Response::builder()
+                            match mode.load(Ordering::SeqCst) {
+                                1 => (
+                                    axum::http::StatusCode::NOT_FOUND,
+                                    Json(json!({"error": "RecordNotFound"})),
+                                )
+                                    .into_response(),
+                                2 => http::Response::builder()
                                     .status(200)
                                     .header(
                                         http::header::CONTENT_LENGTH,
                                         (MAILBOX_KEYS_RECORD_MAX_BYTES + 1).to_string(),
                                     )
                                     .body(axum::body::Body::empty())
-                                    .unwrap();
+                                    .unwrap(),
+                                _ => (
+                                    [(http::header::CONTENT_TYPE, "application/vnd.ipld.car")],
+                                    valid_car.as_ref().clone(),
+                                )
+                                    .into_response(),
                             }
-                            Json(record.as_ref().clone()).into_response()
                         }
                     }
                 }),
@@ -1036,9 +2003,30 @@ mod tests {
         let relayed = relay_mailbox_keys_record(&resolver, target, "self")
             .await
             .unwrap()
-            .expect("record");
-        assert_eq!(serde_json::from_slice::<Value>(&relayed).unwrap(), *record);
+            .expect("verified record");
+        let parsed: Value = serde_json::from_slice(&relayed).unwrap();
+        assert_eq!(
+            parsed["cid"],
+            cids["blue.catbird.labyrinth.mailboxKeys/self"].to_string()
+        );
         assert_eq!(record_hits.load(Ordering::SeqCst), 1);
+
+        // Authenticated non-inclusion in signed MST returns None (`404 RecordNotFound` downstream).
+        assert!(relay_mailbox_keys_record(&resolver, target, "000000000009")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(record_hits.load(Ordering::SeqCst), 2);
+
+        // Unsigned HTTP 404 RecordNotFound JSON is NEVER trusted — fails closed with UpstreamError!
+        mode.store(1, Ordering::SeqCst);
+        assert!(matches!(
+            relay_mailbox_keys_record(&resolver, target, "self").await,
+            Err(SpaceRelayError::UpstreamError(_))
+        ));
+        assert_eq!(record_hits.load(Ordering::SeqCst), 3);
+
+        // Invalid inputs fail before touching upstream.
         for (did, rkey) in [
             ("did:web:peer.example#fragment", "self"),
             (target, "bad/key"),
@@ -1048,21 +2036,21 @@ mod tests {
                 Err(SpaceRelayError::InvalidRequest(_))
             ));
         }
-        assert_eq!(record_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(record_hits.load(Ordering::SeqCst), 3);
 
-        oversized.store(true, Ordering::SeqCst);
+        mode.store(2, Ordering::SeqCst);
         assert!(matches!(
             relay_mailbox_keys_record(&resolver, target, "self").await,
             Err(SpaceRelayError::UpstreamError(_))
         ));
-        assert_eq!(record_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(record_hits.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
     async fn read_relay_rejects_a_declared_body_over_the_nsid_budget() {
         let target = "did:web:space-read-budget.example";
         let router = Router::new().route(
-            "/xrpc/com.atproto.space.listRepos",
+            "/xrpc/com.atproto.space.listWriters",
             get(|| async {
                 let declared_bytes = ORDINARY_DS_CONTROL_MAX_BYTES + 1;
                 http::Response::builder()
@@ -1081,7 +2069,7 @@ mod tests {
 
         let error = relay_space_read_stateless(
             target,
-            "com.atproto.space.listRepos",
+            "com.atproto.space.listWriters",
             None,
             "credential",
             "space",
@@ -1136,17 +2124,19 @@ mod tests {
         let authority = "did:web:credential-relay-post.example";
         let (signing_key, claims, document) = credential_fixture(authority);
         let jwt = mint_space_token(SpaceTokenKind::Credential, &signing_key, &claims).unwrap();
-        let response = Arc::new(Mutex::new(json!({"credential": jwt})));
+        let response = Arc::new(Mutex::new(
+            json!({"credential": jwt, "spaceRev": "3l2aaaaaaaaaa"}),
+        ));
         let document = Arc::new(Mutex::new(document));
         let requests = Arc::new(AtomicUsize::new(0));
         let expected_body = json!({
             "space": claims.sub,
-            "credentialKid": claims.cnf_kid,
+            "credentialKey": claims.cnf_kid,
             "delegationToken": "secret-delegation.jwt",
         });
         let router = Router::new()
             .route(
-                "/xrpc/com.atproto.space.getSpaceCredential",
+                "/xrpc/com.atproto.space.authorizeSpaceSync",
                 post({
                     let response = response.clone();
                     let requests = requests.clone();
@@ -1201,10 +2191,12 @@ mod tests {
             assert_eq!(output.credential, jwt);
             let expected_expiry = chrono::DateTime::from_timestamp(claims.exp as i64, 0)
                 .unwrap()
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             assert_eq!(output.expires_at, expected_expiry);
+            assert!(output.expires_at.ends_with(".000Z"));
+            assert_eq!(output.space_rev.as_deref(), Some("3l2aaaaaaaaaa"));
 
-            response.lock().unwrap()["expiresAt"] = json!("9999-01-01T00:00:00Z");
+            response.lock().unwrap()["expiresAt"] = json!("9999-01-01T00:00:00.000Z");
             assert_eq!(exchange().await.unwrap().expires_at, expected_expiry);
 
             let attacker = p256::SecretKey::from_slice(&[0x22; 32]).unwrap();
@@ -1233,7 +2225,7 @@ mod tests {
                     .into();
             let mut expired = claims.clone();
             expired.iat = NOW - 600;
-            expired.exp = NOW - 1; // The shared verifier's skew must not make an expired relay result usable.
+            expired.exp = NOW - 1;
             for invalid in [
                 forged,
                 tampered_expiry,
@@ -1271,8 +2263,6 @@ mod tests {
                 "{}/did:plc:alice/blue.catbird.labyrinth.entry/3l2aaaaaaaaaa",
                 claims.sub
             );
-            // The PoP key must be a P-256 did:key, and only the exact
-            // at://{authorityDid}/space/{spaceType}/{skey} form names the Space.
             for (target, space, pop_key) in [
                 (authority, claims.sub.as_str(), "not-a-P256-did-key"),
                 (authority, at_space_scheme.as_str(), kid),
@@ -1310,7 +2300,7 @@ mod tests {
         let followed = Arc::new(AtomicUsize::new(0));
         let router = Router::new()
             .route(
-                "/xrpc/com.atproto.space.getSpaceCredential",
+                "/xrpc/com.atproto.space.authorizeSpaceSync",
                 post(|| async {
                     (
                         axum::http::StatusCode::TEMPORARY_REDIRECT,
@@ -1381,12 +2371,12 @@ mod tests {
                             .unwrap()
                             .push((request.method.clone(), request.url.path().to_string()));
                         let body = match request.url.path() {
-                            "/xrpc/com.atproto.space.getSpaceCredential" => {
+                            "/xrpc/com.atproto.space.authorizeSpaceSync" => {
                                 assert_eq!(request.method, http::Method::POST);
                                 assert_eq!(
                                     serde_json::from_slice::<Value>(&request.body).unwrap(),
                                     json!({
-                                        "space": expected_space, "credentialKid": expected_kid,
+                                        "space": expected_space, "credentialKey": expected_kid,
                                         "delegationToken": "simulated-private-delegation",
                                     })
                                 );

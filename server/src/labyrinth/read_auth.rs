@@ -33,7 +33,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::auth::{load_current_device, parse_device_id};
+use super::auth::{load_current_device_with_pending, parse_device_id, DeviceLock};
 use super::error::{LabyrinthError, LabyrinthResult};
 use crate::storage::DbPool;
 
@@ -153,6 +153,18 @@ pub async fn verify(
     expected: Expected<'_>,
     now: DateTime<Utc>,
 ) -> LabyrinthResult<(Uuid, ReadClaim)> {
+    let (device_id, claim, _) = verify_with_pending(pool, proof, expected, now, false).await?;
+    Ok((device_id, claim))
+}
+
+/// Verify a read proof with explicit `pending_approval` policy; returns `(device_id, claim, status)`.
+pub async fn verify_with_pending(
+    pool: &DbPool,
+    proof: &ReadProof,
+    expected: Expected<'_>,
+    now: DateTime<Utc>,
+    allow_pending: bool,
+) -> LabyrinthResult<(Uuid, ReadClaim, String)> {
     let (bytes, claim) = parse_claim(&proof.header)?;
     if claim.did != expected.did {
         return Err(invalid_read("did is not the authenticated account"));
@@ -173,12 +185,19 @@ pub async fn verify(
         .and_then(|s| s.try_into().ok())
         .ok_or_else(|| invalid_read("signature is not 64 base64url bytes"))?;
     let mut conn = pool.acquire().await?;
-    let device = load_current_device(&mut conn, expected.did, device_id, false).await?;
+    let device = load_current_device_with_pending(
+        &mut conn,
+        expected.did,
+        device_id,
+        DeviceLock::None,
+        allow_pending,
+    )
+    .await?;
     VerifyingKey::from_bytes(&device.signing_key)
         .map_err(|_| LabyrinthError::internal())?
         .verify_strict(&signing_input(&bytes), &Signature::from_bytes(&sig))
         .map_err(|_| bad_signature())?;
-    Ok((device_id, claim))
+    Ok((device_id, claim, device.status))
 }
 
 #[cfg(test)]

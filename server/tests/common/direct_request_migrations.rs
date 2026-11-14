@@ -46,7 +46,7 @@ pub fn reviewed_baseline() -> [BaselineMigration; 14] {
     ]
 }
 
-pub fn reviewed_request_migrations() -> [BaselineMigration; 59] {
+pub fn reviewed_request_migrations() -> [BaselineMigration; 60] {
     [
         baseline!(20260919000001, "direct request preparation", "20260919000001_direct_request_preparation.sql", "d4d3527aa77b8fe91d8d754f72290b682571cc6731866d72c059f10d4b2f7cf8ef629069737addeedaabd6f6eee682ca"),
         baseline!(20260919000002, "direct request publication", "20260919000002_direct_request_publication.sql", "7fda0b09fcdef20e4da2e1701f6a56c12f636f7881b46e2f6e249cb0d5fc2aa63c734dc07cbb543169398253e29cec9e"),
@@ -107,6 +107,7 @@ pub fn reviewed_request_migrations() -> [BaselineMigration; 59] {
         baseline!(20261104000012, "postgres churn partitions", "20261104000012_postgres_churn_partitions.sql", "e9700954fc90dd3f99c47eb93eddac7f233e2e2f274f01882c49144b2c9d7499ac60e277f3629039019555c6df9aaa80"),
         baseline!(20261107000001, "application send order", "20261107000001_application_send_order.sql", "457b8d78861a458425a5ed617874a8397547e03fdf2a7038f3ead6737f5cb156b5e9b3fa5df40442a152d72b1279c1c1"),
         baseline!(20261113000001, "remote lifecycle recovery bindings", "20261113000001_remote_lifecycle_recovery_bindings.sql", "78975bab32bfaa527ee1233ad49b36956d91fb4c9fef47533365cabd6c98778b50709a57fda8fa5c5933fab388e9e596"),
+        baseline!(20261114000001, "wave2 multidevice and spaces nov12", "20261114000001_wave2_multidevice_and_spaces_nov12.sql", "f32c9403bbcd7ed6bde26a463912c83f0d95aecffcf7040d5622d4db9e1eb6263db4e0d6edaf7062217098eaa13fe133"),
     ]
 }
 pub fn reviewed_auth_replay_prerequisite() -> BaselineMigration {

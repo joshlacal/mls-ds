@@ -607,6 +607,14 @@ pub(crate) const LOCK_AVAILABLE_RECOVERY_PACKAGE_SQL: &str = r#"
       AND kp.owner_auth_generation = $4
       AND kp.status = 'available'
       AND kp.usage_scope = 'recovery'
+      AND EXISTS (
+          SELECT 1
+          FROM chat.devices d
+          WHERE d.user_did = kp.owner_did
+            AND d.device_id = kp.owner_device_id
+            AND d.status = 'active'
+            AND d.revoked_at IS NULL
+      )
       AND kp.terminal_transition_id IS NULL
       AND kp.terminal_revocation_id IS NULL
       AND kp.terminal_at IS NULL

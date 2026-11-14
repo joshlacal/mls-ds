@@ -4395,12 +4395,14 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
 /// device generation: migration 20261103000002 uniquely binds each activation,
 /// and selecting it before checking revocation prevents historical-key fallback.
 /// The former view pin was 841fe50487 (2026-08-20); c9f01bb72 only added the
-/// generated `direct_request_key_pool: None` field. Both complete files remain
+/// generated `direct_request_key_pool: None` field. Wave-2 D-2 added
+/// `device_name`, `last_active_at`, `dormant_at`, `wire_status()` (`dormant`),
+/// and `pending_approval -> revoked` projection. Both complete files remain
 /// byte-pinned, so any further change still requires review.
 const B_AUTH_DEVICE_DIRECTORY_SHA256: &str =
-    "9fb7a0b025e57f7f1111249b12644b1ea652b69ec1d193f2fd2ce5bb0176da66";
+    "6fdb19ec46bcde33fe7116d1e88621821d12b2be68691c1810ae3944dc992c8f";
 const B_AUTH_DEVICE_VIEWS_SHA256: &str =
-    "4785ce8c99b1127bac2f30647e92c5eeadc05fff5dd2f00a20f64e04d883c980";
+    "361fb5f4e6de3bc4c901c7a6d7be045dc4330e5fcec622e26fceb7c6e1d10b75";
 
 // ---------------------------------------------------------------------------
 // 4-7. Ignored Tokio database cases, class `commit-write`. Task B6 runs these.

@@ -5,7 +5,7 @@
     "main": {
       "type": "permission-set",
       "title": "Use Catbird Encrypted Chat",
-      "detail": "Allows this client to use the MLS chat AppView through the account's PDS. Account service authentication and device-signed mutation authority remain independently enforced.",
+      "detail": "Allows this client to use the MLS chat AppView through the account's PDS and publish create-only MLS device and Labyrinth mailbox key records. Account service authentication and device-signed mutation authority remain independently enforced.",
       "permissions": [
         {
           "type": "permission",
@@ -13,17 +13,16 @@
           "inheritAud": true,
           "lxm": [
             "blue.catbird.chat.acceptConversation",
+            "blue.catbird.chat.acknowledgeEntries",
             "blue.catbird.chat.acknowledgeWelcome",
             "blue.catbird.chat.activateReset",
+            "blue.catbird.chat.approveDevice",
             "blue.catbird.chat.cancelDirectRequestPreparation",
             "blue.catbird.chat.cancelLeafRecovery",
             "blue.catbird.chat.cancelLeave",
             "blue.catbird.chat.closeConversation",
             "blue.catbird.chat.createConversation",
-            "blue.catbird.chat.deleteBlob",
             "blue.catbird.chat.enrollDevice",
-            "blue.catbird.chat.getBlob",
-            "blue.catbird.chat.getBlobUsage",
             "blue.catbird.chat.getConversationState",
             "blue.catbird.chat.getConversations",
             "blue.catbird.chat.getDeviceKey",
@@ -34,21 +33,32 @@
             "blue.catbird.chat.getOwnDevices",
             "blue.catbird.chat.getPendingWelcomes",
             "blue.catbird.chat.getSubscriptionTicket",
-            "blue.catbird.chat.prepareBlobUpload",
             "blue.catbird.chat.prepareDirectRequest",
             "blue.catbird.chat.publishDirectRequest",
             "blue.catbird.chat.publishDirectRequestKeys",
             "blue.catbird.chat.publishTyping",
+            "blue.catbird.chat.registerPushGateway",
             "blue.catbird.chat.rejectWelcome",
+            "blue.catbird.chat.relaySpaceCredential",
+            "blue.catbird.chat.relaySpaceRead",
             "blue.catbird.chat.replenishKeyPackages",
             "blue.catbird.chat.requestLeafRecovery",
             "blue.catbird.chat.requestLeave",
             "blue.catbird.chat.requestReset",
             "blue.catbird.chat.revokeDevice",
             "blue.catbird.chat.sendMessage",
-            "blue.catbird.chat.submitTransition",
-            "blue.catbird.chat.updatePushToken",
-            "blue.catbird.chat.uploadBlob"
+            "blue.catbird.chat.submitTransition"
+          ]
+        },
+        {
+          "type": "permission",
+          "resource": "repo",
+          "action": [
+            "create"
+          ],
+          "collection": [
+            "blue.catbird.chat.device",
+            "blue.catbird.labyrinth.mailboxKeys"
           ]
         }
       ]

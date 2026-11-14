@@ -5,7 +5,7 @@
     "main": {
       "type": "space",
       "key": "literal:self",
-      "name": "Catbird message backup",
+      "title": "Catbird message backup",
       "description": "Personal post-quantum encrypted MLS message backup and mailbox key epoch chain",
       "collections": [
         "blue.catbird.labyrinth.device",
@@ -14,7 +14,9 @@
         "blue.catbird.labyrinth.epochMember",
         "blue.catbird.labyrinth.otcSession",
         "blue.catbird.labyrinth.ownerBatch",
-        "blue.catbird.labyrinth.attachmentManifest"
+        "blue.catbird.labyrinth.attachmentManifest",
+        "blue.catbird.labyrinth.readState",
+        "blue.catbird.labyrinth.circleOwnerState"
       ]
     }
   }

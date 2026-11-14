@@ -732,7 +732,7 @@ async fn run_once(
         .await
         {
             warn!(
-                convo_id = %convo_uuid,
+                convo_id = %crate::crypto::redact_for_log(&convo_uuid.to_string()),
                 sequencer_ds = %crate::crypto::redact_for_log(&sequencer_ds),
                 error = %e,
                 "Failed to reconcile clean conversation"

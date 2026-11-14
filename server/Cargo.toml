@@ -52,14 +52,14 @@ sha2 = "0.10"
 zeroize = "1"
 base64 = "0.21"
 multibase = "0.9"
-cid = "0.11"
+cid = { version = "0.11", features = ["serde"] }
 
 # Auth/JWT
 jsonwebtoken = "9"
 
 # Jacquard (ATProto types)
-catbird-atproto = { path = "../../catbird-atproto", features = ["namespace-atproto-space", "namespace-bluecatbird"] }
-atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
+catbird-atproto = { path = "../../../dec1-w0/wave1-catbird-atproto", features = ["namespace-atproto-space", "namespace-bluecatbird"] }
+atproto-spaces = { path = "../../../dec1-w0/wave1-catbird-atproto/atproto-spaces" }
 labyrinth-protocol = { path = "../../labyrinth/labyrinth-protocol" }
 jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
 jacquard-axum = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
@@ -255,6 +255,11 @@ required-features = ["test-support"]
 name = "deterministic_server_clock_test"
 path = "tests/deterministic_server_clock_test.rs"
 required-features = ["sim"]
+
+[[test]]
+name = "w2d_multidevice_pruning_and_spaces_nov12"
+path = "tests/w2d_multidevice_pruning_and_spaces_nov12.rs"
+required-features = ["test-support"]
 
 [features]
 default = ["namespace-bluecatbird", "server-bin"]

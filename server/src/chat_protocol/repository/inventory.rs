@@ -2468,7 +2468,7 @@ pub(crate) async fn create_device_inventory_session(
     .await?
     .ok_or(InventoryRepositoryError::DeviceAuthorityMismatch)?;
 
-    if device.device_status != "active"
+    if (device.device_status != "active" && device.device_status != "pending_approval")
         || device.device_revoked_at.is_some()
         || device.key_revoked_at.is_some()
         || device.current_dpop_jkt.as_deref() != request.jkt
@@ -2949,10 +2949,17 @@ fn read_facade_device_view(
         available_package_count: view.available_package_count,
         created_at: crate::sqlx_jacquard::chrono_to_datetime(view.created_at),
         device_id: SmolStr::from(view.device_id.to_string()),
+        device_name: Some(SmolStr::from(view.device_name.as_str())),
+        dormant_at: view
+            .dormant_at
+            .map(crate::sqlx_jacquard::chrono_to_datetime),
         key_id: SmolStr::from(view.key_id.as_str()),
+        last_active_at: Some(crate::sqlx_jacquard::chrono_to_datetime(
+            view.last_active_at,
+        )),
         reserved_package_count: view.reserved_package_count,
         signature_public_key: Bytes::from(view.signing_public_key.clone()),
-        status: SmolStr::from(view.status.as_str()),
+        status: SmolStr::from(view.wire_status()),
         updated_at: crate::sqlx_jacquard::chrono_to_datetime(view.updated_at),
         extra_data: None,
     }

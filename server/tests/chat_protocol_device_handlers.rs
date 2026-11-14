@@ -203,6 +203,7 @@ fn post_empty(nsid: &str) -> Request<Body> {
 
 const DEVICE_POST_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.enrollDevice",
+    "blue.catbird.chat.approveDevice",
     "blue.catbird.chat.replenishKeyPackages",
     "blue.catbird.chat.revokeDevice",
 ];
@@ -1066,7 +1067,9 @@ const DEVICE_VIEW_FIELDS: &[&str] = &[
     "availablePackageCount",
     "createdAt",
     "deviceId",
+    "deviceName",
     "keyId",
+    "lastActiveAt",
     "reservedPackageCount",
     "signaturePublicKey",
     "status",

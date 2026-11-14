@@ -10,11 +10,14 @@ use axum::{
 };
 use serde_json::json;
 
-use super::params::{admit_fixed_query, admit_procedure, admit_query, begin_write};
+use super::params::{
+    admit_fixed_query_allowing_pending, admit_procedure_allowing_pending, admit_query,
+    admit_query_allowing_pending, begin_write_allowing_pending,
+};
 use super::respond;
 use crate::federation::space_read_relay::{relay_mailbox_keys_record, SpaceRelayError};
 use crate::handlers::chat::ChatRuntime;
-use crate::labyrinth::auth::{begin_read, Admission};
+use crate::labyrinth::auth::{begin_read, begin_read_allowing_pending, Admission};
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
 use crate::labyrinth::repo::{directory as repo, parse_thread_id};
 use crate::labyrinth::wire::bytes::{check_did, Bytes as AtBytes, MAX_EPOCH_NUMBER};
@@ -33,10 +36,12 @@ pub async fn publish_epoch_head(
 ) -> Response {
     respond(
         async {
-            let adm = admit_procedure(&pool, &rt, "publishEpochHead", &headers, &bytes).await?;
+            let adm =
+                admit_procedure_allowing_pending(&pool, &rt, "publishEpochHead", &headers, &bytes)
+                    .await?;
             let input: PublishHeadIn = body(&bytes)?;
             let epoch = Received::<EpochPublic>::parse(&input.epoch, "epoch")?;
-            let mut w = begin_write!(&pool, adm);
+            let mut w = begin_write_allowing_pending!(&pool, adm);
             let caller = w.caller.clone();
             repo::record_head(&mut w.tx, &caller, &epoch.value, w.instant).await?;
             w.finish_write(to_bytes(&json!({}))?).await
@@ -53,7 +58,7 @@ pub async fn get_epoch_head(
 ) -> Response {
     respond(
         async {
-            let (adm, p) = admit_query(
+            let (adm, p) = admit_query_allowing_pending(
                 &pool,
                 &rt,
                 "getEpochHead",
@@ -64,6 +69,9 @@ pub async fn get_epoch_head(
             .await?;
             let did = p.req("did")?.to_owned();
             check_did("did", &did)?;
+            if adm.caller_status == "pending_approval" && did != adm.did {
+                return Err(LabyrinthError::not_authorized("device is pending approval"));
+            }
             let n = p.int("epochNumber", MAX_EPOCH_NUMBER)?;
             if let Some(bytes) = crate::federation::group_relay::try_relay_labyrinth_directory(
                 &pool,
@@ -77,7 +85,7 @@ pub async fn get_epoch_head(
             {
                 return Ok(bytes);
             }
-            epoch_response(&pool, adm, &did, n).await
+            epoch_response_with_pending(&pool, adm, &did, n, true).await
         }
         .await,
     )
@@ -90,7 +98,7 @@ pub async fn get_mailbox_keys_record(
     RawQuery(q): RawQuery,
 ) -> Response {
     let result: LabyrinthResult<Bytes> = async {
-        let (_admission, params) = admit_fixed_query(
+        let (admission, params) = admit_fixed_query_allowing_pending(
             &pool,
             &rt,
             "getMailboxKeysRecord",
@@ -101,6 +109,9 @@ pub async fn get_mailbox_keys_record(
         .await?;
         let did = params.req("did")?;
         check_did("did", did)?;
+        if admission.caller_status == "pending_approval" && did != admission.did {
+            return Err(LabyrinthError::not_authorized("device is pending approval"));
+        }
         let rkey = params.req("rkey")?;
         let resolver = rt
             .resolver()
@@ -148,7 +159,7 @@ pub async fn get_chat_device_keys(
 ) -> Response {
     respond(
         async {
-            let (adm, p) = admit_query(
+            let (adm, p) = admit_query_allowing_pending(
                 &pool,
                 &rt,
                 "getChatDeviceKeys",
@@ -159,6 +170,9 @@ pub async fn get_chat_device_keys(
             .await?;
             let did = p.req("did")?.to_owned();
             check_did("did", &did)?;
+            if adm.caller_status == "pending_approval" && did != adm.did {
+                return Err(LabyrinthError::not_authorized("device is pending approval"));
+            }
             let page = p.page()?;
             if let Some(bytes) = crate::federation::group_relay::try_relay_labyrinth_directory(
                 &pool,
@@ -172,7 +186,7 @@ pub async fn get_chat_device_keys(
             {
                 return Ok(bytes);
             }
-            keys_response(&pool, adm, &did, &page).await
+            keys_response_with_pending(&pool, adm, &did, &page, true).await
         }
         .await,
     )
@@ -223,7 +237,21 @@ async fn epoch_response(
     did: &str,
     epoch_number: Option<u64>,
 ) -> LabyrinthResult<Vec<u8>> {
-    let mut read = begin_read(pool, admission).await?;
+    epoch_response_with_pending(pool, admission, did, epoch_number, false).await
+}
+
+async fn epoch_response_with_pending(
+    pool: &DbPool,
+    admission: Admission,
+    did: &str,
+    epoch_number: Option<u64>,
+    allow_pending: bool,
+) -> LabyrinthResult<Vec<u8>> {
+    let mut read = if allow_pending {
+        begin_read_allowing_pending(pool, admission).await?
+    } else {
+        begin_read(pool, admission).await?
+    };
     let lookup = repo::get_head(&mut read.tx, did, epoch_number)
         .await?
         .ok_or_else(|| LabyrinthError::not_found("EpochNotFound"))?;
@@ -242,7 +270,21 @@ async fn keys_response(
     did: &str,
     page: &crate::labyrinth::repo::PageReq,
 ) -> LabyrinthResult<Vec<u8>> {
-    let mut read = begin_read(pool, admission).await?;
+    keys_response_with_pending(pool, admission, did, page, false).await
+}
+
+async fn keys_response_with_pending(
+    pool: &DbPool,
+    admission: Admission,
+    did: &str,
+    page: &crate::labyrinth::repo::PageReq,
+    allow_pending: bool,
+) -> LabyrinthResult<Vec<u8>> {
+    let mut read = if allow_pending {
+        begin_read_allowing_pending(pool, admission).await?
+    } else {
+        begin_read(pool, admission).await?
+    };
     let (rows, cursor) = repo::chat_device_keys(&mut read.tx, did, page).await?;
     read.finish_read().await?;
     let items: Vec<_> = rows

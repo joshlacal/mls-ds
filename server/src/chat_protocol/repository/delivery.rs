@@ -3040,19 +3040,25 @@ pub(crate) async fn prune_acknowledged_application_payloads(
                                  'blue.catbird.chat.defs#directRequestEntry') \
             AND e.payload_pruned_at IS NULL \
             AND ({replica_guard}) \
-            AND ($4 OR EXISTS ( \
-                SELECT 1 \
-                  FROM chat.application_intervals ai \
-                  JOIN chat.devices d \
-                    ON d.user_did = ai.recipient_did \
-                   AND d.device_id = ai.recipient_device_id \
-                 WHERE ai.conversation_id = e.conversation_id \
-                   AND ai.generation = e.generation \
-                   AND ai.start_seq <= e.seq \
-                   AND (ai.terminal_seq IS NULL OR e.seq <= ai.terminal_seq) \
-                   AND d.status = 'active' \
-                   AND d.dormant_at IS NULL \
-            )) \
+            AND ($4 \
+                 OR EXISTS ( \
+                     SELECT 1 \
+                       FROM chat.device_entry_acks ack \
+                      WHERE ack.conversation_id = e.conversation_id \
+                        AND ack.acked_through_seq >= e.seq \
+                 ) \
+                 OR NOT EXISTS ( \
+                     SELECT 1 \
+                       FROM chat.application_intervals live_ai \
+                       JOIN chat.devices d \
+                         ON d.user_did = live_ai.recipient_did \
+                        AND d.device_id = live_ai.recipient_device_id \
+                      WHERE live_ai.conversation_id = e.conversation_id \
+                        AND live_ai.generation = e.generation \
+                        AND live_ai.terminal_seq IS NULL \
+                        AND d.status = 'active' \
+                        AND d.dormant_at IS NULL \
+                 )) \
             AND NOT EXISTS ( \
                 SELECT 1 \
                   FROM chat.application_intervals ai \
@@ -3073,6 +3079,7 @@ pub(crate) async fn prune_acknowledged_application_payloads(
                    AND EXISTS ( \
                        SELECT 1 FROM chat.application_intervals current_interval \
                         WHERE current_interval.conversation_id = ai.conversation_id \
+                          AND current_interval.generation = ai.generation \
                           AND current_interval.recipient_did = ai.recipient_did \
                           AND current_interval.recipient_device_id = ai.recipient_device_id \
                           AND current_interval.terminal_seq IS NULL \
@@ -3136,6 +3143,126 @@ pub(crate) async fn prune_acknowledged_application_payloads(
     pruned_seqs.sort_unstable();
     pruned_seqs.dedup();
     Ok(pruned_seqs)
+}
+
+/// Immediately prune all `#applicationEntry` / `#directRequestEntry` payloads in
+/// `(conversation_id, generation)` that are no longer blocked by any active,
+/// non-dormant open-interval member device.
+pub(crate) async fn prune_unblocked_application_payloads(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    generation: i64,
+    is_remote: bool,
+    pruned_at: DateTime<Utc>,
+) -> Result<Vec<i64>, DeliveryRepositoryError> {
+    prune_acknowledged_application_payloads(
+        transaction,
+        conversation_id,
+        generation,
+        i64::MAX,
+        is_remote,
+        pruned_at,
+    )
+    .await
+}
+
+/// Prune unblocked application payloads across all generations of `conversation_id`
+/// and queue signed `entriesPruned` notices to any remote member homes inside the
+/// caller's transaction. If a remote home requires a signed notice and no S2S
+/// signer is available, a savepoint rolls back only that generation's prune so
+/// the caller's primary lifecycle mutation still commits cleanly.
+pub(crate) async fn prune_unblocked_for_conversation_and_notify(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    pruned_at: DateTime<Utc>,
+) -> Result<usize, DeliveryRepositoryError> {
+    let Some(is_remote): Option<bool> =
+        sqlx::query_scalar("SELECT is_remote FROM chat.conversations WHERE conversation_id = $1")
+            .bind(conversation_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+    else {
+        return Ok(0);
+    };
+    let generations: Vec<i64> = sqlx::query_scalar(
+        "SELECT generation FROM chat.generations WHERE conversation_id = $1 ORDER BY generation ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut total_pruned = 0;
+    for generation in generations {
+        let mut savepoint = sqlx::Acquire::begin(&mut **transaction).await?;
+        let pruned = prune_unblocked_application_payloads(
+            &mut savepoint,
+            conversation_id,
+            generation,
+            is_remote,
+            pruned_at,
+        )
+        .await?;
+        if pruned.is_empty() {
+            savepoint.rollback().await?;
+            continue;
+        }
+        if !is_remote {
+            match crate::federation::group_relay::enqueue_entries_pruned_notices(
+                &mut savepoint,
+                conversation_id,
+                generation,
+                &pruned,
+                pruned_at,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(crate::federation::group_relay::SignedRelayError::SignerUnavailable) => {
+                    tracing::warn!(
+                        conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()),
+                        generation,
+                        "unblocked prune deferred: no S2S signing key for entries-pruned notice"
+                    );
+                    savepoint.rollback().await?;
+                    continue;
+                }
+                Err(crate::federation::group_relay::SignedRelayError::Storage(error)) => {
+                    return Err(DeliveryRepositoryError::Database(sqlx::Error::Protocol(
+                        error,
+                    )));
+                }
+            }
+        }
+        savepoint.commit().await?;
+        total_pruned += pruned.len();
+    }
+    Ok(total_pruned)
+}
+
+/// Prune unblocked application payloads across every conversation where `(user_did, device_id)`
+/// held an application interval, queuing signed S2S `entriesPruned` notices as needed.
+pub(crate) async fn prune_unblocked_for_device_and_notify(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_did: &str,
+    device_id: Uuid,
+    pruned_at: DateTime<Utc>,
+) -> Result<usize, DeliveryRepositoryError> {
+    let conversations: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT conversation_id FROM chat.application_intervals \
+          WHERE recipient_did = $1 AND recipient_device_id = $2 \
+          ORDER BY conversation_id ASC",
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut total_pruned = 0;
+    for conversation_id in conversations {
+        total_pruned +=
+            prune_unblocked_for_conversation_and_notify(transaction, conversation_id, pruned_at)
+                .await?;
+    }
+    Ok(total_pruned)
 }
 
 /// Erase from this home's group mirror the application payloads its sequencer

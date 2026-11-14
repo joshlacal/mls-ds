@@ -50,7 +50,10 @@ pub struct TimeRange {
 pub fn parse_thread_id(value: &str) -> LabyrinthResult<Uuid> {
     let id = Uuid::parse_str(value)
         .map_err(|_| LabyrinthError::invalid("threadId must be a canonical lowercase UUIDv4"))?;
-    if id.hyphenated().to_string() != value || id.get_version_num() != 4 {
+    if id.hyphenated().to_string() != value
+        || id.get_version_num() != 4
+        || id.get_variant() != uuid::Variant::RFC4122
+    {
         return Err(LabyrinthError::invalid(
             "threadId must be a canonical lowercase UUIDv4",
         ));

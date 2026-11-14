@@ -1008,7 +1008,7 @@ pub async fn bootstrap_remote_mailbox_from_selector(
             target: "catbird_federation::bootstrap",
             outcome = "applied",
             sequencer_did = %redacted_sequencer,
-            conversation_id = %conversation_id,
+            conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()),
             sequencer_term,
             page_count,
             event_count,

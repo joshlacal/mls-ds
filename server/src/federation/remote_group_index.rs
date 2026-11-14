@@ -524,11 +524,13 @@ async fn relayed_conversations(
                     "$type": CONVERSATION_INVENTORY_STATE,
                     "state": body["state"].take(),
                 })),
-                _ => tracing::warn!(%conversation_id, "relayed group state is malformed"),
+                _ => {
+                    tracing::warn!(conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), "relayed group state is malformed")
+                }
             },
             Ok(None) => {}
             Err(error) => {
-                tracing::warn!(%conversation_id, ?error, "relayed group state unavailable")
+                tracing::warn!(conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), ?error, "relayed group state unavailable")
             }
         }
     }
@@ -580,7 +582,7 @@ async fn relayed_welcomes(
             Ok(Some(views)) => views,
             Ok(None) => continue,
             Err(error) => {
-                tracing::warn!(%conversation_id, ?error, "relayed pending Welcomes unavailable");
+                tracing::warn!(conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), ?error, "relayed pending Welcomes unavailable");
                 continue;
             }
         };
@@ -598,7 +600,7 @@ async fn relayed_welcomes(
             if let Err(error) =
                 forget_pending_welcomes(pool, conversation_id, user_did, device_id, &settled).await
             {
-                tracing::warn!(%conversation_id, %error, "settled Welcome markers were not cleared");
+                tracing::warn!(conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), %error, "settled Welcome markers were not cleared");
             }
         }
         for view in views {

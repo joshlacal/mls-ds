@@ -65,6 +65,7 @@ pub(crate) enum RevocationDeviceViewError {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct DeviceDirectoryView {
     pub(crate) device_id: Uuid,
+    pub(crate) device_name: String,
     pub(crate) key_id: String,
     pub(crate) signing_public_key: Vec<u8>,
     pub(crate) auth_generation: i64,
@@ -72,11 +73,24 @@ pub(crate) struct DeviceDirectoryView {
     pub(crate) status: String,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
+    pub(crate) last_active_at: DateTime<Utc>,
+    pub(crate) dormant_at: Option<DateTime<Utc>>,
     pub(crate) available_package_count: i64,
     pub(crate) reserved_package_count: i64,
     pub(crate) request_available_package_count: i64,
     pub(crate) request_reserved_package_count: i64,
     pub(crate) capabilities_json: String,
+}
+
+impl DeviceDirectoryView {
+    #[allow(dead_code)]
+    pub(crate) fn wire_status(&self) -> &str {
+        if self.status == "active" && self.dormant_at.is_some() {
+            "dormant"
+        } else {
+            self.status.as_str()
+        }
+    }
 }
 
 /// Transaction-bound prewrite projection of the exact active target device
@@ -128,7 +142,7 @@ impl LockedRevocationDeviceView {
             || self.target_did.as_ref() != target_did
             || self.active.device_id != target_device_id
             || u64::try_from(self.active.auth_generation).ok() != Some(target_auth_generation)
-            || self.active.status != "active"
+            || !matches!(self.active.status.as_str(), "active" | "pending_approval")
             || accepted_at != self.locked_at
             || counted_live_packages != revoked_live_package_count
         {
@@ -136,6 +150,7 @@ impl LockedRevocationDeviceView {
         }
         Ok(DeviceDirectoryView {
             device_id: self.active.device_id,
+            device_name: self.active.device_name,
             key_id: self.active.key_id,
             signing_public_key: self.active.signing_public_key,
             auth_generation: self.active.auth_generation,
@@ -143,6 +158,8 @@ impl LockedRevocationDeviceView {
             status: "revoked".to_owned(),
             created_at: self.active.created_at,
             updated_at: accepted_at,
+            last_active_at: self.active.last_active_at,
+            dormant_at: self.active.dormant_at,
             available_package_count: 0,
             reserved_package_count: 0,
             request_available_package_count: 0,
@@ -155,6 +172,7 @@ impl LockedRevocationDeviceView {
 #[derive(sqlx::FromRow)]
 struct ActiveRevocationDeviceViewRow {
     device_id: Uuid,
+    device_name: String,
     key_id: String,
     signing_public_key: Vec<u8>,
     auth_generation: i64,
@@ -163,6 +181,8 @@ struct ActiveRevocationDeviceViewRow {
     status: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    last_active_at: DateTime<Utc>,
+    dormant_at: Option<DateTime<Utc>>,
     device_revoked_at: Option<DateTime<Utc>>,
     device_revocation_id: Option<Uuid>,
     key_revoked_at: Option<DateTime<Utc>>,
@@ -176,6 +196,7 @@ struct ActiveRevocationDeviceViewRow {
 
 const SELECT_DEVICE_VIEW: &str = r#"
     SELECT device.device_id AS device_id,
+           device.device_name AS device_name,
            device_key.key_id AS key_id,
            device_key.signing_public_key AS signing_public_key,
            device.auth_generation AS auth_generation,
@@ -183,6 +204,8 @@ const SELECT_DEVICE_VIEW: &str = r#"
            device.status AS status,
            device.created_at AS created_at,
            device.updated_at AS updated_at,
+           device.last_active_at AS last_active_at,
+           device.dormant_at AS dormant_at,
            device.capabilities::text AS capabilities_json,
            (SELECT count(*)
               FROM chat.key_packages kp
@@ -244,6 +267,7 @@ pub(crate) async fn lock_active_revocation_device_view(
     let row: Option<ActiveRevocationDeviceViewRow> = sqlx::query_as(
         r#"
         SELECT device.device_id,
+               device.device_name,
                device_key.key_id,
                device_key.signing_public_key,
                device.auth_generation,
@@ -252,6 +276,8 @@ pub(crate) async fn lock_active_revocation_device_view(
                device.status,
                device.created_at,
                device.updated_at,
+               device.last_active_at,
+               device.dormant_at,
                device.revoked_at AS device_revoked_at,
                device.revocation_id AS device_revocation_id,
                device_key.revoked_at AS key_revoked_at,
@@ -344,7 +370,7 @@ fn validate_active_revocation_device_view_row(
         return Err(RevocationDeviceViewError::Projection);
     }
     match row.status.as_str() {
-        "active"
+        "active" | "pending_approval"
             if row.device_revoked_at.is_none()
                 && row.device_revocation_id.is_none()
                 && row.key_revoked_at.is_none()
@@ -366,6 +392,7 @@ fn validate_active_revocation_device_view_row(
     }
     Ok(DeviceDirectoryView {
         device_id: row.device_id,
+        device_name: row.device_name,
         key_id: row.key_id,
         signing_public_key: row.signing_public_key,
         auth_generation: row.auth_generation,
@@ -373,6 +400,8 @@ fn validate_active_revocation_device_view_row(
         status: row.status,
         created_at: row.created_at,
         updated_at: row.updated_at,
+        last_active_at: row.last_active_at,
+        dormant_at: row.dormant_at,
         available_package_count: row.available_package_count,
         reserved_package_count: row.reserved_package_count,
         request_available_package_count: row.request_available_package_count,
@@ -410,6 +439,7 @@ fn revocation_device_view_digest(
     for value in [
         transaction_id.as_bytes(),
         target_did.as_bytes(),
+        view.device_name.as_bytes(),
         view.key_id.as_bytes(),
         view.signing_public_key.as_slice(),
         view.dpop_jkt.as_deref().unwrap_or_default().as_bytes(),
@@ -423,6 +453,14 @@ fn revocation_device_view_digest(
     digest.update(view.auth_generation.to_be_bytes());
     digest.update(view.created_at.timestamp_micros().to_be_bytes());
     digest.update(view.updated_at.timestamp_micros().to_be_bytes());
+    digest.update(view.last_active_at.timestamp_micros().to_be_bytes());
+    match view.dormant_at {
+        Some(ts) => {
+            digest.update([1]);
+            digest.update(ts.timestamp_micros().to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
     digest.update(view.available_package_count.to_be_bytes());
     digest.update(view.reserved_package_count.to_be_bytes());
     digest.update(view.request_available_package_count.to_be_bytes());
@@ -438,6 +476,7 @@ mod revocation_tests {
     fn active_view() -> DeviceDirectoryView {
         DeviceDirectoryView {
             device_id: Uuid::parse_str("a65a1a3b-a442-4bfd-9f08-c6877e5c7ecb").unwrap(),
+            device_name: "Test Device".to_owned(),
             key_id: "ERERERERERERERERERERERERERERERERERERERERERE".to_owned(),
             signing_public_key: vec![17; 32],
             auth_generation: 3,
@@ -445,6 +484,8 @@ mod revocation_tests {
             status: "active".to_owned(),
             created_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
             updated_at: DateTime::from_timestamp_millis(1_700_000_001_000).unwrap(),
+            last_active_at: DateTime::from_timestamp_millis(1_699_920_000_000).unwrap(),
+            dormant_at: None,
             available_package_count: 2,
             reserved_package_count: 1,
             request_available_package_count: 0,
@@ -473,6 +514,7 @@ mod revocation_tests {
         let view = active_view();
         ActiveRevocationDeviceViewRow {
             device_id: view.device_id,
+            device_name: view.device_name,
             key_id: view.key_id,
             signing_public_key: view.signing_public_key,
             auth_generation: view.auth_generation,
@@ -481,6 +523,8 @@ mod revocation_tests {
             status: view.status,
             created_at: view.created_at,
             updated_at: view.updated_at,
+            last_active_at: view.last_active_at,
+            dormant_at: view.dormant_at,
             device_revoked_at: None,
             device_revocation_id: None,
             key_revoked_at: None,

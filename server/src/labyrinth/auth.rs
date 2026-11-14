@@ -52,6 +52,15 @@ pub struct Caller {
     pub device_id: Uuid,
     pub key_id: String,
     pub signing_key: [u8; 32],
+    pub status: String,
+}
+
+/// Row lock mode when loading a Labyrinth caller's chat device & key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceLock {
+    None,
+    Share,
+    PromoteWrite,
 }
 
 /// A verified request, before its transaction re-locks the device.
@@ -59,6 +68,7 @@ pub struct Caller {
 pub struct Admission {
     pub did: String,
     pub device_id: Uuid,
+    pub caller_status: String,
     /// The single server-clock instant of this request (ms precision).
     pub instant: DateTime<Utc>,
     /// Present on procedures.
@@ -146,7 +156,10 @@ pub fn actor_device_from_query(query: Option<&str>) -> LabyrinthResult<Uuid> {
 pub(crate) fn parse_device_id(value: &str) -> LabyrinthResult<Uuid> {
     let id = Uuid::parse_str(value)
         .map_err(|_| LabyrinthError::invalid("actorDeviceId is not a UUID"))?;
-    if id.hyphenated().to_string() != value || id.get_version_num() != 4 {
+    if id.hyphenated().to_string() != value
+        || id.get_version_num() != 4
+        || id.get_variant() != uuid::Variant::RFC4122
+    {
         return Err(LabyrinthError::invalid(
             "actorDeviceId must be a canonical lowercase UUIDv4",
         ));
@@ -163,6 +176,28 @@ pub async fn admit_query(
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> LabyrinthResult<Admission> {
+    admit_query_with_pending(pool, cutover_enabled, nsid, headers, query, false).await
+}
+
+/// Admit a query allowing a `pending_approval` caller device (caller-DID self-check enforced by handler).
+pub async fn admit_query_allowing_pending(
+    pool: &DbPool,
+    cutover_enabled: bool,
+    nsid: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> LabyrinthResult<Admission> {
+    admit_query_with_pending(pool, cutover_enabled, nsid, headers, query, true).await
+}
+
+async fn admit_query_with_pending(
+    pool: &DbPool,
+    cutover_enabled: bool,
+    nsid: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+    allow_pending: bool,
+) -> LabyrinthResult<Admission> {
     require_cutover(cutover_enabled)?;
     let principal = crate::auth::verify_mls_service_principal(headers, pool, nsid)
         .await
@@ -176,7 +211,8 @@ pub async fn admit_query(
         nsid,
         query: Some(&canonical),
     };
-    let (signed_device, _) = read_auth::verify(pool, &proof, expected, instant).await?;
+    let (signed_device, _, caller_status) =
+        read_auth::verify_with_pending(pool, &proof, expected, instant, allow_pending).await?;
     if signed_device != device_id {
         return Err(LabyrinthError::invalid(
             "device-signed read: deviceId is not actorDeviceId",
@@ -185,6 +221,7 @@ pub async fn admit_query(
     Ok(Admission {
         did: principal.did().to_owned(),
         device_id,
+        caller_status,
         instant,
         write: None,
         read: Some(proof),
@@ -201,6 +238,28 @@ pub async fn admit_fixed_query(
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> LabyrinthResult<Admission> {
+    admit_fixed_query_with_pending(pool, cutover_enabled, nsid, headers, query, false).await
+}
+
+/// Admit a fixed-shape query allowing a `pending_approval` caller device.
+pub async fn admit_fixed_query_allowing_pending(
+    pool: &DbPool,
+    cutover_enabled: bool,
+    nsid: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> LabyrinthResult<Admission> {
+    admit_fixed_query_with_pending(pool, cutover_enabled, nsid, headers, query, true).await
+}
+
+async fn admit_fixed_query_with_pending(
+    pool: &DbPool,
+    cutover_enabled: bool,
+    nsid: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+    allow_pending: bool,
+) -> LabyrinthResult<Admission> {
     require_cutover(cutover_enabled)?;
     let principal = crate::auth::verify_mls_service_principal(headers, pool, nsid)
         .await
@@ -213,10 +272,12 @@ pub async fn admit_fixed_query(
         nsid,
         query: Some(&canonical),
     };
-    let (device_id, _) = read_auth::verify(pool, &proof, expected, instant).await?;
+    let (device_id, _, caller_status) =
+        read_auth::verify_with_pending(pool, &proof, expected, instant, allow_pending).await?;
     Ok(Admission {
         did: principal.did().to_owned(),
         device_id,
+        caller_status,
         instant,
         write: None,
         read: Some(proof),
@@ -244,13 +305,44 @@ pub async fn admit_procedure(
     headers: &HeaderMap,
     body: &[u8],
 ) -> LabyrinthResult<Admission> {
+    admit_procedure_with_pending(pool, cutover_enabled, nsid, headers, body, false).await
+}
+
+/// Admit a procedure allowing a `pending_approval` caller device (for `publishEpochHead` self-promotion).
+pub async fn admit_procedure_allowing_pending(
+    pool: &DbPool,
+    cutover_enabled: bool,
+    nsid: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> LabyrinthResult<Admission> {
+    admit_procedure_with_pending(pool, cutover_enabled, nsid, headers, body, true).await
+}
+
+async fn admit_procedure_with_pending(
+    pool: &DbPool,
+    cutover_enabled: bool,
+    nsid: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+    allow_pending: bool,
+) -> LabyrinthResult<Admission> {
     require_cutover(cutover_enabled)?;
     let principal = crate::auth::verify_mls_service_principal(headers, pool, nsid)
         .await
         .map_err(|e| service_auth_failure(nsid, e))?;
     let signed = header_b64(headers, WRITE_BODY_HEADER)?;
     let sig = header_b64(headers, WRITE_SIGNATURE_HEADER)?;
-    verify_signed_write(pool, principal.did(), nsid, &signed, &sig, body).await
+    verify_signed_write_with_pending(
+        pool,
+        principal.did(),
+        nsid,
+        &signed,
+        &sig,
+        body,
+        allow_pending,
+    )
+    .await
 }
 
 /// The raw `labyrinthWriteBody` header values of a procedure, for the
@@ -286,6 +378,18 @@ pub async fn verify_signed_write(
     sig: &[u8],
     body: &[u8],
 ) -> LabyrinthResult<Admission> {
+    verify_signed_write_with_pending(pool, did, nsid, signed, sig, body, false).await
+}
+
+async fn verify_signed_write_with_pending(
+    pool: &DbPool,
+    did: &str,
+    nsid: &str,
+    signed: &[u8],
+    sig: &[u8],
+    body: &[u8],
+    allow_pending: bool,
+) -> LabyrinthResult<Admission> {
     let instant = now_ms();
     let wire: WriteBodyWire = serde_json::from_slice(signed)
         .map_err(|e| LabyrinthError::invalid(format!("labyrinthWriteBody: {e}")))?;
@@ -293,7 +397,14 @@ pub async fn verify_signed_write(
     let write = check_write_body(&wire, nsid, body, instant)?;
 
     let mut conn = pool.acquire().await?;
-    let caller = load_current_device(&mut conn, did, device_id, false).await?;
+    let caller = load_current_device_with_pending(
+        &mut conn,
+        did,
+        device_id,
+        DeviceLock::None,
+        allow_pending,
+    )
+    .await?;
     let sig: [u8; 64] = sig
         .try_into()
         .map_err(|_| LabyrinthError::invalid("write signature must be 64 bytes"))?;
@@ -313,6 +424,7 @@ pub async fn verify_signed_write(
     Ok(Admission {
         did: did.to_owned(),
         device_id,
+        caller_status: caller.status,
         instant,
         write: Some(write),
         read: None,
@@ -330,7 +442,8 @@ pub async fn relayed_read(
 ) -> LabyrinthResult<(Admission, read_auth::ReadClaim)> {
     let did = expected.did.to_owned();
     let instant = now_ms();
-    let (signed, claim) = read_auth::verify(pool, &proof, expected, instant).await?;
+    let (signed, claim, caller_status) =
+        read_auth::verify_with_pending(pool, &proof, expected, instant, false).await?;
     if signed != parse_device_id(device_id)? {
         return Err(LabyrinthError::invalid(
             "actorDeviceId differs from the signed read claim",
@@ -339,6 +452,7 @@ pub async fn relayed_read(
     let admission = Admission {
         did,
         device_id: signed,
+        caller_status,
         instant,
         write: None,
         read: Some(proof),
@@ -399,6 +513,33 @@ pub async fn load_current_device(
     device_id: Uuid,
     lock: bool,
 ) -> LabyrinthResult<Caller> {
+    load_current_device_with_pending(
+        conn,
+        did,
+        device_id,
+        if lock {
+            DeviceLock::Share
+        } else {
+            DeviceLock::None
+        },
+        false,
+    )
+    .await
+}
+
+/// Load the caller's device and key with explicit lock mode and `pending_approval` policy.
+pub async fn load_current_device_with_pending(
+    conn: &mut PgConnection,
+    did: &str,
+    device_id: Uuid,
+    lock: DeviceLock,
+    allow_pending: bool,
+) -> LabyrinthResult<Caller> {
+    let lock_clause = match lock {
+        DeviceLock::None => "",
+        DeviceLock::Share => "FOR SHARE OF d, k",
+        DeviceLock::PromoteWrite => "FOR NO KEY UPDATE OF d FOR SHARE OF k",
+    };
     let sql = format!(
         "SELECT d.status, k.key_id, k.signing_public_key, \
                 (k.revoked_at IS NOT NULL) AS key_revoked \
@@ -410,8 +551,7 @@ pub async fn load_current_device(
                 WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
                   AND newer.enrollment_auth_generation>k.enrollment_auth_generation \
                   AND newer.enrollment_auth_generation<=d.auth_generation) \
-          WHERE d.user_did = $1 AND d.device_id = $2 {}",
-        if lock { "FOR SHARE OF d, k" } else { "" }
+          WHERE d.user_did = $1 AND d.device_id = $2 {lock_clause}"
     );
     let row: Option<DeviceRow> = sqlx::query_as(&sql)
         .bind(did)
@@ -419,8 +559,11 @@ pub async fn load_current_device(
         .fetch_optional(&mut *conn)
         .await?;
     let row = row.ok_or_else(|| LabyrinthError::not_authorized("device is not registered"))?;
-    if row.status != "active" || row.key_revoked {
+    if row.status == "revoked" || row.key_revoked {
         return Err(LabyrinthError::device_revoked());
+    }
+    if row.status != "active" && !(allow_pending && row.status == "pending_approval") {
+        return Err(LabyrinthError::not_authorized("device is pending approval"));
     }
     Ok(Caller {
         did: did.to_owned(),
@@ -431,6 +574,7 @@ pub async fn load_current_device(
             .as_slice()
             .try_into()
             .map_err(|_| LabyrinthError::internal())?,
+        status: row.status,
     })
 }
 
@@ -451,8 +595,31 @@ pub enum Begun {
 
 /// Open a read transaction and lock the caller's device.
 pub async fn begin_read(pool: &DbPool, admission: Admission) -> LabyrinthResult<RequestTx> {
+    begin_read_with_pending(pool, admission, false).await
+}
+
+/// Open a read transaction allowing a `pending_approval` caller device.
+pub async fn begin_read_allowing_pending(
+    pool: &DbPool,
+    admission: Admission,
+) -> LabyrinthResult<RequestTx> {
+    begin_read_with_pending(pool, admission, true).await
+}
+
+async fn begin_read_with_pending(
+    pool: &DbPool,
+    admission: Admission,
+    allow_pending: bool,
+) -> LabyrinthResult<RequestTx> {
     let mut tx = pool.begin().await?;
-    let caller = load_current_device(&mut tx, &admission.did, admission.device_id, true).await?;
+    let caller = load_current_device_with_pending(
+        &mut tx,
+        &admission.did,
+        admission.device_id,
+        DeviceLock::Share,
+        allow_pending,
+    )
+    .await?;
     Ok(RequestTx {
         tx,
         caller,
@@ -465,12 +632,39 @@ pub async fn begin_read(pool: &DbPool, admission: Admission) -> LabyrinthResult<
 /// operation with the same id, or refuse one whose payload or endpoint
 /// differs.
 pub async fn begin_write(pool: &DbPool, admission: Admission) -> LabyrinthResult<Begun> {
+    begin_write_with_pending(pool, admission, false).await
+}
+
+/// Open a procedure transaction allowing `pending_approval` self-promotion (`publishEpochHead`).
+pub async fn begin_write_allowing_pending(
+    pool: &DbPool,
+    admission: Admission,
+) -> LabyrinthResult<Begun> {
+    begin_write_with_pending(pool, admission, true).await
+}
+
+async fn begin_write_with_pending(
+    pool: &DbPool,
+    admission: Admission,
+    allow_pending: bool,
+) -> LabyrinthResult<Begun> {
     let write = admission
         .write
         .clone()
         .ok_or_else(LabyrinthError::internal)?;
     let mut tx = pool.begin().await?;
-    let caller = load_current_device(&mut tx, &admission.did, admission.device_id, true).await?;
+    let caller = load_current_device_with_pending(
+        &mut tx,
+        &admission.did,
+        admission.device_id,
+        if allow_pending {
+            DeviceLock::PromoteWrite
+        } else {
+            DeviceLock::Share
+        },
+        allow_pending,
+    )
+    .await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!(
             "labyrinth.operations:{}:{}",

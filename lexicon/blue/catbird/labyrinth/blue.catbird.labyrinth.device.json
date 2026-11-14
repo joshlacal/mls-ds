@@ -60,6 +60,11 @@
             "description": "Set once when the device is revoked; the revoking device opens a new epoch that excludes it ([CB-11]).",
             "format": "datetime"
           },
+          "revocation": {
+            "type": "ref",
+            "ref": "blue.catbird.labyrinth.defs#deviceRevocation",
+            "description": "Cryptographic signature by the revoking physical device authenticating revokedAt."
+          },
           "createdAt": {
             "type": "string",
             "format": "datetime"

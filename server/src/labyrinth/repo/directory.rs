@@ -59,6 +59,28 @@ pub(crate) fn parse_stored(text: &str) -> LabyrinthResult<EpochPublic> {
     })
 }
 
+async fn promote_pending_device(
+    conn: &mut PgConnection,
+    did: &str,
+    device_id: Uuid,
+    at: DateTime<Utc>,
+) -> LabyrinthResult<()> {
+    sqlx::query(
+        "UPDATE chat.devices \
+            SET status = 'active', \
+                updated_at = GREATEST(updated_at, $3) \
+          WHERE user_did = $1 \
+            AND device_id = $2 \
+            AND status = 'pending_approval'",
+    )
+    .bind(did)
+    .bind(device_id)
+    .bind(at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// Accept `epoch` into the caller DID's head chain (`Gate 3`, `Gate 6`, `L-F01`).
 ///
 /// Recomputes `epochHead` (with `membersHash`), verifies XEdDSA `selfSig` and the calling
@@ -66,6 +88,10 @@ pub(crate) fn parse_stored(text: &str) -> LabyrinthResult<EpochPublic> {
 /// rollback floor, and verifies `prevSig` under the previous epoch's signing key.
 /// Re-sending an identical head is idempotent; a different head at the same epoch number
 /// returns `409 EpochHeadConflict`.
+///
+/// A `pending_approval` device (`D-2` recovery self-promotion) may only publish a chained
+/// head (`epoch >= 1` with a verified `prevSig` linking to an existing head in `epoch_heads`)
+/// and is atomically promoted to `status = 'active'` in the same transaction.
 pub async fn record_head(
     conn: &mut PgConnection,
     caller: &Caller,
@@ -87,11 +113,18 @@ pub async fn record_head(
     .fetch_optional(&mut *conn)
     .await?;
     if let Some(text) = existing {
-        return if &parse_stored(&text)? == epoch {
-            Ok(())
-        } else {
-            Err(head_conflict())
-        };
+        if &parse_stored(&text)? != epoch {
+            return Err(head_conflict());
+        }
+        if caller.status == "pending_approval" {
+            if parts.epoch_number == 0 || parts.prev_sig.is_none() {
+                return Err(LabyrinthError::not_authorized(
+                    "pending device requires a chained epoch rotation with prevSig",
+                ));
+            }
+            promote_pending_device(conn, did, caller.device_id, at).await?;
+        }
+        return Ok(());
     }
     let latest: Option<(i64, Vec<u8>, String)> = sqlx::query_as(
         "SELECT epoch_number, epoch_head, epoch_public::text FROM labyrinth.epoch_heads \
@@ -112,6 +145,13 @@ pub async fn record_head(
             Ok((n as u64, head, signing))
         })
         .transpose()?;
+    if caller.status == "pending_approval"
+        && (latest.is_none() || parts.epoch_number == 0 || parts.prev_sig.is_none())
+    {
+        return Err(LabyrinthError::not_authorized(
+            "pending device requires a chained epoch rotation with prevSig",
+        ));
+    }
     let floor: Option<i64> = sqlx::query_scalar(
         "SELECT max_epoch_number FROM labyrinth.epoch_head_floors WHERE did = $1",
     )
@@ -142,6 +182,9 @@ pub async fn record_head(
     .bind(at)
     .execute(&mut *conn)
     .await?;
+    if caller.status == "pending_approval" {
+        promote_pending_device(conn, did, caller.device_id, at).await?;
+    }
     Ok(())
 }
 

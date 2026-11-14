@@ -5,9 +5,9 @@ SQL migrations for `catbird-server`, applied in version order by SQLx (`sqlx::mi
 ## Status
 
 - The R0 seal (bookmark `clean-slate-2026-10-31`, mls-ds `d5f6993c`) has 129 migrations, ending at `20261102000003_conversation_close_terminal_entries.sql`.
-- The unsealed Task 4 R1 provisional commits add fourteen, for 143: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010`, `000011` and `000012`. The seed-2323 fix adds `20261107000001`, for 144. The Round 4 lifecycle relay adds `20261113000001`, for 145. Their contracts are in the sections below.
+- The unsealed Task 4 R1 provisional commits add fourteen, for 143: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010`, `000011` and `000012`. The seed-2323 fix adds `20261107000001`, for 144. The Round 4 lifecycle relay adds `20261113000001`, for 145. Wave 2 multi-device approval and Nov-12 Spaces adds `20261114000001`, for 146. Their contracts are in the sections below.
 - **Held.** These migrations have run only against local disposable and guarded test databases. Do not apply them to a production database until R1 is sealed and the production migration is separately authorized. Server startup applies pending migrations, so the hold also covers starting this tree against a production database.
-- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 145 migrations ending at `20261113000001` (94 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
+- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 146 migrations ending at `20261114000001` (98 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
 
 ## Clean-Chat Operation Claim Rollout
 
@@ -706,9 +706,20 @@ Raw-file size: `4702` bytes. SQLx SHA-384:
 ## Credential and opening evidence contracts
 
 Space credential relays use standard upstream POST JSON
-`{space, credentialKid, delegationToken}`. They verify the returned credential's
-authority, Space, proof-of-possession key and expiry before deriving the home
-response's `expiresAt`; delegation tokens never appear in the URL.
+`{space, credentialKey, delegationToken, clientAttestation?, notify?}` against `com.atproto.space.authorizeSpaceSync`. They verify the returned credential's
+authority, Space, proof-of-possession key and expiry before formatting the home
+response's `expiresAt` in `.xxxZ` millisecond RFC 3339; delegation tokens never appear in the URL.
+
+## Wave 2 multi-device approval and Nov-12 Spaces
+
+`20261114000001_wave2_multidevice_and_spaces_nov12.sql` adds the `'pending_approval'`
+lifecycle status on `chat.devices` (`pending_approval -> active | revoked`), the
+immutable `chat.device_approvals` provenance table and `blue.catbird.chat.approveDevice`
+operation-claim / idempotency / DPoP constraints, and the Nov-12 Space host operational
+columns and tables (`prev_space_rev` and `removed_at` on `chat.conversation_space_writers`,
+`chat.conversation_space_subscribers`, `chat.managed_space_members`, and
+`chat.conversation_space_records`). Raw-file size: `21548` bytes. SQLx SHA-384:
+`f32c9403bbcd7ed6bde26a463912c83f0d95aecffcf7040d5622d4db9e1eb6263db4e0d6edaf7062217098eaa13fe133`.
 
 C33 publication requires the signed `archiveCommitment` for the encrypted
 canonical opening frame. The initial entry retains both its genuine `I13`

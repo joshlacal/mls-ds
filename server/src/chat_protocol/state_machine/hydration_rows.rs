@@ -801,6 +801,7 @@ pub(in crate::chat_protocol::state_machine) fn signed_mutation_kind_code(
         SignedMutationKind::BlobUploadPreparation => 23,
         SignedMutationKind::BlobDeletion => 24,
         SignedMutationKind::Typing => 25,
+        SignedMutationKind::DeviceApproval => 26,
     }
 }
 

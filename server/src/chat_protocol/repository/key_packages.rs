@@ -113,7 +113,7 @@ pub(crate) async fn publish_key_packages(
     .fetch_optional(&mut **transaction)
     .await?;
     let (status, revoked_at) = guard.ok_or(KeyPackageRepositoryError::OwnerKeyMissing)?;
-    if status != "active" || revoked_at.is_some() {
+    if !matches!(status.as_str(), "active" | "pending_approval") || revoked_at.is_some() {
         return Err(KeyPackageRepositoryError::OwnerRevoked);
     }
 

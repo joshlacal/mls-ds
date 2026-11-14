@@ -1,6 +1,6 @@
-//! `blue.catbird.chat.relaySpaceCredential` & `blue.catbird.chat.relaySpaceRead` HTTP handlers (`3A`).
+//! `blue.catbird.chat.relaySpaceCredential` & `blue.catbird.chat.relaySpaceRead` HTTP handlers.
 //!
-//! CRITICAL PRIVACY INVARIANT (`3A`):
+//! CRITICAL PRIVACY INVARIANT:
 //! Both handlers perform strictly READ-ONLY authorization checks against `chat.devices` and write
 //! ZERO rows to any table on the home `mls-ds`.
 
@@ -20,10 +20,13 @@ use uuid::Uuid;
 
 use super::{context, errors::ChatFailure, runtime::ChatRuntime};
 use crate::{
-    chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode},
+    chat_protocol::{
+        error::{ChatEndpoint, ChatProtocolErrorCode},
+        validation::CanonicalUuidV4,
+    },
     federation::space_read_relay::{
-        relay_space_credential_stateless, relay_space_read_stateless, RelayedCredentialOutput,
-        SpaceRelayError,
+        relay_space_credential_with_options, relay_space_read_with_headers, RelayCredentialOptions,
+        RelayedCredentialOutput, SpaceRelayError,
     },
     storage::DbPool,
 };
@@ -59,8 +62,9 @@ async fn verify_active_device_read_only(
     user_did: &str,
     actor_device_id: &str,
 ) -> Result<(), ChatFailure> {
-    let device_uuid = Uuid::parse_str(actor_device_id)
+    let canonical = CanonicalUuidV4::parse(actor_device_id)
         .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    let device_uuid = Uuid::from_bytes(*canonical.as_bytes());
     let status: Option<String> = sqlx::query_scalar(
         "SELECT status FROM chat.devices WHERE user_did = $1 AND device_id = $2",
     )
@@ -108,12 +112,22 @@ async fn relay_credential(
     )
     .await?;
 
+    let options = RelayCredentialOptions {
+        client_attestation: input.client_attestation.as_ref().map(|s| s.as_ref()),
+        notify: input
+            .notify
+            .as_ref()
+            .map(|n| (n.endpoint.as_ref(), n.token.as_ref())),
+        space_rev: input.space_rev.as_ref().map(|t| t.as_str()),
+    };
+
     credential_relay_response(
-        relay_space_credential_stateless(
+        relay_space_credential_with_options(
             input.authority_did.as_ref(),
             input.space.as_ref(),
             input.delegation_token.as_ref(),
             input.cnf_key.as_ref(),
+            options,
         )
         .await,
     )
@@ -137,18 +151,26 @@ fn credential_relay_response(
         }
         Err(error) => return Err(credential_relay_failure(error)),
     };
-    let response_bytes = serde_json::to_vec(&json!({
+    let mut payload = json!({
         "credential": out.credential,
         "expiresAt": out.expires_at,
-    }))
-    .map_err(|_| ChatFailure::invariant(CREDENTIAL_ENDPOINT))?;
+    });
+    if let Some(space_rev) = out.space_rev {
+        payload["spaceRev"] = json!(space_rev);
+    }
+    let response_bytes =
+        serde_json::to_vec(&payload).map_err(|_| ChatFailure::invariant(CREDENTIAL_ENDPOINT))?;
     context::canonical_json_response(CREDENTIAL_ENDPOINT, 200, response_bytes)
 }
 
-/// An authority refusal under the declared `NotAuthorized` that carries a signed `denial`.
+/// An authority refusal under `NotAuthorized` / `AccountNotAuthorized` that carries a signed `denial`.
 fn is_signed_refusal(body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .is_ok_and(|refusal| refusal["error"] == "NotAuthorized" && refusal["denial"].is_string())
+    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|refusal| {
+        matches!(
+            refusal["error"].as_str(),
+            Some("NotAuthorized" | "AccountNotAuthorized")
+        ) && refusal["denial"].is_string()
+    })
 }
 
 /// The authority's refusal reaches the client with its status: 401 rejects the delegation
@@ -234,13 +256,14 @@ async fn relay_read(
         ));
     }
 
-    let relayed = relay_space_read_stateless(
+    let relayed = relay_space_read_with_headers(
         input.target_did.as_ref(),
         input.nsid.as_ref(),
         input.query.as_ref().map(|s| s.as_ref()),
         input.credential.as_ref(),
         input.space_audience.as_ref(),
         input.want_mac.as_ref().map(|s| s.as_ref()),
+        input.accept_signature.as_ref().map(|s| s.as_ref()),
         input.signature_input.as_ref(),
         input.signature.as_ref(),
     )
@@ -259,11 +282,22 @@ async fn relay_read(
     }
     resp_headers.insert(
         HeaderName::from_static("access-control-expose-headers"),
-        HeaderValue::from_static("Atproto-Space-Mac"),
+        HeaderValue::from_static(
+            "Atproto-Space-Commit, Atproto-Space-Record, Signature-Input, Signature, Atproto-Space-Mac",
+        ),
     );
-    if let Some(mac) = relayed.space_mac {
-        if let Ok(val) = HeaderValue::from_str(&mac) {
-            resp_headers.insert(HeaderName::from_static("atproto-space-mac"), val);
+    for (name, opt_val) in [
+        ("atproto-space-mac", relayed.space_mac),
+        ("atproto-space-commit", relayed.space_commit),
+        ("atproto-space-record", relayed.space_record),
+        ("signature-input", relayed.signature_input),
+        ("signature", relayed.signature),
+        ("vary", relayed.vary),
+    ] {
+        if let Some(raw) = opt_val {
+            if let Ok(val) = HeaderValue::from_str(&raw) {
+                resp_headers.insert(HeaderName::from_static(name), val);
+            }
         }
     }
 
@@ -273,7 +307,10 @@ async fn relay_read(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::federation::space_read_relay::register_test_space_relay_target;
+    use crate::federation::space_read_relay::{
+        register_test_space_relay_target, relay_space_credential_stateless,
+        relay_space_read_stateless,
+    };
     use axum::{routing::post, Router};
     use std::sync::{Arc, Mutex};
 
@@ -285,7 +322,7 @@ mod tests {
         let kid = atproto_spaces::kem::encode_p256_did_key(&pop.public_key());
         let upstream = Arc::new(Mutex::new((StatusCode::OK, json!({}))));
         let router = Router::new().route(
-            "/xrpc/com.atproto.space.getSpaceCredential",
+            "/xrpc/com.atproto.space.authorizeSpaceSync",
             post({
                 let upstream = upstream.clone();
                 move || {
@@ -326,21 +363,17 @@ mod tests {
         server.abort();
     }
 
-    /// The authority's signed refusal reaches the client byte for byte (no re-encoding the
-    /// client's signature check would depend on); an unsigned one stays the relay's own
-    /// `NotAuthorized`, which proves nothing.
     #[tokio::test]
     async fn signed_authority_refusals_cross_the_credential_relay_byte_for_byte() {
         let authority = "did:web:credential-relay-signed-denial.example";
         let space = format!("at://{authority}/space/blue.catbird.labyrinth.conversation/c-0");
         let pop = p256::SecretKey::from_slice(&[0x32; 32]).unwrap();
         let kid = atproto_spaces::kem::encode_p256_did_key(&pop.public_key());
-        // Field order and spacing no serializer here would produce.
         let signed: &[u8] =
             br#"{ "message":"not an active member" , "denial":"h.p.s","error":"NotAuthorized"}"#;
         let upstream = Arc::new(Mutex::new(signed.to_vec()));
         let router = Router::new().route(
-            "/xrpc/com.atproto.space.getSpaceCredential",
+            "/xrpc/com.atproto.space.authorizeSpaceSync",
             post({
                 let upstream = upstream.clone();
                 move || {
@@ -386,9 +419,6 @@ mod tests {
         server.abort();
     }
 
-    /// A target, or its authority's DID document, that could not answer now is
-    /// the declared `UpstreamError` as a retryable 503 on both relays; a
-    /// definitive 4xx keeps its meaning.
     #[tokio::test]
     async fn upstream_outages_are_retryable_503s_and_upstream_refusals_are_preserved() {
         let target = "did:web:space-relay-outage.example";
@@ -406,7 +436,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/xrpc/com.atproto.space.getSpaceCredential",
+                "/xrpc/com.atproto.space.authorizeSpaceSync",
                 post(answer.clone()),
             )
             .route(
@@ -494,7 +524,6 @@ mod tests {
         };
         assert_eq!(forwarded.status, 404);
 
-        // The credential arrives, but the authority's DID document does not.
         *upstream.lock().unwrap() = StatusCode::OK;
         for (document_status, status) in [
             (
@@ -520,7 +549,6 @@ mod tests {
             );
         }
 
-        // Nothing listens: the request itself cannot be sent.
         server.abort();
         let _ = server.await;
         let credential_down = relay_space_credential_stateless(target, &space, "dt", &kid)
@@ -540,7 +568,6 @@ mod tests {
         }
     }
 
-    /// `relay_credential` answers `InvalidRequest` for any body this type rejects.
     #[test]
     fn credential_request_requires_the_pop_key_and_an_at_space_uri() {
         let authority = "did:web:credential-relay-input.example";

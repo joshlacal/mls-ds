@@ -642,6 +642,11 @@ fn all_frozen_signed_mutation_contracts_have_owned_type_and_domain() {
             "welcomeRejectionBody",
             "CATBIRD-CHAT-WELCOME-REJECT\0",
         ),
+        (
+            SignedMutationKind::DeviceApproval,
+            "deviceApprovalBody",
+            "CATBIRD-CHAT-DEVICE-APPROVE\0",
+        ),
     ];
     assert_eq!(SignedMutationKind::ALL.len(), expected.len());
     for (kind, body_name, domain) in expected {

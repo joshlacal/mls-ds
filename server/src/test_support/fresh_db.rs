@@ -110,17 +110,47 @@ pub fn validate_chat_protocol_activation_approval(
     }
 }
 
+fn validate_private_loopback_maintenance_url(database_url: &str) -> Option<url::Url> {
+    let parsed = url::Url::parse(database_url).ok()?;
+    if !matches!(parsed.scheme(), "postgresql" | "postgres") {
+        return None;
+    }
+    if parsed.host_str() != Some("127.0.0.1") {
+        return None;
+    }
+    let port = parsed.port()?;
+    if port == 5432 || port < 1024 {
+        return None;
+    }
+    if !matches!(
+        parsed.path(),
+        "/catbird_chat_protocol_test_20260722" | "/postgres"
+    ) {
+        return None;
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return None;
+    }
+    Some(parsed)
+}
+
 /// Derives the maintenance connection URL (`/postgres`) from `TEST_DATABASE_URL`.
 pub fn maintenance_url_from_env() -> Result<String, String> {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .map_err(|_| "TEST_DATABASE_URL is not set".to_owned())?;
-    validate_chat_protocol_database_url(Some(&database_url))
-        .map_err(|error| format!("unsafe TEST_DATABASE_URL for the disposable-DB harness: {error}"))?;
+    let mut parsed = if let Some(private_url) =
+        validate_private_loopback_maintenance_url(&database_url)
+    {
+        private_url
+    } else {
+        validate_chat_protocol_database_url(Some(&database_url))
+            .map_err(|error| format!("unsafe TEST_DATABASE_URL for the disposable-DB harness: {error}"))?;
+        url::Url::parse(&database_url).map_err(|error| error.to_string())?
+    };
     let activation_approval = std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED")
         .map_err(|_| "CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED is not set".to_owned())?;
     validate_chat_protocol_activation_approval(Some(&activation_approval))
         .map_err(|error| format!("invalid operation-claim activation approval: {error}"))?;
-    let mut parsed = url::Url::parse(&database_url).map_err(|error| error.to_string())?;
     parsed.set_path("/postgres");
     Ok(parsed.into())
 }

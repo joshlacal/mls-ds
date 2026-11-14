@@ -907,7 +907,7 @@ pub(crate) async fn try_relay_home_group_operation(
                     super::forget_pending_welcomes(pool, conversation_id, actor, device, &[welcome])
                         .await
                 {
-                    tracing::warn!(%conversation_id, %error, "answered Welcome marker kept");
+                    tracing::warn!(conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), %error, "answered Welcome marker kept");
                 }
             }
         }

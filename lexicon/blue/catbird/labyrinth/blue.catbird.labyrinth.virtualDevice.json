@@ -96,6 +96,12 @@
             "type": "string",
             "format": "datetime"
           },
+          "metadataSig": {
+            "type": "bytes",
+            "description": "XEdDSA signature by deviceKey over the account DID, vdeviceId, mechanism, and createdAt.",
+            "minLength": 64,
+            "maxLength": 64
+          },
           "lastUsedAt": {
             "type": "string",
             "format": "datetime",

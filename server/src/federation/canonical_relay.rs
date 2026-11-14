@@ -4336,7 +4336,7 @@ pub async fn coordinator_handle_message(
                 if let Err(error) =
                     deliver_message_entry_to_peer(&home.endpoint, &home.did, deliver_payload).await
                 {
-                    warn!(%error, %conversation_id, "replayed send's delivery redrive failed");
+                    warn!(%error, conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), "replayed send's delivery redrive failed");
                 }
             }
 

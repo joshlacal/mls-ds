@@ -140,11 +140,16 @@ pub async fn run_chat_expiry_sweeper(pool: DbPool, runtime: Arc<ChatRuntime>) {
             Err(error) => tracing::warn!(%error, "terminal direct request artifact pruning failed"),
         }
         let now = crate::sim_hooks::current_utc();
+        let retention = crate::config::ChatRetentionConfig::from_env();
         match crate::chat_protocol::repository::expiry_sweep::mark_inactive_devices(&pool, now)
             .await
         {
             Ok(marked) if marked > 0 => {
-                tracing::info!(marked, "marked 60d inactive devices dormant")
+                tracing::info!(
+                    marked,
+                    dormant_after_hours = retention.device_dormant_after_hours,
+                    "marked inactive devices dormant"
+                )
             }
             Ok(_) => {}
             Err(error) => tracing::warn!(%error, "device dormancy sweep failed"),
@@ -155,10 +160,14 @@ pub async fn run_chat_expiry_sweeper(pool: DbPool, runtime: Arc<ChatRuntime>) {
         .await
         {
             Ok(pruned) if pruned > 0 => {
-                tracing::info!(pruned, "pruned 30d expired application payloads")
+                tracing::info!(
+                    pruned,
+                    ttl_hours = retention.application_payload_ttl_hours,
+                    "pruned expired application payloads"
+                )
             }
             Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "30d application payload pruning failed"),
+            Err(error) => tracing::warn!(%error, "application payload ceiling pruning failed"),
         }
         let _ = runtime.sse_state().prune_idle_channels().await;
         if counts.had_errors() {
@@ -204,7 +213,7 @@ pub(crate) async fn run_sweep_cycle(
                         counts.recovery_expired += 1;
                         tracing::info!(
                             recovery_request_id = %request.recovery_request_id,
-                            conversation_id = %request.conversation_id,
+                            conversation_id = %crate::crypto::redact_for_log(&request.conversation_id.to_string()),
                             expires_at = %request.expires_at,
                             "clean-chat expiry sweeper expired an overdue leaf-recovery request"
                         );
@@ -216,7 +225,7 @@ pub(crate) async fn run_sweep_cycle(
                         counts.recovery_errors += 1;
                         tracing::warn!(
                             recovery_request_id = %request.recovery_request_id,
-                            conversation_id = %request.conversation_id,
+                            conversation_id = %crate::crypto::redact_for_log(&request.conversation_id.to_string()),
                             error = ?error,
                             "clean-chat expiry sweeper could not expire a leaf-recovery request"
                         );
@@ -242,7 +251,7 @@ pub(crate) async fn run_sweep_cycle(
                         counts.welcome_expired += 1;
                         tracing::info!(
                             welcome_id = %welcome_id,
-                            conversation_id = %conversation_id,
+                            conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()),
                             expires_at = %expires_at,
                             "clean-chat expiry sweeper expired an overdue Welcome delivery"
                         );
@@ -251,7 +260,7 @@ pub(crate) async fn run_sweep_cycle(
                         counts.welcome_skipped += 1;
                         tracing::debug!(
                             welcome_id = %welcome_id,
-                            conversation_id = %conversation_id,
+                            conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()),
                             outcome = ?outcome,
                             "clean-chat expiry sweeper skipped a Welcome delivery"
                         );
@@ -260,7 +269,7 @@ pub(crate) async fn run_sweep_cycle(
                         counts.welcome_errors += 1;
                         tracing::warn!(
                             welcome_id = %welcome_id,
-                            conversation_id = %conversation_id,
+                            conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()),
                             error = ?error,
                             "clean-chat expiry sweeper could not expire a Welcome delivery"
                         );

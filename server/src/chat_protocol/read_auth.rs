@@ -130,8 +130,9 @@ pub(crate) async fn verify_chat_read_headers(
         ));
     }
 
-    let device_uuid = Uuid::parse_str(actor_device_id)
+    let canonical_device_id = super::validation::CanonicalUuidV4::parse(actor_device_id)
         .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    let device_uuid = Uuid::from_bytes(*canonical_device_id.as_bytes());
 
     let key_row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
         "SELECT d.status, dk.signing_public_key \
@@ -159,11 +160,15 @@ pub(crate) async fn verify_chat_read_headers(
             ChatProtocolErrorCode::DeviceNotRegistered,
         ));
     };
-    if status != "active" {
-        return Err(ChatFailure::protocol(
-            endpoint,
-            ChatProtocolErrorCode::DeviceRevoked,
-        ));
+    if status != "active"
+        && !(endpoint == ChatEndpoint::GetOwnDevices && status == "pending_approval")
+    {
+        let code = if status == "revoked" {
+            ChatProtocolErrorCode::DeviceRevoked
+        } else {
+            ChatProtocolErrorCode::NotAuthorized
+        };
+        return Err(ChatFailure::protocol(endpoint, code));
     }
     let Some(pubkey) = pubkey_opt.filter(|k| k.len() == 32) else {
         return Err(ChatFailure::protocol(
@@ -181,11 +186,14 @@ pub(crate) async fn verify_chat_read_headers(
     let _ = sqlx::query(
         "UPDATE chat.devices \
          SET last_active_at = $3, dormant_at = NULL \
-         WHERE user_did = $1 AND device_id = $2 AND status = 'active'",
+         WHERE user_did = $1 AND device_id = $2 AND status = 'active' \
+           AND (last_active_at IS DISTINCT FROM $3 OR dormant_at IS NOT NULL)",
     )
     .bind(principal_did)
     .bind(device_uuid)
-    .bind(crate::sim_hooks::current_utc())
+    .bind(crate::chat_protocol::device_activity::coarse_activity_day(
+        crate::sim_hooks::current_utc(),
+    ))
     .execute(pool)
     .await;
 

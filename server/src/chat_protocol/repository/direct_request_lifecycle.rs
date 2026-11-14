@@ -49,6 +49,7 @@ pub(crate) async fn enforce_ordinary_mutation(
         DeviceEnrollment(p) => p.body(),
         KeyPackageReplenishment(p) => p.body(),
         DeviceRevocation(p) => p.body(),
+        DeviceApproval(p) => p.body(),
         BlobUploadPreparation(p) => p.body(),
         BlobDeletion(p) => p.body(),
         Creation(p) => p.body(),

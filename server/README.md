@@ -23,10 +23,10 @@ cargo run
 |---|---|---|
 | `/health`, `/health/live`, `/health/ready` | always | |
 | `/metrics` | `ENABLE_METRICS` is truthy | `METRICS_TOKEN`, if set, is a required bearer token |
-| `blue.catbird.chat.*` | always | 36 endpoints; each answers `CutoverRequired` until `CHAT_CUTOVER_ENABLED` is set |
+| `blue.catbird.chat.*` | always | 37 endpoints; each answers `CutoverRequired` until `CHAT_CUTOVER_ENABLED` is set |
 | `blue.catbird.mlsDS.*` | always | 35 S2S and admin routes |
-| `com.atproto.space.*` | `SERVICE_DID` and a P-256 Space-host key | 7 Space authority and host routes |
-| `blue.catbird.labyrinth.*` | `LABYRINTH_ENABLED` is truthy | 6 directory and account-lifecycle routes |
+| `com.atproto.space.*`, `com.atproto.memberspace.*`, `com.atproto.managedspace.*` | `SERVICE_DID` and a P-256 Space-host key | Conversation Space authority, host, and managed-space routes (`authorizeSpaceSync`, `listWriters`, `getSpace`, `notifyRepoUpdate`, `removeWriter`, plus memberspace/managedspace host endpoints) |
+| `blue.catbird.labyrinth.*` | `LABYRINTH_ENABLED` is truthy | 7 directory, signed mailbox-key relay, and account-lifecycle routes |
 | `did:web` document path | `RECEIPT_ISSUANCE_MODE=issue` | serves `RECEIPT_DID_DOCUMENT_JSON` |
 
 ### Client: `blue.catbird.chat.*`
@@ -42,7 +42,7 @@ Enabling chat cutover **or federation** requires a valid service signer: federat
 | POST (15 MiB) | `createConversation`, `submitTransition`, `sendMessage` |
 | POST (12 MiB) | `enrollDevice`, `replenishKeyPackages` |
 | POST (64 KiB) | `prepareDirectRequest`, `cancelDirectRequestPreparation`, `registerPushGateway`, `relaySpaceCredential`, `relaySpaceRead`, `acknowledgeEntries` |
-| POST (4 MiB) | `requestReset`, `activateReset`, `revokeDevice`, `acknowledgeWelcome`, `rejectWelcome`, `requestLeafRecovery`, `cancelLeafRecovery`, `requestLeave`, `cancelLeave`, `closeConversation`, `publishTyping`, `acceptConversation`, `getSubscriptionTicket` |
+| POST (4 MiB) | `approveDevice`, `requestReset`, `activateReset`, `revokeDevice`, `acknowledgeWelcome`, `rejectWelcome`, `requestLeafRecovery`, `cancelLeafRecovery`, `requestLeave`, `cancelLeave`, `closeConversation`, `publishTyping`, `acceptConversation`, `getSubscriptionTicket` |
 
 The list is pinned by `chat_protocol_route_inventory`. The pre-clean-slate `blue.catbird.mlsChat.*` and `blue.catbird.mls.*` APIs are gone; for example, `/xrpc/blue.catbird.mlsChat.updatePushToken` returns `404`.
 
@@ -59,11 +59,11 @@ The list is pinned by `chat_protocol_route_inventory`. The pre-clean-slate `blue
 
 ### Space host: `com.atproto.space.*`
 
-POST `getSpaceCredential`, `notifyWrite`, `removeWriter`, `registerNotify`, `unregisterNotify`; GET `listRepos`, `getSpace`. Contracts are in [../SELF_HOSTING.md](../SELF_HOSTING.md#8-space-authority-host-and-relays-3a).
+POST `authorizeSpaceSync`, `notifyRepoUpdate`, `removeWriter`; GET `listWriters`, `getSpace` (plus hosted `getRecord`/`getRepo` and `com.atproto.memberspace.*` / `com.atproto.managedspace.*` ACL routes). Contracts are in [../SELF_HOSTING.md](../SELF_HOSTING.md#8-space-authority-host-and-relays-3a).
 
 ### Labyrinth directory: `blue.catbird.labyrinth.*`
 
-POST `publishEpochHead`, `purgeMailbox`, `deleteAccountData`; GET `getEpochHead`, `getChatDeviceKeys`, `getMemberDevices` (64 KiB). For a remote subject, `getEpochHead` and `getChatDeviceKeys` relay the device-signed read to the subject's home over `getLabyrinthDirectory`. No archive storage, MEK, thread or Space-policy endpoint remains here: `appendBatch`, `getEpoch`, `getThreadStorage`, `appendSpaceBatch`, `listSpaceBatches`, `getSpaceMembership` and `deleteSpaceGeneration` are not mounted.
+POST `publishEpochHead`, `purgeMailbox`, `deleteAccountData`; GET `getEpochHead`, `getMailboxKeysRecord`, `getChatDeviceKeys`, `getMemberDevices` (64 KiB). For a remote subject, `getEpochHead` and `getChatDeviceKeys` relay the device-signed read to the subject's home over `getLabyrinthDirectory`; `getMailboxKeysRecord` fetches and cryptographically verifies the subject's signed `com.atproto.sync.getRecord` CARv1 repository proof for `blue.catbird.labyrinth.mailboxKeys`. No archive storage, MEK, thread or Space-policy endpoint remains here: `appendBatch`, `getEpoch`, `getThreadStorage`, `appendSpaceBatch`, `listSpaceBatches`, `getSpaceMembership` and `deleteSpaceGeneration` are not mounted.
 
 ## Background workers
 
@@ -71,7 +71,7 @@ POST `publishEpochHead`, `purgeMailbox`, `deleteAccountData`; GET `getEpochHead`
 |---|---|
 | Federation outbox handoff | always |
 | Outbound S2S queue and reconciliation | federation enabled and `SIGNING_KEY_PEM` set |
-| Expiry sweeper (30-day pruning, request expiry), 60-day device dormancy | `CHAT_CUTOVER_ENABLED` |
+| Expiry sweeper (72-hour application ciphertext ceiling, request expiry), 48-hour device dormancy | `CHAT_CUTOVER_ENABLED` |
 | Direct-request push wakes | `CHAT_REQUEST_PUSH_ENABLED` |
 | Labyrinth operation GC (hourly, 7-day retention) | `LABYRINTH_ENABLED` |
 | Rate-limiter and JTI-replay cleanup | always, every 5 minutes |
@@ -113,7 +113,7 @@ cargo test --features sim --test deterministic_server_clock_test
 cargo test --test clean_chat_empty_preflight
 ```
 
-`clean_chat_empty_preflight` runs `scripts/assert_clean_chat_empty.sql`, which accepts only a sealed migration catalog. The current seal is 145 migrations ending at `20261113000001`. After a migration change, reseal it from `server/`:
+`clean_chat_empty_preflight` runs `scripts/assert_clean_chat_empty.sql`, which accepts only a sealed migration catalog. The current seal is 146 migrations ending at `20261114000001`. After a migration change, reseal it from `server/`:
 
 ```sh
 CLEAN_CHAT_PREFLIGHT_RESEAL=write cargo test --offline --test clean_chat_empty_preflight -- --ignored --exact reseal_clean_slate_catalog

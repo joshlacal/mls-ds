@@ -1383,6 +1383,15 @@ impl DsResolver {
 
     /// Resolve a DID to its PDS endpoint via DID document.
     pub(crate) async fn resolve_did_to_pds(&self, did: &str) -> Result<String, FederationError> {
+        let (endpoint, _) = self.resolve_did_to_pds_and_atproto_key(did).await?;
+        Ok(endpoint)
+    }
+
+    /// Resolve a DID to its PDS endpoint and optional `#atproto` verification key via DID document.
+    pub(crate) async fn resolve_did_to_pds_and_atproto_key(
+        &self,
+        did: &str,
+    ) -> Result<(String, Option<atproto_spaces::tokens::SpaceVerifyingKey>), FederationError> {
         let doc = self.fetch_did_document(did).await?;
 
         let endpoint = extract_service(&doc, "atproto_pds", None).ok_or_else(|| {
@@ -1395,7 +1404,13 @@ impl DsResolver {
         })?;
 
         self.validate_remote_url(endpoint).await?;
-        Ok(endpoint.to_string())
+        let atproto_key = serde_json::to_vec(&doc)
+            .ok()
+            .and_then(|bytes| {
+                atproto_spaces::did_resolver::DidDocument::parse_json(did, &bytes).ok()
+            })
+            .and_then(|parsed| parsed.atproto_key);
+        Ok((endpoint.to_string(), atproto_key))
     }
 
     /// Fetch and parse a DID document (did:web or did:plc), with SSRF

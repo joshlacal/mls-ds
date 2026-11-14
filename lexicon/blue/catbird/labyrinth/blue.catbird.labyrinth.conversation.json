@@ -5,12 +5,13 @@
     "main": {
       "type": "space",
       "key": "any",
-      "name": "Catbird chat history",
-      "description": "Sender-written post-quantum encrypted MLS conversation history, MEKs, and attachment manifests",
+      "title": "Catbird chat history",
+      "description": "Sender-written post-quantum encrypted MLS conversation history, MEKs, attachment manifests, and author redactions",
       "collections": [
         "blue.catbird.labyrinth.batch",
         "blue.catbird.labyrinth.mek",
-        "blue.catbird.labyrinth.attachmentManifest"
+        "blue.catbird.labyrinth.attachmentManifest",
+        "blue.catbird.labyrinth.authorRedaction"
       ]
     }
   }

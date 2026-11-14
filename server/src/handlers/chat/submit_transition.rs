@@ -154,6 +154,15 @@ pub(super) async fn execute_admitted(
         SignedMutationKind::LeafRecoveryFulfillment => {
             let (resp, bytes) =
                 recovery::execute_prepared(&mut transaction, runtime, ENDPOINT, prepared).await?;
+            if let Some(cid) = conversation_id {
+                crate::chat_protocol::repository::delivery::prune_unblocked_for_conversation_and_notify(
+                    &mut transaction,
+                    cid,
+                    crate::sim_hooks::current_utc(),
+                )
+                .await
+                .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+            }
             enqueue_c33_control(&mut transaction, c33_control_home.as_deref(), &bytes).await?;
             let (fanout, local_push) =
                 prepare_post_commit_work(&mut transaction, runtime, &bytes).await?;

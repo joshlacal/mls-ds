@@ -479,17 +479,20 @@ pub(super) async fn accept_entry_ack_relay(
     .bind(&relay.user_did)
     .bind(relay.device_id)
     .bind(relay.acked_through_seq)
-    .bind(now)
+    .bind(crate::chat_protocol::device_activity::coarse_activity_day(now))
     .fetch_one(&mut *tx)
     .await
     .map_err(storage)?;
     sqlx::query(
         "UPDATE chat.devices SET last_active_at = $3, dormant_at = NULL \
-          WHERE user_did = $1 AND device_id = $2",
+          WHERE user_did = $1 AND device_id = $2 \
+            AND (last_active_at IS DISTINCT FROM $3 OR dormant_at IS NOT NULL)",
     )
     .bind(&relay.user_did)
     .bind(relay.device_id)
-    .bind(now)
+    .bind(crate::chat_protocol::device_activity::coarse_activity_day(
+        now,
+    ))
     .execute(&mut *tx)
     .await
     .map_err(storage)?;

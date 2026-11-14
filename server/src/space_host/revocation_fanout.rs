@@ -1,48 +1,31 @@
-//! Post-commit Space revocation (`notifyCredentialRevoked`), Space deletion (`notifySpaceDeleted`),
-//! and `notifyWrite` syncer fan-out (`M-F04`).
+//! Post-commit Space revocation (`notifyCredentialsRevoked`), Space deletion (`notifySpaceUpdate#spaceDeleted`),
+//! and `notifyRepoUpdate` / `removeWriter` syncer fan-out (`M-F04`).
 //!
-//! CRITICAL INVARIANT (`M-F04`): Every function in this module runs strictly AFTER the outer
+//! CRITICAL INVARIANT (`M-F04`): Every HTTP delivery function in this module runs strictly AFTER the outer
 //! PostgreSQL transaction commits so webhook HTTP calls never hold open row locks or transactions.
 
 use std::{collections::BTreeSet, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::SpaceHostRuntime;
 use crate::push_gateway::ssrf::{system_dns_resolve, validate_https_url_with_resolver};
 
-async fn post_space_notice(
-    runtime: &SpaceHostRuntime,
-    target_did_or_ref: &str,
-    explicit_endpoint_url: Option<&str>,
-    nsid: &str,
-    body: &Value,
-) -> Result<(), String> {
-    let (endpoint_base, is_test_override) = match explicit_endpoint_url {
-        Some(url) if url.starts_with("http://127.0.0.1:") || url.starts_with("http://[::1]:") => {
-            (url.trim_end_matches('/').to_string(), true)
-        }
-        Some(url) => (url.trim_end_matches('/').to_string(), false),
-        None => {
-            let (_, ep, is_override) = runtime
-                .resolve_did_entry(target_did_or_ref, false)
-                .await
-                .map_err(|e| e.to_string())?;
-            (ep, is_override)
-        }
-    };
-    if endpoint_base.is_empty() {
-        return Ok(());
-    }
+pub(crate) fn allow_loopback_space_endpoint(url: &str) -> bool {
+    cfg!(any(test, feature = "test-support"))
+        && (url.starts_with("http://127.0.0.1:") || url.starts_with("http://[::1]:"))
+}
 
-    let full_url = format!("{}/xrpc/{nsid}", endpoint_base.trim_end_matches('/'));
-    let http_client = if is_test_override {
+pub(crate) fn build_space_webhook_client(
+    full_url: &str,
+    is_test_override: bool,
+) -> Result<(String, reqwest::Client), String> {
+    if is_test_override || allow_loopback_space_endpoint(full_url) {
         static TEST_OVERRIDE_CLIENT: std::sync::OnceLock<reqwest::Client> =
             std::sync::OnceLock::new();
-        TEST_OVERRIDE_CLIENT
+        let client = TEST_OVERRIDE_CLIENT
             .get_or_init(|| {
                 reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
@@ -50,18 +33,37 @@ async fn post_space_notice(
                     .build()
                     .expect("build test space notice HTTP client")
             })
-            .clone()
-    } else {
-        let validated =
-            validate_https_url_with_resolver(&full_url, None, false, system_dns_resolve)
-                .map_err(|e| format!("Space notice SSRF check failed: {e}"))?;
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(10))
-            .resolve_to_addrs(&validated.host, &validated.pinned_addrs)
-            .build()
-            .map_err(|e| e.to_string())?
-    };
+            .clone();
+        return Ok((full_url.to_string(), client));
+    }
+    let validated = validate_https_url_with_resolver(full_url, None, false, system_dns_resolve)
+        .map_err(|e| format!("Space notice SSRF check failed: {e}"))?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .resolve_to_addrs(&validated.host, &validated.pinned_addrs)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok((validated.effective_url, client))
+}
+
+async fn post_pds_space_notice(
+    runtime: &SpaceHostRuntime,
+    target_did_or_ref: &str,
+    nsid: &str,
+    body: &Value,
+) -> Result<(), String> {
+    let (_, ep, is_override) = runtime
+        .resolve_did_entry(target_did_or_ref, false)
+        .await
+        .map_err(|e| e.to_string())?;
+    let endpoint_base = ep.trim_end_matches('/');
+    if endpoint_base.is_empty() {
+        return Ok(());
+    }
+
+    let full_url = format!("{endpoint_base}/xrpc/{nsid}");
+    let (effective_url, http_client) = build_space_webhook_client(&full_url, is_override)?;
 
     let aud = if target_did_or_ref.contains('#') {
         target_did_or_ref.to_string()
@@ -71,7 +73,7 @@ async fn post_space_notice(
     let jwt = runtime.mint_service_jwt(&aud, nsid)?;
     let resp = crate::sim_hooks::send_reqwest(
         http_client
-            .post(&full_url)
+            .post(&effective_url)
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(body),
@@ -87,8 +89,78 @@ async fn post_space_notice(
     Ok(())
 }
 
+/// Deliver an unauthenticated `com.atproto.space.notifySpaceUpdate` webhook carrying the
+/// subscriber's registration `token` in the JSON body (`atproto#5187` Nov-12).
+pub(crate) async fn post_syncer_space_update(
+    endpoint_url: &str,
+    space_uri: &str,
+    token: &str,
+    update: Value,
+) -> Result<(), String> {
+    let endpoint_base = endpoint_url.trim_end_matches('/');
+    if endpoint_base.is_empty() {
+        return Ok(());
+    }
+    let full_url = format!("{endpoint_base}/xrpc/com.atproto.space.notifySpaceUpdate");
+    let is_override = allow_loopback_space_endpoint(&full_url);
+    let (effective_url, http_client) = build_space_webhook_client(&full_url, is_override)?;
+
+    let payload = json!({
+        "space": space_uri,
+        "token": token,
+        "update": update,
+    });
+    let resp = crate::sim_hooks::send_reqwest(
+        http_client
+            .post(&effective_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&payload),
+    )
+    .await?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "notifySpaceUpdate returned HTTP {}",
+            resp.status().as_u16()
+        ));
+    }
+    Ok(())
+}
+
+async fn fan_out_revoked_jtis_to_writers(
+    runtime: &SpaceHostRuntime,
+    space_uri: &str,
+    revoked_jtis: &[String],
+    writer_dids: &[String],
+) -> usize {
+    if revoked_jtis.is_empty() || writer_dids.is_empty() {
+        return 0;
+    }
+    let mut delivered = 0_usize;
+    for chunk in revoked_jtis.chunks(100) {
+        let payload = json!({
+            "space": space_uri,
+            "credentials": chunk,
+        });
+        for writer_did in writer_dids {
+            if post_pds_space_notice(
+                runtime,
+                writer_did,
+                "com.atproto.space.notifyCredentialsRevoked",
+                &payload,
+            )
+            .await
+            .is_ok()
+            {
+                delivered += 1;
+            }
+        }
+    }
+    delivered
+}
+
 /// Revoke all active Space credential `jti`s for `target_did` in `(conversation_id, generation)`
-/// and fan out `com.atproto.space.notifyCredentialRevoked` to ALL writers' PDSes and active syncers!
+/// and fan out `com.atproto.space.notifyCredentialsRevoked` to ALL writers' PDSes.
 pub async fn revoke_member_space_credentials_and_fan_out(
     runtime: &SpaceHostRuntime,
     conversation_id: Uuid,
@@ -109,14 +181,14 @@ pub async fn revoke_member_space_credentials_and_fan_out(
     };
 
     let now = crate::sim_hooks::current_utc();
-    let mut revoked_rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+    let mut revoked_jtis: Vec<String> = sqlx::query_scalar(
         "UPDATE chat.space_credential_jtis \
             SET revoked_at = $3 \
           WHERE space_uri = $1 \
             AND writer_did = $2 \
             AND revoked_at IS NULL \
             AND expires_at > $3 \
-      RETURNING jti, expires_at",
+      RETURNING jti",
     )
     .bind(&space_uri)
     .bind(target_did)
@@ -126,28 +198,13 @@ pub async fn revoke_member_space_credentials_and_fan_out(
     .map_err(|e| e.to_string())?;
     // `UPDATE .. RETURNING` has no row-order guarantee. Keep the wire payload
     // stable so retries and deterministic simulator replays send identical bytes.
-    revoked_rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    revoked_jtis.sort_unstable();
 
-    if revoked_rows.is_empty() {
+    if revoked_jtis.is_empty() {
         return Ok(0);
     }
 
-    let credentials_json: Vec<Value> = revoked_rows
-        .iter()
-        .map(|(jti, exp)| {
-            json!({
-                "jti": jti,
-                "expiresAt": exp.to_rfc3339_opts(SecondsFormat::Millis, true),
-            })
-        })
-        .collect();
-
-    let payload = json!({
-        "space": space_uri,
-        "credentials": credentials_json,
-    });
-
-    // Fan out to EVERY writer's PDS in this Space (so cached credentials are evicted across every writer repo host)
+    // Fan out to EVERY writer's PDS in this Space (so cached credentials are evicted across every writer repo host).
     let writer_dids: Vec<String> = sqlx::query_scalar(
         "SELECT writer_did FROM chat.conversation_space_writers WHERE space_uri = $1 ORDER BY writer_did ASC",
     )
@@ -156,45 +213,7 @@ pub async fn revoke_member_space_credentials_and_fan_out(
     .await
     .map_err(|e| e.to_string())?;
 
-    let mut delivered = 0_usize;
-    for writer_did in &writer_dids {
-        if post_space_notice(
-            runtime,
-            writer_did,
-            None,
-            "com.atproto.space.notifyCredentialRevoked",
-            &payload,
-        )
-        .await
-        .is_ok()
-        {
-            delivered += 1;
-        }
-    }
-
-    let syncers: Vec<(String, String)> = sqlx::query_as(
-        "SELECT service_ref, endpoint_url \
-           FROM chat.conversation_space_syncers \
-          WHERE space_uri = $1 AND expires_at > $2",
-    )
-    .bind(&space_uri)
-    .bind(now)
-    .fetch_all(runtime.pool())
-    .await
-    .map_err(|e| e.to_string())?;
-
-    for (service_ref, endpoint_url) in &syncers {
-        let _ = post_space_notice(
-            runtime,
-            service_ref,
-            Some(endpoint_url),
-            "com.atproto.space.notifyCredentialRevoked",
-            &payload,
-        )
-        .await;
-    }
-
-    Ok(delivered)
+    Ok(fan_out_revoked_jtis_to_writers(runtime, &space_uri, &revoked_jtis, &writer_dids).await)
 }
 
 /// Revoke all active Space credentials across every active conversation where `target_did` participates
@@ -232,7 +251,7 @@ pub async fn revoke_user_space_credentials_across_conversations(
     Ok(total)
 }
 
-/// Revoke active Space credentials and fan out `notifyCredentialRevoked` for any writer in
+/// Revoke active Space credentials and fan out `notifyCredentialsRevoked` for any writer in
 /// `(conversation_id, generation)` whose `chat.participants` membership is no longer active (`M-F04`).
 pub async fn revoke_inactive_space_credentials_for_conversation(
     runtime: &SpaceHostRuntime,
@@ -280,7 +299,8 @@ pub async fn revoke_inactive_space_credentials_for_conversation(
 #[derive(Debug, Clone)]
 pub struct PreparedSpaceDeletedFanout {
     pub space_uri: String,
-    pub syncers: Vec<(String, String)>,
+    pub subscribers: Vec<(String, String)>,
+    pub revoked_jtis: Vec<String>,
     pub writer_dids: Vec<String>,
 }
 
@@ -304,16 +324,26 @@ pub async fn prepare_space_deleted_fanout_in_tx(
     let Some(space_uri) = space_uri else {
         return Ok(None);
     };
-    let syncers: Vec<(String, String)> = sqlx::query_as(
-        "SELECT service_ref, endpoint_url \
-           FROM chat.conversation_space_syncers \
-          WHERE space_uri = $1 AND expires_at > $2",
+    let subscribers: Vec<(String, String)> = sqlx::query_as(
+        "SELECT endpoint_url, token \
+           FROM chat.conversation_space_subscribers \
+          WHERE space_uri = $1 AND confirmed = TRUE \
+          ORDER BY endpoint_url ASC, token ASC",
+    )
+    .bind(&space_uri)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut revoked_jtis: Vec<String> = sqlx::query_scalar(
+        "SELECT jti FROM chat.space_credential_jtis \
+          WHERE space_uri = $1 AND revoked_at IS NULL AND expires_at > $2",
     )
     .bind(&space_uri)
     .bind(now)
     .fetch_all(&mut **tx)
     .await
     .map_err(|e| e.to_string())?;
+    revoked_jtis.sort_unstable();
     let writer_dids: BTreeSet<String> = sqlx::query_scalar(
         "SELECT writer_did FROM chat.conversation_space_writers WHERE space_uri = $1",
     )
@@ -325,7 +355,8 @@ pub async fn prepare_space_deleted_fanout_in_tx(
     .collect();
     Ok(Some(PreparedSpaceDeletedFanout {
         space_uri,
-        syncers,
+        subscribers,
+        revoked_jtis,
         writer_dids: writer_dids.into_iter().collect(),
     }))
 }
@@ -334,15 +365,16 @@ pub async fn deliver_prepared_space_deleted(
     runtime: &SpaceHostRuntime,
     prepared: PreparedSpaceDeletedFanout,
 ) -> Result<usize, String> {
-    let payload = json!({ "space": prepared.space_uri });
     let mut delivered = 0_usize;
-    for (service_ref, endpoint_url) in &prepared.syncers {
-        if post_space_notice(
-            runtime,
-            service_ref,
-            Some(endpoint_url),
-            "com.atproto.space.notifySpaceDeleted",
-            &payload,
+    let deleted_update = json!({
+        "$type": "com.atproto.space.notifySpaceUpdate#spaceDeleted",
+    });
+    for (endpoint_url, token) in &prepared.subscribers {
+        if post_syncer_space_update(
+            endpoint_url,
+            &prepared.space_uri,
+            token,
+            deleted_update.clone(),
         )
         .await
         .is_ok()
@@ -350,25 +382,19 @@ pub async fn deliver_prepared_space_deleted(
             delivered += 1;
         }
     }
-    for writer_did in &prepared.writer_dids {
-        if post_space_notice(
-            runtime,
-            writer_did,
-            None,
-            "com.atproto.space.notifySpaceDeleted",
-            &payload,
-        )
-        .await
-        .is_ok()
-        {
-            delivered += 1;
-        }
-    }
+    delivered += fan_out_revoked_jtis_to_writers(
+        runtime,
+        &prepared.space_uri,
+        &prepared.revoked_jtis,
+        &prepared.writer_dids,
+    )
+    .await;
     Ok(delivered)
 }
 
-/// Mark a conversation generation's Space deleted and fan out `com.atproto.space.notifySpaceDeleted`
-/// to all registered syncers and writers' PDSes (`atproto#5187`).
+/// Mark a conversation generation's Space deleted, revoke unexpired credentials, and fan out
+/// `com.atproto.space.notifySpaceUpdate#spaceDeleted` to confirmed subscribers plus
+/// `com.atproto.space.notifyCredentialsRevoked` to writers' PDSes (`atproto#5187`).
 pub async fn fan_out_space_deleted_for_conversation(
     runtime: &SpaceHostRuntime,
     conversation_id: Uuid,
@@ -392,44 +418,29 @@ pub async fn fan_out_space_deleted_for_conversation(
         return Ok(0);
     };
 
-    let _ = sqlx::query(
+    let mut revoked_jtis: Vec<String> = sqlx::query_scalar(
         "UPDATE chat.space_credential_jtis \
-            SET revoked_at = COALESCE(revoked_at, $2) \
-          WHERE space_uri = $1 AND revoked_at IS NULL",
-    )
-    .bind(&space_uri)
-    .bind(now)
-    .execute(runtime.pool())
-    .await;
-
-    let payload = json!({ "space": space_uri });
-    let mut delivered = 0_usize;
-
-    let syncers: Vec<(String, String)> = sqlx::query_as(
-        "SELECT service_ref, endpoint_url \
-           FROM chat.conversation_space_syncers \
-          WHERE space_uri = $1 AND expires_at > $2",
+            SET revoked_at = $2 \
+          WHERE space_uri = $1 AND revoked_at IS NULL AND expires_at > $2 \
+      RETURNING jti",
     )
     .bind(&space_uri)
     .bind(now)
     .fetch_all(runtime.pool())
     .await
     .map_err(|e| e.to_string())?;
+    revoked_jtis.sort_unstable();
 
-    for (service_ref, endpoint_url) in &syncers {
-        if post_space_notice(
-            runtime,
-            service_ref,
-            Some(endpoint_url),
-            "com.atproto.space.notifySpaceDeleted",
-            &payload,
-        )
-        .await
-        .is_ok()
-        {
-            delivered += 1;
-        }
-    }
+    let subscribers: Vec<(String, String)> = sqlx::query_as(
+        "SELECT endpoint_url, token \
+           FROM chat.conversation_space_subscribers \
+          WHERE space_uri = $1 AND confirmed = TRUE \
+          ORDER BY endpoint_url ASC, token ASC",
+    )
+    .bind(&space_uri)
+    .fetch_all(runtime.pool())
+    .await
+    .map_err(|e| e.to_string())?;
 
     let writer_dids: BTreeSet<String> = sqlx::query_scalar(
         "SELECT writer_did FROM chat.conversation_space_writers WHERE space_uri = $1",
@@ -441,37 +452,30 @@ pub async fn fan_out_space_deleted_for_conversation(
     .into_iter()
     .collect();
 
-    for writer_did in writer_dids {
-        if post_space_notice(
-            runtime,
-            &writer_did,
-            None,
-            "com.atproto.space.notifySpaceDeleted",
-            &payload,
-        )
-        .await
-        .is_ok()
-        {
-            delivered += 1;
-        }
-    }
-
-    Ok(delivered)
+    deliver_prepared_space_deleted(
+        runtime,
+        PreparedSpaceDeletedFanout {
+            space_uri,
+            subscribers,
+            revoked_jtis,
+            writer_dids: writer_dids.into_iter().collect(),
+        },
+    )
+    .await
 }
 
-pub(crate) async fn fan_out_notify_write_to_syncers(
+pub(crate) async fn fan_out_space_update_to_subscribers(
     runtime: &SpaceHostRuntime,
     space_uri: &str,
-    writer_did: &str,
-    repo_rev: &str,
     space_rev: &str,
-    data_cid: &[u8; 32],
+    active_update: Value,
 ) -> Result<usize, String> {
     let now = crate::sim_hooks::current_utc();
-    let syncers: Vec<(String, String)> = sqlx::query_as(
-        "SELECT service_ref, endpoint_url \
-           FROM chat.conversation_space_syncers \
-          WHERE space_uri = $1 AND expires_at > $2",
+    let active_subscribers: Vec<(String, String)> = sqlx::query_as(
+        "SELECT endpoint_url, token \
+           FROM chat.conversation_space_subscribers \
+          WHERE space_uri = $1 AND confirmed = TRUE AND expires_at > $2 \
+          ORDER BY endpoint_url ASC, token ASC",
     )
     .bind(space_uri)
     .bind(now)
@@ -479,32 +483,87 @@ pub(crate) async fn fan_out_notify_write_to_syncers(
     .await
     .map_err(|e| e.to_string())?;
 
-    if syncers.is_empty() {
-        return Ok(0);
-    }
-
-    let payload = json!({
-        "space": space_uri,
-        "repo": writer_did,
-        "repoRev": repo_rev,
-        "spaceRev": space_rev,
-        "data": { "$bytes": STANDARD.encode(data_cid) },
-    });
+    let expired_subscribers: Vec<(String, String)> = sqlx::query_as(
+        "UPDATE chat.conversation_space_subscribers \
+            SET notified_expired = TRUE, updated_at = $2 \
+          WHERE space_uri = $1 \
+            AND confirmed = TRUE \
+            AND expires_at <= $2 \
+            AND notified_expired = FALSE \
+      RETURNING endpoint_url, token",
+    )
+    .bind(space_uri)
+    .bind(now)
+    .fetch_all(runtime.pool())
+    .await
+    .map_err(|e| e.to_string())?;
 
     let mut delivered = 0_usize;
-    for (service_ref, endpoint_url) in &syncers {
-        if post_space_notice(
-            runtime,
-            service_ref,
-            Some(endpoint_url),
-            "com.atproto.space.notifyWrite",
-            &payload,
-        )
-        .await
-        .is_ok()
+    for (endpoint_url, token) in &active_subscribers {
+        if post_syncer_space_update(endpoint_url, space_uri, token, active_update.clone())
+            .await
+            .is_ok()
         {
             delivered += 1;
         }
     }
+
+    if !expired_subscribers.is_empty() {
+        let mut sorted_expired = expired_subscribers;
+        sorted_expired.sort_unstable();
+        let expired_update = json!({
+            "$type": "com.atproto.space.notifySpaceUpdate#registrationExpired",
+            "spaceRev": space_rev,
+        });
+        for (endpoint_url, token) in &sorted_expired {
+            if post_syncer_space_update(endpoint_url, space_uri, token, expired_update.clone())
+                .await
+                .is_ok()
+            {
+                delivered += 1;
+            }
+        }
+    }
+
     Ok(delivered)
+}
+
+pub(crate) async fn fan_out_repo_write_to_subscribers(
+    runtime: &SpaceHostRuntime,
+    space_uri: &str,
+    writer_did: &str,
+    repo_rev: &str,
+    space_rev: &str,
+    prev_space_rev: Option<&str>,
+    data_cid: &[u8; 32],
+) -> Result<usize, String> {
+    let mut update = json!({
+        "$type": "com.atproto.space.defs#repoWrite",
+        "repo": writer_did,
+        "repoRev": repo_rev,
+        "data": { "$bytes": STANDARD.encode(data_cid) },
+        "spaceRev": space_rev,
+    });
+    if let Some(prev) = prev_space_rev {
+        update["prevSpaceRev"] = json!(prev);
+    }
+    fan_out_space_update_to_subscribers(runtime, space_uri, space_rev, update).await
+}
+
+pub(crate) async fn fan_out_repo_removed_to_subscribers(
+    runtime: &SpaceHostRuntime,
+    space_uri: &str,
+    writer_did: &str,
+    space_rev: &str,
+    prev_space_rev: Option<&str>,
+) -> Result<usize, String> {
+    let mut update = json!({
+        "$type": "com.atproto.space.defs#repoRemoved",
+        "repo": writer_did,
+        "spaceRev": space_rev,
+    });
+    if let Some(prev) = prev_space_rev {
+        update["prevSpaceRev"] = json!(prev);
+    }
+    fan_out_space_update_to_subscribers(runtime, space_uri, space_rev, update).await
 }

@@ -1878,7 +1878,7 @@ pub(crate) async fn seal_g6_scope_authority(
     let mut devices = Vec::with_capacity(scope.devices().len());
     for device in scope.devices() {
         let valid_status = match device.status() {
-            "active" => device.revoked_at().is_none(),
+            "active" | "pending_approval" => device.revoked_at().is_none(),
             "revoked" => device.revoked_at().is_some(),
             _ => false,
         };
@@ -1908,7 +1908,7 @@ pub(crate) async fn seal_g6_scope_authority(
         })
         .ok_or(LockedG6PreludeError::AudienceMismatch)?;
     let target_status = match target.status.as_str() {
-        "active" => LockedRevocationTargetStatus::Active,
+        "active" | "pending_approval" => LockedRevocationTargetStatus::Active,
         "revoked" => LockedRevocationTargetStatus::Revoked,
         _ => return Err(LockedG6PreludeError::AudienceMismatch),
     };
@@ -2145,7 +2145,7 @@ pub(crate) async fn hydrate_locked_g6_prelude(
                     || fact.dpop_jkt != scope.actor_dpop_jkt
                     || fact.auth_generation != scope.actor_auth_generation))
             || (is_target
-                && (fact.status != "active"
+                && (!matches!(fact.status.as_str(), "active" | "pending_approval")
                     || fact.auth_generation
                         != i64::try_from(scope.target_auth_generation)
                             .map_err(|_| LockedG6PreludeError::PreludeBindingMismatch)?))
@@ -3609,6 +3609,14 @@ async fn hydrate_locked_available_recovery_package_at_coordinate(
           AND kp.not_before < $5
           AND kp.created_at <= $5
           AND $5 < kp.not_after
+          AND EXISTS (
+              SELECT 1
+              FROM chat.devices d
+              WHERE d.user_did = kp.owner_did
+                AND d.device_id = kp.owner_device_id
+                AND d.status = 'active'
+                AND d.revoked_at IS NULL
+          )
         "#,
     );
     if has_usage_scope {

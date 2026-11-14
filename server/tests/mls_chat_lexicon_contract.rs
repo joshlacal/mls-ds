@@ -31,7 +31,23 @@ fn stack_root() -> PathBuf {
 }
 
 fn canonical_root() -> PathBuf {
-    stack_root().join("PetrelCatbird/lexicons/blue/catbird/chat")
+    let local = stack_root().join("PetrelCatbird/lexicons/blue/catbird/chat");
+    if local.is_dir() {
+        return local;
+    }
+    if let Some(workspaces_root) = stack_root().parent() {
+        let wave1 = workspaces_root.join("dec1-w0/wave1-petrel-catbird/lexicons/blue/catbird/chat");
+        if wave1.is_dir() {
+            return wave1;
+        }
+        if let Some(dev_root) = workspaces_root.parent() {
+            let root = dev_root.join("Catbird+Petrel/PetrelCatbird/lexicons/blue/catbird/chat");
+            if root.is_dir() {
+                return root;
+            }
+        }
+    }
+    local
 }
 
 fn mirror_root() -> PathBuf {
@@ -60,8 +76,8 @@ fn corpus(root: &Path) -> BTreeMap<String, Vec<u8>> {
 fn validate_corpus(corpus: &BTreeMap<String, Vec<u8>>, label: &str) {
     assert_eq!(
         corpus.len(),
-        40,
-        "{label}: defs, authFull, thirty-six endpoints, and two records are required"
+        41,
+        "{label}: defs, authFull, thirty-seven endpoints, and two records are required"
     );
     for (filename, bytes) in corpus {
         let source = std::str::from_utf8(bytes)

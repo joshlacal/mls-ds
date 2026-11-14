@@ -95,6 +95,12 @@ async fn enroll(
         let projection = effect
             .enrollment_projection()
             .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+        let device_name = match projection.body().get("deviceName") {
+            Some(crate::chat_protocol::transcript::CanonicalValueRef::Text(value)) => {
+                value.to_owned()
+            }
+            _ => return Err(ChatFailure::invariant(ENDPOINT)),
+        };
         let (raw_packages, expected_signature_key) =
             extract_key_packages(&projection.body(), ENDPOINT)?;
         let key_id = effect
@@ -113,27 +119,10 @@ async fn enroll(
         let trusted_at = effect.trusted_instant();
         let batch_count =
             i64::try_from(raw_packages.len()).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-        let device = chat_dto::DeviceView::<DefaultStr> {
-            auth_generation: 1,
-            available_package_count: batch_count,
-            created_at: chrono_to_datetime(trusted_at),
-            device_id: SmolStr::from(effect.device_id().to_string()),
-            key_id: SmolStr::from(key_id.as_str()),
-            reserved_package_count: 0,
-            signature_public_key: JacquardBytes::from(expected_signature_key.clone()),
-            status: SmolStr::from("active"),
-            updated_at: chrono_to_datetime(trusted_at),
-            extra_data: None,
-        };
-        let output = chat_dto::enroll_device::EnrollDeviceOutput::<DefaultStr> {
-            device,
-            extra_data: None,
-        };
-        let response_bytes =
-            serde_json::to_vec(&output).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-        prelude::persist_enrollment_bootstrap_effects(&mut transaction, &effect)
-            .await
-            .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+        let enrolled_status =
+            prelude::persist_enrollment_bootstrap_effects(&mut transaction, &effect)
+                .await
+                .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
         let packages: Vec<NewKeyPackage<'_>> = raw_packages
             .iter()
             .zip(validated.iter())
@@ -148,7 +137,28 @@ async fn enroll(
         prelude::publish_enrollment_key_packages(&mut transaction, &effect, &packages)
             .await
             .map_err(|error| key_package_failure(ENDPOINT, error))?;
-        response_bytes
+        let coarse_active_at =
+            crate::chat_protocol::device_activity::coarse_activity_day(trusted_at);
+        let device = chat_dto::DeviceView::<DefaultStr> {
+            auth_generation: 1,
+            available_package_count: batch_count,
+            created_at: chrono_to_datetime(trusted_at),
+            device_id: SmolStr::from(effect.device_id().to_string()),
+            device_name: Some(SmolStr::from(device_name.as_str())),
+            dormant_at: None,
+            key_id: SmolStr::from(key_id.as_str()),
+            last_active_at: Some(chrono_to_datetime(coarse_active_at)),
+            reserved_package_count: 0,
+            signature_public_key: JacquardBytes::from(expected_signature_key.clone()),
+            status: SmolStr::from(enrolled_status),
+            updated_at: chrono_to_datetime(trusted_at),
+            extra_data: None,
+        };
+        let output = chat_dto::enroll_device::EnrollDeviceOutput::<DefaultStr> {
+            device,
+            extra_data: None,
+        };
+        serde_json::to_vec(&output).map_err(|_| ChatFailure::invariant(ENDPOINT))?
     };
 
     prelude::complete_enrollment_bootstrap_operation(

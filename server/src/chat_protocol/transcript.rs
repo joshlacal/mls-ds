@@ -971,6 +971,11 @@ signed_mutation_kinds!(
         "CATBIRD-CHAT-DEVICE-REVOKE\0"
     ),
     (
+        DeviceApproval,
+        "deviceApprovalBody",
+        "CATBIRD-CHAT-DEVICE-APPROVE\0"
+    ),
+    (
         BlobUploadPreparation,
         "blobUploadPreparationBody",
         "CATBIRD-CHAT-BLOB-PREPARE\0"
@@ -2027,6 +2032,7 @@ projection_types!(
     (DeviceEnrollment, DeviceEnrollmentProjection),
     (KeyPackageReplenishment, KeyPackageReplenishmentProjection),
     (DeviceRevocation, DeviceRevocationProjection),
+    (DeviceApproval, DeviceApprovalProjection),
     (BlobUploadPreparation, BlobUploadPreparationProjection),
     (BlobDeletion, BlobDeletionProjection),
     (Creation, CreationProjection),
@@ -2072,6 +2078,9 @@ fn projection_for(value: &VerifiedSignedMutation) -> VerifiedMutationProjection<
         }
         SignedMutationKind::DeviceRevocation => {
             VerifiedMutationProjection::DeviceRevocation(DeviceRevocationProjection(value))
+        }
+        SignedMutationKind::DeviceApproval => {
+            VerifiedMutationProjection::DeviceApproval(DeviceApprovalProjection(value))
         }
         SignedMutationKind::BlobUploadPreparation => {
             VerifiedMutationProjection::BlobUploadPreparation(BlobUploadPreparationProjection(
@@ -2160,6 +2169,7 @@ projection_body!(
     DeviceEnrollmentProjection,
     KeyPackageReplenishmentProjection,
     DeviceRevocationProjection,
+    DeviceApprovalProjection,
     BlobUploadPreparationProjection,
     BlobDeletionProjection,
     CreationProjection,

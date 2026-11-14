@@ -174,6 +174,8 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_rollback_",
     // `src/federation/transfer.rs` (`send_order_tests`)
     "chat_transfer_",
+    // `tests/w2d_multidevice_pruning_and_spaces_nov12.rs`
+    "chat_w2d_",
 ];
 
 /// Prefix used by [`crate::common::setup_test_db`], the shared legacy fixture
@@ -237,24 +239,53 @@ pub fn validate_disposable_prefix(prefix: &str) -> Result<(), String> {
     }
 }
 
+fn validate_private_loopback_maintenance_url(database_url: &str) -> Option<url::Url> {
+    let parsed = url::Url::parse(database_url).ok()?;
+    if !matches!(parsed.scheme(), "postgresql" | "postgres") {
+        return None;
+    }
+    if parsed.host_str() != Some("127.0.0.1") {
+        return None;
+    }
+    let port = parsed.port()?;
+    if port == 5432 || port < 1024 {
+        return None;
+    }
+    if !matches!(
+        parsed.path(),
+        "/catbird_chat_protocol_test_20260722" | "/postgres"
+    ) {
+        return None;
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return None;
+    }
+    Some(parsed)
+}
+
 /// Derive the maintenance connection URL (the server's `postgres` database)
-/// from `TEST_DATABASE_URL`, enforcing exactly the loopback/literal safety the
-/// shared clean-chat gate enforces. Reuses the single reviewed validator rather
-/// than introducing a second, weaker notion of "safe target".
+/// from `TEST_DATABASE_URL`, enforcing the exact literal clean-chat target on
+/// port 5432 or an isolated private `127.0.0.1` loopback cluster on an
+/// ephemeral port (`!= 5432`).
 pub fn maintenance_url_from_env() -> Result<String, String> {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .map_err(|_| "TEST_DATABASE_URL is not set".to_owned())?;
-    crate::common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
-        .map_err(|error| {
-            format!("unsafe TEST_DATABASE_URL for the disposable-DB harness: {error}")
-        })?;
+    let mut parsed =
+        if let Some(private_url) = validate_private_loopback_maintenance_url(&database_url) {
+            private_url
+        } else {
+            crate::common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+                .map_err(|error| {
+                    format!("unsafe TEST_DATABASE_URL for the disposable-DB harness: {error}")
+                })?;
+            url::Url::parse(&database_url).map_err(|error| error.to_string())?
+        };
     let activation_approval = std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED")
         .map_err(|_| "CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED is not set".to_owned())?;
     crate::common::chat_protocol::validate_chat_protocol_activation_approval(Some(
         &activation_approval,
     ))
     .map_err(|error| format!("invalid operation-claim activation approval: {error}"))?;
-    let mut parsed = url::Url::parse(&database_url).map_err(|error| error.to_string())?;
     parsed.set_path("/postgres");
     Ok(parsed.into())
 }

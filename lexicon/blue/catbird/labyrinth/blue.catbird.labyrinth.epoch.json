@@ -34,6 +34,23 @@
             "maxLength": 32,
             "minLength": 32
           },
+          "revocations": {
+            "type": "array",
+            "description": "Canonical sorted deviceKeyPubkey entries evicted up to and including this epoch.",
+            "maxLength": 256,
+            "items": {
+              "type": "bytes",
+              "description": "Revoked deviceKeyPubkey (32 bytes).",
+              "minLength": 32,
+              "maxLength": 32
+            }
+          },
+          "revocationsSig": {
+            "type": "bytes",
+            "description": "XEdDSA signature by openedBy over the epoch head and sorted revocations list.",
+            "minLength": 64,
+            "maxLength": 64
+          },
           "createdAt": {
             "type": "string",
             "format": "datetime"

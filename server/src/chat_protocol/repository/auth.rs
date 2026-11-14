@@ -39,6 +39,8 @@ pub(crate) enum AuthRepositoryError {
     DeviceAlreadyRegistered,
     #[error("clean-chat device is revoked")]
     DeviceRevoked,
+    #[error("clean-chat device is pending approval by an active device")]
+    DevicePendingApproval,
     #[error("clean-chat immutable device key is missing")]
     DeviceKeyMissing,
     #[error("clean-chat immutable device key is revoked")]
@@ -2706,7 +2708,7 @@ pub(super) async fn persist_enrollment_bootstrap_effects(
     transaction: &mut Transaction<'_, Postgres>,
     authority: &VerifiedChatDeviceRequest,
     scope: &EnrollmentAbsenceLockedBootstrapScope,
-) -> Result<(), AuthRepositoryError> {
+) -> Result<&'static str, AuthRepositoryError> {
     let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **transaction)
         .await?;
@@ -2757,18 +2759,37 @@ pub(super) async fn persist_enrollment_bootstrap_effects(
     .bind(trusted_at)
     .execute(&mut **transaction)
     .await?;
+    let _: String =
+        sqlx::query_scalar("SELECT user_did FROM chat.principals WHERE user_did = $1 FOR UPDATE")
+            .bind(scope.subject())
+            .fetch_one(&mut **transaction)
+            .await?;
+    let has_active_sibling: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM chat.devices WHERE user_did = $1 AND status = 'active' AND revoked_at IS NULL)",
+    )
+    .bind(scope.subject())
+    .fetch_one(&mut **transaction)
+    .await?;
+    let enrolled_status = if has_active_sibling {
+        "pending_approval"
+    } else {
+        "active"
+    };
+    let coarse_active_at = super::super::device_activity::coarse_activity_day(trusted_at);
     let inserted_device = sqlx::query(
         r#"
         INSERT INTO chat.devices (
             user_did, device_id, device_name, status, dpop_jkt,
             auth_generation, capabilities, last_active_at, created_at, updated_at
-        ) VALUES ($1,$2,$3,'active',$4,1,chat.protocol_capabilities(),$5,$5,$5)
+        ) VALUES ($1,$2,$3,$4,$5,1,chat.protocol_capabilities(),$6,$7,$7)
         "#,
     )
     .bind(scope.subject())
     .bind(scope.device_id())
     .bind(device_name)
+    .bind(enrolled_status)
     .bind(scope.new_jkt())
+    .bind(coarse_active_at)
     .bind(trusted_at)
     .execute(&mut **transaction)
     .await?;
@@ -2793,7 +2814,7 @@ pub(super) async fn persist_enrollment_bootstrap_effects(
     if inserted_key.rows_affected() != 1 {
         return Err(AuthRepositoryError::DeviceKeyMissing);
     }
-    Ok(())
+    Ok(enrolled_status)
 }
 
 #[cfg(any(test, feature = "chat-protocol-production-proof"))]
@@ -3095,7 +3116,7 @@ pub(super) async fn load_validated_completed_enrollment_replay(
     let body = pre_replay
         .enrollment_body()
         .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
-    let state = lock_device_and_key(
+    let state = lock_enrolled_device_and_key(
         transaction,
         pre_replay.subject().as_str(),
         canonical_uuid(pre_replay.device_id()),
@@ -3447,10 +3468,12 @@ async fn lock_existing_authority(
     transaction: &mut Transaction<'_, Postgres>,
     pre_replay: &PreReplayCryptographicVerification,
 ) -> Result<LockedDeviceAuthority, AuthRepositoryError> {
-    let state = lock_device_and_key(
+    let allow_pending = pre_replay.endpoint().as_str() == "blue.catbird.chat.getOwnDevices";
+    let state = lock_device_and_key_with_pending_policy(
         transaction,
         pre_replay.subject().as_str(),
         canonical_uuid(pre_replay.device_id()),
+        allow_pending,
     )
     .await?;
     if !pre_replay.is_standard_service_auth()
@@ -3466,6 +3489,23 @@ async fn lock_device_and_key(
     subject: &str,
     device_id: Uuid,
 ) -> Result<LockedDeviceAuthority, AuthRepositoryError> {
+    lock_device_and_key_with_pending_policy(transaction, subject, device_id, false).await
+}
+
+async fn lock_enrolled_device_and_key(
+    transaction: &mut Transaction<'_, Postgres>,
+    subject: &str,
+    device_id: Uuid,
+) -> Result<LockedDeviceAuthority, AuthRepositoryError> {
+    lock_device_and_key_with_pending_policy(transaction, subject, device_id, true).await
+}
+
+async fn lock_device_and_key_with_pending_policy(
+    transaction: &mut Transaction<'_, Postgres>,
+    subject: &str,
+    device_id: Uuid,
+    allow_pending_approval: bool,
+) -> Result<LockedDeviceAuthority, AuthRepositoryError> {
     let device: Option<DeviceRow> = sqlx::query_as(
         r#"
         SELECT status, dpop_jkt, auth_generation
@@ -3479,8 +3519,11 @@ async fn lock_device_and_key(
     .fetch_optional(&mut **transaction)
     .await?;
     let device = device.ok_or(AuthRepositoryError::DeviceNotRegistered)?;
-    if device.status != "active" {
-        return Err(AuthRepositoryError::DeviceRevoked);
+    match device.status.as_str() {
+        "active" => {}
+        "pending_approval" if allow_pending_approval => {}
+        "pending_approval" => return Err(AuthRepositoryError::DevicePendingApproval),
+        _ => return Err(AuthRepositoryError::DeviceRevoked),
     }
 
     let key: Option<DeviceKeyRow> = sqlx::query_as(
@@ -3955,6 +3998,7 @@ fn endpoint_has_idempotency_record(endpoint: &str) -> bool {
         "blue.catbird.chat.acceptConversation"
             | "blue.catbird.chat.acknowledgeWelcome"
             | "blue.catbird.chat.activateReset"
+            | "blue.catbird.chat.approveDevice"
             | "blue.catbird.chat.cancelLeafRecovery"
             | "blue.catbird.chat.cancelLeave"
             | "blue.catbird.chat.closeConversation"
@@ -3997,6 +4041,7 @@ fn endpoint_accepts_kind(endpoint: &str, kind: SignedMutationKind) -> bool {
             kind == SignedMutationKind::KeyPackageReplenishment
         }
         "blue.catbird.chat.revokeDevice" => kind == SignedMutationKind::DeviceRevocation,
+        "blue.catbird.chat.approveDevice" => kind == SignedMutationKind::DeviceApproval,
         "blue.catbird.chat.prepareBlobUpload" => kind == SignedMutationKind::BlobUploadPreparation,
         "blue.catbird.chat.deleteBlob" => kind == SignedMutationKind::BlobDeletion,
         "blue.catbird.chat.createConversation" => kind == SignedMutationKind::Creation,
@@ -4149,6 +4194,10 @@ mod tests {
             (
                 "blue.catbird.chat.revokeDevice",
                 SignedMutationKind::DeviceRevocation,
+            ),
+            (
+                "blue.catbird.chat.approveDevice",
+                SignedMutationKind::DeviceApproval,
             ),
             (
                 "blue.catbird.chat.acknowledgeWelcome",

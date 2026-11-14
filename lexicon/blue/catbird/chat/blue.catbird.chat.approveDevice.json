@@ -1,0 +1,84 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.approveDevice",
+  "description": "Signed sibling-device approval promoting a pending_approval device on the same account to active using authoritative own-device inventory CAS and public-key binding. Exact completed response-loss replay requires the same authenticated DID, canonical request digest, and signature; it returns the stored response without reexecuting the approval.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedDeviceApproval"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "device"
+          ],
+          "properties": {
+            "device": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#deviceView"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthenticationGenerationConflict"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceAlreadyActive"
+        },
+        {
+          "name": "DeviceNotFound"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
+      ]
+    }
+  }
+}

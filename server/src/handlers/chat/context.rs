@@ -181,12 +181,16 @@ pub(crate) async fn admit_unsigned_read_for_subject(
         .await?;
     } else if let Ok(device_uuid) = uuid::Uuid::parse_str(actor_device_id) {
         let _ = sqlx::query(
-            "UPDATE chat.devices SET last_active_at = $3 \
-             WHERE user_did = $1 AND device_id = $2 AND status = 'active'",
+            "UPDATE chat.devices \
+             SET last_active_at = $3, dormant_at = NULL \
+             WHERE user_did = $1 AND device_id = $2 AND status = 'active' \
+               AND (last_active_at IS DISTINCT FROM $3 OR dormant_at IS NOT NULL)",
         )
         .bind(principal.did())
         .bind(device_uuid)
-        .bind(crate::sim_hooks::current_utc())
+        .bind(crate::chat_protocol::device_activity::coarse_activity_day(
+            crate::sim_hooks::current_utc(),
+        ))
         .execute(pool)
         .await;
     }
@@ -244,12 +248,29 @@ pub(crate) async fn admit_signed_operation_only(
     let method =
         CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(endpoint))?;
     let instant = capture_instant(endpoint)?;
+    let principal_did = principal.did().to_owned();
     let pre_replay =
         dpop::standard_service_auth_evidence(principal, &actor_device_id, method, instant, None)
             .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-    auth::authorize_signed_operation_only(pool, pre_replay, canonical)
+    let admission = auth::authorize_signed_operation_only(pool, pre_replay, canonical)
         .await
-        .map_err(|error| auth_repository_failure(endpoint, error))
+        .map_err(|error| auth_repository_failure(endpoint, error))?;
+    if let Ok(device_uuid) = uuid::Uuid::parse_str(&actor_device_id) {
+        let _ = sqlx::query(
+            "UPDATE chat.devices \
+             SET last_active_at = $3, dormant_at = NULL \
+             WHERE user_did = $1 AND device_id = $2 AND status = 'active' \
+               AND (last_active_at IS DISTINCT FROM $3 OR dormant_at IS NOT NULL)",
+        )
+        .bind(&principal_did)
+        .bind(device_uuid)
+        .bind(crate::chat_protocol::device_activity::coarse_activity_day(
+            crate::sim_hooks::current_utc(),
+        ))
+        .execute(pool)
+        .await;
+    }
+    Ok(admission)
 }
 
 /// Refuse an operation that would otherwise be sequenced by a mirror or
@@ -586,6 +607,7 @@ pub(crate) fn auth_repository_failure(
         E::DeviceNotRegistered | E::DeviceKeyMissing => C::DeviceNotRegistered,
         E::DeviceAlreadyRegistered => C::DeviceAlreadyExists,
         E::DeviceRevoked | E::DeviceKeyRevoked => C::DeviceRevoked,
+        E::DevicePendingApproval => C::NotAuthorized,
         E::AuthenticationGenerationMismatch => {
             if endpoint.declares(C::AuthenticationGenerationConflict) {
                 C::AuthenticationGenerationConflict

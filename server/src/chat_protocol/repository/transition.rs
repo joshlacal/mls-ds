@@ -2439,7 +2439,7 @@ pub(crate) async fn cas_registration_revoke(
                updated_at = $4
          WHERE user_did = $1
            AND device_id = $2
-           AND status = 'active'
+           AND status IN ('active', 'pending_approval')
            AND auth_generation = $3
         "#,
     )

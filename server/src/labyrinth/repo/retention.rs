@@ -84,6 +84,14 @@ pub async fn purge_account(
         .bind(did)
         .execute(&mut *conn)
         .await?;
+    sqlx::query("DELETE FROM chat.conversation_space_records WHERE writer_did = $1")
+        .bind(did)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM chat.managed_space_members WHERE member_did = $1")
+        .bind(did)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("DELETE FROM chat.conversation_space_writers WHERE writer_did = $1")
         .bind(did)
         .execute(&mut *conn)
@@ -214,13 +222,13 @@ async fn prune_application_ciphertext(
             Ok(_) => savepoint.commit().await?,
             Err(SignedRelayError::SignerUnavailable) => {
                 tracing::error!(
-                    %conversation_id,
+                    conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()),
                     "deleted account prune refused: no S2S signing key for its entries-pruned notice"
                 );
                 savepoint.rollback().await?;
             }
             Err(SignedRelayError::Storage(error)) => {
-                tracing::error!(%error, %conversation_id, "deleted account prune failed");
+                tracing::error!(%error, conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), "deleted account prune failed");
                 return Err(LabyrinthError::internal());
             }
         }
@@ -418,7 +426,7 @@ pub(crate) async fn sequence_account_deleted_entry(
         deleted_at: at,
     };
     let sequencer_authority = signer.sign_account_deletion(&deletion).map_err(|error| {
-        tracing::error!(%error, %conversation_id, "sign accountDeletedEntry");
+        tracing::error!(%error, conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), "sign accountDeletedEntry");
         LabyrinthError::internal()
     })?;
     let entry = deletion.entry(&sequencer_authority);
@@ -518,7 +526,7 @@ pub(crate) async fn sequence_account_deleted_entry(
     crate::federation::group_fanout::prepare_group_entry_fanout(tx, &entry)
         .await
         .map_err(|error| {
-            tracing::error!(%error, %conversation_id, "queue accountDeletedEntry fan-out");
+            tracing::error!(%error, conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), "queue accountDeletedEntry fan-out");
             LabyrinthError::internal()
         })?;
     Ok(Some(entry))

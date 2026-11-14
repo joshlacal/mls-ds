@@ -584,7 +584,7 @@ impl PreparedGroupEntryFanout {
                 let error = report_drain_error(error);
                 tracing::warn!(
                     remote_home_did = %home,
-                    conversation_id = %conversation_id,
+                    conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()),
                     %error,
                     "deliverGroupEntry fan-out failed"
                 );

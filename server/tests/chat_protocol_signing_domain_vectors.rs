@@ -90,20 +90,17 @@ const CANONICAL_LEXICON: &[u8] =
 const CANONICAL_LEXICON_PATH: &str = "lexicon/blue/catbird/chat/blue.catbird.chat.defs.json";
 const CANONICAL_SOURCE_LEXICON_PATH: &str =
     "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json";
-// The fixture was regenerated when `applicationSendBody` gained its required
-// signed `sendCounter` (PetrelCatbird e4227af6, catbird-atproto 838df09a).
-const CANONICAL_SOURCE_LEXICON_REVISION: &str = "e4227af68226a61a4cae7478496d1a7b930f28f6";
-const CANONICAL_SOURCE_CORPUS_REVISION: &str = "838df09a4fa46ba651280c01e74b66b989ca7a74";
+// The fixture was regenerated when `deviceApprovalBody` (`CATBIRD-CHAT-DEVICE-APPROVE\0`)
+// and `#deviceView` dormancy/coarse-activity fields landed in Wave-1b
+// (PetrelCatbird 26380cef, catbird-atproto 729503e3).
+const CANONICAL_SOURCE_LEXICON_REVISION: &str = "26380cefa2e4734925efabb178d83052e10a46c7";
+const CANONICAL_SOURCE_CORPUS_REVISION: &str = "729503e36c0684dd74722fc186d9703335eb871b";
 const CANONICAL_SOURCE_LEXICON_SHA256: &str =
-    "1c21d1b04555c800a0491e997b74e3185520b0634362e68a2a27e6b8babdb075";
-// The current canonical contract also contains the direct-request domains and
-// `leafRecoveryView.signedRequest`, while account deletion relies only on its
-// independently verified `sequencerAuthority` (PetrelCatbird 5c991ba1,
-// catbird-atproto 15603813 plus the Task 5 schema projection).
-const CURRENT_SOURCE_LEXICON_REVISION: &str = "5c991ba1410c097c659cc82f3be5247982291ce5";
-const CURRENT_SOURCE_CORPUS_REVISION: &str = "1560381359debd4b75291579161c8846b388df10";
+    "992206c3cfba8db1733c5795d75aacb8352d68d187fe4c793dfc8fe73adfc2a4";
+const CURRENT_SOURCE_LEXICON_REVISION: &str = "26380cefa2e4734925efabb178d83052e10a46c7";
+const CURRENT_SOURCE_CORPUS_REVISION: &str = "729503e36c0684dd74722fc186d9703335eb871b";
 const CURRENT_SOURCE_LEXICON_SHA256: &str =
-    "b0fe4af17f657647a8e1ceedb7a34765a0c72d514420ce3b153d6ecd11d240ff";
+    "992206c3cfba8db1733c5795d75aacb8352d68d187fe4c793dfc8fe73adfc2a4";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures
@@ -487,14 +484,16 @@ fn the_ten_active_signing_domain_vectors_are_server_products_and_match_the_fixtu
 #[test]
 fn every_signing_domain_now_has_a_server_vector() {
     // The accounting the vendoring clients rely on: fourteen domains were
-    // already pinned by `mls_chat_contract_vectors.json`, these ten are the
-    // original remainder, and two newer direct-request control domains have
-    // independent vectors. Together they are the whole enum. Keep the expected set
-    // explicit so adding an enum arm or silently dropping a fixture fails here.
+    // already pinned by `mls_chat_contract_vectors.json`, these eleven are the
+    // non-control active mutations (including `deviceApprovalBody`), and two
+    // direct-request control domains have independent vectors. Together they are
+    // the whole enum. Keep the expected set explicit so adding an enum arm or
+    // silently dropping a fixture fails here.
     let expected = BTreeSet::from([
         "deviceEnrollmentBody",
         "keyPackageReplenishmentBody",
         "deviceRevocationBody",
+        "deviceApprovalBody",
         "blobUploadPreparationBody",
         "blobDeletionBody",
         "creationBody",
@@ -531,7 +530,7 @@ fn every_signing_domain_now_has_a_server_vector() {
         .collect();
     let unpinned = unpinned_body_names();
     assert_eq!(control.len(), 15);
-    assert_eq!(unpinned.len(), 10);
+    assert_eq!(unpinned.len(), 11);
     assert_eq!(
         control.len() + 1 + unpinned.len(),
         SignedMutationKind::ALL.len()
@@ -542,6 +541,7 @@ fn every_signing_domain_now_has_a_server_vector() {
             "deviceEnrollmentBody",
             "keyPackageReplenishmentBody",
             "deviceRevocationBody",
+            "deviceApprovalBody",
             "blobUploadPreparationBody",
             "applicationSendBody",
             "typingBody",
@@ -559,7 +559,7 @@ fn every_signing_domain_now_has_a_server_vector() {
         "the existing corpus must cover 14 kinds"
     );
     let fixture: Value = serde_json::from_str(FIXTURE).expect("the vector fixture parses");
-    for case in fixture["cases"].as_array().expect("ten cases") {
+    for case in fixture["cases"].as_array().expect("eleven cases") {
         fixture_kinds.insert(
             case["bodyName"]
                 .as_str()
@@ -581,7 +581,7 @@ fn each_frozen_case_verifies_and_its_declared_mutation_breaks_the_signature() {
 
     let fixture: Value = serde_json::from_str(FIXTURE).expect("the fixture parses");
     let cases = fixture["cases"].as_array().expect("cases");
-    assert_eq!(cases.len(), 10);
+    assert_eq!(cases.len(), 11);
 
     let public_key: [u8; 32] = hex::decode(fixture["publicKeyHex"].as_str().unwrap())
         .unwrap()
@@ -635,7 +635,7 @@ fn the_domains_are_distinct_and_none_collides_with_a_control_domain() {
             "the fixture's domain must be the server's, NUL included"
         );
     }
-    assert_eq!(seen.len(), 10);
+    assert_eq!(seen.len(), 11);
 }
 
 #[test]

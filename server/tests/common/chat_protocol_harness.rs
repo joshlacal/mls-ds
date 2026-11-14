@@ -49,6 +49,10 @@ pub mod read_authority;
 pub mod dpop;
 
 #[allow(dead_code)]
+#[path = "../../../server/src/chat_protocol/device_activity.rs"]
+pub mod device_activity;
+
+#[allow(dead_code)]
 #[path = "../../../server/src/chat_protocol/public_state.rs"]
 pub mod public_state;
 
@@ -94,6 +98,8 @@ pub mod repository {
     pub mod creation;
     #[path = "../../../server/src/chat_protocol/repository/delivery.rs"]
     pub mod delivery;
+    #[path = "../../../server/src/chat_protocol/repository/device_approval.rs"]
+    pub mod device_approval;
     #[path = "../../../server/src/chat_protocol/repository/device_directory.rs"]
     pub mod device_directory;
     #[path = "../../../server/src/chat_protocol/repository/direct_request_lifecycle.rs"]

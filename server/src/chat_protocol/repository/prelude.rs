@@ -24,7 +24,8 @@ use super::{
     key_packages::{self, KeyPackageOwner, NewKeyPackage},
 };
 use super::{
-    acceptance, creation, leave, recovery, reset, revocation, submit_transition, welcome_terminal,
+    acceptance, creation, device_approval, leave, recovery, reset, revocation, submit_transition,
+    welcome_terminal,
 };
 
 #[derive(Debug, Error)]
@@ -530,6 +531,7 @@ pub(crate) fn endpoint_has_operation_claim(endpoint: &str) -> bool {
         "blue.catbird.chat.acceptConversation"
             | "blue.catbird.chat.acknowledgeWelcome"
             | "blue.catbird.chat.activateReset"
+            | "blue.catbird.chat.approveDevice"
             | "blue.catbird.chat.cancelLeafRecovery"
             | "blue.catbird.chat.cancelLeave"
             | "blue.catbird.chat.closeConversation"
@@ -731,6 +733,7 @@ pub(in crate::chat_protocol::repository) enum SignedOperationReplayPostStateProo
     ResetRequest(reset::ResetReplayPostStateProof),
     ResetActivation(reset::ResetReplayPostStateProof),
     DeviceRevocation(revocation::DeviceRevocationReplayPostStateProof),
+    DeviceApproval(device_approval::DeviceApprovalReplayPostStateProof),
     WelcomeAcknowledgement(welcome_terminal::WelcomeReplayPostStateProof),
     WelcomeRejection(welcome_terminal::WelcomeReplayPostStateProof),
     Recovery(recovery::RecoveryReplayPostStateProof),
@@ -745,6 +748,7 @@ impl SignedOperationReplayPostStateProof {
         match self {
             Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.transaction_id(),
             Self::DeviceRevocation(proof) => proof.transaction_id(),
+            Self::DeviceApproval(proof) => proof.transaction_id(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.transaction_id()
             }
@@ -760,6 +764,7 @@ impl SignedOperationReplayPostStateProof {
         match self {
             Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.operation_id(),
             Self::DeviceRevocation(proof) => proof.operation_id(),
+            Self::DeviceApproval(proof) => proof.operation_id(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.operation_id()
             }
@@ -775,6 +780,7 @@ impl SignedOperationReplayPostStateProof {
         match self {
             Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.principal_did(),
             Self::DeviceRevocation(proof) => proof.principal_did(),
+            Self::DeviceApproval(proof) => proof.principal_did(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.principal_did()
             }
@@ -790,6 +796,7 @@ impl SignedOperationReplayPostStateProof {
         match self {
             Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.endpoint_nsid(),
             Self::DeviceRevocation(proof) => proof.endpoint_nsid(),
+            Self::DeviceApproval(proof) => proof.endpoint_nsid(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.endpoint_nsid()
             }
@@ -805,6 +812,7 @@ impl SignedOperationReplayPostStateProof {
         match self {
             Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.mutation_kind(),
             Self::DeviceRevocation(proof) => proof.mutation_kind(),
+            Self::DeviceApproval(proof) => proof.mutation_kind(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.mutation_kind()
             }
@@ -820,6 +828,7 @@ impl SignedOperationReplayPostStateProof {
         match self {
             Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.request_digest(),
             Self::DeviceRevocation(proof) => proof.request_digest(),
+            Self::DeviceApproval(proof) => proof.request_digest(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.request_digest()
             }
@@ -837,6 +846,7 @@ impl SignedOperationReplayPostStateProof {
                 proof.accepted_request_sha256()
             }
             Self::DeviceRevocation(proof) => proof.accepted_request_sha256(),
+            Self::DeviceApproval(proof) => proof.accepted_request_sha256(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.accepted_request_sha256()
             }
@@ -852,6 +862,7 @@ impl SignedOperationReplayPostStateProof {
         match self {
             Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.signature(),
             Self::DeviceRevocation(proof) => proof.signature(),
+            Self::DeviceApproval(proof) => proof.signature(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.signature()
             }
@@ -867,6 +878,7 @@ impl SignedOperationReplayPostStateProof {
         match self {
             Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.post_state_digest(),
             Self::DeviceRevocation(proof) => proof.post_state_digest(),
+            Self::DeviceApproval(proof) => proof.post_state_digest(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.post_state_digest()
             }
@@ -884,6 +896,7 @@ impl SignedOperationReplayPostStateProof {
                 proof.expected_response_status()
             }
             Self::DeviceRevocation(proof) => proof.expected_status(),
+            Self::DeviceApproval(proof) => proof.expected_status(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.expected_status()
             }
@@ -901,6 +914,7 @@ impl SignedOperationReplayPostStateProof {
                 proof.expected_response_sha256()
             }
             Self::DeviceRevocation(proof) => proof.expected_response_sha256(),
+            Self::DeviceApproval(proof) => proof.expected_response_sha256(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.expected_response_sha256()
             }
@@ -916,6 +930,7 @@ impl SignedOperationReplayPostStateProof {
         match self {
             Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.validates_seal(),
             Self::DeviceRevocation(proof) => proof.validates_seal(),
+            Self::DeviceApproval(proof) => proof.validates_seal(),
             Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
                 proof.validates_seal()
             }
@@ -940,6 +955,10 @@ impl SignedOperationReplayPostStateProof {
             Self::DeviceRevocation(proof) => {
                 proof.endpoint_nsid() == "blue.catbird.chat.revokeDevice"
                     && proof.mutation_kind() == SignedMutationKind::DeviceRevocation
+            }
+            Self::DeviceApproval(proof) => {
+                proof.endpoint_nsid() == "blue.catbird.chat.approveDevice"
+                    && proof.mutation_kind() == SignedMutationKind::DeviceApproval
             }
             Self::WelcomeAcknowledgement(proof) => {
                 proof.endpoint_nsid() == "blue.catbird.chat.acknowledgeWelcome"
@@ -2134,6 +2153,19 @@ impl PreparedBusinessPrelude {
         )
     }
 
+    pub(crate) fn verify_device_approval_operation(
+        self,
+        operation_id: Uuid,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        self.verify_exact_operation_claim(
+            "blue.catbird.chat.approveDevice",
+            SignedMutationKind::DeviceApproval,
+            operation_id,
+            mutation,
+        )
+    }
+
     pub(crate) fn verify_welcome_operation(
         self,
         endpoint: WelcomeOperationEndpoint,
@@ -2735,7 +2767,7 @@ async fn prepare_replenishment_prelude(
 pub(crate) async fn persist_enrollment_bootstrap_effects(
     transaction: &mut Transaction<'_, Postgres>,
     effect: &EnrollmentBootstrapEffectAuthority<'_>,
-) -> Result<(), PreludeError> {
+) -> Result<&'static str, PreludeError> {
     auth::persist_enrollment_bootstrap_effects(transaction, effect.authority, effect.scope)
         .await
         .map_err(PreludeError::Authorization)

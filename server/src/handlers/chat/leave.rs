@@ -125,7 +125,7 @@ pub(super) async fn execute_admitted(
         )
         .await
         .map_err(|error| {
-            tracing::error!(?error, %conversation_id, "close request budget lock failed");
+            tracing::error!(?error, conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), "close request budget lock failed");
             ChatFailure::storage(endpoint)
         })?;
     }
@@ -220,7 +220,7 @@ pub(super) async fn execute_admitted(
                         )
                         .await
                         .map_err(|error| {
-                            tracing::error!(%error, conversation_id = %cid, "group close authority preparation failed");
+                            tracing::error!(%error, conversation_id = %crate::crypto::redact_for_log(&cid.to_string()), "group close authority preparation failed");
                             ChatFailure::storage(endpoint)
                         })?;
                     }
@@ -236,7 +236,7 @@ pub(super) async fn execute_admitted(
             )
             .await
             .map_err(|error| {
-                tracing::error!(?error, conversation_id = %cid, "close terminal entry attach failed");
+                tracing::error!(?error, conversation_id = %crate::crypto::redact_for_log(&cid.to_string()), "close terminal entry attach failed");
                 ChatFailure::storage(endpoint)
             })?;
             prepared_space =
@@ -259,7 +259,7 @@ pub(super) async fn execute_admitted(
                     .execute(&mut *tx)
                     .await
                     .map_err(|error| {
-                        tracing::error!(?error, conversation_id = %cid, "close graph validation failed");
+                        tracing::error!(?error, conversation_id = %crate::crypto::redact_for_log(&cid.to_string()), "close graph validation failed");
                         ChatFailure::storage(endpoint)
                     })?;
             }
@@ -275,7 +275,7 @@ pub(super) async fn execute_admitted(
             )
             .await
             .map_err(|error| {
-                tracing::error!(?error, conversation_id = %cid, "close receipt erasure failed");
+                tracing::error!(?error, conversation_id = %crate::crypto::redact_for_log(&cid.to_string()), "close receipt erasure failed");
                 ChatFailure::storage(endpoint)
             })?;
             let wiped: bool =
@@ -286,7 +286,7 @@ pub(super) async fn execute_admitted(
                     .map_err(|error| {
                         tracing::error!(
                             ?error,
-                            conversation_id = %cid,
+                            conversation_id = %crate::crypto::redact_for_log(&cid.to_string()),
                             "wipe_closed_conversation_operational_rows failed"
                         );
                         ChatFailure::storage(endpoint)
@@ -297,9 +297,25 @@ pub(super) async fn execute_admitted(
             // The wipe emptied this conversation's queue; the close goes last.
             if let Some(fanout) = prepared_group_fanout.as_ref() {
                 fanout.enqueue(&mut tx).await.map_err(|error| {
-                    tracing::error!(%error, conversation_id = %cid, "close fanout enqueue failed");
+                    tracing::error!(%error, conversation_id = %crate::crypto::redact_for_log(&cid.to_string()), "close fanout enqueue failed");
                     ChatFailure::storage(endpoint)
                 })?;
+            }
+        } else if endpoint == ChatEndpoint::RequestLeave {
+            if let Some(cid) = resp_val
+                .pointer("/result/entry/conversationId")
+                .or_else(|| resp_val.pointer("/entry/conversationId"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                .or_else(|| closed_conversation_id(body))
+            {
+                crate::chat_protocol::repository::delivery::prune_unblocked_for_conversation_and_notify(
+                    &mut tx,
+                    cid,
+                    crate::sim_hooks::current_utc(),
+                )
+                .await
+                .map_err(|_| ChatFailure::storage(endpoint))?;
             }
         }
     }
@@ -372,17 +388,17 @@ async fn c33_peer_home(
             error @ (crate::federation::FederationError::Database(_)
             | crate::federation::FederationError::Storage(_)),
         ) => {
-            tracing::error!(%error, %conversation_id, "closeConversation refused: this DS's store failed resolving the C33 peer's home");
+            tracing::error!(%error, conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), "closeConversation refused: this DS's store failed resolving the C33 peer's home");
             Err(ChatFailure::storage(endpoint))
         }
         Err(error) if error.is_retryable() => {
-            tracing::warn!(%error, %conversation_id, "closeConversation refused: the C33 peer's home did not resolve");
+            tracing::warn!(%error, conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), "closeConversation refused: the C33 peer's home did not resolve");
             Err(ChatFailure::unavailable(endpoint))
         }
         // ponytail: a permanently unresolvable home cannot be addressed; the
         // close proceeds and that home keeps its copies until its own expiry.
         Err(error) => {
-            tracing::warn!(%error, %conversation_id, "C33 peer home is unresolvable; its close is owed nowhere");
+            tracing::warn!(%error, conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), "C33 peer home is unresolvable; its close is owed nowhere");
             Ok(None)
         }
     }

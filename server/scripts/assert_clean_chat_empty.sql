@@ -374,7 +374,7 @@ DECLARE
     ];
 
     -- BEGIN GENERATED CLEAN-SLATE SEAL
-    -- 61 migrations after 20260828000005 (145 total, max 20261113000001); chat tables: 94; chat views: 1.
+    -- 62 migrations after 20260828000005 (146 total, max 20261114000001); chat tables: 98; chat views: 1.
     v_clean_slate_versions BIGINT[] := ARRAY[
         20260905000001::BIGINT,
         20260907000001::BIGINT,
@@ -436,7 +436,8 @@ DECLARE
         20261104000011::BIGINT,
         20261104000012::BIGINT,
         20261107000001::BIGINT,
-        20261113000001::BIGINT
+        20261113000001::BIGINT,
+        20261114000001::BIGINT
     ];
     v_clean_slate_descriptions TEXT[] := ARRAY[
         'chat historical recovery package mapping',
@@ -499,7 +500,8 @@ DECLARE
         'direct request route answers',
         'postgres churn partitions',
         'application send order',
-        'remote lifecycle recovery bindings'
+        'remote lifecycle recovery bindings',
+        'wave2 multidevice and spaces nov12'
     ];
     v_clean_slate_checksums TEXT[] := ARRAY[
         'a66f9dc9bd5f8f1cb3da0f3ddfcb64c08fc068de39602891e584c86cdbaebd1de2d29b6bb46959155496639ad12f9c5d',
@@ -562,17 +564,21 @@ DECLARE
         '6a8bce9ce6af92567d62820ca40464860a14b56b47d72f91f51649b1e98ea095ce9ea233258b7cc7cbf26e379516617d',
         'e9700954fc90dd3f99c47eb93eddac7f233e2e2f274f01882c49144b2c9d7499ac60e277f3629039019555c6df9aaa80',
         '457b8d78861a458425a5ed617874a8397547e03fdf2a7038f3ead6737f5cb156b5e9b3fa5df40442a152d72b1279c1c1',
-        '78975bab32bfaa527ee1233ad49b36956d91fb4c9fef47533365cabd6c98778b50709a57fda8fa5c5933fab388e9e596'
+        '78975bab32bfaa527ee1233ad49b36956d91fb4c9fef47533365cabd6c98778b50709a57fda8fa5c5933fab388e9e596',
+        'f32c9403bbcd7ed6bde26a463912c83f0d95aecffcf7040d5622d4db9e1eb6263db4e0d6edaf7062217098eaa13fe133'
     ];
     v_clean_slate_tables TEXT[] := ARRAY[
         'application_intervals',
         'application_schedule_terminal_proofs',
         'application_send_order',
         'conversation_close_terminal_entries',
+        'conversation_space_records',
+        'conversation_space_subscribers',
         'conversation_space_syncers',
         'conversation_space_writers',
         'conversation_spaces',
         'conversations',
+        'device_approvals',
         'device_entry_acks',
         'device_inventory_items',
         'device_inventory_sessions',
@@ -631,6 +637,7 @@ DECLARE
         'key_packages',
         'leaf_recovery_requests',
         'leave_requests',
+        'managed_space_members',
         'member_devices',
         'message_sends',
         'metadata_snapshots',

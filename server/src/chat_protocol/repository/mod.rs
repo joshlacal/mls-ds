@@ -35,6 +35,11 @@ pub(crate) mod delivery;
 #[cfg(any(test, feature = "test-support"))]
 pub mod delivery;
 
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) mod device_approval;
+#[cfg(any(test, feature = "test-support"))]
+pub mod device_approval;
+
 #[allow(dead_code)]
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod device_directory;

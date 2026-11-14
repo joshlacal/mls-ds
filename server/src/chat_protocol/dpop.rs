@@ -934,7 +934,10 @@ impl ReadAdmissionAttempt {
         row: LockedReadDatabaseRow,
     ) -> Result<VerifiedExistingDeviceReadRow, ReadAdmissionBindingError> {
         let binding = self.binding;
-        if &*row.device_status != "active" {
+        if &*row.device_status != "active"
+            && !(binding.endpoint.as_str() == GET_OWN_DEVICES_ENDPOINT_NSID
+                && &*row.device_status == "pending_approval")
+        {
             return Err(ReadAdmissionBindingError::DeviceStatus);
         }
         if row.key_revoked_at.is_some() {

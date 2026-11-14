@@ -545,23 +545,82 @@ pub async fn sweep_expired_published_direct_requests_for_test(
     expire_due_published_requests(pool, signer, 100).await
 }
 
-/// Mark active devices with `last_active_at <= now - 60 days` as dormant so abandoned
-/// devices cannot stall ACK-based ciphertext pruning (`I14`, `G6`).
+/// Mark active devices whose coarse UTC-day `last_active_at` is at or older than
+/// `now - CHAT_DEVICE_DORMANT_AFTER_HOURS` (default `48h`) as dormant so inactive
+/// devices cannot stall ACK-based ciphertext pruning (`I14`, `G6`), and immediately
+/// prune any application payloads that were waiting only on those newly dormant
+/// devices (queuing signed S2S `entriesPruned` notices in the same transaction).
+fn positive_hours_env(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
 pub async fn mark_inactive_devices(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> Result<u64, ExpirySweepError> {
-    let result = sqlx::query(
+    let dormant_after_hours = positive_hours_env("CHAT_DEVICE_DORMANT_AFTER_HOURS", 48);
+    // `last_active_at` is coarse-bucketed to UTC midnight (`00:00:00Z`), which can lag
+    // a late-UTC-day interaction (`23:59:59Z`) by up to 24h; add a +24h margin so the
+    // dormancy threshold reflects at least `dormant_after_hours` of true inactivity.
+    let cutoff = now - chrono::Duration::hours(dormant_after_hours) - chrono::Duration::hours(24);
+    let mut tx = pool.begin().await?;
+    let marked: Vec<(String, Uuid)> = sqlx::query_as(
         "UPDATE chat.devices \
             SET dormant_at = $1 \
           WHERE status = 'active' \
             AND dormant_at IS NULL \
-            AND last_active_at <= $1 - INTERVAL '60 days'",
+            AND last_active_at <= $2 \
+          RETURNING user_did, device_id",
     )
     .bind(now)
-    .execute(pool)
+    .bind(cutoff)
+    .fetch_all(&mut *tx)
     .await?;
-    Ok(result.rows_affected())
+    let marked_count = marked.len() as u64;
+    if !marked.is_empty() {
+        let user_dids: Vec<String> = marked.iter().map(|(did, _)| did.clone()).collect();
+        let device_ids: Vec<Uuid> = marked.iter().map(|(_, id)| *id).collect();
+        let conversations: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT ai.conversation_id \
+               FROM chat.application_intervals ai \
+               JOIN unnest($1::text[], $2::uuid[]) AS m(user_did, device_id) \
+                 ON ai.recipient_did = m.user_did \
+                AND ai.recipient_device_id = m.device_id \
+              ORDER BY ai.conversation_id ASC",
+        )
+        .bind(&user_dids)
+        .bind(&device_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        for conversation_id in conversations {
+            let _ = sqlx::query_scalar::<_, Uuid>(
+                "SELECT conversation_id FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE",
+            )
+            .bind(conversation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            super::delivery::prune_unblocked_for_conversation_and_notify(
+                &mut tx,
+                conversation_id,
+                now,
+            )
+            .await
+            .map_err(|e| match e {
+                super::delivery::DeliveryRepositoryError::Database(db) => {
+                    ExpirySweepError::Database(db)
+                }
+                other => ExpirySweepError::DirectRequest(format!(
+                    "prune dormant-unblocked payloads: {other:?}"
+                )),
+            })?;
+        }
+    }
+    tx.commit().await?;
+    Ok(marked_count)
 }
 
 /// Delete up to `limit` outbound routes no pair coordinator answered, an hour
@@ -630,17 +689,20 @@ pub async fn delete_expired_remote_lifecycle_state(
     Ok(bindings + replays)
 }
 
-/// Hard 30-day ceiling sweep: prune any unpruned `applicationEntry` ciphertext older
-/// than 30 days while keeping contiguous `seq` skeletons and `sequencer_receipt_bytes`.
-/// A sequencer queues the same signed entries-pruned notices as an ACK prune in the
-/// same transaction; without its S2S signer it prunes nothing it would have to notify.
-/// A remote home's transport copy follows the same ceiling from when the home stored
-/// it, acknowledged or not, keeping its original digest, signed metadata and receipt.
+/// Hard ceiling sweep (`CHAT_APPLICATION_PAYLOAD_TTL_HOURS`, default `72h`): prune any
+/// unpruned `applicationEntry` ciphertext older than the configured TTL while keeping
+/// contiguous `seq` skeletons, `sequencer_receipt_bytes`, and all `#commitEntry` /
+/// control ratchet entries intact (`#directRequestEntry` openings keep their 30-day
+/// ceiling). A sequencer queues the same signed entries-pruned notices as an ACK
+/// prune in the same transaction; without its S2S signer it prunes nothing it would
+/// have to notify.
 pub async fn prune_expired_application_payloads(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> Result<u64, ExpirySweepError> {
-    let cutoff = now - chrono::Duration::days(30);
+    let app_ttl_hours = positive_hours_env("CHAT_APPLICATION_PAYLOAD_TTL_HOURS", 72);
+    let app_cutoff = now - chrono::Duration::hours(app_ttl_hours);
+    let opening_cutoff = now - chrono::Duration::days(30);
     let targets: Vec<(Uuid, i64, i64)> = sqlx::query_as(
         "SELECT conversation_id, generation, seq \
            FROM chat.entries \
@@ -650,7 +712,7 @@ pub async fn prune_expired_application_payloads(
           ORDER BY received_at ASC, conversation_id ASC, seq ASC \
           LIMIT 256",
     )
-    .bind(cutoff)
+    .bind(app_cutoff)
     .fetch_all(pool)
     .await?;
     let mut batches: std::collections::BTreeMap<(Uuid, i64), Vec<i64>> = Default::default();
@@ -669,7 +731,7 @@ pub async fn prune_expired_application_payloads(
         for seq in seqs {
             if super::delivery::prune_application_entry_payload(&mut tx, conversation_id, seq, now)
                 .await
-                .map_err(|e| ExpirySweepError::DirectRequest(format!("prune 30d payload: {e:?}")))?
+                .map_err(|e| ExpirySweepError::DirectRequest(format!("prune ttl payload: {e:?}")))?
             {
                 erased.push(seq);
             }
@@ -687,14 +749,14 @@ pub async fn prune_expired_application_payloads(
             Err(crate::federation::group_relay::SignedRelayError::SignerUnavailable) => {
                 tracing::error!(
                     conversation_id = %crate::crypto::redact_for_log(&conversation_id.hyphenated().to_string()),
-                    "30d prune refused: no S2S signing key for its entries-pruned notice"
+                    "ttl prune refused: no S2S signing key for its entries-pruned notice"
                 );
                 tx.rollback().await?;
                 continue;
             }
             Err(crate::federation::group_relay::SignedRelayError::Storage(error)) => {
                 return Err(ExpirySweepError::DirectRequest(format!(
-                    "queue 30d entries-pruned notice: {error}"
+                    "queue ttl entries-pruned notice: {error}"
                 )));
             }
         }
@@ -737,7 +799,7 @@ pub async fn prune_expired_application_payloads(
           ORDER BY created_at ASC, conversation_id ASC, seq ASC \
           LIMIT 256",
     )
-    .bind(cutoff)
+    .bind(app_cutoff)
     .fetch_all(pool)
     .await?;
     for (conversation_id, seq) in transport {
@@ -746,11 +808,11 @@ pub async fn prune_expired_application_payloads(
             &mut tx,
             conversation_id,
             seq,
-            cutoff,
+            app_cutoff,
             now,
         )
         .await
-        .map_err(|e| ExpirySweepError::DirectRequest(format!("prune 30d transport: {e:?}")))?;
+        .map_err(|e| ExpirySweepError::DirectRequest(format!("prune ttl transport: {e:?}")))?;
         if did_prune {
             tx.commit().await?;
             pruned += 1;
@@ -765,17 +827,18 @@ pub async fn prune_expired_application_payloads(
     let mut tx = pool.begin().await?;
     super::delivery::erase_idempotency_payloads(
         &mut tx,
-        super::delivery::ReceiptErasure::CompletedBy(cutoff),
+        super::delivery::ReceiptErasure::CompletedBy(app_cutoff),
         now,
     )
     .await?;
     tx.commit().await?;
 
-    // O7: openings follow the same ceiling on both homes, and a transport-only
+    // O7: openings follow their 30-day ceiling on both homes, and a transport-only
     // home also drops an opening no device can import or read any more. They
     // are not application payloads and are not counted here.
-    super::direct_request_opening::prune_expired_coordinator_openings(pool, cutoff, now).await?;
-    super::direct_request_opening::prune_due_transport_openings(pool, cutoff, now).await?;
+    super::direct_request_opening::prune_expired_coordinator_openings(pool, opening_cutoff, now)
+        .await?;
+    super::direct_request_opening::prune_due_transport_openings(pool, opening_cutoff, now).await?;
     Ok(pruned)
 }
 

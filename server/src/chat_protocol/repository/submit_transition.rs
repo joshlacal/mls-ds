@@ -780,6 +780,18 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         event_position,
     )
     .await?;
+    if !matches!(
+        authority.mutation().map(|m| m.kind()),
+        Some(SignedMutationKind::MetadataTransition)
+    ) {
+        super::delivery::prune_unblocked_for_conversation_and_notify(
+            transaction,
+            Uuid::from_bytes(*parsed.prior.conversation_id()),
+            effective_instant.datetime(),
+        )
+        .await
+        .map_err(SubmitTransitionFacadeError::Delivery)?;
+    }
     if response.sha256() != &response_sha256 {
         return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
     }

@@ -419,19 +419,22 @@ static TRUSTED_PROXY_CIDRS: Lazy<Vec<IpNet>> = Lazy::new(|| {
 /// Middleware for pre-auth throttling.
 /// Uses only source IP identity (optionally from trusted proxy headers).
 pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
-    let uri = request.uri().to_string();
+    // Log the path only. The query string of chat reads carries device ids, conversation
+    // ids and DIDs, and an address next to it would tie those identifiers to a network
+    // location in the log.
+    let path = request.uri().path().to_owned();
     let client_ip = extract_client_ip(&request);
 
     match IP_LIMITER.check(&client_ip) {
         Ok(()) => {
-            tracing::debug!("IP pre-auth rate limit passed for {}: {}", client_ip, uri);
+            tracing::debug!(path = %path, "IP pre-auth rate limit passed");
             Ok(next.run(request).await)
         }
         Err(retry_after) => {
             tracing::warn!(
                 "IP pre-auth rate limit exceeded for {}: {} (retry after {} seconds)",
                 client_ip,
-                uri,
+                path,
                 retry_after
             );
             // Return ATProto-compatible JSON error body with Retry-After header

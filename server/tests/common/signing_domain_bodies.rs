@@ -8,7 +8,10 @@
 //! quietly encoded, which is the point: the shapes are pinned by the same
 //! closed-lexicon projection production uses.
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -105,7 +108,7 @@ fn device_enrollment(key_id: &str, public_key: &[u8; 32]) -> Value {
     })
 }
 
-/// The ten active bodies, each paired with its body name and the top-level field
+/// The eleven active bodies, each paired with its body name and the top-level field
 /// the harness mutates to prove the signature covers it.
 pub fn bodies(key_id: &str, public_key: &[u8; 32]) -> Vec<(&'static str, &'static str, Value)> {
     vec![
@@ -123,6 +126,11 @@ pub fn bodies(key_id: &str, public_key: &[u8; 32]) -> Vec<(&'static str, &'stati
             "deviceRevocationBody",
             "targetDeviceId",
             device_revocation(key_id),
+        ),
+        (
+            "deviceApprovalBody",
+            "targetDeviceId",
+            device_approval(key_id),
         ),
         (
             "blobUploadPreparationBody",
@@ -180,6 +188,27 @@ fn device_revocation(key_id: &str) -> Value {
         "targetDeviceId": "71717171-7171-4171-b171-717171717171",
         "targetAuthGeneration": 1,
         "idempotencyKey": "00000000-0000-4000-8000-000000000014",
+        "signedAt": SIGNED_AT
+    })
+}
+
+fn device_approval(key_id: &str) -> Value {
+    let target_public_key = ed25519_dalek::SigningKey::from_bytes(&[0x5d; 32])
+        .verifying_key()
+        .to_bytes();
+    let target_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(target_public_key));
+    json!({
+        "$type": "blue.catbird.chat.defs#deviceApprovalBody",
+        "signatureDomain": "CATBIRD-CHAT-DEVICE-APPROVE\u{0}",
+        "actorDid": ACTOR_DID,
+        "actorDeviceId": ACTOR_DEVICE_ID,
+        "keyId": key_id,
+        "authGeneration": 1,
+        "targetDeviceId": "72727272-7272-4272-b272-727272727272",
+        "targetKeyId": target_key_id,
+        "targetSignaturePublicKey": STANDARD.encode(target_public_key),
+        "targetAuthGeneration": 1,
+        "idempotencyKey": "00000000-0000-4000-8000-00000000001d",
         "signedAt": SIGNED_AT
     })
 }

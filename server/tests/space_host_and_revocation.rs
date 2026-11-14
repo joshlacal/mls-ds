@@ -1,16 +1,20 @@
-//! Option A Conversation `SpaceHost` & Revocation Fan-Out integration tests (`atproto#5187`).
+//! Option A Conversation `SpaceHost` & Revocation Fan-Out integration tests (Nov-12 Spaces).
 //!
-//! Pins all Review Focus items from Plan 04 Task 3:
-//! 1. `getSpaceCredential` & `notifyWrite` require `status = 'active'` with ZERO `NOT c.is_remote`
-//!    local-only blocks, 60s single-use delegation `jti` replay cache, and 10m credential `jti` ledger.
-//! 2. `listRepos` includes writers with `status IN ('active', 'left', 'removed')` in ascending
-//!    `spaceRev` order while strictly excluding `'pending'` / declined `C33` direct-request targets.
+//! Pins the Nov-12 Conversation Space Authority contract:
+//! 1. `authorizeSpaceSync` & `notifyRepoUpdate` require `status = 'active'` with ZERO `NOT c.is_remote`
+//!    local-only blocks, 60s single-use delegation `jti` replay cache, 10m credential `jti` ledger,
+//!    and synchronous `confirmRegistration` challenge verification when `notify` is supplied.
+//! 2. `listWriters` includes writers with `status IN ('active', 'left', 'removed')` in ascending
+//!    `spaceRev` order (`#repoWrite` with `"repo"`, plus `#repoRemoved` tombstones for `removeWriter`)
+//!    while strictly excluding `'pending'` / declined `C33` direct-request targets.
 //! 3. Member removal or device revocation immediately marks credential `jti`s revoked (`401`
-//!    `CredentialRevoked` on subsequent reads) AND fans out `com.atproto.space.notifyCredentialRevoked`
-//!    to ALL writers' PDSes (after DB commit — never inside an open SQL transaction, `M-F04`).
-//! 4. Account deletion (`delete_account_data_with_conversations` / `removeWriter`) removes the
-//!    deleted DID from `listRepos`, and generation close fans out `com.atproto.space.notifySpaceDeleted`
-//!    to registered syncers and writers' PDSes, after which Space calls return `410 SpaceDeleted`.
+//!    `CredentialRevoked` on subsequent reads) AND fans out `com.atproto.space.notifyCredentialsRevoked`
+//!    (string JTI array) to ALL writers' PDSes (after DB commit — never inside an open SQL transaction, `M-F04`).
+//! 4. Account deletion (`delete_account_data_with_conversations`) removes the deleted DID from
+//!    `listWriters`, `removeWriter` emits `#repoRemoved` + fans out `notifySpaceUpdate`, and
+//!    generation close fans out `com.atproto.space.notifySpaceUpdate` (`#spaceDeleted`) to confirmed
+//!    subscribers, after which Space calls (including unauthenticated `authorizeSpaceSync` probes)
+//!    return `410 SpaceDeleted`.
 
 mod common;
 
@@ -18,10 +22,7 @@ use atproto_spaces::{
     http_signature::sign_credential_request,
     kem::{encapsulate_p256, encode_p256_did_key},
     lthash::LtHash,
-    mac::{
-        format_want_mac_header, verify_commit_mac, COMMIT_MAC_TYPE, SPACE_MAC_HEADER_NAME,
-        SPACE_WANT_MAC_HEADER_NAME,
-    },
+    mac::{format_accept_signature, verify_commit_mac, MacProfile, ACCEPT_SIGNATURE_HEADER},
     tokens::{mint_space_token, SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind},
     SpaceUri,
 };
@@ -97,11 +98,11 @@ async fn inventory_page(
     space: &str,
     cursor: Option<&str>,
     limit: usize,
-) -> (Response, [u8; 32]) {
+) -> (Response, [u8; 32], String) {
     let authority_kem = encode_p256_did_key(&P256PublicKey::from(authority_key.verifying_key()));
     let encapsulation = encapsulate_p256(&authority_kem).expect("encapsulate inventory MAC key");
-    let want_mac =
-        format_want_mac_header(&encapsulation.key_share_did_key, COMMIT_MAC_TYPE).unwrap();
+    let accept_sig =
+        format_accept_signature(MacProfile::Commit, &encapsulation.key_share_did_key).unwrap();
     let mut headers = build_signed_space_headers(
         pop_key,
         credential,
@@ -110,8 +111,8 @@ async fn inventory_page(
         &Uuid::new_v4().to_string(),
     );
     headers.insert(
-        SPACE_WANT_MAC_HEADER_NAME,
-        HeaderValue::from_str(&want_mac).unwrap(),
+        ACCEPT_SIGNATURE_HEADER,
+        HeaderValue::from_str(&accept_sig).unwrap(),
     );
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query.append_pair("space", space);
@@ -121,7 +122,7 @@ async fn inventory_page(
     }
     let mut request = Request::builder()
         .uri(format!(
-            "/xrpc/com.atproto.space.listRepos?{}",
+            "/xrpc/com.atproto.space.listWriters?{}",
             query.finish()
         ))
         .body(Body::empty())
@@ -130,6 +131,7 @@ async fn inventory_page(
     (
         app.clone().oneshot(request).await.unwrap(),
         encapsulation.shared_secret,
+        encapsulation.key_share_did_key,
     )
 }
 
@@ -145,13 +147,32 @@ async fn start_mock_pds_and_syncer() -> (String, Arc<Mutex<Vec<RecordedNotice>>>
     let state = notices.clone();
     let app = Router::new()
         .route(
-            "/xrpc/com.atproto.space.notifyCredentialRevoked",
+            "/xrpc/com.atproto.space.confirmRegistration",
+            post(
+                |State(log): State<Arc<Mutex<Vec<RecordedNotice>>>>,
+                 headers: HeaderMap,
+                 Json(body): Json<Value>| async move {
+                    let challenge = body["challenge"].as_str().unwrap_or_default().to_owned();
+                    log.lock().unwrap().push(RecordedNotice {
+                        path: "/xrpc/com.atproto.space.confirmRegistration".into(),
+                        auth: headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned),
+                        body,
+                    });
+                    (StatusCode::OK, Json(json!({ "challenge": challenge })))
+                },
+            ),
+        )
+        .route(
+            "/xrpc/com.atproto.space.notifyCredentialsRevoked",
             post(
                 |State(log): State<Arc<Mutex<Vec<RecordedNotice>>>>,
                  headers: HeaderMap,
                  Json(body): Json<Value>| async move {
                     log.lock().unwrap().push(RecordedNotice {
-                        path: "/xrpc/com.atproto.space.notifyCredentialRevoked".into(),
+                        path: "/xrpc/com.atproto.space.notifyCredentialsRevoked".into(),
                         auth: headers
                             .get("authorization")
                             .and_then(|v| v.to_str().ok())
@@ -163,31 +184,13 @@ async fn start_mock_pds_and_syncer() -> (String, Arc<Mutex<Vec<RecordedNotice>>>
             ),
         )
         .route(
-            "/xrpc/com.atproto.space.notifySpaceDeleted",
+            "/xrpc/com.atproto.space.notifySpaceUpdate",
             post(
                 |State(log): State<Arc<Mutex<Vec<RecordedNotice>>>>,
                  headers: HeaderMap,
                  Json(body): Json<Value>| async move {
                     log.lock().unwrap().push(RecordedNotice {
-                        path: "/xrpc/com.atproto.space.notifySpaceDeleted".into(),
-                        auth: headers
-                            .get("authorization")
-                            .and_then(|v| v.to_str().ok())
-                            .map(str::to_owned),
-                        body,
-                    });
-                    StatusCode::OK
-                },
-            ),
-        )
-        .route(
-            "/xrpc/com.atproto.space.notifyWrite",
-            post(
-                |State(log): State<Arc<Mutex<Vec<RecordedNotice>>>>,
-                 headers: HeaderMap,
-                 Json(body): Json<Value>| async move {
-                    log.lock().unwrap().push(RecordedNotice {
-                        path: "/xrpc/com.atproto.space.notifyWrite".into(),
+                        path: "/xrpc/com.atproto.space.notifySpaceUpdate".into(),
                         auth: headers
                             .get("authorization")
                             .and_then(|v| v.to_str().ok())
@@ -261,8 +264,6 @@ fn mint_service_jwt_es256(issuer_did: &str, key: &P256SigningKey, aud: &str, lxm
     format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
 }
 
-/// Claims of the authority's signed refusal in a 403 `getSpaceCredential` body, after its
-/// ES256 signature verified under the authority's `#atproto` key.
 fn verified_denial(body: &[u8], authority_key: &P256SigningKey) -> Value {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use p256::ecdsa::{signature::Verifier as _, Signature};
@@ -283,6 +284,7 @@ fn verified_denial(body: &[u8], authority_key: &P256SigningKey) -> Value {
         .expect("signed by the Space authority");
     serde_json::from_slice(&decode(claims)).unwrap()
 }
+
 static SPACE_HOST_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
@@ -319,6 +321,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     .expect("conversation_spaces row");
 
     let (mock_url, recorded_notices) = start_mock_pds_and_syncer().await;
+    let syncer_token = "syncer-subscriber-token-0123456789abcdef";
 
     let authority_key = P256SigningKey::from_bytes((&[0x31u8; 32]).into()).unwrap();
     let sender_pds_key = P256SigningKey::from_bytes((&[0x32u8; 32]).into()).unwrap();
@@ -339,16 +342,12 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         recipient_pds_key.verifying_key(),
         &mock_url,
     );
-    host_runtime.register_test_did_endpoint(
-        "did:plc:syncerserviceaaaaaaaaaaa",
-        sender_pds_key.verifying_key(),
-        &mock_url,
-    );
 
     let app = space_host_router(host_runtime.clone());
     let now_sec = Utc::now().timestamp() as u64;
 
-    // 1. Active sender & active recipient both mint Space credentials even with is_remote = true!
+    // 1. Active sender & active recipient both mint Space credentials via authorizeSpaceSync
+    //    (including synchronous confirmRegistration when `notify` is supplied)!
     let sender_pop = P256SigningKey::from_bytes((&[0x41u8; 32]).into()).unwrap();
     let sender_kid = encode_p256_did_key(&P256PublicKey::from(sender_pop.verifying_key()));
     let sender_del = mint_delegation(
@@ -364,13 +363,17 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .uri("/xrpc/com.atproto.space.authorizeSpaceSync")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "space": space_uri,
-                        "credentialKid": sender_kid,
+                        "credentialKey": sender_kid,
                         "delegationToken": sender_del,
+                        "notify": {
+                            "endpoint": mock_url,
+                            "token": syncer_token,
+                        },
                     }))
                     .unwrap(),
                 ))
@@ -381,12 +384,25 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "active member must mint credential"
+        "active member must mint credential and confirm notify subscriber"
     );
     let sender_cred_json: Value =
         serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 65536).await.unwrap())
             .unwrap();
+    assert!(sender_cred_json.get("expiresAt").is_none());
     let sender_cred = sender_cred_json["credential"].as_str().unwrap().to_string();
+
+    {
+        let log = recorded_notices.lock().unwrap();
+        assert!(
+            log.iter().any(|n| {
+                n.path == "/xrpc/com.atproto.space.confirmRegistration"
+                    && n.body["space"] == space_uri
+                    && n.body["token"] == syncer_token
+            }),
+            "confirmRegistration must run synchronously during authorizeSpaceSync"
+        );
+    }
 
     // Replaying the exact same delegation jti MUST fail closed!
     let replay_resp = app
@@ -394,12 +410,12 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .uri("/xrpc/com.atproto.space.authorizeSpaceSync")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "space": space_uri,
-                        "credentialKid": sender_kid,
+                        "credentialKey": sender_kid,
                         "delegationToken": sender_del,
                     }))
                     .unwrap(),
@@ -433,12 +449,12 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .uri("/xrpc/com.atproto.space.authorizeSpaceSync")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "space": space_uri,
-                        "credentialKid": recip_kid,
+                        "credentialKey": recip_kid,
                         "delegationToken": recip_del,
                     }))
                     .unwrap(),
@@ -456,7 +472,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     .unwrap();
     let recip_cred = recip_cred_json["credential"].as_str().unwrap().to_string();
 
-    // 2. Pending / unaccepted C33 direct-request target MUST be denied getSpaceCredential & excluded from listRepos!
+    // 2. Pending / unaccepted C33 direct-request target MUST be denied authorizeSpaceSync & excluded from listWriters!
     let receipt_key = P256SigningKey::random(&mut OsRng);
     let service_key = P256SigningKey::random(&mut OsRng);
     let receipt_doc = catbird_server::identity::did_doc::build_direct_request_receipt_did_document(
@@ -498,12 +514,12 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .uri("/xrpc/com.atproto.space.authorizeSpaceSync")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "space": pending_space_uri,
-                        "credentialKid": recip_kid,
+                        "credentialKey": recip_kid,
                         "delegationToken": pending_del,
                     }))
                     .unwrap(),
@@ -518,25 +534,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         "pending C33 target must be denied Space credential"
     );
 
-    // 3. Register syncer via registerNotify, then both sender and recipient call notifyWrite
-    let mut reg_headers =
-        build_signed_space_headers(&sender_pop, &sender_cred, authority_did, now_sec, "reg-1");
-    reg_headers.insert("content-type", "application/json".parse().unwrap());
-    let mut reg_req = Request::builder()
-        .method("POST")
-        .uri("/xrpc/com.atproto.space.registerNotify")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "space": space_uri,
-                "service": "did:plc:syncerserviceaaaaaaaaaaa#atproto_sync",
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    *reg_req.headers_mut() = reg_headers;
-    let reg_resp = app.clone().oneshot(reg_req).await.unwrap();
-    assert_eq!(reg_resp.status(), StatusCode::OK, "registerNotify failed");
-
+    // 3. Both sender and recipient call notifyRepoUpdate -> fans out notifySpaceUpdate (#repoWrite) to subscriber!
     for (did, key, rev_str, fill) in [
         (
             &fixture.sender_did,
@@ -555,14 +553,14 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
             did,
             key,
             &format!("{authority_did}#atproto_mls"),
-            "com.atproto.space.notifyWrite",
+            "com.atproto.space.notifyRepoUpdate",
         );
         let nw_resp = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/xrpc/com.atproto.space.notifyWrite")
+                    .uri("/xrpc/com.atproto.space.notifyRepoUpdate")
                     .header("authorization", format!("Bearer {jwt}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -581,15 +579,24 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         assert_eq!(
             nw_resp.status(),
             StatusCode::OK,
-            "notifyWrite for {did} failed"
+            "notifyRepoUpdate for {did} failed"
         );
     }
 
-    // 4. Add a 3rd active member (charlie_did), mint credential + notifyWrite, then remove charlie_did via committed policy transition:
-    //    - Removed member is immediately denied new getSpaceCredential & notifyWrite (403 Forbidden)
-    //    - revoke_inactive_space_credentials_for_conversation revokes charlie_did's existing credential jti (401 CredentialRevoked)
-    //      AND fans out notifyCredentialRevoked to ALL 3 writers' PDSes!
-    //    - listRepos STILL includes charlie_did's historical writer entry alongside active writers in ascending spaceRev order!
+    {
+        let log = recorded_notices.lock().unwrap();
+        assert!(
+            log.iter().any(|n| {
+                n.path == "/xrpc/com.atproto.space.notifySpaceUpdate"
+                    && n.auth.is_none()
+                    && n.body["token"] == syncer_token
+                    && n.body["update"]["$type"] == "com.atproto.space.defs#repoWrite"
+            }),
+            "notifyRepoUpdate must fan out unauthenticated notifySpaceUpdate #repoWrite"
+        );
+    }
+
+    // 4. Add a 3rd active member (charlie_did), mint credential + notifyRepoUpdate, then remove charlie_did:
     let charlie_did = "did:web:charlie-member.routing.example.com";
     let charlie_pds_key = P256SigningKey::from_bytes((&[0x35u8; 32]).into()).unwrap();
     host_runtime.register_test_did_endpoint(
@@ -621,12 +628,12 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .uri("/xrpc/com.atproto.space.authorizeSpaceSync")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "space": space_uri,
-                        "credentialKid": charlie_kid,
+                        "credentialKey": charlie_kid,
                         "delegationToken": charlie_del,
                     }))
                     .unwrap(),
@@ -651,14 +658,14 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         charlie_did,
         &charlie_pds_key,
         &format!("{authority_did}#atproto_mls"),
-        "com.atproto.space.notifyWrite",
+        "com.atproto.space.notifyRepoUpdate",
     );
     let charlie_nw_resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/xrpc/com.atproto.space.notifyWrite")
+                .uri("/xrpc/com.atproto.space.notifyRepoUpdate")
                 .header("authorization", format!("Bearer {charlie_nw_jwt}"))
                 .header("content-type", "application/json")
                 .body(Body::from(
@@ -677,7 +684,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     assert_eq!(
         charlie_nw_resp.status(),
         StatusCode::OK,
-        "notifyWrite for charlie failed"
+        "notifyRepoUpdate for charlie failed"
     );
 
     seed_clean_slate_remove_zero_leaf_member_for_test(
@@ -693,7 +700,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         .await
         .expect("revoke inactive credentials and fan out");
 
-    // Removed member MUST be denied new getSpaceCredential (403 Forbidden)!
+    // Removed member MUST be denied new authorizeSpaceSync (403 Forbidden with signed denial)!
     let charlie_del_after = mint_delegation(
         charlie_did,
         &charlie_pds_key,
@@ -707,12 +714,12 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .uri("/xrpc/com.atproto.space.authorizeSpaceSync")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "space": space_uri,
-                        "credentialKid": charlie_kid,
+                        "credentialKey": charlie_kid,
                         "delegationToken": charlie_del_after,
                     }))
                     .unwrap(),
@@ -724,10 +731,8 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     assert_eq!(
         charlie_after_resp.status(),
         StatusCode::FORBIDDEN,
-        "removed member must be denied getSpaceCredential"
+        "removed member must be denied authorizeSpaceSync"
     );
-    // The refusal is the authority's signed denial of exactly this request: Space, requester,
-    // conversation generation, MLS group and the request's PoP key, live for 60 s.
     let group_id: Vec<u8> = sqlx::query_scalar(
         "SELECT group_id FROM chat.generations WHERE conversation_id = $1 AND generation = 0",
     )
@@ -753,7 +758,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         })
     );
 
-    // Charlie's previously-minted credential MUST now fail with 401 CredentialRevoked on listRepos!
+    // Charlie's previously-minted credential MUST now fail with 401 CredentialRevoked on listWriters!
     let revoked_headers = build_signed_space_headers(
         &charlie_pop,
         &charlie_cred,
@@ -764,7 +769,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     let mut rev_list_req = Request::builder()
         .method("GET")
         .uri(format!(
-            "/xrpc/com.atproto.space.listRepos?space={}",
+            "/xrpc/com.atproto.space.listWriters?space={}",
             urlencoding::encode(&space_uri)
         ))
         .body(Body::empty())
@@ -777,7 +782,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         "revoked credential jti must be rejected immediately"
     );
 
-    // Sender's credential still works AND listRepos still returns ALL THREE writers (active + removed historical writer)!
+    // Sender's credential still works AND listWriters returns ALL THREE writers with `"repo"`!
     let sender_list_headers = build_signed_space_headers(
         &sender_pop,
         &sender_cred,
@@ -788,7 +793,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     let mut list_req = Request::builder()
         .method("GET")
         .uri(format!(
-            "/xrpc/com.atproto.space.listRepos?space={}",
+            "/xrpc/com.atproto.space.listWriters?space={}",
             urlencoding::encode(&space_uri)
         ))
         .body(Body::empty())
@@ -796,6 +801,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     *list_req.headers_mut() = sender_list_headers;
     let list_resp = app.clone().oneshot(list_req).await.unwrap();
     assert_eq!(list_resp.status(), StatusCode::OK);
+    assert_eq!(list_resp.headers()["vary"], "Accept-Signature");
     let list_json: Value = serde_json::from_slice(
         &axum::body::to_bytes(list_resp.into_body(), 65536)
             .await
@@ -806,7 +812,10 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| r["did"].as_str().unwrap())
+        .map(|r| {
+            assert_eq!(r["$type"], "com.atproto.space.defs#repoWrite");
+            r["repo"].as_str().unwrap()
+        })
         .collect();
     assert_eq!(
         repo_dids,
@@ -815,19 +824,19 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
             fixture.recipient_did.as_str(),
             charlie_did
         ],
-        "listRepos must preserve historical removed writer alongside active writers in ascending spaceRev order"
+        "listWriters must preserve historical removed writer alongside active writers in ascending spaceRev order"
     );
 
-    // Verify notifyCredentialRevoked was fanned out to ALL 3 writers' PDSes!
+    // Verify notifyCredentialsRevoked was fanned out to ALL 3 writers' PDSes with string JTI array!
     {
         let log = recorded_notices.lock().unwrap();
         let rev_calls: Vec<&RecordedNotice> = log
             .iter()
-            .filter(|n| n.path == "/xrpc/com.atproto.space.notifyCredentialRevoked")
+            .filter(|n| n.path == "/xrpc/com.atproto.space.notifyCredentialsRevoked")
             .collect();
         assert!(
             rev_calls.len() >= 3,
-            "notifyCredentialRevoked must fan out to all writers' PDSes, got {}",
+            "notifyCredentialsRevoked must fan out to all writers' PDSes, got {}",
             rev_calls.len()
         );
         assert!(rev_calls[0]
@@ -836,13 +845,15 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
             .unwrap_or("")
             .starts_with("Bearer "));
         assert_eq!(rev_calls[0].body["space"], space_uri);
-        assert_eq!(
-            rev_calls[0].body["credentials"].as_array().unwrap().len(),
-            1
+        let creds = rev_calls[0].body["credentials"].as_array().unwrap();
+        assert_eq!(creds.len(), 1);
+        assert!(
+            creds[0].is_string(),
+            "Nov-12 credentials array holds string JTIs"
         );
     }
 
-    // Device revocation across conversations (revoke_user_space_credentials_across_conversations) also revokes recipient's credential!
+    // Device revocation across conversations also revokes recipient's credential!
     revoke_user_space_credentials_across_conversations(&host_runtime, &fixture.recipient_did)
         .await
         .expect("revoke device credentials across conversations");
@@ -856,7 +867,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     let mut recip_rev_req = Request::builder()
         .method("GET")
         .uri(format!(
-            "/xrpc/com.atproto.space.listRepos?space={}",
+            "/xrpc/com.atproto.space.listWriters?space={}",
             urlencoding::encode(&space_uri)
         ))
         .body(Body::empty())
@@ -888,7 +899,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     let mut list_after_del_req = Request::builder()
         .method("GET")
         .uri(format!(
-            "/xrpc/com.atproto.space.listRepos?space={}",
+            "/xrpc/com.atproto.space.listWriters?space={}",
             urlencoding::encode(&space_uri)
         ))
         .body(Body::empty())
@@ -906,28 +917,57 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| r["did"].as_str().unwrap())
+        .map(|r| r["repo"].as_str().unwrap())
         .collect();
     assert_eq!(
         remaining_dids,
         vec![fixture.sender_did.as_str(), fixture.recipient_did.as_str()],
-        "account deletion must remove deleted DID from listRepos"
+        "account deletion must remove deleted DID from listWriters"
     );
 
-    // 6. Generation close fans out notifySpaceDeleted to syncers + writers, and subsequent listRepos returns 410 Gone!
+    // 6. Generation close fans out notifySpaceUpdate (#spaceDeleted) to subscribers, and subsequent
+    //    listWriters + unauthenticated authorizeSpaceSync probes return 410 Gone (SpaceDeleted)!
     fan_out_space_deleted_for_conversation(&host_runtime, fixture.conversation_id, 0)
         .await
-        .expect("fan out notifySpaceDeleted");
+        .expect("fan out notifySpaceUpdate #spaceDeleted");
 
     {
         let log = recorded_notices.lock().unwrap();
         assert!(
-            log.iter()
-                .any(|n| n.path == "/xrpc/com.atproto.space.notifySpaceDeleted"
-                    && n.body["space"] == space_uri),
-            "notifySpaceDeleted must be delivered to registered syncers/writers"
+            log.iter().any(|n| {
+                n.path == "/xrpc/com.atproto.space.notifySpaceUpdate"
+                    && n.auth.is_none()
+                    && n.body["token"] == syncer_token
+                    && n.body["update"]["$type"]
+                        == "com.atproto.space.notifySpaceUpdate#spaceDeleted"
+            }),
+            "notifySpaceUpdate#spaceDeleted must be delivered to confirmed subscribers"
         );
     }
+
+    let unauth_probe_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.authorizeSpaceSync")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "space": space_uri,
+                        "credentialKey": sender_kid,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unauth_probe_resp.status(),
+        StatusCode::GONE,
+        "unauthenticated authorizeSpaceSync probe on deleted Space must return 410 SpaceDeleted"
+    );
 
     let list_closed_headers = build_signed_space_headers(
         &sender_pop,
@@ -939,7 +979,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     let mut closed_req = Request::builder()
         .method("GET")
         .uri(format!(
-            "/xrpc/com.atproto.space.listRepos?space={}",
+            "/xrpc/com.atproto.space.listWriters?space={}",
             urlencoding::encode(&space_uri)
         ))
         .body(Body::empty())
@@ -1015,8 +1055,6 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
     .unwrap();
     let mut expected = Vec::new();
     let mut tx = pool.begin().await.unwrap();
-    // This fixture exercises inventory paging, not transition provenance. Materialize
-    // the otherwise-valid 105-member roster without synthesizing 105 MLS transitions.
     sqlx::query("SET LOCAL session_replication_role = 'replica'")
         .execute(&mut *tx)
         .await
@@ -1095,12 +1133,12 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/xrpc/com.atproto.space.getSpaceCredential")
+                .uri("/xrpc/com.atproto.space.authorizeSpaceSync")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "space": &space_uri,
-                        "credentialKid": &sender_kid,
+                        "credentialKey": &sender_kid,
                         "delegationToken": delegation,
                     }))
                     .unwrap(),
@@ -1118,7 +1156,7 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
     .unwrap();
     let credential = credential_body["credential"].as_str().unwrap();
 
-    let (first_response, first_secret) = inventory_page(
+    let (first_response, first_secret, first_key_share) = inventory_page(
         &app,
         &sender_pop,
         credential,
@@ -1131,10 +1169,7 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
     )
     .await;
     assert_eq!(first_response.status(), StatusCode::OK);
-    let first_mac = first_response.headers()[SPACE_MAC_HEADER_NAME]
-        .to_str()
-        .unwrap()
-        .to_owned();
+    let first_headers = first_response.headers().clone();
     let first: Value = serde_json::from_slice(
         &axum::body::to_bytes(first_response.into_body(), 2 * 1024 * 1024)
             .await
@@ -1152,7 +1187,8 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
         .unwrap();
     verify_commit_mac(
         &first_secret,
-        &first_mac,
+        &first_key_share,
+        &first_headers,
         &space_uri,
         authority_did,
         first_commit["rev"].as_str().unwrap(),
@@ -1160,7 +1196,7 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
     )
     .unwrap();
 
-    let (second_response, second_secret) = inventory_page(
+    let (second_response, second_secret, second_key_share) = inventory_page(
         &app,
         &sender_pop,
         credential,
@@ -1173,10 +1209,7 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
     )
     .await;
     assert_eq!(second_response.status(), StatusCode::OK);
-    let second_mac = second_response.headers()[SPACE_MAC_HEADER_NAME]
-        .to_str()
-        .unwrap()
-        .to_owned();
+    let second_headers = second_response.headers().clone();
     let second: Value = serde_json::from_slice(
         &axum::body::to_bytes(second_response.into_body(), 2 * 1024 * 1024)
             .await
@@ -1189,7 +1222,8 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
     assert_eq!(second["commit"], first_commit);
     verify_commit_mac(
         &second_secret,
-        &second_mac,
+        &second_key_share,
+        &second_headers,
         &space_uri,
         authority_did,
         second["commit"]["rev"].as_str().unwrap(),
@@ -1206,7 +1240,8 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
     assert_eq!(rows.len(), expected.len());
     let mut inventory_hash = LtHash::empty();
     for (row, (expected_did, expected_rev, expected_data)) in rows.iter().zip(&expected) {
-        assert_eq!(row["did"], expected_did.as_str());
+        assert_eq!(row["$type"], "com.atproto.space.defs#repoWrite");
+        assert_eq!(row["repo"], expected_did.as_str());
         assert_eq!(row["repoRev"], expected_rev.as_str());
         assert_eq!(row["spaceRev"], expected_rev.as_str());
         let data: [u8; 32] = base64::engine::general_purpose::STANDARD
@@ -1229,7 +1264,7 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
         b'A'
     };
     let tampered_cursor = std::str::from_utf8(&tampered_cursor).unwrap();
-    let (tampered_response, _) = inventory_page(
+    let (tampered_response, _, _) = inventory_page(
         &app,
         &sender_pop,
         credential,
@@ -1266,7 +1301,7 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
         .await
         .unwrap();
     change.commit().await.unwrap();
-    let (changed_response, _) = inventory_page(
+    let (changed_response, _, _) = inventory_page(
         &app,
         &sender_pop,
         credential,

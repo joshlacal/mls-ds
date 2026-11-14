@@ -15,6 +15,7 @@ use crate::storage::DbPool;
 
 mod accept_conversation;
 mod acknowledge_entries;
+mod approve_device;
 mod context;
 mod conversation_state;
 mod create_conversation;
@@ -282,6 +283,7 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::GetConversationState
             | ChatEndpoint::RequestReset
             | ChatEndpoint::ActivateReset
+            | ChatEndpoint::ApproveDevice
             | ChatEndpoint::RevokeDevice
             | ChatEndpoint::AcknowledgeWelcome
             | ChatEndpoint::RejectWelcome
@@ -371,6 +373,10 @@ where
         .route(
             &xrpc_path(ChatEndpoint::RevokeDevice),
             spost(revoke_device::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::ApproveDevice),
+            spost(approve_device::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::AcknowledgeWelcome),

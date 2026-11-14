@@ -151,6 +151,23 @@ pub async fn admit_query(
     Ok((admission, params))
 }
 
+/// Admit a query for `name` allowing `pending_approval` callers (caller-DID self-check enforced by handler).
+pub async fn admit_query_allowing_pending(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    name: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+    allowed: &[&str],
+) -> LabyrinthResult<(Admission, Params)> {
+    let nsid = format!("{NSID_PREFIX}{name}");
+    let admission =
+        auth::admit_query_allowing_pending(pool, runtime.cutover_enabled(), &nsid, headers, query)
+            .await?;
+    let params = Params::parse(query, allowed)?;
+    Ok((admission, params))
+}
+
 /// Admit a signed query whose only accepted parameters are `allowed`.
 pub async fn admit_fixed_query(
     pool: &DbPool,
@@ -167,6 +184,28 @@ pub async fn admit_fixed_query(
     Ok((admission, params))
 }
 
+/// Admit a fixed-shape query allowing `pending_approval` callers (caller-DID self-check enforced by handler).
+pub async fn admit_fixed_query_allowing_pending(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    name: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+    allowed: &[&str],
+) -> LabyrinthResult<(Admission, Params)> {
+    let nsid = format!("{NSID_PREFIX}{name}");
+    let admission = auth::admit_fixed_query_allowing_pending(
+        pool,
+        runtime.cutover_enabled(),
+        &nsid,
+        headers,
+        query,
+    )
+    .await?;
+    let params = Params::parse_exact(query, allowed)?;
+    Ok((admission, params))
+}
+
 /// Admit a procedure for `name` over this exact body.
 pub async fn admit_procedure(
     pool: &DbPool,
@@ -179,6 +218,19 @@ pub async fn admit_procedure(
     auth::admit_procedure(pool, runtime.cutover_enabled(), &nsid, headers, body).await
 }
 
+/// Admit a procedure for `name` allowing `pending_approval` callers (chained `prevSig` enforced by handler).
+pub async fn admit_procedure_allowing_pending(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    name: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> LabyrinthResult<Admission> {
+    let nsid = format!("{NSID_PREFIX}{name}");
+    auth::admit_procedure_allowing_pending(pool, runtime.cutover_enabled(), &nsid, headers, body)
+        .await
+}
+
 /// Open a procedure transaction, or return the replayed response.
 macro_rules! begin_write {
     ($pool:expr, $admission:expr) => {
@@ -189,3 +241,14 @@ macro_rules! begin_write {
     };
 }
 pub(super) use begin_write;
+
+/// Open a procedure transaction allowing `pending_approval` self-promotion, or return the replayed response.
+macro_rules! begin_write_allowing_pending {
+    ($pool:expr, $admission:expr) => {
+        match crate::labyrinth::auth::begin_write_allowing_pending($pool, $admission).await? {
+            crate::labyrinth::auth::Begun::Replay(bytes) => return Ok(bytes),
+            crate::labyrinth::auth::Begun::Fresh(w) => w,
+        }
+    };
+}
+pub(super) use begin_write_allowing_pending;

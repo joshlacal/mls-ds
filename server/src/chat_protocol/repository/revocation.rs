@@ -293,6 +293,19 @@ impl AppliedDeviceRevocationMutation {
             None,
         )
         .await?;
+        super::delivery::prune_unblocked_for_device_and_notify(
+            transaction,
+            &target_did,
+            target_device_id,
+            self.authority.trusted_instant().datetime(),
+        )
+        .await
+        .map_err(|error| match error {
+            super::delivery::DeliveryRepositoryError::Database(db) => {
+                DeviceRevocationFacadeError::Database(db)
+            }
+            _ => DeviceRevocationFacadeError::Integrity,
+        })?;
         Ok(CompletedDeviceRevocationMutation {
             target_did,
             target_device_id,
@@ -348,7 +361,14 @@ impl CanonicalDeviceRevocationResponse {
                 available_package_count: device.available_package_count,
                 created_at: crate::sqlx_jacquard::chrono_to_datetime(device.created_at),
                 device_id: SmolStr::from(device.device_id.to_string()),
+                device_name: Some(SmolStr::from(device.device_name.as_str())),
+                dormant_at: device
+                    .dormant_at
+                    .map(crate::sqlx_jacquard::chrono_to_datetime),
                 key_id: SmolStr::from(device.key_id.as_str()),
+                last_active_at: Some(crate::sqlx_jacquard::chrono_to_datetime(
+                    device.last_active_at,
+                )),
                 reserved_package_count: device.reserved_package_count,
                 signature_public_key: Bytes::from(device.signing_public_key.clone()),
                 status: SmolStr::from(device.status.as_str()),
@@ -638,6 +658,7 @@ struct DurableDeviceRevocationRow {
 #[derive(sqlx::FromRow)]
 struct RevokedTargetPostStateRow {
     device_id: Uuid,
+    device_name: String,
     key_id: String,
     signing_public_key: Vec<u8>,
     auth_generation: i64,
@@ -646,6 +667,8 @@ struct RevokedTargetPostStateRow {
     status: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    last_active_at: DateTime<Utc>,
+    dormant_at: Option<DateTime<Utc>>,
     device_revoked_at: Option<DateTime<Utc>>,
     device_revocation_id: Option<Uuid>,
     key_revoked_at: Option<DateTime<Utc>>,
@@ -765,6 +788,7 @@ fn device_revocation_replay_post_state_digest(
     digest.update(accepted_at.timestamp_millis().to_be_bytes());
     digest.update(device.device_id.as_bytes());
     for value in [
+        device.device_name.as_bytes(),
         device.key_id.as_bytes(),
         device.signing_public_key.as_slice(),
         device.dpop_jkt.as_deref().unwrap_or_default().as_bytes(),
@@ -777,6 +801,14 @@ fn device_revocation_replay_post_state_digest(
     digest.update(device.auth_generation.to_be_bytes());
     digest.update(device.created_at.timestamp_millis().to_be_bytes());
     digest.update(device.updated_at.timestamp_millis().to_be_bytes());
+    digest.update(device.last_active_at.timestamp_millis().to_be_bytes());
+    match device.dormant_at {
+        Some(ts) => {
+            digest.update([1]);
+            digest.update(ts.timestamp_millis().to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
     digest.update(device.available_package_count.to_be_bytes());
     digest.update(device.reserved_package_count.to_be_bytes());
     digest.update(expected_status.to_be_bytes());
@@ -840,6 +872,7 @@ async fn prepare_device_revocation_replay(
     let target: RevokedTargetPostStateRow = sqlx::query_as(
         r#"
         SELECT device.device_id,
+               device.device_name,
                device_key.key_id,
                device_key.signing_public_key,
                device.auth_generation,
@@ -848,6 +881,8 @@ async fn prepare_device_revocation_replay(
                device.status,
                device.created_at,
                device.updated_at,
+               device.last_active_at,
+               device.dormant_at,
                device.revoked_at AS device_revoked_at,
                device.revocation_id AS device_revocation_id,
                device_key.revoked_at AS key_revoked_at,
@@ -948,6 +983,7 @@ async fn prepare_device_revocation_replay(
     }
     let device = DeviceDirectoryView {
         device_id: target.device_id,
+        device_name: target.device_name,
         key_id: target.key_id,
         signing_public_key: target.signing_public_key,
         auth_generation: target.auth_generation,
@@ -955,6 +991,8 @@ async fn prepare_device_revocation_replay(
         status: target.status,
         created_at: target.created_at,
         updated_at: target.updated_at,
+        last_active_at: target.last_active_at,
+        dormant_at: target.dormant_at,
         available_package_count: target.available_package_count,
         reserved_package_count: target.reserved_package_count,
         request_available_package_count: 0,

@@ -562,7 +562,7 @@ fn origin_hostname_is_valid(host: &str) -> bool {
     })
 }
 
-const CHAT_ENDPOINTS: [&str; 36] = [
+const CHAT_ENDPOINTS: [&str; 37] = [
     "blue.catbird.chat.publishDirectRequestKeys",
     "blue.catbird.chat.prepareDirectRequest",
     "blue.catbird.chat.getDirectRequestOutcome",
@@ -571,6 +571,7 @@ const CHAT_ENDPOINTS: [&str; 36] = [
     "blue.catbird.chat.enrollDevice",
     "blue.catbird.chat.replenishKeyPackages",
     "blue.catbird.chat.revokeDevice",
+    "blue.catbird.chat.approveDevice",
     "blue.catbird.chat.getDeviceKey",
     "blue.catbird.chat.getDevices",
     "blue.catbird.chat.getOwnDevices",

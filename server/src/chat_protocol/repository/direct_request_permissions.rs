@@ -7,7 +7,7 @@ pub(crate) fn allowed_while_pending(kind: SignedMutationKind) -> bool {
     use SignedMutationKind::*;
     match kind {
         ConversationClose | WelcomeAcknowledgement | WelcomeRejection => true,
-        DeviceEnrollment | KeyPackageReplenishment | DeviceRevocation => true,
+        DeviceEnrollment | KeyPackageReplenishment | DeviceRevocation | DeviceApproval => true,
         DirectRequestPublication
         | DirectRequestAcceptance
         | BlobUploadPreparation

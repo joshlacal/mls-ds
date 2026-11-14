@@ -2959,7 +2959,7 @@ async fn handle_deliver_group_entry(
                 // the entry: the remote-group index tracks accounts homed here
                 // and their grants, and their reads relay to the sequencer.
                 Err(failure) => tracing::warn!(
-                    conversation_id = %req.conversation_id,
+                    conversation_id = %crate::crypto::redact_for_log(&req.conversation_id.to_string()),
                     ?failure,
                     "remote group membership catch-up failed; the remote-group index tracks it"
                 ),
