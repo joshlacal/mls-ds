@@ -150,17 +150,10 @@ pub(super) async fn execute_admitted(
             )
             .await
             .map_err(|error| context::operation_prelude_failure(endpoint, error))?;
-            if endpoint == ChatEndpoint::ActivateReset {
-                if let Some(cid) = conversation_id {
-                    crate::chat_protocol::repository::delivery::prune_unblocked_for_conversation_and_notify(
-                        &mut transaction,
-                        cid,
-                        crate::sim_hooks::current_utc(),
-                    )
-                    .await
-                    .map_err(|_| ChatFailure::storage(endpoint))?;
-                }
-            }
+            // B10: Do NOT immediately prune prior-generation un-acked application payloads on
+            // `ActivateReset`; retain them under the normal recipient-ACK / Space-archive / TTL
+            // retention floor so concurrent or offline sibling devices do not suffer premature wipe.
+            let _ = conversation_id;
             (
                 context::canonical_json_response(endpoint, status, response_bytes.clone())?,
                 response_bytes,

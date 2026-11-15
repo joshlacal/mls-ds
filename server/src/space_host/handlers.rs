@@ -212,6 +212,128 @@ pub(crate) async fn load_active_space_status(
     Ok(row)
 }
 
+async fn extract_verified_batch_archived_seqs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    conversation_id: Uuid,
+    generation: i64,
+    caller_did: &str,
+    collection: &str,
+    record: &Value,
+) -> Result<Vec<i64>, sqlx::Error> {
+    if collection != "blue.catbird.labyrinth.batch" {
+        return Ok(Vec::new());
+    }
+    if let Some(thread_id) = record.get("threadId").and_then(Value::as_str) {
+        if thread_id != conversation_id.to_string() {
+            return Ok(Vec::new());
+        }
+    }
+    let Some(items) = record.get("items").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut seqs = Vec::with_capacity(items.len());
+    for item in items {
+        let has_redaction = item.get("redaction").is_some();
+        let has_ciphertext = item
+            .get("signedEncMessage")
+            .and_then(|v| {
+                v.as_str()
+                    .or_else(|| v.get("$bytes").and_then(Value::as_str))
+            })
+            .is_some_and(|s| !s.is_empty());
+        if !has_redaction && !has_ciphertext {
+            continue;
+        }
+        let Some(msg_uuid) = item
+            .get("messageId")
+            .and_then(Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok())
+        else {
+            continue;
+        };
+        let claimed_seq = item.get("seq").and_then(Value::as_i64).or_else(|| {
+            item.pointer("/sequencerReceipt/seq")
+                .and_then(Value::as_i64)
+        });
+        let verified_seq: Option<i64> = sqlx::query_scalar(
+            "SELECT seq \
+               FROM chat.entries \
+              WHERE conversation_id = $1 \
+                AND generation = $2 \
+                AND entry_kind = 'blue.catbird.chat.defs#applicationEntry' \
+                AND actor_did = $3 \
+                AND message_id = $4 \
+                AND ($5::bigint IS NULL OR seq = $5)",
+        )
+        .bind(conversation_id)
+        .bind(generation)
+        .bind(caller_did)
+        .bind(msg_uuid)
+        .bind(claimed_seq)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(seq) = verified_seq {
+            seqs.push(seq);
+        }
+    }
+    seqs.sort_unstable();
+    seqs.dedup();
+    Ok(seqs)
+}
+
+async fn recompute_space_archived_through_seq(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    space_uri: &str,
+    conversation_id: Uuid,
+    generation: i64,
+) -> Result<i64, sqlx::Error> {
+    let max_archived: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(s), 0) \
+           FROM chat.conversation_space_records r, \
+                LATERAL unnest(r.archived_seqs) AS s \
+          WHERE r.space_uri = $1",
+    )
+    .bind(space_uri)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let watermark = if max_archived <= 0 {
+        0_i64
+    } else {
+        let first_unarchived: Option<i64> = sqlx::query_scalar(
+            "SELECT MIN(e.seq) \
+               FROM chat.entries e \
+              WHERE e.conversation_id = $2 \
+                AND e.generation = $3 \
+                AND e.entry_kind = 'blue.catbird.chat.defs#applicationEntry' \
+                AND NOT EXISTS ( \
+                    SELECT 1 \
+                      FROM chat.conversation_space_records r \
+                     WHERE r.space_uri = $1 \
+                       AND e.seq = ANY(r.archived_seqs) \
+                )",
+        )
+        .bind(space_uri)
+        .bind(conversation_id)
+        .bind(generation)
+        .fetch_one(&mut **tx)
+        .await?;
+        match first_unarchived {
+            Some(unarch) => max_archived.min((unarch - 1).max(0)),
+            None => max_archived,
+        }
+    };
+
+    sqlx::query(
+        "UPDATE chat.conversation_spaces SET archived_through_seq = $2 WHERE space_uri = $1",
+    )
+    .bind(space_uri)
+    .bind(watermark)
+    .execute(&mut **tx)
+    .await?;
+    Ok(watermark)
+}
+
 /// Active member check with ZERO `NOT c.is_remote` local-only guard (`atproto#5187` / Spec §6.2).
 async fn is_active_space_member(
     pool: &DbPool,
@@ -2000,6 +2122,21 @@ async fn remove_writer(
         );
     }
 
+    if let Err(e) = recompute_space_archived_through_seq(
+        &mut tx,
+        space_uri,
+        status.conversation_id,
+        status.generation,
+    )
+    .await
+    {
+        return xrpc_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            e.to_string(),
+        );
+    }
+
     if updated > 0 {
         if let Err(e) = sqlx::query(
             "UPDATE chat.conversation_spaces SET latest_space_rev = $2 WHERE space_uri = $1",
@@ -2772,14 +2909,35 @@ async fn put_record(
     let repo_rev = runtime.next_monotonic_tid(now_sec, prev_repo_rev.as_deref());
     let space_rev = runtime.next_monotonic_tid(now_sec, prev_space_rev.as_deref());
 
+    let verified_archived_seqs = match extract_verified_batch_archived_seqs(
+        &mut tx,
+        status.conversation_id,
+        status.generation,
+        &caller_did,
+        &input.collection,
+        &input.record,
+    )
+    .await
+    {
+        Ok(seqs) => seqs,
+        Err(e) => {
+            return xrpc_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                e.to_string(),
+            );
+        }
+    };
+
     if let Err(e) = sqlx::query(
         "INSERT INTO chat.conversation_space_records ( \
-             space_uri, writer_did, collection, rkey, cid, record_cbor, repo_rev, updated_at \
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             space_uri, writer_did, collection, rkey, cid, record_cbor, repo_rev, archived_seqs, updated_at \
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (space_uri, writer_did, collection, rkey) DO UPDATE SET \
              cid = EXCLUDED.cid, \
              record_cbor = EXCLUDED.record_cbor, \
              repo_rev = EXCLUDED.repo_rev, \
+             archived_seqs = EXCLUDED.archived_seqs, \
              updated_at = EXCLUDED.updated_at",
     )
     .bind(space_uri)
@@ -2789,8 +2947,24 @@ async fn put_record(
     .bind(&record_cid_str)
     .bind(&record_cbor)
     .bind(&repo_rev)
+    .bind(&verified_archived_seqs)
     .bind(now)
     .execute(&mut *tx)
+    .await
+    {
+        return xrpc_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            e.to_string(),
+        );
+    }
+
+    if let Err(e) = recompute_space_archived_through_seq(
+        &mut tx,
+        space_uri,
+        status.conversation_id,
+        status.generation,
+    )
     .await
     {
         return xrpc_err(

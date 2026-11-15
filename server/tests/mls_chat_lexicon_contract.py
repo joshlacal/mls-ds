@@ -254,6 +254,7 @@ ENDPOINTS: dict[str, str] = {
 RECORDS: dict[str, str] = {
     "declaration": "record",
     "device": "record",
+    "deviceRevocation": "record",
 }
 
 SIGNED_PROJECTIONS: dict[str, tuple[str, str]] = {
@@ -1538,6 +1539,27 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
     submit_description = endpoint_document(documents, "submitTransition").get("description", "")
     assert "Generic signedCommitTransition has zero Add proposals and zero membership changes" in submit_description
     assert "only signedLeafRecoveryFulfillment may contain exactly one" in submit_description
+
+    revocation_record = documents[f"{PREFIX}.deviceRevocation.json"]["defs"]["main"]
+    assert revocation_record["type"] == "record" and revocation_record["key"] == "any"
+    assert required(revocation_record["record"]) == {
+        "targetDeviceId",
+        "actorDeviceId",
+        "signerPublicKey",
+        "signature",
+        "createdAt",
+    }
+    auth_full_perms = documents[f"{PREFIX}.authFull.json"]["defs"]["main"]["permissions"]
+    create_only_perms = [
+        p for p in auth_full_perms
+        if p.get("resource") == "repo" and p.get("action") == ["create"]
+    ]
+    assert len(create_only_perms) == 1
+    assert set(create_only_perms[0]["collection"]) == {
+        "blue.catbird.chat.device",
+        "blue.catbird.chat.deviceRevocation",
+        "blue.catbird.labyrinth.mailboxKeys",
+    }
 
 
 def validate_normative_prose() -> None:
@@ -3477,7 +3499,13 @@ def validate_crypto_wire_v09_corpus() -> None:
         "tls_codec": "0.5.0",
     }
     assert set(manifest["dependencies"]) == set(expected_dependency_versions)
-    lock_path = STACK_ROOT / "catbird-mls/Cargo.lock"
+    lock_path = (
+        STACK_ROOT / "catbird-mls/Cargo.lock"
+        if (STACK_ROOT / "catbird-mls/Cargo.lock").is_file()
+        else STACK_ROOT.parent / "dec1-w2/catbird-mls/Cargo.lock"
+        if (STACK_ROOT.parent / "dec1-w2/catbird-mls/Cargo.lock").is_file()
+        else STACK_ROOT.parent.parent / "Catbird+Petrel/catbird-mls/Cargo.lock"
+    )
     lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
     lock_packages = lock["package"]
     for package, profile in manifest["dependencies"].items():

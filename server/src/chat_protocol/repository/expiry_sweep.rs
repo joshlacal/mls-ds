@@ -563,18 +563,48 @@ pub async fn mark_inactive_devices(
     now: DateTime<Utc>,
 ) -> Result<u64, ExpirySweepError> {
     let dormant_after_hours = positive_hours_env("CHAT_DEVICE_DORMANT_AFTER_HOURS", 48);
+    let pending_hold_hours = positive_hours_env("CHAT_PENDING_DEVICE_HOLD_HOURS", 72);
     // `last_active_at` is coarse-bucketed to UTC midnight (`00:00:00Z`), which can lag
     // a late-UTC-day interaction (`23:59:59Z`) by up to 24h; add a +24h margin so the
     // dormancy threshold reflects at least `dormant_after_hours` of true inactivity.
     let cutoff = now - chrono::Duration::hours(dormant_after_hours) - chrono::Duration::hours(24);
+    let pending_cutoff = now - chrono::Duration::hours(pending_hold_hours);
     let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE chat.devices d \
+            SET status = 'active', \
+                updated_at = GREATEST(d.updated_at, $1) \
+          WHERE (d.user_did, d.device_id) IN ( \
+              SELECT p.user_did, p.device_id \
+                FROM chat.devices p \
+               WHERE p.status = 'pending_approval' \
+                 AND p.revoked_at IS NULL \
+                 AND p.created_at <= $2 \
+               ORDER BY p.created_at ASC, p.user_did ASC, p.device_id ASC \
+               LIMIT 500 \
+                 FOR UPDATE SKIP LOCKED \
+          )",
+    )
+    .bind(now)
+    .bind(pending_cutoff)
+    .execute(&mut *tx)
+    .await?;
+
     let marked: Vec<(String, Uuid)> = sqlx::query_as(
-        "UPDATE chat.devices \
+        "UPDATE chat.devices d \
             SET dormant_at = $1 \
-          WHERE status = 'active' \
-            AND dormant_at IS NULL \
-            AND last_active_at <= $2 \
-          RETURNING user_did, device_id",
+          WHERE (d.user_did, d.device_id) IN ( \
+              SELECT cand.user_did, cand.device_id \
+                FROM chat.devices cand \
+               WHERE cand.status = 'active' \
+                 AND cand.dormant_at IS NULL \
+                 AND cand.last_active_at <= $2 \
+                 AND NOT (cand.dpop_jkt IS NULL AND cand.device_name = 'federated-group-device') \
+               ORDER BY cand.last_active_at ASC, cand.user_did ASC, cand.device_id ASC \
+               LIMIT 500 \
+                 FOR UPDATE SKIP LOCKED \
+          ) \
+          RETURNING d.user_did, d.device_id",
     )
     .bind(now)
     .bind(cutoff)
@@ -700,19 +730,32 @@ pub async fn prune_expired_application_payloads(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> Result<u64, ExpirySweepError> {
-    let app_ttl_hours = positive_hours_env("CHAT_APPLICATION_PAYLOAD_TTL_HOURS", 72);
+    let app_ttl_hours = positive_hours_env("CHAT_APPLICATION_PAYLOAD_TTL_HOURS", 720);
+    let archived_ttl_hours =
+        positive_hours_env("CHAT_ARCHIVED_APPLICATION_PAYLOAD_TTL_HOURS", 72).min(app_ttl_hours);
     let app_cutoff = now - chrono::Duration::hours(app_ttl_hours);
+    let archived_cutoff = now - chrono::Duration::hours(archived_ttl_hours);
     let opening_cutoff = now - chrono::Duration::days(30);
     let targets: Vec<(Uuid, i64, i64)> = sqlx::query_as(
-        "SELECT conversation_id, generation, seq \
-           FROM chat.entries \
-          WHERE entry_kind = 'blue.catbird.chat.defs#applicationEntry' \
-            AND payload_pruned_at IS NULL \
-            AND received_at <= $1 \
-          ORDER BY received_at ASC, conversation_id ASC, seq ASC \
+        "SELECT e.conversation_id, e.generation, e.seq \
+           FROM chat.entries e \
+          WHERE e.entry_kind = 'blue.catbird.chat.defs#applicationEntry' \
+            AND e.payload_pruned_at IS NULL \
+            AND (e.received_at <= $1 \
+                 OR (e.received_at <= $2 \
+                     AND EXISTS ( \
+                         SELECT 1 \
+                           FROM chat.conversation_spaces cs \
+                          WHERE cs.conversation_id = e.conversation_id \
+                            AND cs.generation = e.generation \
+                            AND cs.deleted_at IS NULL \
+                            AND cs.archived_through_seq >= e.seq \
+                     ))) \
+          ORDER BY e.received_at ASC, e.conversation_id ASC, e.seq ASC \
           LIMIT 256",
     )
     .bind(app_cutoff)
+    .bind(archived_cutoff)
     .fetch_all(pool)
     .await?;
     let mut batches: std::collections::BTreeMap<(Uuid, i64), Vec<i64>> = Default::default();

@@ -3030,6 +3030,15 @@ pub(crate) async fn prune_acknowledged_application_payloads(
     // only devices homed here; the sequencer waits for every home, whose ACKs
     // arrive by relay. A mirror row without a local audience is never served,
     // so it may go immediately.
+    let is_archived = "EXISTS ( \
+        SELECT 1 \
+          FROM chat.conversation_spaces cs \
+         WHERE cs.conversation_id = e.conversation_id \
+           AND cs.generation = e.generation \
+           AND cs.deleted_at IS NULL \
+           AND cs.archived_through_seq >= e.seq \
+    )";
+    let unarchived_floor_cutoff = pruned_at - chrono::Duration::hours(72);
     let pruning_sql = format!(
         "SELECT e.seq, e.entry_kind = 'blue.catbird.chat.defs#directRequestEntry' \
            FROM chat.entries e \
@@ -3041,23 +3050,117 @@ pub(crate) async fn prune_acknowledged_application_payloads(
             AND e.payload_pruned_at IS NULL \
             AND ({replica_guard}) \
             AND ($4 \
+                 OR NOT EXISTS ( \
+                     SELECT 1 \
+                       FROM chat.application_intervals ns_ai \
+                       JOIN chat.devices ns_d \
+                         ON ns_d.user_did = ns_ai.recipient_did \
+                        AND ns_d.device_id = ns_ai.recipient_device_id \
+                      WHERE ns_ai.conversation_id = e.conversation_id \
+                        AND ns_ai.generation = e.generation \
+                        AND ns_ai.start_seq <= e.seq \
+                        AND ns_ai.terminal_seq IS NULL \
+                        AND ns_d.status = 'active' \
+                        AND ns_ai.recipient_did <> e.actor_did \
+                 ) \
                  OR EXISTS ( \
                      SELECT 1 \
                        FROM chat.device_entry_acks ack \
+                       JOIN chat.application_intervals r_ai \
+                         ON r_ai.conversation_id = ack.conversation_id \
+                        AND r_ai.generation = e.generation \
+                        AND r_ai.recipient_did = ack.user_did \
+                        AND r_ai.recipient_device_id = ack.device_id \
+                       JOIN chat.devices r_d \
+                         ON r_d.user_did = r_ai.recipient_did \
+                        AND r_d.device_id = r_ai.recipient_device_id \
                       WHERE ack.conversation_id = e.conversation_id \
                         AND ack.acked_through_seq >= e.seq \
+                        AND ack.user_did <> e.actor_did \
+                        AND r_ai.start_seq <= e.seq \
+                        AND r_ai.terminal_seq IS NULL \
+                        AND r_d.status = 'active' \
                  ) \
+                 OR (({is_archived}) \
+                     AND NOT EXISTS ( \
+                         SELECT 1 \
+                           FROM chat.application_intervals ns_live \
+                           JOIN chat.devices ns_ld \
+                             ON ns_ld.user_did = ns_live.recipient_did \
+                            AND ns_ld.device_id = ns_live.recipient_device_id \
+                          WHERE ns_live.conversation_id = e.conversation_id \
+                            AND ns_live.generation = e.generation \
+                            AND ns_live.start_seq <= e.seq \
+                            AND ns_live.terminal_seq IS NULL \
+                            AND ns_ld.status = 'active' \
+                            AND ns_ld.dormant_at IS NULL \
+                            AND ns_live.recipient_did <> e.actor_did \
+                     ))) \
+            AND ($4 \
+                 OR ({is_archived}) \
+                 OR (EXISTS ( \
+                         SELECT 1 \
+                           FROM chat.device_entry_acks any_ack \
+                          WHERE any_ack.conversation_id = e.conversation_id \
+                            AND any_ack.acked_through_seq >= e.seq \
+                     ) \
+                     AND NOT EXISTS ( \
+                         SELECT 1 \
+                           FROM chat.application_intervals part_ai \
+                           JOIN chat.devices part_d \
+                             ON part_d.user_did = part_ai.recipient_did \
+                            AND part_d.device_id = part_ai.recipient_device_id \
+                          WHERE part_ai.conversation_id = e.conversation_id \
+                            AND part_ai.generation = e.generation \
+                            AND part_ai.start_seq <= e.seq \
+                            AND part_ai.terminal_seq IS NULL \
+                            AND part_d.status = 'active' \
+                            AND NOT EXISTS ( \
+                                SELECT 1 \
+                                  FROM chat.application_intervals sib_ai \
+                                  JOIN chat.devices sib_d \
+                                    ON sib_d.user_did = sib_ai.recipient_did \
+                                   AND sib_d.device_id = sib_ai.recipient_device_id \
+                                  JOIN chat.device_entry_acks sib_ack \
+                                    ON sib_ack.conversation_id = sib_ai.conversation_id \
+                                   AND sib_ack.user_did = sib_ai.recipient_did \
+                                   AND sib_ack.device_id = sib_ai.recipient_device_id \
+                                 WHERE sib_ai.conversation_id = e.conversation_id \
+                                   AND sib_ai.generation = e.generation \
+                                   AND sib_ai.recipient_did = part_ai.recipient_did \
+                                   AND sib_ai.start_seq <= e.seq \
+                                   AND sib_ai.terminal_seq IS NULL \
+                                   AND sib_d.status = 'active' \
+                                   AND sib_ack.acked_through_seq >= e.seq \
+                            ) \
+                     ))) \
+            AND ($4 \
+                 OR ({is_archived}) \
+                 OR e.received_at <= $6 \
                  OR NOT EXISTS ( \
                      SELECT 1 \
-                       FROM chat.application_intervals live_ai \
-                       JOIN chat.devices d \
-                         ON d.user_did = live_ai.recipient_did \
-                        AND d.device_id = live_ai.recipient_device_id \
-                      WHERE live_ai.conversation_id = e.conversation_id \
-                        AND live_ai.generation = e.generation \
-                        AND live_ai.terminal_seq IS NULL \
-                        AND d.status = 'active' \
-                        AND d.dormant_at IS NULL \
+                       FROM chat.application_intervals all_ai \
+                       JOIN chat.devices all_d \
+                         ON all_d.user_did = all_ai.recipient_did \
+                        AND all_d.device_id = all_ai.recipient_device_id \
+                       LEFT JOIN chat.device_entry_acks all_ack \
+                         ON all_ack.conversation_id = all_ai.conversation_id \
+                        AND all_ack.user_did = all_ai.recipient_did \
+                        AND all_ack.device_id = all_ai.recipient_device_id \
+                      WHERE all_ai.conversation_id = e.conversation_id \
+                        AND all_ai.generation = e.generation \
+                        AND all_ai.start_seq <= e.seq \
+                        AND (all_ai.terminal_seq IS NULL OR e.seq <= all_ai.terminal_seq) \
+                        AND all_d.status = 'active' \
+                        AND COALESCE(all_ack.acked_through_seq, 0) < e.seq \
+                        AND EXISTS ( \
+                            SELECT 1 FROM chat.application_intervals current_interval \
+                             WHERE current_interval.conversation_id = all_ai.conversation_id \
+                               AND current_interval.generation = all_ai.generation \
+                               AND current_interval.recipient_did = all_ai.recipient_did \
+                               AND current_interval.recipient_device_id = all_ai.recipient_device_id \
+                               AND current_interval.terminal_seq IS NULL \
+                        ) \
                  )) \
             AND NOT EXISTS ( \
                 SELECT 1 \
@@ -3099,6 +3202,7 @@ pub(crate) async fn prune_acknowledged_application_payloads(
         .bind(acked_through_seq)
         .bind(is_remote)
         .bind(crate::identity::service_did_base())
+        .bind(unarchived_floor_cutoff)
         .fetch_all(&mut **transaction)
         .await?;
     let mut pruned_seqs = Vec::new();

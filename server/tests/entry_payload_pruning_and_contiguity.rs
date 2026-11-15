@@ -472,7 +472,8 @@ async fn dormant_60d_devices_and_30d_ceiling_prune_without_stalling_active_conve
     let marked = mark_inactive_devices(&pool, Utc::now()).await.unwrap();
     assert_eq!(marked, 1, "61-day inactive device marked dormant");
 
-    // Now sender ACK alone prunes the message because recipient device is dormant!
+    // B1(a–b): Without an attested Space archive watermark, sender ACK alone MUST NOT prune
+    // when all recipient devices are dormant — ciphertext survives until Space archive or 30d ceiling!
     let sender_ed = EdSigningKey::from_bytes(&fixture.sender_ed25519_seed);
     let ack = sign_ack_entries_request(
         fixture.sender_device_id,
@@ -494,7 +495,7 @@ async fn dormant_60d_devices_and_30d_ceiling_prune_without_stalling_active_conve
     .await;
     assert_eq!(ack_status, StatusCode::OK);
 
-    let is_pruned: bool = sqlx::query_scalar(
+    let is_pruned_before_archive: bool = sqlx::query_scalar(
         "SELECT payload_pruned_at IS NOT NULL FROM chat.entries WHERE conversation_id = $1 AND seq = $2",
     )
     .bind(fixture.conversation_id)
@@ -503,15 +504,20 @@ async fn dormant_60d_devices_and_30d_ceiling_prune_without_stalling_active_conve
     .await
     .unwrap();
     assert!(
-        is_pruned,
-        "dormant device must not hold up ACK-based pruning"
+        !is_pruned_before_archive,
+        "B1: sender ACK alone must NOT prune un-archived conversation when all recipient devices are dormant"
     );
 
-    // Also verify 30-day hard ceiling sweep on unacked applicationEntry rows:
+    // At 31 days (`> 720h` I14 ceiling), unacked applicationEntry row expires cleanly and idempotently:
     let pruned_30d = prune_expired_application_payloads(&pool, Utc::now() + Duration::days(31))
         .await
         .unwrap();
-    assert_eq!(pruned_30d, 0, "already pruned row is idempotent");
+    assert_eq!(pruned_30d, 1, "30-day I14 ceiling prunes un-archived entry");
+    let pruned_30d_repeat =
+        prune_expired_application_payloads(&pool, Utc::now() + Duration::days(32))
+            .await
+            .unwrap();
+    assert_eq!(pruned_30d_repeat, 0, "already pruned row is idempotent");
 }
 
 #[tokio::test]

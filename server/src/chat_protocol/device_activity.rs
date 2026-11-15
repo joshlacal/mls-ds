@@ -8,6 +8,7 @@
 //! store the UTC day only.
 
 use chrono::{DateTime, Duration, DurationRound, Utc};
+use sqlx::{Executor, Postgres};
 
 /// Truncate `instant` to the start of its UTC day.
 ///
@@ -15,6 +16,43 @@ use chrono::{DateTime, Duration, DurationRound, Utc};
 /// raw request instant.
 pub fn coarse_activity_day(instant: DateTime<Utc>) -> DateTime<Utc> {
     instant.duration_trunc(Duration::days(1)).unwrap_or(instant)
+}
+
+fn pending_device_hold_hours() -> i64 {
+    std::env::var("CHAT_PENDING_DEVICE_HOLD_HOURS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(72)
+}
+
+/// `D-2` / `B10`: Promote any `pending_approval` device on `user_did` whose
+/// 72-hour elapsed-clock recovery hold has completed (`created_at <= now - 72h`)
+/// without sibling revocation (`revoked_at IS NULL`).
+pub async fn promote_matured_pending_devices_for_user<'e, E>(
+    executor: E,
+    user_did: &str,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let cutoff = now - Duration::hours(pending_device_hold_hours());
+    let result = sqlx::query(
+        "UPDATE chat.devices \
+            SET status = 'active', \
+                updated_at = GREATEST(updated_at, $2) \
+          WHERE user_did = $1 \
+            AND status = 'pending_approval' \
+            AND revoked_at IS NULL \
+            AND created_at <= $3",
+    )
+    .bind(user_did)
+    .bind(now)
+    .bind(cutoff)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 #[cfg(test)]

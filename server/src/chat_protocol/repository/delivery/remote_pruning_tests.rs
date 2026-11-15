@@ -252,18 +252,18 @@ async fn unacked_transport_expires_at_the_ceiling_as_home() {
     assert_eq!(acks, 0, "no local device ever acknowledged the entry");
 
     let sweep =
-        |hours: i64| prune_expired_application_payloads(&pool, stored_at + Duration::hours(hours));
-    assert_eq!(sweep(71).await.unwrap(), 0, "inside the ceiling");
+        |days: i64| prune_expired_application_payloads(&pool, stored_at + Duration::days(days));
+    assert_eq!(sweep(29).await.unwrap(), 0, "inside the 30-day ceiling");
     assert_eq!(transport_row(&pool, conversation_id).await, stored);
     #[cfg(feature = "sim")]
     {
-        let retained = crate::sim_hooks::scope_sim_ds(retaining_hooks(&home), sweep(73))
+        let retained = crate::sim_hooks::scope_sim_ds(retaining_hooks(&home), sweep(31))
             .await
             .unwrap();
         assert_eq!(retained, 0, "P8 cannot report fake pruning");
         assert_eq!(transport_row(&pool, conversation_id).await, stored);
     }
-    assert_eq!(sweep(73).await.unwrap(), 1);
+    assert_eq!(sweep(31).await.unwrap(), 1);
     let pruned = transport_row(&pool, conversation_id).await;
     assert!(pruned.pruned && !pruned.evidence_pending);
     assert_application_evidence(&pruned, &fixture, &original);
@@ -312,7 +312,7 @@ async fn unacked_transport_expires_at_the_ceiling_as_home() {
     .execute(&pool)
     .await
     .is_err());
-    assert_eq!(sweep(144).await.unwrap(), 0, "pruning happens once");
+    assert_eq!(sweep(60).await.unwrap(), 0, "pruning happens once");
 }
 
 #[tokio::test]
@@ -394,11 +394,11 @@ async fn nul_signed_legacy_transport_rows_as_home() {
     assert_eq!(legacy.application_message_id, None);
 
     let sweep =
-        |hours: i64| prune_expired_application_payloads(&pool, stored_at + Duration::hours(hours));
+        |days: i64| prune_expired_application_payloads(&pool, stored_at + Duration::days(days));
     assert_eq!(
-        sweep(71).await.unwrap(),
+        sweep(29).await.unwrap(),
         0,
-        "classified, still inside the ceiling"
+        "classified, still inside the 30-day ceiling"
     );
     let classified = transport_row(&pool, conversation_id).await;
     assert!(!classified.evidence_pending && !classified.pruned);
@@ -414,7 +414,7 @@ async fn nul_signed_legacy_transport_rows_as_home() {
     .await
     .is_err());
 
-    assert_eq!(sweep(73).await.unwrap(), 1);
+    assert_eq!(sweep(31).await.unwrap(), 1);
     let pruned = transport_row(&pool, conversation_id).await;
     assert!(pruned.pruned);
     assert_application_evidence(&pruned, &fixture, &original);

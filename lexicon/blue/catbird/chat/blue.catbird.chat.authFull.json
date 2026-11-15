@@ -5,7 +5,7 @@
     "main": {
       "type": "permission-set",
       "title": "Use Catbird Encrypted Chat",
-      "detail": "Allows this client to use the MLS chat AppView through the account's PDS and publish create-only MLS device and Labyrinth mailbox key records. Account service authentication and device-signed mutation authority remain independently enforced.",
+      "detail": "Allows this client to use the MLS chat AppView through the account's PDS and publish create-only MLS device, device revocation, and Labyrinth mailbox key records. Account service authentication and device-signed mutation authority remain independently enforced.",
       "permissions": [
         {
           "type": "permission",
@@ -58,6 +58,7 @@
           ],
           "collection": [
             "blue.catbird.chat.device",
+            "blue.catbird.chat.deviceRevocation",
             "blue.catbird.labyrinth.mailboxKeys"
           ]
         }

@@ -1,0 +1,58 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.deviceRevocation",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Append-only signed device revocation record published to the user's repo via createRecord. Excludes a retired or revoked chat device from peer key-package directory verification without requiring deleteRecord permissions on blue.catbird.chat.device.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "targetDeviceId",
+          "actorDeviceId",
+          "signerPublicKey",
+          "signature",
+          "createdAt"
+        ],
+        "properties": {
+          "targetDeviceId": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "UUIDv4 device identifier of the revoked chat device (matches the record key)."
+          },
+          "actorDeviceId": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "UUIDv4 device identifier of the device that signed this revocation (targetDeviceId for self-retirement or an active sibling device)."
+          },
+          "signerPublicKey": {
+            "type": "bytes",
+            "maxLength": 128,
+            "description": "MLS credential signature public key of actorDeviceId, matching its enrolled blue.catbird.chat.device record."
+          },
+          "signature": {
+            "type": "bytes",
+            "maxLength": 128,
+            "description": "Detached Ed25519 signature over CATBIRD-CHAT-PDS-DEVICE-REVOCATION-V1\\0 || dag_cbor({ actorDeviceId, createdAt, repoDid, targetDeviceId })."
+          },
+          "algorithm": {
+            "type": "string",
+            "maxLength": 32,
+            "description": "Optional signature algorithm identifier ('ed25519' or 'p256'); defaults to 'ed25519'."
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Optional revocation reason (for example 'retired' or 'revoked_by_sibling')."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Timestamp when this device revocation record was created."
+          }
+        }
+      }
+    }
+  }
+}

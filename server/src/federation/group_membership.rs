@@ -430,14 +430,24 @@ pub(crate) async fn stage_verified_remote_device(
     .bind(at)
     .execute(&mut **tx)
     .await?;
+    let coarse_active_at = crate::chat_protocol::device_activity::coarse_activity_day(at);
     sqlx::query(
-        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
-         VALUES($1,$2,'federated-group-device','active',NULL,$3,chat.protocol_capabilities(),$4,$4) \
-         ON CONFLICT(user_did,device_id) DO UPDATE SET auth_generation=EXCLUDED.auth_generation, \
+        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,last_active_at,dormant_at,created_at,updated_at) \
+         VALUES($1,$2,'federated-group-device','active',NULL,$3,chat.protocol_capabilities(),$5,NULL,$4,$4) \
+         ON CONFLICT(user_did,device_id) DO UPDATE SET \
+           auth_generation=GREATEST(chat.devices.auth_generation,EXCLUDED.auth_generation), \
+           last_active_at=GREATEST(chat.devices.last_active_at,EXCLUDED.last_active_at), \
+           dormant_at=NULL, \
            updated_at=GREATEST(chat.devices.updated_at,EXCLUDED.updated_at) \
-         WHERE chat.devices.auth_generation<EXCLUDED.auth_generation",
-    ).bind(user_did).bind(device_id).bind(auth_generation).bind(at)
-        .execute(&mut **tx).await?;
+         WHERE chat.devices.status='active'",
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .bind(auth_generation)
+    .bind(at)
+    .bind(coarse_active_at)
+    .execute(&mut **tx)
+    .await?;
     sqlx::query(
         "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
          VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(user_did,device_id,key_id) DO NOTHING",

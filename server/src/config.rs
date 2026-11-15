@@ -526,13 +526,17 @@ impl InlineTriggerConfig {
 pub struct ChatRetentionConfig {
     pub device_dormant_after_hours: i64,
     pub application_payload_ttl_hours: i64,
+    pub archived_application_payload_ttl_hours: i64,
+    pub pending_device_hold_hours: i64,
 }
 
 impl Default for ChatRetentionConfig {
     fn default() -> Self {
         Self {
             device_dormant_after_hours: 48,
-            application_payload_ttl_hours: 72,
+            application_payload_ttl_hours: 720,
+            archived_application_payload_ttl_hours: 72,
+            pending_device_hold_hours: 72,
         }
     }
 }
@@ -540,14 +544,25 @@ impl Default for ChatRetentionConfig {
 impl ChatRetentionConfig {
     pub fn from_env() -> Self {
         let defaults = Self::default();
+        let application_payload_ttl_hours = parse_env_i64_positive(
+            "CHAT_APPLICATION_PAYLOAD_TTL_HOURS",
+            defaults.application_payload_ttl_hours,
+        );
+        let archived_application_payload_ttl_hours = parse_env_i64_positive(
+            "CHAT_ARCHIVED_APPLICATION_PAYLOAD_TTL_HOURS",
+            defaults.archived_application_payload_ttl_hours,
+        )
+        .min(application_payload_ttl_hours);
         Self {
             device_dormant_after_hours: parse_env_i64_positive(
                 "CHAT_DEVICE_DORMANT_AFTER_HOURS",
                 defaults.device_dormant_after_hours,
             ),
-            application_payload_ttl_hours: parse_env_i64_positive(
-                "CHAT_APPLICATION_PAYLOAD_TTL_HOURS",
-                defaults.application_payload_ttl_hours,
+            application_payload_ttl_hours,
+            archived_application_payload_ttl_hours,
+            pending_device_hold_hours: parse_env_i64_positive(
+                "CHAT_PENDING_DEVICE_HOLD_HOURS",
+                defaults.pending_device_hold_hours,
             ),
         }
     }

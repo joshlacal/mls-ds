@@ -2764,8 +2764,20 @@ pub(super) async fn persist_enrollment_bootstrap_effects(
             .bind(scope.subject())
             .fetch_one(&mut **transaction)
             .await?;
+    super::super::device_activity::promote_matured_pending_devices_for_user(
+        &mut **transaction,
+        scope.subject(),
+        trusted_at,
+    )
+    .await?;
     let has_active_sibling: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM chat.devices WHERE user_did = $1 AND status = 'active' AND revoked_at IS NULL)",
+        "SELECT EXISTS ( \
+             SELECT 1 FROM chat.devices \
+              WHERE user_did = $1 \
+                AND status = 'active' \
+                AND revoked_at IS NULL \
+                AND NOT (dpop_jkt IS NULL AND device_name = 'federated-group-device') \
+         )",
     )
     .bind(scope.subject())
     .fetch_one(&mut **transaction)
@@ -3506,6 +3518,12 @@ async fn lock_device_and_key_with_pending_policy(
     device_id: Uuid,
     allow_pending_approval: bool,
 ) -> Result<LockedDeviceAuthority, AuthRepositoryError> {
+    super::super::device_activity::promote_matured_pending_devices_for_user(
+        &mut **transaction,
+        subject,
+        crate::sim_hooks::current_utc(),
+    )
+    .await?;
     let device: Option<DeviceRow> = sqlx::query_as(
         r#"
         SELECT status, dpop_jkt, auth_generation

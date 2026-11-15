@@ -535,6 +535,12 @@ pub async fn load_current_device_with_pending(
     lock: DeviceLock,
     allow_pending: bool,
 ) -> LabyrinthResult<Caller> {
+    crate::chat_protocol::device_activity::promote_matured_pending_devices_for_user(
+        &mut *conn,
+        did,
+        crate::sim_hooks::current_utc(),
+    )
+    .await?;
     let lock_clause = match lock {
         DeviceLock::None => "",
         DeviceLock::Share => "FOR SHARE OF d, k",

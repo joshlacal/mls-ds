@@ -1810,7 +1810,9 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
     .unwrap();
     assert_eq!(mark_inactive_devices(&pool2, ref_now).await.unwrap(), 0);
 
-    // 73h past coarse UTC-day (`>= 49h` true inactivity) -> `dormant_at` set (`DeviceView.status` projects `"dormant"`) AND `seq_a` immediately pruned without waiting for another ack!
+    // 73h past coarse UTC-day (`>= 49h` true inactivity) -> `dormant_at` set (`DeviceView.status` projects `"dormant"`),
+    // AND under `B1(a–b)` `seq_a` MUST NOT be pruned while un-archived (`archived_through_seq == 0`),
+    // then prunes once an attested Space archive watermark `archived_through_seq >= seq_a` is recorded!
     sqlx::query(
         "UPDATE chat.devices SET last_active_at = $3 WHERE user_did = $1 AND device_id = $2",
     )
@@ -1822,29 +1824,74 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
     .unwrap();
     assert_eq!(mark_inactive_devices(&pool2, ref_now).await.unwrap(), 1);
 
-    let (rec_status, rec_dormant_set, seq_a_pruned): (String, bool, bool) = sqlx::query_as(
-        "SELECT d.status, d.dormant_at IS NOT NULL, \
-            (SELECT payload_pruned_at IS NOT NULL FROM chat.entries WHERE conversation_id = $3 AND seq = $4) \
-         FROM chat.devices d WHERE d.user_did = $1 AND d.device_id = $2",
-    )
-    .bind(&fix2.recipient_did)
-    .bind(fix2.recipient_device_id)
-    .bind(fix2.conversation_id)
-    .bind(seq_a)
-    .fetch_one(&pool2)
-    .await
-    .unwrap();
+    let (rec_status, rec_dormant_set, seq_a_pruned_unarchived): (String, bool, bool) =
+        sqlx::query_as(
+            "SELECT d.status, d.dormant_at IS NOT NULL, \
+                (SELECT payload_pruned_at IS NOT NULL FROM chat.entries WHERE conversation_id = $3 AND seq = $4) \
+             FROM chat.devices d WHERE d.user_did = $1 AND d.device_id = $2",
+        )
+        .bind(&fix2.recipient_did)
+        .bind(fix2.recipient_device_id)
+        .bind(fix2.conversation_id)
+        .bind(seq_a)
+        .fetch_one(&pool2)
+        .await
+        .unwrap();
     assert_eq!(rec_status, "active");
     assert!(
         rec_dormant_set,
         "dormant_at must be populated on dormancy transition"
     );
     assert!(
-        seq_a_pruned,
-        "48h dormancy transition must immediately prune newly unblocked application entries"
+        !seq_a_pruned_unarchived,
+        "B1(a–b): 48h dormancy transition must NOT prune un-archived conversation when all recipient devices are dormant"
     );
 
-    // Verify `72h` hard application TTL ceiling on an unacked application entry:
+    // Record attested Space archive watermark `archived_through_seq = seq_a` on `chat.conversation_spaces`,
+    // then re-send sender ack -> now `is_archived` is TRUE and recipient is dormant, so `seq_a` prunes!
+    let fix2_space_uri = format!(
+        "at://{self_did}/space/blue.catbird.labyrinth.conversation/{}-0",
+        fix2.conversation_id
+    );
+    sqlx::query(
+        "INSERT INTO chat.conversation_spaces \
+             (conversation_id, generation, space_uri, authority_did, archived_through_seq, created_at) \
+         VALUES ($1, 0, $2, $3, $4, $5) \
+         ON CONFLICT (conversation_id, generation) DO UPDATE SET archived_through_seq = EXCLUDED.archived_through_seq",
+    )
+    .bind(fix2.conversation_id)
+    .bind(&fix2_space_uri)
+    .bind(self_did)
+    .bind(seq_a)
+    .bind(ref_now)
+    .execute(&pool2)
+    .await
+    .unwrap();
+    let ack_s2_after_archive = sign_ack_entries_request(
+        fix2.sender_device_id,
+        &fix2.sender_key_id,
+        1,
+        &s2_ed,
+        fix2.conversation_id,
+        0,
+        seq_a,
+    );
+    let (st_ack2, body_ack2) = http::send(
+        router2.clone(),
+        http::unsigned_json_request(
+            &s2_dev,
+            "blue.catbird.chat.acknowledgeEntries",
+            serde_json::to_vec(&ack_s2_after_archive).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(st_ack2, StatusCode::OK);
+    assert_eq!(
+        body_ack2["prunedCount"], 1,
+        "B1(b): once Space archive watermark covers seq_a, dormant-only recipient no longer blocks pruning"
+    );
+
+    // Verify `B1(d)`: `720h` (`30d`) default un-archived application TTL ceiling vs `72h` Space-archived TTL ceiling!
     let db3 = common::fresh_db::fresh_fully_migrated_db("chat_w2d_").await;
     let pool3 = db3.connect(4).await;
     let router3 = build_unified_router(pool3.clone(), None).await;
@@ -1879,16 +1926,24 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
     assert_eq!(st3, StatusCode::OK);
     let unacked_seq = sb3["entry"]["seq"].as_i64().unwrap();
 
-    // At +71h: NOT pruned (`< 72h` TTL).
-    assert_eq!(
-        prune_expired_application_payloads(&pool3, Utc::now() + Duration::hours(71))
-            .await
-            .unwrap(),
-        0
-    );
-    // At +73h: pruned (`> 72h` TTL), while genesis control entry at `seq = 1` stays intact!
+    // Un-archived at +73h and +719h: NOT pruned (`< 720h` 30d default I14 TTL)!
     assert_eq!(
         prune_expired_application_payloads(&pool3, Utc::now() + Duration::hours(73))
+            .await
+            .unwrap(),
+        0,
+        "B1(d): un-archived conversation must NOT expire at 73h"
+    );
+    assert_eq!(
+        prune_expired_application_payloads(&pool3, Utc::now() + Duration::hours(719))
+            .await
+            .unwrap(),
+        0,
+        "B1(d): un-archived conversation must NOT expire before 720h (30d)"
+    );
+    // At +721h (`> 720h` 30d default TTL): pruned, while genesis control entry at `seq = 1` stays intact!
+    assert_eq!(
+        prune_expired_application_payloads(&pool3, Utc::now() + Duration::hours(721))
             .await
             .unwrap(),
         1
@@ -1905,11 +1960,11 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
     .unwrap();
     assert!(
         unacked_pruned,
-        "unacked applicationEntry > 72h must be pruned"
+        "unacked applicationEntry > 720h (30d) must be pruned"
     );
     assert!(
         !ctrl3_pruned,
-        "control entry at seq=1 must survive 72h TTL sweep"
+        "control entry at seq=1 must survive TTL sweep"
     );
 
     pool.close().await;
@@ -3400,7 +3455,8 @@ async fn r2_dormancy_coarse_day_margin_zero_ack_and_post_reset_generation_prunin
     );
 
     // At `2026-11-13T00:01:00Z` (`48h 01m` past `23:59:59Z` Day 0 = `72h 01m` past coarse Day 0):
-    // BOTH devices become dormant AND `seq_a` is immediately pruned despite `0` rows in `device_entry_acks`!
+    // BOTH devices become dormant, AND under `B1(a)` + `B1(b)` (`ctl q#21` Red safe default) `seq_a`
+    // MUST remain UNPRUNED with `0` rows in `device_entry_acks` and `archived_through_seq == 0`!
     let after_cutoff = coarse_day0 + Duration::hours(72) + Duration::minutes(1);
     let marked_a = mark_inactive_devices(&pool_a, after_cutoff).await.unwrap();
     assert_eq!(
@@ -3418,8 +3474,8 @@ async fn r2_dormancy_coarse_day_margin_zero_ack_and_post_reset_generation_prunin
     .await
     .unwrap();
     assert!(
-        pruned_a && payload_null_a,
-        "0-ack conversation must prune immediately once all open-interval devices go dormant"
+        !pruned_a && !payload_null_a,
+        "B1(a)/(b): 0-ack un-archived conversation must NOT prune when all open-interval devices go dormant"
     );
     pool_a.close().await;
 
@@ -3546,7 +3602,8 @@ async fn r2_dormancy_coarse_day_margin_zero_ack_and_post_reset_generation_prunin
     assert_eq!(st_ar, StatusCode::OK, "activateReset failed: {body_ar}");
 
     // Confirm generation `1` has an open `application_intervals` row (`terminal_seq IS NULL`),
-    // AND superseded generation `0`'s `seq_g0` was IMMEDIATELY pruned during `activateReset`!
+    // AND under `B10` (`reset.rs:153-157`) superseded generation `0`'s un-acked `seq_g0` is
+    // RETAINED across `activateReset` until the normal `30d` (`720h`) retention floor!
     let open_gen1_intervals: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM chat.application_intervals \
          WHERE conversation_id = $1 AND generation = 1 AND terminal_seq IS NULL",
@@ -3567,8 +3624,22 @@ async fn r2_dormancy_coarse_day_margin_zero_ack_and_post_reset_generation_prunin
     .await
     .unwrap();
     assert!(
-        gen0_pruned && gen0_payload_null,
-        "superseded generation-0 application payload must prune on ActivateReset even while generation 1 has open intervals"
+        !gen0_pruned && !gen0_payload_null,
+        "B10: superseded generation-0 un-acked application payload must NOT be wiped immediately on ActivateReset"
+    );
+    assert_eq!(
+        prune_expired_application_payloads(&pool_b, Utc::now() + Duration::hours(719))
+            .await
+            .unwrap(),
+        0,
+        "B10 + B1(d): un-archived prior-gen payload must obey 30d (720h) retention floor"
+    );
+    assert_eq!(
+        prune_expired_application_payloads(&pool_b, Utc::now() + Duration::hours(721))
+            .await
+            .unwrap(),
+        1,
+        "B10 + B1(d): un-archived prior-gen payload prunes past 30d (720h) retention ceiling"
     );
 
     pool_b.close().await;
@@ -4270,4 +4341,563 @@ async fn r2_spaces_nov12_client_attestation_notify_null_memberspace_check_access
 
     pool_home.close().await;
     pool_remote.close().await;
+}
+
+// =============================================================================
+// 6. Wave-2 R2 Remediation (`B1`, `B10`, `A6`) End-to-End Regression Suite
+// =============================================================================
+
+#[tokio::test]
+async fn b1_b10_a6_r2_remediation_end_to_end() {
+    let _env_guard = W2D_ENV_LOCK.lock().await;
+    let authority_did = "did:web:chat.catbird.blue";
+    std::env::set_var("SERVICE_DID", authority_did);
+    std::env::set_var("SELF_ENDPOINT", "https://chat.catbird.blue");
+    std::env::set_var("FEDERATION_TEST_ALLOW_ALL_RELATIONSHIPS", "true");
+    std::env::set_var("APP_ENV", "test");
+
+    let db = common::fresh_db::fresh_fully_migrated_db("chat_w2d_").await;
+    let pool = db.connect(6).await;
+    let router = build_unified_router(pool.clone(), None).await;
+
+    let fix = seed_clean_slate_application_fixture_unsealed(
+        &pool,
+        false,
+        authority_did,
+        Some([0x81; 32]),
+        None,
+    )
+    .await
+    .expect("seed B1/B10/A6 fixture");
+
+    let s_p256 = http::random_p256();
+    let s_jwk = http::public_jwk(&s_p256);
+    let s_dev = http::Device {
+        did: fix.sender_did.clone(),
+        device_id: fix.sender_device_id,
+        jkt: http::jwk_thumbprint(&s_jwk),
+        signing: s_p256,
+        jwk: s_jwk,
+    };
+    http::cache_device_did(&s_dev).await;
+
+    let r1_p256 = http::random_p256();
+    let r1_jwk = http::public_jwk(&r1_p256);
+    let r1_dev = http::Device {
+        did: fix.recipient_did.clone(),
+        device_id: fix.recipient_device_id,
+        jkt: http::jwk_thumbprint(&r1_jwk),
+        signing: r1_p256,
+        jwk: r1_jwk,
+    };
+    http::cache_device_did(&r1_dev).await;
+
+    // Publish an `#applicationEntry` (`seq_app`).
+    let (st_send, sb_send) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            &s_dev,
+            "blue.catbird.chat.sendMessage",
+            serde_json::to_vec(&json!({ "signedRequest": fix.signed_request })).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(st_send, StatusCode::OK, "sendMessage failed: {sb_send}");
+    let seq_app = sb_send["entry"]["seq"].as_i64().unwrap();
+    let real_msg_id: Uuid = sqlx::query_scalar(
+        "SELECT message_id FROM chat.entries WHERE conversation_id = $1 AND seq = $2",
+    )
+    .bind(fix.conversation_id)
+    .bind(seq_app)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // -------------------------------------------------------------------------
+    // Part A (`A6`): `prepare_local_entry_wake` queries `(actor_did, actor_device_id)`
+    // from `chat.entries` inside `tx` and excludes the producing sender device
+    // even when `signedRequest` has been stripped from the outbound entry JSON!
+    // -------------------------------------------------------------------------
+    for (did, dev_id, key_id, push_key) in [
+        (
+            &fix.sender_did,
+            fix.sender_device_id,
+            &fix.sender_key_id,
+            "pk_sender_0123456789abcdef",
+        ),
+        (
+            &fix.recipient_did,
+            fix.recipient_device_id,
+            &fix.recipient_key_id,
+            "pk_recip_0123456789abcdef0",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO chat.push_gateway_bindings \
+                (user_did, device_id, gateway_url, app_id, push_key, key_id, auth_generation, signed_at, updated_at) \
+             VALUES ($1, $2, 'https://nest.catbird.blue/xrpc/blue.catbird.push.deliver', 'blue.catbird.ios', $3, $4, 1, clock_timestamp(), clock_timestamp())",
+        )
+        .bind(did)
+        .bind(dev_id)
+        .bind(push_key)
+        .bind(key_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let stripped_entry = json!({
+        "$type": "blue.catbird.chat.defs#applicationEntry",
+        "conversationId": fix.conversation_id.to_string(),
+        "seq": seq_app,
+        "generation": 0,
+    });
+    let mut wake_tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *wake_tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE chat.participants SET ds_did = NULL WHERE conversation_id = $1")
+        .bind(fix.conversation_id)
+        .execute(&mut *wake_tx)
+        .await
+        .unwrap();
+    let prepared_wake = catbird_server::push_gateway::client::prepare_local_entry_wake(
+        &mut wake_tx,
+        &stripped_entry,
+    )
+    .await
+    .expect("prepare_local_entry_wake")
+    .expect("must return wake for recipient");
+    wake_tx.rollback().await.unwrap();
+    assert_eq!(
+        prepared_wake.candidates(),
+        &[(fix.recipient_did.clone(), fix.recipient_device_id)],
+        "A6: stripped entry JSON must still exclude producing sender device and wake only recipient"
+    );
+
+    // -------------------------------------------------------------------------
+    // Part B (`B1(c)`): Un-archived conversation with active `R1` (acked) +
+    // dormant `R2` (unacked) must NOT prune before `received_at <= now - 72h`,
+    // and prunes once `received_at` ages past the `72h` minimum retention floor!
+    // -------------------------------------------------------------------------
+    let r2_id = Uuid::new_v4();
+    let r2_ed = Ed25519SigningKey::from_bytes(&[0x82; 32]);
+    let r2_pub = r2_ed.verifying_key().to_bytes();
+    let r2_key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(r2_pub.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let r2_p256 = http::random_p256();
+    let r2_jwk = http::public_jwk(&r2_p256);
+    let r2_jkt = http::jwk_thumbprint(&r2_jwk);
+    let now_ts: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let dormant_ts = now_ts - Duration::hours(96);
+    sqlx::query(
+        "INSERT INTO chat.devices (user_did, device_id, device_name, status, dpop_jkt, auth_generation, capabilities, created_at, updated_at, last_active_at, dormant_at) \
+         VALUES ($1, $2, 'Recipient Dormant iPad', 'active', $3, 1, chat.protocol_capabilities(), $4, $4, $4, $4)",
+    )
+    .bind(&fix.recipient_did)
+    .bind(r2_id)
+    .bind(&r2_jkt)
+    .bind(dormant_ts)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO chat.device_keys (user_did, device_id, key_id, signing_public_key, enrollment_auth_generation, created_at) \
+         VALUES ($1, $2, $3, $4, 1, $5)",
+    )
+    .bind(&fix.recipient_did)
+    .bind(r2_id)
+    .bind(&r2_key_id)
+    .bind(r2_pub.as_slice())
+    .bind(dormant_ts)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let r_period_id: Uuid = sqlx::query_scalar(
+        "SELECT participant_period_id FROM chat.participants WHERE conversation_id = $1 AND user_did = $2 AND current_membership = TRUE",
+    )
+    .bind(fix.conversation_id)
+    .bind(&fix.recipient_did)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let r2_leaf_id = Uuid::new_v4();
+    let r2_tx_id = Uuid::new_v4();
+    {
+        let mut mtx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *mtx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat.member_devices (leaf_period_id, participant_period_id, conversation_id, generation, user_did, device_id, leaf_index, basic_credential, leaf_signature_key, leaf_key_id, leaf_auth_generation, origin, joined_state_version, joined_transition_id, joined_seq, active, created_at) \
+             VALUES ($1, $2, $3, 0, $4, $5, 98, $6, $7, $8, 1, 'genesis', 1, $9, 1, TRUE, $10)",
+        )
+        .bind(r2_leaf_id)
+        .bind(r_period_id)
+        .bind(fix.conversation_id)
+        .bind(&fix.recipient_did)
+        .bind(r2_id)
+        .bind(format!("{}#{r2_id}", fix.recipient_did).into_bytes())
+        .bind(r2_pub.as_slice())
+        .bind(&r2_key_id)
+        .bind(r2_tx_id)
+        .bind(dormant_ts)
+        .execute(&mut *mtx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat.application_intervals ( \
+                 membership_interval_id, conversation_id, generation, recipient_did, \
+                 recipient_device_id, start_seq, opening_kind, opening_transition_id, \
+                 opening_outer_entry_fingerprint, opening_state_version, opening_group_id, \
+                 opening_epoch, opening_group_context_hash, opening_confirmation_tag, \
+                 opening_leaf_period_id, created_at \
+             ) \
+             SELECT $1, conversation_id, generation, recipient_did, \
+                    $2, start_seq, opening_kind, $1, \
+                    opening_outer_entry_fingerprint, opening_state_version, opening_group_id, \
+                    opening_epoch, opening_group_context_hash, opening_confirmation_tag, \
+                    $3, created_at \
+               FROM chat.application_intervals \
+              WHERE conversation_id = $4 AND recipient_did = $5 AND recipient_device_id = $6",
+        )
+        .bind(r2_tx_id)
+        .bind(r2_id)
+        .bind(r2_leaf_id)
+        .bind(fix.conversation_id)
+        .bind(&fix.recipient_did)
+        .bind(fix.recipient_device_id)
+        .execute(&mut *mtx)
+        .await
+        .unwrap();
+        mtx.commit().await.unwrap();
+    }
+
+    let s_ed = Ed25519SigningKey::from_bytes(&fix.sender_ed25519_seed);
+    let r1_ed = Ed25519SigningKey::from_bytes(&fix.recipient_ed25519_seed);
+    let (_, ack_s) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            &s_dev,
+            "blue.catbird.chat.acknowledgeEntries",
+            serde_json::to_vec(&sign_ack_entries_request(
+                fix.sender_device_id,
+                &fix.sender_key_id,
+                1,
+                &s_ed,
+                fix.conversation_id,
+                0,
+                seq_app,
+            ))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(ack_s["prunedCount"], 0);
+
+    // Active `R1` acks while `received_at` is fresh and `R2` is dormant & unacked -> must hold (`0` pruned)!
+    let (_, ack_r1_fresh) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            &r1_dev,
+            "blue.catbird.chat.acknowledgeEntries",
+            serde_json::to_vec(&sign_ack_entries_request(
+                fix.recipient_device_id,
+                &fix.recipient_key_id,
+                1,
+                &r1_ed,
+                fix.conversation_id,
+                0,
+                seq_app,
+            ))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        ack_r1_fresh["prunedCount"], 0,
+        "B1(c): fresh un-archived entry must NOT prune while dormant sibling R2 has not acked"
+    );
+
+    // -------------------------------------------------------------------------
+    // Part C (`B1` Space-attested `archived_through_seq` + `B1(d)` 72h archived TTL):
+    // Verify `com.atproto.space.putRecord` rejects forged peer `messageId` for
+    // watermark advancement, advances `archived_through_seq` when the true
+    // sender archives `blue.catbird.labyrinth.batch`, and then enables `72h`
+    // archived TTL (plus immediate dormant-sibling unblock once archived)!
+    // -------------------------------------------------------------------------
+    let space_uri: String = sqlx::query_scalar(
+        "SELECT space_uri FROM chat.conversation_spaces WHERE conversation_id = $1 AND generation = 0",
+    )
+    .bind(fix.conversation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let authority_key = P256SigningKey::from_bytes((&[0x83_u8; 32]).into()).unwrap();
+    let sender_pds_key = P256SigningKey::from_bytes((&[0x84_u8; 32]).into()).unwrap();
+    let recipient_pds_key = P256SigningKey::from_bytes((&[0x85_u8; 32]).into()).unwrap();
+    let host_rt = Arc::new(SpaceHostRuntime::new(
+        pool.clone(),
+        SpaceHostConfig::for_test(authority_did.to_owned(), authority_key.clone()),
+    ));
+    host_rt.register_test_did_endpoint(
+        &fix.sender_did,
+        sender_pds_key.verifying_key(),
+        "https://sender.example.test",
+    );
+    host_rt.register_test_did_endpoint(
+        &fix.recipient_did,
+        recipient_pds_key.verifying_key(),
+        "https://recipient.example.test",
+    );
+    let host_router = space_host_router(host_rt);
+
+    let mint_put_jwt = |did: &str, key: &P256SigningKey| {
+        let now = Utc::now().timestamp();
+        sign_es256_jwt(
+            json!({"alg": "ES256", "typ": "JWT"}),
+            json!({
+                "iss": did,
+                "aud": format!("{authority_did}#atproto_mls"),
+                "lxm": "com.atproto.space.putRecord",
+                "iat": now,
+                "exp": now + 60,
+                "jti": Uuid::new_v4().to_string(),
+            }),
+            key,
+        )
+    };
+
+    // Forged batch from `recipient_did` claiming `sender_did`'s `(real_msg_id, seq_app)` must NOT advance `archived_through_seq`!
+    let forged_req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.putRecord")
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!(
+                "Bearer {}",
+                mint_put_jwt(&fix.recipient_did, &recipient_pds_key)
+            ),
+        )
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "space": space_uri,
+                "repo": fix.recipient_did,
+                "collection": "blue.catbird.labyrinth.batch",
+                "rkey": "3k2forged0001",
+                "record": {
+                    "$type": "blue.catbird.labyrinth.batch",
+                    "threadId": fix.conversation_id.to_string(),
+                    "items": [{
+                        "messageId": real_msg_id.to_string(),
+                        "seq": seq_app,
+                        "signedEncMessage": { "$bytes": STANDARD.encode([0xEE_u8; 32]) },
+                    }],
+                },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let forged_resp = host_router.clone().oneshot(forged_req).await.unwrap();
+    assert_eq!(forged_resp.status(), StatusCode::OK);
+    let watermark_after_forged: i64 = sqlx::query_scalar(
+        "SELECT archived_through_seq FROM chat.conversation_spaces WHERE space_uri = $1",
+    )
+    .bind(&space_uri)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        watermark_after_forged, 0,
+        "B1: peer cannot forge sender's messageId to advance archived_through_seq"
+    );
+
+    // Authentic batch from `sender_did` archiving `(real_msg_id, seq_app)` advances `archived_through_seq` to `seq_app`!
+    let auth_req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.putRecord")
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!("Bearer {}", mint_put_jwt(&fix.sender_did, &sender_pds_key)),
+        )
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "space": space_uri,
+                "repo": fix.sender_did,
+                "collection": "blue.catbird.labyrinth.batch",
+                "rkey": "3k2sender0001",
+                "record": {
+                    "$type": "blue.catbird.labyrinth.batch",
+                    "threadId": fix.conversation_id.to_string(),
+                    "items": [{
+                        "messageId": real_msg_id.to_string(),
+                        "seq": seq_app,
+                        "signedEncMessage": { "$bytes": STANDARD.encode([0xCC_u8; 32]) },
+                    }],
+                },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let auth_resp = host_router.clone().oneshot(auth_req).await.unwrap();
+    assert_eq!(auth_resp.status(), StatusCode::OK);
+    let watermark_after_sender: i64 = sqlx::query_scalar(
+        "SELECT archived_through_seq FROM chat.conversation_spaces WHERE space_uri = $1",
+    )
+    .bind(&space_uri)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        watermark_after_sender, seq_app,
+        "B1: verified sender batch must advance archived_through_seq to seq_app"
+    );
+
+    // Verify `B1(d)` `72h` archived TTL: reset acks temporarily to prove TTL sweep at +71h (`0`) vs +73h (`1`)!
+    sqlx::query("DELETE FROM chat.device_entry_acks WHERE conversation_id = $1")
+        .bind(fix.conversation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        prune_expired_application_payloads(&pool, Utc::now() + Duration::hours(71))
+            .await
+            .unwrap(),
+        0,
+        "B1(d): archived entry must NOT expire before 72h"
+    );
+    assert_eq!(
+        prune_expired_application_payloads(&pool, Utc::now() + Duration::hours(73))
+            .await
+            .unwrap(),
+        1,
+        "B1(d): Space-archived entry must expire past 72h archived TTL"
+    );
+
+    // -------------------------------------------------------------------------
+    // Part D (`B10`):
+    // 1) `federated-group-device` (`dpop_jkt IS NULL`) aged 90d is NOT marked dormant by `mark_inactive_devices`.
+    // 2) `pending_approval` sibling device stays `pending_approval` (`401`) at 71h and promotes to `active` (`200 OK`) past 72h!
+    // -------------------------------------------------------------------------
+    let fed_dev_id = Uuid::new_v4();
+    let aged_90d = Utc::now() - Duration::days(90);
+    sqlx::query("INSERT INTO chat.principals (user_did, created_at) VALUES ('did:web:r2-fed-peer.catbird.blue', $1) ON CONFLICT DO NOTHING")
+        .bind(aged_90d)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO chat.devices (user_did, device_id, device_name, status, dpop_jkt, auth_generation, capabilities, created_at, updated_at, last_active_at, dormant_at) \
+         VALUES ('did:web:r2-fed-peer.catbird.blue', $1, 'federated-group-device', 'active', NULL, 1, chat.protocol_capabilities(), $2, $2, $2, NULL)",
+    )
+    .bind(fed_dev_id)
+    .bind(aged_90d)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let _ = mark_inactive_devices(&pool, Utc::now()).await.unwrap();
+    let fed_dormant: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT dormant_at FROM chat.devices WHERE user_did = 'did:web:r2-fed-peer.catbird.blue' AND device_id = $1",
+    )
+    .bind(fed_dev_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        fed_dormant.is_none(),
+        "B10: federated-group-device (dpop_jkt IS NULL) must never be marked dormant by local inactivity sweep"
+    );
+
+    let alice_acct = AccountIdentity::create().await;
+    let alice_d1 = DeviceIdentity::build(&alice_acct, "Alice Primary", 2);
+    let alice_d2 = DeviceIdentity::build(&alice_acct, "Alice Hold Sibling", 2);
+    let (st_d1, _) = http::send(router.clone(), alice_d1.enroll_request()).await;
+    assert_eq!(st_d1, StatusCode::OK);
+    let (st_d2, b_d2) = http::send(router.clone(), alice_d2.enroll_request()).await;
+    assert_eq!(st_d2, StatusCode::OK);
+    assert_eq!(b_d2["device"]["status"], "pending_approval");
+
+    // At 71h (`< 72h` hold): still `pending_approval` (`401 NotAuthorized`).
+    {
+        let mut tx71 = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx71)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE chat.devices SET created_at = clock_timestamp() - interval '71 hours' WHERE user_did = $1 AND device_id = $2")
+            .bind(&alice_acct.did)
+            .bind(alice_d2.device_id)
+            .execute(&mut *tx71)
+            .await
+            .unwrap();
+        tx71.commit().await.unwrap();
+    }
+    let (st_71h, _) = http::send(
+        router.clone(),
+        alice_d2.dpop_get_request(
+            "blue.catbird.chat.getDevices",
+            &format!("userDids={}", fix.recipient_did),
+        ),
+    )
+    .await;
+    assert_eq!(
+        st_71h,
+        StatusCode::UNAUTHORIZED,
+        "B10: pending_approval sibling < 72h must stay gated"
+    );
+
+    // At 73h (`> 72h` hold with no sibling approval/revocation): promotes to `active` (`200 OK`)!
+    {
+        let mut tx73 = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx73)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE chat.devices SET created_at = clock_timestamp() - interval '73 hours' WHERE user_did = $1 AND device_id = $2")
+            .bind(&alice_acct.did)
+            .bind(alice_d2.device_id)
+            .execute(&mut *tx73)
+            .await
+            .unwrap();
+        tx73.commit().await.unwrap();
+    }
+    let (st_73h_dir, _) = http::send(
+        router.clone(),
+        alice_d2.dpop_get_request(
+            "blue.catbird.chat.getDevices",
+            &format!("userDids={}", fix.recipient_did),
+        ),
+    )
+    .await;
+    assert_eq!(
+        st_73h_dir,
+        StatusCode::OK,
+        "B10: pending_approval sibling > 72h must auto-promote to active on DPoP auth"
+    );
+    let (st_73h_convos, _) = http::send(
+        router.clone(),
+        alice_d2.bearer_get_request(
+            "blue.catbird.chat.getConversations",
+            &format!("actorDeviceId={}", alice_d2.device_id),
+        ),
+    )
+    .await;
+    assert_eq!(
+        st_73h_convos,
+        StatusCode::OK,
+        "B10: promoted sibling must succeed on Bearer read_authority"
+    );
+
+    pool.close().await;
+    std::env::remove_var("FEDERATION_TEST_ALLOW_ALL_RELATIONSHIPS");
+    std::env::remove_var("APP_ENV");
 }

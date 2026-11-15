@@ -5,9 +5,9 @@ SQL migrations for `catbird-server`, applied in version order by SQLx (`sqlx::mi
 ## Status
 
 - The R0 seal (bookmark `clean-slate-2026-10-31`, mls-ds `d5f6993c`) has 129 migrations, ending at `20261102000003_conversation_close_terminal_entries.sql`.
-- The unsealed Task 4 R1 provisional commits add fourteen, for 143: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010`, `000011` and `000012`. The seed-2323 fix adds `20261107000001`, for 144. The Round 4 lifecycle relay adds `20261113000001`, for 145. Wave 2 multi-device approval and Nov-12 Spaces adds `20261114000001`, for 146. Their contracts are in the sections below.
+- The unsealed Task 4 R1 provisional commits add fourteen, for 143: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010`, `000011` and `000012`. The seed-2323 fix adds `20261107000001`, for 144. The Round 4 lifecycle relay adds `20261113000001`, for 145. Wave 2 multi-device approval and Nov-12 Spaces adds `20261114000001`, for 146. Wave 2 R2 archive watermark adds `20261115000001`, for 147. Their contracts are in the sections below.
 - **Held.** These migrations have run only against local disposable and guarded test databases. Do not apply them to a production database until R1 is sealed and the production migration is separately authorized. Server startup applies pending migrations, so the hold also covers starting this tree against a production database.
-- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 146 migrations ending at `20261114000001` (98 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
+- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 147 migrations ending at `20261115000001` (98 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
 
 ## Clean-Chat Operation Claim Rollout
 
@@ -720,6 +720,12 @@ columns and tables (`prev_space_rev` and `removed_at` on `chat.conversation_spac
 `chat.conversation_space_subscribers`, `chat.managed_space_members`, and
 `chat.conversation_space_records`). Raw-file size: `21548` bytes. SQLx SHA-384:
 `f32c9403bbcd7ed6bde26a463912c83f0d95aecffcf7040d5622d4db9e1eb6263db4e0d6edaf7062217098eaa13fe133`.
+
+`20261115000001_wave2_r2_archive_watermark.sql` adds the attested Space archive
+watermark `archived_through_seq` on `chat.conversation_spaces` and verified per-batch
+sequence tracking `archived_seqs` on `chat.conversation_space_records` (`B1`).
+Raw-file size: `681` bytes. SQLx SHA-384:
+`a9e60f360a413ff8bcc8a2a1cc083de17c569a0f293cc9c52ac21bd9aacaee6ce3e1762894cb54ef259c7d2d3911cb92`.
 
 C33 publication requires the signed `archiveCommitment` for the encrypted
 canonical opening frame. The initial entry retains both its genuine `I13`

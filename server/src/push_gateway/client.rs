@@ -311,6 +311,10 @@ pub struct PreparedLocalWake {
 }
 
 impl PreparedLocalWake {
+    pub fn candidates(&self) -> &[(String, Uuid)] {
+        &self.candidates
+    }
+
     pub async fn dispatch(
         self,
         pool: &DbPool,
@@ -364,6 +368,33 @@ pub async fn prepare_local_entry_wake(
         .or_else(|| body.and_then(|body| body.pointer("/prior/generation")))
         .and_then(Value::as_i64)
         .unwrap_or(current_generation);
+    let entry_sender: Option<(String, Uuid)> = sqlx::query_as(
+        "SELECT actor_did, actor_device_id \
+           FROM chat.entries \
+          WHERE conversation_id = $1 AND seq = $2",
+    )
+    .bind(conversation_id)
+    .bind(seq)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let json_actor_did = field("actorDid")
+        .or_else(|| entry.get("actorDid"))
+        .or_else(|| entry.get("senderDid"))
+        .and_then(Value::as_str);
+    let json_actor_device = field("actorDeviceId")
+        .or_else(|| entry.get("actorDeviceId"))
+        .or_else(|| entry.get("senderDeviceId"))
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok());
+    let sender_did: Option<&str> = entry_sender
+        .as_ref()
+        .map(|(d, _)| d.as_str())
+        .or(json_actor_did);
+    let sender_device_id: Option<Uuid> = entry_sender
+        .as_ref()
+        .map(|(_, dev)| *dev)
+        .or(json_actor_device);
+
     let mut candidates: Vec<(String, Uuid)> = if is_application {
         sqlx::query_as(
             "SELECT DISTINCT ai.recipient_did, ai.recipient_device_id \
@@ -374,11 +405,15 @@ pub async fn prepare_local_entry_wake(
                  ON b.user_did = ai.recipient_did AND b.device_id = ai.recipient_device_id \
               WHERE ai.conversation_id = $1 AND ai.generation = $2 AND ai.start_seq <= $3 \
                 AND (ai.terminal_seq IS NULL OR $3 <= ai.terminal_seq) AND p.ds_did IS NULL \
+                AND NOT ($4::text IS NOT NULL AND $5::uuid IS NOT NULL \
+                         AND ai.recipient_did = $4 AND ai.recipient_device_id = $5) \
               ORDER BY 1, 2",
         )
         .bind(conversation_id)
         .bind(generation)
         .bind(seq)
+        .bind(sender_did)
+        .bind(sender_device_id)
         .fetch_all(&mut **tx)
         .await?
     } else {
@@ -390,19 +425,20 @@ pub async fn prepare_local_entry_wake(
                JOIN chat.push_gateway_bindings b \
                  ON b.user_did = er.user_did AND b.device_id = er.device_id \
               WHERE er.conversation_id = $1 AND er.seq = $2 AND p.ds_did IS NULL \
+                AND NOT ($3::text IS NOT NULL AND $4::uuid IS NOT NULL \
+                         AND er.user_did = $3 AND er.device_id = $4) \
               ORDER BY 1, 2",
         )
         .bind(conversation_id)
         .bind(seq)
+        .bind(sender_did)
+        .bind(sender_device_id)
         .fetch_all(&mut **tx)
         .await?
     };
-    let actor_did = field("actorDid").and_then(Value::as_str);
-    let actor_device = field("actorDeviceId")
-        .and_then(Value::as_str)
-        .and_then(|id| Uuid::parse_str(id).ok());
-    candidates
-        .retain(|(did, device)| Some(did.as_str()) != actor_did || Some(*device) != actor_device);
+    candidates.retain(|(did, device)| {
+        Some(did.as_str()) != sender_did || Some(*device) != sender_device_id
+    });
     if candidates.is_empty() {
         return Ok(None);
     }

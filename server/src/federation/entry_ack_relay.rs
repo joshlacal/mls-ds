@@ -484,9 +484,11 @@ pub(super) async fn accept_entry_ack_relay(
     .await
     .map_err(storage)?;
     sqlx::query(
-        "UPDATE chat.devices SET last_active_at = $3, dormant_at = NULL \
+        "UPDATE chat.devices \
+            SET last_active_at = GREATEST(last_active_at, $3), \
+                dormant_at = NULL \
           WHERE user_did = $1 AND device_id = $2 \
-            AND (last_active_at IS DISTINCT FROM $3 OR dormant_at IS NOT NULL)",
+            AND (last_active_at < $3 OR dormant_at IS NOT NULL)",
     )
     .bind(&relay.user_did)
     .bind(relay.device_id)

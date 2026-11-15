@@ -374,7 +374,7 @@ DECLARE
     ];
 
     -- BEGIN GENERATED CLEAN-SLATE SEAL
-    -- 62 migrations after 20260828000005 (146 total, max 20261114000001); chat tables: 98; chat views: 1.
+    -- 63 migrations after 20260828000005 (147 total, max 20261115000001); chat tables: 98; chat views: 1.
     v_clean_slate_versions BIGINT[] := ARRAY[
         20260905000001::BIGINT,
         20260907000001::BIGINT,
@@ -437,7 +437,8 @@ DECLARE
         20261104000012::BIGINT,
         20261107000001::BIGINT,
         20261113000001::BIGINT,
-        20261114000001::BIGINT
+        20261114000001::BIGINT,
+        20261115000001::BIGINT
     ];
     v_clean_slate_descriptions TEXT[] := ARRAY[
         'chat historical recovery package mapping',
@@ -501,7 +502,8 @@ DECLARE
         'postgres churn partitions',
         'application send order',
         'remote lifecycle recovery bindings',
-        'wave2 multidevice and spaces nov12'
+        'wave2 multidevice and spaces nov12',
+        'wave2 r2 archive watermark'
     ];
     v_clean_slate_checksums TEXT[] := ARRAY[
         'a66f9dc9bd5f8f1cb3da0f3ddfcb64c08fc068de39602891e584c86cdbaebd1de2d29b6bb46959155496639ad12f9c5d',
@@ -565,7 +567,8 @@ DECLARE
         'e9700954fc90dd3f99c47eb93eddac7f233e2e2f274f01882c49144b2c9d7499ac60e277f3629039019555c6df9aaa80',
         '457b8d78861a458425a5ed617874a8397547e03fdf2a7038f3ead6737f5cb156b5e9b3fa5df40442a152d72b1279c1c1',
         '78975bab32bfaa527ee1233ad49b36956d91fb4c9fef47533365cabd6c98778b50709a57fda8fa5c5933fab388e9e596',
-        'f32c9403bbcd7ed6bde26a463912c83f0d95aecffcf7040d5622d4db9e1eb6263db4e0d6edaf7062217098eaa13fe133'
+        'f32c9403bbcd7ed6bde26a463912c83f0d95aecffcf7040d5622d4db9e1eb6263db4e0d6edaf7062217098eaa13fe133',
+        'a9e60f360a413ff8bcc8a2a1cc083de17c569a0f293cc9c52ac21bd9aacaee6ce3e1762894cb54ef259c7d2d3911cb92'
     ];
     v_clean_slate_tables TEXT[] := ARRAY[
         'application_intervals',

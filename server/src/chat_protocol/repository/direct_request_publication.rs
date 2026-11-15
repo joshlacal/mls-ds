@@ -740,10 +740,14 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     }
     let recipient_devices: Vec<Uuid> = sqlx::query_scalar(
         "SELECT owner_device_id FROM chat.direct_request_device_deliveries \
-          WHERE request_id=$1 AND owner_did=$2 ORDER BY owner_device_id::text",
+          WHERE request_id=$1 AND owner_did=$2 \
+            AND NOT (owner_did=$3 AND owner_device_id=$4) \
+          ORDER BY owner_device_id::text",
     )
     .bind(request)
     .bind(recipient)
+    .bind(actor)
+    .bind(actor_device)
     .fetch_all(&mut **tx)
     .await?;
     let first_message_id = id(&b["firstMessageId"])?;
@@ -761,8 +765,8 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
         .bind(event_id).bind(request).bind(position).bind(notification_outbox).bind(convo)
         .bind(first_message_id).bind(actor).bind(recipient).bind(payload_digest.as_slice())
         .bind(now).execute(&mut **tx).await?;
-    let mapped = sqlx::query("INSERT INTO chat.direct_request_push_event_recipients(event_id,request_id,recipient_did,recipient_device_id) SELECT $1,$2,$3,owner_device_id FROM chat.direct_request_device_deliveries WHERE request_id=$2 AND owner_did=$3 ORDER BY owner_device_id::text")
-        .bind(event_id).bind(request).bind(recipient).execute(&mut **tx).await?;
+    let mapped = sqlx::query("INSERT INTO chat.direct_request_push_event_recipients(event_id,request_id,recipient_did,recipient_device_id) SELECT $1,$2,$3,owner_device_id FROM chat.direct_request_device_deliveries WHERE request_id=$2 AND owner_did=$3 AND NOT (owner_did=$4 AND owner_device_id=$5) ORDER BY owner_device_id::text")
+        .bind(event_id).bind(request).bind(recipient).bind(actor).bind(actor_device).execute(&mut **tx).await?;
     if mapped.rows_affected() != recipient_devices.len() as u64 {
         return Err(PublicationError::Invariant);
     }
