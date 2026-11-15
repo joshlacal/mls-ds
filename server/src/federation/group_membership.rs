@@ -2387,3 +2387,7 @@ mod reenrollment_tests {
         pool.close().await;
     }
 }
+
+#[cfg(test)]
+#[path = "group_membership_c2_unit_tests.rs"]
+mod c2_unit_tests;

@@ -1147,3 +1147,6 @@ async fn s2s_caller_admission_this_ds_could_not_decide_is_not_a_refusal() {
     )
     .await;
 }
+
+#[path = "group_relay_c2_survivor_tests.rs"]
+mod c2_survivor_tests;

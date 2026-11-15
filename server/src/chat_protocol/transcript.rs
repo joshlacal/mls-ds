@@ -4489,4 +4489,15 @@ mod tests {
         assert_eq!(CleanEntryKind::from_type_id("invalid"), None);
         assert_eq!(CleanEntryKind::from_type_id("applicationEntry"), None);
     }
+
+    #[test]
+    fn c2_clean_entry_kind_receipt_requirement_and_type_ids() {
+        for kind in CleanEntryKind::ALL {
+            assert_eq!(
+                kind.requires_sequencer_receipt(),
+                kind != CleanEntryKind::AccountDeletion,
+                "{kind:?}"
+            );
+        }
+    }
 }

@@ -2333,3 +2333,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "receipt_c2_unit_tests.rs"]
+mod c2_unit_tests;
