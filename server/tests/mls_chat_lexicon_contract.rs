@@ -35,16 +35,10 @@ fn canonical_root() -> PathBuf {
     if local.is_dir() {
         return local;
     }
-    if let Some(workspaces_root) = stack_root().parent() {
-        let wave1 = workspaces_root.join("dec1-w0/wave1-petrel-catbird/lexicons/blue/catbird/chat");
-        if wave1.is_dir() {
-            return wave1;
-        }
-        if let Some(dev_root) = workspaces_root.parent() {
-            let root = dev_root.join("Catbird+Petrel/PetrelCatbird/lexicons/blue/catbird/chat");
-            if root.is_dir() {
-                return root;
-            }
+    if let Some(dev_root) = stack_root().parent().and_then(|p| p.parent()) {
+        let root = dev_root.join("Catbird+Petrel/PetrelCatbird/lexicons/blue/catbird/chat");
+        if root.is_dir() {
+            return root;
         }
     }
     local

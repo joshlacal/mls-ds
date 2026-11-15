@@ -415,7 +415,7 @@ class SiblingBuildInputTests(unittest.TestCase):
     def test_every_ci_job_that_builds_the_server_clones_its_path_dependencies(self):
         repos = set(
             re.findall(
-                r'path = "(?:\.\./\.\./(?!\.\./)|(?:\.\./){3}dec1-w0/wave1-)([^/"]+)',
+                r'path = "\.\./\.\./(?!\.\./)([^/"]+)',
                 (SERVER / "Cargo.toml").read_text(),
             )
         )

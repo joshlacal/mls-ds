@@ -35,8 +35,6 @@ STACK_ROOT = MLS_DS_ROOT.parent
 CANONICAL_LEXICON_BASE = (
     STACK_ROOT / "PetrelCatbird/lexicons"
     if (STACK_ROOT / "PetrelCatbird/lexicons").is_dir()
-    else STACK_ROOT.parent / "dec1-w0/wave1-petrel-catbird/lexicons"
-    if (STACK_ROOT.parent / "dec1-w0/wave1-petrel-catbird/lexicons").is_dir()
     else STACK_ROOT.parent.parent / "Catbird+Petrel/PetrelCatbird/lexicons"
 )
 CANONICAL_ROOT = CANONICAL_LEXICON_BASE / "blue/catbird/chat"
@@ -3502,8 +3500,6 @@ def validate_crypto_wire_v09_corpus() -> None:
     lock_path = (
         STACK_ROOT / "catbird-mls/Cargo.lock"
         if (STACK_ROOT / "catbird-mls/Cargo.lock").is_file()
-        else STACK_ROOT.parent / "dec1-w2/catbird-mls/Cargo.lock"
-        if (STACK_ROOT.parent / "dec1-w2/catbird-mls/Cargo.lock").is_file()
         else STACK_ROOT.parent.parent / "Catbird+Petrel/catbird-mls/Cargo.lock"
     )
     lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
