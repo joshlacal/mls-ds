@@ -604,7 +604,7 @@
           "ref": "#directRequestProfile"
         }
       },
-      "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy. Version 2 with directRequestProfile advertises parser support only; admission additionally requires active revisioned exact-package DirectRequestGrant signatures."
+      "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy. Version 2 with directRequestProfile advertises parser support only; admission additionally requires active revisioned exact-package DirectRequestGrant signatures. This exact profile, including the empty KeyPackage, LeafNode and GroupContext extension lists, is fixed for protocol versions 1 and 2. A later protocol version may define optional LeafNode extensions in the RFC 9420 private-use range; such leaves appear only in conversations of that version, which the service never returns to a session whose supportedProtocolVersions does not list it. GroupContext extensions, GroupContextExtensions proposals and RequiredCapabilities stay unused. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon."
     },
     "deviceView": {
       "type": "object",
@@ -6251,6 +6251,37 @@
         "receivedAt": {
           "type": "ref",
           "ref": "#canonicalDatetime"
+        },
+        "actorWrite": {
+          "type": "ref",
+          "ref": "#accountDeletionActorWrite",
+          "description": "Optional. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. The deleting device's own signed deleteAccountData request, copied verbatim. It sits beside sequencerAuthority, whose transcript does not cover it."
+        },
+        "keyProof": {
+          "type": "bytes",
+          "minLength": 1,
+          "maxLength": 16384,
+          "description": "Optional; present only together with actorWrite. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. A CARv1 repository proof in the com.atproto.sync.getRecord shape: the signed repository commit of deletedDid, the MST path, and the record block for blue.catbird.chat.device/{actorDeviceId}, where actorDeviceId comes from actorWrite.writeBody. It verifies under the #atproto key of deletedDid's DID document, so a reader can check the signing device's key after deletedDid's repository is gone. It is captured before the repository is deleted and copied verbatim into every copy of the entry."
+        }
+      }
+    },
+    "accountDeletionActorWrite": {
+      "type": "object",
+      "description": "Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. The signed request with which a device of deletedDid called blue.catbird.labyrinth.deleteAccountData. writeBody is the exact labyrinthWriteBody JSON bytes the device sent, {operationId, actorDeviceId, endpointNsid, payloadSha256, signedAt}, never re-encoded. signature is the device's 64-byte Ed25519 signature over UTF8(CATBIRD-LABYRINTH-WRITE\\0) followed by writeBody. endpointNsid is blue.catbird.labyrinth.deleteAccountData, actorDeviceId names the signing device of deletedDid, and signedAt is the device-signed deletion instant. Every direct, relayed and mirrored copy of the entry carries the same bytes.",
+      "required": [
+        "writeBody",
+        "signature"
+      ],
+      "properties": {
+        "writeBody": {
+          "type": "bytes",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "signature": {
+          "type": "bytes",
+          "minLength": 64,
+          "maxLength": 64
         }
       }
     },
