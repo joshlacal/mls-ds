@@ -743,7 +743,15 @@ impl Device {
     pub async fn query(&self, name: &str, params: &[(&str, String)]) -> Reply {
         let nsid = format!("{PREFIX}{name}");
         let mut query = url::form_urlencoded::Serializer::new(String::new());
-        query.append_pair("actorDeviceId", &self.device_id.to_string());
+        // These private lexicons have no actorDeviceId parameter. Their signed
+        // read claim already names the device, and the handler uses fixed-query
+        // admission so generated clients can call the endpoint as declared.
+        if !matches!(
+            name,
+            "getRecoveryShareCapabilities" | "listRecoveryShares" | "listRecoveryShareEvents"
+        ) {
+            query.append_pair("actorDeviceId", &self.device_id.to_string());
+        }
         for (k, v) in params {
             query.append_pair(k, v);
         }

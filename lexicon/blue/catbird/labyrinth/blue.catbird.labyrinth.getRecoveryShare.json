@@ -40,7 +40,7 @@
                 "restore",
                 "verify"
               ],
-              "description": "restore (the default) for a device recovering the account. verify is the storing device's read-back right after putRecoveryShare; the service honours it only for the active device that stored this share and records it as a verify event, otherwise it treats the call as restore."
+              "description": "restore (the default) for a device recovering the account. verify is the storing device's single uncounted read-back within ten minutes after putRecoveryShare; the service honours it only once for the active device that stored this share and records it as a verify event. Later or other-device reads are recorded and counted as restore fetches even when purpose is verify."
             }
           }
         }

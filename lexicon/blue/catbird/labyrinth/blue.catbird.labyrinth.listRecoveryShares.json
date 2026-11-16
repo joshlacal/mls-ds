@@ -94,7 +94,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991,
-          "description": "Successful restore fetches; verify reads are not counted."
+          "description": "Successful share reads other than the creator's first verify read within ten minutes of put; later purpose-verify reads are counted as fetches."
         }
       }
     }

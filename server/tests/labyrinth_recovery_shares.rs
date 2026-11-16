@@ -162,6 +162,18 @@ async fn pending_fetch_is_hpke_sealed_and_did_scoped_without_operation_write() {
     let output = fetched.ok();
     assert_eq!(unb(&output["sealedShare"]).len(), 48);
     assert_eq!(open(&hpke, &sk, &alice.did, &vid, output), share.to_vec());
+    // The original creator cannot suppress a later fetch by repeating the
+    // one-time `verify` purpose after the first read-back.
+    let repeated_verify = alice
+        .call(
+            "getRecoveryShare",
+            &fetch_input(&vid, &token, &pk, "verify"),
+        )
+        .await;
+    assert_eq!(
+        open(&hpke, &sk, &alice.did, &vid, repeated_verify.ok()),
+        share.to_vec()
+    );
     assert!(!fetched
         .bytes
         .windows(share.len())
@@ -229,7 +241,7 @@ async fn pending_fetch_is_hpke_sealed_and_did_scoped_without_operation_write() {
         .fails(403, "ChatDeviceNotActive");
     let listed = alice.query("listRecoveryShares", &[]).await;
     assert_eq!(listed.ok()["shares"].as_array().unwrap().len(), 1);
-    assert_eq!(listed.json["shares"][0]["fetchCount"], 1);
+    assert_eq!(listed.json["shares"][0]["fetchCount"], 2);
     assert!(!listed
         .bytes
         .windows(share.len())
@@ -242,7 +254,8 @@ async fn pending_fetch_is_hpke_sealed_and_did_scoped_without_operation_write() {
         .filter_map(|event| event["kind"].as_str())
         .collect();
     assert!(kinds.contains(&"verify"));
-    assert!(kinds.contains(&"fetch"));
+    assert_eq!(kinds.iter().filter(|kind| **kind == "verify").count(), 1);
+    assert_eq!(kinds.iter().filter(|kind| **kind == "fetch").count(), 2);
 }
 
 #[tokio::test]

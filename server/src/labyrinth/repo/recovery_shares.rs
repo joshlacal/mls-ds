@@ -275,19 +275,28 @@ pub async fn record_fetch(
     if journal.contains(did, vid) {
         return Err(unavailable());
     }
-    if verify {
-        let live: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM labyrinth.recovery_shares \
-             WHERE owner_did=$1 AND vdevice_id=$2 AND deleted_at IS NULL)",
+    // The creator gets exactly one uncounted read-back shortly after put.
+    // A later `purpose=verify` is a restore fetch, so the original device
+    // cannot hide repeated access by labeling it as verification forever.
+    let first_verify = if verify {
+        sqlx::query(
+            "UPDATE labyrinth.recovery_shares SET verified_at=$3 \
+             WHERE owner_did=$1 AND vdevice_id=$2 AND deleted_at IS NULL \
+               AND created_by_device_id=$4 AND verified_at IS NULL \
+               AND created_at <= $3 AND created_at >= $3 - INTERVAL '10 minutes'",
         )
         .bind(did)
         .bind(vid.as_slice())
-        .fetch_one(&mut *conn)
-        .await?;
-        if !live || journal.contains(did, vid) {
-            return Err(unavailable());
-        }
+        .bind(at)
+        .bind(actor)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected()
+            == 1
     } else {
+        false
+    };
+    if !first_verify {
         let affected = sqlx::query(
             "UPDATE labyrinth.recovery_shares \
              SET fetch_count=fetch_count+1, \
@@ -308,7 +317,7 @@ pub async fn record_fetch(
         conn,
         did,
         vid,
-        if verify { "verify" } else { "fetch" },
+        if first_verify { "verify" } else { "fetch" },
         Some(actor),
         at,
     )

@@ -18,7 +18,10 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use super::params::{admit_procedure_allowing_pending, admit_query_allowing_pending, begin_write};
+use super::params::{
+    admit_fixed_query, admit_fixed_query_allowing_pending, admit_procedure_allowing_pending,
+    begin_write,
+};
 use super::respond;
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth;
@@ -308,7 +311,7 @@ pub async fn list_recovery_shares(
 ) -> Response {
     respond(
         async {
-            let (adm, params) = admit_query_allowing_pending(
+            let (adm, params) = admit_fixed_query(
                 &pool,
                 &rt,
                 "listRecoveryShares",
@@ -365,7 +368,7 @@ pub async fn list_recovery_share_events(
 ) -> Response {
     respond(
         async {
-            let (adm, params) = admit_query_allowing_pending(
+            let (adm, params) = admit_fixed_query(
                 &pool,
                 &rt,
                 "listRecoveryShareEvents",
@@ -422,7 +425,7 @@ pub async fn get_recovery_share_capabilities(
 ) -> Response {
     respond(
         async {
-            let (adm, _) = admit_query_allowing_pending(
+            let (adm, _) = admit_fixed_query_allowing_pending(
                 &pool,
                 &rt,
                 "getRecoveryShareCapabilities",

@@ -12,6 +12,7 @@ CREATE TABLE labyrinth.recovery_shares (
     fetch_verifier BYTEA,
     created_by_device_id UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
+    verified_at TIMESTAMPTZ,
     last_fetched_at TIMESTAMPTZ,
     fetch_count BIGINT NOT NULL DEFAULT 0,
     deleted_at TIMESTAMPTZ,
@@ -21,7 +22,8 @@ CREATE TABLE labyrinth.recovery_shares (
     CONSTRAINT recovery_shares_mechanism_check CHECK (mechanism IN ('code', 'passkey')),
     CONSTRAINT recovery_shares_fetch_count_check CHECK (fetch_count BETWEEN 0 AND 9007199254740991),
     CONSTRAINT recovery_shares_times_check CHECK (
-        (last_fetched_at IS NULL OR last_fetched_at >= created_at)
+        (verified_at IS NULL OR verified_at >= created_at)
+        AND (last_fetched_at IS NULL OR last_fetched_at >= created_at)
         AND (deleted_at IS NULL OR deleted_at >= created_at)
     ),
     CONSTRAINT recovery_shares_live_or_erased_check CHECK (
@@ -54,6 +56,7 @@ BEGIN
        OR NEW.mechanism IS DISTINCT FROM OLD.mechanism
        OR NEW.created_by_device_id IS DISTINCT FROM OLD.created_by_device_id
        OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR (OLD.verified_at IS NOT NULL AND NEW.verified_at IS DISTINCT FROM OLD.verified_at)
        OR NEW.fetch_count < OLD.fetch_count
        OR (OLD.last_fetched_at IS NOT NULL AND (
            NEW.last_fetched_at IS NULL OR NEW.last_fetched_at < OLD.last_fetched_at))

@@ -134,6 +134,18 @@ impl RateLimiter {
         }
     }
 
+    /// Inspect an existing failure bucket without charging a valid request.
+    /// An unseen key has the full burst available.
+    pub fn retry_after_if_exhausted(&self, key: &str) -> Option<u64> {
+        if crate::sim_hooks::is_deterministic_clock_active() {
+            return None;
+        }
+        let bucket = self.buckets.get(key)?;
+        let mut bucket = bucket.lock();
+        bucket.refill();
+        (bucket.tokens < 1.0).then(|| bucket.retry_after_secs())
+    }
+
     /// Cleanup old buckets (call periodically to prevent memory leak)
     pub async fn cleanup_old_buckets(&self, _max_age: Duration) {
         self.buckets.run_pending_tasks();
@@ -378,6 +390,11 @@ pub static FEDERATION_DS_RATE_LIMITER: Lazy<FederationPeerRateLimiter> =
 
 /// Per-IP rate limiter instance
 pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
+/// `getRecoveryShare` charges only malformed/unauthorized ingress here. A
+/// signed wrong-token miss has its own device and IP buckets in the handler,
+/// and a valid fetch must not be blocked by another device's misses.
+static RECOVERY_SHARE_INGRESS_FAILURE_LIMITER: Lazy<RateLimiter> =
+    Lazy::new(|| RateLimiter::new(300, 300.0 / 60.0));
 
 fn default_trusted_proxy_cidrs() -> Vec<IpNet> {
     [
@@ -423,11 +440,23 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
     // ids and DIDs, and an address next to it would tie those identifiers to a network
     // location in the log.
     let path = request.uri().path().to_owned();
-    // The recovery-share fetch checks the token before charging miss-only
-    // device and IP buckets. Charging this shared pre-auth bucket would let
-    // wrong tokens block a correct recovery from the same network origin.
-    if path == "/xrpc/blue.catbird.labyrinth.getRecoveryShare" {
-        return Ok(next.run(request).await);
+    // A valid fetch is exempt from the shared pre-auth bucket: another
+    // device's wrong fetch tokens must not block this one. Malformed or
+    // unauthorized ingress still needs a per-IP cap before expensive auth.
+    if path == "/xrpc/blue.catbird.labyrinth.getRecoveryShare"
+        && request.method() == axum::http::Method::POST
+    {
+        let client_ip = extract_client_ip(&request);
+        if let Some(retry_after) =
+            RECOVERY_SHARE_INGRESS_FAILURE_LIMITER.retry_after_if_exhausted(&client_ip)
+        {
+            return Ok(rate_limited_response(retry_after));
+        }
+        let response = next.run(request).await;
+        if recovery_ingress_failure(response.status()) {
+            let _ = RECOVERY_SHARE_INGRESS_FAILURE_LIMITER.check(&client_ip);
+        }
+        return Ok(response);
     }
     let client_ip = extract_client_ip(&request);
 
@@ -443,23 +472,34 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
                 path,
                 retry_after
             );
-            // Return ATProto-compatible JSON error body with Retry-After header
-            let body = Json(json!({
-                "error": "RateLimitExceeded",
-                "message": format!(
-                    "Too many requests from this IP. Retry after {} second(s).",
-                    retry_after
-                ),
-            }));
-            let mut resp = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
-            resp.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_str(&retry_after.to_string())
-                    .unwrap_or(axum::http::HeaderValue::from_static("1")),
-            );
-            Ok(resp)
+            Ok(rate_limited_response(retry_after))
         }
     }
+}
+
+fn recovery_ingress_failure(status: StatusCode) -> bool {
+    status.is_client_error()
+        && !matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
+fn rate_limited_response(retry_after: u64) -> Response {
+    let body = Json(json!({
+        "error": "RateLimitExceeded",
+        "message": format!(
+            "Too many requests from this IP. Retry after {} second(s).",
+            retry_after
+        ),
+    }));
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_str(&retry_after.to_string())
+            .unwrap_or(axum::http::HeaderValue::from_static("1")),
+    );
+    response
 }
 
 fn parse_ip_from_header(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
@@ -548,6 +588,34 @@ mod tests {
 
         // Should fail after exhausting tokens
         assert!(!bucket.try_consume());
+    }
+
+    #[test]
+    fn recovery_ingress_bucket_charges_failures_only() {
+        let limiter = RateLimiter::new(2, 0.001);
+        assert!(limiter.retry_after_if_exhausted("shared-ip").is_none());
+        assert!(limiter.check("shared-ip").is_ok());
+        assert!(limiter.retry_after_if_exhausted("shared-ip").is_none());
+        assert!(limiter.check("shared-ip").is_ok());
+        assert!(limiter.retry_after_if_exhausted("shared-ip").is_some());
+        assert!(limiter.retry_after_if_exhausted("other-ip").is_none());
+
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ] {
+            assert!(recovery_ingress_failure(status));
+        }
+        for status in [
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert!(!recovery_ingress_failure(status));
+        }
     }
 
     #[tokio::test]
