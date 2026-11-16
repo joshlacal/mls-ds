@@ -8,7 +8,8 @@
 //! store the UTC day only.
 
 use chrono::{DateTime, Duration, DurationRound, Utc};
-use sqlx::{Executor, Postgres};
+use sqlx::PgConnection;
+use uuid::Uuid;
 
 /// Truncate `instant` to the start of its UTC day.
 ///
@@ -18,41 +19,41 @@ pub fn coarse_activity_day(instant: DateTime<Utc>) -> DateTime<Utc> {
     instant.duration_trunc(Duration::days(1)).unwrap_or(instant)
 }
 
-fn pending_device_hold_hours() -> i64 {
+/// Recovery promotion requires a fresh, device-signed action after at least
+/// 72 hours of sibling-visible pending status. Operators may extend the hold,
+/// but cannot shorten the security floor.
+pub fn pending_device_hold_hours() -> i64 {
     std::env::var("CHAT_PENDING_DEVICE_HOLD_HOURS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
-        .filter(|v| *v > 0)
+        .filter(|v| *v >= 72)
         .unwrap_or(72)
 }
 
-/// `D-2` / `B10`: Promote any `pending_approval` device on `user_did` whose
-/// 72-hour elapsed-clock recovery hold has completed (`created_at <= now - 72h`)
-/// without sibling revocation (`revoked_at IS NULL`).
-pub async fn promote_matured_pending_devices_for_user<'e, E>(
-    executor: E,
-    user_did: &str,
-    now: DateTime<Utc>,
-) -> Result<u64, sqlx::Error>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let cutoff = now - Duration::hours(pending_device_hold_hours());
-    let result = sqlx::query(
+/// A successfully device-signed Labyrinth request is activity even when the
+/// device uses no chat endpoint. Wake only a still-active device, and retain the
+/// same coarse UTC-day privacy bound as chat reads and ACKs. Callers must invoke
+/// this only AFTER verifying the device signature.
+pub async fn mark_authenticated_labyrinth_activity(
+    conn: &mut PgConnection,
+    did: &str,
+    device_id: Uuid,
+    at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let day = coarse_activity_day(at);
+    sqlx::query(
         "UPDATE chat.devices \
-            SET status = 'active', \
-                updated_at = GREATEST(updated_at, $2) \
-          WHERE user_did = $1 \
-            AND status = 'pending_approval' \
-            AND revoked_at IS NULL \
-            AND created_at <= $3",
+            SET last_active_at = GREATEST(last_active_at, $3), dormant_at = NULL \
+          WHERE user_did = $1 AND device_id = $2 \
+            AND status = 'active' AND revoked_at IS NULL \
+            AND (last_active_at < $3 OR dormant_at IS NOT NULL)",
     )
-    .bind(user_did)
-    .bind(now)
-    .bind(cutoff)
-    .execute(executor)
+    .bind(did)
+    .bind(device_id)
+    .bind(day)
+    .execute(conn)
     .await?;
-    Ok(result.rows_affected())
+    Ok(())
 }
 
 #[cfg(test)]

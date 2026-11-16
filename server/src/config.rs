@@ -563,7 +563,8 @@ impl ChatRetentionConfig {
             pending_device_hold_hours: parse_env_i64_positive(
                 "CHAT_PENDING_DEVICE_HOLD_HOURS",
                 defaults.pending_device_hold_hours,
-            ),
+            )
+            .max(72),
         }
     }
 }

@@ -563,32 +563,11 @@ pub async fn mark_inactive_devices(
     now: DateTime<Utc>,
 ) -> Result<u64, ExpirySweepError> {
     let dormant_after_hours = positive_hours_env("CHAT_DEVICE_DORMANT_AFTER_HOURS", 48);
-    let pending_hold_hours = positive_hours_env("CHAT_PENDING_DEVICE_HOLD_HOURS", 72);
     // `last_active_at` is coarse-bucketed to UTC midnight (`00:00:00Z`), which can lag
     // a late-UTC-day interaction (`23:59:59Z`) by up to 24h; add a +24h margin so the
     // dormancy threshold reflects at least `dormant_after_hours` of true inactivity.
     let cutoff = now - chrono::Duration::hours(dormant_after_hours) - chrono::Duration::hours(24);
-    let pending_cutoff = now - chrono::Duration::hours(pending_hold_hours);
     let mut tx = pool.begin().await?;
-    sqlx::query(
-        "UPDATE chat.devices d \
-            SET status = 'active', \
-                updated_at = GREATEST(d.updated_at, $1) \
-          WHERE (d.user_did, d.device_id) IN ( \
-              SELECT p.user_did, p.device_id \
-                FROM chat.devices p \
-               WHERE p.status = 'pending_approval' \
-                 AND p.revoked_at IS NULL \
-                 AND p.created_at <= $2 \
-               ORDER BY p.created_at ASC, p.user_did ASC, p.device_id ASC \
-               LIMIT 500 \
-                 FOR UPDATE SKIP LOCKED \
-          )",
-    )
-    .bind(now)
-    .bind(pending_cutoff)
-    .execute(&mut *tx)
-    .await?;
 
     let marked: Vec<(String, Uuid)> = sqlx::query_as(
         "UPDATE chat.devices d \

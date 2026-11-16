@@ -15,6 +15,8 @@ use crate::federation::group_relay::{
 use crate::federation::receipt::{AccountDeletion, AccountDeletionEvidence, I13ReceiptSigner};
 use crate::federation::FederationError;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
+use crate::labyrinth::recovery_tombstones::RecoveryTombstones;
+use crate::labyrinth::repo::recovery_shares;
 use crate::storage::DbPool;
 
 /// Idempotency records in `labyrinth.operations` are kept for 7 days.
@@ -55,6 +57,37 @@ pub async fn purge_account(
     c33_peers: &C33PeerHomes,
     evidence: Option<&AccountDeletionEvidence>,
 ) -> LabyrinthResult<usize> {
+    purge_account_with_recovery(conn, did, at, receipt_signer, c33_peers, evidence, None).await
+}
+
+/// Account deletion with the external erasure journal. The journal syncs each
+/// share tombstone before SQL clears its KEK ciphertext. A caller without the
+/// journal cannot delete an account that has live shares.
+pub async fn purge_account_with_recovery(
+    conn: &mut PgConnection,
+    did: &str,
+    at: DateTime<Utc>,
+    receipt_signer: Option<&I13ReceiptSigner>,
+    c33_peers: &C33PeerHomes,
+    evidence: Option<&AccountDeletionEvidence>,
+    recovery_journal: Option<&RecoveryTombstones>,
+) -> LabyrinthResult<usize> {
+    if recovery_journal.is_none() {
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM labyrinth.recovery_shares \
+             WHERE owner_did=$1 AND deleted_at IS NULL)",
+        )
+        .bind(did)
+        .fetch_one(&mut *conn)
+        .await?;
+        if live {
+            return Err(LabyrinthError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                "recovery-share tombstone journal is required for account deletion",
+            ));
+        }
+    }
     let mut tx = conn.begin().await?;
     let sequenced =
         sequence_account_deleted_entries(&mut tx, did, at, receipt_signer, c33_peers, evidence)
@@ -107,6 +140,9 @@ pub async fn purge_account(
     .bind(at)
     .execute(&mut *conn)
     .await?;
+    if let Some(journal) = recovery_journal {
+        recovery_shares::purge(conn, did, at, journal).await?;
+    }
     purge_mailbox(conn, did).await?;
     Ok(sequenced)
 }

@@ -423,6 +423,12 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
     // ids and DIDs, and an address next to it would tie those identifiers to a network
     // location in the log.
     let path = request.uri().path().to_owned();
+    // The recovery-share fetch checks the token before charging miss-only
+    // device and IP buckets. Charging this shared pre-auth bucket would let
+    // wrong tokens block a correct recovery from the same network origin.
+    if path == "/xrpc/blue.catbird.labyrinth.getRecoveryShare" {
+        return Ok(next.run(request).await);
+    }
     let client_ip = extract_client_ip(&request);
 
     match IP_LIMITER.check(&client_ip) {
@@ -486,17 +492,16 @@ fn is_trusted_proxy(ip: IpAddr, trusted_cidrs: &[IpNet]) -> bool {
     !trusted_cidrs.is_empty() && trusted_cidrs.iter().any(|cidr| cidr.contains(&ip))
 }
 
-fn extract_client_ip_with_trusted(request: &Request, trusted_cidrs: &[IpNet]) -> String {
-    let peer_ip = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip());
-
+fn client_ip_with_trusted(
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trusted_cidrs: &[IpNet],
+) -> String {
     if let Some(source_ip) = peer_ip {
         if is_trusted_proxy(source_ip, trusted_cidrs) {
-            if let Some(ip) = parse_ip_from_header(request.headers(), "cf-connecting-ip")
-                .or_else(|| parse_xff_rightmost_untrusted(request.headers(), trusted_cidrs))
-                .or_else(|| parse_ip_from_header(request.headers(), "x-real-ip"))
+            if let Some(ip) = parse_ip_from_header(headers, "cf-connecting-ip")
+                .or_else(|| parse_xff_rightmost_untrusted(headers, trusted_cidrs))
+                .or_else(|| parse_ip_from_header(headers, "x-real-ip"))
             {
                 return ip.to_string();
             }
@@ -505,6 +510,20 @@ fn extract_client_ip_with_trusted(request: &Request, trusted_cidrs: &[IpNet]) ->
     }
 
     "unknown".to_string()
+}
+
+/// The same trusted-proxy origin selection used by the global IP middleware,
+/// available to recovery-share miss throttling after authentication.
+pub fn recovery_client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    client_ip_with_trusted(headers, peer.map(|addr| addr.ip()), &TRUSTED_PROXY_CIDRS)
+}
+
+fn extract_client_ip_with_trusted(request: &Request, trusted_cidrs: &[IpNet]) -> String {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    client_ip_with_trusted(request.headers(), peer, trusted_cidrs)
 }
 
 fn extract_client_ip(request: &Request) -> String {

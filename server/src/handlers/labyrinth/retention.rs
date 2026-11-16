@@ -96,13 +96,14 @@ pub async fn delete_account_data(
                 auth::AccountDeletionAdmission::NeverEnrolled { did, instant } => {
                     let c33_peers = repo::resolve_c33_peer_homes(&pool, &did).await?;
                     let mut conn = pool.acquire().await?;
-                    repo::purge_account(
+                    repo::purge_account_with_recovery(
                         &mut *conn,
                         &did,
                         instant,
                         rt.i13_receipt_signer(),
                         &c33_peers,
                         None,
+                        rt.recovery_tombstones().map(Arc::as_ref),
                     )
                     .await?;
                     return to_bytes(&json!({}));
@@ -113,13 +114,14 @@ pub async fn delete_account_data(
             let c33_peers = repo::resolve_c33_peer_homes(&pool, &adm.did).await?;
             let mut w = begin_write!(&pool, adm);
             let (caller, at) = (w.caller.clone(), w.instant);
-            let sequenced = repo::purge_account(
+            let sequenced = repo::purge_account_with_recovery(
                 &mut w.tx,
                 &caller.did,
                 at,
                 rt.i13_receipt_signer(),
                 &c33_peers,
                 Some(&evidence),
+                rt.recovery_tombstones().map(Arc::as_ref),
             )
             .await?;
             let resp = w.finish_write(to_bytes(&json!({}))?).await?;

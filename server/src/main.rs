@@ -31,6 +31,9 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Import from library crate instead of re-declaring modules
+use catbird_server::labyrinth::{
+    recovery_crypto::RecoveryCrypto, recovery_tombstones::RecoveryTombstones,
+};
 use catbird_server::{
     auth, config, db, federation, handlers, health, metrics, middleware, realtime,
     request_body_limit, workers, CHAT_DIRECT_REQUEST_BODY_LIMIT_BYTES,
@@ -86,6 +89,43 @@ fn truthy_env_var(name: &str) -> bool {
     std::env::var(name)
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+/// Validate the mounted KEK, verify the external deletion journal and replay
+/// it against a potentially restored PostgreSQL backup before any worker or
+/// listener can expose a share.
+async fn prepare_recovery_shares(
+    pool: &PgPool,
+    required: bool,
+) -> anyhow::Result<Option<(Arc<RecoveryCrypto>, Arc<RecoveryTombstones>)>> {
+    let crypto = RecoveryCrypto::from_env().map_err(anyhow::Error::msg)?;
+    let Some(crypto) = crypto else {
+        anyhow::ensure!(
+            !required,
+            "CHAT_CUTOVER_ENABLED requires a recovery-share KEK mount"
+        );
+        return Ok(None);
+    };
+    let path = std::env::var("LABYRINTH_RECOVERY_SHARE_TOMBSTONE_FILE").map_err(|_| {
+        anyhow::anyhow!("recovery-share tombstone journal path is required with a KEK")
+    })?;
+    let tombstones = RecoveryTombstones::open_existing(path, crypto.journal_key())
+        .map_err(anyhow::Error::msg)?;
+    let key_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT kek_key_id FROM labyrinth.recovery_shares \
+         WHERE deleted_at IS NULL AND kek_key_id IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    anyhow::ensure!(
+        key_ids.iter().all(|id| id == crypto.key_id()),
+        "recovery-share KEK ID does not match stored live shares; rewrap before rotation"
+    );
+    tombstones
+        .replay(pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("recovery-share tombstone replay failed: {error}"))?;
+    Ok(Some((Arc::new(crypto), Arc::new(tombstones))))
 }
 
 fn validate_receipt_startup(
@@ -658,6 +698,9 @@ async fn main() -> anyhow::Result<()> {
     let db_pool = db::init_db_default().await?;
     tracing::info!("Database initialized");
 
+    let recovery_shares =
+        prepare_recovery_shares(&db_pool, truthy_env_var("CHAT_CUTOVER_ENABLED")).await?;
+
     // Initialize SSE state for realtime events
     let sse_buffer_size = std::env::var("SSE_BUFFER_SIZE")
         .unwrap_or_else(|_| "5000".to_string())
@@ -847,18 +890,20 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_token = tokio_util::sync::CancellationToken::new();
 
-    let chat_runtime = Arc::new(
-        catbird_server::handlers::chat::ChatRuntime::from_env_with_federation(
-            sse_state.clone(),
-            resolver.clone(),
-            commit_submitter,
-            receipt_signer.clone(),
-        )
-        .unwrap_or_else(|error| {
-            tracing::error!("clean-chat runtime configuration rejected: {error}");
-            std::process::exit(1);
-        }),
-    );
+    let mut chat_runtime = catbird_server::handlers::chat::ChatRuntime::from_env_with_federation(
+        sse_state.clone(),
+        resolver.clone(),
+        commit_submitter,
+        receipt_signer.clone(),
+    )
+    .unwrap_or_else(|error| {
+        tracing::error!("clean-chat runtime configuration rejected: {error}");
+        std::process::exit(1);
+    });
+    if let Some((crypto, tombstones)) = recovery_shares {
+        chat_runtime = chat_runtime.with_recovery_shares(crypto, tombstones);
+    }
+    let chat_runtime = Arc::new(chat_runtime);
 
     #[cfg(feature = "test-support")]
     if truthy_env_var("FEDERATION_TEST_INITIALIZE_CHAT_FENCE") {

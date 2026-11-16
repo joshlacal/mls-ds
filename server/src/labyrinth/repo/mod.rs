@@ -1,6 +1,7 @@
 //! SQL for the clean-slate `labyrinth` schema (`epoch_heads`, `epoch_head_floors`, `operations`).
 
 pub mod directory;
+pub mod recovery_shares;
 pub mod retention;
 
 use chrono::{DateTime, Utc};

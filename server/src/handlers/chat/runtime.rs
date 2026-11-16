@@ -12,6 +12,8 @@ use zeroize::Zeroizing;
 
 use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
 use crate::chat_protocol::{relationship_policy::ProductionRelationshipAuthority, CursorSealer};
+use crate::labyrinth::recovery_crypto::RecoveryCrypto;
+use crate::labyrinth::recovery_tombstones::RecoveryTombstones;
 
 #[cfg(feature = "test-support")]
 pub fn install_test_https_relationship_resolver(
@@ -98,6 +100,8 @@ pub struct ChatRuntime {
     relationship_authority: Arc<ProductionRelationshipAuthority>,
     sse_state: Arc<SseState>,
     cursor_sealer: Option<CursorSealer>,
+    recovery_crypto: Option<Arc<RecoveryCrypto>>,
+    recovery_tombstones: Option<Arc<RecoveryTombstones>>,
     subscription_endpoint: Option<String>,
     resolver: Option<Arc<crate::federation::DsResolver>>,
     commit_submitter: Option<Arc<crate::federation::commit_submitter::RemoteCommitSubmitter>>,
@@ -123,6 +127,14 @@ impl fmt::Debug for ChatRuntime {
             .field("require_signed_reads", &self.require_signed_reads)
             .field("sse_state", &"conversation-filtered")
             .field("cursor_sealer_configured", &self.cursor_sealer.is_some())
+            .field(
+                "recovery_crypto_configured",
+                &self.recovery_crypto.is_some(),
+            )
+            .field(
+                "recovery_tombstones_configured",
+                &self.recovery_tombstones.is_some(),
+            )
             .field(
                 "subscription_endpoint_configured",
                 &self.subscription_endpoint.is_some(),
@@ -246,6 +258,8 @@ impl ChatRuntime {
             relationship_authority,
             sse_state,
             cursor_sealer,
+            recovery_crypto: None,
+            recovery_tombstones: None,
             subscription_endpoint,
             resolver: None,
             commit_submitter: None,
@@ -345,6 +359,25 @@ impl ChatRuntime {
     pub fn with_resolver(mut self, resolver: Arc<crate::federation::DsResolver>) -> Self {
         self.resolver = Some(resolver);
         self
+    }
+
+    /// Install the startup-validated KEK and replayed external erasure journal.
+    pub fn with_recovery_shares(
+        mut self,
+        crypto: Arc<RecoveryCrypto>,
+        tombstones: Arc<RecoveryTombstones>,
+    ) -> Self {
+        self.recovery_crypto = Some(crypto);
+        self.recovery_tombstones = Some(tombstones);
+        self
+    }
+
+    pub fn recovery_crypto(&self) -> Option<&Arc<RecoveryCrypto>> {
+        self.recovery_crypto.as_ref()
+    }
+
+    pub fn recovery_tombstones(&self) -> Option<&Arc<RecoveryTombstones>> {
+        self.recovery_tombstones.as_ref()
     }
 
     pub fn resolver(&self) -> Option<&Arc<crate::federation::DsResolver>> {
