@@ -293,6 +293,17 @@ async fn a_group_mirror_serves_the_deleting_devices_signed_write_and_key_proof_v
     mirror_serves_device_evidence(0, 512).await;
 }
 
+/// The largest deletion the lexicon admits, a 1024-byte writeBody and a
+/// 16384-byte keyProof, is replicated and served like any other.
+#[tokio::test]
+async fn a_group_mirror_serves_a_maximum_size_account_deletion() {
+    mirror_serves_device_evidence(
+        crate::federation::receipt::ACTOR_WRITE_BODY_MAX_BYTES,
+        crate::federation::receipt::KEY_PROOF_MAX_BYTES,
+    )
+    .await;
+}
+
 /// MLS-R3-02: SEQ rotated its receipt key to `#mls-receipt-2` and retains `#1`.
 /// The home verifies a new `#2` deletion and an archived `#1` one against SEQ's
 /// published history, never requiring the archived method to be current; a key

@@ -246,16 +246,19 @@ pub(crate) async fn load_account_deletions(
     .fetch_all(&mut **transaction)
     .await
     .map_err(|_| ConversationStateReadError::Storage)?;
-    // A replicated deletion is well under 4 KiB: ciphertext rows are skipped by their
-    // stored length, without detoasting them.
+    // Application rows carry their message id, and a replicated deletion is never
+    // longer than its entry bound: every other row is skipped by those stored
+    // columns alone, without detoasting its bytes.
     let replicated: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT entry_bytes FROM chat.direct_request_transport_entries \
-          WHERE conversation_id = $1 AND octet_length(entry_bytes) <= 4096 \
+          WHERE conversation_id = $1 AND application_message_id IS NULL \
+            AND octet_length(entry_bytes) <= $3 \
             AND position($2::bytea IN entry_bytes) > 0 \
           ORDER BY seq",
     )
     .bind(conversation_id)
     .bind(format!("\"{ACCOUNT_DELETED_ENTRY_KIND}\"").into_bytes())
+    .bind(crate::federation::receipt::ACCOUNT_DELETED_ENTRY_MAX_BYTES as i32)
     .fetch_all(&mut **transaction)
     .await
     .map_err(|_| ConversationStateReadError::Storage)?;
