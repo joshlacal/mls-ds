@@ -355,6 +355,8 @@ const ACCOUNT_DELETED_ENTRY_TYPE: &str = "blue.catbird.chat.defs#accountDeletedE
 pub const DELETE_ACCOUNT_DATA_NSID: &str = "blue.catbird.labyrinth.deleteAccountData";
 /// Lexicon `accountDeletionActorWrite.writeBody` maximum length.
 pub const ACTOR_WRITE_BODY_MAX_BYTES: usize = 1024;
+/// Lexicon `accountDeletionActorWrite.payloadBytes` maximum length.
+pub const ACTOR_PAYLOAD_MAX_BYTES: usize = 1024;
 /// Lexicon `accountDeletedEntry.keyProof` maximum length.
 pub const KEY_PROOF_MAX_BYTES: usize = 16_384;
 /// Upper bound on one serialized `accountDeletedEntry`, which holds the largest
@@ -388,6 +390,14 @@ pub struct AccountDeletionActorWrite {
     pub write_body: Vec<u8>,
     #[serde(with = "crate::atproto_bytes")]
     pub signature: Vec<u8>,
+    /// Exact HTTP body whose digest the signed write body covers. Older entries
+    /// decode without this field, but clients cannot enforce their deletion.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::atproto_bytes::option"
+    )]
+    pub payload_bytes: Option<Vec<u8>>,
 }
 
 /// What an `accountDeletedEntry` carries from the deleting device: its signed
@@ -433,6 +443,21 @@ impl AccountDeletionEvidence {
         }
         let wire: crate::labyrinth::auth::WriteBodyWire = serde_json::from_slice(write_body)
             .map_err(|error| format!("actorWrite.writeBody: {error}"))?;
+        if let Some(payload) = &self.actor_write.payload_bytes {
+            if payload.len() < 2 || payload.len() > ACTOR_PAYLOAD_MAX_BYTES {
+                return Err("actorWrite.payloadBytes length is out of range".to_string());
+            }
+            let expected = hex::decode(&wire.payload_sha256)
+                .map_err(|_| "actorWrite.writeBody.payloadSha256 is not hex".to_string())?;
+            if expected.as_slice() != Sha256::digest(payload).as_slice() {
+                return Err("actorWrite.payloadBytes digest does not match writeBody".to_string());
+            }
+            let value: serde_json::Value = serde_json::from_slice(payload)
+                .map_err(|_| "actorWrite.payloadBytes is not JSON".to_string())?;
+            if !matches!(value, serde_json::Value::Object(ref fields) if fields.is_empty()) {
+                return Err("actorWrite.payloadBytes is not an empty object".to_string());
+            }
+        }
         if wire.endpoint_nsid != DELETE_ACCOUNT_DATA_NSID {
             return Err("actorWrite.writeBody names another endpoint".to_string());
         }
@@ -473,6 +498,7 @@ impl AccountDeletionEvidence {
             actor_write: AccountDeletionActorWrite {
                 write_body,
                 signature,
+                payload_bytes: Some(b"{}".to_vec()),
             },
             key_proof,
         }
@@ -2526,6 +2552,7 @@ mod tests {
             json!({
                 "writeBody": { "$bytes": STANDARD.encode(&evidence.actor_write.write_body) },
                 "signature": { "$bytes": STANDARD.encode(&evidence.actor_write.signature) },
+                "payloadBytes": { "$bytes": STANDARD.encode(b"{}") },
             })
         );
         assert_eq!(
@@ -2547,6 +2574,13 @@ mod tests {
         let old = bare.entry(&authority);
         assert!(old.get("actorWrite").is_none() && old.get("keyProof").is_none());
         assert_eq!(AccountDeletion::from_entry(&old).unwrap().0, bare);
+        let mut legacy_actor_write = entry.clone();
+        legacy_actor_write["actorWrite"]
+            .as_object_mut()
+            .unwrap()
+            .remove("payloadBytes");
+        let (legacy, _) = AccountDeletion::from_entry(&legacy_actor_write).unwrap();
+        assert!(legacy.evidence.unwrap().actor_write.payload_bytes.is_none());
 
         // The largest evidence the lexicon admits still fits the entry bound.
         let largest = evidenced_deletion(Some(device_evidence(
@@ -2589,6 +2623,11 @@ mod tests {
             }),
             reshaped(&|e| e.actor_write.write_body = b"{}".to_vec()),
             reshaped(&|e| e.actor_write.write_body = other_endpoint_body.clone()),
+            reshaped(&|e| e.actor_write.payload_bytes = Some(b"{ }!".to_vec())),
+            reshaped(&|e| e.actor_write.payload_bytes = Some(b"{\"unexpected\":1}".to_vec())),
+            reshaped(&|e| {
+                e.actor_write.payload_bytes = Some(vec![b' '; ACTOR_PAYLOAD_MAX_BYTES + 1])
+            }),
             reshaped(&|e| e.key_proof = Some(Vec::new())),
             reshaped(&|e| e.key_proof = Some(vec![0; KEY_PROOF_MAX_BYTES + 1])),
             {

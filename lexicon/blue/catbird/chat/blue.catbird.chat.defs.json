@@ -6267,7 +6267,7 @@
     },
     "accountDeletionActorWrite": {
       "type": "object",
-      "description": "Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. The signed request with which a device of deletedDid called blue.catbird.labyrinth.deleteAccountData. writeBody is the exact labyrinthWriteBody JSON bytes the device sent, {operationId, actorDeviceId, endpointNsid, payloadSha256, signedAt}, never re-encoded. signature is the device's 64-byte Ed25519 signature over UTF8(CATBIRD-LABYRINTH-WRITE\\0) followed by writeBody. endpointNsid is blue.catbird.labyrinth.deleteAccountData, actorDeviceId names the signing device of deletedDid, and signedAt is the device-signed deletion instant. Every direct, relayed and mirrored copy of the entry carries the same bytes.",
+      "description": "Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. The signed request with which a device of deletedDid called blue.catbird.labyrinth.deleteAccountData. writeBody is the exact labyrinthWriteBody JSON bytes the device sent, {operationId, actorDeviceId, endpointNsid, payloadSha256, signedAt}, never re-encoded. payloadBytes is the exact HTTP JSON body whose SHA-256 equals writeBody.payloadSha256; readers parse it as an empty object and do not trust only the hash. signature is the device's 64-byte Ed25519 signature over UTF8(CATBIRD-LABYRINTH-WRITE\\0) followed by writeBody. endpointNsid is blue.catbird.labyrinth.deleteAccountData, actorDeviceId names the signing device of deletedDid, and signedAt is the device-signed deletion instant. Every direct, relayed and mirrored copy of the entry carries the same bytes. Historical entries without payloadBytes decode but do not meet the client deletion-proof gate.",
       "required": [
         "writeBody",
         "signature"
@@ -6282,6 +6282,12 @@
           "type": "bytes",
           "minLength": 64,
           "maxLength": 64
+        },
+        "payloadBytes": {
+          "type": "bytes",
+          "minLength": 2,
+          "maxLength": 1024,
+          "description": "Optional for historical decoding; required for client enforcement. Exact signed deleteAccountData HTTP request body bytes, copied before account data is removed. The reader verifies SHA-256 against writeBody.payloadSha256 and requires the parsed JSON object to have no members."
         }
       }
     },

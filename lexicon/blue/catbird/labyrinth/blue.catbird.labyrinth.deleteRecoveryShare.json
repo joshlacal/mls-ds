@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. Delete the erasable recovery share of one recovery method, so that recovery code (and any passkey wrapping it) stops working on this service, including for someone who copied the code and the bundle. Clients call this first when removing a recovery method, before rotating the bundle's device out of the epoch and deleting the bundle record. Idempotent: deleting a share that is already deleted returns the original deletion time. The service stops serving the share at deletedAt and keeps a deletion record so the share stays deleted if storage is restored from a backup. Deletion is the service's commitment, not a cryptographic proof: it cannot reach copies made before deletion or content already decrypted with the code. Mailbox endpoint on the caller's home DS. Requires a bound Labyrinth device (a current, non-virtual device registered by the calling chat device). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge.",
+      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. Delete the erasable recovery share of one recovery method, so that recovery code (and any passkey wrapping it) stops working on this service, including for someone who copied the code and the bundle. Clients call this first when removing a recovery method, before rotating the bundle's device out of the epoch and deleting the bundle record. Idempotent: deleting a share that is already deleted returns the original deletion time. The service stops serving the share at deletedAt and keeps a deletion record so the share stays deleted if storage is restored from a backup. Deletion is the service's commitment, not a cryptographic proof: it cannot reach copies made before deletion or content already decrypted with the code. Mailbox endpoint on the caller's home DS. Requires an active, non-revoked chat device of the caller DID, proven by the account-bound service JWT and a signed device request. A pending chat device may not store, delete or list shares; the clean-slate service has no Labyrinth-device binding table. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -54,7 +54,7 @@
           "description": "No share was ever stored for this vdeviceId."
         },
         {
-          "name": "LabyrinthDeviceNotBound"
+          "name": "ChatDeviceNotActive"
         }
       ]
     },

@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. Store the erasable recovery share for one recovery method on the account's home delivery service. The share is 32 random bytes that, combined with the key derived from the user's recovery code, opens that method's recovery bundle; on its own it opens nothing. The service keeps the share sealed under its own key-encryption key and serves it only through getRecoveryShare to a caller that presents the matching fetchToken. Deleting the share (deleteRecoveryShare) makes the method unusable on this service. Clients call this before they publish the bundle or show the code, then confirm storage with getRecoveryShare purpose verify. Storing the same share again for the same vdeviceId is idempotent; a different share or fetchVerifier for an existing vdeviceId fails with RecoveryShareConflict. Mailbox endpoint on the caller's home DS. Requires a bound Labyrinth device (a current, non-virtual device registered by the calling chat device). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge.",
+      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. Store the erasable recovery share for one recovery method on the account's home delivery service. The share is 32 random bytes that, combined with the key derived from the user's recovery code, opens that method's recovery bundle; on its own it opens nothing. The service keeps the share sealed under its own key-encryption key and serves it only through getRecoveryShare to a caller that presents the matching fetchToken. Deleting the share (deleteRecoveryShare) makes the method unusable on this service. Clients call this before they publish the bundle or show the code, then confirm storage with getRecoveryShare purpose verify. Storing the same share again for the same vdeviceId is idempotent; a different share or fetchVerifier for an existing vdeviceId fails with RecoveryShareConflict. Mailbox endpoint on the caller's home DS. Requires an active, non-revoked chat device of the caller DID, proven by the account-bound service JWT and a signed device request. A pending chat device may not store, delete or list shares; the clean-slate service has no Labyrinth-device binding table. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -78,7 +78,7 @@
           "description": "The service's limit on live shares or on share writes for the calling device has been reached."
         },
         {
-          "name": "LabyrinthDeviceNotBound"
+          "name": "ChatDeviceNotActive"
         }
       ]
     }

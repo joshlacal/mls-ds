@@ -46,7 +46,10 @@ pub async fn purge_mailbox(
 /// The evidence every `accountDeletedEntry` of this deletion carries: the exact
 /// `labyrinthWriteBody` and signature `admit_procedure` verified, and the
 /// device's optional `keyProof`, each decoded from its header unchanged.
-fn deletion_evidence(headers: &HeaderMap) -> LabyrinthResult<AccountDeletionEvidence> {
+fn deletion_evidence(
+    headers: &HeaderMap,
+    bytes: &Bytes,
+) -> LabyrinthResult<AccountDeletionEvidence> {
     let (write_body, signature) = auth::write_headers(headers)?;
     let key_proof = headers
         .get(auth::KEY_PROOF_HEADER)
@@ -61,6 +64,7 @@ fn deletion_evidence(headers: &HeaderMap) -> LabyrinthResult<AccountDeletionEvid
         actor_write: AccountDeletionActorWrite {
             write_body: auth::decode_b64(auth::WRITE_BODY_HEADER, &write_body)?,
             signature: auth::decode_b64(auth::WRITE_SIGNATURE_HEADER, &signature)?,
+            payload_bytes: Some(bytes.to_vec()),
         },
         key_proof,
     };
@@ -104,7 +108,7 @@ pub async fn delete_account_data(
                     return to_bytes(&json!({}));
                 }
             };
-            let evidence = deletion_evidence(&headers)?;
+            let evidence = deletion_evidence(&headers, &bytes)?;
             // Peer homes resolve over HTTP, so before the transaction opens (M-F04).
             let c33_peers = repo::resolve_c33_peer_homes(&pool, &adm.did).await?;
             let mut w = begin_write!(&pool, adm);
