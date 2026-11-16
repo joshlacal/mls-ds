@@ -769,7 +769,12 @@ async fn service_auth_admits_a_pre_minted_token_after_the_pds_repo_is_deleted() 
     let chat_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
     let signed = SignedDeletion::new(&sender, &chat_key, [0x9D; 16], None);
     // Minted 30 s ago with the 60 s lifetime, before the PDS account was deleted.
-    let pre_minted = service_token(&sender, DELETE_ACCOUNT_DATA, Utc::now().timestamp() - 30, 60);
+    let pre_minted = service_token(
+        &sender,
+        DELETE_ACCOUNT_DATA,
+        Utc::now().timestamp() - 30,
+        60,
+    );
     let (status, body) = http::send(lab.clone(), signed.request_with(&pre_minted)).await;
     assert_eq!((status, &body), (StatusCode::OK, &json!({})));
     assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 1);
