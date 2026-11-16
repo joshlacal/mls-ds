@@ -3326,10 +3326,111 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .unwrap();
     assert_eq!(status_after_forged, "pending_approval");
 
-    // 7. Valid recovery `publishEpochHead` at `epoch = 1` with `prevSig` signed by `alice_link0`
-    //    succeeds (`200 OK`) AND atomically self-promotes `alice_d2` from `pending_approval` to `active`!
-    let (valid_ep1, _) =
+    // 7. A valid chained restore is still refused while another device is
+    //    awake. A correct prevSig does not override sibling approval.
+    let (valid_ep1, alice_link1) =
         build_epoch_public_for_device(&alice_d2, 1, [0x32_u8; 32], Some(alice_link0), None);
+    let (awake_status, awake_body) = http::send(
+        router.clone(),
+        alice_d2.labyrinth_post_request(
+            "publishEpochHead",
+            &json!({ "epoch": valid_ep1.clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(awake_status, StatusCode::UNAUTHORIZED, "{awake_body}");
+    let unpublished_epoch: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM labyrinth.epoch_heads WHERE did = $1 AND epoch_number = 1",
+    )
+    .bind(&alice_acct.did)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unpublished_epoch, 0, "refused promotion must roll back head");
+
+    // The lost sibling becomes dormant. Before the 72h notice hold expires,
+    // an explicit restore action still cannot promote the replacement.
+    sqlx::query(
+        "UPDATE chat.devices SET last_active_at = $3, dormant_at = NULL \
+          WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&alice_acct.did)
+    .bind(alice_d1.device_id)
+    .bind(Utc::now() - Duration::hours(100))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(mark_inactive_devices(&pool, Utc::now()).await.unwrap(), 1);
+    let (early_status, early_body) = http::send(
+        router.clone(),
+        alice_d2.labyrinth_post_request(
+            "publishEpochHead",
+            &json!({ "epoch": valid_ep1.clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(early_status, StatusCode::UNAUTHORIZED, "{early_body}");
+
+    // Age the durable notice, not just the device row. The audit table's
+    // immutability trigger is bypassed only in this isolated test database.
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE chat.device_promotion_audit \
+                SET recorded_at = clock_timestamp() - interval '73 hours' \
+              WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
+        )
+        .bind(&alice_acct.did)
+        .bind(alice_d2.device_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let (no_auto_status, _) = http::send(
+        router.clone(),
+        alice_d2.dpop_get_request(
+            "blue.catbird.chat.getDevices",
+            &format!("userDids={}", bob_acct.did),
+        ),
+    )
+    .await;
+    assert_eq!(no_auto_status, StatusCode::UNAUTHORIZED);
+
+    // A sibling that comes back before the restore action can still deny it.
+    let (wake_status, wake_body) = http::send(
+        router.clone(),
+        alice_d1.dpop_get_request("blue.catbird.chat.getOwnDevices", ""),
+    )
+    .await;
+    assert_eq!(wake_status, StatusCode::OK, "{wake_body}");
+    let (returned_status, returned_body) = http::send(
+        router.clone(),
+        alice_d2.labyrinth_post_request(
+            "publishEpochHead",
+            &json!({ "epoch": valid_ep1.clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(returned_status, StatusCode::UNAUTHORIZED, "{returned_body}");
+
+    // Simulate full loss again; now the aged notice plus a fresh explicit
+    // chained restore promotes the replacement atomically.
+    sqlx::query(
+        "UPDATE chat.devices SET last_active_at = $3, dormant_at = NULL \
+          WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&alice_acct.did)
+    .bind(alice_d1.device_id)
+    .bind(Utc::now() - Duration::hours(100))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(mark_inactive_devices(&pool, Utc::now()).await.unwrap(), 1);
     let (st_ep1, ep1_body) = http::send(
         router.clone(),
         alice_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": valid_ep1.clone() })),
@@ -3359,8 +3460,18 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .unwrap();
     assert_eq!(
         status_after_promote, "active",
-        "chained publishEpochHead must atomically promote pending_approval -> active"
+        "aged full-loss restore must atomically promote pending_approval -> active"
     );
+    let promotion_audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.device_promotion_audit \
+          WHERE user_did = $1 AND device_id = $2 AND event_kind = 'recovery_promoted'",
+    )
+    .bind(&alice_acct.did)
+    .bind(alice_d2.device_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(promotion_audit_count, 1);
 
     // Now promoted `alice_d2` can read foreign-DID `getEpochHead` and `chat.getConversations`!
     let (st_foreign_ok, foreign_ok_body) = http::send(
@@ -3375,6 +3486,69 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     )
     .await;
     assert_eq!(st_conv_ok, StatusCode::OK, "{conv_ok_body}");
+
+    // A later enrollment after every old device is revoked is a restore, not
+    // a brand-new account. It must start pending and wait for its own notice.
+    for target in [alice_d1.device_id, alice_d2.device_id] {
+        let signed_revoke = alice_d2.revocation_wrapper(target, 1);
+        let (status, body) = http::send(
+            router.clone(),
+            alice_d2.dpop_signed_post_request("blue.catbird.chat.revokeDevice", &signed_revoke),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let alice_d3 = DeviceIdentity::build(&alice_acct, "Alice Full-Loss Restore", 2);
+    let (d3_status, d3_body) = http::send(router.clone(), alice_d3.enroll_request()).await;
+    assert_eq!(d3_status, StatusCode::OK, "{d3_body}");
+    assert_eq!(d3_body["device"]["status"], "pending_approval");
+    let (d3_early, _) = http::send(
+        router.clone(),
+        alice_d3.dpop_get_request("blue.catbird.chat.getDevices", &format!("userDids={}", bob_acct.did)),
+    )
+    .await;
+    assert_eq!(d3_early, StatusCode::UNAUTHORIZED);
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE chat.device_promotion_audit \
+                SET recorded_at = clock_timestamp() - interval '73 hours' \
+              WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
+        )
+        .bind(&alice_acct.did)
+        .bind(alice_d3.device_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let (d3_still_pending, _) = http::send(
+        router.clone(),
+        alice_d3.dpop_get_request("blue.catbird.chat.getDevices", &format!("userDids={}", bob_acct.did)),
+    )
+    .await;
+    assert_eq!(d3_still_pending, StatusCode::UNAUTHORIZED);
+    let (alice_ep2, _) =
+        build_epoch_public_for_device(&alice_d3, 2, [0x33_u8; 32], Some(alice_link1), None);
+    let (d3_restore_status, d3_restore_body) = http::send(
+        router.clone(),
+        alice_d3.labyrinth_post_request("publishEpochHead", &json!({ "epoch": alice_ep2 })),
+    )
+    .await;
+    assert_eq!(d3_restore_status, StatusCode::OK, "{d3_restore_body}");
+    let d3_final_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.devices WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&alice_acct.did)
+    .bind(alice_d3.device_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(d3_final_status, "active");
 
     pool.close().await;
 }
@@ -4786,7 +4960,8 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
     // -------------------------------------------------------------------------
     // Part D (`B10`):
     // 1) `federated-group-device` (`dpop_jkt IS NULL`) aged 90d is NOT marked dormant by `mark_inactive_devices`.
-    // 2) `pending_approval` sibling device stays `pending_approval` (`401`) at 71h and promotes to `active` (`200 OK`) past 72h!
+    // 2) Aging a pending sibling never auto-promotes it on auth or sweep. Its
+    //    active sibling can see and deny it even after the old 72h boundary.
     // -------------------------------------------------------------------------
     let fed_dev_id = Uuid::new_v4();
     let aged_90d = Utc::now() - Duration::days(90);
@@ -4855,7 +5030,8 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
         "B10: pending_approval sibling < 72h must stay gated"
     );
 
-    // At 73h (`> 72h` hold with no sibling approval/revocation): promotes to `active` (`200 OK`)!
+    // At 73h the pending device still has no authority. Neither a background
+    // sweep nor ordinary authentication is a recovery approval action.
     {
         let mut tx73 = pool.begin().await.unwrap();
         sqlx::query("SET LOCAL session_replication_role = replica")
@@ -4870,6 +5046,7 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
             .unwrap();
         tx73.commit().await.unwrap();
     }
+    let _ = mark_inactive_devices(&pool, Utc::now()).await.unwrap();
     let (st_73h_dir, _) = http::send(
         router.clone(),
         alice_d2.dpop_get_request(
@@ -4880,8 +5057,8 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
     .await;
     assert_eq!(
         st_73h_dir,
-        StatusCode::OK,
-        "B10: pending_approval sibling > 72h must auto-promote to active on DPoP auth"
+        StatusCode::UNAUTHORIZED,
+        "pending sibling must not silently promote on DPoP auth after 72h"
     );
     let (st_73h_convos, _) = http::send(
         router.clone(),
@@ -4893,9 +5070,51 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
     .await;
     assert_eq!(
         st_73h_convos,
-        StatusCode::OK,
-        "B10: promoted sibling must succeed on Bearer read_authority"
+        StatusCode::UNAUTHORIZED,
+        "pending sibling must not silently promote on Bearer read authority"
     );
+
+    let (own_status, own_body) = http::send(
+        router.clone(),
+        alice_d1.dpop_get_request("blue.catbird.chat.getOwnDevices", ""),
+    )
+    .await;
+    assert_eq!(own_status, StatusCode::OK);
+    assert!(own_body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["device"]["deviceId"] == alice_d2.device_id.to_string()
+            && item["device"]["status"] == "pending_approval"));
+    let pending_notice_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.device_promotion_audit \
+          WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
+    )
+    .bind(&alice_acct.did)
+    .bind(alice_d2.device_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pending_notice_count, 1, "pending enrollment must be audited");
+
+    let deny = alice_d1.revocation_wrapper(alice_d2.device_id, 1);
+    let (deny_status, deny_body) = http::send(
+        router.clone(),
+        alice_d1.dpop_signed_post_request("blue.catbird.chat.revokeDevice", &deny),
+    )
+    .await;
+    assert_eq!(deny_status, StatusCode::OK, "{deny_body}");
+    assert_eq!(deny_body["device"]["status"], "revoked");
+    let promoted_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.device_promotion_audit \
+          WHERE user_did = $1 AND device_id = $2 AND event_kind = 'recovery_promoted'",
+    )
+    .bind(&alice_acct.did)
+    .bind(alice_d2.device_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(promoted_count, 0, "a denied device must not be promoted");
 
     pool.close().await;
     std::env::remove_var("FEDERATION_TEST_ALLOW_ALL_RELATIONSHIPS");

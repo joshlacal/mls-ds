@@ -2764,25 +2764,20 @@ pub(super) async fn persist_enrollment_bootstrap_effects(
             .bind(scope.subject())
             .fetch_one(&mut **transaction)
             .await?;
-    super::super::device_activity::promote_matured_pending_devices_for_user(
-        &mut **transaction,
-        scope.subject(),
-        trusted_at,
-    )
-    .await?;
-    let has_active_sibling: bool = sqlx::query_scalar(
+    // Only the first local device of a new principal is active immediately.
+    // A replacement after every older device has been revoked must still pass
+    // through the visible, vetoable pending hold.
+    let has_prior_local_device: bool = sqlx::query_scalar(
         "SELECT EXISTS ( \
              SELECT 1 FROM chat.devices \
               WHERE user_did = $1 \
-                AND status = 'active' \
-                AND revoked_at IS NULL \
                 AND NOT (dpop_jkt IS NULL AND device_name = 'federated-group-device') \
          )",
     )
     .bind(scope.subject())
     .fetch_one(&mut **transaction)
     .await?;
-    let enrolled_status = if has_active_sibling {
+    let enrolled_status = if has_prior_local_device {
         "pending_approval"
     } else {
         "active"
@@ -2825,6 +2820,18 @@ pub(super) async fn persist_enrollment_bootstrap_effects(
     .await?;
     if inserted_key.rows_affected() != 1 {
         return Err(AuthRepositoryError::DeviceKeyMissing);
+    }
+    if enrolled_status == "pending_approval" {
+        sqlx::query(
+            "INSERT INTO chat.device_promotion_audit \
+             (user_did, device_id, event_kind, recorded_at) \
+             VALUES ($1, $2, 'pending_notice', $3)",
+        )
+        .bind(scope.subject())
+        .bind(scope.device_id())
+        .bind(trusted_at)
+        .execute(&mut **transaction)
+        .await?;
     }
     Ok(enrolled_status)
 }
@@ -3518,12 +3525,6 @@ async fn lock_device_and_key_with_pending_policy(
     device_id: Uuid,
     allow_pending_approval: bool,
 ) -> Result<LockedDeviceAuthority, AuthRepositoryError> {
-    super::super::device_activity::promote_matured_pending_devices_for_user(
-        &mut **transaction,
-        subject,
-        crate::sim_hooks::current_utc(),
-    )
-    .await?;
     let device: Option<DeviceRow> = sqlx::query_as(
         r#"
         SELECT status, dpop_jkt, auth_generation

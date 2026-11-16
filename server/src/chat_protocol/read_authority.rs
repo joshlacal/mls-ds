@@ -413,15 +413,6 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         .parse()
         .map_err(|_| ReadAuthorityError::Invariant)?;
 
-    // Promote any matured `pending_approval` device (`B10` 72h hold) before locking.
-    crate::chat_protocol::device_activity::promote_matured_pending_devices_for_user(
-        &mut **tx,
-        &lock_did,
-        crate::sim_hooks::current_utc(),
-    )
-    .await
-    .map_err(|_| ReadAuthorityError::Storage)?;
-
     // BARRIER 1 — the exact requester device row.
     let device: Option<LockedReadRequesterDeviceRow> = sqlx::query_as(LOCK_READ_DEVICE_SQL)
         .bind(&lock_did)

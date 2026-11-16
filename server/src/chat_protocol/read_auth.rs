@@ -134,14 +134,6 @@ pub(crate) async fn verify_chat_read_headers(
         .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
     let device_uuid = Uuid::from_bytes(*canonical_device_id.as_bytes());
 
-    super::device_activity::promote_matured_pending_devices_for_user(
-        pool,
-        principal_did,
-        crate::sim_hooks::current_utc(),
-    )
-    .await
-    .map_err(|_| ChatFailure::storage(endpoint))?;
-
     let key_row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
         "SELECT d.status, dk.signing_public_key \
          FROM chat.devices d \

@@ -65,13 +65,75 @@ async fn promote_pending_device(
     device_id: Uuid,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<()> {
-    sqlx::query(
+    // Enrollment takes this same principal lock. A new sibling cannot appear
+    // between our full-loss check and the promotion commit.
+    let _: String = sqlx::query_scalar(
+        "SELECT user_did FROM chat.principals WHERE user_did = $1 FOR UPDATE",
+    )
+    .bind(did)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    // Lock every active local sibling, including dormant ones. NOWAIT makes a
+    // concurrent sibling wake/revocation win instead of deadlocking with the
+    // pending caller's device lock acquired by request authentication.
+    let siblings: Vec<(bool,)> = sqlx::query_as(
+        "SELECT dormant_at IS NULL FROM chat.devices \
+          WHERE user_did = $1 AND device_id <> $2 \
+            AND status = 'active' AND revoked_at IS NULL \
+            AND NOT (dpop_jkt IS NULL AND device_name = 'federated-group-device') \
+          FOR SHARE NOWAIT",
+    )
+    .bind(did)
+    .bind(device_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    if siblings.iter().any(|(awake,)| *awake) {
+        return Err(LabyrinthError::not_authorized(
+            "an active sibling must approve or deny the pending device",
+        ));
+    }
+
+    let notice_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT recorded_at FROM chat.device_promotion_audit \
+          WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
+    )
+    .bind(did)
+    .bind(device_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if !notice_at.is_some_and(|notice| {
+        notice <= at - chrono::Duration::hours(
+            crate::chat_protocol::device_activity::pending_device_hold_hours(),
+        )
+    }) {
+        return Err(LabyrinthError::not_authorized(
+            "pending device recovery hold is not complete",
+        ));
+    }
+
+    let promoted = sqlx::query(
         "UPDATE chat.devices \
             SET status = 'active', \
                 updated_at = GREATEST(updated_at, $3) \
           WHERE user_did = $1 \
             AND device_id = $2 \
-            AND status = 'pending_approval'",
+            AND status = 'pending_approval' AND revoked_at IS NULL",
+    )
+    .bind(did)
+    .bind(device_id)
+    .bind(at)
+    .execute(&mut *conn)
+    .await?;
+    if promoted.rows_affected() != 1 {
+        return Err(LabyrinthError::not_authorized(
+            "pending device was revoked or already changed",
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO chat.device_promotion_audit \
+         (user_did, device_id, event_kind, recorded_at) \
+         VALUES ($1, $2, 'recovery_promoted', $3)",
     )
     .bind(did)
     .bind(device_id)
@@ -89,9 +151,9 @@ async fn promote_pending_device(
 /// Re-sending an identical head is idempotent; a different head at the same epoch number
 /// returns `409 EpochHeadConflict`.
 ///
-/// A `pending_approval` device (`D-2` recovery self-promotion) may only publish a chained
-/// head (`epoch >= 1` with a verified `prevSig` linking to an existing head in `epoch_heads`)
-/// and is atomically promoted to `status = 'active'` in the same transaction.
+/// A `pending_approval` device may publish a fresh chained head only after its
+/// sibling-visible 72-hour hold, when no other local device remains awake. A
+/// verified `prevSig` alone never bypasses a live sibling's approval or denial.
 pub async fn record_head(
     conn: &mut PgConnection,
     caller: &Caller,
@@ -117,12 +179,9 @@ pub async fn record_head(
             return Err(head_conflict());
         }
         if caller.status == "pending_approval" {
-            if parts.epoch_number == 0 || parts.prev_sig.is_none() {
-                return Err(LabyrinthError::not_authorized(
-                    "pending device requires a chained epoch rotation with prevSig",
-                ));
-            }
-            promote_pending_device(conn, did, caller.device_id, at).await?;
+            return Err(LabyrinthError::not_authorized(
+                "pending device requires a fresh chained epoch rotation",
+            ));
         }
         return Ok(());
     }
