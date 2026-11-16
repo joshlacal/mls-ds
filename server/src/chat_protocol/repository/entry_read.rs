@@ -11,7 +11,9 @@ use crate::chat_protocol::{
     read_authority::{self, EntryReadAuthority, ReadAuthorityError},
     read_projection::encode_canonical_generated_chat_json_v1,
 };
-use crate::federation::receipt::{AccountDeletion, AccountDeletionAuthority};
+use crate::federation::receipt::{
+    AccountDeletion, AccountDeletionActorWrite, AccountDeletionAuthority, AccountDeletionEvidence,
+};
 
 /// `chat.entries.server_fields_bytes` of an `accountDeletedEntry` (DAG-CBOR): what its
 /// signed entry holds beyond the row, so every read rebuilds exactly what was signed.
@@ -24,7 +26,7 @@ pub(crate) struct AccountDeletedServerFields {
     /// Optional lexicon `actorWrite`, stored verbatim when present. Absent on rows
     /// written without it, which keep their exact stored bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) actor_write: Option<AccountDeletionActorWriteFields>,
+    pub(crate) actor_write: Option<AccountDeletionActorWrite>,
     /// Optional lexicon `keyProof`, stored verbatim when present.
     #[serde(
         default,
@@ -32,17 +34,6 @@ pub(crate) struct AccountDeletedServerFields {
         with = "crate::atproto_bytes::option"
     )]
     pub(crate) key_proof: Option<Vec<u8>>,
-}
-
-/// Lexicon `blue.catbird.chat.defs#accountDeletionActorWrite`: the deleting device's
-/// exact `writeBody` bytes and its 64-byte signature over them.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct AccountDeletionActorWriteFields {
-    #[serde(with = "crate::atproto_bytes")]
-    pub(crate) write_body: Vec<u8>,
-    #[serde(with = "crate::atproto_bytes")]
-    pub(crate) signature: Vec<u8>,
 }
 
 impl AccountDeletedServerFields {
@@ -61,6 +52,11 @@ impl AccountDeletedServerFields {
             seq,
             entry_id,
             deleted_at: received_at,
+            // A stored `keyProof` only ever accompanies its `actorWrite`.
+            evidence: self.actor_write.map(|actor_write| AccountDeletionEvidence {
+                actor_write,
+                key_proof: self.key_proof,
+            }),
         }
         .entry(&self.sequencer_authority)
     }

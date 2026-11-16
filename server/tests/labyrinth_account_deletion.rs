@@ -476,6 +476,7 @@ async fn a_group_mirror_serves_its_stored_deletion_evidence_to_every_member_devi
         seq: 9,
         entry_id: Uuid::new_v4(),
         deleted_at: now(&s.pool).await,
+        evidence: None,
     };
     let entry = deletion.entry(&signer.sign_account_deletion(&deletion).unwrap());
     catbird_server::chat_protocol::repository::delivery::insert_transport_entry(
@@ -499,4 +500,196 @@ async fn a_group_mirror_serves_its_stored_deletion_evidence_to_every_member_devi
         .verify(&signer.verifying_key(), &verified)
         .expect("served exactly as signed");
     assert_eq!(verified, deletion);
+}
+
+const DELETE_ACCOUNT_DATA: &str = "blue.catbird.labyrinth.deleteAccountData";
+
+/// A service-auth token `device`'s DID signs for `nsid`, issued at `iat` and
+/// valid for `lifetime` seconds.
+fn service_token(device: &http::Device, nsid: &str, iat: i64, lifetime: i64) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use p256::ecdsa::{signature::Signer as _, Signature};
+    let encode = |value: Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap());
+    let input = format!(
+        "{}.{}",
+        encode(json!({"alg": "ES256", "typ": "JWT", "kid": format!("{}#atproto", device.did)})),
+        encode(json!({
+            "iss": device.did,
+            "aud": catbird_server::auth::expected_mls_service_ref(),
+            "lxm": nsid,
+            "iat": iat,
+            "exp": iat + lifetime,
+            "jti": Uuid::new_v4().to_string(),
+        })),
+    );
+    let signature: Signature = device.signing.sign(input.as_bytes());
+    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+}
+
+/// One signed `deleteAccountData`: the device's `labyrinthWriteBody` and signature,
+/// and an optional base64url key proof. Each request carries a fresh service-auth token.
+struct SignedDeletion {
+    write_body: Vec<u8>,
+    signature: Vec<u8>,
+    key_proof: Option<String>,
+}
+
+impl SignedDeletion {
+    fn new(
+        device: &http::Device,
+        chat_key: &ed25519_dalek::SigningKey,
+        operation_id: [u8; 16],
+        key_proof: Option<String>,
+    ) -> Self {
+        use ed25519_dalek::Signer as _;
+        use sha2::{Digest as _, Sha256};
+        let write_body = serde_json::to_vec(&json!({
+            "operationId": hex::encode(operation_id),
+            "actorDeviceId": device.device_id.to_string(),
+            "endpointNsid": DELETE_ACCOUNT_DATA,
+            "payloadSha256": hex::encode(Sha256::digest(b"{}")),
+            "signedAt": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        }))
+        .unwrap();
+        let signature = chat_key
+            .sign(&[b"CATBIRD-LABYRINTH-WRITE\0".as_slice(), &write_body].concat())
+            .to_bytes()
+            .to_vec();
+        Self {
+            write_body,
+            signature,
+            key_proof,
+        }
+    }
+
+    fn request(&self, device: &http::Device) -> axum::http::Request<axum::body::Body> {
+        self.request_with(&service_token(
+            device,
+            DELETE_ACCOUNT_DATA,
+            Utc::now().timestamp(),
+            60,
+        ))
+    }
+
+    fn request_with(&self, token: &str) -> axum::http::Request<axum::body::Body> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let mut request = axum::http::Request::post(format!("/xrpc/{DELETE_ACCOUNT_DATA}"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "catbird-labyrinth-write",
+                URL_SAFE_NO_PAD.encode(&self.write_body),
+            )
+            .header(
+                "catbird-labyrinth-write-signature",
+                URL_SAFE_NO_PAD.encode(&self.signature),
+            );
+        if let Some(key_proof) = &self.key_proof {
+            request = request.header("catbird-labyrinth-key-proof", key_proof);
+        }
+        request.body(axum::body::Body::from("{}")).unwrap()
+    }
+}
+
+/// The real Labyrinth router over `s`'s database, with the sequencer's receipt signer.
+async fn labyrinth(s: &Sequencer) -> Router {
+    let (_, runtime) = http::router_and_runtime_for_authenticated_acceptance(s.pool.clone()).await;
+    catbird_server::handlers::labyrinth::labyrinth_router::<http::TestState>().with_state(
+        http::TestState {
+            pool: s.pool.clone(),
+            runtime,
+        },
+    )
+}
+
+/// The `accountDeletedEntry` rows of `cid`.
+async fn deletion_rows(pool: &sqlx::PgPool, cid: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM chat.entries WHERE conversation_id = $1 AND entry_kind = $2",
+    )
+    .bind(cid)
+    .bind(ACCOUNT_DELETED)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_signed_deletion_carries_the_devices_exact_write_and_key_proof_and_replays_once() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let _env = ENV_LOCK.lock().await;
+    let s = sequencer().await;
+    let fixture = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, Some([0x45; 32]))
+        .await
+        .unwrap();
+    let cid = fixture.conversation_id;
+    let lab = labyrinth(&s).await;
+    let sender = device(&fixture.sender_did, fixture.sender_device_id).await;
+    let chat_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
+    let key_proof = vec![0x9A_u8; 2500];
+
+    // A key proof that is not base64url, or longer than the lexicon admits, is
+    // refused before anything is sequenced.
+    for bad in [
+        "not base64url!".to_owned(),
+        URL_SAFE_NO_PAD.encode(vec![0_u8; 16_385]),
+    ] {
+        let refused = SignedDeletion::new(&sender, &chat_key, [0xB0; 16], Some(bad));
+        let (status, body) = http::send(lab.clone(), refused.request(&sender)).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+            "{body}"
+        );
+        assert_eq!(deletion_rows(&s.pool, cid).await, 0);
+    }
+
+    let signed = SignedDeletion::new(
+        &sender,
+        &chat_key,
+        [0xDA; 16],
+        Some(URL_SAFE_NO_PAD.encode(&key_proof)),
+    );
+    let (status, body) = http::send(lab.clone(), signed.request(&sender)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    assert_eq!(deletion_rows(&s.pool, cid).await, 1);
+
+    // Every member read serves the exact bytes the device signed and sent.
+    let member = device(&fixture.recipient_did, fixture.recipient_device_id).await;
+    let (status, page) = read(&s, &member, "blue.catbird.chat.getEntries", cid).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let entry = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["$type"] == ACCOUNT_DELETED)
+        .cloned()
+        .expect("the accountDeletedEntry");
+    let (deletion, authority) = AccountDeletion::from_entry(&entry).expect("the exact entry");
+    authority
+        .verify(&s.signer.verifying_key(), &deletion)
+        .expect("signed by the sequencer's #mls-receipt-1 key");
+    let carried = deletion.evidence.expect("the device's evidence");
+    assert_eq!(carried.actor_write.write_body, signed.write_body);
+    assert_eq!(carried.actor_write.signature, signed.signature);
+    assert_eq!(carried.key_proof, Some(key_proof));
+    assert_eq!(
+        account_deletions(&s, &[&member], cid).await,
+        json!([evidence(&entry)])
+    );
+
+    // The identical request replays its recorded answer and sequences nothing more.
+    let (status, body) = http::send(lab.clone(), signed.request(&sender)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    assert_eq!(deletion_rows(&s.pool, cid).await, 1);
+    let (_, again) = read(&s, &member, "blue.catbird.chat.getEntries", cid).await;
+    assert_eq!(
+        again["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["$type"] == ACCOUNT_DELETED)
+            .collect::<Vec<_>>(),
+        [&entry]
+    );
 }

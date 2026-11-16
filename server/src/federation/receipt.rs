@@ -351,8 +351,19 @@ impl TerminalCloseAuthority {
 
 const ACCOUNT_DELETED_ENTRY_TYPE: &str = "blue.catbird.chat.defs#accountDeletedEntry";
 
+/// The endpoint every `actorWrite` names: the deleting device's own `deleteAccountData`.
+pub const DELETE_ACCOUNT_DATA_NSID: &str = "blue.catbird.labyrinth.deleteAccountData";
+/// Lexicon `accountDeletionActorWrite.writeBody` maximum length.
+pub const ACTOR_WRITE_BODY_MAX_BYTES: usize = 1024;
+/// Lexicon `accountDeletedEntry.keyProof` maximum length.
+pub const KEY_PROOF_MAX_BYTES: usize = 16_384;
+/// Upper bound on one serialized `accountDeletedEntry`, which holds the largest
+/// `actorWrite` and `keyProof` the lexicon admits.
+pub const ACCOUNT_DELETED_ENTRY_MAX_BYTES: usize = 32 * 1024;
+
 /// One sequenced `blue.catbird.chat.defs#accountDeletedEntry`: everything its
-/// [`AccountDeletionAuthority`] binds. `deleted_at` is the entry's `receivedAt`.
+/// [`AccountDeletionAuthority`] binds, plus the deleting device's own evidence,
+/// which that authority does not bind. `deleted_at` is the entry's `receivedAt`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountDeletion {
     pub sequencer_did: String,
@@ -361,6 +372,111 @@ pub struct AccountDeletion {
     pub seq: i64,
     pub entry_id: Uuid,
     pub deleted_at: DateTime<Utc>,
+    /// The deleting device's signed `deleteAccountData` write and repository
+    /// proof, exactly as its home verified them. Absent on deletions sequenced
+    /// before entries carried them.
+    pub evidence: Option<AccountDeletionEvidence>,
+}
+
+/// Lexicon `blue.catbird.chat.defs#accountDeletionActorWrite`: the deleting device's
+/// exact `labyrinthWriteBody` bytes and its Ed25519 signature over
+/// `CATBIRD-LABYRINTH-WRITE\0 || writeBody`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountDeletionActorWrite {
+    #[serde(with = "crate::atproto_bytes")]
+    pub write_body: Vec<u8>,
+    #[serde(with = "crate::atproto_bytes")]
+    pub signature: Vec<u8>,
+}
+
+/// What an `accountDeletedEntry` carries from the deleting device: its signed
+/// write and, when the device sent one, the repository proof of its key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountDeletionEvidence {
+    pub actor_write: AccountDeletionActorWrite,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::atproto_bytes::option"
+    )]
+    pub key_proof: Option<Vec<u8>>,
+}
+
+impl AccountDeletionEvidence {
+    /// The `signedAt` of a well-formed `writeBody`.
+    pub fn signed_at(&self) -> Result<DateTime<Utc>, String> {
+        let wire: crate::labyrinth::auth::WriteBodyWire =
+            serde_json::from_slice(&self.actor_write.write_body)
+                .map_err(|error| format!("actorWrite.writeBody: {error}"))?;
+        DateTime::parse_from_rfc3339(&wire.signed_at)
+            .map(|at| at.with_timezone(&Utc))
+            .map_err(|_| "actorWrite.writeBody.signedAt is not RFC 3339".to_string())
+    }
+
+    /// Check the lexicon shape: a `labyrinthWriteBody` of `deleteAccountData` of
+    /// at most 1024 bytes, a 64-byte signature, and a non-empty `keyProof` of at
+    /// most 16384 bytes. The signature and the proof are for clients to verify.
+    pub fn check_shape(&self) -> Result<(), String> {
+        let write_body = &self.actor_write.write_body;
+        if write_body.is_empty() || write_body.len() > ACTOR_WRITE_BODY_MAX_BYTES {
+            return Err("actorWrite.writeBody length is out of range".to_string());
+        }
+        if self.actor_write.signature.len() != 64 {
+            return Err("actorWrite.signature must be 64 bytes".to_string());
+        }
+        if let Some(key_proof) = &self.key_proof {
+            if key_proof.is_empty() || key_proof.len() > KEY_PROOF_MAX_BYTES {
+                return Err("keyProof length is out of range".to_string());
+            }
+        }
+        let wire: crate::labyrinth::auth::WriteBodyWire = serde_json::from_slice(write_body)
+            .map_err(|error| format!("actorWrite.writeBody: {error}"))?;
+        if wire.endpoint_nsid != DELETE_ACCOUNT_DATA_NSID {
+            return Err("actorWrite.writeBody names another endpoint".to_string());
+        }
+        crate::labyrinth::auth::parse_device_id(&wire.actor_device_id)
+            .map_err(|_| "actorWrite.writeBody.actorDeviceId is not a UUID".to_string())?;
+        self.signed_at().map(|_| ())
+    }
+
+    /// Evidence as a device holding `device_key` signs it: the `labyrinthWriteBody`
+    /// of `deleteAccountData` over the body `{}` under `operation_id` at `signed_at`,
+    /// right-padded with JSON whitespace to `pad_to` bytes when that is longer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn signed_for_test(
+        device_key: &ed25519_dalek::SigningKey,
+        device_id: Uuid,
+        operation_id: [u8; 16],
+        signed_at: DateTime<Utc>,
+        pad_to: usize,
+        key_proof: Option<Vec<u8>>,
+    ) -> Self {
+        use ed25519_dalek::Signer as _;
+        let mut write_body = serde_json::to_vec(&serde_json::json!({
+            "operationId": hex::encode(operation_id),
+            "actorDeviceId": device_id.to_string(),
+            "endpointNsid": DELETE_ACCOUNT_DATA_NSID,
+            "payloadSha256": hex::encode(Sha256::digest(b"{}")),
+            "signedAt": signed_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        }))
+        .expect("write body");
+        if write_body.len() < pad_to {
+            write_body.resize(pad_to, b' ');
+        }
+        let signature = device_key
+            .sign(&[b"CATBIRD-LABYRINTH-WRITE\0".as_slice(), &write_body].concat())
+            .to_bytes()
+            .to_vec();
+        Self {
+            actor_write: AccountDeletionActorWrite {
+                write_body,
+                signature,
+            },
+            key_proof,
+        }
+    }
 }
 
 /// `blue.catbird.chat.defs#accountDeletionAuthority`: the sequencer's signature
@@ -408,7 +524,7 @@ impl AccountDeletion {
 
     /// The canonical entry, exactly as every home stores and `getEntries` presents it.
     pub fn entry(&self, authority: &AccountDeletionAuthority) -> Value {
-        serde_json::json!({
+        let mut entry = serde_json::json!({
             "$type": ACCOUNT_DELETED_ENTRY_TYPE,
             "conversationId": self.conversation_id,
             "deletedDid": self.deleted_did,
@@ -417,7 +533,14 @@ impl AccountDeletion {
             "seq": self.seq,
             "sequencerAuthority": authority,
             "sequencerDid": self.sequencer_did,
-        })
+        });
+        if let (Some(evidence), Some(object)) = (&self.evidence, entry.as_object_mut()) {
+            // The evidence serializes as exactly the lexicon's `actorWrite` and `keyProof`.
+            if let Ok(Value::Object(fields)) = serde_json::to_value(evidence) {
+                object.extend(fields);
+            }
+        }
+        entry
     }
 
     /// Parse an entry that is exactly [`Self::entry`]'s canonical form. This
@@ -435,9 +558,26 @@ impl AccountDeletion {
             seq: i64,
             sequencer_authority: AccountDeletionAuthority,
             sequencer_did: String,
+            #[serde(default)]
+            actor_write: Option<AccountDeletionActorWrite>,
+            #[serde(default, with = "crate::atproto_bytes::option")]
+            key_proof: Option<Vec<u8>>,
         }
         let wire = Wire::deserialize(entry)
             .map_err(|error| format!("invalid account-deleted entry: {error}"))?;
+        let evidence = match (wire.actor_write, wire.key_proof) {
+            (Some(actor_write), key_proof) => Some(AccountDeletionEvidence {
+                actor_write,
+                key_proof,
+            }),
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err("account-deleted keyProof requires its actorWrite".to_string())
+            }
+        };
+        if let Some(evidence) = &evidence {
+            evidence.check_shape()?;
+        }
         let deletion = Self {
             sequencer_did: wire.sequencer_did,
             conversation_id: wire.conversation_id,
@@ -445,12 +585,18 @@ impl AccountDeletion {
             seq: wire.seq,
             entry_id: wire.entry_id,
             deleted_at: wire.received_at,
+            evidence,
         };
         if wire.kind != ACCOUNT_DELETED_ENTRY_TYPE
             || deletion.seq < 1
             || deletion.entry(&wire.sequencer_authority) != *entry
         {
             return Err("account-deleted entry is not canonical".to_string());
+        }
+        if serde_json::to_vec(entry).map_or(usize::MAX, |bytes| bytes.len())
+            > ACCOUNT_DELETED_ENTRY_MAX_BYTES
+        {
+            return Err("account-deleted entry exceeds its size bound".to_string());
         }
         Ok((deletion, wire.sequencer_authority))
     }
@@ -2246,6 +2392,7 @@ mod tests {
             seq: 12,
             entry_id: Uuid::parse_str(ENTRY).unwrap(),
             deleted_at: "2026-11-03T12:00:00.123Z".parse().unwrap(),
+            evidence: None,
         };
         let mut expected = b"catbird-mls-account-deletion-v1\0".to_vec();
         for field in [
@@ -2329,6 +2476,132 @@ mod tests {
         ] {
             let mut changed = entry.clone();
             edit(&mut changed);
+            assert!(AccountDeletion::from_entry(&changed).is_err(), "{changed}");
+        }
+    }
+
+    fn evidenced_deletion(evidence: Option<AccountDeletionEvidence>) -> AccountDeletion {
+        AccountDeletion {
+            sequencer_did: "did:web:sequencer.example.com".to_string(),
+            conversation_id: Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            deleted_did: "did:web:deleted.example.com".to_string(),
+            seq: 12,
+            entry_id: Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
+            deleted_at: "2026-11-03T12:00:00.123Z".parse().unwrap(),
+            evidence,
+        }
+    }
+
+    fn device_evidence(pad_to: usize, key_proof: Option<Vec<u8>>) -> AccountDeletionEvidence {
+        AccountDeletionEvidence::signed_for_test(
+            &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+            Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
+            [0x0D; 16],
+            "2026-11-03T12:00:00.100Z".parse().unwrap(),
+            pad_to,
+            key_proof,
+        )
+    }
+
+    #[test]
+    fn an_account_deleted_entry_carries_its_devices_signed_write_and_key_proof_verbatim() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use serde_json::json;
+
+        let signer = I13ReceiptSigner::new(
+            SigningKey::from_slice(&[7; 32]).unwrap(),
+            "did:web:sequencer.example.com".to_string(),
+        );
+        let evidence = device_evidence(0, Some(vec![0xAB; 300]));
+        let bare = evidenced_deletion(None);
+        let deletion = evidenced_deletion(Some(evidence.clone()));
+        // The sequencer's authority binds exactly what it always did.
+        assert_eq!(deletion.signing_bytes(), bare.signing_bytes());
+        let authority = signer.sign_account_deletion(&deletion).unwrap();
+        authority.verify(&signer.verifying_key(), &bare).unwrap();
+
+        let entry = deletion.entry(&authority);
+        assert_eq!(
+            entry["actorWrite"],
+            json!({
+                "writeBody": { "$bytes": STANDARD.encode(&evidence.actor_write.write_body) },
+                "signature": { "$bytes": STANDARD.encode(&evidence.actor_write.signature) },
+            })
+        );
+        assert_eq!(
+            entry["keyProof"],
+            json!({ "$bytes": STANDARD.encode([0xAB; 300]) })
+        );
+        let (parsed, parsed_authority) = AccountDeletion::from_entry(&entry).unwrap();
+        assert_eq!((&parsed, &parsed_authority), (&deletion, &authority));
+        assert_eq!(parsed.entry(&parsed_authority), entry);
+
+        // An actorWrite without a keyProof, and an entry stored before either.
+        let without_proof = evidenced_deletion(Some(device_evidence(0, None)));
+        let entry_without_proof = without_proof.entry(&authority);
+        assert!(entry_without_proof.get("keyProof").is_none());
+        assert_eq!(
+            AccountDeletion::from_entry(&entry_without_proof).unwrap().0,
+            without_proof
+        );
+        let old = bare.entry(&authority);
+        assert!(old.get("actorWrite").is_none() && old.get("keyProof").is_none());
+        assert_eq!(AccountDeletion::from_entry(&old).unwrap().0, bare);
+
+        // The largest evidence the lexicon admits still fits the entry bound.
+        let largest = evidenced_deletion(Some(device_evidence(
+            ACTOR_WRITE_BODY_MAX_BYTES,
+            Some(vec![0xFF; KEY_PROOF_MAX_BYTES]),
+        )));
+        let largest_entry = largest.entry(&authority);
+        let size = serde_json::to_vec(&largest_entry).unwrap().len();
+        assert!(size < ACCOUNT_DELETED_ENTRY_MAX_BYTES, "{size}");
+        assert_eq!(
+            AccountDeletion::from_entry(&largest_entry).unwrap().0,
+            largest
+        );
+
+        // Only lexicon-shaped evidence parses.
+        let reshaped = |edit: &dyn Fn(&mut AccountDeletionEvidence)| {
+            let mut evidence = evidence.clone();
+            edit(&mut evidence);
+            evidenced_deletion(Some(evidence)).entry(&authority)
+        };
+        let other_endpoint = AccountDeletionEvidence::signed_for_test(
+            &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+            Uuid::new_v4(),
+            [0x0D; 16],
+            Utc::now(),
+            0,
+            None,
+        );
+        let mut other_endpoint_body: Value =
+            serde_json::from_slice(&other_endpoint.actor_write.write_body).unwrap();
+        other_endpoint_body["endpointNsid"] = json!("blue.catbird.labyrinth.purgeMailbox");
+        let other_endpoint_body = serde_json::to_vec(&other_endpoint_body).unwrap();
+        for changed in [
+            reshaped(&|e| e.actor_write.signature.truncate(63)),
+            reshaped(&|e| e.actor_write.write_body.clear()),
+            reshaped(&|e| {
+                e.actor_write
+                    .write_body
+                    .resize(ACTOR_WRITE_BODY_MAX_BYTES + 1, b' ')
+            }),
+            reshaped(&|e| e.actor_write.write_body = b"{}".to_vec()),
+            reshaped(&|e| e.actor_write.write_body = other_endpoint_body.clone()),
+            reshaped(&|e| e.key_proof = Some(Vec::new())),
+            reshaped(&|e| e.key_proof = Some(vec![0; KEY_PROOF_MAX_BYTES + 1])),
+            {
+                let mut proof_alone = old.clone();
+                proof_alone["keyProof"] = json!({ "$bytes": STANDARD.encode([1; 8]) });
+                proof_alone
+            },
+            {
+                let mut unknown = entry.clone();
+                unknown["actorWrite"]["extra"] = json!(1);
+                unknown
+            },
+        ] {
             assert!(AccountDeletion::from_entry(&changed).is_err(), "{changed}");
         }
     }

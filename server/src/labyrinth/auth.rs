@@ -39,6 +39,9 @@ use crate::storage::DbPool;
 pub const WRITE_BODY_HEADER: &str = "catbird-labyrinth-write";
 /// Header carrying `base64url(Ed25519 sig over WRITE_DOMAIN || body bytes)`.
 pub const WRITE_SIGNATURE_HEADER: &str = "catbird-labyrinth-write-signature";
+/// Optional `deleteAccountData` header carrying `base64url(keyProof)`: the
+/// repository proof of the signing device's key, at most 16384 bytes decoded.
+pub const KEY_PROOF_HEADER: &str = "catbird-labyrinth-key-proof";
 /// Signature domain of `labyrinthWriteBody`.
 pub const WRITE_DOMAIN: &[u8] = b"CATBIRD-LABYRINTH-WRITE\0";
 /// Accepted skew between `signedAt` and the server instant.

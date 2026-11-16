@@ -306,6 +306,7 @@ impl Pair {
             seq,
             entry_id,
             deleted_at,
+            evidence: None,
         };
         deletion.entry(&signer.sign_account_deletion(&deletion).unwrap())
     }
@@ -1887,6 +1888,7 @@ async fn a_c33_coordinator_delivers_its_own_partys_deletion_to_the_peers_home() 
                 at,
                 Some(&p.receipt),
                 &C33PeerHomes::default(),
+                None,
             ),
         )
         .await
@@ -1959,6 +1961,7 @@ async fn a_c33_coordinator_delivers_its_own_partys_deletion_to_the_peers_home() 
                 seq: seq + 1,
                 entry_id,
                 deleted_at: at,
+                evidence: None,
             }
         );
         authority
@@ -2190,6 +2193,103 @@ async fn a_transport_home_keeps_its_pairs_stream_after_a_deletion_entry() {
         .await
         .unwrap();
         assert_eq!(held, (1..=seq + 4).collect::<Vec<_>>());
+    })
+    .await;
+}
+
+/// A C33 coordinator's deletion carries D's signed write and key proof: the
+/// control entry queued for P's home, the row the coordinator rebuilds for
+/// getConvoEvents, and the row P's home stores and serves are all that exact
+/// evidence; a redelivery changes nothing.
+#[tokio::test]
+async fn a_c33_deletion_carries_the_devices_signed_write_and_key_proof_to_the_peers_home() {
+    let p = Pair::new().await;
+    let (cid, seq) = (p.cid, p.seq);
+    let deleted = p.deleted().to_owned();
+    scope_ds_clock(p.clock.clone(), async {
+        let at = current_utc();
+        let evidence = crate::federation::receipt::AccountDeletionEvidence::signed_for_test(
+            &ed25519_dalek::SigningKey::from_bytes(&p.fixture.sender_ed25519_seed),
+            p.fixture.sender_device_id,
+            [0xC3; 16],
+            at,
+            0,
+            Some(vec![0x3C; 3000]),
+        );
+        for _ in 0..2 {
+            assert!(
+                scope_sim_ds(
+                    Arc::clone(&p.seq_hooks),
+                    crate::labyrinth::repo::retention::delete_account_data_with_evidence(
+                        &p.seq_pool,
+                        &deleted,
+                        at,
+                        Some(&p.receipt),
+                        Some(&evidence),
+                    ),
+                )
+                .await
+                .unwrap()
+                    <= 1
+            );
+        }
+        let rows = control_rows(&p.seq_pool, cid).await;
+        assert_eq!(rows.len(), 1, "a replay queues nothing more");
+        let entry = serde_json::from_slice::<DeliverTransportControlEntry>(&rows[0].5)
+            .unwrap()
+            .entry;
+        let (deletion, authority) = AccountDeletion::from_entry(&entry).unwrap();
+        authority
+            .verify(&p.receipt.verifying_key(), &deletion)
+            .expect("signed by the coordinator's #mls-receipt-1 key");
+        assert_eq!(deletion.evidence, Some(evidence.clone()), "byte for byte");
+        let (server_fields, entry_id, received_at): (Vec<u8>, Uuid, DateTime<Utc>) =
+            sqlx::query_as(
+                "SELECT server_fields_bytes, entry_id, received_at FROM chat.entries \
+                  WHERE conversation_id = $1 AND seq = $2",
+            )
+            .bind(cid)
+            .bind(seq + 1)
+            .fetch_one(&p.seq_pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_ipld_dagcbor::from_slice::<
+                crate::chat_protocol::repository::entry_read::AccountDeletedServerFields,
+            >(&server_fields)
+            .unwrap()
+            .entry(cid, seq + 1, entry_id, received_at),
+            entry
+        );
+
+        // P's home stores the coordinator's entry verbatim and serves it as signed.
+        p.store(cid, &p.message).await;
+        assert_eq!(
+            p.accept(C33_SEQ, &entry).await.unwrap()["accepted"],
+            json!(true)
+        );
+        let stored: Vec<u8> = sqlx::query_scalar(
+            "SELECT entry_bytes FROM chat.direct_request_transport_entries \
+              WHERE conversation_id = $1 AND seq = $2",
+        )
+        .bind(cid)
+        .bind(seq + 1)
+        .fetch_one(&p.home_pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, serde_json::to_vec(&entry).unwrap());
+        let served = p.peer_entries(seq).await;
+        assert_eq!(served, [entry.clone()]);
+        assert_eq!(
+            AccountDeletion::from_entry(&served[0]).unwrap().0.evidence,
+            Some(evidence)
+        );
+        let settled = home_state(&p.home_pool).await;
+        assert_eq!(
+            p.accept(C33_SEQ, &entry).await.unwrap()["applied"],
+            json!(false)
+        );
+        assert_eq!(home_state(&p.home_pool).await, settled);
     })
     .await;
 }

@@ -885,6 +885,7 @@ async fn account_deletion_key_outage_stays_retryable() {
         entry_id: Uuid::new_v4(),
         deleted_at: chrono::DateTime::from_timestamp_millis(chrono::Utc::now().timestamp_millis())
             .unwrap(),
+        evidence: None,
     };
     let authority = I13ReceiptSigner::new(receipt_key, sequencer.clone())
         .sign_account_deletion(&deletion)

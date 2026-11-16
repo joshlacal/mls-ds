@@ -2809,7 +2809,7 @@ async fn durable_relays_to_a_federation_disabled_peer_stay_queued_for_retry() {
             )
             .await
             .unwrap();
-            enqueue_account_deletion_relays(&mut tx, &deleted.recipient_did, current_utc())
+            enqueue_account_deletion_relays(&mut tx, &deleted.recipient_did, current_utc(), None)
                 .await
                 .unwrap();
             tx.commit().await.unwrap();

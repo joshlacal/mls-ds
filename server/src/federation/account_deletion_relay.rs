@@ -13,10 +13,13 @@
 use super::*;
 use chrono::SecondsFormat;
 
+use crate::federation::receipt::AccountDeletionEvidence;
 use crate::labyrinth::repo::retention;
 
 pub(crate) const RELAY_ACCOUNT_DELETION_NSID: &str = "blue.catbird.mlsDS.relayAccountDeletion";
 const SIGNING_DOMAIN: &[u8] = b"CATBIRD-MLSDS-ACCOUNT-DELETION-RELAY-V1\0";
+/// Room for a relay carrying the largest `actorWrite` and `keyProof`.
+const RELAY_ACCOUNT_DELETION_BODY_LIMIT_BYTES: usize = 65_536;
 
 /// One account deletion, signed by the account's home for one conversation's
 /// sequencer.
@@ -29,6 +32,11 @@ pub(crate) struct AccountDeletionRelay {
     pub(crate) deleted_did: String,
     /// The home's deletion instant, RFC 3339 UTC with milliseconds.
     pub(crate) deleted_at: String,
+    /// The deleting device's signed write and repository proof, exactly as the
+    /// home verified them; the sequencer stores them in the entry it sequences.
+    /// Absent from relays queued before entries carried them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) evidence: Option<AccountDeletionEvidence>,
     /// Base64 low-S ES256 `r || s` over [`AccountDeletionRelay::signing_bytes`].
     pub(crate) signature: String,
 }
@@ -46,6 +54,18 @@ impl AccountDeletionRelay {
             push_field(&mut bytes, field);
         }
         bytes.extend_from_slice(self.conversation_id.as_bytes());
+        // Appended only when present, so a relay without evidence signs exactly
+        // the bytes it always did; a zero length marks an absent `keyProof`.
+        if let Some(evidence) = &self.evidence {
+            for field in [
+                evidence.actor_write.write_body.as_slice(),
+                &evidence.actor_write.signature,
+                evidence.key_proof.as_deref().unwrap_or_default(),
+            ] {
+                bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(field);
+            }
+        }
         bytes
     }
 }
@@ -63,6 +83,7 @@ pub(crate) async fn enqueue_account_deletion_relays(
     tx: &mut Transaction<'_, Postgres>,
     deleted_did: &str,
     deleted_at: DateTime<Utc>,
+    evidence: Option<&AccountDeletionEvidence>,
 ) -> Result<(), SignedRelayError> {
     let home_did = crate::identity::service_did_base();
     let indexed: bool =
@@ -112,6 +133,7 @@ pub(crate) async fn enqueue_account_deletion_relays(
             conversation_id,
             deleted_did: deleted_did.to_owned(),
             deleted_at: deleted_at_text.clone(),
+            evidence: evidence.cloned(),
             signature: String::new(),
         };
         relay.signature = sign(&key, &relay.signing_bytes());
@@ -134,7 +156,9 @@ pub(crate) async fn enqueue_account_deletion_relays(
 pub(super) fn routes() -> Router<GroupRelayState> {
     Router::new().route(
         "/xrpc/blue.catbird.mlsDS.relayAccountDeletion",
-        post(ClockScoped(relay_account_deletion)).layer(DefaultBodyLimit::max(16_384)),
+        post(ClockScoped(relay_account_deletion)).layer(DefaultBodyLimit::max(
+            RELAY_ACCOUNT_DELETION_BODY_LIMIT_BYTES,
+        )),
     )
 }
 
@@ -168,6 +192,20 @@ pub(crate) async fn accept_account_deletion_relay(
     }) else {
         return Err(invalid("invalid account deletion relay"));
     };
+    // The device's evidence is the clients' to verify: here only its shape, and
+    // that it was signed within the write window of the home's deletion instant.
+    if let Some(evidence) = &relay.evidence {
+        let signed_at = evidence
+            .check_shape()
+            .and_then(|()| evidence.signed_at())
+            .map_err(|error| invalid(&error))?;
+        if (signed_at - deleted_at).num_seconds().abs() > crate::labyrinth::auth::WRITE_SKEW_SECONDS
+        {
+            return Err(invalid(
+                "actorWrite was not signed within the deletion's write window",
+            ));
+        }
+    }
     if relay.home_did != caller || relay.sequencer_did != state.self_did {
         return Err(denied("relay is not bound to this caller and sequencer"));
     }
@@ -197,6 +235,7 @@ pub(crate) async fn accept_account_deletion_relay(
         deleted_at,
         now,
         state.i13_receipt_signer.as_deref(),
+        relay.evidence.as_ref(),
     )
     .await
     .map_err(|error| s2s_err(error.status(), error.name(), error.message()))?

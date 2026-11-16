@@ -2383,4 +2383,72 @@ mod tests {
             StrictCleanRemoteEventError::AcceptedPayloadHashMismatch,
         );
     }
+
+    #[test]
+    fn a_reconciled_account_deletion_keeps_the_devices_signed_write_and_key_proof() {
+        use crate::federation::receipt::{AccountDeletion, AccountDeletionEvidence};
+        const SEQUENCER: &str = "did:web:reconciled-sequencer.example";
+        let conversation_id = Uuid::new_v4();
+        let entry_id = Uuid::new_v4();
+        let received_at =
+            DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).expect("instant");
+        let evidence = AccountDeletionEvidence::signed_for_test(
+            &ed25519_dalek::SigningKey::from_bytes(&[0x2E; 32]),
+            Uuid::new_v4(),
+            [0x2E; 16],
+            received_at,
+            0,
+            Some(vec![0x2F; 1500]),
+        );
+        let deletion = AccountDeletion {
+            sequencer_did: SEQUENCER.to_owned(),
+            conversation_id,
+            deleted_did: "did:web:reconciled-deleted.example".to_owned(),
+            seq: 4,
+            entry_id,
+            deleted_at: received_at,
+            evidence: Some(evidence.clone()),
+        };
+        let authority = I13ReceiptSigner::from_signing_key_for_test(
+            SEQUENCER.to_owned(),
+            p256::ecdsa::SigningKey::from_slice(&[0x2D; 32]).unwrap(),
+        )
+        .sign_account_deletion(&deletion)
+        .unwrap();
+        let entry = deletion.entry(&authority);
+        let payload = serde_json::to_vec(&json!({
+            "$type": crate::chat_protocol::transcript::ACCOUNT_DELETED_ENTRY_TYPE_ID,
+            "entryId": entry_id,
+            "conversationId": conversation_id,
+            "seq": 4,
+            "generation": 2,
+            "stateVersion": 3,
+            "deletedDid": deletion.deleted_did,
+            "sequencerDid": SEQUENCER,
+            "receivedAt": received_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        }))
+        .unwrap();
+        let event = StrictCleanRemoteEvent::try_from(RemoteEvent {
+            seq: 4,
+            epoch: 2,
+            msg_id: "deletion".to_string(),
+            message_type: CleanEntryKind::AccountDeletion.type_id().to_string(),
+            accepted_payload_sha256: Some(Sha256::digest(&payload).to_vec()),
+            ciphertext: payload.clone(),
+            padded_size: payload.len() as i64,
+            created_at: received_at,
+            entry_id: Some(entry_id.to_string()),
+            entry_kind: Some(CleanEntryKind::AccountDeletion.type_id().to_string()),
+            signed_request: Some(payload),
+            outer_fingerprint: Some(vec![2; 32]),
+            sequencer_receipt: None,
+            account_deleted_entry: Some(entry.clone()),
+        })
+        .expect("a strict account-deletion event");
+        let (reconciled, reconciled_authority) =
+            parse_bound_account_deletion(&event, SEQUENCER, conversation_id)
+                .expect("the bound deletion");
+        assert_eq!(reconciled.evidence, Some(evidence), "byte for byte");
+        assert_eq!(reconciled.entry(&reconciled_authority), entry);
+    }
 }

@@ -12,7 +12,7 @@ use crate::chat_protocol::repository::{delivery, entry_read::AccountDeletedServe
 use crate::federation::group_relay::{
     enqueue_entries_pruned_notices, enqueue_transport_control_entry, C33PeerHomes, SignedRelayError,
 };
-use crate::federation::receipt::{AccountDeletion, I13ReceiptSigner};
+use crate::federation::receipt::{AccountDeletion, AccountDeletionEvidence, I13ReceiptSigner};
 use crate::federation::FederationError;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
 use crate::storage::DbPool;
@@ -53,11 +53,13 @@ pub async fn purge_account(
     at: DateTime<Utc>,
     receipt_signer: Option<&I13ReceiptSigner>,
     c33_peers: &C33PeerHomes,
+    evidence: Option<&AccountDeletionEvidence>,
 ) -> LabyrinthResult<usize> {
     let mut tx = conn.begin().await?;
     let sequenced =
-        sequence_account_deleted_entries(&mut tx, did, at, receipt_signer, c33_peers).await?;
-    crate::federation::group_relay::enqueue_account_deletion_relays(&mut tx, did, at)
+        sequence_account_deleted_entries(&mut tx, did, at, receipt_signer, c33_peers, evidence)
+            .await?;
+    crate::federation::group_relay::enqueue_account_deletion_relays(&mut tx, did, at, evidence)
         .await
         .map_err(relay_failure)?;
     tx.commit().await?;
@@ -119,9 +121,22 @@ pub async fn delete_account_data_with_conversations(
     at: DateTime<Utc>,
     receipt_signer: Option<&I13ReceiptSigner>,
 ) -> LabyrinthResult<usize> {
+    delete_account_data_with_evidence(pool, did, at, receipt_signer, None).await
+}
+
+/// [`delete_account_data_with_conversations`] for a deletion its device signed:
+/// every `accountDeletedEntry` sequenced here, and every relay queued for one
+/// sequenced elsewhere, carries `evidence` exactly.
+pub async fn delete_account_data_with_evidence(
+    pool: &DbPool,
+    did: &str,
+    at: DateTime<Utc>,
+    receipt_signer: Option<&I13ReceiptSigner>,
+    evidence: Option<&AccountDeletionEvidence>,
+) -> LabyrinthResult<usize> {
     let c33_peers = resolve_c33_peer_homes(pool, did).await?;
     let mut tx = pool.begin().await?;
-    let sequenced = purge_account(&mut tx, did, at, receipt_signer, &c33_peers).await?;
+    let sequenced = purge_account(&mut tx, did, at, receipt_signer, &c33_peers, evidence).await?;
     tx.commit().await?;
     Ok(sequenced)
 }
@@ -296,6 +311,7 @@ async fn sequence_account_deleted_entries(
     at: DateTime<Utc>,
     receipt_signer: Option<&I13ReceiptSigner>,
     c33_peers: &C33PeerHomes,
+    evidence: Option<&AccountDeletionEvidence>,
 ) -> LabyrinthResult<usize> {
     // `coordinated`: a direct pair this DS coordinates, exactly as `C33PeerHomes` resolves.
     let active_convos: Vec<(Uuid, bool)> = sqlx::query_as(
@@ -314,9 +330,16 @@ async fn sequence_account_deleted_entries(
 
     let mut sequenced = 0_usize;
     for (conversation_id, coordinated) in active_convos {
-        let entry =
-            sequence_account_deleted_entry(tx, conversation_id, did, at, at, receipt_signer)
-                .await?;
+        let entry = sequence_account_deleted_entry(
+            tx,
+            conversation_id,
+            did,
+            at,
+            at,
+            receipt_signer,
+            evidence,
+        )
+        .await?;
         let home = if coordinated {
             // A pair `c33_peers` did not resolve (one created since) decided
             // nothing: the identical retry resolves it.
@@ -349,6 +372,7 @@ pub(crate) async fn sequence_account_deleted_entry(
     deleted_at: DateTime<Utc>,
     at: DateTime<Utc>,
     receipt_signer: Option<&I13ReceiptSigner>,
+    evidence: Option<&AccountDeletionEvidence>,
 ) -> LabyrinthResult<Option<Value>> {
     // A remote sequencer owns a mirror's seq chain: it learns of the deletion by relay.
     let head: Option<(i64, i64, i64)> = sqlx::query_as(
@@ -424,18 +448,22 @@ pub(crate) async fn sequence_account_deleted_entry(
         seq,
         entry_id,
         deleted_at: at,
+        evidence: evidence.cloned(),
     };
     let sequencer_authority = signer.sign_account_deletion(&deletion).map_err(|error| {
         tracing::error!(%error, conversation_id = %crate::crypto::redact_for_log(&conversation_id.to_string()), "sign accountDeletedEntry");
         LabyrinthError::internal()
     })?;
     let entry = deletion.entry(&sequencer_authority);
+    let (actor_write, key_proof) = deletion.evidence.map_or((None, None), |evidence| {
+        (Some(evidence.actor_write), evidence.key_proof)
+    });
     let server_fields_bytes = serde_ipld_dagcbor::to_vec(&AccountDeletedServerFields {
         deleted_did: deletion.deleted_did,
         sequencer_did: deletion.sequencer_did,
         sequencer_authority,
-        actor_write: None,
-        key_proof: None,
+        actor_write,
+        key_proof,
     })
     .map_err(|_| LabyrinthError::internal())?;
 

@@ -94,6 +94,7 @@ async fn a_group_mirror_stores_only_its_sequencers_signed_account_deletion_verba
         seq: 9,
         entry_id: Uuid::new_v4(),
         deleted_at: DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap(),
+        evidence: None,
     };
     let sign = |key: &SigningKey, sequencer: &str, deletion: &AccountDeletion| {
         I13ReceiptSigner::new(key.clone(), sequencer.to_owned())
@@ -182,6 +183,116 @@ async fn a_group_mirror_stores_only_its_sequencers_signed_account_deletion_verba
     assert_eq!(served(&pool, cid).await, [evidence(genuine)]);
 }
 
+/// A group mirror receives SEQ's deletion carrying the deleting device's signed
+/// write, padded to `pad_to` bytes, and a `key_proof_len`-byte key proof through
+/// `deliverGroupEntry`, stores it verbatim and serves exactly that evidence.
+async fn mirror_serves_device_evidence(pad_to: usize, key_proof_len: usize) {
+    crate::federation::open_federation_for_test();
+    let db = fresh_fully_migrated_db("chat_fed_relay_").await;
+    let pool = db.connect(4).await;
+    prepare(&pool).await;
+    let mirror = seed_remote_clean_slate_application_fixture(&pool, HOME, SEQ, None)
+        .await
+        .unwrap();
+    let cid = mirror.conversation_id;
+    let (seq_key, home_key, receipt_key) = (key(0x51), key(0x52), key(0x54));
+    let network = Network::new(&[(SEQ, &seq_key), (HOME, &home_key)]);
+    network
+        .documents
+        .lock()
+        .unwrap()
+        .get_mut(host(SEQ))
+        .unwrap()["verificationMethod"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": format!("{SEQ}#mls-receipt-1"),
+            "type": "Multikey",
+            "controller": SEQ,
+            "publicKeyMultibase":
+                crate::identity::did_doc::encode_p256_multikey(receipt_key.verifying_key()),
+        }));
+    let home_hooks = hooks(HOME, Some(&home_key), true, &network);
+    let state = GroupRelayState::for_test(pool.clone(), HOME.to_owned(), HMAC.as_bytes(), None)
+        .with_sim_hooks(Arc::clone(&home_hooks))
+        .with_clock(manual_clock());
+    let deleted_at = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+    let device_evidence = crate::federation::receipt::AccountDeletionEvidence::signed_for_test(
+        &ed25519_dalek::SigningKey::from_bytes(&mirror.sender_ed25519_seed),
+        mirror.sender_device_id,
+        [0x4D; 16],
+        deleted_at,
+        pad_to,
+        Some(vec![0xE7; key_proof_len]),
+    );
+    let deletion = AccountDeletion {
+        sequencer_did: SEQ.to_owned(),
+        conversation_id: cid,
+        deleted_did: mirror.sender_did.clone(),
+        seq: 9,
+        entry_id: Uuid::new_v4(),
+        deleted_at,
+        evidence: Some(device_evidence.clone()),
+    };
+    let genuine = deletion.entry(
+        &I13ReceiptSigner::new(receipt_key.clone(), SEQ.to_owned())
+            .sign_account_deletion(&deletion)
+            .unwrap(),
+    );
+    let body = serde_json::to_vec(&DeliverGroupEntryRequest {
+        conversation_id: cid,
+        generation: 0,
+        space_uri: format!("at://{SEQ}/space/blue.catbird.labyrinth.conversation/{cid}-0"),
+        recipient_dids: vec![mirror.recipient_did.clone()],
+        recipient_devices: vec![(mirror.recipient_did.clone(), mirror.recipient_device_id)],
+        entry: genuine.clone(),
+        close_authority: None,
+    })
+    .unwrap();
+    let response = scope_sim_ds(
+        Arc::clone(&home_hooks),
+        handle_deliver_group_entry(
+            State(state.clone()),
+            deliver_headers(SEQ, &body),
+            Bytes::from(body),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored: Vec<u8> = sqlx::query_scalar(
+        "SELECT entry_bytes FROM chat.direct_request_transport_entries \
+          WHERE conversation_id = $1 AND seq = 9",
+    )
+    .bind(cid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        serde_json::to_vec(&genuine).unwrap(),
+        "stored verbatim"
+    );
+    assert_eq!(served(&pool, cid).await, [evidence(genuine)]);
+    let mut tx = pool.begin().await.unwrap();
+    let loaded = load_account_deletions(&mut tx, cid).await.unwrap();
+    tx.rollback().await.unwrap();
+    let mut union_entry = serde_json::to_value(&loaded[0]).unwrap();
+    union_entry["$type"] = json!("blue.catbird.chat.defs#accountDeletedEntry");
+    assert_eq!(
+        AccountDeletion::from_entry(&union_entry)
+            .unwrap()
+            .0
+            .evidence,
+        Some(device_evidence),
+        "served byte for byte"
+    );
+}
+
+#[tokio::test]
+async fn a_group_mirror_serves_the_deleting_devices_signed_write_and_key_proof_verbatim() {
+    mirror_serves_device_evidence(0, 512).await;
+}
+
 /// MLS-R3-02: SEQ rotated its receipt key to `#mls-receipt-2` and retains `#1`.
 /// The home verifies a new `#2` deletion and an archived `#1` one against SEQ's
 /// published history, never requiring the archived method to be current; a key
@@ -226,6 +337,7 @@ async fn a_group_mirror_verifies_new_and_archived_deletions_after_a_key_rotation
         seq,
         entry_id: Uuid::new_v4(),
         deleted_at: DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap(),
+        evidence: None,
     };
     let sign = |deletion: &AccountDeletion, generation: u8, receipt_key: &SigningKey| {
         let signer = I13ReceiptSigner::new_with_key_id(
@@ -355,6 +467,7 @@ async fn a_c33_transport_home_serves_its_pairs_deletions_to_every_recipient_devi
         seq: 3,
         entry_id: Uuid::new_v4(),
         deleted_at: DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap(),
+        evidence: None,
     };
     let genuine = deletion.entry(&signer.sign_account_deletion(&deletion).unwrap());
     let mention = json!({
