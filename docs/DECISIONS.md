@@ -99,3 +99,9 @@ Because: ordinary authentication and the dormancy sweep previously changed devic
 Residual: `getOwnDevices` exposes the pending device, but mls-ds has no device-specific push or event kind. The client-side unrecognized-device alert must consume this inventory; without that UI, siblings see the notice only when they inspect devices. A dormant but still owned device can miss the 72-hour window and the later explicit recovery action.
 
 Reversible until: merge and production deployment of the Dec 1 mls-ds lane. Override by: changing the unapplied audit migration and the eligibility rule together, then updating the server and client alert tests. Governing plan: workspace `docs/execution-plans/2026-11-16-dec1-security-plan-question-22.md`, WP-S1.
+
+## 2026-11-16 · mls-ds pending-device recovery · Count signed Labyrinth activity
+
+Chose: a successfully device-signed Labyrinth read or write wakes an active chat device using the same coarse UTC-day activity stamp as chat reads (provisional). Because: the full-loss restore gate treats a dormant sibling as lost, but a device using only Labyrinth previously remained dormant and could not veto a pending replacement. An invalid device signature cannot wake it. Rejected: using chat-only activity as the full-loss signal or a fine-grained per-request timestamp.
+
+Reversible until: merge and production deployment of the Dec 1 mls-ds lane. Override by: providing an equivalent authenticated activity signal to the promotion gate and testing Labyrinth-only use. Governing plan: workspace `docs/execution-plans/2026-11-16-dec1-security-plan-question-22.md`, WP-S1.

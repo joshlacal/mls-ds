@@ -464,6 +464,10 @@ async fn verify_signed_write_with_pending(
             "labyrinthWriteBody signature does not verify under the device key",
         )
     })?;
+    crate::chat_protocol::device_activity::mark_authenticated_labyrinth_activity(
+        &mut conn, did, device_id, instant,
+    )
+    .await?;
     Ok(Admission {
         did: did.to_owned(),
         device_id,

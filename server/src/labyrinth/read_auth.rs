@@ -197,6 +197,13 @@ pub async fn verify_with_pending(
         .map_err(|_| LabyrinthError::internal())?
         .verify_strict(&signing_input(&bytes), &Signature::from_bytes(&sig))
         .map_err(|_| bad_signature())?;
+    crate::chat_protocol::device_activity::mark_authenticated_labyrinth_activity(
+        &mut conn,
+        expected.did,
+        device_id,
+        now,
+    )
+    .await?;
     Ok((device_id, claim, device.status))
 }
 

@@ -3426,13 +3426,26 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .await;
     assert_eq!(no_auto_status, StatusCode::UNAUTHORIZED);
 
-    // A sibling that comes back before the restore action can still deny it.
+    // A sibling using only Labyrinth becomes awake again before the restore
+    // action, so an attacker cannot exploit a chat-only activity stamp.
     let (wake_status, wake_body) = http::send(
         router.clone(),
-        alice_d1.dpop_get_request("blue.catbird.chat.getOwnDevices", ""),
+        alice_d1.labyrinth_get_request("getEpochHead", &[("did", &alice_acct.did)]),
     )
     .await;
     assert_eq!(wake_status, StatusCode::OK, "{wake_body}");
+    let d1_awake: bool = sqlx::query_scalar(
+        "SELECT dormant_at IS NULL FROM chat.devices WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&alice_acct.did)
+    .bind(alice_d1.device_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        d1_awake,
+        "authenticated Labyrinth activity must wake its device"
+    );
     let (returned_status, returned_body) = http::send(
         router.clone(),
         alice_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": valid_ep1.clone() })),
@@ -5146,9 +5159,28 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
             .execute(&mut *tx73)
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE chat.device_promotion_audit \
+                SET recorded_at = clock_timestamp() - interval '73 hours' \
+              WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
+        )
+        .bind(&alice_acct.did)
+        .bind(alice_d2.device_id)
+        .execute(&mut *tx73)
+        .await
+        .unwrap();
         tx73.commit().await.unwrap();
     }
     let _ = mark_inactive_devices(&pool, Utc::now()).await.unwrap();
+    let still_pending: String = sqlx::query_scalar(
+        "SELECT status FROM chat.devices WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&alice_acct.did)
+    .bind(alice_d2.device_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(still_pending, "pending_approval");
     let (st_73h_dir, _) = http::send(
         router.clone(),
         alice_d2.dpop_get_request(

@@ -8,6 +8,8 @@
 //! store the UTC day only.
 
 use chrono::{DateTime, Duration, DurationRound, Utc};
+use sqlx::PgConnection;
+use uuid::Uuid;
 
 /// Truncate `instant` to the start of its UTC day.
 ///
@@ -26,6 +28,32 @@ pub fn pending_device_hold_hours() -> i64 {
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|v| *v >= 72)
         .unwrap_or(72)
+}
+
+/// A successfully device-signed Labyrinth request is activity even when the
+/// device uses no chat endpoint. Wake only a still-active device, and retain the
+/// same coarse UTC-day privacy bound as chat reads and ACKs. Callers must invoke
+/// this only AFTER verifying the device signature.
+pub async fn mark_authenticated_labyrinth_activity(
+    conn: &mut PgConnection,
+    did: &str,
+    device_id: Uuid,
+    at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let day = coarse_activity_day(at);
+    sqlx::query(
+        "UPDATE chat.devices \
+            SET last_active_at = GREATEST(last_active_at, $3), dormant_at = NULL \
+          WHERE user_did = $1 AND device_id = $2 \
+            AND status = 'active' AND revoked_at IS NULL \
+            AND (last_active_at < $3 OR dormant_at IS NOT NULL)",
+    )
+    .bind(did)
+    .bind(device_id)
+    .bind(day)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

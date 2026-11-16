@@ -117,13 +117,11 @@ async fn promote_pending_device(
     .bind(device_id)
     .fetch_optional(&mut *conn)
     .await?;
-    if !notice_at.is_some_and(|notice| {
-        notice
-            <= at
-                - chrono::Duration::hours(
-                    crate::chat_protocol::device_activity::pending_device_hold_hours(),
-                )
-    }) {
+    let cutoff = chrono::Duration::try_hours(
+        crate::chat_protocol::device_activity::pending_device_hold_hours(),
+    )
+    .and_then(|hold| at.checked_sub_signed(hold));
+    if !matches!((notice_at, cutoff), (Some(notice), Some(cutoff)) if notice <= cutoff) {
         return Err(LabyrinthError::not_authorized(
             "pending device recovery hold is not complete",
         ));
