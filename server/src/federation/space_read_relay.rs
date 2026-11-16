@@ -69,6 +69,8 @@ pub const ALLOWED_SPACE_READ_NSIDS: &[&str] = &[
 const SPACE_BLOB_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SPACE_REPO_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAILBOX_KEYS_RECORD_MAX_BYTES: usize = 1024 * 1024;
+/// `accountDeletedEntry.keyProof` lexicon ceiling, including the CAR framing.
+const CHAT_DEVICE_KEY_PROOF_MAX_BYTES: usize = 16 * 1024;
 const CAR_HEADER_MAX_BYTES: usize = 64 * 1024;
 const CAR_MAX_BLOCKS: usize = 512;
 const MST_MAX_DEPTH: usize = 64;
@@ -887,8 +889,9 @@ fn verify_canonical_dagcbor(bytes: &[u8]) -> Result<(), SpaceRelayError> {
 
 fn parse_verified_car_v1(
     car_bytes: &[u8],
+    max_bytes: usize,
 ) -> Result<(cid::Cid, HashMap<cid::Cid, Vec<u8>>), SpaceRelayError> {
-    if car_bytes.is_empty() || car_bytes.len() > MAILBOX_KEYS_RECORD_MAX_BYTES {
+    if car_bytes.is_empty() || car_bytes.len() > max_bytes {
         return Err(SpaceRelayError::UpstreamError(
             "CARv1 response empty or exceeds size ceiling".into(),
         ));
@@ -1249,7 +1252,7 @@ fn verify_mailbox_keys_car_proof(
     rkey: &str,
     atproto_key: &SpaceVerifyingKey,
 ) -> Result<Option<bytes::Bytes>, SpaceRelayError> {
-    let (root_cid, blocks) = parse_verified_car_v1(car_bytes)?;
+    let (root_cid, blocks) = parse_verified_car_v1(car_bytes, MAILBOX_KEYS_RECORD_MAX_BYTES)?;
     let commit_bytes = blocks
         .get(&root_cid)
         .ok_or_else(|| SpaceRelayError::UpstreamError("missing root commit block".into()))?;
@@ -1275,6 +1278,170 @@ fn verify_mailbox_keys_car_proof(
     })?;
     let json_bytes = validate_mailbox_keys_cbor_value(record_bytes, record_cid, target_did, rkey)?;
     Ok(Some(json_bytes))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChatDeviceRecordProof {
+    #[serde(rename = "$type")]
+    record_type: String,
+    #[serde(with = "serde_bytes")]
+    mls_signature_public_key: Vec<u8>,
+    algorithm: String,
+    created_at: String,
+}
+
+/// Verify the exact signed repository commit, MST inclusion path, and device record
+/// against the DID's independently resolved `#atproto` key. The returned CAR is
+/// suitable for copying into `accountDeletedEntry.keyProof` unchanged.
+pub fn verify_chat_device_key_proof(
+    car_bytes: &[u8],
+    did: &str,
+    device_id: &str,
+    signing_key: &[u8; 32],
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<(), SpaceRelayError> {
+    if !valid_record_key(device_id)
+        || uuid::Uuid::parse_str(device_id)
+            .map(|id| id.to_string() != device_id)
+            .unwrap_or(true)
+    {
+        return Err(SpaceRelayError::InvalidRequest(
+            "actorDeviceId is not a canonical UUID record key".into(),
+        ));
+    }
+    let (root_cid, blocks) = parse_verified_car_v1(car_bytes, CHAT_DEVICE_KEY_PROOF_MAX_BYTES)?;
+    let commit_bytes = blocks
+        .get(&root_cid)
+        .ok_or_else(|| SpaceRelayError::UpstreamError("missing root commit block".into()))?;
+    let mst_root_cid = verify_atproto_v3_commit(commit_bytes, did, atproto_key)?;
+    let mst_key = format!("blue.catbird.chat.device/{device_id}");
+    let mut visited = HashSet::new();
+    let record_cid = walk_mst_proof(
+        &blocks,
+        mst_root_cid,
+        mst_key.as_bytes(),
+        None,
+        None,
+        &mut visited,
+        0,
+    )?
+    .ok_or_else(|| SpaceRelayError::UpstreamError("device record is absent from MST".into()))?;
+    let record_bytes = blocks.get(&record_cid).ok_or_else(|| {
+        SpaceRelayError::UpstreamError("MST included device CID but CAR omitted record".into())
+    })?;
+    let record: ChatDeviceRecordProof = serde_ipld_dagcbor::from_slice(record_bytes)
+        .map_err(|_| SpaceRelayError::UpstreamError("malformed chat device record".into()))?;
+    if record.record_type != "blue.catbird.chat.device"
+        || record.algorithm != "ed25519"
+        || record.mls_signature_public_key.as_slice() != signing_key.as_slice()
+        || chrono::DateTime::parse_from_rfc3339(&record.created_at).is_err()
+    {
+        return Err(SpaceRelayError::UpstreamError(
+            "chat device record does not bind the admitted signing key".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a caller-supplied pre-deletion CAR using a fresh DID document.
+/// A PDS service is not required because the repository may already be gone.
+pub async fn verify_supplied_chat_device_key_proof(
+    resolver: &DsResolver,
+    did: &str,
+    device_id: &str,
+    signing_key: &[u8; 32],
+    car_bytes: &[u8],
+) -> Result<(), SpaceRelayError> {
+    let atproto_key = resolver
+        .resolve_did_to_atproto_key(did)
+        .await
+        .map_err(mailbox_resolution_error)?
+        .ok_or_else(|| {
+            SpaceRelayError::UpstreamError("deleted DID has no #atproto signing key".into())
+        })?;
+    verify_chat_device_key_proof(car_bytes, did, device_id, signing_key, &atproto_key)
+}
+
+/// Fetch a missing proof before deleting the account's server data. The PDS URL
+/// comes only from the DID document, is DNS-pinned, and receives no caller headers.
+/// An unsigned HTTP 404 cannot prove the record absent and is never accepted.
+pub async fn fetch_chat_device_key_proof(
+    resolver: &DsResolver,
+    did: &str,
+    device_id: &str,
+    signing_key: &[u8; 32],
+) -> Result<Vec<u8>, SpaceRelayError> {
+    if crate::identity::canonical_did(did) != did
+        || !atproto_spaces::is_valid_did(did)
+        || !(did.starts_with("did:plc:") || did.starts_with("did:web:"))
+    {
+        return Err(SpaceRelayError::InvalidRequest(
+            "deleted DID must be one canonical bare did:plc or did:web".into(),
+        ));
+    }
+    if !valid_record_key(device_id) {
+        return Err(SpaceRelayError::InvalidRequest(
+            "invalid chat device record key".into(),
+        ));
+    }
+    let (pds, atproto_key_opt) = resolver
+        .resolve_did_to_pds_and_atproto_key(did)
+        .await
+        .map_err(mailbox_resolution_error)?;
+    let atproto_key = atproto_key_opt.ok_or_else(|| {
+        SpaceRelayError::UpstreamError("deleted DID has no #atproto signing key".into())
+    })?;
+    let mut url = Url::parse(&format!(
+        "{}/xrpc/com.atproto.sync.getRecord",
+        pds.trim_end_matches('/')
+    ))
+    .map_err(|error| SpaceRelayError::InvalidTargetEndpoint(error.to_string()))?;
+    url.query_pairs_mut()
+        .append_pair("did", did)
+        .append_pair("collection", "blue.catbird.chat.device")
+        .append_pair("rkey", device_id);
+    let destination = resolver
+        .resolve_endpoint_destination(url.as_str())
+        .await
+        .map_err(mailbox_resolution_error)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let response = send_hardened_resolution_request(
+        &destination,
+        deadline,
+        did,
+        "chat device CAR proof read failed",
+    )
+    .await
+    .map_err(mailbox_resolution_error)?;
+    let status = response.status();
+    let max_bytes = if status.is_success() {
+        CHAT_DEVICE_KEY_PROOF_MAX_BYTES
+    } else {
+        ERROR_RESPONSE_MAX_BYTES
+    };
+    let body = collect_bounded(response, ResponseBodyBudget::new(max_bytes, deadline))
+        .await
+        .map_err(|error| {
+            if retryable_status(status) || body_read_was_transient(&error) {
+                SpaceRelayError::UpstreamUnavailable(error.to_string())
+            } else {
+                SpaceRelayError::UpstreamError(error.to_string())
+            }
+        })?;
+    if !status.is_success() {
+        let reason = format!(
+            "chat device sync.getRecord returned HTTP {}",
+            status.as_u16()
+        );
+        return Err(if retryable_status(status) {
+            SpaceRelayError::UpstreamUnavailable(reason)
+        } else {
+            SpaceRelayError::UpstreamError(reason)
+        });
+    }
+    verify_chat_device_key_proof(&body, did, device_id, signing_key, &atproto_key)?;
+    Ok(body.to_vec())
 }
 
 fn mailbox_resolution_error(error: FederationError) -> SpaceRelayError {
@@ -1874,6 +2041,57 @@ mod tests {
         for valid in ["self", "000000000007", "a.b_c:d~e-f"] {
             assert!(valid_record_key(valid), "{valid:?}");
         }
+    }
+
+    #[test]
+    fn device_key_car_proof_binds_did_record_key_and_admitted_signer() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let did = "did:web:deleting.example";
+        let device_id = "f65aa2fd-6fae-4fc9-955b-088ce430f8d6";
+        let secret = p256::SecretKey::from_slice(&[0x59; 32]).unwrap();
+        let vk = SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(secret.public_key()));
+        let wrong_secret = p256::SecretKey::from_slice(&[0x5a; 32]).unwrap();
+        let wrong_vk =
+            SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(wrong_secret.public_key()));
+        let signing_key = [0x42; 32];
+        let record = json!({
+            "$type": "blue.catbird.chat.device",
+            "mlsSignaturePublicKey": { "$bytes": STANDARD.encode(signing_key) },
+            "algorithm": "ed25519",
+            "createdAt": "2026-11-16T00:00:00Z",
+        });
+        let key = format!("blue.catbird.chat.device/{device_id}");
+        let (car, _) =
+            build_signed_repo_car(did, "3l2aaaaaaaaaa", &secret, &[(key.as_str(), &record)]);
+        verify_chat_device_key_proof(&car, did, device_id, &signing_key, &vk).unwrap();
+        assert!(verify_chat_device_key_proof(&car, did, device_id, &[0x43; 32], &vk).is_err());
+        assert!(
+            verify_chat_device_key_proof(&car, did, device_id, &signing_key, &wrong_vk).is_err()
+        );
+        assert!(verify_chat_device_key_proof(
+            &car,
+            did,
+            "a3814970-35ec-4d0e-b37a-c39f87849469",
+            &signing_key,
+            &vk,
+        )
+        .is_err());
+        assert!(verify_chat_device_key_proof(
+            &car,
+            "did:web:other.example",
+            device_id,
+            &signing_key,
+            &vk
+        )
+        .is_err());
+        let mut corrupt = car.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(verify_chat_device_key_proof(&corrupt, did, device_id, &signing_key, &vk).is_err());
+        let oversized = vec![0; CHAT_DEVICE_KEY_PROOF_MAX_BYTES + 1];
+        assert!(
+            verify_chat_device_key_proof(&oversized, did, device_id, &signing_key, &vk).is_err()
+        );
     }
 
     #[tokio::test]

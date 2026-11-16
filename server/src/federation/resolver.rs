@@ -1413,6 +1413,21 @@ impl DsResolver {
         Ok((endpoint.to_string(), atproto_key))
     }
 
+    /// Resolve the repository signing key without requiring a live PDS service.
+    /// Account deletion may carry a CAR captured before the repository was removed.
+    pub(crate) async fn resolve_did_to_atproto_key(
+        &self,
+        did: &str,
+    ) -> Result<Option<atproto_spaces::tokens::SpaceVerifyingKey>, FederationError> {
+        let doc = self.fetch_did_document(did).await?;
+        Ok(serde_json::to_vec(&doc)
+            .ok()
+            .and_then(|bytes| {
+                atproto_spaces::did_resolver::DidDocument::parse_json(did, &bytes).ok()
+            })
+            .and_then(|parsed| parsed.atproto_key))
+    }
+
     /// Fetch and parse a DID document (did:web or did:plc), with SSRF
     /// validation of the document URL.
     async fn fetch_did_document(&self, did: &str) -> Result<serde_json::Value, FederationError> {

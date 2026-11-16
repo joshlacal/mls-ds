@@ -765,6 +765,12 @@ async fn completed_operation(
 }
 
 impl RequestTx {
+    /// End a fresh-operation probe before any outbound proof lookup.
+    pub async fn abort(self) -> LabyrinthResult<()> {
+        self.tx.rollback().await?;
+        Ok(())
+    }
+
     /// Commit a read.
     pub async fn finish_read(self) -> LabyrinthResult<()> {
         self.tx.commit().await?;

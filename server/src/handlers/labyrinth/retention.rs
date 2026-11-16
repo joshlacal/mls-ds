@@ -2,13 +2,22 @@
 
 use std::sync::Arc;
 
-use axum::{body::Bytes, extract::State, http::HeaderMap, response::Response};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::Response,
+};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use serde_json::json;
 
 use super::params::{admit_procedure, begin_write};
 use super::respond;
 use crate::federation::receipt::{AccountDeletionActorWrite, AccountDeletionEvidence};
+use crate::federation::space_read_relay::{
+    fetch_chat_device_key_proof, verify_supplied_chat_device_key_proof, SpaceRelayError,
+};
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth;
 use crate::labyrinth::error::{LabyrinthError, LabyrinthResult};
@@ -45,7 +54,8 @@ pub async fn purge_mailbox(
 
 /// The evidence every `accountDeletedEntry` of this deletion carries: the exact
 /// `labyrinthWriteBody` and signature `admit_procedure` verified, and the
-/// device's optional `keyProof`, each decoded from its header unchanged.
+/// device's optional `keyProof`, decoded from its header. A supplied proof is
+/// verified independently; an absent one is fetched from the PDS before purge.
 fn deletion_evidence(
     headers: &HeaderMap,
     bytes: &Bytes,
@@ -70,6 +80,41 @@ fn deletion_evidence(
     };
     evidence.check_shape().map_err(LabyrinthError::invalid)?;
     Ok(evidence)
+}
+
+fn key_proof_unavailable(error: SpaceRelayError) -> LabyrinthError {
+    tracing::warn!(%error, "deleteAccountData refused: device repository proof unavailable");
+    LabyrinthError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ServiceUnavailable",
+        "the deleting device's signed repository proof could not be verified; retry before removing the PDS repository",
+    )
+    .with_retry_after(5)
+}
+
+fn verify_admitted_key(
+    evidence: &AccountDeletionEvidence,
+    signing_key: &[u8; 32],
+) -> LabyrinthResult<()> {
+    let key = VerifyingKey::from_bytes(signing_key).map_err(|_| LabyrinthError::internal())?;
+    let signature: [u8; 64] = evidence
+        .actor_write
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| LabyrinthError::invalid("write signature must be 64 bytes"))?;
+    let mut message =
+        Vec::with_capacity(auth::WRITE_DOMAIN.len() + evidence.actor_write.write_body.len());
+    message.extend_from_slice(auth::WRITE_DOMAIN);
+    message.extend_from_slice(&evidence.actor_write.write_body);
+    key.verify_strict(&message, &Signature::from_bytes(&signature))
+        .map_err(|_| {
+            LabyrinthError::new(
+                StatusCode::UNAUTHORIZED,
+                "InvalidSignature",
+                "deletion write no longer verifies under the current device key",
+            )
+        })
 }
 
 pub async fn delete_account_data(
@@ -109,10 +154,49 @@ pub async fn delete_account_data(
                     return to_bytes(&json!({}));
                 }
             };
-            let evidence = deletion_evidence(&headers, &bytes)?;
+            // A completed operation replays without asking a repository that may
+            // have been deleted since the first call. A fresh probe releases its
+            // device lock before any DID/PDS HTTP work (M-F04).
+            let probe = begin_write!(&pool, adm.clone());
+            let admitted_key = probe.caller.signing_key;
+            (*probe).abort().await?;
+            let mut evidence = deletion_evidence(&headers, &bytes)?;
+            verify_admitted_key(&evidence, &admitted_key)?;
+            let resolver = rt.resolver().ok_or_else(|| {
+                LabyrinthError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                    "device repository proof resolver is unavailable",
+                )
+            })?;
+            let device_id = adm.device_id.to_string();
+            let proof = match evidence.key_proof.take() {
+                Some(proof) => {
+                    verify_supplied_chat_device_key_proof(
+                        resolver,
+                        &adm.did,
+                        &device_id,
+                        &admitted_key,
+                        &proof,
+                    )
+                    .await
+                    .map_err(key_proof_unavailable)?;
+                    proof
+                }
+                None => fetch_chat_device_key_proof(resolver, &adm.did, &device_id, &admitted_key)
+                    .await
+                    .map_err(key_proof_unavailable)?,
+            };
+            evidence.key_proof = Some(proof);
             // Peer homes resolve over HTTP, so before the transaction opens (M-F04).
             let c33_peers = repo::resolve_c33_peer_homes(&pool, &adm.did).await?;
             let mut w = begin_write!(&pool, adm);
+            // The device row is locked again after the external read. A rotation
+            // or revocation during that window cannot bind a proof for the old
+            // key to a write admitted under the new one.
+            if w.caller.signing_key != admitted_key {
+                return Err(LabyrinthError::device_revoked());
+            }
             let (caller, at) = (w.caller.clone(), w.instant);
             let sequenced = repo::purge_account_with_recovery(
                 &mut w.tx,

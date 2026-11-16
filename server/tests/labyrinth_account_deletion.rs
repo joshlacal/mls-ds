@@ -16,6 +16,7 @@ use catbird_server::{
         CleanSlateApplicationFixture,
     },
     federation::receipt::{AccountDeletion, I13ReceiptSigner},
+    federation::space_read_relay::test_car_builder::build_signed_repo_car,
     labyrinth::repo::retention::delete_account_data_with_conversations,
 };
 use chrono::{DateTime, Utc};
@@ -593,13 +594,54 @@ impl SignedDeletion {
 
 /// The real Labyrinth router over `s`'s database, with the sequencer's receipt signer.
 async fn labyrinth(s: &Sequencer) -> Router {
-    let (_, runtime) = http::router_and_runtime_for_authenticated_acceptance(s.pool.clone()).await;
+    let resolver = std::sync::Arc::new(catbird_server::federation::DsResolver::new(
+        s.pool.clone(),
+        reqwest::Client::new(),
+        SELF_DID.to_owned(),
+        SELF_ENDPOINT.to_owned(),
+        None,
+        300,
+    ));
+    labyrinth_with_resolver(s, resolver).await
+}
+
+async fn labyrinth_with_resolver(
+    s: &Sequencer,
+    resolver: std::sync::Arc<catbird_server::federation::DsResolver>,
+) -> Router {
+    let (_, runtime) = http::router_and_runtime_for_authenticated_acceptance_with(
+        s.pool.clone(),
+        move |runtime| runtime.with_resolver(resolver),
+    )
+    .await;
     catbird_server::handlers::labyrinth::labyrinth_router::<http::TestState>().with_state(
         http::TestState {
             pool: s.pool.clone(),
             runtime,
         },
     )
+}
+
+fn signed_device_record_car(
+    device: &http::Device,
+    chat_key: &ed25519_dalek::SigningKey,
+) -> Vec<u8> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let secret = p256::SecretKey::from_slice(&device.signing.to_bytes()).unwrap();
+    let record = json!({
+        "$type": "blue.catbird.chat.device",
+        "mlsSignaturePublicKey": { "$bytes": STANDARD.encode(chat_key.verifying_key().to_bytes()) },
+        "algorithm": "ed25519",
+        "createdAt": "2026-11-16T00:00:00Z",
+    });
+    let key = format!("blue.catbird.chat.device/{}", device.device_id);
+    build_signed_repo_car(
+        &device.did,
+        "3l2aaaaaaaaaa",
+        &secret,
+        &[(key.as_str(), &record)],
+    )
+    .0
 }
 
 /// The `accountDeletedEntry` rows of `cid`.
@@ -626,7 +668,7 @@ async fn a_signed_deletion_carries_the_devices_exact_write_and_key_proof_and_rep
     let lab = labyrinth(&s).await;
     let sender = device(&fixture.sender_did, fixture.sender_device_id).await;
     let chat_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
-    let key_proof = vec![0x9A_u8; 2500];
+    let key_proof = signed_device_record_car(&sender, &chat_key);
 
     // A key proof that is not base64url, or longer than the lexicon admits, is
     // refused before anything is sequenced.
@@ -695,6 +737,132 @@ async fn a_signed_deletion_carries_the_devices_exact_write_and_key_proof_and_rep
 }
 
 #[tokio::test]
+async fn deletion_fetches_a_missing_device_proof_before_purge_and_replays_without_pds() {
+    use axum::{extract::Query, http::HeaderMap, response::IntoResponse as _, routing::get};
+    use catbird_server::federation::resolver::ValidatedRemoteDestination;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let _env = ENV_LOCK.lock().await;
+    let s = sequencer().await;
+    let fixture = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, Some([0x46; 32]))
+        .await
+        .unwrap();
+    let sender = device(&fixture.sender_did, fixture.sender_device_id).await;
+    let chat_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
+    let car = signed_device_record_car(&sender, &chat_key);
+    let did = sender.did.clone();
+    catbird_server::auth::cache_test_did_document(catbird_server::auth::DidDocument {
+        id: did.clone(),
+        verification_method: vec![catbird_server::auth::VerificationMethod {
+            id: format!("{did}#atproto"),
+            key_type: "JsonWebKey2020".to_owned(),
+            controller: did.clone(),
+            public_key_jwk: Some(serde_json::from_value(sender.jwk.clone()).unwrap()),
+            public_key_multibase: None,
+        }],
+        service: Some(vec![catbird_server::auth::Service {
+            id: "#atproto_pds".to_owned(),
+            service_type: "AtprotoPersonalDataServer".to_owned(),
+            service_endpoint: "https://device-proof-pds.example".to_owned(),
+        }]),
+    })
+    .await;
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = Router::new().route(
+        "/xrpc/com.atproto.sync.getRecord",
+        get({
+            let hits = Arc::clone(&hits);
+            let car = Arc::new(car.clone());
+            let did = did.clone();
+            let device_id = sender.device_id.to_string();
+            move |Query(query): Query<std::collections::BTreeMap<String, String>>,
+                  headers: HeaderMap| {
+                let hits = Arc::clone(&hits);
+                let car = Arc::clone(&car);
+                let did = did.clone();
+                let device_id = device_id.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(query.get("did"), Some(&did));
+                    assert_eq!(
+                        query.get("collection").map(String::as_str),
+                        Some("blue.catbird.chat.device")
+                    );
+                    assert_eq!(query.get("rkey"), Some(&device_id));
+                    assert!(headers.get("authorization").is_none());
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/vnd.ipld.car")],
+                        car.as_ref().clone(),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, server).await.unwrap();
+    });
+    let resolver = Arc::new(
+        catbird_server::federation::DsResolver::new(
+            s.pool.clone(),
+            reqwest::Client::new(),
+            SELF_DID.to_owned(),
+            SELF_ENDPOINT.to_owned(),
+            None,
+            300,
+        )
+        .with_destination_resolver_hook(Arc::new(move |target_url: &str| {
+            let remote = url::Url::parse(target_url).unwrap();
+            let mut local = url::Url::parse(&format!("http://127.0.0.1:{}/", addr.port())).unwrap();
+            local.set_path(remote.path());
+            local.set_query(remote.query());
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: local,
+                    host: "127.0.0.1".to_owned(),
+                    addrs: vec![addr],
+                })
+            }))
+        })),
+    );
+    let lab = labyrinth_with_resolver(&s, resolver).await;
+    let signed = SignedDeletion::new(&sender, &chat_key, [0xDB; 16], None);
+    let (status, body) = http::send(lab.clone(), signed.request(&sender)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let member = device(&fixture.recipient_did, fixture.recipient_device_id).await;
+    let (_, page) = read(
+        &s,
+        &member,
+        "blue.catbird.chat.getEntries",
+        fixture.conversation_id,
+    )
+    .await;
+    let entry = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["$type"] == ACCOUNT_DELETED)
+        .unwrap();
+    let (deletion, _) = AccountDeletion::from_entry(entry).unwrap();
+    assert_eq!(deletion.evidence.unwrap().key_proof, Some(car));
+
+    let (status, body) = http::send(lab, signed.request(&sender)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "idempotent replay must not contact the PDS"
+    );
+}
+
+#[tokio::test]
 async fn a_never_enrolled_account_deletion_answers_success_every_time() {
     let _env = ENV_LOCK.lock().await;
     let s = sequencer().await;
@@ -738,10 +906,11 @@ async fn a_never_enrolled_account_deletion_answers_success_every_time() {
 }
 
 /// The app deletes the PDS account first, then calls deleteAccountData with a
-/// token it minted before. Service auth resolves only the DID document, which
-/// outlives the repository, so the pre-minted token is still admitted.
+/// token and repository proof it captured before. The signed CAR remains
+/// verifiable from the DID document even when the repository no longer answers.
 #[tokio::test]
 async fn service_auth_admits_a_pre_minted_token_after_the_pds_repo_is_deleted() {
+    use base64::Engine as _;
     let _env = ENV_LOCK.lock().await;
     let s = sequencer().await;
     let lab = labyrinth(&s).await;
@@ -767,7 +936,21 @@ async fn service_auth_admits_a_pre_minted_token_after_the_pds_repo_is_deleted() 
     })
     .await;
     let chat_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
-    let signed = SignedDeletion::new(&sender, &chat_key, [0x9D; 16], None);
+    let without_proof = SignedDeletion::new(&sender, &chat_key, [0x9C; 16], None);
+    let (status, body) = http::send(lab.clone(), without_proof.request(&sender)).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("ServiceUnavailable")),
+        "{body}"
+    );
+    assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 0);
+    let key_proof = signed_device_record_car(&sender, &chat_key);
+    let signed = SignedDeletion::new(
+        &sender,
+        &chat_key,
+        [0x9D; 16],
+        Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key_proof)),
+    );
     // Minted 30 s ago with the 60 s lifetime, before the PDS account was deleted.
     let pre_minted = service_token(
         &sender,

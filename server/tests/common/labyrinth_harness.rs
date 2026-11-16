@@ -201,8 +201,7 @@ impl Env {
         });
         let resolver = Arc::new(resolver);
         let outbound = Arc::new(OutboundClient::new(2, 10));
-        let mut runtime =
-            runtime_with_resolver(cutover, federation.as_ref().map(|_| Arc::clone(&resolver)));
+        let mut runtime = runtime_with_resolver(cutover, Some(Arc::clone(&resolver)));
         let mut recovery_journal_dir = None;
         let mut recovery_journal = None;
         if recovery {
@@ -834,13 +833,30 @@ impl Device {
         let nsid = format!("{PREFIX}{name}");
         let body = serde_json::to_vec(input).unwrap();
         let (write, sig) = self.write_headers(&nsid, &body, operation_id);
-        let request = Request::post(format!("/xrpc/{nsid}"))
+        let mut request = Request::post(format!("/xrpc/{nsid}"))
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {}", self.token(&nsid)))
             .header("catbird-labyrinth-write", write)
-            .header("catbird-labyrinth-write-signature", sig)
-            .body(Body::from(body))
-            .unwrap();
+            .header("catbird-labyrinth-write-signature", sig);
+        if name == "deleteAccountData" {
+            use catbird_server::federation::space_read_relay::test_car_builder::build_signed_repo_car;
+            let secret = p256::SecretKey::from_slice(&self.jwt_key.to_bytes()).unwrap();
+            let record = json!({
+                "$type": "blue.catbird.chat.device",
+                "mlsSignaturePublicKey": { "$bytes": base64::engine::general_purpose::STANDARD.encode(self.chat_pub()) },
+                "algorithm": "ed25519",
+                "createdAt": "2026-11-16T00:00:00Z",
+            });
+            let key = format!("blue.catbird.chat.device/{}", self.device_id);
+            let (proof, _) = build_signed_repo_car(
+                &self.did,
+                "3l2aaaaaaaaaa",
+                &secret,
+                &[(key.as_str(), &record)],
+            );
+            request = request.header("catbird-labyrinth-key-proof", URL_SAFE_NO_PAD.encode(proof));
+        }
+        let request = request.body(Body::from(body)).unwrap();
         send(&self.router, request).await
     }
 }
