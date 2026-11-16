@@ -2452,3 +2452,7 @@ mod tests {
         assert_eq!(reconciled.entry(&reconciled_authority), entry);
     }
 }
+
+#[cfg(test)]
+#[path = "reconciliation_c2_unit_tests.rs"]
+mod c2_unit_tests;

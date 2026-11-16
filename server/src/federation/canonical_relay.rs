@@ -5060,3 +5060,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "canonical_relay_c2_unit_tests.rs"]
+mod c2_unit_tests;
