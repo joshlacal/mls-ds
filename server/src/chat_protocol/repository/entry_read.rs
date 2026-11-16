@@ -21,6 +21,28 @@ pub(crate) struct AccountDeletedServerFields {
     pub(crate) deleted_did: String,
     pub(crate) sequencer_did: String,
     pub(crate) sequencer_authority: AccountDeletionAuthority,
+    /// Optional lexicon `actorWrite`, stored verbatim when present. Absent on rows
+    /// written without it, which keep their exact stored bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) actor_write: Option<AccountDeletionActorWriteFields>,
+    /// Optional lexicon `keyProof`, stored verbatim when present.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::atproto_bytes::option"
+    )]
+    pub(crate) key_proof: Option<Vec<u8>>,
+}
+
+/// Lexicon `blue.catbird.chat.defs#accountDeletionActorWrite`: the deleting device's
+/// exact `writeBody` bytes and its 64-byte signature over them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AccountDeletionActorWriteFields {
+    #[serde(with = "crate::atproto_bytes")]
+    pub(crate) write_body: Vec<u8>,
+    #[serde(with = "crate::atproto_bytes")]
+    pub(crate) signature: Vec<u8>,
 }
 
 impl AccountDeletedServerFields {
@@ -1022,6 +1044,100 @@ mod tests {
         assert_eq!(
             value["sequencerReceipt"]["signature"]["$bytes"],
             STANDARD.encode([0x26_u8; 64])
+        );
+    }
+
+    fn stored_account_deletion_authority() -> AccountDeletionAuthority {
+        AccountDeletionAuthority {
+            sequencer_did: "did:web:sequencer.example".to_string(),
+            key_id: "did:web:sequencer.example#receipt-1".to_string(),
+            signature: vec![0x5a; 64],
+        }
+    }
+
+    #[test]
+    fn account_deleted_server_fields_decode_rows_stored_before_optional_fields() {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct StoredRow {
+            deleted_did: String,
+            sequencer_did: String,
+            sequencer_authority: AccountDeletionAuthority,
+        }
+        let stored = serde_ipld_dagcbor::to_vec(&StoredRow {
+            deleted_did: "did:plc:deleteddeleteddeleted0".to_string(),
+            sequencer_did: "did:web:sequencer.example".to_string(),
+            sequencer_authority: stored_account_deletion_authority(),
+        })
+        .unwrap();
+
+        let fields: AccountDeletedServerFields = serde_ipld_dagcbor::from_slice(&stored).unwrap();
+        assert_eq!(
+            serde_ipld_dagcbor::to_vec(&fields).unwrap(),
+            stored,
+            "a stored row re-encodes to the same bytes"
+        );
+
+        let conversation_id = Uuid::new_v4();
+        let entry_id = Uuid::new_v4();
+        let received_at = DateTime::parse_from_rfc3339("2026-11-16T12:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let entry = fields.entry(conversation_id, 7, entry_id, received_at);
+        let keys: Vec<&str> = entry
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            !keys.contains(&"actorWrite") && !keys.contains(&"keyProof"),
+            "a stored row without the optional fields rebuilds an entry without them: {keys:?}"
+        );
+        let (deletion, authority) =
+            crate::federation::receipt::AccountDeletion::from_entry(&entry).unwrap();
+        assert_eq!(deletion.seq, 7);
+        assert_eq!(authority, stored_account_deletion_authority());
+    }
+
+    #[test]
+    fn account_deleted_server_fields_decode_rows_carrying_actor_write_and_key_proof() {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ActorWrite {
+            #[serde(with = "crate::atproto_bytes")]
+            write_body: Vec<u8>,
+            #[serde(with = "crate::atproto_bytes")]
+            signature: Vec<u8>,
+        }
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct StoredRow {
+            deleted_did: String,
+            sequencer_did: String,
+            sequencer_authority: AccountDeletionAuthority,
+            actor_write: ActorWrite,
+            #[serde(with = "crate::atproto_bytes")]
+            key_proof: Vec<u8>,
+        }
+        let stored = serde_ipld_dagcbor::to_vec(&StoredRow {
+            deleted_did: "did:plc:deleteddeleteddeleted0".to_string(),
+            sequencer_did: "did:web:sequencer.example".to_string(),
+            sequencer_authority: stored_account_deletion_authority(),
+            actor_write: ActorWrite {
+                write_body: br#"{"operationId":"op"}"#.to_vec(),
+                signature: vec![0x11; 64],
+            },
+            key_proof: vec![0x22; 128],
+        })
+        .unwrap();
+
+        let fields = serde_ipld_dagcbor::from_slice::<AccountDeletedServerFields>(&stored)
+            .expect("a row carrying the optional actor write and key proof decodes");
+        assert_eq!(
+            serde_ipld_dagcbor::to_vec(&fields).unwrap(),
+            stored,
+            "the optional fields survive a decode and re-encode unchanged"
         );
     }
 }

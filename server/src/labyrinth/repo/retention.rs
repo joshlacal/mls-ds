@@ -434,6 +434,8 @@ pub(crate) async fn sequence_account_deleted_entry(
         deleted_did: deletion.deleted_did,
         sequencer_did: deletion.sequencer_did,
         sequencer_authority,
+        actor_write: None,
+        key_proof: None,
     })
     .map_err(|_| LabyrinthError::internal())?;
 
