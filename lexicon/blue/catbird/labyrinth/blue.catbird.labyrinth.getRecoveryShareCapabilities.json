@@ -1,0 +1,49 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.getRecoveryShareCapabilities",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. Authenticated capability probe on the caller's independently resolved home delivery service. A pending or active chat device of the caller's DID may query it before presenting a recovery-code fetch token; a bound Labyrinth device is not required. The caller uses its account-bound service JWT and signed read proof. A v3 recovery-code reader accepts a share only when this query succeeds on the pinned home service and returns the expected suite. An absent endpoint, authentication failure or mismatched suite fails closed. This response grants no recovery access and contains no share or fetch token. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest.",
+      "parameters": {
+        "type": "params",
+        "required": [],
+        "properties": {}
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "supported",
+            "version",
+            "hpkeSuite",
+            "keyId"
+          ],
+          "properties": {
+            "supported": {
+              "type": "boolean",
+              "const": true
+            },
+            "version": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1,
+              "description": "Recovery-share service protocol version, distinct from recovery-code version 3."
+            },
+            "hpkeSuite": {
+              "type": "string",
+              "const": "DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM"
+            },
+            "keyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "description": "Identifier of the currently mounted server key-encryption key; it is not a secret."
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1878,13 +1878,19 @@ pub(crate) async fn verify_mls_service_principal(
     let now = crate::sim_hooks::current_utc().timestamp();
     let (issuer, iat) = validate_mls_service_claims(&claims, endpoint_nsid, now)?;
     enforce_standard_with_replay_store(&claims, endpoint_nsid, pool).await?;
-    AUTH_MIDDLEWARE.check_rate_limit(issuer)?;
-    if let Err(retry_after) =
-        crate::middleware::rate_limit::DID_RATE_LIMITER.check_did_limit(issuer, endpoint_nsid)
-    {
-        return Err(AuthError::RateLimitExceeded {
-            retry_after_secs: retry_after,
-        });
+    // A bad recovery-share token is deliberately throttled by the handler
+    // per signed device and network origin. Charging every attempt to this
+    // account's global buckets lets one ghost device lock out a legitimate
+    // pending device after enough wrong-token attempts.
+    if endpoint_nsid != "blue.catbird.labyrinth.getRecoveryShare" {
+        AUTH_MIDDLEWARE.check_rate_limit(issuer)?;
+        if let Err(retry_after) =
+            crate::middleware::rate_limit::DID_RATE_LIMITER.check_did_limit(issuer, endpoint_nsid)
+        {
+            return Err(AuthError::RateLimitExceeded {
+                retry_after_secs: retry_after,
+            });
+        }
     }
 
     Ok(VerifiedServicePrincipal {

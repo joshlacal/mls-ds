@@ -1,11 +1,10 @@
 //! HTTP layer of the clean-slate Labyrinth directory (`blue.catbird.labyrinth.*`).
 //!
-//! Only the 7 directory, relay, and account-lifecycle endpoints remain on `mls-ds`:
-//! - Procedures (3): `publishEpochHead`, `purgeMailbox`, `deleteAccountData`
-//! - Queries (4): `getEpochHead`, `getMailboxKeysRecord`, `getChatDeviceKeys`, `getMemberDevices`
+//! The directory, account-lifecycle, and erasable recovery-share endpoints.
 
 mod directory;
 mod params;
+mod recovery_shares;
 mod retention;
 
 pub(crate) use directory::read_federated_directory;
@@ -34,6 +33,9 @@ pub const PROCEDURES: &[(&str, usize)] = &[
     ("publishEpochHead", LIMIT_DEFAULT),
     ("purgeMailbox", LIMIT_DEFAULT),
     ("deleteAccountData", LIMIT_DEFAULT),
+    ("putRecoveryShare", LIMIT_DEFAULT),
+    ("getRecoveryShare", LIMIT_DEFAULT),
+    ("deleteRecoveryShare", LIMIT_DEFAULT),
 ];
 
 /// Active queries.
@@ -42,6 +44,9 @@ pub const QUERIES: &[&str] = &[
     "getMailboxKeysRecord",
     "getChatDeviceKeys",
     "getMemberDevices",
+    "listRecoveryShares",
+    "listRecoveryShareEvents",
+    "getRecoveryShareCapabilities",
 ];
 
 fn path(name: &str) -> String {
@@ -81,6 +86,18 @@ where
             &path("deleteAccountData"),
             post(retention::delete_account_data),
         )
+        .route(
+            &path("putRecoveryShare"),
+            post(recovery_shares::put_recovery_share),
+        )
+        .route(
+            &path("getRecoveryShare"),
+            post(recovery_shares::get_recovery_share),
+        )
+        .route(
+            &path("deleteRecoveryShare"),
+            post(recovery_shares::delete_recovery_share),
+        )
         .route(&path("getEpochHead"), get(directory::get_epoch_head))
         .route(
             &path("getMailboxKeysRecord"),
@@ -93,6 +110,18 @@ where
         .route(
             &path("getMemberDevices"),
             get(directory::get_member_devices),
+        )
+        .route(
+            &path("listRecoveryShares"),
+            get(recovery_shares::list_recovery_shares),
+        )
+        .route(
+            &path("listRecoveryShareEvents"),
+            get(recovery_shares::list_recovery_share_events),
+        )
+        .route(
+            &path("getRecoveryShareCapabilities"),
+            get(recovery_shares::get_recovery_share_capabilities),
         )
         .layer(DefaultBodyLimit::max(LIMIT_DEFAULT))
 }
@@ -127,6 +156,6 @@ mod tests {
             assert!(served.insert(((*name).to_owned(), "query".to_owned())));
         }
         assert_eq!(served, lexicon);
-        assert_eq!(served.len(), 7);
+        assert_eq!(served.len(), 13);
     }
 }

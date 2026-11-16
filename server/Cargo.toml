@@ -41,6 +41,8 @@ openmls_libcrux_crypto = { version = "=0.4.0-rc.3", default-features = false, gi
 openmls_memory_storage = { version = "=0.6.0-rc.3", default-features = false, git = "https://github.com/joshlacal/openmls", rev = "3ea192fc346663fba5db63aa8c90ccc3ae49f12b", features = ["draft-ietf-mls-pq-ciphersuites"] }
 libcrux-kem = "=0.0.9"
 x25519-dalek = "=2.0.1"
+hpke-rs = "=0.7.0"
+hpke-rs-rust-crypto = "=0.7.0"
 
 # Crypto
 aes-gcm = "0.10"
@@ -49,6 +51,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 hmac = "0.12"
 rand = "0.8"
 sha2 = "0.10"
+subtle = "2"
 zeroize = "1"
 base64 = "0.21"
 multibase = "0.9"
@@ -214,6 +217,11 @@ required-features = ["test-support"]
 [[test]]
 name = "labyrinth_retention"
 path = "tests/labyrinth_retention.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "labyrinth_recovery_shares"
+path = "tests/labyrinth_recovery_shares.rs"
 required-features = ["test-support"]
 
 [[test]]

@@ -545,6 +545,7 @@ struct DeviceRow {
     status: String,
     key_id: String,
     signing_public_key: Vec<u8>,
+    device_revoked: bool,
     key_revoked: bool,
 }
 
@@ -591,6 +592,7 @@ pub async fn load_current_device_with_pending(
     };
     let sql = format!(
         "SELECT d.status, k.key_id, k.signing_public_key, \
+                (d.revoked_at IS NOT NULL) AS device_revoked, \
                 (k.revoked_at IS NOT NULL) AS key_revoked \
            FROM chat.devices d \
            JOIN chat.device_keys k \
@@ -608,7 +610,7 @@ pub async fn load_current_device_with_pending(
         .fetch_optional(&mut *conn)
         .await?;
     let row = row.ok_or_else(|| LabyrinthError::not_authorized("device is not registered"))?;
-    if row.status == "revoked" || row.key_revoked {
+    if row.status == "revoked" || row.device_revoked || row.key_revoked {
         return Err(LabyrinthError::device_revoked());
     }
     if row.status != "active" && !(allow_pending && row.status == "pending_approval") {

@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. The log of recovery-share activity for the caller's DID, oldest first: stores, verify reads, restore fetches, refused fetches, deletions and account purges, each with the acting chat device where known. Active devices poll it to tell the user when a recovery code or passkey was used to fetch a share. Mailbox endpoint on the caller's home DS. Requires a bound Labyrinth device (a current, non-virtual device registered by the calling chat device). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge.",
+      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. The log of recovery-share activity for the caller's DID, oldest first: stores, verify reads, restore fetches, refused fetches, deletions and account purges, each with the acting chat device where known. Active devices poll it to tell the user when a recovery code or passkey was used to fetch a share. Mailbox endpoint on the caller's home DS. Requires an active, non-revoked chat device of the caller DID, proven by the account-bound service JWT and a signed device request. A pending chat device may not store, delete or list shares; the clean-slate service has no Labyrinth-device binding table. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge.",
       "parameters": {
         "type": "params",
         "required": [],
@@ -48,7 +48,7 @@
       },
       "errors": [
         {
-          "name": "LabyrinthDeviceNotBound"
+          "name": "ChatDeviceNotActive"
         }
       ]
     },

@@ -101,10 +101,10 @@ fn ensure_runtime_env() {
 
 /// A chat runtime with the cutover gate as requested.
 pub fn runtime(cutover: bool) -> Arc<ChatRuntime> {
-    runtime_with_resolver(cutover, None)
+    Arc::new(runtime_with_resolver(cutover, None))
 }
 
-fn runtime_with_resolver(cutover: bool, resolver: Option<Arc<DsResolver>>) -> Arc<ChatRuntime> {
+fn runtime_with_resolver(cutover: bool, resolver: Option<Arc<DsResolver>>) -> ChatRuntime {
     use std::sync::Mutex;
     static LOCK: Mutex<()> = Mutex::new(());
     ensure_runtime_env();
@@ -119,7 +119,7 @@ fn runtime_with_resolver(cutover: bool, resolver: Option<Arc<DsResolver>>) -> Ar
     if let Some(resolver) = resolver {
         runtime = runtime.with_resolver(resolver);
     }
-    Arc::new(runtime)
+    runtime
 }
 
 /// One test's database and router.
@@ -127,24 +127,32 @@ pub struct Env {
     pub pool: PgPool,
     pub router: Router,
     pub request_count: Arc<AtomicUsize>,
+    pub recovery_journal:
+        Option<Arc<catbird_server::labyrinth::recovery_tombstones::RecoveryTombstones>>,
     _db: DisposableDatabase,
+    _recovery_journal_dir: Option<tempfile::TempDir>,
 }
 
 impl Env {
     pub async fn new() -> Self {
-        Self::with(true).await
+        Self::build(true, None, false).await
     }
 
     pub async fn with(cutover: bool) -> Self {
-        Self::build(cutover, None).await
+        Self::build(cutover, None, false).await
+    }
+
+    /// A migrated server with an isolated recovery KEK and durable journal.
+    pub async fn recovery() -> Self {
+        Self::build(true, None, true).await
     }
 
     /// An env with a federation identity (see [`Federation`]).
     pub async fn federated(federation: Federation) -> Self {
-        Self::build(true, Some(federation)).await
+        Self::build(true, Some(federation), false).await
     }
 
-    async fn build(cutover: bool, federation: Option<Federation>) -> Self {
+    async fn build(cutover: bool, federation: Option<Federation>, recovery: bool) -> Self {
         let db = fresh_fully_migrated_db("labyrinth_srv_").await;
         let pool = db.connect(8).await;
         let self_did = federation
@@ -193,8 +201,25 @@ impl Env {
         });
         let resolver = Arc::new(resolver);
         let outbound = Arc::new(OutboundClient::new(2, 10));
-        let runtime =
+        let mut runtime =
             runtime_with_resolver(cutover, federation.as_ref().map(|_| Arc::clone(&resolver)));
+        let mut recovery_journal_dir = None;
+        let mut recovery_journal = None;
+        if recovery {
+            use catbird_server::labyrinth::recovery_crypto::RecoveryCrypto;
+            use catbird_server::labyrinth::recovery_tombstones::RecoveryTombstones;
+            let dir = tempfile::tempdir().expect("recovery journal dir");
+            let path = dir.path().join("deletions.log");
+            let crypto = Arc::new(RecoveryCrypto::new("test-key".into(), vec![0x37; 32]).unwrap());
+            let journal = Arc::new(
+                RecoveryTombstones::provision_new(&path, crypto.journal_key())
+                    .expect("provision recovery tombstone journal"),
+            );
+            runtime = runtime.with_recovery_shares(crypto, Arc::clone(&journal));
+            recovery_journal = Some(journal);
+            recovery_journal_dir = Some(dir);
+        }
+        let runtime = Arc::new(runtime);
         let mut router = labyrinth_router::<TestState>().with_state(TestState {
             pool: pool.clone(),
             runtime,
@@ -231,7 +256,9 @@ impl Env {
             pool,
             router,
             request_count,
+            recovery_journal,
             _db: db,
+            _recovery_journal_dir: recovery_journal_dir,
         }
     }
 
