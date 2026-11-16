@@ -2821,18 +2821,8 @@ pub(super) async fn persist_enrollment_bootstrap_effects(
     if inserted_key.rows_affected() != 1 {
         return Err(AuthRepositoryError::DeviceKeyMissing);
     }
-    if enrolled_status == "pending_approval" {
-        sqlx::query(
-            "INSERT INTO chat.device_promotion_audit \
-             (user_did, device_id, event_kind, recorded_at) \
-             VALUES ($1, $2, 'pending_notice', $3)",
-        )
-        .bind(scope.subject())
-        .bind(scope.device_id())
-        .bind(trusted_at)
-        .execute(&mut **transaction)
-        .await?;
-    }
+    // The devices_record_pending_notice trigger writes the audit row in this
+    // transaction for every pending enrollment, including legacy writers.
     Ok(enrolled_status)
 }
 

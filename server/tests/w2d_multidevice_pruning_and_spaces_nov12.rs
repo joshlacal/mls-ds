@@ -3088,8 +3088,8 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
 
     // 1. Genesis `epoch = 0` self-promotion guard on Bob (`latest.is_none()`):
     //    Enroll `bob_d1` (`active`, 0 epoch heads published) and `bob_d2` (`pending_approval`).
-    //    `bob_d2` MUST be rejected (`401 NotAuthorized`) on genesis `publishEpochHead(epoch = 0)`
-    //    so an OAuth-only attacker can NEVER self-promote without chaining `prevSig`!
+    //    `bob_d2` MUST be rejected (`401 NotAuthorized`) on genesis while the
+    //    notice hold is fresh and while Bob's first device remains awake.
     let bob_d1 = DeviceIdentity::build(&bob_acct, "Bob Phone", 2);
     let bob_d2 = DeviceIdentity::build(&bob_acct, "Bob Unapproved", 2);
     let (st_b1, b1_body) = http::send(router.clone(), bob_d1.enroll_request()).await;
@@ -3103,13 +3103,16 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
         build_epoch_public_for_device(&bob_d2, 0, [0x11_u8; 32], None, None);
     let (st_bob_gen, bob_gen_body) = http::send(
         router.clone(),
-        bob_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": bob_genesis_epoch })),
+        bob_d2.labyrinth_post_request(
+            "publishEpochHead",
+            &json!({ "epoch": bob_genesis_epoch.clone() }),
+        ),
     )
     .await;
     assert_eq!(
         st_bob_gen,
         StatusCode::UNAUTHORIZED,
-        "pending_approval must never self-promote via genesis epoch=0: {bob_gen_body}"
+        "pending genesis must wait for the notice hold: {bob_gen_body}"
     );
     assert_eq!(bob_gen_body["error"], "NotAuthorized");
     let bob_d2_status_db: String = sqlx::query_scalar(
@@ -3121,6 +3124,31 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .await
     .unwrap();
     assert_eq!(bob_d2_status_db, "pending_approval");
+
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE chat.device_promotion_audit \
+                SET recorded_at = clock_timestamp() - interval '73 hours' \
+              WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
+        )
+        .bind(&bob_acct.did)
+        .bind(bob_d2.device_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let (bob_aged_status, bob_aged_body) = http::send(
+        router.clone(),
+        bob_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": bob_genesis_epoch })),
+    )
+    .await;
+    assert_eq!(bob_aged_status, StatusCode::UNAUTHORIZED, "{bob_aged_body}");
 
     // Have `bob_d1` (`active`) publish Bob's genesis epoch head (`epoch = 0`) so foreign-DID read tests have data.
     let (bob_valid_gen, _) = build_epoch_public_for_device(&bob_d1, 0, [0x12_u8; 32], None, None);
@@ -3332,10 +3360,7 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
         build_epoch_public_for_device(&alice_d2, 1, [0x32_u8; 32], Some(alice_link0), None);
     let (awake_status, awake_body) = http::send(
         router.clone(),
-        alice_d2.labyrinth_post_request(
-            "publishEpochHead",
-            &json!({ "epoch": valid_ep1.clone() }),
-        ),
+        alice_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": valid_ep1.clone() })),
     )
     .await;
     assert_eq!(awake_status, StatusCode::UNAUTHORIZED, "{awake_body}");
@@ -3346,7 +3371,10 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(unpublished_epoch, 0, "refused promotion must roll back head");
+    assert_eq!(
+        unpublished_epoch, 0,
+        "refused promotion must roll back head"
+    );
 
     // The lost sibling becomes dormant. Before the 72h notice hold expires,
     // an explicit restore action still cannot promote the replacement.
@@ -3363,10 +3391,7 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     assert_eq!(mark_inactive_devices(&pool, Utc::now()).await.unwrap(), 1);
     let (early_status, early_body) = http::send(
         router.clone(),
-        alice_d2.labyrinth_post_request(
-            "publishEpochHead",
-            &json!({ "epoch": valid_ep1.clone() }),
-        ),
+        alice_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": valid_ep1.clone() })),
     )
     .await;
     assert_eq!(early_status, StatusCode::UNAUTHORIZED, "{early_body}");
@@ -3410,10 +3435,7 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     assert_eq!(wake_status, StatusCode::OK, "{wake_body}");
     let (returned_status, returned_body) = http::send(
         router.clone(),
-        alice_d2.labyrinth_post_request(
-            "publishEpochHead",
-            &json!({ "epoch": valid_ep1.clone() }),
-        ),
+        alice_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": valid_ep1.clone() })),
     )
     .await;
     assert_eq!(returned_status, StatusCode::UNAUTHORIZED, "{returned_body}");
@@ -3504,7 +3526,10 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     assert_eq!(d3_body["device"]["status"], "pending_approval");
     let (d3_early, _) = http::send(
         router.clone(),
-        alice_d3.dpop_get_request("blue.catbird.chat.getDevices", &format!("userDids={}", bob_acct.did)),
+        alice_d3.dpop_get_request(
+            "blue.catbird.chat.getDevices",
+            &format!("userDids={}", bob_acct.did),
+        ),
     )
     .await;
     assert_eq!(d3_early, StatusCode::UNAUTHORIZED);
@@ -3528,7 +3553,10 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     }
     let (d3_still_pending, _) = http::send(
         router.clone(),
-        alice_d3.dpop_get_request("blue.catbird.chat.getDevices", &format!("userDids={}", bob_acct.did)),
+        alice_d3.dpop_get_request(
+            "blue.catbird.chat.getDevices",
+            &format!("userDids={}", bob_acct.did),
+        ),
     )
     .await;
     assert_eq!(d3_still_pending, StatusCode::UNAUTHORIZED);
@@ -3549,6 +3577,80 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .await
     .unwrap();
     assert_eq!(d3_final_status, "active");
+
+    // A never-initialized Labyrinth account has no prior head to chain. The
+    // same full-loss gate admits explicit genesis only after the notice hold.
+    let carol_acct = AccountIdentity::create().await;
+    let carol_d1 = DeviceIdentity::build(&carol_acct, "Carol Lost Phone", 2);
+    let carol_d2 = DeviceIdentity::build(&carol_acct, "Carol Recovery Phone", 2);
+    let (c1_status, _) = http::send(router.clone(), carol_d1.enroll_request()).await;
+    assert_eq!(c1_status, StatusCode::OK);
+    let (c2_status, c2_body) = http::send(router.clone(), carol_d2.enroll_request()).await;
+    assert_eq!(c2_status, StatusCode::OK, "{c2_body}");
+    assert_eq!(c2_body["device"]["status"], "pending_approval");
+    sqlx::query(
+        "UPDATE chat.devices SET last_active_at = $3, dormant_at = NULL \
+          WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&carol_acct.did)
+    .bind(carol_d1.device_id)
+    .bind(Utc::now() - Duration::hours(100))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let _ = mark_inactive_devices(&pool, Utc::now()).await.unwrap();
+    let carol_d1_dormant: bool = sqlx::query_scalar(
+        "SELECT dormant_at IS NOT NULL FROM chat.devices WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&carol_acct.did)
+    .bind(carol_d1.device_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(carol_d1_dormant);
+    let (carol_genesis, _) = build_epoch_public_for_device(&carol_d2, 0, [0x44_u8; 32], None, None);
+    let (c_early_status, c_early_body) = http::send(
+        router.clone(),
+        carol_d2.labyrinth_post_request(
+            "publishEpochHead",
+            &json!({ "epoch": carol_genesis.clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(c_early_status, StatusCode::UNAUTHORIZED, "{c_early_body}");
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE chat.device_promotion_audit \
+                SET recorded_at = clock_timestamp() - interval '73 hours' \
+              WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
+        )
+        .bind(&carol_acct.did)
+        .bind(carol_d2.device_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let (c_restore_status, c_restore_body) = http::send(
+        router.clone(),
+        carol_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": carol_genesis })),
+    )
+    .await;
+    assert_eq!(c_restore_status, StatusCode::OK, "{c_restore_body}");
+    let c_final_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.devices WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&carol_acct.did)
+    .bind(carol_d2.device_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(c_final_status, "active");
 
     pool.close().await;
 }
@@ -5084,8 +5186,10 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["device"]["deviceId"] == alice_d2.device_id.to_string()
-            && item["device"]["status"] == "pending_approval"));
+        .any(
+            |item| item["device"]["deviceId"] == alice_d2.device_id.to_string()
+                && item["device"]["status"] == "pending_approval"
+        ));
     let pending_notice_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM chat.device_promotion_audit \
           WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
@@ -5095,7 +5199,10 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(pending_notice_count, 1, "pending enrollment must be audited");
+    assert_eq!(
+        pending_notice_count, 1,
+        "pending enrollment must be audited"
+    );
 
     let deny = alice_d1.revocation_wrapper(alice_d2.device_id, 1);
     let (deny_status, deny_body) = http::send(

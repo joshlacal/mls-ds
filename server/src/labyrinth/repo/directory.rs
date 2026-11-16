@@ -52,6 +52,18 @@ fn head_conflict() -> LabyrinthError {
     )
 }
 
+fn promotion_lock_error(error: sqlx::Error) -> LabyrinthError {
+    if matches!(&error, sqlx::Error::Database(db) if db.code().as_deref() == Some("55P03")) {
+        return LabyrinthError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "device state is changing; retry the restore",
+        )
+        .with_retry_after(1);
+    }
+    error.into()
+}
+
 pub(crate) fn parse_stored(text: &str) -> LabyrinthResult<EpochPublic> {
     serde_json::from_str(text).map_err(|error| {
         tracing::error!(?error, "stored epoch head does not parse");
@@ -65,14 +77,16 @@ async fn promote_pending_device(
     device_id: Uuid,
     at: DateTime<Utc>,
 ) -> LabyrinthResult<()> {
-    // Enrollment takes this same principal lock. A new sibling cannot appear
-    // between our full-loss check and the promotion commit.
+    // Enrollment and sibling revocation take this principal lock before device
+    // rows. Authentication already holds the pending requester row, so NOWAIT
+    // lets those earlier operations win without reversing their lock order.
     let _: String = sqlx::query_scalar(
-        "SELECT user_did FROM chat.principals WHERE user_did = $1 FOR UPDATE",
+        "SELECT user_did FROM chat.principals WHERE user_did = $1 FOR UPDATE NOWAIT",
     )
     .bind(did)
     .fetch_one(&mut *conn)
-    .await?;
+    .await
+    .map_err(promotion_lock_error)?;
 
     // Lock every active local sibling, including dormant ones. NOWAIT makes a
     // concurrent sibling wake/revocation win instead of deadlocking with the
@@ -87,7 +101,8 @@ async fn promote_pending_device(
     .bind(did)
     .bind(device_id)
     .fetch_all(&mut *conn)
-    .await?;
+    .await
+    .map_err(promotion_lock_error)?;
     if siblings.iter().any(|(awake,)| *awake) {
         return Err(LabyrinthError::not_authorized(
             "an active sibling must approve or deny the pending device",
@@ -103,9 +118,11 @@ async fn promote_pending_device(
     .fetch_optional(&mut *conn)
     .await?;
     if !notice_at.is_some_and(|notice| {
-        notice <= at - chrono::Duration::hours(
-            crate::chat_protocol::device_activity::pending_device_hold_hours(),
-        )
+        notice
+            <= at
+                - chrono::Duration::hours(
+                    crate::chat_protocol::device_activity::pending_device_hold_hours(),
+                )
     }) {
         return Err(LabyrinthError::not_authorized(
             "pending device recovery hold is not complete",
@@ -151,9 +168,11 @@ async fn promote_pending_device(
 /// Re-sending an identical head is idempotent; a different head at the same epoch number
 /// returns `409 EpochHeadConflict`.
 ///
-/// A `pending_approval` device may publish a fresh chained head only after its
-/// sibling-visible 72-hour hold, when no other local device remains awake. A
-/// verified `prevSig` alone never bypasses a live sibling's approval or denial.
+/// A `pending_approval` device may publish a fresh head only after its
+/// sibling-visible 72-hour hold, when no other local device remains awake.
+/// An existing head requires a verified `prevSig` chain; a principal with no
+/// head may begin at genesis (or the next post-purge floor). Neither form
+/// bypasses a live sibling's approval or denial.
 pub async fn record_head(
     conn: &mut PgConnection,
     caller: &Caller,
@@ -205,7 +224,8 @@ pub async fn record_head(
         })
         .transpose()?;
     if caller.status == "pending_approval"
-        && (latest.is_none() || parts.epoch_number == 0 || parts.prev_sig.is_none())
+        && latest.is_some()
+        && (parts.epoch_number == 0 || parts.prev_sig.is_none())
     {
         return Err(LabyrinthError::not_authorized(
             "pending device requires a chained epoch rotation with prevSig",
