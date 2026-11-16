@@ -76,8 +76,34 @@ pub async fn delete_account_data(
 ) -> Response {
     respond(
         async {
-            let adm = admit_procedure(&pool, &rt, "deleteAccountData", &headers, &bytes).await?;
+            let admitted = auth::admit_account_deletion(
+                &pool,
+                rt.cutover_enabled(),
+                crate::federation::receipt::DELETE_ACCOUNT_DATA_NSID,
+                &headers,
+                &bytes,
+            )
+            .await?;
             let EmptyIn {} = body(&bytes)?;
+            let adm = match admitted {
+                auth::AccountDeletionAdmission::Device(adm) => adm,
+                // Nothing here was ever signed by this account's device: purge
+                // what the DID alone owns, which a repeat finds already gone.
+                auth::AccountDeletionAdmission::NeverEnrolled { did, instant } => {
+                    let c33_peers = repo::resolve_c33_peer_homes(&pool, &did).await?;
+                    let mut conn = pool.acquire().await?;
+                    repo::purge_account(
+                        &mut *conn,
+                        &did,
+                        instant,
+                        rt.i13_receipt_signer(),
+                        &c33_peers,
+                        None,
+                    )
+                    .await?;
+                    return to_bytes(&json!({}));
+                }
+            };
             let evidence = deletion_evidence(&headers)?;
             // Peer homes resolve over HTTP, so before the transaction opens (M-F04).
             let c33_peers = repo::resolve_c33_peer_homes(&pool, &adm.did).await?;

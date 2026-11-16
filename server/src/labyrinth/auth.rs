@@ -348,6 +348,46 @@ async fn admit_procedure_with_pending(
     .await
 }
 
+/// What `deleteAccountData` admitted.
+pub enum AccountDeletionAdmission {
+    /// A signed write of one of the account's current chat devices.
+    Device(Admission),
+    /// A service-auth-verified DID that never enrolled a chat device here, so
+    /// holds no device that could sign: its deletion is answered without one.
+    NeverEnrolled { did: String, instant: DateTime<Utc> },
+}
+
+/// Admit `deleteAccountData`: service auth for `nsid`, then, for a DID with any
+/// chat device row here, the signed `labyrinthWriteBody` over this exact `body`.
+pub async fn admit_account_deletion(
+    pool: &DbPool,
+    cutover_enabled: bool,
+    nsid: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> LabyrinthResult<AccountDeletionAdmission> {
+    require_cutover(cutover_enabled)?;
+    let principal = crate::auth::verify_mls_service_principal(headers, pool, nsid)
+        .await
+        .map_err(|e| service_auth_failure(nsid, e))?;
+    let enrolled: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.devices WHERE user_did = $1)")
+            .bind(principal.did())
+            .fetch_one(pool)
+            .await?;
+    if !enrolled {
+        return Ok(AccountDeletionAdmission::NeverEnrolled {
+            did: principal.did().to_owned(),
+            instant: now_ms(),
+        });
+    }
+    let signed = header_b64(headers, WRITE_BODY_HEADER)?;
+    let sig = header_b64(headers, WRITE_SIGNATURE_HEADER)?;
+    verify_signed_write_with_pending(pool, principal.did(), nsid, &signed, &sig, body, false)
+        .await
+        .map(AccountDeletionAdmission::Device)
+}
+
 /// The raw `labyrinthWriteBody` header values of a procedure, for the
 /// federation relay to forward verbatim.
 pub fn write_headers(headers: &HeaderMap) -> LabyrinthResult<(String, String)> {

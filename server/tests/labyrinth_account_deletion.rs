@@ -693,3 +693,84 @@ async fn a_signed_deletion_carries_the_devices_exact_write_and_key_proof_and_rep
         [&entry]
     );
 }
+
+#[tokio::test]
+async fn a_never_enrolled_account_deletion_answers_success_every_time() {
+    let _env = ENV_LOCK.lock().await;
+    let s = sequencer().await;
+    let lab = labyrinth(&s).await;
+    // A DID whose DID document resolves but that never enrolled a chat device.
+    let never = device(&http::random_did(), Uuid::new_v4()).await;
+    let bare = |token: String| {
+        axum::http::Request::post(format!("/xrpc/{DELETE_ACCOUNT_DATA}"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from("{}"))
+            .unwrap()
+    };
+    for _ in 0..2 {
+        let token = service_token(&never, DELETE_ACCOUNT_DATA, Utc::now().timestamp(), 60);
+        let (status, body) = http::send(lab.clone(), bare(token)).await;
+        assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    }
+    // A client that believes it enrolled signs with a key this DS never saw.
+    let unknown_key = ed25519_dalek::SigningKey::from_bytes(&[0x7E; 32]);
+    let signed = SignedDeletion::new(&never, &unknown_key, [0x7E; 16], None);
+    let (status, body) = http::send(lab.clone(), signed.request(&never)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    // Without a valid service-auth token nothing is admitted.
+    let (status, _) = http::send(lab.clone(), bare("not-a-token".to_owned())).await;
+    assert_ne!(status, StatusCode::OK);
+
+    // An enrolled account still needs its device's signed write.
+    let fixture = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, Some([0x46; 32]))
+        .await
+        .unwrap();
+    let sender = device(&fixture.sender_did, fixture.sender_device_id).await;
+    let token = service_token(&sender, DELETE_ACCOUNT_DATA, Utc::now().timestamp(), 60);
+    let (status, body) = http::send(lab.clone(), bare(token)).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+        "{body}"
+    );
+    assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 0);
+}
+
+/// The app deletes the PDS account first, then calls deleteAccountData with a
+/// token it minted before. Service auth resolves only the DID document, which
+/// outlives the repository, so the pre-minted token is still admitted.
+#[tokio::test]
+async fn service_auth_admits_a_pre_minted_token_after_the_pds_repo_is_deleted() {
+    let _env = ENV_LOCK.lock().await;
+    let s = sequencer().await;
+    let lab = labyrinth(&s).await;
+    let fixture = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, Some([0x47; 32]))
+        .await
+        .unwrap();
+    let sender = device(&fixture.sender_did, fixture.sender_device_id).await;
+    // Its DID document still names the PDS, which no longer answers at all.
+    catbird_server::auth::cache_test_did_document(catbird_server::auth::DidDocument {
+        id: sender.did.clone(),
+        verification_method: vec![catbird_server::auth::VerificationMethod {
+            id: format!("{}#atproto", sender.did),
+            key_type: "JsonWebKey2020".to_string(),
+            controller: sender.did.clone(),
+            public_key_jwk: Some(serde_json::from_value(sender.jwk.clone()).unwrap()),
+            public_key_multibase: None,
+        }],
+        service: Some(vec![catbird_server::auth::Service {
+            id: "#atproto_pds".to_string(),
+            service_type: "AtprotoPersonalDataServer".to_string(),
+            service_endpoint: "http://127.0.0.1:9".to_string(),
+        }]),
+    })
+    .await;
+    let chat_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
+    let signed = SignedDeletion::new(&sender, &chat_key, [0x9D; 16], None);
+    // Minted 30 s ago with the 60 s lifetime, before the PDS account was deleted.
+    let pre_minted = service_token(&sender, DELETE_ACCOUNT_DATA, Utc::now().timestamp() - 30, 60);
+    let (status, body) = http::send(lab.clone(), signed.request_with(&pre_minted)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 1);
+}
