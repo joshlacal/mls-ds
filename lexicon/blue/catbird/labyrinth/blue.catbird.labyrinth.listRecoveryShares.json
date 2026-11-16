@@ -1,0 +1,102 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.listRecoveryShares",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. The erasable recovery shares this service holds for the caller's DID, without share bytes. Clients compare it with their recovery methods: a method whose share is missing cannot be restored, and a share whose method was proven removed can be deleted. Mailbox endpoint on the caller's home DS. Requires a bound Labyrinth device (a current, non-virtual device registered by the calling chat device). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge.",
+      "parameters": {
+        "type": "params",
+        "required": [],
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Opaque cursor from the previous page."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Page size (at most 100)."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "shares"
+          ],
+          "properties": {
+            "shares": {
+              "type": "array",
+              "maxLength": 100,
+              "items": {
+                "type": "ref",
+                "ref": "#shareView"
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "Opaque cursor for the next page."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "LabyrinthDeviceNotBound"
+        }
+      ]
+    },
+    "shareView": {
+      "type": "object",
+      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. One stored share, described without its bytes.",
+      "required": [
+        "vdeviceId",
+        "mechanism",
+        "createdAt",
+        "fetchCount"
+      ],
+      "properties": {
+        "vdeviceId": {
+          "type": "bytes",
+          "minLength": 16,
+          "maxLength": 16,
+          "description": "Recovery bundle (virtual device) id: the 16-byte vid derived from the recovery code, equal to the bundle's record key in hex."
+        },
+        "mechanism": {
+          "type": "string",
+          "maxLength": 32,
+          "knownValues": [
+            "code",
+            "passkey"
+          ],
+          "description": "Which recovery method the share belongs to: a typed recovery code, or a recovery code wrapped by a passkey."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "createdByDeviceId": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Chat device that stored the share."
+        },
+        "lastFetchedAt": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "fetchCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Successful restore fetches; verify reads are not counted."
+        }
+      }
+    }
+  }
+}

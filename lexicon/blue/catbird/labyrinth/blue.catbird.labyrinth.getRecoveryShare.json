@@ -1,0 +1,87 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.getRecoveryShare",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. Fetch the erasable recovery share of one recovery method so a restoring device can open the recovery bundle. It is a procedure only so that fetchToken travels in the request body, never in a URL; it changes no share. The response never contains the share in the clear: the service seals it to recipientPublicKey, a fresh X25519 key the caller generates for this request and discards afterwards, using HPKE (RFC 9180) base mode with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and AES-256-GCM, info = UTF8('catbird.labyrinth.recovery_share.seal.v1'), and aad = UTF8(did) || 0x00 || vdeviceId, where did is the caller's account DID. The service records no idempotency response for this method. The caller may be a pending or active chat device of the DID; a bound Labyrinth device is not required, because restore runs before the new device has one. Only shares of the caller's own DID are reachable. Every successful fetch is recorded as an event visible through listRecoveryShareEvents. Failed attempts are throttled per requesting device and per network origin; a caller that presents the correct fetchToken is not refused because of other callers' failed attempts. An unknown vdeviceId and a wrong fetchToken return the same error. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "vdeviceId",
+            "fetchToken",
+            "recipientPublicKey"
+          ],
+          "properties": {
+            "vdeviceId": {
+              "type": "bytes",
+              "minLength": 16,
+              "maxLength": 16,
+              "description": "Recovery bundle (virtual device) id: the 16-byte vid derived from the recovery code, equal to the bundle's record key in hex."
+            },
+            "fetchToken": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "The 32-byte fetch token derived from the recovery code. It is independent of the code-derived bundle key."
+            },
+            "recipientPublicKey": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "Fresh single-use X25519 public key the share is sealed to."
+            },
+            "purpose": {
+              "type": "string",
+              "maxLength": 32,
+              "knownValues": [
+                "restore",
+                "verify"
+              ],
+              "description": "restore (the default) for a device recovering the account. verify is the storing device's read-back right after putRecoveryShare; the service honours it only for the active device that stored this share and records it as a verify event, otherwise it treats the call as restore."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "vdeviceId",
+            "enc",
+            "sealedShare"
+          ],
+          "properties": {
+            "vdeviceId": {
+              "type": "bytes",
+              "minLength": 16,
+              "maxLength": 16,
+              "description": "Recovery bundle (virtual device) id: the 16-byte vid derived from the recovery code, equal to the bundle's record key in hex."
+            },
+            "enc": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "HPKE encapsulated key."
+            },
+            "sealedShare": {
+              "type": "bytes",
+              "minLength": 48,
+              "maxLength": 48,
+              "description": "HPKE ciphertext of the 32-byte share including the 16-byte AES-GCM tag."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "RecoveryShareUnavailable",
+          "description": "No share is available for this vdeviceId and fetchToken: it never existed, was deleted, or the token is wrong."
+        }
+      ]
+    }
+  }
+}

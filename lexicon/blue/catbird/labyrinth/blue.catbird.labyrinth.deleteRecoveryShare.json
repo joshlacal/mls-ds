@@ -1,0 +1,81 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.deleteRecoveryShare",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. Delete the erasable recovery share of one recovery method, so that recovery code (and any passkey wrapping it) stops working on this service, including for someone who copied the code and the bundle. Clients call this first when removing a recovery method, before rotating the bundle's device out of the epoch and deleting the bundle record. Idempotent: deleting a share that is already deleted returns the original deletion time. The service stops serving the share at deletedAt and keeps a deletion record so the share stays deleted if storage is restored from a backup. Deletion is the service's commitment, not a cryptographic proof: it cannot reach copies made before deletion or content already decrypted with the code. Mailbox endpoint on the caller's home DS. Requires a bound Labyrinth device (a current, non-virtual device registered by the calling chat device). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "vdeviceId"
+          ],
+          "properties": {
+            "vdeviceId": {
+              "type": "bytes",
+              "minLength": 16,
+              "maxLength": 16,
+              "description": "Recovery bundle (virtual device) id: the 16-byte vid derived from the recovery code, equal to the bundle's record key in hex."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "vdeviceId",
+            "deletedAt"
+          ],
+          "properties": {
+            "vdeviceId": {
+              "type": "bytes",
+              "minLength": 16,
+              "maxLength": 16,
+              "description": "Recovery bundle (virtual device) id: the 16-byte vid derived from the recovery code, equal to the bundle's record key in hex."
+            },
+            "deletedAt": {
+              "type": "string",
+              "format": "datetime"
+            },
+            "receipt": {
+              "type": "ref",
+              "ref": "#deletionReceipt"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "RecoveryShareNotFound",
+          "description": "No share was ever stored for this vdeviceId."
+        },
+        {
+          "name": "LabyrinthDeviceNotBound"
+        }
+      ]
+    },
+    "deletionReceipt": {
+      "type": "object",
+      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. Optional signed record of the service's commitment to delete one share. signature is low-S ES256 r||s, by the service key keyId in the service's DID document, over UTF8('catbird-labyrinth-recovery-share-deleted-v1\\0') followed by, for each of did, vdeviceId, fetchVerifier, deletedAt and keyId, its u32 big-endian byte length and its bytes (did, deletedAt and keyId as UTF-8 text; vdeviceId and fetchVerifier as raw bytes). It proves only that this service committed to the deletion.",
+      "required": [
+        "keyId",
+        "signature"
+      ],
+      "properties": {
+        "keyId": {
+          "type": "string",
+          "maxLength": 320
+        },
+        "signature": {
+          "type": "bytes",
+          "minLength": 64,
+          "maxLength": 64
+        }
+      }
+    }
+  }
+}

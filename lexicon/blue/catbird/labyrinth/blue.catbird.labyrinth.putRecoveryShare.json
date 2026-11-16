@@ -1,0 +1,86 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.putRecoveryShare",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Private Catbird surface (blue.catbird.labyrinth.*), not an ATProto or community-ratified lexicon. Store the erasable recovery share for one recovery method on the account's home delivery service. The share is 32 random bytes that, combined with the key derived from the user's recovery code, opens that method's recovery bundle; on its own it opens nothing. The service keeps the share sealed under its own key-encryption key and serves it only through getRecoveryShare to a caller that presents the matching fetchToken. Deleting the share (deleteRecoveryShare) makes the method unusable on this service. Clients call this before they publish the bundle or show the code, then confirm storage with getRecoveryShare purpose verify. Storing the same share again for the same vdeviceId is idempotent; a different share or fetchVerifier for an existing vdeviceId fails with RecoveryShareConflict. Mailbox endpoint on the caller's home DS. Requires a bound Labyrinth device (a current, non-virtual device registered by the calling chat device). Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "vdeviceId",
+            "share",
+            "fetchVerifier",
+            "mechanism"
+          ],
+          "properties": {
+            "vdeviceId": {
+              "type": "bytes",
+              "minLength": 16,
+              "maxLength": 16,
+              "description": "Recovery bundle (virtual device) id: the 16-byte vid derived from the recovery code, equal to the bundle's record key in hex."
+            },
+            "share": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "The 32-byte random share."
+            },
+            "fetchVerifier": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32,
+              "description": "SHA-256(UTF8('catbird.labyrinth.recovery_share.fetch.v1|' || did || '|' || lowercase hex(vdeviceId) || '|') || fetchToken), where fetchToken is the 32-byte fetch token derived from the recovery code. The service compares a presented fetchToken against it in constant time."
+            },
+            "mechanism": {
+              "type": "string",
+              "maxLength": 32,
+              "knownValues": [
+                "code",
+                "passkey"
+              ],
+              "description": "Which recovery method the share belongs to: a typed recovery code, or a recovery code wrapped by a passkey."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "vdeviceId",
+            "createdAt"
+          ],
+          "properties": {
+            "vdeviceId": {
+              "type": "bytes",
+              "minLength": 16,
+              "maxLength": 16,
+              "description": "Recovery bundle (virtual device) id: the 16-byte vid derived from the recovery code, equal to the bundle's record key in hex."
+            },
+            "createdAt": {
+              "type": "string",
+              "format": "datetime"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "RecoveryShareConflict",
+          "description": "A share with a different value or fetchVerifier is already stored for this vdeviceId."
+        },
+        {
+          "name": "RecoveryShareLimitReached",
+          "description": "The service's limit on live shares or on share writes for the calling device has been reached."
+        },
+        {
+          "name": "LabyrinthDeviceNotBound"
+        }
+      ]
+    }
+  }
+}
