@@ -367,6 +367,7 @@ pub(crate) async fn stage_verified_remote_device(
     {
         return Err(refused("invalid verified remote device identity"));
     }
+    crate::chat_protocol::lock_account_lifecycle(tx, user_did).await?;
     // Share enrollment's identity-slot lock, including the absent-device case.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("{user_did}#{device_id}"))

@@ -1864,6 +1864,76 @@ pub(crate) async fn verify_mls_service_principal(
     pool: &crate::storage::DbPool,
     endpoint_nsid: &str,
 ) -> Result<VerifiedServicePrincipal, AuthError> {
+    verify_mls_service_principal_inner(headers, pool, endpoint_nsid, true).await
+}
+
+/// Authenticate a deletion without consuming its service nonce yet. The
+/// device-signed intent is checked and bound to that nonce by the caller.
+pub(crate) async fn verify_account_deletion_service_principal(
+    headers: &axum::http::HeaderMap,
+    pool: &crate::storage::DbPool,
+    endpoint_nsid: &str,
+) -> Result<VerifiedServicePrincipal, AuthError> {
+    if endpoint_nsid != "blue.catbird.labyrinth.deleteAccountData" {
+        return Err(AuthError::InvalidToken(
+            "deletion retry admission used for another endpoint".into(),
+        ));
+    }
+    verify_mls_service_principal_inner(headers, pool, endpoint_nsid, false).await
+}
+
+/// Reserve a short-lived service nonce for this exact authenticated deletion.
+/// A retry must present the identical JWT and signed request bytes. The
+/// unsigned keyProof header may change after a failed repository lookup.
+pub(crate) async fn bind_account_deletion_service_nonce(
+    principal: &VerifiedServicePrincipal,
+    pool: &crate::storage::DbPool,
+    intent_sha256: [u8; 32],
+) -> Result<(), AuthError> {
+    use sha2::{Digest as _, Sha256};
+
+    if principal.endpoint_nsid != "blue.catbird.labyrinth.deleteAccountData" {
+        return Err(AuthError::InvalidToken(
+            "deletion retry binding used for another endpoint".into(),
+        ));
+    }
+    let token_sha256 = Sha256::digest(principal.token.as_bytes());
+    let now = crate::sim_hooks::current_utc();
+    let ttl = AuthEnforcementPolicy::from_env().jti_ttl_seconds;
+    // The conflict update is a no-op. Its WHERE clause atomically rejects a
+    // reused JTI with a changed token, signed intent, or endpoint, including
+    // concurrent requests handled by different server processes.
+    let admitted: Option<String> = sqlx::query_scalar(
+        "INSERT INTO auth_jti_nonce \
+           (issuer_did, jti, endpoint_nsid, expires_at, created_at, \
+            deletion_token_sha256, deletion_intent_sha256) \
+         VALUES ($1, $2, $3, $4::timestamptz + make_interval(secs => $5), $4, $6, $7) \
+         ON CONFLICT (issuer_did, jti) DO UPDATE SET jti = EXCLUDED.jti \
+         WHERE auth_jti_nonce.endpoint_nsid = EXCLUDED.endpoint_nsid \
+           AND auth_jti_nonce.expires_at > $4 \
+           AND auth_jti_nonce.deletion_token_sha256 = EXCLUDED.deletion_token_sha256 \
+           AND auth_jti_nonce.deletion_intent_sha256 = EXCLUDED.deletion_intent_sha256 \
+         RETURNING issuer_did",
+    )
+    .bind(&principal.did)
+    .bind(&principal.jti)
+    .bind(&principal.endpoint_nsid)
+    .bind(now)
+    .bind(ttl as f64)
+    .bind(token_sha256.as_slice())
+    .bind(intent_sha256.as_slice())
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| AuthError::Internal(format!("deletion jti binding failed: {error}")))?;
+    admitted.ok_or(AuthError::ReplayDetected).map(|_| ())
+}
+
+async fn verify_mls_service_principal_inner(
+    headers: &axum::http::HeaderMap,
+    pool: &crate::storage::DbPool,
+    endpoint_nsid: &str,
+    consume_nonce: bool,
+) -> Result<VerifiedServicePrincipal, AuthError> {
     let authorization = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -1877,7 +1947,9 @@ pub(crate) async fn verify_mls_service_principal(
         .await?;
     let now = crate::sim_hooks::current_utc().timestamp();
     let (issuer, iat) = validate_mls_service_claims(&claims, endpoint_nsid, now)?;
-    enforce_standard_with_replay_store(&claims, endpoint_nsid, pool).await?;
+    if consume_nonce {
+        enforce_standard_with_replay_store(&claims, endpoint_nsid, pool).await?;
+    }
     // A bad recovery-share token is deliberately throttled by the handler
     // per signed device and network origin. Charging every attempt to this
     // account's global buckets lets one ghost device lock out a legitimate

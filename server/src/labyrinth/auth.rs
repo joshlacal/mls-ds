@@ -4,8 +4,9 @@
 //! mutation transcript machinery:
 //!
 //! * every request carries a standard atproto service-auth JWT whose `lxm`
-//!   is the Labyrinth NSID (`auth::verify_mls_service_principal`, which also
-//!   consumes the `jti`), and names the calling chat device;
+//!   is the Labyrinth NSID. Ordinary procedures consume its `jti` once;
+//!   account deletion binds the exact signed intent to that nonce and admits
+//!   retries with the same JWT until expiry;
 //! * the device and its key are locked `FOR SHARE` inside the request
 //!   transaction and must be current (`chat.devices.status = 'active'`,
 //!   `chat.device_keys.revoked_at IS NULL`), which linearizes every Labyrinth
@@ -353,8 +354,40 @@ pub enum AccountDeletionAdmission {
     /// A signed write of one of the account's current chat devices.
     Device(Admission),
     /// A service-auth-verified DID that never enrolled a chat device here, so
-    /// holds no device that could sign: its deletion is answered without one.
-    NeverEnrolled { did: String, instant: DateTime<Utc> },
+    /// holds no device that could sign. The nonce is bound only after a locked
+    /// recheck, so an enrollment race can retry with a signed write.
+    NeverEnrolled {
+        did: String,
+        principal: crate::auth::VerifiedServicePrincipal,
+        intent_sha256: [u8; 32],
+    },
+}
+
+fn account_deletion_intent_digest(headers: &HeaderMap, body: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-DELETE-ACCOUNT-RETRY\0");
+    for name in [WRITE_BODY_HEADER, WRITE_SIGNATURE_HEADER] {
+        if let Some(value) = headers.get(name) {
+            digest.update([1]);
+            digest.update((value.as_bytes().len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        } else {
+            digest.update([0]);
+        }
+    }
+    digest.update((body.len() as u64).to_be_bytes());
+    digest.update(body);
+    digest.finalize().into()
+}
+
+pub async fn bind_account_deletion_nonce(
+    principal: &crate::auth::VerifiedServicePrincipal,
+    pool: &DbPool,
+    intent_sha256: [u8; 32],
+) -> LabyrinthResult<()> {
+    crate::auth::bind_account_deletion_service_nonce(principal, pool, intent_sha256)
+        .await
+        .map_err(|error| service_auth_failure(principal.endpoint_nsid(), error))
 }
 
 /// Admit `deleteAccountData`: service auth for `nsid`, then, for a DID with any
@@ -367,9 +400,10 @@ pub async fn admit_account_deletion(
     body: &[u8],
 ) -> LabyrinthResult<AccountDeletionAdmission> {
     require_cutover(cutover_enabled)?;
-    let principal = crate::auth::verify_mls_service_principal(headers, pool, nsid)
+    let principal = crate::auth::verify_account_deletion_service_principal(headers, pool, nsid)
         .await
         .map_err(|e| service_auth_failure(nsid, e))?;
+    let intent = account_deletion_intent_digest(headers, body);
     let enrolled: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.devices WHERE user_did = $1)")
             .bind(principal.did())
@@ -378,14 +412,17 @@ pub async fn admit_account_deletion(
     if !enrolled {
         return Ok(AccountDeletionAdmission::NeverEnrolled {
             did: principal.did().to_owned(),
-            instant: now_ms(),
+            principal,
+            intent_sha256: intent,
         });
     }
     let signed = header_b64(headers, WRITE_BODY_HEADER)?;
     let sig = header_b64(headers, WRITE_SIGNATURE_HEADER)?;
-    verify_signed_write_with_pending(pool, principal.did(), nsid, &signed, &sig, body, false)
-        .await
-        .map(AccountDeletionAdmission::Device)
+    let admission =
+        verify_signed_write_with_pending(pool, principal.did(), nsid, &signed, &sig, body, false)
+            .await?;
+    bind_account_deletion_nonce(&principal, pool, intent).await?;
+    Ok(AccountDeletionAdmission::Device(admission))
 }
 
 /// The raw `labyrinthWriteBody` header values of a procedure, for the
@@ -722,7 +759,9 @@ async fn begin_write_with_pending(
         ))
         .execute(&mut *tx)
         .await?;
-    if let Some(response) = completed_operation(&mut tx, &caller, &write).await? {
+    if let Some(response) =
+        completed_operation(&mut tx, &caller.did, caller.device_id, &write).await?
+    {
         return Ok(Begun::Replay(response));
     }
     Ok(Begun::Fresh(Box::new(RequestTx {
@@ -735,7 +774,8 @@ async fn begin_write_with_pending(
 
 async fn completed_operation(
     conn: &mut PgConnection,
-    caller: &Caller,
+    did: &str,
+    device_id: Uuid,
     write: &WriteBody,
 ) -> LabyrinthResult<Option<Vec<u8>>> {
     let row: Option<(String, Vec<u8>, Uuid, Vec<u8>)> = sqlx::query_as(
@@ -743,7 +783,7 @@ async fn completed_operation(
            FROM labyrinth.operations \
           WHERE owner_did = $1 AND operation_id = $2",
     )
-    .bind(&caller.did)
+    .bind(did)
     .bind(write.operation_id.as_slice())
     .fetch_optional(&mut *conn)
     .await?;
@@ -752,7 +792,7 @@ async fn completed_operation(
         Some((nsid, digest, actor_device_id, response))
             if nsid == write.endpoint_nsid
                 && digest == write.payload_sha256
-                && actor_device_id == caller.device_id =>
+                && actor_device_id == device_id =>
         {
             Ok(Some(response))
         }
@@ -762,6 +802,32 @@ async fn completed_operation(
             "operationId was already used for a different request",
         )),
     }
+}
+
+/// Recheck a previously admitted deletion after an outbound proof or peer
+/// lookup fails. This uses the same operation lock as `begin_write`, so a
+/// concurrent final transaction that already started finishes first. The
+/// caller has already passed service and device-signature admission.
+pub async fn completed_write_for_admission(
+    pool: &DbPool,
+    admission: &Admission,
+) -> LabyrinthResult<Option<Vec<u8>>> {
+    let write = admission
+        .write
+        .as_ref()
+        .ok_or_else(LabyrinthError::internal)?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "labyrinth.operations:{}:{}",
+            admission.did,
+            hex::encode(write.operation_id)
+        ))
+        .execute(&mut *tx)
+        .await?;
+    let response = completed_operation(&mut tx, &admission.did, admission.device_id, write).await?;
+    tx.commit().await?;
+    Ok(response)
 }
 
 impl RequestTx {

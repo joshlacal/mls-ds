@@ -1445,6 +1445,9 @@ pub(super) async fn lock_enrollment_absence_scope(
     }
     let subject = authority.subject().as_str().to_owned();
     let device_id = canonical_uuid(authority.device_id());
+    // Keep this order: operation -> DID lifecycle -> device identity ->
+    // principal row. Remote-device staging uses DID -> device as well.
+    crate::chat_protocol::lock_account_lifecycle(transaction, &subject).await?;
     lock_identity_slot(transaction, &subject, device_id).await?;
     let existing: Option<i32> = sqlx::query_scalar(
         "SELECT 1 FROM chat.devices WHERE user_did=$1 AND device_id=$2 FOR UPDATE",
