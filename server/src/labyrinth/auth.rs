@@ -349,20 +349,6 @@ async fn admit_procedure_with_pending(
     .await
 }
 
-/// What `deleteAccountData` admitted.
-pub enum AccountDeletionAdmission {
-    /// A signed write of one of the account's current chat devices.
-    Device(Admission),
-    /// A service-auth-verified DID that never enrolled a chat device here, so
-    /// holds no device that could sign. The nonce is bound only after a locked
-    /// recheck, so an enrollment race can retry with a signed write.
-    NeverEnrolled {
-        did: String,
-        principal: crate::auth::VerifiedServicePrincipal,
-        intent_sha256: [u8; 32],
-    },
-}
-
 fn account_deletion_intent_digest(headers: &HeaderMap, body: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"CATBIRD-DELETE-ACCOUNT-RETRY\0");
@@ -390,15 +376,17 @@ pub async fn bind_account_deletion_nonce(
         .map_err(|error| service_auth_failure(principal.endpoint_nsid(), error))
 }
 
-/// Admit `deleteAccountData`: service auth for `nsid`, then, for a DID with any
-/// chat device row here, the signed `labyrinthWriteBody` over this exact `body`.
+/// Admit `deleteAccountData`: service auth for `nsid`, then a signed
+/// `labyrinthWriteBody` from an enrolled chat device over this exact `body`.
+/// A DID without a local device cannot prove that its server-owned history is
+/// empty, so it fails closed without consuming the service JWT's nonce.
 pub async fn admit_account_deletion(
     pool: &DbPool,
     cutover_enabled: bool,
     nsid: &str,
     headers: &HeaderMap,
     body: &[u8],
-) -> LabyrinthResult<AccountDeletionAdmission> {
+) -> LabyrinthResult<Admission> {
     require_cutover(cutover_enabled)?;
     let principal = crate::auth::verify_account_deletion_service_principal(headers, pool, nsid)
         .await
@@ -410,11 +398,9 @@ pub async fn admit_account_deletion(
             .fetch_one(pool)
             .await?;
     if !enrolled {
-        return Ok(AccountDeletionAdmission::NeverEnrolled {
-            did: principal.did().to_owned(),
-            principal,
-            intent_sha256: intent,
-        });
+        return Err(LabyrinthError::not_authorized(
+            "account deletion requires an enrolled chat device to prove its server-side history",
+        ));
     }
     let signed = header_b64(headers, WRITE_BODY_HEADER)?;
     let sig = header_b64(headers, WRITE_SIGNATURE_HEADER)?;
@@ -422,7 +408,7 @@ pub async fn admit_account_deletion(
         verify_signed_write_with_pending(pool, principal.did(), nsid, &signed, &sig, body, false)
             .await?;
     bind_account_deletion_nonce(&principal, pool, intent).await?;
-    Ok(AccountDeletionAdmission::Device(admission))
+    Ok(admission)
 }
 
 /// The raw `labyrinthWriteBody` header values of a procedure, for the

@@ -863,7 +863,7 @@ async fn deletion_fetches_a_missing_device_proof_before_purge_and_replays_withou
 }
 
 #[tokio::test]
-async fn a_never_enrolled_account_deletion_answers_success_every_time() {
+async fn a_never_enrolled_account_deletion_fails_closed_without_spending_the_nonce() {
     let _env = ENV_LOCK.lock().await;
     let s = sequencer().await;
     let lab = labyrinth(&s).await;
@@ -879,13 +879,21 @@ async fn a_never_enrolled_account_deletion_answers_success_every_time() {
     for _ in 0..2 {
         let token = service_token(&never, DELETE_ACCOUNT_DATA, Utc::now().timestamp(), 60);
         let (status, body) = http::send(lab.clone(), bare(token)).await;
-        assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::UNAUTHORIZED, Some("NotAuthorized")),
+            "{body}"
+        );
     }
     // A client that believes it enrolled signs with a key this DS never saw.
     let unknown_key = ed25519_dalek::SigningKey::from_bytes(&[0x7E; 32]);
     let signed = SignedDeletion::new(&never, &unknown_key, [0x7E; 16], None);
     let (status, body) = http::send(lab.clone(), signed.request(&never)).await;
-    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("NotAuthorized")),
+        "{body}"
+    );
     // Without a valid service-auth token nothing is admitted.
     let (status, _) = http::send(lab.clone(), bare("not-a-token".to_owned())).await;
     assert_ne!(status, StatusCode::OK);
@@ -896,6 +904,13 @@ async fn a_never_enrolled_account_deletion_answers_success_every_time() {
             .await
             .unwrap();
     assert_eq!(principal_rows, 0, "deletion must not create an account row");
+    let spent_nonces: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM auth_jti_nonce WHERE issuer_did = $1")
+            .bind(&never.did)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+    assert_eq!(spent_nonces, 0);
 
     // An enrolled account still needs its device's signed write.
     let fixture = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, Some([0x46; 32]))
@@ -911,8 +926,8 @@ async fn a_never_enrolled_account_deletion_answers_success_every_time() {
     );
     assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 0);
 
-    // The delete only covered state committed before it. A separate later
-    // enrollment is possible; this endpoint leaves no terminal tombstone.
+    // Rejection does not create a terminal tombstone: later enrollment remains
+    // possible, and the caller can then retry with a device-signed write.
     let at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&s.pool)
         .await
@@ -974,195 +989,6 @@ async fn a_principal_without_a_device_cannot_claim_empty_account_deletion() {
 }
 
 #[tokio::test]
-async fn never_enrolled_deletion_rechecks_under_the_enrollment_lock() {
-    use std::time::Duration;
-
-    let _env = ENV_LOCK.lock().await;
-    let s = sequencer().await;
-    let never = device(&http::random_did(), Uuid::new_v4()).await;
-    let mut enrollment = s.pool.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("chat-account-lifecycle:{}", never.did))
-        .execute(&mut *enrollment)
-        .await
-        .unwrap();
-    let at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
-        .fetch_one(&mut *enrollment)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO chat.principals (user_did, created_at) VALUES ($1, $2)")
-        .bind(&never.did)
-        .bind(at)
-        .execute(&mut *enrollment)
-        .await
-        .unwrap();
-
-    // The enrollment transaction has created its principal but has not yet
-    // committed a device, so initial admission sees a never-enrolled DID.
-    let token = service_token(&never, DELETE_ACCOUNT_DATA, Utc::now().timestamp(), 60);
-    let request = axum::http::Request::post(format!("/xrpc/{DELETE_ACCOUNT_DATA}"))
-        .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
-        .body(axum::body::Body::from("{}"))
-        .unwrap();
-    let lab = labyrinth(&s).await;
-    let response = tokio::spawn(async move { http::send(lab, request).await });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let waiting: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
-                 WHERE datname = current_database() AND pid <> pg_backend_pid() \
-                   AND wait_event_type = 'Lock' \
-                   AND query LIKE 'SELECT pg_advisory_xact_lock(hashtextextended%')",
-            )
-            .fetch_one(&s.pool)
-            .await
-            .unwrap();
-            if waiting {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("unsigned admission should reach the DID lifecycle lock");
-
-    sqlx::query(
-        "INSERT INTO chat.devices \
-         (user_did, device_id, device_name, status, dpop_jkt, auth_generation, \
-          capabilities, created_at, updated_at) \
-         VALUES ($1, $2, 'race-test', 'active', $3, 1, chat.protocol_capabilities(), $4, $4)",
-    )
-    .bind(&never.did)
-    .bind(never.device_id)
-    .bind(&never.jkt)
-    .bind(at)
-    .execute(&mut *enrollment)
-    .await
-    .unwrap();
-    enrollment.commit().await.unwrap();
-
-    let (status, body) = tokio::time::timeout(Duration::from_secs(5), response)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        (status, body["error"].as_str()),
-        (StatusCode::UNAUTHORIZED, Some("NotAuthorized")),
-        "{body}"
-    );
-    let devices: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.devices WHERE user_did = $1")
-        .bind(&never.did)
-        .fetch_one(&s.pool)
-        .await
-        .unwrap();
-    assert_eq!(devices, 1);
-    let spent_nonces: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM auth_jti_nonce WHERE issuer_did = $1")
-            .bind(&never.did)
-            .fetch_one(&s.pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        spent_nonces, 0,
-        "the signed retry can reuse its service JWT"
-    );
-}
-
-#[tokio::test]
-async fn a_device_less_legacy_participant_cannot_emit_unsigned_deletion_evidence() {
-    let _env = ENV_LOCK.lock().await;
-    let s = sequencer().await;
-    let fixture = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, None)
-        .await
-        .unwrap();
-    let legacy = device(&http::random_did(), Uuid::new_v4()).await;
-    let at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
-        .fetch_one(&s.pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO chat.principals (user_did, created_at) VALUES ($1, $2)")
-        .bind(&legacy.did)
-        .bind(at)
-        .execute(&s.pool)
-        .await
-        .unwrap();
-    // Reuse the fixture's genuine creation transition and entry as the
-    // invitation provenance. A fabricated transition cannot satisfy the
-    // deferred participant FKs or provenance trigger.
-    let inserted = sqlx::query(
-        "INSERT INTO chat.participants \
-         (participant_period_id, conversation_id, user_did, status, role, \
-          role_transition_id, role_changed_at, created_by_did, created_by_device_id, \
-          invitation_transition_id, invitation_entry_id, invited_at, \
-          current_membership, created_at) \
-         SELECT $1, t.conversation_id, $2, 'pending', 'member', \
-                t.transition_id, t.accepted_at, t.actor_did, t.actor_device_id, \
-                t.transition_id, e.entry_id, t.accepted_at, true, t.accepted_at \
-           FROM chat.transitions t \
-           JOIN chat.entries e ON e.conversation_id = t.conversation_id \
-              AND e.transition_id = t.transition_id \
-          WHERE t.conversation_id = $3 AND t.kind = 'creation'",
-    )
-    .bind(Uuid::new_v4())
-    .bind(&legacy.did)
-    .bind(fixture.conversation_id)
-    .execute(&s.pool)
-    .await
-    .unwrap();
-    assert_eq!(inserted.rows_affected(), 1);
-    let lab = labyrinth(&s).await;
-    let token = service_token(&legacy, DELETE_ACCOUNT_DATA, Utc::now().timestamp(), 60);
-    let request = axum::http::Request::post(format!("/xrpc/{DELETE_ACCOUNT_DATA}"))
-        .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
-        .body(axum::body::Body::from("{}"))
-        .unwrap();
-    let (status, body) = http::send(lab, request).await;
-    assert_eq!(
-        (status, body["error"].as_str()),
-        (StatusCode::UNAUTHORIZED, Some("NotAuthorized")),
-        "{body}"
-    );
-    assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 0);
-}
-
-#[tokio::test]
-async fn a_device_less_legacy_backup_cannot_be_purged_unsigned() {
-    let _env = ENV_LOCK.lock().await;
-    let s = sequencer().await;
-    let legacy = device(&http::random_did(), Uuid::new_v4()).await;
-    sqlx::query(
-        "INSERT INTO labyrinth.mailboxes (owner_did, created_at) \
-         VALUES ($1, clock_timestamp())",
-    )
-    .bind(&legacy.did)
-    .execute(&s.pool)
-    .await
-    .unwrap();
-    let lab = labyrinth(&s).await;
-    let token = service_token(&legacy, DELETE_ACCOUNT_DATA, Utc::now().timestamp(), 60);
-    let request = axum::http::Request::post(format!("/xrpc/{DELETE_ACCOUNT_DATA}"))
-        .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
-        .body(axum::body::Body::from("{}"))
-        .unwrap();
-    let (status, body) = http::send(lab, request).await;
-    assert_eq!(
-        (status, body["error"].as_str()),
-        (StatusCode::UNAUTHORIZED, Some("NotAuthorized")),
-        "{body}"
-    );
-    let mailboxes: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM labyrinth.mailboxes WHERE owner_did = $1")
-            .bind(&legacy.did)
-            .fetch_one(&s.pool)
-            .await
-            .unwrap();
-    assert_eq!(mailboxes, 1);
-}
-
-#[tokio::test]
 async fn a_device_less_remote_group_member_cannot_emit_unsigned_deletion_relay() {
     let _env = ENV_LOCK.lock().await;
     let s = sequencer().await;
@@ -1205,63 +1031,6 @@ async fn a_device_less_remote_group_member_cannot_emit_unsigned_deletion_relay()
     assert_eq!(remaining, 1);
 }
 
-#[tokio::test]
-async fn a_device_less_transport_inbox_cannot_emit_unsigned_deletion_relay() {
-    let _env = ENV_LOCK.lock().await;
-    let s = sequencer().await;
-    let never = device(&http::random_did(), Uuid::new_v4()).await;
-    let conversation_id = Uuid::new_v4();
-    let bytes = b"{}";
-    sqlx::query(
-        "INSERT INTO chat.direct_request_transport_inbox \
-         (request_id, conversation_id, first_message_id, coordinator_did, \
-          sender_did, sender_device_id, recipient_did, recipient_device_id, \
-          request_entry, signed_publication, full_welcome, full_welcome_sha256, \
-          provenance, publication_receipt, import_until, request_entry_sha256, \
-          signed_publication_sha256) \
-         VALUES ($1, $2, $3, $4, $5, $6, $4, $7, \
-                 $8, $8, $8, digest($8, 'sha256'), $8, $8, $9, \
-                 digest($8, 'sha256'), digest($8, 'sha256'))",
-    )
-    .bind(Uuid::new_v4())
-    .bind(conversation_id)
-    .bind(Uuid::new_v4())
-    .bind(SELF_DID)
-    .bind(&never.did)
-    .bind(never.device_id)
-    .bind(Uuid::new_v4())
-    .bind(&bytes[..])
-    .bind(Utc::now() + chrono::Duration::days(1))
-    .execute(&s.pool)
-    .await
-    .unwrap();
-    let token = service_token(&never, DELETE_ACCOUNT_DATA, Utc::now().timestamp(), 60);
-    let request = axum::http::Request::post(format!("/xrpc/{DELETE_ACCOUNT_DATA}"))
-        .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
-        .body(axum::body::Body::from("{}"))
-        .unwrap();
-    let (status, body) = http::send(labyrinth(&s).await, request).await;
-    assert_eq!(
-        (status, body["error"].as_str()),
-        (StatusCode::UNAUTHORIZED, Some("NotAuthorized")),
-        "{body}"
-    );
-    let remaining: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM chat.direct_request_transport_inbox \
-         WHERE conversation_id = $1 AND sender_did = $2",
-    )
-    .bind(conversation_id)
-    .bind(&never.did)
-    .fetch_one(&s.pool)
-    .await
-    .unwrap();
-    assert_eq!(remaining, 1);
-}
-
-/// The app deletes the PDS account first, then calls deleteAccountData with a
-/// token and repository proof it captured before. The signed CAR remains
-/// verifiable from the DID document even when the repository no longer answers.
 #[tokio::test]
 async fn service_auth_admits_a_pre_minted_token_after_the_pds_repo_is_deleted() {
     use base64::Engine as _;

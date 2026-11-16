@@ -4,21 +4,6 @@ use std::panic::AssertUnwindSafe;
 
 use libcrux_kem::{Algorithm as KemAlgorithm, PublicKey as KemPublicKey};
 
-/// Serialize every device bootstrap with a DID-only deletion, including the
-/// case where no principal row exists yet. The domain prefix separates this
-/// 64-bit advisory key from per-device and operation locks; a hash collision
-/// can only add contention, never grant authority.
-pub(crate) async fn lock_account_lifecycle(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    did: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("chat-account-lifecycle:{did}"))
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
 pub(crate) const XWING_PUBLIC_KEY_BYTES: usize = 1_216;
 pub(crate) const XWING_KEM_OUTPUT_BYTES: usize = 1_120;
 // Canonical BasicCredential identity is `actorDid + "#" + deviceId`.
