@@ -54,7 +54,14 @@ DOCS_ROOT = (
     if (STACK_ROOT.parent / "docs").is_dir()
     else STACK_ROOT.parent.parent / "Catbird+Petrel/docs"
 )
-CRYPTO_WIRE_V09_ROOT = SERVER_ROOT / "tests/fixtures/crypto-wire-v09"
+CRYPTO_WIRE_V09_ROOT = DOCS_ROOT / "generated-artifacts/mls-chat-v1/crypto-wire-v09"
+CRYPTO_WIRE_V09_MIRROR = SERVER_ROOT / "tests/fixtures/crypto-wire-v09"
+# The frozen generator and sealer revisions belong to the historical artifacts.
+# These separate pins name the readers that must continue to accept those bytes.
+V09_READER_REVISIONS = {
+    "catbird-mls": "679bdc31ef44dc919f28aee9ce442ec8eb0682c0",
+    "mls-ds": "88e9d8be1be3dd94d368508135865dcc28153e3e",
+}
 PROTOCOL_PATH = DOCS_ROOT / "mls-v2/CHAT_PROTOCOL.md"
 STANDARD_APPVIEW_ADR_PATH = DOCS_ROOT / "design-docs/adr-001-mls-standard-appview-auth.md"
 
@@ -1497,7 +1504,15 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
     assert "nextPageCursor" in own_device_output["properties"] and "nextPageCursor" not in required(own_device_output)
     assert_ref(own_device_output["properties"]["items"]["items"], "ownDeviceView")
 
-    state = endpoint_output(endpoint_document(documents, "getConversationState"))
+    state_document = endpoint_document(documents, "getConversationState")
+    state_params, state = endpoint_input(state_document), endpoint_output(state_document)
+    for schema, name, minimum in ((state_params, "deletionsAfter", 0), (state, "deletionsCursor", 1)):
+        cursor = schema["properties"][name]
+        assert name not in required(schema)
+        assert cursor["type"] == "integer" and cursor["minimum"] == minimum
+        assert cursor["maximum"] == SAFE_INTEGER_MAX
+    assert "accountDeletions" in required(state)
+    assert state["properties"]["accountDeletions"]["maxLength"] == 100
     assert "pendingResetRequests" in required(state)
     assert "pendingLeaveRequests" in required(state)
     assert_ref(state["properties"]["state"], "conversationState")
@@ -3497,24 +3512,14 @@ def validate_crypto_wire_v09_corpus() -> None:
         "tls_codec": "0.5.0",
     }
     assert set(manifest["dependencies"]) == set(expected_dependency_versions)
-    lock_path = (
-        STACK_ROOT / "catbird-mls/Cargo.lock"
-        if (STACK_ROOT / "catbird-mls/Cargo.lock").is_file()
-        else STACK_ROOT.parent.parent / "Catbird+Petrel/catbird-mls/Cargo.lock"
-    )
-    lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
-    lock_packages = lock["package"]
     for package, profile in manifest["dependencies"].items():
-        assert package and "version" in profile and "source" in profile
         assert profile["version"] == expected_dependency_versions[package]
-        matches = [
-            entry for entry in lock_packages
-            if entry["name"] == package and entry["version"] == profile["version"]
-        ]
-        assert len(matches) == 1, f"Cargo.lock package ambiguity for {package}"
-        assert matches[0].get("source") == profile["source"]
-        if "checksum" in profile:
-            assert matches[0].get("checksum") == profile["checksum"]
+        if package.startswith("openmls"):
+            revision = manifest["generator"]["officialClientRevision"]
+            assert profile["source"] == f"git+https://github.com/openmls/openmls?rev={revision}#{revision}"
+        else:
+            assert profile["source"] == "registry+https://github.com/rust-lang/crates.io-index"
+            assert re.fullmatch(r"[0-9a-f]{64}", profile["checksum"])
 
     generator = manifest["generator"]
     for digest_key in (
@@ -3573,22 +3578,11 @@ def validate_crypto_wire_v09_corpus() -> None:
         assert manifest["categories"][category], f"category {category} must not be empty"
 
     sealer = manifest["sealer"]
-    server_lock_path = STACK_ROOT / "mls-ds/Cargo.lock"
-    server_lock = tomllib.loads(server_lock_path.read_text(encoding="utf-8"))
     for digest_key in ("sourceSha256Hex", "serverCargoManifestSha256Hex", "serverCargoLockSha256Hex"):
         assert re.fullmatch(r"[0-9a-f]{64}", sealer[digest_key]), f"invalid sealer {digest_key}"
     assert sealer["openmlsForkRevision"] == "3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
-    assert any(
-        pkg["name"] == "openmls" and sealer["openmlsForkRevision"] in pkg.get("source", "")
-        for pkg in server_lock["package"]
-    ), "mls-ds/Cargo.lock must pin the expected openmls fork revision"
-
-    server_fixture_dir = SERVER_ROOT / "tests/fixtures/crypto-wire-v09"
-    assert server_fixture_dir.is_dir(), f"missing server fixture mirror: {server_fixture_dir}"
-    for filename in expected_files:
-        root_bytes = (CRYPTO_WIRE_V09_ROOT / filename).read_bytes()
-        mirror_bytes = (server_fixture_dir / filename).read_bytes()
-        assert root_bytes == mirror_bytes, f"crypto-wire-v09 mirror drift for {filename}"
+    revision = sealer["openmlsForkRevision"]
+    assert sealer["openmlsForkSource"] == f"git+https://github.com/joshlacal/openmls?rev={revision}#{revision}"
     for filename, wire_format in wrapper_formats.items():
         payload = payloads[filename]
         assert len(payload) >= 4 and int.from_bytes(payload[:2], "big") == 1
@@ -3727,6 +3721,36 @@ class ChatLexiconContractTests(unittest.TestCase):
 
     def test_manifest_and_semantic_schema_are_decision_complete(self) -> None:
         validate_contract(self.canonical, self.vectors)
+
+    def test_v09_frozen_corpus_matches_server_mirror(self) -> None:
+        self.assertFalse(CRYPTO_WIRE_V09_ROOT.samefile(CRYPTO_WIRE_V09_MIRROR))
+        canonical = {p.name for p in CRYPTO_WIRE_V09_ROOT.iterdir()}
+        self.assertEqual(canonical, {p.name for p in CRYPTO_WIRE_V09_MIRROR.iterdir()})
+        self.assertEqual(
+            hashlib.sha256((CRYPTO_WIRE_V09_ROOT / "manifest.json").read_bytes()).hexdigest(),
+            "5a22b11da50ab513ed7d8e9dc21575cc13e9d3097f528ae14438110959cee0d7",
+            "the frozen v09 manifest has changed",
+        )
+        for name in sorted(canonical):
+            with self.subTest(artifact=name):
+                self.assertTrue((CRYPTO_WIRE_V09_ROOT / name).read_bytes() ==
+                                (CRYPTO_WIRE_V09_MIRROR / name).read_bytes(), name)
+
+    def test_v09_reader_dependency_pins(self) -> None:
+        dependencies = strict_load(CRYPTO_WIRE_V09_ROOT / "manifest.json")["dependencies"]
+        for repo, revision in V09_READER_REVISIONS.items():
+            lock = tomllib.loads((STACK_ROOT / repo / "Cargo.lock").read_text(encoding="utf-8"))
+            for name, profile in dependencies.items():
+                with self.subTest(repo=repo, package=name):
+                    matches = [pkg for pkg in lock["package"]
+                               if pkg["name"] == name and pkg["version"] == profile["version"]]
+                    self.assertEqual(len(matches), 1)
+                    if name.startswith("openmls"):
+                        source = f"git+https://github.com/joshlacal/openmls?rev={revision}#{revision}"
+                        self.assertEqual(matches[0]["source"], source)
+                    else:
+                        self.assertEqual(matches[0]["source"], profile["source"])
+                        self.assertEqual(matches[0]["checksum"], profile["checksum"])
 
     def test_non_crypto_contract_is_decision_complete(self) -> None:
         validate_non_crypto_contract(self.canonical, self.vectors)

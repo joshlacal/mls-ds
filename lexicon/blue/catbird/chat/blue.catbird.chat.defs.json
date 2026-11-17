@@ -6267,7 +6267,7 @@
           "type": "bytes",
           "minLength": 1,
           "maxLength": 16384,
-          "description": "Optional; present only together with actorWrite. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. A CARv1 repository proof in the com.atproto.sync.getRecord shape: the signed repository commit of deletedDid, the MST path, and the record block for the create-only blue.catbird.chat.deviceRevocation/{actorDeviceId} record where targetDeviceId == actorDeviceId, createdAt == actorWrite.signedAt, and reason == 'deleteAccountData:' || operationId. Because deviceRevocation is create-only, a valid CARv1 under deletedDid's #atproto key proves actorDeviceId had not been revoked prior to signing deletion even after deletedDid's repository is gone."
+          "description": "Optional, and valid only with actorWrite. Private Catbird surface (blue.catbird.*). CARv1 inclusion proof under deletedDid's #atproto key for the create-only record blue.catbird.chat.deviceRevocation/{actorDeviceId}. Both the actor and target must equal the actorDeviceId in the signed deletion request. The device signature must verify and reason must equal 'deleteAccountData:' followed by the lowercase hexadecimal operationId. The record's createdAt may equal or precede actorWrite.signedAt. A retry of the same operation can refresh the request signature while preserving its original repository record. A later createdAt or a different operationId invalidates the proof."
         }
       }
     },

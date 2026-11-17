@@ -23,6 +23,12 @@
             "minLength": 36,
             "maxLength": 36,
             "description": "Canonical lowercase hyphenated RFC 4122-variant UUIDv4 conversation ID; strict runtime validation rejects every other spelling/version/variant."
+          },
+          "deletionsAfter": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Exclusive deletion sequence cursor. Supply 0 for the first page and follow deletionsCursor on successive responses until it is absent. Omitting this parameter requests a complete inventory in one response. If that would exceed 100 entries, the server returns ProtocolUpgradeRequired."
           }
         }
       },
@@ -67,7 +73,7 @@
               },
               "minLength": 0,
               "maxLength": 100,
-              "description": "Every accountDeletedEntry of this conversation in ascending seq, each exactly as sequenced with its sequencerAuthority. The sequencer, a group mirror and a C33 transport home serve it to any authenticated device of a current member DID, including a device that is not yet an MLS member and holds no entry entitlement, and to no one else. It survives ciphertext pruning. Clients verify each sequencerAuthority with the sequencer's #mls-receipt-1 key before hiding deletedDid's restored history."
+              "description": "One page of this conversation's accountDeletedEntry records in strictly increasing sequence order, each exactly as sequenced with its sequencerAuthority. The sequencer, group mirror and C33 transport home serve the inventory to any authenticated device of a current member DID, including a device without entry entitlement. It survives ciphertext pruning. Restore requires a complete traversal and independent verification of deletion evidence."
             },
             "pendingLeafRecoveryRequests": {
               "type": "array",
@@ -78,6 +84,12 @@
               "minLength": 0,
               "maxLength": 100,
               "description": "Open unexpired leaf recoveries bound to the current coordinate, visible only to an active concrete device leaf that may fulfill them. Excludes the requesting exact device, but includes other devices of the same DID. Ordered oldest first; successful fulfillment changes the coordinate and stale requests must be renewed. Absent on older servers; empty for logical participants without a current concrete leaf. This is separate from the exact-target-device getLeafRecoveryInbox and grants no additional application history."
+            },
+            "deletionsCursor": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991,
+              "description": "Present only if more account deletions remain. Equal to the sequence of the last entry in accountDeletions. Pass this value as deletionsAfter to fetch the next page."
             }
           }
         }
