@@ -428,7 +428,12 @@ pub(crate) async fn sequence_account_deleted_entry(
         "SELECT EXISTS(SELECT 1 FROM chat.participants \
                         WHERE conversation_id = $1 AND user_did = $2 \
                           AND current_membership AND status = 'active'), \
-                EXISTS(SELECT 1 FROM chat.entries WHERE entry_id = $3)",
+                EXISTS(SELECT 1 FROM chat.entries \
+                        WHERE entry_id = $3 \
+                           OR (conversation_id = $1 \
+                               AND message_id IS NULL \
+                               AND entry_kind = 'blue.catbird.chat.defs#accountDeletedEntry' \
+                               AND actor_did = $2))",
     )
     .bind(conversation_id)
     .bind(did)

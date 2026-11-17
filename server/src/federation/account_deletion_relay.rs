@@ -67,13 +67,21 @@ impl AccountDeletionRelay {
                 bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
                 bytes.extend_from_slice(field);
             }
-            if let Some(revocation_proof) = &evidence.revocation_proof {
-                bytes.extend_from_slice(&(revocation_proof.len() as u32).to_be_bytes());
-                bytes.extend_from_slice(revocation_proof);
+            match &evidence.revocation_proof {
+                Some(revocation_proof) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(revocation_proof.len() as u32).to_be_bytes());
+                    bytes.extend_from_slice(revocation_proof);
+                }
+                None => bytes.push(0),
             }
-            if let Some(payload_bytes) = &evidence.actor_write.payload_bytes {
-                bytes.extend_from_slice(&(payload_bytes.len() as u32).to_be_bytes());
-                bytes.extend_from_slice(payload_bytes);
+            match &evidence.actor_write.payload_bytes {
+                Some(payload_bytes) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(payload_bytes.len() as u32).to_be_bytes());
+                    bytes.extend_from_slice(payload_bytes);
+                }
+                None => bytes.push(0),
             }
         }
         bytes

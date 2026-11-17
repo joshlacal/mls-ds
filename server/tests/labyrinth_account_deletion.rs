@@ -1536,3 +1536,121 @@ async fn supplied_malformed_proofs_return_400_and_retry_past_300s_with_prior_cre
     assert_eq!((status, &body), (StatusCode::OK, &json!({})));
     assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 1);
 }
+
+#[tokio::test]
+async fn second_device_deletion_does_not_sequence_duplicate_account_deleted_entry() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    let _env = ENV_LOCK.lock().await;
+    let s = sequencer().await;
+    let lab = labyrinth(&s).await;
+    let fixture = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, Some([0x53; 32]))
+        .await
+        .unwrap();
+    let cid = fixture.conversation_id;
+    let sender1 = device(&fixture.sender_did, fixture.sender_device_id).await;
+    let key1 = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
+    let kp1 = signed_device_record_car(&sender1, &key1);
+    let op1 = [0xD1; 16];
+    let mut del1 = SignedDeletion::new_with_proofs(
+        &sender1,
+        &key1,
+        op1,
+        Some(URL_SAFE_NO_PAD.encode(&kp1)),
+        None,
+    );
+    let rp1 = signed_device_revocation_car(
+        &sender1,
+        &sender1.device_id.to_string(),
+        &key1,
+        &format!("deleteAccountData:{}", hex::encode(op1)),
+        del1.signed_at,
+    );
+    del1.revocation_proof = Some(URL_SAFE_NO_PAD.encode(&rp1));
+
+    // Enroll a second device of the same user with its own admitted Ed25519 key while sharing
+    // the account's `#atproto` identity signing key for service auth + CAR proofs.
+    let jwk2 = http::public_jwk(&http::random_p256());
+    let sender2 = http::Device {
+        did: fixture.sender_did.clone(),
+        device_id: Uuid::new_v4(),
+        signing: sender1.signing.clone(),
+        jkt: http::jwk_thumbprint(&jwk2),
+        jwk: jwk2,
+    };
+    let key2 = ed25519_dalek::SigningKey::from_bytes(&[0x54; 32]);
+    let pk2 = key2.verifying_key().to_bytes().to_vec();
+    let key2_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(&pk2)
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation, \
+             capabilities,created_at,updated_at) \
+         VALUES($1,$2,'second-device','active',$3,1,chat.protocol_capabilities(), \
+             clock_timestamp(),clock_timestamp())",
+    )
+    .bind(&fixture.sender_did)
+    .bind(sender2.device_id)
+    .bind(&sender2.jkt)
+    .execute(&s.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key, \
+             enrollment_auth_generation,created_at) \
+         VALUES($1,$2,$3,$4,1,clock_timestamp())",
+    )
+    .bind(&fixture.sender_did)
+    .bind(sender2.device_id)
+    .bind(&key2_id)
+    .bind(&pk2)
+    .execute(&s.pool)
+    .await
+    .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let kp2 = signed_device_record_car(&sender2, &key2);
+    let op2 = [0xD2; 16];
+    let mut del2 = SignedDeletion::new_with_proofs(
+        &sender2,
+        &key2,
+        op2,
+        Some(URL_SAFE_NO_PAD.encode(&kp2)),
+        None,
+    );
+    let rp2 = signed_device_revocation_car(
+        &sender2,
+        &sender2.device_id.to_string(),
+        &key2,
+        &format!("deleteAccountData:{}", hex::encode(op2)),
+        del2.signed_at,
+    );
+    del2.revocation_proof = Some(URL_SAFE_NO_PAD.encode(&rp2));
+
+    let (status, body) = http::send(lab.clone(), del1.request(&sender1)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    assert_eq!(deletion_rows(&s.pool, cid).await, 1);
+
+    let (status, body) = http::send(lab, del2.request(&sender2)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    assert_eq!(
+        deletion_rows(&s.pool, cid).await,
+        1,
+        "second enrolled device must not sequence a duplicate accountDeletedEntry"
+    );
+
+    let member = device(&fixture.recipient_did, fixture.recipient_device_id).await;
+    let (status, page) = read(&s, &member, "blue.catbird.chat.getEntries", cid).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["$type"] == ACCOUNT_DELETED)
+            .count(),
+        1
+    );
+}
