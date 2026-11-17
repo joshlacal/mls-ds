@@ -27,8 +27,7 @@ With `CHAT_CUTOVER_ENABLED=1`, startup requires:
   rewrap procedure; changing the bytes under the same ID fails journal
   authentication at startup.
 - `LABYRINTH_RECOVERY_SHARE_TOMBSTONE_FILE`: a private, append-only regular
-  file on a durable mount outside PostgreSQL backups. Keep the same file
-  across database restores. The service takes an exclusive OS lock, so only
+  file in a private, writable directory on a durable mount outside PostgreSQL backups. Keep the base file and its segment files together across database restores. The service takes an exclusive OS lock, so only
   one serving process can use this journal.
 
 For a **new** empty journal, run the `provision_recovery_journal` binary with
@@ -53,6 +52,12 @@ journal on every share read and refuses journaled methods, but its database
 may retain restored ciphertext until replay runs. The existing restore
 scripts do not restart the service or invoke replay themselves; operators
 must follow this stop, restore, restart sequence.
+
+## Journal rollover and recovery
+
+The configured path is the original version-1 journal. A running server keeps its exclusive lock on that base file across rotations. At 256 MiB it creates a private sibling named `<base>.segment.<UUID>`, syncs the file and directory, and appends and syncs an authenticated link before acknowledging any erasure in that successor. The limit triggers rollover. Existing valid version-1 journals above the limit are replayed in full and roll forward on their next append.
+
+Take a consistent snapshot of the whole journal directory with the writer stopped or using an atomic filesystem snapshot. Restore the base and every linked segment together. On startup the server verifies each segment header, successor link, and erasure record. A missing linked segment, an invalid header, or a truncated record blocks startup; recover the intact chain from the independent journal backup. A crash between creating the new file and recording its link can leave an unreferenced header-only file. It contains no acknowledged erasures. Keep it with the snapshot. Do not truncate the journal, remove old segments, or substitute an earlier snapshot to make startup succeed. Once the first rollover has occurred, use a server version that reads the segmented format.
 
 Back up the journal and KEK separately with stricter access controls than
 the database. Losing either makes v3 recovery unavailable. Restoring a

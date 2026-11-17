@@ -6,10 +6,10 @@
 //! permits only one writer process for this journal. A missing, malformed, or
 //! locked journal fails startup closed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -21,7 +21,7 @@ use super::error::{LabyrinthError, LabyrinthResult};
 
 const HEADER: &str = "catbird-labyrinth-recovery-tombstones-v1";
 const MAC_DOMAIN: &[u8] = b"catbird-labyrinth-recovery-tombstone-mac-v1\0";
-const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 type HmacSha256 = Hmac<Sha256>;
 type Key = (String, [u8; 16]);
 
@@ -57,7 +57,10 @@ struct Tombstone {
 }
 
 struct JournalState {
+    _root_lock: File,
     file: File,
+    active_id: Option<uuid::Uuid>,
+    bytes: u64,
     tombstones: HashMap<Key, Tombstone>,
     failed: bool,
 }
@@ -65,6 +68,8 @@ struct JournalState {
 /// Process-local index over a durable, exclusively locked journal.
 pub struct RecoveryTombstones {
     state: Mutex<JournalState>,
+    path: PathBuf,
+    segment_bytes: u64,
     mac_key: [u8; 32],
 }
 
@@ -73,113 +78,69 @@ impl RecoveryTombstones {
     /// this explicit provisioning path is useful for a new volume or a test.
     pub fn provision_new(path: impl AsRef<Path>, key: [u8; 32]) -> Result<Self, String> {
         let path = path.as_ref();
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(path)
-            .map_err(|error| format!("provision recovery tombstone journal: {error}"))?;
-        file.write_all(header_line(&key).as_bytes())
-            .map_err(|error| format!("write recovery tombstone header: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("sync recovery tombstone header: {error}"))?;
-        drop(file);
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| format!("sync recovery tombstone directory: {error}"))?;
-        }
+        create_segment(path, &header_line(&key))?;
         Self::open_existing(path, key)
     }
 
-    /// Open and validate a journal supplied by a separate persistent mount.
-    /// Never creates or repairs a missing/partial file at serving startup.
+    /// Open the v1 base and every linked segment. The base inode lock is
+    /// retained for the lifetime of the writer even after a rollover.
     pub fn open_existing(path: impl AsRef<Path>, key: [u8; 32]) -> Result<Self, String> {
-        let path = path.as_ref();
-        let metadata = std::fs::symlink_metadata(path)
-            .map_err(|error| format!("recovery tombstone journal is missing: {error}"))?;
-        if !metadata.file_type().is_file() {
-            return Err("recovery tombstone journal must be a regular, non-symlink file".into());
-        }
-        if metadata.len() > MAX_FILE_BYTES {
-            return Err("recovery tombstone journal exceeds maximum size".into());
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o077 != 0 {
-                return Err("recovery tombstone journal must be private (mode 0600)".into());
-            }
-        }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(path)
-            .map_err(|error| format!("open recovery tombstone journal: {error}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let opened = file
-                .metadata()
-                .map_err(|error| format!("stat recovery tombstone journal: {error}"))?;
-            if (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino()) {
-                return Err("recovery tombstone journal changed while opening".into());
-            }
-        }
-        file.try_lock()
-            .map_err(|error| format!("recovery tombstone journal is already in use: {error}"))?;
-        let mut reader_file = &mut file;
-        if metadata.len() == 0 {
-            return Err("recovery tombstone journal header is missing".into());
-        }
-        reader_file
-            .seek(SeekFrom::End(-1))
-            .map_err(|error| format!("seek recovery tombstone journal: {error}"))?;
-        let mut final_byte = [0_u8; 1];
-        reader_file
-            .read_exact(&mut final_byte)
-            .map_err(|error| format!("read recovery tombstone journal end: {error}"))?;
-        if final_byte != [b'\n'] {
-            return Err("recovery tombstone journal has a truncated final record".into());
-        }
-        reader_file
-            .seek(SeekFrom::Start(0))
-            .map_err(|error| format!("seek recovery tombstone journal: {error}"))?;
-        let mut lines = BufReader::new(reader_file).lines();
-        let expected_header = header_line(&key);
-        if lines
-            .next()
-            .transpose()
-            .map_err(|error| error.to_string())?
-            .as_deref()
-            != Some(expected_header.trim_end_matches('\n'))
-        {
-            return Err("recovery tombstone journal header is missing or invalid".into());
-        }
+        let path = path.as_ref().to_path_buf();
+        let root = open_segment(&path)?;
+        root.try_lock()
+            .map_err(|e| format!("recovery tombstone journal is already in use: {e}"))?;
+        let mut file = root.try_clone().map_err(|e| e.to_string())?;
+        let mut active_id = None;
+        let mut expected = header_line(&key);
+        let mut visited = HashSet::new();
         let mut tombstones = HashMap::new();
-        for line in lines {
-            let line = line.map_err(|error| format!("read recovery tombstone journal: {error}"))?;
-            if line.len() > 1024 {
-                return Err("recovery tombstone journal record is too long".into());
+        loop {
+            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            let mut reader = BufReader::new(&file);
+            let mut line = String::new();
+            if !read_line(&mut reader, &mut line)? || line != expected {
+                return Err("recovery tombstone journal header is missing or invalid".into());
             }
-            let item = decode_record(&line, &key)?;
-            tombstones
-                .entry((item.did.clone(), item.vid))
-                .or_insert(item);
+            let mut successor = None;
+            while read_line(&mut reader, &mut line)? {
+                if successor.is_some() {
+                    return Err("records after recovery tombstone segment seal".into());
+                }
+                if line.starts_with("next-v2\t") {
+                    let body = verified_control(&line, &key)?;
+                    let fields: Vec<_> = body.split('\t').collect();
+                    let ["next-v2", previous, next] = fields.as_slice() else {
+                        return Err("invalid recovery tombstone segment link".into());
+                    };
+                    let id = uuid::Uuid::parse_str(next).map_err(|e| e.to_string())?;
+                    if *previous != segment_label(active_id) || !visited.insert(id) {
+                        return Err("invalid recovery tombstone segment chain".into());
+                    }
+                    successor = Some(id);
+                } else {
+                    let item = decode_record(line.trim_end_matches('\n'), &key)?;
+                    tombstones
+                        .entry((item.did.clone(), item.vid))
+                        .or_insert(item);
+                }
+            }
+            let Some(id) = successor else { break };
+            expected = segment_header(&key, active_id, id);
+            file = open_segment(&segment_path(&path, id))?;
+            active_id = Some(id);
         }
+        let bytes = file.metadata().map_err(|e| e.to_string())?.len();
         Ok(Self {
             state: Mutex::new(JournalState {
+                _root_lock: root,
                 file,
+                bytes,
+                active_id,
                 tombstones,
                 failed: false,
             }),
+            path,
+            segment_bytes: SEGMENT_BYTES,
             mac_key: key,
         })
     }
@@ -241,14 +202,24 @@ impl RecoveryTombstones {
             kind,
         };
         let line = encode_record(&item, &self.mac_key);
-        if let Err(error) = state.file.write_all(line.as_bytes()) {
-            state.failed = true;
-            return Err(format!("append recovery tombstone: {error}"));
+        // The old writer allowed valid v1 files above 256 MiB. Stream them on
+        // startup and roll forward on their next append; never rewrite the base.
+        if state.bytes.saturating_add(line.len() as u64) > self.segment_bytes {
+            let id = uuid::Uuid::new_v4();
+            let header = segment_header(&self.mac_key, state.active_id, id);
+            let file = create_segment(&segment_path(&self.path, id), &header)?;
+            let seal = control_line(
+                &format!("next-v2\t{}\t{id}", segment_label(state.active_id)),
+                &self.mac_key,
+            );
+            // The successor and directory entry are durable before its link.
+            // An interrupted pre-link creation leaves an unreferenced file.
+            state.append_synced(&seal)?;
+            state.file = file;
+            state.active_id = Some(id);
+            state.bytes = header.len() as u64;
         }
-        if let Err(error) = state.file.sync_all() {
-            state.failed = true;
-            return Err(format!("sync recovery tombstone: {error}"));
-        }
+        state.append_synced(&line)?;
         state.tombstones.insert((did.to_owned(), *vid), item);
         Ok(())
     }
@@ -314,6 +285,128 @@ impl RecoveryTombstones {
         tx.commit().await?;
         Ok(erased)
     }
+}
+
+impl JournalState {
+    fn append_synced(&mut self, line: &str) -> Result<(), String> {
+        if let Err(error) = self
+            .file
+            .write_all(line.as_bytes())
+            .and_then(|_| self.file.sync_all())
+        {
+            self.failed = true;
+            return Err(format!(
+                "persist recovery tombstone journal record: {error}"
+            ));
+        }
+        self.bytes += line.len() as u64;
+        Ok(())
+    }
+}
+
+fn open_segment(path: &Path) -> Result<File, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("missing recovery tombstone journal {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err("recovery tombstone journal must be a regular, non-symlink file".into());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("open recovery tombstone journal: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata().map_err(|e| e.to_string())?;
+        if opened.dev() != metadata.dev()
+            || opened.ino() != metadata.ino()
+            || opened.mode() & 0o077 != 0
+        {
+            return Err("recovery tombstone journal is not the expected private file".into());
+        }
+    }
+    Ok(file)
+}
+
+fn create_segment(path: &Path, header: &str) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.read(true).append(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("create recovery tombstone journal: {e}"))?;
+    file.write_all(header.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|e| format!("persist recovery tombstone journal header: {e}"))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(parent)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("sync recovery tombstone directory: {e}"))?;
+    Ok(file)
+}
+
+fn segment_path(base: &Path, id: uuid::Uuid) -> PathBuf {
+    let mut name = base.as_os_str().to_owned();
+    name.push(format!(".segment.{id}"));
+    PathBuf::from(name)
+}
+
+fn segment_label(id: Option<uuid::Uuid>) -> String {
+    id.map_or_else(|| "root".into(), |id| id.to_string())
+}
+
+fn segment_header(key: &[u8; 32], previous: Option<uuid::Uuid>, next: uuid::Uuid) -> String {
+    control_line(
+        &format!("segment-v2\t{}\t{next}", segment_label(previous)),
+        key,
+    )
+}
+
+fn control_mac(body: &str, key: &[u8; 32]) -> HmacSha256 {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    mac.update(b"catbird-labyrinth-recovery-tombstone-segment-v2\0");
+    mac.update(body.as_bytes());
+    mac
+}
+
+fn control_line(body: &str, key: &[u8; 32]) -> String {
+    let tag = control_mac(body, key).finalize().into_bytes();
+    format!("{body}\t{}\n", hex::encode(tag))
+}
+
+fn verified_control<'a>(line: &'a str, key: &[u8; 32]) -> Result<&'a str, String> {
+    let (body, tag) = line
+        .trim_end_matches('\n')
+        .rsplit_once('\t')
+        .ok_or("invalid recovery tombstone control record")?;
+    let tag = hex::decode(tag).map_err(|e| e.to_string())?;
+    control_mac(body, key)
+        .verify_slice(&tag)
+        .map_err(|_| "recovery tombstone segment MAC mismatch")?;
+    Ok(body)
+}
+
+fn read_line(reader: &mut impl BufRead, line: &mut String) -> Result<bool, String> {
+    line.clear();
+    let count = reader
+        .take(1026)
+        .read_line(line)
+        .map_err(|e| e.to_string())?;
+    if count == 0 {
+        return Ok(false);
+    }
+    if count > 1025 || !line.ends_with('\n') {
+        return Err("overlong or truncated recovery tombstone journal record".into());
+    }
+    Ok(true)
 }
 
 fn encode_record(item: &Tombstone, key: &[u8; 32]) -> String {
@@ -391,5 +484,73 @@ mod tests {
         let changed = line.replace("abcdefghijklmnopqrstuvwx", "abcdefghijklmnopqrstuvwy");
         assert!(decode_record(changed.trim_end(), &key).is_err());
         assert_ne!(header_line(&key), header_line(&[0x43; 32]));
+    }
+
+    #[test]
+    fn rotation_reopens_every_legacy_and_linked_erasure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("erasures");
+        let did = "did:plc:abcdefghijklmnopqrstuvwx";
+        let key = [0x44; 32];
+        let at = Utc::now();
+        // Start with bytes emitted by the old writer, then simulate a smaller
+        // rollover threshold. Existing oversized segments are read in place.
+        let mut base = create_segment(&path, &header_line(&key)).unwrap();
+        let legacy = Tombstone {
+            did: did.into(),
+            vid: [0; 16],
+            at,
+            kind: Kind::Delete,
+        };
+        base.write_all(encode_record(&legacy, &key).as_bytes())
+            .unwrap();
+        base.sync_all().unwrap();
+        drop(base);
+        let mut journal = RecoveryTombstones::open_existing(&path, key).unwrap();
+        journal.segment_bytes = 1;
+        journal.append_delete(did, &[1; 16], at).unwrap();
+        journal.append_purge(did, &[2; 16], at).unwrap();
+        journal.append_delete(did, &[1; 16], at).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+        assert!(
+            RecoveryTombstones::open_existing(&path, key).is_err(),
+            "root retains the writer lease"
+        );
+        drop(journal);
+        let journal = RecoveryTombstones::open_existing(&path, key).unwrap();
+        for i in 0..3 {
+            assert!(journal.contains(did, &[i; 16]));
+        }
+        assert!(!journal.contains(did, &[3; 16]));
+        assert_eq!(
+            journal.state.lock().unwrap().tombstones[&(did.into(), [2; 16])].kind,
+            Kind::Purge
+        );
+    }
+
+    #[test]
+    fn missing_substituted_and_truncated_linked_segments_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("erasures");
+        let key = [0x45; 32];
+        let mut journal = RecoveryTombstones::provision_new(&path, key).unwrap();
+        journal.segment_bytes = 1;
+        journal
+            .append_delete("did:plc:abcdefghijklmnopqrstuvwx", &[1; 16], Utc::now())
+            .unwrap();
+        let id = journal.state.lock().unwrap().active_id.unwrap();
+        drop(journal);
+        let linked = segment_path(&path, id);
+        let original = dir.path().join("original");
+        std::fs::rename(&linked, &original).unwrap();
+        assert!(RecoveryTombstones::open_existing(&path, key).is_err());
+        let substituted =
+            create_segment(&linked, &segment_header(&key, None, uuid::Uuid::new_v4())).unwrap();
+        drop(substituted);
+        assert!(RecoveryTombstones::open_existing(&path, key).is_err());
+        std::fs::rename(original, &linked).unwrap();
+        let file = OpenOptions::new().write(true).open(linked).unwrap();
+        file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+        assert!(RecoveryTombstones::open_existing(&path, key).is_err());
     }
 }
