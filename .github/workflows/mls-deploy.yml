@@ -37,8 +37,8 @@ env:
   IMAGE_NAME: ${{ github.repository }}/mls-server
   # Single source for every sibling checkout below. Repin these together when
   # the candidate sibling commits are final.
-  CATBIRD_ATPROTO_REV: "1fc6dfcc76362ab5c7a52044056a46ea390d7d00"
-  CATBIRD_MLS_REV: "7afcc0ef1f0bdd504792ac873cad65130fbe3547"
+  CATBIRD_ATPROTO_REV: "708c2db8a7c703a0f0373db2e7e19bc8d8d729d8"
+  CATBIRD_MLS_REV: "de7942748073fbcbb721cf902b671ac83561bdba"
   LABYRINTH_REV: "a72426ab80608cd14da0cbe274b7a54846f1d3ed"
 
 jobs:
