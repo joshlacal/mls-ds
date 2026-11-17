@@ -1065,6 +1065,20 @@ async fn a_sequencer_stores_the_relayed_devices_signed_write_and_key_proof_verba
             altered.evidence.as_mut().unwrap().key_proof = Some(vec![0x6C; 4096]);
             let mut altered_rev = genuine.clone();
             altered_rev.evidence.as_mut().unwrap().revocation_proof = Some(vec![0x7D; 4096]);
+            let mut altered_payload = genuine.clone();
+            altered_payload
+                .evidence
+                .as_mut()
+                .unwrap()
+                .actor_write
+                .payload_bytes = Some(b"{ }".to_vec());
+            assert_ne!(
+                genuine.signing_bytes(),
+                altered_payload.signing_bytes(),
+                "AccountDeletionRelay::signing_bytes must bind actorWrite.payloadBytes"
+            );
+            let mut missing_payload = evidence.clone();
+            missing_payload.actor_write.payload_bytes = None;
             let mut stripped = genuine.clone();
             stripped.evidence = None;
             let mut short_signature = evidence.clone();
@@ -1073,7 +1087,10 @@ async fn a_sequencer_stores_the_relayed_devices_signed_write_and_key_proof_verba
                 // Evidence changed or removed after the home signed it.
                 (altered, tampered),
                 (altered_rev, tampered),
+                (altered_payload, bad),
                 (stripped, tampered),
+                // Relays omitting actorWrite.payloadBytes are refused on ingress.
+                (evidenced_relay(&home_key, &plain, missing_payload), bad),
                 // A write signed outside the deletion's write window.
                 (
                     evidenced_relay(

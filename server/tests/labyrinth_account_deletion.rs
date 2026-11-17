@@ -1447,3 +1447,92 @@ async fn deletion_rejects_sibling_revoked_device_non_retryably_without_purge() {
     );
     assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 0);
 }
+
+#[tokio::test]
+async fn supplied_malformed_proofs_return_400_and_retry_past_300s_with_prior_created_at_succeeds() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    let _env = ENV_LOCK.lock().await;
+    let s = sequencer().await;
+    let lab = labyrinth(&s).await;
+    let fixture = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, Some([0x51; 32]))
+        .await
+        .unwrap();
+    let sender = device(&fixture.sender_did, fixture.sender_device_id).await;
+    let chat_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
+    let key_proof = signed_device_record_car(&sender, &chat_key);
+    let op_id = [0xEE; 16];
+    let reason = format!("deleteAccountData:{}", hex::encode(op_id));
+    let created_at = Utc::now() - chrono::TimeDelta::seconds(600);
+    let rev_proof = signed_device_revocation_car(
+        &sender,
+        &sender.device_id.to_string(),
+        &chat_key,
+        &reason,
+        created_at,
+    );
+
+    // Caller-supplied malformed CBOR/CAR proof returns 400 InvalidRequest, not 503.
+    let bad_key = SignedDeletion::new_with_proofs(
+        &sender,
+        &chat_key,
+        [0xE1; 16],
+        Some(URL_SAFE_NO_PAD.encode(b"not-a-car-archive")),
+        None,
+    );
+    let (status, body) = http::send(lab.clone(), bad_key.request(&sender)).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+        "malformed keyProof must be 400 InvalidRequest: {body}"
+    );
+    let bad_rev = SignedDeletion::new_with_proofs(
+        &sender,
+        &chat_key,
+        [0xE2; 16],
+        Some(URL_SAFE_NO_PAD.encode(&key_proof)),
+        Some(URL_SAFE_NO_PAD.encode(b"not-a-car-archive")),
+    );
+    let (status, body) = http::send(lab.clone(), bad_rev.request(&sender)).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+        "malformed revocationProof must be 400 InvalidRequest: {body}"
+    );
+    assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 0);
+
+    // A deviceRevocation createdAt > signedAt is rejected as DeviceRevoked.
+    let future_rev_car = signed_device_revocation_car(
+        &sender,
+        &sender.device_id.to_string(),
+        &chat_key,
+        &reason,
+        Utc::now() + chrono::TimeDelta::seconds(60),
+    );
+    let future_rev = SignedDeletion::new_with_proofs(
+        &sender,
+        &chat_key,
+        op_id,
+        Some(URL_SAFE_NO_PAD.encode(&key_proof)),
+        Some(URL_SAFE_NO_PAD.encode(&future_rev_car)),
+    );
+    let (status, body) = http::send(lab.clone(), future_rev.request(&sender)).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("DeviceRevoked")),
+        "postdated createdAt must be rejected: {body}"
+    );
+    assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 0);
+
+    // A retry >300s later reuses the earlier createdAt (-600s) + same operationId with a fresh signedAt.
+    let retried = SignedDeletion::new_with_proofs(
+        &sender,
+        &chat_key,
+        op_id,
+        Some(URL_SAFE_NO_PAD.encode(&key_proof)),
+        Some(URL_SAFE_NO_PAD.encode(&rev_proof)),
+    );
+    let (status, body) = http::send(lab, retried.request(&sender)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 1);
+}

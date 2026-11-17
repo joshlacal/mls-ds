@@ -71,6 +71,10 @@ impl AccountDeletionRelay {
                 bytes.extend_from_slice(&(revocation_proof.len() as u32).to_be_bytes());
                 bytes.extend_from_slice(revocation_proof);
             }
+            if let Some(payload_bytes) = &evidence.actor_write.payload_bytes {
+                bytes.extend_from_slice(&(payload_bytes.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(payload_bytes);
+            }
         }
         bytes
     }
@@ -201,6 +205,9 @@ pub(crate) async fn accept_account_deletion_relay(
     // The device's evidence is the clients' to verify: here only its shape, and
     // that it was signed within the write window of the home's deletion instant.
     if let Some(evidence) = &relay.evidence {
+        if evidence.actor_write.payload_bytes.is_none() {
+            return Err(invalid("actorWrite.payloadBytes is required"));
+        }
         let signed_at = evidence
             .check_shape()
             .and_then(|()| evidence.signed_at())

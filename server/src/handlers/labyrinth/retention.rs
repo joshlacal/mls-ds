@@ -171,6 +171,7 @@ pub async fn delete_account_data(
                 }
             };
             let device_id = adm.device_id.to_string();
+            let has_supplied_key_proof = evidence.key_proof.is_some();
             let proof_result = match evidence.key_proof.take() {
                 Some(proof) => verify_supplied_chat_device_key_proof(
                     resolver,
@@ -195,6 +196,13 @@ pub async fn delete_account_data(
                     {
                         return Ok(response);
                     }
+                    if has_supplied_key_proof {
+                        if let SpaceRelayError::InvalidRequest(msg)
+                        | SpaceRelayError::UpstreamError(msg) = error
+                        {
+                            return Err(LabyrinthError::invalid(msg));
+                        }
+                    }
                     return Err(key_proof_unavailable(error));
                 }
             };
@@ -202,6 +210,7 @@ pub async fn delete_account_data(
             let expected_operation_id =
                 evidence.operation_id().map_err(LabyrinthError::invalid)?;
             let expected_signed_at = evidence.signed_at().map_err(LabyrinthError::invalid)?;
+            let has_supplied_revocation_proof = evidence.revocation_proof.is_some();
             let revocation_result = match evidence.revocation_proof.take() {
                 Some(proof) => verify_supplied_chat_device_revocation_proof(
                     resolver,
@@ -240,6 +249,13 @@ pub async fn delete_account_data(
                     if let Some(response) = auth::completed_write_for_admission(&pool, &adm).await?
                     {
                         return Ok(response);
+                    }
+                    if has_supplied_revocation_proof {
+                        if let SpaceRelayError::InvalidRequest(msg)
+                        | SpaceRelayError::UpstreamError(msg) = error
+                        {
+                            return Err(LabyrinthError::invalid(msg));
+                        }
                     }
                     return Err(key_proof_unavailable(error));
                 }

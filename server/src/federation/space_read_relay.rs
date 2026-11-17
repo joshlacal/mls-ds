@@ -1398,7 +1398,7 @@ pub fn verify_chat_device_key_proof(
         "chat device record",
     )?;
     if record.record_type != "blue.catbird.chat.device"
-        || record.algorithm != "ed25519"
+        || !record.algorithm.eq_ignore_ascii_case("ed25519")
         || record.mls_signature_public_key.as_slice() != signing_key.as_slice()
         || chrono::DateTime::parse_from_rfc3339(&record.created_at).is_err()
     {
@@ -1459,9 +1459,9 @@ pub fn verify_chat_device_revocation_proof(
     }
     let created_at = chrono::DateTime::parse_from_rfc3339(&record.created_at)
         .map_err(|_| SpaceRelayError::DeviceRevoked("invalid deviceRevocation createdAt".into()))?;
-    if created_at.with_timezone(&chrono::Utc) != expected_signed_at {
+    if created_at.with_timezone(&chrono::Utc) > expected_signed_at {
         return Err(SpaceRelayError::DeviceRevoked(
-            "deviceRevocation createdAt does not match deletion signedAt".into(),
+            "deviceRevocation createdAt postdates deletion signedAt".into(),
         ));
     }
     let sig_64: [u8; 64] =
@@ -2386,6 +2386,33 @@ mod tests {
                 &ed_pk,
                 &[0x9B; 16],
                 signed_at,
+                &vk
+            ),
+            Err(SpaceRelayError::DeviceRevoked(_))
+        ));
+
+        // Retry with write signedAt > record createdAt succeeds when operationId matches;
+        // createdAt postdating write signedAt is rejected.
+        let later_retry = signed_at + chrono::TimeDelta::seconds(600);
+        verify_chat_device_revocation_proof(
+            &valid,
+            did,
+            device_id,
+            &ed_pk,
+            &op_id,
+            later_retry,
+            &vk,
+        )
+        .expect("retry after 300s skew window with prior createdAt succeeds");
+        let earlier_write = signed_at - chrono::TimeDelta::seconds(1);
+        assert!(matches!(
+            verify_chat_device_revocation_proof(
+                &valid,
+                did,
+                device_id,
+                &ed_pk,
+                &op_id,
+                earlier_write,
                 &vk
             ),
             Err(SpaceRelayError::DeviceRevoked(_))
