@@ -74,7 +74,22 @@ async fn device(did: &str, device_id: Uuid) -> http::Device {
         signing,
         jwk,
     };
-    http::cache_device_did(&device).await;
+    catbird_server::auth::cache_test_did_document(catbird_server::auth::DidDocument {
+        id: did.to_owned(),
+        verification_method: vec![catbird_server::auth::VerificationMethod {
+            id: format!("{did}#atproto"),
+            key_type: "Multikey".to_owned(),
+            controller: did.to_owned(),
+            public_key_jwk: None,
+            public_key_multibase: Some(
+                catbird_server::identity::did_doc::encode_p256_multikey(
+                    device.signing.verifying_key(),
+                ),
+            ),
+        }],
+        service: Some(Vec::new()),
+    })
+    .await;
     device
 }
 
@@ -758,10 +773,14 @@ async fn deletion_fetches_a_missing_device_proof_before_purge_and_replays_withou
         id: did.clone(),
         verification_method: vec![catbird_server::auth::VerificationMethod {
             id: format!("{did}#atproto"),
-            key_type: "JsonWebKey2020".to_owned(),
+            key_type: "Multikey".to_owned(),
             controller: did.clone(),
-            public_key_jwk: Some(serde_json::from_value(sender.jwk.clone()).unwrap()),
-            public_key_multibase: None,
+            public_key_jwk: None,
+            public_key_multibase: Some(
+                catbird_server::identity::did_doc::encode_p256_multikey(
+                    sender.signing.verifying_key(),
+                ),
+            ),
         }],
         service: Some(vec![catbird_server::auth::Service {
             id: "#atproto_pds".to_owned(),
@@ -837,13 +856,14 @@ async fn deletion_fetches_a_missing_device_proof_before_purge_and_replays_withou
     assert_eq!((status, &body), (StatusCode::OK, &json!({})));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     let member = device(&fixture.recipient_did, fixture.recipient_device_id).await;
-    let (_, page) = read(
+    let (read_status, page) = read(
         &s,
         &member,
         "blue.catbird.chat.getEntries",
         fixture.conversation_id,
     )
     .await;
+    assert_eq!(read_status, StatusCode::OK, "{page}");
     let entry = page["entries"]
         .as_array()
         .unwrap()

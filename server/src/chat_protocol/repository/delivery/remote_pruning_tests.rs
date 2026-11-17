@@ -564,6 +564,48 @@ async fn remote_group_transport_waits_for_local_acks_as_home() {
         .await
         .unwrap();
     }
+    sqlx::query(
+        "UPDATE chat.devices d SET dormant_at = $2 \
+          WHERE EXISTS ( \
+            SELECT 1 FROM chat.group_transport_entry_recipients r \
+             WHERE r.conversation_id = $1 AND r.seq = 4 \
+               AND r.user_did <> $3 \
+               AND r.user_did = d.user_did AND r.device_id = d.device_id)",
+    )
+    .bind(fixture.conversation_id)
+    .bind(now)
+    .bind(&fixture.sender_did)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut dormant_tx = pool.begin().await.unwrap();
+    assert!(
+        prune_acknowledged_transport_application_payloads(
+            &mut dormant_tx,
+            fixture.conversation_id,
+            0,
+            4,
+            now + chrono::Duration::hours(73),
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "a dormant non-sender mirror participant must not become a vacuous quorum"
+    );
+    dormant_tx.commit().await.unwrap();
+    sqlx::query(
+        "UPDATE chat.devices d SET dormant_at = NULL \
+          WHERE EXISTS ( \
+            SELECT 1 FROM chat.group_transport_entry_recipients r \
+             WHERE r.conversation_id = $1 AND r.seq = 4 \
+               AND r.user_did <> $2 \
+               AND r.user_did = d.user_did AND r.device_id = d.device_id)",
+    )
+    .bind(fixture.conversation_id)
+    .bind(&fixture.sender_did)
+    .execute(&pool)
+    .await
+    .unwrap();
     for (index, (did, device)) in audience.iter().enumerate() {
         let mut tx = pool.begin().await.unwrap();
         sqlx::query(
@@ -588,7 +630,7 @@ async fn remote_group_transport_waits_for_local_acks_as_home() {
                     fixture.conversation_id,
                     0,
                     4,
-                    now,
+                    now + chrono::Duration::hours(73),
                 ),
             )
             .await
@@ -618,7 +660,7 @@ async fn remote_group_transport_waits_for_local_acks_as_home() {
             fixture.conversation_id,
             0,
             4,
-            now,
+            now + chrono::Duration::hours(73),
         )
         .await
         .unwrap();

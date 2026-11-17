@@ -166,7 +166,7 @@ pub async fn put(
         )?;
         if existing.mechanism == mechanism
             && constant_time_equal(&existing.fetch_verifier, verifier)
-            && constant_time_equal(existing_share.as_ref(), share)
+            && constant_time_equal(&existing_share, share)
         {
             return Ok(existing.created_at);
         }

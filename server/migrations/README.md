@@ -5,9 +5,9 @@ SQL migrations for `catbird-server`, applied in version order by SQLx (`sqlx::mi
 ## Status
 
 - The R0 seal (bookmark `clean-slate-2026-10-31`, mls-ds `d5f6993c`) has 129 migrations, ending at `20261102000003_conversation_close_terminal_entries.sql`.
-- The unsealed Task 4 R1 provisional commits add fourteen, for 143: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010`, `000011` and `000012`. The seed-2323 fix adds `20261107000001`, for 144. The Round 4 lifecycle relay adds `20261113000001`, for 145. Wave 2 multi-device approval and Nov-12 Spaces adds `20261114000001`, for 146. Wave 2 R2 archive watermark adds `20261115000001`, for 147. Their contracts are in the sections below.
+- The unsealed Task 4 R1 provisional commits add fourteen, for 143: `20261103000001` through `20261103000004`, `20261103000010`, and `20261104000001`, `000002`, `000005`, `000006`, `000007`, `000008`, `000010`, `000011` and `000012`. The seed-2323 fix adds `20261107000001`, for 144. The Round 4 lifecycle relay adds `20261113000001`, for 145. Wave 2 multi-device approval and Nov-12 Spaces adds `20261114000001`, for 146. Wave 2 R2 archive watermark adds `20261115000001`, for 147. The Dec 1 pending-device promotion audit, erasable recovery shares and account-deletion retry binding add `20261116000003`, `20261116000004` and `20261116000005`, for 150. Their contracts are in the sections below.
 - **Held.** These migrations have run only against local disposable and guarded test databases. Do not apply them to a production database until R1 is sealed and the production migration is separately authorized. Server startup applies pending migrations, so the hold also covers starting this tree against a production database.
-- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, accepts only sealed catalogs: the frozen 75- and 84-migration seals, and the current clean-slate seal of 147 migrations ending at `20261115000001` (98 `chat` tables and one view). Reseal it after any migration change; the command is in [../README.md](../README.md#tests).
+- `../scripts/assert_clean_chat_empty.sql`, run by the `clean_chat_empty_preflight` test, still contains the generated 147-migration seal ending at `20261115000001`. The three Dec 1 migrations remain unsealed until the source is final. Run the database-backed generator documented in [../README.md](../README.md#tests); never hand-edit checksums or guess the resulting `chat` table/view catalog.
 
 ## Clean-Chat Operation Claim Rollout
 
@@ -732,6 +732,26 @@ canonical opening frame. The initial entry retains both its genuine `I13`
 `sequencerReceipt` and tagged `publicationReceipt`, including on local and
 federated reads. The dedicated receipt signer is required; the coordinator's
 request-outcome signer and service-auth key are not substitutes.
+
+## Dec 1 device promotion, recovery shares and deletion retries
+
+`20261116000003_pending_device_promotion_audit.sql` adds immutable
+`chat.device_promotion_audit` evidence, records every newly pending device and
+backfills a fresh notice timestamp for existing pending devices before they can
+be recovery-promoted.
+
+`20261116000004_recovery_shares.sql` adds encrypted, erasable
+`labyrinth.recovery_shares` rows and immutable recovery-share events. Erasure
+clears every secret-bearing column while retaining a non-reversible tombstone.
+
+`20261116000005_account_deletion_retry_binding.sql` binds a consumed account
+deletion service token to the same device-signed deletion intent on retry. Its
+optional repository key proof stays outside that retry binding so a caller can
+provide the proof after a retryable lookup failure.
+
+All three remain covered by the migration hold above. Once their source is
+final, regenerate the clean-slate seal against a disposable database; the
+generator, not this prose, supplies their SQLx checksums and exact relation set.
 
 ## Scoped simulation identity caches
 

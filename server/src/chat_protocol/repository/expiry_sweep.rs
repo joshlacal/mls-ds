@@ -698,43 +698,30 @@ pub async fn delete_expired_remote_lifecycle_state(
     Ok(bindings + replays)
 }
 
-/// Hard ceiling sweep (`CHAT_APPLICATION_PAYLOAD_TTL_HOURS`, default `72h`): prune any
-/// unpruned `applicationEntry` ciphertext older than the configured TTL while keeping
-/// contiguous `seq` skeletons, `sequencer_receipt_bytes`, and all `#commitEntry` /
-/// control ratchet entries intact (`#directRequestEntry` openings keep their 30-day
-/// ceiling). A sequencer queues the same signed entries-pruned notices as an ACK
-/// prune in the same transaction; without its S2S signer it prunes nothing it would
-/// have to notify.
+/// Hard ceiling sweep (`CHAT_APPLICATION_PAYLOAD_TTL_HOURS`, default `720h`):
+/// prune application ciphertext at 30 days while archive-content qualification
+/// remains fail-closed, keeping contiguous `seq` skeletons,
+/// `sequencer_receipt_bytes`, and all `#commitEntry` / control ratchet entries
+/// intact (`#directRequestEntry` openings keep the same 30-day ceiling).
+/// A sequencer queues the same signed entries-pruned notices as an ACK prune in
+/// the same transaction; without its S2S signer it prunes nothing it must notify.
 pub async fn prune_expired_application_payloads(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> Result<u64, ExpirySweepError> {
     let app_ttl_hours = positive_hours_env("CHAT_APPLICATION_PAYLOAD_TTL_HOURS", 720);
-    let archived_ttl_hours =
-        positive_hours_env("CHAT_ARCHIVED_APPLICATION_PAYLOAD_TTL_HOURS", 72).min(app_ttl_hours);
     let app_cutoff = now - chrono::Duration::hours(app_ttl_hours);
-    let archived_cutoff = now - chrono::Duration::hours(archived_ttl_hours);
     let opening_cutoff = now - chrono::Duration::days(30);
     let targets: Vec<(Uuid, i64, i64)> = sqlx::query_as(
         "SELECT e.conversation_id, e.generation, e.seq \
            FROM chat.entries e \
           WHERE e.entry_kind = 'blue.catbird.chat.defs#applicationEntry' \
             AND e.payload_pruned_at IS NULL \
-            AND (e.received_at <= $1 \
-                 OR (e.received_at <= $2 \
-                     AND EXISTS ( \
-                         SELECT 1 \
-                           FROM chat.conversation_spaces cs \
-                          WHERE cs.conversation_id = e.conversation_id \
-                            AND cs.generation = e.generation \
-                            AND cs.deleted_at IS NULL \
-                            AND cs.archived_through_seq >= e.seq \
-                     ))) \
+            AND e.received_at <= $1 \
           ORDER BY e.received_at ASC, e.conversation_id ASC, e.seq ASC \
           LIMIT 256",
     )
     .bind(app_cutoff)
-    .bind(archived_cutoff)
     .fetch_all(pool)
     .await?;
     let mut batches: std::collections::BTreeMap<(Uuid, i64), Vec<i64>> = Default::default();
@@ -855,9 +842,8 @@ pub async fn prune_expired_application_payloads(
     .await?;
     tx.commit().await?;
 
-    // O7: openings follow their 30-day ceiling on both homes, and a transport-only
-    // home also drops an opening no device can import or read any more. They
-    // are not application payloads and are not counted here.
+    // O7: openings follow their 30-day ceiling on both homes. They are not
+    // application payloads and are not counted here.
     super::direct_request_opening::prune_expired_coordinator_openings(pool, opening_cutoff, now)
         .await?;
     super::direct_request_opening::prune_due_transport_openings(pool, opening_cutoff, now).await?;

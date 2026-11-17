@@ -102,7 +102,7 @@ PostgreSQL 16 on `127.0.0.1:5432`, with a role that can create databases. Each t
 | Disposable full-catalog tests (lib and most integration targets) | `TEST_DATABASE_URL=postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722` and `CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed` |
 | Direct-request suites sharing the reviewed manifest in `tests/common/direct_request_migrations.rs` | `REQUEST_TEST_DATABASE_URL=postgresql://127.0.0.1:5432/catbird_direct_requests_test_20260919` |
 
-Feature gates: `test-support` is required by the fixture binaries (`federation_fixture`, `encrypted_request_server_fixture`, `clean_slate_federation_fixture`) and by targets such as `federation_group_and_space_relay`, `chat_protocol_federation_routing`, `chat_protocol_federation_router`, `chat_protocol_federation_outbox_retry`, `chat_protocol_remote_prefix_bootstrap`, `federation_fixture_cli` and `federation_fixture_auth_profile`. `deterministic_server_clock_test` requires `sim`.
+Feature gates: `test-support` is required by the fixture binaries (`federation_fixture`, `encrypted_request_server_fixture`, `clean_slate_federation_fixture`) and by targets such as `federation_group_and_space_relay`, `chat_protocol_federation_routing`, `chat_protocol_federation_router`, `chat_protocol_federation_outbox_retry`, `chat_protocol_remote_prefix_bootstrap`, `federation_fixture_cli`, `federation_fixture_auth_profile`, `w2d_multidevice_pruning_and_spaces_nov12`, `entry_payload_pruning_and_contiguity`, `labyrinth_recovery_shares` and `labyrinth_account_deletion`. `deterministic_server_clock_test` requires `sim`.
 
 ```sh
 cargo fmt --check
@@ -113,11 +113,21 @@ cargo test --features sim --test deterministic_server_clock_test
 cargo test --test clean_chat_empty_preflight
 ```
 
-`clean_chat_empty_preflight` runs `scripts/assert_clean_chat_empty.sql`, which accepts only a sealed migration catalog. The current seal is 147 migrations ending at `20261115000001`. After a migration change, reseal it from `server/`:
+`clean_chat_empty_preflight` runs `scripts/assert_clean_chat_empty.sql`, which accepts only a sealed migration catalog. The checked-in generated seal recognizes 147 migrations ending at `20261115000001`; the source catalog also contains the three unsealed `20261116000003`, `20261116000004` and `20261116000005` migrations. Never hand-edit the generated relation or checksum arrays. After the migration source is final, set `PRIVATE_TEST_DATABASE_URL` to a PostgreSQL 16 maintenance URL of the form `postgresql://<CREATEDB-role>@127.0.0.1:<non-5432-port>/postgres`, then run from `server/`:
 
 ```sh
-CLEAN_CHAT_PREFLIGHT_RESEAL=write cargo test --offline --test clean_chat_empty_preflight -- --ignored --exact reseal_clean_slate_catalog
+TEST_DATABASE_URL="$PRIVATE_TEST_DATABASE_URL" \
+CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
+CLEAN_CHAT_PREFLIGHT_RESEAL=write \
+rustup run 1.99.1 cargo test --locked --offline --test clean_chat_empty_preflight \
+  -- --ignored --exact reseal_clean_slate_catalog
+
+TEST_DATABASE_URL="$PRIVATE_TEST_DATABASE_URL" \
+CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
+rustup run 1.99.1 cargo test --locked --offline --test clean_chat_empty_preflight
 ```
+
+The generator migrates a disposable database and derives the exact SQLx checksums and `chat` relation catalog from it. Review only that generated block before running the full suite; the harness rejects port 5432 for private-cluster URLs and any role that cannot create disposable databases.
 
 `../scripts/federation-hostile-test-gate.sh` replaces the deleted `federation_hostile_peers` suite. It runs the current hostile-peer regressions (group relay security, peer policy, untrusted JWT issuers, hostile bootstrap admission, forged or mismatched receipts, untrusted-peer routing) and a lib check, and refuses to start without the database environment above.
 
@@ -139,7 +149,7 @@ CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test --locked --manifest-path e2e-tests/C
 
 `e2e-tests/federation-two-node-e2e.sh` is the shorter Compose readiness, peer-authentication and receipt-configuration smoke. The local client gateway is documented in [../e2e-tests/CLIENT_RUNTIME_GATEWAY.md](../e2e-tests/CLIENT_RUNTIME_GATEWAY.md).
 
-CI (`.github/workflows/mls-deploy.yml`) uses PostgreSQL 16 and runs a narrower set than the commands above: `--bins` unit tests, `chat_protocol_signing_domain_vectors`, `chat_protocol_route_inventory`, `federation_fixture_auth_profile` and `chat_protocol_generated_transition_compat`, the e2e `federation_two_node` lifecycle, the ignored `db_tests` cases, three handler regressions, `labyrinth_directory`, `labyrinth_retention` and `labyrinth_account_deletion`, and `deterministic_server_clock_test` (`sim`), all required. `scripts/test_ops_safety.py` checks the database reset guard, migration-log redaction, the test targets, features and filters of the workflow and hostile gate, and both federation Compose fixtures.
+CI (`.github/workflows/mls-deploy.yml`) uses PostgreSQL 16 and runs a narrower set than the commands above: `--bins` unit tests, `chat_protocol_signing_domain_vectors`, `chat_protocol_route_inventory`, `federation_fixture_auth_profile` and `chat_protocol_generated_transition_compat`, the e2e `federation_two_node` lifecycle, the ignored `db_tests` cases, three handler regressions, `w2d_multidevice_pruning_and_spaces_nov12`, `entry_payload_pruning_and_contiguity`, `labyrinth_directory`, `labyrinth_retention`, `labyrinth_recovery_shares` and `labyrinth_account_deletion`, and `deterministic_server_clock_test` (`sim`), all required. The database suites use `test-support`, a PostgreSQL role allowed to set `session_replication_role`, disposable databases, and one test thread where process-wide runtime settings vary. `scripts/test_ops_safety.py` checks the database reset guard, migration-log redaction, the required Dec 1 suites, test features and filters, the single sibling-revision pin source, and both federation Compose fixtures.
 
 ## Make targets
 

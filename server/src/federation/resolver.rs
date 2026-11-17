@@ -1420,12 +1420,18 @@ impl DsResolver {
         did: &str,
     ) -> Result<Option<atproto_spaces::tokens::SpaceVerifyingKey>, FederationError> {
         let doc = self.fetch_did_document(did).await?;
-        Ok(serde_json::to_vec(&doc)
-            .ok()
-            .and_then(|bytes| {
-                atproto_spaces::did_resolver::DidDocument::parse_json(did, &bytes).ok()
-            })
-            .and_then(|parsed| parsed.atproto_key))
+        let bytes = serde_json::to_vec(&doc).map_err(|error| {
+            FederationError::Unsupported(format!(
+                "failed to serialize resolved DID document: {error}"
+            ))
+        })?;
+        let parsed = atproto_spaces::did_resolver::DidDocument::parse_json(did, &bytes)
+            .map_err(|error| {
+                FederationError::Unsupported(format!(
+                    "resolved DID document has an invalid #atproto key: {error}"
+                ))
+            })?;
+        Ok(parsed.atproto_key)
     }
 
     /// Fetch and parse a DID document (did:web or did:plc), with SSRF

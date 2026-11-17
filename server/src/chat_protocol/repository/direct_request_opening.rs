@@ -333,13 +333,26 @@ async fn transport_opening_supported(connection: &mut PgConnection) -> Result<bo
 }
 
 /// The transport-home audience rule for `e`, a transport entry row (`$1` is now):
-/// its opening is unpruned and no local active, non-dormant device that can still
-/// read it, a recipient or sender of an accepted or still importable pending
-/// inbox row, is behind its seq. An opening no device can import or read any
-/// more has an empty audience, so it is ready. No device at another home is
-/// waited for.
+/// at least one local active, non-dormant sender or recipient can still read the
+/// opening, and none in that accepted/importable local inbox audience is behind
+/// its seq. Expired or all-dormant local audiences are retained until the ceiling.
 const TRANSPORT_OPENING_READY: &str = "e.opening_request_id IS NOT NULL \
     AND e.payload_pruned_at IS NULL \
+    AND EXISTS ( \
+        SELECT 1 \
+          FROM (SELECT recipient_did AS user_did, recipient_device_id AS device_id \
+                  FROM chat.direct_request_transport_inbox i \
+                 WHERE i.conversation_id = e.conversation_id \
+                   AND i.request_id = e.opening_request_id \
+                   AND (i.status = 'accepted' OR (i.status = 'pending' AND i.import_until > $1)) \
+                UNION \
+                SELECT sender_did, sender_device_id \
+                  FROM chat.direct_request_transport_inbox i \
+                 WHERE i.conversation_id = e.conversation_id \
+                   AND i.request_id = e.opening_request_id \
+                   AND (i.status = 'accepted' OR (i.status = 'pending' AND i.import_until > $1))) audience \
+          JOIN chat.devices d USING (user_did, device_id) \
+         WHERE d.status = 'active' AND d.dormant_at IS NULL) \
     AND NOT EXISTS ( \
         SELECT 1 \
           FROM (SELECT recipient_did AS user_did, recipient_device_id AS device_id \
@@ -374,12 +387,14 @@ pub(crate) async fn prune_acknowledged_transport_openings(
     }
     let ready: Vec<(i64, Uuid)> = sqlx::query_as(&format!(
         "SELECT e.seq, e.opening_request_id FROM chat.direct_request_transport_entries e \
-          WHERE e.conversation_id = $2 AND e.seq <= $3 AND {TRANSPORT_OPENING_READY} \
+          WHERE e.conversation_id = $2 AND e.seq <= $3 \
+            AND e.created_at <= $4 AND {TRANSPORT_OPENING_READY} \
           ORDER BY e.seq"
     ))
     .bind(at)
     .bind(conversation_id)
     .bind(acked_through_seq)
+    .bind(at - chrono::Duration::hours(72))
     .fetch_all(&mut **tx)
     .await?;
     let mut pruned = Vec::with_capacity(ready.len());
@@ -392,9 +407,9 @@ pub(crate) async fn prune_acknowledged_transport_openings(
 }
 
 /// The periodic sweep of a transport-only home: every opening the ACK rule
-/// ([`TRANSPORT_OPENING_READY`]) allows, which includes one whose import window
-/// closed unaccepted, and every opening stored before `cutoff` (the 30-day
-/// ceiling), acknowledged or not. Returns how many it pruned.
+/// ([`TRANSPORT_OPENING_READY`]) allows after the 72-hour minimum, and every
+/// opening stored before `cutoff` (the 30-day ceiling), acknowledged or not.
+/// Returns how many it pruned.
 pub(crate) async fn prune_due_transport_openings(
     pool: &PgPool,
     cutoff: DateTime<Utc>,
@@ -406,7 +421,7 @@ pub(crate) async fn prune_due_transport_openings(
     let due: Vec<(Uuid, Uuid)> = sqlx::query_as(&format!(
         "SELECT e.conversation_id, e.opening_request_id \
            FROM chat.direct_request_transport_entries e \
-          WHERE ({TRANSPORT_OPENING_READY}) \
+          WHERE (({TRANSPORT_OPENING_READY}) AND e.created_at <= $3) \
              OR (e.opening_request_id IS NOT NULL AND e.payload_pruned_at IS NULL \
                  AND e.created_at <= $2) \
           ORDER BY e.created_at, e.conversation_id, e.seq \
@@ -414,6 +429,7 @@ pub(crate) async fn prune_due_transport_openings(
     ))
     .bind(now)
     .bind(cutoff)
+    .bind(now - chrono::Duration::hours(72))
     .fetch_all(pool)
     .await?;
     let mut pruned = 0;

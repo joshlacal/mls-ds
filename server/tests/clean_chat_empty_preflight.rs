@@ -131,9 +131,8 @@ async fn setup_post_c855_db() -> (PgPool, DisposableDatabase) {
 async fn setup_post_migration_db() -> (PgPool, DisposableDatabase) {
     let (pool, database) = setup_db(sqlx::migrate!("./migrations")).await;
     run_preflight(&pool).await.expect(
-        "pristine clean-slate database must pass the preflight; after a migration change re-seal \
-         with `CLEAN_CHAT_PREFLIGHT_RESEAL=write cargo test --offline --test \
-         clean_chat_empty_preflight -- --ignored --exact reseal_clean_slate_catalog`",
+        "pristine clean-slate database must pass the preflight; after a migration change run the \
+         database-backed reseal command documented on reseal_clean_slate_catalog",
     );
     (pool, database)
 }
@@ -1511,14 +1510,16 @@ fn sealed_array(name: &str, sql_type: &str, items: &[String]) -> String {
 }
 
 /// Re-seal tool for the clean-slate mode of `scripts/assert_clean_chat_empty.sql`. After any
-/// migration change run, from `server/` with this suite's environment:
+/// migration change, run from `server/` against a private loopback PostgreSQL 16 cluster on an
+/// explicit non-5432 port, using `/postgres` and a role with `CREATEDB`:
 ///
-/// `CLEAN_CHAT_PREFLIGHT_RESEAL=write cargo test --offline --test clean_chat_empty_preflight -- --ignored --exact reseal_clean_slate_catalog`
+/// `TEST_DATABASE_URL="$PRIVATE_TEST_DATABASE_URL" CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed CLEAN_CHAT_PREFLIGHT_RESEAL=write rustup run 1.99.1 cargo test --locked --offline --test clean_chat_empty_preflight -- --ignored --exact reseal_clean_slate_catalog`
 ///
 /// It rewrites only the GENERATED CLEAN-SLATE SEAL block: every migration after the frozen
 /// post-c855 seal (version, description, sha384 as sqlx records them) plus the exact chat tables
-/// and views of a freshly migrated database. Review the diff, then re-run this suite. Without
-/// `CLEAN_CHAT_PREFLIGHT_RESEAL=write` it only checks that the sealed block is current.
+/// and views of a freshly migrated database. Review the diff, then re-run this suite with the same
+/// database environment and without `CLEAN_CHAT_PREFLIGHT_RESEAL`. Without
+/// `CLEAN_CHAT_PREFLIGHT_RESEAL=write` this ignored test only checks that the sealed block is current.
 #[tokio::test]
 #[ignore = "re-seal tool: run explicitly after a migration change"]
 async fn reseal_clean_slate_catalog() {

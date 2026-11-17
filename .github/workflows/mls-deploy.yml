@@ -35,6 +35,11 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/mls-server
+  # Single source for every sibling checkout below. Repin these together when
+  # the candidate sibling commits are final.
+  CATBIRD_ATPROTO_REV: "1fc6dfcc76362ab5c7a52044056a46ea390d7d00"
+  CATBIRD_MLS_REV: "7afcc0ef1f0bdd504792ac873cad65130fbe3547"
+  LABYRINTH_REV: "a72426ab80608cd14da0cbe274b7a54846f1d3ed"
 
 jobs:
   test:
@@ -81,11 +86,11 @@ jobs:
         # catbird-mls and ../BIRDaemon (see "Run two-node federation lifecycle").
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach 49c6fdb00671ffe96e58e3b5ebec7d5e6532f51f
+          git -C ../catbird-atproto checkout --detach "$CATBIRD_ATPROTO_REV"
           git clone --filter=blob:none https://github.com/joshlacal/catbird-mls.git ../catbird-mls
-          git -C ../catbird-mls checkout --detach 085e8a7435c2b1c61189040e626b680f7572559f
+          git -C ../catbird-mls checkout --detach "$CATBIRD_MLS_REV"
           git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
-          git -C ../labyrinth checkout --detach f771b9c26558ce6a39ed87c657dc8bd6e331d94a
+          git -C ../labyrinth checkout --detach "$LABYRINTH_REV"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2026-03-27)
@@ -318,9 +323,9 @@ jobs:
       - name: Clone pinned sibling repos
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach 49c6fdb00671ffe96e58e3b5ebec7d5e6532f51f
+          git -C ../catbird-atproto checkout --detach "$CATBIRD_ATPROTO_REV"
           git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
-          git -C ../labyrinth checkout --detach f771b9c26558ce6a39ed87c657dc8bd6e331d94a
+          git -C ../labyrinth checkout --detach "$LABYRINTH_REV"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2026-03-27)
@@ -387,6 +392,24 @@ jobs:
           # frozen Swift serializer products run in the required pure target.
           cargo test --locked --no-default-features --features test-support --test chat_protocol_create_conversation_handlers generated_transition_handlers_preserve_raw_persistence_replay_and_canonical_reads -- --include-ignored --exact --test-threads=1
 
+      - name: Run pruning and Nov-12 Spaces regressions
+        working-directory: ./server
+        env:
+          DATABASE_URL: postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722
+          TEST_DATABASE_URL: postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722
+          CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: "handlers-and-legacy-apis-sealed"
+          RUST_LOG: info
+          PGUSER: anonymous
+        # Both targets mint fully migrated disposable databases. The fixture
+        # seed path sets session_replication_role, so it needs the service
+        # superuser selected by PGUSER. Serialize each binary's tests because
+        # they deliberately vary process-wide service identity settings.
+        run: |
+          cargo test --locked --features test-support \
+            --test w2d_multidevice_pruning_and_spaces_nov12 \
+            --test entry_payload_pruning_and_contiguity \
+            -- --test-threads=1
+
       - name: Run Labyrinth integration tests
         working-directory: ./server
         env:
@@ -397,7 +420,7 @@ jobs:
           PGUSER: anonymous
         # Each case mints and drops its own disposable database from the
         # reviewed TEST_DATABASE_URL, so it needs this job's trust-auth
-        # service. The directory and retention suites seed chat fixtures under
+        # service. The suites seed chat fixtures under
         # `session_replication_role = replica` (tests/common/labyrinth_harness.rs),
         # so they need a role allowed to set that parameter: a superuser, or a
         # role granted `SET ON PARAMETER session_replication_role`. The
@@ -406,11 +429,11 @@ jobs:
         # still connect as the `runner` role, which is not a superuser and
         # has no such grant.
         # The targets require the test-support feature. SERVICE_DID stays unset,
-        # as in the local gate: the harness and the account-deletion suite set
-        # their own. They run after the handler regressions so a failure here
-        # does not skip them.
+        # as in the local gate: the harness and account-deletion suite set
+        # their own. Serialize tests because the harness varies process-wide
+        # cutover configuration while constructing runtimes.
         run: |
-          cargo test --locked --features test-support --test labyrinth_directory --test labyrinth_retention --test labyrinth_account_deletion
+          cargo test --locked --features test-support --test labyrinth_directory --test labyrinth_retention --test labyrinth_recovery_shares --test labyrinth_account_deletion -- --test-threads=1
 
       - name: Run deterministic server clock test
         working-directory: ./server
@@ -460,9 +483,9 @@ jobs:
       - name: Clone pinned sibling repos
         run: |
           git clone --filter=blob:none https://github.com/joshlacal/catbird-atproto.git ../catbird-atproto
-          git -C ../catbird-atproto checkout --detach 49c6fdb00671ffe96e58e3b5ebec7d5e6532f51f
+          git -C ../catbird-atproto checkout --detach "$CATBIRD_ATPROTO_REV"
           git clone --filter=blob:none https://github.com/joshlacal/labyrinth.git ../labyrinth
-          git -C ../labyrinth checkout --detach f771b9c26558ce6a39ed87c657dc8bd6e331d94a
+          git -C ../labyrinth checkout --detach "$LABYRINTH_REV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0

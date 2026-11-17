@@ -100,6 +100,7 @@ async fn ack(pool: &PgPool, conversation_id: Uuid, did: &str, device: Uuid) {
     .unwrap();
 }
 
+
 async fn rejected(pool: &PgPool, sql: &str, conversation_id: Uuid) -> bool {
     sqlx::query(sql)
         .bind(conversation_id)
@@ -142,6 +143,7 @@ async fn coordinator_opening_waits_for_every_frozen_device_then_loses_every_ciph
     .execute(&pool)
     .await
     .unwrap();
+    let prune_at = Utc::now() + chrono::Duration::hours(73);
     type Evidence = (Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>);
     let evidence = || async {
         sqlx::query_as::<_, Evidence>(
@@ -173,7 +175,14 @@ async fn coordinator_opening_waits_for_every_frozen_device_then_loses_every_ciph
         let mut tx = pool.begin().await.unwrap();
         let pruned = as_service(
             false,
-            prune_acknowledged_application_payloads(&mut tx, cid, 0, 1, false, Utc::now()),
+            prune_acknowledged_application_payloads(
+                &mut tx,
+                cid,
+                0,
+                1,
+                false,
+                prune_at.clone(),
+            ),
         )
         .await
         .unwrap();
@@ -464,16 +473,21 @@ async fn transport_home_opening_waits_for_its_local_audience_and_replays_never_r
     let projection: Value = serde_json::from_slice(&captured.1).unwrap();
     assert_eq!(projection, pruned_opening_entry(&entry));
 
-    let prune = || async {
-        let mut tx = pool.begin().await.unwrap();
-        let pruned = as_service(
-            false,
-            prune_acknowledged_application_payloads(&mut tx, cid, 0, 1, true, now),
-        )
-        .await
-        .unwrap();
-        tx.commit().await.unwrap();
-        pruned
+    let prune = |pruned_at| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            let pruned = as_service(
+                false,
+                prune_acknowledged_application_payloads(
+                    &mut tx, cid, 0, 1, true, pruned_at,
+                ),
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            pruned
+        }
     };
     ack(
         &pool,
@@ -483,11 +497,31 @@ async fn transport_home_opening_waits_for_its_local_audience_and_replays_never_r
     )
     .await;
     assert!(
-        prune().await.is_empty(),
+        prune(now).await.is_empty(),
         "the local sender device has not acked"
     );
     ack(&pool, cid, &seeded.fixture.actor_did, seeded.actor_device).await;
-    assert_eq!(prune().await, vec![1]);
+    assert!(
+        prune(now).await.is_empty(),
+        "complete ACKs cannot bypass the 72-hour minimum"
+    );
+    sqlx::query("UPDATE chat.devices SET dormant_at = $1")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        prune(now + chrono::Duration::hours(73)).await.is_empty(),
+        "an all-dormant transport audience must not become vacuously ready"
+    );
+    sqlx::query("UPDATE chat.devices SET dormant_at = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        prune(now + chrono::Duration::hours(73)).await,
+        vec![1]
+    );
 
     let (served, original_sha256): (Vec<u8>, Vec<u8>) = sqlx::query_as(
         "SELECT entry_bytes, original_entry_sha256 FROM chat.direct_request_transport_entries \
@@ -740,7 +774,7 @@ async fn expiry_prunes_the_coordinators_opening_in_the_expiry_transaction() {
 }
 
 #[tokio::test]
-async fn the_periodic_sweep_prunes_a_transport_opening_nobody_can_import_any_more() {
+async fn an_expired_transport_import_window_still_obeys_the_30_day_ceiling() {
     let db = crate::common::fresh_db::fresh_fully_migrated_db("chat_pruning_").await;
     let pool = db.connect(4).await;
     let seeded = seeded(&pool).await;
@@ -764,7 +798,12 @@ async fn the_periodic_sweep_prunes_a_transport_opening_nobody_can_import_any_mor
     sweep(now + chrono::Duration::days(1)).await.unwrap();
     assert!(!pruned().await, "its recipient can still import it");
     sweep(now + chrono::Duration::days(8)).await.unwrap();
-    assert!(pruned().await, "no device can import or read it any more");
+    assert!(
+        !pruned().await,
+        "an empty import audience is not an ACK quorum"
+    );
+    sweep(now + chrono::Duration::days(31)).await.unwrap();
+    assert!(pruned().await, "the 30-day ceiling still removes the opening");
     assert_eq!(residue(&pool, ciphertext).await, Vec::<String>::new());
 }
 
@@ -875,6 +914,7 @@ async fn an_early_opening_prune_still_releases_every_charged_byte_at_the_termina
     let pool = db.connect(4).await;
     let seeded = seeded(&pool).await;
     let (cid, request) = (seeded.fixture.conversation_id, seeded.fixture.request_id);
+    let prune_at = Utc::now() + chrono::Duration::hours(73);
     // What the terminal prune releases for artifacts when nothing was pruned
     // early: every column and delivery provenance the charge counted.
     let (artifacts, opening_bytes): (i64, i64) = sqlx::query_as(
@@ -903,7 +943,7 @@ async fn an_early_opening_prune_still_releases_every_charged_byte_at_the_termina
     let mut tx = pool.begin().await.unwrap();
     let early = as_service(
         false,
-        prune_acknowledged_application_payloads(&mut tx, cid, 0, 1, false, Utc::now()),
+        prune_acknowledged_application_payloads(&mut tx, cid, 0, 1, false, prune_at),
     )
     .await
     .unwrap();

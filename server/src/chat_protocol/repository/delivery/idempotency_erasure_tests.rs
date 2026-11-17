@@ -191,7 +191,8 @@ async fn entry_count(pool: &PgPool, conversation_id: Uuid) -> i64 {
         .unwrap()
 }
 
-/// Both devices of the fixture acknowledge `seq`, then the ACK prune runs.
+/// Both devices of the fixture acknowledge `seq` after its 72-hour floor,
+/// then the ACK prune runs.
 async fn acknowledge(pool: &PgPool, sent: &Sent, at: DateTime<Utc>) -> Vec<i64> {
     let f = &sent.fixture;
     for (did, device) in [
@@ -221,7 +222,7 @@ async fn acknowledge(pool: &PgPool, sent: &Sent, at: DateTime<Utc>) -> Vec<i64> 
         generation,
         sent.seq,
         false,
-        at,
+        at + Duration::hours(73),
     )
     .await
     .unwrap();

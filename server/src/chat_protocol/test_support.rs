@@ -274,7 +274,7 @@ pub struct GenuineLeaflessGroupRelayFixture {
 }
 
 impl CleanSlateApplicationFixture {
-    pub(crate) fn next_sender_signed_request(&self) -> serde_json::Value {
+    pub fn next_sender_signed_request(&self) -> serde_json::Value {
         let index = self
             .sender_request_index
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

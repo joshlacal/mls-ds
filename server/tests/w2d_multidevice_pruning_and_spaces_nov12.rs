@@ -4,10 +4,10 @@
 //!    `dormantAt`, fail-closed admission on unapproved devices across chat + Space relay +
 //!    Labyrinth, `getDevices` exclusion vs `getOwnDevices` inclusion, idempotent replay,
 //!    `DeviceAlreadyActive`, and direct `pending_approval -> revoked` sibling revocation).
-//! 2. `Y-7` & `PI-META-MIN` ephemeral `#applicationEntry` pruning (multi-device ack frontier,
-//!    immediate prune + federated `notifyEntriesPruned` outbox enqueue when `revokeDevice` unblocks
-//!    the frontier, `48h` `mark_inactive_devices` dormancy sweep + immediate unblock prune, and
-//!    `72h` `prune_expired_application_payloads` application TTL ceiling preserving control entries).
+//! 2. `Y-7` & `PI-META-MIN` ephemeral `#applicationEntry` pruning (recipient ACK
+//!    quorum after the 72-hour floor, fail-closed archive qualification, no vacuous
+//!    revoke/dormancy pruning, federated `notifyEntriesPruned` on eligible prunes,
+//!    and the 30-day ceiling while preserving control entries).
 //! 3. Nov-12 `space_host` + `FC-03` Space credential & read relays (`relaySpaceCredential`
 //!    forwarding `clientAttestation` / `notify` / `spaceRev` with `confirmRegistration` challenge
 //!    and signed `403` `denial` passthrough + subscriber withdrawal; `relaySpaceRead` allowing
@@ -859,6 +859,37 @@ fn sign_ack_entries_request(
     })
 }
 
+async fn age_entry_past_prune_floor(pool: &sqlx::PgPool, conversation_id: Uuid, seq: i64) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chat.entries SET received_at = clock_timestamp() - INTERVAL '73 hours' \
+          WHERE conversation_id = $1 AND seq = $2",
+    )
+    .bind(conversation_id)
+    .bind(seq)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE chat.message_sends send \
+            SET received_at = entry.received_at \
+           FROM chat.entries entry \
+          WHERE entry.conversation_id = $1 AND entry.seq = $2 \
+            AND send.conversation_id = entry.conversation_id \
+            AND send.message_id = entry.message_id",
+    )
+    .bind(conversation_id)
+    .bind(seq)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
 // =============================================================================
 // 1. D-2 Multi-Device Sibling Approval & #deviceView End-to-End
 // =============================================================================
@@ -1272,7 +1303,7 @@ async fn d2_multidevice_enrollment_approval_and_device_view_end_to_end() {
 // =============================================================================
 
 #[tokio::test]
-async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
+async fn y7_pruning_requires_recipient_quorum_after_72h_or_the_30d_ceiling() {
     let _env_guard = W2D_ENV_LOCK.lock().await;
     let self_did = "did:web:chat.catbird.blue";
     let s2s_secret = P256Secret::from_slice(&[0x59_u8; 32]).unwrap();
@@ -1409,10 +1440,9 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
         rtx.commit().await.unwrap();
     }
 
-    // 3. `recipient_d1` (real MLS leaf!) self-revokes via `POST /xrpc/blue.catbird.chat.revokeDevice`!
-    //    `revoke_device` immediately triggers `prune_unblocked_for_device_and_notify` ->
-    //    `app_seq` ciphertext is wiped, control entry `seq = 1` stays intact, AND an S2S
-    //    `notifyEntriesPruned` outbox row is enqueued for `remote_ds_did`!
+    // 3. `recipient_d1` self-revokes. With no remaining non-sender recipient
+    // device ACK and no verified archive, revocation must not turn the recipient
+    // quorum into an empty set or enqueue a false prune notice.
     let revoke_body = json!({
         "$type": "blue.catbird.chat.defs#deviceRevocationBody",
         "signatureDomain": "CATBIRD-CHAT-DEVICE-REVOKE\u{0}",
@@ -1484,8 +1514,8 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
     .await
     .unwrap();
     assert!(
-        app_pruned,
-        "revokeDevice must immediately prune newly unblocked applicationEntry"
+        !app_pruned,
+        "revoking the only unacked recipient must retain the unarchived payload"
     );
     assert!(!ctrl_pruned, "control entry at seq=1 must NEVER be pruned");
 
@@ -1499,14 +1529,13 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
     .await
     .unwrap();
     assert_eq!(
-        outbox_prune_notices, 1,
-        "federated S2S notifyEntriesPruned notice must be enqueued upon unblock prune"
+        outbox_prune_notices, 0,
+        "no entriesPruned notice may be emitted for a retained payload"
     );
 
-    // 3b. Multi-device sibling leaf holdback on the SAME DID:
-    //     When `recipient_did` has TWO active leaves (`recipient_d1` + `recipient_d2`),
-    //     `sender_d1` + `recipient_d1` acking does NOT prune (`prunedCount == 0`) until
-    //     `recipient_d2` ALSO acks (`prunedCount == 1`)!
+    // 3b. One non-dormant enrolled leaf ACK per non-sender participant is the
+    // recipient quorum. A second active sibling on the same DID does not expand
+    // that participant-level quorum, but the 72-hour floor still applies.
     let db_m = common::fresh_db::fresh_fully_migrated_db("chat_w2d_").await;
     let pool_m = db_m.connect(4).await;
     let router_m = build_unified_router(pool_m.clone(), None).await;
@@ -1551,6 +1580,7 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
     .await;
     assert_eq!(stm, StatusCode::OK);
     let seq_m = sbm["entry"]["seq"].as_i64().unwrap();
+    age_entry_past_prune_floor(&pool_m, fix_m.conversation_id, seq_m).await;
 
     // Add active sibling leaf `rm2` + open `chat.application_intervals` row on `fix_m.recipient_did`.
     let rm2_id = Uuid::new_v4();
@@ -1655,13 +1685,13 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
         did: fix_m.recipient_did.clone(),
         device_id: rm2_id,
         jkt: rm2_jkt,
-        signing: rm1_dev.signing.clone(),
-        jwk: rm1_dev.jwk.clone(),
+        signing: rm2_p256,
+        jwk: rm2_jwk,
     };
 
     let sm_ed = Ed25519SigningKey::from_bytes(&fix_m.sender_ed25519_seed);
     let rm1_ed = Ed25519SigningKey::from_bytes(&fix_m.recipient_ed25519_seed);
-    let (_, bm_s) = http::send(
+    let (st_m_s, bm_s) = http::send(
         router_m.clone(),
         http::unsigned_json_request(
             &sm_dev,
@@ -1679,9 +1709,10 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
         ),
     )
     .await;
+    assert_eq!(st_m_s, StatusCode::OK, "sender ACK failed: {bm_s}");
     assert_eq!(bm_s["prunedCount"], 0);
 
-    let (_, bm_r1) = http::send(
+    let (st_m_r1, bm_r1) = http::send(
         router_m.clone(),
         http::unsigned_json_request(
             &rm1_dev,
@@ -1699,11 +1730,15 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
         ),
     )
     .await;
+    assert_eq!(st_m_r1, StatusCode::OK, "recipient ACK failed: {bm_r1}");
     assert_eq!(
-        bm_r1["prunedCount"], 0,
-        "unacked active sibling leaf rm2 must hold back pruning"
+        bm_r1["prunedCount"], 1,
+        "one awake recipient leaf ACK satisfies its participant after the 72-hour floor"
     );
 
+    // The test DID cache holds one document per DID. Switch it to the sibling's
+    // service-auth key only after the first leaf has finished authenticating.
+    http::cache_device_did(&rm2_dev).await;
     let (st_r2, bm_r2) = http::send(
         router_m.clone(),
         http::unsigned_json_request(
@@ -1724,8 +1759,8 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
     .await;
     assert_eq!(st_r2, StatusCode::OK);
     assert_eq!(
-        bm_r2["prunedCount"], 1,
-        "once final active sibling leaf rm2 acks, seq_m must prune immediately"
+        bm_r2["prunedCount"], 0,
+        "a later sibling ACK cannot prune the already-retained skeleton twice"
     );
     pool_m.close().await;
 
@@ -1810,9 +1845,9 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
     .unwrap();
     assert_eq!(mark_inactive_devices(&pool2, ref_now).await.unwrap(), 0);
 
-    // 73h past coarse UTC-day (`>= 49h` true inactivity) -> `dormant_at` set (`DeviceView.status` projects `"dormant"`),
-    // AND under `B1(a–b)` `seq_a` MUST NOT be pruned while un-archived (`archived_through_seq == 0`),
-    // then prunes once an attested Space archive watermark `archived_through_seq >= seq_a` is recorded!
+    // 73h past coarse UTC-day (`>= 49h` true inactivity) marks the recipient
+    // dormant, but neither an empty ACK quorum nor an unqualified archive
+    // watermark may prune the payload.
     sqlx::query(
         "UPDATE chat.devices SET last_active_at = $3 WHERE user_did = $1 AND device_id = $2",
     )
@@ -1847,8 +1882,9 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
         "B1(a–b): 48h dormancy transition must NOT prune un-archived conversation when all recipient devices are dormant"
     );
 
-    // Record attested Space archive watermark `archived_through_seq = seq_a` on `chat.conversation_spaces`,
-    // then re-send sender ack -> now `is_archived` is TRUE and recipient is dormant, so `seq_a` prunes!
+    // A directly injected legacy watermark is not verified archive-content
+    // evidence. Re-sending the sender ACK after 72h must still retain the
+    // payload while the only recipient is dormant.
     let fix2_space_uri = format!(
         "at://{self_did}/space/blue.catbird.labyrinth.conversation/{}-0",
         fix2.conversation_id
@@ -1867,6 +1903,7 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
     .execute(&pool2)
     .await
     .unwrap();
+    age_entry_past_prune_floor(&pool2, fix2.conversation_id, seq_a).await;
     let ack_s2_after_archive = sign_ack_entries_request(
         fix2.sender_device_id,
         &fix2.sender_key_id,
@@ -1887,11 +1924,11 @@ async fn y7_ephemeral_pruning_immediate_revoke_unblock_and_48h_72h_sweeps() {
     .await;
     assert_eq!(st_ack2, StatusCode::OK);
     assert_eq!(
-        body_ack2["prunedCount"], 1,
-        "B1(b): once Space archive watermark covers seq_a, dormant-only recipient no longer blocks pruning"
+        body_ack2["prunedCount"], 0,
+        "an unqualified archive watermark cannot replace the dormant recipient ACK"
     );
 
-    // Verify `B1(d)`: `720h` (`30d`) default un-archived application TTL ceiling vs `72h` Space-archived TTL ceiling!
+    // Verify the fail-closed `720h` (`30d`) application ceiling.
     let db3 = common::fresh_db::fresh_fully_migrated_db("chat_w2d_").await;
     let pool3 = db3.connect(4).await;
     let router3 = build_unified_router(pool3.clone(), None).await;
@@ -3792,6 +3829,16 @@ async fn r2_dormancy_coarse_day_margin_zero_ack_and_post_reset_generation_prunin
         jwk: sb_jwk,
     };
     http::cache_device_did(&sb_dev).await;
+    let rb_p256 = http::random_p256();
+    let rb_jwk = http::public_jwk(&rb_p256);
+    let rb_dev = http::Device {
+        did: fix_b.recipient_did.clone(),
+        device_id: fix_b.recipient_device_id,
+        jkt: http::jwk_thumbprint(&rb_jwk),
+        signing: rb_p256,
+        jwk: rb_jwk,
+    };
+    http::cache_device_did(&rb_dev).await;
 
     // Send an application message in generation `0` with `0` acks.
     let (st_send_b, body_send_b) = http::send(
@@ -3890,9 +3937,9 @@ async fn r2_dormancy_coarse_day_margin_zero_ack_and_post_reset_generation_prunin
     .await;
     assert_eq!(st_ar, StatusCode::OK, "activateReset failed: {body_ar}");
 
-    // Confirm generation `1` has an open `application_intervals` row (`terminal_seq IS NULL`),
-    // AND under `B10` (`reset.rs:153-157`) superseded generation `0`'s un-acked `seq_g0` is
-    // RETAINED across `activateReset` until the normal `30d` (`720h`) retention floor!
+    // Generation `1` has open intervals, while generation `0`'s unacknowledged
+    // payload remains retained across `activateReset`. Its now-terminal
+    // generation-0 intervals still define the ACK audience after the 72h floor.
     let open_gen1_intervals: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM chat.application_intervals \
          WHERE conversation_id = $1 AND generation = 1 AND terminal_seq IS NULL",
@@ -3916,19 +3963,53 @@ async fn r2_dormancy_coarse_day_margin_zero_ack_and_post_reset_generation_prunin
         !gen0_pruned && !gen0_payload_null,
         "B10: superseded generation-0 un-acked application payload must NOT be wiped immediately on ActivateReset"
     );
-    assert_eq!(
-        prune_expired_application_payloads(&pool_b, Utc::now() + Duration::hours(719))
-            .await
+    age_entry_past_prune_floor(&pool_b, fix_b.conversation_id, seq_g0).await;
+    let sender_ed = Ed25519SigningKey::from_bytes(&fix_b.sender_ed25519_seed);
+    let (_, sender_ack) = http::send(
+        router_b.clone(),
+        http::unsigned_json_request(
+            &sb_dev,
+            "blue.catbird.chat.acknowledgeEntries",
+            serde_json::to_vec(&sign_ack_entries_request(
+                fix_b.sender_device_id,
+                &fix_b.sender_key_id,
+                1,
+                &sender_ed,
+                fix_b.conversation_id,
+                0,
+                seq_g0,
+            ))
             .unwrap(),
-        0,
-        "B10 + B1(d): un-archived prior-gen payload must obey 30d (720h) retention floor"
+        ),
+    )
+    .await;
+    assert_eq!(
+        sender_ack["prunedCount"], 0,
+        "the old-generation recipient interval must still block sender-only ACK"
     );
-    assert_eq!(
-        prune_expired_application_payloads(&pool_b, Utc::now() + Duration::hours(721))
-            .await
+    let recipient_ed = Ed25519SigningKey::from_bytes(&fix_b.recipient_ed25519_seed);
+    let (recipient_ack_status, recipient_ack) = http::send(
+        router_b.clone(),
+        http::unsigned_json_request(
+            &rb_dev,
+            "blue.catbird.chat.acknowledgeEntries",
+            serde_json::to_vec(&sign_ack_entries_request(
+                fix_b.recipient_device_id,
+                &fix_b.recipient_key_id,
+                1,
+                &recipient_ed,
+                fix_b.conversation_id,
+                0,
+                seq_g0,
+            ))
             .unwrap(),
-        1,
-        "B10 + B1(d): un-archived prior-gen payload prunes past 30d (720h) retention ceiling"
+        ),
+    )
+    .await;
+    assert_eq!(recipient_ack_status, StatusCode::OK, "{recipient_ack}");
+    assert_eq!(
+        recipient_ack["prunedCount"], 1,
+        "terminal generation-0 intervals must accept their recipient ACK despite open generation-1 intervals"
     );
 
     pool_b.close().await;
@@ -4701,6 +4782,31 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
     .fetch_one(&pool)
     .await
     .unwrap();
+    let high_signed_request = fix.next_sender_signed_request();
+    let (st_high, sb_high) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            &s_dev,
+            "blue.catbird.chat.sendMessage",
+            serde_json::to_vec(&json!({ "signedRequest": high_signed_request })).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        st_high,
+        StatusCode::OK,
+        "second sendMessage failed: {sb_high}"
+    );
+    let seq_high = sb_high["entry"]["seq"].as_i64().unwrap();
+    assert!(seq_high > seq_app);
+    let high_msg_id: Uuid = sqlx::query_scalar(
+        "SELECT message_id FROM chat.entries WHERE conversation_id = $1 AND seq = $2",
+    )
+    .bind(fix.conversation_id)
+    .bind(seq_high)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     // -------------------------------------------------------------------------
     // Part A (`A6`): `prepare_local_entry_wake` queries `(actor_did, actor_device_id)`
@@ -4916,11 +5022,11 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
     );
 
     // -------------------------------------------------------------------------
-    // Part C (`B1` Space-attested `archived_through_seq` + `B1(d)` 72h archived TTL):
-    // Verify `com.atproto.space.putRecord` rejects forged peer `messageId` for
-    // watermark advancement, advances `archived_through_seq` when the true
-    // sender archives `blue.catbird.labyrinth.batch`, and then enables `72h`
-    // archived TTL (plus immediate dormant-sibling unblock once archived)!
+    // Part C (`B1` hosted-record fail-closed validation + 30d ceiling):
+    // This exercises the authority's hosted/simulator putRecord path only; the
+    // production PDS-to-authority evidence bridge and content-proof design are
+    // separate release blockers. Neither live ciphertext nor a signed redaction
+    // directly qualifies archive coverage.
     // -------------------------------------------------------------------------
     let space_uri: String = sqlx::query_scalar(
         "SELECT space_uri FROM chat.conversation_spaces WHERE conversation_id = $1 AND generation = 0",
@@ -4963,8 +5069,21 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
             key,
         )
     };
+    let watermark = || {
+        let pool = pool.clone();
+        let space_uri = space_uri.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT archived_through_seq FROM chat.conversation_spaces WHERE space_uri = $1",
+            )
+            .bind(space_uri)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
 
-    // Forged batch from `recipient_did` claiming `sender_did`'s `(real_msg_id, seq_app)` must NOT advance `archived_through_seq`!
+    // A peer cannot claim another sender's accepted message coordinates.
     let forged_req = Request::builder()
         .method("POST")
         .uri("/xrpc/com.atproto.space.putRecord")
@@ -4984,6 +5103,7 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
                 "rkey": "3k2forged0001",
                 "record": {
                     "$type": "blue.catbird.labyrinth.batch",
+                    "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                     "threadId": fix.conversation_id.to_string(),
                     "items": [{
                         "messageId": real_msg_id.to_string(),
@@ -4995,22 +5115,240 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
             .unwrap(),
         ))
         .unwrap();
-    let forged_resp = host_router.clone().oneshot(forged_req).await.unwrap();
-    assert_eq!(forged_resp.status(), StatusCode::OK);
-    let watermark_after_forged: i64 = sqlx::query_scalar(
-        "SELECT archived_through_seq FROM chat.conversation_spaces WHERE space_uri = $1",
-    )
-    .bind(&space_uri)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
     assert_eq!(
-        watermark_after_forged, 0,
-        "B1: peer cannot forge sender's messageId to advance archived_through_seq"
+        host_router.clone().oneshot(forged_req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(watermark().await, 0);
+
+    let mut archive_receipt = sb_send["sequencerReceipt"].clone();
+    archive_receipt["originalSenderAttestation"] = fix.signed_request
+        .pointer("/body/aad/originalSenderAttestation")
+        .expect("accepted send has original sender attestation")
+        .clone();
+    let sender_archive_key = Ed25519SigningKey::from_bytes(&fix.sender_ed25519_seed);
+    let sender_archive_pubkey = sender_archive_key.verifying_key().to_bytes();
+    let timestamp = Utc::now().timestamp_millis();
+    let base_item = json!({
+        "messageId": real_msg_id.to_string(),
+        "seq": seq_app,
+        "timestamp": timestamp,
+        "mekId": { "$bytes": STANDARD.encode([0xA4_u8; 12]) },
+        "senderTransportPubkey": { "$bytes": STANDARD.encode(sender_archive_pubkey) },
+        "sequencerReceipt": archive_receipt,
+    });
+    let signed_author_redaction = |message_id: Uuid| {
+        let transcript = format!(
+            "catbird.labyrinth.redaction:did={};message_id={message_id};thread_id={}",
+            fix.sender_did,
+            hex::encode(fix.conversation_id.to_string().as_bytes())
+        );
+        json!({
+            "transportPubkey": { "$bytes": STANDARD.encode(sender_archive_pubkey) },
+            "sig": { "$bytes": STANDARD.encode(sender_archive_key.sign(transcript.as_bytes()).to_bytes()) },
+            "redactedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        })
+    };
+
+    let mut high_archive_receipt = sb_high["sequencerReceipt"].clone();
+    high_archive_receipt["originalSenderAttestation"] = high_signed_request
+        .pointer("/body/aad/originalSenderAttestation")
+        .expect("second accepted send has original sender attestation")
+        .clone();
+    let high_item = json!({
+        "messageId": high_msg_id.to_string(),
+        "seq": seq_high,
+        "timestamp": timestamp,
+        "mekId": { "$bytes": STANDARD.encode([0xA4_u8; 12]) },
+        "senderTransportPubkey": { "$bytes": STANDARD.encode(sender_archive_pubkey) },
+        "sequencerReceipt": high_archive_receipt,
+        "signedEncMessage": { "$bytes": "" },
+        "redaction": signed_author_redaction(high_msg_id),
+    });
+
+    // Even a correctly authenticated PDS writer cannot turn opaque live
+    // ciphertext into archive evidence without the private commitment witness.
+    let mut malformed_item = base_item.clone();
+    let mut malformed_envelope = vec![0xCC_u8; 64 + 73];
+    malformed_envelope[64] = 0x02;
+    malformed_item["signedEncMessage"] = json!({ "$bytes": STANDARD.encode(malformed_envelope) });
+    let malformed_archive_req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.putRecord")
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!("Bearer {}", mint_put_jwt(&fix.sender_did, &sender_pds_key)),
+        )
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "space": space_uri,
+                "repo": fix.sender_did,
+                "collection": "blue.catbird.labyrinth.batch",
+                "rkey": "3k2malformed01",
+                "record": {
+                    "$type": "blue.catbird.labyrinth.batch",
+                    "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                    "threadId": fix.conversation_id.to_string(),
+                    "items": [malformed_item],
+                },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        host_router
+            .clone()
+            .oneshot(malformed_archive_req)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(watermark().await, 0);
+
+    // A bare/server redaction is not an author unsend and cannot stand in for
+    // archived ciphertext.
+    let mut malformed_redaction_item = base_item.clone();
+    malformed_redaction_item["signedEncMessage"] = json!({ "$bytes": "" });
+    malformed_redaction_item["redaction"] = json!({
+        "redactedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+    let malformed_redaction_req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.putRecord")
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!("Bearer {}", mint_put_jwt(&fix.sender_did, &sender_pds_key)),
+        )
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "space": space_uri,
+                "repo": fix.sender_did,
+                "collection": "blue.catbird.labyrinth.batch",
+                "rkey": "3k2redaction01",
+                "record": {
+                    "$type": "blue.catbird.labyrinth.batch",
+                    "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                    "threadId": fix.conversation_id.to_string(),
+                    "items": [malformed_redaction_item],
+                },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        host_router
+            .clone()
+            .oneshot(malformed_redaction_req)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(watermark().await, 0);
+
+    // A generation claim that differs from the accepted entry cannot be mixed
+    // into this generation's archive coverage.
+    let mut mixed_generation_item = high_item.clone();
+    mixed_generation_item["sequencerReceipt"]["generation"] = json!(1);
+    let mixed_generation_req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.putRecord")
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!("Bearer {}", mint_put_jwt(&fix.sender_did, &sender_pds_key)),
+        )
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "space": space_uri,
+                "repo": fix.sender_did,
+                "collection": "blue.catbird.labyrinth.batch",
+                "rkey": "3k2mixedgen001",
+                "record": {
+                    "$type": "blue.catbird.labyrinth.batch",
+                    "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                    "threadId": fix.conversation_id.to_string(),
+                    "items": [mixed_generation_item],
+                },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        host_router
+            .clone()
+            .oneshot(mixed_generation_req)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(watermark().await, 0);
+
+    // Even a correctly signed high-seq redaction is not archive-content proof
+    // and cannot advance direct putRecord coverage.
+    let sparse_high_req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.putRecord")
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!("Bearer {}", mint_put_jwt(&fix.sender_did, &sender_pds_key)),
+        )
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "space": space_uri,
+                "repo": fix.sender_did,
+                "collection": "blue.catbird.labyrinth.batch",
+                "rkey": "3k2sparsehigh1",
+                "record": {
+                    "$type": "blue.catbird.labyrinth.batch",
+                    "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                    "threadId": fix.conversation_id.to_string(),
+                    "items": [high_item],
+                },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        host_router
+            .clone()
+            .oneshot(sparse_high_req)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        watermark().await,
+        0,
+        "an author-signed redaction is not substitute archive qualification"
+    );
+    assert_eq!(
+        sqlx::query(
+            "UPDATE chat.conversation_space_records SET archived_seqs = $4 \
+              WHERE space_uri = $1 AND writer_did = $2 AND rkey = $3",
+        )
+        .bind(&space_uri)
+        .bind(&fix.sender_did)
+        .bind("3k2sparsehigh1")
+        .bind(vec![seq_high])
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected(),
+        1,
+        "seed the future reviewed evidence path, not direct putRecord"
     );
 
-    // Authentic batch from `sender_did` archiving `(real_msg_id, seq_app)` advances `archived_through_seq` to `seq_app`!
-    let auth_req = Request::builder()
+    let mut authentic_item = base_item;
+    authentic_item["signedEncMessage"] = json!({ "$bytes": "" });
+    authentic_item["redaction"] = signed_author_redaction(real_msg_id);
+    let authentic_req = Request::builder()
         .method("POST")
         .uri("/xrpc/com.atproto.space.putRecord")
         .header("content-type", "application/json")
@@ -5026,50 +5364,102 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
                 "rkey": "3k2sender0001",
                 "record": {
                     "$type": "blue.catbird.labyrinth.batch",
+                    "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                     "threadId": fix.conversation_id.to_string(),
-                    "items": [{
-                        "messageId": real_msg_id.to_string(),
-                        "seq": seq_app,
-                        "signedEncMessage": { "$bytes": STANDARD.encode([0xCC_u8; 32]) },
-                    }],
+                    "items": [authentic_item],
                 },
             }))
             .unwrap(),
         ))
         .unwrap();
-    let auth_resp = host_router.clone().oneshot(auth_req).await.unwrap();
-    assert_eq!(auth_resp.status(), StatusCode::OK);
-    let watermark_after_sender: i64 = sqlx::query_scalar(
-        "SELECT archived_through_seq FROM chat.conversation_spaces WHERE space_uri = $1",
-    )
-    .bind(&space_uri)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
     assert_eq!(
-        watermark_after_sender, seq_app,
-        "B1: verified sender batch must advance archived_through_seq to seq_app"
+        host_router
+            .clone()
+            .oneshot(authentic_req)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        watermark().await,
+        seq_app - 1,
+        "trusted sparse high coverage must stop before the omitted application; the signed redaction adds none"
+    );
+    assert_eq!(
+        sqlx::query(
+            "UPDATE chat.conversation_space_records SET archived_seqs = $4 \
+              WHERE space_uri = $1 AND writer_did = $2 AND rkey = $3",
+        )
+        .bind(&space_uri)
+        .bind(&fix.sender_did)
+        .bind("3k2sparsehigh1")
+        .bind(vec![seq_app, seq_high])
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected(),
+        1
+    );
+    let recompute_req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.putRecord")
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!("Bearer {}", mint_put_jwt(&fix.sender_did, &sender_pds_key)),
+        )
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "space": space_uri,
+                "repo": fix.sender_did,
+                "collection": "blue.catbird.labyrinth.batch",
+                "rkey": "3k2recompute01",
+                "record": {
+                    "$type": "blue.catbird.labyrinth.batch",
+                    "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                    "threadId": fix.conversation_id.to_string(),
+                    "items": [],
+                },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        host_router
+            .clone()
+            .oneshot(recompute_req)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        watermark().await,
+        seq_high,
+        "trusted coverage can cross metadata gaps only after every application entry is covered"
     );
 
-    // Verify `B1(d)` `72h` archived TTL: reset acks temporarily to prove TTL sweep at +71h (`0`) vs +73h (`1`)!
+    // Synthetic coverage exercises contiguity bookkeeping only. Receipt-based
+    // 72h pruning remains disabled until archive contents are provable.
     sqlx::query("DELETE FROM chat.device_entry_acks WHERE conversation_id = $1")
         .bind(fix.conversation_id)
         .execute(&pool)
         .await
         .unwrap();
     assert_eq!(
-        prune_expired_application_payloads(&pool, Utc::now() + Duration::hours(71))
-            .await
-            .unwrap(),
-        0,
-        "B1(d): archived entry must NOT expire before 72h"
-    );
-    assert_eq!(
         prune_expired_application_payloads(&pool, Utc::now() + Duration::hours(73))
             .await
             .unwrap(),
-        1,
-        "B1(d): Space-archived entry must expire past 72h archived TTL"
+        0,
+        "archive watermark alone must not activate 72h early pruning"
+    );
+    assert_eq!(
+        prune_expired_application_payloads(&pool, Utc::now() + Duration::hours(721))
+            .await
+            .unwrap(),
+        2,
+        "the 30-day ceiling still prunes both application payloads"
     );
 
     // -------------------------------------------------------------------------

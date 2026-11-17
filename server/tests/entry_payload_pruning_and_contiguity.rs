@@ -328,7 +328,7 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
         "must not prune before all active devices ack"
     );
 
-    // 3. Recipient ACKs -> all active devices have acked -> payload_pruned_at set, bytes NULL
+    // 3. Recipient ACK completes quorum, but the 72-hour minimum still holds.
     let recipient_ed = EdSigningKey::from_bytes(&fixture.recipient_ed25519_seed);
     let ack2 = sign_ack_entries_request(
         fixture.recipient_device_id,
@@ -339,7 +339,7 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
         0,
         app_seq,
     );
-    let (ack2_status, ack2_body) = http::send(
+    let (ack2_status, ack2_fresh) = http::send(
         router.clone(),
         http::unsigned_json_request(
             &recipient_dev,
@@ -351,7 +351,54 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
     assert_eq!(
         ack2_status,
         StatusCode::OK,
-        "recipient ack failed: {ack2_body}"
+        "recipient ack failed: {ack2_fresh}"
+    );
+    assert_eq!(ack2_fresh["acknowledgedSeq"], app_seq);
+    assert_eq!(ack2_fresh["prunedCount"], 0);
+
+    let mut age_tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *age_tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chat.entries SET received_at = clock_timestamp() - INTERVAL '73 hours' \
+          WHERE conversation_id = $1 AND seq = $2",
+    )
+    .bind(fixture.conversation_id)
+    .bind(app_seq)
+    .execute(&mut *age_tx)
+    .await
+    .unwrap();
+    // `entries.received_at` and `message_sends.received_at` are one immutable
+    // acceptance instant. Preserve that invariant while test-aging the row.
+    sqlx::query(
+        "UPDATE chat.message_sends send \
+            SET received_at = entry.received_at \
+           FROM chat.entries entry \
+          WHERE entry.conversation_id = $1 AND entry.seq = $2 \
+            AND send.conversation_id = entry.conversation_id \
+            AND send.message_id = entry.message_id",
+    )
+    .bind(fixture.conversation_id)
+    .bind(app_seq)
+    .execute(&mut *age_tx)
+    .await
+    .unwrap();
+    age_tx.commit().await.unwrap();
+    let (ack2_repeat_status, ack2_body) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            &recipient_dev,
+            "blue.catbird.chat.acknowledgeEntries",
+            serde_json::to_vec(&ack2).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        ack2_repeat_status,
+        StatusCode::OK,
+        "repeat recipient ack failed: {ack2_body}"
     );
     assert_eq!(ack2_body["acknowledgedSeq"], app_seq);
     assert_eq!(ack2_body["prunedCount"], 1);
@@ -472,8 +519,8 @@ async fn dormant_60d_devices_and_30d_ceiling_prune_without_stalling_active_conve
     let marked = mark_inactive_devices(&pool, Utc::now()).await.unwrap();
     assert_eq!(marked, 1, "61-day inactive device marked dormant");
 
-    // B1(a–b): Without an attested Space archive watermark, sender ACK alone MUST NOT prune
-    // when all recipient devices are dormant — ciphertext survives until Space archive or 30d ceiling!
+    // Sender ACK alone must not prune when every recipient device is dormant;
+    // ciphertext survives until a recipient quorum or the 30-day ceiling.
     let sender_ed = EdSigningKey::from_bytes(&fixture.sender_ed25519_seed);
     let ack = sign_ack_entries_request(
         fixture.sender_device_id,
@@ -495,7 +542,7 @@ async fn dormant_60d_devices_and_30d_ceiling_prune_without_stalling_active_conve
     .await;
     assert_eq!(ack_status, StatusCode::OK);
 
-    let is_pruned_before_archive: bool = sqlx::query_scalar(
+    let is_pruned_early: bool = sqlx::query_scalar(
         "SELECT payload_pruned_at IS NOT NULL FROM chat.entries WHERE conversation_id = $1 AND seq = $2",
     )
     .bind(fixture.conversation_id)
@@ -504,8 +551,8 @@ async fn dormant_60d_devices_and_30d_ceiling_prune_without_stalling_active_conve
     .await
     .unwrap();
     assert!(
-        !is_pruned_before_archive,
-        "B1: sender ACK alone must NOT prune un-archived conversation when all recipient devices are dormant"
+        !is_pruned_early,
+        "sender ACK alone must not prune when every recipient device is dormant"
     );
 
     // At 31 days (`> 720h` I14 ceiling), unacked applicationEntry row expires cleanly and idempotently:
@@ -707,6 +754,22 @@ async fn assert_c33_transport_only_home_prunes_application(
         .unwrap(),
         catbird_server::chat_protocol::repository::delivery::TransportEntryInsert::Inserted
     );
+    let mut age_tx = home.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *age_tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chat.direct_request_transport_entries \
+            SET created_at = clock_timestamp() - INTERVAL '73 hours' \
+          WHERE conversation_id = $1 AND seq = $2",
+    )
+    .bind(fixture.conversation_id)
+    .bind(seq)
+    .execute(&mut *age_tx)
+    .await
+    .unwrap();
+    age_tx.commit().await.unwrap();
     let conversation_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations WHERE conversation_id = $1")
             .bind(fixture.conversation_id)

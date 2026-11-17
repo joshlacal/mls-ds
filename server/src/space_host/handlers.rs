@@ -212,74 +212,6 @@ pub(crate) async fn load_active_space_status(
     Ok(row)
 }
 
-async fn extract_verified_batch_archived_seqs(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    conversation_id: Uuid,
-    generation: i64,
-    caller_did: &str,
-    collection: &str,
-    record: &Value,
-) -> Result<Vec<i64>, sqlx::Error> {
-    if collection != "blue.catbird.labyrinth.batch" {
-        return Ok(Vec::new());
-    }
-    if let Some(thread_id) = record.get("threadId").and_then(Value::as_str) {
-        if thread_id != conversation_id.to_string() {
-            return Ok(Vec::new());
-        }
-    }
-    let Some(items) = record.get("items").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
-    let mut seqs = Vec::with_capacity(items.len());
-    for item in items {
-        let has_redaction = item.get("redaction").is_some();
-        let has_ciphertext = item
-            .get("signedEncMessage")
-            .and_then(|v| {
-                v.as_str()
-                    .or_else(|| v.get("$bytes").and_then(Value::as_str))
-            })
-            .is_some_and(|s| !s.is_empty());
-        if !has_redaction && !has_ciphertext {
-            continue;
-        }
-        let Some(msg_uuid) = item
-            .get("messageId")
-            .and_then(Value::as_str)
-            .and_then(|s| Uuid::parse_str(s).ok())
-        else {
-            continue;
-        };
-        let claimed_seq = item.get("seq").and_then(Value::as_i64).or_else(|| {
-            item.pointer("/sequencerReceipt/seq")
-                .and_then(Value::as_i64)
-        });
-        let verified_seq: Option<i64> = sqlx::query_scalar(
-            "SELECT seq \
-               FROM chat.entries \
-              WHERE conversation_id = $1 \
-                AND generation = $2 \
-                AND entry_kind = 'blue.catbird.chat.defs#applicationEntry' \
-                AND actor_did = $3 \
-                AND message_id = $4 \
-                AND ($5::bigint IS NULL OR seq = $5)",
-        )
-        .bind(conversation_id)
-        .bind(generation)
-        .bind(caller_did)
-        .bind(msg_uuid)
-        .bind(claimed_seq)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if let Some(seq) = verified_seq {
-            seqs.push(seq);
-        }
-    }
-    seqs.sort_unstable();
-    seqs.dedup();
-    Ok(seqs)
-}
 
 async fn recompute_space_archived_through_seq(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -2909,25 +2841,13 @@ async fn put_record(
     let repo_rev = runtime.next_monotonic_tid(now_sec, prev_repo_rev.as_deref());
     let space_rev = runtime.next_monotonic_tid(now_sec, prev_space_rev.as_deref());
 
-    let verified_archived_seqs = match extract_verified_batch_archived_seqs(
-        &mut tx,
-        status.conversation_id,
-        status.generation,
-        &caller_did,
-        &input.collection,
-        &input.record,
-    )
-    .await
-    {
-        Ok(seqs) => seqs,
-        Err(e) => {
-            return xrpc_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalServerError",
-                e.to_string(),
-            );
-        }
-    };
+    // Hosted putRecord proves only that an authenticated writer supplied these
+    // bytes. The payload and commitment witness are hidden inside MEK ciphertext,
+    // so neither a receipt, envelope signature, nor redaction proves that a stored
+    // item contains the accepted application payload. A reviewed evidence path
+    // must populate coverage after verifying that relation; direct writes remain
+    // deliberately fail-closed.
+    let verified_archived_seqs: Vec<i64> = Vec::new();
 
     if let Err(e) = sqlx::query(
         "INSERT INTO chat.conversation_space_records ( \

@@ -227,6 +227,21 @@ class TestGateTests(unittest.TestCase):
         self.assertIn("--test deterministic_server_clock_test", self.workflow)
         self.assertNotIn("continue-on-error", self.workflow)
 
+    def test_dec1_database_suites_are_required_with_test_support(self):
+        commands = list(cargo_tests(self.workflow))
+        for target in {
+            "w2d_multidevice_pruning_and_spaces_nov12",
+            "entry_payload_pruning_and_contiguity",
+            "labyrinth_recovery_shares",
+            "labyrinth_account_deletion",
+        }:
+            matches = [command for command in commands if target in command[2]]
+            with self.subTest(target=target):
+                self.assertTrue(matches, f"{target} is not in the CI gate")
+                for line, features, _, _, _ in matches:
+                    self.assertIn("test-support", features, line)
+                    self.assertIn("--test-threads=1", line)
+
     def test_hostile_gate_filters_still_select_tests(self):
         sources = [path.read_text() for path in (SERVER / "src").rglob("*.rs")]
         commands = list(cargo_tests(self.hostile_gate))
@@ -319,12 +334,48 @@ class FederationComposeTests(unittest.TestCase):
         names = re.findall(r"/(?:app/)?fixtures/([\w./-]+?\.(?:pem|json))", self.compose)
         self.assertTrue(names)
         for name in names:
-            self.assertTrue((FIXTURES / name).is_file(), name)
-            # `.gitignore` excludes `*.pem` except directly under e2e-tests/fixtures.
-            if shutil.which("git"):
-                ignored = subprocess.run(["git", "-C", str(REPO), "check-ignore", "-q", "--no-index",
-                                          str((FIXTURES / name).relative_to(REPO))])
-                self.assertEqual(ignored.returncode, 1, f"{name} is git-ignored or git failed")
+            fixture = FIXTURES / name
+            self.assertTrue(fixture.is_file(), name)
+            relative = fixture.relative_to(REPO).as_posix()
+            if (REPO / ".git").exists():
+                self.assertIsNotNone(shutil.which("git"), "Git checkout without git executable")
+                tracked = subprocess.run(
+                    ["git", "-C", str(REPO), "ls-files", "--error-unmatch", "--", relative],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    tracked.returncode,
+                    0,
+                    f"{name} is not Git-tracked: {tracked.stderr.strip()}",
+                )
+            elif (REPO / ".jj").exists():
+                self.assertIsNotNone(shutil.which("jj"), "Jujutsu workspace without jj executable")
+                tracked = subprocess.run(
+                    [
+                        "jj",
+                        "--repository",
+                        str(REPO),
+                        "--ignore-working-copy",
+                        "--no-pager",
+                        "file",
+                        "list",
+                        "-T",
+                        'path ++ "\n"',
+                        relative,
+                    ],
+                    cwd=REPO,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    tracked.returncode,
+                    0,
+                    f"jj could not inspect {name}: {tracked.stderr.strip()}",
+                )
+                self.assertEqual(tracked.stdout.splitlines(), [relative], f"{name} is not Jujutsu-tracked")
+            else:
+                self.fail("repository has neither .git nor .jj metadata")
 
     def test_each_home_migrates_its_own_catbird_database_that_the_reset_guard_recognizes(self):
         # Migration 20250101000000 grants on this database by name, so a home
@@ -396,6 +447,28 @@ class SiblingBuildInputTests(unittest.TestCase):
 
     dockerfile = (SERVER / "Dockerfile").read_text()
     workflow = WORKFLOW.read_text()
+    pins = {
+        "catbird-atproto": "CATBIRD_ATPROTO_REV",
+        "catbird-mls": "CATBIRD_MLS_REV",
+        "labyrinth": "LABYRINTH_REV",
+    }
+
+    def test_sibling_revisions_have_one_explicit_pin_source(self):
+        for repo, variable in self.pins.items():
+            with self.subTest(repo=repo):
+                declarations = re.findall(
+                    rf'^  {variable}: "[0-9a-f]{{40}}"$',
+                    self.workflow,
+                    re.M,
+                )
+                self.assertEqual(len(declarations), 1, declarations)
+                checkouts = re.findall(
+                    rf"^ +git -C \.\./{repo} checkout --detach (.+)$",
+                    self.workflow,
+                    re.M,
+                )
+                self.assertTrue(checkouts)
+                self.assertEqual(set(checkouts), {f'"${variable}"'})
 
     def test_every_image_build_supplies_each_named_context_the_dockerfile_copies(self):
         stages = set(re.findall(r"^FROM \S+ AS (\S+)", self.dockerfile, re.M))
@@ -427,8 +500,12 @@ class SiblingBuildInputTests(unittest.TestCase):
         for job in builders:
             for repo in repos:
                 with self.subTest(job=job.split(":", 1)[0], repo=repo):
-                    self.assertRegex(job, rf"git clone --filter=blob:none https://github\.com/joshlacal/{repo}\.git "
-                                          rf"\.\./{repo}\n +git -C \.\./{repo} checkout --detach [0-9a-f]{{40}}\n")
+                    variable = self.pins[repo]
+                    self.assertRegex(
+                        job,
+                        rf"git clone --filter=blob:none https://github\.com/joshlacal/{repo}\.git "
+                        rf'\.\./{repo}\n +git -C \.\./{repo} checkout --detach "\${variable}"\n',
+                    )
 
 
 class DestructiveRouteTests(unittest.TestCase):

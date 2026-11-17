@@ -168,18 +168,19 @@ impl Env {
             None,
             3600,
         );
-        if federation.is_some() {
-            let local_did = self_did.clone();
-            let local_endpoint = self_endpoint.clone();
-            resolver = resolver.with_user_did_resolver_hook(Arc::new(move |_did| {
-                Some(Ok(DsEndpoint {
-                    did: local_did.clone(),
-                    endpoint: local_endpoint.clone(),
-                    supported_cipher_suites: None,
-                    federation_capabilities: None,
-                }))
-            }));
-        }
+        // Every account inserted by this harness is homed at this test server.
+        // Model that authoritative declaration directly instead of making
+        // synthetic DIDs contact a nonexistent PDS.
+        let local_did = self_did.clone();
+        let local_endpoint = self_endpoint.clone();
+        resolver = resolver.with_user_did_resolver_hook(Arc::new(move |_did| {
+            Some(Ok(DsEndpoint {
+                did: local_did.clone(),
+                endpoint: local_endpoint.clone(),
+                supported_cipher_suites: None,
+                federation_capabilities: None,
+            }))
+        }));
         if let Some(addr) = federation.as_ref().and_then(|f| f.peer) {
             resolver = resolver.with_destination_resolver_hook(Arc::new(move |_did| {
                 Some(Box::pin(async move {
@@ -879,23 +880,18 @@ pub async fn send(router: &Router, request: Request<Body>) -> Reply {
 /// Publish `key` as `did`'s `#atproto` verification method in the
 /// process-wide DID-document cache.
 pub async fn cache_did_key(did: &str, key: &P256Key) {
-    let point = key.verifying_key().to_encoded_point(false);
-    let jwk = json!({
-        "kty": "EC",
-        "crv": "P-256",
-        "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
-        "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
-    });
     let document = catbird_server::auth::DidDocument {
         id: did.to_owned(),
         verification_method: vec![catbird_server::auth::VerificationMethod {
             id: format!("{did}#atproto"),
-            key_type: "JsonWebKey2020".to_string(),
+            key_type: "Multikey".to_string(),
             controller: did.to_owned(),
-            public_key_jwk: Some(serde_json::from_value(jwk).unwrap()),
-            public_key_multibase: None,
+            public_key_jwk: None,
+            public_key_multibase: Some(
+                catbird_server::identity::did_doc::encode_p256_multikey(key.verifying_key()),
+            ),
         }],
-        service: None,
+        service: Some(Vec::new()),
     };
     catbird_server::auth::cache_test_did_document(document).await;
 }

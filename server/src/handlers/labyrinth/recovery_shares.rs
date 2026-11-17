@@ -19,8 +19,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::params::{
-    admit_fixed_query, admit_fixed_query_allowing_pending, admit_procedure_allowing_pending,
-    begin_write,
+    admit_fixed_query_allowing_pending, admit_procedure_allowing_pending, begin_write,
 };
 use super::respond;
 use crate::handlers::chat::ChatRuntime;
@@ -227,7 +226,7 @@ pub async fn get_recovery_share(
                 &stored.nonce,
                 &stored.encrypted_share,
             )?;
-            let (enc, sealed) = seal_to_ephemeral_key(&did, &vid, &recipient_key, share.as_ref())?;
+            let (enc, sealed) = seal_to_ephemeral_key(&did, &vid, &recipient_key, &share)?;
             let verify = input.purpose.as_deref() == Some("verify")
                 && read.caller.status == "active"
                 && stored.created_by_device_id == read.caller.device_id;
@@ -311,7 +310,7 @@ pub async fn list_recovery_shares(
 ) -> Response {
     respond(
         async {
-            let (adm, params) = admit_fixed_query(
+            let (adm, params) = admit_fixed_query_allowing_pending(
                 &pool,
                 &rt,
                 "listRecoveryShares",
@@ -368,7 +367,7 @@ pub async fn list_recovery_share_events(
 ) -> Response {
     respond(
         async {
-            let (adm, params) = admit_fixed_query(
+            let (adm, params) = admit_fixed_query_allowing_pending(
                 &pool,
                 &rt,
                 "listRecoveryShareEvents",

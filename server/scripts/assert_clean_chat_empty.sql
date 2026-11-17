@@ -13,11 +13,14 @@
 --   3. Clean-slate: the current full catalog -- the frozen 84 plus every later migration
 --      (clean-slate consolidation 20261031200001 onward) -- with its exact chat tables and
 --      views, sealed in the GENERATED CLEAN-SLATE SEAL block below. Never edit that block by
---      hand: after any migration change, re-seal it from server/ with the suite's environment
---      (TEST_DATABASE_URL, CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED):
---        CLEAN_CHAT_PREFLIGHT_RESEAL=write cargo test --offline --test clean_chat_empty_preflight \
---          -- --ignored --exact reseal_clean_slate_catalog
---      then review the diff and re-run tests/clean_chat_empty_preflight.rs. The 75/84 seals are
+--      hand. After any migration change, re-seal it from server/ against a private loopback
+--      PostgreSQL 16 cluster on an explicit non-5432 port, using /postgres and a CREATEDB role:
+--        TEST_DATABASE_URL="$PRIVATE_TEST_DATABASE_URL" \
+--          CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
+--          CLEAN_CHAT_PREFLIGHT_RESEAL=write rustup run 1.99.1 cargo test --locked --offline \
+--          --test clean_chat_empty_preflight -- --ignored --exact reseal_clean_slate_catalog
+--      Review the generated diff, then re-run tests/clean_chat_empty_preflight.rs with the same
+--      database environment and without CLEAN_CHAT_PREFLIGHT_RESEAL. The 75/84 seals are
 --      frozen and never regenerated.
 --
 -- Requirements:
@@ -374,7 +377,7 @@ DECLARE
     ];
 
     -- BEGIN GENERATED CLEAN-SLATE SEAL
-    -- 63 migrations after 20260828000005 (147 total, max 20261115000001); chat tables: 98; chat views: 1.
+    -- 66 migrations after 20260828000005 (150 total, max 20261116000005); chat tables: 99; chat views: 1.
     v_clean_slate_versions BIGINT[] := ARRAY[
         20260905000001::BIGINT,
         20260907000001::BIGINT,
@@ -438,7 +441,10 @@ DECLARE
         20261107000001::BIGINT,
         20261113000001::BIGINT,
         20261114000001::BIGINT,
-        20261115000001::BIGINT
+        20261115000001::BIGINT,
+        20261116000003::BIGINT,
+        20261116000004::BIGINT,
+        20261116000005::BIGINT
     ];
     v_clean_slate_descriptions TEXT[] := ARRAY[
         'chat historical recovery package mapping',
@@ -503,7 +509,10 @@ DECLARE
         'application send order',
         'remote lifecycle recovery bindings',
         'wave2 multidevice and spaces nov12',
-        'wave2 r2 archive watermark'
+        'wave2 r2 archive watermark',
+        'pending device promotion audit',
+        'recovery shares',
+        'account deletion retry binding'
     ];
     v_clean_slate_checksums TEXT[] := ARRAY[
         'a66f9dc9bd5f8f1cb3da0f3ddfcb64c08fc068de39602891e584c86cdbaebd1de2d29b6bb46959155496639ad12f9c5d',
@@ -568,7 +577,10 @@ DECLARE
         '457b8d78861a458425a5ed617874a8397547e03fdf2a7038f3ead6737f5cb156b5e9b3fa5df40442a152d72b1279c1c1',
         '78975bab32bfaa527ee1233ad49b36956d91fb4c9fef47533365cabd6c98778b50709a57fda8fa5c5933fab388e9e596',
         'f32c9403bbcd7ed6bde26a463912c83f0d95aecffcf7040d5622d4db9e1eb6263db4e0d6edaf7062217098eaa13fe133',
-        'a9e60f360a413ff8bcc8a2a1cc083de17c569a0f293cc9c52ac21bd9aacaee6ce3e1762894cb54ef259c7d2d3911cb92'
+        'a9e60f360a413ff8bcc8a2a1cc083de17c569a0f293cc9c52ac21bd9aacaee6ce3e1762894cb54ef259c7d2d3911cb92',
+        '6000aad2cb12b296fac5b4ec6e11c66df8bdbfdff2c209ae52dc4aa174b50ca52854ff373ad3a4258922504f1beb3c0d',
+        'd6e2970a0a7fb34a1fe1bccef389d3d487957f0a8a49f82a020b29248a4fa8dd716e2a81b37227b0be540a77a260b6ea',
+        'd794a02be9e84436d320ebd91a3c534f2683447085bb92647bfe1746c9dbf02464f5f09d1aa5e74e68d9672a7251137c'
     ];
     v_clean_slate_tables TEXT[] := ARRAY[
         'application_intervals',
@@ -586,6 +598,7 @@ DECLARE
         'device_inventory_items',
         'device_inventory_sessions',
         'device_keys',
+        'device_promotion_audit',
         'device_revocations',
         'devices',
         'direct_request_acceptance_claims',
