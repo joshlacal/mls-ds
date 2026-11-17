@@ -3657,7 +3657,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openmls"
 version = "0.9.0-rc.3"
-source = "git+https://github.com/joshlacal/openmls?rev=3ea192fc346663fba5db63aa8c90ccc3ae49f12b#3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
+source = "git+https://github.com/joshlacal/openmls?rev=88e9d8be1be3dd94d368508135865dcc28153e3e#88e9d8be1be3dd94d368508135865dcc28153e3e"
 dependencies = [
  "log",
  "openmls_serialization_helpers",
@@ -3673,7 +3673,7 @@ dependencies = [
 [[package]]
 name = "openmls_basic_credential"
 version = "0.6.0-rc.3"
-source = "git+https://github.com/joshlacal/openmls?rev=3ea192fc346663fba5db63aa8c90ccc3ae49f12b#3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
+source = "git+https://github.com/joshlacal/openmls?rev=88e9d8be1be3dd94d368508135865dcc28153e3e#88e9d8be1be3dd94d368508135865dcc28153e3e"
 dependencies = [
  "ed25519-dalek",
  "ml-dsa",
@@ -3689,7 +3689,7 @@ dependencies = [
 [[package]]
 name = "openmls_libcrux_crypto"
 version = "0.4.0-rc.3"
-source = "git+https://github.com/joshlacal/openmls?rev=3ea192fc346663fba5db63aa8c90ccc3ae49f12b#3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
+source = "git+https://github.com/joshlacal/openmls?rev=88e9d8be1be3dd94d368508135865dcc28153e3e#88e9d8be1be3dd94d368508135865dcc28153e3e"
 dependencies = [
  "hpke-rs",
  "hpke-rs-crypto",
@@ -3710,7 +3710,7 @@ dependencies = [
 [[package]]
 name = "openmls_memory_storage"
 version = "0.6.0-rc.3"
-source = "git+https://github.com/joshlacal/openmls?rev=3ea192fc346663fba5db63aa8c90ccc3ae49f12b#3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
+source = "git+https://github.com/joshlacal/openmls?rev=88e9d8be1be3dd94d368508135865dcc28153e3e#88e9d8be1be3dd94d368508135865dcc28153e3e"
 dependencies = [
  "log",
  "openmls_traits",
@@ -3722,7 +3722,7 @@ dependencies = [
 [[package]]
 name = "openmls_rust_crypto"
 version = "0.6.0-rc.3"
-source = "git+https://github.com/joshlacal/openmls?rev=3ea192fc346663fba5db63aa8c90ccc3ae49f12b#3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
+source = "git+https://github.com/joshlacal/openmls?rev=88e9d8be1be3dd94d368508135865dcc28153e3e#88e9d8be1be3dd94d368508135865dcc28153e3e"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -3748,7 +3748,7 @@ dependencies = [
 [[package]]
 name = "openmls_serialization_helpers"
 version = "0.1.0-rc.3"
-source = "git+https://github.com/joshlacal/openmls?rev=3ea192fc346663fba5db63aa8c90ccc3ae49f12b#3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
+source = "git+https://github.com/joshlacal/openmls?rev=88e9d8be1be3dd94d368508135865dcc28153e3e#88e9d8be1be3dd94d368508135865dcc28153e3e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3759,7 +3759,7 @@ dependencies = [
 [[package]]
 name = "openmls_traits"
 version = "0.6.0-rc.3"
-source = "git+https://github.com/joshlacal/openmls?rev=3ea192fc346663fba5db63aa8c90ccc3ae49f12b#3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
+source = "git+https://github.com/joshlacal/openmls?rev=88e9d8be1be3dd94d368508135865dcc28153e3e#88e9d8be1be3dd94d368508135865dcc28153e3e"
 dependencies = [
  "serde",
  "tls_codec",

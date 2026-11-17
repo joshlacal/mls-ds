@@ -48,8 +48,8 @@ url = { version = "2", optional = true }
 # Only for tests that include catbird-mls/tests/mock_{storage,credentials}.rs
 # (app-metadata storage beside a real orchestrator); pinned exactly as catbird-mls.
 [dev-dependencies]
-openmls_traits = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
-openmls_basic_credential = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = { version = "=0.6.0-rc.3", git = "https://github.com/joshlacal/openmls", rev = "679bdc31ef44dc919f28aee9ce442ec8eb0682c0", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
+openmls_basic_credential = { version = "=0.6.0-rc.3", git = "https://github.com/joshlacal/openmls", rev = "679bdc31ef44dc919f28aee9ce442ec8eb0682c0", features = ["draft-ietf-mls-pq-ciphersuites"] }
 atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
 labyrinth = { path = "../../labyrinth" }
 bird-daemon = { path = "../../BIRDaemon", default-features = false, features = ["test-support"] }

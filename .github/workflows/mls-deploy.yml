@@ -38,8 +38,8 @@ env:
   # Single source for every sibling checkout below. Repin these together when
   # the candidate sibling commits are final.
   CATBIRD_ATPROTO_REV: "708c2db8a7c703a0f0373db2e7e19bc8d8d729d8"
-  CATBIRD_MLS_REV: "de7942748073fbcbb721cf902b671ac83561bdba"
-  LABYRINTH_REV: "a72426ab80608cd14da0cbe274b7a54846f1d3ed"
+  CATBIRD_MLS_REV: "488e81363f56ece6a7801473eaaba1da655e63e9"
+  LABYRINTH_REV: "f077bee176f21c0f847b2e8a745cf47429ab5548"
 
 jobs:
   test:

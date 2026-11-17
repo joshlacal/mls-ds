@@ -1347,9 +1347,11 @@ fn process_public_commit_with_max(
     let path_ciphertext_counts = commit.path_ciphertext_counts.clone();
     let protocol_message = commit.into_protocol_message();
     let processed = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        next_state
-            .public_group()
-            .process_message(next_state.provider().crypto(), protocol_message)
+        next_state.public_group().process_message_at(
+            next_state.provider().crypto(),
+            protocol_message,
+            openmls::prelude::UnixSeconds::new(policy.now_unix_seconds),
+        )
     }))
     .map_err(|_| WireValidationError::InvalidPublicCommit)?
     .map_err(|_| WireValidationError::InvalidPublicCommit)?;
