@@ -18,8 +18,8 @@ use crate::labyrinth::repo::retention;
 
 pub(crate) const RELAY_ACCOUNT_DELETION_NSID: &str = "blue.catbird.mlsDS.relayAccountDeletion";
 const SIGNING_DOMAIN: &[u8] = b"CATBIRD-MLSDS-ACCOUNT-DELETION-RELAY-V1\0";
-/// Room for a relay carrying the largest `actorWrite` and `keyProof`.
-const RELAY_ACCOUNT_DELETION_BODY_LIMIT_BYTES: usize = 65_536;
+/// Room for a relay carrying the largest `actorWrite`, `keyProof`, and `revocationProof`.
+const RELAY_ACCOUNT_DELETION_BODY_LIMIT_BYTES: usize = 98_304;
 
 /// One account deletion, signed by the account's home for one conversation's
 /// sequencer.
@@ -56,6 +56,8 @@ impl AccountDeletionRelay {
         bytes.extend_from_slice(self.conversation_id.as_bytes());
         // Appended only when present, so a relay without evidence signs exactly
         // the bytes it always did; a zero length marks an absent `keyProof`.
+        // `revocationProof` appends only when present to keep existing test
+        // transcripts byte-identical.
         if let Some(evidence) = &self.evidence {
             for field in [
                 evidence.actor_write.write_body.as_slice(),
@@ -64,6 +66,10 @@ impl AccountDeletionRelay {
             ] {
                 bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
                 bytes.extend_from_slice(field);
+            }
+            if let Some(revocation_proof) = &evidence.revocation_proof {
+                bytes.extend_from_slice(&(revocation_proof.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(revocation_proof);
             }
         }
         bytes

@@ -359,9 +359,11 @@ pub const ACTOR_WRITE_BODY_MAX_BYTES: usize = 1024;
 pub const ACTOR_PAYLOAD_MAX_BYTES: usize = 1024;
 /// Lexicon `accountDeletedEntry.keyProof` maximum length.
 pub const KEY_PROOF_MAX_BYTES: usize = 16_384;
+/// Lexicon `accountDeletedEntry.revocationProof` maximum length.
+pub const REVOCATION_PROOF_MAX_BYTES: usize = 16_384;
 /// Upper bound on one serialized `accountDeletedEntry`, which holds the largest
-/// `actorWrite` and `keyProof` the lexicon admits.
-pub const ACCOUNT_DELETED_ENTRY_MAX_BYTES: usize = 32 * 1024;
+/// `actorWrite`, `keyProof`, and `revocationProof` the lexicon admits.
+pub const ACCOUNT_DELETED_ENTRY_MAX_BYTES: usize = 56 * 1024;
 
 /// One sequenced `blue.catbird.chat.defs#accountDeletedEntry`: everything its
 /// [`AccountDeletionAuthority`] binds, plus the deleting device's own evidence,
@@ -401,7 +403,8 @@ pub struct AccountDeletionActorWrite {
 }
 
 /// What an `accountDeletedEntry` carries from the deleting device: its signed
-/// write and, when the device sent one, the repository proof of its key.
+/// write and, when the device sent one, the repository proof of its key and
+/// self-deletion revocation record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountDeletionEvidence {
@@ -412,9 +415,26 @@ pub struct AccountDeletionEvidence {
         with = "crate::atproto_bytes::option"
     )]
     pub key_proof: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::atproto_bytes::option"
+    )]
+    pub revocation_proof: Option<Vec<u8>>,
 }
 
 impl AccountDeletionEvidence {
+    /// The `operationId` (16 bytes) of a well-formed `writeBody`.
+    pub fn operation_id(&self) -> Result<[u8; 16], String> {
+        let wire: crate::labyrinth::auth::WriteBodyWire =
+            serde_json::from_slice(&self.actor_write.write_body)
+                .map_err(|error| format!("actorWrite.writeBody: {error}"))?;
+        let raw = hex::decode(&wire.operation_id)
+            .map_err(|_| "actorWrite.writeBody.operationId is not hex".to_string())?;
+        raw.try_into()
+            .map_err(|_| "actorWrite.writeBody.operationId is not 16 bytes".to_string())
+    }
+
     /// The `signedAt` of a well-formed `writeBody`.
     pub fn signed_at(&self) -> Result<DateTime<Utc>, String> {
         let wire: crate::labyrinth::auth::WriteBodyWire =
@@ -426,8 +446,8 @@ impl AccountDeletionEvidence {
     }
 
     /// Check the lexicon shape: a `labyrinthWriteBody` of `deleteAccountData` of
-    /// at most 1024 bytes, a 64-byte signature, and a non-empty `keyProof` of at
-    /// most 16384 bytes. The signature and the proof are for clients to verify.
+    /// at most 1024 bytes, a 64-byte signature, and optional non-empty `keyProof`
+    /// and `revocationProof` of at most 16384 bytes each.
     pub fn check_shape(&self) -> Result<(), String> {
         let write_body = &self.actor_write.write_body;
         if write_body.is_empty() || write_body.len() > ACTOR_WRITE_BODY_MAX_BYTES {
@@ -439,6 +459,11 @@ impl AccountDeletionEvidence {
         if let Some(key_proof) = &self.key_proof {
             if key_proof.is_empty() || key_proof.len() > KEY_PROOF_MAX_BYTES {
                 return Err("keyProof length is out of range".to_string());
+            }
+        }
+        if let Some(revocation_proof) = &self.revocation_proof {
+            if revocation_proof.is_empty() || revocation_proof.len() > REVOCATION_PROOF_MAX_BYTES {
+                return Err("revocationProof length is out of range".to_string());
             }
         }
         let wire: crate::labyrinth::auth::WriteBodyWire = serde_json::from_slice(write_body)
@@ -461,9 +486,20 @@ impl AccountDeletionEvidence {
         if wire.endpoint_nsid != DELETE_ACCOUNT_DATA_NSID {
             return Err("actorWrite.writeBody names another endpoint".to_string());
         }
+        let op = hex::decode(&wire.operation_id)
+            .map_err(|_| "actorWrite.writeBody.operationId is not hex".to_string())?;
+        if op.len() != 16 {
+            return Err("actorWrite.writeBody.operationId must be 16 bytes".to_string());
+        }
         crate::labyrinth::auth::parse_device_id(&wire.actor_device_id)
             .map_err(|_| "actorWrite.writeBody.actorDeviceId is not a UUID".to_string())?;
         self.signed_at().map(|_| ())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_revocation_proof(mut self, revocation_proof: Option<Vec<u8>>) -> Self {
+        self.revocation_proof = revocation_proof;
+        self
     }
 
     /// Evidence as a device holding `device_key` signs it: the `labyrinthWriteBody`
@@ -501,6 +537,7 @@ impl AccountDeletionEvidence {
                 payload_bytes: Some(b"{}".to_vec()),
             },
             key_proof,
+            revocation_proof: None,
         }
     }
 }
@@ -588,17 +625,23 @@ impl AccountDeletion {
             actor_write: Option<AccountDeletionActorWrite>,
             #[serde(default, with = "crate::atproto_bytes::option")]
             key_proof: Option<Vec<u8>>,
+            #[serde(default, with = "crate::atproto_bytes::option")]
+            revocation_proof: Option<Vec<u8>>,
         }
         let wire = Wire::deserialize(entry)
             .map_err(|error| format!("invalid account-deleted entry: {error}"))?;
-        let evidence = match (wire.actor_write, wire.key_proof) {
-            (Some(actor_write), key_proof) => Some(AccountDeletionEvidence {
+        let evidence = match (wire.actor_write, wire.key_proof, wire.revocation_proof) {
+            (Some(actor_write), key_proof, revocation_proof) => Some(AccountDeletionEvidence {
                 actor_write,
                 key_proof,
+                revocation_proof,
             }),
-            (None, None) => None,
-            (None, Some(_)) => {
+            (None, None, None) => None,
+            (None, Some(_), _) => {
                 return Err("account-deleted keyProof requires its actorWrite".to_string())
+            }
+            (None, None, Some(_)) => {
+                return Err("account-deleted revocationProof requires its actorWrite".to_string())
             }
         };
         if let Some(evidence) = &evidence {
@@ -2583,10 +2626,13 @@ mod tests {
         assert!(legacy.evidence.unwrap().actor_write.payload_bytes.is_none());
 
         // The largest evidence the lexicon admits still fits the entry bound.
-        let largest = evidenced_deletion(Some(device_evidence(
-            ACTOR_WRITE_BODY_MAX_BYTES,
-            Some(vec![0xFF; KEY_PROOF_MAX_BYTES]),
-        )));
+        let largest = evidenced_deletion(Some(
+            device_evidence(
+                ACTOR_WRITE_BODY_MAX_BYTES,
+                Some(vec![0xFF; KEY_PROOF_MAX_BYTES]),
+            )
+            .with_revocation_proof(Some(vec![0xEE; REVOCATION_PROOF_MAX_BYTES])),
+        ));
         let largest_entry = largest.entry(&authority);
         let size = serde_json::to_vec(&largest_entry).unwrap().len();
         assert!(size < ACCOUNT_DELETED_ENTRY_MAX_BYTES, "{size}");

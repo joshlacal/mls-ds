@@ -143,7 +143,8 @@ fn mailbox_relay_error(error: SpaceRelayError) -> LabyrinthError {
         | SpaceRelayError::InvalidTargetEndpoint(_)
         | SpaceRelayError::InvalidDelegationToken(_)
         | SpaceRelayError::Forbidden(_)
-        | SpaceRelayError::UpstreamError(_) => LabyrinthError::new(
+        | SpaceRelayError::UpstreamError(_)
+        | SpaceRelayError::DeviceRevoked(_) => LabyrinthError::new(
             StatusCode::BAD_GATEWAY,
             "UpstreamError",
             "the target PDS returned an invalid mailboxKeys record",

@@ -193,7 +193,7 @@ fn credential_relay_failure(err: SpaceRelayError) -> ChatFailure {
         SpaceRelayError::InvalidRequest(_) | SpaceRelayError::InvalidNsid(_) => {
             ChatFailure::protocol(CREDENTIAL_ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
         }
-        SpaceRelayError::UpstreamError(_) => {
+        SpaceRelayError::UpstreamError(_) | SpaceRelayError::DeviceRevoked(_) => {
             ChatFailure::protocol(CREDENTIAL_ENDPOINT, ChatProtocolErrorCode::UpstreamError)
         }
         SpaceRelayError::UpstreamUnavailable(_) => upstream_unavailable(CREDENTIAL_ENDPOINT),
@@ -214,7 +214,8 @@ fn read_relay_failure(err: SpaceRelayError) -> ChatFailure {
         }
         SpaceRelayError::InvalidDelegationToken(_)
         | SpaceRelayError::Forbidden(_)
-        | SpaceRelayError::UpstreamError(_) => {
+        | SpaceRelayError::UpstreamError(_)
+        | SpaceRelayError::DeviceRevoked(_) => {
             ChatFailure::protocol(READ_ENDPOINT, ChatProtocolErrorCode::UpstreamError)
         }
         SpaceRelayError::UpstreamUnavailable(_) => upstream_unavailable(READ_ENDPOINT),

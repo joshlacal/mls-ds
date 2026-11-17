@@ -16,7 +16,9 @@ use super::params::{admit_procedure, begin_write};
 use super::respond;
 use crate::federation::receipt::{AccountDeletionActorWrite, AccountDeletionEvidence};
 use crate::federation::space_read_relay::{
-    fetch_chat_device_key_proof, verify_supplied_chat_device_key_proof, SpaceRelayError,
+    fetch_chat_device_key_proof, fetch_chat_device_revocation_proof,
+    verify_supplied_chat_device_key_proof, verify_supplied_chat_device_revocation_proof,
+    SpaceRelayError,
 };
 use crate::handlers::chat::ChatRuntime;
 use crate::labyrinth::auth;
@@ -52,24 +54,35 @@ pub async fn purge_mailbox(
     )
 }
 
+fn decode_optional_proof_header(
+    headers: &HeaderMap,
+    header_name: &str,
+    label: &str,
+) -> LabyrinthResult<Option<Vec<u8>>> {
+    headers
+        .get(header_name)
+        .map(|value| {
+            let value = value
+                .to_str()
+                .map_err(|_| LabyrinthError::invalid(format!("{label} is not base64url")))?;
+            auth::decode_b64(label, value)
+        })
+        .transpose()
+}
+
 /// The evidence every `accountDeletedEntry` of this deletion carries: the exact
 /// `labyrinthWriteBody` and signature `admit_procedure` verified, and the
-/// device's optional `keyProof`, decoded from its header. A supplied proof is
-/// verified independently; an absent one is fetched from the PDS before purge.
+/// device's optional `keyProof` and `revocationProof`, decoded from headers.
+/// Supplied proofs are verified independently; absent ones are fetched from
+/// the PDS before purge.
 fn deletion_evidence(
     headers: &HeaderMap,
     bytes: &Bytes,
 ) -> LabyrinthResult<AccountDeletionEvidence> {
     let (write_body, signature) = auth::write_headers(headers)?;
-    let key_proof = headers
-        .get(auth::KEY_PROOF_HEADER)
-        .map(|value| {
-            let value = value
-                .to_str()
-                .map_err(|_| LabyrinthError::invalid("keyProof is not base64url"))?;
-            auth::decode_b64("keyProof", value)
-        })
-        .transpose()?;
+    let key_proof = decode_optional_proof_header(headers, auth::KEY_PROOF_HEADER, "keyProof")?;
+    let revocation_proof =
+        decode_optional_proof_header(headers, auth::REVOCATION_PROOF_HEADER, "revocationProof")?;
     let evidence = AccountDeletionEvidence {
         actor_write: AccountDeletionActorWrite {
             write_body: auth::decode_b64(auth::WRITE_BODY_HEADER, &write_body)?,
@@ -77,6 +90,7 @@ fn deletion_evidence(
             payload_bytes: Some(bytes.to_vec()),
         },
         key_proof,
+        revocation_proof,
     };
     evidence.check_shape().map_err(LabyrinthError::invalid)?;
     Ok(evidence)
@@ -185,6 +199,52 @@ pub async fn delete_account_data(
                 }
             };
             evidence.key_proof = Some(proof);
+            let expected_operation_id =
+                evidence.operation_id().map_err(LabyrinthError::invalid)?;
+            let expected_signed_at = evidence.signed_at().map_err(LabyrinthError::invalid)?;
+            let revocation_result = match evidence.revocation_proof.take() {
+                Some(proof) => verify_supplied_chat_device_revocation_proof(
+                    resolver,
+                    &adm.did,
+                    &device_id,
+                    &admitted_key,
+                    &expected_operation_id,
+                    expected_signed_at,
+                    &proof,
+                )
+                .await
+                .map(|()| proof),
+                None => {
+                    fetch_chat_device_revocation_proof(
+                        resolver,
+                        &adm.did,
+                        &device_id,
+                        &admitted_key,
+                        &expected_operation_id,
+                        expected_signed_at,
+                    )
+                    .await
+                }
+            };
+            let revocation_proof = match revocation_result {
+                Ok(proof) => proof,
+                Err(SpaceRelayError::DeviceRevoked(reason)) => {
+                    tracing::warn!(%reason, "deleteAccountData refused: device revocation proof rejected device");
+                    if let Some(response) = auth::completed_write_for_admission(&pool, &adm).await?
+                    {
+                        return Ok(response);
+                    }
+                    return Err(LabyrinthError::device_revoked());
+                }
+                Err(error) => {
+                    if let Some(response) = auth::completed_write_for_admission(&pool, &adm).await?
+                    {
+                        return Ok(response);
+                    }
+                    return Err(key_proof_unavailable(error));
+                }
+            };
+            evidence.revocation_proof = Some(revocation_proof);
             // Peer homes resolve over HTTP, so before the transaction opens (M-F04).
             let c33_peers = match repo::resolve_c33_peer_homes(&pool, &adm.did).await {
                 Ok(peers) => peers,

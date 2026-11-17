@@ -34,6 +34,13 @@ pub(crate) struct AccountDeletedServerFields {
         with = "crate::atproto_bytes::option"
     )]
     pub(crate) key_proof: Option<Vec<u8>>,
+    /// Optional lexicon `revocationProof`, stored verbatim when present.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::atproto_bytes::option"
+    )]
+    pub(crate) revocation_proof: Option<Vec<u8>>,
 }
 
 impl AccountDeletedServerFields {
@@ -52,10 +59,11 @@ impl AccountDeletedServerFields {
             seq,
             entry_id,
             deleted_at: received_at,
-            // A stored `keyProof` only ever accompanies its `actorWrite`.
+            // Stored `keyProof` / `revocationProof` only ever accompany `actorWrite`.
             evidence: self.actor_write.map(|actor_write| AccountDeletionEvidence {
                 actor_write,
                 key_proof: self.key_proof,
+                revocation_proof: self.revocation_proof,
             }),
         }
         .entry(&self.sequencer_authority)
@@ -1115,6 +1123,12 @@ mod tests {
             actor_write: ActorWrite,
             #[serde(with = "crate::atproto_bytes")]
             key_proof: Vec<u8>,
+            #[serde(
+                default,
+                skip_serializing_if = "Option::is_none",
+                with = "crate::atproto_bytes::option"
+            )]
+            revocation_proof: Option<Vec<u8>>,
         }
         let stored = serde_ipld_dagcbor::to_vec(&StoredRow {
             deleted_did: "did:plc:deleteddeleteddeleted0".to_string(),
@@ -1125,11 +1139,13 @@ mod tests {
                 signature: vec![0x11; 64],
             },
             key_proof: vec![0x22; 128],
+            revocation_proof: Some(vec![0x33; 128]),
         })
         .unwrap();
 
-        let fields = serde_ipld_dagcbor::from_slice::<AccountDeletedServerFields>(&stored)
-            .expect("a row carrying the optional actor write and key proof decodes");
+        let fields = serde_ipld_dagcbor::from_slice::<AccountDeletedServerFields>(&stored).expect(
+            "a row carrying the optional actor write, key proof, and revocation proof decodes",
+        );
         assert_eq!(
             serde_ipld_dagcbor::to_vec(&fields).unwrap(),
             stored,

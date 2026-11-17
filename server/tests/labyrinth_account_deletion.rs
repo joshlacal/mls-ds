@@ -81,11 +81,9 @@ async fn device(did: &str, device_id: Uuid) -> http::Device {
             key_type: "Multikey".to_owned(),
             controller: did.to_owned(),
             public_key_jwk: None,
-            public_key_multibase: Some(
-                catbird_server::identity::did_doc::encode_p256_multikey(
-                    device.signing.verifying_key(),
-                ),
-            ),
+            public_key_multibase: Some(catbird_server::identity::did_doc::encode_p256_multikey(
+                device.signing.verifying_key(),
+            )),
         }],
         service: Some(Vec::new()),
     })
@@ -543,11 +541,14 @@ fn service_token(device: &http::Device, nsid: &str, iat: i64, lifetime: i64) -> 
 }
 
 /// One signed `deleteAccountData`: the device's `labyrinthWriteBody` and signature,
-/// and an optional base64url key proof. Each request carries a fresh service-auth token.
+/// plus optional base64url key and revocation proofs. Each request carries a fresh service-auth token.
 struct SignedDeletion {
     write_body: Vec<u8>,
     signature: Vec<u8>,
+    signed_at: DateTime<Utc>,
+    operation_id: [u8; 16],
     key_proof: Option<String>,
+    revocation_proof: Option<String>,
 }
 
 impl SignedDeletion {
@@ -557,14 +558,26 @@ impl SignedDeletion {
         operation_id: [u8; 16],
         key_proof: Option<String>,
     ) -> Self {
+        Self::new_with_proofs(device, chat_key, operation_id, key_proof, None)
+    }
+
+    fn new_with_proofs(
+        device: &http::Device,
+        chat_key: &ed25519_dalek::SigningKey,
+        operation_id: [u8; 16],
+        key_proof: Option<String>,
+        revocation_proof: Option<String>,
+    ) -> Self {
+        use chrono::SubsecRound as _;
         use ed25519_dalek::Signer as _;
         use sha2::{Digest as _, Sha256};
+        let signed_at = Utc::now().trunc_subsecs(3);
         let write_body = serde_json::to_vec(&json!({
             "operationId": hex::encode(operation_id),
             "actorDeviceId": device.device_id.to_string(),
             "endpointNsid": DELETE_ACCOUNT_DATA,
             "payloadSha256": hex::encode(Sha256::digest(b"{}")),
-            "signedAt": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "signedAt": signed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         }))
         .unwrap();
         let signature = chat_key
@@ -574,7 +587,10 @@ impl SignedDeletion {
         Self {
             write_body,
             signature,
+            signed_at,
+            operation_id,
             key_proof,
+            revocation_proof,
         }
     }
 
@@ -602,6 +618,9 @@ impl SignedDeletion {
             );
         if let Some(key_proof) = &self.key_proof {
             request = request.header("catbird-labyrinth-key-proof", key_proof);
+        }
+        if let Some(revocation_proof) = &self.revocation_proof {
+            request = request.header("catbird-labyrinth-revocation-proof", revocation_proof);
         }
         request.body(axum::body::Body::from("{}")).unwrap()
     }
@@ -659,6 +678,65 @@ fn signed_device_record_car(
     .0
 }
 
+fn signed_device_revocation_car(
+    target_device: &http::Device,
+    actor_device_id: &str,
+    signer_chat_key: &ed25519_dalek::SigningKey,
+    reason: &str,
+    created_at: DateTime<Utc>,
+) -> Vec<u8> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use ed25519_dalek::Signer as _;
+    #[derive(serde::Serialize)]
+    struct TranscriptPayload<'a> {
+        #[serde(rename = "repoDid")]
+        repo_did: &'a str,
+        #[serde(rename = "createdAt")]
+        created_at: &'a str,
+        #[serde(rename = "actorDeviceId")]
+        actor_device_id: &'a str,
+        #[serde(rename = "targetDeviceId")]
+        target_device_id: &'a str,
+    }
+    let secret = p256::SecretKey::from_slice(&target_device.signing.to_bytes()).unwrap();
+    let target_id = target_device.device_id.to_string();
+    let created_at_str = created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let cbor = serde_ipld_dagcbor::to_vec(&TranscriptPayload {
+        repo_did: &target_device.did,
+        created_at: &created_at_str,
+        actor_device_id,
+        target_device_id: &target_id,
+    })
+    .unwrap();
+    let transcript = [
+        b"CATBIRD-CHAT-PDS-DEVICE-REVOCATION-V1\0".as_slice(),
+        cbor.as_slice(),
+    ]
+    .concat();
+    let sig = signer_chat_key.sign(&transcript).to_bytes();
+    let record = json!({
+        "$type": "blue.catbird.chat.deviceRevocation",
+        "targetDeviceId": target_id,
+        "actorDeviceId": actor_device_id,
+        "signerPublicKey": { "$bytes": STANDARD.encode(signer_chat_key.verifying_key().to_bytes()) },
+        "signature": { "$bytes": STANDARD.encode(sig) },
+        "algorithm": "ed25519",
+        "reason": reason,
+        "createdAt": created_at_str,
+    });
+    let key = format!(
+        "blue.catbird.chat.deviceRevocation/{}",
+        target_device.device_id
+    );
+    build_signed_repo_car(
+        &target_device.did,
+        "3l2aaaaaaaaab",
+        &secret,
+        &[(key.as_str(), &record)],
+    )
+    .0
+}
+
 /// The `accountDeletedEntry` rows of `cid`.
 async fn deletion_rows(pool: &sqlx::PgPool, cid: Uuid) -> i64 {
     sqlx::query_scalar(
@@ -685,14 +763,27 @@ async fn a_signed_deletion_carries_the_devices_exact_write_and_key_proof_and_rep
     let chat_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
     let key_proof = signed_device_record_car(&sender, &chat_key);
 
-    // A key proof that is not base64url, or longer than the lexicon admits, is
-    // refused before anything is sequenced.
+    // A key or revocation proof that is not base64url, or longer than the lexicon
+    // admits, is refused before anything is sequenced.
     for bad in [
         "not base64url!".to_owned(),
         URL_SAFE_NO_PAD.encode(vec![0_u8; 16_385]),
     ] {
-        let refused = SignedDeletion::new(&sender, &chat_key, [0xB0; 16], Some(bad));
+        let refused = SignedDeletion::new(&sender, &chat_key, [0xB0; 16], Some(bad.clone()));
         let (status, body) = http::send(lab.clone(), refused.request(&sender)).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+            "{body}"
+        );
+        let refused_rev = SignedDeletion::new_with_proofs(
+            &sender,
+            &chat_key,
+            [0xB1; 16],
+            Some(URL_SAFE_NO_PAD.encode(&key_proof)),
+            Some(bad),
+        );
+        let (status, body) = http::send(lab.clone(), refused_rev.request(&sender)).await;
         assert_eq!(
             (status, body["error"].as_str()),
             (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
@@ -701,12 +792,22 @@ async fn a_signed_deletion_carries_the_devices_exact_write_and_key_proof_and_rep
         assert_eq!(deletion_rows(&s.pool, cid).await, 0);
     }
 
-    let signed = SignedDeletion::new(
+    let op_id = [0xDA; 16];
+    let mut signed = SignedDeletion::new_with_proofs(
         &sender,
         &chat_key,
-        [0xDA; 16],
+        op_id,
         Some(URL_SAFE_NO_PAD.encode(&key_proof)),
+        None,
     );
+    let revocation_proof = signed_device_revocation_car(
+        &sender,
+        &sender.device_id.to_string(),
+        &chat_key,
+        &format!("deleteAccountData:{}", hex::encode(op_id)),
+        signed.signed_at,
+    );
+    signed.revocation_proof = Some(URL_SAFE_NO_PAD.encode(&revocation_proof));
     let (status, body) = http::send(lab.clone(), signed.request(&sender)).await;
     assert_eq!((status, &body), (StatusCode::OK, &json!({})));
     assert_eq!(deletion_rows(&s.pool, cid).await, 1);
@@ -730,6 +831,7 @@ async fn a_signed_deletion_carries_the_devices_exact_write_and_key_proof_and_rep
     assert_eq!(carried.actor_write.write_body, signed.write_body);
     assert_eq!(carried.actor_write.signature, signed.signature);
     assert_eq!(carried.key_proof, Some(key_proof));
+    assert_eq!(carried.revocation_proof, Some(revocation_proof));
     assert_eq!(
         account_deletions(&s, &[&member], cid).await,
         json!([evidence(&entry)])
@@ -768,6 +870,14 @@ async fn deletion_fetches_a_missing_device_proof_before_purge_and_replays_withou
     let sender = device(&fixture.sender_did, fixture.sender_device_id).await;
     let chat_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
     let car = signed_device_record_car(&sender, &chat_key);
+    let signed = SignedDeletion::new(&sender, &chat_key, [0xDB; 16], None);
+    let rev_car = signed_device_revocation_car(
+        &sender,
+        &sender.device_id.to_string(),
+        &chat_key,
+        &format!("deleteAccountData:{}", hex::encode(signed.operation_id)),
+        signed.signed_at,
+    );
     let did = sender.did.clone();
     catbird_server::auth::cache_test_did_document(catbird_server::auth::DidDocument {
         id: did.clone(),
@@ -776,11 +886,9 @@ async fn deletion_fetches_a_missing_device_proof_before_purge_and_replays_withou
             key_type: "Multikey".to_owned(),
             controller: did.clone(),
             public_key_jwk: None,
-            public_key_multibase: Some(
-                catbird_server::identity::did_doc::encode_p256_multikey(
-                    sender.signing.verifying_key(),
-                ),
-            ),
+            public_key_multibase: Some(catbird_server::identity::did_doc::encode_p256_multikey(
+                sender.signing.verifying_key(),
+            )),
         }],
         service: Some(vec![catbird_server::auth::Service {
             id: "#atproto_pds".to_owned(),
@@ -798,26 +906,29 @@ async fn deletion_fetches_a_missing_device_proof_before_purge_and_replays_withou
         get({
             let hits = Arc::clone(&hits);
             let car = Arc::new(car.clone());
+            let rev_car = Arc::new(rev_car.clone());
             let did = did.clone();
             let device_id = sender.device_id.to_string();
             move |Query(query): Query<std::collections::BTreeMap<String, String>>,
                   headers: HeaderMap| {
                 let hits = Arc::clone(&hits);
                 let car = Arc::clone(&car);
+                let rev_car = Arc::clone(&rev_car);
                 let did = did.clone();
                 let device_id = device_id.clone();
                 async move {
                     hits.fetch_add(1, Ordering::SeqCst);
                     assert_eq!(query.get("did"), Some(&did));
-                    assert_eq!(
-                        query.get("collection").map(String::as_str),
-                        Some("blue.catbird.chat.device")
-                    );
                     assert_eq!(query.get("rkey"), Some(&device_id));
                     assert!(headers.get("authorization").is_none());
+                    let bytes = match query.get("collection").map(String::as_str) {
+                        Some("blue.catbird.chat.device") => car.as_ref().clone(),
+                        Some("blue.catbird.chat.deviceRevocation") => rev_car.as_ref().clone(),
+                        other => panic!("unexpected collection: {other:?}"),
+                    };
                     (
                         [(axum::http::header::CONTENT_TYPE, "application/vnd.ipld.car")],
-                        car.as_ref().clone(),
+                        bytes,
                     )
                         .into_response()
                 }
@@ -851,10 +962,9 @@ async fn deletion_fetches_a_missing_device_proof_before_purge_and_replays_withou
         })),
     );
     let lab = labyrinth_with_resolver(&s, resolver).await;
-    let signed = SignedDeletion::new(&sender, &chat_key, [0xDB; 16], None);
     let (status, body) = http::send(lab.clone(), signed.request(&sender)).await;
     assert_eq!((status, &body), (StatusCode::OK, &json!({})));
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
     let member = device(&fixture.recipient_did, fixture.recipient_device_id).await;
     let (read_status, page) = read(
         &s,
@@ -871,13 +981,15 @@ async fn deletion_fetches_a_missing_device_proof_before_purge_and_replays_withou
         .find(|entry| entry["$type"] == ACCOUNT_DELETED)
         .unwrap();
     let (deletion, _) = AccountDeletion::from_entry(entry).unwrap();
-    assert_eq!(deletion.evidence.unwrap().key_proof, Some(car));
+    let ev = deletion.evidence.unwrap();
+    assert_eq!(ev.key_proof, Some(car));
+    assert_eq!(ev.revocation_proof, Some(rev_car));
 
     let (status, body) = http::send(lab, signed.request(&sender)).await;
     assert_eq!((status, &body), (StatusCode::OK, &json!({})));
     assert_eq!(
         hits.load(Ordering::SeqCst),
-        1,
+        2,
         "idempotent replay must not contact the PDS"
     );
 }
@@ -1097,8 +1209,24 @@ async fn service_auth_admits_a_pre_minted_token_after_the_pds_repo_is_deleted() 
     assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 0);
     let key_proof = signed_device_record_car(&sender, &chat_key);
     let proof_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key_proof);
-    let changed_intent =
-        SignedDeletion::new(&sender, &chat_key, [0x9D; 16], Some(proof_header.clone()));
+    let rev_car = signed_device_revocation_car(
+        &sender,
+        &sender.device_id.to_string(),
+        &chat_key,
+        &format!(
+            "deleteAccountData:{}",
+            hex::encode(without_proof.operation_id)
+        ),
+        without_proof.signed_at,
+    );
+    let rev_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&rev_car);
+    let changed_intent = SignedDeletion::new_with_proofs(
+        &sender,
+        &chat_key,
+        [0x9D; 16],
+        Some(proof_header.clone()),
+        Some(rev_header.clone()),
+    );
     let (status, body) = http::send(lab.clone(), changed_intent.request_with(&pre_minted)).await;
     assert_eq!(
         (status, body["error"].as_str()),
@@ -1108,7 +1236,10 @@ async fn service_auth_admits_a_pre_minted_token_after_the_pds_repo_is_deleted() 
     let signed = SignedDeletion {
         write_body: without_proof.write_body,
         signature: without_proof.signature,
+        signed_at: without_proof.signed_at,
+        operation_id: without_proof.operation_id,
         key_proof: Some(proof_header),
+        revocation_proof: Some(rev_header),
     };
     let (status, body) = http::send(lab.clone(), signed.request_with(&pre_minted)).await;
     assert_eq!((status, &body), (StatusCode::OK, &json!({})));
@@ -1116,4 +1247,203 @@ async fn service_auth_admits_a_pre_minted_token_after_the_pds_repo_is_deleted() 
     let (status, body) = http::send(lab, signed.request_with(&pre_minted)).await;
     assert_eq!((status, &body), (StatusCode::OK, &json!({})));
     assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 1);
+}
+
+#[tokio::test]
+async fn deletion_missing_device_revocation_fails_retryably_without_purge() {
+    use axum::{extract::Query, response::IntoResponse as _, routing::get};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use catbird_server::federation::resolver::ValidatedRemoteDestination;
+    use std::sync::Arc;
+
+    let _env = ENV_LOCK.lock().await;
+    let s = sequencer().await;
+    let fixture = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, Some([0x48; 32]))
+        .await
+        .unwrap();
+    let sender = device(&fixture.sender_did, fixture.sender_device_id).await;
+    let chat_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
+    let key_proof = signed_device_record_car(&sender, &chat_key);
+    let did = sender.did.clone();
+    catbird_server::auth::cache_test_did_document(catbird_server::auth::DidDocument {
+        id: did.clone(),
+        verification_method: vec![catbird_server::auth::VerificationMethod {
+            id: format!("{did}#atproto"),
+            key_type: "Multikey".to_owned(),
+            controller: did.clone(),
+            public_key_jwk: None,
+            public_key_multibase: Some(catbird_server::identity::did_doc::encode_p256_multikey(
+                sender.signing.verifying_key(),
+            )),
+        }],
+        service: Some(vec![catbird_server::auth::Service {
+            id: "#atproto_pds".to_owned(),
+            service_type: "AtprotoPersonalDataServer".to_owned(),
+            service_endpoint: "https://missing-rev-pds.example".to_owned(),
+        }]),
+    })
+    .await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = Router::new().route(
+        "/xrpc/com.atproto.sync.getRecord",
+        get(
+            |Query(_): Query<std::collections::BTreeMap<String, String>>| async move {
+                (
+                    StatusCode::NOT_FOUND,
+                    json!({"error": "RecordNotFound"}).to_string(),
+                )
+                    .into_response()
+            },
+        ),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, server).await.unwrap();
+    });
+    let resolver = Arc::new(
+        catbird_server::federation::DsResolver::new(
+            s.pool.clone(),
+            reqwest::Client::new(),
+            SELF_DID.to_owned(),
+            SELF_ENDPOINT.to_owned(),
+            None,
+            300,
+        )
+        .with_destination_resolver_hook(Arc::new(move |target_url: &str| {
+            let remote = url::Url::parse(target_url).unwrap();
+            let mut local = url::Url::parse(&format!("http://127.0.0.1:{}/", addr.port())).unwrap();
+            local.set_path(remote.path());
+            local.set_query(remote.query());
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: local,
+                    host: "127.0.0.1".to_owned(),
+                    addrs: vec![addr],
+                })
+            }))
+        })),
+    );
+    let lab = labyrinth_with_resolver(&s, resolver).await;
+    let signed = SignedDeletion::new(
+        &sender,
+        &chat_key,
+        [0x88; 16],
+        Some(URL_SAFE_NO_PAD.encode(&key_proof)),
+    );
+    let (status, body) = http::send(lab, signed.request(&sender)).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("ServiceUnavailable")),
+        "{body}"
+    );
+    assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 0);
+}
+
+#[tokio::test]
+async fn deletion_rejects_sibling_revoked_device_non_retryably_without_purge() {
+    use axum::{extract::Query, response::IntoResponse as _, routing::get};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use catbird_server::federation::resolver::ValidatedRemoteDestination;
+    use std::sync::Arc;
+
+    let _env = ENV_LOCK.lock().await;
+    let s = sequencer().await;
+    let fixture = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, Some([0x49; 32]))
+        .await
+        .unwrap();
+    let sender = device(&fixture.sender_did, fixture.sender_device_id).await;
+    let chat_key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
+    let key_proof = signed_device_record_car(&sender, &chat_key);
+    let sibling_id = Uuid::new_v4().to_string();
+    let sibling_key = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
+    let signed = SignedDeletion::new(
+        &sender,
+        &chat_key,
+        [0x89; 16],
+        Some(URL_SAFE_NO_PAD.encode(&key_proof)),
+    );
+    let sibling_rev_car = signed_device_revocation_car(
+        &sender,
+        &sibling_id,
+        &sibling_key,
+        "revoked_by_sibling",
+        signed.signed_at,
+    );
+    let did = sender.did.clone();
+    catbird_server::auth::cache_test_did_document(catbird_server::auth::DidDocument {
+        id: did.clone(),
+        verification_method: vec![catbird_server::auth::VerificationMethod {
+            id: format!("{did}#atproto"),
+            key_type: "Multikey".to_owned(),
+            controller: did.clone(),
+            public_key_jwk: None,
+            public_key_multibase: Some(catbird_server::identity::did_doc::encode_p256_multikey(
+                sender.signing.verifying_key(),
+            )),
+        }],
+        service: Some(vec![catbird_server::auth::Service {
+            id: "#atproto_pds".to_owned(),
+            service_type: "AtprotoPersonalDataServer".to_owned(),
+            service_endpoint: "https://sibling-rev-pds.example".to_owned(),
+        }]),
+    })
+    .await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let rev_bytes = Arc::new(sibling_rev_car.clone());
+    let server = Router::new().route(
+        "/xrpc/com.atproto.sync.getRecord",
+        get(
+            move |Query(query): Query<std::collections::BTreeMap<String, String>>| {
+                let rev_bytes = Arc::clone(&rev_bytes);
+                async move {
+                    assert_eq!(
+                        query.get("collection").map(String::as_str),
+                        Some("blue.catbird.chat.deviceRevocation")
+                    );
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/vnd.ipld.car")],
+                        rev_bytes.as_ref().clone(),
+                    )
+                        .into_response()
+                }
+            },
+        ),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, server).await.unwrap();
+    });
+    let resolver = Arc::new(
+        catbird_server::federation::DsResolver::new(
+            s.pool.clone(),
+            reqwest::Client::new(),
+            SELF_DID.to_owned(),
+            SELF_ENDPOINT.to_owned(),
+            None,
+            300,
+        )
+        .with_destination_resolver_hook(Arc::new(move |target_url: &str| {
+            let remote = url::Url::parse(target_url).unwrap();
+            let mut local = url::Url::parse(&format!("http://127.0.0.1:{}/", addr.port())).unwrap();
+            local.set_path(remote.path());
+            local.set_query(remote.query());
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: local,
+                    host: "127.0.0.1".to_owned(),
+                    addrs: vec![addr],
+                })
+            }))
+        })),
+    );
+    let lab = labyrinth_with_resolver(&s, resolver).await;
+    let (status, body) = http::send(lab, signed.request(&sender)).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("DeviceRevoked")),
+        "{body}"
+    );
+    assert_eq!(deletion_rows(&s.pool, fixture.conversation_id).await, 0);
 }

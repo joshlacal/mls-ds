@@ -43,6 +43,10 @@ pub const WRITE_SIGNATURE_HEADER: &str = "catbird-labyrinth-write-signature";
 /// Optional `deleteAccountData` header carrying `base64url(keyProof)`: the
 /// repository proof of the signing device's key, at most 16384 bytes decoded.
 pub const KEY_PROOF_HEADER: &str = "catbird-labyrinth-key-proof";
+/// Optional `deleteAccountData` header carrying `base64url(revocationProof)`: the
+/// repository proof of the deleting device's self-signed `blue.catbird.chat.deviceRevocation`
+/// record, at most 16384 bytes decoded.
+pub const REVOCATION_PROOF_HEADER: &str = "catbird-labyrinth-revocation-proof";
 /// Signature domain of `labyrinthWriteBody`.
 pub const WRITE_DOMAIN: &[u8] = b"CATBIRD-LABYRINTH-WRITE\0";
 /// Accepted skew between `signedAt` and the server instant.

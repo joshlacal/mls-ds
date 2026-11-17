@@ -224,7 +224,8 @@ async fn mirror_serves_device_evidence(pad_to: usize, key_proof_len: usize) {
         deleted_at,
         pad_to,
         Some(vec![0xE7; key_proof_len]),
-    );
+    )
+    .with_revocation_proof(Some(vec![0xE8; key_proof_len]));
     let deletion = AccountDeletion {
         sequencer_did: SEQ.to_owned(),
         conversation_id: cid,

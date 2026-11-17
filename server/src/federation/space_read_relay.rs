@@ -69,8 +69,10 @@ pub const ALLOWED_SPACE_READ_NSIDS: &[&str] = &[
 const SPACE_BLOB_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SPACE_REPO_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAILBOX_KEYS_RECORD_MAX_BYTES: usize = 1024 * 1024;
-/// `accountDeletedEntry.keyProof` lexicon ceiling, including the CAR framing.
+/// `accountDeletedEntry.keyProof` and `accountDeletedEntry.revocationProof` lexicon ceiling, including CAR framing.
 const CHAT_DEVICE_KEY_PROOF_MAX_BYTES: usize = 16 * 1024;
+const CHAT_DEVICE_REVOCATION_PROOF_MAX_BYTES: usize = 16 * 1024;
+const PDS_DEVICE_REVOCATION_DOMAIN: &[u8] = b"CATBIRD-CHAT-PDS-DEVICE-REVOCATION-V1\0";
 const CAR_HEADER_MAX_BYTES: usize = 64 * 1024;
 const CAR_MAX_BLOCKS: usize = 512;
 const MST_MAX_DEPTH: usize = 64;
@@ -122,6 +124,10 @@ pub enum SpaceRelayError {
     /// timeout, body read, or HTTP 5xx/429). Nothing was decided: retry.
     #[error("upstream Space endpoint unavailable: {0}")]
     UpstreamUnavailable(String),
+    /// A verified PDS repository proof establishes that the device was already revoked
+    /// by a sibling or does not match the delete operation being attempted.
+    #[error("device revocation proof rejected device authority: {0}")]
+    DeviceRevoked(String),
 }
 
 /// A failed DNS lookup decided nothing; every other refusal is permanent.
@@ -1291,16 +1297,39 @@ struct ChatDeviceRecordProof {
     created_at: String,
 }
 
-/// Verify the exact signed repository commit, MST inclusion path, and device record
-/// against the DID's independently resolved `#atproto` key. The returned CAR is
-/// suitable for copying into `accountDeletedEntry.keyProof` unchanged.
-pub fn verify_chat_device_key_proof(
-    car_bytes: &[u8],
-    did: &str,
-    device_id: &str,
-    signing_key: &[u8; 32],
-    atproto_key: &SpaceVerifyingKey,
-) -> Result<(), SpaceRelayError> {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChatDeviceRevocationRecordProof {
+    #[serde(rename = "$type")]
+    record_type: String,
+    target_device_id: String,
+    actor_device_id: String,
+    #[serde(with = "serde_bytes")]
+    signer_public_key: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    signature: Vec<u8>,
+    #[serde(default)]
+    algorithm: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+struct PdsDeviceRevocationTranscriptPayload<'a> {
+    // Ordered strictly by DAG-CBOR map key `(byte_len, utf8_bytes)`:
+    // "repoDid" (7), "createdAt" (9), "actorDeviceId" (13), "targetDeviceId" (14).
+    #[serde(rename = "repoDid")]
+    repo_did: &'a str,
+    #[serde(rename = "createdAt")]
+    created_at: &'a str,
+    #[serde(rename = "actorDeviceId")]
+    actor_device_id: &'a str,
+    #[serde(rename = "targetDeviceId")]
+    target_device_id: &'a str,
+}
+
+fn check_canonical_device_id(device_id: &str) -> Result<(), SpaceRelayError> {
     if !valid_record_key(device_id)
         || uuid::Uuid::parse_str(device_id)
             .map(|id| id.to_string() != device_id)
@@ -1310,12 +1339,25 @@ pub fn verify_chat_device_key_proof(
             "actorDeviceId is not a canonical UUID record key".into(),
         ));
     }
-    let (root_cid, blocks) = parse_verified_car_v1(car_bytes, CHAT_DEVICE_KEY_PROOF_MAX_BYTES)?;
+    Ok(())
+}
+
+fn verify_signed_device_rkey_car<T: for<'de> Deserialize<'de>>(
+    car_bytes: &[u8],
+    did: &str,
+    collection: &str,
+    device_id: &str,
+    max_bytes: usize,
+    atproto_key: &SpaceVerifyingKey,
+    absent_label: &str,
+) -> Result<T, SpaceRelayError> {
+    check_canonical_device_id(device_id)?;
+    let (root_cid, blocks) = parse_verified_car_v1(car_bytes, max_bytes)?;
     let commit_bytes = blocks
         .get(&root_cid)
         .ok_or_else(|| SpaceRelayError::UpstreamError("missing root commit block".into()))?;
     let mst_root_cid = verify_atproto_v3_commit(commit_bytes, did, atproto_key)?;
-    let mst_key = format!("blue.catbird.chat.device/{device_id}");
+    let mst_key = format!("{collection}/{device_id}");
     let mut visited = HashSet::new();
     let record_cid = walk_mst_proof(
         &blocks,
@@ -1326,12 +1368,35 @@ pub fn verify_chat_device_key_proof(
         &mut visited,
         0,
     )?
-    .ok_or_else(|| SpaceRelayError::UpstreamError("device record is absent from MST".into()))?;
+    .ok_or_else(|| SpaceRelayError::UpstreamError(format!("{absent_label} is absent from MST")))?;
     let record_bytes = blocks.get(&record_cid).ok_or_else(|| {
-        SpaceRelayError::UpstreamError("MST included device CID but CAR omitted record".into())
+        SpaceRelayError::UpstreamError(format!(
+            "MST included {absent_label} CID but CAR omitted record"
+        ))
     })?;
-    let record: ChatDeviceRecordProof = serde_ipld_dagcbor::from_slice(record_bytes)
-        .map_err(|_| SpaceRelayError::UpstreamError("malformed chat device record".into()))?;
+    serde_ipld_dagcbor::from_slice(record_bytes)
+        .map_err(|_| SpaceRelayError::UpstreamError(format!("malformed {absent_label}")))
+}
+
+/// Verify the exact signed repository commit, MST inclusion path, and device record
+/// against the DID's independently resolved `#atproto` key. The returned CAR is
+/// suitable for copying into `accountDeletedEntry.keyProof` unchanged.
+pub fn verify_chat_device_key_proof(
+    car_bytes: &[u8],
+    did: &str,
+    device_id: &str,
+    signing_key: &[u8; 32],
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<(), SpaceRelayError> {
+    let record: ChatDeviceRecordProof = verify_signed_device_rkey_car(
+        car_bytes,
+        did,
+        "blue.catbird.chat.device",
+        device_id,
+        CHAT_DEVICE_KEY_PROOF_MAX_BYTES,
+        atproto_key,
+        "chat device record",
+    )?;
     if record.record_type != "blue.catbird.chat.device"
         || record.algorithm != "ed25519"
         || record.mls_signature_public_key.as_slice() != signing_key.as_slice()
@@ -1341,6 +1406,86 @@ pub fn verify_chat_device_key_proof(
             "chat device record does not bind the admitted signing key".into(),
         ));
     }
+    Ok(())
+}
+
+/// Verify the exact signed repository commit, MST inclusion path, and self-deletion
+/// `blue.catbird.chat.deviceRevocation/{device_id}` record against the DID's
+/// independently resolved `#atproto` key.
+///
+/// Rejects sibling-authored, prior, mismatched-operation, or invalidly signed revocation
+/// records with [`SpaceRelayError::DeviceRevoked`]. Missing MST inclusion returns
+/// [`SpaceRelayError::UpstreamError`] so the deletion handler fails closed retryably
+/// (`503 ServiceUnavailable`) before any purge occurs.
+pub fn verify_chat_device_revocation_proof(
+    car_bytes: &[u8],
+    did: &str,
+    device_id: &str,
+    signing_key: &[u8; 32],
+    expected_operation_id: &[u8; 16],
+    expected_signed_at: chrono::DateTime<chrono::Utc>,
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<(), SpaceRelayError> {
+    let record: ChatDeviceRevocationRecordProof = verify_signed_device_rkey_car(
+        car_bytes,
+        did,
+        "blue.catbird.chat.deviceRevocation",
+        device_id,
+        CHAT_DEVICE_REVOCATION_PROOF_MAX_BYTES,
+        atproto_key,
+        "deviceRevocation record",
+    )?;
+    if record.record_type != "blue.catbird.chat.deviceRevocation" {
+        return Err(SpaceRelayError::UpstreamError(
+            "deviceRevocation record has unexpected $type".into(),
+        ));
+    }
+    let expected_reason = format!("deleteAccountData:{}", hex::encode(expected_operation_id));
+    if record.target_device_id != device_id
+        || record.actor_device_id != device_id
+        || record.signer_public_key.as_slice() != signing_key.as_slice()
+        || record.reason.as_deref() != Some(expected_reason.as_str())
+    {
+        return Err(SpaceRelayError::DeviceRevoked(
+            "deviceRevocation binds another actor or operation".into(),
+        ));
+    }
+    if let Some(alg) = &record.algorithm {
+        if !alg.eq_ignore_ascii_case("ed25519") {
+            return Err(SpaceRelayError::DeviceRevoked(
+                "unsupported deviceRevocation algorithm".into(),
+            ));
+        }
+    }
+    let created_at = chrono::DateTime::parse_from_rfc3339(&record.created_at)
+        .map_err(|_| SpaceRelayError::DeviceRevoked("invalid deviceRevocation createdAt".into()))?;
+    if created_at.with_timezone(&chrono::Utc) != expected_signed_at {
+        return Err(SpaceRelayError::DeviceRevoked(
+            "deviceRevocation createdAt does not match deletion signedAt".into(),
+        ));
+    }
+    let sig_64: [u8; 64] =
+        record.signature.as_slice().try_into().map_err(|_| {
+            SpaceRelayError::DeviceRevoked("deviceRevocation signature length".into())
+        })?;
+    let payload = PdsDeviceRevocationTranscriptPayload {
+        repo_did: did,
+        created_at: &record.created_at,
+        actor_device_id: device_id,
+        target_device_id: device_id,
+    };
+    let cbor = serde_ipld_dagcbor::to_vec(&payload).map_err(|error| {
+        SpaceRelayError::UpstreamError(format!("encode deviceRevocation DAG-CBOR: {error}"))
+    })?;
+    let mut transcript = Vec::with_capacity(PDS_DEVICE_REVOCATION_DOMAIN.len() + cbor.len());
+    transcript.extend_from_slice(PDS_DEVICE_REVOCATION_DOMAIN);
+    transcript.extend_from_slice(&cbor);
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(signing_key)
+        .map_err(|_| SpaceRelayError::DeviceRevoked("invalid device verifying key".into()))?;
+    vk.verify_strict(&transcript, &ed25519_dalek::Signature::from_bytes(&sig_64))
+        .map_err(|_| {
+            SpaceRelayError::DeviceRevoked("deviceRevocation signature does not verify".into())
+        })?;
     Ok(())
 }
 
@@ -1363,15 +1508,41 @@ pub async fn verify_supplied_chat_device_key_proof(
     verify_chat_device_key_proof(car_bytes, did, device_id, signing_key, &atproto_key)
 }
 
-/// Fetch a missing proof before deleting the account's server data. The PDS URL
-/// comes only from the DID document, is DNS-pinned, and receives no caller headers.
-/// An unsigned HTTP 404 cannot prove the record absent and is never accepted.
-pub async fn fetch_chat_device_key_proof(
+/// Validate a caller-supplied `revocationProof` CAR using a fresh DID document.
+pub async fn verify_supplied_chat_device_revocation_proof(
     resolver: &DsResolver,
     did: &str,
     device_id: &str,
     signing_key: &[u8; 32],
-) -> Result<Vec<u8>, SpaceRelayError> {
+    expected_operation_id: &[u8; 16],
+    expected_signed_at: chrono::DateTime<chrono::Utc>,
+    car_bytes: &[u8],
+) -> Result<(), SpaceRelayError> {
+    let atproto_key = resolver
+        .resolve_did_to_atproto_key(did)
+        .await
+        .map_err(mailbox_resolution_error)?
+        .ok_or_else(|| {
+            SpaceRelayError::UpstreamError("deleted DID has no #atproto signing key".into())
+        })?;
+    verify_chat_device_revocation_proof(
+        car_bytes,
+        did,
+        device_id,
+        signing_key,
+        expected_operation_id,
+        expected_signed_at,
+        &atproto_key,
+    )
+}
+
+async fn fetch_chat_device_repo_car(
+    resolver: &DsResolver,
+    did: &str,
+    collection: &str,
+    device_id: &str,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, SpaceVerifyingKey), SpaceRelayError> {
     if crate::identity::canonical_did(did) != did
         || !atproto_spaces::is_valid_did(did)
         || !(did.starts_with("did:plc:") || did.starts_with("did:web:"))
@@ -1380,11 +1551,7 @@ pub async fn fetch_chat_device_key_proof(
             "deleted DID must be one canonical bare did:plc or did:web".into(),
         ));
     }
-    if !valid_record_key(device_id) {
-        return Err(SpaceRelayError::InvalidRequest(
-            "invalid chat device record key".into(),
-        ));
-    }
+    check_canonical_device_id(device_id)?;
     let (pds, atproto_key_opt) = resolver
         .resolve_did_to_pds_and_atproto_key(did)
         .await
@@ -1399,7 +1566,7 @@ pub async fn fetch_chat_device_key_proof(
     .map_err(|error| SpaceRelayError::InvalidTargetEndpoint(error.to_string()))?;
     url.query_pairs_mut()
         .append_pair("did", did)
-        .append_pair("collection", "blue.catbird.chat.device")
+        .append_pair("collection", collection)
         .append_pair("rkey", device_id);
     let destination = resolver
         .resolve_endpoint_destination(url.as_str())
@@ -1415,12 +1582,12 @@ pub async fn fetch_chat_device_key_proof(
     .await
     .map_err(mailbox_resolution_error)?;
     let status = response.status();
-    let max_bytes = if status.is_success() {
-        CHAT_DEVICE_KEY_PROOF_MAX_BYTES
+    let response_cap = if status.is_success() {
+        max_bytes
     } else {
         ERROR_RESPONSE_MAX_BYTES
     };
-    let body = collect_bounded(response, ResponseBodyBudget::new(max_bytes, deadline))
+    let body = collect_bounded(response, ResponseBodyBudget::new(response_cap, deadline))
         .await
         .map_err(|error| {
             if retryable_status(status) || body_read_was_transient(&error) {
@@ -1431,7 +1598,7 @@ pub async fn fetch_chat_device_key_proof(
         })?;
     if !status.is_success() {
         let reason = format!(
-            "chat device sync.getRecord returned HTTP {}",
+            "chat device sync.getRecord ({collection}) returned HTTP {}",
             status.as_u16()
         );
         return Err(if retryable_status(status) {
@@ -1440,8 +1607,58 @@ pub async fn fetch_chat_device_key_proof(
             SpaceRelayError::UpstreamError(reason)
         });
     }
+    Ok((body.to_vec(), atproto_key))
+}
+
+/// Fetch a missing proof before deleting the account's server data. The PDS URL
+/// comes only from the DID document, is DNS-pinned, and receives no caller headers.
+/// An unsigned HTTP 404 cannot prove the record absent and is never accepted.
+pub async fn fetch_chat_device_key_proof(
+    resolver: &DsResolver,
+    did: &str,
+    device_id: &str,
+    signing_key: &[u8; 32],
+) -> Result<Vec<u8>, SpaceRelayError> {
+    let (body, atproto_key) = fetch_chat_device_repo_car(
+        resolver,
+        did,
+        "blue.catbird.chat.device",
+        device_id,
+        CHAT_DEVICE_KEY_PROOF_MAX_BYTES,
+    )
+    .await?;
     verify_chat_device_key_proof(&body, did, device_id, signing_key, &atproto_key)?;
-    Ok(body.to_vec())
+    Ok(body)
+}
+
+/// Fetch and verify a missing self-deletion `blue.catbird.chat.deviceRevocation`
+/// CARv1 proof from the deleting account's resolved PDS before purging data.
+pub async fn fetch_chat_device_revocation_proof(
+    resolver: &DsResolver,
+    did: &str,
+    device_id: &str,
+    signing_key: &[u8; 32],
+    expected_operation_id: &[u8; 16],
+    expected_signed_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<u8>, SpaceRelayError> {
+    let (body, atproto_key) = fetch_chat_device_repo_car(
+        resolver,
+        did,
+        "blue.catbird.chat.deviceRevocation",
+        device_id,
+        CHAT_DEVICE_REVOCATION_PROOF_MAX_BYTES,
+    )
+    .await?;
+    verify_chat_device_revocation_proof(
+        &body,
+        did,
+        device_id,
+        signing_key,
+        expected_operation_id,
+        expected_signed_at,
+        &atproto_key,
+    )?;
+    Ok(body)
 }
 
 fn mailbox_resolution_error(error: FederationError) -> SpaceRelayError {
@@ -2092,6 +2309,87 @@ mod tests {
         assert!(
             verify_chat_device_key_proof(&oversized, did, device_id, &signing_key, &vk).is_err()
         );
+    }
+
+    #[test]
+    fn device_revocation_car_proof_binds_self_deletion_and_rejects_sibling() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use ed25519_dalek::Signer as _;
+
+        let did = "did:web:deleting-rev.example";
+        let device_id = "f65aa2fd-6fae-4fc9-955b-088ce430f8d6";
+        let sibling_id = "a3814970-35ec-4d0e-b37a-c39f87849469";
+        let secret = p256::SecretKey::from_slice(&[0x5b; 32]).unwrap();
+        let vk = SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(secret.public_key()));
+        let ed_sk = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
+        let ed_pk = ed_sk.verifying_key().to_bytes();
+        let op_id = [0x9A; 16];
+        let signed_at_str = "2026-11-17T03:00:00.123Z";
+        let signed_at = chrono::DateTime::parse_from_rfc3339(signed_at_str)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let sign_record = |actor: &str, signer: &ed25519_dalek::SigningKey, reason: &str| {
+            let payload = PdsDeviceRevocationTranscriptPayload {
+                repo_did: did,
+                created_at: signed_at_str,
+                actor_device_id: actor,
+                target_device_id: device_id,
+            };
+            let cbor = serde_ipld_dagcbor::to_vec(&payload).unwrap();
+            let transcript = [PDS_DEVICE_REVOCATION_DOMAIN, cbor.as_slice()].concat();
+            let sig = signer.sign(&transcript).to_bytes();
+            let record = json!({
+                "$type": "blue.catbird.chat.deviceRevocation",
+                "targetDeviceId": device_id,
+                "actorDeviceId": actor,
+                "signerPublicKey": { "$bytes": STANDARD.encode(signer.verifying_key().to_bytes()) },
+                "signature": { "$bytes": STANDARD.encode(sig) },
+                "algorithm": "ed25519",
+                "reason": reason,
+                "createdAt": signed_at_str,
+            });
+            let key = format!("blue.catbird.chat.deviceRevocation/{device_id}");
+            build_signed_repo_car(did, "3l2aaaaaaaaaa", &secret, &[(key.as_str(), &record)]).0
+        };
+
+        let valid = sign_record(
+            device_id,
+            &ed_sk,
+            &format!("deleteAccountData:{}", hex::encode(op_id)),
+        );
+        verify_chat_device_revocation_proof(&valid, did, device_id, &ed_pk, &op_id, signed_at, &vk)
+            .unwrap();
+
+        // Sibling revocation -> DeviceRevoked (non-retryable)
+        let sibling_sk = ed25519_dalek::SigningKey::from_bytes(&[0x45; 32]);
+        let sibling_car = sign_record(sibling_id, &sibling_sk, "revoked_by_sibling");
+        assert!(matches!(
+            verify_chat_device_revocation_proof(
+                &sibling_car,
+                did,
+                device_id,
+                &ed_pk,
+                &op_id,
+                signed_at,
+                &vk
+            ),
+            Err(SpaceRelayError::DeviceRevoked(_))
+        ));
+
+        // Mismatched operation id -> DeviceRevoked
+        assert!(matches!(
+            verify_chat_device_revocation_proof(
+                &valid,
+                did,
+                device_id,
+                &ed_pk,
+                &[0x9B; 16],
+                signed_at,
+                &vk
+            ),
+            Err(SpaceRelayError::DeviceRevoked(_))
+        ));
     }
 
     #[tokio::test]

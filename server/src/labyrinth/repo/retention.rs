@@ -491,15 +491,21 @@ pub(crate) async fn sequence_account_deleted_entry(
         LabyrinthError::internal()
     })?;
     let entry = deletion.entry(&sequencer_authority);
-    let (actor_write, key_proof) = deletion.evidence.map_or((None, None), |evidence| {
-        (Some(evidence.actor_write), evidence.key_proof)
-    });
+    let (actor_write, key_proof, revocation_proof) =
+        deletion.evidence.map_or((None, None, None), |evidence| {
+            (
+                Some(evidence.actor_write),
+                evidence.key_proof,
+                evidence.revocation_proof,
+            )
+        });
     let server_fields_bytes = serde_ipld_dagcbor::to_vec(&AccountDeletedServerFields {
         deleted_did: deletion.deleted_did,
         sequencer_did: deletion.sequencer_did,
         sequencer_authority,
         actor_write,
         key_proof,
+        revocation_proof,
     })
     .map_err(|_| LabyrinthError::internal())?;
 

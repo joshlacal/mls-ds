@@ -1056,12 +1056,15 @@ async fn a_sequencer_stores_the_relayed_devices_signed_write_and_key_proof_verba
             let at = current_utc();
             let deleted_at = canonical(at);
             let plain = deletion_relay(&home_key, HOME, SEQ, cid, deleted, &deleted_at);
-            let evidence = device_evidence(fixture.sender_device_id, at, Some(vec![0x6B; 4096]));
+            let evidence = device_evidence(fixture.sender_device_id, at, Some(vec![0x6B; 4096]))
+                .with_revocation_proof(Some(vec![0x7C; 4096]));
             let genuine = evidenced_relay(&home_key, &plain, evidence.clone());
             let bad = (StatusCode::BAD_REQUEST, "InvalidRequest");
             let tampered = (StatusCode::FORBIDDEN, "InvalidSignature");
             let mut altered = genuine.clone();
             altered.evidence.as_mut().unwrap().key_proof = Some(vec![0x6C; 4096]);
+            let mut altered_rev = genuine.clone();
+            altered_rev.evidence.as_mut().unwrap().revocation_proof = Some(vec![0x7D; 4096]);
             let mut stripped = genuine.clone();
             stripped.evidence = None;
             let mut short_signature = evidence.clone();
@@ -1069,6 +1072,7 @@ async fn a_sequencer_stores_the_relayed_devices_signed_write_and_key_proof_verba
             let cases = [
                 // Evidence changed or removed after the home signed it.
                 (altered, tampered),
+                (altered_rev, tampered),
                 (stripped, tampered),
                 // A write signed outside the deletion's write window.
                 (

@@ -6262,6 +6262,12 @@
           "minLength": 1,
           "maxLength": 16384,
           "description": "Optional; present only together with actorWrite. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. A CARv1 repository proof in the com.atproto.sync.getRecord shape: the signed repository commit of deletedDid, the MST path, and the record block for blue.catbird.chat.device/{actorDeviceId}, where actorDeviceId comes from actorWrite.writeBody. It verifies under the #atproto key of deletedDid's DID document, so a reader can check the signing device's key after deletedDid's repository is gone. It is captured before the repository is deleted and copied verbatim into every copy of the entry."
+        },
+        "revocationProof": {
+          "type": "bytes",
+          "minLength": 1,
+          "maxLength": 16384,
+          "description": "Optional; present only together with actorWrite. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. A CARv1 repository proof in the com.atproto.sync.getRecord shape: the signed repository commit of deletedDid, the MST path, and the record block for the create-only blue.catbird.chat.deviceRevocation/{actorDeviceId} record where targetDeviceId == actorDeviceId, createdAt == actorWrite.signedAt, and reason == 'deleteAccountData:' || operationId. Because deviceRevocation is create-only, a valid CARv1 under deletedDid's #atproto key proves actorDeviceId had not been revoked prior to signing deletion even after deletedDid's repository is gone."
         }
       }
     },

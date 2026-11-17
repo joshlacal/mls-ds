@@ -831,9 +831,11 @@ impl Device {
 
     /// `POST` a procedure under `operation_id`.
     pub async fn call_op(&self, name: &str, input: &Value, operation_id: [u8; 16]) -> Reply {
+        use chrono::SubsecRound as _;
         let nsid = format!("{PREFIX}{name}");
         let body = serde_json::to_vec(input).unwrap();
-        let (write, sig) = self.write_headers(&nsid, &body, operation_id);
+        let signed_at = Utc::now().trunc_subsecs(3);
+        let (write, sig) = self.write_headers_at(&nsid, &body, operation_id, signed_at);
         let mut request = Request::post(format!("/xrpc/{nsid}"))
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {}", self.token(&nsid)))
@@ -841,21 +843,70 @@ impl Device {
             .header("catbird-labyrinth-write-signature", sig);
         if name == "deleteAccountData" {
             use catbird_server::federation::space_read_relay::test_car_builder::build_signed_repo_car;
+            use ed25519_dalek::Signer as _;
+            #[derive(serde::Serialize)]
+            struct TranscriptPayload<'a> {
+                #[serde(rename = "repoDid")]
+                repo_did: &'a str,
+                #[serde(rename = "createdAt")]
+                created_at: &'a str,
+                #[serde(rename = "actorDeviceId")]
+                actor_device_id: &'a str,
+                #[serde(rename = "targetDeviceId")]
+                target_device_id: &'a str,
+            }
             let secret = p256::SecretKey::from_slice(&self.jwt_key.to_bytes()).unwrap();
-            let record = json!({
+            let dev_id = self.device_id.to_string();
+            let created_at_str = signed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let device_record = json!({
                 "$type": "blue.catbird.chat.device",
                 "mlsSignaturePublicKey": { "$bytes": base64::engine::general_purpose::STANDARD.encode(self.chat_pub()) },
                 "algorithm": "ed25519",
                 "createdAt": "2026-11-16T00:00:00Z",
             });
-            let key = format!("blue.catbird.chat.device/{}", self.device_id);
+            let cbor = serde_ipld_dagcbor::to_vec(&TranscriptPayload {
+                repo_did: &self.did,
+                created_at: &created_at_str,
+                actor_device_id: &dev_id,
+                target_device_id: &dev_id,
+            })
+            .unwrap();
+            let transcript = [
+                b"CATBIRD-CHAT-PDS-DEVICE-REVOCATION-V1\0".as_slice(),
+                cbor.as_slice(),
+            ]
+            .concat();
+            let rev_sig = self.chat_key.sign(&transcript).to_bytes();
+            let rev_record = json!({
+                "$type": "blue.catbird.chat.deviceRevocation",
+                "targetDeviceId": dev_id,
+                "actorDeviceId": self.device_id.to_string(),
+                "signerPublicKey": { "$bytes": base64::engine::general_purpose::STANDARD.encode(self.chat_pub()) },
+                "signature": { "$bytes": base64::engine::general_purpose::STANDARD.encode(rev_sig) },
+                "algorithm": "ed25519",
+                "reason": format!("deleteAccountData:{}", hex::encode(operation_id)),
+                "createdAt": created_at_str,
+            });
+            let device_key = format!("blue.catbird.chat.device/{}", self.device_id);
+            let rev_key = format!("blue.catbird.chat.deviceRevocation/{}", self.device_id);
             let (proof, _) = build_signed_repo_car(
                 &self.did,
                 "3l2aaaaaaaaaa",
                 &secret,
-                &[(key.as_str(), &record)],
+                &[(device_key.as_str(), &device_record)],
             );
-            request = request.header("catbird-labyrinth-key-proof", URL_SAFE_NO_PAD.encode(proof));
+            let (rev_proof, _) = build_signed_repo_car(
+                &self.did,
+                "3l2aaaaaaaaab",
+                &secret,
+                &[(rev_key.as_str(), &rev_record)],
+            );
+            request = request
+                .header("catbird-labyrinth-key-proof", URL_SAFE_NO_PAD.encode(proof))
+                .header(
+                    "catbird-labyrinth-revocation-proof",
+                    URL_SAFE_NO_PAD.encode(rev_proof),
+                );
         }
         let request = request.body(Body::from(body)).unwrap();
         send(&self.router, request).await
@@ -887,9 +938,9 @@ pub async fn cache_did_key(did: &str, key: &P256Key) {
             key_type: "Multikey".to_string(),
             controller: did.to_owned(),
             public_key_jwk: None,
-            public_key_multibase: Some(
-                catbird_server::identity::did_doc::encode_p256_multikey(key.verifying_key()),
-            ),
+            public_key_multibase: Some(catbird_server::identity::did_doc::encode_p256_multikey(
+                key.verifying_key(),
+            )),
         }],
         service: Some(Vec::new()),
     };
