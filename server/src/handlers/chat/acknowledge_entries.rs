@@ -386,6 +386,10 @@ async fn execute_ack(
                         input.conversation_id,
                         &actor_did,
                         input.actor_device_id,
+                        entry_read::PageRequest {
+                            after: (input.up_to_seq - 1) as u64,
+                            limit: 1,
+                        },
                     )
                     .await?
                     .ok_or_else(denied)?,

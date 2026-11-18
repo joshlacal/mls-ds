@@ -258,6 +258,7 @@ pub(crate) async fn federated_recovery_read_window(
     device: Uuid,
     conversation: Uuid,
     sequencer: &str,
+    post_erasure: Option<crate::chat_protocol::repository::entry_read::PageRequest>,
 ) -> Result<Response, ChatFailure> {
     let admission =
         context::admit_federated_read(pool, ENDPOINT, principal, &device.to_string()).await?;
@@ -266,6 +267,7 @@ pub(crate) async fn federated_recovery_read_window(
         admission,
         conversation,
         sequencer,
+        post_erasure,
     )
     .await
     .map_err(facade_failure)?;

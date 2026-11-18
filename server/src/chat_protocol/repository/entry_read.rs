@@ -1216,6 +1216,10 @@ mod tests {
     }
 }
 
+#[path = "recovery_erasure_read.rs"]
+mod erasure_read;
+pub(crate) use erasure_read::PageRequest;
+
 /// Ephemeral sequencer evidence for a home whose verified mirror has the
 /// member but predates its restored leaf. A later read obtains a fresh window.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1230,6 +1234,8 @@ pub(crate) struct RecoveryReadWindow {
     generation: i64,
     first_seq: i64,
     last_seq: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_erasure: Option<erasure_read::Page>,
 }
 
 pub(crate) async fn acknowledged_recovery_read_window(
@@ -1237,6 +1243,7 @@ pub(crate) async fn acknowledged_recovery_read_window(
     admission: VerifiedReadAdmission,
     conversation: Uuid,
     sequencer: &str,
+    post_erasure: Option<PageRequest>,
 ) -> Result<RecoveryReadWindow, EntryReadFacadeError> {
     let attempt = read_authority::into_single_read_admission(
         admission,
@@ -1284,7 +1291,7 @@ pub(crate) async fn acknowledged_recovery_read_window(
     .await
     .map_err(|_| EntryReadFacadeError::Storage)?
     .ok_or(EntryReadFacadeError::NotEntitled)?;
-    Ok(RecoveryReadWindow {
+    let mut window = RecoveryReadWindow {
         conversation,
         did,
         device: id,
@@ -1294,7 +1301,12 @@ pub(crate) async fn acknowledged_recovery_read_window(
         generation,
         first_seq,
         last_seq,
-    })
+        post_erasure: None,
+    };
+    if let Some(query) = post_erasure {
+        window.post_erasure = Some(erasure_read::authorize(&mut tx, &window, query).await?);
+    }
+    Ok(window)
 }
 
 pub(crate) async fn granted_recovery_page(
@@ -1319,7 +1331,18 @@ pub(crate) async fn granted_recovery_page(
         .await
         .map_err(|_| EntryReadFacadeError::Storage)?;
     validate_recovery_opening(&mut tx, &window, sequencer, conversation, did, device).await?;
-    let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+    let (rows, has_more) = if let Some(page) = &window.post_erasure {
+        page.local_rows(
+            &mut tx,
+            &window,
+            PageRequest {
+                after: after_seq,
+                limit,
+            },
+        )
+        .await?
+    } else {
+        let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
         "SELECT e.seq,e.entry_bytes FROM chat.direct_request_transport_entries e \
          JOIN chat.group_transport_entry_recipients r USING(conversation_id,seq) \
          WHERE e.conversation_id=$1 AND r.user_did=$2 AND r.device_id=$3 AND e.seq>$4 AND e.seq BETWEEN $5 AND $6 \
@@ -1335,7 +1358,9 @@ pub(crate) async fn granted_recovery_page(
     .fetch_all(&mut *tx)
     .await
     .map_err(|_| EntryReadFacadeError::Storage)?;
-    let has_more = rows.len() > limit as usize;
+        let has_more = rows.len() > limit as usize;
+        (rows, has_more)
+    };
     let mut granted = rows
         .into_iter()
         .take(limit as usize)
@@ -1396,13 +1421,14 @@ async fn validate_recovery_opening(
     // delivered here, the active local enrollment, and this mirror's current membership.
     let opening: Vec<u8> = sqlx::query_scalar(
         "SELECT e.entry_bytes FROM chat.conversations c \
-          JOIN chat.remote_group_memberships m ON m.conversation_id=c.conversation_id AND m.sequencer_did=c.sequencer_ds \
-          JOIN chat.devices d ON d.user_did=m.user_did \
+          LEFT JOIN chat.remote_group_memberships m ON m.conversation_id=c.conversation_id AND m.sequencer_did=c.sequencer_ds AND m.user_did=$3 \
+          JOIN chat.devices d ON d.user_did=$3 \
           JOIN chat.device_keys k ON (k.user_did,k.device_id)=(d.user_did,d.device_id) \
           JOIN chat.group_transport_entry_recipients r ON (r.conversation_id,r.user_did,r.device_id)=(c.conversation_id,d.user_did,d.device_id) \
           JOIN chat.direct_request_transport_entries e ON (e.conversation_id,e.seq)=(r.conversation_id,r.seq) \
          WHERE c.conversation_id=$1 AND c.kind='group' AND c.is_remote AND c.sequencer_ds=$2 AND c.lifecycle='active' AND c.current_generation=$8 \
-           AND m.user_did=$3 AND m.status='active' AND d.device_id=$4 AND d.auth_generation=$5 AND d.status='active' AND d.revoked_at IS NULL \
+           AND (m.status='active' OR ($9 AND m.user_did IS NULL AND EXISTS(SELECT 1 FROM chat.participants p \
+             WHERE p.conversation_id=c.conversation_id AND p.user_did=$3 AND p.current_membership AND p.status='active'))) AND d.device_id=$4 AND d.auth_generation=$5 AND d.status='active' AND d.revoked_at IS NULL \
            AND k.key_id=$6 AND k.enrollment_auth_generation<=d.auth_generation AND k.revoked_at IS NULL AND r.seq=$7 \
            AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
              AND newer.enrollment_auth_generation BETWEEN k.enrollment_auth_generation+1 AND d.auth_generation) \
@@ -1416,6 +1442,7 @@ async fn validate_recovery_opening(
     .bind(&window.key_id)
     .bind(window.first_seq)
     .bind(window.generation)
+    .bind(window.post_erasure.is_some())
     .fetch_optional(&mut **tx)
     .await
     .map_err(|_| EntryReadFacadeError::Storage)?
@@ -1435,6 +1462,9 @@ async fn validate_recovery_opening(
         })
     {
         return Err(EntryReadFacadeError::NotEntitled);
+    }
+    if let Some(page) = &window.post_erasure {
+        erasure_read::matches_cut(tx, window, page).await?;
     }
     Ok(())
 }
@@ -1466,6 +1496,23 @@ pub(crate) async fn verify_recovery_ack(
         return Err(EntryReadFacadeError::NotEntitled);
     }
     validate_recovery_opening(tx, window, sequencer, ack.conversation, ack.did, ack.device).await?;
+    if let Some(page) = &window.post_erasure {
+        let (rows, _) = page
+            .local_rows(
+                tx,
+                window,
+                PageRequest {
+                    after: (ack.through - 1) as u64,
+                    limit: 1,
+                },
+            )
+            .await?;
+        return if rows.first().map(|row| row.0) == Some(ack.through) {
+            Ok(())
+        } else {
+            Err(EntryReadFacadeError::NotEntitled)
+        };
+    }
     let granted: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM chat.group_transport_entry_recipients \
          WHERE conversation_id=$1 AND seq=$2 AND user_did=$3 AND device_id=$4)",
