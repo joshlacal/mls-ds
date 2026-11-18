@@ -691,8 +691,17 @@ mod close_racing_accept {
             test_support::{seed_genuine_pending_direct_request, sign_mutation_json_for_test},
         },
         common::{fresh_db::fresh_fully_migrated_db, http_acceptance as http},
-        sim_hooks::{scope_ds_clock, scope_sim_ds, ManualDsClock, QueuedTaskSpawner, SimDsHooks},
+        sim_hooks::{scope_sim_ds, DsClock, QueuedTaskSpawner, SimDsHooks},
     };
+
+    /// Keep the device activity day fixed while using the normal auth cache and replay checks.
+    struct RequestClock(chrono::DateTime<chrono::Utc>);
+
+    impl DsClock for RequestClock {
+        fn now_utc(&self) -> chrono::DateTime<chrono::Utc> {
+            self.0
+        }
+    }
 
     /// `did`'s device with a service-auth key, declaring no home.
     async fn device(did: &str, device_id: Uuid) -> http::Device {
@@ -758,8 +767,11 @@ mod close_racing_accept {
         let request = seed_genuine_pending_direct_request(&pool)
             .await
             .expect("a genuinely published pending request");
+        let now = chrono::Utc::now();
         let router = http::router_for_authenticated_acceptance_with(pool.clone(), |runtime| {
-            runtime.with_spawner(Arc::new(QueuedTaskSpawner::new()))
+            runtime
+                .with_clock(Arc::new(RequestClock(now)))
+                .with_spawner(Arc::new(QueuedTaskSpawner::new()))
         })
         .await;
         let hooks = Arc::new(SimDsHooks {
@@ -781,7 +793,6 @@ mod close_racing_accept {
         // Set up an already active device before locking the head. A first activity
         // write runs devices_metadata_authority_deferred, which itself locks this
         // conversation during authentication, before the close's transaction.
-        let now = chrono::Utc::now();
         let day = crate::chat_protocol::device_activity::coarse_activity_day(now);
         assert_eq!(
             sqlx::query(
@@ -830,22 +841,21 @@ mod close_racing_accept {
             .execute(&mut *barrier)
             .await
             .unwrap();
-        let close = tokio::spawn(scope_ds_clock(
-            Arc::new(ManualDsClock::new(now)),
-            scope_sim_ds(hooks, async move {
-                let close = http::unsigned_json_request(
-                    &closer, "blue.catbird.chat.closeConversation", body,
-                );
-                http::send(router, close).await
-            }),
-        ));
+        let close = tokio::spawn(scope_sim_ds(hooks, async move {
+            let close = http::unsigned_json_request(
+                &closer, "blue.catbird.chat.closeConversation", body,
+            );
+            http::send(router, close).await
+        }));
         let Some(close_waits_in) = blocked_query(&pool, barrier_pid, None, &close).await else {
             panic!("the close finished without queuing on the head: {:?}", close.await);
         };
-        assert!(
-            close_waits_in.contains("FROM chat.conversations c")
-                && close_waits_in.contains("FOR UPDATE OF c"),
-            "expected the close transaction's head lock, observed `{close_waits_in}`"
+        // The consent check locks the head after the close holds the request
+        // budget and identity scope, before the transition reads the full head.
+        assert_eq!(
+            close_waits_in.trim(),
+            "SELECT protocol_version FROM chat.conversations WHERE conversation_id=$1 FOR UPDATE",
+            "expected the close transaction's consent check to be waiting on the head"
         );
         let (pid_sender, pid_receiver) = tokio::sync::oneshot::channel();
         let accept = tokio::spawn({

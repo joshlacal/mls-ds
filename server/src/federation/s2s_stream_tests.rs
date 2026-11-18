@@ -348,6 +348,17 @@ async fn age_entry_past_prune_floor(pool: &DbPool, conversation_id: Uuid, seq: i
     .await
     .unwrap();
     assert_eq!(changed.rows_affected(), 1);
+    // The deferred application mapping checks the paired send row on the next prune.
+    sqlx::query(
+        "UPDATE chat.message_sends send SET received_at = entry.received_at \
+         FROM chat.entries entry WHERE entry.conversation_id = $1 AND entry.seq = $2 \
+           AND send.conversation_id = entry.conversation_id AND send.message_id = entry.message_id",
+    )
+    .bind(conversation_id)
+    .bind(seq)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
 }
 
