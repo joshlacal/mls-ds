@@ -1530,6 +1530,14 @@ async fn sequence_relayed_lifecycle(
             "relayed conversation id does not match the signed request",
         );
     }
+    let recovery_authority =
+        (endpoint == crate::chat_protocol::error::ChatEndpoint::RequestLeafRecovery).then(|| {
+            (
+                canonical.key_id().as_str().to_owned(),
+                canonical.auth_generation(),
+                *canonical.request_digest(),
+            )
+        });
     let principal = crate::auth::VerifiedServicePrincipal::for_federated_s2s(
         &request.actor_did,
         &request.endpoint,
@@ -1797,6 +1805,39 @@ async fn sequence_relayed_lifecycle(
             "unsupported conversation kind",
         );
     };
+    if let Some((key_id, generation, digest)) = recovery_authority {
+        let resolver = super::resolver::DsResolver::new(
+            state.pool.clone(),
+            super::resolver::build_resolver_http_client(),
+            state.self_did.clone(),
+            crate::identity::self_endpoint(),
+            None,
+            300,
+        );
+        match resolver.resolve_authoritative_ds(&request.actor_did).await {
+            Ok(home) if crate::identity::dids_equivalent(&home.did, caller_ds) => {}
+            Ok(_) => {
+                return s2s_err(
+                    StatusCode::FORBIDDEN,
+                    "NotAuthorized",
+                    "caller is not the recovery device's authoritative home",
+                )
+            }
+            Err(error) => return membership::RelayFailure::federation(error).into_response(),
+        }
+        if let Err(error) = membership::stage_home_package(
+            state,
+            caller_ds,
+            request,
+            &key_id,
+            generation,
+            Some(&digest),
+        )
+        .await
+        {
+            return error.into_response();
+        }
+    }
     let mut body = b"{\"signedRequest\":".to_vec();
     body.extend_from_slice(&signed_bytes);
     body.push(b'}');

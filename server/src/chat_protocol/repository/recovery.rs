@@ -606,7 +606,7 @@ pub(crate) const LOCK_AVAILABLE_RECOVERY_PACKAGE_SQL: &str = r#"
       AND kp.owner_key_id = $3
       AND kp.owner_auth_generation = $4
       AND kp.status = 'available'
-      AND kp.usage_scope = 'recovery'
+      AND kp.key_package_ref = $6
       AND EXISTS (
           SELECT 1
           FROM chat.devices d
@@ -5598,21 +5598,8 @@ pub(crate) async fn prepare_recovery_request_authority(
         },
         _ => return Err(RecoveryRepositoryError::ReadSetMismatch),
     };
-    let package: RecoveryPackageRow = sqlx::query_as(LOCK_AVAILABLE_RECOVERY_PACKAGE_SQL)
-        .bind(&actor_did)
-        .bind(actor_device_id)
-        .bind(&actor_key_id)
-        .bind(actor_auth_generation)
-        .bind(trusted_instant)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or(RecoveryRepositoryError::PackageUnavailable)?;
-    validate_package(&package, "available")?;
-    let expires_at = std::cmp::min(trusted_instant + Duration::minutes(5), package.not_after);
-    if expires_at <= trusted_instant {
-        return Err(RecoveryRepositoryError::PackageUnavailable);
-    }
-    let evidence = recovery_evidence(mutation)?;
+    // Select and lock once, including recovery usage and the request's home export
+    // lease. The full row and the execution guard must identify that same package.
     let execution_package = hydrate_locked_available_recovery_package(
         transaction,
         aggregate.head(),
@@ -5624,9 +5611,22 @@ pub(crate) async fn prepare_recovery_request_authority(
         *aggregate.state().coordinate(),
     )
     .await?;
-    if execution_package.key_package_ref().as_slice() != package.key_package_ref.as_slice() {
-        return Err(RecoveryRepositoryError::ReadSetMismatch);
+    let package: RecoveryPackageRow = sqlx::query_as(LOCK_AVAILABLE_RECOVERY_PACKAGE_SQL)
+        .bind(&actor_did)
+        .bind(actor_device_id)
+        .bind(&actor_key_id)
+        .bind(actor_auth_generation)
+        .bind(trusted_instant)
+        .bind(execution_package.key_package_ref().as_slice())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(RecoveryRepositoryError::PackageUnavailable)?;
+    validate_package(&package, "available")?;
+    let expires_at = std::cmp::min(trusted_instant + Duration::minutes(5), package.not_after);
+    if expires_at <= trusted_instant {
+        return Err(RecoveryRepositoryError::PackageUnavailable);
     }
+    let evidence = recovery_evidence(mutation)?;
     let request_row = NewLeafRecoveryRequest {
         recovery_request_id: request_id,
         conversation_id: head.conversation_id,

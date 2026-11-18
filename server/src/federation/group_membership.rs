@@ -28,9 +28,9 @@ const CLAIM_GROUP_PACKAGE_EXPORT_SQL: &str = r#"
     ON CONFLICT(key_package_ref) DO UPDATE SET
         conversation_id=EXCLUDED.conversation_id,recovery_request_id=EXCLUDED.recovery_request_id,
         sequencer_did=EXCLUDED.sequencer_did,expires_at=EXCLUDED.expires_at
-    WHERE lease.expires_at <= $6 OR
+    WHERE lease.transfer_request_sha256 IS NULL AND (lease.expires_at <= $6 OR
         (lease.conversation_id,lease.recovery_request_id,lease.sequencer_did) =
-        (EXCLUDED.conversation_id,EXCLUDED.recovery_request_id,EXCLUDED.sequencer_did)
+        (EXCLUDED.conversation_id,EXCLUDED.recovery_request_id,EXCLUDED.sequencer_did))
 "#;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -49,6 +49,8 @@ struct GroupPackage {
     device: GroupDevice,
     wrapper: Vec<u8>,
     created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transfer_request_sha256: Option<[u8; 32]>,
 }
 
 pub(super) fn routes() -> Router<GroupRelayState> {
@@ -477,7 +479,7 @@ async fn stage_package(
     tx: &mut Transaction<'_, Postgres>,
     package: &GroupPackage,
     at: DateTime<Utc>,
-) -> Result<(), FederationError> {
+) -> Result<([u8; 32], DateTime<Utc>), FederationError> {
     let refused = |error: &dyn std::fmt::Display| FederationError::Forbidden(error.to_string());
     let device = &package.device;
     let credential = crate::chat_protocol::validation::basic_credential_identity(
@@ -505,7 +507,7 @@ async fn stage_package(
         .bind(valid.init_key()).bind(&device.user_did).bind(device.device_id).bind(&device.key_id).bind(device.auth_generation)
         .bind(not_before).bind(not_after).bind(package.created_at.min(at))
         .execute(&mut **tx).await?;
-    Ok(())
+    Ok((*valid.key_package_ref(), not_after))
 }
 
 #[derive(Deserialize)]
@@ -557,26 +559,30 @@ async fn export_package(
         &device.signing_public_key,
     )
     .map_err(RelayFailure::denied)?;
-    let VerifiedMutationProjection::ParticipantAcceptance(acceptance) = mutation.projection()
-    else {
-        return Err(RelayFailure::denied(
-            "package export requires signed participant acceptance",
-        ));
+    let (recovery, prior, request_id) = match mutation.projection() {
+        VerifiedMutationProjection::ParticipantAcceptance(acceptance) => {
+            (false, acceptance.prior(), acceptance.recovery_request_id())
+        }
+        VerifiedMutationProjection::LeafRecoveryRequest(recovery)
+            if matches!(recovery.recovery_kind(), "add" | "replace") =>
+        {
+            (true, recovery.prior(), recovery.recovery_request_id())
+        }
+        _ => {
+            return Err(RelayFailure::denied(
+                "package export requires a signed acceptance or recovery request",
+            ))
+        }
     };
     if mutation.actor_did().as_str() != request.user_did
         || mutation.actor_device_id().as_bytes() != request.device_id.as_bytes()
+        || mutation.key_id().as_str() != request.key_id
         || mutation.auth_generation() != device.auth_generation as u64
-        || acceptance.recovery_request_id().as_bytes() != request.recovery_request_id.as_bytes()
-        || acceptance
-            .prior()
-            .get("conversationId")
-            .and_then(|v| match v {
-                crate::chat_protocol::transcript::CanonicalValueRef::Uuid(id) => {
-                    Some(id.as_bytes())
-                }
-                _ => None,
-            })
-            != Some(request.conversation_id.as_bytes())
+        || request_id.as_bytes() != request.recovery_request_id.as_bytes()
+        || prior.get("conversationId").and_then(|v| match v {
+            crate::chat_protocol::transcript::CanonicalValueRef::Uuid(id) => Some(id.as_bytes()),
+            _ => None,
+        }) != Some(request.conversation_id.as_bytes())
     {
         return Err(RelayFailure::denied(
             "package export acceptance binding mismatch",
@@ -591,10 +597,10 @@ async fn export_package(
           WHERE c.conversation_id=$1 AND c.kind='group' AND c.is_remote AND c.sequencer_ds=$2 \
             AND (EXISTS(SELECT 1 FROM chat.participants p \
                   WHERE p.conversation_id=c.conversation_id AND p.user_did=$3 \
-                    AND p.current_membership AND p.status IN ('pending','active')) \
+                    AND p.current_membership AND (p.status='active' OR (NOT $4 AND p.status='pending'))) \
                  OR EXISTS(SELECT 1 FROM chat.remote_group_memberships m \
                   WHERE m.conversation_id=c.conversation_id AND m.user_did=$3 \
-                    AND m.sequencer_did=c.sequencer_ds AND m.status IN ('pending','active'))) \
+                    AND m.sequencer_did=c.sequencer_ds AND (m.status='active' OR (NOT $4 AND m.status='pending')))) \
             AND NOT EXISTS(SELECT 1 FROM chat.remote_group_memberships m \
                   WHERE m.conversation_id=c.conversation_id AND m.user_did=$3 \
                     AND m.status='removed'))",
@@ -602,24 +608,46 @@ async fn export_package(
     .bind(request.conversation_id)
     .bind(caller)
     .bind(&request.user_did)
+    .bind(recovery)
     .fetch_one(&mut *tx)
     .await
     .map_err(RelayFailure::storage)?;
-    if !allowed {
+    let direct = if recovery && !allowed {
+        matches!(super::remote_sequence_target(pool, &request.user_did, request.device_id,
+            request.conversation_id).await.map_err(|e| RelayFailure::denied(format!("{e:?}")))?,
+            Some((sequencer, true)) if crate::identity::dids_equivalent(&sequencer, caller))
+    } else {
+        false
+    };
+    if !allowed && !direct {
         return Err(RelayFailure::denied(
             "package requester is not this invitation's sequencer",
         ));
+    }
+    let binding = recovery.then_some(*mutation.request_digest());
+    if recovery {
+        // Serialize retries of this signed operation even when multiple packages are available.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("recovery-package:{}", request.recovery_request_id))
+            .execute(&mut *tx)
+            .await
+            .map_err(RelayFailure::storage)?;
     }
     let candidate: Option<(Vec<u8>, Vec<u8>, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
         "SELECT kp.key_package_ref,kp.wrapper_bytes,kp.created_at,kp.not_after FROM chat.key_packages kp \
           LEFT JOIN chat.group_key_package_exports e USING(key_package_ref) \
          WHERE kp.owner_did=$1 AND kp.owner_device_id=$2 AND kp.owner_key_id=$3 \
            AND kp.owner_auth_generation=$4 AND kp.usage_scope='recovery' AND kp.status='available' \
-           AND kp.not_before < $5 AND $5 < kp.not_after \
-           AND (e.key_package_ref IS NULL OR e.expires_at <= $5 OR (e.conversation_id=$6 AND e.recovery_request_id=$7 AND e.sequencer_did=$8)) \
+           AND kp.created_at <= $5 AND kp.not_before < $5 AND $5 < kp.not_after \
+           AND (e.key_package_ref IS NULL OR (e.transfer_request_sha256 IS NULL AND e.expires_at <= $5) \
+                OR (e.conversation_id=$6 AND e.recovery_request_id=$7 AND e.sequencer_did=$8 \
+                    AND e.transfer_request_sha256 IS NOT DISTINCT FROM $9::bytea)) \
+           AND NOT EXISTS(SELECT 1 FROM chat.group_key_package_exports claimed \
+                WHERE claimed.recovery_request_id=$7 AND claimed.transfer_request_sha256 IS NOT NULL \
+                  AND claimed.key_package_ref <> kp.key_package_ref) \
          ORDER BY (e.recovery_request_id=$7) DESC NULLS LAST,kp.created_at,kp.key_package_ref LIMIT 1 FOR UPDATE OF kp",
     ).bind(&device.user_did).bind(device.device_id).bind(&device.key_id).bind(device.auth_generation).bind(now)
-        .bind(request.conversation_id).bind(request.recovery_request_id).bind(caller)
+        .bind(request.conversation_id).bind(request.recovery_request_id).bind(caller).bind(binding.as_ref().map(|d|d.as_slice()))
         .fetch_optional(&mut *tx).await.map_err(RelayFailure::storage)?;
     let Some((reference, wrapper, created_at, not_after)) = candidate else {
         return Err(RelayFailure::Protocol(
@@ -628,27 +656,73 @@ async fn export_package(
     };
     // This is a fresh statement after the KeyPackage lock. Its conflict predicate
     // also rechecks the winning lease after any concurrent UPSERT wait.
-    let claimed = sqlx::query(CLAIM_GROUP_PACKAGE_EXPORT_SQL)
-        .bind(reference)
-        .bind(request.conversation_id)
-        .bind(request.recovery_request_id)
-        .bind(caller)
-        .bind((now + chrono::Duration::minutes(5)).min(not_after))
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(RelayFailure::storage)?;
-    if claimed.rows_affected() != 1 {
-        return Err(RelayFailure::Protocol(
-            ChatProtocolErrorCode::KeyPackageUnavailable,
-        ));
+    if let Some(digest) = binding {
+        claim_recovery_transfer(
+            &mut tx,
+            &reference,
+            request.conversation_id,
+            request.recovery_request_id,
+            caller,
+            &digest,
+            not_after,
+            now,
+        )
+        .await?;
+    } else {
+        let claimed = sqlx::query(CLAIM_GROUP_PACKAGE_EXPORT_SQL)
+            .bind(reference)
+            .bind(request.conversation_id)
+            .bind(request.recovery_request_id)
+            .bind(caller)
+            .bind((now + chrono::Duration::minutes(5)).min(not_after))
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(RelayFailure::storage)?;
+        if claimed.rows_affected() != 1 {
+            return Err(RelayFailure::Protocol(
+                ChatProtocolErrorCode::KeyPackageUnavailable,
+            ));
+        }
     }
     tx.commit().await.map_err(RelayFailure::storage)?;
     Ok(GroupPackage {
         device,
         wrapper,
         created_at,
+        transfer_request_sha256: binding,
     })
+}
+
+/// Both services keep the same exact package assigned to this signed request for its
+/// full MLS lifetime, including after a lost response or cancellation.
+#[allow(clippy::too_many_arguments)]
+async fn claim_recovery_transfer(
+    tx: &mut Transaction<'_, Postgres>,
+    reference: &[u8],
+    conversation: Uuid,
+    recovery: Uuid,
+    sequencer: &str,
+    digest: &[u8; 32],
+    not_after: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), RelayFailure> {
+    let claimed = sqlx::query(
+        "INSERT INTO chat.group_key_package_exports AS e \
+         (key_package_ref,conversation_id,recovery_request_id,sequencer_did,expires_at,transfer_request_sha256) \
+         VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(key_package_ref) DO UPDATE SET \
+         conversation_id=$2,recovery_request_id=$3,sequencer_did=$4,expires_at=$5,transfer_request_sha256=$6 \
+         WHERE (e.transfer_request_sha256 IS NULL AND e.expires_at <= $7) OR \
+         (e.conversation_id=$2 AND e.recovery_request_id=$3 AND e.sequencer_did=$4 \
+          AND e.expires_at=$5 AND e.transfer_request_sha256=$6)")
+        .bind(reference).bind(conversation).bind(recovery).bind(sequencer).bind(not_after)
+        .bind(digest.as_slice()).bind(now).execute(&mut **tx).await.map_err(RelayFailure::storage)?;
+    if claimed.rows_affected() != 1 {
+        return Err(RelayFailure::Protocol(
+            ChatProtocolErrorCode::KeyPackageUnavailable,
+        ));
+    }
+    Ok(())
 }
 
 /// Catch this home's mirror of `conversation_id` up to its sequencer's
@@ -742,6 +816,7 @@ pub(super) async fn bootstrap_home_group(
                 },
                 wrapper,
                 created_at: event.received_at(),
+                transfer_request_sha256: None,
             },
             event.received_at(),
         )
@@ -809,7 +884,7 @@ impl RelayFailure {
     /// `Database` is matched before `is_retryable`, which also holds for it;
     /// any other failure of this DS (`status_code` 5xx: configuration,
     /// signer) is `Storage`; every remaining failure refuses the step.
-    fn federation(error: FederationError) -> Self {
+    pub(super) fn federation(error: FederationError) -> Self {
         match error {
             FederationError::Database(error) => Self::storage(error),
             error if error.is_retryable() => Self::unavailable(error),
@@ -937,7 +1012,7 @@ pub(crate) async fn try_relay_home_group_operation(
         {
             let _ = sqlx::query(
                 "DELETE FROM chat.group_key_package_exports \
-                  WHERE conversation_id = $1 AND recovery_request_id = $2",
+                  WHERE conversation_id = $1 AND recovery_request_id = $2 AND transfer_request_sha256 IS NULL",
             )
             .bind(conversation_id)
             .bind(recovery_request_id)
@@ -1318,61 +1393,15 @@ async fn relay_membership_inner(
         .is_some();
     let accept = request.endpoint == "blue.catbird.chat.acceptConversation";
     if accept && !completed {
-        let recovery = request
-            .signed_request
-            .pointer("/body/recoveryRequestId")
-            .and_then(Value::as_str)
-            .ok_or(RelayFailure::Protocol(
-                ChatProtocolErrorCode::InvalidRequest,
-            ))?;
-        let payload = json!({ "conversationId": request.conversation_id, "userDid": request.actor_did,
-            "deviceId": request.actor_device_id, "keyId": actor_key_id, "recoveryRequestId": recovery,
-            "signedRequest": request.signed_request });
-        let (status, response) = call_home_response(&state.pool, caller, PACKAGE_NSID, &payload)
-            .await
-            .map_err(RelayFailure::federation)?;
-        if !(200..300).contains(&status) {
-            return Err(match GroupRelayError::from_response(status, &response) {
-                GroupRelayError::Rejected(code) => RelayFailure::Protocol(code),
-                GroupRelayError::Unavailable(reason) => {
-                    RelayFailure::Unavailable(format!("{PACKAGE_NSID}: {reason}"))
-                }
-                GroupRelayError::Internal(reason) => RelayFailure::Storage(reason),
-            });
-        }
-        // The home answered success with no usable package: as definitive as
-        // its refusal.
-        let exported: Value = serde_json::from_slice(&response).map_err(RelayFailure::denied)?;
-        let package: GroupPackage =
-            serde_json::from_value(exported["package"].clone()).map_err(RelayFailure::denied)?;
-        let authorized = resolver
-            .resolve_authorized_device_keys(&request.actor_did)
-            .await
-            .map_err(RelayFailure::federation)?;
-        if package.device.user_did != request.actor_did
-            || package.device.device_id != request.actor_device_id
-            || package.device.key_id != actor_key_id
-            || package.device.auth_generation as u64 != actor_auth_generation
-            || !authorized
-                .iter()
-                .any(|key| key == &package.device.signing_public_key)
-        {
-            return Err(RelayFailure::denied(
-                "exported package owner is not authoritative",
-            ));
-        }
-        let mut tx = state.pool.begin().await.map_err(RelayFailure::storage)?;
-        stage_devices(
-            &mut tx,
-            std::slice::from_ref(&package.device),
-            crate::sim_hooks::current_utc(),
+        stage_home_package(
+            state,
+            caller,
+            request,
+            &actor_key_id,
+            actor_auth_generation,
+            None,
         )
-        .await
-        .map_err(RelayFailure::federation)?;
-        stage_package(&mut tx, &package, crate::sim_hooks::current_utc())
-            .await
-            .map_err(RelayFailure::federation)?;
-        tx.commit().await.map_err(RelayFailure::storage)?;
+        .await?;
     }
     if accept {
         let relationship = state
@@ -1407,6 +1436,92 @@ async fn relay_membership_inner(
         .await
         .unwrap_or_else(IntoResponse::into_response))
     }
+}
+
+pub(super) async fn stage_home_package(
+    state: &GroupRelayState,
+    caller: &str,
+    request: &RelayGroupMutationRequest,
+    actor_key_id: &str,
+    actor_auth_generation: u64,
+    binding: Option<&[u8; 32]>,
+) -> Result<(), RelayFailure> {
+    let recovery = request
+        .signed_request
+        .pointer("/body/recoveryRequestId")
+        .and_then(Value::as_str)
+        .ok_or(RelayFailure::Protocol(
+            ChatProtocolErrorCode::InvalidRequest,
+        ))?;
+    let payload = json!({ "conversationId": request.conversation_id, "userDid": request.actor_did,
+            "deviceId": request.actor_device_id, "keyId": actor_key_id, "recoveryRequestId": recovery,
+            "signedRequest": request.signed_request });
+    let (status, response) = call_home_response(&state.pool, caller, PACKAGE_NSID, &payload)
+        .await
+        .map_err(RelayFailure::federation)?;
+    if !(200..300).contains(&status) {
+        return Err(match GroupRelayError::from_response(status, &response) {
+            GroupRelayError::Rejected(code) => RelayFailure::Protocol(code),
+            GroupRelayError::Unavailable(reason) => {
+                RelayFailure::Unavailable(format!("{PACKAGE_NSID}: {reason}"))
+            }
+            GroupRelayError::Internal(reason) => RelayFailure::Storage(reason),
+        });
+    }
+    // The home answered success with no usable package: as definitive as
+    // its refusal.
+    let exported: Value = serde_json::from_slice(&response).map_err(RelayFailure::denied)?;
+    let package: GroupPackage =
+        serde_json::from_value(exported["package"].clone()).map_err(RelayFailure::denied)?;
+    let authorized = resolver(&state.pool)
+        .resolve_authorized_device_keys(&request.actor_did)
+        .await
+        .map_err(RelayFailure::federation)?;
+    if package.device.user_did != request.actor_did
+        || package.device.device_id != request.actor_device_id
+        || package.device.key_id != actor_key_id
+        || package.device.auth_generation as u64 != actor_auth_generation
+        || !authorized
+            .iter()
+            .any(|key| key == &package.device.signing_public_key)
+    {
+        return Err(RelayFailure::denied(
+            "exported package owner is not authoritative",
+        ));
+    }
+    if package.transfer_request_sha256.as_ref() != binding {
+        return Err(RelayFailure::denied(
+            "home did not bind this package to the signed request",
+        ));
+    }
+    let mut tx = state.pool.begin().await.map_err(RelayFailure::storage)?;
+    stage_devices(
+        &mut tx,
+        std::slice::from_ref(&package.device),
+        crate::sim_hooks::current_utc(),
+    )
+    .await
+    .map_err(RelayFailure::federation)?;
+    let now = crate::sim_hooks::current_utc();
+    let (reference, not_after) = stage_package(&mut tx, &package, now)
+        .await
+        .map_err(RelayFailure::federation)?;
+    if let Some(digest) = binding {
+        let recovery_id = Uuid::parse_str(recovery).map_err(RelayFailure::denied)?;
+        claim_recovery_transfer(
+            &mut tx,
+            &reference,
+            request.conversation_id,
+            recovery_id,
+            &state.self_did,
+            digest,
+            not_after,
+            now,
+        )
+        .await?;
+    }
+    tx.commit().await.map_err(RelayFailure::storage)?;
+    Ok(())
 }
 
 #[derive(Deserialize)]

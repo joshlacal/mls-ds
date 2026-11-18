@@ -94,7 +94,7 @@ impl Party {
         (request_id, signed)
     }
 
-    fn recovery_request(&self, prior: &Value) -> (Uuid, Value) {
+    fn recovery_request(&self, prior: &Value, kind: &str) -> (Uuid, Value) {
         let request_id = Uuid::new_v4();
         let signed = sign_mutation_json_for_test(
             &json!({
@@ -107,7 +107,7 @@ impl Party {
                 "keyId": self.key_id,
                 "authGeneration": 1,
                 "prior": prior,
-                "recoveryKind": "replace",
+                "recoveryKind": kind,
                 "signedAt": canonical(current_utc()),
             }),
             &self.signing_key(),
@@ -1075,6 +1075,23 @@ async fn a_c33_peer_recovery_round_trip_uses_transport_only_home_bindings() {
         Box::pin(async {
             c.hold_opening(&c.peer, &c.actor, "accepted").await;
             let now = current_utc();
+            publish_device(&c.network, &c.peer.did, &c.peer.signing_key().verifying_key().to_bytes());
+            let (empty_id, empty_signed) = c.peer.recovery_request(&c.prior, "replace");
+            let (empty_status, _, empty_bytes) = c.lifecycle_bytes(
+                &c.peer, "blue.catbird.chat.requestLeafRecovery", empty_signed, true,
+            ).await;
+            assert!(!empty_status.is_success(), "{}", String::from_utf8_lossy(&empty_bytes));
+            let error: Value = serde_json::from_slice(&empty_bytes).unwrap();
+            assert_eq!(error["error"], "KeyPackageUnavailable");
+            assert!(error.get("package").is_none() && error.get("recovery").is_none());
+            for pool in [&c.home_pool, &c.seq_pool] {
+                let residue: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1) \
+                         OR EXISTS(SELECT 1 FROM chat.key_package_reservations WHERE recovery_request_id=$1) \
+                         OR EXISTS(SELECT 1 FROM chat.remote_lifecycle_recovery_bindings WHERE recovery_request_id=$1)",
+                ).bind(empty_id).fetch_one(pool).await.unwrap();
+                assert!(!residue, "an empty home inventory must not open or bind a request");
+            }
             let package_owner =
                 crate::common::executor_seed::genuine_terminal_fixture::AcceptanceInvitee {
                     did: c.peer.did.clone(),
@@ -1092,7 +1109,7 @@ async fn a_c33_peer_recovery_round_trip_uses_transport_only_home_bindings() {
                         now + chrono::Duration::days(1),
                     );
             crate::common::executor_seed::seed_genuine_key_package_at(
-                &c.seq_pool,
+                &c.home_pool,
                 &c.peer.did,
                 c.peer.device,
                 &c.peer.key_id,
@@ -1112,7 +1129,24 @@ async fn a_c33_peer_recovery_round_trip_uses_transport_only_home_bindings() {
             .unwrap();
             assert!(!home_conversation, "the home must remain transport-only");
 
-            let (recovery_id, signed_request) = c.peer.recovery_request(&c.prior);
+            let staged: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM chat.key_packages WHERE key_package_ref=$1)",
+            ).bind(package_ref.as_slice()).fetch_one(&c.seq_pool).await.unwrap();
+            assert!(!staged, "the fresh package initially exists only at its owner's home");
+
+            // Even if a previous export left a different live package for this
+            // device at the sequencer, the reservation belongs to this export.
+            let earlier = now - chrono::Duration::seconds(1);
+            let (other_ref, other_wrapper, start, end) =
+                crate::common::executor_seed::genuine_terminal_fixture::build_genuine_invitee_key_package(
+                    &package_owner, earlier, not_before, not_after,
+                );
+            crate::common::executor_seed::seed_genuine_key_package_at(
+                &c.seq_pool, &c.peer.did, c.peer.device, &c.peer.key_id, &other_ref,
+                &other_wrapper, start, end, earlier,
+            ).await;
+
+            let (recovery_id, signed_request) = c.peer.recovery_request(&c.prior, "replace");
             let (status, _, first) = c
                 .lifecycle_bytes(
                     &c.peer,
@@ -1140,6 +1174,19 @@ async fn a_c33_peer_recovery_round_trip_uses_transport_only_home_bindings() {
                 retry, first,
                 "recovery retry must return exact coordinator bytes"
             );
+            let bound: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM chat.key_package_reservations r \
+                 JOIN chat.key_packages kp USING(key_package_ref) \
+                 JOIN chat.leaf_recovery_requests req USING(recovery_request_id) \
+                 WHERE r.recovery_request_id=$1 AND r.conversation_id=$2 \
+                   AND r.requester_did=$3 AND r.requester_device_id=$4 AND r.requester_key_id=$5 \
+                   AND r.requester_auth_generation=1 AND r.recipient_did=$3 AND r.recipient_device_id=$4 \
+                   AND r.purpose='leafRecovery' AND r.status='active' AND r.expires_at <= kp.not_after \
+                   AND req.status='open' AND req.recovery_kind='replace' \
+                   AND kp.key_package_ref=$6 AND kp.wrapper_bytes=$7 AND kp.usage_scope='recovery')",
+            ).bind(recovery_id).bind(c.cid).bind(&c.peer.did).bind(c.peer.device).bind(&c.peer.key_id)
+                .bind(package_ref.as_slice()).bind(&wrapper).fetch_one(&c.seq_pool).await.unwrap();
+            assert!(bound, "the sequencer must reserve the exact owner's home package for this request");
             let retained: Vec<u8> = sqlx::query_scalar(
                 "SELECT response_bytes FROM chat.remote_lifecycle_recovery_bindings \
                  WHERE recovery_request_id=$1",
@@ -1525,3 +1572,6 @@ async fn a_close_whose_peer_home_cannot_be_resolved_now_commits_nothing() {
     )
     .await;
 }
+
+#[path = "group_membership_recovery_tests.rs"]
+mod group_recovery;

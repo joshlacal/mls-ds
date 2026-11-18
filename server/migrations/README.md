@@ -420,6 +420,15 @@ a short request-bound home lease so concurrent recovery cannot select that
 still-available package before the accepted prefix is mirrored. These leases
 cascade on conversation deletion and are removed on close.
 
+The private POST form of `fetchKeyPackage` also accepts a device's signed
+`requestLeafRecovery` for an existing membership. Migration
+`20261117000005_remote_recovery_package_transfers.sql` binds that transfer to
+the signed request digest on the device's home service. This also works when
+the home serves a direct conversation's transport without storing its membership
+graph. One recovery request selects one package. Its transfer stays recorded
+through the package's cryptographic lifetime, including after conversation close
+or a lost reply.
+
 A group's remote homes receive every entry, application entries included, only
 through the sequencer's ordered `deliverGroupEntry` stream; groups queue no
 `deliverMessage` or federated `deliverWelcome` (direct and C33 conversations

@@ -87,6 +87,7 @@ async fn owned_database() -> (PgPool, DisposableDatabase) {
             20261117000002,
             20261117000003,
             20261117000004,
+            20261117000005,
         ],
         "reviewed migrations following the deployed stage"
     );
