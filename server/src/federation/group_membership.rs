@@ -528,6 +528,7 @@ async fn fetch_package(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let received_at = crate::sim_hooks::current_utc();
     let caller = match verify_s2s_caller(&state, &headers, PACKAGE_NSID, &body).await {
         Ok(caller) => caller,
         Err(response) => return response,
@@ -536,7 +537,7 @@ async fn fetch_package(
         Ok(request) => request,
         Err(e) => return s2s_err(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()),
     };
-    match export_package(&state.pool, &caller, &request).await {
+    match export_package(&state.pool, &caller, &request, received_at).await {
         Ok(package) => Json(json!({ "package": package })).into_response(),
         Err(failure) => failure.into_response(),
     }
@@ -546,6 +547,7 @@ async fn export_package(
     pool: &DbPool,
     caller: &str,
     request: &PackageRequest,
+    received_at: DateTime<Utc>,
 ) -> Result<GroupPackage, RelayFailure> {
     let device = devices_for_user(pool, &request.user_did)
         .await
@@ -618,13 +620,14 @@ async fn export_package(
         } else {
             crate::chat_protocol::validation::validate_first_execution_signed_at(
                 mutation.signed_at(),
-                &TrustedRequestInstant::from_datetime(now).map_err(RelayFailure::storage)?,
+                &TrustedRequestInstant::from_datetime(received_at)
+                    .map_err(RelayFailure::storage)?,
             )
             .map_err(RelayFailure::denied)?;
         }
     }
-    let candidate: Option<(Vec<u8>, Vec<u8>, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT kp.key_package_ref,kp.wrapper_bytes,kp.created_at,kp.not_after FROM chat.key_packages kp \
+    let candidate: Option<(Vec<u8>, Vec<u8>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT kp.key_package_ref,kp.wrapper_bytes,kp.created_at,kp.not_before,kp.not_after FROM chat.key_packages kp \
           LEFT JOIN chat.group_key_package_exports e USING(key_package_ref) \
          WHERE kp.owner_did=$1 AND kp.owner_device_id=$2 AND kp.owner_key_id=$3 \
            AND kp.owner_auth_generation=$4 AND kp.usage_scope='recovery' AND kp.status='available' \
@@ -642,13 +645,13 @@ async fn export_package(
     // The package query can wait for another allocator. Read and hold the
     // current route, membership and device authority after taking that lock.
     require_live_export_authority(&mut tx, caller, request, &device, recovery).await?;
-    let Some((reference, wrapper, created_at, not_after)) = candidate else {
+    let Some((reference, wrapper, created_at, not_before, not_after)) = candidate else {
         return Err(RelayFailure::Protocol(
             ChatProtocolErrorCode::KeyPackageUnavailable,
         ));
     };
     let now = crate::sim_hooks::current_utc();
-    if now >= not_after || created_at > now {
+    if now <= not_before || now >= not_after || created_at > now {
         return Err(RelayFailure::Protocol(
             ChatProtocolErrorCode::KeyPackageUnavailable,
         ));
@@ -693,6 +696,12 @@ async fn export_package(
                 ChatProtocolErrorCode::KeyPackageUnavailable,
             ));
         }
+    }
+    let granted_at = crate::sim_hooks::current_utc();
+    if granted_at <= not_before || granted_at >= not_after || granted_at < created_at {
+        return Err(RelayFailure::Protocol(
+            ChatProtocolErrorCode::KeyPackageUnavailable,
+        ));
     }
     tx.commit().await.map_err(RelayFailure::storage)?;
     Ok(GroupPackage {
