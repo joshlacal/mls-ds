@@ -1573,6 +1573,147 @@ async fn relay_membership_inner(
     }
 }
 
+/// A newly approved device may have never contacted a conversation's sequencer.
+/// Restore only independently authenticated directory state, without granting a group leaf.
+pub(super) async fn prepare_first_group_recovery_device(
+    state: &GroupRelayState,
+    caller: &str,
+    request: &RelayGroupMutationRequest,
+    signed: &crate::chat_protocol::transcript::CanonicalSignedMutation,
+    received_at: &TrustedRequestInstant,
+) -> Result<(), RelayFailure> {
+    use crate::chat_protocol::{
+        transcript::verify_ed25519_strict, validation::validate_first_execution_signed_at,
+    };
+    use crate::federation::space_read_relay::{verify_live_recovered_enrollment, SpaceRelayError};
+
+    // Known or retired devices and recorded operations must use normal admission/replay.
+    let operation = Uuid::from_bytes(
+        *signed
+            .operation_id()
+            .map_err(RelayFailure::denied)?
+            .as_bytes(),
+    );
+    let known: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.devices WHERE user_did=$1 AND device_id=$2)
+             OR EXISTS(SELECT 1 FROM chat.operation_claims WHERE operation_id=$3)",
+    )
+    .bind(&request.actor_did)
+    .bind(request.actor_device_id)
+    .bind(operation)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(RelayFailure::storage)?;
+    if known {
+        return Ok(());
+    }
+    let mut conn = state.pool.acquire().await.map_err(RelayFailure::storage)?;
+    if !first_recovery_membership(&mut conn, state, caller, request).await? {
+        // Other conversation kinds and actors keep their established admission path.
+        return Ok(());
+    }
+    drop(conn);
+    validate_first_execution_signed_at(signed.signed_at(), received_at)
+        .map_err(RelayFailure::denied)?;
+    let destination = resolver(&state.pool);
+    let home = destination
+        .resolve_authoritative_ds(&request.actor_did)
+        .await
+        .map_err(RelayFailure::federation)?;
+    if !crate::identity::dids_equivalent(&home.did, caller)
+        || crate::identity::dids_equivalent(caller, &state.self_did)
+    {
+        return Err(RelayFailure::denied(
+            "caller is not the recovery device's authoritative home",
+        ));
+    }
+    let routes = BTreeMap::from([(request.actor_did.clone(), Some(home.did))]);
+    let device = remote_devices(&state.pool, &routes)
+        .await
+        .map_err(RelayFailure::federation)?
+        .into_iter()
+        .find(|device| {
+            device.device_id == request.actor_device_id
+                && device.key_id == signed.key_id().as_str()
+                && u64::try_from(device.auth_generation).ok() == Some(signed.auth_generation())
+        })
+        .ok_or_else(|| {
+            RelayFailure::denied("home directory does not match the signed recovery device")
+        })?;
+    let key: &[u8; 32] = device
+        .signing_public_key
+        .as_slice()
+        .try_into()
+        .map_err(RelayFailure::denied)?;
+    verify_ed25519_strict(key, signed.transcript_bytes(), signed.signature())
+        .map_err(RelayFailure::denied)?;
+    verify_live_recovered_enrollment(
+        &destination,
+        &device.user_did,
+        &device.device_id.to_string(),
+        key,
+    )
+    .await
+    .map_err(|error| match error {
+        SpaceRelayError::UpstreamUnavailable(_) => RelayFailure::unavailable(error),
+        _ => RelayFailure::denied(error),
+    })?;
+
+    let mut tx = state.pool.begin().await.map_err(RelayFailure::storage)?;
+    // Never replace a device that was enrolled or retired while the home answered.
+    // If another registration owns the slot, retry from current authorities.
+    let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!("{}#{}", device.user_did, device.device_id))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(RelayFailure::storage)?;
+    if !free {
+        return Err(RelayFailure::unavailable(
+            "recovery device registration is in progress",
+        ));
+    }
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.devices WHERE user_did=$1 AND device_id=$2)",
+    )
+    .bind(&device.user_did)
+    .bind(device.device_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(RelayFailure::storage)?;
+    if exists {
+        return Ok(());
+    }
+    if !first_recovery_membership(&mut tx, state, caller, request).await? {
+        return Err(RelayFailure::denied(
+            "recovery membership is no longer current",
+        ));
+    }
+    stage_devices(
+        &mut tx,
+        std::slice::from_ref(&device),
+        crate::sim_hooks::current_utc(),
+    )
+    .await
+    .map_err(RelayFailure::federation)?;
+    tx.commit().await.map_err(RelayFailure::storage)
+}
+
+async fn first_recovery_membership(
+    conn: &mut sqlx::PgConnection,
+    state: &GroupRelayState,
+    caller: &str,
+    request: &RelayGroupMutationRequest,
+) -> Result<bool, RelayFailure> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.conversations c JOIN chat.participants p USING(conversation_id)
+          WHERE c.conversation_id=$1 AND c.kind='group' AND c.lifecycle='active' AND NOT c.is_remote
+            AND (c.sequencer_ds IS NULL OR split_part(c.sequencer_ds,'#',1)=$4)
+            AND p.user_did=$2 AND p.current_membership AND p.status='active'
+            AND split_part(p.ds_did,'#',1)=$3 FOR SHARE OF c,p)",
+    ).bind(request.conversation_id).bind(&request.actor_did).bind(crate::identity::canonical_did(caller))
+       .bind(crate::identity::canonical_did(&state.self_did)).fetch_one(conn).await.map_err(RelayFailure::storage)
+}
+
 pub(super) async fn stage_home_package(
     state: &GroupRelayState,
     caller: &str,

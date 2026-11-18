@@ -1573,6 +1573,22 @@ async fn sequence_relayed_lifecycle(
             )
         }
     };
+    if endpoint == crate::chat_protocol::error::ChatEndpoint::RequestLeafRecovery
+        && canonical.kind()
+            == crate::chat_protocol::transcript::SignedMutationKind::LeafRecoveryRequest
+    {
+        if let Err(error) = membership::prepare_first_group_recovery_device(
+            state,
+            caller_ds,
+            request,
+            &canonical,
+            &trusted_instant,
+        )
+        .await
+        {
+            return error.into_response();
+        }
+    }
     let pre_replay = match crate::chat_protocol::dpop::standard_service_auth_evidence(
         principal,
         &request.actor_device_id.to_string(),
