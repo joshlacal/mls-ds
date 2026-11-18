@@ -328,6 +328,27 @@ fn recovery_export_rechecks_authority_and_time_after_the_package_lock() {
         .split_once("let now = crate::sim_hooks::current_utc();")
         .unwrap()
         .1;
-    let after_expiry = after_clock.split_once("if now >= not_after").unwrap().1;
-    assert!(after_expiry.contains("claim_recovery_transfer("));
+    let (before_claim, after_claim) = after_clock.split_once("claim_recovery_transfer(").unwrap();
+    for bound in ["now <= not_before", "now >= not_after", "created_at > now"] {
+        assert!(
+            before_claim.contains(bound),
+            "missing claim-time bound {bound}"
+        );
+    }
+
+    let after_grant_clock = after_claim
+        .split_once("let granted_at = crate::sim_hooks::current_utc();")
+        .unwrap()
+        .1;
+    let (before_commit, _) = after_grant_clock.split_once("tx.commit()").unwrap();
+    for bound in [
+        "granted_at <= not_before",
+        "granted_at >= not_after",
+        "granted_at < created_at",
+    ] {
+        assert!(
+            before_commit.contains(bound),
+            "missing grant-time bound {bound}"
+        );
+    }
 }
