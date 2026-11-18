@@ -1213,7 +1213,7 @@ async fn d2_multidevice_enrollment_approval_and_device_view_end_to_end() {
     );
 
     // Verify `DeviceView.status == "dormant"` over HTTP (`getOwnDevices` from active sibling `alice_d1`)
-    // when `alice_d2` crosses `48h` inactivity, and wake-up back to `"active"` when `alice_d2` authenticates!
+    // when `alice_d2` crosses `60d` inactivity, and wake-up back to `"active"` when `alice_d2` authenticates!
     let dorm_ref = Utc::now();
     sqlx::query(
         "UPDATE chat.devices SET last_active_at = $3 WHERE user_did = $1 AND device_id = $2",
@@ -1229,7 +1229,7 @@ async fn d2_multidevice_enrollment_approval_and_device_view_end_to_end() {
     )
     .bind(&alice_acct.did)
     .bind(alice_d2.device_id)
-    .bind(dorm_ref - Duration::hours(73))
+    .bind(dorm_ref - Duration::days(61))
     .execute(&pool)
     .await
     .unwrap();
@@ -1299,7 +1299,7 @@ async fn d2_multidevice_enrollment_approval_and_device_view_end_to_end() {
 }
 
 // =============================================================================
-// 2. Y-7 Ephemeral Pruning, Immediate Unblock Triggers, & 48h/72h Sweeps
+// 2. Y-7 Ephemeral Pruning, Recipient ACK floor, 30-day ceiling, and 60-day dormancy
 // =============================================================================
 
 #[tokio::test]
@@ -1764,7 +1764,7 @@ async fn y7_pruning_requires_recipient_quorum_after_72h_or_the_30d_ceiling() {
     );
     pool_m.close().await;
 
-    // 4. Now test exact `48h` dormancy threshold + immediate unblock prune, and `72h` application TTL ceiling!
+    // 4. Now test the 60-day dormancy threshold and 30-day application ceiling!
     let db2 = common::fresh_db::fresh_fully_migrated_db("chat_w2d_").await;
     let pool2 = db2.connect(4).await;
     let router2 = build_unified_router(pool2.clone(), None).await;
@@ -1823,7 +1823,7 @@ async fn y7_pruning_requires_recipient_quorum_after_72h_or_the_30d_ceiling() {
     .await;
     assert_eq!(st_ack, StatusCode::OK);
 
-    // Keep sender fresh, set recipient 49h past coarse UTC-day (`<= 72h` cutoff with +24h margin) -> NOT dormant yet!
+    // Keep sender fresh, set recipient just inside the 60-day inactivity window plus its UTC-day allowance -> NOT dormant yet!
     let ref_now = Utc::now();
     sqlx::query(
         "UPDATE chat.devices SET last_active_at = $3 WHERE user_did = $1 AND device_id = $2",
@@ -1839,13 +1839,13 @@ async fn y7_pruning_requires_recipient_quorum_after_72h_or_the_30d_ceiling() {
     )
     .bind(&fix2.recipient_did)
     .bind(fix2.recipient_device_id)
-    .bind(ref_now - Duration::hours(49))
+    .bind(ref_now - Duration::days(61) + Duration::minutes(1))
     .execute(&pool2)
     .await
     .unwrap();
     assert_eq!(mark_inactive_devices(&pool2, ref_now).await.unwrap(), 0);
 
-    // 73h past coarse UTC-day (`>= 49h` true inactivity) marks the recipient
+    // Just past the 61-day coarse cutoff marks the recipient
     // dormant, but neither an empty ACK quorum nor an unqualified archive
     // watermark may prune the payload.
     sqlx::query(
@@ -1853,7 +1853,7 @@ async fn y7_pruning_requires_recipient_quorum_after_72h_or_the_30d_ceiling() {
     )
     .bind(&fix2.recipient_did)
     .bind(fix2.recipient_device_id)
-    .bind(ref_now - Duration::hours(73))
+    .bind(ref_now - Duration::days(61) - Duration::minutes(1))
     .execute(&pool2)
     .await
     .unwrap();
@@ -1879,7 +1879,7 @@ async fn y7_pruning_requires_recipient_quorum_after_72h_or_the_30d_ceiling() {
     );
     assert!(
         !seq_a_pruned_unarchived,
-        "B1(a–b): 48h dormancy transition must NOT prune un-archived conversation when all recipient devices are dormant"
+        "B1(a–b): 60-day dormancy transition must NOT prune un-archived conversation when all recipient devices are dormant"
     );
 
     // A directly injected legacy watermark is not verified archive-content
@@ -3425,7 +3425,7 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(mark_inactive_devices(&pool, Utc::now()).await.unwrap(), 1);
+    assert_eq!(mark_inactive_devices(&pool, Utc::now()).await.unwrap(), 0);
     let (early_status, early_body) = http::send(
         router.clone(),
         alice_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": valid_ep1.clone() })),
@@ -3502,7 +3502,7 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(mark_inactive_devices(&pool, Utc::now()).await.unwrap(), 1);
+    assert_eq!(mark_inactive_devices(&pool, Utc::now()).await.unwrap(), 0);
     let (st_ep1, ep1_body) = http::send(
         router.clone(),
         alice_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": valid_ep1.clone() })),
@@ -3657,7 +3657,10 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(carol_d1_dormant);
+    assert!(
+        !carol_d1_dormant,
+        "recovery eligibility must not shorten the delivery dormancy window"
+    );
     let (carol_genesis, _) = build_epoch_public_for_device(&carol_d2, 0, [0x44_u8; 32], None, None);
     let (c_early_status, c_early_body) = http::send(
         router.clone(),
@@ -3711,7 +3714,6 @@ async fn r2_dormancy_coarse_day_margin_zero_ack_and_post_reset_generation_prunin
     let self_did = "did:web:chat.catbird.blue";
     std::env::set_var("SERVICE_DID", self_did);
     std::env::set_var("SELF_ENDPOINT", "https://chat.example.net");
-    std::env::remove_var("CHAT_DEVICE_DORMANT_AFTER_HOURS");
 
     // Part A: `+24h` coarse UTC-day dormancy margin + `0`-ack dormancy pruning (`#69` Findings 2 & 3).
     let db_a = common::fresh_db::fresh_fully_migrated_db("chat_w2d_").await;
@@ -3765,29 +3767,33 @@ async fn r2_dormancy_coarse_day_margin_zero_ack_and_post_reset_generation_prunin
     let coarse_day0 = chrono::DateTime::parse_from_rfc3339("2026-11-10T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
-    sqlx::query("UPDATE chat.devices SET last_active_at = $1")
+    // Seed the legacy 48-hour sweep result on the existing devices.
+    sqlx::query("UPDATE chat.devices SET last_active_at = $1, dormant_at = $2")
         .bind(coarse_day0)
+        .bind(coarse_day0 + Duration::days(3))
         .execute(&pool_a)
         .await
         .unwrap();
 
-    // At `2026-11-12T23:58:00Z` (`47h 58m` of true inactivity since `23:59:59Z` Day 0, even though
-    // `71h 58m` since coarse `00:00:00Z` Day 0): MUST NOT mark dormant (`0`)!
-    let before_cutoff = coarse_day0 + Duration::hours(71) + Duration::minutes(58);
+    // Just inside the 60-day window for a last interaction at the end of Day 0.
+    let before_cutoff = coarse_day0 + Duration::days(61) - Duration::minutes(2);
     assert_eq!(
         mark_inactive_devices(&pool_a, before_cutoff).await.unwrap(),
-        0,
-        "devices active at 23:59:59Z Day 0 must not become dormant before 48h of true inactivity"
+        0
     );
-
-    // At `2026-11-13T00:01:00Z` (`48h 01m` past `23:59:59Z` Day 0 = `72h 01m` past coarse Day 0):
-    // BOTH devices become dormant, AND under `B1(a)` + `B1(b)` (`ctl q#21` Red safe default) `seq_a`
-    // MUST remain UNPRUNED with `0` rows in `device_entry_acks` and `archived_through_seq == 0`!
-    let after_cutoff = coarse_day0 + Duration::hours(72) + Duration::minutes(1);
+    let still_marked: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.devices WHERE dormant_at IS NOT NULL")
+            .fetch_one(&pool_a)
+            .await
+            .unwrap();
+    assert_eq!(still_marked, 0, "premature legacy dormancy must be cleared");
+    // Once every possible instant of the coarse day is older than 60 days,
+    // both devices are dormant. Dormancy by itself cannot authorize pruning.
+    let after_cutoff = coarse_day0 + Duration::days(61) + Duration::minutes(1);
     let marked_a = mark_inactive_devices(&pool_a, after_cutoff).await.unwrap();
     assert_eq!(
         marked_a, 2,
-        "both open-interval devices marked dormant after 72h coarse cutoff"
+        "both devices marked dormant after the 60-day window and coarse-day allowance"
     );
 
     let (pruned_a, payload_null_a): (bool, bool) = sqlx::query_as(
@@ -4890,7 +4896,7 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let dormant_ts = now_ts - Duration::hours(96);
+    let dormant_ts = now_ts - Duration::days(62);
     sqlx::query(
         "INSERT INTO chat.devices (user_did, device_id, device_name, status, dpop_jkt, auth_generation, capabilities, created_at, updated_at, last_active_at, dormant_at) \
          VALUES ($1, $2, 'Recipient Dormant iPad', 'active', $3, 1, chat.protocol_capabilities(), $4, $4, $4, $4)",

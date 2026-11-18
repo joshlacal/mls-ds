@@ -513,29 +513,23 @@ impl InlineTriggerConfig {
     }
 }
 
-/// Clean-chat multi-device dormancy and ephemeral application-payload retention.
-///
-/// - `CHAT_DEVICE_DORMANT_AFTER_HOURS` (default `48`): active devices whose
-///   coarse UTC-day `last_active_at` is at or older than `now - N hours` are
-///   marked dormant so inactive devices cannot stall ACK-driven payload pruning.
-/// - `CHAT_APPLICATION_PAYLOAD_TTL_HOURS` (default `72`): hard ceiling after
-///   which unacknowledged `#applicationEntry` ciphertexts are pruned even if an
-///   active device has not acknowledged them (`#commitEntry` and control entries
-///   remain untouched).
+/// Fixed protocol windows. A host must not shorten unacknowledged delivery or
+/// retain ciphertext beyond the published ceiling through an environment override.
+pub const DEVICE_DORMANCY_DAYS: i64 = 60;
+pub const APPLICATION_RETENTION_DAYS: i64 = 30;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChatRetentionConfig {
     pub device_dormant_after_hours: i64,
     pub application_payload_ttl_hours: i64,
-    pub archived_application_payload_ttl_hours: i64,
     pub pending_device_hold_hours: i64,
 }
 
 impl Default for ChatRetentionConfig {
     fn default() -> Self {
         Self {
-            device_dormant_after_hours: 48,
-            application_payload_ttl_hours: 720,
-            archived_application_payload_ttl_hours: 72,
+            device_dormant_after_hours: DEVICE_DORMANCY_DAYS * 24,
+            application_payload_ttl_hours: APPLICATION_RETENTION_DAYS * 24,
             pending_device_hold_hours: 72,
         }
     }
@@ -543,28 +537,10 @@ impl Default for ChatRetentionConfig {
 
 impl ChatRetentionConfig {
     pub fn from_env() -> Self {
-        let defaults = Self::default();
-        let application_payload_ttl_hours = parse_env_i64_positive(
-            "CHAT_APPLICATION_PAYLOAD_TTL_HOURS",
-            defaults.application_payload_ttl_hours,
-        );
-        let archived_application_payload_ttl_hours = parse_env_i64_positive(
-            "CHAT_ARCHIVED_APPLICATION_PAYLOAD_TTL_HOURS",
-            defaults.archived_application_payload_ttl_hours,
-        )
-        .min(application_payload_ttl_hours);
         Self {
-            device_dormant_after_hours: parse_env_i64_positive(
-                "CHAT_DEVICE_DORMANT_AFTER_HOURS",
-                defaults.device_dormant_after_hours,
-            ),
-            application_payload_ttl_hours,
-            archived_application_payload_ttl_hours,
-            pending_device_hold_hours: parse_env_i64_positive(
-                "CHAT_PENDING_DEVICE_HOLD_HOURS",
-                defaults.pending_device_hold_hours,
-            )
-            .max(72),
+            pending_device_hold_hours:
+                crate::chat_protocol::device_activity::pending_device_hold_hours(),
+            ..Self::default()
         }
     }
 }

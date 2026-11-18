@@ -456,7 +456,7 @@ async fn i13_receipt_survives_all_device_ack_payload_pruning_and_preserves_seq_c
     assert_eq!(pruned_entry["payloadPruned"], true);
     assert!(pruned_entry.get("signedRequest").is_none());
     assert_eq!(pruned_entry["sequencerReceipt"]["sequencerDid"], self_did);
-    assert_c33_transport_only_home_prunes_application(
+    assert_c33_transport_only_home_retains_application_until_ceiling(
         &pool,
         &fixture,
         &sender_dev,
@@ -663,7 +663,7 @@ async fn delete_account_data_sequences_account_deleted_entry_in_active_conversat
     let _ = Router::<()>::new;
 }
 
-async fn assert_c33_transport_only_home_prunes_application(
+async fn assert_c33_transport_only_home_retains_application_until_ceiling(
     source: &sqlx::PgPool,
     fixture: &catbird_server::chat_protocol::test_support::CleanSlateApplicationFixture,
     sender: &http::Device,
@@ -748,28 +748,12 @@ async fn assert_c33_transport_only_home_prunes_application(
             seq,
             entry_id,
             &original,
-            now,
+            now + Duration::days(10),
         )
         .await
         .unwrap(),
         catbird_server::chat_protocol::repository::delivery::TransportEntryInsert::Inserted
     );
-    let mut age_tx = home.begin().await.unwrap();
-    sqlx::query("SET LOCAL session_replication_role = replica")
-        .execute(&mut *age_tx)
-        .await
-        .unwrap();
-    sqlx::query(
-        "UPDATE chat.direct_request_transport_entries \
-            SET created_at = clock_timestamp() - INTERVAL '73 hours' \
-          WHERE conversation_id = $1 AND seq = $2",
-    )
-    .bind(fixture.conversation_id)
-    .bind(seq)
-    .execute(&mut *age_tx)
-    .await
-    .unwrap();
-    age_tx.commit().await.unwrap();
     let conversation_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations WHERE conversation_id = $1")
             .bind(fixture.conversation_id)
@@ -788,7 +772,7 @@ async fn assert_c33_transport_only_home_prunes_application(
         0,
         seq,
     );
-    for expected_pruned in [1_i64, 0] {
+    for _ in 0..2 {
         let (status, body) = http::send(
             router.clone(),
             http::unsigned_json_request(
@@ -800,7 +784,10 @@ async fn assert_c33_transport_only_home_prunes_application(
         .await;
         assert_eq!(status, StatusCode::OK, "C33 ACK: {body}");
         assert_eq!(body["acknowledgedSeq"], seq);
-        assert_eq!(body["prunedCount"], expected_pruned);
+        assert_eq!(
+            body["prunedCount"], 0,
+            "a local ACK cannot erase the transport copy"
+        );
     }
     let watermark: i64 = sqlx::query_scalar(
         "SELECT acked_through_seq FROM chat.device_entry_acks \
@@ -813,6 +800,46 @@ async fn assert_c33_transport_only_home_prunes_application(
     .await
     .unwrap();
     assert_eq!(watermark, seq, "transport-only ACK must be durable");
+    // A legacy row without a sequencer receipt can only prove its local arrival.
+    let mut legacy = entry.clone();
+    legacy.as_object_mut().unwrap().remove("sequencerReceipt");
+    let arrival = now + Duration::days(10);
+    let legacy_start: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT chat.transport_application_retention_start($1, $2, $3, $4, $5)")
+            .bind(serde_json::to_vec(&legacy).unwrap())
+            .bind(arrival)
+            .bind(fixture.conversation_id)
+            .bind(entry_id)
+            .bind(seq)
+            .fetch_one(&home)
+            .await
+            .unwrap();
+    assert_eq!(legacy_start.timestamp_micros(), arrival.timestamp_micros());
+
+    // Delivering ten days late cannot reset the immutable sequencer receipt's clock.
+    let accepted =
+        chrono::DateTime::from_timestamp_millis(receipt["issuedAtMs"].as_i64().unwrap()).unwrap();
+    assert_eq!(
+        prune_expired_application_payloads(&home, accepted + Duration::hours(719))
+            .await
+            .unwrap(),
+        0
+    );
+    let intact: Vec<u8> = sqlx::query_scalar(
+        "SELECT entry_bytes FROM chat.direct_request_transport_entries WHERE conversation_id = $1 AND seq = $2",
+    )
+    .bind(fixture.conversation_id)
+    .bind(seq)
+    .fetch_one(&home)
+    .await
+    .unwrap();
+    assert_eq!(intact, original);
+    assert_eq!(
+        prune_expired_application_payloads(&home, accepted + Duration::hours(721))
+            .await
+            .unwrap(),
+        1
+    );
     let (digest, metadata, bytes, pruned): (Vec<u8>, Vec<u8>, Vec<u8>, bool) = sqlx::query_as(
         "SELECT original_entry_sha256, application_metadata_bytes, entry_bytes, \
                 payload_pruned_at IS NOT NULL FROM chat.direct_request_transport_entries \

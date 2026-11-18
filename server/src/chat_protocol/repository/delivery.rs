@@ -2874,7 +2874,7 @@ pub(crate) async fn prune_expired_transport_application_payload(
             SET entry_bytes = pruned_entry_bytes, payload_pruned_at = $3 \
           WHERE conversation_id = $1 AND seq = $2 \
             AND application_message_id IS NOT NULL AND payload_pruned_at IS NULL \
-            AND created_at <= $4",
+            AND chat.transport_application_retention_start(pruned_entry_bytes, created_at, conversation_id, entry_id, seq) <= $4",
     )
     .bind(conversation_id)
     .bind(seq)
@@ -2889,156 +2889,12 @@ pub(crate) async fn prune_expired_transport_application_payload(
     Ok(true)
 }
 
-/// Prune a remote home's transport and matching local application copies against
-/// their frozen local audience. C33 homes use their exact inbox devices instead
-/// of group grants; neither path waits for devices at another home.
-pub(crate) async fn prune_acknowledged_transport_application_payloads(
-    transaction: &mut Transaction<'_, Postgres>,
-    conversation_id: Uuid,
-    generation: i64,
-    acked_through_seq: i64,
-    pruned_at: DateTime<Utc>,
-) -> Result<Vec<i64>, DeliveryRepositoryError> {
-    // Older acceptance manifests intentionally predate both optional surfaces.
-    // Never name missing columns/tables in a parsed statement on those schemas.
-    let (has_evidence, has_group_grants): (bool, bool) = sqlx::query_as(
-        "SELECT EXISTS(SELECT 1 FROM pg_attribute \
-                        WHERE attrelid = to_regclass('chat.direct_request_transport_entries') \
-                          AND attname = 'payload_pruned_at' AND NOT attisdropped), \
-                to_regclass('chat.group_transport_entry_recipients') IS NOT NULL",
-    )
-    .fetch_one(&mut **transaction)
-    .await?;
-    if !has_evidence {
-        return Ok(Vec::new());
-    }
-    let has_inbox: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_transport_inbox WHERE conversation_id = $1)",
-    )
-    .bind(conversation_id)
-    .fetch_one(&mut **transaction)
-    .await?;
-    let audience_ready = if has_inbox {
-        r#"
-        EXISTS (
-            SELECT 1
-              FROM (
-                  SELECT recipient_did AS user_did, recipient_device_id AS device_id
-                    FROM chat.direct_request_transport_inbox
-                   WHERE conversation_id = $1 AND status = 'accepted'
-                  UNION
-                  SELECT sender_did, sender_device_id
-                    FROM chat.direct_request_transport_inbox
-                   WHERE conversation_id = $1 AND status = 'accepted'
-              ) recipient
-              JOIN chat.devices d USING (user_did, device_id)
-             WHERE d.status = 'active' AND d.dormant_at IS NULL
-        )
-        AND NOT EXISTS (
-            SELECT 1
-              FROM (
-                  SELECT recipient_did AS user_did, recipient_device_id AS device_id
-                    FROM chat.direct_request_transport_inbox
-                   WHERE conversation_id = $1 AND status = 'accepted'
-                  UNION
-                  SELECT sender_did, sender_device_id
-                    FROM chat.direct_request_transport_inbox
-                   WHERE conversation_id = $1 AND status = 'accepted'
-              ) recipient
-              JOIN chat.devices d USING (user_did, device_id)
-              LEFT JOIN chat.device_entry_acks ack
-                ON ack.conversation_id = $1
-               AND ack.user_did = d.user_did AND ack.device_id = d.device_id
-             WHERE d.status = 'active' AND d.dormant_at IS NULL
-               AND COALESCE(ack.acked_through_seq, 0) < e.seq
-        )
-        "#
-    } else if has_group_grants {
-        r#"
-        EXISTS (SELECT 1 FROM chat.conversations
-                 WHERE conversation_id = $1 AND kind = 'group' AND is_remote)
-        AND EXISTS (
-            SELECT 1
-              FROM chat.group_transport_entry_recipients r
-              JOIN chat.devices d USING (user_did, device_id)
-              JOIN chat.participants p
-                ON p.conversation_id = r.conversation_id AND p.user_did = r.user_did
-             WHERE r.conversation_id = e.conversation_id AND r.seq = e.seq
-               AND p.current_membership AND p.status = 'active'
-               AND (p.ds_did IS NULL OR p.ds_did = $5)
-               AND d.status = 'active' AND d.dormant_at IS NULL
-        )
-        AND NOT EXISTS (
-            SELECT 1
-              FROM chat.group_transport_entry_recipients participant_r
-              JOIN chat.participants participant_p
-                ON participant_p.conversation_id = participant_r.conversation_id
-               AND participant_p.user_did = participant_r.user_did
-             WHERE participant_r.conversation_id = e.conversation_id
-               AND participant_r.seq = e.seq
-               AND participant_p.current_membership AND participant_p.status = 'active'
-               AND (participant_p.ds_did IS NULL OR participant_p.ds_did = $5)
-               AND NOT EXISTS (
-                   SELECT 1
-                     FROM chat.group_transport_entry_recipients ack_r
-                     JOIN chat.devices ack_d USING (user_did, device_id)
-                     JOIN chat.device_entry_acks ack
-                       ON ack.conversation_id = ack_r.conversation_id
-                      AND ack.user_did = ack_r.user_did
-                      AND ack.device_id = ack_r.device_id
-                    WHERE ack_r.conversation_id = participant_r.conversation_id
-                      AND ack_r.seq = participant_r.seq
-                      AND ack_r.user_did = participant_r.user_did
-                      AND ack_d.status = 'active' AND ack_d.dormant_at IS NULL
-                      AND ack.acked_through_seq >= e.seq
-               )
-        )
-        "#
-    } else {
-        return Ok(Vec::new());
-    };
-    #[cfg(feature = "sim")]
-    if crate::sim_hooks::active_sim_ds().is_some_and(|hooks| hooks.retain_application_ciphertext) {
-        return Ok(Vec::new());
-    }
-    let floor_cutoff = pruned_at - chrono::Duration::hours(72);
-    let cutoff_parameter = if has_inbox { "$5" } else { "$6" };
-    let sql = format!(
-        "UPDATE chat.direct_request_transport_entries e \
-            SET entry_bytes = e.pruned_entry_bytes, \
-                payload_pruned_at = $4 \
-          WHERE e.conversation_id = $1 AND e.seq <= $3 \
-            AND e.application_message_id IS NOT NULL AND e.payload_pruned_at IS NULL \
-            AND e.application_generation = $2 \
-            AND e.created_at <= {cutoff_parameter} \
-            AND ({audience_ready}) \
-          RETURNING e.seq"
-    );
-    let query = sqlx::query_scalar(&sql)
-        .bind(conversation_id)
-        .bind(generation)
-        .bind(acked_through_seq)
-        .bind(pruned_at);
-    let query = if has_inbox {
-        query.bind(floor_cutoff)
-    } else {
-        query
-            .bind(crate::identity::service_did_base())
-            .bind(floor_cutoff)
-    };
-    let pruned_seqs: Vec<i64> = query.fetch_all(&mut **transaction).await?;
-    for &seq in &pruned_seqs {
-        prune_application_entry_payload(transaction, conversation_id, seq, pruned_at).await?;
-    }
-    Ok(pruned_seqs)
-}
-
 /// The one ACK-driven prune, shared by a local device ACK and a sequencer's
 /// verified remote-home ACK relay. After the 72-hour minimum, application
 /// payloads prune only when every current non-sender participant has an awake
 /// enrolled leaf ACK covering the entry's historical generation interval.
 /// Direct-request openings instead use their exact frozen sender-and-recipient
-/// device audience. Remote mirrors use their frozen transport audience. I13
+/// device audience. Mirrors wait for the sequencer's signed prune notice. I13
 /// receipts and immutable metadata stay. Returns erased sequences, not storage
 /// copies.
 pub(crate) async fn prune_acknowledged_application_payloads(
@@ -3049,27 +2905,26 @@ pub(crate) async fn prune_acknowledged_application_payloads(
     is_remote: bool,
     pruned_at: DateTime<Utc>,
 ) -> Result<Vec<i64>, DeliveryRepositoryError> {
-    let has_transport_entries = is_remote
-        && sqlx::query_scalar::<_, bool>(
-            "SELECT to_regclass('chat.direct_request_transport_entries') IS NOT NULL",
+    // Only the sequencer knows whether every non-sender's home has acknowledged.
+    // A mirror relays its local ACK and retains application bytes until the sequencer's
+    // signed prune notice or the ordinary 30-day expiry. Direct-request openings
+    // are a separate entry kind with their own frozen audience.
+    if is_remote {
+        return super::direct_request_opening::prune_acknowledged_transport_openings(
+            transaction,
+            conversation_id,
+            acked_through_seq,
+            pruned_at,
         )
-        .fetch_one(&mut **transaction)
-        .await?;
-    // Replicated sequences are governed by the frozen transport audience, not a
-    // possibly older mirror interval snapshot. Its executor erases both copies.
-    let replica_guard = if has_transport_entries {
-        "NOT EXISTS (SELECT 1 FROM chat.direct_request_transport_entries replica \
-                      WHERE replica.conversation_id = e.conversation_id AND replica.seq = e.seq)"
-    } else {
-        "TRUE"
-    };
+        .await
+        .map_err(Into::into);
+    }
     // Historical intervals remain authoritative for the sequence they covered.
     // A reset closes the old generation's intervals, but must not turn its
     // recipient set into an empty quorum. Removed participants do not retain
     // application access; current participants do, including across resets.
     let floor_cutoff = pruned_at - chrono::Duration::hours(72);
-    let pruning_sql = format!(
-        "SELECT e.seq, e.entry_kind = 'blue.catbird.chat.defs#directRequestEntry' \
+    let pruning_sql = "SELECT e.seq, e.entry_kind = 'blue.catbird.chat.defs#directRequestEntry' \
            FROM chat.entries e \
           WHERE e.conversation_id = $1 \
             AND e.generation = $2 \
@@ -3077,8 +2932,7 @@ pub(crate) async fn prune_acknowledged_application_payloads(
             AND e.entry_kind IN ('blue.catbird.chat.defs#applicationEntry', \
                                  'blue.catbird.chat.defs#directRequestEntry') \
             AND e.payload_pruned_at IS NULL \
-            AND ({replica_guard}) \
-            AND e.received_at <= $6 \
+            AND e.received_at <= $4 \
             AND ( \
                 (e.entry_kind = 'blue.catbird.chat.defs#directRequestEntry' \
                  AND EXISTS ( \
@@ -3133,8 +2987,6 @@ pub(crate) async fn prune_acknowledged_application_payloads(
                         AND recipient_ai.recipient_did <> e.actor_did \
                         AND recipient_p.current_membership \
                         AND recipient_p.status = 'active' \
-                        AND (NOT $4 OR recipient_p.ds_did IS NULL \
-                             OR recipient_p.ds_did = $5) \
                  ) \
                  AND NOT EXISTS ( \
                      SELECT 1 \
@@ -3150,8 +3002,6 @@ pub(crate) async fn prune_acknowledged_application_payloads(
                         AND participant_ai.recipient_did <> e.actor_did \
                         AND participant_p.current_membership \
                         AND participant_p.status = 'active' \
-                        AND (NOT $4 OR participant_p.ds_did IS NULL \
-                             OR participant_p.ds_did = $5) \
                         AND NOT EXISTS ( \
                             SELECT 1 \
                               FROM chat.application_intervals ack_ai \
@@ -3174,14 +3024,11 @@ pub(crate) async fn prune_acknowledged_application_payloads(
                         ) \
                  )) \
             ) \
-          ORDER BY e.seq ASC",
-    );
-    let prunable: Vec<(i64, bool)> = sqlx::query_as(&pruning_sql)
+          ORDER BY e.seq ASC";
+    let prunable: Vec<(i64, bool)> = sqlx::query_as(pruning_sql)
         .bind(conversation_id)
         .bind(generation)
         .bind(acked_through_seq)
-        .bind(is_remote)
-        .bind(crate::identity::service_did_base())
         .bind(floor_cutoff)
         .fetch_all(&mut **transaction)
         .await?;
@@ -3201,27 +3048,6 @@ pub(crate) async fn prune_acknowledged_application_payloads(
         if pruned {
             pruned_seqs.push(seq);
         }
-    }
-    if is_remote {
-        pruned_seqs.extend(
-            prune_acknowledged_transport_application_payloads(
-                transaction,
-                conversation_id,
-                generation,
-                acked_through_seq,
-                pruned_at,
-            )
-            .await?,
-        );
-        pruned_seqs.extend(
-            super::direct_request_opening::prune_acknowledged_transport_openings(
-                transaction,
-                conversation_id,
-                acked_through_seq,
-                pruned_at,
-            )
-            .await?,
-        );
     }
     // Count erased entries, never a P8-retained payload.
     pruned_seqs.sort_unstable();
@@ -3398,13 +3224,45 @@ pub(crate) async fn prune_transport_applications_sent_by(
     did: &str,
     pruned_at: DateTime<Utc>,
 ) -> Result<usize, DeliveryRepositoryError> {
+    prune_transport_applications(transaction, conversation_id, did, None, pruned_at).await
+}
+
+/// Erase only this actor's application entries preceding the verified deletion,
+/// using the original sequencer receipt time even for a late-arriving mirror.
+pub(crate) async fn prune_transport_applications_sent_before(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    did: &str,
+    before_seq: i64,
+    cutoff: DateTime<Utc>,
+    pruned_at: DateTime<Utc>,
+) -> Result<usize, DeliveryRepositoryError> {
+    prune_transport_applications(
+        transaction,
+        conversation_id,
+        did,
+        Some((before_seq, cutoff)),
+        pruned_at,
+    )
+    .await
+}
+
+async fn prune_transport_applications(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    did: &str,
+    bound: Option<(i64, DateTime<Utc>)>,
+    pruned_at: DateTime<Utc>,
+) -> Result<usize, DeliveryRepositoryError> {
     let held: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as(
         "SELECT seq, entry_bytes, evidence_pending FROM chat.direct_request_transport_entries \
           WHERE conversation_id = $1 AND payload_pruned_at IS NULL \
+            AND ($2::bigint IS NULL OR seq < $2) \
             AND (application_message_id IS NOT NULL OR evidence_pending) \
           ORDER BY seq",
     )
     .bind(conversation_id)
+    .bind(bound.map(|(seq, _)| seq))
     .fetch_all(&mut **transaction)
     .await?;
     let mut by_generation = std::collections::BTreeMap::<i64, Vec<i64>>::new();
@@ -3421,6 +3279,16 @@ pub(crate) async fn prune_transport_applications_sent_by(
         let (true, Some(generation)) = (sent_by_did, generation) else {
             continue;
         };
+        if let Some((_, cutoff)) = bound {
+            let received_at = entry
+                .get("receivedAt")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .ok_or_else(|| invalid_transport_entry("missing sequencer receipt time"))?;
+            if received_at > cutoff {
+                continue;
+            }
+        }
         if legacy {
             classify_legacy_transport_entry(&mut **transaction, conversation_id, seq, &bytes)
                 .await?;

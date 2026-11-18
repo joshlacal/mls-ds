@@ -545,29 +545,34 @@ pub async fn sweep_expired_published_direct_requests_for_test(
     expire_due_published_requests(pool, signer, 100).await
 }
 
-/// Mark active devices whose coarse UTC-day `last_active_at` is at or older than
-/// `now - CHAT_DEVICE_DORMANT_AFTER_HOURS` (default `48h`) as dormant so inactive
-/// devices cannot stall ACK-based ciphertext pruning (`I14`, `G6`), and immediately
-/// prune any application payloads that were waiting only on those newly dormant
-/// devices (queuing signed S2S `entriesPruned` notices in the same transaction).
-fn positive_hours_env(name: &str, default: i64) -> i64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(default)
-}
-
+/// Mark devices after the 60-day inactivity window. Coarse UTC-day timestamps
+/// need a one-day allowance to avoid expiring activity early.
 pub async fn mark_inactive_devices(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> Result<u64, ExpirySweepError> {
-    let dormant_after_hours = positive_hours_env("CHAT_DEVICE_DORMANT_AFTER_HOURS", 48);
+    let dormancy = chrono::Duration::days(crate::config::DEVICE_DORMANCY_DAYS);
     // `last_active_at` is coarse-bucketed to UTC midnight (`00:00:00Z`), which can lag
     // a late-UTC-day interaction (`23:59:59Z`) by up to 24h; add a +24h margin so the
-    // dormancy threshold reflects at least `dormant_after_hours` of true inactivity.
-    let cutoff = now - chrono::Duration::hours(dormant_after_hours) - chrono::Duration::hours(24);
+    // dormancy threshold reflects at least 60 days of true inactivity.
+    let cutoff = now - dormancy - chrono::Duration::days(1);
     let mut tx = pool.begin().await?;
+
+    // Rows classified under the former 48-hour policy must become eligible for
+    // the new quorum again. No activity timestamp is invented by the repair.
+    sqlx::query(
+        "UPDATE chat.devices d SET dormant_at = NULL \
+          WHERE (d.user_did, d.device_id) IN ( \
+              SELECT cand.user_did, cand.device_id FROM chat.devices cand \
+               WHERE cand.status = 'active' AND cand.dormant_at IS NOT NULL \
+                 AND cand.last_active_at > $1 \
+               ORDER BY cand.user_did, cand.device_id \
+               LIMIT 500 FOR UPDATE SKIP LOCKED \
+          )",
+    )
+    .bind(cutoff)
+    .execute(&mut *tx)
+    .await?;
 
     let marked: Vec<(String, Uuid)> = sqlx::query_as(
         "UPDATE chat.devices d \
@@ -698,7 +703,7 @@ pub async fn delete_expired_remote_lifecycle_state(
     Ok(bindings + replays)
 }
 
-/// Hard ceiling sweep (`CHAT_APPLICATION_PAYLOAD_TTL_HOURS`, default `720h`):
+/// Hard ceiling sweep (30 days):
 /// prune application ciphertext at 30 days while archive-content qualification
 /// remains fail-closed, keeping contiguous `seq` skeletons,
 /// `sequencer_receipt_bytes`, and all `#commitEntry` / control ratchet entries
@@ -709,8 +714,7 @@ pub async fn prune_expired_application_payloads(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> Result<u64, ExpirySweepError> {
-    let app_ttl_hours = positive_hours_env("CHAT_APPLICATION_PAYLOAD_TTL_HOURS", 720);
-    let app_cutoff = now - chrono::Duration::hours(app_ttl_hours);
+    let app_cutoff = now - chrono::Duration::days(crate::config::APPLICATION_RETENTION_DAYS);
     let opening_cutoff = now - chrono::Duration::days(30);
     let targets: Vec<(Uuid, i64, i64)> = sqlx::query_as(
         "SELECT e.conversation_id, e.generation, e.seq \
@@ -804,8 +808,8 @@ pub async fn prune_expired_application_payloads(
     let transport: Vec<(Uuid, i64)> = sqlx::query_as(
         "SELECT conversation_id, seq FROM chat.direct_request_transport_entries \
           WHERE application_message_id IS NOT NULL AND payload_pruned_at IS NULL \
-            AND created_at <= $1 \
-          ORDER BY created_at ASC, conversation_id ASC, seq ASC \
+            AND chat.transport_application_retention_start(pruned_entry_bytes, created_at, conversation_id, entry_id, seq) <= $1 \
+          ORDER BY chat.transport_application_retention_start(pruned_entry_bytes, created_at, conversation_id, entry_id, seq), conversation_id, seq \
           LIMIT 256",
     )
     .bind(app_cutoff)

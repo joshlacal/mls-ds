@@ -91,8 +91,12 @@ async fn promote_pending_device(
     // Lock every active local sibling, including dormant ones. NOWAIT makes a
     // concurrent sibling wake/revocation win instead of deadlocking with the
     // pending caller's device lock acquired by request authentication.
+    // Full-loss recovery has its own 72-hour visible notice and sibling activity
+    // check. The 60-day delivery-retention window must not delay recovery.
+    // Preserve the previous 48 hours of true inactivity plus the coarse-day margin.
+    let recovery_activity_cutoff = at - chrono::Duration::hours(72);
     let siblings: Vec<(bool,)> = sqlx::query_as(
-        "SELECT dormant_at IS NULL FROM chat.devices \
+        "SELECT last_active_at > $3 FROM chat.devices \
           WHERE user_did = $1 AND device_id <> $2 \
             AND status = 'active' AND revoked_at IS NULL \
             AND NOT (dpop_jkt IS NULL AND device_name = 'federated-group-device') \
@@ -100,6 +104,7 @@ async fn promote_pending_device(
     )
     .bind(did)
     .bind(device_id)
+    .bind(recovery_activity_cutoff)
     .fetch_all(&mut *conn)
     .await
     .map_err(promotion_lock_error)?;

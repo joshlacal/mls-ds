@@ -425,7 +425,7 @@ async fn nul_signed_legacy_transport_rows_as_home() {
 }
 
 #[tokio::test]
-async fn remote_group_transport_waits_for_both_frozen_local_device_acks() {
+async fn remote_group_transport_waits_for_sequencer_notice_after_all_local_acks() {
     as_pruning_home(remote_group_transport_waits_for_local_acks_as_home()).await
 }
 
@@ -580,11 +580,12 @@ async fn remote_group_transport_waits_for_local_acks_as_home() {
     .unwrap();
     let mut dormant_tx = pool.begin().await.unwrap();
     assert!(
-        prune_acknowledged_transport_application_payloads(
+        prune_acknowledged_application_payloads(
             &mut dormant_tx,
             fixture.conversation_id,
             0,
             4,
+            true,
             now + chrono::Duration::hours(73),
         )
         .await
@@ -625,11 +626,12 @@ async fn remote_group_transport_waits_for_local_acks_as_home() {
             let hooks = retaining_hooks(&home);
             let retained = crate::sim_hooks::scope_sim_ds(
                 hooks,
-                prune_acknowledged_transport_application_payloads(
+                prune_acknowledged_application_payloads(
                     &mut tx,
                     fixture.conversation_id,
                     0,
                     4,
+                    true,
                     now + chrono::Duration::hours(73),
                 ),
             )
@@ -655,16 +657,20 @@ async fn remote_group_transport_waits_for_local_acks_as_home() {
             assert!(still_retained);
             assert!(local_retained, "P8 must retain both ciphertext copies");
         }
-        let pruned = prune_acknowledged_transport_application_payloads(
+        let pruned = prune_acknowledged_application_payloads(
             &mut tx,
             fixture.conversation_id,
             0,
             4,
+            true,
             now + chrono::Duration::hours(73),
         )
         .await
         .unwrap();
-        assert_eq!(pruned, if index == 0 { Vec::new() } else { vec![4] });
+        assert!(
+            pruned.is_empty(),
+            "local ACKs cannot prove the global recipient quorum"
+        );
         let local_pruned: bool = sqlx::query_scalar(
             "SELECT payload_pruned_at IS NOT NULL AND accepted_payload_bytes IS NULL \
                     AND signed_request_bytes IS NULL \
@@ -674,13 +680,24 @@ async fn remote_group_transport_waits_for_local_acks_as_home() {
         .fetch_one(&mut *tx)
         .await
         .unwrap();
-        assert_eq!(
-            local_pruned,
-            index == 1,
-            "both mirror copies share frozen ACK readiness"
+        assert!(
+            !local_pruned,
+            "the mirrored append log must wait for a sequencer notice"
         );
         tx.commit().await.unwrap();
     }
+    let mut notice = pool.begin().await.unwrap();
+    let erased = prune_transport_payloads_pruned_by_sequencer(
+        &mut notice,
+        fixture.conversation_id,
+        0,
+        &[4],
+        now + chrono::Duration::hours(73),
+    )
+    .await
+    .unwrap();
+    assert_eq!(erased, vec![4]);
+    notice.commit().await.unwrap();
     let (bytes, digest, metadata, pruned): (Vec<u8>, Vec<u8>, Vec<u8>, bool) = sqlx::query_as(
         "SELECT entry_bytes, original_entry_sha256, application_metadata_bytes, \
                 payload_pruned_at IS NOT NULL \
