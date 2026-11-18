@@ -57,6 +57,9 @@ pub(crate) use accept_conversation::execute_admitted as execute_federated_group_
 #[cfg(test)]
 pub(crate) use acknowledge_entries::execute_for_principal as acknowledge_entries_for_principal;
 pub(crate) use conversation_state::execute_federated_read as execute_federated_conversation_state_read;
+pub(crate) use get_entries::{
+    facade_failure as entries_read_failure, federated_recovery_read_window,
+};
 pub(crate) use welcome::execute_admitted as execute_federated_group_welcome;
 
 pub(crate) fn federated_admission_failure(

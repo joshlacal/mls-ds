@@ -41,13 +41,39 @@ async fn get_entries(
     context::require_cutover(runtime, ENDPOINT)?;
     let (actor_device_id, conversation_id, after_seq, limit) = parse_query(query)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-    let admission =
-        context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers, &actor_device_id)
-            .await?;
-    let response = get_entries_for_admission(pool, admission, conversation_id, after_seq, limit)
-        .await
-        .map_err(facade_failure)?;
-    Ok(context::json_ok(response.into_response_bytes()))
+    let (admission, subject) = context::admit_unsigned_read_for_subject(
+        pool,
+        runtime,
+        ENDPOINT,
+        method,
+        headers,
+        &actor_device_id,
+    )
+    .await?;
+    match get_entries_for_admission(pool, admission, conversation_id, after_seq, limit).await {
+        Ok(response) => Ok(context::json_ok(response.into_response_bytes())),
+        Err(EntryReadFacadeError::NotEntitled) => {
+            if let Some(resolver) = runtime.resolver() {
+                let device = Uuid::parse_str(&actor_device_id)
+                    .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+                if let Some(bytes) = crate::federation::group_relay::try_relay_recovery_entries(
+                    pool,
+                    resolver,
+                    conversation_id,
+                    &subject,
+                    device,
+                    after_seq,
+                    limit,
+                )
+                .await?
+                {
+                    return Ok(context::json_ok(bytes));
+                }
+            }
+            Err(facade_failure(EntryReadFacadeError::NotEntitled))
+        }
+        Err(error) => Err(facade_failure(error)),
+    }
 }
 
 fn parse_query(query: Option<&str>) -> Result<(String, Uuid, u64, i64), ChatFailure> {
@@ -156,7 +182,7 @@ fn percent_decode(value: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-fn facade_failure(error: EntryReadFacadeError) -> ChatFailure {
+pub(crate) fn facade_failure(error: EntryReadFacadeError) -> ChatFailure {
     tracing::error!("get_entries facade_failure: {:?}", error);
     match error {
         EntryReadFacadeError::AccessOutsideMembershipInterval => ChatFailure::protocol(
@@ -224,4 +250,24 @@ mod tests {
         let query = format!("conversationId={}&afterSeq=0", convo);
         assert!(parse_query(Some(&query)).is_err());
     }
+}
+
+pub(crate) async fn federated_recovery_read_window(
+    pool: &DbPool,
+    principal: crate::auth::VerifiedServicePrincipal,
+    device: Uuid,
+    conversation: Uuid,
+    sequencer: &str,
+) -> Result<Response, ChatFailure> {
+    let admission =
+        context::admit_federated_read(pool, ENDPOINT, principal, &device.to_string()).await?;
+    let window = crate::chat_protocol::repository::entry_read::acknowledged_recovery_read_window(
+        pool,
+        admission,
+        conversation,
+        sequencer,
+    )
+    .await
+    .map_err(facade_failure)?;
+    Ok(axum::Json(window).into_response())
 }

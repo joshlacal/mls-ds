@@ -14,6 +14,10 @@ use chrono::{DateTime, Utc};
 use sha2::Digest as _;
 use sqlx::{Postgres, Transaction};
 
+#[path = "group_recovery_reads.rs"]
+mod recovery_reads;
+pub(crate) use recovery_reads::try_relay_recovery_entries;
+
 const DIRECTORY_NSID: &str = "blue.catbird.mlsDS.resolveGroupDevices";
 const PACKAGE_NSID: &str = "blue.catbird.mlsDS.fetchKeyPackage";
 const LABYRINTH_DIRECTORY_NSID: &str = "blue.catbird.mlsDS.getLabyrinthDirectory";
@@ -57,6 +61,7 @@ struct GroupPackage {
 
 pub(super) fn routes() -> Router<GroupRelayState> {
     Router::new()
+        .merge(recovery_reads::route())
         .route(
             "/xrpc/blue.catbird.mlsDS.resolveGroupDevices",
             post(ClockScoped(resolve_devices)),
@@ -1053,9 +1058,8 @@ pub(crate) async fn try_relay_home_group_operation(
 }
 
 /// Relay a signed Welcome disposition and seal the sequencer's answer as the
-/// response bytes when the actor is a member only the home's remote-group index
-/// knows: that Welcome has no local mailbox row, so the sequencer's disposition
-/// is the whole answer. `None` leaves the disposition to the local facade.
+/// response bytes when this remote group's home has no local delivery to settle.
+/// A restored device can be absent from a clean mirror containing a sibling.
 pub(crate) async fn try_relay_index_only_welcome(
     pool: &DbPool,
     actor: &str,
@@ -1074,15 +1078,17 @@ pub(crate) async fn try_relay_index_only_welcome(
     else {
         return Ok(None);
     };
-    let Some(conversation_id) = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            let signed = value.get("signedRequest").unwrap_or(&value);
-            signed
-                .pointer("/body/coordinates/conversationId")
-                .and_then(Value::as_str)
-                .and_then(|id| Uuid::parse_str(id).ok())
-        })
+    let Some((conversation, welcome)) =
+        serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                let signed = value.get("signedRequest").unwrap_or(&value);
+                let id = |path| Uuid::parse_str(signed.pointer(path)?.as_str()?).ok();
+                Some((
+                    id("/body/coordinates/conversationId")?,
+                    id("/body/welcomeId")?,
+                ))
+            })
     else {
         return Ok(None);
     };
@@ -1090,11 +1096,29 @@ pub(crate) async fn try_relay_index_only_welcome(
         .acquire()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
-    let standing = remote_group_standing(&mut conn, conversation_id, actor)
+    match remote_group_standing(&mut conn, conversation, actor)
         .await
-        .map_err(|_| ChatFailure::storage(endpoint))?;
-    if standing != RemoteGroupStanding::IndexOnly {
-        return Ok(None);
+        .map_err(|_| ChatFailure::storage(endpoint))?
+    {
+        RemoteGroupStanding::IndexOnly => {}
+        RemoteGroupStanding::CleanMember => {
+            let mirrored: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM chat.welcome_deliveries d \
+                 JOIN chat.welcome_bundles w USING(welcome_id) WHERE w.conversation_id=$1 \
+                 AND d.welcome_id=$2 AND d.recipient_did=$3 AND d.recipient_device_id=$4)",
+            )
+            .bind(conversation)
+            .bind(welcome)
+            .bind(actor)
+            .bind(device)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
+            if mirrored {
+                return Ok(None);
+            }
+        }
+        _ => return Ok(None),
     }
     serde_json::to_vec(&output)
         .map(Some)
