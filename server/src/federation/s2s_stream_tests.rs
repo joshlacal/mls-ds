@@ -331,6 +331,26 @@ fn edited(mut relay: EntryAckRelay, edit: impl FnOnce(&mut EntryAckRelay)) -> En
     relay
 }
 
+/// Age only the sequencer entry so the signed ACKs and relay credentials remain current.
+async fn age_entry_past_prune_floor(pool: &DbPool, conversation_id: Uuid, seq: i64) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let changed = sqlx::query(
+        "UPDATE chat.entries SET received_at = clock_timestamp() - INTERVAL '73 hours' \
+         WHERE conversation_id = $1 AND seq = $2",
+    )
+    .bind(conversation_id)
+    .bind(seq)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    tx.commit().await.unwrap();
+}
+
 /// The ACK and payload state a relay may change at the sequencer: ACK rows,
 /// their watermark sum, retained application ciphertexts and send payloads,
 /// and retained I13 receipts.
@@ -612,6 +632,8 @@ async fn sequencer_prunes_only_after_the_remote_home_relays_its_device_ack() {
         .entry;
         let seq = entry["seq"].as_i64().unwrap();
         assert!(entry.get("sequencerReceipt").is_some(), "I13 receipt");
+
+        age_entry_past_prune_floor(&seq_pool, cid, seq).await;
 
         // The local device's ACK alone never prunes the remote-homed audience.
         let local = scope_sim_ds(
@@ -2037,6 +2059,7 @@ async fn a_sequencer_prune_without_the_remote_member_ack_notifies_its_home() {
                 .entry["seq"]
                 .as_i64()
                 .unwrap();
+            age_entry_past_prune_floor(&pool, cid, seq).await;
             // The remote-homed device never ACKs again: like its removal, its
             // dormancy drops it from the audience the sequencer waits for,
             // while its home's mirror still counts it.
@@ -2477,6 +2500,7 @@ async fn effects_needing_a_signed_relay_or_notice_fail_closed_without_a_signer()
     let (fixture, state, seq) =
         relayed_application(&pool, Arc::clone(&keyless), clock.clone(), &seq_key).await;
     let cid = fixture.conversation_id;
+    age_entry_past_prune_floor(&pool, cid, seq).await;
     scope_ds_clock(
         clock.clone(),
         scope_sim_ds(keyless, async {
@@ -2983,6 +3007,7 @@ async fn c33_sequencer_applies_the_declared_homes_ack_relay_for_its_transport_on
             .await
             .expect("coordinate the remote sender's application");
             let seq = sequenced["entry"]["seq"].as_i64().unwrap();
+            age_entry_past_prune_floor(&seq_pool, cid, seq).await;
             assert!(sequenced.get("sequencerReceipt").is_some(), "I13 receipt");
 
             // The local recipient's ACK alone never prunes the remote device's payload.
