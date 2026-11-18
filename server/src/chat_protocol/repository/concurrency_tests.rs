@@ -691,7 +691,7 @@ mod close_racing_accept {
             test_support::{seed_genuine_pending_direct_request, sign_mutation_json_for_test},
         },
         common::{fresh_db::fresh_fully_migrated_db, http_acceptance as http},
-        sim_hooks::{scope_sim_ds, QueuedTaskSpawner, SimDsHooks},
+        sim_hooks::{scope_ds_clock, scope_sim_ds, ManualDsClock, QueuedTaskSpawner, SimDsHooks},
     };
 
     /// `did`'s device with a service-auth key, declaring no home.
@@ -716,28 +716,32 @@ mod close_racing_accept {
             .unwrap()
     }
 
-    /// Wait until `sessions` sessions of this database wait on `holder`,
-    /// directly or behind one another; `false` once `task` finished instead.
-    async fn queued<T>(pool: &PgPool, holder: i32, sessions: i64, task: &JoinHandle<T>) -> bool {
+    /// Observe the actual statement waiting behind the barrier. Once the accept
+    /// starts, distinguish its backend from the already queued close.
+    async fn blocked_query<T>(
+        pool: &PgPool,
+        holder: i32,
+        waiter: Option<i32>,
+        task: &JoinHandle<T>,
+    ) -> Option<String> {
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
-                let waiting: i64 = sqlx::query_scalar(
+                let query = sqlx::query_scalar::<_, String>(
                     "WITH RECURSIVE w(pid) AS ( \
                          SELECT pid FROM pg_stat_activity \
                           WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid)) \
                          UNION SELECT a.pid FROM pg_stat_activity a \
                           JOIN w ON w.pid = ANY(pg_blocking_pids(a.pid))) \
-                     SELECT count(*) FROM w",
+                     SELECT a.query FROM pg_stat_activity a JOIN w USING(pid) \
+                      WHERE $2::integer IS NULL OR a.pid = $2 LIMIT 1",
                 )
                 .bind(holder)
-                .fetch_one(pool)
+                .bind(waiter)
+                .fetch_optional(pool)
                 .await
                 .unwrap();
-                if waiting >= sessions {
-                    return true;
-                }
-                if task.is_finished() {
-                    return false;
+                if query.is_some() || task.is_finished() {
+                    return query;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -774,6 +778,25 @@ mod close_racing_accept {
         let closer = device(&sender, sender_device).await;
         // The recipient's document declares no home: the close owes no C33 fan-out.
         device(&recipient, recipient_device).await;
+        // Set up an already active device before locking the head. A first activity
+        // write runs devices_metadata_authority_deferred, which itself locks this
+        // conversation during authentication, before the close's transaction.
+        let now = chrono::Utc::now();
+        let day = crate::chat_protocol::device_activity::coarse_activity_day(now);
+        assert_eq!(
+            sqlx::query(
+                "UPDATE chat.devices SET last_active_at = $3, dormant_at = NULL \
+                 WHERE user_did = $1 AND device_id = $2 AND status = 'active'",
+            )
+            .bind(&sender)
+            .bind(sender_device)
+            .bind(day)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected(),
+            1
+        );
         let prior = request.coordinate().clone();
         let mut retired = prior.clone();
         retired["stateVersion"] = json!(prior["stateVersion"].as_u64().unwrap() + 1);
@@ -792,8 +815,7 @@ mod close_racing_accept {
                 "conversationKind": "direct",
                 "prior": prior,
                 "retired": retired,
-                "signedAt": chrono::Utc::now()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "signedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             }),
             &ed25519_dalek::SigningKey::from_bytes(&seed),
         )
@@ -808,17 +830,23 @@ mod close_racing_accept {
             .execute(&mut *barrier)
             .await
             .unwrap();
-        let close = tokio::spawn(scope_sim_ds(hooks, async move {
-            let close =
-                http::unsigned_json_request(&closer, "blue.catbird.chat.closeConversation", body);
-            http::send(router, close).await
-        }));
-        if !queued(&pool, barrier_pid, 1, &close).await {
-            panic!(
-                "the close finished without queuing on the head: {:?}",
-                close.await
-            );
-        }
+        let close = tokio::spawn(scope_ds_clock(
+            Arc::new(ManualDsClock::new(now)),
+            scope_sim_ds(hooks, async move {
+                let close = http::unsigned_json_request(
+                    &closer, "blue.catbird.chat.closeConversation", body,
+                );
+                http::send(router, close).await
+            }),
+        ));
+        let Some(close_waits_in) = blocked_query(&pool, barrier_pid, None, &close).await else {
+            panic!("the close finished without queuing on the head: {:?}", close.await);
+        };
+        assert!(
+            close_waits_in.contains("FROM chat.conversations c")
+                && close_waits_in.contains("FOR UPDATE OF c"),
+            "expected the close transaction's head lock, observed `{close_waits_in}`"
+        );
         let (pid_sender, pid_receiver) = tokio::sync::oneshot::channel();
         let accept = tokio::spawn({
             let (pool, request_id, conversation_id) =
@@ -841,15 +869,9 @@ mod close_racing_accept {
             }
         });
         let accept_pid = pid_receiver.await.unwrap();
-        if !queued(&pool, barrier_pid, 2, &accept).await {
+        let Some(accept_waits_in) = blocked_query(&pool, barrier_pid, Some(accept_pid), &accept).await else {
             panic!("the accept finished without queuing: {:?}", accept.await);
-        }
-        let accept_waits_in: String =
-            sqlx::query_scalar("SELECT query FROM pg_stat_activity WHERE pid = $1")
-                .bind(accept_pid)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        };
         barrier.rollback().await.unwrap();
         let (status, reply) = close.await.unwrap();
         let accepted = accept.await.unwrap();
