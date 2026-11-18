@@ -50,7 +50,10 @@ use catbird_server::{
         build_direct_request_receipt_did_document, build_service_did_document,
         did_web_document_path,
     },
-    labyrinth::repo::retention::delete_account_data_with_conversations,
+    labyrinth::{
+        recovery_crypto::RecoveryCrypto, recovery_tombstones::RecoveryTombstones,
+        repo::retention::delete_account_data_with_conversations,
+    },
     push_gateway::{client::PushGatewayClient, ssrf::register_test_gateway_override},
     realtime::SseState,
     space_host::{
@@ -1976,6 +1979,20 @@ async fn main() -> Result<()> {
         "clean_slate_federation_fixture requires APP_ENV=test"
     );
 
+    if let Ok(hosts) = std::env::var("REQUEST_FIXTURE_DID_HOSTS") {
+        let hosts: Vec<_> = hosts.split(',').map(str::to_string).collect();
+        anyhow::ensure!(
+            hosts
+                .iter()
+                .all(|host| host.ends_with(".request-fixture.catbird.blue")),
+            "invalid private fixture host"
+        );
+        let port = std::env::var("REQUEST_FIXTURE_DID_PORT")?.parse()?;
+        let ca = std::fs::read(std::env::var("REQUEST_FIXTURE_DID_CA_PEM")?)?;
+        catbird_server::auth::install_test_https_did_resolver(&hosts, port, &ca)
+            .map_err(anyhow::Error::msg)?;
+    }
+
     let database_url =
         std::env::var("TEST_DATABASE_URL").context("TEST_DATABASE_URL is required")?;
     anyhow::ensure!(
@@ -2098,10 +2115,12 @@ async fn main() -> Result<()> {
         "CHAT_CURSOR_SEALING_SECRET",
         URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
     );
-    std::env::set_var(
-        "CHAT_SUBSCRIPTION_ENDPOINT",
-        "wss://chat.federation.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents",
-    );
+    if std::env::var_os("CHAT_SUBSCRIPTION_ENDPOINT").is_none() {
+        std::env::set_var(
+            "CHAT_SUBSCRIPTION_ENDPOINT",
+            "wss://chat.federation.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents",
+        );
+    }
     std::env::set_var("FEDERATION_TEST_ALLOW_ALL_RELATIONSHIPS", "true");
     std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
     std::env::set_var("FEDERATION_MODE", "open");
@@ -2136,6 +2155,18 @@ async fn main() -> Result<()> {
         .map_err(anyhow::Error::msg)?
         .with_resolver(resolver.clone())
         .with_i13_receipt_signer(i13_signer.clone());
+    if let Some(crypto) = RecoveryCrypto::from_env().map_err(anyhow::Error::msg)? {
+        let journal_path = std::env::var("LABYRINTH_RECOVERY_SHARE_TOMBSTONE_FILE")?;
+        // This fixture always creates a fresh dedicated database. Exclusive
+        // provisioning pairs it with a fresh journal and refuses any old path.
+        let journal = RecoveryTombstones::provision_new(journal_path, crypto.journal_key())
+            .map_err(anyhow::Error::msg)?;
+        journal
+            .replay(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("journal replay: {e}"))?;
+        runtime_builder = runtime_builder.with_recovery_shares(Arc::new(crypto), Arc::new(journal));
+    }
     if let Some(ref sa) = service_auth {
         let submitter = Arc::new(
             catbird_server::federation::commit_submitter::RemoteCommitSubmitter::new(
