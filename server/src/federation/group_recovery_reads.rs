@@ -86,7 +86,7 @@ async fn surviving_enrollment(
     did: &str,
     device: Uuid,
 ) -> Result<(String, i64), RelayFailure> {
-    use crate::federation::space_read_relay::{fetch_chat_device_key_proof, SpaceRelayError};
+    use crate::federation::space_read_relay::{verify_live_recovered_enrollment, SpaceRelayError};
 
     let (key_id, generation, public_key) = sqlx::query_as::<_, (String, i64, Vec<u8>)>(
         "SELECT k.key_id,d.auth_generation,k.signing_public_key FROM chat.devices d \
@@ -104,7 +104,7 @@ async fn surviving_enrollment(
     let key = public_key
         .try_into()
         .map_err(|_| RelayFailure::storage("invalid stored signing key"))?;
-    fetch_chat_device_key_proof(&resolver(pool), did, &device.to_string(), &key)
+    verify_live_recovered_enrollment(&resolver(pool), did, &device.to_string(), &key)
         .await
         .map_err(|error| match error {
             SpaceRelayError::UpstreamUnavailable(_) => RelayFailure::unavailable(error),

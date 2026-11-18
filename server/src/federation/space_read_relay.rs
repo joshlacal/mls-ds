@@ -1392,30 +1392,61 @@ fn device_record_and_signature(
     atproto_key: &SpaceVerifyingKey,
     absent_label: &str,
 ) -> Result<(Vec<u8>, bool), SpaceRelayError> {
+    let (record, authenticated) = device_record_at_head(
+        car_bytes,
+        did,
+        collection,
+        device_id,
+        max_bytes,
+        atproto_key,
+        None,
+    )?;
+    let record = record.ok_or_else(|| {
+        SpaceRelayError::UpstreamError(format!("{absent_label} is absent from MST"))
+    })?;
+    Ok((record, authenticated))
+}
+
+fn device_record_at_head(
+    car_bytes: &[u8],
+    did: &str,
+    collection: &str,
+    device_id: &str,
+    max_bytes: usize,
+    atproto_key: &SpaceVerifyingKey,
+    observed_head: Option<cid::Cid>,
+) -> Result<(Option<Vec<u8>>, bool), SpaceRelayError> {
     check_canonical_device_id(device_id)?;
     let (root_cid, mut blocks) = parse_verified_car_v1(car_bytes, max_bytes)?;
-    let commit_bytes = blocks
+    if observed_head.is_some_and(|head| head != root_cid) {
+        return Err(SpaceRelayError::UpstreamUnavailable(
+            "the actor's repository head changed during the device authority read".into(),
+        ));
+    }
+    let commit = blocks
         .get(&root_cid)
         .ok_or_else(|| SpaceRelayError::UpstreamError("missing root commit block".into()))?;
-    let (mst_root_cid, authenticated) = atproto_commit_signature(commit_bytes, did, atproto_key)?;
-    let mst_key = format!("{collection}/{device_id}");
-    let mut visited = HashSet::new();
-    let record_cid = walk_mst_proof(
+    let (tree, signed) = atproto_commit_signature(commit, did, atproto_key)?;
+    let path = format!("{collection}/{device_id}");
+    let record = walk_mst_proof(
         &blocks,
-        mst_root_cid,
-        mst_key.as_bytes(),
+        tree,
+        path.as_bytes(),
         None,
         None,
-        &mut visited,
+        &mut HashSet::new(),
         0,
-    )?
-    .ok_or_else(|| SpaceRelayError::UpstreamError(format!("{absent_label} is absent from MST")))?;
-    let record_bytes = blocks.remove(&record_cid).ok_or_else(|| {
-        SpaceRelayError::UpstreamError(format!(
-            "MST included {absent_label} CID but CAR omitted record"
-        ))
-    })?;
-    Ok((record_bytes, authenticated))
+    )?;
+    let bytes = record
+        .map(|cid| {
+            blocks.remove(&cid).ok_or_else(|| {
+                SpaceRelayError::UpstreamError(format!(
+                    "MST included {collection} CID but CAR omitted record"
+                ))
+            })
+        })
+        .transpose()?;
+    Ok((bytes, signed))
 }
 
 /// When the original commit no longer verifies under the account's current key, require
@@ -1559,6 +1590,12 @@ pub(crate) fn chat_device_key_and_creation(
         atproto_key,
         "chat device record",
     )?;
+    decode_enrollment_key(record)
+}
+
+fn decode_enrollment_key(
+    record: ChatDeviceRecordProof,
+) -> Result<([u8; 32], chrono::DateTime<chrono::Utc>), SpaceRelayError> {
     if record.record_type != "blue.catbird.chat.device"
         || !record.algorithm.eq_ignore_ascii_case("ed25519")
     {
@@ -1797,6 +1834,19 @@ async fn fetch_chat_device_repo_car(
     device_id: &str,
     max_bytes: usize,
 ) -> Result<(Vec<u8>, SpaceVerifyingKey), SpaceRelayError> {
+    let (pds, key) = device_proof_authority(resolver, did, device_id).await?;
+    let url = device_record_url(&pds, did, collection, device_id)?;
+    Ok((
+        fetch_device_repository_bytes(resolver, did, &url, max_bytes).await?,
+        key,
+    ))
+}
+
+async fn device_proof_authority(
+    resolver: &DsResolver,
+    did: &str,
+    device_id: &str,
+) -> Result<(String, SpaceVerifyingKey), SpaceRelayError> {
     if crate::identity::canonical_did(did) != did
         || !atproto_spaces::is_valid_did(did)
         || !(did.starts_with("did:plc:") || did.starts_with("did:web:"))
@@ -1813,6 +1863,15 @@ async fn fetch_chat_device_repo_car(
     let atproto_key = atproto_key_opt.ok_or_else(|| {
         SpaceRelayError::UpstreamError("deleted DID has no #atproto signing key".into())
     })?;
+    Ok((pds, atproto_key))
+}
+
+fn device_record_url(
+    pds: &str,
+    did: &str,
+    collection: &str,
+    device_id: &str,
+) -> Result<Url, SpaceRelayError> {
     let mut url = Url::parse(&format!(
         "{}/xrpc/com.atproto.sync.getRecord",
         pds.trim_end_matches('/')
@@ -1822,6 +1881,15 @@ async fn fetch_chat_device_repo_car(
         .append_pair("did", did)
         .append_pair("collection", collection)
         .append_pair("rkey", device_id);
+    Ok(url)
+}
+
+async fn fetch_device_repository_bytes(
+    resolver: &DsResolver,
+    did: &str,
+    url: &Url,
+    max_bytes: usize,
+) -> Result<Vec<u8>, SpaceRelayError> {
     let destination = resolver
         .resolve_endpoint_destination(url.as_str())
         .await
@@ -1852,7 +1920,7 @@ async fn fetch_chat_device_repo_car(
         })?;
     if !status.is_success() {
         let reason = format!(
-            "chat device sync.getRecord ({collection}) returned HTTP {}",
+            "chat device repository read returned HTTP {}",
             status.as_u16()
         );
         return Err(if retryable_status(status) {
@@ -1861,7 +1929,7 @@ async fn fetch_chat_device_repo_car(
             SpaceRelayError::UpstreamError(reason)
         });
     }
-    Ok((body.to_vec(), atproto_key))
+    Ok(body.to_vec())
 }
 
 /// Fetch a missing proof before deleting the account's server data. The PDS URL
@@ -1883,6 +1951,108 @@ pub async fn fetch_chat_device_key_proof(
     .await?;
     verify_chat_device_key_proof(&body, did, device_id, signing_key, &atproto_key)?;
     Ok(body)
+}
+
+/// Authorize the narrow post-erasure read against the actor's current signed repository.
+/// Fetch both rkey witnesses from one resolved PDS, then sample its head. A moving head
+/// or an incomplete witness can be retried without admitting the read.
+pub(crate) async fn verify_live_recovered_enrollment(
+    resolver: &DsResolver,
+    did: &str,
+    device: &str,
+    signing_key: &[u8; 32],
+) -> Result<(), SpaceRelayError> {
+    let (pds, key) = device_proof_authority(resolver, did, device).await?;
+    let enrollment_url = device_record_url(&pds, did, "blue.catbird.chat.device", device)?;
+    let revocation_url =
+        device_record_url(&pds, did, "blue.catbird.chat.deviceRevocation", device)?;
+    let (enrollment, revocation) = tokio::try_join!(
+        fetch_device_repository_bytes(
+            resolver,
+            did,
+            &enrollment_url,
+            CHAT_DEVICE_KEY_PROOF_MAX_BYTES
+        ),
+        fetch_device_repository_bytes(
+            resolver,
+            did,
+            &revocation_url,
+            CHAT_DEVICE_REVOCATION_PROOF_MAX_BYTES
+        ),
+    )?;
+    let mut url = Url::parse(&format!(
+        "{}/xrpc/com.atproto.sync.getLatestCommit",
+        pds.trim_end_matches('/')
+    ))
+    .map_err(|error| SpaceRelayError::InvalidTargetEndpoint(error.to_string()))?;
+    url.query_pairs_mut().append_pair("did", did);
+    #[derive(serde::Deserialize)]
+    struct LatestCommit {
+        cid: String,
+    }
+    let latest = fetch_device_repository_bytes(resolver, did, &url, 4096).await?;
+    let latest: LatestCommit = serde_json::from_slice(&latest)
+        .map_err(|_| SpaceRelayError::UpstreamError("invalid latest repository commit".into()))?;
+    let head = latest.cid.parse().map_err(|_| {
+        SpaceRelayError::UpstreamError("invalid latest repository commit CID".into())
+    })?;
+    verify_current_recovered_device(
+        &enrollment,
+        &revocation,
+        head,
+        did,
+        device,
+        signing_key,
+        &key,
+    )
+}
+
+fn verify_current_recovered_device(
+    key_car: &[u8],
+    revocation_car: &[u8],
+    observed_head: cid::Cid,
+    did: &str,
+    device_id: &str,
+    signing_key: &[u8; 32],
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<(), SpaceRelayError> {
+    let (record, signed) = device_record_at_head(
+        key_car,
+        did,
+        "blue.catbird.chat.device",
+        device_id,
+        CHAT_DEVICE_KEY_PROOF_MAX_BYTES,
+        atproto_key,
+        Some(observed_head),
+    )?;
+    require_current_signature(signed)?;
+    let bytes = record.ok_or_else(|| {
+        SpaceRelayError::UpstreamError("missing recovered device enrollment".into())
+    })?;
+    let enrollment = serde_ipld_dagcbor::from_slice(&bytes).map_err(|_| {
+        SpaceRelayError::UpstreamError("invalid recovered device enrollment".into())
+    })?;
+    if decode_enrollment_key(enrollment)?.0 != *signing_key {
+        return Err(SpaceRelayError::InvalidRequest(
+            "recovered device signing key mismatch".into(),
+        ));
+    }
+    let (revoked, signed) = device_record_at_head(
+        revocation_car,
+        did,
+        "blue.catbird.chat.deviceRevocation",
+        device_id,
+        CHAT_DEVICE_REVOCATION_PROOF_MAX_BYTES,
+        atproto_key,
+        Some(observed_head),
+    )?;
+    require_current_signature(signed)?;
+    if revoked.is_some() {
+        return Err(SpaceRelayError::DeviceRevoked(
+            "recovered device has a published revocation".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Fetch and verify a missing self-deletion `blue.catbird.chat.deviceRevocation`
