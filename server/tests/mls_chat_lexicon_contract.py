@@ -3744,6 +3744,23 @@ class ChatLexiconContractTests(unittest.TestCase):
                 self.assertTrue((CRYPTO_WIRE_V09_ROOT / name).read_bytes() ==
                                 (CRYPTO_WIRE_V09_MIRROR / name).read_bytes(), name)
 
+    def test_server_reducer_corpus_preserves_its_historical_identity(self) -> None:
+        # The SQL reducer fixtures use fixed signer keys and times from the original
+        # server corpus at fbe1e23f. The public conformance mirror has its own pin.
+        root = SERVER_ROOT / "tests/fixtures/crypto-wire-v09-server-integration"
+        manifest = (root / "manifest.json").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(manifest).hexdigest(),
+            "d1c43de1fe8ce5373d413fce1c3464d07ab5a03a4c77a17361cc4fe2feba1beb",
+        )
+        files = json.loads(manifest)["files"]
+        self.assertEqual({p.name for p in root.iterdir()}, set(files) | {"manifest.json"})
+        for name, record in files.items():
+            with self.subTest(artifact=name):
+                data = (root / name).read_bytes()
+                self.assertEqual(len(data), record["length"])
+                self.assertEqual(hashlib.sha256(data).hexdigest(), record["sha256Hex"])
+
     def test_v09_reader_dependency_pins(self) -> None:
         dependencies = strict_load(CRYPTO_WIRE_V09_ROOT / "manifest.json")["dependencies"]
         for repo, revision in V09_READER_REVISIONS.items():

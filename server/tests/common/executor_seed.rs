@@ -145,7 +145,7 @@ mod genuine_creation_fixture {
             0xad, 0x82, 0xe9, 0xb5,
         ];
         let manifest: Value =
-            serde_json::from_str(include_str!("../fixtures/crypto-wire-v09/manifest.json"))
+            serde_json::from_str(include_str!("../fixtures/crypto-wire-v09-server-integration/manifest.json"))
                 .expect("parse frozen crypto-wire manifest");
         let bob = &manifest["identity"]["bob"];
         let signing_key = SigningKey::from_bytes(&BOB_SIGNING_SEED);
@@ -1033,7 +1033,7 @@ async fn seed_genuine_creation_graph_inner(
     } else if public_state.is_some() {
         fs::read(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/crypto-wire-v09/group-info.mls"),
+                .join("tests/fixtures/crypto-wire-v09-server-integration/group-info.mls"),
         )
         .expect("read genuine frozen genesis GroupInfo")
     } else {
@@ -6343,7 +6343,7 @@ pub struct CorpusChain {
 }
 
 pub fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire-v09")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire-v09-server-integration")
 }
 pub fn corpus_file(name: &str) -> Vec<u8> {
     fs::read(corpus_dir().join(name)).expect("read frozen crypto-wire corpus")
