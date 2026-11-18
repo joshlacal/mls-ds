@@ -23,7 +23,10 @@ use crate::{
     chat_protocol::{
         dpop,
         error::{ChatEndpoint, ChatProtocolErrorCode},
-        repository::{auth, delivery},
+        repository::{
+            auth, delivery,
+            entry_read::{self, EntryReadFacadeError, RecoveryAck, RecoveryReadWindow},
+        },
         validation::{
             CanonicalHttpMethod, CanonicalTimestamp, KeyThumbprint, TrustedRequestInstant,
         },
@@ -89,13 +92,23 @@ async fn execute(
         ));
     }
     let principal = context::verify_service_principal(pool, ENDPOINT, headers).await?;
-    execute_for_principal(pool, principal, body).await
+    execute_ack(pool, principal, body, runtime.resolver().map(Arc::as_ref)).await
 }
 
+#[cfg(test)]
 pub(crate) async fn execute_for_principal(
     pool: &DbPool,
     principal: crate::auth::VerifiedServicePrincipal,
     body: &[u8],
+) -> Result<Response, ChatFailure> {
+    execute_ack(pool, principal, body, None).await
+}
+
+async fn execute_ack(
+    pool: &DbPool,
+    principal: crate::auth::VerifiedServicePrincipal,
+    body: &[u8],
+    resolver: Option<&crate::federation::DsResolver>,
 ) -> Result<Response, ChatFailure> {
     let input: AcknowledgeEntriesInput = serde_json::from_slice(body)
         .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
@@ -130,54 +143,58 @@ pub(crate) async fn execute_for_principal(
         .await
         .map_err(|error| context::auth_repository_failure(ENDPOINT, error))?;
 
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+    let mut recovered: Option<(String, RecoveryReadWindow)> = None;
+    let (mut tx, convo_head, sequencer) = loop {
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
-    let skew = (now - signed_at_ts.datetime()).num_seconds().abs();
-    if skew > MAX_ACK_SKEW_SECS {
-        return Err(ChatFailure::protocol(
-            ENDPOINT,
-            ChatProtocolErrorCode::InvalidRequest,
-        ));
-    }
+        let skew = (crate::sim_hooks::current_utc() - signed_at_ts.datetime())
+            .num_seconds()
+            .abs();
+        if skew > MAX_ACK_SKEW_SECS {
+            return Err(ChatFailure::protocol(
+                ENDPOINT,
+                ChatProtocolErrorCode::InvalidRequest,
+            ));
+        }
 
-    let convo_head: Option<(i64, bool, Option<String>)> = sqlx::query_as(
-        "SELECT next_entry_seq, is_remote, sequencer_ds FROM chat.conversations \
+        let convo_head: Option<(i64, bool, Option<String>)> = sqlx::query_as(
+            "SELECT next_entry_seq, is_remote, sequencer_ds FROM chat.conversations \
           WHERE conversation_id = $1 FOR UPDATE",
-    )
-    .bind(input.conversation_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-
-    if convo_head.is_none() {
-        // Serialize every C33 device ACK on the same inbox rows, before locking
-        // the actor device. Otherwise simultaneous final ACKs can both miss the
-        // other's uncommitted watermark and leave ciphertext behind.
-        sqlx::query(
-            "SELECT delivery_id FROM chat.direct_request_transport_inbox \
-              WHERE conversation_id = $1 ORDER BY delivery_id FOR UPDATE",
         )
         .bind(input.conversation_id)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-    }
 
-    type TransportInbox = (
-        String,
-        String,
-        Option<Uuid>,
-        String,
-        Uuid,
-        DateTime<Utc>,
-        String,
-    );
-    let transport_inbox: Option<TransportInbox> = if convo_head.is_none() {
-        sqlx::query_as(
-            "SELECT status, sender_did, sender_device_id, recipient_did, recipient_device_id, \
+        if convo_head.is_none() {
+            // Serialize every C33 device ACK on the same inbox rows, before locking
+            // the actor device. Otherwise simultaneous final ACKs can both miss the
+            // other's uncommitted watermark and leave ciphertext behind.
+            sqlx::query(
+                "SELECT delivery_id FROM chat.direct_request_transport_inbox \
+              WHERE conversation_id = $1 ORDER BY delivery_id FOR UPDATE",
+            )
+            .bind(input.conversation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+        }
+
+        type TransportInbox = (
+            String,
+            String,
+            Option<Uuid>,
+            String,
+            Uuid,
+            DateTime<Utc>,
+            String,
+        );
+        let transport_inbox: Option<TransportInbox> = if convo_head.is_none() {
+            sqlx::query_as(
+                "SELECT status, sender_did, sender_device_id, recipient_did, recipient_device_id, \
                     import_until, coordinator_did \
                FROM chat.direct_request_transport_inbox \
               WHERE conversation_id = $1 \
@@ -189,26 +206,26 @@ pub(crate) async fn execute_for_principal(
               END \
               LIMIT 1 \
               FOR UPDATE",
-        )
-        .bind(input.conversation_id)
-        .bind(&actor_did)
-        .bind(input.actor_device_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|_| ChatFailure::storage(ENDPOINT))?
-    } else {
-        None
-    };
+            )
+            .bind(input.conversation_id)
+            .bind(&actor_did)
+            .bind(input.actor_device_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| ChatFailure::storage(ENDPOINT))?
+        } else {
+            None
+        };
 
-    if convo_head.is_none() && transport_inbox.is_none() {
-        return Err(ChatFailure::protocol(
-            ENDPOINT,
-            ChatProtocolErrorCode::ConversationNotFound,
-        ));
-    }
+        if convo_head.is_none() && transport_inbox.is_none() {
+            return Err(ChatFailure::protocol(
+                ENDPOINT,
+                ChatProtocolErrorCode::ConversationNotFound,
+            ));
+        }
 
-    let dev_row: Option<(String, i64, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT d.status, d.auth_generation, dk.signing_public_key \
+        let dev_row: Option<(String, i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT d.status, d.auth_generation, dk.signing_public_key \
            FROM chat.devices d \
            LEFT JOIN chat.device_keys dk \
              ON dk.user_did = d.user_did AND dk.device_id = d.device_id AND dk.key_id = $3 \
@@ -222,92 +239,93 @@ pub(crate) async fn execute_for_principal(
             ) \
           WHERE d.user_did = $1 AND d.device_id = $2 \
           FOR UPDATE OF d",
-    )
-    .bind(&actor_did)
-    .bind(input.actor_device_id)
-    .bind(&input.key_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+        )
+        .bind(&actor_did)
+        .bind(input.actor_device_id)
+        .bind(&input.key_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
 
-    let Some((dev_status, dev_auth_gen, pubkey_opt)) = dev_row else {
-        return Err(ChatFailure::protocol(
-            ENDPOINT,
-            ChatProtocolErrorCode::DeviceNotRegistered,
-        ));
-    };
-    if dev_status == "revoked" {
-        return Err(ChatFailure::protocol(
-            ENDPOINT,
-            ChatProtocolErrorCode::DeviceRevoked,
-        ));
-    }
-    if dev_status != "active" {
-        return Err(ChatFailure::protocol(
-            ENDPOINT,
-            ChatProtocolErrorCode::DeviceNotRegistered,
-        ));
-    }
-    if dev_auth_gen != input.auth_generation {
-        return Err(ChatFailure::protocol(
-            ENDPOINT,
-            ChatProtocolErrorCode::NotAuthorized,
-        ));
-    }
-    let pubkey_raw: [u8; 32] = pubkey_opt
-        .and_then(|v| v.try_into().ok())
-        .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::NotAuthorized))?;
-    let verifying_key = VerifyingKey::from_bytes(&pubkey_raw)
-        .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidSignature))?;
-
-    let transcript = build_ack_transcript(&input)?;
-    verifying_key
-        .verify(&transcript, &signature)
-        .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidSignature))?;
-
-    // The DS sequencing a conversation held here only as a C33 inbox or a
-    // remote mirror; it waits for this ACK, so the ACK is relayed to it.
-    let mut sequencer = None;
-    if convo_head.is_none() {
-        let (
-            status,
-            sender_did,
-            sender_device_id,
-            recipient_did,
-            recipient_device_id,
-            import_until,
-            coordinator_did,
-        ) = transport_inbox.ok_or_else(|| {
-            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::ConversationNotFound)
+        let Some((dev_status, dev_auth_gen, pubkey_opt)) = dev_row else {
+            return Err(ChatFailure::protocol(
+                ENDPOINT,
+                ChatProtocolErrorCode::DeviceNotRegistered,
+            ));
+        };
+        if dev_status == "revoked" {
+            return Err(ChatFailure::protocol(
+                ENDPOINT,
+                ChatProtocolErrorCode::DeviceRevoked,
+            ));
+        }
+        if dev_status != "active" {
+            return Err(ChatFailure::protocol(
+                ENDPOINT,
+                ChatProtocolErrorCode::DeviceNotRegistered,
+            ));
+        }
+        if dev_auth_gen != input.auth_generation {
+            return Err(ChatFailure::protocol(
+                ENDPOINT,
+                ChatProtocolErrorCode::NotAuthorized,
+            ));
+        }
+        let pubkey_raw: [u8; 32] = pubkey_opt
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::NotAuthorized))?;
+        let verifying_key = VerifyingKey::from_bytes(&pubkey_raw).map_err(|_| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidSignature)
         })?;
-        sequencer = Some(coordinator_did);
-        if status == "pending" {
-            if now > import_until {
+
+        let transcript = build_ack_transcript(&input)?;
+        verifying_key.verify(&transcript, &signature).map_err(|_| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidSignature)
+        })?;
+
+        // The DS sequencing a conversation held here only as a C33 inbox or a
+        // remote mirror; it waits for this ACK, so the ACK is relayed to it.
+        let mut sequencer = None;
+        if convo_head.is_none() {
+            let (
+                status,
+                sender_did,
+                sender_device_id,
+                recipient_did,
+                recipient_device_id,
+                import_until,
+                coordinator_did,
+            ) = transport_inbox.ok_or_else(|| {
+                ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::ConversationNotFound)
+            })?;
+            sequencer = Some(coordinator_did);
+            if status == "pending" {
+                if now > import_until {
+                    return Err(ChatFailure::protocol(
+                        ENDPOINT,
+                        ChatProtocolErrorCode::ConversationNotFound,
+                    ));
+                }
+            } else if status != "accepted" {
                 return Err(ChatFailure::protocol(
                     ENDPOINT,
                     ChatProtocolErrorCode::ConversationNotFound,
                 ));
             }
-        } else if status != "accepted" {
-            return Err(ChatFailure::protocol(
-                ENDPOINT,
-                ChatProtocolErrorCode::ConversationNotFound,
-            ));
+            let device_matches = (actor_did == recipient_did
+                && input.actor_device_id == recipient_device_id)
+                || (actor_did == sender_did && sender_device_id == Some(input.actor_device_id));
+            if !device_matches {
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::DeviceNotLeaf,
+                ));
+            }
         }
-        let device_matches = (actor_did == recipient_did
-            && input.actor_device_id == recipient_device_id)
-            || (actor_did == sender_did && sender_device_id == Some(input.actor_device_id));
-        if !device_matches {
-            return Err(ChatFailure::protocol(
-                ENDPOINT,
-                ChatProtocolErrorCode::DeviceNotLeaf,
-            ));
-        }
-    }
 
-    let is_leaf: bool = if convo_head.is_some() {
-        sqlx::query_scalar(
-            "SELECT EXISTS( \
+        let is_leaf: bool = if convo_head.is_some() {
+            sqlx::query_scalar(
+                "SELECT EXISTS( \
                  SELECT 1 FROM chat.application_intervals \
                   WHERE conversation_id = $1 AND generation = $2 \
                     AND recipient_did = $3 AND recipient_device_id = $4 \
@@ -316,24 +334,67 @@ pub(crate) async fn execute_for_principal(
                   WHERE conversation_id = $1 AND generation = $2 \
                     AND user_did = $3 AND device_id = $4 \
              )",
-        )
-        .bind(input.conversation_id)
-        .bind(input.generation)
-        .bind(&actor_did)
-        .bind(input.actor_device_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| ChatFailure::storage(ENDPOINT))?
-    } else {
-        true // The exact C33 inbox device was authorized above.
+            )
+            .bind(input.conversation_id)
+            .bind(input.generation)
+            .bind(&actor_did)
+            .bind(input.actor_device_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| ChatFailure::storage(ENDPOINT))?
+        } else {
+            true // The exact C33 inbox device was authorized above.
+        };
+        if !is_leaf {
+            let denied = || ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::DeviceNotLeaf);
+            let current_ds = convo_head
+                .as_ref()
+                .filter(|(_, remote, _)| *remote)
+                .and_then(|(_, _, ds)| ds.as_deref())
+                .ok_or_else(denied)?;
+            if let Some((window_ds, window)) = &recovered {
+                if current_ds != window_ds {
+                    return Err(denied());
+                }
+                let ack = RecoveryAck {
+                    conversation: input.conversation_id,
+                    did: &actor_did,
+                    device: input.actor_device_id,
+                    generation: input.generation,
+                    key_id: &input.key_id,
+                    auth_generation: input.auth_generation,
+                    through: input.up_to_seq,
+                };
+                entry_read::verify_recovery_ack(&mut tx, window, current_ds, ack)
+                    .await
+                    .map_err(|error| match error {
+                        EntryReadFacadeError::NotEntitled => denied(),
+                        _ => ChatFailure::storage(ENDPOINT),
+                    })?;
+            } else {
+                // Fetch the sequencer's current interval without holding either home
+                // lock. Retry the normal device lock, signature and freshness checks
+                // before using that interval to advance the authenticated watermark.
+                tx.rollback()
+                    .await
+                    .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+                recovered = Some(
+                    crate::federation::group_relay::recovery_window_for_home(
+                        pool,
+                        resolver,
+                        ENDPOINT,
+                        input.conversation_id,
+                        &actor_did,
+                        input.actor_device_id,
+                    )
+                    .await?
+                    .ok_or_else(denied)?,
+                );
+                continue;
+            }
+        }
+        break (tx, convo_head, sequencer);
     };
-    if !is_leaf {
-        return Err(ChatFailure::protocol(
-            ENDPOINT,
-            ChatProtocolErrorCode::DeviceNotLeaf,
-        ));
-    }
-
     let (next_entry_seq, is_remote, sequencer_ds) = convo_head.unwrap_or((1, true, None));
     let sequencer = sequencer
         .or(sequencer_ds.filter(|_| is_remote))

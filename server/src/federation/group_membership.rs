@@ -16,7 +16,7 @@ use sqlx::{Postgres, Transaction};
 
 #[path = "group_recovery_reads.rs"]
 mod recovery_reads;
-pub(crate) use recovery_reads::try_relay_recovery_entries;
+pub(crate) use recovery_reads::{recovery_window_for_home, try_relay_recovery_entries};
 
 const DIRECTORY_NSID: &str = "blue.catbird.mlsDS.resolveGroupDevices";
 const PACKAGE_NSID: &str = "blue.catbird.mlsDS.fetchKeyPackage";
