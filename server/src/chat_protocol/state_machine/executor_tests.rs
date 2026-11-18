@@ -98,7 +98,8 @@ async fn build_creation(pool: &PgPool, kind: ConversationKind) -> CreationApply 
 async fn existing_executor_pool() -> PgPool {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must name the existing clean-chat test database");
-    common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+    common::chat_protocol::validate_repository_test_target(&database_url)
+        .await
         .expect("unsafe TEST_DATABASE_URL for policy ChangeRole executor test");
     PgPool::connect(&database_url)
         .await

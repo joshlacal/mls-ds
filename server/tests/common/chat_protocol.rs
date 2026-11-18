@@ -1118,6 +1118,25 @@ pub async fn setup_chat_protocol_db(max_connections: u32) -> PgPool {
     );
     let database_url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must explicitly name catbird_chat_protocol_test_20260722");
+    if database_url != CHAT_PROTOCOL_TEST_DATABASE_URL {
+        require_owned_postgres_fixture(&database_url)
+            .await
+            .expect("owned private clean-chat fixture");
+        // This suite validates the historical schema; current delivery-server fixtures
+        // on the same owned cluster use the full migration set in separate databases.
+        let (pool, database) =
+            crate::common::fresh_db::fresh_clean_protocol_db("chat_freshdb_", max_connections)
+                .await;
+        validate_exact_reviewed_ledger(&pool)
+            .await
+            .expect("isolated reviewed migration ledger");
+        let closed = pool.close_event();
+        tokio::spawn(async move {
+            closed.await;
+            drop(database);
+        });
+        return pool;
+    }
     validate_chat_protocol_database_url(Some(&database_url))
         .expect("unsafe TEST_DATABASE_URL for clean-chat repository test");
     let activation_approval = std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED")
@@ -1260,4 +1279,76 @@ pub async fn assert_zero_db_writes(
         before_snapshot, &after_snapshot,
         "{context}: expected zero database writes across all protected tables"
     );
+}
+
+/// Permit a separate, explicitly owned cluster for tests without changing the fixed stage gate.
+/// Independently read pg_controldata's system identifier from the private fixture at launch.
+pub async fn require_owned_postgres_fixture(database_url: &str) -> Result<(), String> {
+    use sqlx::Connection;
+    let url = url::Url::parse(database_url).map_err(|_| "invalid private fixture URL")?;
+    let port = url
+        .port()
+        .filter(|port| *port >= 1024 && *port != 5432)
+        .ok_or("private fixture port required")?;
+    if database_url != format!("postgresql://127.0.0.1:{port}/{CHAT_PROTOCOL_TEST_DATABASE_NAME}") {
+        return Err("private tests require the exact loopback fixture database".into());
+    }
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("CATBIRD_TEST_PGDATA").ok_or("private fixture PGDATA required")?,
+    );
+    let identifier: u64 = std::env::var("CATBIRD_TEST_PG_SYSTEM_IDENTIFIER")
+        .map_err(|_| "fixture system identifier required")?
+        .parse()
+        .map_err(|_| "invalid fixture system identifier")?;
+    if identifier == 0
+        || !dir.is_absolute()
+        || std::fs::canonicalize(&dir).ok().as_ref() != Some(&dir)
+    {
+        return Err("canonical private fixture directory and system identifier required".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dir_meta =
+            std::fs::metadata(&dir).map_err(|_| "cannot verify private fixture directory")?;
+        let pid_meta = std::fs::symlink_metadata(dir.join("postmaster.pid"))
+            .map_err(|_| "cannot verify private fixture postmaster")?;
+        if dir_meta.mode() & 0o077 != 0 || !pid_meta.is_file() || pid_meta.uid() != dir_meta.uid() {
+            return Err(
+                "private fixture directory and postmaster must share a protected owner".into(),
+            );
+        }
+    }
+    let postmaster = std::fs::read_to_string(dir.join("postmaster.pid"))
+        .map_err(|_| "cannot read the private fixture postmaster")?;
+    let fields: Vec<_> = postmaster.lines().collect();
+    if fields.get(1).copied() != dir.to_str()
+        || fields.get(3).and_then(|line| line.parse::<u16>().ok()) != Some(port)
+        || fields.get(7).map(|status| status.trim()) != Some("ready")
+    {
+        return Err("the owned fixture is not running at the requested port".into());
+    }
+    // The first connection only reads identity. A recycled port, unrelated server,
+    // non-owner login or wrong control-file identifier cannot authorize any test write.
+    let mut conn = PgConnection::connect(database_url)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (system_id, pgdata, local_owner): (String,String,bool) = sqlx::query_as(
+        "SELECT system_identifier::text, current_setting('data_directory'),
+                inet_server_addr() = '127.0.0.1'::inet AND inet_server_port()=$1
+                AND current_database()=$2 AND datdba=(SELECT oid FROM pg_roles WHERE rolname=current_user)
+         FROM pg_control_system(), pg_database WHERE datname=current_database()")
+        .bind(i32::from(port)).bind(CHAT_PROTOCOL_TEST_DATABASE_NAME).fetch_one(&mut conn).await.map_err(|e| e.to_string())?;
+    if !local_owner || system_id != identifier.to_string() || std::path::Path::new(&pgdata) != dir {
+        return Err("live PostgreSQL identity does not match the owned fixture".into());
+    }
+    Ok(())
+}
+
+pub async fn validate_repository_test_target(database_url: &str) -> Result<(), String> {
+    if validate_chat_protocol_database_url(Some(database_url)).is_ok() {
+        Ok(())
+    } else {
+        require_owned_postgres_fixture(database_url).await
+    }
 }

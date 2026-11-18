@@ -63,21 +63,32 @@ async fn owned_database() -> (PgPool, DisposableDatabase) {
             )
             .is_none());
     }
-    // Re-pinned 2026-11-04 from 85 (the inventory at `02d7eeed9`, "mls-ds:
-    // checkpoint deployed recovery and binary stream source"): 44 migrations
-    // were added by the commits in `02d7eeed9..d5f6993c` (first `0ff1d22f1`,
-    // "chat: let an invited direct recipient discover its own invitation";
-    // last `d5f6993c`, "mls-ds: Add federated group handoff, terminal close
-    // retention, …") and 14 by Task 4 (20261103000001-04, 20261103000010,
-    // 20261104000001-02, 20261104000005-08, 20261104000010-12). The guard had
-    // stayed red since the first of them; the disposable fixture must still
-    // match this exact stage inventory. The seed-2323 send-order fix added
-    // 20261107000001 (144); the remote lifecycle recovery binding and
-    // operation replay state added 20261113000001 (145).
+    // Keep the deployed stage boundary independent from the later candidate additions.
+    const LAST_DEPLOYED_STAGE: i64 = 20261113000001;
     assert_eq!(
-        expected.len(),
+        expected.range(..=LAST_DEPLOYED_STAGE).count(),
         145,
-        "exact deployed stage migration inventory"
+        "deployed stage inventory"
+    );
+    let new_versions: Vec<i64> = expected
+        .keys()
+        .copied()
+        .filter(|v| *v > LAST_DEPLOYED_STAGE)
+        .collect();
+    assert_eq!(
+        new_versions,
+        [
+            20261114000001,
+            20261115000001,
+            20261116000003,
+            20261116000004,
+            20261116000005,
+            20261117000001,
+            20261117000002,
+            20261117000003,
+            20261117000004,
+        ],
+        "reviewed migrations following the deployed stage"
     );
     let applied: Vec<(i64, bool, Vec<u8>)> =
         sqlx::query_as("SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version")

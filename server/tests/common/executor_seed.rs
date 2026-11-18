@@ -1824,10 +1824,11 @@ impl Drop for FreshDbGuard {
 
 /// Derive the maintenance connection URL (the server's `postgres` database) from
 /// `TEST_DATABASE_URL`, enforcing loopback safety exactly as the shared gate does.
-pub fn maintenance_url_from_env() -> String {
+pub async fn maintenance_url_from_env() -> String {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must name the loopback clean-chat test database");
-    crate::common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+    crate::common::chat_protocol::validate_repository_test_target(&database_url)
+        .await
         .expect("unsafe TEST_DATABASE_URL for the fresh-DB executor harness");
     let activation_approval = std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED")
         .expect("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED must authorize migration 00004");
@@ -1906,7 +1907,7 @@ fn fresh_db_creation_gate() -> &'static tokio::sync::Mutex<()> {
 
 pub async fn fresh_executor_db() -> (PgPool, FreshDbGuard) {
     let _migration_guard = crate::common::fresh_db::acquire_migration_lock().await;
-    let maintenance_url = maintenance_url_from_env();
+    let maintenance_url = maintenance_url_from_env().await;
     let admin = PgPoolOptions::new()
         .max_connections(1)
         .connect(&maintenance_url)

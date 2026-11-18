@@ -447,7 +447,8 @@ fn delivery_conflict(result: Result<(), DeliveryRepositoryError>) {
 async fn existing_chat_protocol_db() -> PgPool {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must name the existing clean-chat test database");
-    crate::common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+    crate::common::chat_protocol::validate_repository_test_target(&database_url)
+        .await
         .expect("unsafe TEST_DATABASE_URL for transition repository test");
     PgPool::connect(&database_url)
         .await
