@@ -999,6 +999,7 @@ struct GroupStream {
     seq_pool: DbPool,
     home_pool: DbPool,
     cid: Uuid,
+    recipient_did: String,
     seq_hooks: Arc<SimDsHooks>,
     network: Network,
     clock: Arc<ManualDsClock>,
@@ -1017,10 +1018,9 @@ impl GroupStream {
         let home_pool = home_db.connect(4).await;
         prepare(&seq_pool).await;
         prepare(&home_pool).await;
-        let cid = seed_remote_group_application_routing_fixture(&home_pool, HOME, SEQ)
+        let fixture = seed_remote_group_application_routing_fixture(&home_pool, HOME, SEQ)
             .await
-            .unwrap()
-            .conversation_id;
+            .unwrap();
         let (seq_key, home_key) = (key(0x31), key(0x32));
         let network = Network::new(&[(SEQ, &seq_key), (HOME, &home_key)]);
         let clock = manual_clock();
@@ -1047,7 +1047,8 @@ impl GroupStream {
             ),
             seq_pool,
             home_pool,
-            cid,
+            cid: fixture.conversation_id,
+            recipient_did: fixture.recipient_did,
             seq_hooks: hooks(SEQ, Some(&seq_key), true, &network),
             network,
             clock,
@@ -1512,7 +1513,13 @@ fn acceptance_entry(invitee: &Actor, cid: Uuid, seq: i64, provenance: Value) -> 
 
 /// `admin`'s signed fulfilment at `seq` of `invitee`'s add recovery: one
 /// Welcome `welcome` for `invitee`'s device.
-fn fulfilment_entry(admin: &Actor, invitee: &Actor, cid: Uuid, seq: i64, welcome: Uuid) -> Value {
+fn fulfilment_entry(
+    admin: &Actor,
+    invitee: (&str, Uuid),
+    cid: Uuid,
+    seq: i64,
+    welcome: Uuid,
+) -> Value {
     let recovery = Uuid::new_v4();
     let transition = Uuid::new_v4();
     let identifier = |id: Uuid| STANDARD.encode(id.as_bytes());
@@ -1554,8 +1561,8 @@ fn fulfilment_entry(admin: &Actor, invitee: &Actor, cid: Uuid, seq: i64, welcome
                     "opaqueWelcome": opaque_welcome,
                     "sha256": welcome_sha256,
                     "deliveries": [{
-                        "recipientDid": invitee.did,
-                        "recipientDeviceId": invitee.device,
+                        "recipientDid": invitee.0,
+                        "recipientDeviceId": invitee.1,
                         "provenance": {
                             "recoveryRequestId": recovery,
                             "keyPackageRef": STANDARD.encode(KEY_PACKAGE_REF),
@@ -1893,7 +1900,8 @@ async fn an_invitees_acceptance_and_fulfilment_cross_a_partition_into_its_homes_
             s.network.partition(true);
             let acceptance = acceptance_entry(&invitee, cid, 5, provenance(&admin, transition));
             assert!(s.send(s.queued(acceptance, &audience).await).await.is_err());
-            let fulfilment = fulfilment_entry(&admin, &invitee, cid, 6, welcome);
+            let fulfilment =
+                fulfilment_entry(&admin, (invitee.did, invitee.device), cid, 6, welcome);
             s.send(s.queued(fulfilment, &audience).await)
                 .await
                 .expect("queued behind the acceptance");
@@ -3153,3 +3161,6 @@ mod account_deletion;
 
 #[path = "direct_request_relay_tests.rs"]
 mod direct_request_relay;
+
+#[path = "recovery_fulfillment_read_tests.rs"]
+mod recovery_fulfillment_read_tests;
