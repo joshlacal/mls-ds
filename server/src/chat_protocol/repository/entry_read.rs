@@ -418,12 +418,26 @@ async fn read_entries_in_transaction(
             serde_json::to_vec(&body).map_err(|_| EntryReadFacadeError::Invariant)?;
         return Ok(CanonicalEntriesResponse { response_bytes });
     }
-    let authority = read_authority::authorize_entries(transaction, device, conversation_id)
+    let reader_did = device.user_did().to_owned();
+    let reader_device = device.device_id();
+    let authority = match read_authority::authorize_entries(transaction, device, conversation_id)
         .await
-        .map_err(|e| {
-            tracing::error!("authorize_entries failed: {:?}", e);
-            map_authority_error(e)
-        })?;
+    {
+        Ok(authority) => authority,
+        Err(ReadAuthorityError::NotEntitled)
+            if standing == RemoteGroupStanding::CleanMember && has_group_grants && limit == 1 =>
+        {
+            return pending_recovery_fulfillment_page(
+                transaction,
+                conversation_id,
+                &reader_did,
+                reader_device,
+                after_seq,
+            )
+            .await;
+        }
+        Err(error) => return Err(map_authority_error(error)),
+    };
     let page = delivery::get_entries_with_terminal_control_interval(
         transaction,
         conversation_id,
@@ -548,6 +562,54 @@ async fn read_entries_in_transaction(
     });
     let response_bytes = serde_json::to_vec(&body).map_err(|_| EntryReadFacadeError::Invariant)?;
     Ok(CanonicalEntriesResponse { response_bytes })
+}
+
+/// A mirror may know the account's membership before its new device's leaf. The
+/// verified Welcome and its exact-device transport grant authorize only the
+/// signed transition the device must verify before it can install that Welcome.
+async fn pending_recovery_fulfillment_page(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    did: &str,
+    device: Uuid,
+    after_seq: u64,
+) -> Result<CanonicalEntriesResponse, EntryReadFacadeError> {
+    let seq = after_seq
+        .checked_add(1)
+        .and_then(|s| i64::try_from(s).ok())
+        .ok_or(EntryReadFacadeError::InvalidRequest)?;
+    let (bytes, welcome): (Vec<u8>, Uuid) = sqlx::query_as(
+        "SELECT e.entry_bytes,w.welcome_id FROM chat.remote_group_pending_welcomes w \
+         JOIN chat.group_transport_entry_recipients r \
+           ON (r.conversation_id,r.seq,r.user_did,r.device_id)=(w.conversation_id,w.evidence_seq,w.user_did,w.device_id) \
+         JOIN chat.direct_request_transport_entries e ON (e.conversation_id,e.seq)=(r.conversation_id,r.seq) \
+         JOIN chat.remote_group_memberships m ON (m.conversation_id,m.user_did)=(w.conversation_id,w.user_did) \
+         JOIN chat.conversations c ON c.conversation_id=w.conversation_id AND c.sequencer_ds=m.sequencer_did \
+         WHERE w.conversation_id=$1 AND w.user_did=$2 AND w.device_id=$3 AND w.evidence_seq=$4 \
+           AND m.status='active' AND c.is_remote AND c.kind='group' AND c.lifecycle='active' \
+           AND NOT EXISTS(SELECT 1 FROM federation_sync_state WHERE convo_id=$1::text AND status='quarantined')",
+    ).bind(conversation_id).bind(did).bind(device).bind(seq)
+        .fetch_optional(&mut **tx).await.map_err(|_| EntryReadFacadeError::Storage)?
+        .ok_or(EntryReadFacadeError::NotEntitled)?;
+    let mut entry: Value =
+        serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
+    let body = &entry["signedRequest"]["body"];
+    if entry["$type"] != "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry"
+        || body["$type"] != "blue.catbird.chat.defs#leafRecoveryFulfillmentBody"
+        || body["manifest"]["welcomeBundle"]["welcomeId"] != welcome.to_string()
+        || entry["seq"].as_i64() != Some(seq)
+    {
+        return Err(EntryReadFacadeError::NotEntitled);
+    }
+    crate::chat_protocol::direct_request_transcript::present_read_presentation(
+        "conversationEntry",
+        &mut entry,
+    )
+    .map_err(|_| EntryReadFacadeError::Invariant)?;
+    let body = json!({"entries":[entry], "nextAfterSeq":seq, "hasMore":false});
+    Ok(CanonicalEntriesResponse {
+        response_bytes: serde_json::to_vec(&body).map_err(|_| EntryReadFacadeError::Invariant)?,
+    })
 }
 
 pub(super) fn replicated_entry_supersedes_local(local: Option<&Value>, replicated: &Value) -> bool {
