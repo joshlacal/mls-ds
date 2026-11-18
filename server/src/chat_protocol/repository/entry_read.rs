@@ -1334,7 +1334,9 @@ pub(crate) async fn granted_recovery_page(
           JOIN chat.direct_request_transport_entries e ON (e.conversation_id,e.seq)=(r.conversation_id,r.seq) \
          WHERE c.conversation_id=$1 AND c.kind='group' AND c.is_remote AND c.sequencer_ds=$2 AND c.lifecycle='active' \
            AND m.user_did=$3 AND m.status='active' AND d.device_id=$4 AND d.auth_generation=$5 AND d.status='active' AND d.revoked_at IS NULL \
-           AND k.key_id=$6 AND k.enrollment_auth_generation=d.auth_generation AND k.revoked_at IS NULL AND r.seq=$7 \
+           AND k.key_id=$6 AND k.enrollment_auth_generation<=d.auth_generation AND k.revoked_at IS NULL AND r.seq=$7 \
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+             AND newer.enrollment_auth_generation BETWEEN k.enrollment_auth_generation+1 AND d.auth_generation) \
            AND NOT EXISTS(SELECT 1 FROM federation_sync_state WHERE convo_id=c.conversation_id::text AND status='quarantined')",
     )
     .bind(conversation)
@@ -1344,7 +1346,7 @@ pub(crate) async fn granted_recovery_page(
     .bind(window.auth_generation)
     .bind(&window.key_id)
     .bind(window.first_seq)
-     .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|_| EntryReadFacadeError::Storage)?
     .ok_or(EntryReadFacadeError::NotEntitled)?;
@@ -1364,8 +1366,8 @@ pub(crate) async fn granted_recovery_page(
     {
         return Err(EntryReadFacadeError::NotEntitled);
     }
-    let rows: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT e.entry_bytes FROM chat.direct_request_transport_entries e \
+    let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT e.seq,e.entry_bytes FROM chat.direct_request_transport_entries e \
          JOIN chat.group_transport_entry_recipients r USING(conversation_id,seq) \
          WHERE e.conversation_id=$1 AND r.user_did=$2 AND r.device_id=$3 AND e.seq>$4 AND e.seq BETWEEN $5 AND $6 \
          ORDER BY e.seq LIMIT $7",
@@ -1374,18 +1376,44 @@ pub(crate) async fn granted_recovery_page(
     .bind(did)
     .bind(device)
     .bind(i64::try_from(after_seq).map_err(|_| EntryReadFacadeError::InvalidRequest)?)
-     .bind(window.first_seq)
+    .bind(window.first_seq)
     .bind(window.last_seq)
-    .bind(limit+1)
+    .bind(limit + 1)
     .fetch_all(&mut *tx)
     .await
     .map_err(|_| EntryReadFacadeError::Storage)?;
     let has_more = rows.len() > limit as usize;
-    let entries = rows
-        .iter()
+    let mut granted = rows
+        .into_iter()
         .take(limit as usize)
-        .map(|b| present_transport_entry(b))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|(seq, bytes)| Ok((seq, present_transport_entry(&bytes)?)))
+        .collect::<Result<std::collections::BTreeMap<_, _>, EntryReadFacadeError>>()?;
+    if !granted.is_empty() {
+        // A prune can precede delivery of a full transport copy. The grant
+        // bounds the lookup; an already-erased local payload always stays erased.
+        let seqs: Vec<_> = granted.keys().copied().collect();
+        let pruned: Vec<DeliveredEntryRow> = sqlx::query_as(
+            "SELECT conversation_id, seq, entry_id, entry_kind, signed_request_bytes, request_digest, \
+             signature, server_fields_bytes, outer_entry_fingerprint, payload_pruned_at, sequencer_receipt_bytes, received_at \
+             FROM chat.entries WHERE conversation_id=$1 AND seq=ANY($2) AND entry_kind=$3 \
+               AND (payload_pruned_at IS NOT NULL OR signed_request_bytes IS NULL)"
+        ).bind(conversation).bind(&seqs).bind(delivery::APPLICATION_ENTRY_KIND)
+         .fetch_all(&mut *tx).await.map_err(|_| EntryReadFacadeError::Storage)?;
+        for row in pruned {
+            let replica = granted
+                .get_mut(&row.seq)
+                .ok_or(EntryReadFacadeError::Invariant)?;
+            let mut local = entry_json(&row)?;
+            if local["entryId"] != replica["entryId"] {
+                return Err(EntryReadFacadeError::Invariant);
+            }
+            preserve_replicated_receipt_on_pruned_local(&mut local, replica);
+            if !replicated_entry_supersedes_local(Some(&local), replica) {
+                *replica = local;
+            }
+        }
+    }
+    let entries = granted.into_values().collect::<Vec<_>>();
     let cursor = entries
         .last()
         .and_then(|e| e["seq"].as_u64())
