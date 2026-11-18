@@ -148,154 +148,173 @@ pub async fn delete_account_data(
             )
             .await?;
             let EmptyIn {} = body(&bytes)?;
-            // A completed operation replays without asking a repository that may
-            // have been deleted since the first call. A fresh probe releases its
-            // device lock before any DID/PDS HTTP work (M-F04).
-            let probe = begin_write!(&pool, adm.clone());
-            let admitted_key = probe.caller.signing_key;
-            (*probe).abort().await?;
-            let mut evidence = deletion_evidence(&headers, &bytes)?;
-            verify_admitted_key(&evidence, &admitted_key)?;
-            let resolver = match rt.resolver() {
-                Some(resolver) => resolver,
-                None => {
-                    if let Some(response) = auth::completed_write_for_admission(&pool, &adm).await?
-                    {
-                        return Ok(response);
-                    }
-                    return Err(LabyrinthError::new(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "ServiceUnavailable",
-                        "device repository proof resolver is unavailable",
-                    ));
-                }
+            let require_completion = match headers.get("catbird-require-erasure-completion") {
+                None => false,
+                Some(value) if value == "1" => true,
+                Some(_) => return Err(LabyrinthError::invalid("invalid hosted erasure completion preference")),
             };
-            let device_id = adm.device_id.to_string();
-            let has_supplied_key_proof = evidence.key_proof.is_some();
-            let proof_result = match evidence.key_proof.take() {
-                Some(proof) => verify_supplied_chat_device_key_proof(
-                    resolver,
-                    &adm.did,
-                    &device_id,
-                    &admitted_key,
-                    &proof,
-                )
-                .await
-                .map(|()| proof),
-                None => {
-                    fetch_chat_device_key_proof(resolver, &adm.did, &device_id, &admitted_key).await
-                }
-            };
-            let proof = match proof_result {
-                Ok(proof) => proof,
-                Err(error) => {
-                    // Another identical request may have committed while this
-                    // one was fetching. Return its result before requiring a
-                    // repository that deletion itself may have removed.
-                    if let Some(response) = auth::completed_write_for_admission(&pool, &adm).await?
-                    {
-                        return Ok(response);
-                    }
-                    if has_supplied_key_proof {
-                        if let SpaceRelayError::InvalidRequest(msg)
-                        | SpaceRelayError::UpstreamError(msg) = error
-                        {
-                            return Err(LabyrinthError::invalid(msg));
-                        }
-                    }
-                    return Err(key_proof_unavailable(error));
-                }
-            };
-            evidence.key_proof = Some(proof);
-            let expected_operation_id =
-                evidence.operation_id().map_err(LabyrinthError::invalid)?;
-            let expected_signed_at = evidence.signed_at().map_err(LabyrinthError::invalid)?;
-            let has_supplied_revocation_proof = evidence.revocation_proof.is_some();
-            let revocation_result = match evidence.revocation_proof.take() {
-                Some(proof) => verify_supplied_chat_device_revocation_proof(
-                    resolver,
-                    &adm.did,
-                    &device_id,
-                    &admitted_key,
-                    &expected_operation_id,
-                    expected_signed_at,
-                    &proof,
-                )
-                .await
-                .map(|()| proof),
-                None => {
-                    fetch_chat_device_revocation_proof(
-                        resolver,
-                        &adm.did,
-                        &device_id,
-                        &admitted_key,
-                        &expected_operation_id,
-                        expected_signed_at,
-                    )
-                    .await
-                }
-            };
-            let revocation_proof = match revocation_result {
-                Ok(proof) => proof,
-                Err(SpaceRelayError::DeviceRevoked(reason)) => {
-                    tracing::warn!(%reason, "deleteAccountData refused: device revocation proof rejected device");
-                    if let Some(response) = auth::completed_write_for_admission(&pool, &adm).await?
-                    {
-                        return Ok(response);
-                    }
-                    return Err(LabyrinthError::device_revoked());
-                }
-                Err(error) => {
-                    if let Some(response) = auth::completed_write_for_admission(&pool, &adm).await?
-                    {
-                        return Ok(response);
-                    }
-                    if has_supplied_revocation_proof {
-                        if let SpaceRelayError::InvalidRequest(msg)
-                        | SpaceRelayError::UpstreamError(msg) = error
-                        {
-                            return Err(LabyrinthError::invalid(msg));
-                        }
-                    }
-                    return Err(key_proof_unavailable(error));
-                }
-            };
-            evidence.revocation_proof = Some(revocation_proof);
-            // Peer homes resolve over HTTP, so before the transaction opens (M-F04).
-            let c33_peers = match repo::resolve_c33_peer_homes(&pool, &adm.did).await {
-                Ok(peers) => peers,
-                Err(error) => {
-                    if let Some(response) = auth::completed_write_for_admission(&pool, &adm).await?
-                    {
-                        return Ok(response);
-                    }
-                    return Err(error);
-                }
-            };
-            let mut w = begin_write!(&pool, adm);
-            // The device row is locked again after the external read. A rotation
-            // or revocation during that window cannot bind a proof for the old
-            // key to a write admitted under the new one.
-            if w.caller.signing_key != admitted_key {
-                return Err(LabyrinthError::device_revoked());
+            let completed = delete_admitted(&pool, &rt, &headers, &bytes, adm.clone()).await?;
+            if !require_completion {
+                return Ok(completed);
             }
-            let (caller, at) = (w.caller.clone(), w.instant);
-            let sequenced = repo::purge_account_with_recovery(
-                &mut w.tx,
-                &caller.did,
-                at,
-                rt.i13_receipt_signer(),
-                &c33_peers,
-                Some(&evidence),
-                rt.recovery_tombstones().map(Arc::as_ref),
-            )
-            .await?;
-            let resp = w.finish_write(to_bytes(&json!({}))?).await?;
-            if sequenced > 0 {
-                rt.notify_events();
+            let operation = &adm.write.as_ref().ok_or_else(LabyrinthError::internal)?.operation_id;
+            if repo::has_pending_peer_erasure(&pool, &adm.did, operation).await? {
+                return Err(LabyrinthError::new(StatusCode::SERVICE_UNAVAILABLE, "PeerErasurePending",
+                    "Remote erasure deliveries are pending. Keep the account and retry this operation.").with_retry_after(5));
             }
-            Ok(resp)
+            // A local reply records admission. Legacy rows, an empty queue and first-hop
+            // delivery cannot establish complete lifetime coverage or downstream erasure.
+            Err(LabyrinthError::new(StatusCode::SERVICE_UNAVAILABLE, "PeerErasureUnverified",
+                "Complete peer erasure cannot be verified. Keep the account available for recovery."))
         }
         .await,
     )
+}
+
+async fn delete_admitted(
+    pool: &DbPool,
+    rt: &ChatRuntime,
+    headers: &HeaderMap,
+    bytes: &Bytes,
+    adm: auth::Admission,
+) -> LabyrinthResult<Vec<u8>> {
+    // A completed operation replays without asking a repository that may
+    // have been deleted since the first call. A fresh probe releases its
+    // device lock before any DID/PDS HTTP work (M-F04).
+    let probe = begin_write!(pool, adm.clone());
+    let admitted_key = probe.caller.signing_key;
+    (*probe).abort().await?;
+    let mut evidence = deletion_evidence(headers, bytes)?;
+    verify_admitted_key(&evidence, &admitted_key)?;
+    let resolver = match rt.resolver() {
+        Some(resolver) => resolver,
+        None => {
+            if let Some(response) = auth::completed_write_for_admission(pool, &adm).await? {
+                return Ok(response);
+            }
+            return Err(LabyrinthError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                "device repository proof resolver is unavailable",
+            ));
+        }
+    };
+    let device_id = adm.device_id.to_string();
+    let has_supplied_key_proof = evidence.key_proof.is_some();
+    let proof_result = match evidence.key_proof.take() {
+        Some(proof) => verify_supplied_chat_device_key_proof(
+            resolver,
+            &adm.did,
+            &device_id,
+            &admitted_key,
+            &proof,
+        )
+        .await
+        .map(|()| proof),
+        None => fetch_chat_device_key_proof(resolver, &adm.did, &device_id, &admitted_key).await,
+    };
+    let proof = match proof_result {
+        Ok(proof) => proof,
+        Err(error) => {
+            // Another identical request may have committed while this
+            // one was fetching. Return its result before requiring a
+            // repository that deletion itself may have removed.
+            if let Some(response) = auth::completed_write_for_admission(pool, &adm).await? {
+                return Ok(response);
+            }
+            if has_supplied_key_proof {
+                if let SpaceRelayError::InvalidRequest(msg) | SpaceRelayError::UpstreamError(msg) =
+                    error
+                {
+                    return Err(LabyrinthError::invalid(msg));
+                }
+            }
+            return Err(key_proof_unavailable(error));
+        }
+    };
+    evidence.key_proof = Some(proof);
+    let expected_operation_id = evidence.operation_id().map_err(LabyrinthError::invalid)?;
+    let expected_signed_at = evidence.signed_at().map_err(LabyrinthError::invalid)?;
+    let has_supplied_revocation_proof = evidence.revocation_proof.is_some();
+    let revocation_result = match evidence.revocation_proof.take() {
+        Some(proof) => verify_supplied_chat_device_revocation_proof(
+            resolver,
+            &adm.did,
+            &device_id,
+            &admitted_key,
+            &expected_operation_id,
+            expected_signed_at,
+            &proof,
+        )
+        .await
+        .map(|()| proof),
+        None => {
+            fetch_chat_device_revocation_proof(
+                resolver,
+                &adm.did,
+                &device_id,
+                &admitted_key,
+                &expected_operation_id,
+                expected_signed_at,
+            )
+            .await
+        }
+    };
+    let revocation_proof = match revocation_result {
+        Ok(proof) => proof,
+        Err(SpaceRelayError::DeviceRevoked(reason)) => {
+            tracing::warn!(%reason, "deleteAccountData refused: device revocation proof rejected device");
+            if let Some(response) = auth::completed_write_for_admission(pool, &adm).await? {
+                return Ok(response);
+            }
+            return Err(LabyrinthError::device_revoked());
+        }
+        Err(error) => {
+            if let Some(response) = auth::completed_write_for_admission(pool, &adm).await? {
+                return Ok(response);
+            }
+            if has_supplied_revocation_proof {
+                if let SpaceRelayError::InvalidRequest(msg) | SpaceRelayError::UpstreamError(msg) =
+                    error
+                {
+                    return Err(LabyrinthError::invalid(msg));
+                }
+            }
+            return Err(key_proof_unavailable(error));
+        }
+    };
+    evidence.revocation_proof = Some(revocation_proof);
+    // Peer homes resolve over HTTP, so before the transaction opens (M-F04).
+    let c33_peers = match repo::resolve_c33_peer_homes(pool, &adm.did).await {
+        Ok(peers) => peers,
+        Err(error) => {
+            if let Some(response) = auth::completed_write_for_admission(pool, &adm).await? {
+                return Ok(response);
+            }
+            return Err(error);
+        }
+    };
+    let mut w = begin_write!(pool, adm);
+    // The device row is locked again after the external read. A rotation
+    // or revocation during that window cannot bind a proof for the old
+    // key to a write admitted under the new one.
+    if w.caller.signing_key != admitted_key {
+        return Err(LabyrinthError::device_revoked());
+    }
+    let (caller, at) = (w.caller.clone(), w.instant);
+    let sequenced = repo::purge_account_with_recovery(
+        &mut w.tx,
+        &caller.did,
+        at,
+        rt.i13_receipt_signer(),
+        &c33_peers,
+        Some(&evidence),
+        rt.recovery_tombstones().map(Arc::as_ref),
+    )
+    .await?;
+    let resp = w.finish_write(to_bytes(&json!({}))?).await?;
+    if sequenced > 0 {
+        rt.notify_events();
+    }
+    Ok(resp)
 }

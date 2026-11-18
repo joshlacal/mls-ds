@@ -854,6 +854,112 @@ async fn a_signed_deletion_carries_the_devices_exact_write_and_key_proof_and_rep
 }
 
 #[tokio::test]
+async fn hosted_deletion_keeps_the_pds_when_peer_jobs_are_pending_failed_or_gone() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use p256::pkcs8::{EncodePrivateKey, LineEnding};
+
+    let _env = ENV_LOCK.lock().await;
+    let s = sequencer().await;
+    let f = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, Some([0x45; 32]))
+        .await
+        .unwrap();
+    let lab = labyrinth(&s).await;
+    let sender = device(&f.sender_did, f.sender_device_id).await;
+    let key = ed25519_dalek::SigningKey::from_bytes(&f.sender_ed25519_seed);
+    let op = [0x38; 16];
+    let mut signed = SignedDeletion::new(
+        &sender,
+        &key,
+        op,
+        Some(URL_SAFE_NO_PAD.encode(signed_device_record_car(&sender, &key))),
+    );
+    let revocation = signed_device_revocation_car(
+        &sender,
+        &sender.device_id.to_string(),
+        &key,
+        &format!("deleteAccountData:{}", hex::encode(op)),
+        signed.signed_at,
+    );
+    signed.revocation_proof = Some(URL_SAFE_NO_PAD.encode(revocation));
+    let hosted = || {
+        let mut request = signed.request(&sender);
+        request
+            .headers_mut()
+            .insert("catbird-require-erasure-completion", "1".parse().unwrap());
+        request
+    };
+    // The home also retains a removed membership in another sequencer's history.
+    let remote_group = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO chat.remote_group_memberships
+        (conversation_id,user_did,sequencer_did,status,evidence_seq,evidence_entry_id,updated_at)
+        VALUES($1,$2,'did:web:former-home.example.com','removed',9,$3,now())",
+    )
+    .bind(remote_group)
+    .bind(&sender.did)
+    .bind(Uuid::new_v4())
+    .execute(&s.pool)
+    .await
+    .unwrap();
+    let previous = std::env::var_os("SIGNING_KEY_PEM");
+    std::env::set_var(
+        "SIGNING_KEY_PEM",
+        http::random_p256()
+            .to_pkcs8_pem(LineEnding::LF)
+            .unwrap()
+            .as_str(),
+    );
+    let (status, reply) = http::send(lab.clone(), hosted()).await;
+    if let Some(previous) = previous {
+        std::env::set_var("SIGNING_KEY_PEM", previous);
+    } else {
+        std::env::remove_var("SIGNING_KEY_PEM");
+    }
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reply}");
+    assert_eq!(reply["error"], "PeerErasurePending", "{reply}");
+    assert_eq!(deletion_rows(&s.pool, f.conversation_id).await, 1);
+
+    // The locally completed standalone contract remains idempotent; its cached reply
+    // must never be replayed as permission for the stronger hosted operation.
+    let (status, reply) = http::send(lab.clone(), signed.request(&sender)).await;
+    assert_eq!((status, reply), (StatusCode::OK, json!({})));
+    let (status, reply) = http::send(lab.clone(), hosted()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply["error"], "PeerErasurePending");
+    let id = format!(
+        "account-deletion-{remote_group}-{}-{}",
+        sender.did,
+        hex::encode(op)
+    );
+    let count = sqlx::query("UPDATE public.outbound_queue SET status='dead' WHERE id=$1")
+        .bind(&id)
+        .execute(&s.pool)
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(count, 1);
+    let (_, reply) = http::send(lab.clone(), hosted()).await;
+    assert_eq!(reply["error"], "PeerErasureUnverified", "{reply}");
+    // Even a first-hop success would not prove that its downstream mirrors erased data.
+    sqlx::query("UPDATE public.outbound_queue SET status='delivered' WHERE id=$1")
+        .bind(&id)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    let (_, reply) = http::send(lab.clone(), hosted()).await;
+    assert_eq!(reply["error"], "PeerErasureUnverified", "{reply}");
+    sqlx::query("DELETE FROM public.outbound_queue WHERE id=$1")
+        .bind(&id)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    let (status, reply) = http::send(lab, hosted()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply["error"], "PeerErasureUnverified", "{reply}");
+    assert_eq!(deletion_rows(&s.pool, f.conversation_id).await, 1);
+}
+
+#[tokio::test]
 async fn deletion_fetches_a_missing_device_proof_before_purge_and_replays_without_pds() {
     use axum::{extract::Query, http::HeaderMap, response::IntoResponse as _, routing::get};
     use catbird_server::federation::resolver::ValidatedRemoteDestination;

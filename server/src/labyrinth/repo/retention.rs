@@ -35,6 +35,32 @@ pub async fn purge_mailbox(conn: &mut PgConnection, did: &str) -> LabyrinthResul
     Ok(())
 }
 
+/// The home records no bare account identifier in either the erasure ledger or the queue tag.
+fn account_erasure_digest(did: &str, operation: &[u8; 16]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(b"CATBIRD-LABYRINTH-ACCOUNT-ERASURE-V1\0")
+        .chain_update(operation)
+        .chain_update(did.as_bytes())
+        .finalize()
+        .into()
+}
+
+/// A positive match is evidence of pending work. An empty queue cannot establish
+/// the account's lifetime home history or transitive completion at other servers.
+pub(crate) async fn has_pending_peer_erasure(
+    pool: &DbPool,
+    did: &str,
+    operation: &[u8; 16],
+) -> LabyrinthResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM public.outbound_queue
+          WHERE erasure_operation_digest=$1 AND status IN ('pending', 'in_flight'))",
+    )
+    .bind(account_erasure_digest(did, operation).as_slice())
+    .fetch_one(pool)
+    .await?)
+}
+
 /// `deleteAccountData`: sequence `blue.catbird.chat.defs#accountDeletedEntry`, signed by
 /// `receipt_signer`, across every active conversation this DS sequences where `did`
 /// currently holds active membership, queueing each C33 pair's entry to the peer's
@@ -77,11 +103,7 @@ pub async fn purge_account_with_recovery(
         let operation = evidence.operation_id().map_err(LabyrinthError::invalid)?;
         // Preserve idempotency after the response expires without retaining the erased
         // account identifier or a per-account history in the home ledger.
-        let operation_digest = Sha256::new()
-            .chain_update(b"CATBIRD-LABYRINTH-ACCOUNT-ERASURE-V1\0")
-            .chain_update(operation)
-            .chain_update(did.as_bytes())
-            .finalize();
+        let operation_digest = account_erasure_digest(did, &operation);
         let claimed = sqlx::query(
             "INSERT INTO labyrinth.account_erasure_operations(operation_digest, cutoff)
              VALUES ($1,$2) ON CONFLICT DO NOTHING",
@@ -93,6 +115,12 @@ pub async fn purge_account_with_recovery(
         if claimed.rows_affected() == 0 {
             return Ok(0);
         }
+        // Every nested fan-out, relay and prune notice inherits this transaction-local tag.
+        // No unrelated request can share it, even on a reused pool connection.
+        sqlx::query("SELECT set_config('catbird.erasure_operation', $1, true)")
+            .bind(hex::encode(operation_digest))
+            .execute(&mut *tx)
+            .await?;
     }
     let sequenced = purge_new_account_operation(
         &mut tx,

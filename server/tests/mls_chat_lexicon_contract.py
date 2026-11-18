@@ -1577,6 +1577,13 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
 
 def validate_normative_prose() -> None:
     prose = PROTOCOL_PATH.read_text(encoding="utf-8")
+    endpoint_section = prose.split("## 10. Public endpoints and proof gate", 1)[1]
+    inventory = endpoint_section.split("```text\n", 1)[1].split("\n```", 1)[0]
+    endpoint_names = [
+        name for line in inventory.splitlines() if not line.lstrip().startswith("#")
+        for name in line.split()
+    ]
+    assert sorted(endpoint_names) == sorted(ENDPOINTS), "documented endpoint inventory differs from the wire contract"
     prose += "\n" + STANDARD_APPVIEW_ADR_PATH.read_text(encoding="utf-8")
     for required_phrase in (
         "not currently an IANA-assigned stable MLS ciphersuite codepoint",
@@ -1667,7 +1674,9 @@ def validate_normative_prose() -> None:
         "Optional blurhash is exactly 6–256 UTF-8 bytes",
         "Message attachments instead use `applicationAttachmentBinding`, whose purpose is structurally fixed to `attachment`",
         "A metadata avatar uses the distinct `metadataAvatarBinding`, whose purpose is structurally fixed to `metadata`",
-        "returns `uploadedBlobBinding`, whose purpose reflects the prepared `attachment | metadata` value",
+        "Delivery-service blob storage (`prepareBlobUpload`, `uploadBlob`, `deleteBlob`, `getBlob`, `getBlobUsage`) is retired",
+        "`com.atproto.repo.uploadBlob`",
+        "`blue.catbird.labyrinth.attachmentManifest` into the conversation Space before calling `sendMessage`",
         "checked arithmetic requires `ciphertextSize == plaintextSize + 16`",
         "A reaction value uses Unicode 17.0.0 NFC",
         "exactly one UAX #29 extended grapheme cluster under Unicode 17.0.0",
@@ -1727,7 +1736,6 @@ def validate_normative_prose() -> None:
         "Deterministic precedence is:",
         "Every failure leaves zero conversation mutation, invitation count, package reservation, or idempotency-result residue",
         "conversationState.snapshotSeq",
-        "exactly these 32 endpoints",
     ):
         assert required_phrase in prose, f"normative protocol missing phrase: {required_phrase}"
 

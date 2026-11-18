@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Account deletion (decision J1). Requires a bound Labyrinth device. Locally, in one transaction: purge the mailbox exactly as purgeMailbox does (including every ORF state), redact every thread item the DID authored in conversations this DS sequences with a server redaction (defs#redaction variant 2: by, reason accountDeleted, redactedAt, and a DS signature), and queue a durable purgeAuthor job for the sequencer of every other conversation the DID takes or took part in; those are delivered with retries, so an unreachable DS neither blocks nor loses the deletion. Idempotency records are kept (they expire after 7 days), so a replayed pre-deletion write answers from its record instead of running again. MEK records stay, because other members' batches can be sealed under them. The exact signed JSON request body is limited to 1024 bytes so accountDeletedEntry.actorWrite can carry it verbatim. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded.",
+      "description": "Account deletion (decision J1). Requires a bound Labyrinth device. Locally, in one transaction: purge the mailbox exactly as purgeMailbox does (including every ORF state), redact every thread item the DID authored in conversations this DS sequences with a server redaction (defs#redaction variant 2: by, reason accountDeleted, redactedAt, and a DS signature), and queue a durable purgeAuthor job for the sequencer of every other conversation the DID takes or took part in; those are delivered with retries, so an unreachable DS neither blocks nor loses the deletion. Idempotency records are kept (they expire after 7 days), so a replayed pre-deletion write answers from its record instead of running again. MEK records stay, because other members' batches can be sealed under them. The exact signed JSON request body is limited to 1024 bytes so accountDeletedEntry.actorWrite can carry it verbatim. Common errors: NotAuthorized, AccountSessionExpired, DeviceRevoked, RateLimited, InvalidRequest, PayloadTooLarge, QuotaExceeded. Hosted account shutdown requests completed peer erasure with Catbird-Require-Erasure-Completion: 1. The header leaves the signed JSON body unchanged. When requested, success requires durable evidence that every required peer completed erasure. A queued delivery, missing evidence or a legacy empty response leaves shutdown pending.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -18,12 +18,28 @@
         "schema": {
           "type": "object",
           "required": [],
-          "properties": {}
+          "properties": {
+            "erasureCompletion": {
+              "type": "string",
+              "knownValues": [
+                "confirmed"
+              ],
+              "description": "Present as confirmed only after the service verifies completion for the authenticated deletion operation at every required peer. Hosted callers require this exact value before proceeding with account shutdown."
+            }
+          }
         }
       },
       "errors": [
         {
           "name": "LabyrinthDeviceNotBound"
+        },
+        {
+          "name": "PeerErasurePending",
+          "description": "Peer erasure for the authenticated operation is still pending. Retry the same operation."
+        },
+        {
+          "name": "PeerErasureUnverified",
+          "description": "The service cannot verify complete peer erasure for the authenticated operation."
         }
       ]
     }
