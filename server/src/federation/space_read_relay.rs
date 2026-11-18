@@ -3494,3 +3494,7 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "space_read_relay_recovered_tests.rs"]
+mod recovered_tests;
