@@ -478,6 +478,8 @@ pub(crate) async fn accept_transport_control_entry(
         None,
         300,
     );
+    let entry_bytes =
+        serde_json::to_vec(&request.entry).map_err(|error| storage(error.to_string()))?;
     let deletion = match AccountDeletion::from_entry(&request.entry) {
         Ok((deletion, authority)) => {
             if !crate::identity::dids_equivalent(&deletion.sequencer_did, caller) {
@@ -490,6 +492,29 @@ pub(crate) async fn accept_transport_control_entry(
             } else {
                 return Err(denied("deleted account is not a party of the pair"));
             };
+            // Match the exact stored signed entry and the separately committed authorization
+            // before acknowledging a previously applied deletion while the user's PDS is offline.
+            if let Some(proof) = &deletion.evidence {
+                let operation = proof.operation_id().map_err(|e| invalid(&e))?;
+                let accepted: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                    SELECT 1 FROM chat.direct_request_transport_entries e
+                    JOIN chat.account_deletion_operations o ON o.conversation_id=e.conversation_id
+                    WHERE e.conversation_id=$1 AND e.seq=$2 AND e.entry_bytes=$3
+                      AND o.deleted_did=$4 AND o.operation_id=$5 AND o.before_seq=e.seq)",
+                )
+                .bind(conversation_id)
+                .bind(locator.seq)
+                .bind(&entry_bytes)
+                .bind(&deletion.deleted_did)
+                .bind(operation.as_slice())
+                .fetch_one(&state.pool)
+                .await
+                .map_err(storage)?;
+                if accepted {
+                    return Ok(json!({ "accepted": true, "applied": false, "prunedCount": 0 }));
+                }
+            }
             // A C33 coordinator is one of the pair's two homes. The other
             // party must therefore be homed here before deletion may prune.
             match resolver.resolve_authoritative_ds(party).await {
@@ -594,8 +619,6 @@ pub(crate) async fn accept_transport_control_entry(
         )
         .map_err(ControlReceiptError::into_response)?;
     }
-    let entry_bytes =
-        serde_json::to_vec(&request.entry).map_err(|error| storage(error.to_string()))?;
     match delivery::insert_transport_entry(
         &mut tx,
         conversation_id,
@@ -686,6 +709,7 @@ async fn prune_deleted_account_payloads(
         evidence,
         cutoff,
         deletion.seq,
+        None,
     )
     .await?
     {

@@ -992,6 +992,26 @@ fn verify_atproto_v3_commit(
     expected_did: &str,
     atproto_key: &SpaceVerifyingKey,
 ) -> Result<cid::Cid, SpaceRelayError> {
+    let (root, authenticated) = atproto_commit_signature(commit_bytes, expected_did, atproto_key)?;
+    require_current_signature(authenticated)?;
+    Ok(root)
+}
+
+fn require_current_signature(authenticated: bool) -> Result<(), SpaceRelayError> {
+    if authenticated {
+        Ok(())
+    } else {
+        Err(SpaceRelayError::UpstreamError(
+            "ATProto commit signature failed verification under target #atproto key".into(),
+        ))
+    }
+}
+
+fn atproto_commit_signature(
+    commit_bytes: &[u8],
+    expected_did: &str,
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<(cid::Cid, bool), SpaceRelayError> {
     let commit: SignedAtprotoCommitV3 = serde_ipld_dagcbor::from_slice(commit_bytes)
         .map_err(|_| SpaceRelayError::UpstreamError("malformed ATProto v3 commit".into()))?;
     if commit.version != 3 {
@@ -1024,12 +1044,10 @@ fn verify_atproto_v3_commit(
     let unsigned_bytes = serde_ipld_dagcbor::to_vec(&unsigned).map_err(|_| {
         SpaceRelayError::UpstreamError("failed to encode unsigned ATProto commit".into())
     })?;
-    if !atproto_key.verify_raw(atproto_key.expected_alg(), &unsigned_bytes, &commit.sig) {
-        return Err(SpaceRelayError::UpstreamError(
-            "ATProto commit signature failed verification under target #atproto key".into(),
-        ));
-    }
-    Ok(commit.data)
+    Ok((
+        commit.data,
+        atproto_key.verify_raw(atproto_key.expected_alg(), &unsigned_bytes, &commit.sig),
+    ))
 }
 
 fn walk_mst_proof(
@@ -1351,12 +1369,35 @@ fn verify_signed_device_rkey_car<T: for<'de> Deserialize<'de>>(
     atproto_key: &SpaceVerifyingKey,
     absent_label: &str,
 ) -> Result<T, SpaceRelayError> {
+    let (record, authenticated) = device_record_and_signature(
+        car_bytes,
+        did,
+        collection,
+        device_id,
+        max_bytes,
+        atproto_key,
+        absent_label,
+    )?;
+    require_current_signature(authenticated)?;
+    serde_ipld_dagcbor::from_slice(&record)
+        .map_err(|_| SpaceRelayError::UpstreamError(format!("malformed {absent_label}")))
+}
+
+fn device_record_and_signature(
+    car_bytes: &[u8],
+    did: &str,
+    collection: &str,
+    device_id: &str,
+    max_bytes: usize,
+    atproto_key: &SpaceVerifyingKey,
+    absent_label: &str,
+) -> Result<(Vec<u8>, bool), SpaceRelayError> {
     check_canonical_device_id(device_id)?;
-    let (root_cid, blocks) = parse_verified_car_v1(car_bytes, max_bytes)?;
+    let (root_cid, mut blocks) = parse_verified_car_v1(car_bytes, max_bytes)?;
     let commit_bytes = blocks
         .get(&root_cid)
         .ok_or_else(|| SpaceRelayError::UpstreamError("missing root commit block".into()))?;
-    let mst_root_cid = verify_atproto_v3_commit(commit_bytes, did, atproto_key)?;
+    let (mst_root_cid, authenticated) = atproto_commit_signature(commit_bytes, did, atproto_key)?;
     let mst_key = format!("{collection}/{device_id}");
     let mut visited = HashSet::new();
     let record_cid = walk_mst_proof(
@@ -1369,13 +1410,118 @@ fn verify_signed_device_rkey_car<T: for<'de> Deserialize<'de>>(
         0,
     )?
     .ok_or_else(|| SpaceRelayError::UpstreamError(format!("{absent_label} is absent from MST")))?;
-    let record_bytes = blocks.get(&record_cid).ok_or_else(|| {
+    let record_bytes = blocks.remove(&record_cid).ok_or_else(|| {
         SpaceRelayError::UpstreamError(format!(
             "MST included {absent_label} CID but CAR omitted record"
         ))
     })?;
-    serde_ipld_dagcbor::from_slice(record_bytes)
-        .map_err(|_| SpaceRelayError::UpstreamError(format!("malformed {absent_label}")))
+    Ok((record_bytes, authenticated))
+}
+
+/// When the original commit no longer verifies under the account's current key, require
+/// the authoritative PDS to prove the identical record bytes at the same DID and MST key.
+async fn reanchor_device_car<'a>(
+    resolver: &DsResolver,
+    supplied: &'a [u8],
+    did: &str,
+    collection: &str,
+    device_id: &str,
+    maximum: usize,
+    current_key: &SpaceVerifyingKey,
+) -> Result<std::borrow::Cow<'a, [u8]>, SpaceRelayError> {
+    let (original, signed) = device_record_and_signature(
+        supplied,
+        did,
+        collection,
+        device_id,
+        maximum,
+        current_key,
+        collection,
+    )?;
+    if signed {
+        return Ok(std::borrow::Cow::Borrowed(supplied));
+    }
+    let (current, _) =
+        fetch_chat_device_repo_car(resolver, did, collection, device_id, maximum).await?;
+    let (record, signed) = device_record_and_signature(
+        &current,
+        did,
+        collection,
+        device_id,
+        maximum,
+        current_key,
+        collection,
+    )?;
+    require_current_signature(signed)?;
+    if original != record {
+        return Err(SpaceRelayError::DeviceRevoked(
+            "current repository record differs from deletion evidence".into(),
+        ));
+    }
+    Ok(std::borrow::Cow::Owned(current))
+}
+
+/// Retain the original evidence for replication. The temporary current proofs only
+/// authorize identical device records when the original repository key has rotated.
+pub(super) async fn verify_peer_deletion_evidence(
+    resolver: &DsResolver,
+    did: &str,
+    evidence: &crate::federation::receipt::AccountDeletionEvidence,
+    key: &SpaceVerifyingKey,
+) -> Result<chrono::DateTime<chrono::Utc>, SpaceRelayError> {
+    evidence
+        .check_shape()
+        .map_err(SpaceRelayError::InvalidRequest)?;
+    let write: crate::labyrinth::auth::WriteBodyWire =
+        serde_json::from_slice(&evidence.actor_write.write_body)
+            .map_err(|_| SpaceRelayError::InvalidRequest("malformed actorWrite".into()))?;
+    let mut authenticated = evidence.clone();
+    let key_car = evidence
+        .key_proof
+        .as_deref()
+        .ok_or_else(|| SpaceRelayError::InvalidRequest("missing device key proof".into()))?;
+    if let std::borrow::Cow::Owned(current) =
+        reanchor_device_key_car(resolver, key_car, did, &write.actor_device_id, key).await?
+    {
+        authenticated.key_proof = Some(current);
+    }
+    let revoked = evidence
+        .revocation_proof
+        .as_deref()
+        .ok_or_else(|| SpaceRelayError::InvalidRequest("missing revocation proof".into()))?;
+    if let std::borrow::Cow::Owned(current) = reanchor_device_car(
+        resolver,
+        revoked,
+        did,
+        "blue.catbird.chat.deviceRevocation",
+        &write.actor_device_id,
+        CHAT_DEVICE_REVOCATION_PROOF_MAX_BYTES,
+        key,
+    )
+    .await?
+    {
+        authenticated.revocation_proof = Some(current);
+    }
+    verify_account_deletion_evidence(did, &authenticated, key)
+}
+
+pub(super) async fn reanchor_device_key_car<'a>(
+    resolver: &DsResolver,
+    supplied: &'a [u8],
+    did: &str,
+    device_id: &str,
+    key: &SpaceVerifyingKey,
+) -> Result<std::borrow::Cow<'a, [u8]>, SpaceRelayError> {
+    reanchor_device_car(
+        resolver,
+        supplied,
+        did,
+        "blue.catbird.chat.device",
+        device_id,
+        CHAT_DEVICE_KEY_PROOF_MAX_BYTES,
+        key,
+    )
+    .await
 }
 
 /// Verify the exact signed repository commit, MST inclusion path, and device record
@@ -2017,7 +2163,22 @@ pub mod test_car_builder {
         operation: [u8; 16],
         at: chrono::DateTime<chrono::Utc>,
     ) -> crate::federation::receipt::AccountDeletionEvidence {
-        let repository = p256::SecretKey::from_slice(&[0x5b; 32]).unwrap();
+        deletion_evidence_with_repository(
+            did,
+            device,
+            operation,
+            at,
+            &p256::SecretKey::from_slice(&[0x5b; 32]).unwrap(),
+        )
+    }
+
+    pub fn deletion_evidence_with_repository(
+        did: &str,
+        device: uuid::Uuid,
+        operation: [u8; 16],
+        at: chrono::DateTime<chrono::Utc>,
+        repository: &p256::SecretKey,
+    ) -> crate::federation::receipt::AccountDeletionEvidence {
         let signer = ed25519_dalek::SigningKey::from_bytes(&[0x5d; 32]);
         let id = device.to_string();
         let created = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -2038,7 +2199,7 @@ pub mod test_car_builder {
             build_signed_repo_car(
                 did,
                 "3l2aaaaaaaaaa",
-                &repository,
+                repository,
                 &[(&format!("{collection}/{id}"), value)],
             )
             .0

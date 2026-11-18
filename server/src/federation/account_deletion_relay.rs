@@ -12,6 +12,7 @@
 
 use super::*;
 use chrono::SecondsFormat;
+use sha2::{Digest, Sha256};
 
 use crate::federation::receipt::AccountDeletionEvidence;
 use crate::federation::resolver::{build_resolver_http_client, DsResolver};
@@ -218,8 +219,20 @@ pub(super) async fn verify_user_deletion(
             }
         })?
         .ok_or_else(|| denied("missing account repository key"))?;
-    crate::federation::space_read_relay::verify_account_deletion_evidence(did, evidence, &key)
-        .map_err(|_| denied("device deletion authority did not verify"))
+    crate::federation::space_read_relay::verify_peer_deletion_evidence(
+        resolver, did, evidence, &key,
+    )
+    .await
+    .map_err(deletion_proof_error)
+}
+
+fn deletion_proof_error(error: crate::federation::space_read_relay::SpaceRelayError) -> Response {
+    match error {
+        crate::federation::space_read_relay::SpaceRelayError::UpstreamUnavailable(_) => {
+            unavailable(error)
+        }
+        _ => denied("device deletion authority did not verify"),
+    }
 }
 
 /// Record the first scope an authorized operation acquired. Duplicate delivery is an
@@ -231,18 +244,20 @@ pub(super) async fn claim_deletion_operation(
     evidence: &AccountDeletionEvidence,
     cutoff: DateTime<Utc>,
     before_seq: i64,
+    accepted_relay_sha256: Option<&[u8]>,
 ) -> Result<bool, Response> {
     let operation = evidence.operation_id().map_err(|err| invalid(&err))?;
     let result = sqlx::query(
         "INSERT INTO chat.account_deletion_operations
-            (conversation_id, deleted_did, operation_id, cutoff, before_seq)
-         VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+            (conversation_id, deleted_did, operation_id, cutoff, before_seq, accepted_relay_sha256)
+         VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
     )
     .bind(conversation_id)
     .bind(did)
     .bind(operation.as_slice())
     .bind(cutoff)
     .bind(before_seq)
+    .bind(accepted_relay_sha256)
     .execute(&mut **tx)
     .await
     .map_err(storage)?;
@@ -303,6 +318,22 @@ pub(crate) async fn accept_account_deletion_relay(
         .await?;
     }
 
+    let digest = Sha256::digest(relay.signing_bytes());
+    // The service signature and authenticated caller still bind the exact original
+    // envelope. A durable receipt only acknowledges; it cannot authorize new work.
+    if let Some(evidence) = &relay.evidence {
+        let operation = evidence.operation_id().map_err(|e| invalid(&e))?;
+        let accepted: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM chat.account_deletion_operations
+              WHERE conversation_id=$1 AND deleted_did=$2 AND operation_id=$3 AND accepted_relay_sha256=$4)",
+        )
+        .bind(relay.conversation_id).bind(&relay.deleted_did).bind(operation.as_slice()).bind(digest.as_slice())
+        .fetch_one(&state.pool).await.map_err(storage)?;
+        if accepted {
+            return Ok(json!({"accepted": true, "sequenced": false, "prunedCount": 0}));
+        }
+    }
+
     if participant_home(state, relay.conversation_id, &relay.deleted_did).await? != caller {
         return Err(denied("caller is not the participant's home"));
     }
@@ -340,8 +371,17 @@ pub(crate) async fn accept_account_deletion_relay(
                 }
             })?
             .ok_or_else(|| denied("missing account repository key"))?;
-        let (device_key, _) = crate::federation::space_read_relay::chat_device_key_and_creation(
+        let verified_car = crate::federation::space_read_relay::reanchor_device_key_car(
+            &resolver,
             key_car,
+            &relay.deleted_did,
+            &write.actor_device_id,
+            &repository_key,
+        )
+        .await
+        .map_err(deletion_proof_error)?;
+        let (device_key, _) = crate::federation::space_read_relay::chat_device_key_and_creation(
+            &verified_car,
             &relay.deleted_did,
             &write.actor_device_id,
             &repository_key,
@@ -385,9 +425,18 @@ pub(crate) async fn accept_account_deletion_relay(
         evidence,
         cutoff,
         before_seq,
+        Some(digest.as_slice()),
     )
     .await?
     {
+        // Operations admitted before receipts existed acquire one only after full
+        // verification. Never replace the original cutoff or an existing receipt.
+        let operation = evidence.operation_id().map_err(|e| invalid(&e))?;
+        sqlx::query("UPDATE chat.account_deletion_operations SET accepted_relay_sha256=$4
+            WHERE conversation_id=$1 AND deleted_did=$2 AND operation_id=$3 AND accepted_relay_sha256 IS NULL")
+            .bind(relay.conversation_id).bind(&relay.deleted_did).bind(operation.as_slice()).bind(digest.as_slice())
+            .execute(&mut *tx).await.map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
         return Ok(json!({"accepted": true, "sequenced": false, "prunedCount": 0}));
     }
     // A deletion this sequencer cannot sign answers 503, so the home's relay retries.

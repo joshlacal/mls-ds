@@ -2304,6 +2304,18 @@ async fn a_c33_deletion_carries_the_devices_signed_write_and_key_proof_to_the_pe
             Some(evidence)
         );
         let settled = home_state(&p.home_pool).await;
+        // The PDS and repository key may disappear with the account after first admission.
+        p.network.partition(true);
+        p.network.documents.lock().unwrap().remove(host(&deleted));
+        scope_sim_ds(
+            Arc::clone(&p.home_hooks),
+            crate::auth::cache_test_did_document(crate::auth::DidDocument {
+                id: deleted.clone(),
+                verification_method: Vec::new(),
+                service: None,
+            }),
+        )
+        .await;
         assert_eq!(
             p.accept(C33_SEQ, &entry).await.unwrap()["applied"],
             json!(false)

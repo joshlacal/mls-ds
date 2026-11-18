@@ -377,7 +377,7 @@ DECLARE
     ];
 
     -- BEGIN GENERATED CLEAN-SLATE SEAL
-    -- 68 migrations after 20260828000005 (152 total, max 20261117000002); chat tables: 100; chat views: 1.
+    -- 69 migrations after 20260828000005 (153 total, max 20261117000003); chat tables: 100; chat views: 1.
     v_clean_slate_versions BIGINT[] := ARRAY[
         20260905000001::BIGINT,
         20260907000001::BIGINT,
@@ -446,7 +446,8 @@ DECLARE
         20261116000004::BIGINT,
         20261116000005::BIGINT,
         20261117000001::BIGINT,
-        20261117000002::BIGINT
+        20261117000002::BIGINT,
+        20261117000003::BIGINT
     ];
     v_clean_slate_descriptions TEXT[] := ARRAY[
         'chat historical recovery package mapping',
@@ -516,7 +517,8 @@ DECLARE
         'recovery shares',
         'account deletion retry binding',
         'account deletion operation bounds',
-        'transport retention time'
+        'transport retention time',
+        'account deletion relay receipts'
     ];
     v_clean_slate_checksums TEXT[] := ARRAY[
         'a66f9dc9bd5f8f1cb3da0f3ddfcb64c08fc068de39602891e584c86cdbaebd1de2d29b6bb46959155496639ad12f9c5d',
@@ -586,7 +588,8 @@ DECLARE
         'd6e2970a0a7fb34a1fe1bccef389d3d487957f0a8a49f82a020b29248a4fa8dd716e2a81b37227b0be540a77a260b6ea',
         'd794a02be9e84436d320ebd91a3c534f2683447085bb92647bfe1746c9dbf02464f5f09d1aa5e74e68d9672a7251137c',
         'cb5453f212f7a736268eb93bea2e7c5dc6bd76ece844eb2c436ed4d7ec618a686e122501362f4ce37dc92a58b083a904',
-        '10063fa29142ba09f069c75ffb79c14d6cfe4a5a361e3dbf80b5aa052a09dc1bc8c96350723529448db338ba1fe4746b'
+        '10063fa29142ba09f069c75ffb79c14d6cfe4a5a361e3dbf80b5aa052a09dc1bc8c96350723529448db338ba1fe4746b',
+        '80854c0776dbaae4903e09266c840b5d22ba64e555b66257e5608a7905694377bd6b5c6bf674c2fe19fbc81299f71fc0'
     ];
     v_clean_slate_tables TEXT[] := ARRAY[
         'account_deletion_operations',

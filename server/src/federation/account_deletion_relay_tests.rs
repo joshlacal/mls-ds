@@ -299,6 +299,138 @@ async fn a_deleted_accounts_home_relays_each_remote_conversation_and_never_write
 }
 
 #[tokio::test]
+async fn a_rotated_repository_must_reanchor_both_unchanged_records_then_redeliver_offline() {
+    use crate::federation::space_read_relay::test_car_builder::{
+        deletion_evidence, deletion_evidence_with_repository,
+    };
+    let db = fresh_fully_migrated_db("chat_fed_relay_").await;
+    let pool = db.connect(4).await;
+    prepare(&pool).await;
+    let (seq_key, home_key) = (key(0x31), key(0x32));
+    let network = Network::new(&[(SEQ, &seq_key), (HOME, &home_key)]);
+    let clock = manual_clock();
+    let (fixture, state, seq) = relayed_application(
+        &pool,
+        hooks(SEQ, Some(&seq_key), false, &network),
+        clock.clone(),
+        &seq_key,
+    )
+    .await;
+    let (cid, device, did) = (
+        fixture.conversation_id,
+        fixture.sender_device_id,
+        fixture.sender_did,
+    );
+    let at = scope_ds_clock(clock.clone(), async { current_utc() }).await;
+    let original = deletion_evidence(&did, device, [4; 16], at);
+    let rotated_key = p256::SecretKey::from_slice(&[0x77; 32]).unwrap();
+    let rotated = deletion_evidence_with_repository(&did, device, [4; 16], at, &rotated_key);
+    let different = deletion_evidence_with_repository(&did, device, [5; 16], at, &rotated_key);
+    assert_ne!(original.key_proof, rotated.key_proof);
+    assert_ne!(original.revocation_proof, rotated.revocation_proof);
+    let plain = deletion_relay(&home_key, HOME, SEQ, cid, &did, &canonical(at));
+    let relay = evidenced_relay(&home_key, &plain, original.clone());
+    let body = serde_json::to_vec(&relay).unwrap();
+
+    // Only the authoritative DID document supplies this PDS and its current repository key.
+    let pds = "rotation-proof.example.com";
+    let current_doc = json!({
+        "id":did, "verificationMethod":[{"id":format!("{did}#atproto"),"type":"Multikey","controller":did,
+        "publicKeyMultibase":crate::identity::did_doc::encode_p256_multikey(key(0x77).verifying_key())}],
+        "service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":format!("https://{pds}")}]
+    });
+    network
+        .documents
+        .lock()
+        .unwrap()
+        .insert(host(&did).to_owned(), current_doc);
+    let records = Arc::new(Mutex::new(Some((
+        rotated.key_proof.unwrap(),
+        different.revocation_proof.unwrap(),
+    ))));
+    let mut seq_hooks = hooks(SEQ, Some(&seq_key), false, &network);
+    let base = network.transport();
+    let expected_did = did.clone();
+    let served = Arc::clone(&records);
+    Arc::get_mut(&mut seq_hooks).unwrap().http_transport =
+        Arc::new(move |req| {
+            if req.url.host_str() != Some(pds) {
+                return base(req);
+            }
+            assert_eq!(req.url.path(), "/xrpc/com.atproto.sync.getRecord");
+            assert!(!req.headers.contains_key(http::header::AUTHORIZATION));
+            let query: HashMap<_, _> = req.url.query_pairs().collect();
+            assert_eq!(query["did"], expected_did);
+            assert_eq!(query["rkey"], device.to_string());
+            let car = served.lock().unwrap().as_ref().map(|(key, revocation)| {
+                match &*query["collection"] {
+                    "blue.catbird.chat.device" => key.clone(),
+                    "blue.catbird.chat.deviceRevocation" => revocation.clone(),
+                    other => panic!("unexpected collection {other}"),
+                }
+            });
+            Box::pin(async move {
+                car.map(|bytes| http::Response::builder().status(200).body(bytes).unwrap())
+                    .ok_or_else(|| "PDS unavailable".to_string())
+            })
+        });
+    let run = async {
+        assert_refused(
+            &state,
+            HOME,
+            &relay,
+            cid,
+            (StatusCode::FORBIDDEN, "NotAuthorized"),
+        )
+        .await;
+        records.lock().unwrap().as_mut().unwrap().1 = rotated.revocation_proof.unwrap();
+        let accepted = accept_account_deletion_relay(&state, HOME, &body)
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted,
+            json!({"accepted": true, "sequenced": true, "prunedCount": 1})
+        );
+        let queued = queue_rows(&pool, cid)
+            .await
+            .into_iter()
+            .find(|row| row.0 == format!("group-entry-{cid}-{}-{HOME}", seq + 1))
+            .unwrap();
+        let sent: DeliverGroupEntryRequest = serde_json::from_slice(&queued.5).unwrap();
+        let (deletion, _) =
+            crate::federation::receipt::AccountDeletion::from_entry(&sent.entry).unwrap();
+        assert_eq!(
+            deletion.evidence,
+            Some(original),
+            "replicate the original signed bytes"
+        );
+
+        *records.lock().unwrap() = None;
+        let applied = sequencer_state(&pool, cid).await;
+        let retry = accept_account_deletion_relay(&state, HOME, &body)
+            .await
+            .unwrap();
+        assert_eq!(
+            retry,
+            json!({"accepted": true, "sequenced": false, "prunedCount": 0})
+        );
+        // An older row with no receipt still needs full proof on its first retry.
+        sqlx::query("UPDATE chat.account_deletion_operations SET accepted_relay_sha256=NULL WHERE conversation_id=$1")
+            .bind(cid).execute(&pool).await.unwrap();
+        assert_refused(
+            &state,
+            HOME,
+            &relay,
+            cid,
+            (StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable"),
+        )
+        .await;
+        assert_eq!(sequencer_state(&pool, cid).await, applied);
+    };
+    scope_ds_clock(clock, scope_sim_ds(seq_hooks, run)).await;
+}
+
+#[tokio::test]
 async fn a_sequencer_applies_its_homes_account_deletion_relay_exactly_once() {
     let db = fresh_fully_migrated_db("chat_fed_relay_").await;
     let pool = db.connect(4).await;
