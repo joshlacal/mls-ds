@@ -313,7 +313,7 @@ impl Page {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sim"))]
 mod tests {
     use super::*;
     use crate::chat_protocol::test_support::seed_clean_slate_application_fixture;
@@ -325,6 +325,25 @@ mod tests {
 
     #[tokio::test]
     async fn surviving_device_pages_only_its_erasure_controls_and_new_signed_entries() {
+        let identity = std::sync::Arc::new(crate::sim_hooks::SimDsHooks {
+            service_did: "did:web:chat.catbird.blue".into(),
+            self_endpoint: "https://chat.catbird.blue".into(),
+            signing_key_pem: None,
+            group_relay_hmac_secret: None,
+            http_transport: std::sync::Arc::new(|_| {
+                Box::pin(async {
+                    Err("unexpected network call from local sequencing fixture".into())
+                })
+            }),
+            dns_resolver: std::sync::Arc::new(|_| {
+                Err("unexpected DNS in local sequencing fixture".into())
+            }),
+            retain_application_ciphertext: false,
+        });
+        crate::sim_hooks::scope_sim_ds(identity, check_pages()).await;
+    }
+
+    async fn check_pages() {
         let source = fresh_fully_migrated_db("chat_fed_relay_").await;
         let source_pool = source.connect(4).await;
         http::ensure_fence(&source_pool).await;
