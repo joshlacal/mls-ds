@@ -3631,6 +3631,11 @@ async fn hydrate_locked_available_recovery_package_at_coordinate(
                  AND exported.expires_at > $5
                  AND (exported.recovery_request_id <> $6 OR exported.conversation_id <> $7)
           )
+          AND NOT EXISTS (
+              SELECT 1 FROM chat.group_key_package_exports bound
+               WHERE bound.recovery_request_id = $6 AND bound.conversation_id = $7
+                 AND bound.expires_at > $5 AND bound.key_package_ref <> kp.key_package_ref
+          )
         ORDER BY EXISTS (
             SELECT 1 FROM chat.group_key_package_exports exported
              WHERE exported.key_package_ref = kp.key_package_ref

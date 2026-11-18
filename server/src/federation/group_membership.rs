@@ -51,6 +51,8 @@ struct GroupPackage {
     created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transfer_request_sha256: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transfer_package_ref: Option<[u8; 32]>,
 }
 
 pub(super) fn routes() -> Router<GroupRelayState> {
@@ -593,35 +595,28 @@ async fn export_package(
     // The invitee is a clean-graph participant or a pending/active member of
     // the stored sequencer's verified index; an index removal always refuses.
     let allowed: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM chat.conversations c \
-          WHERE c.conversation_id=$1 AND c.kind='group' AND c.is_remote AND c.sequencer_ds=$2 \
-            AND (EXISTS(SELECT 1 FROM chat.participants p \
-                  WHERE p.conversation_id=c.conversation_id AND p.user_did=$3 \
-                    AND p.current_membership AND (p.status='active' OR (NOT $4 AND p.status='pending'))) \
+        "SELECT (EXISTS(SELECT 1 FROM chat.conversations c JOIN chat.participants p USING(conversation_id) \
+                  WHERE c.conversation_id=$1 AND c.kind='group' AND c.is_remote AND c.sequencer_ds=$2 \
+                    AND c.lifecycle='active' AND p.user_did=$3 AND p.current_membership \
+                    AND (p.status='active' OR (NOT $4 AND p.status='pending'))) \
                  OR EXISTS(SELECT 1 FROM chat.remote_group_memberships m \
-                  WHERE m.conversation_id=c.conversation_id AND m.user_did=$3 \
-                    AND m.sequencer_did=c.sequencer_ds AND (m.status='active' OR (NOT $4 AND m.status='pending')))) \
-            AND NOT EXISTS(SELECT 1 FROM chat.remote_group_memberships m \
-                  WHERE m.conversation_id=c.conversation_id AND m.user_did=$3 \
-                    AND m.status='removed'))",
-    )
-    .bind(request.conversation_id)
-    .bind(caller)
-    .bind(&request.user_did)
-    .bind(recovery)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(RelayFailure::storage)?;
-    let direct = if recovery && !allowed {
-        matches!(super::remote_sequence_target(pool, &request.user_did, request.device_id,
-            request.conversation_id).await.map_err(|e| RelayFailure::denied(format!("{e:?}")))?,
-            Some((sequencer, true)) if crate::identity::dids_equivalent(&sequencer, caller))
-    } else {
-        false
-    };
-    if !allowed && !direct {
+                  WHERE m.conversation_id=$1 AND m.user_did=$3 AND m.sequencer_did=$2 \
+                    AND (m.status='active' OR (NOT $4 AND m.status='pending')))) \
+                AND NOT EXISTS(SELECT 1 FROM chat.remote_group_memberships m \
+                  WHERE m.conversation_id=$1 AND m.user_did=$3 AND (m.status='removed' OR m.sequencer_did<>$2)) \
+                AND NOT EXISTS(SELECT 1 FROM chat.conversations c WHERE c.conversation_id=$1 \
+                  AND (c.kind<>'group' OR NOT c.is_remote OR c.sequencer_ds IS DISTINCT FROM $2 OR c.lifecycle<>'active')) \
+              OR ($4 AND NOT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id=$1) \
+                AND EXISTS(SELECT 1 FROM chat.direct_request_transport_inbox i WHERE i.conversation_id=$1 \
+                  AND i.coordinator_did=$2 AND i.status='accepted' AND \
+                    ((i.sender_did=$3 AND i.sender_device_id=$5) OR (i.recipient_did=$3 AND i.recipient_device_id=$5))) \
+                AND NOT EXISTS(SELECT 1 FROM chat.direct_request_transport_inbox i WHERE i.conversation_id=$1 \
+                  AND (i.status<>'accepted' OR i.coordinator_did<>$2 OR $3 NOT IN(i.sender_did,i.recipient_did))))")
+        .bind(request.conversation_id).bind(caller).bind(&request.user_did).bind(recovery).bind(request.device_id)
+        .fetch_one(&mut *tx).await.map_err(RelayFailure::storage)?;
+    if !allowed {
         return Err(RelayFailure::denied(
-            "package requester is not this invitation's sequencer",
+            "caller is not the signed member's conversation sequencer",
         ));
     }
     let binding = recovery.then_some(*mutation.request_digest());
@@ -632,6 +627,28 @@ async fn export_package(
             .execute(&mut *tx)
             .await
             .map_err(RelayFailure::storage)?;
+    }
+    if let Some(digest) = binding {
+        let existing: Option<(Vec<u8>, Uuid, String)> = sqlx::query_as(
+            "SELECT transfer_request_sha256,conversation_id,sequencer_did FROM chat.group_key_package_exports
+             WHERE recovery_request_id=$1 AND transfer_request_sha256 IS NOT NULL")
+            .bind(request.recovery_request_id).fetch_optional(&mut *tx).await.map_err(RelayFailure::storage)?;
+        if let Some((bound, conversation, sequencer)) = existing {
+            if bound.as_slice() != digest
+                || conversation != request.conversation_id
+                || sequencer != caller
+            {
+                return Err(RelayFailure::denied(
+                    "recovery request is already bound to another transfer",
+                ));
+            }
+        } else {
+            crate::chat_protocol::validation::validate_first_execution_signed_at(
+                mutation.signed_at(),
+                &TrustedRequestInstant::from_datetime(now).map_err(RelayFailure::storage)?,
+            )
+            .map_err(RelayFailure::denied)?;
+        }
     }
     let candidate: Option<(Vec<u8>, Vec<u8>, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
         "SELECT kp.key_package_ref,kp.wrapper_bytes,kp.created_at,kp.not_after FROM chat.key_packages kp \
@@ -656,6 +673,16 @@ async fn export_package(
     };
     // This is a fresh statement after the KeyPackage lock. Its conflict predicate
     // also rechecks the winning lease after any concurrent UPSERT wait.
+    let transfer_package_ref = if recovery {
+        Some(
+            reference
+                .as_slice()
+                .try_into()
+                .map_err(RelayFailure::storage)?,
+        )
+    } else {
+        None
+    };
     if let Some(digest) = binding {
         claim_recovery_transfer(
             &mut tx,
@@ -691,6 +718,7 @@ async fn export_package(
         wrapper,
         created_at,
         transfer_request_sha256: binding,
+        transfer_package_ref,
     })
 }
 
@@ -817,6 +845,7 @@ pub(super) async fn bootstrap_home_group(
                 wrapper,
                 created_at: event.received_at(),
                 transfer_request_sha256: None,
+                transfer_package_ref: None,
             },
             event.received_at(),
         )
@@ -1507,6 +1536,32 @@ pub(super) async fn stage_home_package(
         .await
         .map_err(RelayFailure::federation)?;
     if let Some(digest) = binding {
+        if package.transfer_package_ref != Some(reference) || package.created_at > now {
+            return Err(RelayFailure::denied(
+                "exported recovery package reference or creation time is invalid",
+            ));
+        }
+        // An INSERT may have met a pre-existing KeyPackage or an init-key collision.
+        // Only the exact authenticated recovery package can become this request's grant.
+        let exact: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat.key_packages kp
+              WHERE kp.key_package_ref=$1 AND kp.wrapper_bytes=$2 AND kp.owner_did=$3
+                AND kp.owner_device_id=$4 AND kp.owner_key_id=$5 AND kp.owner_auth_generation=$6
+                AND kp.usage_scope='recovery' AND kp.not_before<$7 AND kp.created_at<=$7 AND $7<kp.not_after
+                AND (kp.status='available' OR EXISTS(SELECT 1 FROM chat.group_key_package_exports e
+                     WHERE e.key_package_ref=kp.key_package_ref AND e.conversation_id=$8
+                       AND e.sequencer_did=$9 AND e.transfer_request_sha256=$10))
+                FOR UPDATE OF kp)")
+            .bind(reference.as_slice()).bind(&package.wrapper).bind(&request.actor_did)
+            .bind(request.actor_device_id).bind(actor_key_id).bind(package.device.auth_generation)
+            .bind(now).bind(request.conversation_id).bind(&state.self_did).bind(digest.as_slice())
+            .fetch_one(&mut *tx).await.map_err(RelayFailure::storage)?;
+        if !exact {
+            return Err(RelayFailure::denied(
+                "stored package does not match the authoritative transfer",
+            ));
+        }
+
         let recovery_id = Uuid::parse_str(recovery).map_err(RelayFailure::denied)?;
         claim_recovery_transfer(
             &mut tx,
