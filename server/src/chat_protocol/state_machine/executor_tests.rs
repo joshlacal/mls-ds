@@ -13025,7 +13025,7 @@ fn migration_text(filename: &str) -> String {
 }
 
 async fn fresh_upgrade_db() -> (PgPool, FreshDbGuard) {
-    let maintenance_url = maintenance_url_from_env();
+    let maintenance_url = maintenance_url_from_env().await;
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&maintenance_url)
