@@ -45,9 +45,10 @@ use crate::{
 #[path = "group_membership.rs"]
 mod membership;
 pub(crate) use membership::{
-    active_device_key, stage_remote_group_participants, stage_verified_remote_device,
-    try_relay_group_state_page, try_relay_home_group_operation, try_relay_index_only_welcome,
-    try_relay_labyrinth_directory, try_relay_labyrinth_member_devices, try_relay_recovery_entries,
+    active_device_key, recovery_window_for_home, stage_remote_group_participants,
+    stage_verified_remote_device, try_relay_group_state_page, try_relay_home_group_operation,
+    try_relay_index_only_welcome, try_relay_labyrinth_directory,
+    try_relay_labyrinth_member_devices, try_relay_recovery_entries,
 };
 
 #[path = "remote_group_index.rs"]

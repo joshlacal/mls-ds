@@ -130,7 +130,7 @@ async fn restored_leafless_device_reads_only_its_pending_fulfillment_on_its_home
     let window = |device: Uuid, key_id: &str, opening: Uuid, first: i64| -> RecoveryReadWindow {
         serde_json::from_value(json!({
             "conversation": cid, "did": member, "device": device, "authGeneration": 1,
-            "keyId": key_id, "welcome": opening, "firstSeq": first, "lastSeq": 7
+            "keyId": key_id, "welcome": opening, "generation": 0, "firstSeq": first, "lastSeq": 7
         }))
         .unwrap()
     };
@@ -170,6 +170,34 @@ async fn restored_leafless_device_reads_only_its_pending_fulfillment_on_its_home
         ));
     }
 
+    // The published ACK can advance only this enrollment, in this generation,
+    // through a sequence this particular device actually received.
+    use crate::chat_protocol::repository::entry_read::{verify_recovery_ack, RecoveryAck};
+    let mut tx = s.home_pool.begin().await.unwrap();
+    let win = target_window();
+    for (seq, generation, device, key, allowed) in [
+        (6, 0, target, &target_key, true),
+        (4, 0, target, &target_key, false),
+        (7, 0, target, &target_key, false),
+        (8, 0, target, &target_key, false),
+        (6, 1, target, &target_key, false),
+        (6, 0, sibling, &sibling_key, false),
+    ] {
+        let ack = RecoveryAck {
+            conversation: cid,
+            did: member,
+            device,
+            generation,
+            key_id: key,
+            auth_generation: 1,
+            through: seq,
+        };
+        assert_eq!(
+            verify_recovery_ack(&mut tx, &win, SEQ, ack).await.is_ok(),
+            allowed
+        );
+    }
+    tx.rollback().await.unwrap();
     let revoke = crate::chat_protocol::test_support::sign_mutation_json_for_test(
         &json!({
             "$type": "blue.catbird.chat.defs#deviceRevocationBody",

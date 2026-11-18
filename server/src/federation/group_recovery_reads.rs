@@ -72,8 +72,42 @@ pub(crate) async fn try_relay_recovery_entries(
     after: u64,
     limit: i64,
 ) -> Result<Option<Vec<u8>>, crate::handlers::chat::ChatFailure> {
+    let Some((sequencer, window)) = recovery_window_for_home(
+        pool,
+        Some(destination_resolver),
+        ChatEndpoint::GetEntries,
+        conversation,
+        did,
+        device,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    entry_read::granted_recovery_page(
+        pool,
+        window,
+        &sequencer,
+        conversation,
+        did,
+        device,
+        after,
+        limit,
+    )
+    .await
+    .map(Some)
+    .map_err(crate::handlers::chat::entries_read_failure)
+}
+
+pub(crate) async fn recovery_window_for_home(
+    pool: &DbPool,
+    destination_resolver: Option<&super::super::super::resolver::DsResolver>,
+    endpoint: ChatEndpoint,
+    conversation: Uuid,
+    did: &str,
+    device: Uuid,
+) -> Result<Option<(String, RecoveryReadWindow)>, crate::handlers::chat::ChatFailure> {
     use crate::handlers::chat::ChatFailure;
-    let endpoint = ChatEndpoint::GetEntries;
     let mut conn = pool
         .acquire()
         .await
@@ -109,25 +143,22 @@ pub(crate) async fn try_relay_recovery_entries(
         actor_device_id: device
     });
     let (status, bytes) =
-        call_home_response_via(pool, Some(destination_resolver), &sequencer, NSID, &request)
+        call_home_response_via(pool, destination_resolver, &sequencer, NSID, &request)
             .await
             .map_err(|e| GroupRelayError::from_local(e).into_failure(endpoint))?;
     if !(200..300).contains(&status) {
-        return Err(GroupRelayError::from_response(status, &bytes).into_failure(endpoint));
+        let error = GroupRelayError::from_response(status, &bytes);
+        if endpoint == ChatEndpoint::AcknowledgeEntries
+            && matches!(&error, GroupRelayError::Rejected(code) if !endpoint.declares(*code))
+        {
+            return Err(ChatFailure::protocol(
+                endpoint,
+                ChatProtocolErrorCode::DeviceNotLeaf,
+            ));
+        }
+        return Err(error.into_failure(endpoint));
     }
     let window: RecoveryReadWindow =
         serde_json::from_slice(&bytes).map_err(|_| ChatFailure::invariant(endpoint))?;
-    entry_read::granted_recovery_page(
-        pool,
-        window,
-        &sequencer,
-        conversation,
-        did,
-        device,
-        after,
-        limit,
-    )
-    .await
-    .map(Some)
-    .map_err(crate::handlers::chat::entries_read_failure)
+    Ok(Some((sequencer, window)))
 }
