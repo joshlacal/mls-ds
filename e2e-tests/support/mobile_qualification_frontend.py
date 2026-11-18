@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run two private DS processes and two independent synthetic account/PDS processes.
+"""Run two private DS processes and independent synthetic account/PDS processes.
 
 First use --initialize DIR to create private credentials, then --serve DIR with
 an explicitly supplied disposable local PostgreSQL port and fixture binaries.
@@ -54,11 +54,14 @@ def put_json(path, value):
     os.replace(tmp, path)
 
 
-def init(directory):
+def init(directory, with_upgrade_account=False):
     directory.mkdir(mode=0o700)
+    homes = {"alice": "ds1", "bob": "ds2"}
+    if with_upgrade_account:
+        homes["carol"] = "ds1"
     hosts = {
         name: name + "-" + secrets.token_hex(4) + SUFFIX
-        for name in ("ds1", "ds2", "alice", "bob", "gateway")
+        for name in ("ds1", "ds2", *homes, "gateway")
     }
 
     def openssl(*args):
@@ -128,7 +131,7 @@ def init(directory):
     }
     put_json(directory / "endpoints.json", endpoint)
     accounts = []
-    for label, ds in (("alice", "ds1"), ("bob", "ds2")):
+    for label, ds in homes.items():
         accounts.append(
             {
                 "label": label,
@@ -343,9 +346,11 @@ def serve(args):
     dbs = {}
     migrations = {}
     children = []
+    processes = {}
+    ds_configs = {}
 
     def launch(binary, label, env, config=None):
-        log = (run / (label + ".log")).open("wb")
+        log = (run / (label + ".log")).open("ab")
         with log:
             child = subprocess.Popen(
                 ["/usr/bin/sandbox-exec", "-p", SEATBELT, str(binary.resolve())],
@@ -355,6 +360,7 @@ def serve(args):
                 env=env,
             )
         children.append(child)
+        processes[label] = child
         if config:
             child.stdin.write(json.dumps(config).encode())
         child.stdin.close()
@@ -369,6 +375,22 @@ def serve(args):
             raise ValueError("child must bind loopback")
         state["ports"][label] = parsed.port
         return ready
+
+    def register(ds, registration):
+        for actor in registration:
+            conn = http.client.HTTPConnection(LOOPBACK, state["ports"][ds], timeout=10)
+            with contextlib.closing(conn):
+                conn.request(
+                    "POST",
+                    "/_test/clean-slate/register-did",
+                    json.dumps(actor),
+                    {"Content-Type": "application/json"},
+                )
+                reply = conn.getresponse()
+                if reply.status != 200:
+                    raise RuntimeError(
+                        f"{ds} DID registration HTTP {reply.status}: {reply.read()[:200]}"
+                    )
 
     with (
         http.server.ThreadingHTTPServer((LOOPBACK, args.tls_port), HttpHandler) as tls,
@@ -416,26 +438,28 @@ def serve(args):
                 kek = run / (ds + ".kek")
                 kek.write_bytes(secrets.token_bytes(32))
                 key = signing_key()
-                ready = launch(
-                    delivery_binary,
-                    ds,
-                    env
-                    | {
-                        "TEST_DATABASE_URL": f"postgresql://{LOOPBACK}:{args.pg_port}/{db}",
-                        "SERVICE_DID": did,
-                        "SIGNING_KEY_PEM": key.decode(),
-                        "RECEIPT_SIGNING_KEY_PEM": signing_key().decode(),
-                        "FEDERATION_GROUP_RELAY_HMAC_SECRET": s2s,
-                        "CHAT_SUBSCRIPTION_ENDPOINT": "wss://"
-                        + hosts[ds]
-                        + "/xrpc/blue.catbird.chat.subscribeEvents",
-                        "LABYRINTH_RECOVERY_SHARE_KEK_FILE": str(kek),
-                        "LABYRINTH_RECOVERY_SHARE_KEK_ID": ds,
-                        "LABYRINTH_RECOVERY_SHARE_TOMBSTONE_FILE": str(
-                            run / (ds + ".journal")
-                        ),
-                    },
-                )
+                ds_env = env | {
+                    "TEST_DATABASE_URL": f"postgresql://{LOOPBACK}:{args.pg_port}/{db}",
+                    "SERVICE_DID": did,
+                    "SIGNING_KEY_PEM": key.decode(),
+                    "RECEIPT_SIGNING_KEY_PEM": signing_key().decode(),
+                    "FEDERATION_GROUP_RELAY_HMAC_SECRET": s2s,
+                    "CHAT_SUBSCRIPTION_ENDPOINT": "wss://"
+                    + hosts[ds]
+                    + "/xrpc/blue.catbird.chat.subscribeEvents",
+                    "LABYRINTH_RECOVERY_SHARE_KEK_FILE": str(kek),
+                    "LABYRINTH_RECOVERY_SHARE_KEK_ID": ds,
+                    "LABYRINTH_RECOVERY_SHARE_TOMBSTONE_FILE": str(
+                        run / (ds + ".journal")
+                    ),
+                }
+                ds_env["CLEAN_SLATE_OUTBOUND_WORKER"] = "1"
+                ready = launch(delivery_binary, ds, ds_env)
+                ds_configs[ds] = ds_env | {
+                    "CLEAN_SLATE_RESUME": "1",
+                    "CLEAN_SLATE_LISTEN": f"{LOOPBACK}:{state['ports'][ds]}",
+                }
+                put_json(run / (ds + ".private.json"), ds_configs[ds])
                 migrations[ds] = subprocess.check_output(
                     [
                         "psql",
@@ -491,22 +515,7 @@ def serve(args):
                 )
             put_json(registry, state["docs"])
             for ds in ("ds1", "ds2"):
-                for actor in registration:
-                    conn = http.client.HTTPConnection(
-                        LOOPBACK, state["ports"][ds], timeout=10
-                    )
-                    with contextlib.closing(conn):
-                        conn.request(
-                            "POST",
-                            "/_test/clean-slate/register-did",
-                            json.dumps(actor),
-                            {"Content-Type": "application/json"},
-                        )
-                        reply = conn.getresponse()
-                        if reply.status != 200:
-                            raise RuntimeError(
-                                f"{ds} DID registration HTTP {reply.status}: {reply.read()[:200]}"
-                            )
+                register(ds, registration)
             with delivery_binary.open("rb") as binary:
                 delivery_hash = hashlib.file_digest(binary, "sha256").hexdigest()
             with pds_binary.open("rb") as binary:
@@ -523,7 +532,8 @@ def serve(args):
                     "sessions": str(root / "sessions.json"),
                     "processes": {
                         k: {"port": v, "pid": p.pid}
-                        for (k, v), p in zip(state["ports"].items(), children)
+                        for k, v in state["ports"].items()
+                        for p in [processes[k]]
                     },
                     "databases": dbs,
                     "runDirectory": str(run),
@@ -531,9 +541,78 @@ def serve(args):
                 },
             )
             print("Private mobile fixture ready", flush=True)
-            while all(p.poll() is None for p in children):
-                threading.Event().wait(2)
-            raise RuntimeError("fixture child exited")
+            # A private control file explicitly requests a quiescent DS-only restart.
+            # Preserve live PDS state even if a new DS fails to start.
+            last_request = None
+            while all(processes[a["label"]].poll() is None for a in accounts):
+                threading.Event().wait(1)
+                request = run / "restart.json"
+                if not request.exists():
+                    continue
+                control = json.loads(request.read_text())
+                if control == last_request:
+                    continue
+                last_request = control
+                try:
+                    expected = control["sha256"]
+                    if not re.fullmatch(r"[a-f0-9]{64}", expected):
+                        raise ValueError("invalid candidate hash")
+                    candidate = run / ("delivery-" + expected)
+                    with candidate.open("rb") as binary:
+                        if (
+                            hashlib.file_digest(binary, "sha256").hexdigest()
+                            != expected
+                        ):
+                            raise ValueError("candidate binary hash mismatch")
+                    for ds in ("ds1", "ds2"):
+                        if processes[ds].poll() is None:
+                            processes[ds].terminate()
+                            processes[ds].wait(timeout=20)
+                        ready = launch(candidate, ds, ds_configs[ds])
+                        if ready["baseUrl"] != services[ep["homeDids"][ds]]:
+                            raise ValueError("delivery origin changed on resume")
+                        if (
+                            ready["didDocument"]["verificationMethod"]
+                            != state["docs"][ep["homeDids"][ds]]["verificationMethod"]
+                        ):
+                            raise ValueError("delivery identity changed on resume")
+                        register(ds, registration)
+                        migrations[ds] = subprocess.check_output(
+                            [
+                                "psql",
+                                "-XAt",
+                                "-h",
+                                LOOPBACK,
+                                "-p",
+                                str(args.pg_port),
+                                "-d",
+                                dbs[ds],
+                                "-c",
+                                "SELECT max(version) FROM _sqlx_migrations WHERE success",
+                            ],
+                            env=env,
+                            text=True,
+                        ).strip()
+                    manifest = json.loads((root / "manifest.json").read_text())
+                    manifest.update(deliverySha256=expected, migrations=migrations)
+                    for ds in ("ds1", "ds2"):
+                        manifest["processes"][ds]["pid"] = processes[ds].pid
+                    put_json(root / "manifest.json", manifest)
+                    put_json(
+                        run / "restart-result.json",
+                        {"request": control, "ok": True, "migrations": migrations},
+                    )
+                except (
+                    ValueError,
+                    OSError,
+                    RuntimeError,
+                    subprocess.SubprocessError,
+                ) as exc:
+                    put_json(
+                        run / "restart-result.json",
+                        {"request": control, "ok": False, "error": str(exc)},
+                    )
+            raise RuntimeError("fixture PDS exited")
         finally:
             for proc in children:
                 if proc.poll() is None:
@@ -759,10 +838,12 @@ def check(root, pds_binary, *, fresh):
         },
     )
     print(
-        "Verified both signed-in accounts, signed CAR records and scoped service tokens"
+        f"Verified {len(rows)} synthetic accounts, signed CAR records and scoped service tokens"
     )
     if fresh:
-        print("Both fresh accounts received an HTTP 401 device-less deletion refusal")
+        print(
+            f"All {len(rows)} fresh accounts received an HTTP 401 device-less deletion refusal"
+        )
 
 
 def main():
@@ -784,7 +865,14 @@ def main():
     parser.add_argument("--pg-port", type=int)
     parser.add_argument("--tls-port", type=int, default=0)
     parser.add_argument("--proxy-port", type=int, default=0)
+    parser.add_argument(
+        "--with-upgrade-account",
+        action="store_true",
+        help="initialize a third independent account on the first home for old-app upgrade testing",
+    )
     args = parser.parse_args()
+    if args.with_upgrade_account and not args.initialize:
+        parser.error("--with-upgrade-account applies to --initialize")
     if args.check or args.check_live:
         if not args.pds_binary:
             parser.error("supply the PDS fixture binary to verify CAR proofs")
@@ -795,7 +883,7 @@ def main():
         )
         return
     if args.initialize:
-        init(args.initialize.resolve())
+        init(args.initialize.resolve(), args.with_upgrade_account)
         return
     if (
         not args.pg_port

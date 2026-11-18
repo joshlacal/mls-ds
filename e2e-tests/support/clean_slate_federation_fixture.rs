@@ -1967,8 +1967,17 @@ async fn admin_add_zero_leaf_member(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    // Debug builds retain large stack frames along the signed group acceptance
+    // path (historical participant hydration + signature hashing). Keep the
+    // fixture's release build on the same worker defaults as the service.
+    #[cfg(debug_assertions)]
+    builder.thread_stack_size(8 * 1024 * 1024);
+    builder.enable_all().build()?.block_on(run_fixture())
+}
+
+async fn run_fixture() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -2157,10 +2166,14 @@ async fn main() -> Result<()> {
         .with_i13_receipt_signer(i13_signer.clone());
     if let Some(crypto) = RecoveryCrypto::from_env().map_err(anyhow::Error::msg)? {
         let journal_path = std::env::var("LABYRINTH_RECOVERY_SHARE_TOMBSTONE_FILE")?;
-        // This fixture always creates a fresh dedicated database. Exclusive
-        // provisioning pairs it with a fresh journal and refuses any old path.
-        let journal = RecoveryTombstones::provision_new(journal_path, crypto.journal_key())
-            .map_err(anyhow::Error::msg)?;
+        // New fixture databases get a new journal. An explicit restart must
+        // retain the original independently mounted journal and KEK.
+        let journal = if std::env::var("CLEAN_SLATE_RESUME").as_deref() == Ok("1") {
+            RecoveryTombstones::open_existing(journal_path, crypto.journal_key())
+        } else {
+            RecoveryTombstones::provision_new(journal_path, crypto.journal_key())
+        }
+        .map_err(anyhow::Error::msg)?;
         journal
             .replay(&pool)
             .await
@@ -2239,6 +2252,25 @@ async fn main() -> Result<()> {
             get(get_convo_events),
         )
         .with_state(pool.clone());
+
+    if std::env::var("CLEAN_SLATE_OUTBOUND_WORKER").as_deref() == Ok("1") {
+        let auth = service_auth
+            .clone()
+            .context("outbound worker requires service auth")?;
+        let queue = Arc::new(catbird_server::federation::queue::OutboundQueue::new(
+            pool.clone(),
+            catbird_server::auth::shared_auth_middleware(),
+            resolver.clone(),
+        ));
+        let outbound = Arc::clone(&outbound);
+        let sign: Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync> =
+            Arc::new(move |did, method| auth.sign_request(did, method).map_err(|e| e.to_string()));
+        tokio::spawn(async move {
+            queue
+                .run_worker(outbound, sign, tokio_util::sync::CancellationToken::new())
+                .await;
+        });
+    }
 
     let state = CleanSlateServerState {
         pool: pool.clone(),

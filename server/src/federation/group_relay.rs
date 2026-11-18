@@ -628,6 +628,24 @@ const RELAY_GROUP_MUTATION_RESPONSE_MAX_BYTES: usize =
     SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES + 2 * 1024 * 1024;
 const RELAY_GROUP_MUTATION_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn group_s2s_post(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+    #[cfg(feature = "test-support")]
+    let fixture_client = url::Url::parse(url)
+        .ok()
+        .filter(|uri| {
+            uri.scheme() == "https"
+                && uri
+                    .host_str()
+                    .is_some_and(crate::auth::is_test_fixture_host)
+        })
+        .and_then(|_| crate::auth::test_fixture_http_client());
+    #[cfg(feature = "test-support")]
+    let client = fixture_client.as_ref().unwrap_or(client);
+    client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+}
+
 /// Outbound S2S client helper: relay a group mutation from the member's home `mls-ds` to `sequencer_ds`.
 pub async fn relay_group_mutation_to_sequencer(
     sequencer_endpoint: &str,
@@ -671,9 +689,7 @@ async fn relay_group_mutation_bytes_to_sequencer(
             .build()
             .expect("build group mutation HTTP client")
     });
-    let mut req = client
-        .post(&url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    let mut req = group_s2s_post(client, &url);
     req = attach_group_s2s_auth(
         req,
         caller_norm,
@@ -1223,9 +1239,7 @@ pub async fn deliver_group_entry_to_remote_home(
             .build()
             .expect("build group delivery HTTP client")
     });
-    let mut req = client
-        .post(&url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    let mut req = group_s2s_post(client, &url);
     req = attach_group_s2s_auth(
         req,
         caller_norm,
