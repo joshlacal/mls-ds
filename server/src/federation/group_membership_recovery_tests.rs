@@ -221,6 +221,57 @@ async fn active_group_member_add_exports_only_its_live_recovery_package() {
     .await;
 }
 
+fn signed_invitation_acceptance(c: &Closing) -> (Uuid, Value) {
+    let id = Uuid::new_v4();
+    let transition = Uuid::new_v4();
+    let mut next = c.prior.clone();
+    next["stateVersion"] = json!(c.prior["stateVersion"].as_i64().unwrap() + 1);
+    let signed = sign_mutation_json_for_test(
+        &json!({
+            "$type": "blue.catbird.chat.defs#participantAcceptanceBody",
+            "signatureDomain": "CATBIRD-CHAT-ACCEPT\u{0}",
+            "transitionId": transition, "idempotencyKey": transition, "recoveryRequestId": id,
+            "actorDid": c.peer.did, "actorDeviceId": c.peer.device,
+            "keyId": c.peer.key_id, "authGeneration": 1,
+            "prior": c.prior, "next": next, "signedAt": canonical(current_utc()),
+            "invitationProvenance": {
+                "invitationTransitionId": Uuid::new_v4(),
+                "invitedByDid": c.actor.did, "invitedByDeviceId": c.actor.device,
+            },
+        }),
+        &c.peer.signing_key(),
+    )
+    .unwrap();
+    (id, signed)
+}
+
+#[tokio::test]
+async fn ordinary_invitation_export_requires_a_local_conversation_graph() {
+    let (mut c, _) = mirror_fixture().await;
+    scope_ds_clock(c.clock.clone(), async {
+        set_membership(&c, "pending", 1).await;
+        let wrapper = inventory(&c.home_pool, &c.peer, "recovery").await;
+        let (id, signed) = signed_invitation_acceptance(&c);
+        let (status, reply) = fetch(&c, &c.peer, id, &signed).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_eq!(reply["package"]["wrapper"], json!(wrapper));
+        let graph: Uuid = sqlx::query_scalar(
+            "SELECT invitation_conversation_id FROM chat.group_key_package_exports WHERE recovery_request_id=$1",
+        ).bind(id).fetch_one(&c.home_pool).await.unwrap();
+        assert_eq!(graph, c.cid);
+
+        c.cid = Uuid::new_v4();
+        c.prior["conversationId"] = json!(c.cid);
+        set_membership(&c, "pending", 1).await;
+        inventory(&c.home_pool, &c.peer, "recovery").await;
+        let (id, signed) = signed_invitation_acceptance(&c);
+        let (status, reply) = fetch(&c, &c.peer, id, &signed).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{reply}");
+        assert!(reply.get("package").is_none());
+        assert_eq!(transfer_count(&c.home_pool, id).await, 0);
+    }).await;
+}
+
 #[tokio::test]
 async fn recovery_on_a_graphless_home_uses_the_indexed_membership() {
     let (mut c, _) = mirror_fixture().await;
