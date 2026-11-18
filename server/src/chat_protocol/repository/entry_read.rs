@@ -355,54 +355,7 @@ async fn read_entries_in_transaction(
         let entries: Vec<Value> = stored_entries
             .into_iter()
             .take(limit as usize)
-            .map(|bytes| {
-                let mut val: Value =
-                    serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
-                if val.get("$type").is_none() {
-                    let inferred = match val
-                        .pointer("/signedRequest/body/$type")
-                        .and_then(Value::as_str)
-                    {
-                        Some("blue.catbird.chat.defs#applicationSendBody") => {
-                            Some("blue.catbird.chat.defs#applicationEntry")
-                        }
-                        Some("blue.catbird.chat.defs#commitTransitionBody") => {
-                            Some("blue.catbird.chat.defs#commitEntry")
-                        }
-                        Some("blue.catbird.chat.defs#metadataTransitionBody") => {
-                            Some("blue.catbird.chat.defs#metadataEntry")
-                        }
-                        Some("blue.catbird.chat.defs#policyTransitionBody") => {
-                            Some("blue.catbird.chat.defs#policyEntry")
-                        }
-                        Some("blue.catbird.chat.defs#leafRecoveryFulfillmentBody") => {
-                            Some("blue.catbird.chat.defs#leafRecoveryFulfillmentEntry")
-                        }
-                        Some("blue.catbird.chat.defs#leaveCommitFulfillmentBody") => {
-                            Some("blue.catbird.chat.defs#leaveCommitFulfillmentEntry")
-                        }
-                        _ => None,
-                    };
-                    if let Some(ty) = inferred {
-                        val["$type"] = json!(ty);
-                    }
-                }
-                let presented = if let Ok(canonical) = encode_canonical_generated_chat_json_v1(
-                    &val,
-                    "blue.catbird.chat.defs#conversationEntry",
-                ) {
-                    serde_json::from_slice(canonical.bytes())
-                        .map_err(|_| EntryReadFacadeError::Invariant)?
-                } else {
-                    crate::chat_protocol::direct_request_transcript::present_read_presentation(
-                        "conversationEntry",
-                        &mut val,
-                    )
-                    .map_err(|_| EntryReadFacadeError::Invariant)?;
-                    val
-                };
-                Ok(presented)
-            })
+            .map(|bytes| present_transport_entry(&bytes))
             .collect::<Result<_, EntryReadFacadeError>>()?;
 
         let next_after_seq = entries
@@ -562,6 +515,53 @@ async fn read_entries_in_transaction(
     });
     let response_bytes = serde_json::to_vec(&body).map_err(|_| EntryReadFacadeError::Invariant)?;
     Ok(CanonicalEntriesResponse { response_bytes })
+}
+
+fn present_transport_entry(bytes: &[u8]) -> Result<Value, EntryReadFacadeError> {
+    let mut val: Value =
+        serde_json::from_slice(bytes).map_err(|_| EntryReadFacadeError::Invariant)?;
+    if val.get("$type").is_none() {
+        let inferred = match val
+            .pointer("/signedRequest/body/$type")
+            .and_then(Value::as_str)
+        {
+            Some("blue.catbird.chat.defs#applicationSendBody") => {
+                Some("blue.catbird.chat.defs#applicationEntry")
+            }
+            Some("blue.catbird.chat.defs#commitTransitionBody") => {
+                Some("blue.catbird.chat.defs#commitEntry")
+            }
+            Some("blue.catbird.chat.defs#metadataTransitionBody") => {
+                Some("blue.catbird.chat.defs#metadataEntry")
+            }
+            Some("blue.catbird.chat.defs#policyTransitionBody") => {
+                Some("blue.catbird.chat.defs#policyEntry")
+            }
+            Some("blue.catbird.chat.defs#leafRecoveryFulfillmentBody") => {
+                Some("blue.catbird.chat.defs#leafRecoveryFulfillmentEntry")
+            }
+            Some("blue.catbird.chat.defs#leaveCommitFulfillmentBody") => {
+                Some("blue.catbird.chat.defs#leaveCommitFulfillmentEntry")
+            }
+            _ => None,
+        };
+        if let Some(ty) = inferred {
+            val["$type"] = json!(ty);
+        }
+    }
+    let presented = if let Ok(canonical) =
+        encode_canonical_generated_chat_json_v1(&val, "blue.catbird.chat.defs#conversationEntry")
+    {
+        serde_json::from_slice(canonical.bytes()).map_err(|_| EntryReadFacadeError::Invariant)?
+    } else {
+        crate::chat_protocol::direct_request_transcript::present_read_presentation(
+            "conversationEntry",
+            &mut val,
+        )
+        .map_err(|_| EntryReadFacadeError::Invariant)?;
+        val
+    };
+    Ok(presented)
 }
 
 /// A mirror may know the account's membership before its new device's leaf. The
@@ -1214,4 +1214,210 @@ mod tests {
             "the optional fields survive a decode and re-encode unchanged"
         );
     }
+}
+
+/// Ephemeral sequencer evidence for a home whose verified mirror has the
+/// member but predates its restored leaf. A later read obtains a fresh window.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RecoveryReadWindow {
+    conversation: Uuid,
+    did: String,
+    device: Uuid,
+    key_id: String,
+    auth_generation: i64,
+    welcome: Uuid,
+    first_seq: i64,
+    last_seq: i64,
+}
+
+pub(crate) async fn acknowledged_recovery_read_window(
+    pool: &sqlx::PgPool,
+    admission: VerifiedReadAdmission,
+    conversation: Uuid,
+    sequencer: &str,
+) -> Result<RecoveryReadWindow, EntryReadFacadeError> {
+    let attempt = read_authority::into_single_read_admission(
+        admission,
+        read_authority::OrdinaryReadEndpoint::GetEntries,
+    )
+    .map_err(map_authority_error)?
+    .into_attempt();
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| EntryReadFacadeError::Storage)?;
+    let device = read_authority::lock_read_device_authority_once(&mut tx, attempt)
+        .await
+        .map_err(map_authority_error)?;
+    let did = device.user_did().to_owned();
+    let id = device.device_id();
+    let auth_generation =
+        i64::try_from(device.auth_generation()).map_err(|_| EntryReadFacadeError::Invariant)?;
+    let key_id = device.active_key_id().to_owned();
+    let authorized = read_authority::authorize_entries(&mut tx, device, conversation)
+        .await
+        .map_err(map_authority_error)?;
+    if authorized.terminal_control_interval().is_some() {
+        return Err(EntryReadFacadeError::NotEntitled);
+    }
+    let (welcome, first_seq, last_seq) = sqlx::query_as::<_, (Uuid, i64, i64)>(
+        "SELECT w.welcome_id,i.start_seq,c.next_entry_seq-1 FROM chat.conversations c \
+         JOIN chat.application_intervals i ON i.conversation_id=c.conversation_id AND i.generation=c.current_generation \
+         JOIN chat.welcome_bundles w ON (w.conversation_id,w.entry_seq,w.transition_id)=(i.conversation_id,i.start_seq,i.opening_transition_id) \
+         JOIN chat.welcome_deliveries d ON d.welcome_id=w.welcome_id AND d.recipient_did=i.recipient_did AND d.recipient_device_id=i.recipient_device_id \
+         JOIN chat.leaf_recovery_requests q ON q.recovery_request_id=d.recovery_request_id AND q.fulfilling_transition_id=w.transition_id \
+         JOIN chat.participants p ON p.conversation_id=c.conversation_id AND p.user_did=i.recipient_did AND p.current_membership \
+         WHERE c.conversation_id=$1 AND c.kind='group' AND c.lifecycle='active' AND NOT c.is_remote AND (c.sequencer_ds IS NULL OR c.sequencer_ds=$4) \
+           AND i.recipient_did=$2 AND i.recipient_device_id=$3 AND i.terminal_seq IS NULL AND p.status='active' \
+           AND d.status='acknowledged' AND q.status='fulfilled' AND q.requester_did=$2 AND q.requester_device_id=$3 \
+           AND q.source='requestLeafRecovery' AND q.requester_key_id=$5 AND q.requester_auth_generation=$6",
+    )
+    .bind(conversation)
+    .bind(&did)
+    .bind(id)
+    .bind(sequencer)
+    .bind(&key_id)
+    .bind(auth_generation)
+        .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| EntryReadFacadeError::Storage)?
+        .ok_or(EntryReadFacadeError::NotEntitled)?;
+    Ok(RecoveryReadWindow {
+        conversation,
+        did,
+        device: id,
+        key_id,
+        auth_generation,
+        welcome,
+        first_seq,
+        last_seq,
+    })
+}
+
+pub(crate) async fn granted_recovery_page(
+    pool: &sqlx::PgPool,
+    window: RecoveryReadWindow,
+    sequencer: &str,
+    conversation: Uuid,
+    did: &str,
+    device: Uuid,
+    after_seq: u64,
+    limit: i64,
+) -> Result<Vec<u8>, EntryReadFacadeError> {
+    if window.conversation != conversation
+        || window.did != did
+        || window.device != device
+        || !(1..=100).contains(&limit)
+        || window.last_seq > crate::chat_protocol::validation::MAX_SAFE_INTEGER
+        || window.first_seq < 1
+        || window.last_seq < window.first_seq
+    {
+        return Err(EntryReadFacadeError::NotEntitled);
+    }
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| EntryReadFacadeError::Storage)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| EntryReadFacadeError::Storage)?;
+    // Bind the sequencer's window to the exact signed fulfillment actually
+    // delivered here, the active local enrollment, and this mirror's current membership.
+    let opening: Vec<u8> = sqlx::query_scalar(
+        "SELECT e.entry_bytes FROM chat.conversations c \
+          JOIN chat.remote_group_memberships m ON m.conversation_id=c.conversation_id AND m.sequencer_did=c.sequencer_ds \
+          JOIN chat.devices d ON d.user_did=m.user_did \
+          JOIN chat.device_keys k ON (k.user_did,k.device_id)=(d.user_did,d.device_id) \
+          JOIN chat.group_transport_entry_recipients r ON (r.conversation_id,r.user_did,r.device_id)=(c.conversation_id,d.user_did,d.device_id) \
+          JOIN chat.direct_request_transport_entries e ON (e.conversation_id,e.seq)=(r.conversation_id,r.seq) \
+         WHERE c.conversation_id=$1 AND c.kind='group' AND c.is_remote AND c.sequencer_ds=$2 AND c.lifecycle='active' \
+           AND m.user_did=$3 AND m.status='active' AND d.device_id=$4 AND d.auth_generation=$5 AND d.status='active' AND d.revoked_at IS NULL \
+           AND k.key_id=$6 AND k.enrollment_auth_generation<=d.auth_generation AND k.revoked_at IS NULL AND r.seq=$7 \
+           AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id \
+             AND newer.enrollment_auth_generation BETWEEN k.enrollment_auth_generation+1 AND d.auth_generation) \
+           AND NOT EXISTS(SELECT 1 FROM federation_sync_state WHERE convo_id=c.conversation_id::text AND status='quarantined')",
+    )
+    .bind(conversation)
+    .bind(sequencer)
+    .bind(did)
+    .bind(device)
+    .bind(window.auth_generation)
+    .bind(&window.key_id)
+    .bind(window.first_seq)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| EntryReadFacadeError::Storage)?
+    .ok_or(EntryReadFacadeError::NotEntitled)?;
+    let entry: Value =
+        serde_json::from_slice(&opening).map_err(|_| EntryReadFacadeError::Invariant)?;
+    let bundle = &entry["signedRequest"]["body"]["manifest"]["welcomeBundle"];
+    if entry["$type"] != "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry"
+        || entry["conversationId"] != conversation.to_string()
+        || entry["seq"].as_i64() != Some(window.first_seq)
+        || entry["signedRequest"]["body"]["$type"]
+            != "blue.catbird.chat.defs#leafRecoveryFulfillmentBody"
+        || bundle["welcomeId"] != window.welcome.to_string()
+        || !bundle["deliveries"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|d| d["recipientDid"] == did && d["recipientDeviceId"] == device.to_string())
+        })
+    {
+        return Err(EntryReadFacadeError::NotEntitled);
+    }
+    let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT e.seq,e.entry_bytes FROM chat.direct_request_transport_entries e \
+         JOIN chat.group_transport_entry_recipients r USING(conversation_id,seq) \
+         WHERE e.conversation_id=$1 AND r.user_did=$2 AND r.device_id=$3 AND e.seq>$4 AND e.seq BETWEEN $5 AND $6 \
+         ORDER BY e.seq LIMIT $7",
+    )
+    .bind(conversation)
+    .bind(did)
+    .bind(device)
+    .bind(i64::try_from(after_seq).map_err(|_| EntryReadFacadeError::InvalidRequest)?)
+    .bind(window.first_seq)
+    .bind(window.last_seq)
+    .bind(limit + 1)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|_| EntryReadFacadeError::Storage)?;
+    let has_more = rows.len() > limit as usize;
+    let mut granted = rows
+        .into_iter()
+        .take(limit as usize)
+        .map(|(seq, bytes)| Ok((seq, present_transport_entry(&bytes)?)))
+        .collect::<Result<std::collections::BTreeMap<_, _>, EntryReadFacadeError>>()?;
+    if !granted.is_empty() {
+        // A prune can precede delivery of a full transport copy. The grant
+        // bounds the lookup; an already-erased local payload always stays erased.
+        let seqs: Vec<_> = granted.keys().copied().collect();
+        let pruned: Vec<DeliveredEntryRow> = sqlx::query_as(
+            "SELECT conversation_id, seq, entry_id, entry_kind, signed_request_bytes, request_digest, \
+             signature, server_fields_bytes, outer_entry_fingerprint, payload_pruned_at, sequencer_receipt_bytes, received_at \
+             FROM chat.entries WHERE conversation_id=$1 AND seq=ANY($2) AND entry_kind=$3 \
+               AND (payload_pruned_at IS NOT NULL OR signed_request_bytes IS NULL)"
+        ).bind(conversation).bind(&seqs).bind(delivery::APPLICATION_ENTRY_KIND)
+         .fetch_all(&mut *tx).await.map_err(|_| EntryReadFacadeError::Storage)?;
+        for row in pruned {
+            let replica = granted
+                .get_mut(&row.seq)
+                .ok_or(EntryReadFacadeError::Invariant)?;
+            let mut local = entry_json(&row)?;
+            if local["entryId"] != replica["entryId"] {
+                return Err(EntryReadFacadeError::Invariant);
+            }
+            preserve_replicated_receipt_on_pruned_local(&mut local, replica);
+            if !replicated_entry_supersedes_local(Some(&local), replica) {
+                *replica = local;
+            }
+        }
+    }
+    let entries = granted.into_values().collect::<Vec<_>>();
+    let cursor = entries
+        .last()
+        .and_then(|e| e["seq"].as_u64())
+        .unwrap_or(after_seq);
+    serde_json::to_vec(&json!({"entries":entries,"hasMore":has_more,"nextAfterSeq":cursor}))
+        .map_err(|_| EntryReadFacadeError::Invariant)
 }
