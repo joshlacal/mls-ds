@@ -315,11 +315,24 @@ async fn a_sequencer_applies_its_homes_account_deletion_relay_exactly_once() {
     assert_eq!(ack_state(&pool, cid).await, [0, 0, 1, 1, 1]);
 
     scope_ds_clock(
-        clock,
+        clock.clone(),
         scope_sim_ds(seq_hooks, async {
             let deleted_at = canonical(current_utc());
             let later = canonical(current_utc() + chrono::TimeDelta::milliseconds(1));
-            let genuine = deletion_relay(&home_key, HOME, SEQ, cid, deleted, &deleted_at);
+            let plain = deletion_relay(&home_key, HOME, SEQ, cid, deleted, &deleted_at);
+            let bad_authority = (StatusCode::FORBIDDEN, "NotAuthorized");
+            assert_refused(&state, HOME, &plain, cid, bad_authority).await;
+            crate::federation::space_read_relay::test_car_builder::cache_deletion_repository(
+                deleted,
+            )
+            .await;
+            let evidence = crate::federation::space_read_relay::test_car_builder::deletion_evidence(
+                deleted,
+                fixture.sender_device_id,
+                [0x17; 16],
+                current_utc(),
+            );
+            let genuine = evidenced_relay(&home_key, &plain, evidence);
             let edited = |edit: &dyn Fn(&mut AccountDeletionRelay)| {
                 let mut relay = genuine.clone();
                 edit(&mut relay);
@@ -409,6 +422,11 @@ async fn a_sequencer_applies_its_homes_account_deletion_relay_exactly_once() {
             for (caller, relay, refusal) in cases {
                 assert_refused(&state, caller, &relay, cid, refusal).await;
             }
+
+            let mut invalid_evidence = genuine.evidence.clone().unwrap();
+            invalid_evidence.revocation_proof = Some(vec![1, 2, 3]);
+            let invalid_proof = evidenced_relay(&home_key, &plain, invalid_evidence);
+            assert_refused(&state, HOME, &invalid_proof, cid, forbidden).await;
 
             // A sequencer without its #mls-receipt-1 signer cannot sequence the
             // signed entry: it answers 503 so the home retries, and changes nothing.
@@ -508,8 +526,28 @@ async fn a_sequencer_applies_its_homes_account_deletion_relay_exactly_once() {
                 "the stored row rebuilds exactly the fanned-out entry"
             );
 
+            // The user resumes sending after the erasure. Delivery of the old operation must
+            // leave the new ciphertext and its receipt available.
+            clock.advance(chrono::TimeDelta::seconds(1));
+            let followup = RelayGroupMutationRequest {
+                conversation_id: cid,
+                endpoint: "blue.catbird.chat.sendMessage".to_owned(),
+                actor_did: deleted.to_owned(),
+                actor_device_id: fixture.sender_device_id,
+                signed_request: fixture.next_sender_signed_request(),
+                signed_request_bytes: None,
+            };
+            let next = sequence_relayed_group_application_send(&state, HOME, &followup)
+                .await
+                .expect("sequence the returning member's message");
+            assert_eq!(next.entry["seq"], json!(seq + 2));
             // A duplicate relay sequences, prunes and queues nothing more.
             let settled = sequencer_state(&pool, cid).await;
+            let mut legacy = genuine.clone();
+            let signature: Signature = home_key.sign(&legacy.encode_signing_bytes(false));
+            legacy.signature =
+                STANDARD.encode(signature.normalize_s().unwrap_or(signature).to_bytes());
+            let body = serde_json::to_vec(&legacy).unwrap();
             let again = accept_account_deletion_relay(&state, HOME, &body)
                 .await
                 .expect("a duplicate relay is accepted");
@@ -521,6 +559,35 @@ async fn a_sequencer_applies_its_homes_account_deletion_relay_exactly_once() {
         }),
     )
     .await;
+}
+
+#[tokio::test]
+async fn a_delayed_first_relay_preserves_messages_after_the_home_deletion() {
+    let db = fresh_fully_migrated_db("chat_fed_relay_").await;
+    let pool = db.connect(4).await;
+    prepare(&pool).await;
+    let (seq_key, home_key) = (key(0x31), key(0x32));
+    let network = Network::new(&[(SEQ, &seq_key), (HOME, &home_key)]);
+    let clock = manual_clock();
+    let seq_hooks = hooks(SEQ, Some(&seq_key), false, &network);
+    let (fixture, state, seq) =
+        relayed_application(&pool, Arc::clone(&seq_hooks), clock.clone(), &seq_key).await;
+    scope_ds_clock(clock, scope_sim_ds(seq_hooks, async {
+        let cid = fixture.conversation_id;
+        let deleted = &fixture.sender_did;
+        let at = current_utc() - chrono::Duration::minutes(1);
+        crate::federation::space_read_relay::test_car_builder::cache_deletion_repository(deleted).await;
+        let evidence = crate::federation::space_read_relay::test_car_builder::deletion_evidence(
+            deleted, fixture.sender_device_id, [0x19; 16], at,
+        );
+        let plain = deletion_relay(&home_key, HOME, SEQ, cid, deleted, &canonical(at));
+        let body = serde_json::to_vec(&evidenced_relay(&home_key, &plain, evidence)).unwrap();
+        let applied = accept_account_deletion_relay(&state, HOME, &body).await.unwrap();
+        assert_eq!(applied, json!({"accepted":true, "sequenced":true, "prunedCount":0}));
+        let kept: bool = sqlx::query_scalar("SELECT accepted_payload_bytes IS NOT NULL AND payload_pruned_at IS NULL FROM chat.entries WHERE conversation_id=$1 AND seq=$2")
+            .bind(cid).bind(seq).fetch_one(&pool).await.unwrap();
+        assert!(kept, "the intervening message remains retrievable");
+    })).await;
 }
 
 /// One production queue-worker pass at `did`.
@@ -707,7 +774,9 @@ async fn a_c33_coordinator_applies_the_deletion_its_transport_only_home_relays()
         for _ in 0..2 {
             let local = scope_sim_ds(
                 Arc::clone(&home_hooks),
-                delete_account_data_with_conversations(&home_pool, deleted, at, None),
+                crate::labyrinth::repo::retention::delete_account_data_with_fixture_authority(
+                    &home_pool, deleted, at, None,
+                ),
             )
             .await
             .unwrap();
@@ -1056,8 +1125,16 @@ async fn a_sequencer_stores_the_relayed_devices_signed_write_and_key_proof_verba
             let at = current_utc();
             let deleted_at = canonical(at);
             let plain = deletion_relay(&home_key, HOME, SEQ, cid, deleted, &deleted_at);
-            let evidence = device_evidence(fixture.sender_device_id, at, Some(vec![0x6B; 4096]))
-                .with_revocation_proof(Some(vec![0x7C; 4096]));
+            crate::federation::space_read_relay::test_car_builder::cache_deletion_repository(
+                deleted,
+            )
+            .await;
+            let evidence = crate::federation::space_read_relay::test_car_builder::deletion_evidence(
+                deleted,
+                fixture.sender_device_id,
+                [0x18; 16],
+                at,
+            );
             let genuine = evidenced_relay(&home_key, &plain, evidence.clone());
             let bad = (StatusCode::BAD_REQUEST, "InvalidRequest");
             let tampered = (StatusCode::FORBIDDEN, "InvalidSignature");

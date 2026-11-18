@@ -14,6 +14,7 @@ use super::*;
 use chrono::SecondsFormat;
 
 use crate::federation::receipt::AccountDeletionEvidence;
+use crate::federation::resolver::{build_resolver_http_client, DsResolver};
 use crate::labyrinth::repo::retention;
 
 pub(crate) const RELAY_ACCOUNT_DELETION_NSID: &str = "blue.catbird.mlsDS.relayAccountDeletion";
@@ -44,6 +45,10 @@ pub(crate) struct AccountDeletionRelay {
 impl AccountDeletionRelay {
     /// Domain-separated, length-prefixed bytes binding every relayed field.
     pub(crate) fn signing_bytes(&self) -> Vec<u8> {
+        self.encode_signing_bytes(true)
+    }
+
+    pub(crate) fn encode_signing_bytes(&self, tagged: bool) -> Vec<u8> {
         let mut bytes = SIGNING_DOMAIN.to_vec();
         for field in [
             &self.home_did,
@@ -67,21 +72,17 @@ impl AccountDeletionRelay {
                 bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
                 bytes.extend_from_slice(field);
             }
-            match &evidence.revocation_proof {
-                Some(revocation_proof) => {
-                    bytes.push(1);
-                    bytes.extend_from_slice(&(revocation_proof.len() as u32).to_be_bytes());
-                    bytes.extend_from_slice(revocation_proof);
+            for field in [
+                &evidence.revocation_proof,
+                &evidence.actor_write.payload_bytes,
+            ] {
+                if tagged {
+                    bytes.push(u8::from(field.is_some()));
                 }
-                None => bytes.push(0),
-            }
-            match &evidence.actor_write.payload_bytes {
-                Some(payload_bytes) => {
-                    bytes.push(1);
-                    bytes.extend_from_slice(&(payload_bytes.len() as u32).to_be_bytes());
-                    bytes.extend_from_slice(payload_bytes);
+                if let Some(field) = field {
+                    bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
+                    bytes.extend_from_slice(field);
                 }
-                None => bytes.push(0),
             }
         }
         bytes
@@ -144,6 +145,10 @@ pub(crate) async fn enqueue_account_deletion_relays(
     }
     let key = service_signing_key()?;
     let deleted_at_text = canonical_instant(deleted_at);
+    let operation_key = match evidence {
+        Some(evidence) => hex::encode(evidence.operation_id().map_err(SignedRelayError::Storage)?),
+        None => deleted_at_text.clone(),
+    };
     for (conversation_id, sequencer) in sequenced_elsewhere {
         let mut relay = AccountDeletionRelay {
             home_did: home_did.clone(),
@@ -159,7 +164,7 @@ pub(crate) async fn enqueue_account_deletion_relays(
             .map_err(|error| SignedRelayError::Storage(error.to_string()))?;
         queue_signed(
             tx,
-            &format!("account-deletion-{conversation_id}-{deleted_did}-{deleted_at_text}"),
+            &format!("account-deletion-{conversation_id}-{deleted_did}-{operation_key}"),
             &relay.sequencer_did,
             RELAY_ACCOUNT_DELETION_NSID,
             &payload,
@@ -191,6 +196,59 @@ async fn relay_account_deletion(
     }
 }
 
+/// Resolve the user's own repository key before any SQL mutation. A home or sequencer
+/// attestation cannot substitute for device authority on a destructive operation.
+pub(super) async fn verify_user_deletion(
+    resolver: &DsResolver,
+    did: &str,
+    evidence: Option<&AccountDeletionEvidence>,
+) -> Result<chrono::DateTime<chrono::Utc>, Response> {
+    let evidence = evidence.ok_or_else(|| denied("account deletion requires device evidence"))?;
+    if evidence.key_proof.is_none() || evidence.revocation_proof.is_none() {
+        return Err(denied("account deletion requires both repository proofs"));
+    }
+    let key = resolver
+        .resolve_did_to_atproto_key(did)
+        .await
+        .map_err(|error| {
+            if error.is_retryable() {
+                unavailable(error)
+            } else {
+                denied("cannot resolve the deleting account's repository key")
+            }
+        })?
+        .ok_or_else(|| denied("missing account repository key"))?;
+    crate::federation::space_read_relay::verify_account_deletion_evidence(did, evidence, &key)
+        .map_err(|_| denied("device deletion authority did not verify"))
+}
+
+/// Record the first scope an authorized operation acquired. Duplicate delivery is an
+/// acknowledgement, including when a former participant no longer needs a sequence entry.
+pub(super) async fn claim_deletion_operation(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    did: &str,
+    evidence: &AccountDeletionEvidence,
+    cutoff: DateTime<Utc>,
+    before_seq: i64,
+) -> Result<bool, Response> {
+    let operation = evidence.operation_id().map_err(|err| invalid(&err))?;
+    let result = sqlx::query(
+        "INSERT INTO chat.account_deletion_operations
+            (conversation_id, deleted_did, operation_id, cutoff, before_seq)
+         VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+    )
+    .bind(conversation_id)
+    .bind(did)
+    .bind(operation.as_slice())
+    .bind(cutoff)
+    .bind(before_seq)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// Apply a relayed account deletion from an authenticated `caller` at this
 /// sequencer exactly as a local deletion, once per deletion.
 pub(crate) async fn accept_account_deletion_relay(
@@ -198,7 +256,7 @@ pub(crate) async fn accept_account_deletion_relay(
     caller: &str,
     body: &[u8],
 ) -> Result<Value, Response> {
-    let relay: AccountDeletionRelay =
+    let mut relay: AccountDeletionRelay =
         serde_json::from_slice(body).map_err(|error| invalid(&error.to_string()))?;
     let deleted_at = DateTime::parse_from_rfc3339(&relay.deleted_at)
         .ok()
@@ -210,8 +268,7 @@ pub(crate) async fn accept_account_deletion_relay(
     }) else {
         return Err(invalid("invalid account deletion relay"));
     };
-    // The device's evidence is the clients' to verify: here only its shape, and
-    // that it was signed within the write window of the home's deletion instant.
+    // Reject malformed evidence before resolving the home and device authorities.
     if let Some(evidence) = &relay.evidence {
         if evidence.actor_write.payload_bytes.is_none() {
             return Err(invalid("actorWrite.payloadBytes is required"));
@@ -230,23 +287,108 @@ pub(crate) async fn accept_account_deletion_relay(
     if relay.home_did != caller || relay.sequencer_did != state.self_did {
         return Err(denied("relay is not bound to this caller and sequencer"));
     }
-    verify_service_signature(&relay.home_did, &relay.signing_bytes(), &relay.signature).await?;
+    if let Err(err) =
+        verify_service_signature(&relay.home_did, &relay.signing_bytes(), &relay.signature).await
+    {
+        // Honor a queued pre-tag envelope only after checking the original service
+        // signature. Every destructive field is independently authenticated below.
+        if err.status() != StatusCode::FORBIDDEN || relay.evidence.is_none() {
+            return Err(err);
+        }
+        verify_service_signature(
+            &relay.home_did,
+            &relay.encode_signing_bytes(false),
+            &relay.signature,
+        )
+        .await?;
+    }
 
     if participant_home(state, relay.conversation_id, &relay.deleted_did).await? != caller {
         return Err(denied("caller is not the participant's home"));
     }
 
+    let resolver = DsResolver::new(
+        state.pool.clone(),
+        build_resolver_http_client(),
+        state.self_did.clone(),
+        crate::identity::self_endpoint(),
+        None,
+        300,
+    );
+    let evidence = relay
+        .evidence
+        .as_mut()
+        .ok_or_else(|| denied("account deletion requires device evidence"))?;
+    if evidence.revocation_proof.is_none() {
+        // A pre-Track-A outbox could carry a device write and key CAR but no revocation CAR.
+        // Recover its missing authority from the account's PDS; unresolved legacy entries remain unpruned.
+        let key_car = evidence
+            .key_proof
+            .as_deref()
+            .ok_or_else(|| denied("missing deleting device key proof"))?;
+        let write: crate::labyrinth::auth::WriteBodyWire =
+            serde_json::from_slice(&evidence.actor_write.write_body)
+                .map_err(|_| denied("malformed deleting device write"))?;
+        let repository_key = resolver
+            .resolve_did_to_atproto_key(&relay.deleted_did)
+            .await
+            .map_err(|error| {
+                if error.is_retryable() {
+                    unavailable(error)
+                } else {
+                    denied("cannot resolve account repository key")
+                }
+            })?
+            .ok_or_else(|| denied("missing account repository key"))?;
+        let (device_key, _) = crate::federation::space_read_relay::chat_device_key_and_creation(
+            key_car,
+            &relay.deleted_did,
+            &write.actor_device_id,
+            &repository_key,
+        )
+        .map_err(|_| denied("invalid deleting device proof"))?;
+        evidence.revocation_proof = Some(
+            crate::federation::space_read_relay::fetch_chat_device_revocation_proof(
+                &resolver,
+                &relay.deleted_did,
+                &write.actor_device_id,
+                &device_key,
+                &evidence.operation_id().map_err(|e| invalid(&e))?,
+                evidence.signed_at().map_err(|e| invalid(&e))?,
+            )
+            .await
+            .map_err(|error| match error {
+                crate::federation::space_read_relay::SpaceRelayError::DeviceRevoked(_) => {
+                    denied("device revocation rejected deletion")
+                }
+                _ => unavailable(error),
+            })?,
+        );
+    }
+    let signed_at = verify_user_deletion(&resolver, &relay.deleted_did, Some(evidence)).await?;
+    let cutoff = deleted_at
+        .min(signed_at + chrono::Duration::seconds(crate::labyrinth::auth::WRITE_SKEW_SECONDS));
     let now = crate::sim_hooks::current_utc();
     let mut tx = state.pool.begin().await.map_err(storage)?;
-    let sequenced_here: Option<bool> = sqlx::query_scalar(
-        "SELECT NOT is_remote FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE",
+    let before_seq: Option<i64> = sqlx::query_scalar(
+        "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id = $1 AND NOT is_remote FOR UPDATE",
     )
     .bind(relay.conversation_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(storage)?;
-    if sequenced_here != Some(true) {
-        return Err(missing("conversation is not sequenced here"));
+    let before_seq = before_seq.ok_or_else(|| missing("conversation is not sequenced here"))?;
+    if !claim_deletion_operation(
+        &mut tx,
+        relay.conversation_id,
+        &relay.deleted_did,
+        evidence,
+        cutoff,
+        before_seq,
+    )
+    .await?
+    {
+        return Ok(json!({"accepted": true, "sequenced": false, "prunedCount": 0}));
     }
     // A deletion this sequencer cannot sign answers 503, so the home's relay retries.
     let sequenced = retention::sequence_account_deleted_entry(
@@ -261,10 +403,12 @@ pub(crate) async fn accept_account_deletion_relay(
     .await
     .map_err(|error| s2s_err(error.status(), error.name(), error.message()))?
     .is_some();
-    let pruned = retention::prune_account_ciphertext(
+    let pruned = retention::prune_account_ciphertext_before(
         &mut tx,
         relay.conversation_id,
         &relay.deleted_did,
+        before_seq,
+        cutoff,
         now,
     )
     .await

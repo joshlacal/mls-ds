@@ -513,6 +513,17 @@ pub(crate) async fn accept_transport_control_entry(
             authority
                 .verify(&key, &deletion)
                 .map_err(|error| s2s_err(StatusCode::FORBIDDEN, "InvalidSignature", error))?;
+            let signed_at = super::account_deletion_relay::verify_user_deletion(
+                &resolver,
+                &deletion.deleted_did,
+                deletion.evidence.as_ref(),
+            )
+            .await?;
+            if signed_at - deletion.deleted_at
+                > chrono::Duration::seconds(crate::labyrinth::auth::WRITE_SKEW_SECONDS)
+            {
+                return Err(denied("device deletion postdates sequencer entry"));
+            }
             Some(deletion)
         }
         Err(_) => None,
@@ -658,20 +669,46 @@ async fn prune_deleted_account_payloads(
     deletion: &AccountDeletion,
     now: DateTime<Utc>,
 ) -> Result<usize, Response> {
-    let pruned = delivery::prune_transport_applications_sent_by(
+    let evidence = deletion
+        .evidence
+        .as_ref()
+        .ok_or_else(|| denied("missing deletion authority"))?;
+    let signed_at = evidence.signed_at().map_err(|err| invalid(&err))?;
+    // On a C33 mirror receivedAt is the sequencer instant, which may lag the original home.
+    // The peer only removes entries within both the signed time and ordered entry boundary.
+    let cutoff = deletion
+        .deleted_at
+        .min(signed_at + chrono::Duration::seconds(crate::labyrinth::auth::WRITE_SKEW_SECONDS));
+    if !super::account_deletion_relay::claim_deletion_operation(
         tx,
         deletion.conversation_id,
         &deletion.deleted_did,
+        evidence,
+        cutoff,
+        deletion.seq,
+    )
+    .await?
+    {
+        return Ok(0);
+    }
+    let pruned = delivery::prune_transport_applications_sent_before(
+        tx,
+        deletion.conversation_id,
+        &deletion.deleted_did,
+        deletion.seq,
+        cutoff,
         now,
     )
     .await
     .map_err(|error| storage(format!("{error:?}")))?;
     // The deleted account's direct-request opening carries application ciphertext
     // too (O7): its copies go here as well, outside the application count.
-    crate::chat_protocol::repository::direct_request_opening::prune_transport_openings_sent_by(
+    crate::chat_protocol::repository::direct_request_opening::prune_transport_openings_sent_before(
         tx,
         deletion.conversation_id,
         &deletion.deleted_did,
+        deletion.seq,
+        cutoff,
         now,
     )
     .await

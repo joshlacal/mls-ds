@@ -1003,6 +1003,8 @@ struct GroupStateRequest {
     conversation_id: Uuid,
     actor_did: String,
     actor_device_id: Uuid,
+    #[serde(default)]
+    deletions_after: Option<i64>,
 }
 
 /// Read a remote conversation's state from its sequencer for a local device: a
@@ -1014,6 +1016,16 @@ pub(crate) async fn try_relay_group_state(
     actor_did: &str,
     actor_device_id: Uuid,
     conversation_id: Uuid,
+) -> Result<Option<Vec<u8>>, GroupRelayError> {
+    try_relay_group_state_page(pool, actor_did, actor_device_id, conversation_id, None).await
+}
+
+pub(crate) async fn try_relay_group_state_page(
+    pool: &DbPool,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    conversation_id: Uuid,
+    deletions_after: Option<i64>,
 ) -> Result<Option<Vec<u8>>, GroupRelayError> {
     let sequencer: Option<String> = sqlx::query_scalar(
         "SELECT sequencer_ds FROM chat.conversations \
@@ -1034,11 +1046,14 @@ pub(crate) async fn try_relay_group_state(
     let Some(sequencer) = sequencer else {
         return Ok(None);
     };
-    let payload = json!({
+    let mut payload = json!({
         "conversationId": conversation_id,
         "actorDid": actor_did,
         "actorDeviceId": actor_device_id,
     });
+    if let Some(after) = deletions_after {
+        payload["deletionsAfter"] = json!(after);
+    }
     let (status, bytes) = call_home_response(pool, &sequencer, GROUP_STATE_NSID, &payload)
         .await
         .map_err(GroupRelayError::from_local)?;
@@ -1063,6 +1078,16 @@ async fn get_group_state(
         Ok(request) => request,
         Err(e) => return s2s_err(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()),
     };
+    if request
+        .deletions_after
+        .is_some_and(|n| !(0..=9_007_199_254_740_991).contains(&n))
+    {
+        return s2s_err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "invalid deletionsAfter",
+        );
+    }
     match resolver(&state.pool)
         .resolve_authoritative_ds(&request.actor_did)
         .await
@@ -1103,6 +1128,7 @@ async fn get_group_state(
         principal,
         request.actor_device_id,
         request.conversation_id,
+        request.deletions_after,
     )
     .await
     .unwrap_or_else(IntoResponse::into_response)

@@ -306,7 +306,14 @@ impl Pair {
             seq,
             entry_id,
             deleted_at,
-            evidence: None,
+            evidence: Some(
+                crate::federation::space_read_relay::test_car_builder::deletion_evidence(
+                    deleted_did,
+                    uuid::uuid!("00000000-0000-4000-8000-000000000001"),
+                    *entry_id.as_bytes(),
+                    deleted_at,
+                ),
+            ),
         };
         deletion.entry(&signer.sign_account_deletion(&deletion).unwrap())
     }
@@ -1591,7 +1598,7 @@ async fn survivor_metadata_never_resolves_or_queues_to_a_deleted_peer() {
     scope_ds_clock(p.clock.clone(), async {
         let sequenced = scope_sim_ds(
             Arc::clone(&p.seq_hooks),
-            crate::labyrinth::repo::retention::delete_account_data_with_conversations(
+            crate::labyrinth::repo::retention::delete_account_data_with_fixture_authority(
                 &p.seq_pool,
                 p.deleted(),
                 current_utc(),
@@ -1871,7 +1878,12 @@ async fn a_c33_coordinator_delivers_its_own_partys_deletion_to_the_peers_home() 
         // was not resolved before the transaction, the deletion commits nothing.
         let unsigned = scope_sim_ds(
             Arc::clone(&p.seq_hooks),
-            delete_account_data_with_conversations(&p.seq_pool, &deleted, at, None),
+            crate::labyrinth::repo::retention::delete_account_data_with_fixture_authority(
+                &p.seq_pool,
+                &deleted,
+                at,
+                None,
+            ),
         )
         .await
         .expect_err("no receipt signer");
@@ -1904,7 +1916,12 @@ async fn a_c33_coordinator_delivers_its_own_partys_deletion_to_the_peers_home() 
         assert_eq!(
             scope_sim_ds(
                 Arc::clone(&p.seq_hooks),
-                delete_account_data_with_conversations(&p.seq_pool, &deleted, at, Some(&p.receipt)),
+                crate::labyrinth::repo::retention::delete_account_data_with_fixture_authority(
+                    &p.seq_pool,
+                    &deleted,
+                    at,
+                    Some(&p.receipt)
+                ),
             )
             .await
             .unwrap(),
@@ -1961,7 +1978,11 @@ async fn a_c33_coordinator_delivers_its_own_partys_deletion_to_the_peers_home() 
                 seq: seq + 1,
                 entry_id,
                 deleted_at: at,
-                evidence: None,
+                evidence: Some(
+                    crate::federation::space_read_relay::test_car_builder::local_deletion_evidence(
+                        &deleted, at
+                    )
+                ),
             }
         );
         authority
@@ -2208,13 +2229,11 @@ async fn a_c33_deletion_carries_the_devices_signed_write_and_key_proof_to_the_pe
     let deleted = p.deleted().to_owned();
     scope_ds_clock(p.clock.clone(), async {
         let at = current_utc();
-        let evidence = crate::federation::receipt::AccountDeletionEvidence::signed_for_test(
-            &ed25519_dalek::SigningKey::from_bytes(&p.fixture.sender_ed25519_seed),
+        let evidence = crate::federation::space_read_relay::test_car_builder::deletion_evidence(
+            &deleted,
             p.fixture.sender_device_id,
             [0xC3; 16],
             at,
-            0,
-            Some(vec![0x3C; 3000]),
         );
         for _ in 0..2 {
             assert!(

@@ -72,6 +72,51 @@ pub async fn purge_account_with_recovery(
     evidence: Option<&AccountDeletionEvidence>,
     recovery_journal: Option<&RecoveryTombstones>,
 ) -> LabyrinthResult<usize> {
+    let mut tx = conn.begin().await?;
+    if let Some(evidence) = evidence {
+        let operation = evidence.operation_id().map_err(LabyrinthError::invalid)?;
+        // Preserve idempotency after the response expires without retaining the erased
+        // account identifier or a per-account history in the home ledger.
+        let operation_digest = Sha256::new()
+            .chain_update(b"CATBIRD-LABYRINTH-ACCOUNT-ERASURE-V1\0")
+            .chain_update(operation)
+            .chain_update(did.as_bytes())
+            .finalize();
+        let claimed = sqlx::query(
+            "INSERT INTO labyrinth.account_erasure_operations(operation_digest, cutoff)
+             VALUES ($1,$2) ON CONFLICT DO NOTHING",
+        )
+        .bind(operation_digest.as_slice())
+        .bind(at)
+        .execute(&mut *tx)
+        .await?;
+        if claimed.rows_affected() == 0 {
+            return Ok(0);
+        }
+    }
+    let sequenced = purge_new_account_operation(
+        &mut tx,
+        did,
+        at,
+        receipt_signer,
+        c33_peers,
+        evidence,
+        recovery_journal,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(sequenced)
+}
+
+async fn purge_new_account_operation(
+    conn: &mut PgConnection,
+    did: &str,
+    at: DateTime<Utc>,
+    receipt_signer: Option<&I13ReceiptSigner>,
+    c33_peers: &C33PeerHomes,
+    evidence: Option<&AccountDeletionEvidence>,
+    recovery_journal: Option<&RecoveryTombstones>,
+) -> LabyrinthResult<usize> {
     if recovery_journal.is_none() {
         let live: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM labyrinth.recovery_shares \
@@ -158,6 +203,22 @@ pub async fn delete_account_data_with_conversations(
     receipt_signer: Option<&I13ReceiptSigner>,
 ) -> LabyrinthResult<usize> {
     delete_account_data_with_evidence(pool, did, at, receipt_signer, None).await
+}
+
+/// Exercise the same proven evidence used by a device without requiring a separate PDS process.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn delete_account_data_with_fixture_authority(
+    pool: &DbPool,
+    did: &str,
+    at: DateTime<Utc>,
+    receipt_signer: Option<&I13ReceiptSigner>,
+) -> LabyrinthResult<usize> {
+    use crate::federation::space_read_relay::test_car_builder::{
+        cache_deletion_repository, local_deletion_evidence,
+    };
+    cache_deletion_repository(did).await;
+    let evidence = local_deletion_evidence(did, at);
+    delete_account_data_with_evidence(pool, did, at, receipt_signer, Some(&evidence)).await
 }
 
 /// [`delete_account_data_with_conversations`] for a deletion its device signed:
@@ -298,6 +359,17 @@ pub(crate) async fn prune_account_ciphertext(
     did: &str,
     at: DateTime<Utc>,
 ) -> Result<usize, SignedRelayError> {
+    prune_account_ciphertext_before(tx, conversation_id, did, i64::MAX, at, at).await
+}
+
+pub(crate) async fn prune_account_ciphertext_before(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    did: &str,
+    before_seq: i64,
+    cutoff: DateTime<Utc>,
+    at: DateTime<Utc>,
+) -> Result<usize, SignedRelayError> {
     let held: Vec<(i64, i64)> = sqlx::query_as(
         "SELECT e.generation, e.seq \
            FROM chat.entries e \
@@ -305,13 +377,15 @@ pub(crate) async fn prune_account_ciphertext(
           WHERE e.conversation_id = $1 \
             AND NOT c.is_remote \
             AND e.actor_did = $2 \
-            AND e.entry_kind = $3 \
+            AND e.entry_kind = $3 AND e.seq < $4 AND e.received_at <= $5 \
             AND e.payload_pruned_at IS NULL \
           ORDER BY e.generation, e.seq",
     )
     .bind(conversation_id)
     .bind(did)
     .bind(delivery::APPLICATION_ENTRY_KIND)
+    .bind(before_seq)
+    .bind(cutoff)
     .fetch_all(&mut **tx)
     .await?;
     let mut pruned_count = 0;
@@ -335,6 +409,8 @@ pub(crate) async fn prune_account_ciphertext(
         tx,
         conversation_id,
         did,
+        before_seq,
+        cutoff,
         at,
     )
     .await?;
@@ -398,8 +474,8 @@ async fn sequence_account_deleted_entries(
 /// Sequence `accountDeletedEntry(did)` in one active conversation this DS sequences where
 /// `did` still holds active membership, with `receipt_signer`'s `sequencerAuthority`, and
 /// queue its ordered delivery to every remote home in `tx`. The entry id derives from the
-/// deletion instant `deleted_at`, so replaying one deletion (a duplicate relay) sequences
-/// nothing more; `at` stamps the entry. Returns the exact signed entry it sequenced; one
+/// verified operation, falling back to the original deletion instant for legacy entries.
+/// The sequencer's own `at` stamps the entry. Returns the exact signed entry it sequenced; one
 /// it owes but cannot sign is refused (`SignerUnavailable`) before any write.
 pub(crate) async fn sequence_account_deleted_entry(
     tx: &mut Transaction<'_, Postgres>,
@@ -423,25 +499,48 @@ pub(crate) async fn sequence_account_deleted_entry(
     let Some((generation, state_version, seq)) = head else {
         return Ok(None);
     };
-    let entry_id = account_deleted_entry_id(conversation_id, did, deleted_at);
-    let (member, already_sequenced): (bool, bool) = sqlx::query_as(
+    let legacy_id = account_deleted_entry_id(conversation_id, did, deleted_at);
+    // A retried operation keeps its entry ID even when re-signed at another instant.
+    let entry_id = match evidence {
+        Some(evidence) => {
+            let operation = evidence.operation_id().map_err(LabyrinthError::invalid)?;
+            let mut hash = Sha256::new();
+            hash.update(b"CATBIRD-CHAT-ACCOUNT-DELETION-OPERATION-ID-V1\0");
+            hash.update(conversation_id.as_bytes());
+            hash.update(operation);
+            hash.update(did.as_bytes());
+            let mut id = [0; 16];
+            id.copy_from_slice(&hash.finalize()[..16]);
+            uuid::Builder::from_random_bytes(id).into_uuid()
+        }
+        None => legacy_id,
+    };
+    let (member, already_sequenced, legacy_fields): (bool, bool, Option<Vec<u8>>) = sqlx::query_as(
         "SELECT EXISTS(SELECT 1 FROM chat.participants \
                         WHERE conversation_id = $1 AND user_did = $2 \
                           AND current_membership AND status = 'active'), \
                 EXISTS(SELECT 1 FROM chat.entries \
-                        WHERE entry_id = $3 \
-                           OR (conversation_id = $1 \
-                               AND message_id IS NULL \
-                               AND entry_kind = 'blue.catbird.chat.defs#accountDeletedEntry' \
-                               AND actor_did = $2))",
+                        WHERE entry_id = $3),
+                (SELECT server_fields_bytes FROM chat.entries WHERE entry_id = $4 AND entry_id <> $3)",
     )
     .bind(conversation_id)
     .bind(did)
     .bind(entry_id)
+    .bind(legacy_id)
     .fetch_one(&mut **tx)
     .await?;
     if !member || already_sequenced {
         return Ok(None);
+    }
+    if let (Some(bytes), Some(evidence)) = (legacy_fields, evidence) {
+        let fields: AccountDeletedServerFields =
+            serde_ipld_dagcbor::from_slice(&bytes).map_err(|_| LabyrinthError::internal())?;
+        if fields.actor_write.as_ref() == Some(&evidence.actor_write)
+            && fields.key_proof == evidence.key_proof
+            && fields.revocation_proof == evidence.revocation_proof
+        {
+            return Ok(None);
+        }
     }
     let actor_leaf: Option<(Uuid, String, i64)> = sqlx::query_as(
         "SELECT md.device_id, md.leaf_key_id, md.leaf_auth_generation \

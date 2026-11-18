@@ -266,7 +266,7 @@ impl RelayedPair {
     async fn relay_deletion(&self) -> i64 {
         scope_sim_ds(
             Arc::clone(&self.home_hooks),
-            delete_account_data_with_conversations(
+            crate::labyrinth::repo::retention::delete_account_data_with_fixture_authority(
                 &self.home_pool,
                 &self.fixture.sender_did,
                 current_utc(),
@@ -568,7 +568,7 @@ async fn a_relay_deleted_partys_home_is_owed_no_later_deletion_or_close() {
 
         let sequenced = scope_sim_ds(
             Arc::clone(&p.seq_hooks),
-            delete_account_data_with_conversations(
+            crate::labyrinth::repo::retention::delete_account_data_with_fixture_authority(
                 &p.seq_pool,
                 &p.fixture.recipient_did,
                 current_utc(),
@@ -830,7 +830,7 @@ async fn a_c33_senders_transport_only_home_relays_its_state_read_to_the_coordina
     scope_ds_clock(p.clock.clone(), async {
         let sequenced = scope_sim_ds(
             Arc::clone(&p.seq_hooks),
-            delete_account_data_with_conversations(
+            crate::labyrinth::repo::retention::delete_account_data_with_fixture_authority(
                 &p.seq_pool,
                 &f.recipient_did,
                 current_utc(),
@@ -855,6 +855,7 @@ async fn a_c33_senders_transport_only_home_relays_its_state_read_to_the_coordina
                 VerifiedServicePrincipal::for_federated_s2s(&f.sender_did, STATE),
                 f.sender_device_id,
                 cid,
+                None,
             ),
         )
         .await
@@ -1137,7 +1138,7 @@ async fn a_transport_home_relays_to_its_recorded_coordinator_and_replays_pruned_
         p.store(cid, &p.message).await;
         scope_sim_ds(
             Arc::clone(&p.seq_hooks),
-            delete_account_data_with_conversations(
+            crate::labyrinth::repo::retention::delete_account_data_with_fixture_authority(
                 &p.seq_pool,
                 p.deleted(),
                 current_utc(),

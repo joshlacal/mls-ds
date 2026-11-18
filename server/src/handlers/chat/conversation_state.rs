@@ -12,7 +12,7 @@ use crate::{
     chat_protocol::{
         error::{ChatEndpoint, ChatProtocolErrorCode},
         repository::conversation::{
-            read_conversation_state_for_admission, ConversationStateReadError,
+            read_conversation_state_page_for_admission, ConversationStateReadError,
         },
         validation::{CanonicalHttpMethod, CanonicalUuidV4},
     },
@@ -42,7 +42,7 @@ async fn get_conversation_state(
     query: Option<&str>,
 ) -> Result<Response, ChatFailure> {
     context::require_cutover(runtime, ENDPOINT)?;
-    let (actor_device_id, conversation_id) = parse_query(query)?;
+    let (actor_device_id, conversation_id, deletions_after) = parse_query(query)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let (admission, subject) = context::admit_unsigned_read_for_subject(
         pool,
@@ -56,8 +56,16 @@ async fn get_conversation_state(
     // A remote group's roster and coordinates belong to its sequencer, and a
     // C33 pair's to its coordinator when this DS homes the pair's sender only.
     if let Ok(device_id) = uuid::Uuid::parse_str(&actor_device_id) {
-        use crate::federation::group_relay::{try_relay_group_state, GroupRelayError};
-        match try_relay_group_state(pool, &subject, device_id, conversation_id).await {
+        use crate::federation::group_relay::{try_relay_group_state_page, GroupRelayError};
+        match try_relay_group_state_page(
+            pool,
+            &subject,
+            device_id,
+            conversation_id,
+            deletions_after,
+        )
+        .await
+        {
             Ok(Some(bytes)) => return Ok(context::json_ok(bytes)),
             Ok(None) => {}
             Err(GroupRelayError::Rejected(code)) => {
@@ -86,7 +94,10 @@ async fn get_conversation_state(
                 .fetch_one(&mut *conn)
                 .await
                 .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-                if standing == RemoteGroupStanding::IndexOnly || !mirrored {
+                if deletions_after.is_some()
+                    || standing == RemoteGroupStanding::IndexOnly
+                    || !mirrored
+                {
                     tracing::warn!(
                         ?error,
                         "sequencer state read unavailable without a home mirror"
@@ -102,9 +113,14 @@ async fn get_conversation_state(
         }
     }
 
-    let response = read_conversation_state_for_admission(pool, admission, conversation_id)
-        .await
-        .map_err(facade_failure)?;
+    let response = read_conversation_state_page_for_admission(
+        pool,
+        admission,
+        conversation_id,
+        deletions_after,
+    )
+    .await
+    .map_err(facade_failure)?;
     Ok(context::json_ok(response.into_response_bytes()))
 }
 
@@ -114,13 +130,19 @@ pub(crate) async fn execute_federated_read(
     principal: crate::auth::VerifiedServicePrincipal,
     actor_device_id: uuid::Uuid,
     conversation_id: uuid::Uuid,
+    deletions_after: Option<i64>,
 ) -> Result<Response, ChatFailure> {
     let admission =
         context::admit_federated_read(pool, ENDPOINT, principal, &actor_device_id.to_string())
             .await?;
-    let response = read_conversation_state_for_admission(pool, admission, conversation_id)
-        .await
-        .map_err(facade_failure)?;
+    let response = read_conversation_state_page_for_admission(
+        pool,
+        admission,
+        conversation_id,
+        deletions_after,
+    )
+    .await
+    .map_err(facade_failure)?;
     Ok(context::json_ok(response.into_response_bytes()))
 }
 
@@ -139,13 +161,17 @@ fn facade_failure(error: ConversationStateReadError) -> ChatFailure {
         ConversationStateReadError::DeviceRevoked => {
             ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::DeviceRevoked)
         }
+        ConversationStateReadError::PaginationRequired => {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::ProtocolUpgradeRequired)
+        }
         ConversationStateReadError::Storage | ConversationStateReadError::Invariant => {
             ChatFailure::invariant(ENDPOINT)
         }
     }
 }
 
-fn parse_query(query: Option<&str>) -> Result<(String, uuid::Uuid), ChatFailure> {
+fn parse_query(query: Option<&str>) -> Result<(String, uuid::Uuid, Option<i64>), ChatFailure> {
+    let mut deletions_after = None;
     let mut actor_device_id = None;
     let mut conversation_id = None;
     for pair in query
@@ -178,6 +204,17 @@ fn parse_query(query: Option<&str>) -> Result<(String, uuid::Uuid), ChatFailure>
                 })?;
                 conversation_id = Some(uuid);
             }
+            "deletionsAfter" if deletions_after.is_none() => {
+                deletions_after = Some(
+                    value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|n| (0..=9_007_199_254_740_991).contains(n))
+                        .ok_or_else(|| {
+                            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                        })?,
+                );
+            }
             "include" => {}
             _ => {
                 return Err(ChatFailure::protocol(
@@ -191,7 +228,7 @@ fn parse_query(query: Option<&str>) -> Result<(String, uuid::Uuid), ChatFailure>
         .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
     let conversation_id = conversation_id
         .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-    Ok((actor_device_id, conversation_id))
+    Ok((actor_device_id, conversation_id, deletions_after))
 }
 
 fn percent_decode(value: &str) -> Option<String> {

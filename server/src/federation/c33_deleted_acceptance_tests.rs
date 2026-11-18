@@ -665,7 +665,7 @@ impl PendingPair {
     async fn relay_requester_deletion(&self) {
         scope_sim_ds(
             Arc::clone(&self.home_hooks),
-            delete_account_data_with_conversations(
+            crate::labyrinth::repo::retention::delete_account_data_with_fixture_authority(
                 &self.home_pool,
                 &self.fixture.actor_did,
                 current_utc(),
@@ -691,7 +691,7 @@ impl PendingPair {
         assert_eq!(
             scope_sim_ds(
                 Arc::clone(&self.seq_hooks),
-                delete_account_data_with_conversations(
+                crate::labyrinth::repo::retention::delete_account_data_with_fixture_authority(
                     &self.seq_pool,
                     &self.fixture.actor_did,
                     current_utc(),

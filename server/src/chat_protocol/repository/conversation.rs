@@ -30,6 +30,8 @@ use super::super::{
 pub(crate) enum ConversationStateReadError {
     #[error("conversation not found")]
     ConversationNotFound,
+    #[error("client must opt into paginated deletion inventory")]
+    PaginationRequired,
     #[error("not entitled")]
     NotEntitled,
     #[error("outside membership interval")]
@@ -58,6 +60,15 @@ pub(crate) async fn read_conversation_state_for_admission(
     admission: VerifiedReadAdmission,
     conversation_id: Uuid,
 ) -> Result<CanonicalConversationStateResponse, ConversationStateReadError> {
+    read_conversation_state_page_for_admission(pool, admission, conversation_id, None).await
+}
+
+pub(crate) async fn read_conversation_state_page_for_admission(
+    pool: &sqlx::PgPool,
+    admission: VerifiedReadAdmission,
+    conversation_id: Uuid,
+    deletions_after: Option<i64>,
+) -> Result<CanonicalConversationStateResponse, ConversationStateReadError> {
     let attempt = into_single_read_admission(admission, OrdinaryReadEndpoint::GetConversationState)
         .map_err(|_| ConversationStateReadError::Invariant)?
         .into_attempt();
@@ -71,8 +82,13 @@ pub(crate) async fn read_conversation_state_for_admission(
         .await
         .map_err(|_| ConversationStateReadError::Storage)?;
 
-    let result =
-        read_conversation_state_in_transaction(&mut transaction, attempt, conversation_id).await;
+    let result = read_conversation_state_in_transaction(
+        &mut transaction,
+        attempt,
+        conversation_id,
+        deletions_after,
+    )
+    .await;
     let _ = transaction.rollback().await;
     result
 }
@@ -81,6 +97,7 @@ async fn read_conversation_state_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
     conversation_id: Uuid,
+    deletions_after: Option<i64>,
 ) -> Result<CanonicalConversationStateResponse, ConversationStateReadError> {
     let device = lock_read_device_authority_once(transaction, attempt)
         .await
@@ -128,16 +145,17 @@ async fn read_conversation_state_in_transaction(
             recovery::load_pending_leaf_recoveries(transaction, &authority).await?;
         // Deletion evidence is current-member material, leaf or not: a fresh device of a
         // member DID needs it to hide restored history it can never read entries for.
-        let account_deletions = if established {
-            load_account_deletions(transaction, conversation_id).await?
+        let (account_deletions, deletions_cursor) = if established {
+            load_account_deletion_page(transaction, conversation_id, deletions_after).await?
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
 
         return conversation_state_response(
             catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
                 GetConversationStateOutput {
                     account_deletions,
+                    deletions_cursor,
                     pending_leave_requests,
                     pending_leaf_recovery_requests: Some(pending_leaf_recovery_requests),
                     pending_reset_requests,
@@ -178,16 +196,17 @@ async fn read_conversation_state_in_transaction(
         .await
         .map_err(|_| ConversationStateReadError::Storage)?;
 
-    let account_deletions = if member {
-        load_account_deletions(transaction, conversation_id).await?
+    let (account_deletions, deletions_cursor) = if member {
+        load_account_deletion_page(transaction, conversation_id, deletions_after).await?
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
 
     conversation_state_response(
         catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
             GetConversationStateOutput {
                 account_deletions,
+                deletions_cursor,
                 pending_leave_requests: Vec::new(),
                 pending_leaf_recovery_requests: Some(Vec::new()),
                 pending_reset_requests: Vec::new(),
@@ -237,28 +256,51 @@ pub(crate) async fn load_account_deletions(
     Vec<catbird_atproto::generated::blue_catbird::chat::AccountDeletedEntry>,
     ConversationStateReadError,
 > {
+    Ok(
+        load_account_deletion_page(transaction, conversation_id, None)
+            .await?
+            .0,
+    )
+}
+
+pub(crate) async fn load_account_deletion_page(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    after: Option<i64>,
+) -> Result<
+    (
+        Vec<catbird_atproto::generated::blue_catbird::chat::AccountDeletedEntry>,
+        Option<i64>,
+    ),
+    ConversationStateReadError,
+> {
+    const PAGE_SIZE: usize = 100;
     let sequenced: Vec<(i64, Uuid, DateTime<Utc>, Vec<u8>)> = sqlx::query_as(
         "SELECT seq, entry_id, received_at, server_fields_bytes FROM chat.entries \
-          WHERE conversation_id = $1 AND entry_kind = $2 ORDER BY seq",
+          WHERE conversation_id = $1 AND entry_kind = $2 AND seq > $3 ORDER BY seq LIMIT 101",
     )
     .bind(conversation_id)
     .bind(ACCOUNT_DELETED_ENTRY_KIND)
+    .bind(after.unwrap_or(0))
     .fetch_all(&mut **transaction)
     .await
     .map_err(|_| ConversationStateReadError::Storage)?;
     // Application rows carry their message id, and a replicated deletion is never
     // longer than its entry bound: every other row is skipped by those stored
     // columns alone, without detoasting its bytes.
-    let replicated: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT entry_bytes FROM chat.direct_request_transport_entries \
-          WHERE conversation_id = $1 AND application_message_id IS NULL \
-            AND octet_length(entry_bytes) <= $3 \
-            AND position($2::bytea IN entry_bytes) > 0 \
-          ORDER BY seq",
+    let replicated: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT seq, entry_bytes FROM chat.direct_request_transport_entries
+          WHERE conversation_id = $1 AND application_message_id IS NULL AND seq > $4
+            AND CASE WHEN octet_length(entry_bytes) <= $3 AND position($2::bytea IN entry_bytes) > 0
+                     THEN convert_from(entry_bytes, 'UTF8')::jsonb ->> '$type' = $5
+                     ELSE false END
+          ORDER BY seq LIMIT 101",
     )
     .bind(conversation_id)
     .bind(format!("\"{ACCOUNT_DELETED_ENTRY_KIND}\"").into_bytes())
     .bind(crate::federation::receipt::ACCOUNT_DELETED_ENTRY_MAX_BYTES as i32)
+    .bind(after.unwrap_or(0))
+    .bind(ACCOUNT_DELETED_ENTRY_KIND)
     .fetch_all(&mut **transaction)
     .await
     .map_err(|_| ConversationStateReadError::Storage)?;
@@ -273,33 +315,39 @@ pub(crate) async fn load_account_deletions(
             fields.entry(conversation_id, seq, entry_id, received_at),
         );
     }
-    for bytes in replicated {
+    for (seq, bytes) in replicated {
         let entry: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| ConversationStateReadError::Invariant)?;
-        if entry.get("$type").and_then(serde_json::Value::as_str)
-            != Some(ACCOUNT_DELETED_ENTRY_KIND)
-        {
-            continue;
-        }
         // Its home verified the authority before storing it; it must still be exact.
         let (deletion, _) = crate::federation::receipt::AccountDeletion::from_entry(&entry)
             .map_err(|_| ConversationStateReadError::Invariant)?;
-        if deletion.conversation_id != conversation_id {
+        if deletion.conversation_id != conversation_id || deletion.seq != seq {
             return Err(ConversationStateReadError::Invariant);
         }
-        by_seq.insert(deletion.seq, entry);
+        if by_seq.get(&seq).is_some_and(|existing| existing != &entry) {
+            return Err(ConversationStateReadError::Invariant);
+        }
+        by_seq.insert(seq, entry);
     }
-    // ponytail: a conversation past 100 deletions exceeds the lexicon cap; page
-    // accountDeletions if one ever nears it.
-    by_seq
+    let next = if by_seq.len() > PAGE_SIZE {
+        if after.is_none() {
+            return Err(ConversationStateReadError::PaginationRequired);
+        }
+        by_seq.keys().nth(PAGE_SIZE - 1).copied()
+    } else {
+        None
+    };
+    let page = by_seq
         .into_values()
+        .take(PAGE_SIZE)
         .map(|mut entry| {
             if let Some(object) = entry.as_object_mut() {
                 object.remove("$type");
             }
             serde_json::from_value(entry).map_err(|_| ConversationStateReadError::Invariant)
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((page, next))
 }
 
 /// Present one `getConversationState` output.
@@ -314,8 +362,9 @@ fn conversation_state_response(
 ) -> Result<CanonicalConversationStateResponse, ConversationStateReadError> {
     let Some(request) = &output.state.direct_request else {
         return Ok(CanonicalConversationStateResponse {
-            bytes: canonical_conversation_state_response(
+            bytes: canonical_conversation_state_response_page(
                 &output.account_deletions,
+                output.deletions_cursor,
                 &output.state,
                 output
                     .pending_leaf_recovery_requests
@@ -367,6 +416,24 @@ fn canonical_conversation_state_response(
     pending_leave_requests: &[catbird_atproto::generated::blue_catbird::chat::LeaveRequestView],
     pending_reset_requests: &[catbird_atproto::generated::blue_catbird::chat::ResetRequestView],
 ) -> Result<Vec<u8>, ConversationStateReadError> {
+    canonical_conversation_state_response_page(
+        account_deletions,
+        None,
+        state,
+        pending_leaf_recovery_requests,
+        pending_leave_requests,
+        pending_reset_requests,
+    )
+}
+
+fn canonical_conversation_state_response_page(
+    account_deletions: &[catbird_atproto::generated::blue_catbird::chat::AccountDeletedEntry],
+    deletions_cursor: Option<i64>,
+    state: &catbird_atproto::generated::blue_catbird::chat::ConversationState,
+    pending_leaf_recovery_requests: &[catbird_atproto::generated::blue_catbird::chat::LeafRecoveryView],
+    pending_leave_requests: &[catbird_atproto::generated::blue_catbird::chat::LeaveRequestView],
+    pending_reset_requests: &[catbird_atproto::generated::blue_catbird::chat::ResetRequestView],
+) -> Result<Vec<u8>, ConversationStateReadError> {
     let canonical_state =
         encode_canonical_generated_chat_json_v1(state, "blue.catbird.chat.defs#conversationState")
             .map_err(|_| ConversationStateReadError::Invariant)?;
@@ -377,7 +444,12 @@ fn canonical_conversation_state_response(
         account_deletions,
         "blue.catbird.chat.defs#accountDeletedEntry",
     )?;
-    bytes.extend_from_slice(br#"],"pendingLeafRecoveryRequests":["#);
+    bytes.push(b']');
+    if let Some(cursor) = deletions_cursor {
+        bytes.extend_from_slice(br#","deletionsCursor":"#);
+        bytes.extend_from_slice(cursor.to_string().as_bytes());
+    }
+    bytes.extend_from_slice(br#","pendingLeafRecoveryRequests":["#);
     append_canonical_array(
         &mut bytes,
         pending_leaf_recovery_requests,

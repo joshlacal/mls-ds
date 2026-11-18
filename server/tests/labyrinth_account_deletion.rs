@@ -1538,7 +1538,7 @@ async fn supplied_malformed_proofs_return_400_and_retry_past_300s_with_prior_cre
 }
 
 #[tokio::test]
-async fn second_device_deletion_does_not_sequence_duplicate_account_deleted_entry() {
+async fn second_device_with_a_distinct_deletion_sequences_a_new_cutoff() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     let _env = ENV_LOCK.lock().await;
@@ -1637,8 +1637,8 @@ async fn second_device_deletion_does_not_sequence_duplicate_account_deleted_entr
     assert_eq!((status, &body), (StatusCode::OK, &json!({})));
     assert_eq!(
         deletion_rows(&s.pool, cid).await,
-        1,
-        "second enrolled device must not sequence a duplicate accountDeletedEntry"
+        2,
+        "a second device-authorized erasure advances the deletion boundary"
     );
 
     let member = device(&fixture.recipient_did, fixture.recipient_device_id).await;
@@ -1651,6 +1651,69 @@ async fn second_device_deletion_does_not_sequence_duplicate_account_deleted_entr
             .iter()
             .filter(|entry| entry["$type"] == ACCOUNT_DELETED)
             .count(),
-        1
+        2
     );
+}
+
+#[tokio::test]
+async fn deletion_inventory_pages_past_one_hundred_entries_without_omission() {
+    let _env = ENV_LOCK.lock().await;
+    let s = sequencer().await;
+    let fixture = seed_clean_slate_application_fixture(&s.pool, false, SELF_DID, Some([0x53; 32]))
+        .await
+        .unwrap();
+    let cid = fixture.conversation_id;
+    let at = now(&s.pool).await;
+    let key = ed25519_dalek::SigningKey::from_bytes(&fixture.sender_ed25519_seed);
+    for n in 0..101_u128 {
+        let evidence =
+            catbird_server::federation::receipt::AccountDeletionEvidence::signed_for_test(
+                &key,
+                fixture.sender_device_id,
+                n.to_be_bytes(),
+                at,
+                0,
+                None,
+            );
+        catbird_server::labyrinth::repo::retention::delete_account_data_with_evidence(
+            &s.pool,
+            &fixture.sender_did,
+            at,
+            Some(&s.signer),
+            Some(&evidence),
+        )
+        .await
+        .unwrap();
+    }
+    let reader = device(&fixture.recipient_did, fixture.recipient_device_id).await;
+    let nsid = "blue.catbird.chat.getConversationState";
+    let (_, legacy) = read(&s, &reader, nsid, cid).await;
+    assert_eq!(legacy["error"], "ProtocolUpgradeRequired", "{legacy}");
+    let mut after = 0;
+    let mut seqs = Vec::new();
+    for count in [100, 1] {
+        let query = format!(
+            "actorDeviceId={}&conversationId={cid}&deletionsAfter={after}",
+            reader.device_id
+        );
+        let (status, page) = http::send(
+            s.router.clone(),
+            http::unsigned_get_request(&reader, nsid, &query),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let entries = page["accountDeletions"].as_array().unwrap();
+        assert_eq!(entries.len(), count);
+        for entry in entries {
+            seqs.push(entry["seq"].as_i64().unwrap());
+        }
+        if count == 100 {
+            after = page["deletionsCursor"].as_i64().unwrap();
+            assert_eq!(Some(&after), seqs.last());
+        } else {
+            assert!(page.get("deletionsCursor").is_none());
+        }
+    }
+    assert_eq!(seqs.len(), 101);
+    assert!(seqs.windows(2).all(|s| s[0] < s[1]));
 }

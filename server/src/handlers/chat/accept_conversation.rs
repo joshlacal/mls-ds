@@ -957,15 +957,27 @@ async fn party_deleted(
         .begin()
         .await
         .map_err(|_| ChatFailure::storage(endpoint))?;
-    let deletions = crate::chat_protocol::repository::conversation::load_account_deletions(
-        &mut read,
-        conversation_id,
-    )
-    .await
-    .map_err(|_| ChatFailure::storage(endpoint))?;
-    Ok(deletions
-        .iter()
-        .any(|deletion| parties.contains(&deletion.deleted_did.as_str())))
+    let mut after = 0;
+    loop {
+        let (deletions, next) =
+            crate::chat_protocol::repository::conversation::load_account_deletion_page(
+                &mut read,
+                conversation_id,
+                Some(after),
+            )
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
+        if deletions
+            .iter()
+            .any(|deletion| parties.contains(&deletion.deleted_did.as_str()))
+        {
+            return Ok(true);
+        }
+        match next {
+            Some(seq) => after = seq,
+            None => return Ok(false),
+        }
+    }
 }
 
 #[cfg(test)]

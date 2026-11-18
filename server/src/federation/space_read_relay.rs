@@ -1388,6 +1388,22 @@ pub fn verify_chat_device_key_proof(
     signing_key: &[u8; 32],
     atproto_key: &SpaceVerifyingKey,
 ) -> Result<(), SpaceRelayError> {
+    let (key, _) = chat_device_key_and_creation(car_bytes, did, device_id, atproto_key)?;
+    if key != *signing_key {
+        return Err(SpaceRelayError::UpstreamError(
+            "chat device record does not bind the admitted signing key".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Recover the signing key and enrollment instant from the account's signed record.
+pub(crate) fn chat_device_key_and_creation(
+    car_bytes: &[u8],
+    did: &str,
+    device_id: &str,
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<([u8; 32], chrono::DateTime<chrono::Utc>), SpaceRelayError> {
     let record: ChatDeviceRecordProof = verify_signed_device_rkey_car(
         car_bytes,
         did,
@@ -1399,14 +1415,85 @@ pub fn verify_chat_device_key_proof(
     )?;
     if record.record_type != "blue.catbird.chat.device"
         || !record.algorithm.eq_ignore_ascii_case("ed25519")
-        || record.mls_signature_public_key.as_slice() != signing_key.as_slice()
-        || chrono::DateTime::parse_from_rfc3339(&record.created_at).is_err()
     {
-        return Err(SpaceRelayError::UpstreamError(
-            "chat device record does not bind the admitted signing key".into(),
+        return Err(SpaceRelayError::InvalidRequest(
+            "unsupported device record".into(),
         ));
     }
-    Ok(())
+    let key = record
+        .mls_signature_public_key
+        .try_into()
+        .map_err(|_| SpaceRelayError::InvalidRequest("invalid device key length".into()))?;
+    let created = chrono::DateTime::parse_from_rfc3339(&record.created_at)
+        .map_err(|_| SpaceRelayError::InvalidRequest("invalid enrollment timestamp".into()))?;
+    Ok((key, created.with_timezone(&chrono::Utc)))
+}
+
+/// Independently authorize a destructive federated action with the account's repository key.
+/// Only fully proven, device-signed writes over the exact deletion payload establish a cutoff.
+pub(crate) fn verify_account_deletion_evidence(
+    did: &str,
+    evidence: &crate::federation::receipt::AccountDeletionEvidence,
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<chrono::DateTime<chrono::Utc>, SpaceRelayError> {
+    evidence
+        .check_shape()
+        .map_err(SpaceRelayError::InvalidRequest)?;
+    if evidence.actor_write.payload_bytes.is_none() {
+        return Err(SpaceRelayError::InvalidRequest(
+            "missing signed deletion payload".into(),
+        ));
+    }
+    let write: crate::labyrinth::auth::WriteBodyWire =
+        serde_json::from_slice(&evidence.actor_write.write_body)
+            .map_err(|_| SpaceRelayError::InvalidRequest("malformed actorWrite".into()))?;
+    let key_car = evidence
+        .key_proof
+        .as_deref()
+        .ok_or_else(|| SpaceRelayError::InvalidRequest("missing device key proof".into()))?;
+    let revocation_car = evidence
+        .revocation_proof
+        .as_deref()
+        .ok_or_else(|| SpaceRelayError::InvalidRequest("missing device revocation proof".into()))?;
+    let signed_at = evidence
+        .signed_at()
+        .map_err(SpaceRelayError::InvalidRequest)?;
+    let operation_id = evidence
+        .operation_id()
+        .map_err(SpaceRelayError::InvalidRequest)?;
+    let (device_key, enrolled_at) =
+        chat_device_key_and_creation(key_car, did, &write.actor_device_id, atproto_key)?;
+    if enrolled_at > signed_at {
+        return Err(SpaceRelayError::InvalidRequest(
+            "deletion predates device enrollment".into(),
+        ));
+    }
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&device_key)
+        .map_err(|_| SpaceRelayError::InvalidRequest("invalid device key".into()))?;
+    let signature = ed25519_dalek::Signature::from_slice(&evidence.actor_write.signature)
+        .map_err(|_| SpaceRelayError::InvalidRequest("invalid deletion signature length".into()))?;
+    let bytes = [
+        crate::labyrinth::auth::WRITE_DOMAIN,
+        evidence.actor_write.write_body.as_slice(),
+    ]
+    .concat();
+    key.verify_strict(&bytes, &signature)
+        .map_err(|_| SpaceRelayError::InvalidRequest("invalid device deletion signature".into()))?;
+    let revoked_at = verified_device_revocation_instant(
+        revocation_car,
+        did,
+        &write.actor_device_id,
+        &device_key,
+        &operation_id,
+        signed_at,
+        atproto_key,
+    )?;
+    if revoked_at < enrolled_at {
+        return Err(SpaceRelayError::DeviceRevoked(
+            "device revocation predates enrollment".into(),
+        ));
+    }
+    Ok(signed_at)
 }
 
 /// Verify the exact signed repository commit, MST inclusion path, and self-deletion
@@ -1426,6 +1513,27 @@ pub fn verify_chat_device_revocation_proof(
     expected_signed_at: chrono::DateTime<chrono::Utc>,
     atproto_key: &SpaceVerifyingKey,
 ) -> Result<(), SpaceRelayError> {
+    verified_device_revocation_instant(
+        car_bytes,
+        did,
+        device_id,
+        signing_key,
+        expected_operation_id,
+        expected_signed_at,
+        atproto_key,
+    )
+    .map(|_| ())
+}
+
+fn verified_device_revocation_instant(
+    car_bytes: &[u8],
+    did: &str,
+    device_id: &str,
+    signing_key: &[u8; 32],
+    expected_operation_id: &[u8; 16],
+    expected_signed_at: chrono::DateTime<chrono::Utc>,
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<chrono::DateTime<chrono::Utc>, SpaceRelayError> {
     let record: ChatDeviceRevocationRecordProof = verify_signed_device_rkey_car(
         car_bytes,
         did,
@@ -1486,7 +1594,7 @@ pub fn verify_chat_device_revocation_proof(
         .map_err(|_| {
             SpaceRelayError::DeviceRevoked("deviceRevocation signature does not verify".into())
         })?;
-    Ok(())
+    Ok(created_at.with_timezone(&chrono::Utc))
 }
 
 /// Validate a caller-supplied pre-deletion CAR using a fresh DID document.
@@ -1901,6 +2009,98 @@ pub mod test_car_builder {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+    /// Build a complete device-authorized operation for the federated retention fixtures.
+    pub fn deletion_evidence(
+        did: &str,
+        device: uuid::Uuid,
+        operation: [u8; 16],
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::federation::receipt::AccountDeletionEvidence {
+        let repository = p256::SecretKey::from_slice(&[0x5b; 32]).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x5d; 32]);
+        let id = device.to_string();
+        let created = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let pk = STANDARD.encode(signer.verifying_key().to_bytes());
+        let payload = PdsDeviceRevocationTranscriptPayload {
+            repo_did: did,
+            created_at: &created,
+            actor_device_id: &id,
+            target_device_id: &id,
+        };
+        let cbor = serde_ipld_dagcbor::to_vec(&payload).unwrap();
+        let signature = signer.sign(&[PDS_DEVICE_REVOCATION_DOMAIN, cbor.as_slice()].concat());
+        let device_record = json!({"$type":"blue.catbird.chat.device", "mlsSignaturePublicKey":{"$bytes":pk}, "createdAt":created, "algorithm":"ed25519"});
+        let revoked = json!({"$type":"blue.catbird.chat.deviceRevocation", "actorDeviceId":id, "targetDeviceId":id,
+            "signerPublicKey":{"$bytes":pk}, "signature":{"$bytes":STANDARD.encode(signature.to_bytes())}, "createdAt":created,
+            "reason":format!("deleteAccountData:{}",hex::encode(operation)), "algorithm":"ed25519"});
+        let car = |collection: &str, value: &Value| {
+            build_signed_repo_car(
+                did,
+                "3l2aaaaaaaaaa",
+                &repository,
+                &[(&format!("{collection}/{id}"), value)],
+            )
+            .0
+        };
+        crate::federation::receipt::AccountDeletionEvidence::signed_for_test(
+            &signer,
+            device,
+            operation,
+            at,
+            0,
+            Some(car("blue.catbird.chat.device", &device_record)),
+        )
+        .with_revocation_proof(Some(car("blue.catbird.chat.deviceRevocation", &revoked)))
+    }
+
+    pub fn local_deletion_evidence(
+        did: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::federation::receipt::AccountDeletionEvidence {
+        let mut operation = [0; 16];
+        operation[..8].copy_from_slice(&at.timestamp_millis().to_be_bytes());
+        deletion_evidence(
+            did,
+            uuid::uuid!("00000000-0000-4000-8000-000000000001"),
+            operation,
+            at,
+        )
+    }
+
+    pub fn deletion_repository_method(did: &str) -> crate::auth::VerificationMethod {
+        let repo_key = SigningKey::from_slice(&[0x5b; 32]).unwrap();
+        crate::auth::VerificationMethod {
+            id: format!("{did}#atproto"),
+            key_type: "Multikey".into(),
+            controller: did.to_string(),
+            public_key_jwk: None,
+            public_key_multibase: Some(crate::identity::did_doc::encode_p256_multikey(
+                repo_key.verifying_key(),
+            )),
+        }
+    }
+
+    pub async fn cache_deletion_repository(did: &str) {
+        let previous = crate::auth::get_cached_test_did_document_json(did)
+            .await
+            .and_then(|v| serde_json::from_value::<crate::auth::DidDocument>(v).ok());
+        #[cfg(feature = "sim")]
+        let previous = if previous.is_none() && crate::sim_hooks::active_sim_ds().is_some() {
+            crate::auth::shared_auth_middleware()
+                .resolve_did(did)
+                .await
+                .ok()
+        } else {
+            previous
+        };
+        crate::auth::cache_test_did_document(crate::auth::DidDocument {
+            id: did.to_owned(),
+            service: Some(previous.and_then(|doc| doc.service).unwrap_or_default()),
+            verification_method: vec![deletion_repository_method(did)],
+        })
+        .await;
+    }
 
     fn write_cbor_head(out: &mut Vec<u8>, major: u8, val: u64) {
         let prefix = major << 5;

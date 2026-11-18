@@ -2864,6 +2864,7 @@ impl Network {
             host(user).to_owned(),
             json!({
                 "id": user,
+                "verificationMethod": [crate::federation::space_read_relay::test_car_builder::deletion_repository_method(user)],
                 "service": [{
                     "id": "#atproto_pds",
                     "type": "AtprotoPersonalDataServer",

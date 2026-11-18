@@ -199,18 +199,22 @@ pub(crate) async fn prune_coordinator_openings_sent_by(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
     did: &str,
+    before_seq: i64,
+    cutoff: DateTime<Utc>,
     at: DateTime<Utc>,
 ) -> Result<usize, sqlx::Error> {
     let seqs: Vec<i64> = sqlx::query_scalar(
         "SELECT e.seq FROM chat.entries e \
            JOIN chat.conversations c ON c.conversation_id = e.conversation_id \
           WHERE e.conversation_id = $1 AND NOT c.is_remote AND e.entry_kind = $2 \
-            AND e.actor_did = $3 AND e.payload_pruned_at IS NULL \
+            AND e.actor_did = $3 AND e.payload_pruned_at IS NULL AND e.seq < $4 AND e.received_at <= $5 \
           ORDER BY e.seq",
     )
     .bind(conversation_id)
     .bind(DIRECT_REQUEST_ENTRY_KIND)
     .bind(did)
+    .bind(before_seq)
+    .bind(cutoff)
     .fetch_all(&mut **tx)
     .await?;
     let mut pruned = 0;
@@ -481,6 +485,27 @@ pub(crate) async fn prune_transport_openings_sent_by(
     did: &str,
     at: DateTime<Utc>,
 ) -> Result<usize, sqlx::Error> {
+    prune_transport_openings(tx, conversation_id, did, None, at).await
+}
+
+pub(crate) async fn prune_transport_openings_sent_before(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    did: &str,
+    before_seq: i64,
+    cutoff: DateTime<Utc>,
+    at: DateTime<Utc>,
+) -> Result<usize, sqlx::Error> {
+    prune_transport_openings(tx, conversation_id, did, Some((before_seq, cutoff)), at).await
+}
+
+async fn prune_transport_openings(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    did: &str,
+    bounds: Option<(i64, DateTime<Utc>)>,
+    at: DateTime<Utc>,
+) -> Result<usize, sqlx::Error> {
     if ciphertext_retained() || !transport_opening_supported(&mut **tx).await? {
         return Ok(0);
     }
@@ -509,17 +534,36 @@ pub(crate) async fn prune_transport_openings_sent_by(
             );
         }
     }
-    let requests: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT request_id FROM chat.direct_request_transport_inbox \
-          WHERE conversation_id = $1 AND sender_did = $2 AND opening_pruned_at IS NULL \
-          ORDER BY request_id",
+    let requests: Vec<(Uuid, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT DISTINCT ON (request_id) request_id, CASE WHEN $3 THEN request_entry END
+           FROM chat.direct_request_transport_inbox
+          WHERE conversation_id = $1 AND sender_did = $2 AND opening_pruned_at IS NULL
+          ORDER BY request_id, delivery_id",
     )
     .bind(conversation_id)
     .bind(did)
+    .bind(bounds.is_some())
     .fetch_all(&mut **tx)
     .await?;
     let mut pruned = 0;
-    for request_id in requests {
+    for (request_id, entry) in requests {
+        if let Some((before_seq, cutoff)) = bounds {
+            // The authenticated opening is available even before its transport chain arrives.
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct OpeningScope {
+                seq: i64,
+                received_at: DateTime<Utc>,
+            }
+            let scope = entry
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice::<OpeningScope>(bytes).ok());
+            if !scope.is_some_and(|scope| {
+                scope.seq > 0 && scope.seq < before_seq && scope.received_at <= cutoff
+            }) {
+                continue;
+            }
+        }
         pruned += usize::from(prune_transport_opening(tx, conversation_id, request_id, at).await?);
     }
     Ok(pruned)
