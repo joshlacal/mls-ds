@@ -59,8 +59,10 @@ def init(directory, with_upgrade_account=False):
     homes = {"alice": "ds1", "bob": "ds2"}
     if with_upgrade_account:
         homes["carol"] = "ds1"
+    # Petrel admits delivery-service origins that share the gateway run suffix.
+    run_suffix = secrets.token_hex(4) + SUFFIX
     hosts = {
-        name: name + "-" + secrets.token_hex(4) + SUFFIX
+        name: name + "-" + run_suffix
         for name in ("ds1", "ds2", *homes, "gateway")
     }
 
