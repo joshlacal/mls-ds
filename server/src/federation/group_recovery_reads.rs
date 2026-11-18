@@ -52,32 +52,17 @@ async fn window(State(state): State<GroupRelayState>, headers: HeaderMap, body: 
         Ok(_) => return RelayFailure::denied("caller is not the actor's home").into_response(),
         Err(error) => return RelayFailure::federation(error).into_response(),
     }
-    if request.post_erasure.is_some() {
-        // A hosted account whose PDS and device records are gone cannot use
-        // this post-erasure path, even with an old local enrollment row.
-        let active_keys = match resolver(&state.pool)
-            .resolve_authorized_device_keys(&request.actor_did)
-            .await
-        {
-            Ok(keys) => keys,
-            Err(e) => return RelayFailure::federation(e).into_response(),
-        };
-        let found:Result<bool,sqlx::Error>=sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM chat.devices d JOIN chat.device_keys k USING(user_did,device_id) \
-             WHERE d.user_did=$1 AND d.device_id=$2 AND d.status='active' AND d.revoked_at IS NULL AND k.revoked_at IS NULL \
-               AND k.signing_public_key=ANY($3) AND k.enrollment_auth_generation<=d.auth_generation \
-               AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer WHERE newer.user_did=k.user_did AND newer.device_id=k.device_id AND \
-                 newer.enrollment_auth_generation BETWEEN k.enrollment_auth_generation+1 AND d.auth_generation))"
-        ).bind(&request.actor_did).bind(request.actor_device_id).bind(&active_keys).fetch_one(&state.pool).await;
-        match found {
-            Ok(true) => {}
-            Ok(false) => {
-                return RelayFailure::denied("surviving device is not published by the actor")
-                    .into_response()
+    let post_erasure = match request.post_erasure {
+        Some(page) => {
+            match surviving_enrollment(&state.pool, &request.actor_did, request.actor_device_id)
+                .await
+            {
+                Ok((key_id, generation)) => Some((page, key_id, generation)),
+                Err(error) => return error.into_response(),
             }
-            Err(e) => return RelayFailure::storage(e).into_response(),
         }
-    }
+        None => None,
+    };
     let principal = crate::auth::VerifiedServicePrincipal::for_federated_s2s(
         &request.actor_did,
         "blue.catbird.chat.getEntries",
@@ -88,10 +73,44 @@ async fn window(State(state): State<GroupRelayState>, headers: HeaderMap, body: 
         request.actor_device_id,
         request.conversation_id,
         &state.self_did,
-        request.post_erasure,
+        post_erasure,
     )
     .await
     .unwrap_or_else(IntoResponse::into_response)
+}
+
+/// Check the exact current enrollment at the actor's independently resolved PDS.
+/// The caller binds this result to the locked enrollment in the read transaction.
+async fn surviving_enrollment(
+    pool: &DbPool,
+    did: &str,
+    device: Uuid,
+) -> Result<(String, i64), RelayFailure> {
+    use crate::federation::space_read_relay::{fetch_chat_device_key_proof, SpaceRelayError};
+
+    let (key_id, generation, public_key) = sqlx::query_as::<_, (String, i64, Vec<u8>)>(
+        "SELECT k.key_id,d.auth_generation,k.signing_public_key FROM chat.devices d \
+         JOIN LATERAL (SELECT key_id,signing_public_key,revoked_at FROM chat.device_keys \
+           WHERE user_did=d.user_did AND device_id=d.device_id AND enrollment_auth_generation<=d.auth_generation \
+           ORDER BY enrollment_auth_generation DESC LIMIT 1) k ON k.revoked_at IS NULL \
+         WHERE d.user_did=$1 AND d.device_id=$2 AND d.status='active' AND d.revoked_at IS NULL",
+    )
+    .bind(did)
+    .bind(device)
+    .fetch_optional(pool)
+    .await
+    .map_err(RelayFailure::storage)?
+    .ok_or_else(|| RelayFailure::denied("surviving device has no current enrollment"))?;
+    let key = public_key
+        .try_into()
+        .map_err(|_| RelayFailure::storage("invalid stored signing key"))?;
+    fetch_chat_device_key_proof(&resolver(pool), did, &device.to_string(), &key)
+        .await
+        .map_err(|error| match error {
+            SpaceRelayError::UpstreamUnavailable(_) => RelayFailure::unavailable(error),
+            _ => RelayFailure::denied("surviving device lacks a matching current repository proof"),
+        })?;
+    Ok((key_id, generation))
 }
 
 pub(crate) async fn try_relay_recovery_entries(

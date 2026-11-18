@@ -1243,7 +1243,7 @@ pub(crate) async fn acknowledged_recovery_read_window(
     admission: VerifiedReadAdmission,
     conversation: Uuid,
     sequencer: &str,
-    post_erasure: Option<PageRequest>,
+    post_erasure: Option<(PageRequest, String, i64)>,
 ) -> Result<RecoveryReadWindow, EntryReadFacadeError> {
     let attempt = read_authority::into_single_read_admission(
         admission,
@@ -1303,7 +1303,10 @@ pub(crate) async fn acknowledged_recovery_read_window(
         last_seq,
         post_erasure: None,
     };
-    if let Some(query) = post_erasure {
+    if let Some((query, published_key, published_generation)) = post_erasure {
+        if published_key != window.key_id || published_generation != window.auth_generation {
+            return Err(EntryReadFacadeError::NotEntitled);
+        }
         window.post_erasure = Some(erasure_read::authorize(&mut tx, &window, query).await?);
     }
     Ok(window)
