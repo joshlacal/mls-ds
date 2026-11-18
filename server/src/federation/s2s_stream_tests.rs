@@ -331,7 +331,7 @@ fn edited(mut relay: EntryAckRelay, edit: impl FnOnce(&mut EntryAckRelay)) -> En
     relay
 }
 
-/// Age only the sequencer entry so the signed ACKs and relay credentials remain current.
+/// Age the sequencer entry and paired send together, keeping ACK and relay credentials current.
 async fn age_entry_past_prune_floor(pool: &DbPool, conversation_id: Uuid, seq: i64) {
     let mut tx = pool.begin().await.unwrap();
     sqlx::query("SET LOCAL session_replication_role = replica")
@@ -568,7 +568,7 @@ async fn receipted_relay_refuses_an_archive_less_group_send_before_any_effect() 
 }
 
 #[tokio::test]
-async fn sequencer_prunes_only_after_the_remote_home_relays_its_device_ack() {
+async fn sequencer_prunes_an_acknowledged_application_on_the_remote_homes_retried_relay() {
     crate::federation::open_federation_for_test();
     let seq_db = fresh_fully_migrated_db("chat_fed_relay_").await;
     let seq_pool = seq_db.connect(4).await;
@@ -644,9 +644,7 @@ async fn sequencer_prunes_only_after_the_remote_home_relays_its_device_ack() {
         let seq = entry["seq"].as_i64().unwrap();
         assert!(entry.get("sequencerReceipt").is_some(), "I13 receipt");
 
-        age_entry_past_prune_floor(&seq_pool, cid, seq).await;
-
-        // The local device's ACK alone never prunes the remote-homed audience.
+        // The sole non-sending participant acknowledges within the minimum retention period.
         let local = scope_sim_ds(
             Arc::clone(&seq_hooks),
             local_ack(
@@ -786,6 +784,7 @@ async fn sequencer_prunes_only_after_the_remote_home_relays_its_device_ack() {
         assert_eq!(ack_state(&seq_pool, cid).await, [1, seq, 1, 1, 1]);
         network.partition(false);
         clock.set_utc(*due);
+        age_entry_past_prune_floor(&seq_pool, cid, seq).await;
         let delivered = scope_sim_ds(
             Arc::clone(&home_hooks),
             queue.process_pending_batch(&outbound, &auth_sign),
@@ -795,8 +794,8 @@ async fn sequencer_prunes_only_after_the_remote_home_relays_its_device_ack() {
         assert_eq!(delivered, 1);
         let rows = queue_rows(&home_pool, cid).await;
         assert_eq!(rows[0].2, "delivered");
-        // Both devices acknowledged: ciphertext and send payload are gone, the
-        // I13 receipt and immutable metadata remain.
+        // The sender's relay reevaluates retention after the floor. The I13
+        // receipt and immutable metadata survive the payload prune.
         assert_eq!(ack_state(&seq_pool, cid).await, [2, 2 * seq, 0, 0, 1]);
 
         // A duplicate and an older relay are idempotent no-ops.
@@ -2071,9 +2070,8 @@ async fn a_sequencer_prune_without_the_remote_member_ack_notifies_its_home() {
                 .as_i64()
                 .unwrap();
             age_entry_past_prune_floor(&pool, cid, seq).await;
-            // The remote-homed device never ACKs again: like its removal, its
-            // dormancy drops it from the audience the sequencer waits for,
-            // while its home's mirror still counts it.
+            // The remote sender has gone dormant without an ACK. Its home still
+            // needs a signed notice when the sequencer erases this payload.
             sqlx::query(
                 "UPDATE chat.devices SET dormant_at = $3 WHERE user_did = $1 AND device_id = $2",
             )
@@ -2511,7 +2509,6 @@ async fn effects_needing_a_signed_relay_or_notice_fail_closed_without_a_signer()
     let (fixture, state, seq) =
         relayed_application(&pool, Arc::clone(&keyless), clock.clone(), &seq_key).await;
     let cid = fixture.conversation_id;
-    age_entry_past_prune_floor(&pool, cid, seq).await;
     scope_ds_clock(
         clock.clone(),
         scope_sim_ds(keyless, async {
@@ -2524,11 +2521,13 @@ async fn effects_needing_a_signed_relay_or_notice_fail_closed_without_a_signer()
                     seq,
                 )
             };
-            // The local device's ACK prunes nothing yet, so it needs no notice.
+            // The fresh application must be retained, so this ACK needs no notice.
             let ack = local_ack(&pool, &fixture.recipient_did, recipient_ack()).await;
             assert_eq!(ack["prunedCount"], 0);
             assert_eq!(ack_state(&pool, cid).await, [1, seq, 1, 1, 1]);
-            // HOME's relay completes the audience: its prune would need a notice.
+            // The sole recipient has acknowledged. After the floor, HOME's sender
+            // relay would trigger a prune that requires a signed notice.
+            age_entry_past_prune_floor(&pool, cid, seq).await;
             let relay = signed_relay(
                 &home_key,
                 HOME,
@@ -2551,7 +2550,7 @@ async fn effects_needing_a_signed_relay_or_notice_fail_closed_without_a_signer()
             .unwrap();
             assert_eq!(body["error"], "SignerUnavailable");
             assert_eq!(ack_state(&pool, cid).await, [1, seq, 1, 1, 1]);
-            // So does a local ACK that completes it.
+            // A new local ACK also needs a signed notice while HOME's sender is dormant.
             sqlx::query(
                 "UPDATE chat.devices SET dormant_at = $3 WHERE user_did = $1 AND device_id = $2",
             )
@@ -2953,8 +2952,8 @@ impl Network {
 
 /// The C33 coordinator records no home for a remote party: it learns that
 /// home only from the user's PDS declaration. It applies the declared home's
-/// signed ACK relay for the transport-only device it sequences for and prunes
-/// once its whole frozen audience acknowledged.
+/// signed ACK relay for its transport-only sender device. A relay after the
+/// minimum retention period can prune an application the recipient already acknowledged.
 #[tokio::test]
 async fn c33_sequencer_applies_the_declared_homes_ack_relay_for_its_transport_only_device() {
     crate::federation::open_federation_for_test();
@@ -3018,10 +3017,9 @@ async fn c33_sequencer_applies_the_declared_homes_ack_relay_for_its_transport_on
             .await
             .expect("coordinate the remote sender's application");
             let seq = sequenced["entry"]["seq"].as_i64().unwrap();
-            age_entry_past_prune_floor(&seq_pool, cid, seq).await;
             assert!(sequenced.get("sequencerReceipt").is_some(), "I13 receipt");
 
-            // The local recipient's ACK alone never prunes the remote device's payload.
+            // The sole non-sending participant acknowledges while the payload is still fresh.
             let local = local_ack(
                 &seq_pool,
                 &fixture.recipient_did,
@@ -3116,8 +3114,9 @@ async fn c33_sequencer_applies_the_declared_homes_ack_relay_for_its_transport_on
                 assert_rejected(&seq_state, caller, &relay, cid, status, code).await;
             }
 
-            // The declared home's relay completes the frozen audience: the
-            // ciphertext and send payload go; digests, seq and I13 receipt stay.
+            // The recipient has acknowledged. Once the retention floor passes, the
+            // sender's genuine relay triggers pruning and records its own watermark.
+            age_entry_past_prune_floor(&seq_pool, cid, seq).await;
             let applied = accept_entry_ack_relay(
                 &seq_state,
                 C33_HOME,
