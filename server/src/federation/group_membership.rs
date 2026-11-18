@@ -592,33 +592,6 @@ async fn export_package(
     }
     let now = crate::sim_hooks::current_utc();
     let mut tx = pool.begin().await.map_err(RelayFailure::storage)?;
-    // The invitee is a clean-graph participant or a pending/active member of
-    // the stored sequencer's verified index; an index removal always refuses.
-    let allowed: bool = sqlx::query_scalar(
-        "SELECT (EXISTS(SELECT 1 FROM chat.conversations c JOIN chat.participants p USING(conversation_id) \
-                  WHERE c.conversation_id=$1 AND c.kind='group' AND c.is_remote AND c.sequencer_ds=$2 \
-                    AND c.lifecycle='active' AND p.user_did=$3 AND p.current_membership \
-                    AND (p.status='active' OR (NOT $4 AND p.status='pending'))) \
-                 OR EXISTS(SELECT 1 FROM chat.remote_group_memberships m \
-                  WHERE m.conversation_id=$1 AND m.user_did=$3 AND m.sequencer_did=$2 \
-                    AND (m.status='active' OR (NOT $4 AND m.status='pending')))) \
-                AND NOT EXISTS(SELECT 1 FROM chat.remote_group_memberships m \
-                  WHERE m.conversation_id=$1 AND m.user_did=$3 AND (m.status='removed' OR m.sequencer_did<>$2)) \
-                AND NOT EXISTS(SELECT 1 FROM chat.conversations c WHERE c.conversation_id=$1 \
-                  AND (c.kind<>'group' OR NOT c.is_remote OR c.sequencer_ds IS DISTINCT FROM $2 OR c.lifecycle<>'active')) \
-              OR ($4 AND NOT EXISTS(SELECT 1 FROM chat.conversations WHERE conversation_id=$1) \
-                AND EXISTS(SELECT 1 FROM chat.direct_request_transport_inbox i WHERE i.conversation_id=$1 \
-                  AND i.coordinator_did=$2 AND i.status='accepted' AND \
-                    ((i.sender_did=$3 AND i.sender_device_id=$5) OR (i.recipient_did=$3 AND i.recipient_device_id=$5))) \
-                AND NOT EXISTS(SELECT 1 FROM chat.direct_request_transport_inbox i WHERE i.conversation_id=$1 \
-                  AND (i.status<>'accepted' OR i.coordinator_did<>$2 OR $3 NOT IN(i.sender_did,i.recipient_did))))")
-        .bind(request.conversation_id).bind(caller).bind(&request.user_did).bind(recovery).bind(request.device_id)
-        .fetch_one(&mut *tx).await.map_err(RelayFailure::storage)?;
-    if !allowed {
-        return Err(RelayFailure::denied(
-            "caller is not the signed member's conversation sequencer",
-        ));
-    }
     let binding = recovery.then_some(*mutation.request_digest());
     if recovery {
         // Serialize retries of this signed operation even when multiple packages are available.
@@ -666,11 +639,20 @@ async fn export_package(
     ).bind(&device.user_did).bind(device.device_id).bind(&device.key_id).bind(device.auth_generation).bind(now)
         .bind(request.conversation_id).bind(request.recovery_request_id).bind(caller).bind(binding.as_ref().map(|d|d.as_slice()))
         .fetch_optional(&mut *tx).await.map_err(RelayFailure::storage)?;
+    // The package query can wait for another allocator. Read and hold the
+    // current route, membership and device authority after taking that lock.
+    require_live_export_authority(&mut tx, caller, request, &device, recovery).await?;
     let Some((reference, wrapper, created_at, not_after)) = candidate else {
         return Err(RelayFailure::Protocol(
             ChatProtocolErrorCode::KeyPackageUnavailable,
         ));
     };
+    let now = crate::sim_hooks::current_utc();
+    if now >= not_after || created_at > now {
+        return Err(RelayFailure::Protocol(
+            ChatProtocolErrorCode::KeyPackageUnavailable,
+        ));
+    }
     // This is a fresh statement after the KeyPackage lock. Its conflict predicate
     // also rechecks the winning lease after any concurrent UPSERT wait.
     let transfer_package_ref = if recovery {
@@ -720,6 +702,97 @@ async fn export_package(
         transfer_request_sha256: binding,
         transfer_package_ref,
     })
+}
+
+async fn require_live_export_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    caller: &str,
+    request: &PackageRequest,
+    device: &GroupDevice,
+    recovery: bool,
+) -> Result<(), RelayFailure> {
+    let denied =
+        || RelayFailure::denied("caller lacks current authority for this recovery package");
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.devices d JOIN chat.device_keys k USING(user_did,device_id)
+          WHERE d.user_did=$1 AND d.device_id=$2 AND d.status='active' AND d.revoked_at IS NULL
+            AND d.auth_generation=$3 AND k.key_id=$4 AND k.revoked_at IS NULL AND k.signing_public_key=$5
+            AND k.enrollment_auth_generation<=d.auth_generation
+            AND NOT EXISTS(SELECT 1 FROM chat.device_keys newer
+                WHERE newer.user_did=d.user_did AND newer.device_id=d.device_id
+                  AND newer.enrollment_auth_generation>k.enrollment_auth_generation
+                  AND newer.enrollment_auth_generation<=d.auth_generation)
+          FOR SHARE OF d,k)")
+        .bind(&device.user_did).bind(device.device_id).bind(device.auth_generation)
+        .bind(&device.key_id).bind(&device.signing_public_key)
+        .fetch_one(&mut **tx).await.map_err(RelayFailure::storage)?;
+    if !active {
+        return Err(denied());
+    }
+    let sync_status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM federation_sync_state WHERE convo_id=$1::text FOR SHARE",
+    )
+    .bind(request.conversation_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(RelayFailure::storage)?;
+    if sync_status.as_deref() == Some("quarantined") {
+        return Err(denied());
+    }
+    let graph: Option<(String,bool,Option<String>,String)> = sqlx::query_as(
+        "SELECT kind,is_remote,sequencer_ds,lifecycle FROM chat.conversations WHERE conversation_id=$1 FOR SHARE")
+        .bind(request.conversation_id).fetch_optional(&mut **tx).await.map_err(RelayFailure::storage)?;
+    if let Some((kind, remote, sequencer, lifecycle)) = &graph {
+        if kind != "group"
+            || !remote
+            || lifecycle != "active"
+            || !sequencer
+                .as_deref()
+                .is_some_and(|did| crate::identity::dids_equivalent(did, caller))
+        {
+            return Err(denied());
+        }
+    } else if !recovery {
+        // An ordinary invitation lease has a foreign key to the local group graph.
+        return Err(denied());
+    }
+    let indexed: Option<(String, String)> = sqlx::query_as(
+        "SELECT status,sequencer_did FROM chat.remote_group_memberships
+          WHERE conversation_id=$1 AND user_did=$2 FOR SHARE",
+    )
+    .bind(request.conversation_id)
+    .bind(&device.user_did)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(RelayFailure::storage)?;
+    let qualifies = |status: &str| status == "active" || (!recovery && status == "pending");
+    if let Some((status, sequencer)) = indexed {
+        // The authenticated membership index can carry a newer reinvitation or
+        // removal than a delayed graph, and is sufficient for standalone recovery.
+        return if crate::identity::dids_equivalent(&sequencer, caller) && qualifies(&status) {
+            Ok(())
+        } else {
+            Err(denied())
+        };
+    }
+    if graph.is_some() {
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership FOR SHARE")
+            .bind(request.conversation_id).bind(&device.user_did).fetch_optional(&mut **tx).await.map_err(RelayFailure::storage)?;
+        return if status.as_deref().is_some_and(qualifies) {
+            Ok(())
+        } else {
+            Err(denied())
+        };
+    }
+    let openings: Vec<super::TransportOpeningParty> = sqlx::query_as(
+        "SELECT coordinator_did,sender_did,sender_device_id,recipient_did,recipient_device_id,status
+           FROM chat.direct_request_transport_inbox WHERE conversation_id=$1 ORDER BY delivery_id FOR SHARE")
+        .bind(request.conversation_id).fetch_all(&mut **tx).await.map_err(RelayFailure::storage)?;
+    match super::direct_sequence_target(&openings, &device.user_did, device.device_id) {
+        Ok(Some((did, true))) if crate::identity::dids_equivalent(&did, caller) => Ok(()),
+        _ => Err(denied()),
+    }
 }
 
 /// Both services keep the same exact package assigned to this signed request for its
@@ -1574,6 +1647,11 @@ pub(super) async fn stage_home_package(
             now,
         )
         .await?;
+    }
+    if binding.is_some() && crate::sim_hooks::current_utc() >= not_after {
+        return Err(RelayFailure::Protocol(
+            ChatProtocolErrorCode::KeyPackageUnavailable,
+        ));
     }
     tx.commit().await.map_err(RelayFailure::storage)?;
     Ok(())

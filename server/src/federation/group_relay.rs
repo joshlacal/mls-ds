@@ -1132,7 +1132,7 @@ async fn remote_sequence_target(
             return Ok(Some((sequencer, false)));
         }
     }
-    let rows: Vec<(String, String, Uuid, String, Uuid, String)> = sqlx::query_as(
+    let rows: Vec<TransportOpeningParty> = sqlx::query_as(
         "SELECT coordinator_did,sender_did,sender_device_id,recipient_did,recipient_device_id,status \
            FROM chat.direct_request_transport_inbox WHERE conversation_id=$1 ORDER BY delivery_id",
     )
@@ -1140,6 +1140,16 @@ async fn remote_sequence_target(
     .fetch_all(pool)
     .await
     .map_err(|error| GroupRelayError::Internal(error.to_string()))?;
+    direct_sequence_target(&rows, actor_did, actor_device_id)
+}
+
+type TransportOpeningParty = (String, String, Uuid, String, Uuid, String);
+
+fn direct_sequence_target(
+    rows: &[TransportOpeningParty],
+    actor_did: &str,
+    actor_device_id: Uuid,
+) -> Result<Option<(String, bool)>, GroupRelayError> {
     let Some((coordinator, sender, sender_device, recipient, _, _)) = rows.first() else {
         return Ok(None);
     };
