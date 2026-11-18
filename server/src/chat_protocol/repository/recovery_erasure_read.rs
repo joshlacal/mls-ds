@@ -312,3 +312,156 @@ impl Page {
         Ok((output, self.has_more))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat_protocol::test_support::seed_clean_slate_application_fixture;
+    use crate::common::{fresh_db::fresh_fully_migrated_db, http_acceptance as http};
+    use crate::federation::{
+        receipt::I13ReceiptSigner, space_read_relay::test_car_builder::deletion_evidence,
+    };
+    use crate::labyrinth::repo::retention::sequence_account_deleted_entry;
+
+    #[tokio::test]
+    async fn surviving_device_pages_only_its_erasure_controls_and_new_signed_entries() {
+        let source = fresh_fully_migrated_db("chat_fed_relay_").await;
+        let source_pool = source.connect(4).await;
+        http::ensure_fence(&source_pool).await;
+        let mirror = fresh_fully_migrated_db("chat_fed_relay_").await;
+        let mirror_pool = mirror.connect(3).await;
+        let ds = crate::identity::service_did_base();
+        let signer = I13ReceiptSigner::new(http::random_p256(), ds.clone());
+        let router =
+            http::router_for_authenticated_acceptance_with(source_pool.clone(), |runtime| {
+                runtime.with_i13_receipt_signer(signer.clone())
+            })
+            .await;
+        let room = seed_clean_slate_application_fixture(&source_pool, false, &ds, Some([0x57; 32]))
+            .await
+            .unwrap();
+        let cid = room.conversation_id;
+        let live_device = room.sender_device_id;
+        let original = Uuid::new_v4();
+        let signing = http::random_p256();
+        let jwk = http::public_jwk(&signing);
+        let reader = http::Device {
+            did: room.sender_did.clone(),
+            device_id: live_device,
+            signing,
+            jkt: http::jwk_thumbprint(&jwk),
+            jwk,
+        };
+        http::cache_device_did(&reader).await;
+        let send = |signed: &Value| {
+            let request = http::unsigned_json_request(
+                &reader,
+                "blue.catbird.chat.sendMessage",
+                serde_json::to_vec(&json!({"signedRequest":signed})).unwrap(),
+            );
+            http::send(router.clone(), request)
+        };
+        let (status, sent) = send(&room.signed_request).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{sent}");
+        let old_seq = sent["entry"]["seq"].as_i64().unwrap();
+        let at = Utc::now();
+        let proof = deletion_evidence(&room.sender_did, original, [0x41; 16], at);
+        let mut tx = source_pool.begin().await.unwrap();
+        let marker = sequence_account_deleted_entry(
+            &mut tx,
+            cid,
+            &room.sender_did,
+            at,
+            at,
+            Some(&signer),
+            Some(&proof),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tx.commit().await.unwrap();
+        let cut = marker["seq"].as_i64().unwrap();
+        assert_eq!(cut, old_seq + 1);
+        let (status, newer) = send(&room.next_sender_signed_request()).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{newer}");
+        let latest = newer["entry"]["seq"].as_i64().unwrap();
+        assert_eq!(latest, cut + 1);
+        // Both stores get the same sequencer-signed data through their own
+        // ordinary persistence functions. The old transport payload still exists.
+        let mut mirror_tx = mirror_pool.begin().await.unwrap();
+        for seq in [old_seq, cut, latest] {
+            let entry = super::super::entry_json_for_test(&source_pool, cid, seq)
+                .await
+                .unwrap();
+            delivery::insert_transport_entry(
+                &mut mirror_tx,
+                cid,
+                seq,
+                entry["entryId"].as_str().unwrap().parse().unwrap(),
+                &serde_json::to_vec(&entry).unwrap(),
+                at,
+            )
+            .await
+            .unwrap();
+        }
+        mirror_tx.commit().await.unwrap();
+        let mut window = RecoveryReadWindow {
+            conversation: cid,
+            did: room.sender_did,
+            device: live_device,
+            key_id: room.sender_key_id,
+            auth_generation: 1,
+            welcome: Uuid::new_v4(),
+            generation: 0,
+            first_seq: 1,
+            last_seq: latest,
+            post_erasure: None,
+        };
+        let mut source_tx = source_pool.begin().await.unwrap();
+        let mut mirror_tx = mirror_pool.begin().await.unwrap();
+        for (after, limit, expected, more) in [
+            (0, 100, vec![cut, latest], false),
+            (0, 1, vec![cut], true),
+            (cut as u64, 100, vec![latest], false),
+            (latest as u64, 100, vec![], false),
+        ] {
+            let query = PageRequest { after, limit };
+            let page = authorize(&mut source_tx, &window, query).await.unwrap();
+            matches_cut(&mut mirror_tx, &window, &page).await.unwrap();
+            let (rows, has_more) = page
+                .local_rows(&mut mirror_tx, &window, query)
+                .await
+                .unwrap();
+            assert_eq!(has_more, more);
+            assert_eq!(
+                rows.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+                expected
+            );
+            for (seq, bytes) in rows {
+                let presented: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(presented["seq"], seq);
+                if seq == cut {
+                    assert_eq!(presented["deletedDid"], reader.did);
+                } else {
+                    assert_eq!(presented["entryId"], newer["entry"]["entryId"]);
+                }
+            }
+        }
+        // An unlisted sibling receives no marker control. The deleting enrollment is denied.
+        window.device = Uuid::new_v4();
+        let query = PageRequest {
+            after: 0,
+            limit: 100,
+        };
+        assert!(authorize(&mut source_tx, &window, query)
+            .await
+            .unwrap()
+            .allowed
+            .is_empty());
+        window.device = original;
+        assert!(matches!(
+            authorize(&mut source_tx, &window, query).await,
+            Err(Failure::NotEntitled)
+        ));
+    }
+}
