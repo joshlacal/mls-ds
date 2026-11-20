@@ -212,7 +212,6 @@ pub(crate) async fn load_active_space_status(
     Ok(row)
 }
 
-
 async fn recompute_space_archived_through_seq(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     space_uri: &str,
@@ -1747,7 +1746,8 @@ fn decode_32_byte_data(val: &Value) -> Option<[u8; 32]> {
         .get("$bytes")
         .and_then(Value::as_str)
         .or_else(|| val.as_str())?;
-    let bytes = STANDARD.decode(b64).ok()?;
+    // The reference PDS sends `$bytes` unpadded; see `atproto_bytes::decode_base64`.
+    let bytes = crate::atproto_bytes::decode_base64(b64).ok()?;
     bytes.try_into().ok()
 }
 
@@ -2637,8 +2637,7 @@ fn encode_atproto_json_item(value: &Value, out: &mut Vec<u8>, depth: usize) -> R
                     let Some(b64) = b64_val.as_str() else {
                         return Err("$bytes value must be a base64 string".into());
                     };
-                    let raw = STANDARD
-                        .decode(b64)
+                    let raw = crate::atproto_bytes::decode_base64(b64)
                         .map_err(|e| format!("invalid $bytes base64: {e}"))?;
                     write_dagcbor_head(out, 2, raw.len() as u64);
                     out.extend_from_slice(&raw);
@@ -3403,6 +3402,59 @@ mod tests {
     use axum::{body::Body, http::Request};
     use p256::ecdsa::SigningKey;
     use tower_util::ServiceExt;
+
+    /// `notifyRepoUpdate.data` is a 32-byte commitment. The reference PDS sends it as
+    /// unpadded base64 (43 characters); production refused it with
+    /// "data must decode to 32 bytes" on 2026-11-20.
+    #[test]
+    fn notify_data_decodes_as_the_reference_pds_sends_it() {
+        let commitment = [0x5Au8; 32];
+        let unpadded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(commitment);
+        let padded = STANDARD.encode(commitment);
+        assert_eq!(unpadded.len(), 43);
+
+        assert_eq!(
+            decode_32_byte_data(&json!({ "$bytes": unpadded })),
+            Some(commitment)
+        );
+        assert_eq!(
+            decode_32_byte_data(&json!({ "$bytes": padded })),
+            Some(commitment)
+        );
+        assert_eq!(decode_32_byte_data(&json!(unpadded)), Some(commitment));
+        // Still 32 bytes exactly, and still base64.
+        assert_eq!(
+            decode_32_byte_data(&json!({ "$bytes": STANDARD.encode([0u8; 31]) })),
+            None
+        );
+        assert_eq!(
+            decode_32_byte_data(&json!({ "$bytes": "not base64!" })),
+            None
+        );
+    }
+
+    /// A record value read back from a writer's PDS is re-encoded to DAG-CBOR to check its
+    /// CID. The bytes are the same whichever way the PDS spelled them.
+    #[test]
+    fn record_bytes_encode_the_same_with_or_without_padding() {
+        let raw = b"sealed batch bytes!!";
+        let unpadded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(raw);
+        let padded = STANDARD.encode(raw);
+        assert_ne!(unpadded, padded, "the fixture must exercise padding");
+
+        let mut from_unpadded = Vec::new();
+        encode_atproto_json_item(
+            &json!({ "ct": { "$bytes": unpadded } }),
+            &mut from_unpadded,
+            0,
+        )
+        .expect("unpadded $bytes is valid");
+        let mut from_padded = Vec::new();
+        encode_atproto_json_item(&json!({ "ct": { "$bytes": padded } }), &mut from_padded, 0)
+            .expect("padded $bytes is valid");
+
+        assert_eq!(from_unpadded, from_padded);
+    }
 
     #[tokio::test]
     async fn space_host_router_uses_runtime_clock_for_service_auth() {

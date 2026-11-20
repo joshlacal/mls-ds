@@ -8,6 +8,28 @@ struct BytesWrapper {
     bytes: String,
 }
 
+/// Standard-alphabet base64 that takes padding or leaves it.
+///
+/// The ATProto data model writes `$bytes` without padding, and the reference PDS does so;
+/// Swan and this server pad. A decoder that insists on padding refuses every byte string
+/// the reference PDS sends.
+///
+/// Still checked: the alphabet, the length, and that the bits left over in the last
+/// symbol are zero, so each byte string has one spelling apart from its padding. Padding
+/// itself is only loosely checked: none and the canonical amount are both accepted, and
+/// so is a single `=` where two are canonical (`AA=`). Every caller uses the decoded
+/// bytes, never the text, so those spellings are not distinguishable downstream.
+const BYTES_DECODER: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+);
+
+/// Decodes the text of a `$bytes` value from any ATProto server.
+pub fn decode_base64(text: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    BYTES_DECODER.decode(text)
+}
+
 pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -32,9 +54,7 @@ where
     D: Deserializer<'de>,
 {
     let wrapper = BytesWrapper::deserialize(deserializer)?;
-    base64::engine::general_purpose::STANDARD
-        .decode(&wrapper.bytes)
-        .map_err(serde::de::Error::custom)
+    decode_base64(&wrapper.bytes).map_err(serde::de::Error::custom)
 }
 
 /// Serde module for optional ATProto bytes: None -> null, Some(bytes) -> {"$bytes": "base64..."}
@@ -80,9 +100,8 @@ pub mod option {
         match opt_wrapper {
             None => Ok(None),
             Some(wrapper) => {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&wrapper.bytes)
-                    .map_err(serde::de::Error::custom)?;
+                let bytes =
+                    super::decode_base64(&wrapper.bytes).map_err(serde::de::Error::custom)?;
                 Ok(Some(bytes))
             }
         }
@@ -105,6 +124,62 @@ mod tests {
         let json = r#"{"data": {"$bytes": "SGVsbG8gV29ybGQ="}}"#;
         let result: TestStruct = serde_json::from_str(json).unwrap();
         assert_eq!(result.data, b"Hello World");
+    }
+
+    /// The reference PDS writes `$bytes` without padding; Swan and this server pad it.
+    #[test]
+    fn deserializes_unpadded_bytes_as_the_reference_pds_writes_them() {
+        let json = r#"{"data": {"$bytes": "SGVsbG8gV29ybGQ"}}"#;
+        let result: TestStruct = serde_json::from_str(json).unwrap();
+        assert_eq!(result.data, b"Hello World");
+
+        let optional: TestOptionalStruct = serde_json::from_str(json).unwrap();
+        assert_eq!(optional.data, Some(b"Hello World".to_vec()));
+    }
+
+    #[test]
+    fn a_thirty_two_byte_value_decodes_with_or_without_padding() {
+        let bytes = [0xA5u8; 32];
+        let padded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+        let unpadded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, bytes);
+        assert_eq!(padded.len(), 44);
+        assert_eq!(unpadded.len(), 43);
+        assert_eq!(crate::atproto_bytes::decode_base64(&padded).unwrap(), bytes);
+        assert_eq!(
+            crate::atproto_bytes::decode_base64(&unpadded).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn rejects_text_that_is_not_base64_in_either_form() {
+        // Outside the alphabet; an impossible length; non-zero bits left in the last
+        // symbol; padding in the middle; more padding than a group can have.
+        for text in [
+            "SGVsbG8*",
+            "SGVsbG8gV29ybGQ==",
+            "SGVsbG8gV29ybGR",
+            "AA==AA==",
+            "AA===",
+        ] {
+            assert!(
+                crate::atproto_bytes::decode_base64(text).is_err(),
+                "{text} must be refused"
+            );
+        }
+    }
+
+    /// Pins what "padding optional" means with this decoder, so a change is noticed.
+    #[test]
+    fn padding_may_be_absent_canonical_or_short() {
+        for text in ["AA", "AA==", "AA="] {
+            assert_eq!(
+                crate::atproto_bytes::decode_base64(text).unwrap(),
+                vec![0u8],
+                "{text}"
+            );
+        }
     }
 
     #[test]
