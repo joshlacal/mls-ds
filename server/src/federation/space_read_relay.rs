@@ -1074,7 +1074,11 @@ fn walk_mst_proof(
     })?;
     let node: MstNodeData = serde_ipld_dagcbor::from_slice(node_bytes)
         .map_err(|_| SpaceRelayError::UpstreamError("malformed MST node block".into()))?;
-    if depth > 0 && node.e.is_empty() {
+    // A node may have no entries of its own and only a left subtree: the reference PDS
+    // writes one wherever a key sits more than one layer below its parent. Only a node
+    // below the root with neither entries nor a subtree is malformed. Bounds, depth and
+    // cycle checks apply to the subtree exactly as they do below an entry.
+    if depth > 0 && node.e.is_empty() && node.l.is_none() {
         return Err(SpaceRelayError::UpstreamError(
             "non-root MST node cannot be empty".into(),
         ));
@@ -2539,6 +2543,19 @@ pub mod test_car_builder {
         p256_secret: &p256::SecretKey,
         records: &[(&str, &Value)],
     ) -> (Vec<u8>, BTreeMap<String, cid::Cid>) {
+        build_signed_repo_car_under_entryless_nodes(did, rev, p256_secret, records, 0)
+    }
+
+    /// Like [`build_signed_repo_car`], with the node that holds the records placed under
+    /// `entryless_layers` nodes that have a left subtree and no entries. The reference PDS
+    /// writes such nodes wherever a key's layer is more than one below its parent's.
+    pub fn build_signed_repo_car_under_entryless_nodes(
+        did: &str,
+        rev: &str,
+        p256_secret: &p256::SecretKey,
+        records: &[(&str, &Value)],
+        entryless_layers: usize,
+    ) -> (Vec<u8>, BTreeMap<String, cid::Cid>) {
         let mut sorted: Vec<(&str, &Value)> = records.to_vec();
         sorted.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
 
@@ -2573,8 +2590,16 @@ pub mod test_car_builder {
             "l": Value::Null,
             "e": entries_json,
         }));
-        let mst_cid = compute_dagcbor_cid(&mst_cbor);
+        let mut mst_cid = compute_dagcbor_cid(&mst_cbor);
         blocks.push((mst_cid, mst_cbor));
+        for _ in 0..entryless_layers {
+            let node_cbor = json_to_canonical_dagcbor(&json!({
+                "l": { "$link": mst_cid.to_string() },
+                "e": [],
+            }));
+            mst_cid = compute_dagcbor_cid(&node_cbor);
+            blocks.push((mst_cid, node_cbor));
+        }
 
         let unsigned_cbor = json_to_canonical_dagcbor(&json!({
             "did": did,
@@ -2707,6 +2732,54 @@ mod tests {
             ),
             ERROR_RESPONSE_MAX_BYTES
         );
+    }
+
+    /// The reference PDS's tree has nodes with a left subtree and no entries. Production
+    /// answered 502 "the target PDS returned an invalid mailboxKeys record" for an account
+    /// on that PDS on 2026-11-20, from "non-root MST node cannot be empty".
+    #[test]
+    fn car_proof_follows_entryless_nodes_as_the_reference_pds_writes_them() {
+        let did = "did:web:mailbox.example";
+        let secret = p256::SecretKey::from_slice(&[0x51; 32]).unwrap();
+        let vk = SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(secret.public_key()));
+        let value = sample_mailbox_value(7);
+        let (car, _) = super::test_car_builder::build_signed_repo_car_under_entryless_nodes(
+            did,
+            "3l2aaaaaaaaaa",
+            &secret,
+            &[("blue.catbird.labyrinth.mailboxKeys/000000000007", &value)],
+            2,
+        );
+
+        assert!(
+            verify_mailbox_keys_car_proof(&car, did, "000000000007", &vk)
+                .expect("a proof through entry-less nodes is valid")
+                .is_some(),
+            "the record is found below the entry-less nodes"
+        );
+        assert!(
+            verify_mailbox_keys_car_proof(&car, did, "self", &vk)
+                .expect("absence is provable through the same nodes")
+                .is_none(),
+            "a key that is not there is proven absent"
+        );
+    }
+
+    /// A node below the root with neither entries nor a subtree is still not a tree.
+    #[test]
+    fn car_proof_refuses_a_non_root_node_with_no_entries_and_no_subtree() {
+        let did = "did:web:mailbox.example";
+        let secret = p256::SecretKey::from_slice(&[0x51; 32]).unwrap();
+        let vk = SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(secret.public_key()));
+        let (car, _) = super::test_car_builder::build_signed_repo_car_under_entryless_nodes(
+            did,
+            "3l2aaaaaaaaaa",
+            &secret,
+            &[],
+            1,
+        );
+
+        assert!(verify_mailbox_keys_car_proof(&car, did, "self", &vk).is_err());
     }
 
     #[test]
