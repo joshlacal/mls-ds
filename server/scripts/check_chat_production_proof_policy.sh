@@ -52,7 +52,7 @@ if proof_feature in defaults:
     raise SystemExit(f"{proof_feature} must not be a default feature")
 
 targets = {(target["kind"][0], target["name"]): target for target in package["targets"]}
-for binary_name in ("catbird-server", "deadletter_recover"):
+for binary_name in ("catbird-server",):
     target = targets.get(("bin", binary_name))
     if target is None:
         raise SystemExit(f"missing explicit shipping binary target {binary_name}")
