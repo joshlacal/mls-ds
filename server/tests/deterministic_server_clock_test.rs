@@ -1385,12 +1385,23 @@ async fn execute_scenario_run(
     outputs.push(("get_conversations".to_owned(), conversations_bytes));
     outputs.push(("get_pending_welcomes".to_owned(), welcomes_bytes));
 
+    // Application payloads are held for 72 hours after receipt before an ACK
+    // can prune them (delivery::prune_acknowledged_application_payloads), so
+    // Alice's early ACK prunes nothing and Bob acknowledges after the hold.
+    const PRUNE_HOLD_MS: i64 = 72 * 60 * 60 * 1000;
     for (label, actor, offset_ms, expected_pruned) in [
         ("acknowledge_entries_alice", &scenario.alice, 2020, 0),
-        ("acknowledge_entries_bob", &scenario.bob_primary, 2030, 1),
+        (
+            "acknowledge_entries_bob",
+            &scenario.bob_primary,
+            PRUNE_HOLD_MS + 2030,
+            1,
+        ),
     ] {
         let ack_time = t0 + TimeDelta::milliseconds(offset_ms);
         clock.set_utc(ack_time);
+        // The DID cache ages entries on the sim clock; re-seed after the jump.
+        scope_ds_clock(clock.clone(), seed_sim_did_document(actor.did_document())).await;
         let bytes = execute_request(
             router,
             label,
@@ -1408,8 +1419,13 @@ async fn execute_scenario_run(
         outputs.push((label.to_owned(), bytes));
     }
 
-    let pruned_time = t0 + TimeDelta::milliseconds(2040);
+    let pruned_time = t0 + TimeDelta::milliseconds(PRUNE_HOLD_MS + 2040);
     clock.set_utc(pruned_time);
+    scope_ds_clock(
+        clock.clone(),
+        seed_sim_did_document(scenario.alice.did_document()),
+    )
+    .await;
     let pruned_bytes = execute_request(
         router,
         "get_entries_pruned",

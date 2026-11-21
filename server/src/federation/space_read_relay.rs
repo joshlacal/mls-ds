@@ -3043,7 +3043,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let router = Router::new()
             .route(
-                "/.well-known/did.json",
+                /* did-web-test */ "/.well-known/did.json",
                 get({
                     let multibase = pds_did_key.strip_prefix("did:key:").unwrap().to_string();
                     move || {
