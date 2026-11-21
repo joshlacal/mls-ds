@@ -230,6 +230,9 @@ jobs:
         # Migration struct fields, integer overflow behavior).
         # - RUSTSEC-2024-0363: sqlx Binary Protocol Misinterpretation
         # - RUSTSEC-2024-0436: paste unmaintained (via sqlx-macros)
+        # - RUSTSEC-2026-0459: libsqlite3-sys bundled SQLite CVE (0.27 via
+        #   sqlx 0.7.4 optional sqlx-sqlite; locked but never compiled since
+        #   the sqlite feature is off; fixed in 0.39, which needs sqlx 0.8)
         #
         # ── Group 2: awaits a2 release dropping rustls 0.22 ──────────────
         # a2 0.10.0 (latest) pulls rustls 0.22.4 / rustls-webpki 0.102.8 /
@@ -266,6 +269,7 @@ jobs:
             --deny warnings \
             --ignore RUSTSEC-2024-0363 \
             --ignore RUSTSEC-2024-0436 \
+            --ignore RUSTSEC-2026-0459 \
             --ignore RUSTSEC-2025-0134 \
             --ignore RUSTSEC-2026-0049 \
             --ignore RUSTSEC-2026-0098 \
