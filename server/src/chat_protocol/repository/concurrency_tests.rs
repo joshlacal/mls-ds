@@ -842,13 +842,15 @@ mod close_racing_accept {
             .await
             .unwrap();
         let close = tokio::spawn(scope_sim_ds(hooks, async move {
-            let close = http::unsigned_json_request(
-                &closer, "blue.catbird.chat.closeConversation", body,
-            );
+            let close =
+                http::unsigned_json_request(&closer, "blue.catbird.chat.closeConversation", body);
             http::send(router, close).await
         }));
         let Some(close_waits_in) = blocked_query(&pool, barrier_pid, None, &close).await else {
-            panic!("the close finished without queuing on the head: {:?}", close.await);
+            panic!(
+                "the close finished without queuing on the head: {:?}",
+                close.await
+            );
         };
         // The consent check locks the head after the close holds the request
         // budget and identity scope, before the transition reads the full head.
@@ -879,7 +881,9 @@ mod close_racing_accept {
             }
         });
         let accept_pid = pid_receiver.await.unwrap();
-        let Some(accept_waits_in) = blocked_query(&pool, barrier_pid, Some(accept_pid), &accept).await else {
+        let Some(accept_waits_in) =
+            blocked_query(&pool, barrier_pid, Some(accept_pid), &accept).await
+        else {
             panic!("the accept finished without queuing: {:?}", accept.await);
         };
         barrier.rollback().await.unwrap();

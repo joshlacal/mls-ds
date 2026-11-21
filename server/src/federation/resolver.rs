@@ -1425,12 +1425,13 @@ impl DsResolver {
                 "failed to serialize resolved DID document: {error}"
             ))
         })?;
-        let parsed = atproto_spaces::did_resolver::DidDocument::parse_json(did, &bytes)
-            .map_err(|error| {
+        let parsed = atproto_spaces::did_resolver::DidDocument::parse_json(did, &bytes).map_err(
+            |error| {
                 FederationError::Unsupported(format!(
                     "resolved DID document has an invalid #atproto key: {error}"
                 ))
-            })?;
+            },
+        )?;
         Ok(parsed.atproto_key)
     }
 

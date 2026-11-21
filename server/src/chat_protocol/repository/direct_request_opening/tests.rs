@@ -100,7 +100,6 @@ async fn ack(pool: &PgPool, conversation_id: Uuid, did: &str, device: Uuid) {
     .unwrap();
 }
 
-
 async fn rejected(pool: &PgPool, sql: &str, conversation_id: Uuid) -> bool {
     sqlx::query(sql)
         .bind(conversation_id)
@@ -175,14 +174,7 @@ async fn coordinator_opening_waits_for_every_frozen_device_then_loses_every_ciph
         let mut tx = pool.begin().await.unwrap();
         let pruned = as_service(
             false,
-            prune_acknowledged_application_payloads(
-                &mut tx,
-                cid,
-                0,
-                1,
-                false,
-                prune_at.clone(),
-            ),
+            prune_acknowledged_application_payloads(&mut tx, cid, 0, 1, false, prune_at.clone()),
         )
         .await
         .unwrap();
@@ -479,9 +471,7 @@ async fn transport_home_opening_waits_for_its_local_audience_and_replays_never_r
             let mut tx = pool.begin().await.unwrap();
             let pruned = as_service(
                 false,
-                prune_acknowledged_application_payloads(
-                    &mut tx, cid, 0, 1, true, pruned_at,
-                ),
+                prune_acknowledged_application_payloads(&mut tx, cid, 0, 1, true, pruned_at),
             )
             .await
             .unwrap();
@@ -518,10 +508,7 @@ async fn transport_home_opening_waits_for_its_local_audience_and_replays_never_r
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(
-        prune(now + chrono::Duration::hours(73)).await,
-        vec![1]
-    );
+    assert_eq!(prune(now + chrono::Duration::hours(73)).await, vec![1]);
 
     let (served, original_sha256): (Vec<u8>, Vec<u8>) = sqlx::query_as(
         "SELECT entry_bytes, original_entry_sha256 FROM chat.direct_request_transport_entries \
@@ -803,7 +790,10 @@ async fn an_expired_transport_import_window_still_obeys_the_30_day_ceiling() {
         "an empty import audience is not an ACK quorum"
     );
     sweep(now + chrono::Duration::days(31)).await.unwrap();
-    assert!(pruned().await, "the 30-day ceiling still removes the opening");
+    assert!(
+        pruned().await,
+        "the 30-day ceiling still removes the opening"
+    );
     assert_eq!(residue(&pool, ciphertext).await, Vec::<String>::new());
 }
 

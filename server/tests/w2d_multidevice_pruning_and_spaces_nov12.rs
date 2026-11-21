@@ -5122,13 +5122,19 @@ async fn b1_b10_a6_r2_remediation_end_to_end() {
         ))
         .unwrap();
     assert_eq!(
-        host_router.clone().oneshot(forged_req).await.unwrap().status(),
+        host_router
+            .clone()
+            .oneshot(forged_req)
+            .await
+            .unwrap()
+            .status(),
         StatusCode::OK
     );
     assert_eq!(watermark().await, 0);
 
     let mut archive_receipt = sb_send["sequencerReceipt"].clone();
-    archive_receipt["originalSenderAttestation"] = fix.signed_request
+    archive_receipt["originalSenderAttestation"] = fix
+        .signed_request
         .pointer("/body/aad/originalSenderAttestation")
         .expect("accepted send has original sender attestation")
         .clone();

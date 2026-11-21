@@ -97,7 +97,8 @@ struct RawSnapshot {
 
 // The SQL fixture timeline and pinned signer identities belong to the original server corpus.
 fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire-v09-server-integration")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/crypto-wire-v09-server-integration")
 }
 
 fn hex_array<const N: usize>(value: &str) -> [u8; N] {

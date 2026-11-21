@@ -92,7 +92,8 @@ struct CorpusChain {
 }
 
 fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire-v09-server-integration")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/crypto-wire-v09-server-integration")
 }
 
 fn corpus_file(name: &str) -> Vec<u8> {
