@@ -11,6 +11,15 @@ x-ds-command: &ds-command
     RECEIPT_SIGNING_KEY_PEM="$$(cat "$$RECEIPT_SIGNING_KEY_FILE")"
     RECEIPT_DID_DOCUMENT_JSON="$$(cat "$$RECEIPT_DID_DOCUMENT_FILE")"
     export SIGNING_KEY_PEM RECEIPT_SIGNING_KEY_PEM RECEIPT_DID_DOCUMENT_JSON
+    # CHAT_CUTOVER_ENABLED requires a mounted recovery-share KEK and an
+    # existing erasure journal. Provision both once per container; a restart
+    # keeps them so stored shares stay readable.
+    if [ ! -s "$$LABYRINTH_RECOVERY_SHARE_KEK_FILE" ]; then
+      umask 077
+      mkdir -p "$$(dirname "$$LABYRINTH_RECOVERY_SHARE_KEK_FILE")"
+      head -c 32 /dev/urandom > "$$LABYRINTH_RECOVERY_SHARE_KEK_FILE"
+      provision_recovery_journal
+    fi
     exec catbird-server
 
 x-did-resolver: &did-resolver
@@ -119,6 +128,9 @@ services:
       FEDERATION_TEST_ALLOW_ALL_RELATIONSHIPS: "true"
       FEDERATION_TEST_LOCAL_USER_DIDS: "did:web:alice.catbird.blue"
       CHAT_CUTOVER_ENABLED: "${CHAT_CUTOVER_ENABLED:-true}"
+      LABYRINTH_RECOVERY_SHARE_KEK_FILE: /app/recovery/kek
+      LABYRINTH_RECOVERY_SHARE_KEK_ID: ds1-e2e
+      LABYRINTH_RECOVERY_SHARE_TOMBSTONE_FILE: /app/recovery/erasure.journal
       CHAT_CURSOR_KEY_ID: "${CHAT_CURSOR_KEY_ID:-ERERERERERERERERERERERERERERERERERERERERERE}"
       CHAT_CURSOR_SEALING_SECRET: "${CHAT_CURSOR_SEALING_SECRET:-IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI}"
       CHAT_SUBSCRIPTION_ENDPOINT: "${DS1_CHAT_SUBSCRIPTION_ENDPOINT:-wss://ds1.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents}"
@@ -214,6 +226,9 @@ services:
       FEDERATION_TEST_ALLOW_ALL_RELATIONSHIPS: "true"
       FEDERATION_TEST_LOCAL_USER_DIDS: "did:web:bob.catbird.blue"
       CHAT_CUTOVER_ENABLED: "${CHAT_CUTOVER_ENABLED:-true}"
+      LABYRINTH_RECOVERY_SHARE_KEK_FILE: /app/recovery/kek
+      LABYRINTH_RECOVERY_SHARE_KEK_ID: ds2-e2e
+      LABYRINTH_RECOVERY_SHARE_TOMBSTONE_FILE: /app/recovery/erasure.journal
       CHAT_CURSOR_KEY_ID: "${CHAT_CURSOR_KEY_ID:-ERERERERERERERERERERERERERERERERERERERERERE}"
       CHAT_CURSOR_SEALING_SECRET: "${CHAT_CURSOR_SEALING_SECRET:-IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI}"
       CHAT_SUBSCRIPTION_ENDPOINT: "${DS2_CHAT_SUBSCRIPTION_ENDPOINT:-wss://ds2.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents}"

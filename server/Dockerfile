@@ -35,7 +35,7 @@ RUN cargo build --locked --release -p catbird-server
 # ---------- federation-builder (test-only builder) ----------
 FROM builder AS federation-builder
 
-RUN cargo build --locked --release -p catbird-server --features test-support --bin federation_fixture --bin catbird-server
+RUN cargo build --locked --release -p catbird-server --features test-support --bin federation_fixture --bin provision_recovery_journal --bin catbird-server
 
 # ---------- runtime-base ----------
 FROM debian:bookworm-slim AS runtime-base
@@ -63,6 +63,7 @@ FROM runtime-base AS federation-test
 USER root
 COPY --from=federation-builder /build/target/release/catbird-server /usr/local/bin/catbird-server
 COPY --from=federation-builder /build/target/release/federation_fixture /usr/local/bin/federation_fixture
+COPY --from=federation-builder /build/target/release/provision_recovery_journal /usr/local/bin/provision_recovery_journal
 COPY e2e-tests/fixtures /app/fixtures
 RUN chown -R catbird:catbird /app/fixtures /usr/local/bin/federation_fixture
 
