@@ -51,7 +51,7 @@ These tests cover this contract. Task 4 R1 gate results are tracked outside this
 - `server/tests/space_host_and_revocation.rs` (`archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_commit`): 105 writers across two pages, identical commitment, independently verified page MACs/LtHash, terminal cursor semantics, cursor tampering, and fail-closed concurrent change.
 - `server/src/federation/{account_deletion_relay_tests,deletion_evidence_tests,c33_deleted_peer_tests,c33_deleted_acceptance_tests,c33_close_relay_tests,transport_control_entry_tests}.rs`: deletion relays, `sequencerAuthority` evidence, and C33 deletion and close propagation.
 - `e2e-tests/tests/ipados_ios_second_device.rs` (`ipados_ios_second_device_every_row_branches`): close residue, peer retrieval of the signed close, fresh-close rejection, and byte-identical replay.
-- `e2e-tests/tests/federation_spaces_full_cutover.rs`: two homes, Spaces, relays and push wakes end to end. Commands are in [../server/README.md](../server/README.md#tests).
+- `e2e-birdaemon/tests/federation_spaces_full_cutover.rs` (its own crate, because it needs a BIRDaemon checkout at `../BIRDaemon`): two homes, Spaces, relays and push wakes end to end. Commands are in [../server/README.md](../server/README.md#tests).
 - `e2e-tests/tests/space_denial_two_home_live.rs` (`--features labyrinth`): two live homes; members removed by a foreign and by their own home's Space authority restore their owner-rescued history on a fresh device only on the authority's signed denial relayed byte for byte, while a missing, forged, altered or replayed denial leaves the restore `ArchiveRestorePending`.
 
 Production deployment, production migration, and live PDS Spaces interoperability remain separate qualifications.

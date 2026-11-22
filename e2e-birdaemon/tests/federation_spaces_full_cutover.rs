@@ -12,7 +12,7 @@
 #![cfg(feature = "labyrinth")]
 
 #[allow(dead_code)]
-#[path = "support/native_spaces.rs"]
+#[path = "../../e2e-tests/tests/support/native_spaces.rs"]
 mod native_spaces;
 
 use std::{

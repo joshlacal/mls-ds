@@ -1,6 +1,6 @@
 [workspace]
 members = ["server", "codegen"]
-exclude = ["e2e-tests"]
+exclude = ["e2e-tests", "e2e-birdaemon"]
 resolver = "2"
 
 [workspace.package]

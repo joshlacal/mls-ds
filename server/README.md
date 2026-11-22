@@ -131,11 +131,11 @@ The generator migrates a disposable database and derives the exact SQLx checksum
 
 `../scripts/federation-hostile-test-gate.sh` replaces the deleted `federation_hostile_peers` suite. It runs the current hostile-peer regressions (group relay security, peer policy, untrusted JWT issuers, hostile bootstrap admission, forged or mismatched receipts, untrusted-peer routing) and a lib check, and refuses to start without the database environment above.
 
-Two-home end-to-end suite, from the repository root (`e2e-tests` is outside the workspace):
+Two-home end-to-end suite, from the repository root (`e2e-tests` and `e2e-birdaemon` are outside the workspace; `e2e-birdaemon` also needs a BIRDaemon checkout at `../BIRDaemon`):
 
 ```sh
 cargo build --locked --manifest-path server/Cargo.toml --features test-support --bin clean_slate_federation_fixture
-cargo test --manifest-path e2e-tests/Cargo.toml --features labyrinth --test federation_spaces_full_cutover
+cargo test --manifest-path e2e-birdaemon/Cargo.toml --features labyrinth --test federation_spaces_full_cutover
 cargo test --manifest-path e2e-tests/Cargo.toml --features labyrinth --test space_denial_two_home_live
 ```
 
