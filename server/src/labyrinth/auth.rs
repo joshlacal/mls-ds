@@ -124,6 +124,12 @@ fn service_auth_failure(nsid: &str, error: AuthError) -> LabyrinthError {
         )
         .with_retry_after(retry_after_secs),
         AuthError::Internal(_) => LabyrinthError::internal(),
+        // The operator took this account down in Ozone.
+        AuthError::AccountTakendown => LabyrinthError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "AccountTakedown",
+            "the operator has taken this account down",
+        ),
         // The caller's DID document could not be fetched now: nothing was
         // decided, so this is not the client's `Forbidden`.
         AuthError::DidResolutionUnavailable(_) => LabyrinthError::new(
@@ -896,6 +902,20 @@ mod service_auth_failure_tests {
         assert_eq!(
             (refusal.status(), refusal.name()),
             (axum::http::StatusCode::UNAUTHORIZED, "NotAuthorized")
+        );
+    }
+
+    /// An operator takedown keeps its own name and status, so the client can
+    /// tell it apart from a failed sign-in.
+    #[test]
+    fn a_takedown_is_403_account_takedown() {
+        let takedown = service_auth_failure(
+            "blue.catbird.labyrinth.getEpochHead",
+            AuthError::AccountTakendown,
+        );
+        assert_eq!(
+            (takedown.status(), takedown.name()),
+            (axum::http::StatusCode::FORBIDDEN, "AccountTakedown")
         );
     }
 }

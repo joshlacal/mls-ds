@@ -762,6 +762,28 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .expect("Failed to build HTTP client");
 
+    // ── Operator moderation (Ozone takedown labels) ─────────────────────
+    let moderation_cfg = catbird_server::moderation::ModerationLabelConfig::from_env();
+    catbird_server::moderation::set_enforcement_enabled(moderation_cfg.is_some());
+    match catbird_server::moderation::prune_to_config(&db_pool, moderation_cfg.as_ref()).await {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!(rows, "dropped moderation labels no longer enforced"),
+        Err(error) => tracing::error!(%error, "pruning moderation labels failed"),
+    }
+    match moderation_cfg {
+        Some(moderation_cfg) => {
+            tokio::spawn(catbird_server::moderation::run_label_poller(
+                db_pool.clone(),
+                http_client.clone(),
+                moderation_cfg,
+            ));
+        }
+        None if is_production => {
+            tracing::warn!("MODERATION_LABELER_DID/URL unset: Ozone takedowns are NOT enforced")
+        }
+        None => tracing::info!("Ozone moderation labels not configured"),
+    }
+
     let resolver = federation::DsResolver::new(
         db_pool.clone(),
         http_client.clone(),

@@ -96,6 +96,10 @@ fn service_auth_failure(endpoint: ChatEndpoint, error: AuthError) -> ChatFailure
             Some(retry_after_secs),
         ),
         AuthError::Internal(_) => ChatFailure::storage(endpoint),
+        // The operator took this account down in Ozone.
+        AuthError::AccountTakendown => {
+            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::AccountTakedown)
+        }
         // The issuer's DID document could not be fetched now: nothing decided.
         AuthError::DidResolutionUnavailable(_) => ChatFailure::unavailable(endpoint),
         _ => ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized),
@@ -774,6 +778,11 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("5")
         );
+
+        // 3c. An operator takedown -> AccountTakedown (403)
+        let failure = service_auth_failure(endpoint, AuthError::AccountTakendown);
+        assert_eq!(failure.code(), Some(ChatProtocolErrorCode::AccountTakedown));
+        assert_eq!(failure.into_response().status(), StatusCode::FORBIDDEN);
 
         // 4. All other variants -> NotAuthorized (401)
         let not_authorized_variants = vec![

@@ -97,6 +97,11 @@ pub enum AuthError {
     #[error("Authentication or device authorization denied")]
     DeviceAuthorizationDenied,
 
+    /// The operator took this account down in Ozone (`!takedown` /
+    /// `!suspend` label). See [`crate::moderation`].
+    #[error("Account has been taken down")]
+    AccountTakendown,
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -169,6 +174,9 @@ impl IntoResponse for AuthError {
                 "Unauthorized",
                 "Authentication or device authorization denied".to_string(),
             ),
+            AuthError::AccountTakendown => {
+                (StatusCode::FORBIDDEN, "AccountTakedown", self.to_string())
+            }
             AuthError::Internal(e) => {
                 tracing::error!("Internal auth error: {}", e);
                 (
@@ -1949,6 +1957,17 @@ async fn verify_mls_service_principal_inner(
     let (issuer, iat) = validate_mls_service_claims(&claims, endpoint_nsid, now)?;
     if consume_nonce {
         enforce_standard_with_replay_store(&claims, endpoint_nsid, pool).await?;
+    }
+    // Operator takedowns (Ozone labels mirrored by `crate::moderation`). The
+    // check runs after the signature and audience are proven, so an
+    // unauthenticated caller learns nothing about who is restricted.
+    if crate::moderation::enforcement_enabled()
+        && !crate::moderation::exempt_from_account_restriction(endpoint_nsid)
+        && crate::moderation::is_account_restricted(pool, issuer)
+            .await
+            .map_err(|error| AuthError::Internal(format!("moderation lookup failed: {error}")))?
+    {
+        return Err(AuthError::AccountTakendown);
     }
     // A bad recovery-share token is deliberately throttled by the handler
     // per signed device and network origin. Charging every attempt to this

@@ -189,14 +189,17 @@ impl IntoResponse for ChatFailure {
 
 /// HTTP status for a declared protocol failure. The wire contract is the error
 /// *name* (XRPC clients dispatch on it); the status is a best-effort transport
-/// hint. Auth failures surface 401, rate limits 429, a capacity or relationship
-/// source that is unavailable now 503, everything else the XRPC default 400.
+/// hint. Auth failures surface 401, an operator takedown 403, rate limits 429,
+/// a capacity or relationship source that is unavailable now 503, everything
+/// else the XRPC default 400.
 fn protocol_http_status(code: ChatProtocolErrorCode) -> StatusCode {
     use ChatProtocolErrorCode::{
-        AccountSessionExpired, CapacityUnavailable, DeviceBindingMismatch, DeviceNotRegistered,
-        DeviceRevoked, InvalidSignature, NotAuthorized, RateLimited, RelationshipPolicyUnavailable,
+        AccountSessionExpired, AccountTakedown, CapacityUnavailable, DeviceBindingMismatch,
+        DeviceNotRegistered, DeviceRevoked, InvalidSignature, NotAuthorized, RateLimited,
+        RelationshipPolicyUnavailable,
     };
     match code {
+        AccountTakedown => StatusCode::FORBIDDEN,
         AccountSessionExpired
         | DeviceBindingMismatch
         | InvalidSignature

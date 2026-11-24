@@ -48,6 +48,7 @@ macro_rules! define_error_codes {
 define_error_codes!(
     AccessOutsideMembershipInterval,
     AccountSessionExpired,
+    AccountTakedown,
     AcknowledgementConflict,
     AdminRequired,
     AuthenticationGenerationConflict,
@@ -253,6 +254,7 @@ define_endpoint_contracts!(
     PublishDirectRequestKeys => ("blue.catbird.chat.publishDirectRequestKeys", [
         AccountSessionExpired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
         DeviceNotRegistered,
         DeviceRevoked,
@@ -282,6 +284,7 @@ define_endpoint_contracts!(
     PrepareDirectRequest => ("blue.catbird.chat.prepareDirectRequest", [
         AccountSessionExpired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
         DeviceNotRegistered,
         DeviceRevoked,
@@ -311,6 +314,7 @@ define_endpoint_contracts!(
     GetDirectRequestOutcome => ("blue.catbird.chat.getDirectRequestOutcome", [
         AccountSessionExpired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
         DeviceNotRegistered,
         DeviceRevoked,
@@ -340,6 +344,7 @@ define_endpoint_contracts!(
     CancelDirectRequestPreparation => ("blue.catbird.chat.cancelDirectRequestPreparation", [
         AccountSessionExpired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
         DeviceNotRegistered,
         DeviceRevoked,
@@ -369,6 +374,7 @@ define_endpoint_contracts!(
     PublishDirectRequest => ("blue.catbird.chat.publishDirectRequest", [
         AccountSessionExpired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
         DeviceNotRegistered,
         DeviceRevoked,
@@ -419,6 +425,7 @@ define_endpoint_contracts!(
         StaleCoordinates,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
         CapacityUnavailable,
     ]),
@@ -436,6 +443,7 @@ define_endpoint_contracts!(
         WelcomeSuperseded,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
         CapacityUnavailable,
     ]),
@@ -456,6 +464,7 @@ define_endpoint_contracts!(
         InvalidSignature,
         MetadataNonceReuse,
         NotAuthorized,
+        AccountTakedown,
         NotMember,
         RateLimited,
         ResetRequestNotFound,
@@ -477,6 +486,7 @@ define_endpoint_contracts!(
         InvalidSignature,
         LeafRecoveryNotFound,
         NotAuthorized,
+        AccountTakedown,
         RateLimited,
         ProtocolUpgradeRequired,
         DeviceBindingMismatch,
@@ -493,6 +503,7 @@ define_endpoint_contracts!(
         InvalidSignature,
         LeaveRequestNotFound,
         NotAuthorized,
+        AccountTakedown,
         RateLimited,
         ProtocolUpgradeRequired,
         DeviceBindingMismatch,
@@ -513,6 +524,7 @@ define_endpoint_contracts!(
         StaleCoordinates,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
         CapacityUnavailable,
     ]),
@@ -534,6 +546,7 @@ define_endpoint_contracts!(
         MessagesDisabled,
         MetadataNonceReuse,
         NotAuthorized,
+        AccountTakedown,
         NotFollowedByRecipient,
         RateLimited,
         RelationshipPolicyUnavailable,
@@ -553,6 +566,7 @@ define_endpoint_contracts!(
         InvalidRequest,
         InvalidSignature,
         NotAuthorized,
+        AccountTakedown,
         ProtocolUpgradeRequired,
     ]),
     EnrollDevice => ("blue.catbird.chat.enrollDevice", [
@@ -568,6 +582,7 @@ define_endpoint_contracts!(
         InvalidSignature,
         KeyPackageInventoryLimitReached,
         NotAuthorized,
+        AccountTakedown,
         RateLimited,
         ProtocolUpgradeRequired,
         DeviceBindingMismatch,
@@ -584,6 +599,7 @@ define_endpoint_contracts!(
         RateLimited,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     GetConversations => ("blue.catbird.chat.getConversations", [
@@ -597,12 +613,14 @@ define_endpoint_contracts!(
         RateLimited,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     GetDeviceKey => ("blue.catbird.chat.getDeviceKey", [
         AccountSessionExpired, CutoverRequired, DeviceNotRegistered,
         DeviceRevoked, DeviceKeyNotFound, InvalidRequest, RateLimited,
-        ProtocolUpgradeRequired, NotAuthorized, DeviceBindingMismatch,
+        ProtocolUpgradeRequired, NotAuthorized, AccountTakedown,
+        DeviceBindingMismatch,
     ]),
     GetDevices => ("blue.catbird.chat.getDevices", [
         AccountSessionExpired,
@@ -613,6 +631,7 @@ define_endpoint_contracts!(
         RateLimited,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     GetEntries => ("blue.catbird.chat.getEntries", [
@@ -627,6 +646,7 @@ define_endpoint_contracts!(
         RateLimited,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     GetLeafRecoveryInbox => ("blue.catbird.chat.getLeafRecoveryInbox", [
@@ -641,6 +661,7 @@ define_endpoint_contracts!(
         RateLimited,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     GetOwnDevices => ("blue.catbird.chat.getOwnDevices", [
@@ -653,6 +674,7 @@ define_endpoint_contracts!(
         RateLimited,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     GetPendingWelcomes => ("blue.catbird.chat.getPendingWelcomes", [
@@ -667,6 +689,7 @@ define_endpoint_contracts!(
         RateLimited,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     GetSubscriptionTicket => ("blue.catbird.chat.getSubscriptionTicket", [
@@ -682,6 +705,7 @@ define_endpoint_contracts!(
         RateLimited,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     RegisterPushGateway => ("blue.catbird.chat.registerPushGateway", [
@@ -694,6 +718,7 @@ define_endpoint_contracts!(
         InvalidRequest,
         InvalidSignature,
         NotAuthorized,
+        AccountTakedown,
         ProtocolUpgradeRequired,
     ]),
     RelaySpaceCredential => ("blue.catbird.chat.relaySpaceCredential", [
@@ -705,6 +730,7 @@ define_endpoint_contracts!(
         InvalidRequest,
         InvalidTargetEndpoint,
         NotAuthorized,
+        AccountTakedown,
         ProtocolUpgradeRequired,
         UpstreamError,
     ]),
@@ -717,6 +743,7 @@ define_endpoint_contracts!(
         InvalidRequest,
         InvalidTargetEndpoint,
         NotAuthorized,
+        AccountTakedown,
         ProtocolUpgradeRequired,
         UpstreamError,
     ]),
@@ -738,6 +765,7 @@ define_endpoint_contracts!(
         StaleCoordinates,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     RejectWelcome => ("blue.catbird.chat.rejectWelcome", [
@@ -754,6 +782,7 @@ define_endpoint_contracts!(
         WelcomeSuperseded,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
         CapacityUnavailable,
     ]),
@@ -769,6 +798,7 @@ define_endpoint_contracts!(
         InvalidSignature,
         KeyPackageInventoryLimitReached,
         NotAuthorized,
+        AccountTakedown,
         RateLimited,
         ProtocolUpgradeRequired,
         DeviceBindingMismatch,
@@ -791,6 +821,7 @@ define_endpoint_contracts!(
         StaleCoordinates,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     RequestLeave => ("blue.catbird.chat.requestLeave", [
@@ -812,6 +843,7 @@ define_endpoint_contracts!(
         StaleCoordinates,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     RequestReset => ("blue.catbird.chat.requestReset", [
@@ -830,6 +862,7 @@ define_endpoint_contracts!(
         StaleCoordinates,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     RevokeDevice => ("blue.catbird.chat.revokeDevice", [
@@ -843,6 +876,7 @@ define_endpoint_contracts!(
         InvalidRequest,
         InvalidSignature,
         NotAuthorized,
+        AccountTakedown,
         RateLimited,
         ProtocolUpgradeRequired,
         DeviceBindingMismatch,
@@ -860,6 +894,7 @@ define_endpoint_contracts!(
         InvalidRequest,
         InvalidSignature,
         NotAuthorized,
+        AccountTakedown,
         ProtocolUpgradeRequired,
         RateLimited,
     ]),
@@ -887,6 +922,7 @@ define_endpoint_contracts!(
         UnsupportedMlsProfile,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
     SubmitTransition => ("blue.catbird.chat.submitTransition", [
@@ -925,6 +961,7 @@ define_endpoint_contracts!(
         MetadataVersionOverflow,
         MissingMetadataSnapshot,
         NotAuthorized,
+        AccountTakedown,
         NotFollowedByRecipient,
         NotMember,
         ParticipantLeafLimitReached,
@@ -948,6 +985,7 @@ define_endpoint_contracts!(
         RateLimited,
         ProtocolUpgradeRequired,
         NotAuthorized,
+        AccountTakedown,
         DeviceBindingMismatch,
     ]),
 );

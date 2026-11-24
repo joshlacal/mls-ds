@@ -76,6 +76,7 @@ pub mod labyrinth;
 pub mod metrics;
 pub mod middleware;
 pub mod mls_group_info_verifier;
+pub mod moderation;
 pub mod push_gateway;
 pub mod realtime;
 pub mod sim_hooks;

@@ -99,6 +99,8 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_restore_path_",
     // `tests/db_tests.rs`
     "mlsds_dbtests_",
+    // `tests/moderation_labels.rs`
+    "moderation_labels_",
     // `tests/labyrinth_*.rs` (via `tests/common/labyrinth_harness.rs`)
     "labyrinth_srv_",
     // `tests/federation_hostile_peers.rs`
