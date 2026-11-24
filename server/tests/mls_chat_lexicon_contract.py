@@ -1322,6 +1322,8 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
         errors = [entry["name"] for entry in main.get("errors", [])]
         assert len(errors) == len(set(errors)), f"{name} errors must be unique"
         assert "InvalidDPoP" not in errors, f"{name} must not expose retired custom DPoP"
+        if "NotAuthorized" in errors:
+            assert "AccountTakedown" in errors, f"{name} missing AccountTakedown"
         if name != "subscribeEvents":
             assert "AccountSessionExpired" in errors, f"{name} missing AccountSessionExpired"
             assert "ProtocolUpgradeRequired" in errors, f"{name} missing ProtocolUpgradeRequired"

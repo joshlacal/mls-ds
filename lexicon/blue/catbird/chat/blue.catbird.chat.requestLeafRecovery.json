@@ -82,6 +82,10 @@
           "name": "NotAuthorized"
         },
         {
+          "name": "AccountTakedown",
+          "description": "The operator has taken this account down. Only deleting the account's own data is still allowed."
+        },
+        {
           "name": "DeviceBindingMismatch"
         },
         {
