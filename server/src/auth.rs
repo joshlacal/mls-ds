@@ -1961,7 +1961,8 @@ async fn verify_mls_service_principal_inner(
     // Operator takedowns (Ozone labels mirrored by `crate::moderation`). The
     // check runs after the signature and audience are proven, so an
     // unauthenticated caller learns nothing about who is restricted.
-    if !crate::moderation::exempt_from_account_restriction(endpoint_nsid)
+    if crate::moderation::enforcement_enabled()
+        && !crate::moderation::exempt_from_account_restriction(endpoint_nsid)
         && crate::moderation::is_account_restricted(pool, issuer)
             .await
             .map_err(|error| AuthError::Internal(format!("moderation lookup failed: {error}")))?

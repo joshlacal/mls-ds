@@ -764,6 +764,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Operator moderation (Ozone takedown labels) ─────────────────────
     let moderation_cfg = catbird_server::moderation::ModerationLabelConfig::from_env();
+    catbird_server::moderation::set_enforcement_enabled(moderation_cfg.is_some());
     match catbird_server::moderation::prune_to_config(&db_pool, moderation_cfg.as_ref()).await {
         Ok(0) => {}
         Ok(rows) => tracing::info!(rows, "dropped moderation labels no longer enforced"),

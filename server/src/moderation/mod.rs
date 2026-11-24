@@ -17,6 +17,7 @@
 
 pub mod labels;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::storage::DbPool;
@@ -110,6 +111,21 @@ pub async fn prune_to_config(
         }
     };
     Ok(result.rows_affected())
+}
+
+/// Whether this process enforces Ozone labels. Set once at startup from
+/// [`ModerationLabelConfig::from_env`]. While it is off the stored-label table
+/// is empty (startup prunes it), so admission skips the lookup entirely.
+static ENFORCEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Turn label enforcement on or off for this process.
+pub fn set_enforcement_enabled(enabled: bool) {
+    ENFORCEMENT_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether admission should look up account labels at all.
+pub fn enforcement_enabled() -> bool {
+    ENFORCEMENT_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Endpoints a restricted account may still call. Deleting one's own data
