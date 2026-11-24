@@ -11,7 +11,7 @@
 
 CREATE SCHEMA IF NOT EXISTS moderation;
 
-CREATE TABLE moderation.account_labels (
+CREATE TABLE IF NOT EXISTS moderation.account_labels (
     src        TEXT        NOT NULL,
     did        TEXT        NOT NULL,
     val        TEXT        NOT NULL,
@@ -26,12 +26,6 @@ CREATE TABLE moderation.account_labels (
     CONSTRAINT account_labels_val_len CHECK (char_length(val) BETWEEN 1 AND 128)
 );
 
-CREATE INDEX account_labels_live_by_did
+CREATE INDEX IF NOT EXISTS account_labels_live_by_did
     ON moderation.account_labels (did)
     WHERE NOT neg;
-
-CREATE TABLE moderation.label_cursors (
-    src        TEXT        PRIMARY KEY,
-    cursor     TEXT,
-    updated_at TIMESTAMPTZ NOT NULL
-);

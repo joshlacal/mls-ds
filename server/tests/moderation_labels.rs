@@ -108,3 +108,49 @@ async fn malformed_dids_are_refused_by_the_schema() {
     bad.did = "at://did:plc:x/app.bsky.feed.post/1".into();
     assert!(apply_label_event(&pool, &bad).await.is_err());
 }
+
+#[tokio::test]
+async fn startup_prune_drops_labels_the_config_no_longer_enforces() {
+    use catbird_server::moderation::{prune_to_config, ModerationLabelConfig};
+
+    let db = common::fresh_db::fresh_fully_migrated_db("moderation_labels_").await;
+    let pool = db.connect(2).await;
+    let t0 = Utc::now() - Duration::minutes(10);
+
+    apply_label_event(&pool, &event("!takedown", t0, None, false))
+        .await
+        .unwrap();
+    let mut other_labeler = event("!takedown", t0, None, false);
+    other_labeler.src = "did:plc:retiredlabeler".into();
+    other_labeler.did = BYSTANDER.into();
+    apply_label_event(&pool, &other_labeler).await.unwrap();
+    assert!(is_account_restricted(&pool, BYSTANDER).await.unwrap());
+
+    let cfg = ModerationLabelConfig {
+        labeler_did: OZONE.into(),
+        labeler_url: "https://ozone.example".into(),
+        enforced_labels: vec!["!takedown".into()],
+        poll_interval: std::time::Duration::from_secs(30),
+    };
+    assert_eq!(prune_to_config(&pool, Some(&cfg)).await.unwrap(), 1);
+    assert!(is_account_restricted(&pool, SPAMMER).await.unwrap());
+    assert!(!is_account_restricted(&pool, BYSTANDER).await.unwrap());
+
+    // Dropping a value from the enforced list lifts bans carried by it.
+    let suspend_only = ModerationLabelConfig {
+        enforced_labels: vec!["!suspend".into()],
+        ..cfg.clone()
+    };
+    assert_eq!(
+        prune_to_config(&pool, Some(&suspend_only)).await.unwrap(),
+        1
+    );
+    assert!(!is_account_restricted(&pool, SPAMMER).await.unwrap());
+
+    // Unconfigured moderation keeps nothing.
+    apply_label_event(&pool, &event("!takedown", t0, None, false))
+        .await
+        .unwrap();
+    assert_eq!(prune_to_config(&pool, None).await.unwrap(), 1);
+    assert!(!is_account_restricted(&pool, SPAMMER).await.unwrap());
+}
