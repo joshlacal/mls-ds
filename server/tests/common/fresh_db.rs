@@ -95,6 +95,8 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_freshdb_",
     // `src/chat_protocol/repository/concurrency_tests.rs`
     "chat_concurrency_",
+    // `tests/restore_search_path.rs`
+    "chat_restore_path_",
     // `tests/db_tests.rs`
     "mlsds_dbtests_",
     // `tests/labyrinth_*.rs` (via `tests/common/labyrinth_harness.rs`)
