@@ -1349,7 +1349,7 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
     assert required(space_credential) == {"actorDeviceId", "authorityDid", "space", "delegationToken", "cnfKey"}
     credential_fields = space_credential["properties"]
     assert credential_fields["space"]["format"] == "space-ref"
-    assert credential_fields["space"]["description"].startswith("Exactly at://{authorityDid}/space/{spaceType}/{skey}.")
+    assert credential_fields["space"]["description"].startswith("Exactly at:space/{authorityDid}/{spaceType}/{skey}.")
     assert credential_fields["delegationToken"]["maxLength"] == 8192  # atproto-spaces MAX_COMPACT_JWT_BYTES
     delegation = credential_fields["delegationToken"]["description"]
     for clause in ("sub is exactly space", "aud is {authorityDid}#atproto_pds", "no cnf claim", "at most 60 seconds"):

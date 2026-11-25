@@ -187,7 +187,7 @@ fn scopes() -> Vec<String> {
 }
 
 fn mailbox(did: &str) -> String {
-    format!("at://{did}/space/blue.catbird.labyrinth.mailbox/self")
+    format!("at:space/{did}/blue.catbird.labyrinth.mailbox/self")
 }
 
 fn decode<T: serde::de::DeserializeOwned>(records: Vec<(String, Value)>) -> Result<Vec<T>> {
@@ -311,7 +311,7 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
         .clone()
         .context("a live group pins its conversation Space")?;
     anyhow::ensure!(
-        space == format!("at://{DS_DID}/space/blue.catbird.labyrinth.conversation/{cid}-0"),
+        space == format!("at:space/{DS_DID}/blue.catbird.labyrinth.conversation/{cid}-0"),
         "conversation Space {space}"
     );
     // Bob accepts the invitation, the phone fulfils his leaf recovery, and Bob

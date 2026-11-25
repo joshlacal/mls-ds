@@ -433,7 +433,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let space_uri = seeded_b["spaceUri"].as_str().unwrap().to_string();
     assert_eq!(
         space_uri,
-        format!("at://{DS_B_DID}/space/blue.catbird.labyrinth.conversation/{convo_id}-0"),
+        format!("at:space/{DS_B_DID}/blue.catbird.labyrinth.conversation/{convo_id}-0"),
         "Conversation Space URI must be rooted at sequencing DS (ds-b did:plc)"
     );
 
@@ -652,7 +652,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     );
     assert_eq!(
         alice_enroll.mailbox_space_uri,
-        format!("at://{alice_sdk_did}/space/blue.catbird.labyrinth.mailbox/self")
+        format!("at:space/{alice_sdk_did}/blue.catbird.labyrinth.mailbox/self")
     );
 
     // Publish real signed `EpochPublic` (epoch 0) for Alice to `ds-a`'s `publishEpochHead` and verify via `getEpochHead` (`Gate 6`, `L-F01`)
@@ -1189,7 +1189,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     );
     let pair_coord_did = std::cmp::min(DS_A_DID, DS_B_DID);
     let fed_space_uri =
-        format!("at://{pair_coord_did}/space/blue.catbird.labyrinth.conversation/{fed_convo_id}-0");
+        format!("at:space/{pair_coord_did}/blue.catbird.labyrinth.conversation/{fed_convo_id}-0");
     use labyrinth::records::nsid;
     for (did, mailbox) in [
         (&alice_sdk_did, &alice_enroll.mailbox_space_uri),

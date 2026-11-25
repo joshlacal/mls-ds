@@ -318,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn authority_denials_keep_their_status_through_the_credential_relay() {
         let authority = "did:web:credential-relay-denial.example";
-        let space = format!("at://{authority}/space/blue.catbird.labyrinth.mailbox/self");
+        let space = format!("at:space/{authority}/blue.catbird.labyrinth.mailbox/self");
         let pop = p256::SecretKey::from_slice(&[0x31; 32]).unwrap();
         let kid = atproto_spaces::kem::encode_p256_did_key(&pop.public_key());
         let upstream = Arc::new(Mutex::new((StatusCode::OK, json!({}))));
@@ -367,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn signed_authority_refusals_cross_the_credential_relay_byte_for_byte() {
         let authority = "did:web:credential-relay-signed-denial.example";
-        let space = format!("at://{authority}/space/blue.catbird.labyrinth.conversation/c-0");
+        let space = format!("at:space/{authority}/blue.catbird.labyrinth.conversation/c-0");
         let pop = p256::SecretKey::from_slice(&[0x32; 32]).unwrap();
         let kid = atproto_spaces::kem::encode_p256_did_key(&pop.public_key());
         let signed: &[u8] =
@@ -423,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn upstream_outages_are_retryable_503s_and_upstream_refusals_are_preserved() {
         let target = "did:web:space-relay-outage.example";
-        let space = format!("at://{target}/space/blue.catbird.labyrinth.mailbox/self");
+        let space = format!("at:space/{target}/blue.catbird.labyrinth.mailbox/self");
         let pop = p256::SecretKey::from_slice(&[0x31; 32]).unwrap();
         let kid = atproto_spaces::kem::encode_p256_did_key(&pop.public_key());
         let upstream = Arc::new(Mutex::new(StatusCode::OK));
@@ -575,7 +575,7 @@ mod tests {
         let valid = json!({
             "actorDeviceId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
             "authorityDid": authority,
-            "space": format!("at://{authority}/space/blue.catbird.labyrinth.mailbox/self"),
+            "space": format!("at:space/{authority}/blue.catbird.labyrinth.mailbox/self"),
             "delegationToken": "delegation.jwt.0123456789",
             "cnfKey": "did:key:zDnaerDaTF5BXEavCrfRZEk316dpbLsfPDZ3WJ5hRTPFU2169",
         });

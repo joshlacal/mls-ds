@@ -390,7 +390,7 @@ async fn c2_remote_home_refusal_keeps_only_declared_identifier_shapes() {
     let request = DeliverGroupEntryRequest {
         conversation_id: Uuid::new_v4(),
         generation: 0,
-        space_uri: "at://did:web:relay-source.example.com/space/x".to_owned(),
+        space_uri: "at:space/did:web:relay-source.example.com/x".to_owned(),
         recipient_dids: Vec::new(),
         recipient_devices: Vec::new(),
         entry: json!({}),
@@ -473,7 +473,7 @@ async fn c2_account_deletion_binds_both_conversation_and_sequencer() {
         conversation_id,
         generation: 0,
         space_uri: format!(
-            "at://{sequencer}/space/blue.catbird.labyrinth.conversation/{conversation_id}-0"
+            "at:space/{sequencer}/blue.catbird.labyrinth.conversation/{conversation_id}-0"
         ),
         recipient_dids: Vec::new(),
         recipient_devices: Vec::new(),
